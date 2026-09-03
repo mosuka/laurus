@@ -1092,6 +1092,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87fbd1ecd2ed790e11c8fbe034f9b3e7687404818d1bdfd8218d26ec645ec7c5"
 
 [[package]]
+name = "crawdad"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abed0ad19907fc8472dae05f0418dfa82fdf0eaef18427c7c7cc4e42db41534b"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1246,6 +1252,12 @@ name = "daachorse"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d358f1fa877be3097baa74c1fc22288626450392cb37d844f850baa60e6439a0"
+
+[[package]]
+name = "daachorse"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd10668980c9e7ba8aa2e616207d9ec52f7db66ebb47db857ed1f3c342530dad"
 
 [[package]]
 name = "darling"
@@ -2831,7 +2843,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "lindera",
- "lindera-dictionary",
+ "lindera-dictionary 6.0.0",
  "log",
  "lru",
  "memmap2",
@@ -3068,7 +3080,7 @@ checksum = "65015f4b12a1b869058a602e3cf7b39239ca1fbedd4b451bc9bb2fd2c9989eee"
 dependencies = [
  "anyhow",
  "lindera-cc-cedict",
- "lindera-dictionary",
+ "lindera-dictionary 5.3.0",
  "lindera-ipadic",
  "lindera-ko-dic",
  "log",
@@ -3086,7 +3098,7 @@ version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a37a0487f0adbbf4693439f1331d453abc5aa23ce647ca16c39b608211fb9be6"
 dependencies = [
- "lindera-dictionary",
+ "lindera-dictionary 5.3.0",
 ]
 
 [[package]]
@@ -3097,7 +3109,7 @@ checksum = "647b3dd3102151b82d6995f5fafdb4fe512f8b65b5f92ccf6bfde2ba33596423"
 dependencies = [
  "anyhow",
  "byteorder",
- "crawdad",
+ "crawdad 0.3.0",
  "csv",
  "daachorse 4.0.0",
  "encoding_rs",
@@ -3122,12 +3134,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "lindera-dictionary"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1b3280d38586314078049deb66f332f544765cc23b683c56c28e335cabcb20"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "crawdad 0.4.1",
+ "csv",
+ "daachorse 5.0.0",
+ "encoding_rs",
+ "encoding_rs_io",
+ "glob",
+ "log",
+ "memchr",
+ "once_cell",
+ "rayon",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "lindera-ipadic"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d01d06a14be0253c6f11cd48e3acebb0698aee3b199715e8ffae0c6f3111eb8"
 dependencies = [
- "lindera-dictionary",
+ "lindera-dictionary 5.3.0",
 ]
 
 [[package]]
@@ -3136,7 +3174,7 @@ version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ba1a7fbc96a797201784c473c94d9d33f6b5d7990d5510967c42df514587b14"
 dependencies = [
- "lindera-dictionary",
+ "lindera-dictionary 5.3.0",
 ]
 
 [[package]]
@@ -5571,7 +5609,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

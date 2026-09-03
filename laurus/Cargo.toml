@@ -34,7 +34,7 @@ fst = "0.4.7"
 futures = "0.3.33"
 lazy_static = "1.5.0"
 lindera = { version = "5.3.0" }
-lindera-dictionary = { version = "5.3.0", default-features = false }
+lindera-dictionary = { version = "6.0.0", default-features = false }
 log = "0.4.33"
 lru = "0.18.2"
 parking_lot = "0.12.5"
