@@ -407,7 +407,11 @@ let updated_schema = engine.delete_field("category").await?;
 
 ### 共通の注意事項
 
-返却された `Schema` は呼び出し側で永続化する必要があります（例: `schema.toml` への書き出し）。
+`Engine::builder().persist_schema_with(hook)` でスキーマ永続化フックを設定していれば、
+`add_field`/`delete_field` は返却前に自らそのフックを呼び出してスキーマを永続化します
+（`laurus-cli` と `laurus-server` はどちらもこのフックで `schema.toml` への書き出しを
+行っています）。フックを設定していない場合は、従来どおり返却された `Schema` を
+呼び出し側で永続化する必要があります（例: `schema.toml` への書き出し）。
 
 ## スキーマ設計のヒント
 

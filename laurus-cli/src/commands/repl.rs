@@ -123,7 +123,7 @@ pub async fn run(index_dir: &Path, format: OutputFormat) -> Result<()> {
                     eprintln!("{NO_INDEX_MSG}");
                     continue;
                 };
-                handle_add(eng, index_dir, parts[1], parts.get(2).copied()).await
+                handle_add(eng, parts[1], parts.get(2).copied()).await
             }
             "put" => {
                 if parts.len() < 2 {
@@ -156,7 +156,7 @@ pub async fn run(index_dir: &Path, format: OutputFormat) -> Result<()> {
                     eprintln!("{NO_INDEX_MSG}");
                     continue;
                 };
-                handle_delete(eng, index_dir, parts[1], parts.get(2).copied()).await
+                handle_delete(eng, parts[1], parts.get(2).copied()).await
             }
             "commit" => {
                 let Some(ref eng) = engine else {
@@ -315,12 +315,7 @@ async fn handle_search(engine: &Engine, query_str: &str, format: OutputFormat) -
 }
 
 /// Handle `add field ...` and `add doc ...` commands.
-async fn handle_add(
-    engine: &Engine,
-    index_dir: &Path,
-    resource: &str,
-    rest: Option<&str>,
-) -> Result<()> {
+async fn handle_add(engine: &Engine, resource: &str, rest: Option<&str>) -> Result<()> {
     match resource {
         "field" => {
             let rest = rest.context("Usage: add field <name> <json>")?;
@@ -329,11 +324,10 @@ async fn handle_add(
                 .context("Usage: add field <name> <json>")?;
             let field_option: FieldOption =
                 serde_json::from_str(json_str).context("Failed to parse field option JSON")?;
-            let updated_schema = engine
+            engine
                 .add_field(name, field_option)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            context::save_schema(index_dir, &updated_schema)?;
             println!("Field '{name}' added.");
             Ok(())
         }
@@ -415,20 +409,14 @@ async fn handle_get(
 }
 
 /// Handle `delete field ...` and `delete docs ...` commands.
-async fn handle_delete(
-    engine: &Engine,
-    index_dir: &Path,
-    resource: &str,
-    rest: Option<&str>,
-) -> Result<()> {
+async fn handle_delete(engine: &Engine, resource: &str, rest: Option<&str>) -> Result<()> {
     match resource {
         "field" => {
             let name = rest.context("Usage: delete field <name>")?;
-            let updated_schema = engine
+            engine
                 .delete_field(name)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            context::save_schema(index_dir, &updated_schema)?;
             println!("Field '{name}' deleted.");
             Ok(())
         }

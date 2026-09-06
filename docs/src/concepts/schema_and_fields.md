@@ -410,8 +410,14 @@ let updated_schema = engine.add_field(
 ```
 
 Existing documents are unaffected—they simply have no value for the new
-field. The returned `Schema` should be persisted (e.g., to `schema.toml`)
-by the caller.
+field.
+
+If a schema-persist hook was configured via
+`Engine::builder().persist_schema_with(hook)`, `add_field`/`delete_field`
+call it themselves before returning, persisting the schema on the
+caller's behalf (both `laurus-cli` and `laurus-server` configure this
+hook to write `schema.toml`). Otherwise, as before, the returned `Schema`
+should be persisted (e.g., to `schema.toml`) by the caller.
 
 ### Removing a Field
 

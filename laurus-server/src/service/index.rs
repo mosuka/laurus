@@ -133,8 +133,6 @@ impl IndexServiceTrait for IndexService {
             .await
             .map_err(error::to_status)?;
 
-        context::save_schema(&self.data_dir, &updated_schema).map_err(error::anyhow_to_status)?;
-
         tracing::info!("Field '{}' added to index", name);
         let proto_schema = schema_convert::to_proto(&updated_schema);
         Ok(Response::new(AddFieldResponse {
@@ -159,8 +157,6 @@ impl IndexServiceTrait for IndexService {
             .ok_or_else(|| Status::failed_precondition("No index is open"))?;
 
         let updated_schema = engine.delete_field(&name).await.map_err(error::to_status)?;
-
-        context::save_schema(&self.data_dir, &updated_schema).map_err(error::anyhow_to_status)?;
 
         tracing::info!("Field '{}' deleted from index", name);
         let proto_schema = schema_convert::to_proto(&updated_schema);

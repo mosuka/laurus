@@ -6,16 +6,30 @@
 //! * `store/`      – the underlying storage directory managed by [`Engine`].
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use laurus::storage::file::FileStorageConfig;
-use laurus::{CommitPolicy, Engine, Schema, StorageConfig, StorageFactory, WalSyncPolicy};
+use laurus::{
+    CommitPolicy, Engine, LaurusError, Schema, StorageConfig, StorageFactory, WalSyncPolicy,
+};
 
 /// Filename used to persist the index schema inside the data directory.
 const SCHEMA_FILE: &str = "schema.toml";
 
 /// Subdirectory name for the underlying storage inside the data directory.
 const STORE_DIR: &str = "store";
+
+/// Build a [`laurus::SchemaPersistHook`] that writes `schema.toml` inside
+/// `data_dir` (Issue #1078).
+///
+/// Attached to every [`Engine`] this module builds, so
+/// [`Engine::add_field`]/[`Engine::delete_field`] persist the schema
+/// themselves instead of relying on the gRPC handlers to do it.
+fn schema_persist_hook(data_dir: &Path) -> laurus::SchemaPersistHook {
+    let data_dir = data_dir.to_path_buf();
+    Arc::new(move |schema| save_schema(&data_dir, schema).map_err(LaurusError::from))
+}
 
 /// Create a new index at the given data directory with the provided schema.
 ///
@@ -67,6 +81,7 @@ pub async fn create_index(
     let engine = Engine::builder(storage, schema.clone())
         .wal_sync_policy(wal_policy)
         .commit_policy(commit_policy)
+        .persist_schema_with(schema_persist_hook(data_dir))
         .build()
         .await?;
 
@@ -116,6 +131,7 @@ pub async fn open_index(
     let engine = Engine::builder(storage, schema)
         .wal_sync_policy(wal_policy)
         .commit_policy(commit_policy)
+        .persist_schema_with(schema_persist_hook(data_dir))
         .build()
         .await?;
 

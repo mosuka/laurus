@@ -13,9 +13,11 @@ use crate::context;
 
 /// Execute the `delete field` command.
 ///
-/// Opens the index at `index_dir`, calls [`Engine::delete_field`], and writes
-/// the updated schema to disk. Existing data in the index is not deleted;
-/// the field simply becomes inaccessible for future indexing and searching.
+/// Opens the index at `index_dir` and calls [`Engine::delete_field`], which
+/// persists the updated schema itself (the engine returned by
+/// [`context::open_index`] is configured with a schema-persist hook — see
+/// Issue #1078). Existing data in the index is not deleted; the field
+/// simply becomes inaccessible for future indexing and searching.
 ///
 /// # Arguments
 ///
@@ -31,12 +33,10 @@ use crate::context;
 pub async fn run_field(name: &str, index_dir: &Path) -> Result<()> {
     let engine = context::open_index(index_dir).await?;
 
-    let updated_schema = engine
+    engine
         .delete_field(name)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    context::save_schema(index_dir, &updated_schema)?;
 
     println!("Field '{name}' deleted successfully.");
     Ok(())

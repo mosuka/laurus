@@ -5,16 +5,28 @@
 //! used by the various CLI subcommands to obtain an [`Engine`] instance.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use laurus::storage::file::FileStorageConfig;
-use laurus::{CommitPolicy, Engine, Schema, StorageConfig, StorageFactory};
+use laurus::{CommitPolicy, Engine, LaurusError, Schema, StorageConfig, StorageFactory};
 
 /// File name used to persist the schema inside the index directory.
 const SCHEMA_FILE: &str = "schema.toml";
 
 /// Subdirectory name used for the storage backend within the index directory.
 const STORE_DIR: &str = "store";
+
+/// Build a [`laurus::SchemaPersistHook`] that writes `schema.toml` inside
+/// `index_dir` (Issue #1078).
+///
+/// Attached to every [`Engine`] this module builds, so
+/// [`Engine::add_field`]/[`Engine::delete_field`] persist the schema
+/// themselves instead of relying on each call site to do it.
+fn schema_persist_hook(index_dir: &Path) -> laurus::SchemaPersistHook {
+    let index_dir = index_dir.to_path_buf();
+    Arc::new(move |schema| save_schema(&index_dir, schema).map_err(LaurusError::from))
+}
 
 /// Create a new index in the given index directory from a schema TOML file.
 ///
@@ -131,7 +143,10 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
     // Create the storage and engine to initialize the index structure.
     let storage_config = StorageConfig::File(FileStorageConfig::new(&store_path));
     let storage = StorageFactory::create(storage_config)?;
-    let _engine = Engine::new(storage, schema).await?;
+    let _engine = Engine::builder(storage, schema)
+        .persist_schema_with(schema_persist_hook(index_dir))
+        .build()
+        .await?;
 
     Ok(())
 }
@@ -208,6 +223,7 @@ pub async fn open_index_with_commit_policy(
     };
     let engine = Engine::builder(storage, schema)
         .commit_policy(commit_policy)
+        .persist_schema_with(schema_persist_hook(index_dir))
         .build()
         .await?;
 
@@ -247,4 +263,67 @@ pub fn save_schema(index_dir: &Path, schema: &Schema) -> Result<()> {
     let schema_dest = index_dir.join(SCHEMA_FILE);
     std::fs::write(&schema_dest, &schema_toml).context("Failed to write schema file")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #1078: `add_field`/`delete_field` must persist `schema.toml`
+    /// themselves via the hook this module attaches, so a dynamic schema
+    /// change survives closing and reopening the index (simulating a
+    /// process restart) without any call site needing to call
+    /// `save_schema` explicitly.
+    #[tokio::test]
+    async fn dynamic_field_add_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        create_index_from_schema(dir.path(), Schema::new())
+            .await
+            .unwrap();
+
+        {
+            let engine = open_index(dir.path()).await.unwrap();
+            engine
+                .add_field(
+                    "title",
+                    laurus::FieldOption::Text(laurus::TextOption::default()),
+                )
+                .await
+                .unwrap();
+            // No explicit `save_schema` call here — the point of this test.
+        }
+
+        // Reopen as a fresh process would, and confirm the change survived.
+        let reopened_schema = read_schema(dir.path()).unwrap();
+        assert!(
+            reopened_schema.fields.contains_key("title"),
+            "add_field should have persisted schema.toml via the engine's hook"
+        );
+
+        let engine = open_index(dir.path()).await.unwrap();
+        assert!(engine.schema().fields.contains_key("title"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_field_delete_survives_reopen() {
+        let schema = Schema::builder()
+            .add_field(
+                "title",
+                laurus::FieldOption::Text(laurus::TextOption::default()),
+            )
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        create_index_from_schema(dir.path(), schema).await.unwrap();
+
+        {
+            let engine = open_index(dir.path()).await.unwrap();
+            engine.delete_field("title").await.unwrap();
+        }
+
+        let reopened_schema = read_schema(dir.path()).unwrap();
+        assert!(
+            !reopened_schema.fields.contains_key("title"),
+            "delete_field should have persisted schema.toml via the engine's hook"
+        );
+    }
 }

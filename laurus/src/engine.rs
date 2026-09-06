@@ -32,6 +32,17 @@ use crate::vector::store::config::VectorIndexConfig;
 
 use self::schema::Schema;
 
+/// Callback invoked to persist a [`Schema`] snapshot outside the engine's own
+/// [`Storage`] (Issue #1078).
+///
+/// The engine's `storage` only ever covers its `store/` subdirectory —
+/// `schema.toml` conventionally lives one level up, alongside it, and where
+/// (or whether) to write it is a decision that belongs to the caller, not the
+/// engine. Set via [`EngineBuilder::persist_schema_with`]; when set,
+/// [`Engine::add_field`] and [`Engine::delete_field`] invoke it with the
+/// updated schema instead of leaving persistence to the caller.
+pub type SchemaPersistHook = Arc<dyn Fn(&Schema) -> Result<()> + Send + Sync>;
+
 /// Policy controlling when the engine automatically runs the commit ladder
 /// during ingestion (Issue #890).
 ///
@@ -438,6 +449,9 @@ pub struct Engine {
     /// Absent on `wasm32` (no background threads — `Interval` is a no-op).
     #[cfg(not(target_arch = "wasm32"))]
     _commit_timer: Option<CommitTimer>,
+    /// Optional callback that persists the schema outside the engine's own
+    /// storage (Issue #1078). See [`SchemaPersistHook`].
+    schema_persist_hook: Option<SchemaPersistHook>,
 }
 
 use crate::engine::search::{FusionAlgorithm, SearchResult};
@@ -1327,6 +1341,19 @@ impl Engine {
         )
     }
 
+    /// Persist the current schema via the configured hook, if any (Issue #1078).
+    ///
+    /// No-op when [`EngineBuilder::persist_schema_with`] was not called
+    /// (the caller remains responsible for persisting the schema itself, as
+    /// before). Called by [`Self::add_field`] and [`Self::delete_field`]
+    /// after they update the in-memory schema.
+    fn persist_schema(&self, schema: &Schema) -> Result<()> {
+        if let Some(hook) = &self.schema_persist_hook {
+            hook(schema)?;
+        }
+        Ok(())
+    }
+
     /// Dynamically add a new field to the engine at runtime.
     ///
     /// This method registers the field in both the engine schema and the
@@ -1345,8 +1372,11 @@ impl Engine {
     ///
     /// # Returns
     ///
-    /// Returns the updated [`Schema`] on success. The caller is responsible
-    /// for persisting it (e.g., writing `schema.toml`).
+    /// Returns the updated [`Schema`] on success. If
+    /// [`EngineBuilder::persist_schema_with`] was configured, the returned
+    /// schema has already been persisted via that hook; otherwise the
+    /// caller remains responsible for persisting it (e.g., writing
+    /// `schema.toml`).
     ///
     /// # Errors
     ///
@@ -1354,6 +1384,8 @@ impl Engine {
     /// - A field with the same name already exists.
     /// - The field references an unknown analyzer or embedder.
     /// - The underlying store rejects the field.
+    /// - A configured schema-persist hook fails (the in-memory schema has
+    ///   already been updated at that point; this is not rolled back).
     pub async fn add_field(&self, name: &str, option: schema::FieldOption) -> Result<Schema> {
         // 1a. Reject reserved field names (e.g. `_`-prefixed except `_id`).
         schema::validate_field_name(name)?;
@@ -1435,7 +1467,9 @@ impl Engine {
             schema.fields.insert(name.to_string(), option);
         }
 
-        Ok(self.schema.read().clone())
+        let updated = self.schema.read().clone();
+        self.persist_schema(&updated)?;
+        Ok(updated)
     }
 
     /// Dynamically remove a field from the engine schema at runtime.
@@ -1459,13 +1493,18 @@ impl Engine {
     ///
     /// # Returns
     ///
-    /// The updated [`Schema`] after the field has been removed.
+    /// The updated [`Schema`] after the field has been removed. If
+    /// [`EngineBuilder::persist_schema_with`] was configured, it has
+    /// already been persisted via that hook; otherwise the caller remains
+    /// responsible for persisting it.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No field with the given name exists in the schema.
     /// - The underlying store rejects the deletion.
+    /// - A configured schema-persist hook fails (the in-memory schema has
+    ///   already been updated at that point; this is not rolled back).
     pub async fn delete_field(&self, name: &str) -> Result<Schema> {
         // 1. Check that the field exists.
         let option = {
@@ -1493,7 +1532,9 @@ impl Engine {
             schema.default_fields.retain(|f| f != name);
         }
 
-        Ok(self.schema.read().clone())
+        let updated = self.schema.read().clone();
+        self.persist_schema(&updated)?;
+        Ok(updated)
     }
 
     /// Resolve a [`LexicalSearchQuery`] into a concrete [`Query`] object.
@@ -2619,6 +2660,7 @@ pub struct EngineBuilder {
     embedding_cache_capacity: Option<usize>,
     wal_sync_policy: WalSyncPolicy,
     commit_policy: CommitPolicy,
+    schema_persist_hook: Option<SchemaPersistHook>,
 }
 
 impl EngineBuilder {
@@ -2633,7 +2675,29 @@ impl EngineBuilder {
             embedding_cache_capacity: None,
             wal_sync_policy: WalSyncPolicy::default(),
             commit_policy: CommitPolicy::default(),
+            schema_persist_hook: None,
         }
+    }
+
+    /// Register a callback that persists the schema whenever
+    /// [`Engine::add_field`] or [`Engine::delete_field`] changes it
+    /// (Issue #1078).
+    ///
+    /// Without this, callers are responsible for persisting the `Schema`
+    /// those methods return (e.g. writing `schema.toml`) themselves, and
+    /// forgetting to do so silently loses the change on the next restart.
+    /// `laurus-cli` and `laurus-server` both set this to write
+    /// `<index_dir>/schema.toml`.
+    ///
+    /// # Arguments
+    ///
+    /// * `hook` - Called with the updated schema after each successful
+    ///   `add_field`/`delete_field`. An error from the hook is propagated to
+    ///   the caller of `add_field`/`delete_field`; the in-memory schema has
+    ///   already been updated by that point (this does not roll back).
+    pub fn persist_schema_with(mut self, hook: SchemaPersistHook) -> Self {
+        self.schema_persist_hook = Some(hook);
+        self
     }
 
     /// Set the analyzer for text fields.
@@ -2824,6 +2888,7 @@ impl EngineBuilder {
             _wal_flush_timer: wal_flush_timer,
             #[cfg(not(target_arch = "wasm32"))]
             _commit_timer: commit_timer,
+            schema_persist_hook: self.schema_persist_hook,
         };
 
         engine.recover().await?;
@@ -3359,6 +3424,121 @@ mod tests {
 
         let result = engine.delete_field("nonexistent").await;
         assert!(result.is_err(), "Deleting a nonexistent field should fail");
+    }
+
+    /// Issue #1078: `add_field`/`delete_field` invoke the configured
+    /// schema-persist hook with the up-to-date schema, and propagate its
+    /// error (rather than silently swallowing it) when it fails.
+    #[tokio::test]
+    async fn test_add_field_invokes_schema_persist_hook() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::new();
+
+        let persisted: Arc<parking_lot::Mutex<Vec<Schema>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let persisted_clone = Arc::clone(&persisted);
+
+        let engine = Engine::builder(storage, schema)
+            .persist_schema_with(Arc::new(move |schema: &Schema| {
+                persisted_clone.lock().push(schema.clone());
+                Ok(())
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        engine
+            .add_field(
+                "title",
+                schema::FieldOption::Text(crate::lexical::core::field::TextOption::default()),
+            )
+            .await
+            .unwrap();
+
+        let calls = persisted.lock();
+        assert_eq!(calls.len(), 1, "hook should be called exactly once");
+        assert!(calls[0].fields.contains_key("title"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_field_invokes_schema_persist_hook() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field(
+                "title",
+                schema::FieldOption::Text(crate::lexical::core::field::TextOption::default()),
+            )
+            .build();
+
+        let persisted: Arc<parking_lot::Mutex<Vec<Schema>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let persisted_clone = Arc::clone(&persisted);
+
+        let engine = Engine::builder(storage, schema)
+            .persist_schema_with(Arc::new(move |schema: &Schema| {
+                persisted_clone.lock().push(schema.clone());
+                Ok(())
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        engine.delete_field("title").await.unwrap();
+
+        let calls = persisted.lock();
+        assert_eq!(calls.len(), 1, "hook should be called exactly once");
+        assert!(!calls[0].fields.contains_key("title"));
+    }
+
+    #[tokio::test]
+    async fn test_add_field_without_hook_does_not_persist() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::new();
+
+        // No `persist_schema_with` configured: this is the pre-#1078
+        // behavior, preserved for callers that persist the schema
+        // themselves.
+        let engine = Engine::new(storage, schema).await.unwrap();
+
+        let updated = engine
+            .add_field(
+                "title",
+                schema::FieldOption::Text(crate::lexical::core::field::TextOption::default()),
+            )
+            .await
+            .unwrap();
+        assert!(updated.fields.contains_key("title"));
+    }
+
+    #[tokio::test]
+    async fn test_add_field_propagates_schema_persist_hook_error() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::new();
+
+        let engine = Engine::builder(storage, schema)
+            .persist_schema_with(Arc::new(|_schema: &Schema| {
+                Err(crate::error::LaurusError::invalid_argument(
+                    "simulated persistence failure",
+                ))
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let result = engine
+            .add_field(
+                "title",
+                schema::FieldOption::Text(crate::lexical::core::field::TextOption::default()),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a failing schema-persist hook must fail add_field"
+        );
+
+        // The in-memory schema was already updated before the hook ran
+        // (this phase does not add rollback — see #1077).
+        assert!(engine.schema().fields.contains_key("title"));
     }
 
     #[tokio::test]

@@ -15,8 +15,10 @@ use crate::json_doc::parse_document_json;
 
 /// Execute the `add field` command.
 ///
-/// Opens the index at `index_dir`, parses the field option JSON, calls
-/// [`Engine::add_field`], and writes the updated schema to disk.
+/// Opens the index at `index_dir`, parses the field option JSON, and calls
+/// [`Engine::add_field`], which persists the updated schema itself (the
+/// engine returned by [`context::open_index`] is configured with a
+/// schema-persist hook — see Issue #1078).
 ///
 /// # Arguments
 ///
@@ -38,12 +40,10 @@ pub async fn run_field(name: &str, field_option_json: &str, index_dir: &Path) ->
     let field_option: FieldOption =
         serde_json::from_str(field_option_json).context("Failed to parse field option JSON")?;
 
-    let updated_schema = engine
+    engine
         .add_field(name, field_option)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    context::save_schema(index_dir, &updated_schema)?;
 
     println!("Field '{name}' added successfully.");
     Ok(())
