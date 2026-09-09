@@ -66,7 +66,18 @@ impl FieldOption {
         }
     }
 
-    /// Get the base weight.
+    /// Get this field's relative scoring priority (Issue #1084).
+    ///
+    /// Read by `VectorStore::search_impl` and multiplied into a query's
+    /// per-field weight, so it only matters when a query is routed to two
+    /// or more specific vector fields at once — it has no effect on a
+    /// single-field query, and it does not affect the lexical-vs-vector
+    /// balance in a hybrid search's fusion (`FusionAlgorithm::RRF` is
+    /// rank-only and `WeightedSum` min-max normalizes each side before
+    /// weighting, so a uniform per-field scalar is normalized away on
+    /// either side). Should be a positive, finite value — non-positive or
+    /// non-finite values are clamped to `1.0` (with a warning) wherever
+    /// they are read.
     pub fn base_weight(&self) -> f32 {
         match self {
             FieldOption::Flat(opt) => opt.base_weight,
@@ -94,7 +105,10 @@ pub struct FlatOption {
     /// Distance metric used for similarity computation. Defaults to [`DistanceMetric::Cosine`].
     #[serde(default = "default_distance_metric")]
     pub distance: DistanceMetric,
-    /// Base weight applied to similarity scores from this field. Defaults to `1.0`.
+    /// This field's relative scoring priority when searched alongside
+    /// other vector fields (Issue #1084). See
+    /// [`FieldOption::base_weight`] for the full contract. Defaults to
+    /// `1.0`.
     #[serde(default = "default_weight")]
     pub base_weight: f32,
     /// Quantization method used for the on-disk vector format.
@@ -172,7 +186,10 @@ pub struct HnswOption {
     /// Issue [#644](https://github.com/mosuka/laurus/issues/644).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_ef_search: Option<usize>,
-    /// Base weight applied to similarity scores from this field. Defaults to `1.0`.
+    /// This field's relative scoring priority when searched alongside
+    /// other vector fields (Issue #1084). See
+    /// [`FieldOption::base_weight`] for the full contract. Defaults to
+    /// `1.0`.
     #[serde(default = "default_weight")]
     pub base_weight: f32,
     /// Quantization method used for the on-disk vector format.
@@ -256,7 +273,10 @@ pub struct IvfOption {
     /// Higher values improve recall at the cost of query latency. Defaults to `1`.
     #[serde(default = "default_getting_n_probe")]
     pub n_probe: usize,
-    /// Base weight applied to similarity scores from this field. Defaults to `1.0`.
+    /// This field's relative scoring priority when searched alongside
+    /// other vector fields (Issue #1084). See
+    /// [`FieldOption::base_weight`] for the full contract. Defaults to
+    /// `1.0`.
     #[serde(default = "default_weight")]
     pub base_weight: f32,
     /// Quantization method used for the on-disk vector format.
