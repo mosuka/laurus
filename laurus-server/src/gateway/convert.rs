@@ -624,10 +624,14 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
             .get("ef_construction")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32,
+        // Unset (omitted by the client) means "use the engine's default"
+        // (#1084), unlike `dimension`/`m`/`ef_construction` above, which
+        // have no such tri-state and are left as their existing
+        // `unwrap_or(0)` behavior.
         base_weight: json
             .get("base_weight")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32,
+            .map(|v| v as f32),
         quantizer: json.get("quantizer").and_then(json_to_quantizer),
         embedder: json
             .get("embedder")
@@ -660,10 +664,11 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
             .and_then(|v| v.as_str())
             .map(parse_distance_metric)
             .unwrap_or(v1::DistanceMetric::Cosine as i32),
+        // Unset means "use the engine's default" (#1084).
         base_weight: json
             .get("base_weight")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32,
+            .map(|v| v as f32),
         quantizer: json.get("quantizer").and_then(json_to_quantizer),
         embedder: json
             .get("embedder")
@@ -685,10 +690,11 @@ fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
             .unwrap_or(v1::DistanceMetric::Cosine as i32),
         n_clusters: json.get("n_clusters").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         n_probe: json.get("n_probe").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        // Unset means "use the engine's default" (#1084).
         base_weight: json
             .get("base_weight")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32,
+            .map(|v| v as f32),
         quantizer: json.get("quantizer").and_then(json_to_quantizer),
         embedder: json
             .get("embedder")
@@ -706,8 +712,13 @@ fn hnsw_option_to_json(opt: &v1::HnswOption) -> Value {
         "distance": distance_metric_to_string(opt.distance),
         "m": opt.m,
         "ef_construction": opt.ef_construction,
-        "base_weight": opt.base_weight,
     });
+    // Surfaced only when explicitly set (#1084): an absent `base_weight`
+    // means "use the engine's default", same as `analyzer`/`term_vectors`
+    // elsewhere, rather than a `null` standing in for `0.0`.
+    if let Some(base_weight) = opt.base_weight {
+        obj["base_weight"] = json!(base_weight);
+    }
     if let Some(q) = &opt.quantizer {
         obj["quantizer"] = quantizer_to_json(q);
     }
@@ -727,8 +738,11 @@ fn flat_option_to_json(opt: &v1::FlatOption) -> Value {
     let mut obj = json!({
         "dimension": opt.dimension,
         "distance": distance_metric_to_string(opt.distance),
-        "base_weight": opt.base_weight,
     });
+    // Unset means "use the engine's default" (#1084).
+    if let Some(base_weight) = opt.base_weight {
+        obj["base_weight"] = json!(base_weight);
+    }
     if let Some(q) = &opt.quantizer {
         obj["quantizer"] = quantizer_to_json(q);
     }
@@ -747,8 +761,11 @@ fn ivf_option_to_json(opt: &v1::IvfOption) -> Value {
         "distance": distance_metric_to_string(opt.distance),
         "n_clusters": opt.n_clusters,
         "n_probe": opt.n_probe,
-        "base_weight": opt.base_weight,
     });
+    // Unset means "use the engine's default" (#1084).
+    if let Some(base_weight) = opt.base_weight {
+        obj["base_weight"] = json!(base_weight);
+    }
     if let Some(q) = &opt.quantizer {
         obj["quantizer"] = quantizer_to_json(q);
     }
@@ -1375,6 +1392,37 @@ mod tests {
         let empty =
             json_to_hnsw_option(&json!({ "dimension": 32, "pq_codebook_path": "" })).unwrap();
         assert_eq!(empty.pq_codebook_path, None, "empty must normalize to None");
+    }
+
+    /// Issue #1084: `base_weight` survives the HTTP gateway's
+    /// JSON -> proto -> JSON round-trip when explicitly set, and an absent
+    /// key stays absent (rather than materializing as `0.0`, which would
+    /// silently zero out every vector score for a client that never sent
+    /// it).
+    #[test]
+    fn test_base_weight_round_trips_through_json_and_absent_key_stays_absent() {
+        let json = json!({ "dimension": 32, "base_weight": 2.5 });
+        let opt = json_to_hnsw_option(&json).unwrap();
+        assert_eq!(opt.base_weight, Some(2.5));
+
+        let back = hnsw_option_to_json(&opt);
+        assert_eq!(back.get("base_weight").and_then(|v| v.as_f64()), Some(2.5));
+
+        let plain = json_to_hnsw_option(&json!({ "dimension": 32 })).unwrap();
+        assert_eq!(plain.base_weight, None);
+        assert!(
+            hnsw_option_to_json(&plain).get("base_weight").is_none(),
+            "an unset base_weight must not emit a key"
+        );
+
+        // Flat and Ivf follow the same contract.
+        let flat = json_to_flat_option(&json!({ "dimension": 32 })).unwrap();
+        assert_eq!(flat.base_weight, None);
+        assert!(flat_option_to_json(&flat).get("base_weight").is_none());
+
+        let ivf = json_to_ivf_option(&json!({ "dimension": 32 })).unwrap();
+        assert_eq!(ivf.base_weight, None);
+        assert!(ivf_option_to_json(&ivf).get("base_weight").is_none());
     }
 
     #[test]

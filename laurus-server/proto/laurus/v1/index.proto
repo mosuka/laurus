@@ -238,7 +238,13 @@ message HnswOption {
   DistanceMetric distance = 2;
   uint32 m = 3;
   uint32 ef_construction = 4;
-  float base_weight = 5;
+  // Relative priority of this field's similarity scores when multiple
+  // vector fields are searched together (issue #1084). Unset means "use
+  // the engine's default" (currently `1.0`) rather than an explicit
+  // `0.0` — a plain `float` cannot distinguish the two, which silently
+  // zeroed out every vector score for gRPC/REST-created fields that
+  // omitted it.
+  optional float base_weight = 5;
   optional QuantizationConfig quantizer = 6;
   // Embedder name (empty = no auto-embedding).
   string embedder = 7;
@@ -264,7 +270,8 @@ message HnswOption {
 message FlatOption {
   uint32 dimension = 1;
   DistanceMetric distance = 2;
-  float base_weight = 3;
+  // See `HnswOption.base_weight`.
+  optional float base_weight = 3;
   optional QuantizationConfig quantizer = 4;
   // Embedder name (empty = no auto-embedding).
   string embedder = 5;
@@ -279,7 +286,8 @@ message IvfOption {
   DistanceMetric distance = 2;
   uint32 n_clusters = 3;
   uint32 n_probe = 4;
-  float base_weight = 5;
+  // See `HnswOption.base_weight`.
+  optional float base_weight = 5;
   optional QuantizationConfig quantizer = 6;
   // Embedder name (empty = no auto-embedding).
   string embedder = 7;

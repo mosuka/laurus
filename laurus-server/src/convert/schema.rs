@@ -160,7 +160,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             distance: distance_to_proto(&o.distance) as i32,
             m: o.m as u32,
             ef_construction: o.ef_construction as u32,
-            base_weight: o.base_weight,
+            base_weight: Some(o.base_weight),
             quantizer: Some(quantization_to_proto(&o.quantizer)),
             embedder: o.embedder.clone().unwrap_or_default(),
             default_ef_search: o.default_ef_search.map(|v| v as u32),
@@ -170,7 +170,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::Flat(o) => Some(Opt::Flat(v1::FlatOption {
             dimension: o.dimension as u32,
             distance: distance_to_proto(&o.distance) as i32,
-            base_weight: o.base_weight,
+            base_weight: Some(o.base_weight),
             quantizer: Some(quantization_to_proto(&o.quantizer)),
             embedder: o.embedder.clone().unwrap_or_default(),
             rerank_storage: o.rerank_storage.map(|k| rerank_storage_to_proto(k) as i32),
@@ -180,7 +180,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             distance: distance_to_proto(&o.distance) as i32,
             n_clusters: o.n_clusters as u32,
             n_probe: o.n_probe as u32,
-            base_weight: o.base_weight,
+            base_weight: Some(o.base_weight),
             quantizer: Some(quantization_to_proto(&o.quantizer)),
             embedder: o.embedder.clone().unwrap_or_default(),
             rerank_storage: o.rerank_storage.map(|k| rerank_storage_to_proto(k) as i32),
@@ -240,7 +240,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             m: o.m as usize,
             ef_construction: o.ef_construction as usize,
             default_ef_search: o.default_ef_search.map(|v| v as usize),
-            base_weight: o.base_weight,
+            // Unset means "use the engine's default" (#1084).
+            base_weight: o.base_weight.unwrap_or(1.0),
             quantizer: o
                 .quantizer
                 .as_ref()
@@ -260,7 +261,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
         Some(Opt::Flat(o)) => Some(FieldOption::Flat(FlatOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
-            base_weight: o.base_weight,
+            // Unset means "use the engine's default" (#1084).
+            base_weight: o.base_weight.unwrap_or(1.0),
             quantizer: o
                 .quantizer
                 .as_ref()
@@ -278,7 +280,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             distance: distance_from_proto(o.distance),
             n_clusters: o.n_clusters as usize,
             n_probe: o.n_probe as usize,
-            base_weight: o.base_weight,
+            // Unset means "use the engine's default" (#1084).
+            base_weight: o.base_weight.unwrap_or(1.0),
             quantizer: o
                 .quantizer
                 .as_ref()
@@ -1028,6 +1031,97 @@ mod tests {
         match back.fields.get("embedding") {
             Some(FieldOption::Hnsw(h)) => {
                 assert_eq!(h.pq_codebook_path, None, "empty must normalize to None");
+            }
+            other => panic!("expected FieldOption::Hnsw, got {other:?}"),
+        }
+    }
+
+    /// Issue #1084: `base_weight` round-trips as `Some` through proto for
+    /// Hnsw/Flat/Ivf, and a gRPC client that omits it (proto `None`, the
+    /// zero-value before this fix) restores to the engine's default
+    /// (`1.0`) rather than the silent `0.0` a plain `float` produced.
+    #[test]
+    fn base_weight_round_trips_through_proto_and_unset_defaults_to_one() {
+        let schema = Schema::builder()
+            .add_field(
+                "hnsw_explicit",
+                FieldOption::Hnsw(HnswOption {
+                    dimension: 8,
+                    base_weight: 2.5,
+                    ..Default::default()
+                }),
+            )
+            .add_field(
+                "flat_explicit",
+                FieldOption::Flat(FlatOption {
+                    dimension: 8,
+                    base_weight: 3.5,
+                    ..Default::default()
+                }),
+            )
+            .add_field(
+                "ivf_explicit",
+                FieldOption::Ivf(laurus::IvfOption {
+                    dimension: 8,
+                    base_weight: 4.5,
+                    ..Default::default()
+                }),
+            )
+            .build();
+
+        let proto = to_proto(&schema);
+        for (name, expected) in [
+            ("hnsw_explicit", 2.5f32),
+            ("flat_explicit", 3.5f32),
+            ("ivf_explicit", 4.5f32),
+        ] {
+            let base_weight = match proto.fields.get(name).and_then(|f| f.option.as_ref()) {
+                Some(v1::field_option::Option::Hnsw(h)) => h.base_weight,
+                Some(v1::field_option::Option::Flat(f)) => f.base_weight,
+                Some(v1::field_option::Option::Ivf(i)) => i.base_weight,
+                other => panic!("unexpected proto option for {name}: {other:?}"),
+            };
+            assert_eq!(
+                base_weight,
+                Some(expected),
+                "to_proto must carry an explicit base_weight as Some for {name}"
+            );
+        }
+
+        let back = from_proto(&proto).expect("from_proto must succeed");
+        for (name, expected) in [
+            ("hnsw_explicit", 2.5f32),
+            ("flat_explicit", 3.5f32),
+            ("ivf_explicit", 4.5f32),
+        ] {
+            let base_weight = match back.fields.get(name) {
+                Some(FieldOption::Hnsw(h)) => h.base_weight,
+                Some(FieldOption::Flat(f)) => f.base_weight,
+                Some(FieldOption::Ivf(i)) => i.base_weight,
+                other => panic!("unexpected laurus option for {name}: {other:?}"),
+            };
+            assert_eq!(base_weight, expected, "round-trip mismatch for {name}");
+        }
+
+        // A gRPC client omitting base_weight entirely (proto `None`) must
+        // restore to the engine default, not the proto3 zero-value.
+        let mut unset = proto.clone();
+        if let Some(v1::field_option::Option::Hnsw(h)) = unset
+            .fields
+            .get_mut("hnsw_explicit")
+            .and_then(|f| f.option.as_mut())
+        {
+            h.base_weight = None;
+        } else {
+            panic!("hnsw_explicit must be an Hnsw proto option");
+        }
+        let back = from_proto(&unset).expect("from_proto must succeed");
+        match back.fields.get("hnsw_explicit") {
+            Some(FieldOption::Hnsw(h)) => {
+                assert_eq!(
+                    h.base_weight, 1.0,
+                    "unset base_weight must default to 1.0, not the proto3 zero-value"
+                );
             }
             other => panic!("expected FieldOption::Hnsw, got {other:?}"),
         }
