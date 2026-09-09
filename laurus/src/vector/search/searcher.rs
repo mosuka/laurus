@@ -502,6 +502,11 @@ pub struct VectorSearchParams {
     #[serde(default = "default_overfetch")]
     pub overfetch: f32,
     /// Minimum score threshold. Results below this score are filtered out.
+    ///
+    /// Compared against the raw per-field similarity BEFORE `QueryVector`'s
+    /// `weight` and the field's `base_weight` (Issue #1084) are applied —
+    /// this is a similarity floor, not a final-score floor, matching the
+    /// pre-existing contract for `QueryVector.weight`.
     #[serde(default)]
     pub min_score: f32,
     /// List of allowed document IDs (for internal use by Engine filtering).

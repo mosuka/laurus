@@ -129,7 +129,10 @@ pub struct VectorSearchOptions {
     pub score_mode: VectorScoreMode,
 
     /// Minimum score threshold. Results below this score are discarded.
-    /// Defaults to `0.0` (no threshold).
+    /// Defaults to `0.0` (no threshold). Compared against the raw
+    /// per-field similarity BEFORE `QueryVector.weight` and the field's
+    /// `base_weight` (Issue #1084) are applied — a similarity floor, not a
+    /// final-score floor.
     pub min_score: f32,
 
     /// Optional Stage 2 rerank factor (Issue #481).

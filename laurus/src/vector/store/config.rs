@@ -459,12 +459,6 @@ impl Default for VectorFieldConfig {
     }
 }
 
-impl VectorFieldConfig {
-    pub fn default_weight() -> f32 {
-        1.0
-    }
-}
-
 // Moved to crate::vector::core::field
 // use crate::vector::core::field::{VectorOption, FlatOption, HnswOption, IvfOption, VectorIndexKind};
 

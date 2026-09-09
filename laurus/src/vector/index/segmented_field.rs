@@ -623,6 +623,12 @@ impl VectorFieldReader for SegmentedVectorField {
         let mut merged: HashMap<u64, FieldHit> = HashMap::new();
 
         for query in &request.query_vectors {
+            // Deliberately just `query.weight`, NOT multiplied by the
+            // field's `base_weight` (Issue #1084): that factor is applied
+            // one layer up, in `VectorStore::search_impl`'s per-field
+            // query-weight computation. Applying it here too — if this
+            // type is ever wired back into the production search path —
+            // would double-apply it.
             let effective_weight = query.weight;
             let query_vec = &query.vector.data;
 
