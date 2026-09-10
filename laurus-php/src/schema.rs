@@ -294,7 +294,12 @@ impl PhpSchema {
     ///   `quantizer` is "product_quantization"; commits then encode against
     ///   the pre-trained codebook instead of re-training k-means per
     ///   segment. Omitted (default) keeps per-segment training.
-    #[php(defaults(m = 16, ef_construction = 200))]
+    /// * `base_weight` - This field's relative scoring priority when
+    ///   searched alongside other vector fields (Issue #1084). Defaults to
+    ///   1.0. Only matters when a query targets two or more specific
+    ///   vector fields at once; has no effect on the lexical-vs-vector
+    ///   balance of a hybrid search.
+    #[php(defaults(m = 16, ef_construction = 200, base_weight = 1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
         &self,
@@ -309,6 +314,7 @@ impl PhpSchema {
         subvector_count: Option<i64>,
         rerank_storage: Option<String>,
         pq_codebook_path: Option<String>,
+        base_weight: f64,
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = HnswOption {
@@ -321,7 +327,7 @@ impl PhpSchema {
             rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
             embedder,
             pq_codebook_path,
-            ..Default::default()
+            base_weight: base_weight as f32,
         };
         self.inner
             .borrow_mut()
@@ -338,18 +344,24 @@ impl PhpSchema {
     /// * `dimension` - Vector dimensionality.
     /// * `distance` - Distance metric (default: "cosine").
     /// * `embedder` - Embedder name registered via `addEmbedder` (default: "" for none).
+    /// * `base_weight` - This field's relative scoring priority when
+    ///   searched alongside other vector fields (Issue #1084). Defaults to
+    ///   1.0. See `add_hnsw_field` for the full contract.
+    #[php(defaults(base_weight = 1.0))]
     pub fn add_flat_field(
         &self,
         name: String,
         dimension: i64,
         distance: Option<String>,
         embedder: Option<String>,
+        base_weight: f64,
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = laurus::FlatOption {
             dimension: dimension as usize,
             distance: parse_distance(&dist_str)?,
             embedder,
+            base_weight: base_weight as f32,
             ..Default::default()
         };
         self.inner
@@ -369,7 +381,11 @@ impl PhpSchema {
     /// * `n_clusters` - Number of Voronoi clusters (default: 100).
     /// * `n_probe` - Number of clusters to probe at search time (default: 1).
     /// * `embedder` - Embedder name registered via `addEmbedder` (default: "" for none).
-    #[php(defaults(n_clusters = 100, n_probe = 1))]
+    /// * `base_weight` - This field's relative scoring priority when
+    ///   searched alongside other vector fields (Issue #1084). Defaults to
+    ///   1.0. See `add_hnsw_field` for the full contract.
+    #[php(defaults(n_clusters = 100, n_probe = 1, base_weight = 1.0))]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
         &self,
         name: String,
@@ -378,6 +394,7 @@ impl PhpSchema {
         n_clusters: i64,
         n_probe: i64,
         embedder: Option<String>,
+        base_weight: f64,
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = IvfOption {
@@ -386,6 +403,7 @@ impl PhpSchema {
             n_clusters: n_clusters as usize,
             n_probe: n_probe as usize,
             embedder,
+            base_weight: base_weight as f32,
             ..Default::default()
         };
         self.inner

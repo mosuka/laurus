@@ -10,7 +10,7 @@ use laurus::{
 };
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
-use magnus::{Error, RArray, RHash, RModule, Ruby, Value};
+use magnus::{Error, RArray, RHash, RModule, Ruby, TryConvert, Value};
 
 /// Parse a distance metric string into [`DistanceMetric`].
 fn parse_distance(s: &str) -> Result<DistanceMetric, Error> {
@@ -29,6 +29,24 @@ fn parse_distance(s: &str) -> Result<DistanceMetric, Error> {
             ),
         )),
     }
+}
+
+/// Extract `base_weight:` from a splat `RHash` of otherwise-unrecognized
+/// keyword arguments, defaulting to `1.0` when absent.
+///
+/// `base_weight` is pulled out via the `get_kwargs` `Splat` slot (an
+/// `RHash` of everything not already named in `optional`) rather than
+/// being added directly to the `Opt` tuple, because `magnus::scan_args`'s
+/// `ScanArgsOpt` is only implemented for tuples up to 9 elements
+/// (Issue #1084) and the HNSW field builder's existing option list
+/// already uses all 9.
+fn base_weight_from_splat(splat: RHash) -> Result<f32, Error> {
+    let ruby = Ruby::get().expect("called from Ruby thread");
+    let value: Option<f64> = splat
+        .get(ruby.to_symbol("base_weight"))
+        .map(TryConvert::try_convert)
+        .transpose()?;
+    Ok(value.unwrap_or(1.0) as f32)
 }
 
 /// Parse a quantizer name plus optional `subvector_count` into a
@@ -380,6 +398,11 @@ impl RbSchema {
     ///     `quantizer:` "product_quantization"; commits then encode against
     ///     the pre-trained codebook instead of re-training k-means per
     ///     segment. Omitted (default) keeps per-segment training.
+    ///   - `base_weight:` (Float, default 1.0): This field's relative
+    ///     scoring priority when searched alongside other vector fields
+    ///     (Issue #1084). Only matters when a query targets two or more
+    ///     specific vector fields at once; has no effect on the
+    ///     lexical-vs-vector balance of a hybrid search.
     fn add_hnsw_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
@@ -397,7 +420,7 @@ impl RbSchema {
                 Option<String>,
                 Option<String>,
             ),
-            (),
+            RHash,
         >(
             args.keywords,
             &[],
@@ -435,7 +458,7 @@ impl RbSchema {
             rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
             embedder: embedder.flatten(),
             pq_codebook_path,
-            ..Default::default()
+            base_weight: base_weight_from_splat(kwargs.splat)?,
         };
         self.inner
             .borrow_mut()
@@ -453,20 +476,24 @@ impl RbSchema {
     ///   - `dimension` (usize): Vector dimensionality.
     ///   - `distance:` (String, default "cosine"): Distance metric.
     ///   - `embedder:` (String, optional): Embedder name registered via `add_embedder`.
+    ///   - `base_weight:` (Float, default 1.0): This field's relative
+    ///     scoring priority when searched alongside other vector fields
+    ///     (Issue #1084). See `add_hnsw_field` for the full contract.
     fn add_flat_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<String>, Option<Option<String>>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<String>, Option<Option<String>>, Option<f64>), ()>(
             args.keywords,
             &[],
-            &["distance", "embedder"],
+            &["distance", "embedder", "base_weight"],
         )?;
-        let (distance, embedder) = kwargs.optional;
+        let (distance, embedder, base_weight) = kwargs.optional;
         let distance_str = distance.as_deref().unwrap_or("cosine");
         let opt = laurus::FlatOption {
             dimension,
             distance: parse_distance(distance_str)?,
             embedder: embedder.flatten(),
+            base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
         };
         self.inner
@@ -487,6 +514,9 @@ impl RbSchema {
     ///   - `n_clusters:` (usize, default 100): Number of Voronoi clusters.
     ///   - `n_probe:` (usize, default 1): Number of clusters to probe at search time.
     ///   - `embedder:` (String, optional): Embedder name registered via `add_embedder`.
+    ///   - `base_weight:` (Float, default 1.0): This field's relative
+    ///     scoring priority when searched alongside other vector fields
+    ///     (Issue #1084). See `add_hnsw_field` for the full contract.
     fn add_ivf_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
@@ -498,14 +528,21 @@ impl RbSchema {
                 Option<usize>,
                 Option<usize>,
                 Option<Option<String>>,
+                Option<f64>,
             ),
             (),
         >(
             args.keywords,
             &[],
-            &["distance", "n_clusters", "n_probe", "embedder"],
+            &[
+                "distance",
+                "n_clusters",
+                "n_probe",
+                "embedder",
+                "base_weight",
+            ],
         )?;
-        let (distance, n_clusters, n_probe, embedder) = kwargs.optional;
+        let (distance, n_clusters, n_probe, embedder, base_weight) = kwargs.optional;
         let distance_str = distance.as_deref().unwrap_or("cosine");
         let opt = IvfOption {
             dimension,
@@ -513,6 +550,7 @@ impl RbSchema {
             n_clusters: n_clusters.unwrap_or(100),
             n_probe: n_probe.unwrap_or(1),
             embedder: embedder.flatten(),
+            base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
         };
         self.inner

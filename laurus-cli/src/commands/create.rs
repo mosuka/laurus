@@ -473,6 +473,19 @@ fn prompt_usize(prompt: &str, default: usize) -> Result<usize> {
     Ok(val)
 }
 
+/// Prompt for a vector field's `base_weight` (Issue #1084): this field's
+/// relative scoring priority when searched alongside other vector fields.
+/// Defaults to `1.0`. Only matters when a query targets two or more
+/// specific vector fields at once; has no effect on the lexical-vs-vector
+/// balance of a hybrid search.
+fn prompt_base_weight() -> Result<f32> {
+    let val: f64 = Input::new()
+        .with_prompt("Base weight (relative priority vs. other vector fields in this schema)")
+        .default(1.0)
+        .interact_text()?;
+    Ok(val as f32)
+}
+
 /// Prompt for HnswOption.
 fn prompt_hnsw_option() -> Result<FieldOption> {
     let dimension = prompt_usize("Dimension", 128)?;
@@ -482,6 +495,7 @@ fn prompt_hnsw_option() -> Result<FieldOption> {
     let quantizer = prompt_quantization_method(dimension)?;
     let pq_codebook_path = prompt_pq_codebook_path(&quantizer)?;
     let rerank_storage = prompt_rerank_storage()?;
+    let base_weight = prompt_base_weight()?;
 
     Ok(FieldOption::Hnsw(HnswOption {
         dimension,
@@ -489,7 +503,7 @@ fn prompt_hnsw_option() -> Result<FieldOption> {
         m,
         ef_construction,
         default_ef_search: None,
-        base_weight: 1.0,
+        base_weight,
         quantizer,
         rerank_storage,
         embedder: None,
@@ -589,11 +603,12 @@ fn prompt_rerank_storage() -> Result<Option<RerankStorageKind>> {
 fn prompt_flat_option() -> Result<FieldOption> {
     let dimension = prompt_usize("Dimension", 128)?;
     let distance = prompt_distance_metric()?;
+    let base_weight = prompt_base_weight()?;
 
     Ok(FieldOption::Flat(FlatOption {
         dimension,
         distance,
-        base_weight: 1.0,
+        base_weight,
         quantizer: Default::default(),
         rerank_storage: None,
         embedder: None,
@@ -606,13 +621,14 @@ fn prompt_ivf_option() -> Result<FieldOption> {
     let distance = prompt_distance_metric()?;
     let n_clusters = prompt_usize("Number of clusters", 100)?;
     let n_probe = prompt_usize("Number of probes", 1)?;
+    let base_weight = prompt_base_weight()?;
 
     Ok(FieldOption::Ivf(IvfOption {
         dimension,
         distance,
         n_clusters,
         n_probe,
-        base_weight: 1.0,
+        base_weight,
         quantizer: Default::default(),
         rerank_storage: None,
         embedder: None,

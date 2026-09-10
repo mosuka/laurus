@@ -378,7 +378,12 @@ impl PySchema {
     ///         `quantizer="product_quantization"`; commits then encode
     ///         against the pre-trained codebook instead of re-training
     ///         k-means per segment. None (default) keeps per-segment training.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", m=16, ef_construction=200, default_ef_search=None, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None))]
+    ///     base_weight: This field's relative scoring priority when
+    ///         searched alongside other vector fields (Issue #1084).
+    ///         Defaults to 1.0. Only matters when a query targets two or
+    ///         more specific vector fields at once; has no effect on the
+    ///         lexical-vs-vector balance of a hybrid search.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", m=16, ef_construction=200, default_ef_search=None, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
         &mut self,
@@ -393,6 +398,7 @@ impl PySchema {
         rerank_storage: Option<String>,
         embedder: Option<String>,
         pq_codebook_path: Option<String>,
+        base_weight: f32,
     ) -> PyResult<()> {
         let opt = HnswOption {
             dimension,
@@ -404,7 +410,7 @@ impl PySchema {
             rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
             embedder,
             pq_codebook_path,
-            ..Default::default()
+            base_weight,
         };
         self.inner
             .fields
@@ -420,18 +426,23 @@ impl PySchema {
     ///     distance: Distance metric — "cosine" (default), "euclidean", "dot_product".
     ///     embedder: Optional embedder name registered via `add_embedder`.
     ///         When set, text payloads are automatically embedded by the Rust engine.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", embedder=None))]
+    ///     base_weight: This field's relative scoring priority when
+    ///         searched alongside other vector fields (Issue #1084).
+    ///         Defaults to 1.0. See `add_hnsw_field` for the full contract.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", embedder=None, base_weight=1.0))]
     pub fn add_flat_field(
         &mut self,
         name: &str,
         dimension: usize,
         distance: &str,
         embedder: Option<String>,
+        base_weight: f32,
     ) -> PyResult<()> {
         let opt = FlatOption {
             dimension,
             distance: parse_distance(distance)?,
             embedder,
+            base_weight,
             ..Default::default()
         };
         self.inner
@@ -450,7 +461,11 @@ impl PySchema {
     ///     n_probe: Number of clusters to probe at search time (default 1).
     ///     embedder: Optional embedder name registered via `add_embedder`.
     ///         When set, text payloads are automatically embedded by the Rust engine.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None))]
+    ///     base_weight: This field's relative scoring priority when
+    ///         searched alongside other vector fields (Issue #1084).
+    ///         Defaults to 1.0. See `add_hnsw_field` for the full contract.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0))]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
         &mut self,
         name: &str,
@@ -459,6 +474,7 @@ impl PySchema {
         n_clusters: usize,
         n_probe: usize,
         embedder: Option<String>,
+        base_weight: f32,
     ) -> PyResult<()> {
         let opt = IvfOption {
             dimension,
@@ -466,6 +482,7 @@ impl PySchema {
             n_clusters,
             n_probe,
             embedder,
+            base_weight,
             ..Default::default()
         };
         self.inner
