@@ -98,11 +98,19 @@ field = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 // so CJK / Cyrillic / Greek / accented Latin etc. all parse as bare
 // terms without requiring quoting. `boolean_op` keywords (AND / OR)
 // remain whitespace-bounded as before.
+// `'` is allowed unescaped (issue #1111): it has no syntactic meaning in
+// the DSL, unlike `+`/`-`/`:`/`"` etc., and is extremely common in
+// ordinary English text (contractions like `it's`/`don't`, possessives
+// like `user's`). Added to both `unescaped_term` and `normal_char` — the
+// latter is what `escaped_char+` (tried before `unescaped_term` below)
+// actually consumes a bare, non-backslashed character with, so omitting
+// it there would truncate `it's` to `it` before the apostrophe was ever
+// reached.
 term = @{ escaped_char+ | unescaped_term }
-unescaped_term = @{ (LETTER | NUMBER | "_" | "-")+ }
+unescaped_term = @{ (LETTER | NUMBER | "_" | "-" | "'")+ }
 escaped_char = @{ "\\" ~ special_char | normal_char }
 special_char = { "+" | "-" | "!" | "(" | ")" | "{" | "}" | "[" | "]" | "^" | "\"" | "~" | "*" | "?" | ":" | "\\" | "/" }
-normal_char = @{ LETTER | NUMBER | "_" | "-" }
+normal_char = @{ LETTER | NUMBER | "_" | "-" | "'" }
 
 // Quoted string
 quoted_string = { "\"" ~ quoted_content ~ "\"" }
