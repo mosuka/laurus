@@ -202,9 +202,9 @@ class Schema {
 | `addGeoField(name, stored?, indexed?)` | Geographic coordinate field. |
 | `addGeo3dField(name, stored?, indexed?)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md). |
 | `addDatetimeField(name, stored?, indexed?)` | UTC datetime field. |
-| `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?)` | HNSW vector field. |
-| `addFlatField(name, dimension, distance?, embedder?)` | Flat (brute-force) vector field. |
-| `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?)` | IVF vector field. |
+| `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW vector field. `baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
+| `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
+| `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF vector field. |
 | `addEmbedder(name, config)` | Register a named embedder. |
 | `setDefaultFields(fields)` | Set default search fields. |
 | `setDynamicFieldPolicy(policy)` | Set how undeclared fields are handled. `policy` is `"strict"`, `"dynamic"` (default), or `"ignore"`. See notes below. |

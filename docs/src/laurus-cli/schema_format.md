@@ -181,7 +181,7 @@ base_weight = 1.0
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
 | `m` | `integer` | `16` | Max bi-directional connections per node. Higher = better recall, more memory |
 | `ef_construction` | `integer` | `200` | Search width during index construction. Higher = better quality, slower build |
-| `base_weight` | `float` | `1.0` | Scoring weight in hybrid search fusion |
+| `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)). `"F32"` enables a per-field f32 sidecar so search can rescore int8 candidates against the original vectors. Omit to keep Stage 1 int8-only behavior. |
 | `pq_codebook_path` | `string` | *(omit)* | Storage-relative file name of a shared PQ codebook (Issue #631); only meaningful with a `ProductQuantization` quantizer. Train it with `laurus train pq-codebook`; commits then encode against it instead of re-training k-means per segment. When set but not yet trained, commits fail loudly (no silent fallback). Omit to train per segment. |
@@ -207,7 +207,7 @@ base_weight = 1.0
 | :--- | :--- | :--- | :--- |
 | `dimension` | `integer` | `128` | Vector dimensionality |
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
-| `base_weight` | `float` | `1.0` | Scoring weight in hybrid search fusion |
+| `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
 
@@ -230,7 +230,7 @@ base_weight = 1.0
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
 | `n_clusters` | `integer` | `100` | Number of clusters. More clusters = finer partitioning |
 | `n_probe` | `integer` | `1` | Number of clusters to search at query time. Higher = better recall, slower |
-| `base_weight` | `float` | `1.0` | Scoring weight in hybrid search fusion |
+| `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
 

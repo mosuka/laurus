@@ -171,9 +171,9 @@ new \Laurus\Schema()
 | `addGeoField(string $name, bool $stored = true, bool $indexed = true): void` | 地理座標フィールド（緯度/経度）。 |
 | `addGeo3dField(string $name, bool $stored = true, bool $indexed = true): void` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。 |
 | `addDatetimeField(string $name, bool $stored = true, bool $indexed = true): void` | UTC 日時フィールド。 |
-| `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null): void` | HNSW 近似最近傍ベクトルフィールド。 |
-| `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null): void` | Flat（総当たり）ベクトルフィールド。 |
-| `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null): void` | IVF 近似最近傍ベクトルフィールド。 |
+| `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW 近似最近傍ベクトルフィールド。`$baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
+| `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0): void` | Flat（総当たり）ベクトルフィールド。 |
+| `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0): void` | IVF 近似最近傍ベクトルフィールド。 |
 
 **ベクトル量子化とリランクストレージ**（HNSW フィールド）:
 

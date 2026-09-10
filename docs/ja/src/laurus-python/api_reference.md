@@ -200,9 +200,9 @@ class Schema:
 | `add_geo_field(name, *, stored=True, indexed=True)` | 地理座標フィールド（緯度/経度）。 |
 | `add_geo3d_field(name, *, stored=True, indexed=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。 |
 | `add_datetime_field(name, *, stored=True, indexed=True)` | UTC 日時フィールド。 |
-| `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None)` | HNSW 近似最近傍ベクトルフィールド。 |
-| `add_flat_field(name, dimension, *, distance="cosine", embedder=None)` | Flat（総当たり）ベクトルフィールド。 |
-| `add_ivf_field(name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None)` | IVF 近似最近傍ベクトルフィールド。 |
+| `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
+| `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat（総当たり）ベクトルフィールド。 |
+| `add_ivf_field(name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0)` | IVF 近似最近傍ベクトルフィールド。 |
 
 **ベクトル量子化とリランクストレージ**（HNSW フィールド）:
 

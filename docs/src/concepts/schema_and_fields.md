@@ -109,7 +109,7 @@ let opt = HnswOption {
     m: 16,                                           // max connections per layer
     ef_construction: 200,                            // construction search width
     default_ef_search: Some(100),                    // schema-level ef_search default (issue #644)
-    base_weight: 1.0,                                // default scoring weight
+    base_weight: 1.0,                                // relative priority vs. other vector fields (issue #1084)
     quantizer: QuantizationMethod::Scalar8Bit,       // mandatory; default Scalar8Bit
     embedder: None,                                  // optional named embedder
 };

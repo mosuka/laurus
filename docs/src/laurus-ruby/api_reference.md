@@ -161,9 +161,9 @@ Laurus::Schema.new
 | `add_geo_field(name, stored: true, indexed: true)` | Geographic coordinate field (lat/lon). |
 | `add_geo3d_field(name, stored: true, indexed: true)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md). |
 | `add_datetime_field(name, stored: true, indexed: true)` | UTC datetime field. |
-| `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil)` | HNSW approximate nearest-neighbor vector field. |
-| `add_flat_field(name, dimension, distance: "cosine", embedder: nil)` | Flat (brute-force) vector field. |
-| `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil)` | IVF approximate nearest-neighbor vector field. |
+| `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
+| `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat (brute-force) vector field. |
+| `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil, base_weight: 1.0)` | IVF approximate nearest-neighbor vector field. |
 
 **Vector quantization & rerank storage** (HNSW fields):
 

@@ -204,9 +204,9 @@ class Schema {
 | `addGeoField(name, stored?, indexed?)` | 地理座標フィールド。 |
 | `addGeo3dField(name, stored?, indexed?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。 |
 | `addDatetimeField(name, stored?, indexed?)` | UTC 日時フィールド。 |
-| `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?)` | HNSW ベクトルフィールド。 |
-| `addFlatField(name, dimension, distance?, embedder?)` | Flat（全探索）ベクトルフィールド。 |
-| `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?)` | IVF ベクトルフィールド。 |
+| `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW ベクトルフィールド。`baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
+| `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
+| `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |
 | `addEmbedder(name, config)` | 名前付き Embedder を登録。 |
 | `setDefaultFields(fields)` | デフォルト検索フィールドを設定。 |
 | `setDynamicFieldPolicy(policy)` | 未宣言フィールドの扱いを設定。`policy` は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"`。詳細は下記を参照。 |

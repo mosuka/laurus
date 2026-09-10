@@ -108,7 +108,7 @@ let opt = HnswOption {
     m: 16,                                           // max connections per layer
     ef_construction: 200,                            // construction search width
     default_ef_search: Some(100),                    // schema-level ef_search default (issue #644)
-    base_weight: 1.0,                                // default scoring weight
+    base_weight: 1.0,                                // 他の vector フィールドに対する相対的な優先度（issue #1084）
     quantizer: QuantizationMethod::Scalar8Bit,       // 必須（デフォルト Scalar8Bit）
     embedder: None,                                  // 任意の embedder 名
 };
