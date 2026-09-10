@@ -1149,6 +1149,51 @@ mod tests {
     }
 
     #[test]
+    fn test_apostrophe_in_unquoted_term() {
+        // Issue #1111: `'` has no syntactic meaning in the DSL, but was
+        // previously absent from both `unescaped_term` and `special_char`,
+        // so it could not appear in a bare term at all -- not even
+        // backslash-escaped. Contractions (`it's`, `don't`) and
+        // possessives (`user's`) are extremely common in ordinary English
+        // text, so this must parse without requiring the whole query to
+        // be wrapped in quotes (which would silently change unquoted
+        // OR-of-tokens semantics into an exact phrase match).
+        let parser = create_test_parser().with_default_field("content");
+
+        for q in ["It's Only the Himalayas", "don't", "user's book", "isn't"] {
+            parser
+                .parse(q)
+                .unwrap_or_else(|e| panic!("failed to parse {q:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_apostrophe_grammar_consumes_the_whole_word() {
+        // The `term` rule must consume the ENTIRE word including the
+        // apostrophe, not stop short at it and strand the rest to be
+        // re-parsed as a spurious second clause. This is the
+        // `normal_char` half of the #1111 fix: `term`'s `escaped_char+`
+        // alternative is tried before `unescaped_term`, and `escaped_char`
+        // bottoms out at `normal_char` for any non-backslashed character
+        // -- so `'` must be in `normal_char` too, or `escaped_char+`
+        // would stop consuming right at the apostrophe.
+        //
+        // Verified directly against the grammar (not through `parse()`)
+        // because the effect of the bug isn't a parse error: without this
+        // fix, `don't` silently parses as two adjacent bare terms (`don`
+        // and `'t`), which `analyze_term` OR's together into a
+        // `BooleanQuery` just like a legitimate two-word query would --
+        // there is no error to assert against, only the wrong split.
+        let pairs = QueryStringParser::parse(Rule::term, "don't")
+            .unwrap_or_else(|e| panic!("failed to parse term \"don't\": {e}"));
+        let matched = pairs.as_str();
+        assert_eq!(
+            matched, "don't",
+            "the term rule must consume the whole word in one match, got {matched:?}"
+        );
+    }
+
+    #[test]
     fn test_unquoted_cjk_boolean() {
         // Whitespace-bounded boolean ops still kick in between CJK terms.
         let parser = create_test_parser().with_default_field("content");
