@@ -121,6 +121,8 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Shared PQ codebook:** the optional `pq_codebook_path` field on `HnswOption` (Issue #631) names a storage-relative shared PQ codebook file, trained once via the `laurus train pq-codebook` CLI command. Segments are then encoded against the pre-trained codebook instead of re-training k-means on every commit and merge. Only meaningful with a `PRODUCT_QUANTIZATION` quantizer; when set but not yet trained, commits fail with an error naming the training command (no silent fallback to per-segment training). Unset keeps per-segment training.
 
+**Base weight:** `base_weight` on `HnswOption`/`FlatOption`/`IvfOption` is `optional float` (Issue #1084): a client that omits it gets the engine's default (`1.0`), distinguishable from an explicit `0.0`. It sets the field's relative scoring priority when a query targets it alongside other vector fields — see [Vector Search → Weights](../concepts/search/vector_search.md#weights) for what it does and does not affect.
+
 **QuantizationConfig structure:**
 
 | Field | Type | Description |

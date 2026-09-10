@@ -197,6 +197,18 @@ text_vec:"cute kitten"^1.0 image_vec:"fluffy cat"^0.5
 
 This means text similarity counts twice as much as image similarity.
 
+A vector field's schema-level `base_weight` (Issue #1084) works the same
+way but is a per-field default rather than a per-query override: it is
+multiplied into the query weight above, so `base_weight` and `^`/`weight`
+compose. Because both only affect the vector side's own scoring, neither
+can rebalance a hybrid search's lexical-vs-vector split —
+`FusionAlgorithm::RRF` is rank-only and ignores the underlying score
+entirely, and `FusionAlgorithm::WeightedSum` min-max normalizes each side
+before applying `lexical_weight`/`vector_weight`, which cancels out a
+uniform per-field scalar. What both weighting mechanisms DO affect is the
+relative priority *among* vector fields when a query targets two or more
+at once.
+
 ### Field Routing
 
 In a multi-field schema, each vector field has its own HNSW graph. By

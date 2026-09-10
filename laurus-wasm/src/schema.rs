@@ -295,6 +295,11 @@ impl WasmSchema {
     ///   `quantizer` is "product_quantization"; commits then encode against
     ///   the pre-trained codebook instead of re-training k-means per
     ///   segment. Omitted (default) keeps per-segment training.
+    /// * `baseWeight` - This field's relative scoring priority when
+    ///   searched alongside other vector fields (Issue #1084). Defaults to
+    ///   1.0. Only matters when a query targets two or more specific
+    ///   vector fields at once; has no effect on the lexical-vs-vector
+    ///   balance of a hybrid search.
     #[wasm_bindgen(js_name = "addHnswField")]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
@@ -310,6 +315,7 @@ impl WasmSchema {
         subvector_count: Option<u32>,
         rerank_storage: Option<String>,
         pq_codebook_path: Option<String>,
+        base_weight: Option<f32>,
     ) -> Result<(), JsValue> {
         let opt = HnswOption {
             dimension: dimension as usize,
@@ -321,13 +327,19 @@ impl WasmSchema {
             rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
             embedder,
             pq_codebook_path,
-            ..Default::default()
+            base_weight: base_weight.unwrap_or(1.0),
         };
         self.inner.fields.insert(name, FieldOption::Hnsw(opt));
         Ok(())
     }
 
     /// Add a flat (brute-force) vector index field.
+    ///
+    /// # Arguments
+    ///
+    /// * `baseWeight` - This field's relative scoring priority when
+    ///   searched alongside other vector fields (Issue #1084). Defaults to
+    ///   1.0. See `addHnswField` for the full contract.
     #[wasm_bindgen(js_name = "addFlatField")]
     pub fn add_flat_field(
         &mut self,
@@ -335,11 +347,13 @@ impl WasmSchema {
         dimension: u32,
         distance: Option<String>,
         embedder: Option<String>,
+        base_weight: Option<f32>,
     ) -> Result<(), JsValue> {
         let opt = FlatOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
             embedder,
+            base_weight: base_weight.unwrap_or(1.0),
             ..Default::default()
         };
         self.inner.fields.insert(name, FieldOption::Flat(opt));
@@ -347,7 +361,14 @@ impl WasmSchema {
     }
 
     /// Add an IVF approximate nearest-neighbor vector field.
+    ///
+    /// # Arguments
+    ///
+    /// * `baseWeight` - This field's relative scoring priority when
+    ///   searched alongside other vector fields (Issue #1084). Defaults to
+    ///   1.0. See `addHnswField` for the full contract.
     #[wasm_bindgen(js_name = "addIvfField")]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
         &mut self,
         name: String,
@@ -356,6 +377,7 @@ impl WasmSchema {
         n_clusters: Option<u32>,
         n_probe: Option<u32>,
         embedder: Option<String>,
+        base_weight: Option<f32>,
     ) -> Result<(), JsValue> {
         let opt = IvfOption {
             dimension: dimension as usize,
@@ -363,6 +385,7 @@ impl WasmSchema {
             n_clusters: n_clusters.unwrap_or(100) as usize,
             n_probe: n_probe.unwrap_or(1) as usize,
             embedder,
+            base_weight: base_weight.unwrap_or(1.0),
             ..Default::default()
         };
         self.inner.fields.insert(name, FieldOption::Ivf(opt));

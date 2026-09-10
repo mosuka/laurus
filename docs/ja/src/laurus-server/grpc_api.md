@@ -121,6 +121,8 @@ message AnalyzerDefinition {
 
 **共有 PQ codebook:** `HnswOption` のオプションフィールド `pq_codebook_path`（Issue #631）は、`laurus train pq-codebook` CLI コマンドで一度だけ学習するストレージ相対の共有 PQ codebook ファイルを指定します。設定すると segment は commit / merge のたびに k-means を再学習する代わりに、学習済み codebook で encode されます。`PRODUCT_QUANTIZATION` quantizer との組み合わせでのみ意味を持ち、設定済みで未学習の場合、commit は学習コマンドを示すエラーで失敗します（per-segment 学習への無言のフォールバック無し）。未設定なら per-segment 学習のままです。
 
+**Base weight:** `HnswOption`/`FlatOption`/`IvfOption` の `base_weight` は `optional float`（Issue #1084）です。クライアントが省略するとエンジンのデフォルト（`1.0`）が使われ、これは明示的な `0.0` とは区別されます。他の vector フィールドと同時にクエリ対象になったときの、そのフィールドの相対的なスコアリング優先度を設定します。何に効いて何に効かないかは[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照してください。
+
 **QuantizationConfig 構造:**
 
 | フィールド | 型 | 説明 |

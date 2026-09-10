@@ -406,7 +406,7 @@ WASM バインディングは `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` /
 
 バイナリデータフィールドを追加します。
 
-#### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?)`
+#### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)`
 
 HNSW ベクトルインデックスフィールドを追加します。
 
@@ -418,12 +418,13 @@ HNSW ベクトルインデックスフィールドを追加します。
 - `subvectorCount`: PQ サブベクトル数。`dimension` を割り切れる値を指定します
 - `rerankStorage`: 省略（デフォルト）するか、`"f32"` を指定して完全精度のリランクサイドカーを保存します
 - `pqCodebookPath`: 省略（デフォルト）するか、segment 間で再利用する共有 PQ codebook のストレージ相対ファイル名（Issue #631）を指定します（segment ごとの学習の代替）
+- `baseWeight`: 他の vector フィールドと同時に検索されたときの、このフィールドの相対的なスコアリング優先度（デフォルト `1.0`、Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照してください
 
-#### `addFlatField(name, dimension, distance?, embedder?)`
+#### `addFlatField(name, dimension, distance?, embedder?, baseWeight?)`
 
 全探索ベクトルインデックスフィールドを追加します。
 
-#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?)`
+#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)`
 
 IVF ベクトルインデックスフィールドを追加します。
 

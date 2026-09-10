@@ -181,7 +181,7 @@ base_weight = 1.0
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
 | `m` | `integer` | `16` | ノードあたりの最大双方向接続数。大きいほど再現率が向上するがメモリ使用量が増加 |
 | `ef_construction` | `integer` | `200` | インデックス構築時の探索幅。大きいほど品質が向上するが構築が遅くなる |
-| `base_weight` | `float` | `1.0` | ハイブリッド検索のスコア融合における重み |
+| `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできるようにする。省略すると Stage 1 int8-only の挙動を維持。 |
 | `pq_codebook_path` | `string` | *（省略）* | 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`ProductQuantization` quantizer との組み合わせでのみ意味を持つ。`laurus train pq-codebook` で学習すると、以後の commit は segment ごとの k-means 再学習の代わりにこの codebook で encode する。設定済みで未学習の場合、commit は明示的にエラーになる（無言のフォールバック無し）。省略すると segment ごとに学習。 |
@@ -207,7 +207,7 @@ base_weight = 1.0
 | :--- | :--- | :--- | :--- |
 | `dimension` | `integer` | `128` | ベクトルの次元数 |
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
-| `base_weight` | `float` | `1.0` | ハイブリッド検索のスコア融合における重み |
+| `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
 
@@ -230,7 +230,7 @@ base_weight = 1.0
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
 | `n_clusters` | `integer` | `100` | クラスタ数。多いほど細かい分割が可能 |
 | `n_probe` | `integer` | `1` | クエリ時に検索するクラスタ数。大きいほど再現率が向上するが遅くなる |
-| `base_weight` | `float` | `1.0` | ハイブリッド検索のスコア融合における重み |
+| `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
 

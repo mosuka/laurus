@@ -544,10 +544,17 @@ fn classify_vector_common(old: &FieldOption, new: &FieldOption) -> FieldChangeKi
 }
 
 /// Classification for HNSW-specific parameters. `default_ef_search` and
-/// `base_weight` are metadata-only (read only at query/searcher-construction
-/// time) and need no check. `m`/`ef_construction`/`quantizer`/
-/// `rerank_storage`/`pq_codebook_path` all require rebuilding the graph
-/// from the raw vectors already on disk.
+/// `base_weight` are metadata-only: both are read only at query time
+/// (`base_weight` by `VectorStore::search_impl`'s per-field query-weight
+/// computation, Issue #1084; `default_ef_search` by the searcher
+/// construction path), so neither needs an on-disk rebuild. Known gap
+/// (shared by both, not yet fixed): `Engine::update_field`'s
+/// `MetadataOnly` arm updates the persisted schema but does not push the
+/// new value into an already-open `VectorStore` — the change only takes
+/// effect the next time the index is opened, not immediately, despite the
+/// `MetadataOnly` classification's usual "no rebuild needed" implication.
+/// `m`/`ef_construction`/`quantizer`/`rerank_storage`/`pq_codebook_path`
+/// all require rebuilding the graph from the raw vectors already on disk.
 fn classify_hnsw_specific(old: &HnswOption, new: &HnswOption) -> FieldChangeKind {
     let mut kind = FieldChangeKind::MetadataOnly;
     if old.m != new.m
@@ -562,8 +569,11 @@ fn classify_hnsw_specific(old: &HnswOption, new: &HnswOption) -> FieldChangeKind
 }
 
 /// Classification for Flat-specific parameters. `base_weight` is
-/// metadata-only; `quantizer`/`rerank_storage` require rebuilding from the
-/// raw vectors already on disk.
+/// metadata-only (read only at query time by `VectorStore::search_impl`'s
+/// per-field query-weight computation, Issue #1084 — see
+/// `classify_hnsw_specific`'s doc comment for the known "not live-reflected
+/// without reopening" gap); `quantizer`/`rerank_storage` require rebuilding
+/// from the raw vectors already on disk.
 fn classify_flat_specific(old: &FlatOption, new: &FlatOption) -> FieldChangeKind {
     if old.quantizer != new.quantizer || old.rerank_storage != new.rerank_storage {
         FieldChangeKind::Reindex
@@ -575,8 +585,12 @@ fn classify_flat_specific(old: &FlatOption, new: &FlatOption) -> FieldChangeKind
 /// Classification for IVF-specific parameters. `n_probe` and `base_weight`
 /// are metadata-only (search-time only; the persisted `n_probe` value's
 /// read-back is discarded — see `laurus/src/vector/index/ivf/writer.rs`).
-/// `n_clusters` requires re-running k-means; `quantizer`/`rerank_storage`
-/// require rebuilding from the raw vectors already on disk.
+/// `base_weight` is read at query time by `VectorStore::search_impl`'s
+/// per-field query-weight computation (Issue #1084) — see
+/// `classify_hnsw_specific`'s doc comment for the known "not live-reflected
+/// without reopening" gap. `n_clusters` requires re-running k-means;
+/// `quantizer`/`rerank_storage` require rebuilding from the raw vectors
+/// already on disk.
 fn classify_ivf_specific(old: &IvfOption, new: &IvfOption) -> FieldChangeKind {
     if old.n_clusters != new.n_clusters
         || old.quantizer != new.quantizer

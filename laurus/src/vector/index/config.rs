@@ -654,8 +654,10 @@ impl HnswIndexConfig {
     /// * `embedder` — `HnswOption::embedder` is an embedder *name*
     ///   (`Option<String>`) while the config holds an
     ///   `Arc<dyn Embedder>`; resolution happens at the store level.
-    /// * `base_weight` — a scoring-level knob with no config
-    ///   counterpart.
+    /// * `base_weight` — a query-time scoring scalar (Issue #1084),
+    ///   consumed by `VectorStore::search_impl`'s per-field query-weight
+    ///   computation, not by the on-disk index geometry this config
+    ///   describes. It has no counterpart here by design.
     ///
     /// `normalize_vectors` is set to `distance == Cosine` (Issue #794):
     /// L2-normalizing the stored vectors only makes sense for

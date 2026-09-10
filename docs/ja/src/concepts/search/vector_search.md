@@ -166,6 +166,18 @@ text_vec:"cute kitten"^1.0 image_vec:"fluffy cat"^0.5
 
 これは、テキストの類似度が画像の類似度の 2 倍の重みを持つことを意味します。
 
+vector フィールドのスキーマレベルの `base_weight`（Issue #1084）も同様に
+機能しますが、クエリ単位の上書きではなくフィールド単位のデフォルト値
+である点が異なります。上記のクエリ重みに乗算されるため、`base_weight`
+と `^`/`weight` は組み合わさります。どちらも vector 側自体のスコアリング
+にしか影響しないため、ハイブリッド検索の lexical-vs-vector のバランス
+を変えることはできません。`FusionAlgorithm::RRF` はランクのみを見て元の
+スコアを完全に無視しますし、`FusionAlgorithm::WeightedSum` は
+`lexical_weight`/`vector_weight` を適用する前に各側を min-max 正規化
+するため、フィールド単位の一様なスカラー倍は打ち消されます。両方の
+重み付け機構が実際に影響するのは、1 回のクエリで複数の vector フィール
+ドを対象にしたときの、フィールド間の相対的な優先度です。
+
 ### フィールドルーティング
 
 マルチフィールドスキーマでは、各 vector フィールドが独自の HNSW graph を

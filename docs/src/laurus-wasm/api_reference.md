@@ -406,7 +406,7 @@ above.
 
 Add a binary data field.
 
-#### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?)`
+#### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)`
 
 Add an HNSW vector index field.
 
@@ -424,12 +424,15 @@ Add an HNSW vector index field.
 - `pqCodebookPath`: omit (default) or the storage-relative file name of
   a shared PQ codebook (Issue #631) to reuse across segments instead of
   per-segment training
+- `baseWeight`: this field's relative scoring priority when searched
+  alongside other vector fields (default `1.0`, Issue #1084); see
+  [Vector Search → Weights](../concepts/search/vector_search.md#weights)
 
-#### `addFlatField(name, dimension, distance?, embedder?)`
+#### `addFlatField(name, dimension, distance?, embedder?, baseWeight?)`
 
 Add a brute-force vector index field.
 
-#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?)`
+#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)`
 
 Add an IVF vector index field.
 

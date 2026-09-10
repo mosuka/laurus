@@ -27,6 +27,7 @@ pub mod memory;
 pub mod request;
 pub mod response;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -68,6 +69,13 @@ pub struct VectorStore {
     /// [`Self::with_index_type_config`] (the single-index constructor),
     /// which never had a collection-wide config to retain.
     config: Option<VectorIndexConfig>,
+    /// Per-field relative scoring priority (Issue #1084), keyed by field
+    /// name. Seeded from `config.fields` at construction and kept in sync
+    /// by [`Self::add_field`]/[`Self::delete_field`]/[`Self::rebuild_field`].
+    /// A field with no entry (including every field of a store built via
+    /// [`Self::with_index_type_config`]) falls back to `1.0` in
+    /// [`Self::base_weight_of`].
+    base_weights: parking_lot::RwLock<HashMap<String, f32>>,
 }
 
 impl std::fmt::Debug for VectorStore {
@@ -107,11 +115,22 @@ impl VectorStore {
             &field_configs,
             config.embedder.clone(),
         )?;
+        let base_weights = config
+            .fields
+            .iter()
+            .filter_map(|(name, field_config)| {
+                field_config
+                    .vector
+                    .as_ref()
+                    .map(|opt| (name.clone(), Self::sanitize_base_weight(opt.base_weight())))
+            })
+            .collect();
         Ok(Self {
             index: Box::new(index),
             writer_cache: Mutex::new(None),
             searcher_cache: parking_lot::RwLock::new(None),
             config: Some(config),
+            base_weights: parking_lot::RwLock::new(base_weights),
         })
     }
 
@@ -138,6 +157,7 @@ impl VectorStore {
             writer_cache: Mutex::new(None),
             searcher_cache: parking_lot::RwLock::new(None),
             config: None,
+            base_weights: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -572,6 +592,32 @@ impl VectorStore {
         self.search_impl(request, Some(parallel_threshold))
     }
 
+    /// Clamp a raw `base_weight` to a usable value (Issue #1084).
+    ///
+    /// `base_weight` is a multiplicative factor on similarity scores, so a
+    /// non-positive or non-finite value would zero out, negate, or NaN-out
+    /// every hit from the field. This also rescues indexes whose
+    /// `schema.toml` already has `base_weight: 0.0` from a pre-#1084
+    /// gRPC/REST-created schema (proto3's non-optional `float` used to
+    /// default to `0.0`, silently distinct from core's `1.0` default).
+    fn sanitize_base_weight(raw: f32) -> f32 {
+        if raw.is_finite() && raw > 0.0 {
+            raw
+        } else {
+            log::warn!(
+                "base_weight must be a positive, finite value; got {raw}, falling back to 1.0"
+            );
+            1.0
+        }
+    }
+
+    /// Look up a field's sanitized `base_weight`, defaulting to `1.0` when
+    /// the field has no entry (schema-less fields, non-vector fields, and
+    /// every field of a store built via [`Self::with_index_type_config`]).
+    fn base_weight_of(&self, field: &str) -> f32 {
+        self.base_weights.read().get(field).copied().unwrap_or(1.0)
+    }
+
     /// Resolve the set of vector fields a single query should be routed to
     /// (Issue #676).
     ///
@@ -710,12 +756,16 @@ impl VectorStore {
                 q
             };
             if targets.is_empty() {
+                // Field-less fanout search (Issue #676): no single field is
+                // known here, so `base_weight` cannot be applied (Issue
+                // #1084 leaves this out of scope — see the store-level doc
+                // comment on `base_weights`).
                 index_queries.push(make(None));
                 query_weights.push(qv.weight);
             } else {
                 for field in &targets {
                     index_queries.push(make(Some(field)));
-                    query_weights.push(qv.weight);
+                    query_weights.push(qv.weight * self.base_weight_of(field));
                 }
             }
         }
@@ -1040,6 +1090,11 @@ impl VectorStore {
             self.index.add_field(name, field_config)?;
         }
 
+        self.base_weights.write().insert(
+            name.to_string(),
+            Self::sanitize_base_weight(vector_opt.base_weight()),
+        );
+
         if let Some(field_embedder) = embedder {
             let index_embedder = self.index.embedder();
             if let Some(pfe) = index_embedder
@@ -1096,6 +1151,8 @@ impl VectorStore {
         // contract (documented above) is unchanged; physical deletion is
         // opt-in via `Self::rebuild_field` (Issue #1080).
         self.index.remove_field(name, false)?;
+
+        self.base_weights.write().remove(name);
 
         // Remove the field-specific embedder from the PerFieldEmbedder if present.
         let index_embedder = self.index.embedder();
@@ -1188,6 +1245,11 @@ impl VectorStore {
         } else {
             self.index.rebuild_field(name, new_config)?;
         }
+
+        self.base_weights.write().insert(
+            name.to_string(),
+            Self::sanitize_base_weight(new_option.base_weight()),
+        );
 
         if let Some(field_embedder) = embedder {
             let index_embedder = self.index.embedder();

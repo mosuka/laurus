@@ -169,9 +169,9 @@ new \Laurus\Schema()
 | `addGeoField(string $name, bool $stored = true, bool $indexed = true): void` | Geographic coordinate field (lat/lon). |
 | `addGeo3dField(string $name, bool $stored = true, bool $indexed = true): void` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md). |
 | `addDatetimeField(string $name, bool $stored = true, bool $indexed = true): void` | UTC datetime field. |
-| `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null): void` | HNSW approximate nearest-neighbor vector field. |
-| `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null): void` | Flat (brute-force) vector field. |
-| `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null): void` | IVF approximate nearest-neighbor vector field. |
+| `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW approximate nearest-neighbor vector field. `$baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
+| `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0): void` | Flat (brute-force) vector field. |
+| `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0): void` | IVF approximate nearest-neighbor vector field. |
 
 **Vector quantization & rerank storage** (HNSW fields):
 
