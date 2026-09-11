@@ -117,13 +117,20 @@ pub struct TopFieldCollector<'a> {
     total_hits: u64,
     /// Reference to the index reader for accessing field values.
     reader: &'a dyn crate::lexical::reader::LexicalIndexReader,
-    /// Whether `field_name` has a DocValues column, resolved once at
-    /// construction (Issue #1053). `field_name` is fixed for the whole
-    /// collector's lifetime, so caching this here -- rather than
-    /// re-probing per document -- avoids paying a lock-guarded
+    /// Whether ANY segment has a DocValues column for `field_name`,
+    /// resolved once at construction (Issue #1053). `field_name` is fixed
+    /// for the whole collector's lifetime, so caching this here -- rather
+    /// than re-probing per document -- avoids paying a lock-guarded
     /// `has_doc_values` check on every hit for no benefit; mirrors the
     /// same per-field caching `FacetCollector::collect_doc` does for the
     /// same reason (#597).
+    ///
+    /// This is index-wide, not per-document: `InvertedIndexReader::
+    /// has_doc_values` is `any(...)` across segments (Issue #1047), so
+    /// `true` does not guarantee `get_doc_value` will find a value for
+    /// every doc -- a segment lacking the column entirely (mixed old/new
+    /// segments, or a field with `doc_values: false`) still needs the
+    /// stored-document fallback per miss. See [`Self::get_field_value`].
     has_dv: bool,
 }
 
@@ -171,26 +178,28 @@ impl<'a> TopFieldCollector<'a> {
 
     /// Get the field value for a document, preferring DocValues.
     ///
-    /// When `field_name` has no DocValues column, falls back to the
-    /// stored document (Issue #1053) instead of yielding `Null` --
-    /// otherwise every value compares equal and sorting silently
-    /// degrades to doc-id order. Mirrors `FacetCollector::collect_doc`'s
-    /// stored-document fallback for the same absent-column case.
+    /// When `field_name` has no DocValues column at all, or a `Some`
+    /// column exists index-wide but this particular document's segment
+    /// doesn't have it (Issue #1047: mixed segments, e.g. straddling a
+    /// `doc_values: false` change or a #1052-era segment boundary), falls
+    /// back to the stored document instead of yielding `Null` --
+    /// otherwise every such value compares equal and sorting silently
+    /// degrades to doc-id order for exactly the documents that lack the
+    /// column. Mirrors `FacetCollector::collect_doc`'s stored-document
+    /// fallback for the same absent-column case. Uses `document_fields`
+    /// rather than `document` to avoid cloning every field of a
+    /// wide-schema document just to read one.
     fn get_field_value(&self, doc_id: u64) -> crate::lexical::core::field::FieldValue {
         use crate::lexical::core::field::FieldValue;
 
-        if self.has_dv {
-            return match self.reader.get_doc_value(&self.field_name, doc_id) {
-                Ok(Some(value)) => value,
-                _ => FieldValue::Null,
-            };
+        if self.has_dv
+            && let Ok(Some(value)) = self.reader.get_doc_value(&self.field_name, doc_id)
+        {
+            return value;
         }
 
-        match self.reader.document(doc_id) {
-            Ok(Some(document)) => document
-                .get(&self.field_name)
-                .cloned()
-                .unwrap_or(FieldValue::Null),
+        match self.reader.document_fields(doc_id, &[&self.field_name]) {
+            Ok(Some(mut fields)) => fields.remove(&self.field_name).unwrap_or(FieldValue::Null),
             _ => FieldValue::Null,
         }
     }
@@ -1360,6 +1369,103 @@ mod tests {
             ids,
             vec![0, 1, 2],
             "Vector values always tie on rank, so order stays doc-id order"
+        );
+    }
+
+    /// Reader where `has_doc_values` reports `true` (simulating "some
+    /// segment has this column") but `get_doc_value` always misses
+    /// (simulating THIS document's segment lacking the column) — the
+    /// mixed-segment case Issue #1047 identified as unreachable via
+    /// `DocFallbackMockReader` (which reports `has_doc_values = false`
+    /// index-wide, the "no column anywhere" case #1053 already covered).
+    #[derive(Debug)]
+    struct DocValuesMissMockReader {
+        docs: Vec<crate::Document>,
+    }
+
+    impl DocValuesMissMockReader {
+        fn new(docs: Vec<crate::Document>) -> Self {
+            Self { docs }
+        }
+    }
+
+    impl crate::lexical::reader::LexicalIndexReader for DocValuesMissMockReader {
+        fn doc_count(&self) -> u64 {
+            self.docs.len() as u64
+        }
+        fn max_doc(&self) -> u64 {
+            self.docs.len() as u64
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(&self, doc_id: u64) -> Result<Option<crate::Document>> {
+            Ok(self.docs.get(doc_id as usize).cloned())
+        }
+        fn term_info(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(None)
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>> {
+            Ok(None)
+        }
+        fn field_stats(&self, _field: &str) -> Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn has_doc_values(&self, _field: &str) -> bool {
+            true
+        }
+        // `get_doc_value` deliberately left at the trait's default
+        // (`Ok(None)`): every lookup misses, as if this doc's segment
+        // never wrote the column despite another segment having it.
+    }
+
+    /// Issue #1047 regression: when `has_doc_values` is `true` index-wide
+    /// but this document's segment misses (`get_doc_value` returns
+    /// `Ok(None)`), `get_field_value` must fall back to the stored
+    /// document instead of collapsing to `Null`. Before the fix every
+    /// value resolved to `Null` (doc-id order `[0, 1, 2]`); after, content
+    /// order (`[1] < [2] < [3]`, i.e. `[2, 0, 1]`).
+    #[test]
+    fn test_top_field_collector_falls_back_when_has_dv_is_true_but_the_value_is_missing() {
+        let docs = vec![
+            crate::Document::builder()
+                .add_bytes("blob", vec![2])
+                .build(), // doc_id 0
+            crate::Document::builder()
+                .add_bytes("blob", vec![3])
+                .build(), // doc_id 1
+            crate::Document::builder()
+                .add_bytes("blob", vec![1])
+                .build(), // doc_id 2
+        ];
+        let reader = DocValuesMissMockReader::new(docs);
+        let mut collector = TopFieldCollector::new(3, "blob".to_string(), true, &reader);
+        for doc_id in 0..3 {
+            collector.collect(doc_id, 0.0).unwrap();
+        }
+        let ids: Vec<u64> = collector.results().iter().map(|h| h.doc_id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 0, 1],
+            "a DocValues miss with has_dv=true must still fall back to the \
+             stored document, ordering by content ([1] < [2] < [3]) not doc id"
         );
     }
 }

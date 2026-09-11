@@ -2126,6 +2126,18 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         self
     }
 
+    /// Searches every segment for `doc_id`'s value, returning the first
+    /// hit. `Ok(None)` means either no segment has a DocValues column for
+    /// `field`, or every segment that does simply lacks a value for this
+    /// particular doc — the two cases are indistinguishable from this
+    /// return value alone. Callers that also consult
+    /// [`Self::has_doc_values`] to decide whether to read DocValues at
+    /// all must still treat `Ok(None)` from this method as "fall back to
+    /// the stored document", not as "the value is absent" (Issue #1047):
+    /// segments can disagree on whether they have the column (mixed
+    /// old/new segments, or a field with `doc_values: false`), so
+    /// `has_doc_values() == true` index-wide does not guarantee this
+    /// specific document's segment has it.
     fn get_doc_value(&self, field: &str, doc_id: u64) -> Result<Option<FieldValue>> {
         // Search across all segments
         for segment_lock in &self.segment_readers {
@@ -2137,6 +2149,12 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         Ok(None)
     }
 
+    /// Returns whether ANY segment has a DocValues column for `field` —
+    /// an index-wide, not per-document, answer. `true` does not mean
+    /// every document has a value via [`Self::get_doc_value`]: segments
+    /// can disagree (Issue #1047), so a caller must still fall back to
+    /// the stored document on an `Ok(None)` miss from `get_doc_value`
+    /// rather than treating this method's `true` as a per-doc guarantee.
     fn has_doc_values(&self, field: &str) -> bool {
         // Check if any segment has DocValues for this field
         self.segment_readers.iter().any(|seg_lock| {
