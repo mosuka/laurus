@@ -925,7 +925,7 @@ impl SegmentReader {
 
         let doc_values = self.doc_values.read().unwrap();
         if let Some(reader) = doc_values.as_ref() {
-            Ok(reader.get_value(field, doc_id).cloned())
+            reader.get_value(field, doc_id)
         } else {
             Ok(None)
         }

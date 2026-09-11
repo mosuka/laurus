@@ -311,8 +311,18 @@ impl Storage for DvOpenCountingStorage {
     }
 }
 
-/// #943: repeated field-sorted searches must load each segment's `.dv`
-/// file once — not re-parse it on every per-hit `get_doc_value` call.
+/// #943 / #1047 Phase 2: repeated field-sorted searches must not re-parse
+/// a segment's `.dv` file per call.
+///
+/// Lazy per-field materialization (#1047 Phase 2) changed the *exact*
+/// open count from "one open per segment" (the old eager, whole-file
+/// load) to "one directory-only open, plus one payload open per field
+/// the query actually touches, per segment" -- so this no longer pins a
+/// literal `2`. What must still hold is the actual invariant behind the
+/// old assertion: once a segment's directory is read and a field's
+/// column is materialized, neither is fetched again by a later call.
+/// This re-runs the identical search twice and asserts the second run
+/// adds zero further `.dv` opens.
 #[test]
 fn doc_values_load_once_per_segment() {
     let dv_opens = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -337,21 +347,30 @@ fn doc_values_load_once_per_segment() {
     store.upsert_document(4, doc(20)).unwrap();
     store.commit().unwrap();
 
-    for _ in 0..2 {
+    let run = |store: &LexicalStore| {
         let query: Box<dyn Query> = Box::new(TermQuery::new("body", "alpha"));
         let ids = field_sorted_ids(
-            &store,
+            store,
             LexicalSearchRequest::new(query)
                 .limit(4)
                 .sort_by_field_desc("popularity"),
         );
         assert_eq!(ids, vec![3, 2, 4, 1]);
-    }
+    };
 
+    run(&store);
+    let opens_after_first_search = dv_opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        opens_after_first_search > 0,
+        "the .dv file must have been opened at least once to serve the sort"
+    );
+
+    run(&store);
     assert_eq!(
         dv_opens.load(std::sync::atomic::Ordering::Relaxed),
-        2,
-        ".dv must be loaded once per segment, not per get_doc_value call"
+        opens_after_first_search,
+        "a repeated search must not re-open .dv files whose directory and \
+         materialized fields are already cached"
     );
 }
 
