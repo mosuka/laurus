@@ -87,7 +87,7 @@ impl FlatVectorIndexReader {
         path: &str,
         distance_metric: DistanceMetric,
     ) -> Result<Self> {
-        use crate::vector::index::alloc_bounds::checked_capacity;
+        use crate::util::alloc_bounds::checked_capacity;
         use std::io::{Read, Seek};
 
         // Open the index file

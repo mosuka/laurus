@@ -1,15 +1,18 @@
-//! Allocation bounds for on-disk vector segment parsing (Issue #806).
+//! Allocation bounds for on-disk segment parsing (Issue #806, moved here
+//! from `vector::index` in Issue #1047 so lexical loaders can share it).
 //!
-//! Generalizes the Issue #791 technique. A vector segment reader/loader
-//! takes element counts and byte lengths straight from an on-disk header
-//! that has **not** yet been integrity-checked. The `.hnsw` CRC footer
-//! (Issue #786) is verified before the reader's structural parse, but
-//! *legacy footer-less segments* — and every writer load path, which does
-//! not run the footer verification at all — reach these counts unverified.
-//! A single flipped byte can turn a small `num_vectors` / `node_count` /
-//! `field_name_len` into a multi-GiB allocation request that aborts the
-//! process through `handle_alloc_error` (OOM) instead of surfacing a clean
-//! "corrupted segment" error.
+//! Generalizes the Issue #791 technique. A segment reader/loader takes
+//! element counts and byte lengths straight from an on-disk header that
+//! has **not** yet been integrity-checked. For vector segments, the
+//! `.hnsw` CRC footer (Issue #786) is verified before the reader's
+//! structural parse, but *legacy footer-less segments* — and every writer
+//! load path, which does not run the footer verification at all — reach
+//! these counts unverified. Lexical `.dv` (DocValues) segments have no
+//! footer verification at all. A single flipped byte can turn a small
+//! `num_vectors` / `node_count` / `field_name_len` / `num_fields` into a
+//! multi-GiB allocation request that aborts the process through
+//! `handle_alloc_error` (OOM) instead of surfacing a clean "corrupted
+//! segment" error.
 //!
 //! These helpers reject impossible sizes up front by comparing the
 //! header-declared size against ground truth: the true byte length of the
@@ -63,7 +66,7 @@ pub(crate) fn checked_capacity(
     if count as u64 > max_elements {
         return Err(LaurusError::index(format!(
             "{what}: header declares {count} elements but at most {max_elements} can fit in the \
-             {available} bytes left in the file — vector segment is corrupted"
+             {available} bytes left in the file — segment is corrupted"
         )));
     }
     Ok(count)
@@ -96,7 +99,7 @@ pub(crate) fn checked_len(len: usize, available: u64, what: &str) -> Result<usiz
     if len as u64 > available {
         return Err(LaurusError::index(format!(
             "{what}: header declares {len} bytes but only {available} bytes are left in the file \
-             — vector segment is corrupted"
+             — segment is corrupted"
         )));
     }
     Ok(len)

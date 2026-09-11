@@ -203,11 +203,7 @@ impl QuantizedSegmentVectors {
         // (the header + prefix already consumed can only make the true
         // remainder smaller, so `available` is a safe upper bound).
         let total = vector_count.saturating_mul(Self::record_size(dim));
-        crate::vector::index::alloc_bounds::checked_len(
-            total,
-            available,
-            "quantized segment data size",
-        )?;
+        crate::util::alloc_bounds::checked_len(total, available, "quantized segment data size")?;
         let mut data = vec![0u8; total];
         reader.read_exact(&mut data)?;
 
