@@ -736,6 +736,7 @@ impl Default for Geo3dOption {
 ///     indexed: true,
 ///     stored: true,
 ///     term_vectors: true,
+///     doc_values: true,
 ///     analyzer: None,
 /// });
 ///
