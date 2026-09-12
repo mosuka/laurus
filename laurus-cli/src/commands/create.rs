@@ -333,7 +333,7 @@ fn prompt_field_type_and_options() -> Result<FieldOption> {
     }
 }
 
-/// Prompt for TextOption (indexed, stored, term_vectors, analyzer).
+/// Prompt for TextOption (indexed, stored, term_vectors, doc_values, analyzer).
 fn prompt_text_option() -> Result<FieldOption> {
     let indexed = Confirm::new()
         .with_prompt("Indexed?")
@@ -345,6 +345,10 @@ fn prompt_text_option() -> Result<FieldOption> {
         .interact()?;
     let term_vectors = Confirm::new()
         .with_prompt("Term vectors?")
+        .default(true)
+        .interact()?;
+    let doc_values = Confirm::new()
+        .with_prompt("Doc values? (needed for sorting/faceting/aggregation)")
         .default(true)
         .interact()?;
 
@@ -393,7 +397,7 @@ fn prompt_text_option() -> Result<FieldOption> {
         indexed,
         stored,
         term_vectors,
-        doc_values: true,
+        doc_values,
         analyzer,
     }))
 }
@@ -419,38 +423,43 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
         false
     };
 
+    let doc_values = Confirm::new()
+        .with_prompt("Doc values? (needed for sorting/faceting/aggregation)")
+        .default(true)
+        .interact()?;
+
     Ok(match type_name {
         "Integer" => FieldOption::Integer(IntegerOption {
             indexed,
             stored,
             multi_valued,
-            doc_values: true,
+            doc_values,
         }),
         "Float" => FieldOption::Float(FloatOption {
             indexed,
             stored,
             multi_valued,
-            doc_values: true,
+            doc_values,
         }),
         "Boolean" => FieldOption::Boolean(BooleanOption {
             indexed,
             stored,
-            doc_values: true,
+            doc_values,
         }),
         "DateTime" => FieldOption::DateTime(DateTimeOption {
             indexed,
             stored,
-            doc_values: true,
+            doc_values,
         }),
         "Geo" => FieldOption::Geo(GeoOption {
             indexed,
             stored,
-            doc_values: true,
+            doc_values,
         }),
         "Geo3d" => FieldOption::Geo3d(Geo3dOption {
             indexed,
             stored,
-            doc_values: true,
+            doc_values,
         }),
         _ => unreachable!(),
     })

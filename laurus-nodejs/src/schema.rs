@@ -120,6 +120,9 @@ impl JsSchema {
     /// * `indexed` - Whether the field is searchable (default `true`).
     /// * `term_vectors` - Whether term positions are stored, required by
     ///   phrase and span queries over this field (default `true`).
+    /// * `docValues` - Whether the value is also copied into DocValues,
+    ///   the column-oriented store sort/facet/aggregation read from
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     /// * `analyzer` - Optional analyzer name. For parameter-less built-ins
     ///   (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`)
     ///   pass the name directly. For parameterized presets such as the
@@ -133,6 +136,7 @@ impl JsSchema {
         stored: Option<bool>,
         indexed: Option<bool>,
         term_vectors: Option<bool>,
+        doc_values: Option<bool>,
         analyzer: Option<String>,
     ) {
         self.inner.fields.insert(
@@ -141,7 +145,7 @@ impl JsSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 term_vectors: term_vectors.unwrap_or(true),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
@@ -157,6 +161,8 @@ impl JsSchema {
     /// * `multi_valued` - When `true`, the field accepts arrays of integers
     ///   and range queries match if any value satisfies the predicate
     ///   (Lucene-style "any match"). Default `false`.
+    /// * `docValues` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
     pub fn add_integer_field(
         &mut self,
@@ -164,6 +170,7 @@ impl JsSchema {
         stored: Option<bool>,
         indexed: Option<bool>,
         multi_valued: Option<bool>,
+        doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
             name,
@@ -171,7 +178,7 @@ impl JsSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
@@ -186,6 +193,8 @@ impl JsSchema {
     /// * `multi_valued` - When `true`, the field accepts arrays of floats
     ///   and range queries match if any value satisfies the predicate
     ///   (Lucene-style "any match"). Default `false`.
+    /// * `docValues` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
     pub fn add_float_field(
         &mut self,
@@ -193,6 +202,7 @@ impl JsSchema {
         stored: Option<bool>,
         indexed: Option<bool>,
         multi_valued: Option<bool>,
+        doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
             name,
@@ -200,7 +210,7 @@ impl JsSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
@@ -212,14 +222,22 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `docValues` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
-    pub fn add_boolean_field(&mut self, name: String, stored: Option<bool>, indexed: Option<bool>) {
+    pub fn add_boolean_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        doc_values: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
@@ -231,19 +249,22 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `docValues` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
     pub fn add_datetime_field(
         &mut self,
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
@@ -255,14 +276,22 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `docValues` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
-    pub fn add_geo_field(&mut self, name: String, stored: Option<bool>, indexed: Option<bool>) {
+    pub fn add_geo_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        doc_values: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
@@ -279,14 +308,22 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `docValues` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi(js_name = "addGeo3dField")]
-    pub fn add_geo3d_field(&mut self, name: String, stored: Option<bool>, indexed: Option<bool>) {
+    pub fn add_geo3d_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        doc_values: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
-                doc_values: true,
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
