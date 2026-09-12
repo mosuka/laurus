@@ -194,14 +194,14 @@ class Schema {
 
 | Method | Description |
 | :--- | :--- |
-| `addTextField(name, stored?, indexed?, termVectors?, analyzer?)` | Full-text field (inverted index, BM25). `analyzer` is the name of a parameter-less built-in (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or any custom name registered via `addAnalyzer`. For the parameterised Japanese preset (which requires a Lindera dictionary path), register a custom analyzer with a `lindera` tokenizer and reference it by name. |
-| `addIntegerField(name, stored?, indexed?, multiValued?)` | 64-bit integer field. Pass `multiValued: true` to accept arrays of integers (range queries match if any value satisfies the predicate). |
-| `addFloatField(name, stored?, indexed?, multiValued?)` | 64-bit float field. Pass `multiValued: true` to accept arrays of floats (range queries match if any value satisfies the predicate). |
-| `addBooleanField(name, stored?, indexed?)` | Boolean field. |
-| `addBytesField(name, stored?)` | Raw bytes field. |
-| `addGeoField(name, stored?, indexed?)` | Geographic coordinate field. |
-| `addGeo3dField(name, stored?, indexed?)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md). |
-| `addDatetimeField(name, stored?, indexed?)` | UTC datetime field. |
+| `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)` | Full-text field (inverted index, BM25). `docValues` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047, default `true`); takes effect only when `stored` is also `true`. `analyzer` is the name of a parameter-less built-in (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or any custom name registered via `addAnalyzer`. For the parameterised Japanese preset (which requires a Lindera dictionary path), register a custom analyzer with a `lindera` tokenizer and reference it by name. |
+| `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)` | 64-bit integer field. Pass `multiValued: true` to accept arrays of integers (range queries match if any value satisfies the predicate). See `docValues` above. |
+| `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64-bit float field. Pass `multiValued: true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `docValues` above. |
+| `addBooleanField(name, stored?, indexed?, docValues?)` | Boolean field. See `docValues` above. |
+| `addBytesField(name, stored?)` | Raw bytes field. No `docValues` option: a `Bytes` value is never written to DocValues regardless. |
+| `addGeoField(name, stored?, indexed?, docValues?)` | Geographic coordinate field. See `docValues` above. |
+| `addGeo3dField(name, stored?, indexed?, docValues?)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `docValues` above. |
+| `addDatetimeField(name, stored?, indexed?, docValues?)` | UTC datetime field. See `docValues` above. |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW vector field. `baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF vector field. |

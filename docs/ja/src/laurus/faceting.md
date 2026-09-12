@@ -82,7 +82,14 @@ Category
 
 ファセットカウントは stored document ではなく、各フィールドの **DocValues** 列から読み取られます。
 収集された各ヒットについて、コレクターはファセットフィールドの値だけを per-field の DocValues
-ルックアップで読むため、ファセット対象の全フィールドが DocValues 列を持つ場合（既定では、index 時に
-全 stored field が DocValues に書かれるため常に成立）、stored fields blob 全体を decode / clone しません。
-DocValues を持たないフィールドは透過的に stored document へフォールバックするため、結果はどちらの経路でも
+ルックアップで読むため、ファセット対象の全フィールドが DocValues 列を持つ場合（`stored: true` な
+フィールドは既定でこれに該当します。ただし後述のとおり型によって除外される場合や、`doc_values`
+オプションが明示的に `false` に設定されている場合を除きます）、stored fields blob 全体を
+decode / clone しません。DocValues を持たないフィールド ―― オプトアウトしている、`stored`
+ではない、あるいは `Bytes`/`Vector` の値（DocValues には設定にかかわらず一切格納されません）
+であるため ―― は透過的に stored document へフォールバックするため、結果はどちらの経路でも
 同一で、変わるのは読み取り経路だけです。
+
+ソートにもファセットにも使わないフィールドで `doc_values: false` を設定すると、値が二重（stored
+document と DocValues）ではなく一度（stored document のみ）しか書き込まれなくなるため、
+セグメントの使用容量が削減されます。

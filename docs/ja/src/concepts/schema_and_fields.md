@@ -69,14 +69,15 @@ Lexical フィールドは転置インデックス（Inverted Index）を使用�
 ```rust
 use laurus::lexical::TextOption;
 
-// Default: indexed + stored + term vectors (all true)
+// Default: indexed + stored + term vectors + doc values (all true)
 let opt = TextOption::default();
 
 // Customize
 let opt = TextOption::default()
     .indexed(true)
     .stored(true)
-    .term_vectors(true);
+    .term_vectors(true)
+    .doc_values(true);
 ```
 
 | オプション | デフォルト | 説明 |
@@ -84,6 +85,16 @@ let opt = TextOption::default()
 | `indexed` | `true` | フィールドが検索可能かどうか |
 | `stored` | `true` | 元の値が取得用に保存されるかどうか |
 | `term_vectors` | `true` | ターム位置が保存されるかどうか（フレーズクエリ・スパンクエリで使用。ハイライトは常に保存済みテキストを再トークナイズするため使用しない） |
+| `doc_values` | `true` | 値を DocValues（[ソート](../laurus/faceting.md)・ファセット・集計が読み取る列指向ストア）にもコピーするかどうか |
+
+`doc_values` は `TextOption` 専用ではありません。`BytesOption` を除く全ての lexical
+フィールドオプション（`IntegerOption`, `FloatOption`, `BooleanOption`, `DateTimeOption`,
+`GeoOption`, `Geo3dOption`）が同じ設定を持ちます。`BytesOption` にはこの設定がありません
+――  `Bytes` の値はソートにもファセットにも使えないため、設定にかかわらず DocValues には
+一切書き込まれないからです。実効ルールは次のとおりです: DocValues 列が書き込まれるのは
+`stored` と `doc_values` の両方が `true`（かつ値の型が `Bytes` でない）場合のみです。
+ソートにもファセットにも使わないフィールドで `doc_values: false` を設定すると、二重目の
+コピーを省略できるため、セグメントの使用容量が削減されます。
 
 ### Vector フィールド
 

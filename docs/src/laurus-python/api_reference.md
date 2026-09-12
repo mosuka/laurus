@@ -189,14 +189,14 @@ class Schema:
 
 | Method | Description |
 | :--- | :--- |
-| `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, analyzer=None)` | Full-text field (inverted index, BM25). `term_vectors` controls whether term positions are stored, read by phrase and span queries. `analyzer` accepts a built-in name (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`, or any custom name registered via `add_analyzer`) or a dict configuring a parameterised preset such as `{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}`. The bare string `"japanese"` is rejected because the preset requires a Lindera dictionary path. |
-| `add_integer_field(name, *, stored=True, indexed=True, multi_valued=False)` | 64-bit integer field. Set `multi_valued=True` to accept arrays of integers (range queries match if any value satisfies the predicate). |
-| `add_float_field(name, *, stored=True, indexed=True, multi_valued=False)` | 64-bit float field. Set `multi_valued=True` to accept arrays of floats (range queries match if any value satisfies the predicate). |
-| `add_boolean_field(name, *, stored=True, indexed=True)` | Boolean field. |
-| `add_bytes_field(name, *, stored=True)` | Raw bytes field. |
-| `add_geo_field(name, *, stored=True, indexed=True)` | Geographic coordinate field (lat/lon). |
-| `add_geo3d_field(name, *, stored=True, indexed=True)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md). |
-| `add_datetime_field(name, *, stored=True, indexed=True)` | UTC datetime field. |
+| `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, doc_values=True, analyzer=None)` | Full-text field (inverted index, BM25). `term_vectors` controls whether term positions are stored, read by phrase and span queries. `doc_values` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `stored=True`. `analyzer` accepts a built-in name (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`, or any custom name registered via `add_analyzer`) or a dict configuring a parameterised preset such as `{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}`. The bare string `"japanese"` is rejected because the preset requires a Lindera dictionary path. |
+| `add_integer_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64-bit integer field. Set `multi_valued=True` to accept arrays of integers (range queries match if any value satisfies the predicate). See `doc_values` above. |
+| `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64-bit float field. Set `multi_valued=True` to accept arrays of floats (range queries match if any value satisfies the predicate). See `doc_values` above. |
+| `add_boolean_field(name, *, stored=True, indexed=True, doc_values=True)` | Boolean field. See `doc_values` above. |
+| `add_bytes_field(name, *, stored=True)` | Raw bytes field. No `doc_values` option: a `Bytes` value is never written to DocValues regardless. |
+| `add_geo_field(name, *, stored=True, indexed=True, doc_values=True)` | Geographic coordinate field (lat/lon). See `doc_values` above. |
+| `add_geo3d_field(name, *, stored=True, indexed=True, doc_values=True)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values` above. |
+| `add_datetime_field(name, *, stored=True, indexed=True, doc_values=True)` | UTC datetime field. See `doc_values` above. |
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat (brute-force) vector field. |
 | `add_ivf_field(name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0)` | IVF approximate nearest-neighbor vector field. |

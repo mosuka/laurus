@@ -84,6 +84,13 @@ Facet counts are read from each field's **DocValues** column, not from the
 stored document. For every collected hit the collector reads only the facet
 field's value via the per-field DocValues lookup, so it never decodes or clones
 the whole stored-fields blob when every faceted field has a DocValues column
-(which is the default — every stored field is written to DocValues at index
-time). A field that lacks DocValues transparently falls back to the stored
-document, so results are identical either way; only the read path changes.
+(the default for any `stored: true` field, unless its type is excluded — see
+below — or its `doc_values` option is explicitly set to `false`). A field that
+lacks DocValues — because it opted out, isn't stored, or is a `Bytes`/`Vector`
+value, which DocValues never carries regardless of the setting — transparently
+falls back to the stored document, so results are identical either way; only
+the read path changes.
+
+Setting `doc_values: false` on a field that is never sorted or faceted on
+shrinks its segment footprint, since the value is then written once (to the
+stored document) instead of twice.

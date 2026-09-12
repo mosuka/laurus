@@ -43,6 +43,7 @@ default_fields = ["title", "body"]
 indexed = true      # このフィールドを検索用にインデックスするかどうか
 stored = true       # 取得用に元の値を保存するかどうか
 term_vectors = true # タームの位置を保存するかどうか（フレーズクエリ・スパンクエリ用）
+doc_values = true   # 値を DocValues にもコピーするかどうか（ソート・ファセット用）
 ```
 
 | オプション | 型 | デフォルト | 説明 |
@@ -50,6 +51,7 @@ term_vectors = true # タームの位置を保存するかどうか（フレー�
 | `indexed` | `bool` | `true` | このフィールドの検索を有効にする |
 | `stored` | `bool` | `true` | 結果に返せるよう元の値を保存する |
 | `term_vectors` | `bool` | `true` | フレーズクエリ・スパンクエリが読み取るタームの位置を保存する。ハイライトは常に保存済みテキストを再トークナイズするため使用しない |
+| `doc_values` | `bool` | `true` | 値を DocValues（[ソート](../laurus/faceting.md)・ファセット・集計が読み取る列指向ストア）にもコピーする。`stored` も `true` の場合のみ有効 —— 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Integer
 
@@ -60,6 +62,7 @@ term_vectors = true # タームの位置を保存するかどうか（フレー�
 indexed = true
 stored = true
 multi_valued = false
+doc_values = true
 ```
 
 | オプション | 型 | デフォルト | 説明 |
@@ -67,6 +70,7 @@ multi_valued = false
 | `indexed` | `bool` | `true` | 範囲クエリおよび完全一致クエリを有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
 | `multi_valued` | `bool` | `false` | 整数の配列を受け付け、範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア） |
+| `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Float
 
@@ -77,6 +81,7 @@ multi_valued = false
 indexed = true
 stored = true
 multi_valued = false
+doc_values = true
 ```
 
 | オプション | 型 | デフォルト | 説明 |
@@ -84,6 +89,7 @@ multi_valued = false
 | `indexed` | `bool` | `true` | 範囲クエリを有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
 | `multi_valued` | `bool` | `false` | 浮動小数点の配列を受け付け、範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア） |
+| `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Boolean
 
@@ -93,12 +99,14 @@ multi_valued = false
 [fields.published.Boolean]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | ブーリアン値によるフィルタリングを有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
+| `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### DateTime
 
@@ -108,12 +116,14 @@ UTC タイムスタンプフィールド。範囲クエリをサポートしま�
 [fields.created_at.DateTime]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | 日時の範囲クエリを有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
+| `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Geo
 
@@ -123,12 +133,14 @@ stored = true
 [fields.location.Geo]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Geo クエリ（半径、バウンディングボックス）を有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
+| `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Geo3d
 
@@ -138,12 +150,14 @@ stored = true
 [fields.position.Geo3d]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | 3D 地理クエリ（`geo3d_distance`、`geo3d_bbox`、`geo3d_nearest`）を有効にする |
 | `stored` | `bool` | `true` | 元の `(x, y, z)` 値を保存する |
+| `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Bytes
 
@@ -157,6 +171,21 @@ stored = true
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `stored` | `bool` | `true` | バイナリデータを保存する |
+
+`BytesOption` に `doc_values` 設定はありません。`Bytes` の値はソートにもファセットにも
+使えないため、設定にかかわらず DocValues には一切書き込まれないからです。
+
+#### 共通オプション: `doc_values`
+
+上記の lexical フィールドオプションのうち `BytesOption` を除く全てが `doc_values` オプションを
+持ち、値を DocValues ―― [ソート](../laurus/faceting.md)・ファセット・集計が読み取る列指向ストア
+―― にもコピーするかどうかを制御します。実効ルールは次のとおりです: DocValues 列が書き込まれる
+のは `stored` と `doc_values` の両方が `true` の場合のみです。`doc_values: false` と
+`stored: false` の組み合わせは（エラーにせず）黙って無視されます。ソートにもファセットにも
+使わないフィールドで `doc_values` を無効にすると、値が二重（stored document と DocValues）
+ではなく一度（stored document のみ）しか書き込まれなくなるため、セグメントの使用容量が
+削減されます。フィールド自体は引き続き完全に検索・取得可能で、ソートやファセットを行う際は
+単に stored document へフォールバックします。
 
 ### Vector フィールド
 

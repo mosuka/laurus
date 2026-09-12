@@ -100,16 +100,18 @@ Each `FieldOption` is a `oneof` with one of the following field types:
 
 | Lexical Fields | Vector Fields |
 | :--- | :--- |
-| `TextOption` (`indexed`, `stored`, `term_vectors`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
-| `IntegerOption` (`indexed`, `stored`, `multi_valued`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
-| `FloatOption` (`indexed`, `stored`, `multi_valued`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
-| `BooleanOption` (`indexed`, `stored`) | |
-| `DateTimeOption` (`indexed`, `stored`) | |
-| `GeoOption` (`indexed`, `stored`) | |
-| `Geo3dOption` (`indexed`, `stored`) | |
+| `TextOption` (`indexed`, `stored`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
+| `IntegerOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
+| `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
+| `BooleanOption` (`indexed`, `stored`, `doc_values`) | |
+| `DateTimeOption` (`indexed`, `stored`, `doc_values`) | |
+| `GeoOption` (`indexed`, `stored`, `doc_values`) | |
+| `Geo3dOption` (`indexed`, `stored`, `doc_values`) | |
 | `BytesOption` (`stored`) | |
 
 The `embedder` field in vector options specifies the name of an embedder defined in `Schema.embedders`. When set, the server automatically generates vectors from document text fields at index time. Leave empty to supply pre-computed vectors directly.
+
+**Doc values:** `doc_values` (Issue #1047) is `optional bool` on every lexical option above except `BytesOption`, following the same tri-state contract as `term_vectors`: a client that omits it gets the engine's default (`true`), distinguishable from an explicit `false`. It controls whether the field's value is also copied into DocValues, the column-oriented store sorting and faceting/aggregation read from — a DocValues column is written only when `stored` and `doc_values` are both `true`. `BytesOption` carries no such field: a `Bytes` value is never written to DocValues regardless. Turning `doc_values` off for a field that is never sorted or faceted on shrinks its segment footprint; the field remains fully searchable and retrievable either way.
 
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 

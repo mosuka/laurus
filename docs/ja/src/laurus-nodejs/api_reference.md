@@ -196,14 +196,14 @@ class Schema {
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addTextField(name, stored?, indexed?, termVectors?, analyzer?)` | 全文検索フィールド（転置インデックス、BM25）。`analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットを使う場合は、`lindera` tokenizer を含むカスタム analyzer を登録して、その名前を参照してください。 |
-| `addIntegerField(name, stored?, indexed?, multiValued?)` | 64 ビット整数フィールド。`multiValued: true` で整数配列を受け付け（範囲クエリは "any match"）。 |
-| `addFloatField(name, stored?, indexed?, multiValued?)` | 64 ビット浮動小数点フィールド。`multiValued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。 |
-| `addBooleanField(name, stored?, indexed?)` | 真偽値フィールド。 |
-| `addBytesField(name, stored?)` | バイナリデータフィールド。 |
-| `addGeoField(name, stored?, indexed?)` | 地理座標フィールド。 |
-| `addGeo3dField(name, stored?, indexed?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。 |
-| `addDatetimeField(name, stored?, indexed?)` | UTC 日時フィールド。 |
+| `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)` | 全文検索フィールド（転置インデックス、BM25）。`docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047、デフォルト `true`）。`stored` も `true` の場合のみ有効です。`analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットを使う場合は、`lindera` tokenizer を含むカスタム analyzer を登録して、その名前を参照してください。 |
+| `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット整数フィールド。`multiValued: true` で整数配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
+| `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット浮動小数点フィールド。`multiValued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
+| `addBooleanField(name, stored?, indexed?, docValues?)` | 真偽値フィールド。`docValues` は上記を参照。 |
+| `addBytesField(name, stored?)` | バイナリデータフィールド。`docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
+| `addGeoField(name, stored?, indexed?, docValues?)` | 地理座標フィールド。`docValues` は上記を参照。 |
+| `addGeo3dField(name, stored?, indexed?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
+| `addDatetimeField(name, stored?, indexed?, docValues?)` | UTC 日時フィールド。`docValues` は上記を参照。 |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW ベクトルフィールド。`baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |

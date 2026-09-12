@@ -43,6 +43,7 @@ Full-text searchable field. Text is processed by the analysis pipeline (tokeniza
 indexed = true      # Whether to index this field for search
 stored = true       # Whether to store the original value for retrieval
 term_vectors = true # Whether to store term positions (for phrase and span queries)
+doc_values = true   # Whether to also copy the value into DocValues (for sorting/faceting)
 ```
 
 | Option | Type | Default | Description |
@@ -50,6 +51,7 @@ term_vectors = true # Whether to store term positions (for phrase and span queri
 | `indexed` | `bool` | `true` | Enables searching this field |
 | `stored` | `bool` | `true` | Stores the original value so it can be returned in results |
 | `term_vectors` | `bool` | `true` | Stores term positions, read by phrase and span queries; highlighting always re-tokenizes the stored text and does not use them |
+| `doc_values` | `bool` | `true` | Copies the value into DocValues, the column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation read from. Takes effect only when `stored` is also `true` — see [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Integer
 
@@ -60,6 +62,7 @@ term_vectors = true # Whether to store term positions (for phrase and span queri
 indexed = true
 stored = true
 multi_valued = false
+doc_values = true
 ```
 
 | Option | Type | Default | Description |
@@ -67,6 +70,7 @@ multi_valued = false
 | `indexed` | `bool` | `true` | Enables range and exact-match queries |
 | `stored` | `bool` | `true` | Stores the original value |
 | `multi_valued` | `bool` | `false` | Accept arrays of integers; range queries match if **any** value satisfies the predicate (Lucene-style "any match" with constant scoring) |
+| `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Float
 
@@ -77,6 +81,7 @@ multi_valued = false
 indexed = true
 stored = true
 multi_valued = false
+doc_values = true
 ```
 
 | Option | Type | Default | Description |
@@ -84,6 +89,7 @@ multi_valued = false
 | `indexed` | `bool` | `true` | Enables range queries |
 | `stored` | `bool` | `true` | Stores the original value |
 | `multi_valued` | `bool` | `false` | Accept arrays of floats; range queries match if **any** value satisfies the predicate (Lucene-style "any match" with constant scoring) |
+| `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Boolean
 
@@ -93,12 +99,14 @@ Boolean field (`true` / `false`).
 [fields.published.Boolean]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables filtering by boolean value |
 | `stored` | `bool` | `true` | Stores the original value |
+| `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### DateTime
 
@@ -108,12 +116,14 @@ UTC timestamp field. Supports range queries.
 [fields.created_at.DateTime]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables range queries on date/time |
 | `stored` | `bool` | `true` | Stores the original value |
+| `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Geo
 
@@ -123,12 +133,14 @@ Geographic point field (latitude/longitude). Supports radius and bounding box qu
 [fields.location.Geo]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables geo queries (radius, bounding box) |
 | `stored` | `bool` | `true` | Stores the original value |
+| `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Geo3d
 
@@ -138,12 +150,14 @@ stored = true
 [fields.position.Geo3d]
 indexed = true
 stored = true
+doc_values = true
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables 3D geo queries (`geo3d_distance`, `geo3d_bbox`, `geo3d_nearest`) |
 | `stored` | `bool` | `true` | Stores the original `(x, y, z)` value |
+| `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Bytes
 
@@ -157,6 +171,23 @@ stored = true
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `stored` | `bool` | `true` | Stores the binary data |
+
+`BytesOption` has no `doc_values` setting: a `Bytes` value is never written to
+DocValues regardless, since neither sorting nor faceting can do anything with
+it.
+
+#### Common option: `doc_values`
+
+Every lexical field option above except `BytesOption` carries a `doc_values`
+option, controlling whether the value is also copied into DocValues — the
+column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation
+read from. The effective rule: a DocValues column is written only when
+`stored` and `doc_values` are both `true`. Setting `doc_values: false` with
+`stored: false` is silently ignored (not an error). Turning `doc_values` off
+for a field that is never sorted or faceted on shrinks its segment footprint,
+since the value is then written once (to the stored document) instead of
+twice; the field remains fully searchable and retrievable either way — sorting
+and faceting on it simply fall back to the stored document.
 
 ### Vector Fields
 
