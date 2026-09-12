@@ -2516,6 +2516,65 @@ mod tests {
     use super::*;
     use crate::lexical::reader::PostingIterator;
 
+    /// #1047: `has_doc_values` must reflect the schema's per-field
+    /// `doc_values` flag on a real, on-disk segment -- a field declared
+    /// `doc_values: false` gets no column, one left at the default does.
+    #[test]
+    fn has_doc_values_reflects_the_schemas_doc_values_flag() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
+        fields.insert(
+            "internal_note".to_string(),
+            FieldOption::Text(TextOption {
+                doc_values: false,
+                ..Default::default()
+            }),
+        );
+        let config = InvertedIndexConfig {
+            fields,
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, config).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document(
+                crate::Document::builder()
+                    .add_text("title", "hello")
+                    .add_text("internal_note", "shh")
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let segment = inverted.segment_readers()[0].read().unwrap();
+
+        assert!(
+            segment.has_doc_values("title"),
+            "a field without doc_values: false must get a column"
+        );
+        assert!(
+            !segment.has_doc_values("internal_note"),
+            "doc_values: false must keep the field out of the segment's \
+             DocValues directory entirely"
+        );
+    }
+
     /// #541 — `SegmentReader::postings` must never yield a deleted
     /// document, on either of its paths.
     ///

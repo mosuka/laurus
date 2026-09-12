@@ -552,6 +552,31 @@ impl InvertedIndex {
     /// files are removed — minimizing any window in which a document could be
     /// seen in both a source and the merged segment). A no-op for fewer than
     /// two sources.
+    /// Every currently-declared field's `doc_values` setting, merging the
+    /// initial schema (`config.fields`) with fields added at runtime
+    /// (`extra_fields`) -- the same union [`Self::writer`] builds for
+    /// `InvertedIndexWriterConfig::fields`. Feeds
+    /// [`MergeConfig::field_doc_values`](self::segment::merge_engine::MergeConfig::field_doc_values)
+    /// so a merge or field rebuild resolves DocValues from the CURRENT
+    /// schema first (Issue #1047), not from whatever a source segment
+    /// happens to have on disk.
+    fn current_field_doc_values(&self) -> HashMap<String, bool> {
+        let mut out = HashMap::new();
+        for (name, option) in &self.config.fields {
+            if let Some(dv) = option.doc_values() {
+                out.insert(name.clone(), dv);
+            }
+        }
+        // Runtime-added fields win over the initial schema on a name
+        // clash, mirroring `writer()`'s `fields.extend(extra_fields)`.
+        for (name, option) in self.extra_fields.read().iter() {
+            if let Some(dv) = option.doc_values() {
+                out.insert(name.clone(), dv);
+            }
+        }
+        out
+    }
+
     fn merge_segment_set(&self, sources: &[SegmentInfo], next_generation: u64) -> Result<()> {
         use self::segment::merge_engine::{MergeConfig, MergeEngine};
         use self::segment::{ManagedSegmentInfo, MergeCandidate, MergeStrategy};
@@ -578,6 +603,8 @@ impl InvertedIndex {
         let engine = MergeEngine::new(
             MergeConfig {
                 use_compound: self.config.use_compound,
+                field_doc_values: self.current_field_doc_values(),
+                default_doc_values: self.config.store_doc_values,
                 ..MergeConfig::default()
             },
             self.storage.clone(),
@@ -739,6 +766,7 @@ impl LexicalIndex for InvertedIndex {
             fields,
             use_compound: self.config.use_compound,
             store_term_positions: self.config.store_term_vectors,
+            store_doc_values: self.config.store_doc_values,
             ..Default::default()
         };
         // Hand the writer the shared metadata and manifest handles
@@ -863,6 +891,10 @@ impl LexicalIndex for InvertedIndex {
             FieldOption::Text(text_option) => text_option.term_vectors,
             _ => self.config.store_term_vectors,
         };
+        // #1047: same idea for DocValues -- `option.doc_values()` is
+        // `None` only for `Bytes` (which has no such flag), so this falls
+        // back to the index-wide default in exactly that one case.
+        let target_doc_values = option.doc_values().unwrap_or(self.config.store_doc_values);
 
         let segments = self.load_segments()?;
         if !segments.is_empty() {
@@ -891,6 +923,8 @@ impl LexicalIndex for InvertedIndex {
             let engine = MergeEngine::new(
                 MergeConfig {
                     use_compound: self.config.use_compound,
+                    field_doc_values: self.current_field_doc_values(),
+                    default_doc_values: self.config.store_doc_values,
                     ..MergeConfig::default()
                 },
                 self.storage.clone(),
@@ -906,6 +940,7 @@ impl LexicalIndex for InvertedIndex {
                 name,
                 analyzer.as_ref(),
                 target_term_vectors,
+                target_doc_values,
                 &new_segment_ids,
             )?;
 

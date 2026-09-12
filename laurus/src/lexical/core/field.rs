@@ -806,6 +806,27 @@ impl FieldOption {
             }),
         }
     }
+
+    /// This option's own `doc_values` setting, or `None` for `Bytes` (the
+    /// one field option with no such flag -- Issue #1047).
+    ///
+    /// Centralizes the 7-arm match so callers that need a field's raw
+    /// schema-level `doc_values` setting (as opposed to a fully resolved
+    /// default-and-override decision, like
+    /// [`InvertedIndexWriterConfig::stores_doc_values`](crate::lexical::index::inverted::writer::InvertedIndexWriterConfig::stores_doc_values))
+    /// don't each duplicate it.
+    pub(crate) fn doc_values(&self) -> Option<bool> {
+        match self {
+            FieldOption::Text(opt) => Some(opt.doc_values),
+            FieldOption::Integer(opt) => Some(opt.doc_values),
+            FieldOption::Float(opt) => Some(opt.doc_values),
+            FieldOption::Boolean(opt) => Some(opt.doc_values),
+            FieldOption::DateTime(opt) => Some(opt.doc_values),
+            FieldOption::Geo(opt) => Some(opt.doc_values),
+            FieldOption::Geo3d(opt) => Some(opt.doc_values),
+            FieldOption::Bytes(_) => None,
+        }
+    }
 }
 
 impl Default for GeoOption {

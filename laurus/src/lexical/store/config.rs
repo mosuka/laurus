@@ -135,6 +135,7 @@ pub struct LexicalIndexConfigBuilder {
     write_buffer_size: Option<usize>,
     compress_stored_fields: Option<bool>,
     store_term_vectors: Option<bool>,
+    store_doc_values: Option<bool>,
     merge_factor: Option<u32>,
     max_segments: Option<u32>,
     default_fields: Vec<String>,
@@ -160,6 +161,7 @@ impl LexicalIndexConfigBuilder {
             write_buffer_size: None,
             compress_stored_fields: None,
             store_term_vectors: None,
+            store_doc_values: None,
             merge_factor: None,
             max_segments: None,
             default_fields: Vec::new(),
@@ -237,6 +239,18 @@ impl LexicalIndexConfigBuilder {
     /// Default: true
     pub fn store_term_vectors(mut self, store: bool) -> Self {
         self.store_term_vectors = Some(store);
+        self
+    }
+
+    /// Enable or disable the index-wide default for writing a field's
+    /// value into DocValues (Issue #1047).
+    ///
+    /// A field's own `doc_values` option (present on every field option
+    /// except `BytesOption`) overrides this default. See
+    /// [`InvertedIndexConfig::store_doc_values`].
+    /// Default: true
+    pub fn store_doc_values(mut self, store: bool) -> Self {
+        self.store_doc_values = Some(store);
         self
     }
 
@@ -332,6 +346,9 @@ impl LexicalIndexConfigBuilder {
         }
         if let Some(store) = self.store_term_vectors {
             config.store_term_vectors = store;
+        }
+        if let Some(store) = self.store_doc_values {
+            config.store_doc_values = store;
         }
         if let Some(factor) = self.merge_factor {
             config.merge_factor = factor;
