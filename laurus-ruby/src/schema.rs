@@ -167,6 +167,7 @@ impl RbSchema {
                 indexed,
                 stored,
                 term_vectors,
+                doc_values: true,
                 analyzer,
             }),
         );
@@ -199,6 +200,7 @@ impl RbSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: true,
             }),
         );
         Ok(())
@@ -230,6 +232,7 @@ impl RbSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: true,
             }),
         );
         Ok(())
@@ -257,6 +260,7 @@ impl RbSchema {
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
         Ok(())
@@ -284,6 +288,7 @@ impl RbSchema {
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
         Ok(())
@@ -311,6 +316,7 @@ impl RbSchema {
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
         Ok(())
@@ -343,6 +349,7 @@ impl RbSchema {
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
         Ok(())

@@ -155,6 +155,7 @@ impl WasmSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 term_vectors: term_vectors.unwrap_or(true),
+                doc_values: true,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
@@ -175,6 +176,7 @@ impl WasmSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: true,
             }),
         );
     }
@@ -194,6 +196,7 @@ impl WasmSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: true,
             }),
         );
     }
@@ -206,6 +209,7 @@ impl WasmSchema {
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }
@@ -223,6 +227,7 @@ impl WasmSchema {
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }
@@ -235,6 +240,7 @@ impl WasmSchema {
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }
@@ -252,6 +258,7 @@ impl WasmSchema {
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }

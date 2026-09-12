@@ -141,6 +141,7 @@ impl JsSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 term_vectors: term_vectors.unwrap_or(true),
+                doc_values: true,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
@@ -170,6 +171,7 @@ impl JsSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: true,
             }),
         );
     }
@@ -198,6 +200,7 @@ impl JsSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: true,
             }),
         );
     }
@@ -216,6 +219,7 @@ impl JsSchema {
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }
@@ -239,6 +243,7 @@ impl JsSchema {
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }
@@ -257,6 +262,7 @@ impl JsSchema {
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }
@@ -280,6 +286,7 @@ impl JsSchema {
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: true,
             }),
         );
     }

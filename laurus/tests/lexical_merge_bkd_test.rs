@@ -47,6 +47,7 @@ fn merge_preserves_bkd_points_for_index_only_numeric_field() {
                 indexed: true,
                 stored: false,
                 multi_valued: false,
+                doc_values: true,
             }),
         )
         .build();

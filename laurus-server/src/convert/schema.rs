@@ -205,33 +205,42 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             // Unset means "use the engine's default", matching
             // `TextOption::default()` (#1083).
             term_vectors: o.term_vectors.unwrap_or(true),
+            // The proto message has no `doc_values` field yet; pin to the
+            // pre-#1047 implicit default until the protocol is wired up.
+            doc_values: true,
             analyzer: o.analyzer.as_ref().and_then(analyzer_spec_from_proto),
         })),
         Some(Opt::Integer(o)) => Some(FieldOption::Integer(IntegerOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
+            doc_values: true,
         })),
         Some(Opt::Float(o)) => Some(FieldOption::Float(FloatOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
+            doc_values: true,
         })),
         Some(Opt::Boolean(o)) => Some(FieldOption::Boolean(BooleanOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: true,
         })),
         Some(Opt::DateTime(o)) => Some(FieldOption::DateTime(DateTimeOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: true,
         })),
         Some(Opt::Geo(o)) => Some(FieldOption::Geo(GeoOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: true,
         })),
         Some(Opt::Geo3d(o)) => Some(FieldOption::Geo3d(Geo3dOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: true,
         })),
         Some(Opt::Bytes(o)) => Some(FieldOption::Bytes(BytesOption { stored: o.stored })),
         Some(Opt::Hnsw(o)) => Some(FieldOption::Hnsw(HnswOption {
@@ -1177,6 +1186,7 @@ mod tests {
                 Geo3dOption {
                     indexed: true,
                     stored: false,
+                    doc_values: true,
                 },
             )
             .build();

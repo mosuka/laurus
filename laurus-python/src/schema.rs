@@ -244,6 +244,7 @@ impl PySchema {
                 indexed,
                 stored,
                 term_vectors,
+                doc_values: true,
                 analyzer,
             }),
         );
@@ -274,6 +275,7 @@ impl PySchema {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values: true,
             }),
         );
     }
@@ -296,6 +298,7 @@ impl PySchema {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values: true,
             }),
         );
     }
@@ -305,7 +308,11 @@ impl PySchema {
     pub fn add_boolean_field(&mut self, name: &str, stored: bool, indexed: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::Boolean(BooleanOption { indexed, stored }),
+            FieldOption::Boolean(BooleanOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
         );
     }
 
@@ -314,7 +321,11 @@ impl PySchema {
     pub fn add_datetime_field(&mut self, name: &str, stored: bool, indexed: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::DateTime(DateTimeOption { indexed, stored }),
+            FieldOption::DateTime(DateTimeOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
         );
     }
 
@@ -323,7 +334,11 @@ impl PySchema {
     pub fn add_geo_field(&mut self, name: &str, stored: bool, indexed: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::Geo(GeoOption { indexed, stored }),
+            FieldOption::Geo(GeoOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
         );
     }
 
@@ -337,7 +352,11 @@ impl PySchema {
     pub fn add_geo3d_field(&mut self, name: &str, stored: bool, indexed: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::Geo3d(Geo3dOption { indexed, stored }),
+            FieldOption::Geo3d(Geo3dOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
         );
     }
 

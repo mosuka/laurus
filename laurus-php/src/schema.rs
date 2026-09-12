@@ -138,6 +138,7 @@ impl PhpSchema {
                 indexed,
                 stored,
                 term_vectors,
+                doc_values: true,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
@@ -161,6 +162,7 @@ impl PhpSchema {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values: true,
             }),
         );
     }
@@ -183,6 +185,7 @@ impl PhpSchema {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values: true,
             }),
         );
     }
@@ -198,7 +201,11 @@ impl PhpSchema {
     pub fn add_boolean_field(&self, name: String, stored: bool, indexed: bool) {
         self.inner.borrow_mut().fields.insert(
             name,
-            FieldOption::Boolean(BooleanOption { indexed, stored }),
+            FieldOption::Boolean(BooleanOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
         );
     }
 
@@ -213,7 +220,11 @@ impl PhpSchema {
     pub fn add_datetime_field(&self, name: String, stored: bool, indexed: bool) {
         self.inner.borrow_mut().fields.insert(
             name,
-            FieldOption::DateTime(DateTimeOption { indexed, stored }),
+            FieldOption::DateTime(DateTimeOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
         );
     }
 
@@ -226,10 +237,14 @@ impl PhpSchema {
     /// * `indexed` - Whether the field is searchable (default: true).
     #[php(defaults(stored = true, indexed = true))]
     pub fn add_geo_field(&self, name: String, stored: bool, indexed: bool) {
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Geo(GeoOption { indexed, stored }));
+        self.inner.borrow_mut().fields.insert(
+            name,
+            FieldOption::Geo(GeoOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
+        );
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -246,10 +261,14 @@ impl PhpSchema {
     /// * `indexed` - Whether the field is searchable (default: true).
     #[php(defaults(stored = true, indexed = true))]
     pub fn add_geo3d_field(&self, name: String, stored: bool, indexed: bool) {
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Geo3d(Geo3dOption { indexed, stored }));
+        self.inner.borrow_mut().fields.insert(
+            name,
+            FieldOption::Geo3d(Geo3dOption {
+                indexed,
+                stored,
+                doc_values: true,
+            }),
+        );
     }
 
     /// Add a binary data field.

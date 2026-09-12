@@ -393,6 +393,7 @@ fn prompt_text_option() -> Result<FieldOption> {
         indexed,
         stored,
         term_vectors,
+        doc_values: true,
         analyzer,
     }))
 }
@@ -423,16 +424,34 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
             indexed,
             stored,
             multi_valued,
+            doc_values: true,
         }),
         "Float" => FieldOption::Float(FloatOption {
             indexed,
             stored,
             multi_valued,
+            doc_values: true,
         }),
-        "Boolean" => FieldOption::Boolean(BooleanOption { indexed, stored }),
-        "DateTime" => FieldOption::DateTime(DateTimeOption { indexed, stored }),
-        "Geo" => FieldOption::Geo(GeoOption { indexed, stored }),
-        "Geo3d" => FieldOption::Geo3d(Geo3dOption { indexed, stored }),
+        "Boolean" => FieldOption::Boolean(BooleanOption {
+            indexed,
+            stored,
+            doc_values: true,
+        }),
+        "DateTime" => FieldOption::DateTime(DateTimeOption {
+            indexed,
+            stored,
+            doc_values: true,
+        }),
+        "Geo" => FieldOption::Geo(GeoOption {
+            indexed,
+            stored,
+            doc_values: true,
+        }),
+        "Geo3d" => FieldOption::Geo3d(Geo3dOption {
+            indexed,
+            stored,
+            doc_values: true,
+        }),
         _ => unreachable!(),
     })
 }
@@ -706,6 +725,7 @@ mod tests {
         let opt = FieldOption::Geo3d(Geo3dOption {
             indexed: true,
             stored: true,
+            doc_values: true,
         });
         assert_eq!(field_type_label(&opt), "Geo3d");
         assert!(is_lexical_field(&opt));
