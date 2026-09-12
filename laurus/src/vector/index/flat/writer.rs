@@ -7,10 +7,10 @@ use rayon::prelude::*;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
+use crate::util::alloc_bounds::checked_capacity;
 use crate::vector::core::quantization::ScalarQuantParams;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::FlatIndexConfig;
-use crate::vector::index::alloc_bounds::checked_capacity;
 use crate::vector::index::field::LegacyVectorFieldWriter;
 use crate::vector::index::format::{
     QuantHeader, VERSION_FIELD_DICT, VectorSegmentHeader, build_field_dict, record_prefix_size,

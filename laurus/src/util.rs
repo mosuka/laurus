@@ -1,5 +1,6 @@
 //! Shared utility modules used across Laurus components.
 
+pub(crate) mod alloc_bounds;
 pub mod ecef;
 pub mod id;
 pub mod levenshtein;

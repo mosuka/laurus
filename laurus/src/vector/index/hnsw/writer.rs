@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
+use crate::util::alloc_bounds::checked_capacity;
 use crate::vector::core::rerank::RerankStorageKind;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::HnswIndexConfig;
-use crate::vector::index::alloc_bounds::checked_capacity;
 use crate::vector::index::field::LegacyVectorFieldWriter;
 use crate::vector::index::format::{
     QuantHeader, VERSION_FIELD_DICT, VERSION_ORDINAL_GRAPH, VectorSegmentHeader, build_field_dict,

@@ -155,14 +155,14 @@ Laurus::Schema.new
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `add_text_field(name, stored: true, indexed: true, term_vectors: true, analyzer: nil)` | 全文フィールド（転置インデックス、BM25）。`term_vectors:` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`analyzer:` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
-| `add_integer_field(name, stored: true, indexed: true, multi_valued: false)` | 64 ビット整数フィールド。`multi_valued: true` で整数配列を受け付け（範囲クエリは "any match"）。 |
-| `add_float_field(name, stored: true, indexed: true, multi_valued: false)` | 64 ビット浮動小数点フィールド。`multi_valued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。 |
-| `add_boolean_field(name, stored: true, indexed: true)` | ブールフィールド。 |
-| `add_bytes_field(name, stored: true)` | 生バイトフィールド。 |
-| `add_geo_field(name, stored: true, indexed: true)` | 地理座標フィールド（緯度/経度）。 |
-| `add_geo3d_field(name, stored: true, indexed: true)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。 |
-| `add_datetime_field(name, stored: true, indexed: true)` | UTC 日時フィールド。 |
+| `add_text_field(name, stored: true, indexed: true, term_vectors: true, doc_values: true, analyzer: nil)` | 全文フィールド（転置インデックス、BM25）。`term_vectors:` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values:` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored: true` の場合のみ有効です。`analyzer:` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
+| `add_integer_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット整数フィールド。`multi_valued: true` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
+| `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット浮動小数点フィールド。`multi_valued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
+| `add_boolean_field(name, stored: true, indexed: true, doc_values: true)` | ブールフィールド。`doc_values:` は上記を参照。 |
+| `add_bytes_field(name, stored: true)` | 生バイトフィールド。`doc_values:` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
+| `add_geo_field(name, stored: true, indexed: true, doc_values: true)` | 地理座標フィールド（緯度/経度）。`doc_values:` は上記を参照。 |
+| `add_geo3d_field(name, stored: true, indexed: true, doc_values: true)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values:` は上記を参照。 |
+| `add_datetime_field(name, stored: true, indexed: true, doc_values: true)` | UTC 日時フィールド。`doc_values:` は上記を参照。 |
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat（総当たり）ベクトルフィールド。 |
 | `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil, base_weight: 1.0)` | IVF 近似最近傍ベクトルフィールド。 |

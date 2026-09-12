@@ -58,6 +58,10 @@ pub struct InvertedIndexWriterConfig {
     /// Whether to store term positions for phrase queries.
     pub store_term_positions: bool,
 
+    /// Index-wide default for whether a field's value is also copied into
+    /// DocValues (Issue #1047). See [`Self::stores_doc_values`].
+    pub store_doc_values: bool,
+
     /// Whether to optimize segments after writing.
     pub optimize_segments: bool,
 
@@ -79,6 +83,16 @@ pub struct InvertedIndexWriterConfig {
     /// document-indexing path, where [`Self::stores_term_positions`]
     /// instead resolves from `fields` and `store_term_positions`.
     pub field_term_positions: HashMap<String, bool>,
+
+    /// Per-field override for whether to write a DocValues column, keyed
+    /// by field name.
+    ///
+    /// Set only when replaying documents during a segment merge or a
+    /// field rebuild, to reproduce the DocValues state each field already
+    /// had on disk regardless of the current schema. Empty in the normal
+    /// document-indexing path, where [`Self::stores_doc_values`] instead
+    /// resolves from `fields` and `store_doc_values`.
+    pub field_doc_values: HashMap<String, bool>,
 }
 
 impl std::fmt::Debug for InvertedIndexWriterConfig {
@@ -88,6 +102,7 @@ impl std::fmt::Debug for InvertedIndexWriterConfig {
             .field("max_buffer_memory", &self.max_buffer_memory)
             .field("segment_prefix", &self.segment_prefix)
             .field("store_term_positions", &self.store_term_positions)
+            .field("store_doc_values", &self.store_doc_values)
             .field("optimize_segments", &self.optimize_segments)
             .field("analyzer", &self.analyzer.name())
             .finish()
@@ -102,11 +117,13 @@ impl Default for InvertedIndexWriterConfig {
             max_buffer_memory: 64 * 1024 * 1024, // 64MB
             segment_prefix: "segment".to_string(),
             store_term_positions: true,
+            store_doc_values: true,
             optimize_segments: false,
             analyzer: Arc::new(StandardAnalyzer::new().unwrap()),
             shard_id: 0,
             fields: HashMap::new(),
             field_term_positions: HashMap::new(),
+            field_doc_values: HashMap::new(),
         }
     }
 }
@@ -131,6 +148,34 @@ impl InvertedIndexWriterConfig {
             return opt.term_vectors;
         }
         self.store_term_positions
+    }
+
+    /// Resolves whether `field_name`'s value should also be written to
+    /// DocValues.
+    ///
+    /// Resolution order (most specific wins):
+    /// 1. `field_doc_values[field_name]` — set only when replaying
+    ///    documents during a segment merge or field rebuild, to preserve
+    ///    each field's on-disk DocValues state.
+    /// 2. `fields[field_name]`'s own `doc_values` setting — every field
+    ///    option except `BytesOption` carries one.
+    /// 3. `store_doc_values` — the index-wide default, used for
+    ///    schema-less fields, reserved fields (names starting with `_`),
+    ///    and any field declared `Bytes` (moot in practice: a `Bytes`
+    ///    value is excluded from DocValues by [`Self`]'s caller
+    ///    regardless of this result, via `is_doc_values_candidate`).
+    ///
+    /// Note this only decides *whether* a candidate value is written --
+    /// [`InvertedIndexWriter::is_doc_values_candidate`] separately
+    /// excludes `Bytes`/`Vector` values by type unconditionally.
+    pub(crate) fn stores_doc_values(&self, field_name: &str) -> bool {
+        if let Some(&override_value) = self.field_doc_values.get(field_name) {
+            return override_value;
+        }
+        self.fields
+            .get(field_name)
+            .and_then(FieldOption::doc_values)
+            .unwrap_or(self.store_doc_values)
     }
 }
 
@@ -697,9 +742,10 @@ impl InvertedIndexWriter {
         }
 
         // Add field values to DocValues, skipping payloads no consumer of
-        // DocValues can use (#1047).
+        // DocValues can use (#1047) and fields opted out of DocValues via
+        // `doc_values: false`.
         for (field_name, value) in &analyzed_doc.stored_fields {
-            if Self::is_doc_values_candidate(value) {
+            if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name) {
                 self.doc_values_writer
                     .add_value(doc_id, field_name, value.clone());
             }
@@ -999,7 +1045,7 @@ impl InvertedIndexWriter {
     ///
     /// [`sort_type_rank`]: crate::lexical::query::collector
     /// [`TopFieldCollector::get_field_value`]: crate::lexical::query::collector::TopFieldCollector
-    fn is_doc_values_candidate(value: &crate::data::DataValue) -> bool {
+    pub(crate) fn is_doc_values_candidate(value: &crate::data::DataValue) -> bool {
         !matches!(
             value,
             crate::data::DataValue::Bytes(_, _) | crate::data::DataValue::Vector(_)
@@ -2024,7 +2070,8 @@ impl InvertedIndexWriter {
             // Re-add stored fields to DocValues, under the same filter as
             // the ingest path (#1047) so a rebuild cannot reintroduce them.
             for (field_name, value) in &analyzed_doc.stored_fields {
-                if Self::is_doc_values_candidate(value) {
+                if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name)
+                {
                     self.doc_values_writer
                         .add_value(id, field_name, value.clone());
                 }
@@ -2706,6 +2753,163 @@ mod tests {
             .insert("schemaless_field".to_string(), true);
         assert!(!config.stores_term_positions("with_vectors"));
         assert!(config.stores_term_positions("schemaless_field"));
+    }
+
+    /// #1047: `stores_doc_values` must resolve `field_doc_values` before
+    /// the field's own schema setting, and the field's schema setting
+    /// before the index-wide default -- for every field option type that
+    /// carries `doc_values`, not just `Text`.
+    #[test]
+    fn stores_doc_values_resolution_order() {
+        use crate::lexical::core::field::{FieldOption, IntegerOption, TextOption};
+
+        let mut config = InvertedIndexWriterConfig {
+            store_doc_values: false,
+            ..Default::default()
+        };
+        config.fields.insert(
+            "with_dv".to_string(),
+            FieldOption::Text(TextOption {
+                doc_values: true,
+                ..Default::default()
+            }),
+        );
+        config.fields.insert(
+            "without_dv".to_string(),
+            FieldOption::Text(TextOption {
+                doc_values: false,
+                ..Default::default()
+            }),
+        );
+        config.fields.insert(
+            "integer_without_dv".to_string(),
+            FieldOption::Integer(IntegerOption {
+                doc_values: false,
+                ..Default::default()
+            }),
+        );
+
+        // Level 3: no field entry, no override -> index-wide default.
+        assert!(!config.stores_doc_values("schemaless_field"));
+
+        // Level 2: the field's own `doc_values` setting overrides the
+        // index-wide default in both directions, for Text and non-Text
+        // field options alike.
+        assert!(config.stores_doc_values("with_dv"));
+        assert!(!config.stores_doc_values("without_dv"));
+        assert!(!config.stores_doc_values("integer_without_dv"));
+
+        // Level 1: `field_doc_values` overrides everything, including a
+        // field with an opposite schema setting.
+        config.field_doc_values.insert("with_dv".to_string(), false);
+        config
+            .field_doc_values
+            .insert("schemaless_field".to_string(), true);
+        assert!(!config.stores_doc_values("with_dv"));
+        assert!(config.stores_doc_values("schemaless_field"));
+    }
+
+    /// #1047: a `Text` field declared `doc_values: false` must not get a
+    /// DocValues column, even though its value is a perfectly ordinary
+    /// sortable type (unlike the type-based exclusion `Bytes`/`Vector`
+    /// values already get). Asserted on the serialized payload, mirroring
+    /// [`binary_payloads_are_kept_out_of_doc_values`].
+    #[test]
+    fn doc_values_false_excludes_a_sortable_field() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
+            crate::storage::memory::MemoryStorageConfig::default(),
+        ));
+        let mut config = InvertedIndexWriterConfig::default();
+        // Declaring any field switches `analyze_document` out of
+        // schema-less mode (undeclared, non-`_`-prefixed fields are then
+        // skipped entirely) -- so "title" must be declared too, with the
+        // default `doc_values: true`, to stay a fair comparison.
+        config.fields.insert(
+            "title".to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
+        config.fields.insert(
+            "internal_note".to_string(),
+            FieldOption::Text(TextOption {
+                doc_values: false,
+                ..Default::default()
+            }),
+        );
+        let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
+
+        let doc = Document::builder()
+            .add_field("title", crate::data::DataValue::Text("sortable".into()))
+            .add_field(
+                "internal_note",
+                crate::data::DataValue::Text("opted out via schema".into()),
+            )
+            .build();
+        writer.add_document(doc).unwrap();
+
+        let mut serialized: Vec<u8> = Vec::new();
+        writer
+            .doc_values_writer
+            .write_to_output(&mut serialized)
+            .unwrap();
+        let names = String::from_utf8_lossy(&serialized).to_string();
+
+        assert!(
+            names.contains("title"),
+            "a field without doc_values: false must still get a column"
+        );
+        assert!(
+            !names.contains("internal_note"),
+            "doc_values: false must keep the field out of DocValues even \
+             though its value type (Text) is otherwise a DocValues candidate"
+        );
+    }
+
+    /// #1047: `doc_values: false` on a large field must measurably shrink
+    /// the `.dv` payload, mirroring
+    /// [`doc_values_payload_does_not_scale_with_binary_fields`] but for
+    /// the schema flag rather than a type-based exclusion.
+    #[test]
+    fn doc_values_false_shrinks_the_dv_payload_for_a_large_field() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let build = |doc_values: bool| -> usize {
+            let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
+                crate::storage::memory::MemoryStorageConfig::default(),
+            ));
+            let mut config = InvertedIndexWriterConfig::default();
+            config.fields.insert(
+                "title".to_string(),
+                FieldOption::Text(TextOption::default()),
+            );
+            config.fields.insert(
+                "notes".to_string(),
+                FieldOption::Text(TextOption {
+                    doc_values,
+                    ..Default::default()
+                }),
+            );
+            let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
+            for i in 0..20u64 {
+                let doc = Document::builder()
+                    .add_field("title", crate::data::DataValue::Text(format!("doc {i}")))
+                    .add_field("notes", crate::data::DataValue::Text("x".repeat(4096)))
+                    .build();
+                writer.upsert_document(i, doc).unwrap();
+            }
+            let mut out: Vec<u8> = Vec::new();
+            writer.doc_values_writer.write_to_output(&mut out).unwrap();
+            out.len()
+        };
+
+        let with_dv = build(true);
+        let without_dv = build(false);
+        assert!(
+            without_dv < with_dv,
+            "doc_values: false on a large field must shrink the .dv payload: \
+             {without_dv} (false) vs {with_dv} (true)"
+        );
     }
 
     /// #1083: repeated occurrences of the same term in one document must

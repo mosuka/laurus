@@ -282,7 +282,12 @@ impl FacetCollector {
     pub fn collect_doc(&mut self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<()> {
         // Resolve per-field DocValues availability once (Issue #597). It is
         // doc-independent, so caching it here keeps `collect_doc` free of a
-        // lock-guarded `has_doc_values` probe per hit.
+        // lock-guarded `has_doc_values` probe per hit. NOTE: `true` here
+        // means "some segment has this column" (`InvertedIndexReader::
+        // has_doc_values` is `any(...)` across segments) -- it does not
+        // guarantee `get_doc_value` finds a value for THIS doc, since
+        // segments can disagree on whether a field has a column (Issue
+        // #1047: mixed old/new segments, or a `doc_values: false` field).
         if self.field_has_dv.len() != self.facet_fields.len() {
             self.field_has_dv = self
                 .facet_fields
@@ -291,17 +296,17 @@ impl FacetCollector {
                 .collect();
         }
 
-        // Only decode the stored-fields blob (`reader.document`) when at
-        // least one facet field lacks a DocValues column. When every facet
-        // field has DocValues we read the per-field values directly and skip
-        // the whole-document decode + `Document::clone()` entirely (#597).
-        // The document, when needed, is still fetched once per call (#409).
-        let needs_document = self.field_has_dv.iter().any(|&has| !has);
-        let doc_result = if needs_document {
-            Some(reader.document(doc_id))
-        } else {
-            None
-        };
+        // Fetched lazily and cached for the rest of this call (#409: at
+        // most once per `collect_doc`) the first time a field actually
+        // needs it -- either because it has no DocValues column at all,
+        // or because this document's segment misses despite the field
+        // having DocValues elsewhere (#1047). Fields that always hit
+        // DocValues never pay for this. Uses `document_fields` (only the
+        // facet fields), not `document`, to avoid cloning every field of
+        // a wide-schema document.
+        let mut doc_fields: Option<
+            Result<Option<std::collections::HashMap<String, crate::data::DataValue>>>,
+        > = None;
 
         // Reusable scratch buffers — allocated once per call, cleared at
         // each field iteration. Avoids per-field `Vec` reallocations that
@@ -321,34 +326,37 @@ impl FacetCollector {
             path_components.clear();
             {
                 let field_name: &str = &self.facet_fields[field_idx];
-                if has_dv {
-                    // DocValues fast path (#597). `FieldValue` is
-                    // `DataValue`, so the value maps to facet path
-                    // components exactly as the stored document would; a
-                    // read error or absent value yields no contribution.
-                    if let Ok(Some(value)) = reader.get_doc_value(field_name, doc_id) {
-                        push_path_components(&value, &mut path_components);
-                    }
+                // DocValues fast path (#597). `FieldValue` is `DataValue`,
+                // so the value maps to facet path components exactly as
+                // the stored document would.
+                let dv_hit = has_dv
+                    .then(|| reader.get_doc_value(field_name, doc_id).ok().flatten())
+                    .flatten();
+
+                if let Some(value) = dv_hit {
+                    push_path_components(&value, &mut path_components);
                 } else {
-                    match &doc_result {
-                        Some(Ok(Some(document))) => {
-                            if let Some(val) = document.get(field_name) {
+                    // No DocValues column, or a miss despite `has_dv`
+                    // (#1047) -- fall back to the stored document.
+                    let result = doc_fields.get_or_insert_with(|| {
+                        let field_refs: Vec<&str> =
+                            self.facet_fields.iter().map(String::as_str).collect();
+                        reader.document_fields(doc_id, &field_refs)
+                    });
+                    match result {
+                        Ok(Some(fields)) => {
+                            if let Some(val) = fields.get(field_name) {
                                 push_path_components(val, &mut path_components);
                             }
                         }
-                        Some(Ok(None)) => {
+                        Ok(None) => {
                             // Document not found — no facet contribution.
                         }
-                        Some(Err(_)) => {
+                        Err(_) => {
                             // Synthetic fallback preserved from the pre-#409
                             // implementation: 5 distinct values stratified
                             // by `doc_id`.
                             path_components.push(format!("value_{}", doc_id % 5));
-                        }
-                        None => {
-                            // Unreachable: a field without DocValues forces
-                            // `needs_document = true`, so `doc_result` is
-                            // `Some`. Guard defensively rather than panic.
                         }
                     }
                 }
@@ -1069,6 +1077,11 @@ mod tests {
         docs: Vec<Document>,
         dv_fields: HashSet<String>,
         panic_on_document: bool,
+        /// Doc ids for which `get_doc_value` reports `Ok(None)` even though
+        /// the field is listed in `dv_fields` -- simulating a segment that
+        /// has the DocValues column but lacks this particular document's
+        /// value (Issue #1047 mixed-segment case).
+        dv_miss_doc_ids: HashSet<u64>,
     }
 
     impl DvMockReader {
@@ -1077,6 +1090,18 @@ mod tests {
                 docs,
                 dv_fields: dv_fields.iter().map(|s| (*s).to_string()).collect(),
                 panic_on_document,
+                dv_miss_doc_ids: HashSet::new(),
+            }
+        }
+
+        /// Like `new`, but `get_doc_value` misses for every doc id in
+        /// `miss_doc_ids` while `has_doc_values` still reports `true`.
+        fn with_dv_miss(docs: Vec<Document>, dv_fields: &[&str], miss_doc_ids: &[u64]) -> Self {
+            Self {
+                docs,
+                dv_fields: dv_fields.iter().map(|s| (*s).to_string()).collect(),
+                panic_on_document: false,
+                dv_miss_doc_ids: miss_doc_ids.iter().copied().collect(),
             }
         }
     }
@@ -1123,7 +1148,7 @@ mod tests {
             self.dv_fields.contains(field)
         }
         fn get_doc_value(&self, field: &str, doc_id: u64) -> Result<Option<FieldValue>> {
-            if !self.dv_fields.contains(field) {
+            if !self.dv_fields.contains(field) || self.dv_miss_doc_ids.contains(&doc_id) {
                 return Ok(None);
             }
             Ok(self
@@ -1239,6 +1264,34 @@ mod tests {
             ]
         );
         assert_eq!(flatten(&results, "cat"), vec![(vec!["a".to_string()], 2)]);
+    }
+
+    #[test]
+    fn facet_falls_back_when_has_dv_is_true_but_this_docs_value_is_missing() {
+        // Issue #1047 regression: `has_doc_values("cat")` reports `true`
+        // (another segment has the column), but THIS doc's DocValues lookup
+        // misses (`Ok(None)`). Before the fix, `collect_doc` treated any
+        // non-`Ok(Some(_))` DV read under `has_dv == true` as "no
+        // contribution" and never fell back to the stored document, so
+        // doc 1's `cat` facet would be silently dropped.
+        let docs = vec![
+            text_doc(&[("cat", "a")]), // doc_id 0: DV hit
+            text_doc(&[("cat", "b")]), // doc_id 1: DV miss -> must fall back
+        ];
+        let reader = DvMockReader::with_dv_miss(docs, &["cat"], &[1]);
+        let mut collector = FacetCollector::new(FacetConfig::default(), vec!["cat".to_string()]);
+        collector
+            .collect_doc(0, &reader)
+            .expect("collect_doc must not error");
+        collector
+            .collect_doc(1, &reader)
+            .expect("collect_doc must not error");
+        let results = collector.finalize().expect("finalize must not error");
+        assert_eq!(
+            flatten(&results, "cat"),
+            vec![(vec!["a".to_string()], 1), (vec!["b".to_string()], 1)],
+            "a DocValues miss with has_dv=true must still fall back to the stored document"
+        );
     }
 
     #[test]

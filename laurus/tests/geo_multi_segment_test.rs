@@ -59,6 +59,7 @@ fn stored_only_geo_field_matches_via_fallback_across_segments() {
             FieldOption::Geo(GeoOption {
                 indexed: false,
                 stored: true,
+                doc_values: true,
             }),
         )
         .build();
@@ -106,6 +107,7 @@ fn index_only_geo_field_matches_via_bkd() {
             FieldOption::Geo(GeoOption {
                 indexed: true,
                 stored: false,
+                doc_values: true,
             }),
         )
         .build();
@@ -149,6 +151,7 @@ fn geo_query_on_sparse_field_across_segments() {
             FieldOption::Geo(GeoOption {
                 indexed: true,
                 stored: true,
+                doc_values: true,
             }),
         )
         .add_field("body", FieldOption::Text(TextOption::default()))

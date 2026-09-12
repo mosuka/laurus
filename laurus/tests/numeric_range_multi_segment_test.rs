@@ -38,6 +38,7 @@ fn store_config() -> LexicalIndexConfig {
                 indexed: true,
                 stored: true,
                 multi_valued: false,
+                doc_values: true,
             }),
         )
         .add_field("body", FieldOption::Text(TextOption::default()))
@@ -101,6 +102,7 @@ fn range_query_on_stored_only_field_matches_via_fallback() {
                 indexed: false,
                 stored: true,
                 multi_valued: false,
+                doc_values: true,
             }),
         )
         .build();

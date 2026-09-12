@@ -108,6 +108,7 @@ impl<D: rkyv::rancor::Fallible + ?Sized>
 ///         indexed: true,
 ///         stored: true,
 ///         term_vectors: true,
+///         doc_values: true,
 ///         analyzer: None,
 ///     }),
 /// };
@@ -201,6 +202,21 @@ pub struct TextOption {
     #[serde(default = "default_true")]
     pub term_vectors: bool,
 
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`. `doc_values: true` with `stored:
+    /// false` is silently ignored (no error) rather than rejected, the
+    /// same precedent as an `indexed: false` + `term_vectors: true`
+    /// combination. Turning this off for a large field that is never
+    /// sorted or faceted on shrinks the segment at the cost of losing
+    /// that field from sort/facet/aggregation until the field is
+    /// rebuilt or the segment merges.
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
+
     /// Analyzer reference for this field. Either a bare name
     /// (e.g. `"standard"`, `"english"`) or a parameterized built-in
     /// preset (e.g. `{"language": "japanese", "dict": "/path/to/ipadic"}`).
@@ -259,6 +275,23 @@ impl TextOption {
         self
     }
 
+    /// Sets whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047); see
+    /// the field's doc comment for the full effective rule.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_values` - `true` to write a DocValues column, `false` otherwise.
+    ///
+    /// # Returns
+    ///
+    /// The modified `TextOption` for method chaining.
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
+        self
+    }
+
     /// Sets the analyzer for this field.
     ///
     /// Accepts either a bare name (`&str` / `String`) for analyzers that
@@ -292,12 +325,19 @@ impl Default for TextOption {
             indexed: true,
             stored: true,
             term_vectors: true,
+            doc_values: true,
             analyzer: None,
         }
     }
 }
 
 /// Option for Bytes field.
+///
+/// Has no `doc_values` flag, unlike the other six field options: a
+/// `Bytes` (or `Vector`) value is never written to DocValues regardless
+/// of any flag (`is_doc_values_candidate` excludes both types
+/// unconditionally, Issue #1052/#1053), so a `doc_values` field here
+/// would always be a dead setting.
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
@@ -350,6 +390,16 @@ pub struct IntegerOption {
     /// with constant scoring). Defaults to `false`.
     #[serde(default)]
     pub multi_valued: bool,
+
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`; `doc_values: true` with `stored:
+    /// false` is silently ignored (no error).
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
 }
 
 impl IntegerOption {
@@ -364,6 +414,14 @@ impl IntegerOption {
         self.stored = stored;
         self
     }
+
+    /// Set whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047).
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
+        self
+    }
 }
 
 impl Default for IntegerOption {
@@ -372,6 +430,7 @@ impl Default for IntegerOption {
             indexed: true,
             stored: true,
             multi_valued: false,
+            doc_values: true,
         }
     }
 }
@@ -397,6 +456,16 @@ pub struct FloatOption {
     /// with constant scoring). Defaults to `false`.
     #[serde(default)]
     pub multi_valued: bool,
+
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`; `doc_values: true` with `stored:
+    /// false` is silently ignored (no error).
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
 }
 
 impl FloatOption {
@@ -411,6 +480,14 @@ impl FloatOption {
         self.stored = stored;
         self
     }
+
+    /// Set whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047).
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
+        self
+    }
 }
 
 impl Default for FloatOption {
@@ -419,6 +496,7 @@ impl Default for FloatOption {
             indexed: true,
             stored: true,
             multi_valued: false,
+            doc_values: true,
         }
     }
 }
@@ -435,6 +513,16 @@ pub struct BooleanOption {
     /// Whether to store the original value.
     #[serde(default = "default_true")]
     pub stored: bool,
+
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`; `doc_values: true` with `stored:
+    /// false` is silently ignored (no error).
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
 }
 
 impl BooleanOption {
@@ -449,6 +537,14 @@ impl BooleanOption {
         self.stored = stored;
         self
     }
+
+    /// Set whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047).
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
+        self
+    }
 }
 
 impl Default for BooleanOption {
@@ -456,6 +552,7 @@ impl Default for BooleanOption {
         Self {
             indexed: true,
             stored: true,
+            doc_values: true,
         }
     }
 }
@@ -472,6 +569,16 @@ pub struct DateTimeOption {
     /// Whether to store the original value.
     #[serde(default = "default_true")]
     pub stored: bool,
+
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`; `doc_values: true` with `stored:
+    /// false` is silently ignored (no error).
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
 }
 
 impl DateTimeOption {
@@ -486,6 +593,14 @@ impl DateTimeOption {
         self.stored = stored;
         self
     }
+
+    /// Set whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047).
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
+        self
+    }
 }
 
 impl Default for DateTimeOption {
@@ -493,6 +608,7 @@ impl Default for DateTimeOption {
         Self {
             indexed: true,
             stored: true,
+            doc_values: true,
         }
     }
 }
@@ -509,6 +625,16 @@ pub struct GeoOption {
     /// Whether to store the original value.
     #[serde(default = "default_true")]
     pub stored: bool,
+
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`; `doc_values: true` with `stored:
+    /// false` is silently ignored (no error).
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
 }
 
 impl GeoOption {
@@ -521,6 +647,14 @@ impl GeoOption {
     /// Set whether the field is stored.
     pub fn stored(mut self, stored: bool) -> Self {
         self.stored = stored;
+        self
+    }
+
+    /// Set whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047).
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
         self
     }
 }
@@ -543,6 +677,16 @@ pub struct Geo3dOption {
     /// Whether to store the original value.
     #[serde(default = "default_true")]
     pub stored: bool,
+
+    /// Whether this field's value is also copied into DocValues, the
+    /// column-oriented store `SortField::Field`, faceting, and
+    /// aggregations read from (Issue #1047).
+    ///
+    /// Effective rule: a DocValues column is written only when `stored
+    /// && doc_values` are both `true`; `doc_values: true` with `stored:
+    /// false` is silently ignored (no error).
+    #[serde(default = "default_true")]
+    pub doc_values: bool,
 }
 
 impl Geo3dOption {
@@ -557,6 +701,14 @@ impl Geo3dOption {
         self.stored = stored;
         self
     }
+
+    /// Set whether this field's value is also copied into DocValues.
+    ///
+    /// Takes effect only when `stored` is also `true` (Issue #1047).
+    pub fn doc_values(mut self, doc_values: bool) -> Self {
+        self.doc_values = doc_values;
+        self
+    }
 }
 
 impl Default for Geo3dOption {
@@ -564,6 +716,7 @@ impl Default for Geo3dOption {
         Self {
             indexed: true,
             stored: true,
+            doc_values: true,
         }
     }
 }
@@ -583,6 +736,7 @@ impl Default for Geo3dOption {
 ///     indexed: true,
 ///     stored: true,
 ///     term_vectors: true,
+///     doc_values: true,
 ///     analyzer: None,
 /// });
 ///
@@ -653,6 +807,27 @@ impl FieldOption {
             }),
         }
     }
+
+    /// This option's own `doc_values` setting, or `None` for `Bytes` (the
+    /// one field option with no such flag -- Issue #1047).
+    ///
+    /// Centralizes the 7-arm match so callers that need a field's raw
+    /// schema-level `doc_values` setting (as opposed to a fully resolved
+    /// default-and-override decision, like
+    /// [`InvertedIndexWriterConfig::stores_doc_values`](crate::lexical::index::inverted::writer::InvertedIndexWriterConfig::stores_doc_values))
+    /// don't each duplicate it.
+    pub(crate) fn doc_values(&self) -> Option<bool> {
+        match self {
+            FieldOption::Text(opt) => Some(opt.doc_values),
+            FieldOption::Integer(opt) => Some(opt.doc_values),
+            FieldOption::Float(opt) => Some(opt.doc_values),
+            FieldOption::Boolean(opt) => Some(opt.doc_values),
+            FieldOption::DateTime(opt) => Some(opt.doc_values),
+            FieldOption::Geo(opt) => Some(opt.doc_values),
+            FieldOption::Geo3d(opt) => Some(opt.doc_values),
+            FieldOption::Bytes(_) => None,
+        }
+    }
 }
 
 impl Default for GeoOption {
@@ -660,6 +835,7 @@ impl Default for GeoOption {
         Self {
             indexed: true,
             stored: true,
+            doc_values: true,
         }
     }
 }

@@ -69,14 +69,15 @@ Lexical fields are indexed using an inverted index and support keyword-based que
 ```rust
 use laurus::lexical::TextOption;
 
-// Default: indexed + stored + term vectors (all true)
+// Default: indexed + stored + term vectors + doc values (all true)
 let opt = TextOption::default();
 
 // Customize
 let opt = TextOption::default()
     .indexed(true)
     .stored(true)
-    .term_vectors(true);
+    .term_vectors(true)
+    .doc_values(true);
 ```
 
 | Option | Default | Description |
@@ -84,6 +85,17 @@ let opt = TextOption::default()
 | `indexed` | `true` | Whether the field is searchable |
 | `stored` | `true` | Whether the original value is stored for retrieval |
 | `term_vectors` | `true` | Whether term positions are stored (needed for phrase and span queries; highlighting always re-tokenizes the stored text and does not use them) |
+| `doc_values` | `true` | Whether the value is also copied into DocValues, the column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation read from |
+
+`doc_values` is not unique to `TextOption` — every lexical field option except
+`BytesOption` carries it (`IntegerOption`, `FloatOption`, `BooleanOption`,
+`DateTimeOption`, `GeoOption`, `Geo3dOption`). `BytesOption` has no such
+setting: a `Bytes` value is never written to DocValues regardless, since
+neither sorting nor faceting can do anything with it. The effective rule is:
+a DocValues column is written only when `stored` and `doc_values` are both
+`true` (and the value's type isn't `Bytes`); setting `doc_values: false` on a
+field that is never sorted or faceted on shrinks its segment footprint by
+skipping the second copy.
 
 ### Vector Fields
 

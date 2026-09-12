@@ -925,7 +925,7 @@ impl SegmentReader {
 
         let doc_values = self.doc_values.read().unwrap();
         if let Some(reader) = doc_values.as_ref() {
-            Ok(reader.get_value(field, doc_id).cloned())
+            reader.get_value(field, doc_id)
         } else {
             Ok(None)
         }
@@ -2126,6 +2126,18 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         self
     }
 
+    /// Searches every segment for `doc_id`'s value, returning the first
+    /// hit. `Ok(None)` means either no segment has a DocValues column for
+    /// `field`, or every segment that does simply lacks a value for this
+    /// particular doc — the two cases are indistinguishable from this
+    /// return value alone. Callers that also consult
+    /// [`Self::has_doc_values`] to decide whether to read DocValues at
+    /// all must still treat `Ok(None)` from this method as "fall back to
+    /// the stored document", not as "the value is absent" (Issue #1047):
+    /// segments can disagree on whether they have the column (mixed
+    /// old/new segments, or a field with `doc_values: false`), so
+    /// `has_doc_values() == true` index-wide does not guarantee this
+    /// specific document's segment has it.
     fn get_doc_value(&self, field: &str, doc_id: u64) -> Result<Option<FieldValue>> {
         // Search across all segments
         for segment_lock in &self.segment_readers {
@@ -2137,6 +2149,12 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         Ok(None)
     }
 
+    /// Returns whether ANY segment has a DocValues column for `field` —
+    /// an index-wide, not per-document, answer. `true` does not mean
+    /// every document has a value via [`Self::get_doc_value`]: segments
+    /// can disagree (Issue #1047), so a caller must still fall back to
+    /// the stored document on an `Ok(None)` miss from `get_doc_value`
+    /// rather than treating this method's `true` as a per-doc guarantee.
     fn has_doc_values(&self, field: &str) -> bool {
         // Check if any segment has DocValues for this field
         self.segment_readers.iter().any(|seg_lock| {
@@ -2497,6 +2515,65 @@ impl crate::lexical::reader::PostingIterator for MergedPostingIterator {
 mod tests {
     use super::*;
     use crate::lexical::reader::PostingIterator;
+
+    /// #1047: `has_doc_values` must reflect the schema's per-field
+    /// `doc_values` flag on a real, on-disk segment -- a field declared
+    /// `doc_values: false` gets no column, one left at the default does.
+    #[test]
+    fn has_doc_values_reflects_the_schemas_doc_values_flag() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
+        fields.insert(
+            "internal_note".to_string(),
+            FieldOption::Text(TextOption {
+                doc_values: false,
+                ..Default::default()
+            }),
+        );
+        let config = InvertedIndexConfig {
+            fields,
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, config).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document(
+                crate::Document::builder()
+                    .add_text("title", "hello")
+                    .add_text("internal_note", "shh")
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let segment = inverted.segment_readers()[0].read().unwrap();
+
+        assert!(
+            segment.has_doc_values("title"),
+            "a field without doc_values: false must get a column"
+        );
+        assert!(
+            !segment.has_doc_values("internal_note"),
+            "doc_values: false must keep the field out of the segment's \
+             DocValues directory entirely"
+        );
+    }
 
     /// #541 — `SegmentReader::postings` must never yield a deleted
     /// document, on either of its paths.

@@ -220,12 +220,17 @@ impl PySchema {
     ///     indexed: Whether the field is searchable (default True).
     ///     term_vectors: Whether term positions are stored, required by
     ///         phrase and span queries over this field (default True).
+    ///     doc_values: Whether the value is also copied into DocValues,
+    ///         the column-oriented store sort/facet/aggregation read
+    ///         from (default True). Takes effect only when ``stored`` is
+    ///         also True.
     ///     analyzer: Either a string analyzer name (``"standard"``,
     ///         ``"english"``, ``"keyword"``, ``"simple"``, ``"noop"``, or
     ///         a custom name registered via ``add_analyzer``), or a dict
     ///         configuring a parameterized built-in preset such as
     ///         ``{"language": "japanese", "dict": "/var/lib/lindera/ipadic"}``.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, term_vectors=true, analyzer=None))]
+    #[pyo3(signature = (name, *, stored=true, indexed=true, term_vectors=true, doc_values=true, analyzer=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
         &mut self,
         py: Python<'_>,
@@ -233,6 +238,7 @@ impl PySchema {
         stored: bool,
         indexed: bool,
         term_vectors: bool,
+        doc_values: bool,
         analyzer: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         let analyzer = analyzer
@@ -244,6 +250,7 @@ impl PySchema {
                 indexed,
                 stored,
                 term_vectors,
+                doc_values,
                 analyzer,
             }),
         );
@@ -260,13 +267,17 @@ impl PySchema {
     ///     multi_valued: When True, the field accepts arrays of integers
     ///         and range queries match if any value satisfies the
     ///         predicate (Lucene-style "any match"). Default False.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false))]
+    ///     doc_values: Whether the value is also copied into DocValues
+    ///         (default True). Takes effect only when ``stored`` is also
+    ///         True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_integer_field(
         &mut self,
         name: &str,
         stored: bool,
         indexed: bool,
         multi_valued: bool,
+        doc_values: bool,
     ) {
         self.inner.fields.insert(
             name.to_string(),
@@ -274,6 +285,7 @@ impl PySchema {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values,
             }),
         );
     }
@@ -288,42 +300,86 @@ impl PySchema {
     ///     multi_valued: When True, the field accepts arrays of floats
     ///         and range queries match if any value satisfies the
     ///         predicate (Lucene-style "any match"). Default False.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false))]
-    pub fn add_float_field(&mut self, name: &str, stored: bool, indexed: bool, multi_valued: bool) {
+    ///     doc_values: Whether the value is also copied into DocValues
+    ///         (default True). Takes effect only when ``stored`` is also
+    ///         True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
+    pub fn add_float_field(
+        &mut self,
+        name: &str,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.fields.insert(
             name.to_string(),
             FieldOption::Float(FloatOption {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values,
             }),
         );
     }
 
     /// Add a boolean field.
-    #[pyo3(signature = (name, *, stored=true, indexed=true))]
-    pub fn add_boolean_field(&mut self, name: &str, stored: bool, indexed: bool) {
+    ///
+    /// Args:
+    ///     doc_values: Whether the value is also copied into DocValues
+    ///         (default True). Takes effect only when ``stored`` is also
+    ///         True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
+    pub fn add_boolean_field(&mut self, name: &str, stored: bool, indexed: bool, doc_values: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::Boolean(BooleanOption { indexed, stored }),
+            FieldOption::Boolean(BooleanOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
         );
     }
 
     /// Add a date/time field.
-    #[pyo3(signature = (name, *, stored=true, indexed=true))]
-    pub fn add_datetime_field(&mut self, name: &str, stored: bool, indexed: bool) {
+    ///
+    /// Args:
+    ///     doc_values: Whether the value is also copied into DocValues
+    ///         (default True). Takes effect only when ``stored`` is also
+    ///         True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
+    pub fn add_datetime_field(
+        &mut self,
+        name: &str,
+        stored: bool,
+        indexed: bool,
+        doc_values: bool,
+    ) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::DateTime(DateTimeOption { indexed, stored }),
+            FieldOption::DateTime(DateTimeOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
         );
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
-    #[pyo3(signature = (name, *, stored=true, indexed=true))]
-    pub fn add_geo_field(&mut self, name: &str, stored: bool, indexed: bool) {
+    ///
+    /// Args:
+    ///     doc_values: Whether the value is also copied into DocValues
+    ///         (default True). Takes effect only when ``stored`` is also
+    ///         True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
+    pub fn add_geo_field(&mut self, name: &str, stored: bool, indexed: bool, doc_values: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::Geo(GeoOption { indexed, stored }),
+            FieldOption::Geo(GeoOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
         );
     }
 
@@ -333,11 +389,20 @@ impl PySchema {
     /// queryable via `Geo3dDistanceQuery`, `Geo3dBoundingBoxQuery`, and
     /// `Geo3dNearestQuery`. See the conceptual docs at
     /// `docs/src/concepts/geo3d.md` for the coordinate system.
-    #[pyo3(signature = (name, *, stored=true, indexed=true))]
-    pub fn add_geo3d_field(&mut self, name: &str, stored: bool, indexed: bool) {
+    ///
+    /// Args:
+    ///     doc_values: Whether the value is also copied into DocValues
+    ///         (default True). Takes effect only when ``stored`` is also
+    ///         True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
+    pub fn add_geo3d_field(&mut self, name: &str, stored: bool, indexed: bool, doc_values: bool) {
         self.inner.fields.insert(
             name.to_string(),
-            FieldOption::Geo3d(Geo3dOption { indexed, stored }),
+            FieldOption::Geo3d(Geo3dOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
         );
     }
 

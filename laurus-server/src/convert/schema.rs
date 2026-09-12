@@ -127,32 +127,39 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             stored: o.stored,
             term_vectors: Some(o.term_vectors),
             analyzer: o.analyzer.as_ref().map(analyzer_spec_to_proto),
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::Integer(o) => Some(Opt::Integer(v1::IntegerOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::Float(o) => Some(Opt::Float(v1::FloatOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::Boolean(o) => Some(Opt::Boolean(v1::BooleanOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::DateTime(o) => Some(Opt::DateTime(v1::DateTimeOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::Geo(o) => Some(Opt::Geo(v1::GeoOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::Geo3d(o) => Some(Opt::Geo3d(v1::Geo3dOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: Some(o.doc_values),
         })),
         FieldOption::Bytes(o) => Some(Opt::Bytes(v1::BytesOption { stored: o.stored })),
         FieldOption::Hnsw(o) => Some(Opt::Hnsw(v1::HnswOption {
@@ -205,33 +212,41 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             // Unset means "use the engine's default", matching
             // `TextOption::default()` (#1083).
             term_vectors: o.term_vectors.unwrap_or(true),
+            // Same tri-state treatment for the same reason (#1047).
+            doc_values: o.doc_values.unwrap_or(true),
             analyzer: o.analyzer.as_ref().and_then(analyzer_spec_from_proto),
         })),
         Some(Opt::Integer(o)) => Some(FieldOption::Integer(IntegerOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
+            doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Float(o)) => Some(FieldOption::Float(FloatOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
+            doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Boolean(o)) => Some(FieldOption::Boolean(BooleanOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::DateTime(o)) => Some(FieldOption::DateTime(DateTimeOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Geo(o)) => Some(FieldOption::Geo(GeoOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Geo3d(o)) => Some(FieldOption::Geo3d(Geo3dOption {
             indexed: o.indexed,
             stored: o.stored,
+            doc_values: true,
         })),
         Some(Opt::Bytes(o)) => Some(FieldOption::Bytes(BytesOption { stored: o.stored })),
         Some(Opt::Hnsw(o)) => Some(FieldOption::Hnsw(HnswOption {
@@ -1177,6 +1192,7 @@ mod tests {
                 Geo3dOption {
                     indexed: true,
                     stored: false,
+                    doc_values: true,
                 },
             )
             .build();
@@ -1190,6 +1206,89 @@ mod tests {
                 assert!(!o.stored);
             }
             other => panic!("expected FieldOption::Geo3d, got {other:?}"),
+        }
+    }
+
+    /// #1047: `doc_values` follows the same tri-state contract as
+    /// `term_vectors` (#1083) -- `to_proto` carries an explicit setting as
+    /// `Some`, and `from_proto` restores an unset value to the engine's
+    /// default (`true`), not the proto3 zero-value (`false`). Covers
+    /// `Text` (which also carries `term_vectors`, to prove the two flags
+    /// don't interfere) and `Integer` (a non-`Text` arm).
+    #[test]
+    fn doc_values_round_trips_through_proto_and_unset_defaults_to_true() {
+        let schema = Schema::builder()
+            .add_field(
+                "text_explicit_false",
+                FieldOption::Text(TextOption {
+                    doc_values: false,
+                    ..Default::default()
+                }),
+            )
+            .add_field(
+                "integer_explicit_false",
+                FieldOption::Integer(IntegerOption {
+                    doc_values: false,
+                    ..Default::default()
+                }),
+            )
+            .build();
+
+        let proto = to_proto(&schema);
+        for (name, opt_matcher) in [
+            (
+                "text_explicit_false",
+                &(|o: &v1::FieldOption| match o.option.as_ref() {
+                    Some(v1::field_option::Option::Text(t)) => t.doc_values,
+                    other => panic!("unexpected proto option: {other:?}"),
+                }) as &dyn Fn(&v1::FieldOption) -> Option<bool>,
+            ),
+            (
+                "integer_explicit_false",
+                &(|o: &v1::FieldOption| match o.option.as_ref() {
+                    Some(v1::field_option::Option::Integer(i)) => i.doc_values,
+                    other => panic!("unexpected proto option: {other:?}"),
+                }),
+            ),
+        ] {
+            let doc_values = opt_matcher(proto.fields.get(name).expect("field must exist"));
+            assert_eq!(
+                doc_values,
+                Some(false),
+                "to_proto must carry an explicit doc_values: false as Some for {name}"
+            );
+        }
+
+        let back = from_proto(&proto).expect("from_proto must succeed");
+        match back.fields.get("text_explicit_false") {
+            Some(FieldOption::Text(o)) => assert!(!o.doc_values),
+            other => panic!("expected FieldOption::Text, got {other:?}"),
+        }
+        match back.fields.get("integer_explicit_false") {
+            Some(FieldOption::Integer(o)) => assert!(!o.doc_values),
+            other => panic!("expected FieldOption::Integer, got {other:?}"),
+        }
+
+        // A client omitting doc_values entirely (proto `None`) must
+        // restore to the engine default (`true`), not the proto3
+        // zero-value (`false`).
+        let mut unset = proto.clone();
+        if let Some(v1::field_option::Option::Text(t)) = unset
+            .fields
+            .get_mut("text_explicit_false")
+            .and_then(|f| f.option.as_mut())
+        {
+            t.doc_values = None;
+        } else {
+            panic!("text_explicit_false must be a Text proto option");
+        }
+        let back = from_proto(&unset).expect("from_proto must succeed");
+        match back.fields.get("text_explicit_false") {
+            Some(FieldOption::Text(o)) => assert!(
+                o.doc_values,
+                "unset doc_values must default to true, not the proto3 zero-value"
+            ),
+            other => panic!("expected FieldOption::Text, got {other:?}"),
         }
     }
 }

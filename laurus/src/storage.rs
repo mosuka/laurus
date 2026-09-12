@@ -594,7 +594,7 @@ pub trait StorageInput: Read + Seek + Send + Sync + std::fmt::Debug {
     /// rejected as corruption *before* the allocation, so a flipped byte
     /// cannot drive a multi-GiB `with_capacity` that aborts the process via
     /// `handle_alloc_error` (Issues #791 and #806; see
-    /// [`crate::vector::index::alloc_bounds`]). A backend that returns a
+    /// [`crate::util::alloc_bounds`]). A backend that returns a
     /// truncated or inflated size would weaken that guard, so new backends
     /// must preserve the invariant.
     fn size(&self) -> Result<u64>;

@@ -20,6 +20,13 @@ fn default_use_compound() -> bool {
     crate::lexical::index::inverted::compound::default_use_compound()
 }
 
+/// serde default for [`InvertedIndexConfig::store_doc_values`] -- a
+/// config missing the field (every index created before Issue #1047)
+/// must behave exactly as it did before the flag existed.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InvertedIndexConfig {
     /// Write flushed segments as one compound `.cfs` container instead of
@@ -67,6 +74,22 @@ pub struct InvertedIndexConfig {
     /// Disabling it shrinks segments at the cost of phrase and span
     /// queries over the fields it applies to.
     pub store_term_vectors: bool,
+
+    /// Index-wide default for whether a field's value is also copied into
+    /// DocValues (Issue #1047).
+    ///
+    /// Like [`Self::store_term_vectors`], this is only the **default**: a
+    /// field's own [`TextOption::doc_values`](crate::lexical::core::field::TextOption::doc_values)
+    /// (or the equivalent on the other six field options that carry the
+    /// flag) overrides it. This value governs schema-less fields,
+    /// reserved `_`-prefixed fields, and any lexical field type declared
+    /// without an explicit `doc_values` setting.
+    ///
+    /// Disabling it index-wide shrinks every segment at the cost of
+    /// losing sort/facet/aggregation support on every field that does not
+    /// explicitly opt back in via its own `doc_values: true`.
+    #[serde(default = "default_true")]
+    pub store_doc_values: bool,
 
     /// Merge factor for segment merging.
     ///
@@ -140,6 +163,7 @@ impl Default for InvertedIndexConfig {
             write_buffer_size: 1024 * 1024, // 1MB
             compress_stored_fields: false,
             store_term_vectors: true,
+            store_doc_values: true,
             merge_factor: 10,
             max_segments: 100,
             analyzer: std::sync::Arc::new(
@@ -162,6 +186,7 @@ impl std::fmt::Debug for InvertedIndexConfig {
             .field("write_buffer_size", &self.write_buffer_size)
             .field("compress_stored_fields", &self.compress_stored_fields)
             .field("store_term_vectors", &self.store_term_vectors)
+            .field("store_doc_values", &self.store_doc_values)
             .field("merge_factor", &self.merge_factor)
             .field("max_segments", &self.max_segments)
             .field("analyzer", &self.analyzer.name())

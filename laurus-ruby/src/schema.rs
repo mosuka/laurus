@@ -132,6 +132,10 @@ impl RbSchema {
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
     ///   - `term_vectors:` (bool, default true): Whether term positions are
     ///     stored, required by phrase and span queries over this field.
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues, the column-oriented store
+    ///     sort/facet/aggregation read from. Takes effect only when
+    ///     `stored:` is also true.
     ///   - `analyzer:` (String, optional): Analyzer name. For
     ///     parameter-less built-ins (`"standard"`, `"english"`,
     ///     `"keyword"`, `"simple"`, `"noop"`) pass the name directly.
@@ -148,18 +152,26 @@ impl RbSchema {
                 Option<bool>,
                 Option<bool>,
                 Option<bool>,
+                Option<bool>,
                 Option<Option<String>>,
             ),
             (),
         >(
             args.keywords,
             &[],
-            &["stored", "indexed", "term_vectors", "analyzer"],
+            &[
+                "stored",
+                "indexed",
+                "term_vectors",
+                "doc_values",
+                "analyzer",
+            ],
         )?;
-        let (stored, indexed, term_vectors, analyzer) = kwargs.optional;
+        let (stored, indexed, term_vectors, doc_values, analyzer) = kwargs.optional;
         let stored = stored.unwrap_or(true);
         let indexed = indexed.unwrap_or(true);
         let term_vectors = term_vectors.unwrap_or(true);
+        let doc_values = doc_values.unwrap_or(true);
         let analyzer = analyzer.flatten().map(laurus::AnalyzerSpec::Named);
         self.inner.borrow_mut().fields.insert(
             name,
@@ -167,6 +179,7 @@ impl RbSchema {
                 indexed,
                 stored,
                 term_vectors,
+                doc_values,
                 analyzer,
             }),
         );
@@ -184,21 +197,26 @@ impl RbSchema {
     ///   - `multi_valued:` (bool, default false): When true, the field
     ///     accepts arrays of integers and range queries match if any value
     ///     satisfies the predicate (Lucene-style "any match").
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues. Takes effect only when `stored:` is
+    ///     also true.
     fn add_integer_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
-            args.keywords,
-            &[],
-            &["stored", "indexed", "multi_valued"],
-        )?;
-        let (stored, indexed, multi_valued) = kwargs.optional;
+        let kwargs =
+            get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>, Option<bool>), ()>(
+                args.keywords,
+                &[],
+                &["stored", "indexed", "multi_valued", "doc_values"],
+            )?;
+        let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
         Ok(())
@@ -215,21 +233,26 @@ impl RbSchema {
     ///   - `multi_valued:` (bool, default false): When true, the field
     ///     accepts arrays of floats and range queries match if any value
     ///     satisfies the predicate (Lucene-style "any match").
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues. Takes effect only when `stored:` is
+    ///     also true.
     fn add_float_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
-            args.keywords,
-            &[],
-            &["stored", "indexed", "multi_valued"],
-        )?;
-        let (stored, indexed, multi_valued) = kwargs.optional;
+        let kwargs =
+            get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>, Option<bool>), ()>(
+                args.keywords,
+                &[],
+                &["stored", "indexed", "multi_valued", "doc_values"],
+            )?;
+        let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Float(FloatOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
         Ok(())
@@ -243,20 +266,24 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues. Takes effect only when `stored:` is
+    ///     also true.
     fn add_boolean_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
             args.keywords,
             &[],
-            &["stored", "indexed"],
+            &["stored", "indexed", "doc_values"],
         )?;
-        let (stored, indexed) = kwargs.optional;
+        let (stored, indexed, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
         Ok(())
@@ -270,20 +297,24 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues. Takes effect only when `stored:` is
+    ///     also true.
     fn add_datetime_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
             args.keywords,
             &[],
-            &["stored", "indexed"],
+            &["stored", "indexed", "doc_values"],
         )?;
-        let (stored, indexed) = kwargs.optional;
+        let (stored, indexed, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
         Ok(())
@@ -297,20 +328,24 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues. Takes effect only when `stored:` is
+    ///     also true.
     fn add_geo_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
             args.keywords,
             &[],
-            &["stored", "indexed"],
+            &["stored", "indexed", "doc_values"],
         )?;
-        let (stored, indexed) = kwargs.optional;
+        let (stored, indexed, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
         Ok(())
@@ -329,20 +364,24 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `doc_values:` (bool, default true): Whether the value is also
+    ///     copied into DocValues. Takes effect only when `stored:` is
+    ///     also true.
     fn add_geo3d_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
             args.keywords,
             &[],
-            &["stored", "indexed"],
+            &["stored", "indexed", "doc_values"],
         )?;
-        let (stored, indexed) = kwargs.optional;
+        let (stored, indexed, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
         Ok(())

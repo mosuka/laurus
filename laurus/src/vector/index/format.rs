@@ -510,7 +510,7 @@ impl VectorSegmentHeader {
                 // bytes the file actually has left (the fixed prefix +
                 // PQ params block consumed so far is PQ_PREFIX_SIZE)
                 // before reserving anything.
-                crate::vector::index::alloc_bounds::checked_capacity(
+                crate::util::alloc_bounds::checked_capacity(
                     codebook_len,
                     4,
                     available.saturating_sub(PQ_PREFIX_SIZE),
@@ -545,7 +545,7 @@ impl VectorSegmentHeader {
                 }
                 let codebook_len = params.codebook_len();
                 // Issue #921: same allocation bound as the PQ branch above.
-                crate::vector::index::alloc_bounds::checked_capacity(
+                crate::util::alloc_bounds::checked_capacity(
                     codebook_len,
                     4,
                     available.saturating_sub(PQ_PREFIX_SIZE),
@@ -650,7 +650,7 @@ impl VectorSegmentHeader {
                     ))
                 })
         } else {
-            use crate::vector::index::alloc_bounds::checked_len;
+            use crate::util::alloc_bounds::checked_len;
 
             let mut len_bytes = [0u8; 4];
             reader.read_exact(&mut len_bytes)?;

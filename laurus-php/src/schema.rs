@@ -118,18 +118,22 @@ impl PhpSchema {
     /// * `indexed` - Whether the field is searchable (default: true).
     /// * `term_vectors` - Whether term positions are stored, required by
     ///   phrase and span queries over this field (default: true).
+    /// * `doc_values` - Whether the value is also copied into DocValues,
+    ///   the column-oriented store sort/facet/aggregation read from
+    ///   (default: true). Takes effect only when `stored` is also true.
     /// * `analyzer` - Optional analyzer name. For parameter-less built-in
     ///   analyzers (`"standard"`, `"english"`, `"keyword"`, `"simple"`,
     ///   `"noop"`) pass the name directly. Parameterized presets such as
     ///   the Japanese analyzer (which needs a Lindera dictionary path)
     ///   should be registered via `addAnalyzer` and referenced by name.
-    #[php(defaults(stored = true, indexed = true, term_vectors = true))]
+    #[php(defaults(stored = true, indexed = true, term_vectors = true, doc_values = true))]
     pub fn add_text_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
         term_vectors: bool,
+        doc_values: bool,
         analyzer: Option<String>,
     ) {
         self.inner.borrow_mut().fields.insert(
@@ -138,6 +142,7 @@ impl PhpSchema {
                 indexed,
                 stored,
                 term_vectors,
+                doc_values,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
@@ -153,14 +158,24 @@ impl PhpSchema {
     /// * `multi_valued` - When true, the field accepts arrays of integers
     ///   and range queries match if any value satisfies the predicate
     ///   (Lucene-style "any match"). Default: false.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false))]
-    pub fn add_integer_field(&self, name: String, stored: bool, indexed: bool, multi_valued: bool) {
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default: true). Takes effect only when `stored` is also true.
+    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    pub fn add_integer_field(
+        &self,
+        name: String,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values,
             }),
         );
     }
@@ -175,14 +190,24 @@ impl PhpSchema {
     /// * `multi_valued` - When true, the field accepts arrays of floats
     ///   and range queries match if any value satisfies the predicate
     ///   (Lucene-style "any match"). Default: false.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false))]
-    pub fn add_float_field(&self, name: String, stored: bool, indexed: bool, multi_valued: bool) {
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default: true). Takes effect only when `stored` is also true.
+    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    pub fn add_float_field(
+        &self,
+        name: String,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Float(FloatOption {
                 indexed,
                 stored,
                 multi_valued,
+                doc_values,
             }),
         );
     }
@@ -194,11 +219,17 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    #[php(defaults(stored = true, indexed = true))]
-    pub fn add_boolean_field(&self, name: String, stored: bool, indexed: bool) {
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default: true). Takes effect only when `stored` is also true.
+    #[php(defaults(stored = true, indexed = true, doc_values = true))]
+    pub fn add_boolean_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
         self.inner.borrow_mut().fields.insert(
             name,
-            FieldOption::Boolean(BooleanOption { indexed, stored }),
+            FieldOption::Boolean(BooleanOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
         );
     }
 
@@ -209,11 +240,17 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    #[php(defaults(stored = true, indexed = true))]
-    pub fn add_datetime_field(&self, name: String, stored: bool, indexed: bool) {
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default: true). Takes effect only when `stored` is also true.
+    #[php(defaults(stored = true, indexed = true, doc_values = true))]
+    pub fn add_datetime_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
         self.inner.borrow_mut().fields.insert(
             name,
-            FieldOption::DateTime(DateTimeOption { indexed, stored }),
+            FieldOption::DateTime(DateTimeOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
         );
     }
 
@@ -224,12 +261,18 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    #[php(defaults(stored = true, indexed = true))]
-    pub fn add_geo_field(&self, name: String, stored: bool, indexed: bool) {
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Geo(GeoOption { indexed, stored }));
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default: true). Takes effect only when `stored` is also true.
+    #[php(defaults(stored = true, indexed = true, doc_values = true))]
+    pub fn add_geo_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
+        self.inner.borrow_mut().fields.insert(
+            name,
+            FieldOption::Geo(GeoOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
+        );
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -244,12 +287,18 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    #[php(defaults(stored = true, indexed = true))]
-    pub fn add_geo3d_field(&self, name: String, stored: bool, indexed: bool) {
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Geo3d(Geo3dOption { indexed, stored }));
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default: true). Takes effect only when `stored` is also true.
+    #[php(defaults(stored = true, indexed = true, doc_values = true))]
+    pub fn add_geo3d_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
+        self.inner.borrow_mut().fields.insert(
+            name,
+            FieldOption::Geo3d(Geo3dOption {
+                indexed,
+                stored,
+                doc_values,
+            }),
+        );
     }
 
     /// Add a binary data field.

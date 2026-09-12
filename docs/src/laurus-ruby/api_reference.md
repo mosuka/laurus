@@ -153,14 +153,14 @@ Laurus::Schema.new
 
 | Method | Description |
 | :--- | :--- |
-| `add_text_field(name, stored: true, indexed: true, term_vectors: true, analyzer: nil)` | Full-text field (inverted index, BM25). `term_vectors:` controls whether term positions are stored, read by phrase and span queries. `analyzer:` is the name of a parameter-less built-in (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or a custom name registered via `add_analyzer`. The Japanese preset requires a Lindera dictionary path, so register it as a custom analyzer with a `lindera` tokenizer and reference it by name. |
-| `add_integer_field(name, stored: true, indexed: true, multi_valued: false)` | 64-bit integer field. Pass `multi_valued: true` to accept arrays of integers (range queries match if any value satisfies the predicate). |
-| `add_float_field(name, stored: true, indexed: true, multi_valued: false)` | 64-bit float field. Pass `multi_valued: true` to accept arrays of floats (range queries match if any value satisfies the predicate). |
-| `add_boolean_field(name, stored: true, indexed: true)` | Boolean field. |
-| `add_bytes_field(name, stored: true)` | Raw bytes field. |
-| `add_geo_field(name, stored: true, indexed: true)` | Geographic coordinate field (lat/lon). |
-| `add_geo3d_field(name, stored: true, indexed: true)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md). |
-| `add_datetime_field(name, stored: true, indexed: true)` | UTC datetime field. |
+| `add_text_field(name, stored: true, indexed: true, term_vectors: true, doc_values: true, analyzer: nil)` | Full-text field (inverted index, BM25). `term_vectors:` controls whether term positions are stored, read by phrase and span queries. `doc_values:` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `stored: true`. `analyzer:` is the name of a parameter-less built-in (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or a custom name registered via `add_analyzer`. The Japanese preset requires a Lindera dictionary path, so register it as a custom analyzer with a `lindera` tokenizer and reference it by name. |
+| `add_integer_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64-bit integer field. Pass `multi_valued: true` to accept arrays of integers (range queries match if any value satisfies the predicate). See `doc_values:` above. |
+| `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64-bit float field. Pass `multi_valued: true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `doc_values:` above. |
+| `add_boolean_field(name, stored: true, indexed: true, doc_values: true)` | Boolean field. See `doc_values:` above. |
+| `add_bytes_field(name, stored: true)` | Raw bytes field. No `doc_values:` option: a `Bytes` value is never written to DocValues regardless. |
+| `add_geo_field(name, stored: true, indexed: true, doc_values: true)` | Geographic coordinate field (lat/lon). See `doc_values:` above. |
+| `add_geo3d_field(name, stored: true, indexed: true, doc_values: true)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values:` above. |
+| `add_datetime_field(name, stored: true, indexed: true, doc_values: true)` | UTC datetime field. See `doc_values:` above. |
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat (brute-force) vector field. |
 | `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil, base_weight: 1.0)` | IVF approximate nearest-neighbor vector field. |

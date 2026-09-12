@@ -131,6 +131,9 @@ impl WasmSchema {
     /// * `indexed` - Whether the field is searchable (default `true`).
     /// * `term_vectors` - Whether term positions are stored, required by
     ///   phrase and span queries over this field (default `true`).
+    /// * `doc_values` - Whether the value is also copied into DocValues,
+    ///   the column-oriented store sort/facet/aggregation read from
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     /// * `analyzer` - Optional analyzer name. Pass a parameter-less
     ///   built-in directly: `"standard"`, `"english"`, `"keyword"`,
     ///   `"simple"`, `"noop"`. For the Japanese analyzer, build it
@@ -147,6 +150,7 @@ impl WasmSchema {
         stored: Option<bool>,
         indexed: Option<bool>,
         term_vectors: Option<bool>,
+        doc_values: Option<bool>,
         analyzer: Option<String>,
     ) {
         self.inner.fields.insert(
@@ -155,12 +159,16 @@ impl WasmSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 term_vectors: term_vectors.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
     }
 
     /// Add an integer (i64) field.
+    ///
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addIntegerField")]
     pub fn add_integer_field(
         &mut self,
@@ -168,6 +176,7 @@ impl WasmSchema {
         stored: Option<bool>,
         indexed: Option<bool>,
         multi_valued: Option<bool>,
+        doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
             name,
@@ -175,11 +184,15 @@ impl WasmSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
 
     /// Add a float (f64) field.
+    ///
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addFloatField")]
     pub fn add_float_field(
         &mut self,
@@ -187,6 +200,7 @@ impl WasmSchema {
         stored: Option<bool>,
         indexed: Option<bool>,
         multi_valued: Option<bool>,
+        doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
             name,
@@ -194,47 +208,73 @@ impl WasmSchema {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
 
     /// Add a boolean field.
+    ///
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addBooleanField")]
-    pub fn add_boolean_field(&mut self, name: String, stored: Option<bool>, indexed: Option<bool>) {
+    pub fn add_boolean_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        doc_values: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
 
     /// Add a date/time field.
+    ///
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addDatetimeField")]
     pub fn add_datetime_field(
         &mut self,
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
+    ///
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addGeoField")]
-    pub fn add_geo_field(&mut self, name: String, stored: Option<bool>, indexed: Option<bool>) {
+    pub fn add_geo_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        doc_values: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }
@@ -245,13 +285,23 @@ impl WasmSchema {
     /// queryable via `searchGeo3dDistance`, `searchGeo3dBoundingBox`,
     /// and `searchGeo3dNearest` on `Index`. See the conceptual docs at
     /// `docs/src/concepts/geo3d.md`.
+    ///
+    /// * `doc_values` - Whether the value is also copied into DocValues
+    ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addGeo3dField")]
-    pub fn add_geo3d_field(&mut self, name: String, stored: Option<bool>, indexed: Option<bool>) {
+    pub fn add_geo3d_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        doc_values: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                doc_values: doc_values.unwrap_or(true),
             }),
         );
     }

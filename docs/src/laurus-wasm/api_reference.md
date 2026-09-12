@@ -355,46 +355,49 @@ Create an empty schema.
 
 ### Methods
 
-#### `addTextField(name, stored?, indexed?, termVectors?, analyzer?)`
+#### `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)`
 
-Add a full-text field. `analyzer` is the name of a parameter-less
-built-in (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`)
-or the name of a runtime analyzer registered via `addAnalyzer()`.
+Add a full-text field. `docValues` controls whether the value is also
+copied into DocValues, the column-oriented store sort/facet/aggregation
+read from (Issue #1047, default `true`); takes effect only when `stored`
+is also `true`. `analyzer` is the name of a parameter-less built-in
+(`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or the
+name of a runtime analyzer registered via `addAnalyzer()`.
 
 For Japanese morphological analysis, build a `JapaneseAnalyzer` from
 raw IPADIC bytes and register it with `addAnalyzer()` first; see
 [`JapaneseAnalyzer.fromBytes`](#japaneseanalyzerfrombytesmetadata-dicttrie--mode)
 and [`addAnalyzer`](#addanalyzername-analyzer) below.
 
-#### `addIntegerField(name, stored?, indexed?, multiValued?)`
+#### `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)`
 
 Add a 64-bit integer field. Pass `multiValued: true` to accept arrays of
 integers; range queries then match if any value satisfies the predicate
-(Lucene-style "any match" with constant scoring).
+(Lucene-style "any match" with constant scoring). See `docValues` above.
 
-#### `addFloatField(name, stored?, indexed?, multiValued?)`
+#### `addFloatField(name, stored?, indexed?, multiValued?, docValues?)`
 
 Add a 64-bit float field. Pass `multiValued: true` to accept arrays of
 floats; range queries then match if any value satisfies the predicate
-(Lucene-style "any match" with constant scoring).
+(Lucene-style "any match" with constant scoring). See `docValues` above.
 
-#### `addBooleanField(name, stored?, indexed?)`
+#### `addBooleanField(name, stored?, indexed?, docValues?)`
 
-Add a boolean field.
+Add a boolean field. See `docValues` above.
 
-#### `addDatetimeField(name, stored?, indexed?)`
+#### `addDatetimeField(name, stored?, indexed?, docValues?)`
 
-Add a date/time field.
+Add a date/time field. See `docValues` above.
 
-#### `addGeoField(name, stored?, indexed?)`
+#### `addGeoField(name, stored?, indexed?, docValues?)`
 
-Add a geographic coordinate field.
+Add a geographic coordinate field. See `docValues` above.
 
-#### `addGeo3dField(name, stored?, indexed?)`
+#### `addGeo3dField(name, stored?, indexed?, docValues?)`
 
 Add a 3D ECEF Cartesian point field. Values are submitted as a `{ x, y, z }`
 object with metres units. See [Geo3d concepts](../concepts/geo3d.md) for
-ECEF theory.
+ECEF theory, and `docValues` above.
 
 The WASM binding does not expose `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery`
 / `Geo3dNearestQuery` as JS classes (wasm-bindgen cannot expose `dyn Query`
@@ -404,7 +407,8 @@ above.
 
 #### `addBytesField(name, stored?)`
 
-Add a binary data field.
+Add a binary data field. No `docValues` option: a `Bytes` value is never
+written to DocValues regardless.
 
 #### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)`
 

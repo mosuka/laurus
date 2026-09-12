@@ -356,45 +356,49 @@ for (let i = 0; i < 10000; i++) {
 
 ### メソッド
 
-#### `addTextField(name, stored?, indexed?, termVectors?, analyzer?)`
+#### `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)`
 
-全文検索テキストフィールドを追加します。`analyzer` にはパラメータ不要の
-組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` /
-`"noop"`）または `addAnalyzer()` で登録したランタイム analyzer 名を
-指定します。
+全文検索テキストフィールドを追加します。`docValues` は値を DocValues
+（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを
+制御します（Issue #1047、デフォルト `true`）。`stored` も `true` の場合のみ
+有効です。`analyzer` にはパラメータ不要の組込名（`"standard"` /
+`"english"` / `"keyword"` / `"simple"` / `"noop"`）または `addAnalyzer()`
+で登録したランタイム analyzer 名を指定します。
 
 日本語の形態素解析を行う場合は、まず `JapaneseAnalyzer` を IPADIC の
 バイト列から構築し、`addAnalyzer()` で登録してください。
 [`JapaneseAnalyzer.fromBytes`](#japaneseanalyzerfrombytesmetadata-dicttrie--mode)
 と [`addAnalyzer`](#addanalyzername-analyzer) を参照。
 
-#### `addIntegerField(name, stored?, indexed?, multiValued?)`
+#### `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)`
 
 64 ビット整数フィールドを追加します。`multiValued: true` を指定すると整数配列を受け付け、
 範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア）します。
+`docValues` は上記を参照。
 
-#### `addFloatField(name, stored?, indexed?, multiValued?)`
+#### `addFloatField(name, stored?, indexed?, multiValued?, docValues?)`
 
 64 ビット浮動小数点フィールドを追加します。`multiValued: true` を指定すると浮動小数点配列を受け付け、
 範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア）します。
+`docValues` は上記を参照。
 
-#### `addBooleanField(name, stored?, indexed?)`
+#### `addBooleanField(name, stored?, indexed?, docValues?)`
 
-真偽値フィールドを追加します。
+真偽値フィールドを追加します。`docValues` は上記を参照。
 
-#### `addDatetimeField(name, stored?, indexed?)`
+#### `addDatetimeField(name, stored?, indexed?, docValues?)`
 
-日時フィールドを追加します。
+日時フィールドを追加します。`docValues` は上記を参照。
 
-#### `addGeoField(name, stored?, indexed?)`
+#### `addGeoField(name, stored?, indexed?, docValues?)`
 
-地理座標フィールドを追加します。
+地理座標フィールドを追加します。`docValues` は上記を参照。
 
-#### `addGeo3dField(name, stored?, indexed?)`
+#### `addGeo3dField(name, stored?, indexed?, docValues?)`
 
 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）を追加します。値は
 `{ x, y, z }` オブジェクトで投入します。詳細は
-[Geo3d の概念](../concepts/geo3d.md) を参照。
+[Geo3d の概念](../concepts/geo3d.md) を参照。`docValues` は上記を参照。
 
 WASM バインディングは `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` /
 `Geo3dNearestQuery` を JS クラスとして公開していません（wasm-bindgen は
@@ -404,7 +408,8 @@ WASM バインディングは `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` /
 
 #### `addBytesField(name, stored?)`
 
-バイナリデータフィールドを追加します。
+バイナリデータフィールドを追加します。`docValues` オプションはありません
+—— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。
 
 #### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)`
 

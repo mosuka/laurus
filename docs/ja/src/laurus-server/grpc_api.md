@@ -100,16 +100,18 @@ message AnalyzerDefinition {
 
 | Lexical フィールド | Vector フィールド |
 | :--- | :--- |
-| `TextOption` (`indexed`, `stored`, `term_vectors`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
-| `IntegerOption` (`indexed`, `stored`, `multi_valued`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
-| `FloatOption` (`indexed`, `stored`, `multi_valued`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
-| `BooleanOption` (`indexed`, `stored`) | |
-| `DateTimeOption` (`indexed`, `stored`) | |
-| `GeoOption` (`indexed`, `stored`) | |
-| `Geo3dOption` (`indexed`, `stored`) | |
+| `TextOption` (`indexed`, `stored`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
+| `IntegerOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
+| `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
+| `BooleanOption` (`indexed`, `stored`, `doc_values`) | |
+| `DateTimeOption` (`indexed`, `stored`, `doc_values`) | |
+| `GeoOption` (`indexed`, `stored`, `doc_values`) | |
+| `Geo3dOption` (`indexed`, `stored`, `doc_values`) | |
 | `BytesOption` (`stored`) | |
 
 ベクトルフィールドオプションの `embedder` フィールドには、`Schema.embedders` で定義したエンベッダー名を指定します。設定すると、インデックス時にドキュメントのテキストフィールドからベクトルを自動生成します。事前計算済みのベクトルを直接供給する場合は空のままにします。
+
+**Doc values:** `doc_values`（Issue #1047）は、上記の `BytesOption` を除く全ての lexical オプションで `optional bool` であり、`term_vectors` と同じ tri-state の契約に従います。クライアントが省略するとエンジンのデフォルト（`true`）になり、明示的な `false` とは区別されます。フィールドの値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御し、DocValues 列が書き込まれるのは `stored` と `doc_values` の両方が `true` の場合のみです。`BytesOption` にはこのフィールドがありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。ソートにもファセットにも使わないフィールドで `doc_values` を無効にするとセグメントの使用容量が削減されます。フィールド自体は引き続き完全に検索・取得可能です。
 
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 

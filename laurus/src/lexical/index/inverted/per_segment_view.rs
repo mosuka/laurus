@@ -161,6 +161,20 @@ impl LexicalIndexReader for PerSegmentReaderView {
         seg.document(doc_id)
     }
 
+    fn document_fields(
+        &self,
+        doc_id: u64,
+        field_names: &[&str],
+    ) -> Result<Option<std::collections::HashMap<String, crate::data::DataValue>>> {
+        // Without this override, the trait default forwards to `document`
+        // above and clones every field just to filter it back down --
+        // defeating the whole point of `document_fields` (Issue #1047: a
+        // DocValues-miss fallback on this per-segment view would otherwise
+        // clone the full document per hit).
+        let seg = self.segment.read().unwrap();
+        seg.document_fields(doc_id, field_names)
+    }
+
     fn doc_ids(&self) -> Result<Vec<u64>> {
         // Segment-local ids (global id values, but only those present in
         // this segment) so stored-document scans stay segment-bounded

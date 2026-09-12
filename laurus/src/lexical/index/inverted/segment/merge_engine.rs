@@ -49,6 +49,34 @@ pub struct MergeConfig {
 
     /// Verify integrity after merge.
     pub verify_after_merge: bool,
+
+    /// The current schema's per-field `doc_values` setting, keyed by
+    /// field name (Issue #1047).
+    ///
+    /// Unlike term positions (which are detected from what a source
+    /// segment already has on disk, since a discarded position cannot be
+    /// recovered -- see [`Self::default_doc_values`]'s doc comment for
+    /// why this is deliberately different), DocValues columns can always
+    /// be regenerated from `stored_fields`. So the CURRENT schema wins
+    /// here: a field this map declares is written (or not) according to
+    /// the schema regardless of what any source segment happened to have.
+    /// Only a field this map does *not* mention falls back to detecting
+    /// each source segment's existing column.
+    ///
+    /// Populated by the caller from the owning index's `config.fields` +
+    /// `extra_fields` (`InvertedIndex::merge_segment_set` /
+    /// `InvertedIndex::rebuild_field`); empty for a bare
+    /// `MergeConfig::default()`, which makes every field fall through to
+    /// pure detection, then [`Self::default_doc_values`].
+    pub field_doc_values: HashMap<String, bool>,
+
+    /// Index-wide default for whether a field's value is written to
+    /// DocValues, used only for a field neither `field_doc_values` nor
+    /// per-segment detection resolves (i.e. no source segment ever had a
+    /// candidate value for it at all -- so this is rarely, if ever,
+    /// actually consulted). Mirrors
+    /// [`InvertedIndexConfig::store_doc_values`](crate::lexical::index::config::InvertedIndexConfig::store_doc_values).
+    pub default_doc_values: bool,
 }
 
 impl Default for MergeConfig {
@@ -61,6 +89,8 @@ impl Default for MergeConfig {
             remove_deleted_docs: true,
             sort_by_doc_id: true,
             verify_after_merge: true,
+            field_doc_values: HashMap::new(),
+            default_doc_values: true,
         }
     }
 }
@@ -299,12 +329,23 @@ impl MergeEngine {
         // segment reproduces every field's positions state independently
         // (#1083).
         let mut positions_by_field: HashMap<String, bool> = HashMap::new();
+        // Whether the merged segment should write a DocValues column, per
+        // field (#1047). Seeded from the CURRENT schema so it wins over
+        // whatever a source segment happens to have on disk; a field the
+        // schema does not mention falls back to detection inside
+        // `reconstruct_segment` (`.entry().or_insert_with()` only fills
+        // gaps `field_doc_values` left open).
+        let mut doc_values_by_field: HashMap<String, bool> = self.config.field_doc_values.clone();
 
         for segment in segments {
             let reader = SegmentReader::open(segment.segment_info.clone(), self.storage.clone())?;
             let deleted = self.load_deleted_docs(&segment.segment_info)?;
-            let reconstructed =
-                self.reconstruct_segment(&reader, &deleted, &mut positions_by_field)?;
+            let reconstructed = self.reconstruct_segment(
+                &reader,
+                &deleted,
+                &mut positions_by_field,
+                &mut doc_values_by_field,
+            )?;
             stats.deleted_docs_removed += deleted.len();
             for (doc_id, analyzed) in reconstructed {
                 if docs.insert(doc_id, analyzed).is_none() {
@@ -327,6 +368,8 @@ impl MergeEngine {
         // unbounded so the merge produces exactly one output segment.
         let writer_config = InvertedIndexWriterConfig {
             field_term_positions: positions_by_field,
+            field_doc_values: doc_values_by_field,
+            store_doc_values: self.config.default_doc_values,
             shard_id: stats.shard_id,
             max_buffered_docs: usize::MAX,
             max_buffer_memory: usize::MAX,
@@ -424,6 +467,12 @@ impl MergeEngine {
     /// positions state it already had, detected the same way
     /// [`Self::perform_merge`] does.
     ///
+    /// `target_doc_values` is `target_field`'s new `doc_values` setting
+    /// (#1047), seeded the same way into the per-field DocValues map for
+    /// the same reason. Every other field resolves from
+    /// [`MergeConfig::field_doc_values`] first, detection second, exactly
+    /// as [`Self::perform_merge`] does.
+    ///
     /// # Errors
     ///
     /// Returns the first error encountered and aborts the writer that hit
@@ -441,6 +490,7 @@ impl MergeEngine {
         target_field: &str,
         analyzer: Option<&Arc<dyn Analyzer>>,
         target_term_vectors: bool,
+        target_doc_values: bool,
         new_segment_ids: &[String],
     ) -> Result<Vec<MergeResult>> {
         assert_eq!(
@@ -457,6 +507,12 @@ impl MergeEngine {
         // never overrides the new schema's setting.
         let mut positions_by_field: HashMap<String, bool> = HashMap::new();
         positions_by_field.insert(target_field.to_string(), target_term_vectors);
+        // Same idea for DocValues (#1047): seed the CURRENT schema (minus
+        // `target_field`, whose stale on-disk column must not leak
+        // through), then pin `target_field` to its NEW setting so
+        // detection can never override either.
+        let mut doc_values_by_field: HashMap<String, bool> = self.config.field_doc_values.clone();
+        doc_values_by_field.insert(target_field.to_string(), target_doc_values);
         let mut results = Vec::with_capacity(segments.len());
 
         for (segment, new_segment_id) in segments.iter().zip(new_segment_ids) {
@@ -466,6 +522,7 @@ impl MergeEngine {
                 &reader,
                 &deleted,
                 &mut positions_by_field,
+                &mut doc_values_by_field,
                 target_field,
                 analyzer,
             )?;
@@ -476,6 +533,8 @@ impl MergeEngine {
 
             let writer_config = InvertedIndexWriterConfig {
                 field_term_positions: positions_by_field.clone(),
+                field_doc_values: doc_values_by_field.clone(),
+                store_doc_values: self.config.default_doc_values,
                 shard_id: segment.segment_info.shard_id,
                 max_buffered_docs: usize::MAX,
                 max_buffer_memory: usize::MAX,
@@ -594,11 +653,19 @@ impl MergeEngine {
     /// the merged segment reproduces each field's positions state
     /// independently — fields can disagree, e.g. one `term_vectors: true`
     /// and one `false` (#1083).
+    ///
+    /// `doc_values_by_field` (#1047) works the same way but only fills
+    /// gaps the caller's schema-derived seed left open (see
+    /// [`MergeConfig::field_doc_values`]): for a field this map does not
+    /// already mention, the first document in *this* segment with a
+    /// DocValues-candidate value for it records whether this segment's
+    /// `.dv` currently has a column for that field.
     fn reconstruct_segment(
         &self,
         reader: &SegmentReader,
         deleted: &RoaringTreemap,
         positions_by_field: &mut HashMap<String, bool>,
+        doc_values_by_field: &mut HashMap<String, bool>,
     ) -> Result<Vec<(u64, AnalyzedDocument)>> {
         // Pass 1: bucket postings into per-doc analyzed terms.
         let mut field_terms: AHashMap<u64, AHashMap<String, Vec<AnalyzedTerm>>> = AHashMap::new();
@@ -707,6 +774,15 @@ impl MergeEngine {
             analyzed.point_values = points.remove(&doc_id).unwrap_or_default();
 
             for (field_name, value) in &stored.fields {
+                if InvertedIndexWriter::is_doc_values_candidate(value) {
+                    // Only fills a gap the schema-derived seed left open
+                    // (#1047) -- a field `doc_values_by_field` already
+                    // covers (the current schema decided it) is never
+                    // touched here.
+                    doc_values_by_field
+                        .entry(field_name.clone())
+                        .or_insert_with(|| reader.has_doc_values(field_name));
+                }
                 analyzed
                     .stored_fields
                     .insert(field_name.clone(), value.clone());
@@ -754,6 +830,7 @@ impl MergeEngine {
         reader: &SegmentReader,
         deleted: &RoaringTreemap,
         positions_by_field: &mut HashMap<String, bool>,
+        doc_values_by_field: &mut HashMap<String, bool>,
         target_field: &str,
         analyzer: Option<&Arc<dyn Analyzer>>,
     ) -> Result<Vec<(u64, AnalyzedDocument)>> {
@@ -851,6 +928,17 @@ impl MergeEngine {
             analyzed.point_values = points.remove(&doc_id).unwrap_or_default();
 
             for (field_name, value) in &stored.fields {
+                if InvertedIndexWriter::is_doc_values_candidate(value) {
+                    // `target_field` is pre-seeded by
+                    // `rebuild_field_across_segments` with the field's NEW
+                    // `doc_values` setting, so this never overrides it
+                    // with the stale on-disk state (#1047, mirrors
+                    // `positions_by_field`'s identical pre-seeding for
+                    // `target_term_vectors`).
+                    doc_values_by_field
+                        .entry(field_name.clone())
+                        .or_insert_with(|| reader.has_doc_values(field_name));
+                }
                 analyzed
                     .stored_fields
                     .insert(field_name.clone(), value.clone());
@@ -1319,5 +1407,229 @@ mod tests {
         // Both orderings, so the result cannot depend on field-name sort order.
         run("a_vec", "b_novec");
         run("a_novec", "b_vec");
+    }
+
+    /// #1047: mirrors [`merge_preserves_per_field_term_vectors_independently`]
+    /// for DocValues -- after merging two segments, each field must keep its
+    /// OWN `doc_values` state independently, detected per field from what
+    /// each source segment actually has on disk (`MergeConfig::default()`,
+    /// no schema override). Run with both field-name orderings.
+    #[test]
+    fn merge_preserves_per_field_doc_values_independently() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let run = |dv_field: &str, nodv_field: &str| {
+            let storage: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(
+                dv_field.to_string(),
+                FieldOption::Text(TextOption {
+                    doc_values: true,
+                    ..Default::default()
+                }),
+            );
+            fields.insert(
+                nodv_field.to_string(),
+                FieldOption::Text(TextOption {
+                    doc_values: false,
+                    ..Default::default()
+                }),
+            );
+            let config = InvertedIndexWriterConfig {
+                fields,
+                ..Default::default()
+            };
+
+            let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+            let d0 = writer
+                .add_document(
+                    Document::builder()
+                        .add_field(dv_field, DataValue::Text("alpha".to_string()))
+                        .add_field(nodv_field, DataValue::Text("alpha".to_string()))
+                        .build(),
+                )
+                .unwrap();
+            writer.commit().unwrap(); // segment_000000
+            let d1 = writer
+                .add_document(
+                    Document::builder()
+                        .add_field(dv_field, DataValue::Text("bravo".to_string()))
+                        .add_field(nodv_field, DataValue::Text("bravo".to_string()))
+                        .build(),
+                )
+                .unwrap();
+            writer.commit().unwrap(); // segment_000001
+            drop(writer);
+
+            let si0 = segment_info("segment_000000", 1, d0, d0, 0);
+            let si1 = segment_info("segment_000001", 1, d1, d1, 1);
+            let candidate = MergeCandidate {
+                segments: vec![si0.segment_id.clone(), si1.segment_id.clone()],
+                priority: 1.0,
+                estimated_size: 0,
+                strategy: MergeStrategy::SizeBased,
+            };
+            let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+            let result = engine
+                .merge_segments(
+                    &candidate,
+                    &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
+                    1,
+                )
+                .unwrap();
+
+            let merged =
+                SegmentReader::open(result.new_segment.segment_info.clone(), storage.clone())
+                    .unwrap();
+            assert!(
+                merged.has_doc_values(dv_field),
+                "{dv_field} must keep its DocValues column after merge"
+            );
+            assert!(
+                !merged.has_doc_values(nodv_field),
+                "{nodv_field} must not have a DocValues column after merge"
+            );
+        };
+
+        // Both orderings, so the result cannot depend on field-name sort order.
+        run("a_dv", "b_nodv");
+        run("a_nodv", "b_dv");
+    }
+
+    /// #1047: the merge's CURRENT schema (`MergeConfig::field_doc_values`)
+    /// must win over a source segment's stale on-disk DocValues state --
+    /// the deliberate deviation from `term_vectors`' detection-only
+    /// resolution (Issue #1047's design rationale: a DocValues column can
+    /// always be regenerated from `stored_fields`, so there is no harm in
+    /// re-deriving it from the current schema on every merge).
+    #[test]
+    fn merge_resolves_doc_values_from_the_current_schema_over_stale_segments() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        // Written with a bare (pre-flag-change) writer, so "notes" gets a
+        // DocValues column the ordinary way (doc_values defaults to true).
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let d0 = writer
+            .add_document(
+                Document::builder()
+                    .add_field("title", DataValue::Text("alpha".to_string()))
+                    .add_field("notes", DataValue::Text("legacy note".to_string()))
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap(); // segment_000000
+        drop(writer);
+
+        let si0 = segment_info("segment_000000", 1, d0, d0, 0);
+        assert!(
+            SegmentReader::open(si0.clone(), storage.clone())
+                .unwrap()
+                .has_doc_values("notes"),
+            "sanity: the source segment must have the column before the merge"
+        );
+
+        // The schema has SINCE changed "notes" to `doc_values: false`. Even
+        // though the only source segment still has the column on disk, the
+        // merge must honor the new schema.
+        let mut field_doc_values = std::collections::HashMap::new();
+        field_doc_values.insert("notes".to_string(), false);
+        let config = MergeConfig {
+            field_doc_values,
+            ..MergeConfig::default()
+        };
+        let candidate = MergeCandidate {
+            segments: vec![si0.segment_id.clone()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+        let engine = MergeEngine::new(config, storage.clone());
+        let result = engine
+            .merge_segments(&candidate, &[ManagedSegmentInfo::new(si0)], 1)
+            .unwrap();
+
+        let merged =
+            SegmentReader::open(result.new_segment.segment_info.clone(), storage.clone()).unwrap();
+        assert!(
+            !merged.has_doc_values("notes"),
+            "the current schema's doc_values: false must win over the \
+             source segment's on-disk column"
+        );
+        assert!(
+            merged.has_doc_values("title"),
+            "a field the schema doesn't mention still detects from the source segment"
+        );
+    }
+
+    /// #1047: a source segment with no value at all for some field must
+    /// not be misread as that field having opted out of DocValues --
+    /// another segment's real column, and its values, must still survive
+    /// the merge intact. Deliberately processes the value-less segment
+    /// FIRST so a naive "first segment seen decides" bug (as opposed to
+    /// "first segment that actually HAS the field decides") would be
+    /// caught.
+    #[test]
+    fn merge_does_not_misdetect_a_valueless_field_as_opted_out() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        // segment_000000: no "extra" field at all.
+        let d0 = writer
+            .add_document(
+                Document::builder()
+                    .add_field("title", DataValue::Text("alpha".to_string()))
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+        // segment_000001: "extra" is present, with its own real column.
+        let d1 = writer
+            .add_document(
+                Document::builder()
+                    .add_field("title", DataValue::Text("bravo".to_string()))
+                    .add_field("extra", DataValue::Text("present".to_string()))
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let si0 = segment_info("segment_000000", 1, d0, d0, 0);
+        let si1 = segment_info("segment_000001", 1, d1, d1, 1);
+        let candidate = MergeCandidate {
+            segments: vec![si0.segment_id.clone(), si1.segment_id.clone()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine
+            .merge_segments(
+                &candidate,
+                &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
+                1,
+            )
+            .unwrap();
+
+        let merged =
+            SegmentReader::open(result.new_segment.segment_info.clone(), storage.clone()).unwrap();
+        assert!(
+            merged.has_doc_values("extra"),
+            "segment_000000 having no value for \"extra\" at all must not be \
+             misread as an opt-out; segment_000001's real column must still win"
+        );
+        assert_eq!(
+            merged.get_doc_value("extra", d1).unwrap(),
+            Some(DataValue::Text("present".to_string())),
+            "the merged value itself must be intact"
+        );
     }
 }

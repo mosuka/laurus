@@ -254,7 +254,7 @@ impl HnswIndexReader {
         file_size: u64,
         doc_ids: Arc<[u64]>,
     ) -> Result<Option<Arc<OrdinalHnswGraph>>> {
-        use crate::vector::index::alloc_bounds::checked_capacity;
+        use crate::util::alloc_bounds::checked_capacity;
         use ahash::AHashMap;
 
         let mut has_graph_buf = [0u8; 1];
@@ -388,7 +388,7 @@ impl HnswIndexReader {
         file_size: u64,
         doc_ids: Arc<[u64]>,
     ) -> Result<Option<Arc<OrdinalHnswGraph>>> {
-        use crate::vector::index::alloc_bounds::checked_capacity;
+        use crate::util::alloc_bounds::checked_capacity;
 
         let mut has_graph_buf = [0u8; 1];
         if input.read_exact(&mut has_graph_buf).is_err() || has_graph_buf[0] != 1 {
@@ -480,7 +480,7 @@ impl HnswIndexReader {
         path: &str,
         distance_metric: DistanceMetric,
     ) -> Result<Self> {
-        use crate::vector::index::alloc_bounds::{checked_capacity, checked_len};
+        use crate::util::alloc_bounds::{checked_capacity, checked_len};
         use std::io::{Read, Seek};
 
         // Open the index file
