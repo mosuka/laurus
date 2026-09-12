@@ -938,15 +938,12 @@ impl InvertedIndexWriter {
                 continue; // Skip fields not in schema
             };
 
+            // `FieldOption::indexed`/`stored` centralize this 8-arm match
+            // (Issue #1114) -- `DocumentParser::parse` and
+            // `Engine::update_field`'s rebuild path need the same
+            // decision and must agree on it.
             let (should_index, should_store) = match option {
-                Some(FieldOption::Text(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Integer(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Float(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Boolean(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::DateTime(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Geo(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Geo3d(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Bytes(opt)) => (false, opt.stored), // Bytes are not lexically indexed
+                Some(opt) => (opt.indexed(), opt.stored()),
                 None => (true, true), // Internal or schema-less default
             };
 

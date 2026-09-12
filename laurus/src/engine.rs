@@ -1889,16 +1889,10 @@ impl Engine {
                     // lexical field type (`analyze_field_value` never
                     // reads the analyzer for those, but still requires a
                     // reference to be passed through).
-                    let field_is_indexed = match &lexical_opt {
-                        crate::lexical::core::field::FieldOption::Text(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::Integer(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::Float(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::Boolean(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::DateTime(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::Geo(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::Geo3d(opt) => opt.indexed,
-                        crate::lexical::core::field::FieldOption::Bytes(_) => false,
-                    };
+                    // `FieldOption::indexed` centralizes this 8-arm match
+                    // (Issue #1114); `InvertedIndexWriter::analyze_document`
+                    // and `DocumentParser::parse` need the same decision.
+                    let field_is_indexed = lexical_opt.indexed();
 
                     // Same analyzer-resolution pattern as `add_field`
                     // above. Note there is no `purge`-driven branch here,
