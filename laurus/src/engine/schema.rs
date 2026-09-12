@@ -363,36 +363,46 @@ pub enum FieldChangeKind {
 /// stored as raw vectors; lexical fields honor `stored` independently).
 pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind {
     match (old, new) {
-        (FieldOption::Text(o), FieldOption::Text(n)) => classify_text(o, n),
+        (FieldOption::Text(o), FieldOption::Text(n)) => {
+            classify_text(o, n).max(classify_doc_values(o.doc_values, n.doc_values, o.stored))
+        }
         (FieldOption::Integer(o), FieldOption::Integer(n)) => classify_numeric_lexical(
             o.indexed,
             n.indexed,
             o.stored,
             o.multi_valued,
             n.multi_valued,
-        ),
+        )
+        .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
         (FieldOption::Float(o), FieldOption::Float(n)) => classify_numeric_lexical(
             o.indexed,
             n.indexed,
             o.stored,
             o.multi_valued,
             n.multi_valued,
-        ),
-        (FieldOption::Boolean(o), FieldOption::Boolean(n)) => {
-            classify_indexed_only(o.indexed, n.indexed, o.stored)
-        }
-        (FieldOption::DateTime(o), FieldOption::DateTime(n)) => {
-            classify_indexed_only(o.indexed, n.indexed, o.stored)
-        }
-        (FieldOption::Geo(o), FieldOption::Geo(n)) => {
-            classify_indexed_only(o.indexed, n.indexed, o.stored)
-        }
-        (FieldOption::Geo3d(o), FieldOption::Geo3d(n)) => {
-            classify_indexed_only(o.indexed, n.indexed, o.stored)
-        }
+        )
+        .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
+        (FieldOption::Boolean(o), FieldOption::Boolean(n)) => classify_indexed_only(
+            o.indexed, n.indexed, o.stored,
+        )
+        .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
+        (FieldOption::DateTime(o), FieldOption::DateTime(n)) => classify_indexed_only(
+            o.indexed, n.indexed, o.stored,
+        )
+        .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
+        (FieldOption::Geo(o), FieldOption::Geo(n)) => classify_indexed_only(
+            o.indexed, n.indexed, o.stored,
+        )
+        .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
+        (FieldOption::Geo3d(o), FieldOption::Geo3d(n)) => classify_indexed_only(
+            o.indexed, n.indexed, o.stored,
+        )
+        .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
         // `stored` changes (for every lexical variant, including Bytes) are
         // always metadata-only: they only affect documents ingested after
-        // the change, never data already on disk.
+        // the change, never data already on disk. `Bytes` has no
+        // `doc_values` flag (Issue #1047: is_doc_values_candidate excludes
+        // it unconditionally), so there is no fold here.
         (FieldOption::Bytes(_), FieldOption::Bytes(_)) => FieldChangeKind::MetadataOnly,
 
         (FieldOption::Hnsw(o), FieldOption::Hnsw(n)) => {
@@ -447,6 +457,28 @@ fn classify_indexed_only(
     } else {
         FieldChangeKind::MetadataOnly
     }
+}
+
+/// Classification for a `doc_values` change (Issue #1047), shared by
+/// every lexical field option except `Bytes` (which has no such flag).
+///
+/// Identical reasoning to [`classify_indexed_only`], so it delegates to
+/// the same function: turning DocValues ON needs the column regenerated
+/// from the field's original values (existing segments simply have no
+/// column to read), so `false -> true` is `Reindex` when `old_stored`
+/// (the merge/field-rebuild path detects the gap and regenerates the
+/// column from `stored_fields`, Issue #1047 Phase 4) or `Destructive`
+/// otherwise. `true -> false` is `MetadataOnly`: an existing column is
+/// simply never consulted once every reader treats the field as
+/// `doc_values: false` (`InvertedIndexWriterConfig::stores_doc_values`
+/// gates every future write), so there is no correctness risk in leaving
+/// stale columns on disk until the next merge reclaims the space.
+fn classify_doc_values(
+    old_doc_values: bool,
+    new_doc_values: bool,
+    old_stored: bool,
+) -> FieldChangeKind {
+    classify_indexed_only(old_doc_values, new_doc_values, old_stored)
 }
 
 /// Classification for `TextOption`: `indexed` follows
@@ -964,6 +996,24 @@ mod tests {
                 text(|o| o.stored(false).term_vectors(true)),
                 Destructive,
             ),
+            (
+                "text: doc_values false->true requires reindex",
+                text(|o| o.doc_values(false)),
+                text(|o| o.doc_values(true)),
+                Reindex,
+            ),
+            (
+                "text: doc_values true->false is metadata-only",
+                text(|o| o.doc_values(true)),
+                text(|o| o.doc_values(false)),
+                MetadataOnly,
+            ),
+            (
+                "text: doc_values false->true on a stored:false field is destructive (no original value to regenerate the column from)",
+                text(|o| o.stored(false).doc_values(false)),
+                text(|o| o.stored(false).doc_values(true)),
+                Destructive,
+            ),
             // ---- Integer ----
             (
                 "integer: stored toggle is metadata-only",
@@ -1011,6 +1061,12 @@ mod tests {
                 integer(|o| o.stored(false)),
                 Reindex,
             ),
+            (
+                "integer: doc_values false->true requires reindex",
+                integer(|o| o.doc_values(false)),
+                integer(|o| o.doc_values(true)),
+                Reindex,
+            ),
             // ---- Float ----
             (
                 "float: stored toggle is metadata-only",
@@ -1045,6 +1101,12 @@ mod tests {
                 boolean(|o| o.indexed(false)),
                 boolean(|o| o.indexed(true)),
                 Reindex,
+            ),
+            (
+                "boolean: doc_values true->false is metadata-only",
+                boolean(|o| o.doc_values(true)),
+                boolean(|o| o.doc_values(false)),
+                MetadataOnly,
             ),
             // ---- DateTime ----
             (
