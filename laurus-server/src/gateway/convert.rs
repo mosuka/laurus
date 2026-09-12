@@ -424,6 +424,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             // `indexed`/`stored` above, which have no such tri-state and
             // are left as their existing `unwrap_or(false)` behavior.
             term_vectors: v.get("term_vectors").and_then(|v| v.as_bool()),
+            // Same tri-state treatment for the same reason (#1047).
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
             analyzer: v.get("analyzer").map(json_to_analyzer_spec).transpose()?,
         })
     } else if let Some(v) = obj.get("integer") {
@@ -434,6 +436,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
                 .get("multi_valued")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("float") {
         Opt::Float(v1::FloatOption {
@@ -443,26 +446,31 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
                 .get("multi_valued")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("boolean") {
         Opt::Boolean(v1::BooleanOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("date_time") {
         Opt::DateTime(v1::DateTimeOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("geo") {
         Opt::Geo(v1::GeoOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("geo3d") {
         Opt::Geo3d(v1::Geo3dOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("bytes") {
         Opt::Bytes(v1::BytesOption {
@@ -497,29 +505,57 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             if let Some(term_vectors) = v.term_vectors {
                 text_obj["term_vectors"] = json!(term_vectors);
             }
+            // Same tri-state treatment for the same reason (#1047).
+            if let Some(doc_values) = v.doc_values {
+                text_obj["doc_values"] = json!(doc_values);
+            }
             if let Some(spec) = v.analyzer.as_ref().and_then(analyzer_spec_to_json) {
                 text_obj["analyzer"] = spec;
             }
             json!({ "text": text_obj })
         }
-        Some(Opt::Integer(v)) => json!({
-            "integer": { "indexed": v.indexed, "stored": v.stored }
-        }),
-        Some(Opt::Float(v)) => json!({
-            "float": { "indexed": v.indexed, "stored": v.stored }
-        }),
-        Some(Opt::Boolean(v)) => json!({
-            "boolean": { "indexed": v.indexed, "stored": v.stored }
-        }),
-        Some(Opt::DateTime(v)) => json!({
-            "date_time": { "indexed": v.indexed, "stored": v.stored }
-        }),
-        Some(Opt::Geo(v)) => json!({
-            "geo": { "indexed": v.indexed, "stored": v.stored }
-        }),
-        Some(Opt::Geo3d(v)) => json!({
-            "geo3d": { "indexed": v.indexed, "stored": v.stored }
-        }),
+        Some(Opt::Integer(v)) => {
+            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            if let Some(doc_values) = v.doc_values {
+                obj["doc_values"] = json!(doc_values);
+            }
+            json!({ "integer": obj })
+        }
+        Some(Opt::Float(v)) => {
+            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            if let Some(doc_values) = v.doc_values {
+                obj["doc_values"] = json!(doc_values);
+            }
+            json!({ "float": obj })
+        }
+        Some(Opt::Boolean(v)) => {
+            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            if let Some(doc_values) = v.doc_values {
+                obj["doc_values"] = json!(doc_values);
+            }
+            json!({ "boolean": obj })
+        }
+        Some(Opt::DateTime(v)) => {
+            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            if let Some(doc_values) = v.doc_values {
+                obj["doc_values"] = json!(doc_values);
+            }
+            json!({ "date_time": obj })
+        }
+        Some(Opt::Geo(v)) => {
+            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            if let Some(doc_values) = v.doc_values {
+                obj["doc_values"] = json!(doc_values);
+            }
+            json!({ "geo": obj })
+        }
+        Some(Opt::Geo3d(v)) => {
+            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            if let Some(doc_values) = v.doc_values {
+                obj["doc_values"] = json!(doc_values);
+            }
+            json!({ "geo3d": obj })
+        }
         Some(Opt::Bytes(v)) => json!({
             "bytes": { "stored": v.stored }
         }),
@@ -1423,6 +1459,55 @@ mod tests {
         let ivf = json_to_ivf_option(&json!({ "dimension": 32 })).unwrap();
         assert_eq!(ivf.base_weight, None);
         assert!(ivf_option_to_json(&ivf).get("base_weight").is_none());
+    }
+
+    /// #1047: `doc_values` follows the same tri-state contract as
+    /// `base_weight`/`term_vectors` above -- an absent key must round-trip
+    /// as absent (not a `false`/zero-value standing in for "unset"), for
+    /// both `Text` (which also carries `term_vectors`) and a non-`Text`
+    /// variant.
+    #[test]
+    fn test_doc_values_round_trips_through_json_and_absent_key_stays_absent() {
+        let with_dv = json!({ "text": { "indexed": true, "stored": true, "doc_values": false } });
+        let proto = json_to_proto_field_option(&with_dv).unwrap();
+        match &proto.option {
+            Some(v1::field_option::Option::Text(t)) => assert_eq!(t.doc_values, Some(false)),
+            other => panic!("expected Text option, got {other:?}"),
+        }
+        let back = proto_field_option_to_json(&proto);
+        assert_eq!(
+            back["text"].get("doc_values").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let without_dv = json!({ "text": { "indexed": true, "stored": true } });
+        let proto = json_to_proto_field_option(&without_dv).unwrap();
+        match &proto.option {
+            Some(v1::field_option::Option::Text(t)) => assert_eq!(t.doc_values, None),
+            other => panic!("expected Text option, got {other:?}"),
+        }
+        let back = proto_field_option_to_json(&proto);
+        assert!(
+            back["text"].get("doc_values").is_none(),
+            "an unset doc_values must not emit a key: {back:?}"
+        );
+
+        // Non-Text variant: same contract.
+        let integer_dv =
+            json!({ "integer": { "indexed": true, "stored": true, "doc_values": true } });
+        let proto = json_to_proto_field_option(&integer_dv).unwrap();
+        match &proto.option {
+            Some(v1::field_option::Option::Integer(i)) => assert_eq!(i.doc_values, Some(true)),
+            other => panic!("expected Integer option, got {other:?}"),
+        }
+        let integer_unset = json!({ "integer": { "indexed": true, "stored": true } });
+        let proto = json_to_proto_field_option(&integer_unset).unwrap();
+        match &proto.option {
+            Some(v1::field_option::Option::Integer(i)) => assert_eq!(i.doc_values, None),
+            other => panic!("expected Integer option, got {other:?}"),
+        }
+        let back = proto_field_option_to_json(&proto);
+        assert!(back["integer"].get("doc_values").is_none());
     }
 
     #[test]

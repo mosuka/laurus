@@ -114,6 +114,11 @@ message TextOption {
   optional bool term_vectors = 3;
   // Analyzer reference. Unset means use the engine default analyzer.
   AnalyzerSpec analyzer = 4;
+  // Whether this field's value is also copied into DocValues (the
+  // column-oriented store sort/facet/aggregation read from). Unset means
+  // "use the engine's default" (currently `true`), for the same reason
+  // as `term_vectors` above.
+  optional bool doc_values = 5;
 }
 
 // Reference to an analyzer for a text field.
@@ -157,6 +162,10 @@ message IntegerOption {
   // When true, the field accepts arrays of integers and range queries
   // match a document if any value satisfies the predicate (Lucene-style).
   bool multi_valued = 3;
+  // Whether this field's value is also copied into DocValues. Unset
+  // means "use the engine's default" (currently `true`); see
+  // `TextOption.doc_values`.
+  optional bool doc_values = 4;
 }
 
 message FloatOption {
@@ -165,21 +174,37 @@ message FloatOption {
   // When true, the field accepts arrays of floats and range queries
   // match a document if any value satisfies the predicate (Lucene-style).
   bool multi_valued = 3;
+  // Whether this field's value is also copied into DocValues. Unset
+  // means "use the engine's default" (currently `true`); see
+  // `TextOption.doc_values`.
+  optional bool doc_values = 4;
 }
 
 message BooleanOption {
   bool indexed = 1;
   bool stored = 2;
+  // Whether this field's value is also copied into DocValues. Unset
+  // means "use the engine's default" (currently `true`); see
+  // `TextOption.doc_values`.
+  optional bool doc_values = 3;
 }
 
 message DateTimeOption {
   bool indexed = 1;
   bool stored = 2;
+  // Whether this field's value is also copied into DocValues. Unset
+  // means "use the engine's default" (currently `true`); see
+  // `TextOption.doc_values`.
+  optional bool doc_values = 3;
 }
 
 message GeoOption {
   bool indexed = 1;
   bool stored = 2;
+  // Whether this field's value is also copied into DocValues. Unset
+  // means "use the engine's default" (currently `true`); see
+  // `TextOption.doc_values`.
+  optional bool doc_values = 3;
 }
 
 // Options for 3D ECEF (Earth-Centered Earth-Fixed) geographic point fields.
@@ -188,6 +213,10 @@ message GeoOption {
 message Geo3dOption {
   bool indexed = 1;
   bool stored = 2;
+  // Whether this field's value is also copied into DocValues. Unset
+  // means "use the engine's default" (currently `true`); see
+  // `TextOption.doc_values`.
+  optional bool doc_values = 3;
 }
 
 message BytesOption {
