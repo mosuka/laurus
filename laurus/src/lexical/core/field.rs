@@ -828,6 +828,50 @@ impl FieldOption {
             FieldOption::Bytes(_) => None,
         }
     }
+
+    /// Whether this field is lexically indexed.
+    ///
+    /// `Bytes` is always `false`: `BytesOption` carries no `indexed` flag
+    /// at all, since a binary payload has no term representation to
+    /// index.
+    ///
+    /// Centralizes the 8-arm match (Issue #1114) -- `InvertedIndexWriter::
+    /// analyze_document`, `DocumentParser::parse`, and
+    /// `Engine::update_field`'s rebuild path all need this decision and
+    /// must agree on it, the same rationale as [`Self::doc_values`]
+    /// (#1047).
+    pub(crate) fn indexed(&self) -> bool {
+        match self {
+            FieldOption::Text(opt) => opt.indexed,
+            FieldOption::Integer(opt) => opt.indexed,
+            FieldOption::Float(opt) => opt.indexed,
+            FieldOption::Boolean(opt) => opt.indexed,
+            FieldOption::DateTime(opt) => opt.indexed,
+            FieldOption::Geo(opt) => opt.indexed,
+            FieldOption::Geo3d(opt) => opt.indexed,
+            FieldOption::Bytes(_) => false,
+        }
+    }
+
+    /// Whether this field's original value is kept in the stored
+    /// document. Unlike [`Self::indexed`], `Bytes` has a real `stored`
+    /// setting of its own -- a binary payload can never be indexed, but
+    /// it can still be stored or not.
+    ///
+    /// Centralizes the same 8-arm match as [`Self::indexed`] (Issue
+    /// #1114).
+    pub(crate) fn stored(&self) -> bool {
+        match self {
+            FieldOption::Text(opt) => opt.stored,
+            FieldOption::Integer(opt) => opt.stored,
+            FieldOption::Float(opt) => opt.stored,
+            FieldOption::Boolean(opt) => opt.stored,
+            FieldOption::DateTime(opt) => opt.stored,
+            FieldOption::Geo(opt) => opt.stored,
+            FieldOption::Geo3d(opt) => opt.stored,
+            FieldOption::Bytes(opt) => opt.stored,
+        }
+    }
 }
 
 impl Default for GeoOption {
@@ -836,6 +880,107 @@ impl Default for GeoOption {
             indexed: true,
             stored: true,
             doc_values: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #1114: `FieldOption::indexed()`/`stored()` must read the
+    /// right field for every variant, and `Bytes` (which has no
+    /// `indexed` flag of its own) must report `indexed() == false`
+    /// unconditionally while still reporting its own `stored` setting.
+    #[test]
+    fn indexed_and_stored_read_every_variant_correctly() {
+        let cases: Vec<(FieldOption, bool, bool)> = vec![
+            (
+                FieldOption::Text(TextOption {
+                    indexed: false,
+                    stored: true,
+                    ..Default::default()
+                }),
+                false,
+                true,
+            ),
+            (
+                FieldOption::Integer(IntegerOption {
+                    indexed: true,
+                    stored: false,
+                    ..Default::default()
+                }),
+                true,
+                false,
+            ),
+            (
+                FieldOption::Float(FloatOption {
+                    indexed: false,
+                    stored: false,
+                    ..Default::default()
+                }),
+                false,
+                false,
+            ),
+            (
+                FieldOption::Boolean(BooleanOption {
+                    indexed: true,
+                    stored: true,
+                    ..Default::default()
+                }),
+                true,
+                true,
+            ),
+            (
+                FieldOption::DateTime(DateTimeOption {
+                    indexed: true,
+                    stored: false,
+                    ..Default::default()
+                }),
+                true,
+                false,
+            ),
+            (
+                FieldOption::Geo(GeoOption {
+                    indexed: false,
+                    stored: true,
+                    ..Default::default()
+                }),
+                false,
+                true,
+            ),
+            (
+                FieldOption::Geo3d(Geo3dOption {
+                    indexed: false,
+                    stored: false,
+                    ..Default::default()
+                }),
+                false,
+                false,
+            ),
+            (
+                FieldOption::Bytes(BytesOption { stored: true }),
+                false, // Bytes has no `indexed` flag: always false.
+                true,
+            ),
+            (
+                FieldOption::Bytes(BytesOption { stored: false }),
+                false,
+                false,
+            ),
+        ];
+
+        for (option, want_indexed, want_stored) in cases {
+            assert_eq!(
+                option.indexed(),
+                want_indexed,
+                "indexed() mismatch for {option:?}"
+            );
+            assert_eq!(
+                option.stored(),
+                want_stored,
+                "stored() mismatch for {option:?}"
+            );
         }
     }
 }

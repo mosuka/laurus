@@ -781,28 +781,36 @@ impl InvertedIndexWriter {
     ///
     /// ```rust,no_run
     /// use laurus::lexical::core::document::Document;
+    /// use laurus::lexical::core::field::{FieldOption, TextOption};
     /// use laurus::lexical::core::parser::DocumentParser;
     /// use laurus::analysis::analyzer::per_field::PerFieldAnalyzer;
     /// use laurus::analysis::analyzer::standard::StandardAnalyzer;
     /// use laurus::lexical::index::inverted::writer::{InvertedIndexWriter, InvertedIndexWriterConfig};
     /// use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
     /// use laurus::storage::StorageConfig;
+    /// use std::collections::HashMap;
     /// use std::sync::Arc;
     ///
     /// let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
     /// let per_field = PerFieldAnalyzer::new(Arc::new(StandardAnalyzer::new().unwrap()));
+    /// let mut fields = HashMap::new();
+    /// fields.insert("title".to_string(), FieldOption::Text(TextOption::default()));
     /// let config = InvertedIndexWriterConfig {
     ///     analyzer: Arc::new(per_field.clone()),
+    ///     fields: fields.clone(),
     ///     ..Default::default()
     /// };
     /// let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
     ///
-    /// use laurus::lexical::core::field::TextOption;
     /// let doc = Document::builder()
     ///     .add_text("title", "Rust Programming")
     ///     .build();
     ///
-    /// let doc_parser = DocumentParser::new(Arc::new(per_field));
+    /// // `.with_fields(fields)` makes the parser apply the same
+    /// // indexed/stored gating `add_document` would for the same schema
+    /// // (Issue #1114) -- pass the writer config's own `fields` map to
+    /// // keep the two paths in agreement.
+    /// let doc_parser = DocumentParser::new(Arc::new(per_field)).with_fields(fields);
     /// let analyzed = doc_parser.parse(doc).unwrap();
     /// let doc_id = writer.add_analyzed_document(analyzed).unwrap();
     /// ```
@@ -938,15 +946,12 @@ impl InvertedIndexWriter {
                 continue; // Skip fields not in schema
             };
 
+            // `FieldOption::indexed`/`stored` centralize this 8-arm match
+            // (Issue #1114) -- `DocumentParser::parse` and
+            // `Engine::update_field`'s rebuild path need the same
+            // decision and must agree on it.
             let (should_index, should_store) = match option {
-                Some(FieldOption::Text(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Integer(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Float(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Boolean(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::DateTime(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Geo(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Geo3d(opt)) => (opt.indexed, opt.stored),
-                Some(FieldOption::Bytes(opt)) => (false, opt.stored), // Bytes are not lexically indexed
+                Some(opt) => (opt.indexed(), opt.stored()),
                 None => (true, true), // Internal or schema-less default
             };
 
