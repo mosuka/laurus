@@ -33,6 +33,18 @@
 //! - **Binary**: Stored only, not indexed
 //! - **Null**: Stored only, not indexed
 //!
+//! # Schema Awareness (Issue #1114)
+//!
+//! By default a [`DocumentParser`] is schema-less: every field above is
+//! both indexed and stored, regardless of type. Attach a schema via
+//! [`DocumentParser::with_fields`] to honor each field's `indexed`/
+//! `stored` settings instead -- the same gate
+//! [`InvertedIndexWriter::add_document`](crate::lexical::index::inverted::writer::InvertedIndexWriter::add_document)
+//! applies, so a document parsed here and fed to
+//! [`InvertedIndexWriter::add_analyzed_document`](crate::lexical::index::inverted::writer::InvertedIndexWriter::add_analyzed_document)
+//! lands in the index identically to one passed to `add_document`
+//! directly.
+//!
 //! # Examples
 //!
 //! Basic usage with default analyzer:
@@ -82,6 +94,38 @@
 //! // "id" field is treated as a single keyword token
 //! assert_eq!(analyzed.field_terms.get("id").unwrap()[0].term, "DOC-001");
 //! ```
+//!
+//! With schema field options (Issue #1114) -- `indexed: false` keeps a
+//! field out of the index while it's still retrievable:
+//!
+//! ```
+//! use laurus::lexical::core::document::Document;
+//! use laurus::lexical::core::parser::DocumentParser;
+//! use laurus::lexical::{FieldOption, TextOption};
+//! use laurus::analysis::analyzer::standard::StandardAnalyzer;
+//! use std::collections::HashMap;
+//! use std::sync::Arc;
+//!
+//! let mut fields = HashMap::new();
+//! fields.insert("title".to_string(), FieldOption::Text(TextOption::default()));
+//! fields.insert(
+//!     "internal_note".to_string(),
+//!     FieldOption::Text(TextOption::default().indexed(false)),
+//! );
+//!
+//! let parser = DocumentParser::new(Arc::new(StandardAnalyzer::new().unwrap()))
+//!     .with_fields(fields);
+//!
+//! let doc = Document::builder()
+//!     .add_text("title", "Rust Programming")
+//!     .add_text("internal_note", "not searchable, but still retrievable")
+//!     .build();
+//!
+//! let analyzed = parser.parse(doc).unwrap();
+//! assert!(analyzed.field_terms.contains_key("title"));
+//! assert!(!analyzed.field_terms.contains_key("internal_note"));
+//! assert!(analyzed.stored_fields.contains_key("internal_note"));
+//! ```
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -101,6 +145,10 @@ use crate::lexical::core::field::{FieldOption, FieldValue};
 /// Similar to how QueryParser analyzes query strings, DocumentParser
 /// analyzes Document fields using a PerFieldAnalyzer to produce
 /// tokenized, indexed-ready AnalyzedDocuments.
+///
+/// Schema-less by default (every field is indexed and stored); chain
+/// [`Self::with_fields`] to gate fields by a schema's `indexed`/`stored`
+/// settings instead (Issue #1114).
 ///
 /// # Example
 ///
