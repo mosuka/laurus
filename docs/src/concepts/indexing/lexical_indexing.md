@@ -233,7 +233,7 @@ graph TB
     S1 --- F4[".docs (doc store)"]
     S1 --- F5[".dv (doc values)"]
     S1 --- F6[".meta (metadata)"]
-    S1 --- F7[".lens (field lengths)"]
+    S1 --- F7[".norms (field-length norms)"]
 ```
 
 | File Extension | Contents |
@@ -244,7 +244,7 @@ graph TB
 | `.docs` | Stored field values (the original document content) |
 | `.dv` | Doc values for sorting and filtering |
 | `.meta` | Segment metadata (doc count, term count, etc.) |
-| `.lens` | Field length norms (for BM25 scoring) |
+| `.norms` | 1-byte-quantised field-length norms (for BM25 scoring), one byte per (document, field) |
 
 ### Segment Lifecycle
 

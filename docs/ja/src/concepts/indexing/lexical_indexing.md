@@ -224,7 +224,7 @@ graph TB
     S1 --- F4[".docs (doc store)"]
     S1 --- F5[".dv (doc values)"]
     S1 --- F6[".meta (metadata)"]
-    S1 --- F7[".lens (field lengths)"]
+    S1 --- F7[".norms (field-length norms)"]
 ```
 
 | ファイル拡張子 | 内容 |
@@ -235,7 +235,7 @@ graph TB
 | `.docs` | 格納されたフィールド値（元のドキュメント内容） |
 | `.dv` | ソートおよびフィルタリング用の Doc Values |
 | `.meta` | セグメントメタデータ（ドキュメント数、ターム数など） |
-| `.lens` | フィールド長の正規化値（BM25 スコアリング用） |
+| `.norms` | 1バイトに量子化されたフィールド長の正規化値（BM25 スコアリング用、ドキュメント×フィールドごとに1バイト） |
 
 ### セグメントのライフサイクル
 

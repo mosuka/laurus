@@ -987,7 +987,7 @@ mod tests {
             facade.file_exists("segment_000002.delmap"),
             "passthrough hit — a table-only answer would resurrect deletions"
         );
-        assert!(!facade.file_exists("segment_000002.lens"), "true miss");
+        assert!(!facade.file_exists("segment_000002.norms"), "true miss");
         assert_eq!(facade.file_size("segment_000002.post").unwrap(), 1);
         let mut input = facade.open_input("segment_000002.delmap").unwrap();
         let mut bytes = Vec::new();

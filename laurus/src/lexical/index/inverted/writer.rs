@@ -1248,10 +1248,10 @@ impl InvertedIndexWriter {
         let norms = NormsBuilder::from_buffered(&self.buffered_docs);
         self.write_inverted_index(&mut sink, &norms)?;
         self.write_stored_documents(&mut sink)?;
-        self.write_field_lengths(&mut sink)?;
-        self.write_field_stats(&mut sink)?;
-        // Additive (#555 Phase 2): written alongside the files above so
-        // existing readers are unaffected until Phase 4 switches them over.
+        // `.lens`/`.fstats` are no longer written (#555 Phase 5); `.norms`
+        // is the sole field-length/statistics source for new segments. Old
+        // segments that still carry `.lens`/`.fstats` remain readable via
+        // `SegmentNorms::Legacy` until their next merge.
         self.write_norms(&mut sink, &norms)?;
         self.write_doc_values(&mut sink)?;
         self.write_bkd_trees(&mut sink)?;
@@ -1572,90 +1572,9 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Calculate field statistics from buffered documents.
-    fn calculate_field_stats(&self) -> AHashMap<String, (u64, f64, u64, u64)> {
-        // field_name -> (doc_count, total_length, min_length, max_length)
-        let mut field_stats: AHashMap<String, (u64, u64, u64, u64)> = AHashMap::new();
-
-        for (_doc_id, doc) in &self.buffered_docs {
-            for (field_name, &length) in &doc.field_lengths {
-                let stats = field_stats
-                    .entry(field_name.clone())
-                    .or_insert((0, 0, u64::MAX, 0));
-                stats.0 += 1; // doc_count
-                stats.1 += length as u64; // total_length
-                stats.2 = stats.2.min(length as u64); // min_length
-                stats.3 = stats.3.max(length as u64); // max_length
-            }
-        }
-
-        // Convert to (doc_count, avg_length, min_length, max_length)
-        field_stats
-            .into_iter()
-            .map(
-                |(field, (doc_count, total_length, min_length, max_length))| {
-                    let avg_length = if doc_count > 0 {
-                        total_length as f64 / doc_count as f64
-                    } else {
-                        0.0
-                    };
-                    (field, (doc_count, avg_length, min_length, max_length))
-                },
-            )
-            .collect()
-    }
-
-    /// Write field lengths to storage.
-    fn write_field_lengths(&self, sink: &mut PartSink<'_>) -> Result<()> {
-        let lens_output = sink.part("lens")?;
-        let mut lens_writer = StructWriter::new(lens_output);
-
-        // Write document count
-        lens_writer.write_varint(self.buffered_docs.len() as u64)?;
-
-        // Write field lengths for each document
-        for (doc_id, doc) in &self.buffered_docs {
-            lens_writer.write_u64(*doc_id)?;
-            lens_writer.write_varint(doc.field_lengths.len() as u64)?;
-
-            for (field_name, length) in &doc.field_lengths {
-                lens_writer.write_string(field_name)?;
-                lens_writer.write_u32(*length)?;
-            }
-        }
-
-        lens_writer.close()?;
-        sink.seal()?;
-        Ok(())
-    }
-
-    /// Write field statistics to storage.
-    fn write_field_stats(&self, sink: &mut PartSink<'_>) -> Result<()> {
-        let fstats_output = sink.part("fstats")?;
-        let mut fstats_writer = StructWriter::new(fstats_output);
-
-        let field_stats = self.calculate_field_stats();
-
-        // Write number of fields
-        fstats_writer.write_varint(field_stats.len() as u64)?;
-
-        for (field_name, (doc_count, avg_length, min_length, max_length)) in field_stats {
-            fstats_writer.write_string(&field_name)?;
-            fstats_writer.write_u64(doc_count)?;
-            fstats_writer.write_f64(avg_length)?;
-            fstats_writer.write_u64(min_length)?;
-            fstats_writer.write_u64(max_length)?;
-        }
-
-        fstats_writer.close()?;
-        sink.seal()?;
-        Ok(())
-    }
-
-    /// Write the `.norms` segment part (Issue #555 Phase 2): a columnar,
-    /// 1-byte-quantised field-length column that will eventually replace
-    /// `.lens`/`.fstats`. Written alongside them for now — the reader does
-    /// not consult `.norms` until Phase 4.
+    /// Write the `.norms` segment part (Issue #555): a columnar,
+    /// 1-byte-quantised field-length column that replaces the old
+    /// `.lens`/`.fstats` files.
     fn write_norms(&self, sink: &mut PartSink<'_>, norms: &NormsBuilder) -> Result<()> {
         let norms_output = sink.part("norms")?;
         let mut norms_writer = StructWriter::new(norms_output);
