@@ -494,6 +494,16 @@ impl NormsReader {
             max_length: f.max_length as u64,
         })
     }
+
+    /// All field names this `.norms` file recorded a length column for. A
+    /// pure directory lookup, mirroring
+    /// [`super::doc_values::DocValuesReader::field_names`] -- used by the
+    /// merge engine (#1122) to reconstruct a length for a field that
+    /// analyzed to zero tokens (and so left no term postings for
+    /// `field_terms`-based enumeration to find).
+    pub(crate) fn field_names(&self) -> Vec<String> {
+        self.fields.keys().cloned().collect()
+    }
 }
 
 #[cfg(test)]
