@@ -56,7 +56,7 @@ pub async fn create_index(index_dir: &Path, schema_path: &Path) -> Result<()> {
     // Read and parse the schema file.
     let schema_content =
         std::fs::read_to_string(schema_path).context("Failed to read schema file")?;
-    let schema: Schema = toml::from_str(&schema_content).context("Failed to parse schema TOML")?;
+    let schema = Schema::from_toml(&schema_content).context("Failed to parse schema TOML")?;
 
     init_index(index_dir, schema).await
 }
@@ -130,12 +130,13 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
     let schema = if schema_exists && !store_exists {
         let content =
             std::fs::read_to_string(&schema_path).context("Failed to read existing schema file")?;
-        toml::from_str(&content).context("Failed to parse existing schema TOML")?
+        Schema::from_toml(&content).context("Failed to parse existing schema TOML")?
     } else {
         // Create the index directory and write the schema.
         std::fs::create_dir_all(index_dir).context("Failed to create index directory")?;
-        let schema_toml =
-            toml::to_string_pretty(&schema).context("Failed to serialize schema to TOML")?;
+        let schema_toml = schema
+            .to_toml()
+            .context("Failed to serialize schema to TOML")?;
         std::fs::write(&schema_path, &schema_toml).context("Failed to write schema file")?;
         schema
     };
@@ -211,7 +212,7 @@ pub async fn open_index_with_commit_policy(
     // Read the schema.
     let schema_toml =
         std::fs::read_to_string(&schema_path).context("Failed to read schema file")?;
-    let schema: Schema = toml::from_str(&schema_toml).context("Failed to parse schema TOML")?;
+    let schema = Schema::from_toml(&schema_toml).context("Failed to parse schema TOML")?;
 
     // Open or create storage depending on whether the store directory exists.
     let store_path = index_dir.join(STORE_DIR);
@@ -243,7 +244,7 @@ pub fn read_schema(index_dir: &Path) -> Result<Schema> {
     let schema_path = index_dir.join(SCHEMA_FILE);
     let schema_toml =
         std::fs::read_to_string(&schema_path).context("Failed to read schema file")?;
-    let schema: Schema = toml::from_str(&schema_toml).context("Failed to parse schema TOML")?;
+    let schema = Schema::from_toml(&schema_toml).context("Failed to parse schema TOML")?;
     Ok(schema)
 }
 
@@ -258,8 +259,9 @@ pub fn read_schema(index_dir: &Path) -> Result<Schema> {
 ///
 /// Returns an error if serialization or file write fails.
 pub fn save_schema(index_dir: &Path, schema: &Schema) -> Result<()> {
-    let schema_toml =
-        toml::to_string_pretty(schema).context("Failed to serialize schema to TOML")?;
+    let schema_toml = schema
+        .to_toml()
+        .context("Failed to serialize schema to TOML")?;
     let schema_dest = index_dir.join(SCHEMA_FILE);
     std::fs::write(&schema_dest, &schema_toml).context("Failed to write schema file")?;
     Ok(())

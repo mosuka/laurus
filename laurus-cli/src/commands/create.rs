@@ -68,7 +68,7 @@ pub async fn run_index(
             Some(path) => {
                 let content =
                     std::fs::read_to_string(path).context("Failed to read schema file")?;
-                toml::from_str(&content).context("Failed to parse schema TOML")?
+                Schema::from_toml(&content).context("Failed to parse schema TOML")?
             }
             None => build_schema_interactive()?,
         }
@@ -206,7 +206,9 @@ pub fn run_schema(output: &Path) -> Result<()> {
     let schema = build_schema_interactive()?;
 
     // Show preview.
-    let toml_str = toml::to_string_pretty(&schema).context("Failed to serialize schema to TOML")?;
+    let toml_str = schema
+        .to_toml()
+        .context("Failed to serialize schema to TOML")?;
     println!("\n--- Preview ---");
     println!("{toml_str}");
     println!("---------------\n");
