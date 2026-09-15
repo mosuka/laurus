@@ -207,9 +207,6 @@ impl NormsBuilder {
     /// the reader will substitute this same decoded value back in at search
     /// time, so anchoring the score bound to it keeps the bound valid (see
     /// [`length_to_norm`]'s round-down guarantee).
-    // Wired into `write_inverted_index`'s score-bound precomputation in
-    // Phase 3 (#555); unused until then.
-    #[allow(dead_code)]
     pub(crate) fn decoded_length(&self, doc_id: u64, field: &str) -> Option<u32> {
         self.fields
             .get(field)?
@@ -222,9 +219,6 @@ impl NormsBuilder {
     /// `f32` only after the division) so `avg_field_length` stays
     /// bit-identical to before #555. `0.0` when the field is absent from
     /// this segment, matching the pre-#555 fallback.
-    // Wired into `write_inverted_index`'s score-bound precomputation in
-    // Phase 3 (#555); unused until then.
-    #[allow(dead_code)]
     pub(crate) fn avg_length_f32(&self, field: &str) -> f32 {
         let Some(lengths) = self.fields.get(field) else {
             return 0.0;
