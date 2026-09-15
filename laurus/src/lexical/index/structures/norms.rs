@@ -57,9 +57,6 @@ use crate::storage::structured::{StructReader, StructWriter};
 use crate::util::alloc_bounds::{checked_capacity, checked_len};
 
 /// `.norms` segment part file extension.
-// Consumed by `NormsReader::load`, wired into `SegmentReader` in Phase 4
-// (#555); unused until then.
-#[allow(dead_code)]
 const NORMS_EXTENSION: &str = ".norms";
 
 const MAGIC: &[u8; 4] = b"NRMS";
@@ -78,9 +75,6 @@ const ENCODING_PRESENCE_BITMAP: u8 = 1;
 /// name + four 1-byte varints + the encoding byte). Used to bound a
 /// header-declared `num_fields` against the file's true size before it
 /// drives an allocation, the same technique [`super::doc_values`] uses.
-// Consumed by `NormsReader::load`, wired into `SegmentReader` in Phase 4
-// (#555); unused until then.
-#[allow(dead_code)]
 const MIN_FIELD_RECORD_SIZE: u64 = 1 + 1 + 1 + 1 + 1 + 1;
 
 /// Lengths `0..EXACT_LENGTH_BOUND` map to themselves; beyond that the table
@@ -305,9 +299,6 @@ impl NormsBuilder {
 }
 
 /// Maps a segment's (possibly non-contiguous) doc ids to dense array slots.
-// Wired into `NormsReader`/`SegmentReader` in Phase 4 (#555); unused until
-// then.
-#[allow(dead_code)]
 #[derive(Debug)]
 enum SlotMap {
     /// `doc_ids` form an unbroken range `min_doc_id..min_doc_id + count`.
@@ -316,7 +307,6 @@ enum SlotMap {
     Sparse(Vec<u64>),
 }
 
-#[allow(dead_code)]
 impl SlotMap {
     fn slot_of(&self, doc_id: u64) -> Option<usize> {
         match self {
@@ -332,9 +322,6 @@ impl SlotMap {
 /// One field's exact statistics and quantised norm column, as read from a
 /// `.norms` file. Indices into `norms`/`presence` are slots resolved via the
 /// enclosing [`NormsReader`]'s [`SlotMap`].
-// Wired into `NormsReader`/`SegmentReader` in Phase 4 (#555); unused until
-// then.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct NormsField {
     present_count: u64,
@@ -355,15 +342,12 @@ struct NormsField {
 /// [`super::doc_values::DocValuesReader`], there is no per-field lazy
 /// materialization here, because a `.norms` file is already close to the
 /// smallest useful representation (module docs).
-// Wired into `SegmentReader` in Phase 4 (#555); unused until then.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct NormsReader {
     slot_map: SlotMap,
     fields: AHashMap<String, NormsField>,
 }
 
-#[allow(dead_code)]
 impl NormsReader {
     /// Load `{segment_id}.norms` from `storage`. `Ok(None)` means the file
     /// does not exist (a pre-#555 segment, or one with no indexed fields

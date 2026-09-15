@@ -432,6 +432,45 @@ impl crate::lexical::reader::PostingIterator for InvertedIndexPostingIterator {
     }
 }
 
+/// A segment's field-length/statistics source, resolved once by
+/// [`SegmentReader::load_norms`] (Issue #555 Phase 4).
+#[derive(Debug)]
+enum SegmentNorms {
+    /// `{segment_id}.norms` — the current, 1-byte-quantised columnar
+    /// format.
+    V1(crate::lexical::index::structures::norms::NormsReader),
+    /// A pre-#555 segment: `.lens`/`.fstats` on disk, no `.norms` yet.
+    /// Returns exact, unquantised lengths -- quantising them here would
+    /// violate the BM25 score bound this segment's `.dict` was computed
+    /// against at its original flush time, which predates quantisation
+    /// entirely. Empty maps cover both "no indexed fields" and "neither
+    /// file exists", which behave identically to callers. Disappears the
+    /// next time this segment is rewritten by a merge, which always
+    /// writes `.norms`.
+    Legacy {
+        lengths: BTreeMap<u64, AHashMap<String, u32>>,
+        stats: AHashMap<String, FieldStats>,
+    },
+}
+
+impl SegmentNorms {
+    fn field_length(&self, doc_id: u64, field: &str) -> Option<u32> {
+        match self {
+            SegmentNorms::V1(reader) => reader.field_length(doc_id, field),
+            SegmentNorms::Legacy { lengths, .. } => lengths
+                .get(&doc_id)
+                .and_then(|doc_lengths| doc_lengths.get(field).copied()),
+        }
+    }
+
+    fn field_stats(&self, field: &str) -> Option<FieldStats> {
+        match self {
+            SegmentNorms::V1(reader) => reader.field_stats(field),
+            SegmentNorms::Legacy { stats, .. } => stats.get(field).cloned(),
+        }
+    }
+}
+
 /// Reader for a single segment (schema-less mode).
 #[derive(Debug)]
 pub struct SegmentReader {
@@ -453,11 +492,10 @@ pub struct SegmentReader {
     /// Cached stored documents.
     stored_documents: RwLock<Option<BTreeMap<u64, Document>>>,
 
-    /// Cached field lengths: doc_id -> (field_name -> length).
-    field_lengths: RwLock<Option<BTreeMap<u64, AHashMap<String, u32>>>>,
-
-    /// Cached field statistics: field_name -> FieldStats.
-    field_stats: RwLock<Option<AHashMap<String, crate::lexical::reader::FieldStats>>>,
+    /// Cached field-length/statistics source for this segment (#555 Phase
+    /// 4): the `.norms` columnar format, or a `.lens`/`.fstats` pre-#555
+    /// segment read via the legacy path. See [`SegmentNorms`].
+    norms: RwLock<Option<Arc<SegmentNorms>>>,
 
     /// DocValues reader for this segment.
     doc_values: RwLock<Option<Arc<DocValuesReader>>>,
@@ -507,8 +545,7 @@ impl SegmentReader {
             compound,
             term_dictionary: RwLock::new(None),
             stored_documents: RwLock::new(None),
-            field_lengths: RwLock::new(None),
-            field_stats: RwLock::new(None),
+            norms: RwLock::new(None),
             doc_values: RwLock::new(None),
             deletion_bitmap: RwLock::new(None),
             bkd_trees: RwLock::new(AHashMap::new()),
@@ -947,102 +984,95 @@ impl SegmentReader {
         }
     }
 
-    /// Load field lengths from the segment.
-    fn load_field_lengths(&self) -> Result<()> {
+    /// Load this segment's field-length/statistics source (#555 Phase 4):
+    /// `.norms` if present, otherwise the pre-#555 `.lens`/`.fstats` pair
+    /// via the legacy path (empty maps if neither exists -- a segment with
+    /// no indexed fields, or one predating field-length tracking
+    /// altogether).
+    fn load_norms(&self) -> Result<()> {
+        if let Some(reader) = crate::lexical::index::structures::norms::NormsReader::load(
+            self.storage.as_ref(),
+            &self.info.segment_id,
+        )? {
+            *self.norms.write().unwrap() = Some(Arc::new(SegmentNorms::V1(reader)));
+            return Ok(());
+        }
+
         let lens_file = format!("{}.lens", self.info.segment_id);
+        let lengths = if self.storage.file_exists(&lens_file) {
+            let lens_input = self.storage.open_input(&lens_file)?;
+            let mut lens_reader = StructReader::new(lens_input)?;
 
-        // Check if file exists (for backward compatibility with old indexes)
-        if !self.storage.file_exists(&lens_file) {
-            // Old index without field lengths - initialize empty
-            *self.field_lengths.write().unwrap() = Some(BTreeMap::new());
-            return Ok(());
-        }
+            let doc_count = lens_reader.read_varint()? as usize;
+            let mut all_field_lengths = BTreeMap::new();
+            for _ in 0..doc_count {
+                let doc_id = lens_reader.read_u64()?;
+                let field_count = lens_reader.read_varint()? as usize;
 
-        let lens_input = self.storage.open_input(&lens_file)?;
-        let mut lens_reader = StructReader::new(lens_input)?;
-
-        let doc_count = lens_reader.read_varint()? as usize;
-        let mut all_field_lengths = BTreeMap::new();
-
-        for _ in 0..doc_count {
-            let doc_id = lens_reader.read_u64()?;
-            let field_count = lens_reader.read_varint()? as usize;
-
-            let mut field_lens = AHashMap::new();
-            for _ in 0..field_count {
-                let field_name = lens_reader.read_string()?;
-                let length = lens_reader.read_u32()?;
-                field_lens.insert(field_name, length);
+                let mut field_lens = AHashMap::new();
+                for _ in 0..field_count {
+                    let field_name = lens_reader.read_string()?;
+                    let length = lens_reader.read_u32()?;
+                    field_lens.insert(field_name, length);
+                }
+                all_field_lengths.insert(doc_id, field_lens);
             }
+            all_field_lengths
+        } else {
+            BTreeMap::new()
+        };
 
-            all_field_lengths.insert(doc_id, field_lens);
-        }
-
-        *self.field_lengths.write().unwrap() = Some(all_field_lengths);
-        Ok(())
-    }
-
-    /// Load field statistics from the segment.
-    fn load_field_stats(&self) -> Result<()> {
         let fstats_file = format!("{}.fstats", self.info.segment_id);
+        let stats = if self.storage.file_exists(&fstats_file) {
+            let fstats_input = self.storage.open_input(&fstats_file)?;
+            let mut fstats_reader = StructReader::new(fstats_input)?;
 
-        // Check if file exists (for backward compatibility with old indexes)
-        if !self.storage.file_exists(&fstats_file) {
-            // Old index without field stats - initialize empty
-            *self.field_stats.write().unwrap() = Some(AHashMap::new());
-            return Ok(());
-        }
+            let field_count = fstats_reader.read_varint()? as usize;
+            let mut all_field_stats = AHashMap::new();
+            for _ in 0..field_count {
+                let field_name = fstats_reader.read_string()?;
+                let doc_count = fstats_reader.read_u64()?;
+                let avg_length = fstats_reader.read_f64()?;
+                let min_length = fstats_reader.read_u64()?;
+                let max_length = fstats_reader.read_u64()?;
 
-        let fstats_input = self.storage.open_input(&fstats_file)?;
-        let mut fstats_reader = StructReader::new(fstats_input)?;
+                all_field_stats.insert(
+                    field_name.clone(),
+                    crate::lexical::reader::FieldStats {
+                        field: field_name,
+                        unique_terms: 0, // Not stored, not needed for BM25
+                        total_terms: 0,  // Not stored, not needed for BM25
+                        doc_count,
+                        avg_length,
+                        min_length,
+                        max_length,
+                    },
+                );
+            }
+            all_field_stats
+        } else {
+            AHashMap::new()
+        };
 
-        let field_count = fstats_reader.read_varint()? as usize;
-        let mut all_field_stats = AHashMap::new();
-
-        for _ in 0..field_count {
-            let field_name = fstats_reader.read_string()?;
-            let doc_count = fstats_reader.read_u64()?;
-            let avg_length = fstats_reader.read_f64()?;
-            let min_length = fstats_reader.read_u64()?;
-            let max_length = fstats_reader.read_u64()?;
-
-            all_field_stats.insert(
-                field_name.clone(),
-                crate::lexical::reader::FieldStats {
-                    field: field_name,
-                    unique_terms: 0, // Not stored, not needed for BM25
-                    total_terms: 0,  // Not stored, not needed for BM25
-                    doc_count,
-                    avg_length,
-                    min_length,
-                    max_length,
-                },
-            );
-        }
-
-        *self.field_stats.write().unwrap() = Some(all_field_stats);
+        *self.norms.write().unwrap() = Some(Arc::new(SegmentNorms::Legacy { lengths, stats }));
         Ok(())
     }
 
     /// Get field statistics for a specific field.
     pub fn field_stats(&self, field: &str) -> Result<Option<FieldStats>> {
-        // Ensure field stats are loaded
-        if self.field_stats.read().unwrap().is_none() {
-            self.load_field_stats()?;
+        if self.norms.read().unwrap().is_none() {
+            self.load_norms()?;
         }
-
-        let field_stats = self.field_stats.read().unwrap();
-        if let Some(ref stats_map) = *field_stats {
-            return Ok(stats_map.get(field).cloned());
-        }
-        Ok(None)
+        let norms = self.norms.read().unwrap();
+        Ok(norms.as_ref().and_then(|n| n.field_stats(field)))
     }
 
     /// Get field length for a specific document and field.
     ///
-    /// Uses a fast path with a single `RwLock` acquisition when field lengths
-    /// are already loaded (hot path). Falls back to loading on the first call
-    /// (cold path), which requires a second acquisition.
+    /// Uses a fast path with a single `RwLock` acquisition when the
+    /// field-length source is already loaded (hot path). Falls back to
+    /// loading on the first call (cold path), which requires a second
+    /// acquisition.
     ///
     /// # Arguments
     ///
@@ -1059,23 +1089,16 @@ impl SegmentReader {
         }
 
         // Fast path: try to read with a single lock acquisition.
-        let field_lengths = self.field_lengths.read().unwrap();
-        if let Some(ref lengths_map) = *field_lengths {
-            return Ok(lengths_map
-                .get(&doc_id)
-                .and_then(|doc_lengths| doc_lengths.get(field).copied()));
+        let norms = self.norms.read().unwrap();
+        if let Some(n) = norms.as_ref() {
+            return Ok(n.field_length(doc_id, field));
         }
-        drop(field_lengths);
+        drop(norms);
 
-        // Cold path: load field lengths (one-time), then retry.
-        self.load_field_lengths()?;
-        let field_lengths = self.field_lengths.read().unwrap();
-        if let Some(ref lengths_map) = *field_lengths {
-            return Ok(lengths_map
-                .get(&doc_id)
-                .and_then(|doc_lengths| doc_lengths.get(field).copied()));
-        }
-        Ok(None)
+        // Cold path: load (one-time), then retry.
+        self.load_norms()?;
+        let norms = self.norms.read().unwrap();
+        Ok(norms.as_ref().and_then(|n| n.field_length(doc_id, field)))
     }
 
     /// Get a document by ID from this segment.
@@ -3095,5 +3118,210 @@ mod tests {
         assert_eq!(info.min_doc_id, 0);
         assert_eq!(info.max_doc_id, 999);
         assert!(!info.has_deletions);
+    }
+
+    /// #555 Phase 4: a pre-#555 segment (only `.lens`/`.fstats`, no
+    /// `.norms`) must still report exact, unquantised lengths and stats
+    /// through [`SegmentNorms::Legacy`] -- quantising them here would
+    /// violate a score bound that a pre-#555 binary computed against the
+    /// exact length at that segment's original flush time.
+    #[test]
+    fn legacy_lens_and_fstats_segment_reports_exact_length_and_stats() {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::storage::structured::StructWriter;
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let segment_id = "legacy_seg";
+
+        {
+            let output = storage
+                .create_output(&format!("{segment_id}.lens"))
+                .unwrap();
+            let mut w = StructWriter::new(output);
+            w.write_varint(2).unwrap(); // doc_count
+            w.write_u64(0).unwrap();
+            w.write_varint(1).unwrap();
+            w.write_string("body").unwrap();
+            w.write_u32(7).unwrap();
+            w.write_u64(1).unwrap();
+            w.write_varint(1).unwrap();
+            w.write_string("body").unwrap();
+            w.write_u32(20).unwrap();
+            w.close().unwrap();
+        }
+        {
+            let output = storage
+                .create_output(&format!("{segment_id}.fstats"))
+                .unwrap();
+            let mut w = StructWriter::new(output);
+            w.write_varint(1).unwrap(); // field_count
+            w.write_string("body").unwrap();
+            w.write_u64(2).unwrap(); // doc_count
+            w.write_f64(13.5).unwrap(); // avg_length
+            w.write_u64(7).unwrap(); // min_length
+            w.write_u64(20).unwrap(); // max_length
+            w.close().unwrap();
+        }
+
+        let info = SegmentInfo {
+            segment_id: segment_id.to_string(),
+            doc_count: 2,
+            min_doc_id: 0,
+            max_doc_id: 1,
+            generation: 0,
+            has_deletions: false,
+            shard_id: 0,
+        };
+        let reader = SegmentReader::open(info, storage).unwrap();
+
+        assert_eq!(reader.field_length(0, "body").unwrap(), Some(7));
+        assert_eq!(reader.field_length(1, "body").unwrap(), Some(20));
+        assert_eq!(reader.field_length(0, "missing").unwrap(), None);
+
+        let stats = reader.field_stats("body").unwrap().unwrap();
+        assert_eq!(stats.doc_count, 2);
+        assert_eq!(stats.min_length, 7);
+        assert_eq!(stats.max_length, 20);
+        assert!((stats.avg_length - 13.5).abs() < 1e-9);
+    }
+
+    /// `.norms` must win even when stale `.lens`/`.fstats` are also
+    /// present (e.g. leftover from a partially-completed migration) --
+    /// [`SegmentReader::load_norms`] must not fall back to the legacy
+    /// path just because those files happen to exist.
+    #[test]
+    fn norms_file_takes_precedence_over_stale_legacy_files() {
+        use crate::lexical::core::analyzed::AnalyzedDocument;
+        use crate::lexical::index::structures::norms::NormsBuilder;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::storage::structured::StructWriter;
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let segment_id = "mixed_seg";
+
+        // Stale legacy files claiming length 7.
+        {
+            let output = storage
+                .create_output(&format!("{segment_id}.lens"))
+                .unwrap();
+            let mut w = StructWriter::new(output);
+            w.write_varint(1).unwrap();
+            w.write_u64(0).unwrap();
+            w.write_varint(1).unwrap();
+            w.write_string("body").unwrap();
+            w.write_u32(7).unwrap();
+            w.close().unwrap();
+        }
+
+        // The current .norms file claiming length 25 -- this must win.
+        {
+            let mut doc = AnalyzedDocument::new();
+            doc.field_lengths.insert("body".to_string(), 25); // within the exact window (< 40)
+            let norms = NormsBuilder::from_buffered(&[(0u64, doc)]);
+            let output = storage
+                .create_output(&format!("{segment_id}.norms"))
+                .unwrap();
+            let mut w = StructWriter::new(output);
+            norms.write_to(&mut w).unwrap();
+            w.close().unwrap();
+        }
+
+        let info = SegmentInfo {
+            segment_id: segment_id.to_string(),
+            doc_count: 1,
+            min_doc_id: 0,
+            max_doc_id: 0,
+            generation: 0,
+            has_deletions: false,
+            shard_id: 0,
+        };
+        let reader = SegmentReader::open(info, storage).unwrap();
+
+        assert_eq!(reader.field_length(0, "body").unwrap(), Some(25));
+    }
+
+    /// #555 Phase 3/4 end-to-end: the BM25 score-bound precomputed at
+    /// flush time (`TermInfo::max_score_factor`/`block_max`) must remain a
+    /// true upper bound once the reader substitutes back the *quantised*
+    /// length via `.norms`. This is the invariant Block-Max-WAND's pruning
+    /// correctness depends on; if it is violated a real match can be
+    /// silently skipped.
+    ///
+    /// Each fixture document gets its own unique term (not shared with any
+    /// other document), so each term's `max_score_factor`/`block_max` is
+    /// derived **solely from that one document's length** -- a shared term
+    /// would let a short, unquantised document's larger factor mask a long
+    /// document's quantisation error, defeating the test.
+    #[test]
+    fn block_max_bound_is_never_violated_after_norms_quantisation() {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        // (unique term, term frequency, filler-word count). Field length =
+        // tf + filler. Spans well below and well above
+        // EXACT_LENGTH_BOUND (40) so quantisation actually applies to some.
+        let fixtures: Vec<(&str, u32, u32)> = vec![
+            ("shortterm", 2, 3),         // length 5, exact
+            ("boundaryterm", 1, 38),     // length 39, exact (boundary)
+            ("overterm", 5, 50),         // length 55, just above the window
+            ("longterm", 1, 999),        // length 1_000
+            ("verylongterm", 20, 4_980), // length 5_000
+        ];
+        for &(term, tf, filler) in &fixtures {
+            let mut body = format!("{term} ").repeat(tf as usize);
+            body.push_str(&"filler ".repeat(filler as usize));
+            writer
+                .add_document(crate::Document::builder().add_text("body", body).build())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let segment = inverted.segment_readers()[0].read().unwrap();
+
+        let stats = segment.field_stats("body").unwrap().unwrap();
+        let total_docs = segment.segment_info().doc_count;
+
+        for (doc_id, &(term, tf, _filler)) in fixtures.iter().enumerate() {
+            let doc_id = doc_id as u64;
+            let term_info = segment.term_info("body", term).unwrap().unwrap();
+            let scorer = BM25Scorer::with_block_max(
+                term_info.doc_frequency,
+                term_info.total_frequency,
+                stats.doc_count,
+                stats.avg_length,
+                total_docs,
+                1.0,
+                term_info.max_score_factor,
+                term_info.block_max.into(),
+            );
+
+            let field_length = segment.field_length(doc_id, "body").unwrap().unwrap();
+            let score = scorer.score(doc_id, tf as f32, Some(field_length as f32));
+
+            assert!(
+                score <= scorer.max_score() + 1e-4,
+                "doc {doc_id} ({term}): score {score} exceeds the term-level bound {}",
+                scorer.max_score()
+            );
+            assert!(
+                score <= scorer.block_max_score_at(doc_id) + 1e-4,
+                "doc {doc_id} ({term}): score {score} exceeds the block-max bound {}",
+                scorer.block_max_score_at(doc_id)
+            );
+        }
     }
 }
