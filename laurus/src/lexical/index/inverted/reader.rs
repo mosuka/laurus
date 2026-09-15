@@ -1967,7 +1967,11 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         // of per-segment factors — each segment computed
         // `max_score_factor` against its own `avg_field_length`, but
         // `max(seg_max)` remains a valid upper bound on any
-        // individual posting's TF-component contribution (#403 PR-B2).
+        // individual posting's TF-component contribution **as long as
+        // the query-time `avg_field_length` does not exceed the local
+        // average each factor was anchored against** (#403 PR-B2;
+        // soundness gap tracked and closed as #1120 — see the guard
+        // below).
         //
         // Block-max metadata is concatenated across segments
         // (#403 PR-D). The inverted writer assigns segments
@@ -1977,22 +1981,31 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         // on.
         //
         // Per-block `max_factor` was computed against each segment's
-        // local `avg_field_length`. The cross-segment BM25 scorer
-        // uses the global average; the per-block factor is therefore
-        // approximate. For corpora whose segments have similar
-        // average field lengths (the common case — segments are
-        // sized in docs, not field-length bytes) the divergence is
-        // small and the factor remains a usable bound. For corpora
-        // with widely-varying segment averages a future PR will need
-        // to either re-index or store enough per-block raw data
-        // (max-tf + min-field-length) to re-anchor the factor at
-        // query time.
+        // local `avg_field_length`. `BM25Scorer::tf`'s TF component is
+        // monotonically *increasing* in `avg_field_length` (a larger
+        // average shrinks `field_length / avg_length`, which shrinks
+        // the denominator), so a factor computed against a smaller
+        // local average understates what the same posting would score
+        // under a larger cross-segment average -- the precomputed
+        // bound would then no longer be an upper bound. The guard
+        // after this loop drops both `max_score_factor` and
+        // `block_max` whenever that cannot be ruled out, falling back
+        // to `BM25Scorer`'s always-valid loose `k1 + 1` ceiling
+        // (`scorer.rs`'s `max_score`/`current_block_max_score`/
+        // `block_max_score_at`). Tightening this (storing enough
+        // per-block raw data to re-anchor the factor at query time) is
+        // a format change tracked separately.
         let mut total_doc_freq = 0;
         let mut total_term_freq = 0;
         let mut max_score_factor: f32 = 0.0;
         let mut matched_count = 0_usize;
         let mut combined_block_max: Vec<crate::lexical::index::structures::dictionary::BlockMax> =
             Vec::new();
+        // Smallest local `avg_field_length` among segments that matched
+        // this term -- the soundness guard below needs the *tightest*
+        // (smallest) local average, since the bound was computed against
+        // whichever segment anchors the weakest.
+        let mut min_matched_avg: Option<f64> = None;
 
         for segment_reader in &self.segment_readers {
             let reader = segment_reader.read().unwrap();
@@ -2002,6 +2015,10 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
                 max_score_factor = max_score_factor.max(term_info.max_score_factor);
                 matched_count += 1;
                 combined_block_max.extend(term_info.block_max.iter().copied());
+                if let Some(stats) = reader.field_stats(field)? {
+                    min_matched_avg =
+                        Some(min_matched_avg.map_or(stats.avg_length, |m| m.min(stats.avg_length)));
+                }
             }
         }
 
@@ -2022,12 +2039,37 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         //    the searcher's break would fire too early.
         //
         // Falling back to the term-level `max_score_factor` in the
-        // multi-segment case sidesteps both issues. Cross-segment
-        // block-max passthrough is tracked as a follow-up.
+        // multi-segment case sidesteps both issues -- but does not by
+        // itself restore soundness, since `max_score_factor` is still
+        // carried forward: the guard below is what actually enforces
+        // it (#1120).
         let aggregated_block_max = if matched_count == 1 {
             combined_block_max
         } else {
             Vec::new()
+        };
+
+        // Soundness guard (#1120): `max_score_factor`/`aggregated_block_max`
+        // are only valid upper bounds if the `avg_field_length` a caller
+        // will actually score against (`Self::field_stats`, which
+        // `TermQuery::scorer` reads from this same reader) does not exceed
+        // the smallest local average any matched segment anchored its
+        // bound to. Compared at `f32` precision because that is the
+        // granularity `BM25Scorer::tf` actually computes at
+        // (`avg_field_length as f32`) -- comparing at `f64` could reject a
+        // bound that is provably safe once narrowed to `f32`.
+        let (max_score_factor, aggregated_block_max) = if found {
+            match min_matched_avg {
+                Some(min_avg) => match self.field_stats(field)? {
+                    Some(global_stats) if (global_stats.avg_length as f32) <= (min_avg as f32) => {
+                        (max_score_factor, aggregated_block_max)
+                    }
+                    _ => (0.0, Vec::new()),
+                },
+                None => (0.0, Vec::new()),
+            }
+        } else {
+            (max_score_factor, aggregated_block_max)
         };
 
         if found {
@@ -2093,7 +2135,13 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         self.check_closed()?;
 
         let mut total_doc_count = 0u64;
-        let mut total_length_sum = 0u64; // Sum of (avg_length * doc_count) for weighted average
+        // Sum of (avg_length * doc_count) for the weighted average. `f64`,
+        // not `u64` (#1120): truncating each segment's contribution before
+        // summing made even a single-segment index's aggregate diverge
+        // slightly from that segment's own `avg_length` -- and the
+        // `term_info` soundness guard below relies on the two being
+        // exactly equal in that case.
+        let mut total_length_sum = 0.0f64;
         let mut min_length = u64::MAX;
         let mut max_length = 0u64;
         let mut found = false;
@@ -2105,8 +2153,7 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
             // Get field stats from this segment
             if let Some(segment_stats) = reader.field_stats(field)? {
                 total_doc_count += segment_stats.doc_count;
-                total_length_sum +=
-                    (segment_stats.avg_length * segment_stats.doc_count as f64) as u64;
+                total_length_sum += segment_stats.avg_length * segment_stats.doc_count as f64;
                 min_length = min_length.min(segment_stats.min_length);
                 max_length = max_length.max(segment_stats.max_length);
                 found = true;
@@ -2120,7 +2167,7 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
                 total_terms: 0,  // Not aggregated
                 doc_count: total_doc_count,
                 avg_length: if total_doc_count > 0 {
-                    total_length_sum as f64 / total_doc_count as f64
+                    total_length_sum / total_doc_count as f64
                 } else {
                     0.0
                 },

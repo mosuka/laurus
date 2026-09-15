@@ -415,6 +415,13 @@ impl InvertedIndexSearcher {
         // re-activates PR-F's BMW pivot loop on each one. Cross-
         // segment merge collects the per-segment top-K into the
         // caller's collector.
+        //
+        // This gate is a performance choice, not a soundness one
+        // (#1120): a collector that falls through to the cross-segment
+        // matcher-driven path below still scores correctly, because
+        // `InvertedIndexReader::term_info`'s bound is only ever tight,
+        // never unsound, regardless of whether it went through this
+        // fanout.
         if collector.bmw_capable()
             && let Some(inverted_reader) =
                 self.reader.as_any().downcast_ref::<InvertedIndexReader>()
@@ -1971,6 +1978,12 @@ mod tests {
     /// from global-avg single-segment scoring. Comparing fanout to
     /// the **legacy path on the same multi-segment store** isolates
     /// the fanout's correctness from that scoring choice.
+    ///
+    /// This fixture's per-segment averages are close (see
+    /// `build_skewed_store_with_segments`), so the cross-segment bound
+    /// stays valid throughout. A fixture with sharply divergent segment
+    /// averages is covered separately by
+    /// `cross_segment_bm25_bound_holds_with_divergent_segment_avgs` (#1120).
     #[test]
     fn per_segment_fanout_topk_matches_legacy_multi_segment_path() {
         use crate::lexical::query::SearchHit;
@@ -2042,6 +2055,186 @@ mod tests {
                 tol,
             );
         }
+    }
+
+    /// #1120 fixture: two segments with deliberately divergent local
+    /// `avg_field_length` (2.0 vs 100.0), so the cross-segment weighted
+    /// average (~83.67) exceeds segment A's own local average. Targets
+    /// the corrected danger direction: a cross-segment aggregate *larger*
+    /// than a matching segment's local average, not smaller.
+    ///
+    /// `term_in_segment_b` additionally plants a "rare" occurrence in
+    /// segment B, producing `matched_count == 2` in
+    /// `InvertedIndexReader::term_info` -- exercising the case where the
+    /// `matched_count > 1` `block_max` fallback (`reader.rs:2027-2031`)
+    /// alone would *not* have restored soundness, since `max_score_factor`
+    /// still survives via `max()`.
+    fn build_divergent_avg_store(term_in_segment_b: bool) -> crate::lexical::store::LexicalStore {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+
+        // Segment A: 12 docs, local avg_field_length = 2.0. "rare" occurs
+        // in every doc (tf=1 in 11 of them, tf=2 in doc 11).
+        for id in 0..=10u64 {
+            let doc = Document::builder().add_text("body", "rare pad").build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store
+            .upsert_document(
+                11,
+                Document::builder().add_text("body", "rare rare").build(),
+            )
+            .unwrap();
+        store.commit().unwrap();
+
+        // Segment B: 60 docs, local avg_field_length = 100.0 (no "rare"
+        // unless `term_in_segment_b`, kept at exactly length 100 either
+        // way so the segment's own average is unaffected).
+        for id in 12..=71u64 {
+            let body = if term_in_segment_b && id == 12 {
+                format!("rare {}", "filler ".repeat(99))
+            } else {
+                "filler ".repeat(100)
+            };
+            let doc = Document::builder().add_text("body", body).build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+
+        store
+    }
+
+    /// #1120: the BM25 score bound (`TermInfo::max_score_factor`/
+    /// `block_max`, precomputed per-segment against that segment's own
+    /// `avg_field_length`) must remain a true upper bound against the
+    /// cross-segment `BM25Scorer` `TermQuery::scorer` actually builds
+    /// (`term.rs:71-104`), even when the cross-segment aggregate average
+    /// diverges sharply from a matching segment's local average.
+    ///
+    /// Mirrors `reader.rs`'s
+    /// `block_max_bound_is_never_violated_after_norms_quantisation`: build
+    /// the scorer exactly as `TermQuery::scorer` does, then check every
+    /// matched document's real score against both the term-level and
+    /// per-block bounds.
+    #[test]
+    fn cross_segment_bm25_bound_holds_with_divergent_segment_avgs() {
+        use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+
+        for term_in_segment_b in [false, true] {
+            let store = build_divergent_avg_store(term_in_segment_b);
+            let reader = store.reader_for_tests().unwrap();
+            let inverted = reader
+                .as_any()
+                .downcast_ref::<InvertedIndexReader>()
+                .unwrap();
+            assert_eq!(
+                inverted.segment_count(),
+                2,
+                "fixture must produce exactly two segments"
+            );
+
+            let term_info = reader.term_info("body", "rare").unwrap().unwrap();
+            let field_stats = reader.field_stats("body").unwrap().unwrap();
+            assert!(
+                field_stats.avg_length > 80.0 && field_stats.avg_length < 84.0,
+                "fixture's global avg_length should be ~83.67, got {}",
+                field_stats.avg_length
+            );
+
+            let scorer = BM25Scorer::with_block_max(
+                term_info.doc_freq,
+                term_info.total_freq,
+                field_stats.doc_count,
+                field_stats.avg_length,
+                reader.doc_count(),
+                1.0,
+                term_info.max_score_factor,
+                Arc::from(term_info.block_max.into_boxed_slice()),
+            );
+
+            // Every document containing "rare": docs 0..=10 (tf=1, len 2),
+            // doc 11 (tf=2, len 2), and doc 12 (tf=1, len 100) when planted.
+            let mut docs: Vec<(u64, f32, f32)> = (0..=10u64).map(|id| (id, 1.0, 2.0)).collect();
+            docs.push((11, 2.0, 2.0));
+            if term_in_segment_b {
+                docs.push((12, 1.0, 100.0));
+            }
+
+            for (doc_id, tf, field_length) in docs {
+                let score = scorer.score(doc_id, tf, Some(field_length));
+                assert!(
+                    score <= scorer.max_score() + 1e-4,
+                    "term_in_segment_b={term_in_segment_b}, doc {doc_id}: score {score} \
+                     exceeds the term-level bound {}",
+                    scorer.max_score()
+                );
+                assert!(
+                    score <= scorer.block_max_score_at(doc_id) + 1e-4,
+                    "term_in_segment_b={term_in_segment_b}, doc {doc_id}: score {score} \
+                     exceeds the block-max bound {}",
+                    scorer.block_max_score_at(doc_id)
+                );
+            }
+        }
+    }
+
+    /// #1120 end-to-end: a collector that reaches the cross-segment
+    /// matcher-driven path (bypassing the per-segment fanout, e.g. via
+    /// `NonBmwTopDocs`) must not lose a real top-1 document to the score
+    /// bound this issue fixes. Before the fix, doc 11 (the true top scorer
+    /// -- tf=2 among length-2 docs) was pruned because the stale bound
+    /// (anchored to segment A's local avg=2.0) fell below doc 11's real
+    /// score once the scorer used the larger cross-segment average.
+    #[test]
+    fn cross_segment_topk_is_not_pruned_by_stale_score_bound() {
+        use crate::lexical::query::SearchHit;
+
+        let store = build_divergent_avg_store(false);
+        let reader = store.reader_for_tests().unwrap();
+
+        // Ground truth: a heap large enough that it never fills, so
+        // `min_competitive` stays `NEG_INFINITY` and no pruning occurs
+        // (same technique as `bmw_topk_equivalence_should_or`).
+        let ground_truth: Vec<SearchHit> = {
+            let searcher = InvertedIndexSearcher::from_arc(reader.clone());
+            let collector = NonBmwTopDocs(TopDocsCollector::new(usize::MAX));
+            searcher
+                .search_with_collector(Box::new(TermQuery::new("body", "rare")), collector)
+                .unwrap()
+                .0
+                .results()
+        };
+
+        // The path under test: a real top-1 request through the same
+        // non-fanout collector.
+        let top1: Vec<SearchHit> = {
+            let searcher = InvertedIndexSearcher::from_arc(reader);
+            let collector = NonBmwTopDocs(TopDocsCollector::new(1));
+            searcher
+                .search_with_collector(Box::new(TermQuery::new("body", "rare")), collector)
+                .unwrap()
+                .0
+                .results()
+        };
+
+        let mut sorted_truth = ground_truth.clone();
+        sorted_truth.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+
+        assert_eq!(top1.len(), 1, "top-1 request must return exactly one hit");
+        assert_eq!(
+            top1[0].doc_id,
+            sorted_truth[0].doc_id,
+            "top-1 must match the unpruned ground truth's top document \
+             (ground truth top-5: {:?})",
+            sorted_truth[..5.min(sorted_truth.len())]
+                .iter()
+                .map(|h| (h.doc_id, h.score))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// PR-F follow-up #476 Phase 1: the per-segment fanout must
