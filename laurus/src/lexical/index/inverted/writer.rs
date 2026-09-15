@@ -24,6 +24,7 @@ use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::structures::bkd_tree::BKDWriter;
 use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermInfo};
 use crate::lexical::index::structures::doc_values::DocValuesWriter;
+use crate::lexical::index::structures::norms::NormsBuilder;
 use crate::lexical::writer::LexicalIndexWriter;
 
 use crate::storage::Storage;
@@ -1241,6 +1242,12 @@ impl InvertedIndexWriter {
         self.write_stored_documents(&mut sink)?;
         self.write_field_lengths(&mut sink)?;
         self.write_field_stats(&mut sink)?;
+        // Additive (#555 Phase 2): written alongside the files above so
+        // existing readers are unaffected until Phase 4 switches them over.
+        // `NormsBuilder` also anchors `write_inverted_index`'s BM25 score
+        // bound once Phase 3 lands; for now it exists purely to produce
+        // `.norms`.
+        self.write_norms(&mut sink)?;
         self.write_doc_values(&mut sink)?;
         self.write_bkd_trees(&mut sink)?;
         sink.finish()
@@ -1682,6 +1689,20 @@ impl InvertedIndexWriter {
         }
 
         fstats_writer.close()?;
+        sink.seal()?;
+        Ok(())
+    }
+
+    /// Write the `.norms` segment part (Issue #555 Phase 2): a columnar,
+    /// 1-byte-quantised field-length column that will eventually replace
+    /// `.lens`/`.fstats`. Written alongside them for now — the reader does
+    /// not consult `.norms` until Phase 4.
+    fn write_norms(&self, sink: &mut PartSink<'_>) -> Result<()> {
+        let norms_output = sink.part("norms")?;
+        let mut norms_writer = StructWriter::new(norms_output);
+        let norms = NormsBuilder::from_buffered(&self.buffered_docs);
+        norms.write_to(&mut norms_writer)?;
+        norms_writer.close()?;
         sink.seal()?;
         Ok(())
     }
