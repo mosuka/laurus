@@ -38,6 +38,17 @@ pub trait Collector: Send + Debug {
     /// which disables the optimisation for collectors that do not have
     /// a meaningful upper-bound concept (count-only, all-docs, etc.).
     ///
+    /// Returning a finite value here is always safe regardless of which
+    /// search path (per-segment fanout or the cross-segment matcher-driven
+    /// default) a caller's query ends up on: the scorer's own upper bound
+    /// (`Scorer::max_score`/`block_max_score_at`) is guaranteed sound
+    /// against whatever `avg_field_length` it was actually built with —
+    /// `InvertedIndexReader::term_info` drops an unprovable cross-segment
+    /// bound to the always-valid loose ceiling rather than ship one that
+    /// could prune a real match (#1120). A finite `min_competitive` does
+    /// not need [`Self::bmw_capable`]'s fanout routing to stay correct;
+    /// that routing is purely a performance choice.
+    ///
     /// # Returns
     ///
     /// The score that an incoming candidate's upper bound must exceed
@@ -56,6 +67,9 @@ pub trait Collector: Send + Debug {
     /// `AllDocsCollector`) keep the default `false` so the searcher
     /// stays on the existing matcher-driven path, where BMW would add
     /// overhead without delivering any pruning benefit.
+    ///
+    /// This is a performance hint only, not a correctness precondition
+    /// for [`Self::min_competitive`] (#1120) — see its doc comment.
     fn bmw_capable(&self) -> bool {
         false
     }

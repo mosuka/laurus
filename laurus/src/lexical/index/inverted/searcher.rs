@@ -415,6 +415,13 @@ impl InvertedIndexSearcher {
         // re-activates PR-F's BMW pivot loop on each one. Cross-
         // segment merge collects the per-segment top-K into the
         // caller's collector.
+        //
+        // This gate is a performance choice, not a soundness one
+        // (#1120): a collector that falls through to the cross-segment
+        // matcher-driven path below still scores correctly, because
+        // `InvertedIndexReader::term_info`'s bound is only ever tight,
+        // never unsound, regardless of whether it went through this
+        // fanout.
         if collector.bmw_capable()
             && let Some(inverted_reader) =
                 self.reader.as_any().downcast_ref::<InvertedIndexReader>()

@@ -22,6 +22,15 @@
 //! divergence between segments is accepted: top-K ranking from each
 //! segment, then merge.
 //!
+//! This view exists for *tightness* (keeping `block_max` usable for
+//! Block-Max-WAND pruning), not *soundness*: `InvertedIndexReader::term_info`
+//! (the cross-segment aggregate this view deliberately avoids for
+//! `max_score_factor`/`block_max`) already drops those fields to a safe
+//! `0.0`/empty whenever it cannot prove they are a valid bound against the
+//! `avg_field_length` a caller would actually score with (#1120) — so a
+//! caller using the aggregate reader directly is never unsound, only
+//! potentially looser than this per-segment view.
+//!
 //! ## Why this matters for #476
 //!
 //! `InvertedIndexReader::term_info`'s cross-segment aggregation
