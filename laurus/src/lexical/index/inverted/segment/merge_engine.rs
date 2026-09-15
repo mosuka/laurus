@@ -1671,4 +1671,186 @@ mod tests {
             "the merged value itself must be intact"
         );
     }
+
+    /// #1122: a field that analyzes to zero tokens has no term postings,
+    /// so `reconstruct_segment`'s old `field_terms.keys()`-only enumeration
+    /// silently dropped its length across a merge (`Some(0)` -> `None`).
+    ///
+    /// The normal flush path (`InvertedIndexWriter::analyze_document`)
+    /// never records `Some(0)` in the first place -- it skips inserting a
+    /// field into `field_terms`/`field_lengths` whenever analysis produces
+    /// no terms. `DocumentParser::parse` has no such guard (Issue #1114's
+    /// investigation), so this fixture goes through
+    /// `DocumentParser::parse` + `InvertedIndexWriter::add_analyzed_document`
+    /// -- the exact usage `add_analyzed_document`'s own doc comment
+    /// recommends -- to produce a document with a real, recorded zero
+    /// length to begin with.
+    #[test]
+    fn merge_preserves_a_zero_length_field_produced_by_document_parser() {
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+        use crate::lexical::core::field::{FieldOption, TextOption};
+        use crate::lexical::core::parser::DocumentParser;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("body".to_string(), FieldOption::Text(TextOption::default()));
+        let config = InvertedIndexWriterConfig {
+            fields: fields.clone(),
+            ..Default::default()
+        };
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+
+        let per_field = PerFieldAnalyzer::new(Arc::new(StandardAnalyzer::new().unwrap()));
+        let doc_parser = DocumentParser::new(Arc::new(per_field)).with_fields(fields);
+        let analyzed = doc_parser
+            .parse(Document::builder().add_text("body", "").build())
+            .unwrap();
+        assert_eq!(
+            analyzed.field_lengths.get("body"),
+            Some(&0),
+            "test precondition: DocumentParser must record a zero length, \
+             not skip the field entirely"
+        );
+        let d0 = writer.add_analyzed_document(analyzed).unwrap();
+        writer.commit().unwrap(); // segment_000000
+
+        let d1 = writer
+            .add_document(
+                Document::builder()
+                    .add_text("body", "quick brown fox")
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap(); // segment_000001
+        drop(writer);
+
+        let si0 = segment_info("segment_000000", 1, d0, d0, 0);
+        assert_eq!(
+            SegmentReader::open(si0.clone(), storage.clone())
+                .unwrap()
+                .field_length(d0, "body")
+                .unwrap(),
+            Some(0),
+            "pre-merge: the zero-token field must read back as Some(0)"
+        );
+
+        let si1 = segment_info("segment_000001", 1, d1, d1, 1);
+        let candidate = MergeCandidate {
+            segments: vec![si0.segment_id.clone(), si1.segment_id.clone()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine
+            .merge_segments(
+                &candidate,
+                &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
+                1,
+            )
+            .unwrap();
+
+        let merged =
+            SegmentReader::open(result.new_segment.segment_info.clone(), storage.clone()).unwrap();
+        assert_eq!(
+            merged.field_length(d0, "body").unwrap(),
+            Some(0),
+            "post-merge: the zero-token field's length must survive as \
+             Some(0), not vanish to None"
+        );
+        assert!(
+            merged.field_length(d1, "body").unwrap().unwrap() > 0,
+            "sanity: the ordinary document's real length must be unaffected"
+        );
+    }
+
+    /// #1122 via the field-rebuild path (`reconstruct_segment_with_field_override`,
+    /// Issue #1081): `target_field` itself re-analyzing to zero tokens must
+    /// also survive as `Some(0)`, not `None` -- and a document that never
+    /// had `target_field` at all must not gain a phantom `Some(0)` merely
+    /// because the field is in the segment's recorded-length set.
+    #[test]
+    fn field_rebuild_preserves_a_target_field_that_re_analyzes_to_zero_tokens() {
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+        use crate::lexical::core::field::{FieldOption, TextOption};
+        use crate::lexical::core::parser::DocumentParser;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("body".to_string(), FieldOption::Text(TextOption::default()));
+        fields.insert(
+            "other".to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
+        let config = InvertedIndexWriterConfig {
+            fields: fields.clone(),
+            ..Default::default()
+        };
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+
+        // d0: "body" recorded as Some(0) via DocumentParser (same
+        // precondition as the plain-merge test above) -- this is what the
+        // rebuild's re-analysis of the still-empty stored value must
+        // reproduce.
+        let per_field = PerFieldAnalyzer::new(Arc::new(StandardAnalyzer::new().unwrap()));
+        let doc_parser = DocumentParser::new(Arc::new(per_field)).with_fields(fields);
+        let analyzed = doc_parser
+            .parse(Document::builder().add_text("body", "").build())
+            .unwrap();
+        let d0 = writer.add_analyzed_document(analyzed).unwrap();
+
+        // d1: no "body" field at all -- must never gain a phantom length.
+        let d1 = writer
+            .add_document(Document::builder().add_text("other", "hello").build())
+            .unwrap();
+        writer.commit().unwrap(); // segment_000000
+        drop(writer);
+
+        let si0 = segment_info("segment_000000", 2, d0.min(d1), d0.max(d1), 0);
+        assert_eq!(
+            SegmentReader::open(si0.clone(), storage.clone())
+                .unwrap()
+                .field_length(d1, "body")
+                .unwrap(),
+            None,
+            "sanity: a document without the field has no recorded length"
+        );
+
+        let rebuild_analyzer: Arc<dyn Analyzer> = Arc::new(PerFieldAnalyzer::new(Arc::new(
+            StandardAnalyzer::new().unwrap(),
+        )));
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let results = engine
+            .rebuild_field_across_segments(
+                &[ManagedSegmentInfo::new(si0)],
+                "body",
+                Some(&rebuild_analyzer),
+                false,
+                false,
+                &["segment_rebuilt".to_string()],
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        let rebuilt =
+            SegmentReader::open(results[0].new_segment.segment_info.clone(), storage).unwrap();
+        assert_eq!(
+            rebuilt.field_length(d0, "body").unwrap(),
+            Some(0),
+            "the rebuilt target_field's zero-token re-analysis must survive \
+             as Some(0), not None"
+        );
+        assert_eq!(
+            rebuilt.field_length(d1, "body").unwrap(),
+            None,
+            "a document that never had target_field must not gain a \
+             phantom Some(0) from being in the segment's recorded-length set"
+        );
+    }
 }
