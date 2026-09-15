@@ -93,7 +93,7 @@ fn assert_round_trip(index: &InvertedIndex, storage: &Arc<dyn Storage>) {
     let files = storage.list_files().unwrap();
     let containers = files.iter().filter(|f| f.ends_with(".cfs")).count();
     assert_eq!(containers, 2, "one container per committed segment");
-    for suffix in [".post", ".dict", ".docs", ".lens", ".fstats", ".dv", ".bkd"] {
+    for suffix in [".post", ".dict", ".docs", ".norms", ".dv", ".bkd"] {
         assert!(
             !files.iter().any(|f| f.ends_with(suffix)),
             "no loose {suffix} may exist next to the containers: {files:?}"

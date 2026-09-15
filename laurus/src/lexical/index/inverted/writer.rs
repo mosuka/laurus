@@ -24,6 +24,7 @@ use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::structures::bkd_tree::BKDWriter;
 use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermInfo};
 use crate::lexical::index::structures::doc_values::DocValuesWriter;
+use crate::lexical::index::structures::norms::NormsBuilder;
 use crate::lexical::writer::LexicalIndexWriter;
 
 use crate::storage::Storage;
@@ -1237,10 +1238,21 @@ impl InvertedIndexWriter {
                 paths: Vec::new(),
             }
         };
-        self.write_inverted_index(&mut sink)?;
+        // Built once and shared by `write_inverted_index` (BM25 score-bound
+        // precomputation) and `write_norms` (the `.norms` part itself) —
+        // #555 Phase 3. A single instance is what guarantees the two agree
+        // on the same decoded (quantised-then-decoded) length; two
+        // independent traversals of `buffered_docs` (as `.lens`/`.fstats`
+        // did) is how the score bound and the on-disk length could
+        // silently diverge once quantisation was introduced.
+        let norms = NormsBuilder::from_buffered(&self.buffered_docs);
+        self.write_inverted_index(&mut sink, &norms)?;
         self.write_stored_documents(&mut sink)?;
-        self.write_field_lengths(&mut sink)?;
-        self.write_field_stats(&mut sink)?;
+        // `.lens`/`.fstats` are no longer written (#555 Phase 5); `.norms`
+        // is the sole field-length/statistics source for new segments. Old
+        // segments that still carry `.lens`/`.fstats` remain readable via
+        // `SegmentNorms::Legacy` until their next merge.
+        self.write_norms(&mut sink, &norms)?;
         self.write_doc_values(&mut sink)?;
         self.write_bkd_trees(&mut sink)?;
         sink.finish()
@@ -1284,26 +1296,12 @@ impl InvertedIndexWriter {
     }
 
     /// Write the inverted index to storage.
-    fn write_inverted_index(&self, sink: &mut PartSink<'_>) -> Result<()> {
+    fn write_inverted_index(&self, sink: &mut PartSink<'_>, norms: &NormsBuilder) -> Result<()> {
         // Write posting lists
         let posting_output = sink.part("post")?;
         let mut posting_writer = StructWriter::new(posting_output);
 
         let mut term_dict_builder = TermDictionaryBuilder::new();
-
-        // Compute per-field average length and a `doc_id → field_lengths`
-        // lookup once per flush. Both are needed to precompute the
-        // tightened BM25 TF-component upper bound stored as
-        // `TermInfo::max_score_factor` (#403 PR-B2). The factor uses
-        // the default BM25 parameters (`k1 = 1.2`, `b = 0.75`) — at
-        // search time, scorers fall back to the loose `k1 + 1` ceiling
-        // when the caller overrides `(k1, b)`.
-        let field_avg_lengths = self.compute_field_avg_lengths();
-        let field_lengths_by_doc: AHashMap<u64, &AHashMap<String, u32>> = self
-            .buffered_docs
-            .iter()
-            .map(|(doc_id, doc)| (*doc_id, &doc.field_lengths))
-            .collect();
 
         // Collect and sort terms for deterministic output
         let mut terms: Vec<_> = self.inverted_index.terms().collect();
@@ -1329,25 +1327,18 @@ impl InvertedIndexWriter {
                 // the BM25 scorer will fall back to the loose bound.
                 let (max_score_factor, block_max) = match term.split_once(':') {
                     Some((field_name, _)) => {
-                        let avg_len = field_avg_lengths
-                            .get(field_name)
-                            .copied()
-                            .unwrap_or(0.0_f32);
+                        let avg_len = norms.avg_length_f32(field_name);
                         let term_factor = Self::compute_term_max_score_factor(
                             posting_list,
                             field_name,
                             avg_len,
-                            &field_lengths_by_doc,
+                            norms,
                         );
                         // Compute per-block max-impact metadata for
                         // Block-Max-WAND (#403 PR-C). A term with no
                         // postings naturally produces no blocks.
-                        let blocks = Self::compute_term_block_max(
-                            posting_list,
-                            field_name,
-                            avg_len,
-                            &field_lengths_by_doc,
-                        );
+                        let blocks =
+                            Self::compute_term_block_max(posting_list, field_name, avg_len, norms);
                         (term_factor, blocks)
                     }
                     None => (0.0_f32, Vec::new()),
@@ -1381,32 +1372,6 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Compute per-field average field length over the currently
-    /// buffered documents. Used by [`Self::write_inverted_index`] to
-    /// precompute the tightened BM25 TF-component bound that lands in
-    /// each term's `TermInfo::max_score_factor` (#403 PR-B2).
-    fn compute_field_avg_lengths(&self) -> AHashMap<String, f32> {
-        let mut totals: AHashMap<String, (u64, u64)> = AHashMap::new();
-        for (_doc_id, doc) in &self.buffered_docs {
-            for (field_name, &length) in &doc.field_lengths {
-                let entry = totals.entry(field_name.clone()).or_insert((0, 0));
-                entry.0 += 1; // doc count contributing to this field
-                entry.1 += length as u64; // total length for this field
-            }
-        }
-        totals
-            .into_iter()
-            .map(|(field, (count, total))| {
-                let avg = if count > 0 {
-                    total as f32 / count as f32
-                } else {
-                    0.0
-                };
-                (field, avg)
-            })
-            .collect()
-    }
-
     /// Compute the per-term tightened BM25 TF-component upper bound
     /// using the default `k1 = 1.2`, `b = 0.75` parameters and the
     /// segment's average field length (#403 PR-B2).
@@ -1415,11 +1380,16 @@ impl InvertedIndexWriter {
     /// `(tf · (k1 + 1)) / (tf + k1 · (1 - b + b · (L / avg_L)))`
     /// taken over every posting in `posting_list`. `0.0` if the
     /// posting list is empty or no doc lengths are resolvable.
+    ///
+    /// `L` is read via [`NormsBuilder::decoded_length`] — the same
+    /// quantised-then-decoded value the reader will substitute back in at
+    /// search time (#555) — not the exact length, so this bound stays a
+    /// true upper bound once `.norms` is what the reader consults.
     fn compute_term_max_score_factor(
         posting_list: &crate::lexical::index::inverted::core::posting::PostingList,
         field_name: &str,
         avg_field_length: f32,
-        field_lengths_by_doc: &AHashMap<u64, &AHashMap<String, u32>>,
+        norms: &NormsBuilder,
     ) -> f32 {
         const K1: f32 = 1.2;
         const B: f32 = 0.75;
@@ -1430,10 +1400,8 @@ impl InvertedIndexWriter {
             if tf == 0.0 {
                 continue;
             }
-            let field_len = field_lengths_by_doc
-                .get(&posting.doc_id)
-                .and_then(|fls| fls.get(field_name))
-                .copied()
+            let field_len = norms
+                .decoded_length(posting.doc_id, field_name)
                 .unwrap_or(0) as f32;
             let len_ratio = if avg_field_length > 0.0 {
                 field_len / avg_field_length
@@ -1465,7 +1433,7 @@ impl InvertedIndexWriter {
         posting_list: &crate::lexical::index::inverted::core::posting::PostingList,
         field_name: &str,
         avg_field_length: f32,
-        field_lengths_by_doc: &AHashMap<u64, &AHashMap<String, u32>>,
+        norms: &NormsBuilder,
     ) -> Vec<crate::lexical::index::structures::dictionary::BlockMax> {
         use crate::lexical::index::structures::dictionary::{BLOCK_SIZE, BlockMax};
 
@@ -1484,10 +1452,8 @@ impl InvertedIndexWriter {
                 if tf == 0.0 {
                     continue;
                 }
-                let field_len = field_lengths_by_doc
-                    .get(&posting.doc_id)
-                    .and_then(|fls| fls.get(field_name))
-                    .copied()
+                let field_len = norms
+                    .decoded_length(posting.doc_id, field_name)
                     .unwrap_or(0) as f32;
                 let len_ratio = if avg_field_length > 0.0 {
                     field_len / avg_field_length
@@ -1606,82 +1572,14 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Calculate field statistics from buffered documents.
-    fn calculate_field_stats(&self) -> AHashMap<String, (u64, f64, u64, u64)> {
-        // field_name -> (doc_count, total_length, min_length, max_length)
-        let mut field_stats: AHashMap<String, (u64, u64, u64, u64)> = AHashMap::new();
-
-        for (_doc_id, doc) in &self.buffered_docs {
-            for (field_name, &length) in &doc.field_lengths {
-                let stats = field_stats
-                    .entry(field_name.clone())
-                    .or_insert((0, 0, u64::MAX, 0));
-                stats.0 += 1; // doc_count
-                stats.1 += length as u64; // total_length
-                stats.2 = stats.2.min(length as u64); // min_length
-                stats.3 = stats.3.max(length as u64); // max_length
-            }
-        }
-
-        // Convert to (doc_count, avg_length, min_length, max_length)
-        field_stats
-            .into_iter()
-            .map(
-                |(field, (doc_count, total_length, min_length, max_length))| {
-                    let avg_length = if doc_count > 0 {
-                        total_length as f64 / doc_count as f64
-                    } else {
-                        0.0
-                    };
-                    (field, (doc_count, avg_length, min_length, max_length))
-                },
-            )
-            .collect()
-    }
-
-    /// Write field lengths to storage.
-    fn write_field_lengths(&self, sink: &mut PartSink<'_>) -> Result<()> {
-        let lens_output = sink.part("lens")?;
-        let mut lens_writer = StructWriter::new(lens_output);
-
-        // Write document count
-        lens_writer.write_varint(self.buffered_docs.len() as u64)?;
-
-        // Write field lengths for each document
-        for (doc_id, doc) in &self.buffered_docs {
-            lens_writer.write_u64(*doc_id)?;
-            lens_writer.write_varint(doc.field_lengths.len() as u64)?;
-
-            for (field_name, length) in &doc.field_lengths {
-                lens_writer.write_string(field_name)?;
-                lens_writer.write_u32(*length)?;
-            }
-        }
-
-        lens_writer.close()?;
-        sink.seal()?;
-        Ok(())
-    }
-
-    /// Write field statistics to storage.
-    fn write_field_stats(&self, sink: &mut PartSink<'_>) -> Result<()> {
-        let fstats_output = sink.part("fstats")?;
-        let mut fstats_writer = StructWriter::new(fstats_output);
-
-        let field_stats = self.calculate_field_stats();
-
-        // Write number of fields
-        fstats_writer.write_varint(field_stats.len() as u64)?;
-
-        for (field_name, (doc_count, avg_length, min_length, max_length)) in field_stats {
-            fstats_writer.write_string(&field_name)?;
-            fstats_writer.write_u64(doc_count)?;
-            fstats_writer.write_f64(avg_length)?;
-            fstats_writer.write_u64(min_length)?;
-            fstats_writer.write_u64(max_length)?;
-        }
-
-        fstats_writer.close()?;
+    /// Write the `.norms` segment part (Issue #555): a columnar,
+    /// 1-byte-quantised field-length column that replaces the old
+    /// `.lens`/`.fstats` files.
+    fn write_norms(&self, sink: &mut PartSink<'_>, norms: &NormsBuilder) -> Result<()> {
+        let norms_output = sink.part("norms")?;
+        let mut norms_writer = StructWriter::new(norms_output);
+        norms.write_to(&mut norms_writer)?;
+        norms_writer.close()?;
         sink.seal()?;
         Ok(())
     }
@@ -2547,6 +2445,62 @@ impl PartSink<'_> {
 mod tests {
     use super::*;
     use crate::data::DataValue;
+    use crate::lexical::index::inverted::core::posting::PostingList;
+
+    /// #555 Phase 3: the score-bound precomputation must anchor to the
+    /// *decoded* (quantised-then-decoded) length, not the exact one --
+    /// otherwise the reader (which will only ever see the decoded length
+    /// once Phase 4 lands) could score a document above the bound `.dict`
+    /// stored for it, letting Block-Max-WAND wrongly prune a real match.
+    #[test]
+    fn score_bound_uses_decoded_length_and_never_tightens_relative_to_exact() {
+        let exact_len = 10_000u32; // above EXACT_LENGTH_BOUND, so quantisation is lossy
+        let mut doc = AnalyzedDocument::new();
+        doc.field_lengths.insert("body".to_string(), exact_len);
+        let docs = vec![(7u64, doc)];
+        let norms = NormsBuilder::from_buffered(&docs);
+
+        let decoded_len = norms.decoded_length(7, "body").unwrap();
+        assert!(
+            decoded_len < exact_len,
+            "test is only meaningful if quantisation actually lost precision"
+        );
+
+        let mut postings = PostingList::new("body:widget".to_string());
+        postings.add_posting(Posting::with_frequency(7, 3));
+
+        let avg_len = norms.avg_length_f32("body");
+        assert_eq!(avg_len, exact_len as f32); // single doc: avg == exact
+
+        let factor_from_decoded =
+            InvertedIndexWriter::compute_term_max_score_factor(&postings, "body", avg_len, &norms);
+
+        const K1: f32 = 1.2;
+        const B: f32 = 0.75;
+        let bm25_tf_factor = |length: f32| -> f32 {
+            let tf = 3.0_f32;
+            let len_ratio = length / avg_len;
+            let denom = tf + K1 * (1.0 - B + B * len_ratio);
+            (tf * (K1 + 1.0)) / denom
+        };
+
+        assert_eq!(
+            factor_from_decoded,
+            bm25_tf_factor(decoded_len as f32),
+            "the writer's bound must be anchored to the decoded length, not the exact one"
+        );
+
+        // Soundness: a bound computed from a length that never overestimates
+        // the true (quantised) length can only be looser (>=) than one
+        // computed from the exact length -- never tighter, which is what
+        // would let Block-Max-WAND wrongly prune a matching document.
+        let factor_from_exact = bm25_tf_factor(exact_len as f32);
+        assert!(
+            factor_from_decoded >= factor_from_exact,
+            "decoded-length bound ({factor_from_decoded}) must never be tighter than \
+             the exact-length bound ({factor_from_exact})"
+        );
+    }
 
     /// An `AnalyzedDocument` carrying only `point_values`.
     fn doc_with_points(count: usize, dims: usize) -> AnalyzedDocument {

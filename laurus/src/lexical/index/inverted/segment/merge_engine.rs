@@ -789,7 +789,11 @@ impl MergeEngine {
             }
 
             // Field lengths are read back from the segment so BM25 length
-            // normalization is preserved exactly. Only indexed fields have a
+            // normalization is preserved -- exactly for a source segment
+            // still on `.lens`/`.fstats`, or up to the `.norms` quantisation
+            // (Issue #555) once the source has already been through it; the
+            // quantisation is idempotent, so re-merging a `.norms` segment
+            // does not compound the rounding. Only indexed fields have a
             // recorded length.
             let indexed_fields: Vec<String> = analyzed.field_terms.keys().cloned().collect();
             for field_name in indexed_fields {
