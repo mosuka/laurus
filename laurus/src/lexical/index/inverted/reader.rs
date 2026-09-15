@@ -469,6 +469,16 @@ impl SegmentNorms {
             SegmentNorms::Legacy { stats, .. } => stats.get(field).cloned(),
         }
     }
+
+    /// All field names this segment recorded a length for (#1122). For
+    /// `Legacy`, `stats`' keys are exactly `.fstats`' field directory --
+    /// the same field set `.lens` carries per-doc entries for.
+    fn field_names(&self) -> Vec<String> {
+        match self {
+            SegmentNorms::V1(reader) => reader.field_names(),
+            SegmentNorms::Legacy { stats, .. } => stats.keys().cloned().collect(),
+        }
+    }
 }
 
 /// Reader for a single segment (schema-less mode).
@@ -1099,6 +1109,21 @@ impl SegmentReader {
         self.load_norms()?;
         let norms = self.norms.read().unwrap();
         Ok(norms.as_ref().and_then(|n| n.field_length(doc_id, field)))
+    }
+
+    /// All field names this segment recorded a length for (#1122).
+    ///
+    /// Mirrors [`Self::bkd_field_names`]'s role for BKD trees: the merge
+    /// engine needs this to reconstruct a length for a field that analyzed
+    /// to zero tokens for a given document, which leaves no term postings
+    /// and so would otherwise be invisible to a `field_terms`-keyed
+    /// enumeration.
+    pub(crate) fn norms_field_names(&self) -> Result<Vec<String>> {
+        if self.norms.read().unwrap().is_none() {
+            self.load_norms()?;
+        }
+        let norms = self.norms.read().unwrap();
+        Ok(norms.as_ref().map(|n| n.field_names()).unwrap_or_default())
     }
 
     /// Get a document by ID from this segment.

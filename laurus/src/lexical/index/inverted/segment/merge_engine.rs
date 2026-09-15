@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use roaring::RoaringTreemap;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
@@ -757,6 +757,16 @@ impl MergeEngine {
             }
         }
 
+        // Every field name this segment ever recorded a length for,
+        // fetched once (not per document): a field that analyzed to zero
+        // tokens for a document has no term postings, so it never appears
+        // in that document's `field_terms` -- enumerating from
+        // `field_terms.keys()` alone would silently drop its `Some(0)`
+        // length across the merge (Issue #1122). `reader.field_length`
+        // already returns `None` for a field this particular document
+        // doesn't have, so unioning this segment-wide set in is safe.
+        let recorded_length_fields = reader.norms_field_names()?;
+
         // Pass 2: assemble each live document.
         let mut out = Vec::new();
         for doc_id in reader.doc_ids()? {
@@ -793,9 +803,10 @@ impl MergeEngine {
             // still on `.lens`/`.fstats`, or up to the `.norms` quantisation
             // (Issue #555) once the source has already been through it; the
             // quantisation is idempotent, so re-merging a `.norms` segment
-            // does not compound the rounding. Only indexed fields have a
-            // recorded length.
-            let indexed_fields: Vec<String> = analyzed.field_terms.keys().cloned().collect();
+            // does not compound the rounding.
+            let mut indexed_fields: AHashSet<String> =
+                analyzed.field_terms.keys().cloned().collect();
+            indexed_fields.extend(recorded_length_fields.iter().cloned());
             for field_name in indexed_fields {
                 if let Some(len) = reader.field_length(doc_id, &field_name)? {
                     analyzed.field_lengths.insert(field_name, len);
@@ -913,6 +924,11 @@ impl MergeEngine {
             }
         }
 
+        // Every field name this segment ever recorded a length for,
+        // fetched once (not per document) -- see `reconstruct_segment`'s
+        // identical comment (Issue #1122).
+        let recorded_length_fields = reader.norms_field_names()?;
+
         // Pass 2: assemble each live document, re-deriving `target_field`
         // from its stored value via the SAME per-value analysis
         // `InvertedIndexWriter::analyze_document` uses for fresh ingestion
@@ -948,6 +964,12 @@ impl MergeEngine {
                     .insert(field_name.clone(), value.clone());
             }
 
+            // `target_field` must not get a phantom `Some(0)` length
+            // below when a document never had it at all (#1122) -- record
+            // presence before the re-analysis block, which only inserts
+            // into `field_terms` when re-analysis actually produced terms.
+            let target_field_present_for_doc = stored.fields.contains_key(target_field);
+
             if let (Some(analyzer), Some(target_value)) =
                 (analyzer, stored.fields.get(target_field))
             {
@@ -963,11 +985,24 @@ impl MergeEngine {
             // `target_field`'s terms/points are already absent (Pass 1/1.5
             // skipped it above), so there is nothing further to do here.
 
-            let indexed_fields: Vec<String> = analyzed.field_terms.keys().cloned().collect();
+            let mut indexed_fields: AHashSet<String> =
+                analyzed.field_terms.keys().cloned().collect();
+            indexed_fields.extend(recorded_length_fields.iter().cloned());
             for field_name in indexed_fields {
                 if field_name == target_field {
-                    let len = analyzed.field_terms[&field_name].len() as u32;
-                    analyzed.field_lengths.insert(field_name, len);
+                    // Only record a length when `target_field` was
+                    // actually (re)analyzed for this document -- covers
+                    // the field re-analyzing to zero tokens (#1122, via
+                    // `map_or(0, ..)` since a zero-token result leaves no
+                    // `field_terms` entry) without inventing a length for
+                    // a document that never had the field at all.
+                    if analyzer.is_some() && target_field_present_for_doc {
+                        let len = analyzed
+                            .field_terms
+                            .get(target_field)
+                            .map_or(0, |t| t.len() as u32);
+                        analyzed.field_lengths.insert(field_name, len);
+                    }
                 } else if let Some(len) = reader.field_length(doc_id, &field_name)? {
                     analyzed.field_lengths.insert(field_name, len);
                 }
