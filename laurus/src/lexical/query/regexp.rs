@@ -119,6 +119,10 @@ impl MultiTermQuery for RegexpQuery {
 }
 
 impl Query for RegexpQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         let rewritten = MultiTermQuery::rewrite(self, reader)?;
         rewritten.matcher(reader)

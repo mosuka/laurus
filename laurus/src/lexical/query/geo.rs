@@ -450,6 +450,10 @@ impl GeoDistanceQuery {
 }
 
 impl Query for GeoDistanceQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         let matches = self.find_matches(reader)?;
         Ok(Box::new(GeoMatcher::new(matches)))
@@ -817,6 +821,10 @@ impl GeoBoundingBoxQuery {
 }
 
 impl Query for GeoBoundingBoxQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         let matches = self.find_matches(reader)?;
         Ok(Box::new(GeoMatcher::new(matches)))

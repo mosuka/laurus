@@ -201,6 +201,10 @@ impl MultiTermQuery for WildcardQuery {
 }
 
 impl Query for WildcardQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         let rewritten = MultiTermQuery::rewrite(self, reader)?;
         rewritten.matcher(reader)
