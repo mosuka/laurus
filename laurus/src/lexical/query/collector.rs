@@ -312,7 +312,6 @@ impl<'a> TopFieldCollector<'a> {
 
     /// Consume the collector, yielding its top-K best-first together with
     /// the sort value each entry was ranked by (#1127).
-    #[allow(dead_code)] // consumed by the fanout merge in the next commit
     pub(crate) fn into_field_hits(self) -> Vec<FieldHit> {
         self.top_k.into_sorted_hits()
     }

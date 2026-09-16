@@ -20,7 +20,7 @@ use crate::lexical::index::inverted::reader::InvertedIndexReader;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanQuery, Occur};
 use crate::lexical::query::collector::{
-    Collector, CountCollector, TopDocsCollector, TopFieldCollector,
+    Collector, CountCollector, FieldHit, FieldTopK, TopDocsCollector, TopFieldCollector,
 };
 use crate::lexical::query::parser::LexicalQueryParser;
 use crate::lexical::query::term::TermQuery;
@@ -81,6 +81,18 @@ fn sort_key_as_point(value: &crate::lexical::core::field::FieldValue) -> Option<
         FieldValue::DateTime(dt) => Some(dt.timestamp() as f64),
         _ => None,
     }
+}
+
+/// Pruning floor established by a full lead top-K (#944), read off the
+/// value the per-segment collector ranked its K-th hit by (#1127) — no
+/// DocValues re-read. `None` below `limit` hits or when the K-th key has
+/// no point-space image.
+fn lead_floor(hits: &[FieldHit], limit: usize) -> Option<f64> {
+    if hits.len() < limit {
+        return None;
+    }
+    hits.last()
+        .and_then(|worst| sort_key_as_point(&worst.value))
 }
 
 /// Whether a segment could still contribute a document that outranks the
@@ -742,11 +754,12 @@ impl InvertedIndexSearcher {
     /// Field-sorted per-segment fanout (#944 Phase A).
     ///
     /// Runs the query independently on every segment with a per-segment
-    /// [`TopFieldCollector`] (in parallel off-wasm), then re-collects
-    /// the per-segment top-K into a fresh global-reader collector so
-    /// ordering — including the doc-id tie-break — matches the
-    /// single-pass path exactly. The merge re-resolves at most
-    /// `limit × segment_count` DocValues.
+    /// [`TopFieldCollector`] (in parallel off-wasm), then merges the
+    /// per-segment top-K through a reader-free `FieldTopK` on the sort
+    /// values each collector already ranked by (#1127), so the merge
+    /// performs no DocValues or stored-document reads. Ordering —
+    /// including the doc-id tie-break — matches the single-pass path
+    /// exactly because both go through the same comparator.
     ///
     /// `total_hits` sums the per-segment totals: segments partition the
     /// live documents (tombstoned copies are filtered at posting-decode
@@ -857,7 +870,7 @@ impl InvertedIndexSearcher {
         let collect_segment = |seg_arc: &Arc<
             std::sync::RwLock<crate::lexical::index::inverted::reader::SegmentReader>,
         >|
-         -> Result<(Vec<SearchHit>, u64)> {
+         -> Result<(Vec<FieldHit>, u64)> {
             let view = PerSegmentReaderView::new(
                 seg_arc.clone(),
                 global_doc_count,
@@ -880,33 +893,19 @@ impl InvertedIndexSearcher {
                 false,
                 deadline,
             )?;
-            Ok((collected.results(), collected.total_hits()))
+            let total_hits = collected.total_hits();
+            Ok((collected.into_field_hits(), total_hits))
         };
 
         // Wave 1: the lead segment, establishing the floor.
-        let mut lead_result: Option<Result<(Vec<SearchHit>, u64)>> = None;
+        let mut lead_result: Option<Result<(Vec<FieldHit>, u64)>> = None;
         let mut floor: Option<f64> = None;
         if let Some(idx) = lead {
             let result = collect_segment(&segments[idx]);
-            if let Ok((hits, _)) = &result
-                && hits.len() >= limit
-                && let Some(worst) = hits.last()
-            {
+            if let Ok((hits, _)) = &result {
                 // The K-th best of a full per-segment top-K: nothing
                 // ranked below it can enter the global top-K either.
-                floor = worst
-                    .document
-                    .as_ref()
-                    .and_then(|d| d.get(field_name))
-                    .and_then(sort_key_as_point);
-                if floor.is_none() {
-                    floor = segments[idx]
-                        .read()
-                        .ok()
-                        .and_then(|seg| seg.get_doc_value(field_name, worst.doc_id).ok().flatten())
-                        .as_ref()
-                        .and_then(sort_key_as_point);
-                }
+                floor = lead_floor(hits, limit);
             }
             lead_result = Some(result);
         }
@@ -923,8 +922,8 @@ impl InvertedIndexSearcher {
         #[cfg(target_arch = "wasm32")]
         let rest_iter = rest.iter();
 
-        let mut per_segment_results: Vec<Result<(Vec<SearchHit>, u64)>> = rest_iter
-            .map(|(i, seg_arc)| -> Result<(Vec<SearchHit>, u64)> {
+        let mut per_segment_results: Vec<Result<(Vec<FieldHit>, u64)>> = rest_iter
+            .map(|(i, seg_arc)| -> Result<(Vec<FieldHit>, u64)> {
                 if prunable
                     && !segment_can_contribute(ranges.get(*i).copied().flatten(), floor, ascending)
                 {
@@ -948,27 +947,21 @@ impl InvertedIndexSearcher {
             per_segment_results.push(result);
         }
 
-        // Merge: re-collect the per-segment top-K into a global-reader
-        // collector (same comparator + doc-id tie-break as the
-        // single-pass path). `min_score` was already applied per
-        // segment, and scores are unchanged, so re-applying it here is
-        // a no-op either way.
-        let mut merged = TopFieldCollector::with_min_score(
-            limit,
-            min_score,
-            field_name.to_string(),
-            ascending,
-            self.reader.as_ref(),
-        );
+        // Merge on the values the per-segment collectors already ranked
+        // by: `FieldTopK` has no reader, so this step performs no
+        // DocValues or stored-document reads (#1127). Same comparator +
+        // doc-id tie-break as the single-pass path. `min_score` was
+        // already applied per segment.
+        let mut merged = FieldTopK::new(limit, ascending);
         let mut total_hits = 0u64;
         for seg_result in per_segment_results {
             let (seg_hits, seg_total) = seg_result?;
             total_hits += seg_total;
             for hit in seg_hits {
-                merged.collect(hit.doc_id, hit.score)?;
+                merged.push(hit);
             }
         }
-        Ok((merged.results(), total_hits))
+        Ok((merged.sorted_search_hits(), total_hits))
     }
 
     /// Execute a BooleanQuery with parallel sub-query execution.
@@ -2552,6 +2545,58 @@ mod tests {
         assert_eq!(sort_key_as_point(&FieldValue::Text("x".into())), None);
         assert_eq!(sort_key_as_point(&FieldValue::Bool(true)), None);
         assert_eq!(sort_key_as_point(&FieldValue::Null), None);
+    }
+
+    /// #1127: the lead floor is read off the value the per-segment
+    /// collector ranked its K-th hit by. Below a full top-K there is no
+    /// floor; a K-th key with no point-space image (Null, Text) cannot
+    /// bound anything either.
+    #[test]
+    fn lead_floor_needs_a_full_top_k_and_a_point_typed_worst() {
+        use crate::lexical::core::field::FieldValue;
+        use crate::lexical::query::collector::FieldHit;
+
+        let hit = |doc_id: u64, value: FieldValue| FieldHit {
+            doc_id,
+            score: 0.0,
+            value,
+        };
+        let full = vec![
+            hit(1, FieldValue::Int64(23)),
+            hit(2, FieldValue::Int64(22)),
+            hit(3, FieldValue::Int64(20)),
+        ];
+
+        assert_eq!(
+            lead_floor(&full, 3),
+            Some(20.0),
+            "the K-th (last, worst) hit is the floor"
+        );
+        assert_eq!(lead_floor(&full, 4), None, "fewer than K hits: no floor");
+        assert_eq!(lead_floor(&full[..2], 3), None);
+        assert_eq!(
+            lead_floor(&[], 0),
+            None,
+            "limit 0 collects nothing to bound"
+        );
+
+        let null_worst = vec![hit(1, FieldValue::Int64(23)), hit(2, FieldValue::Null)];
+        assert_eq!(
+            lead_floor(&null_worst, 2),
+            None,
+            "Null has no point-space image"
+        );
+        let text_worst = vec![
+            hit(1, FieldValue::Text("b".into())),
+            hit(2, FieldValue::Text("a".into())),
+        ];
+        assert_eq!(lead_floor(&text_worst, 2), None);
+
+        let dt = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        assert_eq!(
+            lead_floor(&[hit(1, FieldValue::DateTime(dt))], 1),
+            Some(1_600_000_000.0)
+        );
     }
 
     /// #944 Phase A prerequisite: the per-segment view must forward

@@ -122,6 +122,87 @@ fn field_sort_falls_back_when_a_segments_dv_file_is_missing() {
     assert_eq!(results.total_hits, 6);
 }
 
+/// #1127: the two-wave fanout's pruning floor now comes from the value
+/// the lead segment's collector actually ranked by -- here the
+/// stored-document fallback, because the lead's `.dv` file is gone --
+/// instead of a DocValues re-read that had nothing to read. This pins
+/// output order and the exact `total_hits` on that newly reachable floor
+/// path; that the floor itself derives from the fallback value is pinned
+/// by the `lead_floor_*` unit test in `searcher.rs` (the merged result is
+/// identical whether or not the other segments end up pruned).
+#[test]
+fn field_sort_prunes_against_a_floor_from_the_stored_document_fallback() {
+    // Three commits with disjoint, strictly increasing `score` ranges:
+    // segment 0 -> [0, 4), segment 1 -> [10, 14), segment 2 -> [20, 24);
+    // doc ids 1..=12 in the same order.
+    let build = || {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(
+            storage.clone(),
+            LexicalIndexConfig::Inverted(loose_config()),
+        )
+        .unwrap();
+        for group in 0..3u64 {
+            for offset in 0..4u64 {
+                let doc_id = group * 4 + offset + 1;
+                store
+                    .upsert_document(doc_id, doc_with_score((group * 10 + offset) as i64))
+                    .unwrap();
+            }
+            store.commit().unwrap();
+        }
+        let dv_files = dv_files_sorted(&storage);
+        assert_eq!(
+            dv_files.len(),
+            3,
+            "expected one standalone .dv file per segment, found {dv_files:?}"
+        );
+        (store, storage, dv_files)
+    };
+
+    // Descending: the newest segment leads. Without its `.dv` file its
+    // collector ranks on stored values, and the K-th of those (20) is the
+    // floor the two older segments are pruned against.
+    let (store, storage, dv_files) = build();
+    storage.delete_file(&dv_files[2]).unwrap();
+    let query: Box<dyn Query> = Box::new(TermQuery::new("body", "alpha"));
+    let results = store
+        .search(
+            LexicalSearchRequest::new(query)
+                .limit(4)
+                .sort_by_field_desc("score"),
+        )
+        .unwrap();
+    assert_eq!(
+        results.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+        vec![12, 11, 10, 9],
+        "the lead's fallback-ranked top-4 must be the answer"
+    );
+    assert_eq!(
+        results.total_hits, 12,
+        "pruned segments must still be counted exactly"
+    );
+
+    // Ascending mirror: the oldest segment leads, so its `.dv` is the one
+    // deleted.
+    let (store, storage, dv_files) = build();
+    storage.delete_file(&dv_files[0]).unwrap();
+    let query: Box<dyn Query> = Box::new(TermQuery::new("body", "alpha"));
+    let results = store
+        .search(
+            LexicalSearchRequest::new(query)
+                .limit(4)
+                .sort_by_field_asc("score"),
+        )
+        .unwrap();
+    assert_eq!(
+        results.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(results.total_hits, 12);
+}
+
 #[test]
 fn facet_falls_back_when_a_segments_dv_file_is_missing() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
