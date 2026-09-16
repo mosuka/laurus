@@ -28,6 +28,7 @@ let config = HighlightConfig::default()
 | `fragment_separator` | `String` | `" ... "` | フラグメント間の区切り文字 |
 | `return_entire_field_if_no_highlight` | `bool` | false | マッチがない場合にフィールド全体の値を返却する |
 | `max_analyzed_chars` | `usize` | 1,000,000 | ハイライト解析対象の最大文字数 |
+| `require_field_match` | `bool` | true | ハイライト対象フィールドを対象とするクエリ語のみを使う（`false` にするとクエリ内の全フィールドの語でハイライトする） |
 
 ### Builderメソッド
 
@@ -37,8 +38,26 @@ let config = HighlightConfig::default()
 | `css_class(class)` | タグのCSSクラスを設定 |
 | `max_fragments(count)` | フラグメントの最大数を設定 |
 | `fragment_size(size)` | フラグメントの目標文字数を設定 |
+| `require_field_match(flag)` | ハイライト対象フィールドを対象とする語のみを使うかを設定 |
 | `opening_tag()` | 開始HTMLタグ文字列を取得（例: `<mark class="highlight">`） |
 | `closing_tag()` | 終了HTMLタグ文字列を取得（例: `</mark>`） |
+
+## 対応クエリ
+
+ハイライト対象の語はクエリの説明文字列ではなくクエリ木（`Query::collect_highlight_terms`）から取得され、ハイライタのアナライザ（既定は `StandardAnalyzer`。日本語テキストなどフィールドのアナライザに合わせるには `Highlighter::with_analyzer` を使う）が生成したトークンと照合されます。
+
+| クエリ | ハイライトされるもの |
+| :--- | :--- |
+| `TermQuery` | 語と一致するトークン |
+| `PhraseQuery` | フレーズを構成する連続トークン。検索と同じ「順序どおり・語間の隙間が `slop` 以内」の規則で、出現 1 回が 1 つのハイライト |
+| `PrefixQuery`、`WildcardQuery`、`RegexpQuery`、`FuzzyQuery` | パターン（または編集距離）に一致するすべてのトークン |
+| `BooleanQuery` | `Must`・`Should`・`Filter` 節の語。`MustNot` 節は除外 |
+| `AdvancedQuery` | コアクエリ・フィルタ・ポストフィルタの語。ネガティブフィルタは除外 |
+| `MultiFieldQuery` | 設定された各フィールドにおけるクエリ文字列 |
+| スパンクエリ（`SpanQueryWrapper`） | ラップされたクエリ内のすべてのスパン語 |
+| Range・Numeric・DateTime・Geo クエリ | なし |
+
+既定ではハイライト対象フィールドを対象とする語のみが使われます（`require_field_match`）。クエリ内の全フィールドの語でハイライトするには `false` に設定してください。
 
 ## HighlightFragment
 
