@@ -7,7 +7,7 @@
 //!
 //! # Scope
 //!
-//! Three measurement scenarios:
+//! Four measurement scenarios:
 //!
 //! 1. **`bench_simple_highlight_terms`** — `SimpleHighlighter::highlight_terms`.
 //!    Sweeps text size {1 KB, 100 KB} × term count {1, 5, 20}. Each
@@ -21,6 +21,11 @@
 //!    against a fixed-size text (~10 KB), simulating top-K result
 //!    processing. Sweep K ∈ {1, 10, 50}. Reports `Throughput::Elements(K)`
 //!    so per-hit cost is comparable.
+//! 4. **`bench_full_highlight_dense_spans`** — `Highlighter::highlight` with
+//!    a `PrefixQuery` over a text where every third token matches, so the
+//!    fragment-grouping stage sees `n` spans (#595). Sweeps `n` on a 4×
+//!    ladder {1k, 4k, 16k} so the growth exponent of that stage is
+//!    visible directly.
 //!
 //! # Note on `extract_query_terms`
 //!
@@ -34,7 +39,9 @@
 //! text inside `find_highlight_spans`, which is the cost we want to
 //! measure. Scenario 1 (SimpleHighlighter) bypasses `extract_query_terms`
 //! entirely and produces real `<mark>`-wrapped output, which is what the
-//! sanity assert checks.
+//! sanity assert checks. Scenario 4 needs real spans and gets them through
+//! `PrefixQuery`, whose description `"PrefixQuery(field: body, prefix: rust)"`
+//! does leak the bare term `rust` past `trim_matches` — see its doc comment.
 //!
 //! # Run
 //!
@@ -64,10 +71,12 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use laurus::lexical::TermQuery;
+use common::SAMPLE_SIZE_SLOW;
+
 use laurus::lexical::search::features::highlight::{
     HighlightConfig, Highlighter, SimpleHighlighter,
 };
+use laurus::lexical::{PrefixQuery, TermQuery};
 
 /// Vocabulary used for the synthetic English-like text. The set spans
 /// common search-engine terminology so that terms picked from the same
@@ -268,11 +277,77 @@ fn bench_full_highlight_top_k(c: &mut Criterion) {
     group.finish();
 }
 
+/// Dense-span fragment grouping (#595). Every third token matches, so `n`
+/// repetitions yield `n` merged spans and `group_spans_into_fragments` has
+/// `n` windows to fill. Before the fix that stage rescanned every span per
+/// window and rendered every candidate fragment before the top-
+/// `max_fragments` cut (quadratic); after it, one binary search per window
+/// and rendering only the survivors (`n log n`). The 4× ladder makes the
+/// exponent readable: ~16× per step is quadratic, ~4× is linear
+/// (tokenisation-bound).
+///
+/// Uses `PrefixQuery` rather than `TermQuery` on purpose: `PrefixQuery`'s
+/// `description()` is `"PrefixQuery(field: body, prefix: rust)"`, from
+/// which `extract_query_terms` recovers the bare `rust`, whereas a
+/// `TermQuery`'s `"body:rust"` never splits (header note) — that is why
+/// scenarios 2 and 3 return zero fragments. If #594 replaces the
+/// description-string extraction, revisit this coupling.
+fn bench_full_highlight_dense_spans(c: &mut Criterion) {
+    let mut group = c.benchmark_group("highlight/dense_spans");
+    // The pre-fix 16k case runs for hundreds of milliseconds per call.
+    group.sample_size(SAMPLE_SIZE_SLOW);
+
+    let config = HighlightConfig::default();
+    let expected_fragments = config.max_fragments;
+    let highlighter = Highlighter::new(config);
+    let query = PrefixQuery::new("body", "rust");
+
+    for &n in &[1_000usize, 4_000, 16_000] {
+        let text = "alpha beta rust ".repeat(n);
+
+        // Sanity: the term must leak through `extract_query_terms` and the
+        // grouping stage must produce real fragments, otherwise this would
+        // measure the zero-fragment path like scenarios 2 and 3.
+        let probe = highlighter
+            .highlight(&query, "body", &text)
+            .expect("highlight probe must not error");
+        assert_eq!(
+            probe.fragments.len(),
+            expected_fragments,
+            "dense_spans probe must fill max_fragments (n={n})"
+        );
+        assert!(
+            probe
+                .fragments
+                .iter()
+                .all(|f| f.text.contains("<mark>rust</mark>")),
+            "every dense_spans fragment must carry a highlighted term (n={n})"
+        );
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("spans_{n}")),
+            &(),
+            |b, _| {
+                b.iter(|| {
+                    let out = highlighter
+                        .highlight(black_box(&query), black_box("body"), black_box(&text))
+                        .unwrap();
+                    black_box(out);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_highlight_terms,
     bench_simple_highlight_terms_precompiled,
     bench_full_highlight_retokenize,
     bench_full_highlight_top_k,
+    bench_full_highlight_dense_spans,
 );
 criterion_main!(benches);
