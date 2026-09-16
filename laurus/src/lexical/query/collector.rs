@@ -105,7 +105,7 @@ struct ScoredDoc {
 }
 
 /// A document with field value for field-based sorting.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct FieldScoredDoc {
     doc_id: u64,
     score: f32,
@@ -113,20 +113,124 @@ struct FieldScoredDoc {
     ascending: bool,
 }
 
+/// A ranked sort-field hit carrying the value it was ranked by, so a
+/// downstream merge can order it without re-reading it (#1127).
+#[derive(Debug, Clone)]
+pub(crate) struct FieldHit {
+    pub(crate) doc_id: u64,
+    pub(crate) score: f32,
+    pub(crate) value: crate::lexical::core::field::FieldValue,
+}
+
+/// Bounded top-K over sort-field values with no reader access (#1127).
+///
+/// Owns the comparator contract — [`FieldScoredDoc`]'s `Ord`, i.e.
+/// [`compare_sort_key`] plus the doc-id tie-break — for both
+/// [`TopFieldCollector`] and the field-sorted fanout merge, so the two
+/// can never disagree on order. Having no reader is the point: a merge
+/// built on this type cannot re-resolve a value it was already handed.
+#[derive(Debug)]
+pub(crate) struct FieldTopK {
+    max_docs: usize,
+    ascending: bool,
+    /// Max-heap whose `Ord`-greatest element is the current worst
+    /// ranked document (see [`FieldScoredDoc::cmp`]).
+    hits: BinaryHeap<FieldScoredDoc>,
+}
+
+impl FieldTopK {
+    pub(crate) fn new(max_docs: usize, ascending: bool) -> Self {
+        FieldTopK {
+            max_docs,
+            ascending,
+            hits: BinaryHeap::new(),
+        }
+    }
+
+    /// Maximum number of hits retained.
+    pub(crate) fn capacity(&self) -> usize {
+        self.max_docs
+    }
+
+    /// Offer a hit: kept while there is room, otherwise it replaces the
+    /// current worst only when it ranks better (`Ordering::Less`, see
+    /// [`FieldScoredDoc::cmp`]). A zero-capacity heap keeps nothing.
+    pub(crate) fn push(&mut self, hit: FieldHit) {
+        if self.max_docs == 0 {
+            return;
+        }
+
+        let doc = FieldScoredDoc {
+            doc_id: hit.doc_id,
+            score: hit.score,
+            field_value: hit.value,
+            ascending: self.ascending,
+        };
+
+        if self.hits.len() < self.max_docs {
+            self.hits.push(doc);
+        } else if self
+            .hits
+            .peek()
+            .is_some_and(|worst| doc.cmp(worst) == Ordering::Less)
+        {
+            self.hits.pop();
+            self.hits.push(doc);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.hits.clear();
+    }
+
+    /// Retained hits best-first as [`SearchHit`]s (`document: None`).
+    ///
+    /// `FieldScoredDoc::Ord` is defined so that `Less` always means
+    /// "ranks better" for both sort directions, so a plain ascending
+    /// sort yields best-first output regardless of `ascending`. Sorts
+    /// references so no `FieldValue` is cloned.
+    pub(crate) fn sorted_search_hits(&self) -> Vec<SearchHit> {
+        let mut sorted: Vec<&FieldScoredDoc> = self.hits.iter().collect();
+        sorted.sort_unstable();
+
+        sorted
+            .into_iter()
+            .map(|doc| SearchHit {
+                doc_id: doc.doc_id,
+                score: doc.score,
+                document: None,
+            })
+            .collect()
+    }
+
+    /// Retained hits best-first, moving the sort values out.
+    pub(crate) fn into_sorted_hits(self) -> Vec<FieldHit> {
+        self.hits
+            .into_sorted_vec()
+            .into_iter()
+            .map(|doc| FieldHit {
+                doc_id: doc.doc_id,
+                score: doc.score,
+                value: doc.field_value,
+            })
+            .collect()
+    }
+}
+
 /// A collector that keeps the top N documents sorted by a field value.
 /// This performs sorting during collection (Lucene-style) rather than after.
+///
+/// Composes a reader-free `FieldTopK` for the ranking itself and adds
+/// only what needs the index: resolving each document's sort value, the
+/// `min_score` threshold and the `total_hits` count.
 #[derive(Debug)]
 pub struct TopFieldCollector<'a> {
-    /// Maximum number of documents to collect.
-    max_docs: usize,
     /// Minimum score threshold.
     min_score: f32,
     /// Field name to sort by.
     field_name: String,
-    /// Sort order (true for ascending, false for descending).
-    ascending: bool,
-    /// Collected hits (min-heap for ascending, needs reverse comparison).
-    hits: BinaryHeap<FieldScoredDoc>,
+    /// Ranked hits; capacity and sort direction live here.
+    top_k: FieldTopK,
     /// Total number of documents processed.
     total_hits: u64,
     /// Reference to the index reader for accessing field values.
@@ -156,17 +260,7 @@ impl<'a> TopFieldCollector<'a> {
         ascending: bool,
         reader: &'a dyn crate::lexical::reader::LexicalIndexReader,
     ) -> Self {
-        let has_dv = reader.has_doc_values(&field_name);
-        TopFieldCollector {
-            max_docs,
-            min_score: 0.0,
-            field_name,
-            ascending,
-            hits: BinaryHeap::new(),
-            total_hits: 0,
-            reader,
-            has_dv,
-        }
+        Self::with_min_score(max_docs, 0.0, field_name, ascending, reader)
     }
 
     /// Create a new top field collector with minimum score threshold.
@@ -179,11 +273,9 @@ impl<'a> TopFieldCollector<'a> {
     ) -> Self {
         let has_dv = reader.has_doc_values(&field_name);
         TopFieldCollector {
-            max_docs,
             min_score,
             field_name,
-            ascending,
-            hits: BinaryHeap::new(),
+            top_k: FieldTopK::new(max_docs, ascending),
             total_hits: 0,
             reader,
             has_dv,
@@ -218,20 +310,11 @@ impl<'a> TopFieldCollector<'a> {
         }
     }
 
-    /// Check if a new document should be collected based on field value.
-    ///
-    /// Compares against the current heap-worst (`Ord`-greatest, see
-    /// [`FieldScoredDoc::cmp`]) — a new doc is worth collecting when it
-    /// ranks better (`Ordering::Less`) than the worst.
-    fn should_collect(&self, new_doc: &FieldScoredDoc) -> bool {
-        if self.hits.len() < self.max_docs {
-            return true;
-        }
-
-        match self.hits.peek() {
-            Some(worst) => new_doc.cmp(worst) == Ordering::Less,
-            None => true,
-        }
+    /// Consume the collector, yielding its top-K best-first together with
+    /// the sort value each entry was ranked by (#1127).
+    #[allow(dead_code)] // consumed by the fanout merge in the next commit
+    pub(crate) fn into_field_hits(self) -> Vec<FieldHit> {
+        self.top_k.into_sorted_hits()
     }
 }
 
@@ -239,55 +322,25 @@ impl<'a> Collector for TopFieldCollector<'a> {
     fn collect(&mut self, doc_id: u64, score: f32) -> Result<()> {
         self.total_hits += 1;
 
-        if self.max_docs == 0 {
-            return Ok(());
-        }
-
-        // Check minimum score threshold
-        if score < self.min_score {
+        // Both gates sit ahead of the reader access on purpose: a
+        // zero-limit or below-threshold hit must not cost a lookup.
+        if self.top_k.capacity() == 0 || score < self.min_score {
             return Ok(());
         }
 
         // Get field value during collection (Lucene-style)
-        let field_value = self.get_field_value(doc_id);
-
-        let scored_doc = FieldScoredDoc {
+        let value = self.get_field_value(doc_id);
+        self.top_k.push(FieldHit {
             doc_id,
             score,
-            field_value,
-            ascending: self.ascending,
-        };
-
-        if self.hits.len() < self.max_docs {
-            // We have space, just add it
-            self.hits.push(scored_doc);
-        } else {
-            // Check if this document should replace the worst one
-            if self.should_collect(&scored_doc) {
-                self.hits.pop();
-                self.hits.push(scored_doc);
-            }
-        }
+            value,
+        });
 
         Ok(())
     }
 
     fn results(&self) -> Vec<SearchHit> {
-        // `FieldScoredDoc::Ord` is defined so that `Less` always means
-        // "ranks better" (for both sort directions — see the `cmp` impl
-        // below), so a plain ascending sort by `Ord` yields best-first
-        // output regardless of `self.ascending`.
-        let mut sorted_docs: Vec<_> = self.hits.iter().cloned().collect();
-        sorted_docs.sort_unstable();
-
-        sorted_docs
-            .into_iter()
-            .map(|doc| SearchHit {
-                doc_id: doc.doc_id,
-                score: doc.score,
-                document: None,
-            })
-            .collect()
+        self.top_k.sorted_search_hits()
     }
 
     fn total_hits(&self) -> u64 {
@@ -316,7 +369,7 @@ impl<'a> Collector for TopFieldCollector<'a> {
     }
 
     fn reset(&mut self) {
-        self.hits.clear();
+        self.top_k.clear();
         self.total_hits = 0;
     }
 }
@@ -337,7 +390,7 @@ impl PartialOrd for FieldScoredDoc {
 
 /// Natural ascending order over sort-field values, used as the single
 /// source of truth for both [`FieldScoredDoc::cmp`] (heap order) and
-/// [`TopFieldCollector::results`] (final output order) — see #608.
+/// `FieldTopK::sorted_search_hits` (final output order) — see #608.
 ///
 /// `Null` always sorts greatest (last in ascending order), independent
 /// of sort direction; direction is applied by the caller via
@@ -1481,5 +1534,174 @@ mod tests {
             "a DocValues miss with has_dv=true must still fall back to the \
              stored document, ordering by content ([1] < [2] < [3]) not doc id"
         );
+    }
+
+    // --- FieldTopK (#1127): the reader-free core the fanout merges on ---
+
+    /// Merging per-partition collectors through `FieldTopK` must order
+    /// exactly like one collector over the union: mixed Int64/Float64
+    /// (#945), Null-last, cross-partition ties and eviction all go
+    /// through the same comparator either way. `limit == 4` exercises
+    /// eviction in the merge; `limit == 12` keeps every hit so the Null
+    /// and tie positions inside the full order are compared too.
+    #[test]
+    fn field_top_k_merge_matches_one_collector_over_the_union() {
+        use crate::lexical::core::field::FieldValue;
+
+        let values: Vec<(u64, FieldValue)> = vec![
+            (1, FieldValue::Int64(7)),
+            (2, FieldValue::Float64(7.5)),
+            (3, FieldValue::Null),
+            (4, FieldValue::Int64(7)), // ties with doc 1 across partitions
+            (5, FieldValue::Int64(-3)),
+            (6, FieldValue::Float64(-3.0)), // ties with doc 5 numerically
+            (7, FieldValue::Int64(42)),
+            (8, FieldValue::Null),
+            (9, FieldValue::Int64(0)),
+            (10, FieldValue::Int64(42)),
+            (11, FieldValue::Float64(0.25)),
+            (12, FieldValue::Int64(-10)),
+        ];
+        let reader = FieldValueMockReader::new(&values);
+
+        for (ascending, limit) in [(true, 4), (false, 4), (true, 12), (false, 12)] {
+            let mut whole = TopFieldCollector::new(limit, "value".to_string(), ascending, &reader);
+            for (doc_id, _) in &values {
+                whole.collect(*doc_id, 0.0).unwrap();
+            }
+            let expected: Vec<u64> = whole.results().iter().map(|h| h.doc_id).collect();
+
+            let mut merged = FieldTopK::new(limit, ascending);
+            for partition in 0..3u64 {
+                let mut part =
+                    TopFieldCollector::new(limit, "value".to_string(), ascending, &reader);
+                for (doc_id, _) in values.iter().filter(|(id, _)| id % 3 == partition) {
+                    part.collect(*doc_id, 0.0).unwrap();
+                }
+                for hit in part.into_field_hits() {
+                    merged.push(hit);
+                }
+            }
+            let actual: Vec<u64> = merged
+                .sorted_search_hits()
+                .iter()
+                .map(|h| h.doc_id)
+                .collect();
+
+            assert_eq!(actual, expected, "ascending = {ascending}, limit = {limit}");
+        }
+    }
+
+    #[test]
+    fn field_top_k_evicts_worst_in_both_directions() {
+        use crate::lexical::core::field::FieldValue;
+
+        let ids = |ascending: bool| -> Vec<u64> {
+            let mut top_k = FieldTopK::new(3, ascending);
+            for i in 1..=5u64 {
+                top_k.push(FieldHit {
+                    doc_id: i,
+                    score: 0.0,
+                    value: FieldValue::Int64(i as i64),
+                });
+            }
+            top_k
+                .sorted_search_hits()
+                .iter()
+                .map(|h| h.doc_id)
+                .collect()
+        };
+
+        assert_eq!(ids(true), vec![1, 2, 3], "ascending keeps the smallest");
+        assert_eq!(ids(false), vec![5, 4, 3], "descending keeps the largest");
+    }
+
+    #[test]
+    fn field_top_k_zero_capacity_accepts_nothing() {
+        use crate::lexical::core::field::FieldValue;
+
+        let mut top_k = FieldTopK::new(0, true);
+        top_k.push(FieldHit {
+            doc_id: 1,
+            score: 1.0,
+            value: FieldValue::Int64(1),
+        });
+
+        assert!(top_k.sorted_search_hits().is_empty());
+        assert!(top_k.into_sorted_hits().is_empty());
+    }
+
+    #[test]
+    fn field_top_k_into_sorted_hits_is_best_first_and_keeps_values() {
+        use crate::lexical::core::field::FieldValue;
+
+        let mut top_k = FieldTopK::new(3, true);
+        for (doc_id, value) in [(1u64, 30i64), (2, 10), (3, 20), (4, 40)] {
+            top_k.push(FieldHit {
+                doc_id,
+                score: doc_id as f32,
+                value: FieldValue::Int64(value),
+            });
+        }
+
+        let hits: Vec<(u64, f32, FieldValue)> = top_k
+            .into_sorted_hits()
+            .into_iter()
+            .map(|h| (h.doc_id, h.score, h.value))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![
+                (2, 2.0, FieldValue::Int64(10)),
+                (3, 3.0, FieldValue::Int64(20)),
+                (1, 1.0, FieldValue::Int64(30)),
+            ],
+            "best-first, with score and the ranked value moved out intact"
+        );
+    }
+
+    /// The value that reaches a downstream merge must be the one the
+    /// collector actually ranked by -- including a stored-document
+    /// fallback value -- not `Null`.
+    #[test]
+    fn top_field_collector_into_field_hits_carries_the_fallback_value() {
+        use crate::lexical::core::field::FieldValue;
+
+        let docs = vec![
+            crate::Document::builder()
+                .add_bytes("blob", vec![2])
+                .build(), // doc_id 0
+            crate::Document::builder()
+                .add_bytes("blob", vec![3])
+                .build(), // doc_id 1
+            crate::Document::builder()
+                .add_bytes("blob", vec![1])
+                .build(), // doc_id 2
+        ];
+        let reader = DocFallbackMockReader::new(docs);
+        let mut collector = TopFieldCollector::new(3, "blob".to_string(), true, &reader);
+        for doc_id in 0..3 {
+            collector.collect(doc_id, 0.0).unwrap();
+        }
+
+        let carried: Vec<(u64, Vec<u8>)> = collector
+            .into_field_hits()
+            .into_iter()
+            .map(|h| match h.value {
+                FieldValue::Bytes(content, _) => (h.doc_id, content),
+                other => panic!("expected the fallback Bytes value to be carried, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(carried, vec![(2, vec![1]), (0, vec![2]), (1, vec![3])]);
+    }
+
+    /// Compile-time gate for #1127: a type holding `&'a dyn
+    /// LexicalIndexReader` cannot be `'static`, so this only builds while
+    /// `FieldTopK` carries no reader. `Send` is what the rayon fanout
+    /// needs of it.
+    #[test]
+    fn field_top_k_is_reader_free() {
+        fn assert_static_send<T: 'static + Send>() {}
+        assert_static_send::<FieldTopK>();
     }
 }
