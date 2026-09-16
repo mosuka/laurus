@@ -138,6 +138,10 @@ impl RangeQuery {
 }
 
 impl Query for RangeQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, _reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         Ok(Box::new(EmptyMatcher::new()))
     }
@@ -612,6 +616,10 @@ impl Scorer for RangeScorer {
 }
 
 impl Query for NumericRangeQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         // Try to use BKD Tree if available
         if let Some(bkd_tree) = reader.get_bkd_tree(&self.field)? {
@@ -937,6 +945,10 @@ impl DateTimeRangeQuery {
 }
 
 impl Query for DateTimeRangeQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, _reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         Ok(Box::new(DateTimeRangeMatcher::new(
             self.lower_bound,

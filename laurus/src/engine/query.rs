@@ -1046,6 +1046,25 @@ mod tests {
         parser.parse("title:[A TO Z]").await.unwrap();
     }
 
+    /// Numeric ranges parse to `NumericRangeQuery` and `?`/`*` terms to
+    /// `WildcardQuery`; both must report their field through
+    /// `Query::field()` so a misspelled field is rejected exactly like it
+    /// is for a plain term (#1131).
+    #[tokio::test]
+    async fn validate_rejects_unknown_field_in_numeric_range_and_wildcard_terms() {
+        let parser = make_parser_with_known_fields(&["title", "price"]);
+        for dsl in ["pric:[1 TO 10]", "titl:fo?"] {
+            let err = match parser.parse(dsl).await {
+                Ok(_) => panic!("expected an unknown-field error for {dsl}"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("unknown field"), "{dsl}: {err}");
+        }
+        // The declared spellings still parse.
+        parser.parse("price:[1 TO 10]").await.unwrap();
+        parser.parse("title:fo?").await.unwrap();
+    }
+
     #[tokio::test]
     async fn validate_skipped_when_known_fields_empty() {
         // The default parser has an empty `known_fields` set, so the

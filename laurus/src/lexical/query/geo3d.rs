@@ -359,6 +359,10 @@ impl Scorer for Geo3dScorer {
 }
 
 impl Query for Geo3dDistanceQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         Ok(Box::new(Geo3dMatcher::new(self.find_matches(reader)?)))
     }
@@ -537,6 +541,10 @@ impl Geo3dBoundingBoxQuery {
 }
 
 impl Query for Geo3dBoundingBoxQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         Ok(Box::new(Geo3dMatcher::new(self.find_matches(reader)?)))
     }
@@ -875,6 +883,10 @@ impl IntersectVisitor for NearestVisitor {
 }
 
 impl Query for Geo3dNearestQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         Ok(Box::new(Geo3dMatcher::new(self.find_matches(reader)?)))
     }

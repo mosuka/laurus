@@ -463,3 +463,126 @@ mod highlight_term_tests {
         assert!(collect(&query, None).is_empty());
     }
 }
+
+#[cfg(test)]
+mod leaf_field_tests {
+    use super::*;
+    use crate::data::GeoEcefPoint;
+    use crate::lexical::core::field::NumericType;
+    use crate::lexical::query::range::{DateTimeRangeQuery, RangeQuery};
+
+    /// Every single-field leaf query type that is neither a term, phrase,
+    /// prefix nor fuzzy query, built on `field` (#1131).
+    fn leaf_queries(field: &str) -> Vec<(&'static str, Box<dyn Query>)> {
+        let point = || GeoPoint {
+            lat: 35.0,
+            lon: 139.0,
+        };
+        let ecef = |v: f64| GeoEcefPoint { x: v, y: v, z: v };
+        let bbox = GeoBoundingBox::new(
+            GeoPoint {
+                lat: 34.0,
+                lon: 138.0,
+            },
+            GeoPoint {
+                lat: 36.0,
+                lon: 140.0,
+            },
+        )
+        .unwrap();
+
+        vec![
+            (
+                "WildcardQuery",
+                Box::new(WildcardQuery::new(field, "fo?").unwrap()),
+            ),
+            (
+                "RegexpQuery",
+                Box::new(RegexpQuery::new(field, "^fo.*").unwrap()),
+            ),
+            (
+                "RangeQuery",
+                Box::new(RangeQuery::new(
+                    field,
+                    Some("a".to_string()),
+                    Some("z".to_string()),
+                )),
+            ),
+            (
+                "NumericRangeQuery",
+                Box::new(NumericRangeQuery::new(
+                    field,
+                    NumericType::Float,
+                    Some(1.0),
+                    Some(10.0),
+                    true,
+                    true,
+                )),
+            ),
+            (
+                "DateTimeRangeQuery",
+                Box::new(DateTimeRangeQuery::new(field, None, None, true, true)),
+            ),
+            (
+                "GeoDistanceQuery",
+                Box::new(GeoDistanceQuery::new(field, point(), 1_000.0)),
+            ),
+            (
+                "GeoBoundingBoxQuery",
+                Box::new(GeoBoundingBoxQuery::new(field, bbox)),
+            ),
+            (
+                "Geo3dDistanceQuery",
+                Box::new(Geo3dDistanceQuery::new(field, ecef(1.0), 1_000.0)),
+            ),
+            (
+                "Geo3dBoundingBoxQuery",
+                Box::new(Geo3dBoundingBoxQuery::new(field, ecef(0.0), ecef(1.0)).unwrap()),
+            ),
+            (
+                "Geo3dNearestQuery",
+                Box::new(Geo3dNearestQuery::new(field, ecef(1.0), 10)),
+            ),
+        ]
+    }
+
+    /// `Query::field()` feeds `collect_field_refs`, which schema validation
+    /// walks: a leaf that stays at the `None` default is invisible to it.
+    #[test]
+    fn every_single_field_leaf_query_reports_its_field() {
+        for (name, query) in leaf_queries("price") {
+            assert_eq!(query.field(), Some("price"), "{name}::field()");
+
+            let mut refs = HashSet::new();
+            query.collect_field_refs(&mut refs);
+            assert_eq!(
+                refs,
+                HashSet::from(["price".to_string()]),
+                "{name}::collect_field_refs"
+            );
+        }
+    }
+
+    /// `apply_field_boosts` scales a leaf's boost only when its field is
+    /// in the map — so it must know its field.
+    #[test]
+    fn field_boosts_reach_every_single_field_leaf_query() {
+        let matching: HashMap<String, f32> = HashMap::from([("price".to_string(), 3.0)]);
+        for (name, mut query) in leaf_queries("price") {
+            let before = query.boost();
+            query.apply_field_boosts(&matching);
+            assert_eq!(query.boost(), before * 3.0, "{name}: boost must be scaled");
+        }
+
+        let other: HashMap<String, f32> = HashMap::from([("title".to_string(), 3.0)]);
+        for (name, mut query) in leaf_queries("price") {
+            let before = query.boost();
+            query.apply_field_boosts(&other);
+            assert_eq!(
+                query.boost(),
+                before,
+                "{name}: a boost for another field must not apply"
+            );
+        }
+    }
+}
