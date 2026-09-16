@@ -7,12 +7,12 @@ use roaring::RoaringTreemap;
 use crate::error::Result;
 use crate::lexical::index::inverted::per_segment_view::PerSegmentReaderView;
 use crate::lexical::index::inverted::reader::InvertedIndexReader;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::{
     ConjunctionMatcher, ConjunctionNotMatcher, DisjunctionMatcher, EmptyMatcher, Matcher,
     PreComputedMatcher,
 };
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::{LexicalIndexReader, scan_doc_ids};
 
 /// Occurrence requirements for boolean clauses.
@@ -521,6 +521,15 @@ impl Query for BooleanQuery {
     fn collect_field_refs(&self, out: &mut std::collections::HashSet<String>) {
         for clause in &self.clauses {
             clause.query.collect_field_refs(out);
+        }
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        // A MustNot clause describes what a hit does not contain.
+        for clause in &self.clauses {
+            if clause.occur != Occur::MustNot {
+                clause.query.collect_highlight_terms(field, out);
+            }
         }
     }
 

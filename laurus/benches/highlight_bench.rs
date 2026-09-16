@@ -22,26 +22,22 @@
 //!    processing. Sweep K ∈ {1, 10, 50}. Reports `Throughput::Elements(K)`
 //!    so per-hit cost is comparable.
 //! 4. **`bench_full_highlight_dense_spans`** — `Highlighter::highlight` with
-//!    a `PrefixQuery` over a text where every third token matches, so the
+//!    a `TermQuery` over a text where every third token matches, so the
 //!    fragment-grouping stage sees `n` spans (#595). Sweeps `n` on a 4×
 //!    ladder {1k, 4k, 16k} so the growth exponent of that stage is
 //!    visible directly.
 //!
-//! # Note on `extract_query_terms`
+//! # Note on term extraction
 //!
-//! `Highlighter::extract_query_terms` splits the query's `description()`
-//! on whitespace and strips non-alphanumeric characters from the ends only.
-//! `TermQuery::description()` returns `"field:term"`, which `trim_matches`
-//! does not strip the embedded `:` from. The resulting term `"field:term"`
-//! never matches an analyzer-produced token, so the highlight fragments
-//! returned by scenarios 2 and 3 are typically empty. This is fine for the
-//! purpose of this bench — the analyzer is still invoked over the whole
-//! text inside `find_highlight_spans`, which is the cost we want to
-//! measure. Scenario 1 (SimpleHighlighter) bypasses `extract_query_terms`
-//! entirely and produces real `<mark>`-wrapped output, which is what the
-//! sanity assert checks. Scenario 4 needs real spans and gets them through
-//! `PrefixQuery`, whose description `"PrefixQuery(field: body, prefix: rust)"`
-//! does leak the bare term `rust` past `trim_matches` — see its doc comment.
+//! `Highlighter::extract_query_terms` walks the query tree
+//! (`Query::collect_highlight_terms`, #594), so `TermQuery::new("body",
+//! "rust")` highlights every `rust` token and scenarios 2-4 produce real
+//! `<mark>`-wrapped fragments — their sanity asserts check that. Scenario 1
+//! (SimpleHighlighter) bypasses query-term extraction entirely and works
+//! from a term list. Before #594 the terms were scraped out of
+//! `description()`, which never matched for a `TermQuery`, so scenarios 2
+//! and 3 used to measure the zero-fragment path; numbers recorded before
+//! that change are not comparable.
 //!
 //! # Run
 //!
@@ -73,10 +69,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use common::SAMPLE_SIZE_SLOW;
 
+use laurus::lexical::TermQuery;
 use laurus::lexical::search::features::highlight::{
     HighlightConfig, Highlighter, SimpleHighlighter,
 };
-use laurus::lexical::{PrefixQuery, TermQuery};
 
 /// Vocabulary used for the synthetic English-like text. The set spans
 /// common search-engine terminology so that terms picked from the same
@@ -223,13 +219,15 @@ fn bench_full_highlight_retokenize(c: &mut Criterion) {
     ] {
         let text = build_text(target_bytes);
 
-        // Sanity check: highlight() must not error. Fragment count is
-        // expected to be zero in this scenario because TermQuery's
-        // description (`"body:rust"`) never matches an analyzer-produced
-        // token; this is documented in the file header.
-        let _probe = highlighter
+        // Sanity: the corpus contains `rust`, so highlighting must produce
+        // fragments — otherwise this would measure the zero-fragment path.
+        let probe = highlighter
             .highlight(&query, "body", &text)
             .expect("highlight probe must not error");
+        assert!(
+            !probe.fragments.is_empty(),
+            "retokenize probe must produce fragments (size={label})"
+        );
 
         group.bench_with_input(BenchmarkId::from_parameter(label), &(), |b, _| {
             b.iter(|| {
@@ -251,10 +249,15 @@ fn bench_full_highlight_top_k(c: &mut Criterion) {
     let query = TermQuery::new("body", "rust");
     let text = build_text(10 * 1024); // ~10 KB per hit, representative of a result snippet field
 
-    // Sanity check: highlight() must not error.
-    let _probe = highlighter
+    // Sanity: the corpus contains `rust`, so highlighting must produce
+    // fragments — otherwise this would measure the zero-fragment path.
+    let probe = highlighter
         .highlight(&query, "body", &text)
         .expect("highlight probe must not error");
+    assert!(
+        !probe.fragments.is_empty(),
+        "top_k probe must produce fragments"
+    );
 
     for &k in &[1usize, 10, 50] {
         group.throughput(Throughput::Elements(k as u64));
@@ -285,13 +288,6 @@ fn bench_full_highlight_top_k(c: &mut Criterion) {
 /// and rendering only the survivors (`n log n`). The 4× ladder makes the
 /// exponent readable: ~16× per step is quadratic, ~4× is linear
 /// (tokenisation-bound).
-///
-/// Uses `PrefixQuery` rather than `TermQuery` on purpose: `PrefixQuery`'s
-/// `description()` is `"PrefixQuery(field: body, prefix: rust)"`, from
-/// which `extract_query_terms` recovers the bare `rust`, whereas a
-/// `TermQuery`'s `"body:rust"` never splits (header note) — that is why
-/// scenarios 2 and 3 return zero fragments. If #594 replaces the
-/// description-string extraction, revisit this coupling.
 fn bench_full_highlight_dense_spans(c: &mut Criterion) {
     let mut group = c.benchmark_group("highlight/dense_spans");
     // The pre-fix 16k case runs for hundreds of milliseconds per call.
@@ -300,14 +296,13 @@ fn bench_full_highlight_dense_spans(c: &mut Criterion) {
     let config = HighlightConfig::default();
     let expected_fragments = config.max_fragments;
     let highlighter = Highlighter::new(config);
-    let query = PrefixQuery::new("body", "rust");
+    let query = TermQuery::new("body", "rust");
 
     for &n in &[1_000usize, 4_000, 16_000] {
         let text = "alpha beta rust ".repeat(n);
 
-        // Sanity: the term must leak through `extract_query_terms` and the
-        // grouping stage must produce real fragments, otherwise this would
-        // measure the zero-fragment path like scenarios 2 and 3.
+        // Sanity: the grouping stage must produce real fragments, otherwise
+        // this would measure the zero-fragment path.
         let probe = highlighter
             .highlight(&query, "body", &text)
             .expect("highlight probe must not error");

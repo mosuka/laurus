@@ -10,10 +10,10 @@ use crate::error::{LaurusError, Result};
 use crate::lexical::index::inverted::core::automaton::{AutomatonTermsEnum, RegexAutomaton};
 use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
 use crate::lexical::index::inverted::reader::InvertedIndexReader;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
 use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches documents containing terms that match a regular expression.
@@ -173,6 +173,22 @@ impl Query for RegexpQuery {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if self.pattern.is_empty() || field.is_some_and(|f| f != self.field) {
+            return;
+        }
+        // `regex` is `None` after deserialization; recompile like
+        // `get_terms_enum` does.
+        let regex = match &self.regex {
+            Some(regex) => Arc::clone(regex),
+            None => match Regex::new(&self.pattern) {
+                Ok(regex) => Arc::new(regex),
+                Err(_) => return,
+            },
+        };
+        out.push(HighlightTerm::Regex(regex));
     }
 
     fn cache_key(&self) -> Option<String> {

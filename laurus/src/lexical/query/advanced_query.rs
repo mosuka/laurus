@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::lexical::query::Query;
-use crate::lexical::query::QueryResult;
 use crate::lexical::query::boolean::{BooleanQuery, Occur};
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::{HighlightTerm, Query, QueryResult};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// Configuration for advanced query execution.
@@ -302,6 +301,14 @@ impl Query for AdvancedQuery {
         }
         for filter in &self.post_filters {
             filter.collect_field_refs(out);
+        }
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        // Negative filters describe what a hit does not contain.
+        self.core_query.collect_highlight_terms(field, out);
+        for filter in self.filters.iter().chain(&self.post_filters) {
+            filter.collect_highlight_terms(field, out);
         }
     }
 
@@ -608,6 +615,14 @@ impl Query for MultiFieldQuery {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        // The matcher expands to one unanalysed `TermQuery` per configured
+        // field, so the raw text is the exact term.
+        if !self.query_text.is_empty() && field.is_none_or(|f| self.fields.contains_key(f)) {
+            out.push(HighlightTerm::Exact(self.query_text.clone()));
+        }
     }
 
     fn clone_box(&self) -> Box<dyn Query> {

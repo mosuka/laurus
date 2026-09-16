@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A span represents a term occurrence with position information.
@@ -70,6 +70,15 @@ pub trait SpanQuery: Send + Sync + std::fmt::Debug {
 
     /// Clone this span query.
     fn clone_box(&self) -> Box<dyn SpanQuery>;
+
+    /// Collect the terms this span query matches, for highlighting (#594).
+    ///
+    /// Composites recurse into every child: a `SpanWithinQuery`'s `exclude`
+    /// is a positive proximity requirement, not a negation. Field gating is
+    /// the wrapper's job (`SpanQueryWrapper`).
+    fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
+        let _ = out;
+    }
 }
 
 /// A span query that matches a single term.
@@ -141,6 +150,12 @@ impl SpanQuery for SpanTermQuery {
     fn clone_box(&self) -> Box<dyn SpanQuery> {
         Box::new(self.clone())
     }
+
+    fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
+        if !self.term.is_empty() {
+            out.push(HighlightTerm::Exact(self.term.clone()));
+        }
+    }
 }
 
 /// A span query that matches terms near each other.
@@ -198,6 +213,12 @@ impl SpanNearQuery {
 }
 
 impl SpanQuery for SpanNearQuery {
+    fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
+        for clause in &self.clauses {
+            clause.collect_highlight_terms(out);
+        }
+    }
+
     fn get_spans(&self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<Vec<Span>> {
         let mut all_clause_spans = Vec::new();
 
@@ -368,6 +389,11 @@ impl SpanContainingQuery {
 }
 
 impl SpanQuery for SpanContainingQuery {
+    fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
+        self.big.collect_highlight_terms(out);
+        self.little.collect_highlight_terms(out);
+    }
+
     fn get_spans(&self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<Vec<Span>> {
         let big_spans = self.big.get_spans(doc_id, reader)?;
         let little_spans = self.little.get_spans(doc_id, reader)?;
@@ -452,6 +478,12 @@ impl SpanWithinQuery {
 }
 
 impl SpanQuery for SpanWithinQuery {
+    fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
+        // `exclude` bounds where `include` may appear; both are matched.
+        self.include.collect_highlight_terms(out);
+        self.exclude.collect_highlight_terms(out);
+    }
+
     fn get_spans(&self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<Vec<Span>> {
         let include_spans = self.include.get_spans(doc_id, reader)?;
         let exclude_spans = self.exclude.get_spans(doc_id, reader)?;
@@ -730,6 +762,12 @@ impl Query for SpanQueryWrapper {
 
     fn collect_field_refs(&self, out: &mut std::collections::HashSet<String>) {
         out.insert(self.span_query.field_name().to_string());
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if field.is_none_or(|f| f == self.span_query.field_name()) {
+            self.span_query.collect_highlight_terms(out);
+        }
     }
 }
 

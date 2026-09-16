@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
+use crate::analysis::token::Token;
 use crate::error::Result;
-use crate::lexical::query::Query;
+use crate::lexical::index::inverted::core::automaton::{Automaton, LevenshteinAutomaton};
+use crate::lexical::query::{HighlightTerm, Query};
 
 /// Configuration for text highlighting.
 #[derive(Debug, Clone)]
@@ -30,6 +32,10 @@ pub struct HighlightConfig {
     pub return_entire_field_if_no_highlight: bool,
     /// Maximum length of returned text.
     pub max_analyzed_chars: usize,
+    /// Whether only query terms targeting the highlighted field are used
+    /// (`true`, the default, as in Elasticsearch's `require_field_match`).
+    /// With `false`, terms from every field in the query highlight.
+    pub require_field_match: bool,
 }
 
 impl Default for HighlightConfig {
@@ -43,6 +49,7 @@ impl Default for HighlightConfig {
             fragment_separator: " ... ".to_string(),
             return_entire_field_if_no_highlight: false,
             max_analyzed_chars: 1_000_000,
+            require_field_match: true,
         }
     }
 }
@@ -74,6 +81,12 @@ impl HighlightConfig {
     /// Set the fragment size.
     pub fn fragment_size(mut self, fragment_size: usize) -> Self {
         self.fragment_size = fragment_size;
+        self
+    }
+
+    /// Set whether only query terms targeting the highlighted field are used.
+    pub fn require_field_match(mut self, require_field_match: bool) -> Self {
+        self.require_field_match = require_field_match;
         self
     }
 
@@ -247,7 +260,7 @@ impl Highlighter {
         let text = text.as_ref();
 
         // Extract terms from query
-        let highlight_terms = self.extract_query_terms(query)?;
+        let highlight_terms = self.extract_query_terms(query, field_name);
 
         if highlight_terms.is_empty() {
             return self.create_no_highlight_result(field_name, text);
@@ -271,119 +284,86 @@ impl Highlighter {
         Ok(field_highlight)
     }
 
-    /// Extract terms to highlight from a query.
-    fn extract_query_terms<Q: Query>(&self, query: &Q) -> Result<HashSet<String>> {
-        // This is a simplified implementation
-        // In a real implementation, we would:
-        // 1. Traverse the query tree
-        // 2. Extract all terms, phrases, and patterns
-        // 3. Handle different query types appropriately
-
-        let mut terms = HashSet::new();
-
-        // For now, we'll add some basic term extraction
-        let description = query.description();
-
-        // Simple heuristic: extract words from the description
-        let words: Vec<&str> = description.split_whitespace().collect();
-        for word in words {
-            // Clean up the word (remove quotes, parentheses, etc.)
-            let cleaned = word.trim_matches(|c: char| !c.is_alphanumeric());
-            if !cleaned.is_empty() && cleaned.len() > 1 {
-                terms.insert(cleaned.to_lowercase());
-            }
-        }
-
-        Ok(terms)
+    /// Collect what `query` would highlight in `field_name` by walking the
+    /// query tree (#594). With `require_field_match` on, leaves that target
+    /// another field are skipped.
+    fn extract_query_terms<Q: Query>(&self, query: &Q, field_name: &str) -> Vec<HighlightTerm> {
+        let field = self.config.require_field_match.then_some(field_name);
+        let mut terms = Vec::new();
+        query.collect_highlight_terms(field, &mut terms);
+        terms
     }
 
     /// Find highlight spans in text.
+    ///
+    /// One analyzer pass over `text`. Every token is probed against the
+    /// exact terms (a byte-length prefilter, then a hash lookup), the
+    /// prefixes, the compiled regexes and the fuzzy automata. Tokens are
+    /// buffered only when a phrase is present; phrases are then matched on
+    /// token positions with the same in-order, per-gap slop rule as the
+    /// index-side phrase matcher, so what highlights is what searches.
     fn find_highlight_spans(
         &self,
         text: &str,
-        terms: &HashSet<String>,
+        terms: &[HighlightTerm],
     ) -> Result<Vec<HighlightSpan>> {
-        let mut spans = Vec::new();
-
-        // Precompute the byte-length range of single-word terms so we can
-        // length-filter analyzer tokens before the (relatively expensive)
-        // string-keyed `HashSet` probe. Phrase terms (containing spaces)
-        // are handled by the regex pass below and excluded here.
-        //
-        // Empty range → no single-word terms; the per-token loop becomes a
-        // no-op and only the phrase pass runs.
+        let mut exact: HashSet<String> = HashSet::new();
         let mut min_term_len = usize::MAX;
         let mut max_term_len = 0usize;
+        let mut phrases: Vec<(Vec<String>, u32)> = Vec::new();
+        let mut prefixes: Vec<&str> = Vec::new();
+        let mut regexes: Vec<&Regex> = Vec::new();
+        let mut fuzzy: Vec<&LevenshteinAutomaton> = Vec::new();
         for term in terms {
-            if term.contains(' ') {
-                continue;
+            match term {
+                HighlightTerm::Exact(term) => {
+                    let term = term.to_lowercase();
+                    min_term_len = min_term_len.min(term.len());
+                    max_term_len = max_term_len.max(term.len());
+                    exact.insert(term);
+                }
+                HighlightTerm::Phrase { terms, slop } => {
+                    phrases.push((terms.iter().map(|t| t.to_lowercase()).collect(), *slop));
+                }
+                HighlightTerm::Prefix(prefix) => prefixes.push(prefix),
+                HighlightTerm::Regex(regex) => regexes.push(regex),
+                HighlightTerm::Fuzzy(automaton) => fuzzy.push(automaton),
             }
-            min_term_len = min_term_len.min(term.len());
-            max_term_len = max_term_len.max(term.len());
         }
 
-        // Tokenize the text. The previous code collected the iterator into
-        // a `Vec<Token>` — we drop that collect since tokens are consumed
-        // exactly once below; the analyzer iterator streams a `Token` at a
-        // time.
-        let tokens = self.analyzer.analyze(text)?;
+        // Exact terms are compared lowercased; patterns are tested as the
+        // query wrote them, exactly as the term-dictionary enumeration does.
+        // The length prefilter only gates the hash probe (#408).
+        let matches_token = |candidate: &str| -> bool {
+            let len = candidate.len();
+            (len >= min_term_len && len <= max_term_len && exact.contains(candidate))
+                || prefixes.iter().any(|prefix| candidate.starts_with(prefix))
+                || regexes.iter().any(|regex| regex.is_match(candidate))
+                || fuzzy.iter().any(|automaton| automaton.matches(candidate))
+        };
 
-        // Find matching tokens.
-        //
-        // `terms` arrives lowercased from `extract_query_terms`. Most
-        // analyzer pipelines (e.g. `StandardAnalyzer`) already lowercase
-        // tokens via `LowercaseFilter`, so the previous unconditional
-        // `to_lowercase()` allocated a `String` per token even though the
-        // token text was already in canonical form. For 1 MB / ~200k-token
-        // fields this allocation alone dominated the per-hit cost (#408).
-        //
-        // Try a direct `&str` lookup first. Only when the token contains
-        // an upper-case character does the lookup fall back to
-        // `to_lowercase()` — preserving case-insensitive matching for
-        // callers that plug in a custom analyzer without a lowercase
-        // filter. Tokens whose length is outside the term-length range
-        // can never match and are skipped before the hash probe.
-        if max_term_len > 0 {
-            for token in tokens {
-                let len = token.text.len();
-                if len < min_term_len || len > max_term_len {
-                    continue;
-                }
-                let matched = if has_uppercase(&token.text) {
-                    terms.contains(&token.text.to_lowercase())
-                } else {
-                    terms.contains(token.text.as_str())
-                };
-                if matched {
-                    let score = self.calculate_term_score(&token.text, terms);
-                    spans.push(HighlightSpan::new(
-                        token.start_offset..token.start_offset + token.text.len(),
-                        true,
-                        score,
-                    ));
-                }
+        // Most analyzers already lowercase, so the `to_lowercase()`
+        // fallback only runs for tokens that still carry uppercase (#408).
+        let mut spans = Vec::new();
+        let mut buffered: Vec<Token> = Vec::new();
+        for token in self.analyzer.analyze(text)? {
+            let matched = matches_token(&token.text)
+                || (has_uppercase(&token.text) && matches_token(&token.text.to_lowercase()));
+            if matched {
+                let score = self.calculate_term_score(&token.text, terms.len());
+                spans.push(HighlightSpan::new(
+                    token.start_offset..token.start_offset + token.text.len(),
+                    true,
+                    score,
+                ));
             }
-        } else {
-            // Drain the analyzer iterator to keep observable side-effects
-            // (e.g. character-position bookkeeping) consistent with the
-            // pre-#408 path that always collected first.
-            for _ in tokens {}
+            if !phrases.is_empty() {
+                buffered.push(token);
+            }
         }
 
-        // Also find phrase matches (simple implementation)
-        for term in terms {
-            if term.contains(' ') {
-                // This is a phrase
-                if let Ok(regex) = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(term))) {
-                    for mat in regex.find_iter(text) {
-                        spans.push(HighlightSpan::new(
-                            mat.range(),
-                            true,
-                            2.0, // Phrases get higher score
-                        ));
-                    }
-                }
-            }
+        for (phrase, slop) in &phrases {
+            spans.extend(phrase_spans(&buffered, phrase, *slop));
         }
 
         // Sort spans by position
@@ -396,11 +376,11 @@ impl Highlighter {
     }
 
     /// Calculate score for a term match.
-    fn calculate_term_score(&self, term: &str, all_terms: &HashSet<String>) -> f32 {
+    fn calculate_term_score(&self, term: &str, term_count: usize) -> f32 {
         // Simple scoring based on term length and rarity
         let base_score = 1.0;
         let length_bonus = (term.len() as f32).log2() * 0.1;
-        let rarity_bonus = 1.0 / (all_terms.len() as f32).sqrt();
+        let rarity_bonus = 1.0 / (term_count as f32).sqrt();
 
         base_score + length_bonus + rarity_bonus
     }
@@ -829,6 +809,69 @@ fn ceil_boundary(text: &str, pos: usize) -> usize {
     pos
 }
 
+/// Spans of `phrase` within `tokens` (analyzer output in text order).
+///
+/// Mirrors the index-side phrase matcher: the first term anchors, each
+/// following term must appear at the first position in
+/// `expected..=expected + slop`, and the match then continues from that
+/// position. Positions come from the analyzer, so a stop word removed
+/// without renumbering leaves the same gap here as in the index. A span
+/// runs from the first token's start to the last token's end.
+fn phrase_spans(tokens: &[Token], phrase: &[String], slop: u32) -> Vec<HighlightSpan> {
+    let token_is = |token: &Token, term: &str| {
+        token.text == term || (has_uppercase(&token.text) && token.text.to_lowercase() == term)
+    };
+    let token_end = |token: &Token| token.start_offset + token.text.len();
+
+    let mut spans = Vec::new();
+    let Some((first, rest)) = phrase.split_first() else {
+        return spans;
+    };
+
+    for (anchor_idx, anchor) in tokens.iter().enumerate() {
+        if !token_is(anchor, first) {
+            continue;
+        }
+
+        let mut expected = anchor.position + 1;
+        let mut end = token_end(anchor);
+        let mut cursor = anchor_idx + 1;
+        let mut complete = true;
+        for term in rest {
+            while cursor < tokens.len() && tokens[cursor].position < expected {
+                cursor += 1;
+            }
+            let mut probe = cursor;
+            let mut found = None;
+            while probe < tokens.len() && tokens[probe].position <= expected + slop as usize {
+                if token_is(&tokens[probe], term) {
+                    found = Some(probe);
+                    break;
+                }
+                probe += 1;
+            }
+            match found {
+                Some(idx) => {
+                    expected = tokens[idx].position + 1;
+                    end = token_end(&tokens[idx]);
+                    cursor = idx + 1;
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        if complete {
+            // Phrases outrank single terms, as before.
+            spans.push(HighlightSpan::new(anchor.start_offset..end, true, 2.0));
+        }
+    }
+
+    spans
+}
+
 /// Return `true` if `s` contains any upper-case character.
 ///
 /// Fast path: ASCII-only strings are scanned byte by byte (`is_ascii`
@@ -850,7 +893,14 @@ fn has_uppercase(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lexical::query::advanced_query::MultiFieldQuery;
+    use crate::lexical::query::range::RangeQuery;
+    use crate::lexical::query::span::{SpanNearQuery, SpanQuery, SpanQueryWrapper, SpanTermQuery};
     use crate::lexical::query::term::TermQuery;
+    use crate::lexical::query::{
+        AdvancedQuery, BooleanQuery, FuzzyQuery, PhraseQuery, PrefixQuery, RegexpQuery,
+        WildcardQuery,
+    };
 
     #[test]
     fn test_highlight_config() {
@@ -969,10 +1019,15 @@ mod tests {
         let highlighter = Highlighter::new(config);
 
         let query = TermQuery::new("field", "search");
-        let terms = highlighter.extract_query_terms(&query).unwrap();
-
-        // Note: This is a simplified test since term extraction is basic
-        assert!(!terms.is_empty());
+        let terms = highlighter.extract_query_terms(&query, "field");
+        assert!(
+            matches!(terms.as_slice(), [HighlightTerm::Exact(term)] if term == "search"),
+            "the query tree yields the exact term, got {terms:?}"
+        );
+        assert!(
+            highlighter.extract_query_terms(&query, "other").is_empty(),
+            "require_field_match is on by default"
+        );
     }
 
     #[test]
@@ -996,8 +1051,7 @@ mod tests {
         // an upper-cased token in the source text must still match a
         // lower-cased term.
         let highlighter = Highlighter::new(HighlightConfig::default());
-        let mut terms = HashSet::new();
-        terms.insert("rust".to_string());
+        let terms = [HighlightTerm::Exact("rust".to_string())];
 
         let spans = highlighter
             .find_highlight_spans("learning Rust today", &terms)
@@ -1328,7 +1382,7 @@ mod tests {
     #[test]
     fn create_fragments_matches_the_quadratic_reference_on_analyzer_spans() {
         let text = "alpha rust beta rust gamma delta rust ".repeat(40);
-        let terms: HashSet<String> = ["rust".to_string()].into_iter().collect();
+        let terms = [HighlightTerm::Exact("rust".to_string())];
 
         for &fragment_size in &[10usize, 150] {
             for &max_fragments in &[usize::MAX, 5] {
@@ -1386,5 +1440,202 @@ mod tests {
     fn merge_overlapping_spans_empty_input() {
         let h = Highlighter::new(HighlightConfig::default());
         assert!(h.merge_overlapping_spans(Vec::new()).is_empty());
+    }
+
+    // --- Query-tree term extraction (#594) ---
+
+    /// Every `<mark>…</mark>` run across `fragments`, in order.
+    fn marked(fragments: &[HighlightFragment]) -> Vec<String> {
+        let mut out = Vec::new();
+        for fragment in fragments {
+            let mut rest = fragment.text.as_str();
+            while let Some(start) = rest.find("<mark>") {
+                let after = &rest[start + "<mark>".len()..];
+                let end = after.find("</mark>").expect("closing tag");
+                out.push(after[..end].to_string());
+                rest = &after[end + "</mark>".len()..];
+            }
+        }
+        out
+    }
+
+    fn highlight_marks<Q: Query>(query: &Q, field: &str, text: &str) -> Vec<String> {
+        let highlighter = Highlighter::new(HighlightConfig::default());
+        marked(&highlighter.highlight(query, field, text).unwrap().fragments)
+    }
+
+    #[test]
+    fn term_query_highlights_its_term() {
+        assert_eq!(
+            highlight_marks(
+                &TermQuery::new("body", "rust"),
+                "body",
+                "Learning Rust today"
+            ),
+            ["Rust"]
+        );
+    }
+
+    #[test]
+    fn boolean_query_skips_must_not() {
+        let mut query = BooleanQuery::new();
+        query.add_must(Box::new(TermQuery::new("body", "rust")));
+        query.add_must_not(Box::new(TermQuery::new("body", "java")));
+        query.add_should(Box::new(TermQuery::new("body", "search")));
+        assert_eq!(
+            highlight_marks(&query, "body", "rust search java"),
+            ["rust", "search"]
+        );
+    }
+
+    #[test]
+    fn phrase_query_highlights_only_adjacent_occurrences() {
+        let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]);
+        assert_eq!(
+            highlight_marks(
+                &query,
+                "body",
+                "hello world. world hello. hello there world"
+            ),
+            ["hello world"]
+        );
+    }
+
+    #[test]
+    fn phrase_query_honours_slop_like_phrase_matcher() {
+        let phrase = |slop: u32| {
+            PhraseQuery::new("body", vec!["hello".into(), "world".into()]).with_slop(slop)
+        };
+        assert_eq!(
+            highlight_marks(&phrase(1), "body", "hello big world"),
+            ["hello big world"]
+        );
+        assert!(highlight_marks(&phrase(0), "body", "hello big world").is_empty());
+        // The stop filter drops `the` but keeps its position, so the
+        // remaining tokens sit one apart: a gap at slop 0, fine at slop 1 —
+        // exactly what the index-side phrase matcher sees.
+        assert!(highlight_marks(&phrase(0), "body", "hello the world").is_empty());
+        assert_eq!(
+            highlight_marks(&phrase(1), "body", "hello the world"),
+            ["hello the world"]
+        );
+    }
+
+    #[test]
+    fn prefix_query_highlights_prefixed_tokens() {
+        assert_eq!(
+            highlight_marks(
+                &PrefixQuery::new("body", "rust"),
+                "body",
+                "rust rustacean trust"
+            ),
+            ["rust", "rustacean"]
+        );
+    }
+
+    #[test]
+    fn wildcard_query_highlights_matching_tokens() {
+        let query = WildcardQuery::new("body", "r?st").unwrap();
+        assert_eq!(
+            highlight_marks(&query, "body", "rust rest roast"),
+            ["rust", "rest"]
+        );
+    }
+
+    #[test]
+    fn regexp_query_highlights_matching_tokens() {
+        let query = RegexpQuery::new("body", "^ru.*").unwrap();
+        assert_eq!(
+            highlight_marks(&query, "body", "rust trust rusty"),
+            ["rust", "rusty"]
+        );
+    }
+
+    #[test]
+    fn fuzzy_query_highlights_tokens_within_edit_distance() {
+        let query = FuzzyQuery::new("body", "rust").max_edits(1);
+        assert_eq!(
+            highlight_marks(&query, "body", "rust rusty roast"),
+            ["rust", "rusty"]
+        );
+    }
+
+    #[test]
+    fn span_query_wrapper_highlights_span_terms() {
+        let clauses: Vec<Box<dyn SpanQuery>> = vec![
+            Box::new(SpanTermQuery::new("body", "rust")),
+            Box::new(SpanTermQuery::new("body", "safety")),
+        ];
+        let query = SpanQueryWrapper::new(Box::new(SpanNearQuery::new("body", clauses, 3, true)));
+        assert_eq!(
+            highlight_marks(&query, "body", "rust brings safety"),
+            ["rust", "safety"]
+        );
+    }
+
+    #[test]
+    fn multi_field_query_highlights_configured_fields_only() {
+        let query = MultiFieldQuery::new("rust".to_string()).add_field("title".to_string(), 1.0);
+        assert_eq!(highlight_marks(&query, "title", "rust title"), ["rust"]);
+        assert!(highlight_marks(&query, "body", "rust body").is_empty());
+    }
+
+    #[test]
+    fn advanced_query_skips_negative_filters() {
+        let query = AdvancedQuery::new(Box::new(TermQuery::new("body", "rust")))
+            .with_negative_filter(Box::new(TermQuery::new("body", "slow")));
+        assert_eq!(
+            highlight_marks(&query, "body", "rust is not slow"),
+            ["rust"]
+        );
+    }
+
+    #[test]
+    fn range_query_highlights_nothing() {
+        let query = RangeQuery::new("body", Some("a".to_string()), Some("z".to_string()));
+        assert!(highlight_marks(&query, "body", "anything at all").is_empty());
+    }
+
+    #[test]
+    fn require_field_match_filters_other_fields() {
+        let query = TermQuery::new("title", "rust");
+        let text = "rust everywhere";
+
+        assert!(
+            highlight_marks(&query, "body", text).is_empty(),
+            "a title term must not highlight the body by default"
+        );
+
+        let cross_field = Highlighter::new(HighlightConfig::default().require_field_match(false));
+        let fragments = cross_field
+            .highlight(&query, "body", text)
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["rust"]);
+    }
+
+    /// Terms are matched against the highlighter's own analyzer output, so a
+    /// character-level analyzer lets a single kanji term highlight inside
+    /// running Japanese text (the default `\w+` tokenizer would keep the
+    /// whole run as one token).
+    #[test]
+    fn japanese_unigram_analyzer_highlights_kanji_term() {
+        use std::sync::Arc;
+
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::tokenizer::Tokenizer;
+        use crate::analysis::tokenizer::ngram::NgramTokenizer;
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(NgramTokenizer::new(1, 1).unwrap());
+        let highlighter = Highlighter::with_analyzer(
+            HighlightConfig::default(),
+            Box::new(PipelineAnalyzer::new(tokenizer)),
+        );
+        let query = TermQuery::new("body", "猫");
+        let fragments = highlighter
+            .highlight(&query, "body", "吾輩は猫である。")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["猫"]);
     }
 }

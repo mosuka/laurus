@@ -28,6 +28,7 @@ let config = HighlightConfig::default()
 | `fragment_separator` | `String` | `" ... "` | Separator between fragments |
 | `return_entire_field_if_no_highlight` | `bool` | false | Return the full field value if no matches found |
 | `max_analyzed_chars` | `usize` | 1,000,000 | Maximum characters to analyze for highlights |
+| `require_field_match` | `bool` | true | Use only query terms that target the highlighted field (set to `false` to highlight terms from any field in the query) |
 
 ### Builder Methods
 
@@ -37,8 +38,26 @@ let config = HighlightConfig::default()
 | `css_class(class)` | Set the CSS class for the tag |
 | `max_fragments(count)` | Set maximum fragment count |
 | `fragment_size(size)` | Set target fragment size in characters |
+| `require_field_match(flag)` | Set whether only terms targeting the highlighted field are used |
 | `opening_tag()` | Get the opening HTML tag string (e.g., `<mark class="highlight">`) |
 | `closing_tag()` | Get the closing HTML tag string (e.g., `</mark>`) |
+
+## Supported Queries
+
+Highlight terms come from the query tree (`Query::collect_highlight_terms`), not from the query's description string, and are matched against the tokens produced by the highlighter's analyzer (`StandardAnalyzer` by default; use `Highlighter::with_analyzer` to match the field's analyzer, for example for Japanese text).
+
+| Query | What is highlighted |
+| :--- | :--- |
+| `TermQuery` | Tokens equal to the term |
+| `PhraseQuery` | Consecutive tokens forming the phrase, with the same in-order, per-gap `slop` rule as search; each occurrence is one highlight |
+| `PrefixQuery`, `WildcardQuery`, `RegexpQuery`, `FuzzyQuery` | Every token the pattern (or edit distance) matches |
+| `BooleanQuery` | Terms of `Must`, `Should` and `Filter` clauses; `MustNot` clauses are skipped |
+| `AdvancedQuery` | Terms of the core query, filters and post filters; negative filters are skipped |
+| `MultiFieldQuery` | Its text, in each configured field |
+| Span queries (`SpanQueryWrapper`) | Every span term in the wrapped query |
+| Range, numeric, date-time and geo queries | Nothing |
+
+By default only terms that target the highlighted field are used (`require_field_match`). Set it to `false` to highlight terms from every field in the query.
 
 ## HighlightFragment
 
