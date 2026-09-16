@@ -182,6 +182,15 @@ impl HighlightSpan {
     }
 }
 
+/// One fragment candidate: the run of spans that overlaps `window`.
+#[derive(Debug)]
+struct FragmentCandidate {
+    /// Index range into the span slice the candidate was built from.
+    spans: Range<usize>,
+    /// Byte window in the original text.
+    window: Range<usize>,
+}
+
 /// Main highlighter that can highlight text based on search queries.
 pub struct Highlighter {
     /// Configuration for highlighting.
@@ -397,15 +406,14 @@ impl Highlighter {
     }
 
     /// Merge overlapping highlight spans.
-    fn merge_overlapping_spans(&self, mut spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
-        if spans.is_empty() {
-            return spans;
-        }
+    fn merge_overlapping_spans(&self, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
+        let mut iter = spans.into_iter();
+        let Some(mut current) = iter.next() else {
+            return Vec::new();
+        };
 
         let mut merged = Vec::new();
-        let mut current = spans.remove(0);
-
-        for span in spans {
+        for span in iter {
             if span.range.start <= current.range.end {
                 // Overlapping spans - merge them
                 current.range.end = current.range.end.max(span.range.end);
@@ -422,45 +430,76 @@ impl Highlighter {
     }
 
     /// Create text fragments with highlighting.
+    ///
+    /// Candidates are scored and cut to `max_fragments` first; clipping the
+    /// span coordinates and rendering the markup happens only for the
+    /// survivors (#595). Previously every candidate was rendered and then
+    /// discarded, which made this stage `O(spans × fragment_size)`.
     fn create_fragments(
         &self,
         text: &str,
         spans: &[HighlightSpan],
     ) -> Result<Vec<HighlightFragment>> {
-        let mut fragments = Vec::new();
+        let mut candidates: Vec<(FragmentCandidate, f32)> = self
+            .group_spans_into_fragments(text, spans)
+            .into_iter()
+            .map(|candidate| {
+                let group = &spans[candidate.spans.clone()];
+                let score = group.iter().map(|s| s.score).sum::<f32>() / group.len() as f32;
+                (candidate, score)
+            })
+            .collect();
 
-        // Group spans into fragments
-        let fragment_groups = self.group_spans_into_fragments(text, spans);
+        // Sort by score (highest first). Stable, so equal scores keep span
+        // order; then keep only the fragments that will be returned.
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.truncate(self.config.max_fragments);
 
-        for (group_spans, fragment_range) in fragment_groups {
+        let mut fragments = Vec::with_capacity(candidates.len());
+        for (FragmentCandidate { spans: run, window }, score) in candidates {
+            // Adjust span coordinates relative to the fragment window.
+            let group_spans: Vec<HighlightSpan> = spans[run]
+                .iter()
+                .map(|s| {
+                    let relative_start = s.range.start.saturating_sub(window.start);
+                    let relative_end = (s.range.end - window.start).min(window.len());
+                    HighlightSpan::new(relative_start..relative_end, s.highlight, s.score)
+                })
+                .collect();
+
             // Defensive snap: span ends are derived from *filtered* token
             // text lengths (`start_offset + token.text.len()`), which can
             // diverge from the source span when a filter rewrites a token
             // (NFKC, stemming, ...). Snapping keeps the slice total even
             // when an upstream offset is off.
-            let start = floor_boundary(text, fragment_range.start);
-            let end = ceil_boundary(text, fragment_range.end).max(start);
+            let start = floor_boundary(text, window.start);
+            let end = ceil_boundary(text, window.end).max(start);
             let fragment_text = self.apply_highlighting(&text[start..end], &group_spans, start)?;
-            let score = group_spans.iter().map(|s| s.score).sum::<f32>() / group_spans.len() as f32;
 
             fragments.push(HighlightFragment::new(fragment_text, start, end, score));
         }
 
-        // Sort fragments by score (highest first)
-        fragments.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-        // Limit number of fragments
-        fragments.truncate(self.config.max_fragments);
-
         Ok(fragments)
     }
 
-    /// Group highlight spans into fragments.
+    /// Group highlight spans into fragment candidates.
+    ///
+    /// Precondition: `spans` sorted by start with non-decreasing ends — the
+    /// shape `merge_overlapping_spans` produces. Under it the spans
+    /// overlapping any window form one contiguous run, so each window costs
+    /// two binary searches instead of a scan over every span (#595).
     fn group_spans_into_fragments(
         &self,
         text: &str,
         spans: &[HighlightSpan],
-    ) -> Vec<(Vec<HighlightSpan>, Range<usize>)> {
+    ) -> Vec<FragmentCandidate> {
+        debug_assert!(
+            spans.windows(2).all(|w| {
+                w[0].range.start <= w[1].range.start && w[0].range.end <= w[1].range.end
+            }),
+            "spans must be sorted by start with non-decreasing ends"
+        );
+
         let mut groups = Vec::new();
         let text_len = text.len();
 
@@ -476,39 +515,24 @@ impl Highlighter {
             let fragment_start = self.find_word_boundary(text, fragment_start, false);
             let fragment_end = self.find_word_boundary(text, fragment_end, true);
 
-            let fragment_range = fragment_start..fragment_end;
+            let window = fragment_start..fragment_end;
 
-            // Find all spans that overlap with this fragment
-            let mut group_spans = Vec::new();
-            for candidate_span in spans {
-                if candidate_span.range.start < fragment_range.end
-                    && candidate_span.range.end > fragment_range.start
-                {
-                    // Adjust span coordinates relative to fragment
-                    let relative_start = candidate_span
-                        .range
-                        .start
-                        .saturating_sub(fragment_range.start);
-                    let relative_end =
-                        (candidate_span.range.end - fragment_range.start).min(fragment_range.len());
+            // Overlap predicate `s.start < window.end && s.end > window.start`:
+            // ends are non-decreasing, so the second half holds from `lo` on;
+            // starts are non-decreasing, so the first half holds before `hi`.
+            let lo = spans.partition_point(|s| s.range.end <= window.start);
+            let hi = spans.partition_point(|s| s.range.start < window.end);
 
-                    group_spans.push(HighlightSpan::new(
-                        relative_start..relative_end,
-                        candidate_span.highlight,
-                        candidate_span.score,
-                    ));
-                }
-            }
-
-            if !group_spans.is_empty() {
-                groups.push((group_spans, fragment_range));
+            if lo < hi {
+                groups.push(FragmentCandidate {
+                    spans: lo..hi,
+                    window,
+                });
             }
         }
 
         // Remove duplicate fragments (simple deduplication)
-        groups.dedup_by(|(_, range1), (_, range2)| {
-            (range1.start as i32 - range2.start as i32).abs() < 50
-        });
+        groups.dedup_by(|a, b| (a.window.start as i32 - b.window.start as i32).abs() < 50);
 
         groups
     }
@@ -1082,5 +1106,285 @@ mod tests {
         let text = "吾輩は猫である。名前はまだ無い。".repeat(3);
         let result = highlighter.highlight(&query, "body", &text);
         assert!(result.is_ok(), "must not panic when truncating mid-field");
+    }
+
+    // --- Fragment grouping / rendering (#595) ---
+
+    /// The pre-#595 `create_fragments` pipeline, kept as the reference:
+    /// every window rescans every span, every candidate is rendered, then a
+    /// stable score sort and the `max_fragments` cut. Also asserts the
+    /// invariant the binary-search version relies on -- for sorted,
+    /// non-overlapping spans each window's overlapping set is one
+    /// contiguous index run.
+    fn reference_fragments(
+        h: &Highlighter,
+        text: &str,
+        spans: &[HighlightSpan],
+    ) -> Vec<HighlightFragment> {
+        let text_len = text.len();
+        let mut groups: Vec<(Vec<HighlightSpan>, Range<usize>)> = Vec::new();
+        for span in spans {
+            let fragment_start = span.range.start.saturating_sub(h.config.fragment_size / 2);
+            let fragment_end = (span.range.end + h.config.fragment_size / 2).min(text_len);
+            let fragment_start = h.find_word_boundary(text, fragment_start, false);
+            let fragment_end = h.find_word_boundary(text, fragment_end, true);
+            let window = fragment_start..fragment_end;
+
+            let indices: Vec<usize> = spans
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.range.start < window.end && s.range.end > window.start)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                indices.windows(2).all(|w| w[1] == w[0] + 1),
+                "overlapping spans must form one contiguous run: {indices:?}"
+            );
+
+            let group: Vec<HighlightSpan> = indices
+                .iter()
+                .map(|&i| {
+                    let s = &spans[i];
+                    let relative_start = s.range.start.saturating_sub(window.start);
+                    let relative_end = (s.range.end - window.start).min(window.len());
+                    HighlightSpan::new(relative_start..relative_end, s.highlight, s.score)
+                })
+                .collect();
+            if !group.is_empty() {
+                groups.push((group, window));
+            }
+        }
+        groups.dedup_by(|(_, a), (_, b)| (a.start as i32 - b.start as i32).abs() < 50);
+
+        let mut fragments = Vec::new();
+        for (group, window) in groups {
+            let start = floor_boundary(text, window.start);
+            let end = ceil_boundary(text, window.end).max(start);
+            let rendered = h
+                .apply_highlighting(&text[start..end], &group, start)
+                .unwrap();
+            let score = group.iter().map(|s| s.score).sum::<f32>() / group.len() as f32;
+            fragments.push(HighlightFragment::new(rendered, start, end, score));
+        }
+        fragments.sort_by(|a, b| b.score.total_cmp(&a.score));
+        fragments.truncate(h.config.max_fragments);
+        fragments
+    }
+
+    fn fragment_keys(fragments: &[HighlightFragment]) -> Vec<(String, usize, usize, u32)> {
+        fragments
+            .iter()
+            .map(|f| {
+                (
+                    f.text.clone(),
+                    f.start_offset,
+                    f.end_offset,
+                    f.score.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    /// Deterministic LCG so the generated corpora are reproducible.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Text from a vocabulary mixing ASCII and multi-byte words, plus the
+    /// byte ranges of its words (maximal alphanumeric runs -- the shape
+    /// `find_word_boundary` snaps to).
+    fn synthetic_text(rng: &mut Lcg, words: usize) -> (String, Vec<Range<usize>>) {
+        const VOCAB: &[&str] = &[
+            "rust",
+            "search",
+            "検索",
+            "猫である",
+            "naïve",
+            "42",
+            "engine",
+            "x",
+        ];
+        const SEPARATORS: &[&str] = &[" ", ", ", "。", "\n", "  "];
+
+        let mut text = String::new();
+        for i in 0..words {
+            if i > 0 {
+                text.push_str(SEPARATORS[rng.below(SEPARATORS.len() as u64) as usize]);
+            }
+            text.push_str(VOCAB[rng.below(VOCAB.len() as u64) as usize]);
+        }
+
+        let mut ranges = Vec::new();
+        let mut current: Option<usize> = None;
+        for (idx, c) in text.char_indices() {
+            if c.is_alphanumeric() {
+                current.get_or_insert(idx);
+            } else if let Some(start) = current.take() {
+                ranges.push(start..idx);
+            }
+        }
+        if let Some(start) = current {
+            ranges.push(start..text.len());
+        }
+        (text, ranges)
+    }
+
+    /// Sorted, strictly non-overlapping spans over `word_ranges`: each word
+    /// is picked with probability `per_mille`/1000, a picked word is
+    /// sometimes fused with its successor into a phrase-like span, and
+    /// `force_edges` guarantees the first and last words are covered.
+    fn synthetic_spans(
+        rng: &mut Lcg,
+        word_ranges: &[Range<usize>],
+        per_mille: u64,
+        force_edges: bool,
+    ) -> Vec<HighlightSpan> {
+        let mut spans = Vec::new();
+        let mut i = 0;
+        while i < word_ranges.len() {
+            let forced = force_edges && (i == 0 || i + 1 == word_ranges.len());
+            if forced || rng.below(1000) < per_mille {
+                let mut range = word_ranges[i].clone();
+                if i + 2 < word_ranges.len() && rng.below(4) == 0 {
+                    range.end = word_ranges[i + 1].end;
+                    i += 1;
+                }
+                let score = 1.0 + rng.below(2000) as f32 / 1000.0;
+                let highlight = rng.below(8) != 0;
+                spans.push(HighlightSpan::new(range, highlight, score));
+            }
+            i += 1;
+        }
+        assert!(
+            spans.windows(2).all(|w| w[0].range.end < w[1].range.start),
+            "generator must produce strictly non-overlapping spans"
+        );
+        spans
+    }
+
+    /// `create_fragments` must produce exactly what the quadratic reference
+    /// produces -- same fragments, offsets, scores and order -- across
+    /// fragment sizes from 0 (window = the word itself) to far beyond the
+    /// text, span densities, corpus sizes and `max_fragments` cuts.
+    #[test]
+    fn create_fragments_matches_the_quadratic_reference() {
+        let mut rng = Lcg(0x5eed_0595);
+        let mut cases = 0usize;
+        let mut nonempty_cases = 0usize;
+
+        for &fragment_size in &[0usize, 1, 7, 30, 150, 1_000, 100_000] {
+            for &max_fragments in &[usize::MAX, 5, 1] {
+                let h = Highlighter::new(
+                    HighlightConfig::new()
+                        .fragment_size(fragment_size)
+                        .max_fragments(max_fragments),
+                );
+                for &per_mille in &[20u64, 300, 1000] {
+                    for &words in &[1usize, 3, 60, 800] {
+                        for &force_edges in &[false, true] {
+                            let (text, word_ranges) = synthetic_text(&mut rng, words);
+                            let spans =
+                                synthetic_spans(&mut rng, &word_ranges, per_mille, force_edges);
+
+                            let expected = reference_fragments(&h, &text, &spans);
+                            let actual = h.create_fragments(&text, &spans).unwrap();
+                            assert_eq!(
+                                fragment_keys(&actual),
+                                fragment_keys(&expected),
+                                "fragment_size={fragment_size} max_fragments={max_fragments} \
+                                 per_mille={per_mille} words={words} force_edges={force_edges}"
+                            );
+
+                            cases += 1;
+                            if !expected.is_empty() {
+                                nonempty_cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            nonempty_cases > cases / 2,
+            "the generator must mostly exercise non-empty fragment sets ({nonempty_cases}/{cases})"
+        );
+    }
+
+    /// Same equivalence, but on spans from the real `find_highlight_spans`
+    /// pipeline rather than the synthetic generator.
+    #[test]
+    fn create_fragments_matches_the_quadratic_reference_on_analyzer_spans() {
+        let text = "alpha rust beta rust gamma delta rust ".repeat(40);
+        let terms: HashSet<String> = ["rust".to_string()].into_iter().collect();
+
+        for &fragment_size in &[10usize, 150] {
+            for &max_fragments in &[usize::MAX, 5] {
+                let h = Highlighter::new(
+                    HighlightConfig::new()
+                        .fragment_size(fragment_size)
+                        .max_fragments(max_fragments),
+                );
+                let spans = h.find_highlight_spans(&text, &terms).unwrap();
+                assert!(spans.len() >= 100, "the corpus must yield many spans");
+
+                let expected = reference_fragments(&h, &text, &spans);
+                let actual = h.create_fragments(&text, &spans).unwrap();
+                assert_eq!(
+                    fragment_keys(&actual),
+                    fragment_keys(&expected),
+                    "fragment_size={fragment_size} max_fragments={max_fragments}"
+                );
+            }
+        }
+    }
+
+    /// Only `max_fragments` fragments come back, best score first, and
+    /// equal scores keep span order (the sort is stable).
+    #[test]
+    fn create_fragments_keeps_tie_order_and_truncates() {
+        // "rust" + 60 spaces, five times: spans at 0, 64, 128, 192, 256, so
+        // no two windows start within 50 bytes and dedup never fires.
+        let text = format!("rust{}", " ".repeat(60)).repeat(5);
+        let spans: Vec<HighlightSpan> = [1.0f32, 3.0, 1.0, 3.0, 2.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &score)| HighlightSpan::new(i * 64..i * 64 + 4, true, score))
+            .collect();
+
+        let h = Highlighter::new(HighlightConfig::new().fragment_size(4).max_fragments(3));
+        let fragments = h.create_fragments(&text, &spans).unwrap();
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(
+            fragments.iter().map(|f| f.start_offset).collect::<Vec<_>>(),
+            vec![62, 190, 254],
+            "the two 3.0s keep span order, then the 2.0"
+        );
+        assert_eq!(
+            fragments.iter().map(|f| f.score).collect::<Vec<_>>(),
+            vec![3.0, 3.0, 2.0]
+        );
+        assert_eq!(fragments[0].text, "  <mark>rust</mark>  ");
+
+        let none = Highlighter::new(HighlightConfig::new().fragment_size(4).max_fragments(0));
+        assert!(none.create_fragments(&text, &spans).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_overlapping_spans_empty_input() {
+        let h = Highlighter::new(HighlightConfig::default());
+        assert!(h.merge_overlapping_spans(Vec::new()).is_empty());
     }
 }
