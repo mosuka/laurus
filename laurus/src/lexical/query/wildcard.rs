@@ -8,10 +8,10 @@ use regex::Regex;
 use crate::error::Result;
 use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
 use crate::lexical::index::inverted::reader::InvertedIndexReader;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
 use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches documents containing terms that match a wildcard pattern.
@@ -256,6 +256,12 @@ impl Query for WildcardQuery {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if !self.pattern.is_empty() && field.is_none_or(|f| f == self.field) {
+            out.push(HighlightTerm::Regex(Arc::clone(&self.regex)));
+        }
     }
 
     fn cache_key(&self) -> Option<String> {

@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
 use crate::lexical::index::inverted::reader::InvertedIndexReader;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
 use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches terms starting with a specific prefix.
@@ -178,6 +178,12 @@ impl Query for PrefixQuery {
 
     fn field(&self) -> Option<&str> {
         Some(&self.field)
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if !self.prefix.is_empty() && field.is_none_or(|f| f == self.field) {
+            out.push(HighlightTerm::Prefix(self.prefix.clone()));
+        }
     }
 
     fn cache_key(&self) -> Option<String> {

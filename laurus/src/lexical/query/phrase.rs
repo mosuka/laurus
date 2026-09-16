@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use crate::error::Result;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::{EmptyMatcher, Matcher};
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A matcher that finds documents containing phrase matches.
@@ -520,6 +520,15 @@ impl Query for PhraseQuery {
 
     fn field(&self) -> Option<&str> {
         Some(&self.field)
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if !self.terms.is_empty() && field.is_none_or(|f| f == self.field) {
+            out.push(HighlightTerm::Phrase {
+                terms: self.terms.clone(),
+                slop: self.slop,
+            });
+        }
     }
 
     fn cache_key(&self) -> Option<String> {

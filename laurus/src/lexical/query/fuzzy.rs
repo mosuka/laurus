@@ -5,12 +5,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::lexical::index::inverted::core::automaton::LevenshteinAutomaton;
 use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
 use crate::lexical::index::inverted::reader::InvertedIndexReader;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
 use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A fuzzy query for approximate string matching.
@@ -136,23 +137,25 @@ impl FuzzyQuery {
         if let Some(inverted_reader) = reader.as_any().downcast_ref::<InvertedIndexReader>()
             && let Some(terms) = inverted_reader.terms(&self.field)?
         {
-            // Use LevenshteinAutomaton
-            let automaton =
-                crate::lexical::index::inverted::core::automaton::LevenshteinAutomaton::new(
-                    &self.term,
-                    self.max_edits,
-                    self.prefix_length as usize,
-                    self.transpositions,
-                );
-
             let terms_enum =
                 crate::lexical::index::inverted::core::automaton::AutomatonTermsEnum::new(
                     terms.iterator()?,
-                    automaton,
+                    self.automaton(),
                 );
             return Ok(Some(Box::new(terms_enum)));
         }
         Ok(None)
+    }
+
+    /// The edit-distance automaton this query enumerates terms with — and
+    /// what the highlighter tests tokens against (#594).
+    fn automaton(&self) -> LevenshteinAutomaton {
+        LevenshteinAutomaton::new(
+            &self.term,
+            self.max_edits,
+            self.prefix_length as usize,
+            self.transpositions,
+        )
     }
 }
 
@@ -237,6 +240,12 @@ impl Query for FuzzyQuery {
 
     fn field(&self) -> Option<&str> {
         Some(&self.field)
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if !self.term.is_empty() && field.is_none_or(|f| f == self.field) {
+            out.push(HighlightTerm::Fuzzy(self.automaton()));
+        }
     }
 
     fn cache_key(&self) -> Option<String> {

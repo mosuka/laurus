@@ -1,9 +1,9 @@
 //! Term query implementation for exact term matching.
 
 use crate::error::Result;
-use crate::lexical::query::Query;
 use crate::lexical::query::matcher::{EmptyMatcher, Matcher, PostingMatcher};
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches documents containing a specific term.
@@ -145,6 +145,12 @@ impl Query for TermQuery {
 
     fn field(&self) -> Option<&str> {
         Some(&self.field)
+    }
+
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        if !self.term.is_empty() && field.is_none_or(|f| f == self.field) {
+            out.push(HighlightTerm::Exact(self.term.clone()));
+        }
     }
 
     fn cache_key(&self) -> Option<String> {

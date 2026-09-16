@@ -40,8 +40,12 @@ pub use wildcard::WildcardQuery;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::sync::Arc;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+use crate::lexical::index::inverted::core::automaton::LevenshteinAutomaton;
 
 use crate::error::Result;
 #[allow(unused_imports)]
@@ -105,6 +109,29 @@ pub struct QueryResult {
     pub doc_id: u64,
     /// Score.
     pub score: f32,
+}
+
+/// What a query would highlight, expressed over analyzed tokens so the
+/// highlighter needs no index access. Produced by
+/// [`Query::collect_highlight_terms`].
+#[derive(Debug, Clone)]
+pub enum HighlightTerm {
+    /// One analyzed term, matched against each token.
+    Exact(String),
+    /// Ordered terms matched on token positions with the same in-order,
+    /// per-gap `slop` rule as the phrase matcher.
+    Phrase {
+        /// The phrase's terms, in order.
+        terms: Vec<String>,
+        /// Maximum position gap allowed between consecutive terms.
+        slop: u32,
+    },
+    /// Tokens starting with this prefix.
+    Prefix(String),
+    /// Tokens matching this compiled regex (wildcard and regexp queries).
+    Regex(Arc<Regex>),
+    /// Tokens within the automaton's edit distance (fuzzy queries).
+    Fuzzy(LevenshteinAutomaton),
 }
 
 /// Trait for search queries.
@@ -232,6 +259,23 @@ pub trait Query: Send + Sync + Debug {
         }
     }
 
+    /// Collect what this query would highlight, expressed over analyzed
+    /// tokens (#594).
+    ///
+    /// `field == Some(f)` keeps only leaves targeting `f`; `None` keeps
+    /// every leaf. Composites recurse into positive clauses only: a
+    /// `MustNot` clause or a negative filter describes what a hit does
+    /// *not* contain. Queries without text terms (range, numeric, geo)
+    /// keep this no-op default.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Restrict to leaves targeting this field, or `None` for all.
+    /// * `out` - Terms are appended in query-tree order.
+    fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
+        let _ = (field, out);
+    }
+
     /// Apply field-level boosts to this query and its sub-queries.
     fn apply_field_boosts(&mut self, boosts: &HashMap<String, f32>) {
         if let Some(f) = self.field()
@@ -269,5 +313,153 @@ pub trait Query: Send + Sync + Debug {
     /// `Some(canonical_key)` if this query may be cached, `None` otherwise.
     fn cache_key(&self) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod highlight_term_tests {
+    use super::*;
+    use crate::lexical::index::inverted::core::automaton::Automaton;
+    use crate::lexical::query::advanced_query::MultiFieldQuery;
+    use crate::lexical::query::range::RangeQuery;
+    use crate::lexical::query::span::{
+        SpanNearQuery, SpanQueryWrapper, SpanTermQuery, SpanWithinQuery,
+    };
+
+    fn collect(query: &dyn Query, field: Option<&str>) -> Vec<HighlightTerm> {
+        let mut out = Vec::new();
+        query.collect_highlight_terms(field, &mut out);
+        out
+    }
+
+    fn exact(terms: &[HighlightTerm]) -> Vec<&str> {
+        terms
+            .iter()
+            .map(|term| match term {
+                HighlightTerm::Exact(text) => text.as_str(),
+                other => panic!("expected Exact, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn term_query_is_gated_by_field_and_skips_empty_terms() {
+        let query = TermQuery::new("body", "rust");
+        assert_eq!(exact(&collect(&query, Some("body"))), ["rust"]);
+        assert_eq!(exact(&collect(&query, None)), ["rust"]);
+        assert!(collect(&query, Some("title")).is_empty());
+        assert!(collect(&TermQuery::new("body", ""), None).is_empty());
+    }
+
+    #[test]
+    fn phrase_query_keeps_terms_and_slop() {
+        let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]).with_slop(2);
+        match collect(&query, Some("body")).as_slice() {
+            [HighlightTerm::Phrase { terms, slop }] => {
+                assert_eq!(terms, &["hello", "world"]);
+                assert_eq!(*slop, 2);
+            }
+            other => panic!("expected one Phrase, got {other:?}"),
+        }
+        assert!(collect(&query, Some("title")).is_empty());
+        assert!(collect(&PhraseQuery::new("body", Vec::new()), None).is_empty());
+    }
+
+    #[test]
+    fn multi_term_queries_yield_their_matcher_shapes() {
+        assert!(matches!(
+            collect(&PrefixQuery::new("body", "ru"), Some("body")).as_slice(),
+            [HighlightTerm::Prefix(prefix)] if prefix == "ru"
+        ));
+        assert!(collect(&PrefixQuery::new("body", ""), None).is_empty());
+
+        let wildcard = WildcardQuery::new("body", "r?st").unwrap();
+        assert!(matches!(
+            collect(&wildcard, Some("body")).as_slice(),
+            [HighlightTerm::Regex(regex)] if regex.is_match("rust") && !regex.is_match("roast")
+        ));
+
+        let regexp = RegexpQuery::new("body", "^ru.*").unwrap();
+        assert!(matches!(
+            collect(&regexp, Some("body")).as_slice(),
+            [HighlightTerm::Regex(regex)] if regex.is_match("rusty") && !regex.is_match("trust")
+        ));
+
+        let fuzzy = FuzzyQuery::new("body", "rust").max_edits(1);
+        assert!(matches!(
+            collect(&fuzzy, Some("body")).as_slice(),
+            [HighlightTerm::Fuzzy(automaton)] if automaton.matches("rusty") && !automaton.matches("roast")
+        ));
+        assert!(collect(&fuzzy, Some("title")).is_empty());
+    }
+
+    #[test]
+    fn boolean_query_skips_must_not_but_keeps_filters() {
+        let mut query = BooleanQuery::new();
+        query.add_must(Box::new(TermQuery::new("body", "rust")));
+        query.add_must_not(Box::new(TermQuery::new("body", "java")));
+        query.add_filter(Box::new(TermQuery::new("body", "search")));
+        let mut nested = BooleanQuery::new();
+        nested.add_should(Box::new(TermQuery::new("body", "engine")));
+        nested.add_should(Box::new(TermQuery::new("title", "engine")));
+        query.add_should(Box::new(nested));
+
+        assert_eq!(
+            exact(&collect(&query, Some("body"))),
+            ["rust", "search", "engine"]
+        );
+        assert_eq!(
+            exact(&collect(&query, None)),
+            ["rust", "search", "engine", "engine"]
+        );
+    }
+
+    #[test]
+    fn advanced_query_skips_negative_filters() {
+        let query = AdvancedQuery::new(Box::new(TermQuery::new("body", "rust")))
+            .with_filter(Box::new(TermQuery::new("body", "fast")))
+            .with_negative_filter(Box::new(TermQuery::new("body", "slow")))
+            .with_post_filter(Box::new(TermQuery::new("body", "safe")));
+        assert_eq!(
+            exact(&collect(&query, Some("body"))),
+            ["rust", "fast", "safe"]
+        );
+    }
+
+    #[test]
+    fn multi_field_query_yields_its_text_for_configured_fields_only() {
+        let query = MultiFieldQuery::new("rust".to_string())
+            .add_field("title".to_string(), 2.0)
+            .add_field("body".to_string(), 1.0);
+        assert_eq!(exact(&collect(&query, Some("body"))), ["rust"]);
+        assert_eq!(exact(&collect(&query, None)), ["rust"]);
+        assert!(collect(&query, Some("tags")).is_empty());
+    }
+
+    #[test]
+    fn span_wrapper_collects_every_span_term_in_its_field() {
+        let clauses: Vec<Box<dyn SpanQuery>> = vec![
+            Box::new(SpanTermQuery::new("body", "rust")),
+            Box::new(SpanTermQuery::new("body", "safety")),
+        ];
+        let near = SpanNearQuery::new("body", clauses, 3, true);
+        let within = SpanWithinQuery::new(
+            "body",
+            Box::new(near),
+            Box::new(SpanTermQuery::new("body", "memory")),
+            5,
+        );
+        let query = SpanQueryWrapper::new(Box::new(within));
+        assert_eq!(
+            exact(&collect(&query, Some("body"))),
+            ["rust", "safety", "memory"]
+        );
+        assert!(collect(&query, Some("title")).is_empty());
+    }
+
+    #[test]
+    fn range_query_yields_nothing() {
+        let query = RangeQuery::new("body", Some("a".to_string()), Some("z".to_string()));
+        assert!(collect(&query, None).is_empty());
     }
 }
