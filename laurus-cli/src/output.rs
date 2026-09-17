@@ -10,7 +10,8 @@ use base64::Engine as _;
 use clap::ValueEnum;
 use laurus::{DataValue, Document, EngineStats, SearchResult};
 use serde_json::json;
-use tabled::settings::Style;
+use tabled::settings::location::ByColumnName;
+use tabled::settings::{Remove, Style};
 use tabled::{Table, Tabled};
 
 /// Output format for CLI results.
@@ -31,19 +32,7 @@ pub enum OutputFormat {
 pub fn print_search_results(results: &[SearchResult], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
-            let json_results: Vec<serde_json::Value> = results
-                .iter()
-                .map(|r| {
-                    let mut obj = json!({
-                        "id": r.id,
-                        "score": r.score,
-                    });
-                    if let Some(ref doc) = r.document {
-                        obj["fields"] = fields_to_json(&doc.fields);
-                    }
-                    obj
-                })
-                .collect();
+            let json_results = search_results_to_json(results);
             println!("{}", serde_json::to_string_pretty(&json_results).unwrap());
         }
         OutputFormat::Table => {
@@ -52,6 +41,7 @@ pub fn print_search_results(results: &[SearchResult], format: OutputFormat) {
                 return;
             }
 
+            let has_highlights = results.iter().any(|r| !r.highlights.is_empty());
             let rows: Vec<SearchResultRow> = results
                 .iter()
                 .map(|r| {
@@ -64,14 +54,45 @@ pub fn print_search_results(results: &[SearchResult], format: OutputFormat) {
                         id: r.id.clone(),
                         score: format!("{:.4}", r.score),
                         fields,
+                        highlights: format_highlights_compact(&r.highlights),
                     }
                 })
                 .collect();
 
-            let table = Table::new(&rows).with(Style::rounded()).to_string();
+            let mut table = Table::new(&rows);
+            table.with(Style::rounded());
+            // Highlighting was not requested for this search (Issue #1134):
+            // drop the column instead of rendering it empty on every row.
+            if !has_highlights {
+                table.with(Remove::column(ByColumnName::new("Highlights")));
+            }
             println!("{table}");
         }
     }
+}
+
+/// Convert search results to the JSON shape [`print_search_results`] prints:
+/// `{"id", "score", "fields"?, "highlights"?}` per result. `"highlights"` is
+/// present only when at least one field actually highlighted (Issue #1134),
+/// matching the HTTP gateway's and laurus-mcp's `SearchResult` -> JSON
+/// conversions.
+fn search_results_to_json(results: &[SearchResult]) -> Vec<serde_json::Value> {
+    results
+        .iter()
+        .map(|r| {
+            let mut obj = json!({
+                "id": r.id,
+                "score": r.score,
+            });
+            if let Some(ref doc) = r.document {
+                obj["fields"] = fields_to_json(&doc.fields);
+            }
+            if !r.highlights.is_empty() {
+                obj["highlights"] = json!(r.highlights);
+            }
+            obj
+        })
+        .collect()
 }
 
 /// Print documents to stdout.
@@ -181,6 +202,8 @@ struct SearchResultRow {
     score: String,
     #[tabled(rename = "Fields")]
     fields: String,
+    #[tabled(rename = "Highlights")]
+    highlights: String,
 }
 
 #[derive(Tabled)]
@@ -222,12 +245,50 @@ fn fields_to_json(fields: &HashMap<String, DataValue>) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Convert highlights (Issue #1134) to a compact display string, fields in
+/// sorted order for deterministic output: `field: frag1 | frag2, other: ...`.
+/// Each fragment is truncated the same way a text field value is.
+fn format_highlights_compact(highlights: &HashMap<String, Vec<String>>) -> String {
+    let mut fields: Vec<&String> = highlights.keys().collect();
+    fields.sort();
+    fields
+        .into_iter()
+        .map(|field| {
+            let fragments = highlights[field]
+                .iter()
+                .map(|fragment| truncate_preview(fragment, TEXT_PREVIEW_CHARS))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("{field}: {fragments}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Maximum number of characters rendered for a text value in table output.
 ///
 /// Values longer than this are cut to `TEXT_PREVIEW_CHARS - 3` characters
 /// and suffixed with `...` so the rendered cell never exceeds
 /// `TEXT_PREVIEW_CHARS` characters.
 const TEXT_PREVIEW_CHARS: usize = 80;
+
+/// Truncate `s` to at most `max_chars` characters, on character boundaries
+/// rather than byte boundaries — the previous inline version of this logic
+/// (`&s[..77]`) sliced raw bytes and panicked whenever the cut point landed
+/// inside a multi-byte character, i.e. on essentially any Japanese value.
+/// A value cut short is suffixed with `...`.
+///
+/// `s.len()` (bytes) is always >= the character count, so the byte-length
+/// guard short-circuits the O(n) `chars().count()` for the common
+/// already-short case without changing the result.
+fn truncate_preview(s: &str, max_chars: usize) -> String {
+    if s.len() > max_chars && s.chars().count() > max_chars {
+        let head: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{head}...")
+    } else {
+        s.to_string()
+    }
+}
 
 /// Format a DataValue for compact display.
 fn format_data_value(value: &DataValue) -> String {
@@ -236,22 +297,7 @@ fn format_data_value(value: &DataValue) -> String {
         DataValue::Bool(b) => b.to_string(),
         DataValue::Int64(i) => i.to_string(),
         DataValue::Float64(f) => f.to_string(),
-        DataValue::Text(s) => {
-            // Truncate on character boundaries, not byte boundaries. The
-            // previous `&s[..77]` sliced raw bytes and panicked whenever
-            // byte 77 landed inside a multi-byte character — i.e. on
-            // essentially any Japanese field value.
-            //
-            // `s.len()` (bytes) is always >= the character count, so the
-            // byte-length guard short-circuits the O(n) `chars().count()`
-            // for the common short-value case without changing the result.
-            if s.len() > TEXT_PREVIEW_CHARS && s.chars().count() > TEXT_PREVIEW_CHARS {
-                let head: String = s.chars().take(TEXT_PREVIEW_CHARS - 3).collect();
-                format!("{head}...")
-            } else {
-                s.clone()
-            }
-        }
+        DataValue::Text(s) => truncate_preview(s, TEXT_PREVIEW_CHARS),
         DataValue::Bytes(b, _) => format!("<{} bytes>", b.len()),
         DataValue::Vector(v) => format!("<vector dim={}>", v.len()),
         DataValue::DateTime(dt) => dt.to_rfc3339(),
@@ -346,5 +392,74 @@ mod tests {
         text.push_str(&"b".repeat(20));
         let out = format_data_value(&DataValue::Text(text));
         assert!(out.ends_with("..."), "long text must be elided: {out}");
+    }
+
+    fn result_with_highlights(id: &str, highlights: HashMap<String, Vec<String>>) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score: 1.0,
+            document: None,
+            highlights,
+        }
+    }
+
+    #[test]
+    fn format_highlights_compact_sorts_fields_and_joins_fragments() {
+        let mut highlights = HashMap::new();
+        highlights.insert("title".to_string(), vec!["<mark>Rust</mark>".to_string()]);
+        highlights.insert(
+            "body".to_string(),
+            vec!["frag one".to_string(), "frag two".to_string()],
+        );
+
+        let out = format_highlights_compact(&highlights);
+        assert_eq!(
+            out, "body: frag one | frag two, title: <mark>Rust</mark>",
+            "fields sorted alphabetically (body before title): {out}"
+        );
+    }
+
+    #[test]
+    fn format_highlights_compact_is_empty_for_no_highlights() {
+        assert_eq!(format_highlights_compact(&HashMap::new()), "");
+    }
+
+    /// `search_results_to_json` (Issue #1134): the JSON output must gain a
+    /// `"highlights"` key only for a result that actually has one.
+    #[test]
+    fn search_results_to_json_includes_highlights_only_when_present() {
+        let mut highlights = HashMap::new();
+        highlights.insert("body".to_string(), vec!["<mark>Rust</mark>".to_string()]);
+        let results = vec![
+            result_with_highlights("doc1", highlights),
+            result_with_highlights("doc2", HashMap::new()),
+        ];
+
+        let json = search_results_to_json(&results);
+        assert_eq!(
+            json[0]["highlights"]["body"],
+            serde_json::json!(["<mark>Rust</mark>"])
+        );
+        assert!(
+            json[1].get("highlights").is_none(),
+            "a result with no highlights must not have the key: {}",
+            json[1]
+        );
+    }
+
+    /// Table rendering with and without highlights must not panic, and the
+    /// `Highlights` column must actually disappear when nothing in the
+    /// result set has any (rather than rendering an all-empty column).
+    #[test]
+    fn print_search_results_table_drops_the_highlights_column_when_empty() {
+        let no_highlights = vec![result_with_highlights("doc1", HashMap::new())];
+        print_search_results(&no_highlights, OutputFormat::Table);
+        print_search_results(&no_highlights, OutputFormat::Json);
+
+        let mut highlights = HashMap::new();
+        highlights.insert("body".to_string(), vec!["<mark>Rust</mark>".to_string()]);
+        let with_highlights = vec![result_with_highlights("doc1", highlights)];
+        print_search_results(&with_highlights, OutputFormat::Table);
+        print_search_results(&with_highlights, OutputFormat::Json);
     }
 }

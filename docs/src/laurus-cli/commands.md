@@ -468,7 +468,7 @@ laurus train pq-codebook --field embedding --from-index --sample-size 5000 --upd
 Execute a search query using the [Query DSL](../concepts/query_dsl.md).
 
 ```bash
-laurus search <QUERY> [--limit <N>] [--offset <N>]
+laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
 ```
 
 The query string is analyzed with each field's own configured analyzer —
@@ -485,6 +485,7 @@ field is always queryable even though it does not appear in the schema.
 | `<QUERY>` | Yes | — | Query string in Laurus Query DSL |
 | `--limit <N>` | No | `10` | Maximum number of results |
 | `--offset <N>` | No | `0` | Number of results to skip |
+| `--highlight <FIELD>` | No | (none) | Stored text field to highlight (Issue #1134); repeat for multiple fields. Uses the default `HighlightConfig` — one-shot only, not available in the [REPL](repl.md) |
 
 **Query syntax examples:**
 
@@ -511,6 +512,12 @@ laurus search "price:[10 TO 50]"
 laurus search "position:geo3d_distance(-3955182, 3350553, 3700276, 5000)"
 laurus search "position:geo3d_bbox(-4000000, 3300000, 3650000, -3900000, 3400000, 3750000)"
 laurus search "position:geo3d_nearest(-3955182, 3350553, 3700276, 10)"
+
+# Highlighted fragments on the "body" field
+laurus search "body:rust" --highlight body
+
+# Highlight multiple fields
+laurus search "body:rust" --highlight title --highlight body
 ```
 
 **Table output example:**
@@ -524,6 +531,16 @@ laurus search "position:geo3d_nearest(-3955182, 3350553, 3700276, 10)"
 ╰──────┴────────┴─────────────────────────────────────────╯
 ```
 
+A `Highlights` column appears only when `--highlight` was passed:
+
+```text
+╭──────┬────────┬─────────────────────────┬──────────────────────────────╮
+│ ID   │ Score  │ Fields                  │ Highlights                   │
+├──────┼────────┼─────────────────────────┼──────────────────────────────┤
+│ doc1 │ 0.8532 │ body: Rust is a syst... │ body: <mark>Rust</mark> is a │
+╰──────┴────────┴─────────────────────────┴──────────────────────────────╯
+```
+
 **JSON output example:**
 
 ```bash
@@ -535,13 +552,37 @@ laurus --format json search "body:rust" --limit 5
   {
     "id": "doc1",
     "score": 0.8532,
-    "document": {
+    "fields": {
       "title": "Introduction to Rust",
       "body": "Rust is a systems programming language."
     }
   }
 ]
 ```
+
+With `--highlight body`, each matching result also gains a `"highlights"`
+key (present only when at least one field actually highlighted):
+
+```json
+[
+  {
+    "id": "doc1",
+    "score": 0.8532,
+    "fields": {
+      "title": "Introduction to Rust",
+      "body": "Rust is a systems programming language."
+    },
+    "highlights": {
+      "body": ["<mark>Rust</mark> is a systems programming language."]
+    }
+  }
+]
+```
+
+See [Highlighting](../laurus/highlighting.md) for the full semantics —
+field selection, per-field analyzers, and why a `filter_query` never
+highlights (not reachable from this one-shot form of `search`, but
+relevant to any client using the same underlying option).
 
 ---
 

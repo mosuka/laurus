@@ -463,7 +463,7 @@ laurus train pq-codebook --field embedding --from-index --sample-size 5000 --upd
 [Query DSL](../concepts/query_dsl.md) を使用して検索クエリを実行します。
 
 ```bash
-laurus search <QUERY> [--limit <N>] [--offset <N>]
+laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
 ```
 
 クエリ文字列は、各フィールドに設定されたアナライザー自身で解析されます。例えば `schema.toml` で日本語（Lindera）アナライザーを設定したフィールドは、インデックス時と同じ方法でクエリ時にも解析されます。スキーマに宣言されていないフィールドを参照すると、そのフィールド名を含むエラーで拒否されます（typo の検出に役立ちます）。予約済みの `_id` フィールドはスキーマに現れませんが、常に検索可能です。
@@ -475,6 +475,7 @@ laurus search <QUERY> [--limit <N>] [--offset <N>]
 | `<QUERY>` | はい | — | Laurus Query DSL によるクエリ文字列 |
 | `--limit <N>` | いいえ | `10` | 最大結果件数 |
 | `--offset <N>` | いいえ | `0` | スキップする結果件数 |
+| `--highlight <FIELD>` | いいえ | （なし） | ハイライトする保存済みテキストフィールド（Issue #1134）。複数フィールドを指定する場合は繰り返す。既定の `HighlightConfig` を使用 — one-shot 専用で [REPL](repl.md) では使用不可 |
 
 **クエリ構文の例:**
 
@@ -501,6 +502,12 @@ laurus search "price:[10 TO 50]"
 laurus search "position:geo3d_distance(-3955182, 3350553, 3700276, 5000)"
 laurus search "position:geo3d_bbox(-4000000, 3300000, 3650000, -3900000, 3400000, 3750000)"
 laurus search "position:geo3d_nearest(-3955182, 3350553, 3700276, 10)"
+
+# "body" フィールドをハイライト
+laurus search "body:rust" --highlight body
+
+# 複数フィールドをハイライト
+laurus search "body:rust" --highlight title --highlight body
 ```
 
 **テーブル出力の例:**
@@ -514,6 +521,16 @@ laurus search "position:geo3d_nearest(-3955182, 3350553, 3700276, 10)"
 ╰──────┴────────┴─────────────────────────────────────────╯
 ```
 
+`--highlight` を指定した場合のみ `Highlights` 列が追加されます。
+
+```text
+╭──────┬────────┬─────────────────────────┬──────────────────────────────╮
+│ ID   │ Score  │ Fields                  │ Highlights                   │
+├──────┼────────┼─────────────────────────┼──────────────────────────────┤
+│ doc1 │ 0.8532 │ body: Rust is a syst... │ body: <mark>Rust</mark> is a │
+╰──────┴────────┴─────────────────────────┴──────────────────────────────╯
+```
+
 **JSON 出力の例:**
 
 ```bash
@@ -525,13 +542,33 @@ laurus --format json search "body:rust" --limit 5
   {
     "id": "doc1",
     "score": 0.8532,
-    "document": {
+    "fields": {
       "title": "Introduction to Rust",
       "body": "Rust is a systems programming language."
     }
   }
 ]
 ```
+
+`--highlight body` を指定すると、マッチした結果には `"highlights"` キーが追加されます（少なくとも1つのフィールドが実際にハイライトされた場合のみ）。
+
+```json
+[
+  {
+    "id": "doc1",
+    "score": 0.8532,
+    "fields": {
+      "title": "Introduction to Rust",
+      "body": "Rust is a systems programming language."
+    },
+    "highlights": {
+      "body": ["<mark>Rust</mark> is a systems programming language."]
+    }
+  }
+]
+```
+
+完全な意味論（フィールド選択、フィールドごとのアナライザー、`filter_query` がハイライトされない理由など）は[ハイライト](../laurus/highlighting.md)を参照してください。
 
 ---
 
