@@ -68,7 +68,7 @@ laurus> search body:rust
 ╰──────┴────────┴────────────────────────────────────╯
 ```
 
-`search` は [Query DSL](../concepts/query_dsl.md) の全体（Lexical・Vector・ハイブリッド句）を受け付け、単発の `laurus search` コマンドと同様に、クエリを各フィールドに設定されたアナライザー自身で解析します。結果件数は常に 10 件に制限されます。異なる件数が必要な場合は、REPL の外で `laurus search --limit N` を使用してください。
+`search` は [Query DSL](../concepts/query_dsl.md) の全体（Lexical・Vector・ハイブリッド句）を受け付け、単発の `laurus search` コマンドと同様に、クエリを各フィールドに設定されたアナライザー自身で解析します。結果件数は常に 10 件に制限されます。異なる件数が必要な場合は、REPL の外で `laurus search --limit N` を使用してください。同様に REPL には `--highlight`（Issue #1134）に相当する機能もありません — [ハイライト付きの結果](commands.md#search)が必要な場合は単発の `laurus search --highlight <FIELD>` コマンドを使用してください。
 
 ### フィールドの管理
 

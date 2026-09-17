@@ -1,11 +1,12 @@
 //! Criterion benchmarks for the document fetch + sparse-field selection
-//! pattern used by `result_processor::retrieve_document_fields`.
+//! pattern that once lived in the (now-removed, #1134) `result_processor`
+//! module as `retrieve_document_fields`.
 //!
-//! Targets the audit issue #410 (per-field document fetch). Today the
-//! result processor calls `reader.document(doc_id)`, which deserializes
-//! every field, then filters down to the requested subset via
-//! `should_retrieve_field`. The unrequested fields are full waste on a
-//! wide-schema with sparse field selection.
+//! Targets the audit issue #410 (per-field document fetch). That code
+//! called `reader.document(doc_id)`, which deserializes every field, then
+//! filtered down to the requested subset via `should_retrieve_field`. The
+//! unrequested fields are full waste on a wide-schema with sparse field
+//! selection.
 //!
 //! # Scope
 //!
@@ -178,7 +179,7 @@ impl LexicalIndexReader for MockStoreReader {
     }
 }
 
-/// Reproduce the body of `result_processor::retrieve_document_fields`:
+/// Reproduce the body of the removed `result_processor::retrieve_document_fields`:
 /// fetch the document by ID, iterate every stored field, and pick the
 /// subset matching `selected`. Returns a `HashMap<String, String>` whose
 /// values are stringified `DataValue`s.
@@ -216,9 +217,9 @@ fn fetch_subset(
     out
 }
 
-/// Convert a `DataValue` to a stringified form. Mirrors the shape of
-/// `result_processor::field_value_to_string` — a String already in Text
-/// form is cloned, other types fall back to `Debug`.
+/// Convert a `DataValue` to a stringified form. Mirrors the shape of the
+/// removed `result_processor::field_value_to_string` — a String already in
+/// Text form is cloned, other types fall back to `Debug`.
 fn data_value_to_string(value: &DataValue) -> String {
     match value {
         DataValue::Text(s) => s.clone(),

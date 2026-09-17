@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | Delete all versions for the given ID. |
 | `commit(): void` | Flush buffered writes and make all pending changes searchable. |
 | `flushWal(): void` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records. Useful when running under a group-commit policy (see below). |
-| `search(mixed $query, int $limit = 10, int $offset = 0): array` | Execute a search query. Returns an array of `SearchResult`. |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | Execute a search query. Returns an array of `SearchResult`. |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` applies identically to every query in the batch. |
 | `stats(): array` | Return index statistics (`"documentCount"`, `"vectorFields"`). |
 
 ### `search` query argument
@@ -45,6 +45,20 @@ The `$query` parameter accepts any of the following:
 - A **`SearchRequest`** for full control
 
 The same value kinds are accepted as the elements of `searchBatch`'s `$queries` array — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
+
+### Highlighting
+
+`search`/`searchBatch`'s `$highlight` parameter (Issue #1134) requests highlighted fragments per field on each hit's `SearchResult::getHighlights()`. It accepts:
+
+- A **list of field names**: `["body"]`
+- An **associative array** with a required `"fields"` key plus any of the optional `HighlightConfig` knobs — `max_fragments`, `fragment_size`, `tag`, `css_class`, `require_field_match`, `max_analyzed_chars`, `return_entire_field_if_no_highlight` — e.g. `["fields" => ["body"], "tag" => "em", "max_fragments" => 2]`
+
+```php
+$results = $index->search("body:rust", 10, 0, ["body"]);
+$results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems programming language."]]
+```
+
+Highlighting follows the query passed to `search`/`searchBatch` (or `SearchRequest`'s `$query`/`$lexical_query` — see below), and only `stored: true` text fields can be highlighted; a field that is absent, not stored, or not text is silently skipped. Omitting `$highlight` leaves every result's highlights empty. The same `highlight` argument is also accepted by `SearchRequest`'s constructor.
 
 ### WAL sync policy & durability
 
@@ -398,6 +412,7 @@ new \Laurus\SearchRequest(
     mixed $fusion = null,
     int $limit = 10,
     int $offset = 0,
+    ?array $highlight = null,
 )
 ```
 
@@ -410,6 +425,7 @@ new \Laurus\SearchRequest(
 | `$fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k: 60)` when both components are set. |
 | `$limit` | Maximum number of results (default 10). |
 | `$offset` | Pagination offset (default 0). |
+| `$highlight` | Same list-or-associative-array shape as `Index->search()`'s `$highlight` (Issue #1134). See [Highlighting](#highlighting). Only `$limit`/`$offset` have PHP-level defaults today, so a call that names `$highlight` must still pass every earlier parameter positionally or by name. |
 
 ---
 
@@ -418,10 +434,13 @@ new \Laurus\SearchRequest(
 Returned by `Index->search()`.
 
 ```php
-$result->getId()        // string   -- External document identifier
-$result->getScore()     // float    -- Relevance score
-$result->getDocument()  // array|null -- Retrieved field values, or null if not stored
+$result->getId()          // string   -- External document identifier
+$result->getScore()       // float    -- Relevance score
+$result->getDocument()    // array|null -- Retrieved field values, or null if not stored
+$result->getHighlights()  // array    -- Highlighted fragments per requested field
 ```
+
+`getHighlights()` maps each field named in `$highlight` to its highlighted fragments (best first); a field that did not highlight is absent from the array, and it returns `[]` when `$highlight` was not requested. See [Highlighting](#highlighting).
 
 ---
 

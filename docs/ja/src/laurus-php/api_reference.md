@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
 | `commit(): void` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flushWal(): void` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(mixed $query, int $limit = 10, int $offset = 0): array` | 検索クエリを実行します。`SearchResult` の配列を返します。 |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。 |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。 |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` はバッチ内のすべてのクエリに同一に適用されます。 |
 | `stats(): array` | インデックス統計（`"documentCount"`、`"vectorFields"`）を返します。 |
 
 ### `search` の query 引数
@@ -45,6 +45,20 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 - **`SearchRequest`**（完全な制御が必要な場合）
 
 `searchBatch` の `$queries` 配列の各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
+
+### ハイライト
+
+`search`/`searchBatch` の `$highlight` パラメータ（Issue #1134）は、各ヒットの `SearchResult::getHighlights()` にフィールドごとのハイライト済みフラグメントを要求します。以下のいずれかを受け付けます。
+
+- **フィールド名のリスト**: `["body"]`
+- **連想配列**: 必須の `"fields"` キーに加えて、`HighlightConfig` の任意の設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`）を指定 — 例: `["fields" => ["body"], "tag" => "em", "max_fragments" => 2]`
+
+```php
+$results = $index->search("body:rust", 10, 0, ["body"]);
+$results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems programming language."]]
+```
+
+ハイライトは `search`/`searchBatch` に渡したクエリ（または `SearchRequest` の `$query`/`$lexicalQuery`、下記参照）に従い、`stored: true` のテキストフィールドのみハイライト可能です。存在しない、保存されていない、テキスト型でないフィールドは黙ってスキップされます。`$highlight` を省略すると、すべての結果のハイライトは空のままになります。同じ `highlight` 引数は `SearchRequest` のコンストラクタでも使用できます。
 
 ### WAL 同期ポリシーと耐久性
 
@@ -394,6 +408,7 @@ new \Laurus\SearchRequest(
     mixed $fusion = null,
     int $limit = 10,
     int $offset = 0,
+    ?array $highlight = null,
 )
 ```
 
@@ -406,6 +421,7 @@ new \Laurus\SearchRequest(
 | `$fusion` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。 |
 | `$limit` | 最大結果件数（デフォルト 10）。 |
 | `$offset` | ページネーションオフセット（デフォルト 0）。 |
+| `$highlight` | `Index->search()` の `$highlight` と同じリストまたは連想配列の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。`$limit`/`$offset` 以外は PHP レベルのデフォルトを持たないため、`$highlight` を名前付き引数で渡す場合もそれ以前の引数はすべて位置または名前で渡す必要があります。 |
 
 ---
 
@@ -414,10 +430,13 @@ new \Laurus\SearchRequest(
 `Index->search()` が返すクラスです。
 
 ```php
-$result->getId()        // string   -- 外部ドキュメント識別子
-$result->getScore()     // float    -- 関連性スコア
-$result->getDocument()  // array|null -- 取得されたフィールド値。stored=false の場合は null
+$result->getId()          // string   -- 外部ドキュメント識別子
+$result->getScore()       // float    -- 関連性スコア
+$result->getDocument()    // array|null -- 取得されたフィールド値。stored=false の場合は null
+$result->getHighlights()  // array    -- 要求したフィールドごとのハイライト済みフラグメント
 ```
+
+`getHighlights()` は `$highlight` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドは配列に現れず、`$highlight` を要求しなかった場合は `[]` を返します。詳細は[ハイライト](#ハイライト)を参照してください。
 
 ---
 

@@ -412,6 +412,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `lexical_params` | `LexicalParams` | いいえ | Lexical 検索パラメータ |
 | `vector_params` | `VectorParams` | いいえ | ベクトル検索パラメータ |
 | `field_boosts` | `map<string, float>` | いいえ | フィールドごとのスコアブースト |
+| `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
 
 `query` または `query_vectors` のいずれか 1 つ以上を指定する必要があります。
 
@@ -467,6 +468,27 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `rerank_factor` | `optional uint32` | Stage 2 rerank の widening 係数（Issue #481）。`rerank_storage` を有効にしたフィールドに対してこの値を設定すると、サーバは int8/PQ 候補取得を `top_k * rerank_factor` まで広げ、元の完全精度ベクトルで再スコアしてから上位 `top_k` を返します。#932 以降 3 つのベクトルインデックスタイプ（HNSW・Flat・IVF）すべてで反映されます（Flat/IVF はフィールド指定クエリに適用）。`rerank_storage = "F32"` を設定していないフィールドでは silent に int8 ランキングへフォールバックします — f32 情報を復元することはできません。`0` または省略で rerank 無効。 |
 | `ef_search` | `optional uint32` | HNSW の `ef_search` 候補リストサイズをクエリ単位で上書き（Issue #644）。PQ → SQ → f32 の3段 rerank チェーン（Issue #673）も、この値がゲートとなります。`rerank_storage` を有効にした PQ フィールドで `ef_search` を `top_k * rerank_factor` より広く設定すると、グラフが計算した候補集合全体を安価な int8 段で再ランキングしてから exact 段の狭い予算を切り出すようになります（`rerank_storage` サイドカーから導出、追加設定不要）。HNSW 以外のフィールドでは無視されます。 |
 
+### HighlightParams
+
+指定したフィールドのハイライト済みフラグメントを要求します（Issue #1134）。ハイライトは `SearchRequest.query`（DSL クエリの lexical 節）— つまり lexical スコアリングを駆動するのと同じクエリ — によって行われます。`filter_query` はハイライト対象の語を提供せず、lexical クエリを持たない Vector-only のリクエストはハイライトを生成しません。`stored: true` のテキストフィールドのみハイライト可能で、それ以外のフィールド名は黙ってスキップされます。詳細な意味論は[ハイライト](../laurus/highlighting.md)を参照してください。
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `fields` | `repeated string` | ハイライト対象の保存済みテキストフィールド。必須 — 未設定または空の場合は `INVALID_ARGUMENT` で拒否される |
+| `max_fragments` | `optional uint32` | フィールドあたりの最大フラグメント数（デフォルト: 5）。`0` は拒否される |
+| `fragment_size` | `optional uint32` | フラグメントの目標文字数（デフォルト: 150）。`0` は拒否される |
+| `tag` | `optional string` | マッチを囲む HTML タグ（デフォルト: `"mark"`）。空文字列は未設定として扱われる |
+| `css_class` | `optional string` | タグに追加する CSS クラス。空文字列は未設定として扱われる |
+| `require_field_match` | `optional bool` | ハイライト対象フィールドを対象とするクエリ語のみを使う（デフォルト: `true`） |
+| `max_analyzed_chars` | `optional uint64` | フィールドのテキストのうち解析する最大文字数（デフォルト: 1,000,000） |
+| `return_entire_field_if_no_highlight` | `optional bool` | マッチがない場合にフィールド全体を1つのフラグメントとして返す（デフォルト: `false`） |
+
+### Highlights
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `fragments` | `repeated string` | 1 フィールド分のハイライト済みフラグメント（最も良いフラグメントが先頭） |
+
 ### SearchResult
 
 | フィールド | 型 | 説明 |
@@ -474,6 +496,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `id` | `string` | 外部ドキュメント ID |
 | `score` | `float` | 関連度スコア |
 | `document` | `Document` | ドキュメントの内容 |
+| `highlights` | `map<string, Highlights>` | `SearchRequest.highlight.fields` で指定したフィールドごとのハイライト済みフラグメント。ハイライトがないフィールドはこのマップに現れない |
 
 ### 例
 
@@ -490,6 +513,27 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
   "field_boosts": {
     "title": 2.0
   }
+}
+```
+
+### 例: ハイライト
+
+```json
+{
+  "query": "body:rust",
+  "limit": 10,
+  "highlight": {"fields": ["body"], "max_fragments": 2, "tag": "em"}
+}
+```
+
+マッチしたヒットの `SearchResult` は以下のようになります。
+
+```json
+{
+  "id": "doc1",
+  "score": 1.2,
+  "document": {"fields": {"body": {"text_value": "Rust is great"}}},
+  "highlights": {"body": {"fragments": ["<em>Rust</em> is great"]}}
 }
 ```
 

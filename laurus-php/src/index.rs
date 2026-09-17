@@ -15,7 +15,9 @@ use laurus::{
 use crate::convert::{document_to_hashtable, hashtable_to_document};
 use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::schema::PhpSchema;
-use crate::search::{PhpSearchResult, build_request_from_php, to_php_search_result};
+use crate::search::{
+    PhpSearchResult, build_request_from_php, parse_highlight_option, to_php_search_result,
+};
 
 // ---------------------------------------------------------------------------
 // WalSyncPolicy
@@ -525,13 +527,25 @@ impl PhpIndex {
     /// * `query` - The query to execute.
     /// * `limit` - Maximum number of results (default: 10).
     /// * `offset` - Pagination offset (default: 0).
+    /// * `highlight` - Request highlighted fragments per field (Issue
+    ///   #1134): a list of field names or an associative array adding
+    ///   `HighlightConfig` knobs. Highlighting follows this query, and only
+    ///   `stored: true` text fields can be highlighted.
     ///
     /// # Returns
     ///
     /// An array of `SearchResult` objects.
     #[php(defaults(limit = 10, offset = 0))]
-    pub fn search(&self, query: &Zval, limit: i64, offset: i64) -> PhpResult<Vec<PhpSearchResult>> {
-        let request = build_request_from_php(query, limit as usize, offset as usize)?;
+    pub fn search(
+        &self,
+        query: &Zval,
+        limit: i64,
+        offset: i64,
+        highlight: Option<&ZendHashTable>,
+    ) -> PhpResult<Vec<PhpSearchResult>> {
+        let highlight = parse_highlight_option(highlight)?;
+        let request =
+            build_request_from_php(query, limit as usize, offset as usize, highlight.as_ref())?;
 
         let engine = self.engine()?;
         let results = self
@@ -556,6 +570,9 @@ impl PhpIndex {
     /// * `queries` - An array of queries to execute.
     /// * `limit` - Maximum number of results per query (default: 10).
     /// * `offset` - Pagination offset per query (default: 0).
+    /// * `highlight` - Request highlighted fragments per field, applied
+    ///   identically to every query in the batch — same format as
+    ///   `search`'s `$highlight` (Issue #1134).
     ///
     /// # Returns
     ///
@@ -571,7 +588,9 @@ impl PhpIndex {
         queries: &Zval,
         limit: i64,
         offset: i64,
+        highlight: Option<&ZendHashTable>,
     ) -> PhpResult<Vec<Vec<PhpSearchResult>>> {
+        let highlight = parse_highlight_option(highlight)?;
         let arr = queries.array().ok_or_else(|| {
             PhpException::from(
                 "search_batch: expected an array of queries (DSL string, Query object, or SearchRequest)".to_string(),
@@ -588,6 +607,7 @@ impl PhpIndex {
                 value,
                 limit as usize,
                 offset as usize,
+                highlight.as_ref(),
             )?);
         }
 

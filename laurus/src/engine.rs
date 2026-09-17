@@ -2586,6 +2586,12 @@ impl Engine {
     /// Results are paginated via `offset` and `limit` on the
     /// [`SearchRequest`](self::search::SearchRequest).
     ///
+    /// When `lexical_options.highlight` is set, each returned hit's
+    /// [`highlights`](self::search::SearchResult::highlights) is filled from
+    /// its stored document using the request's lexical query (without the
+    /// request-level `filter_query`), each field tokenized with its own
+    /// index analyzer. Vector-only requests ignore the option.
+    ///
     /// # Parameters
     ///
     /// - `request` - The unified search request.
@@ -2647,7 +2653,20 @@ impl Engine {
                 )?,
             };
 
-        // 0b. Pre-process Filter
+        // 0b. Resolve the user's lexical query once. The searcher gets it
+        // filter-wrapped and boosted below; the highlighter gets this
+        // unwrapped form, so request-level filter terms never highlight.
+        let user_lexical_query: Option<Box<dyn crate::lexical::query::Query>> =
+            match &lexical_search_request {
+                Some(lex_req) => Some(self.resolve_query(lex_req.query.clone())?),
+                None => None,
+            };
+        let highlight_query = match (&lexical_options.highlight, &user_lexical_query) {
+            (Some(options), Some(query)) if !options.fields.is_empty() => Some(query.clone_box()),
+            _ => None,
+        };
+
+        // 0c. Pre-process Filter
         let (allowed_filter, lexical_query_override) = if let Some(filter_query) = &request_filter {
             // Evaluate the filter through the snapshot-scoped query/filter cache
             // (Issue #578): a repeated filter is served as a cached doc-id set
@@ -2661,18 +2680,15 @@ impl Engine {
                 return Ok(Vec::new());
             }
 
-            let new_lexical_query: Option<Box<dyn crate::lexical::query::Query>> =
-                if let Some(lex_req) = &lexical_search_request {
-                    use crate::lexical::query::boolean::BooleanQueryBuilder;
-                    let user_query = self.resolve_query(lex_req.query.clone())?;
-                    let bool_query = BooleanQueryBuilder::new()
-                        .must(user_query)
+            let new_lexical_query = user_lexical_query.as_ref().map(|user_query| {
+                use crate::lexical::query::boolean::BooleanQueryBuilder;
+                Box::new(
+                    BooleanQueryBuilder::new()
+                        .must(user_query.clone_box())
                         .filter(filter_query.clone_box())
-                        .build();
-                    Some(Box::new(bool_query))
-                } else {
-                    None
-                };
+                        .build(),
+                ) as Box<dyn crate::lexical::query::Query>
+            });
 
             (Some(allowed), new_lexical_query)
         } else {
@@ -2680,13 +2696,7 @@ impl Engine {
         };
 
         // 1. Execute Lexical Search
-        let mut lexical_query_to_use = if lexical_query_override.is_some() {
-            lexical_query_override
-        } else if let Some(lex_req) = &lexical_search_request {
-            Some(self.resolve_query(lex_req.query.clone())?)
-        } else {
-            None
-        };
+        let mut lexical_query_to_use = lexical_query_override.or(user_lexical_query);
 
         if let Some(query) = &mut lexical_query_to_use
             && let Some(lex_req) = &lexical_search_request
@@ -2821,7 +2831,7 @@ impl Engine {
         let vector_hits = vec_res?.map(|r| r.hits).unwrap_or_default();
 
         // 3. Fusion
-        if lexical_search_request.is_some() && vector_search_request.is_some() {
+        let mut results = if lexical_search_request.is_some() && vector_search_request.is_some() {
             let algorithm = fusion_algorithm.unwrap_or(FusionAlgorithm::RRF { k: 60.0 });
             let mut results = self.fuse_results(
                 lexical_hits,
@@ -2834,7 +2844,7 @@ impl Engine {
                 results = results.into_iter().skip(request_offset).collect();
             }
             results.truncate(request_limit);
-            Ok(results)
+            results
         } else if !vector_hits.is_empty() {
             // Only vector results — batch-resolve external IDs and documents.
             let paginated: Vec<_> = vector_hits
@@ -2855,10 +2865,11 @@ impl Engine {
                         id: external_id,
                         score: hit.score,
                         document,
+                        highlights: HashMap::new(),
                     });
                 }
             }
-            Ok(results)
+            results
         } else {
             // Only lexical results (or both empty)
             let paginated: Vec<_> = lexical_hits
@@ -2879,11 +2890,88 @@ impl Engine {
                         id: external_id,
                         score: hit.score,
                         document,
+                        highlights: HashMap::new(),
                     });
                 }
             }
-            Ok(results)
+            results
+        };
+
+        // 4. Highlighting: after pagination, so the cost is bounded by
+        // `limit × fields` analyzer passes.
+        if let (Some(options), Some(query)) = (&lexical_options.highlight, &highlight_query) {
+            self.apply_highlights(&mut results, query.as_ref(), options)?;
         }
+
+        Ok(results)
+    }
+
+    /// Fill [`highlights`](self::search::SearchResult::highlights) for every
+    /// field in `options.fields` (#1134).
+    ///
+    /// Text comes from the already-resolved `document`, so only `stored:
+    /// true` fields are reachable; a field that is absent or not text is
+    /// skipped. One [`Highlighter`] per requested field, driven by that
+    /// field's index-time analyzer (`PerFieldAnalyzer::get_analyzer`), so
+    /// what highlights is what matched. `query` is the user's lexical query
+    /// without the request-level `filter_query`.
+    ///
+    /// [`Highlighter`]: crate::lexical::search::features::highlight::Highlighter
+    fn apply_highlights(
+        &self,
+        results: &mut [self::search::SearchResult],
+        query: &dyn crate::lexical::query::Query,
+        options: &self::search::HighlightOptions,
+    ) -> Result<()> {
+        use crate::lexical::search::features::highlight::Highlighter;
+
+        if options.fields.is_empty() || results.is_empty() {
+            return Ok(());
+        }
+
+        // One analyzer lookup per search: `LexicalStore::analyzer` opens a
+        // fresh index reader.
+        let index_analyzer = self.lexical.analyzer()?;
+        let per_field = index_analyzer.as_any().downcast_ref::<PerFieldAnalyzer>();
+
+        let mut highlighters: Vec<(&str, Highlighter)> = Vec::with_capacity(options.fields.len());
+        for field in &options.fields {
+            if highlighters.iter().any(|(name, _)| *name == field.as_str()) {
+                continue;
+            }
+            let analyzer = per_field
+                .map(|analyzer| analyzer.get_analyzer(field))
+                .unwrap_or_else(|| Arc::clone(&index_analyzer));
+            highlighters.push((
+                field.as_str(),
+                Highlighter::with_shared_analyzer(options.config.clone(), analyzer),
+            ));
+        }
+
+        for result in results.iter_mut() {
+            let Some(document) = result.document.as_ref() else {
+                continue;
+            };
+            for (field, highlighter) in &highlighters {
+                let Some(text) = document.get(field).and_then(|value| value.as_text()) else {
+                    continue;
+                };
+                let highlight = highlighter.highlight(query, field, text)?;
+                if highlight.fragments.is_empty() {
+                    continue;
+                }
+                result.highlights.insert(
+                    (*field).to_string(),
+                    highlight
+                        .fragments
+                        .into_iter()
+                        .map(|fragment| fragment.text)
+                        .collect(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Combine results from lexical and vector engines.
@@ -3003,6 +3091,7 @@ impl Engine {
                     id: external_id,
                     score,
                     document: final_doc,
+                    highlights: HashMap::new(),
                 });
             }
         }

@@ -2,6 +2,39 @@
 
 Highlighting marks matching terms in search results, helping users see why a document matched their query. Laurus generates highlighted text fragments with configurable HTML tags.
 
+## Highlighting search results
+
+The easiest way to get highlights is through the search API itself: ask for them on a [`SearchRequest`](./engine.md), and each hit's [`SearchResult::highlights`](./api_reference.md) comes back filled in.
+
+```rust
+use laurus::{HighlightConfig, SearchRequestBuilder};
+
+let request = SearchRequestBuilder::new()
+    .lexical_query(query)
+    .highlight(vec!["body".to_string()])
+    .highlight_config(HighlightConfig::default().tag("em".to_string()))
+    .build();
+
+let results = engine.search(request).await?;
+for result in &results {
+    if let Some(fragments) = result.highlights.get("body") {
+        println!("{}", fragments.join(" ... "));
+    }
+}
+```
+
+`highlight(fields)` and `highlight_config(config)` are independent `SearchRequestBuilder` methods and compose in either order; calling `highlight` again replaces the field list, and the same holds for `highlight_config`. Omitting `highlight` (or requesting no fields) leaves every hit's `highlights` map empty — the engine does no highlighting work in that case.
+
+Semantics to keep in mind:
+
+- **Field selection.** Only fields named in `highlight(fields)` are considered, and only when they are `stored: true` text fields. A field that is absent from the document, not stored, or not a text field is silently skipped — it never appears as a key in `highlights`.
+- **Analyzer.** Each field is tokenized with its own index-time analyzer (per-field analyzers apply automatically), so highlighting reflects what actually matched at index time — not a generic tokenizer.
+- **Which query is highlighted.** The request's lexical query drives highlighting, including in hybrid search — a vector-only request produces no highlights. Terms contributed only by the request-level `filter_query` are never highlighted, since they describe eligibility, not relevance to what was searched for.
+- **Empty result.** A field with no highlight fragments (no match, or `return_entire_field_if_no_highlight` not set) is omitted from `highlights` entirely rather than mapped to an empty list.
+- **Cost.** Highlighting runs after pagination, so its cost scales with `limit × len(fields)`, not with the total number of matches.
+
+For direct control over highlighting outside the search API — for example to highlight text that never went through `Engine::search` — use `Highlighter` as described below.
+
 ## HighlightConfig
 
 `HighlightConfig` controls how highlights are generated:
@@ -24,8 +57,8 @@ let config = HighlightConfig::default()
 | `css_class` | `Option<String>` | `None` | Optional CSS class added to the tag |
 | `max_fragments` | `usize` | 5 | Maximum number of fragments to return |
 | `fragment_size` | `usize` | 150 | Target fragment length in characters |
-| `fragment_overlap` | `usize` | 20 | Character overlap between adjacent fragments |
-| `fragment_separator` | `String` | `" ... "` | Separator between fragments |
+| `fragment_overlap` | `usize` | 20 | Reserved; not currently read by fragment selection |
+| `fragment_separator` | `String` | `" ... "` | Reserved; not currently read — fragments are returned as a list, not pre-joined |
 | `return_entire_field_if_no_highlight` | `bool` | false | Return the full field value if no matches found |
 | `max_analyzed_chars` | `usize` | 1,000,000 | Maximum characters to analyze for highlights |
 | `require_field_match` | `bool` | true | Use only query terms that target the highlighted field (set to `false` to highlight terms from any field in the query) |
@@ -89,8 +122,8 @@ With `css_class("highlight")`:
 
 When a field is long, Laurus selects the most relevant fragments:
 
-1. The text is split into overlapping windows of `fragment_size` characters
+1. The text is split into windows of `fragment_size` characters
 2. Each fragment is scored by how many query terms it contains
-3. The top `max_fragments` fragments are returned, joined by `fragment_separator`
+3. The top `max_fragments` fragments are returned, in original order, as a `Vec<HighlightFragment>` (callers join or render the list themselves)
 
 If no fragments contain matches and `return_entire_field_if_no_highlight` is true, the full field value is returned instead.

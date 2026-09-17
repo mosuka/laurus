@@ -224,6 +224,17 @@ workloads.
 | `lexical_options` | `LexicalSearchOptions` | Default | Parameters controlling lexical search behavior |
 | `vector_options` | `VectorSearchOptions` | Default | Parameters controlling vector search behavior |
 
+### LexicalSearchOptions
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field_boosts` | `HashMap<String, f32>` | Empty | Per-field score multipliers |
+| `min_score` | `f32` | 0.0 | Minimum score threshold |
+| `timeout_ms` | `Option<u64>` | None | Search timeout in milliseconds |
+| `parallel` | `bool` | false | Run segment search in parallel |
+| `sort_by` | `SortField` | `Score` | Sort order for lexical results |
+| `highlight` | `Option<HighlightOptions>` | None | Fields and configuration for search-result highlighting; `None` leaves every hit's `SearchResult::highlights` empty. Set via `SearchRequestBuilder::highlight` / `.highlight_config`, see [Highlighting](./highlighting.md). Ignored by vector-only requests. |
+
 ## FusionAlgorithm
 
 | Variant | Description |

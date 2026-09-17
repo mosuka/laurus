@@ -405,4 +405,13 @@ pub struct SearchCommand {
     /// Number of results to skip.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
+
+    /// Stored text field to highlight (Issue #1134). Repeat to request
+    /// highlights on multiple fields, e.g. `--highlight title --highlight
+    /// body`. Highlighting follows this query's lexical clause — a
+    /// vector-only query produces no highlights. Uses the default
+    /// `HighlightConfig` (tag `mark`, up to 5 fragments); there is no flag
+    /// for the other `HighlightConfig` knobs.
+    #[arg(long = "highlight", value_name = "FIELD")]
+    pub highlight: Vec<String>,
 }

@@ -118,6 +118,8 @@ cargo doc --open
 | `.lexical_timeout_ms(u64)` | Lexical検索のタイムアウト（ミリ秒） |
 | `.lexical_parallel(bool)` | Lexical検索の並列実行を有効化 |
 | `.sort_by(SortField)` | Lexical検索のソート順を設定 |
+| `.highlight(fields)` | これらの保存済みテキストフィールドに対するハイライトを要求（[ハイライト](./highlighting.md)） |
+| `.highlight_config(HighlightConfig)` | ハイライトに使うタグ・フラグメント・`require_field_match` の設定を指定 |
 | `.vector_score_mode(VectorScoreMode)` | Vector検索のスコア結合モードを設定 |
 | `.vector_min_score(f32)` | Vector検索の最小スコアしきい値 |
 | `.build()` | `SearchRequest` を構築 |
@@ -143,6 +145,7 @@ cargo doc --open
 | `id` | `String` | 外部ドキュメントID |
 | `score` | `f32` | 関連度スコア |
 | `document` | `Option<Document>` | ドキュメント内容（ロードされた場合） |
+| `highlights` | `HashMap<String, Vec<String>>` | `.highlight()` で要求したフィールドごとのハイライト済みフラグメント。未要求またはマッチなしの場合は空（[ハイライト](./highlighting.md)） |
 
 ### FusionAlgorithm
 

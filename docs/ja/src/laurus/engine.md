@@ -222,6 +222,17 @@ Vector データを OS page cache に pre-fault します。HNSW グラフは常
 | `lexical_options` | `LexicalSearchOptions` | デフォルト | Lexical検索の動作パラメータ（ブースト、タイムアウト等） |
 | `vector_options` | `VectorSearchOptions` | デフォルト | Vector検索の動作パラメータ（スコアモード等） |
 
+### LexicalSearchOptions
+
+| フィールド | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field_boosts` | `HashMap<String, f32>` | 空 | フィールドごとのスコア倍率 |
+| `min_score` | `f32` | 0.0 | 最小スコアしきい値 |
+| `timeout_ms` | `Option<u64>` | None | 検索タイムアウト（ミリ秒） |
+| `parallel` | `bool` | false | セグメント検索を並列実行するか |
+| `sort_by` | `SortField` | `Score` | Lexical結果のソート順 |
+| `highlight` | `Option<HighlightOptions>` | None | 検索結果ハイライトの対象フィールドと設定。`None` の場合、各ヒットの `SearchResult::highlights` は空のまま。`SearchRequestBuilder::highlight` / `.highlight_config` で設定する（[ハイライト](./highlighting.md)参照）。Vector-onlyのリクエストでは無視される |
+
 ## FusionAlgorithm
 
 | バリアント | 説明 |

@@ -37,14 +37,16 @@ use crate::output::{self, OutputFormat};
 pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<Vec<SearchResult>> {
     let engine = context::open_index(index_dir).await?;
 
-    let request = SearchRequestBuilder::new()
+    let mut builder = SearchRequestBuilder::new()
         .query_dsl(cmd.query.clone())
         .limit(cmd.limit)
-        .offset(cmd.offset)
-        .build();
+        .offset(cmd.offset);
+    if !cmd.highlight.is_empty() {
+        builder = builder.highlight(cmd.highlight.clone());
+    }
 
     engine
-        .search(request)
+        .search(builder.build())
         .await
         .context("Failed to execute search")
 }
@@ -100,6 +102,7 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             query: query.to_string(),
             limit: 10,
             offset: 0,
+            highlight: Vec::new(),
         }
     }
 
@@ -269,6 +272,7 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
                 query: "猫で".to_string(),
                 limit: 2,
                 offset: 0,
+                highlight: Vec::new(),
             },
             dir.path(),
         )
@@ -308,5 +312,80 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
         let results = execute(&search_command("猫で"), dir.path()).await.unwrap();
         output::print_search_results(&results, OutputFormat::Table);
         output::print_search_results(&results, OutputFormat::Json);
+    }
+
+    /// `--highlight body` (Issue #1134) must reach the engine and come back
+    /// as fragments on the matching hit.
+    #[tokio::test]
+    async fn search_with_highlight_returns_fragments_for_the_requested_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.toml"), BIGRAM_SCHEMA).unwrap();
+
+        let engine = context::open_index(dir.path()).await.unwrap();
+        engine
+            .put_document(
+                "doc1",
+                laurus::Document::builder()
+                    .add_field("body", "吾輩は猫である")
+                    .build(),
+            )
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        // Issue #1086: `Engine::build()` now takes an exclusive lock on
+        // the storage directory, so this handle must close before
+        // `execute` opens a second `Engine` over the same directory --
+        // exactly what a real CLI invocation would do anyway (each
+        // `laurus` command is a separate process that exits when done).
+        drop(engine);
+
+        let results = execute(
+            &SearchCommand {
+                query: "吾輩は猫".to_string(),
+                limit: 10,
+                offset: 0,
+                highlight: vec!["body".to_string()],
+            },
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let fragments = results[0]
+            .highlights
+            .get("body")
+            .expect("body must be highlighted");
+        assert!(
+            fragments.iter().any(|f| f.contains("<mark>")),
+            "{fragments:?}"
+        );
+    }
+
+    /// Without `--highlight`, every hit's `highlights` stays empty — the
+    /// default `SearchCommand` (no flag) must not turn highlighting on.
+    #[tokio::test]
+    async fn search_without_highlight_flag_leaves_highlights_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.toml"), BIGRAM_SCHEMA).unwrap();
+
+        let engine = context::open_index(dir.path()).await.unwrap();
+        engine
+            .put_document(
+                "doc1",
+                laurus::Document::builder()
+                    .add_field("body", "吾輩は猫である")
+                    .build(),
+            )
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let results = execute(&search_command("吾輩は猫"), dir.path())
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.highlights.is_empty()));
     }
 }

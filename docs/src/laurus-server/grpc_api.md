@@ -413,6 +413,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `lexical_params` | `LexicalParams` | No | Lexical search parameters |
 | `vector_params` | `VectorParams` | No | Vector search parameters |
 | `field_boosts` | `map<string, float>` | No | Per-field score boosting |
+| `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
 
 At least one of `query` or `query_vectors` must be provided.
 
@@ -468,6 +469,33 @@ A `oneof` with two options:
 | `rerank_factor` | `optional uint32` | Stage 2 rerank widening factor (Issue #481). When set on a field whose schema enabled `rerank_storage`, the server widens the int8/PQ candidate fetch to `top_k * rerank_factor` and rescores the candidates against the original full-precision vectors before returning the top `top_k`. Honored on all three vector index types since #932 (HNSW, Flat, IVF — on Flat/IVF this applies to field-routed queries); fields without `rerank_storage = "F32"` silently fall back to int8 ranking — there is no f32 information to recover. A value of `0` or omitting the field disables rerank. |
 | `ef_search` | `optional uint32` | Per-query override for the HNSW `ef_search` candidate-list size (Issue #644). Also gates the PQ → SQ → f32 three-stage rerank chain (Issue #673): on a PQ field with `rerank_storage` enabled, setting `ef_search` wider than `top_k * rerank_factor` activates an extra int8 stage that rescores the graph's full candidate set — derived from the same `rerank_storage` sidecar, no extra configuration needed — before the exact stage's narrower budget is carved out of it. Ignored on non-HNSW fields. |
 
+### HighlightParams
+
+Requests highlighted fragments for specific fields (Issue #1134). Highlighting
+uses `SearchRequest.query` (or the lexical clause of a DSL query), the same
+query that drives lexical scoring — `filter_query` never contributes
+highlighted terms, and a vector-only request (no lexical query) produces no
+highlights. Only `stored: true` text fields can be highlighted; other names
+are silently skipped. See [Highlighting](../laurus/highlighting.md) for full
+semantics.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `fields` | `repeated string` | Stored text fields to highlight. Required — a request with this unset or empty is rejected with `INVALID_ARGUMENT` |
+| `max_fragments` | `optional uint32` | Maximum fragments per field (default: 5). `0` is rejected |
+| `fragment_size` | `optional uint32` | Target fragment length in characters (default: 150). `0` is rejected |
+| `tag` | `optional string` | HTML tag to wrap matches (default: `"mark"`). An empty string is treated as unset |
+| `css_class` | `optional string` | CSS class added to the tag. An empty string is treated as unset |
+| `require_field_match` | `optional bool` | Only use query terms that target the highlighted field (default: `true`) |
+| `max_analyzed_chars` | `optional uint64` | Maximum characters of a field's text to analyze (default: 1,000,000) |
+| `return_entire_field_if_no_highlight` | `optional bool` | Return the full field value as one fragment when nothing matched (default: `false`) |
+
+### Highlights
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `fragments` | `repeated string` | Highlighted fragments for one field, best fragment first |
+
 ### SearchResult
 
 | Field | Type | Description |
@@ -475,6 +503,7 @@ A `oneof` with two options:
 | `id` | `string` | External document ID |
 | `score` | `float` | Relevance score |
 | `document` | `Document` | Document content |
+| `highlights` | `map<string, Highlights>` | Highlighted fragments per field named in `SearchRequest.highlight.fields`. A field with no highlight is absent from this map |
 
 ### Example
 
@@ -491,6 +520,27 @@ A `oneof` with two options:
   "field_boosts": {
     "title": 2.0
   }
+}
+```
+
+### Example: Highlighting
+
+```json
+{
+  "query": "body:rust",
+  "limit": 10,
+  "highlight": {"fields": ["body"], "max_fragments": 2, "tag": "em"}
+}
+```
+
+A matching hit's `SearchResult` then carries:
+
+```json
+{
+  "id": "doc1",
+  "score": 1.2,
+  "document": {"fields": {"body": {"text_value": "Rust is great"}}},
+  "highlights": {"body": {"fragments": ["<em>Rust</em> is great"]}}
 }
 ```
 

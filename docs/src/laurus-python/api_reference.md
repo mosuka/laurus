@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, *, limit=10, offset=0) -> list[SearchResult]` | Execute a search query. |
-| `search_batch(queries, *, limit=10, offset=0) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. |
+| `search(query, *, limit=10, offset=0, highlight=None) -> list[SearchResult]` | Execute a search query. |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` applies identically to every query in the batch. |
 | `stats() -> dict` | Return index statistics (`document_count`, `vector_fields`). |
 
 ### `search` query argument
@@ -52,6 +52,20 @@ The `query` parameter accepts any of the following:
 - A **`SearchRequest`** for full control
 
 The same value kinds are accepted as the elements of `search_batch`'s `queries` list — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
+
+### Highlighting
+
+`search`/`search_batch`'s `highlight` parameter (Issue #1134) requests highlighted fragments per field on each hit's `SearchResult.highlights`. It accepts:
+
+- A **list of field names**: `highlight=["body"]`
+- A **dict** with a required `"fields"` key plus any of the optional `HighlightConfig` knobs: `max_fragments`, `fragment_size`, `tag`, `css_class`, `require_field_match`, `max_analyzed_chars`, `return_entire_field_if_no_highlight` — e.g. `highlight={"fields": ["body"], "tag": "em", "max_fragments": 2}`
+
+```python
+results = index.search("body:rust", highlight=["body"])
+print(results[0].highlights)  # {"body": ["<mark>Rust</mark> is a systems programming language."]}
+```
+
+Highlighting follows the query passed to `search`/`search_batch` (or `SearchRequest.query`/`lexical_query` — see below), and only `stored: true` text fields can be highlighted; a field that is absent, not stored, or not text is silently skipped. Omitting `highlight` leaves every result's `highlights` empty. The same `highlight=` keyword is also accepted by `SearchRequest`.
 
 ### WAL sync policy / durability
 
@@ -497,6 +511,7 @@ class SearchRequest:
         fusion=None,
         limit: int = 10,
         offset: int = 0,
+        highlight=None,
     ) -> None: ...
 ```
 
@@ -509,6 +524,7 @@ class SearchRequest:
 | `fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k=60)` when both components are set. |
 | `limit` | Maximum number of results (default 10). |
 | `offset` | Pagination offset (default 0). |
+| `highlight` | Same list-or-dict shape as `Index.search`'s `highlight` parameter (Issue #1134). See [Highlighting](#highlighting). |
 
 ---
 
@@ -521,7 +537,10 @@ class SearchResult:
     id: str          # External document identifier
     score: float     # Relevance score
     document: dict | None  # Retrieved field values, or None if not stored
+    highlights: dict[str, list[str]]  # Highlighted fragments per requested field
 ```
+
+`highlights` maps each field named in `highlight` to its highlighted fragments (best first); a field that did not highlight is absent from the dict, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
 
 ---
 

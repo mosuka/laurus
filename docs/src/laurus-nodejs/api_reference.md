@@ -38,12 +38,12 @@ class Index {
 | `deleteDocuments(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush writes and make pending changes searchable. |
 | `flushWal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, limit?, offset?)` | Search with a DSL string. |
-| `searchTerm(field, term, limit?, offset?)` | Search with an exact term match. |
+| `search(query, limit?, offset?, highlight?)` | Search with a DSL string. |
+| `searchTerm(field, term, limit?, offset?, highlight?)` | Search with an exact term match. |
 | `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector. |
 | `searchVectorText(field, text, limit?, offset?)` | Search with text (auto-embedded). |
 | `searchWithRequest(request)` | Search with a `SearchRequest`. |
-| `searchBatch(queries, limit?, offset?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. |
+| `searchBatch(queries, limit?, offset?, highlight?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` applies identically to every query. |
 | `stats()` | Return index statistics (`documentCount`, `vectorFields`). |
 
 All document methods and search methods are async
@@ -448,6 +448,7 @@ interface SearchRequestOptions {
   queryDsl?: string;
   limit?: number;   // default 10
   offset?: number;  // default 0
+  highlight?: HighlightOptions;
 }
 
 class SearchRequest {
@@ -458,7 +459,8 @@ class SearchRequest {
 Construct with primitive options first; attach polymorphic clauses with
 the per-type setters below. As with `BooleanQuery`, the binding exposes
 per-type setters because of `napi-derive`'s limitation on `Either<&T, ...>`
-arguments.
+arguments. `highlight` is plain data (not a class-instance union), so it
+lives directly on `SearchRequestOptions` rather than behind a setter.
 
 ### DSL and fusion setters
 
@@ -497,6 +499,28 @@ req.setRrfFusion(new RRF(60.0));
 const results = await index.searchWithRequest(req);
 ```
 
+### Highlighting
+
+`search`, `searchTerm`, `searchBatch` and `SearchRequestOptions` accept an optional `highlight` object (Issue #1134):
+
+```typescript
+interface HighlightOptions {
+  fields: string[];
+  fragmentSize?: number;    // default 150
+  maxFragments?: number;    // default 5
+  tag?: string;             // default "mark"
+  cssClass?: string;
+  requireFieldMatch?: boolean; // default true
+}
+```
+
+Only `fields` is required. Highlighting follows the query passed to the same call, and only `stored: true` text fields can be highlighted — a field that isn't stored, isn't a text field, or had no match is simply absent from the result's `highlights` object.
+
+```javascript
+const results = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
+// results[0].highlights => { body: ["<em>Rust</em> is a systems programming language."] }
+```
+
 ---
 
 ## SearchResult
@@ -508,8 +532,11 @@ interface SearchResult {
   id: string;        // External document identifier
   score: number;     // Relevance score
   document: object | null; // Retrieved fields, or null if not stored
+  highlights: Record<string, string[]>; // Highlighted fragments per requested field
 }
 ```
+
+`highlights` maps each field named in `highlight.fields` to its highlighted fragments (best first); a field that did not highlight is absent from the object, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
 
 ---
 

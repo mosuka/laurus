@@ -8,7 +8,7 @@ use crate::convert::{document_to_hash, hash_to_document};
 use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::gvl::without_gvl;
 use crate::schema::RbSchema;
-use crate::search::{build_request_from_rb, to_rb_search_result};
+use crate::search::{build_request_from_rb, rb_to_highlight_options, to_rb_search_result};
 use crate::wal::RbWalSyncPolicy;
 use laurus::{Engine, EngineStats, Schema, Storage, StorageConfig, StorageFactory};
 use magnus::prelude::*;
@@ -341,6 +341,10 @@ impl RbIndex {
     ///   - `query`: The query to execute.
     ///   - `limit:` (Integer, default 10): Maximum number of results.
     ///   - `offset:` (Integer, default 0): Pagination offset.
+    ///   - `highlight:` - Request highlighted fragments per field (Issue
+    ///     #1134): an Array of field names or a config Hash. Highlighting
+    ///     follows this query, and only `stored: true` text fields can be
+    ///     highlighted.
     ///
     /// # Returns
     ///
@@ -349,16 +353,19 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (query,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<usize>, Option<usize>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<Value>), ()>(
             args.keywords,
             &[],
-            &["limit", "offset"],
+            &["limit", "offset", "highlight"],
         )?;
-        let (limit, offset) = kwargs.optional;
+        let (limit, offset, highlight) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
+        let highlight = highlight
+            .map(|v| rb_to_highlight_options(&ruby, v))
+            .transpose()?;
 
-        let request = build_request_from_rb(query, limit, offset)?;
+        let request = build_request_from_rb(query, limit, offset, highlight.as_ref())?;
 
         let engine = self.engine()?;
         let results =
@@ -387,6 +394,9 @@ impl RbIndex {
     ///   - `queries`: An Array of queries to execute.
     ///   - `limit:` (Integer, default 10): Maximum number of results per query.
     ///   - `offset:` (Integer, default 0): Pagination offset per query.
+    ///   - `highlight:` - Request highlighted fragments per field, applied
+    ///     identically to every query in the batch — same format as
+    ///     `search`'s `highlight:` (Issue #1134).
     ///
     /// # Returns
     ///
@@ -400,14 +410,17 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (queries,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<usize>, Option<usize>), ()>(
+        let kwargs = get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<Value>), ()>(
             args.keywords,
             &[],
-            &["limit", "offset"],
+            &["limit", "offset", "highlight"],
         )?;
-        let (limit, offset) = kwargs.optional;
+        let (limit, offset, highlight) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
+        let highlight = highlight
+            .map(|v| rb_to_highlight_options(&ruby, v))
+            .transpose()?;
 
         let queries_array: RArray = TryConvert::try_convert(queries).map_err(|_| {
             Error::new(
@@ -422,7 +435,12 @@ impl RbIndex {
 
         let mut requests = Vec::with_capacity(queries_array.len());
         for item in queries_array.into_iter() {
-            requests.push(build_request_from_rb(item, limit, offset)?);
+            requests.push(build_request_from_rb(
+                item,
+                limit,
+                offset,
+                highlight.as_ref(),
+            )?);
         }
 
         let engine = self.engine()?;

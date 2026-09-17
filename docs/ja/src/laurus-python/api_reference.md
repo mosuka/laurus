@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit()` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal()` | WAL の永続性バリアを強制します。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。 |
-| `search(query, *, limit=10, offset=0) -> list[SearchResult]` | 検索クエリを実行します。 |
-| `search_batch(queries, *, limit=10, offset=0) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。 |
+| `search(query, *, limit=10, offset=0, highlight=None) -> list[SearchResult]` | 検索クエリを実行します。 |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` はバッチ内のすべてのクエリに同一に適用されます。 |
 | `stats() -> dict` | インデックス統計（`document_count`、`vector_fields`）を返します。 |
 
 ### `search` の query 引数
@@ -52,6 +52,20 @@ class Index:
 - **`SearchRequest`**（完全な制御が必要な場合）
 
 `search_batch` の `queries` リストの各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
+
+### ハイライト
+
+`search`/`search_batch` の `highlight` パラメータ（Issue #1134）は、各ヒットの `SearchResult.highlights` にフィールドごとのハイライト済みフラグメントを要求します。以下のいずれかを受け付けます。
+
+- **フィールド名のリスト**: `highlight=["body"]`
+- **辞書**: 必須の `"fields"` キーに加えて、`HighlightConfig` の任意の設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`）を指定 — 例: `highlight={"fields": ["body"], "tag": "em", "max_fragments": 2}`
+
+```python
+results = index.search("body:rust", highlight=["body"])
+print(results[0].highlights)  # {"body": ["<mark>Rust</mark> is a systems programming language."]}
+```
+
+ハイライトは `search`/`search_batch` に渡したクエリ（または `SearchRequest.query`/`lexical_query`、下記参照）に従い、`stored: true` のテキストフィールドのみハイライト可能です。存在しない、保存されていない、テキスト型でないフィールドは黙ってスキップされます。`highlight` を省略すると、すべての結果の `highlights` は空のままになります。同じ `highlight=` キーワードは `SearchRequest` でも使用できます。
 
 ### WAL 同期ポリシー / 永続性
 
@@ -436,6 +450,7 @@ class SearchRequest:
         fusion=None,
         limit: int = 10,
         offset: int = 0,
+        highlight=None,
     ) -> None: ...
 ```
 
@@ -448,6 +463,7 @@ class SearchRequest:
 | `fusion` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k=60)`。 |
 | `limit` | 最大結果件数（デフォルト 10）。 |
 | `offset` | ページネーションオフセット（デフォルト 0）。 |
+| `highlight` | `Index.search` の `highlight` パラメータと同じリストまたは辞書の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
 
 ---
 
@@ -460,7 +476,10 @@ class SearchResult:
     id: str          # 外部ドキュメント識別子
     score: float     # 関連性スコア
     document: dict | None  # 取得されたフィールド値。stored=False の場合は None
+    highlights: dict[str, list[str]]  # 要求したフィールドごとのハイライト済みフラグメント
 ```
+
+`highlights` は `highlight` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドは辞書に現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
 
 ---
 

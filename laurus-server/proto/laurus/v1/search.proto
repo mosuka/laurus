@@ -56,6 +56,12 @@ message SearchRequest {
 
   // Per-field boost factors for lexical scoring.
   map<string, float> field_boosts = 8;
+
+  // Request highlighted fragments for these fields (Issue #1134). Unset (or
+  // no `fields` on it) returns no highlights. Highlighting uses the lexical
+  // query above, ignoring `filter_query` and vector queries — a vector-only
+  // request produces no highlights.
+  optional HighlightParams highlight = 9;
 }
 
 message QueryVector {
@@ -131,6 +137,48 @@ enum VectorScoreMode {
   VECTOR_SCORE_MODE_LATE_INTERACTION = 2;
 }
 
+// Search-result highlighting parameters (Issue #1134). Mirrors
+// `laurus::HighlightConfig` plus the field list; see the `laurus` crate's
+// highlighting docs for full semantics (field selection, per-field
+// analyzers, which query drives highlighting).
+message HighlightParams {
+  // Stored text fields to highlight. Required; a request with this unset or
+  // empty is rejected.
+  repeated string fields = 1;
+
+  // Maximum number of fragments to return per field. Unset uses the
+  // `laurus` default (5). Zero is rejected.
+  optional uint32 max_fragments = 2;
+
+  // Target fragment length in characters. Unset uses the `laurus` default
+  // (150). Zero is rejected.
+  optional uint32 fragment_size = 3;
+
+  // HTML tag used to wrap matches. Unset (or empty) uses the `laurus`
+  // default ("mark").
+  optional string tag = 4;
+
+  // Optional CSS class added to the tag.
+  optional string css_class = 5;
+
+  // Only use query terms that target the highlighted field. Unset uses the
+  // `laurus` default (true).
+  optional bool require_field_match = 6;
+
+  // Maximum characters of a field's text to analyze for highlights. Unset
+  // uses the `laurus` default (1,000,000).
+  optional uint64 max_analyzed_chars = 7;
+
+  // Return the full field value as a single fragment when nothing matched.
+  // Unset uses the `laurus` default (false).
+  optional bool return_entire_field_if_no_highlight = 8;
+}
+
+// Highlighted fragments for one field, best fragment first.
+message Highlights {
+  repeated string fragments = 1;
+}
+
 message SearchResponse {
   repeated SearchResult results = 1;
   // Total number of matching results (before limit/offset).
@@ -141,4 +189,9 @@ message SearchResult {
   string id = 1;
   float score = 2;
   Document document = 3;
+
+  // Highlighted fragments per field named in the request's `highlight`
+  // params. A field with no highlight is absent from this map (Issue
+  // #1134).
+  map<string, Highlights> highlights = 4;
 }

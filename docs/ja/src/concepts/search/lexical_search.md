@@ -283,6 +283,7 @@ Lexical 検索の動作パラメータは `SearchRequestBuilder` のメソッド
 | `timeout_ms` | None | 検索の時間予算（ミリ秒、下記の注記を参照） |
 | `parallel` | false | セグメント間の並列検索を有効にする |
 | `sort_by` | `Score` | 関連性スコアでソート、またはフィールドでソート（`asc` / `desc`） |
+| `highlight` | None | 各ヒットの `SearchResult::highlights` に含めるフィールドと設定（[ハイライト](../../laurus/highlighting.md)参照） |
 
 フィールドソート検索（`sort_by: Field { .. }`）は常に全候補ドキュメントを走査します。
 スコアソートで利用可能な block-max ベースの早期終了とは異なり、フィールドソートには早期終了が
@@ -315,6 +316,8 @@ let request = SearchRequestBuilder::new()
     .limit(20)
     .build();
 ```
+
+`.highlight(fields)` と `.highlight_config(config)` は各ヒットのハイライト済みフラグメントを要求します。詳細は[ハイライト](../../laurus/highlighting.md)を参照してください。
 
 ## Query DSL の使用
 

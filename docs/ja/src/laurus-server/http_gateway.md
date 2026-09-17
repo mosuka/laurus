@@ -215,6 +215,36 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
+#### ハイライト付き検索
+
+`highlight` を指定すると、フィールドごとのハイライト済みフラグメントを要求できます（Issue #1134）。省略形はフィールド名の配列だけです。
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "body:rust", "limit": 10, "highlight": ["body"]}'
+```
+
+オブジェクト形式では `HighlightConfig` の各設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`）を追加できます。
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "body:rust",
+    "limit": 10,
+    "highlight": {"fields": ["body"], "max_fragments": 2, "tag": "em"}
+  }'
+```
+
+各結果には、少なくとも1つのフィールドが実際にハイライトされた場合にのみ `"highlights"` オブジェクトが追加されます。
+
+```json
+{"id": "doc1", "score": 1.2, "fields": {...}, "highlights": {"body": ["<em>Rust</em> is a systems programming language"]}}
+```
+
+`highlight` はスキーマ上で `stored: true` のテキストフィールドにのみ作用し、ハイライトは常にリクエストの lexical クエリに従います。`filter_query` はハイライト対象の語を提供せず、Vector-only のリクエストは `highlights` を一切生成しません。詳細な意味論は[ハイライト](../laurus/highlighting.md)を参照してください。
+
 ### ストリーミング検索（SSE）
 
 `/v1/search/stream` エンドポイントは Server-Sent Events（SSE）として結果を返します。各結果は個別のイベントとして送信されます。

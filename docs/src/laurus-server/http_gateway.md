@@ -225,6 +225,44 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
+#### Search with Highlighting
+
+`highlight` requests highlighted fragments per field (Issue #1134). The
+shorthand form is just a field list:
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "body:rust", "limit": 10, "highlight": ["body"]}'
+```
+
+The full object form adds `HighlightConfig` knobs — `max_fragments`,
+`fragment_size`, `tag`, `css_class`, `require_field_match`,
+`max_analyzed_chars`, `return_entire_field_if_no_highlight`:
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "body:rust",
+    "limit": 10,
+    "highlight": {"fields": ["body"], "max_fragments": 2, "tag": "em"}
+  }'
+```
+
+Each result gains a `"highlights"` object, present only when at least one
+field actually highlighted:
+
+```json
+{"id": "doc1", "score": 1.2, "fields": {...}, "highlights": {"body": ["<em>Rust</em> is a systems programming language"]}}
+```
+
+`highlight` only affects fields that are `stored: true` text fields in the
+schema, and highlighting always follows the request's lexical query — a
+`filter_query` never contributes highlighted terms and a vector-only
+request produces no `highlights` at all. See [Highlighting](../laurus/highlighting.md)
+for the full semantics.
+
 ### Streaming Search (SSE)
 
 The `/v1/search/stream` endpoint returns results as Server-Sent Events (SSE). Each result is sent as a separate event:

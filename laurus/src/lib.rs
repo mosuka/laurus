@@ -100,8 +100,8 @@ pub use engine::schema::{
     DynamicFieldPolicy, FieldChangeKind, FieldOption, Schema, classify_change,
 };
 pub use engine::search::{
-    FusionAlgorithm, HybridMode, LexicalSearchOptions, SearchQuery, SearchRequest,
-    SearchRequestBuilder, SearchResult, VectorSearchOptions, VectorSearchQuery,
+    FusionAlgorithm, HighlightOptions, HybridMode, LexicalSearchOptions, SearchQuery,
+    SearchRequest, SearchRequestBuilder, SearchResult, VectorSearchOptions, VectorSearchQuery,
 };
 pub use engine::type_inference::{InferredValue, infer_from_json, infer_option_from_data_value};
 pub use engine::{UpdateFieldOptions, UpdateFieldOutcome};
@@ -110,6 +110,7 @@ pub use lexical::core::field::{
     BooleanOption, BytesOption, DateTimeOption, FloatOption, Geo3dOption, GeoOption, IntegerOption,
     TextOption,
 };
+pub use lexical::search::features::highlight::HighlightConfig;
 pub use lexical::search::searcher::{
     LexicalSearchParams, LexicalSearchQuery, LexicalSearchRequest, SortField, SortOrder,
 };

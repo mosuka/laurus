@@ -1,5 +1,7 @@
 //! Node.js wrappers for search request/result and fusion algorithm types.
 
+use std::collections::HashMap;
+
 use crate::convert::data_value_to_json;
 use crate::query::{
     JsBooleanQuery, JsFuzzyQuery, JsGeo3dBoundingBoxQuery, JsGeo3dDistanceQuery,
@@ -8,9 +10,63 @@ use crate::query::{
     JsVectorTextQuery, JsWildcardQuery, extract_lexical_query, query_to_lexical_search_query,
     vector_query_to_search_query,
 };
-use laurus::{FusionAlgorithm, LexicalSearchQuery, SearchRequestBuilder, SearchResult};
+use laurus::{
+    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
+    SearchResult,
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+
+// ---------------------------------------------------------------------------
+// Highlighting (Issue #1134)
+// ---------------------------------------------------------------------------
+
+/// Options object accepted by `search`/`searchTerm`/`searchBatch`'s
+/// `highlight` parameter and by [`JsSearchRequestOptions::highlight`].
+///
+/// Only `fields` is required; everything else falls back to
+/// [`HighlightConfig::default`]. Unlike the polymorphic query/fusion
+/// fields on [`JsSearchRequestOptions`], every field here is plain data
+/// (no class-instance union), so it needs none of that struct's
+/// setter-method workaround.
+#[napi(object)]
+pub struct JsHighlightOptions {
+    /// Stored text fields to highlight.
+    pub fields: Vec<String>,
+    /// Target fragment length in characters (default 150).
+    pub fragment_size: Option<u32>,
+    /// Maximum number of fragments per field (default 5).
+    pub max_fragments: Option<u32>,
+    /// HTML tag to wrap matches (default `"mark"`).
+    pub tag: Option<String>,
+    /// CSS class added to the tag.
+    pub css_class: Option<String>,
+    /// Only use query terms that target the highlighted field (default `true`).
+    pub require_field_match: Option<bool>,
+}
+
+/// Convert [`JsHighlightOptions`] into the core [`HighlightOptions`]. Takes
+/// `&JsHighlightOptions` rather than by value since `JsSearchRequest::build`
+/// only has `&self`.
+pub fn js_highlight_options_to_core(options: &JsHighlightOptions) -> HighlightOptions {
+    let mut config = HighlightConfig::new();
+    if let Some(fragment_size) = options.fragment_size {
+        config = config.fragment_size(fragment_size as usize);
+    }
+    if let Some(max_fragments) = options.max_fragments {
+        config = config.max_fragments(max_fragments as usize);
+    }
+    if let Some(tag) = &options.tag {
+        config = config.tag(tag.clone());
+    }
+    if let Some(css_class) = &options.css_class {
+        config = config.css_class(css_class.clone());
+    }
+    if let Some(require_field_match) = options.require_field_match {
+        config = config.require_field_match(require_field_match);
+    }
+    HighlightOptions::new(options.fields.clone()).with_config(config)
+}
 
 // ---------------------------------------------------------------------------
 // Fusion algorithm types
@@ -85,6 +141,9 @@ impl JsWeightedSum {
 ///   - `id` (string): External document identifier.
 ///   - `score` (number): Relevance score (BM25, similarity, or fused).
 ///   - `document` (object | null): Retrieved document fields, or `null` if deleted.
+///   - `highlights` (object): Highlighted fragments per field requested via
+///     `highlight`, best fragment first. Empty when highlighting was not
+///     requested, the field was not a stored text field, or nothing matched.
 #[napi(object)]
 pub struct JsSearchResult {
     /// External document identifier.
@@ -93,6 +152,8 @@ pub struct JsSearchResult {
     pub score: f64,
     /// Retrieved document fields as a key-value object, or `null`.
     pub document: Option<serde_json::Value>,
+    /// Highlighted fragments per field.
+    pub highlights: HashMap<String, Vec<String>>,
 }
 
 /// Convert a [`SearchResult`] from the engine into a serializable [`JsSearchResult`].
@@ -116,6 +177,7 @@ pub fn to_js_search_result(r: SearchResult) -> JsSearchResult {
         id: r.id,
         score: r.score as f64,
         document,
+        highlights: r.highlights,
     }
 }
 
@@ -153,6 +215,8 @@ pub struct JsSearchRequest {
     pub(crate) fusion: Option<FusionChoice>,
     pub(crate) limit: usize,
     pub(crate) offset: usize,
+    /// Highlight request (Issue #1134).
+    pub(crate) highlight: Option<JsHighlightOptions>,
 }
 
 pub enum FusionChoice {
@@ -179,6 +243,10 @@ pub struct JsSearchRequestOptions {
     pub limit: Option<u32>,
     /// Pagination offset (default 0).
     pub offset: Option<u32>,
+    /// Request highlighted fragments per field (Issue #1134). Plain data,
+    /// so — unlike the polymorphic fields below — it lives here directly
+    /// rather than behind a setter.
+    pub highlight: Option<JsHighlightOptions>,
 }
 
 #[napi]
@@ -207,6 +275,7 @@ impl JsSearchRequest {
             query_dsl: None,
             limit: None,
             offset: None,
+            highlight: None,
         });
         Self {
             query_dsl: options.query_dsl,
@@ -216,6 +285,7 @@ impl JsSearchRequest {
             fusion: None,
             limit: options.limit.unwrap_or(10) as usize,
             offset: options.offset.unwrap_or(0) as usize,
+            highlight: options.highlight,
         }
     }
 
@@ -436,6 +506,15 @@ impl JsSearchRequest {
         // Filter query
         if let Some(fq) = &self.filter_query {
             builder = builder.filter_query(extract_lexical_query(fq)?);
+        }
+
+        // Highlighting (Issue #1134). Applied before every branch below
+        // returns, so it takes effect regardless of which query shape is set.
+        if let Some(h) = &self.highlight {
+            let options = js_highlight_options_to_core(h);
+            builder = builder
+                .highlight(options.fields)
+                .highlight_config(options.config);
         }
 
         // Explicit hybrid: lexical_query + vector_query both set

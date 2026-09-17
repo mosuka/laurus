@@ -158,6 +158,101 @@ pub fn json_to_field_boosts(
         .collect())
 }
 
+/// Parse a JSON string into a proto [`v1::HighlightParams`] (Issue #1134),
+/// for the `search` / `search_batch` tools' `highlight` parameter.
+///
+/// Accepts two formats, matching the HTTP gateway's `highlight` field:
+/// - The array shorthand — just a field list: `["title", "body"]`.
+/// - The full object form, adding any of the optional `HighlightConfig`
+///   knobs: `{"fields": ["body"], "max_fragments": 2, "tag": "em",
+///   "css_class": "hl", "require_field_match": false,
+///   "max_analyzed_chars": 500, "return_entire_field_if_no_highlight": true}`.
+///
+/// # Arguments
+///
+/// * `json_str` - JSON string in either of the two formats above.
+///
+/// # Errors
+///
+/// Returns an error if the JSON is malformed, not an array or object, or an
+/// object form has no non-empty `fields` array. Validation that only
+/// `from_proto` can perform (e.g. rejecting a zero `max_fragments`) is left
+/// to the server; this function only parses the shape.
+pub fn json_to_highlight_params(json_str: &str) -> anyhow::Result<v1::HighlightParams> {
+    let val: Value = serde_json::from_str(json_str)?;
+
+    let fields_from = |v: &Value| -> Option<Vec<String>> {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.as_str().map(str::to_string))
+                .collect()
+        })
+    };
+
+    if let Some(fields) = fields_from(&val) {
+        if fields.is_empty() {
+            return Err(anyhow::anyhow!("highlight field list must not be empty"));
+        }
+        return Ok(v1::HighlightParams {
+            fields,
+            ..Default::default()
+        });
+    }
+
+    let obj = val
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("highlight must be a field array or an object"))?;
+    let fields = obj.get("fields").and_then(fields_from).unwrap_or_default();
+    if fields.is_empty() {
+        return Err(anyhow::anyhow!(
+            "highlight.fields must be a non-empty array of field names"
+        ));
+    }
+    Ok(v1::HighlightParams {
+        fields,
+        max_fragments: obj
+            .get("max_fragments")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        fragment_size: obj
+            .get("fragment_size")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        tag: obj.get("tag").and_then(|v| v.as_str()).map(str::to_string),
+        css_class: obj
+            .get("css_class")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        require_field_match: obj.get("require_field_match").and_then(|v| v.as_bool()),
+        max_analyzed_chars: obj.get("max_analyzed_chars").and_then(|v| v.as_u64()),
+        return_entire_field_if_no_highlight: obj
+            .get("return_entire_field_if_no_highlight")
+            .and_then(|v| v.as_bool()),
+    })
+}
+
+/// Convert a proto [`v1::SearchResult`] to the JSON shape every MCP search
+/// tool returns: `{"id", "score", "fields", "highlights"?}`. `"highlights"`
+/// is present only when at least one field actually highlighted, matching
+/// the HTTP gateway's `proto_search_result_to_json` (Issue #1134).
+pub fn search_result_to_json(result: &v1::SearchResult) -> Value {
+    let mut obj = json!({
+        "id": result.id,
+        "score": result.score,
+        "fields": result.document.as_ref().map(document_fields_to_json),
+    });
+    if !result.highlights.is_empty() {
+        obj["highlights"] = Value::Object(
+            result
+                .highlights
+                .iter()
+                .map(|(field, highlights)| (field.clone(), json!(highlights.fragments)))
+                .collect(),
+        );
+    }
+    obj
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +353,88 @@ mod tests {
     fn test_json_to_field_boosts_invalid() {
         let json = r#"[1, 2, 3]"#;
         assert!(json_to_field_boosts(json).is_err());
+    }
+
+    #[test]
+    fn test_json_to_highlight_params_array_shorthand() {
+        let params = json_to_highlight_params(r#"["title", "body"]"#).unwrap();
+        assert_eq!(params.fields, ["title", "body"]);
+        assert_eq!(params.max_fragments, None);
+    }
+
+    #[test]
+    fn test_json_to_highlight_params_object_form() {
+        let json = r#"{
+            "fields": ["body"],
+            "max_fragments": 2,
+            "fragment_size": 80,
+            "tag": "em",
+            "css_class": "hl",
+            "require_field_match": false,
+            "max_analyzed_chars": 500,
+            "return_entire_field_if_no_highlight": true
+        }"#;
+        let params = json_to_highlight_params(json).unwrap();
+        assert_eq!(params.fields, ["body"]);
+        assert_eq!(params.max_fragments, Some(2));
+        assert_eq!(params.fragment_size, Some(80));
+        assert_eq!(params.tag.as_deref(), Some("em"));
+        assert_eq!(params.css_class.as_deref(), Some("hl"));
+        assert_eq!(params.require_field_match, Some(false));
+        assert_eq!(params.max_analyzed_chars, Some(500));
+        assert_eq!(params.return_entire_field_if_no_highlight, Some(true));
+    }
+
+    #[test]
+    fn test_json_to_highlight_params_rejects_empty_array() {
+        assert!(json_to_highlight_params("[]").is_err());
+    }
+
+    #[test]
+    fn test_json_to_highlight_params_rejects_missing_fields() {
+        assert!(json_to_highlight_params(r#"{"max_fragments": 2}"#).is_err());
+        assert!(json_to_highlight_params(r#"{"fields": []}"#).is_err());
+    }
+
+    #[test]
+    fn test_json_to_highlight_params_rejects_non_array_non_object() {
+        assert!(json_to_highlight_params("42").is_err());
+    }
+
+    #[test]
+    fn test_search_result_to_json_includes_highlights_when_present() {
+        let mut highlights = HashMap::new();
+        highlights.insert(
+            "body".to_string(),
+            v1::Highlights {
+                fragments: vec!["<mark>Rust</mark> is great".to_string()],
+            },
+        );
+        let result = v1::SearchResult {
+            id: "doc1".to_string(),
+            score: 0.5,
+            document: None,
+            highlights,
+        };
+
+        let json = search_result_to_json(&result);
+        assert_eq!(
+            json["highlights"]["body"],
+            json!(["<mark>Rust</mark> is great"])
+        );
+    }
+
+    #[test]
+    fn test_search_result_to_json_omits_highlights_key_when_empty() {
+        let result = v1::SearchResult {
+            id: "doc1".to_string(),
+            score: 0.5,
+            document: None,
+            highlights: HashMap::new(),
+        };
+
+        let json = search_result_to_json(&result);
+        assert!(json.get("highlights").is_none());
     }
 
     #[test]

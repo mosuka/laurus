@@ -1,11 +1,74 @@
 //! Python wrappers for search request/result and fusion algorithm types.
 
+use std::collections::HashMap;
+
 use crate::convert::document_to_dict;
 use crate::query::{
     extract_lexical_query, is_vector_query, py_to_lexical_search_query, py_to_vector_search_query,
 };
-use laurus::{FusionAlgorithm, LexicalSearchQuery, SearchRequestBuilder, SearchResult};
+use laurus::{
+    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
+    SearchResult,
+};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+// ---------------------------------------------------------------------------
+// Highlighting (Issue #1134)
+// ---------------------------------------------------------------------------
+
+/// Convert a Python `highlight` argument into [`HighlightOptions`].
+///
+/// Accepts either a list of field names (`["title", "body"]`), or a dict
+/// with a required `"fields"` key plus any of the optional
+/// [`HighlightConfig`] knobs: `max_fragments`, `fragment_size`, `tag`,
+/// `css_class`, `require_field_match`, `max_analyzed_chars`,
+/// `return_entire_field_if_no_highlight`. The dict form is checked first
+/// (a Python `dict`'s default iteration yields keys, which would otherwise
+/// silently mis-extract as a one-element field list).
+fn py_to_highlight_options(obj: &Bound<PyAny>) -> PyResult<HighlightOptions> {
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let fields: Vec<String> = dict
+            .get_item("fields")?
+            .ok_or_else(|| PyValueError::new_err("highlight dict requires a 'fields' key"))?
+            .extract()?;
+
+        let mut config = HighlightConfig::new();
+        if let Some(v) = dict.get_item("max_fragments")? {
+            config = config.max_fragments(v.extract()?);
+        }
+        if let Some(v) = dict.get_item("fragment_size")? {
+            config = config.fragment_size(v.extract()?);
+        }
+        if let Some(v) = dict.get_item("tag")? {
+            config = config.tag(v.extract()?);
+        }
+        if let Some(v) = dict.get_item("css_class")? {
+            config = config.css_class(v.extract()?);
+        }
+        if let Some(v) = dict.get_item("require_field_match")? {
+            config = config.require_field_match(v.extract()?);
+        }
+        if let Some(v) = dict.get_item("max_analyzed_chars")? {
+            config.max_analyzed_chars = v.extract()?;
+        }
+        if let Some(v) = dict.get_item("return_entire_field_if_no_highlight")? {
+            config.return_entire_field_if_no_highlight = v.extract()?;
+        }
+
+        return Ok(HighlightOptions::new(fields).with_config(config));
+    }
+
+    if let Ok(fields) = obj.extract::<Vec<String>>() {
+        return Ok(HighlightOptions::new(fields));
+    }
+
+    Err(PyValueError::new_err(
+        "highlight must be a list of field names or a dict, \
+         e.g. ['body'] or {'fields': ['body'], 'tag': 'em'}",
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Fusion algorithm types
@@ -78,12 +141,18 @@ impl PyWeightedSum {
 ///     id (str): External document identifier.
 ///     score (float): Relevance score (BM25, similarity, or fused).
 ///     document (dict | None): Retrieved document fields, or `None` if deleted.
+///     highlights (dict[str, list[str]]): Highlighted fragments per field
+///         requested via `highlight=`, best fragment first. Empty when
+///         highlighting was not requested, the field was not a stored text
+///         field, or nothing in it matched.
 #[pyclass(name = "SearchResult")]
 pub struct PySearchResult {
     #[pyo3(get)]
     pub id: String,
     #[pyo3(get)]
     pub score: f32,
+    #[pyo3(get)]
+    pub highlights: HashMap<String, Vec<String>>,
     document: Option<Py<PyAny>>,
 }
 
@@ -111,6 +180,7 @@ pub fn to_py_search_result(py: Python, r: SearchResult) -> PyResult<PySearchResu
     Ok(PySearchResult {
         id: r.id,
         score: r.score,
+        highlights: r.highlights,
         document,
     })
 }
@@ -151,6 +221,10 @@ pub struct PySearchRequest {
     pub fusion: Option<Py<PyAny>>,
     pub limit: usize,
     pub offset: usize,
+    /// Highlight request: a list of field names, or a dict adding
+    /// `HighlightConfig` knobs (Issue #1134). See `Index.search`'s
+    /// `highlight` parameter for the accepted shapes.
+    pub highlight: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -164,7 +238,8 @@ impl PySearchRequest {
         filter_query=None,
         fusion=None,
         limit=10,
-        offset=0
+        offset=0,
+        highlight=None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -175,6 +250,7 @@ impl PySearchRequest {
         fusion: Option<Py<PyAny>>,
         limit: usize,
         offset: usize,
+        highlight: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             query,
@@ -184,6 +260,7 @@ impl PySearchRequest {
             fusion,
             limit,
             offset,
+            highlight,
         }
     }
 
@@ -219,6 +296,18 @@ impl PySearchRequest {
         if let Some(fq) = &self.filter_query {
             let fq_obj: &Bound<'_, PyAny> = fq.bind(py);
             builder = builder.filter_query(extract_lexical_query(py, fq_obj)?);
+        }
+
+        // ── Highlighting (Issue #1134) ──────────────────────────────────────
+        // Applied before every branch below returns, so it takes effect
+        // regardless of which query shape (`query`, `lexical_query` +
+        // `vector_query`, or either alone) is set.
+        if let Some(h) = &self.highlight {
+            let h_obj: &Bound<'_, PyAny> = h.bind(py);
+            let options = py_to_highlight_options(h_obj)?;
+            builder = builder
+                .highlight(options.fields)
+                .highlight_config(options.config);
         }
 
         // ── Explicit hybrid: lexical_query + vector_query both set ────────
@@ -270,7 +359,7 @@ impl PySearchRequest {
 // ---------------------------------------------------------------------------
 
 /// Build a [`laurus::SearchRequest`] from the arguments passed to
-/// `Index.search(query, limit, offset)`.
+/// `Index.search(query, limit, offset, highlight)`.
 ///
 /// `query` may be:
 /// - A `str` (DSL)
@@ -278,11 +367,16 @@ impl PySearchRequest {
 /// - Any lexical query class (`TermQuery`, `BooleanQuery`, …)
 /// - `VectorQuery` or `VectorTextQuery`
 /// - A `PyRRF` / `PyWeightedSum` are not valid here
+///
+/// When `query` is a `PySearchRequest`, `limit`/`offset`/`highlight` are
+/// used as-is from the request without overriding — same precedent as
+/// `limit`/`offset` already had here before highlighting existed.
 pub fn build_request_from_py(
     py: Python,
     query: &Bound<PyAny>,
     limit: usize,
     offset: usize,
+    highlight: Option<&Bound<PyAny>>,
 ) -> PyResult<laurus::SearchRequest> {
     // Full SearchRequest object — use limit/offset as-is without overriding.
     if let Ok(req) = query.extract::<PyRef<PySearchRequest>>() {
@@ -290,6 +384,13 @@ pub fn build_request_from_py(
     }
 
     let mut builder = SearchRequestBuilder::new().limit(limit).offset(offset);
+
+    if let Some(h) = highlight {
+        let options = py_to_highlight_options(h)?;
+        builder = builder
+            .highlight(options.fields)
+            .highlight_config(options.config);
+    }
 
     // DSL string
     if let Ok(s) = query.extract::<String>() {

@@ -72,7 +72,9 @@ laurus> search body:rust
 vector, and hybrid clauses — and analyzes the query with each field's own
 configured analyzer, the same as the one-shot `laurus search` command.
 Results are always limited to 10; use `laurus search --limit N` outside the
-REPL for a different page size.
+REPL for a different page size. The REPL has no equivalent of `--highlight`
+(Issue #1134) either — use the one-shot `laurus search --highlight <FIELD>`
+command for [highlighted results](commands.md#search).
 
 ### Managing Fields
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -208,8 +209,9 @@ struct FragmentCandidate {
 pub struct Highlighter {
     /// Configuration for highlighting.
     config: HighlightConfig,
-    /// Text analyzer for tokenization.
-    analyzer: Box<dyn Analyzer>,
+    /// Text analyzer for tokenization. Shared, so the engine can hand the
+    /// index's per-field analyzer straight in (#1134).
+    analyzer: Arc<dyn Analyzer>,
 }
 
 impl std::fmt::Debug for Highlighter {
@@ -226,17 +228,26 @@ impl Highlighter {
     pub fn new(config: HighlightConfig) -> Self {
         Highlighter {
             config,
-            analyzer: Box::new(StandardAnalyzer::new().unwrap()),
+            analyzer: Arc::new(StandardAnalyzer::new().unwrap()),
         }
     }
 
     /// Create a highlighter with a custom analyzer.
     pub fn with_analyzer(config: HighlightConfig, analyzer: Box<dyn Analyzer>) -> Self {
+        Self::with_shared_analyzer(config, Arc::from(analyzer))
+    }
+
+    /// Create a highlighter over an analyzer shared with the index — the
+    /// way the engine highlights each field with its own analyzer (#1134).
+    pub fn with_shared_analyzer(config: HighlightConfig, analyzer: Arc<dyn Analyzer>) -> Self {
         Highlighter { config, analyzer }
     }
 
     /// Highlight text based on a query.
-    pub fn highlight<Q: Query>(
+    ///
+    /// `Q: ?Sized`, so a `&dyn Query` (the engine's resolved query) can be
+    /// passed directly.
+    pub fn highlight<Q: Query + ?Sized>(
         &self,
         query: &Q,
         field_name: &str,
@@ -287,7 +298,11 @@ impl Highlighter {
     /// Collect what `query` would highlight in `field_name` by walking the
     /// query tree (#594). With `require_field_match` on, leaves that target
     /// another field are skipped.
-    fn extract_query_terms<Q: Query>(&self, query: &Q, field_name: &str) -> Vec<HighlightTerm> {
+    fn extract_query_terms<Q: Query + ?Sized>(
+        &self,
+        query: &Q,
+        field_name: &str,
+    ) -> Vec<HighlightTerm> {
         let field = self.config.require_field_match.then_some(field_name);
         let mut terms = Vec::new();
         query.collect_highlight_terms(field, &mut terms);
@@ -1634,6 +1649,39 @@ mod tests {
         let query = TermQuery::new("body", "猫");
         let fragments = highlighter
             .highlight(&query, "body", "吾輩は猫である。")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["猫"]);
+    }
+
+    // --- Engine integration surface (#1134) ---
+
+    /// The engine holds its resolved query as `Box<dyn Query>`; `highlight`
+    /// must accept the unsized trait object directly.
+    #[test]
+    fn highlight_accepts_an_unsized_dyn_query() {
+        let query: Box<dyn Query> = Box::new(TermQuery::new("body", "rust"));
+        let highlighter = Highlighter::new(HighlightConfig::default());
+        let fragments = highlighter
+            .highlight(query.as_ref(), "body", "Learning Rust today")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["Rust"]);
+    }
+
+    /// An `Arc<dyn Analyzer>` shared with the index drives tokenisation the
+    /// same way a boxed one does.
+    #[test]
+    fn with_shared_analyzer_uses_the_given_analyzer() {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::tokenizer::Tokenizer;
+        use crate::analysis::tokenizer::ngram::NgramTokenizer;
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(NgramTokenizer::new(1, 1).unwrap());
+        let analyzer: Arc<dyn Analyzer> = Arc::new(PipelineAnalyzer::new(tokenizer));
+        let highlighter = Highlighter::with_shared_analyzer(HighlightConfig::default(), analyzer);
+        let fragments = highlighter
+            .highlight(&TermQuery::new("body", "猫"), "body", "吾輩は猫である。")
             .unwrap()
             .fragments;
         assert_eq!(marked(&fragments), ["猫"]);

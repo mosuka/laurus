@@ -31,8 +31,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync し、`nil` を返します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(query, limit: 10, offset: 0) -> Array<SearchResult>` | 検索クエリを実行します。 |
-| `search_batch(queries, limit: 10, offset: 0) -> Array<Array<SearchResult>>` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空の配列の場合は `[]` を返します。 |
+| `search(query, limit: 10, offset: 0, highlight: nil) -> Array<SearchResult>` | 検索クエリを実行します。 |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空の配列の場合は `[]` を返します。`highlight:` はバッチ内のすべてのクエリに同一に適用されます。 |
 | `stats -> Hash` | インデックス統計（`"document_count"`、`"vector_fields"`）を返します。 |
 
 ### `search` の query 引数
@@ -45,6 +45,20 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 - **`SearchRequest`**（完全な制御が必要な場合）
 
 `search_batch` の `queries` 配列の各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
+
+### ハイライト
+
+`search`/`search_batch` の `highlight:` キーワード（Issue #1134）は、各ヒットの `SearchResult#highlights` にフィールドごとのハイライト済みフラグメントを要求します。以下のいずれかを受け付けます。
+
+- **フィールド名の配列**: `highlight: ["body"]`
+- **Hash**: 必須の `fields` キー（String または Symbol）に加えて、`HighlightConfig` の任意の設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`。キーは String・Symbol どちらも可）を指定 — 例: `highlight: {fields: ["body"], tag: "em", max_fragments: 2}`
+
+```ruby
+results = index.search("body:rust", highlight: ["body"])
+results[0].highlights # => {"body" => ["<mark>Rust</mark> is a systems programming language."]}
+```
+
+ハイライトは `search`/`search_batch` に渡したクエリ（または `SearchRequest` の `query`/`lexical_query`、下記参照）に従い、`stored: true` のテキストフィールドのみハイライト可能です。存在しない、保存されていない、テキスト型でないフィールドは黙ってスキップされます。`highlight:` を省略すると、すべての結果の `highlights` は空のままになります。同じ `highlight:` キーワードは `SearchRequest.new` でも使用できます。
 
 ### WAL 同期ポリシーと耐久性
 
@@ -374,6 +388,7 @@ Laurus::SearchRequest.new(
   fusion: nil,
   limit: 10,
   offset: 0,
+  highlight: nil,
 )
 ```
 
@@ -386,6 +401,7 @@ Laurus::SearchRequest.new(
 | `fusion:` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。 |
 | `limit:` | 最大結果件数（デフォルト 10）。 |
 | `offset:` | ページネーションオフセット（デフォルト 0）。 |
+| `highlight:` | `Index#search` の `highlight:` と同じ配列または Hash の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
 
 ---
 
@@ -394,10 +410,13 @@ Laurus::SearchRequest.new(
 `Index#search` が返すクラスです。
 
 ```ruby
-result.id        # => String   -- 外部ドキュメント識別子
-result.score     # => Float    -- 関連性スコア
-result.document  # => Hash|nil -- 取得されたフィールド値。削除済みの場合は nil
+result.id         # => String   -- 外部ドキュメント識別子
+result.score      # => Float    -- 関連性スコア
+result.document   # => Hash|nil -- 取得されたフィールド値。削除済みの場合は nil
+result.highlights # => Hash     -- 要求したフィールドごとのハイライト済みフラグメント
 ```
+
+`highlights` は `highlight:` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドは Hash に現れず、`highlight:` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
 
 ---
 

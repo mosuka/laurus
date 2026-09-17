@@ -285,6 +285,7 @@ Lexical search behavior is controlled via `LexicalSearchOptions` on the `SearchR
 | `timeout_ms` | None | Search time budget in milliseconds (see note below) |
 | `parallel` | false | Enable parallel search across segments |
 | `sort_by` | `Score` | Sort by relevance score, or by a field (`asc` / `desc`) |
+| `highlight` | None | Fields (and configuration) to highlight in each hit's `SearchResult::highlights`; see [Highlighting](../../laurus/highlighting.md) |
 
 Field-sorted searches (`sort_by: Field { .. }`) always scan every candidate
 document — there is no early termination for field sorts, unlike the
@@ -320,6 +321,8 @@ let request = SearchRequestBuilder::new()
     .limit(20)
     .build();
 ```
+
+`.highlight(fields)` and `.highlight_config(config)` request highlighted fragments per hit — see [Highlighting](../../laurus/highlighting.md).
 
 ## Using the Query DSL
 

@@ -38,12 +38,12 @@ class Index {
 | `deleteDocuments(id)` | 指定 ID の全バージョンを削除。 |
 | `commit()` | 書き込みをフラッシュし変更を検索可能にする。 |
 | `flushWal()` | WAL の永続性バリアを強制する。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照。 |
-| `search(query, limit?, offset?)` | DSL 文字列で検索。 |
-| `searchTerm(field, term, limit?, offset?)` | 完全一致 Term 検索。 |
+| `search(query, limit?, offset?, highlight?)` | DSL 文字列で検索。 |
+| `searchTerm(field, term, limit?, offset?, highlight?)` | 完全一致 Term 検索。 |
 | `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。 |
 | `searchVectorText(field, text, limit?, offset?)` | テキストを自動埋め込みして検索。 |
 | `searchWithRequest(request)` | `SearchRequest` で検索。 |
-| `searchBatch(queries, limit?, offset?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。 |
+| `searchBatch(queries, limit?, offset?, highlight?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` はすべてのクエリに同一に適用されます。 |
 | `stats()` | インデックス統計（`documentCount`、`vectorFields`）を返す。 |
 
 ドキュメント操作と検索メソッドはすべて非同期で Promise を返します。
@@ -442,6 +442,7 @@ interface SearchRequestOptions {
   queryDsl?: string;
   limit?: number;   // デフォルト 10
   offset?: number;  // デフォルト 0
+  highlight?: HighlightOptions;
 }
 
 class SearchRequest {
@@ -452,6 +453,8 @@ class SearchRequest {
 コンストラクタにはプリミティブな options を渡し、多態クエリ句は下記の
 per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` の
 `Either<&T, ...>` バリデーション制限を回避するため per-type 化されています。
+`highlight` はプレーンなデータ（クラスインスタンスのユニオンではない）なので、
+セッターを介さず `SearchRequestOptions` に直接持たせています。
 
 ### DSL とフュージョンセッター
 
@@ -490,6 +493,28 @@ req.setRrfFusion(new RRF(60.0));
 const results = await index.searchWithRequest(req);
 ```
 
+### ハイライト
+
+`search`、`searchTerm`、`searchBatch`、`SearchRequestOptions` は省略可能な `highlight` オブジェクトを受け付けます（Issue #1134）。
+
+```typescript
+interface HighlightOptions {
+  fields: string[];
+  fragmentSize?: number;    // デフォルト 150
+  maxFragments?: number;    // デフォルト 5
+  tag?: string;             // デフォルト "mark"
+  cssClass?: string;
+  requireFieldMatch?: boolean; // デフォルト true
+}
+```
+
+必須なのは `fields` のみです。ハイライトは同じ呼び出しに渡したクエリに従い、`stored: true` のテキストフィールドのみハイライト可能です — 保存されていない、テキスト型でない、またはマッチしなかったフィールドは結果の `highlights` オブジェクトに現れません。
+
+```javascript
+const results = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
+// results[0].highlights => { body: ["<em>Rust</em> is a systems programming language."] }
+```
+
 ---
 
 ## SearchResult
@@ -501,8 +526,11 @@ interface SearchResult {
   id: string;        // 外部ドキュメント識別子
   score: number;     // 関連度スコア
   document: object | null; // 取得フィールド、stored=false の場合は null
+  highlights: Record<string, string[]>; // 要求したフィールドごとのハイライト済みフラグメント
 }
 ```
+
+`highlights` は `highlight.fields` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドはオブジェクトに現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
 
 ---
 
