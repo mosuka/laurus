@@ -336,6 +336,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `offset` | integer | いいえ | ページネーション用スキップ数（デフォルト: 0） |
 | `fusion` | string | いいえ | ハイブリッド検索用の融合アルゴリズム（JSON） |
 | `field_boosts` | string | いいえ | フィールド毎のブースト係数（JSON） |
+| `highlight` | string | いいえ | フィールドごとのハイライト済みフラグメント（JSON、[ハイライトの例](#ハイライトの例)を参照） |
 
 ### クエリ DSL の例
 
@@ -395,7 +396,23 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 {"title": 2.0, "body": 1.0}
 ```
 
+### ハイライトの例
+
+`highlight` はフィールドごとのハイライト済みフラグメントを要求します（Issue #1134）。ハイライトはこのツールの lexical クエリに従うため、Vector-only のクエリはハイライトを生成しません。また `stored: true` のテキストフィールドのみハイライト可能です。省略形はフィールド名の配列だけです。
+
+```json
+["body"]
+```
+
+オブジェクト形式では `HighlightConfig` の各設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`）を追加できます。
+
+```json
+{"fields": ["body"], "max_fragments": 2, "tag": "em"}
+```
+
 ### 結果
+
+`highlight` を要求し、少なくとも1つのフィールドが実際にハイライトされた場合、各結果に `"highlights"` オブジェクトが追加されます。
 
 ```json
 {
@@ -404,7 +421,8 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
     {
       "id": "doc-1",
       "score": 3.14,
-      "fields": { "title": "Hello World", "body": "..." }
+      "fields": { "title": "Hello World", "body": "..." },
+      "highlights": { "body": ["<em>Hello</em> World"] }
     },
     {
       "id": "doc-2",
@@ -431,6 +449,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `queries` | 文字列の配列 | はい | laurus 統一クエリ DSL のクエリ文字列（`search` と同じ構文） |
 | `limit` | 整数 | いいえ | クエリごとの最大結果数（デフォルト: 10） |
 | `offset` | 整数 | いいえ | クエリごとのページネーションオフセット（デフォルト: 0） |
+| `highlight` | 文字列 | いいえ | フィールドごとのハイライト済みフラグメント（JSON）。`search` の `highlight` と同じ形式で、バッチ内のすべてのクエリに同一に適用される |
 
 ### 結果
 

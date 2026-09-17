@@ -165,6 +165,17 @@ struct SearchParams {
     ///
     /// Example: `{"title": 2.0, "body": 1.0}`
     field_boosts: Option<String>,
+
+    /// Request highlighted fragments per field, as a JSON string (Issue
+    /// #1134). Highlighting follows this tool's lexical query; a
+    /// vector-only query produces no highlights. Only `stored: true` text
+    /// fields can be highlighted.
+    ///
+    /// Accepts either a bare field-name array or an object adding
+    /// `HighlightConfig` knobs:
+    /// - `["title", "body"]`
+    /// - `{"fields": ["body"], "max_fragments": 2, "tag": "em"}`
+    highlight: Option<String>,
 }
 
 /// Parameters for the `search_batch` tool.
@@ -180,6 +191,11 @@ struct SearchBatchParams {
 
     /// Number of results to skip per query for pagination. Defaults to `0`.
     offset: Option<u32>,
+
+    /// Request highlighted fragments per field, as a JSON string — same
+    /// format as the `search` tool's `highlight` parameter. Applied
+    /// identically to every query in the batch (Issue #1134).
+    highlight: Option<String>,
 }
 
 /// Parameters for the `add_field` tool.
@@ -870,7 +886,7 @@ impl LaurusMcpServer {
 
     /// Search documents using the laurus unified query DSL.
     #[tool(
-        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Returns JSON with total count and array of results (id, score, fields)."
+        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Returns JSON with total count and array of results (id, score, fields, highlights when requested via the highlight parameter)."
     )]
     async fn search(
         &self,
@@ -905,12 +921,23 @@ impl LaurusMcpServer {
             std::collections::HashMap::new()
         };
 
+        // Parse optional highlight request (Issue #1134)
+        let highlight = if let Some(ref highlight_json) = params.highlight {
+            match convert::json_to_highlight_params(highlight_json) {
+                Ok(h) => Some(h),
+                Err(e) => return Ok(Self::tool_error(format!("Invalid highlight JSON: {e}"))),
+            }
+        } else {
+            None
+        };
+
         let request = SearchRequest {
             query: params.query,
             limit: params.limit.unwrap_or(10),
             offset: params.offset.unwrap_or(0),
             fusion,
             field_boosts,
+            highlight,
             ..Default::default()
         };
 
@@ -920,13 +947,7 @@ impl LaurusMcpServer {
                 let json_results: Vec<Value> = r
                     .results
                     .iter()
-                    .map(|result| {
-                        json!({
-                            "id": result.id,
-                            "score": result.score,
-                            "fields": result.document.as_ref().map(convert::document_fields_to_json),
-                        })
-                    })
+                    .map(convert::search_result_to_json)
                     .collect();
 
                 let output = json!({
@@ -942,7 +963,7 @@ impl LaurusMcpServer {
     }
 
     #[tool(
-        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit and offset apply to every query. Returns JSON with a `batch` array; batch[i] holds the total count and results (id, score, fields) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
+        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset and highlight settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the total count and results (id, score, fields, highlights when requested) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
     )]
     async fn search_batch(
         &self,
@@ -964,6 +985,17 @@ impl LaurusMcpServer {
             )]));
         }
 
+        // Parse optional highlight request (Issue #1134), applied identically
+        // to every query in the batch.
+        let highlight = if let Some(ref highlight_json) = params.highlight {
+            match convert::json_to_highlight_params(highlight_json) {
+                Ok(h) => Some(h),
+                Err(e) => return Ok(Self::tool_error(format!("Invalid highlight JSON: {e}"))),
+            }
+        } else {
+            None
+        };
+
         let limit = params.limit.unwrap_or(10);
         let offset = params.offset.unwrap_or(0);
         let queries: Vec<SearchRequest> = params
@@ -973,6 +1005,7 @@ impl LaurusMcpServer {
                 query,
                 limit,
                 offset,
+                highlight: highlight.clone(),
                 ..Default::default()
             })
             .collect();
@@ -992,13 +1025,7 @@ impl LaurusMcpServer {
                         let json_results: Vec<Value> = per_query
                             .results
                             .iter()
-                            .map(|result| {
-                                json!({
-                                    "id": result.id,
-                                    "score": result.score,
-                                    "fields": result.document.as_ref().map(convert::document_fields_to_json),
-                                })
-                            })
+                            .map(convert::search_result_to_json)
                             .collect();
                         json!({
                             "total": per_query.total_hits,

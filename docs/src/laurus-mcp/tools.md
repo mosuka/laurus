@@ -349,6 +349,7 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `offset` | integer | No | Results to skip for pagination (default: 0) |
 | `fusion` | string | No | Fusion algorithm as JSON (for hybrid search) |
 | `field_boosts` | string | No | Per-field boost factors as JSON |
+| `highlight` | string | No | Highlighted fragments per field, as JSON (see [Highlight example](#highlight-example)) |
 
 ### Query DSL examples
 
@@ -408,7 +409,29 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 {"title": 2.0, "body": 1.0}
 ```
 
+### Highlight example
+
+`highlight` requests highlighted fragments per field (Issue #1134),
+following this tool's lexical query — a vector-only query produces no
+highlights, and only `stored: true` text fields can be highlighted. The
+shorthand form is just a field list:
+
+```json
+["body"]
+```
+
+The full object form adds `HighlightConfig` knobs — `max_fragments`,
+`fragment_size`, `tag`, `css_class`, `require_field_match`,
+`max_analyzed_chars`, `return_entire_field_if_no_highlight`:
+
+```json
+{"fields": ["body"], "max_fragments": 2, "tag": "em"}
+```
+
 ### Result
+
+Each result gains a `"highlights"` object when `highlight` was requested
+and at least one field actually highlighted:
 
 ```json
 {
@@ -417,7 +440,8 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
     {
       "id": "doc-1",
       "score": 3.14,
-      "fields": { "title": "Hello World", "body": "..." }
+      "fields": { "title": "Hello World", "body": "..." },
+      "highlights": { "body": ["<em>Hello</em> World"] }
     },
     {
       "id": "doc-2",
@@ -443,6 +467,7 @@ query. Useful for agents issuing several sub-queries per turn.
 | `queries` | array of string | Yes | Query strings, each in the laurus unified query DSL (same syntax as `search`) |
 | `limit` | integer | No | Maximum results per query (default: 10) |
 | `offset` | integer | No | Results to skip per query for pagination (default: 0) |
+| `highlight` | string | No | Highlighted fragments per field, as JSON — same format as `search`'s `highlight`, applied identically to every query |
 
 ### Result
 
