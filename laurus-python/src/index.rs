@@ -696,18 +696,27 @@ impl PyIndex {
     ///     query: The query to execute.
     ///     limit: Maximum number of results to return (default 10).
     ///     offset: Pagination offset (default 0).
+    ///     highlight: Request highlighted fragments per field (Issue
+    ///         #1134). Either a list of field names (`["body"]`) or a dict
+    ///         adding `HighlightConfig` knobs (`{"fields": ["body"],
+    ///         "max_fragments": 2, "tag": "em"}`). Highlighting follows
+    ///         this query, and only `stored: true` text fields can be
+    ///         highlighted. `None` (the default) leaves every result's
+    ///         `highlights` empty.
     ///
     /// Returns:
-    ///     A list of [`SearchResult`] objects with `.id`, `.score`, `.document`.
-    #[pyo3(signature = (query, *, limit=10, offset=0))]
+    ///     A list of [`SearchResult`] objects with `.id`, `.score`,
+    ///     `.document`, `.highlights`.
+    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None))]
     pub fn search(
         &self,
         py: Python,
         query: &Bound<PyAny>,
         limit: usize,
         offset: usize,
+        highlight: Option<&Bound<PyAny>>,
     ) -> PyResult<Vec<PySearchResult>> {
-        let request = build_request_from_py(py, query, limit, offset)?;
+        let request = build_request_from_py(py, query, limit, offset, highlight)?;
 
         let engine = self.engine()?;
         let results = py
@@ -735,6 +744,9 @@ impl PyIndex {
     ///     limit: Maximum number of results to return per query
     ///         (default 10).
     ///     offset: Pagination offset applied to each query (default 0).
+    ///     highlight: Request highlighted fragments per field, applied
+    ///         identically to every query in the batch — same format as
+    ///         `search`'s `highlight` parameter (Issue #1134).
     ///
     /// Returns:
     ///     A list of lists: `results[i]` is the result list for
@@ -743,13 +755,14 @@ impl PyIndex {
     ///
     /// Issue [#717](https://github.com/mosuka/laurus/issues/717)
     /// Phase 3b of [#648](https://github.com/mosuka/laurus/issues/648).
-    #[pyo3(signature = (queries, *, limit=10, offset=0))]
+    #[pyo3(signature = (queries, *, limit=10, offset=0, highlight=None))]
     pub fn search_batch(
         &self,
         py: Python,
         queries: &Bound<PyAny>,
         limit: usize,
         offset: usize,
+        highlight: Option<&Bound<PyAny>>,
     ) -> PyResult<Vec<Vec<PySearchResult>>> {
         let queries_seq = queries.try_iter().map_err(|_| {
             PyRuntimeError::new_err(
@@ -760,7 +773,7 @@ impl PyIndex {
         let mut requests = Vec::new();
         for item in queries_seq {
             let item = item?;
-            requests.push(build_request_from_py(py, &item, limit, offset)?);
+            requests.push(build_request_from_py(py, &item, limit, offset, highlight)?);
         }
 
         if requests.is_empty() {
