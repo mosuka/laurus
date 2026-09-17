@@ -157,6 +157,9 @@ let fusion = FusionAlgorithm::WeightedSum {
 | `id` | `String` | 外部ドキュメント ID |
 | `score` | `f32` | フュージョン後の関連性スコア |
 | `document` | `Option<Document>` | ドキュメントの全内容（ロードされた場合） |
+| `highlights` | `HashMap<String, Vec<String>>` | `lexical_options.highlight` で要求した場合のハイライト済みフラグメント |
+
+ハイブリッド検索でのハイライトはリクエストの lexical クエリによって駆動されるため、Vector 側だけでヒットした結果の `highlights` は空になります。詳細は[ハイライト](../../laurus/highlighting.md)を参照してください。
 
 ## フィルター付きハイブリッド検索
 

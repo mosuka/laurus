@@ -118,6 +118,8 @@ A collection of named field values.
 | `.lexical_timeout_ms(u64)` | Set lexical search timeout in milliseconds |
 | `.lexical_parallel(bool)` | Enable parallel lexical search |
 | `.sort_by(SortField)` | Set sort order for lexical search results |
+| `.highlight(fields)` | Request highlights on these stored text fields ([Highlighting](./highlighting.md)) |
+| `.highlight_config(HighlightConfig)` | Set the tag/fragment/`require_field_match` settings used for highlighting |
 | `.vector_score_mode(VectorScoreMode)` | Set score combination mode for vector search |
 | `.vector_min_score(f32)` | Set minimum score threshold for vector search |
 | `.build()` | Build the `SearchRequest` |
@@ -143,6 +145,7 @@ A collection of named field values.
 | `id` | `String` | External document ID |
 | `score` | `f32` | Relevance score |
 | `document` | `Option<Document>` | Document content (if loaded) |
+| `highlights` | `HashMap<String, Vec<String>>` | Highlighted fragments per field requested via `.highlight()`; empty when not requested or nothing matched ([Highlighting](./highlighting.md)) |
 
 ### FusionAlgorithm
 

@@ -171,6 +171,9 @@ Each result contains:
 | `id` | `String` | External document ID |
 | `score` | `f32` | Fused relevance score |
 | `document` | `Option<Document>` | Full document content (if loaded) |
+| `highlights` | `HashMap<String, Vec<String>>` | Highlighted fragments, if requested via `lexical_options.highlight` |
+
+Highlighting in hybrid search is driven by the request's lexical query, so a hit that came only from the vector side has an empty `highlights` map. See [Highlighting](../../laurus/highlighting.md).
 
 ## Filtered Hybrid Search
 
