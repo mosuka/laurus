@@ -1,16 +1,94 @@
 //! Ruby wrappers for search request/result and fusion algorithm types.
 
+use std::collections::HashMap;
+
 use crate::convert::document_to_hash;
 use crate::query::{
     extract_lexical_query, is_vector_query, rb_to_lexical_search_query, rb_to_vector_search_query,
 };
 use laurus::{
-    Document, FusionAlgorithm, LexicalSearchQuery, SearchRequestBuilder, SearchResult,
-    VectorSearchQuery,
+    Document, FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery,
+    SearchRequestBuilder, SearchResult, VectorSearchQuery,
 };
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
-use magnus::{Error, RHash, RModule, Ruby, Value};
+use magnus::{Error, RArray, RHash, RModule, Ruby, TryConvert, Value};
+
+// ---------------------------------------------------------------------------
+// Highlighting (Issue #1134)
+// ---------------------------------------------------------------------------
+
+/// Convert a Ruby `highlight:` value into [`HighlightOptions`].
+///
+/// Accepts either an `Array` of field names (`["title", "body"]`), or a
+/// `Hash` with a `:fields`/`"fields"` key plus any of the optional
+/// [`HighlightConfig`] knobs: `:max_fragments`, `:fragment_size`, `:tag`,
+/// `:css_class`, `:require_field_match`, `:max_analyzed_chars`,
+/// `:return_entire_field_if_no_highlight` (String or Symbol keys, both
+/// accepted). The `Array` check comes first — a `Hash`'s default iteration
+/// also yields entries in a way that could otherwise be mistaken for a
+/// list, so type-sniff before assuming either shape.
+pub fn rb_to_highlight_options(ruby: &Ruby, value: Value) -> Result<HighlightOptions, Error> {
+    if value.is_kind_of(ruby.class_array()) {
+        let arr = RArray::from_value(value)
+            .ok_or_else(|| Error::new(ruby.exception_type_error(), "expected an Array"))?;
+        let fields: Vec<String> = arr.to_vec()?;
+        return Ok(HighlightOptions::new(fields));
+    }
+
+    if value.is_kind_of(ruby.class_hash()) {
+        let hash = RHash::from_value(value)
+            .ok_or_else(|| Error::new(ruby.exception_type_error(), "expected a Hash"))?;
+
+        let fields_val = hash_get_str_or_sym(ruby, hash, "fields")?.ok_or_else(|| {
+            Error::new(
+                ruby.exception_arg_error(),
+                "highlight Hash must have a 'fields' key",
+            )
+        })?;
+        let fields: Vec<String> = RArray::try_convert(fields_val)?.to_vec()?;
+
+        let mut config = HighlightConfig::new();
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "max_fragments")? {
+            config = config.max_fragments(usize::try_convert(v)?);
+        }
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "fragment_size")? {
+            config = config.fragment_size(usize::try_convert(v)?);
+        }
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "tag")? {
+            config = config.tag(String::try_convert(v)?);
+        }
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "css_class")? {
+            config = config.css_class(String::try_convert(v)?);
+        }
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "require_field_match")? {
+            config = config.require_field_match(bool::try_convert(v)?);
+        }
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "max_analyzed_chars")? {
+            config.max_analyzed_chars = usize::try_convert(v)?;
+        }
+        if let Some(v) = hash_get_str_or_sym(ruby, hash, "return_entire_field_if_no_highlight")? {
+            config.return_entire_field_if_no_highlight = bool::try_convert(v)?;
+        }
+
+        return Ok(HighlightOptions::new(fields).with_config(config));
+    }
+
+    Err(Error::new(
+        ruby.exception_arg_error(),
+        "highlight must be an Array of field names or a Hash, \
+         e.g. ['body'] or {fields: ['body'], tag: 'em'}",
+    ))
+}
+
+/// Look up `key` in `hash`, trying the Symbol form first (the natural shape
+/// of a Ruby kwargs-style Hash literal) and falling back to the String form.
+fn hash_get_str_or_sym(ruby: &Ruby, hash: RHash, key: &str) -> Result<Option<Value>, Error> {
+    if let Some(v) = hash.get(ruby.to_symbol(key)) {
+        return Ok(Some(v));
+    }
+    Ok(hash.get(ruby.str_new(key)))
+}
 
 // ---------------------------------------------------------------------------
 // Fusion algorithm types
@@ -94,12 +172,16 @@ impl RbWeightedSum {
 ///   - `id` (String): External document identifier.
 ///   - `score` (Float): Relevance score (BM25, similarity, or fused).
 ///   - `document` (Hash | nil): Retrieved document fields.
+///   - `highlights` (Hash): Highlighted fragments per field requested via
+///     `highlight:`, best fragment first. Empty when highlighting was not
+///     requested, the field was not a stored text field, or nothing matched.
 #[magnus::wrap(class = "Laurus::SearchResult")]
 pub struct RbSearchResult {
     pub id: String,
     pub score: f32,
     /// Stores the Rust Document to avoid Send issues with Ruby RHash values.
     pub document: Option<Document>,
+    pub highlights: HashMap<String, Vec<String>>,
 }
 
 impl RbSearchResult {
@@ -122,6 +204,17 @@ impl RbSearchResult {
         }
     }
 
+    /// Return the highlighted fragments as a Hash of field name -> Array of
+    /// fragment strings.
+    fn highlights(&self) -> Result<RHash, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let hash = ruby.hash_new();
+        for (field, fragments) in &self.highlights {
+            hash.aset(ruby.str_new(field), fragments.clone())?;
+        }
+        Ok(hash)
+    }
+
     fn inspect(&self) -> String {
         format!("SearchResult(id='{}', score={:.4})", self.id, self.score)
     }
@@ -141,6 +234,7 @@ pub fn to_rb_search_result(r: SearchResult) -> RbSearchResult {
         id: r.id,
         score: r.score,
         document: r.document,
+        highlights: r.highlights,
     }
 }
 
@@ -176,6 +270,8 @@ pub struct RbSearchRequest {
     limit: usize,
     /// Pagination offset.
     offset: usize,
+    /// Highlight request (Issue #1134).
+    highlight: Option<HighlightOptions>,
 }
 
 impl RbSearchRequest {
@@ -193,7 +289,10 @@ impl RbSearchRequest {
     ///   - `fusion:` - `RRF` or `WeightedSum` fusion algorithm.
     ///   - `limit:` (usize, default 10): Maximum results.
     ///   - `offset:` (usize, default 0): Pagination offset.
+    ///   - `highlight:` - Field list (Array) or config Hash for
+    ///     search-result highlighting (Issue #1134).
     fn new(args: &[Value]) -> Result<Self, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
         let kwargs = get_kwargs::<
             _,
@@ -206,6 +305,7 @@ impl RbSearchRequest {
                 Option<Value>,
                 Option<usize>,
                 Option<usize>,
+                Option<Value>,
             ),
             (),
         >(
@@ -219,6 +319,7 @@ impl RbSearchRequest {
                 "fusion",
                 "limit",
                 "offset",
+                "highlight",
             ],
         )?;
         let (
@@ -229,7 +330,12 @@ impl RbSearchRequest {
             fusion_val,
             limit,
             offset,
+            highlight_val,
         ) = kwargs.optional;
+
+        let highlight = highlight_val
+            .map(|v| rb_to_highlight_options(&ruby, v))
+            .transpose()?;
 
         // Convert fusion
         let fusion = if let Some(f) = fusion_val {
@@ -281,6 +387,7 @@ impl RbSearchRequest {
             fusion,
             limit: limit.unwrap_or(10),
             offset: offset.unwrap_or(0),
+            highlight,
         })
     }
 
@@ -307,6 +414,14 @@ impl RbSearchRequest {
         // Filter query - we cannot move out of &self, so we need to handle this differently.
         // Since build() takes &self, we cannot consume filter_query. This is a design issue.
         // For now, we skip filter in the &self case. The actual search path uses build_request_from_rb.
+
+        // Highlighting (Issue #1134). Applied before every branch below
+        // returns, so it takes effect regardless of which query shape is set.
+        if let Some(options) = &self.highlight {
+            builder = builder
+                .highlight(options.fields.clone())
+                .highlight_config(options.config.clone());
+        }
 
         // Explicit hybrid: lexical_query + vector_query both set
         if let (Some(lq), Some(vq)) = (&self.lexical_query, &self.vector_query) {
@@ -353,7 +468,7 @@ impl RbSearchRequest {
 // ---------------------------------------------------------------------------
 
 /// Build a [`laurus::SearchRequest`] from the arguments passed to
-/// `Index#search(query, limit:, offset:)`.
+/// `Index#search(query, limit:, offset:, highlight:)`.
 ///
 /// `query` may be:
 /// - A `String` (DSL)
@@ -361,11 +476,16 @@ impl RbSearchRequest {
 /// - Any lexical query class
 /// - `VectorQuery` or `VectorTextQuery`
 ///
+/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight` are used
+/// as-is from the request without overriding — same precedent as
+/// `limit`/`offset` already had here before highlighting existed.
+///
 /// # Arguments
 ///
 /// * `query` - Ruby value for the query.
 /// * `limit` - Maximum results.
 /// * `offset` - Pagination offset.
+/// * `highlight` - Already-parsed highlight options, if `highlight:` was given.
 ///
 /// # Returns
 ///
@@ -374,6 +494,7 @@ pub fn build_request_from_rb(
     query: Value,
     limit: usize,
     offset: usize,
+    highlight: Option<&HighlightOptions>,
 ) -> Result<laurus::SearchRequest, Error> {
     // Full SearchRequest object
     if let Ok(req) = <&RbSearchRequest>::try_convert(query) {
@@ -381,6 +502,12 @@ pub fn build_request_from_rb(
     }
 
     let mut builder = SearchRequestBuilder::new().limit(limit).offset(offset);
+
+    if let Some(options) = highlight {
+        builder = builder
+            .highlight(options.fields.clone())
+            .highlight_config(options.config.clone());
+    }
 
     // DSL string
     if let Ok(s) = String::try_convert(query) {
@@ -427,6 +554,7 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
     sr.define_method("id", magnus::method!(RbSearchResult::id, 0))?;
     sr.define_method("score", magnus::method!(RbSearchResult::score, 0))?;
     sr.define_method("document", magnus::method!(RbSearchResult::document, 0))?;
+    sr.define_method("highlights", magnus::method!(RbSearchResult::highlights, 0))?;
     sr.define_method("inspect", magnus::method!(RbSearchResult::inspect, 0))?;
     sr.define_method("to_s", magnus::method!(RbSearchResult::inspect, 0))?;
 

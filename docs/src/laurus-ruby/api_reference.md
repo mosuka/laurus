@@ -31,8 +31,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records and returns `nil`. Useful when running under a group-commit policy (see below). |
-| `search(query, limit: 10, offset: 0) -> Array<SearchResult>` | Execute a search query. |
-| `search_batch(queries, limit: 10, offset: 0) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. |
+| `search(query, limit: 10, offset: 0, highlight: nil) -> Array<SearchResult>` | Execute a search query. |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight:` applies identically to every query in the batch. |
 | `stats -> Hash` | Return index statistics (`"document_count"`, `"vector_fields"`). |
 
 ### `search` query argument
@@ -45,6 +45,20 @@ The `query` parameter accepts any of the following:
 - A **`SearchRequest`** for full control
 
 The same value kinds are accepted as the elements of `search_batch`'s `queries` Array — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
+
+### Highlighting
+
+`search`/`search_batch`'s `highlight:` keyword (Issue #1134) requests highlighted fragments per field on each hit's `SearchResult#highlights`. It accepts:
+
+- An **Array of field names**: `highlight: ["body"]`
+- A **Hash** with a required `fields` key (String or Symbol) plus any of the optional `HighlightConfig` knobs — `max_fragments`, `fragment_size`, `tag`, `css_class`, `require_field_match`, `max_analyzed_chars`, `return_entire_field_if_no_highlight` (String or Symbol keys both work) — e.g. `highlight: {fields: ["body"], tag: "em", max_fragments: 2}`
+
+```ruby
+results = index.search("body:rust", highlight: ["body"])
+results[0].highlights # => {"body" => ["<mark>Rust</mark> is a systems programming language."]}
+```
+
+Highlighting follows the query passed to `search`/`search_batch` (or `SearchRequest`'s `query`/`lexical_query` — see below), and only `stored: true` text fields can be highlighted; a field that is absent, not stored, or not text is silently skipped. Omitting `highlight:` leaves every result's `highlights` empty. The same `highlight:` keyword is also accepted by `SearchRequest.new`.
 
 ### WAL sync policy & durability
 
@@ -378,6 +392,7 @@ Laurus::SearchRequest.new(
   fusion: nil,
   limit: 10,
   offset: 0,
+  highlight: nil,
 )
 ```
 
@@ -390,6 +405,7 @@ Laurus::SearchRequest.new(
 | `fusion:` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k: 60)` when both components are set. |
 | `limit:` | Maximum number of results (default 10). |
 | `offset:` | Pagination offset (default 0). |
+| `highlight:` | Same Array-or-Hash shape as `Index#search`'s `highlight:` (Issue #1134). See [Highlighting](#highlighting). |
 
 ---
 
@@ -398,10 +414,13 @@ Laurus::SearchRequest.new(
 Returned by `Index#search`.
 
 ```ruby
-result.id        # => String   -- External document identifier
-result.score     # => Float    -- Relevance score
-result.document  # => Hash|nil -- Retrieved field values, or nil if deleted
+result.id         # => String   -- External document identifier
+result.score      # => Float    -- Relevance score
+result.document   # => Hash|nil -- Retrieved field values, or nil if deleted
+result.highlights # => Hash     -- Highlighted fragments per requested field
 ```
+
+`highlights` maps each field named in `highlight:` to its highlighted fragments (best first); a field that did not highlight is absent from the Hash, and `highlights` is `{}` when `highlight:` was not requested. See [Highlighting](#highlighting).
 
 ---
 
