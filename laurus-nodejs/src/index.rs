@@ -9,8 +9,8 @@ use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::query::{JsQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery};
 use crate::schema::JsSchema;
 use crate::search::{
-    JsSearchRequest, JsSearchResult, build_dsl_request, build_lexical_request,
-    build_vector_request, to_js_search_result,
+    JsHighlightOptions, JsSearchRequest, JsSearchResult, build_dsl_request, build_lexical_request,
+    build_vector_request, js_highlight_options_to_core, to_js_search_result,
 };
 use crate::wal::JsWalSyncPolicy;
 use laurus::{Engine, Schema, Storage, StorageConfig, StorageFactory};
@@ -310,6 +310,9 @@ impl JsIndex {
     /// * `query` - The query DSL string (e.g. `"title:hello"`, `"~\"memory safety\""`).
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    /// * `highlight` - Request highlighted fragments per field (Issue
+    ///   #1134). Highlighting follows this query, and only `stored: true`
+    ///   text fields can be highlighted.
     ///
     /// # Returns
     ///
@@ -320,12 +323,14 @@ impl JsIndex {
         query: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        highlight: Option<JsHighlightOptions>,
     ) -> Result<Vec<JsSearchResult>> {
-        let request = build_dsl_request(
+        let mut request = build_dsl_request(
             query,
             limit.unwrap_or(10) as usize,
             offset.unwrap_or(0) as usize,
         );
+        request.lexical_options.highlight = highlight.as_ref().map(js_highlight_options_to_core);
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
@@ -338,6 +343,7 @@ impl JsIndex {
     /// * `term` - The exact term to match.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    /// * `highlight` - Same as `search`'s `highlight` parameter (Issue #1134).
     ///
     /// # Returns
     ///
@@ -349,13 +355,15 @@ impl JsIndex {
         term: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        highlight: Option<JsHighlightOptions>,
     ) -> Result<Vec<JsSearchResult>> {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
-        let request = build_lexical_request(
+        let mut request = build_lexical_request(
             &query,
             limit.unwrap_or(10) as usize,
             offset.unwrap_or(0) as usize,
         )?;
+        request.lexical_options.highlight = highlight.as_ref().map(js_highlight_options_to_core);
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
@@ -453,6 +461,8 @@ impl JsIndex {
     /// * `queries` - An array of query DSL strings.
     /// * `limit` - Maximum number of results per query (default 10).
     /// * `offset` - Pagination offset applied to each query (default 0).
+    /// * `highlight` - Request highlighted fragments per field, applied
+    ///   identically to every query in the batch (Issue #1134).
     ///
     /// # Returns
     ///
@@ -468,6 +478,7 @@ impl JsIndex {
         queries: Vec<String>,
         limit: Option<u32>,
         offset: Option<u32>,
+        highlight: Option<JsHighlightOptions>,
     ) -> Result<Vec<Vec<JsSearchResult>>> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -475,9 +486,14 @@ impl JsIndex {
 
         let limit = limit.unwrap_or(10) as usize;
         let offset = offset.unwrap_or(0) as usize;
+        let highlight = highlight.as_ref().map(js_highlight_options_to_core);
         let requests: Vec<_> = queries
             .into_iter()
-            .map(|q| build_dsl_request(q, limit, offset))
+            .map(|q| {
+                let mut request = build_dsl_request(q, limit, offset);
+                request.lexical_options.highlight = highlight.clone();
+                request
+            })
             .collect();
 
         let batch_results = self
