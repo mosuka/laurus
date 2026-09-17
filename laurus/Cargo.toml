@@ -48,6 +48,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1.53.1", features = ["sync", "macros"] }
+# TOML (de)serialization for `Schema::from_toml`/`to_toml`, used by every
+# target including wasm32 (bindings load/save schemas as TOML). The
+# `index_dir` module's own `schema.toml` handling stays native-only (wasm32
+# has no filesystem), independent of this dependency.
+toml = { workspace = true }
 unicode-normalization = "0.1.25"
 unicode-segmentation = "1.13.3"
 uuid = { version = "1.24.0", features = ["v4", "js"] }
@@ -103,12 +108,6 @@ image = { version = "0.25.10", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
-
-# TOML (de)serialization for `Schema::from_toml`/`to_toml` and the
-# `index_dir` module's `schema.toml` handling. Not needed on wasm32, which
-# has neither `index_dir` (no filesystem) nor a use for standalone TOML I/O.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-toml = { workspace = true }
 
 [features]
 default = ["native"]
