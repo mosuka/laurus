@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::lexical::query::Query;
+use crate::lexical::search::features::highlight::HighlightConfig;
 use crate::lexical::search::searcher::{LexicalSearchQuery, SortField};
 // Re-export VectorSearchQuery so engine.rs and query.rs can refer to it
 // via `self::search::VectorSearchQuery` without reaching into vector internals.
@@ -75,6 +76,37 @@ pub enum HybridMode {
 
 // ── Option types (how to search) ─────────────────────────────────────────────
 
+/// What to highlight in each hit, and how (#1134).
+///
+/// Highlighting is a lexical-side concern: it uses the request's lexical
+/// query (in hybrid mode too) and is ignored by vector-only requests. The
+/// text comes from the hit's stored document, so only `stored: true` text
+/// fields can be highlighted; other names are skipped. Each field is
+/// tokenized with its own index-time analyzer.
+#[derive(Debug, Clone, Default)]
+pub struct HighlightOptions {
+    /// Stored text fields to highlight. Empty means no highlighting.
+    pub fields: Vec<String>,
+    /// Tag, fragment sizing and `require_field_match` settings.
+    pub config: HighlightConfig,
+}
+
+impl HighlightOptions {
+    /// Highlight `fields` with [`HighlightConfig::default`].
+    pub fn new(fields: Vec<String>) -> Self {
+        Self {
+            fields,
+            config: HighlightConfig::default(),
+        }
+    }
+
+    /// Replace the highlight configuration.
+    pub fn with_config(mut self, config: HighlightConfig) -> Self {
+        self.config = config;
+        self
+    }
+}
+
 /// Parameters controlling lexical search behavior.
 ///
 /// These are separated from the query itself so that the same options can
@@ -103,6 +135,10 @@ pub struct LexicalSearchOptions {
     /// Sort results by field value or by relevance score.
     /// Defaults to [`SortField::Score`].
     pub sort_by: SortField,
+
+    /// Search-result highlighting. `None` (the default) leaves
+    /// [`SearchResult::highlights`] empty.
+    pub highlight: Option<HighlightOptions>,
 }
 
 impl Default for LexicalSearchOptions {
@@ -113,6 +149,7 @@ impl Default for LexicalSearchOptions {
             timeout_ms: None,
             parallel: false,
             sort_by: SortField::Score,
+            highlight: None,
         }
     }
 }
@@ -410,6 +447,32 @@ impl SearchRequestBuilder {
         self
     }
 
+    // ── Highlighting ─────────────────────────────────────────────────────
+
+    /// Request highlights for `fields` (stored text fields) in each hit.
+    ///
+    /// Uses [`HighlightConfig::default`] unless
+    /// [`highlight_config`](Self::highlight_config) is also called; the two
+    /// compose in either order. Replaces the field list of an earlier call.
+    pub fn highlight(mut self, fields: Vec<String>) -> Self {
+        self.lexical_options
+            .highlight
+            .get_or_insert_with(HighlightOptions::default)
+            .fields = fields;
+        self
+    }
+
+    /// Set the tag, fragment sizing and `require_field_match` used for
+    /// highlighting. Has no effect until [`highlight`](Self::highlight)
+    /// names at least one field.
+    pub fn highlight_config(mut self, config: HighlightConfig) -> Self {
+        self.lexical_options
+            .highlight
+            .get_or_insert_with(HighlightOptions::default)
+            .config = config;
+        self
+    }
+
     // ── Vector options ───────────────────────────────────────────────────
 
     /// Set the score combination mode for vector search.
@@ -491,4 +554,72 @@ pub struct SearchResult {
     /// The stored fields of the document, or `None` if the document could
     /// not be retrieved (e.g. it was deleted between scoring and retrieval).
     pub document: Option<crate::data::Document>,
+    /// Highlighted fragments per requested field, best fragment first, with
+    /// the configured tags applied (e.g. `<mark>Rust</mark>`). Empty when
+    /// highlighting was not requested, when the field is not a stored text
+    /// field, or when nothing in it matched (unless
+    /// `return_entire_field_if_no_highlight` is set).
+    pub highlights: HashMap<String, Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_lexical_options_have_no_highlight() {
+        assert!(LexicalSearchOptions::default().highlight.is_none());
+        assert!(
+            SearchRequestBuilder::new()
+                .build()
+                .lexical_options
+                .highlight
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn builder_highlight_sets_fields_with_default_config() {
+        let request = SearchRequestBuilder::new()
+            .highlight(vec!["body".to_string()])
+            .build();
+        let options = request.lexical_options.highlight.expect("highlight set");
+        assert_eq!(options.fields, ["body"]);
+        assert_eq!(options.config.tag, "mark");
+        assert!(options.config.require_field_match);
+    }
+
+    #[test]
+    fn builder_highlight_config_alone_keeps_fields_empty() {
+        let request = SearchRequestBuilder::new()
+            .highlight_config(HighlightConfig::default().tag("em".to_string()))
+            .build();
+        let options = request.lexical_options.highlight.expect("highlight set");
+        assert!(options.fields.is_empty());
+        assert_eq!(options.config.tag, "em");
+    }
+
+    #[test]
+    fn builder_highlight_and_config_compose_in_either_order() {
+        let config = || {
+            HighlightConfig::default()
+                .tag("em".to_string())
+                .css_class("hl".to_string())
+        };
+        let fields_first = SearchRequestBuilder::new()
+            .highlight(vec!["body".to_string()])
+            .highlight_config(config())
+            .build();
+        let config_first = SearchRequestBuilder::new()
+            .highlight_config(config())
+            .highlight(vec!["body".to_string()])
+            .build();
+
+        for request in [fields_first, config_first] {
+            let options = request.lexical_options.highlight.expect("highlight set");
+            assert_eq!(options.fields, ["body"]);
+            assert_eq!(options.config.tag, "em");
+            assert_eq!(options.config.css_class.as_deref(), Some("hl"));
+        }
+    }
 }
