@@ -120,7 +120,7 @@ durable persistence.
 
 - **Returns:** `Promise<void>`
 
-#### `search(query, limit?, offset?)`
+#### `search(query, limit?, offset?, highlight?)`
 
 Search using a DSL string query.
 
@@ -128,9 +128,10 @@ Search using a DSL string query.
   - `query` (string) -- Query DSL (e.g. `"title:hello"`).
   - `limit` (number, default 10)
   - `offset` (number, default 0)
+  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below.
 - **Returns:** `Promise<SearchResult[]>`
 
-#### `searchTerm(field, term, limit?, offset?)`
+#### `searchTerm(field, term, limit?, offset?, highlight?)`
 
 Search for an exact term.
 
@@ -138,7 +139,33 @@ Search for an exact term.
   - `field` (string) -- Field name.
   - `term` (string) -- Exact term.
   - `limit`, `offset` (number, optional)
+  - `highlight` (`HighlightOptions`, optional) -- Same as `search`'s `highlight` argument.
 - **Returns:** `Promise<SearchResult[]>`
+
+#### Highlighting
+
+`search` and `searchTerm` accept an optional `highlight` argument — a plain object shaped like:
+
+```typescript
+interface HighlightOptions {
+  fields: string[];
+  fragmentSize?: number;
+  maxFragments?: number;
+  tag?: string;
+  cssClass?: string;
+  requireFieldMatch?: boolean;
+}
+```
+
+Only `fields` is required; everything else falls back to the engine's default `HighlightConfig` (tag `"mark"`, up to 5 fragments of ~150 characters, `requireFieldMatch: true`). Highlighting follows the query passed to `search`/`searchTerm`, and only `stored: true` text fields can be highlighted — a field that isn't stored, isn't a text field, or had no match is simply absent from the result's `highlights` object. Omitting `highlight` (or passing `undefined`) leaves every result's `highlights` empty.
+
+```js
+const results = await index.search("body:rust", 10, 0, {
+  fields: ["body"],
+  tag: "em",
+});
+// results[0].highlights => { body: ["<em>Rust</em> is a systems programming language"] }
+```
 
 #### `searchVector(field, vector, limit?, offset?)`
 
@@ -541,8 +568,11 @@ interface SearchResult {
   id: string;
   score: number;
   document: object | null;
+  highlights: Record<string, string[]>;
 }
 ```
+
+`highlights` maps each field named in the request's `highlight.fields` to its highlighted fragments (best first); a field that did not highlight is absent from the object, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
 
 ## Analysis
 

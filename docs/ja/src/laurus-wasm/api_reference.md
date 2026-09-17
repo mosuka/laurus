@@ -117,7 +117,7 @@ OPFS で永続化されたインデックスを開くか、新規作成します
 
 - **戻り値:** `Promise<void>`
 
-#### `search(query, limit?, offset?)`
+#### `search(query, limit?, offset?, highlight?)`
 
 DSL 文字列クエリで検索します。
 
@@ -125,9 +125,10 @@ DSL 文字列クエリで検索します。
   - `query` (string) -- クエリ DSL（例: `"title:hello"`）
   - `limit` (number, デフォルト 10)
   - `offset` (number, デフォルト 0)
+  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照
 - **戻り値:** `Promise<SearchResult[]>`
 
-#### `searchTerm(field, term, limit?, offset?)`
+#### `searchTerm(field, term, limit?, offset?, highlight?)`
 
 完全一致タームで検索します。
 
@@ -135,7 +136,33 @@ DSL 文字列クエリで検索します。
   - `field` (string) -- フィールド名
   - `term` (string) -- 検索ターム
   - `limit`, `offset` (number, 省略可)
+  - `highlight` (`HighlightOptions`, 省略可) -- `search` の `highlight` 引数と同じ
 - **戻り値:** `Promise<SearchResult[]>`
+
+#### ハイライト
+
+`search` と `searchTerm` は省略可能な `highlight` 引数を受け付けます。以下の形の単純なオブジェクトです。
+
+```typescript
+interface HighlightOptions {
+  fields: string[];
+  fragmentSize?: number;
+  maxFragments?: number;
+  tag?: string;
+  cssClass?: string;
+  requireFieldMatch?: boolean;
+}
+```
+
+必須なのは `fields` のみで、それ以外はエンジンの既定 `HighlightConfig`（タグ `"mark"`、約150文字のフラグメントを最大5件、`requireFieldMatch: true`）にフォールバックします。ハイライトは `search`/`searchTerm` に渡したクエリに従い、`stored: true` のテキストフィールドのみハイライト可能です — 保存されていない、テキスト型でない、またはマッチしなかったフィールドは結果の `highlights` オブジェクトに現れません。`highlight` を省略する（または `undefined` を渡す）と、すべての結果の `highlights` は空のままになります。
+
+```js
+const results = await index.search("body:rust", 10, 0, {
+  fields: ["body"],
+  tag: "em",
+});
+// results[0].highlights => { body: ["<em>Rust</em> is a systems programming language"] }
+```
 
 #### `searchVector(field, vector, limit?, offset?)`
 
@@ -528,8 +555,11 @@ interface SearchResult {
   id: string;
   score: number;
   document: object | null;
+  highlights: Record<string, string[]>;
 }
 ```
+
+`highlights` はリクエストの `highlight.fields` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドはオブジェクトに現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
 
 ## Analysis
 

@@ -10,7 +10,9 @@ use crate::query::{
     JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery,
 };
 use crate::schema::WasmSchema;
-use crate::search::{build_dsl_request, build_lexical_request, build_vector_request};
+use crate::search::{
+    build_dsl_request, build_lexical_request, build_vector_request, parse_highlight_options,
+};
 use crate::storage::OpfsPersistence;
 use crate::wal::WasmWalSyncPolicy;
 use laurus::embedding::embedder::Embedder;
@@ -45,6 +47,7 @@ fn search_results_to_js(results: Vec<laurus::SearchResult>) -> Result<JsValue, J
                 "id": r.id,
                 "score": r.score,
                 "document": document,
+                "highlights": r.highlights,
             })
         })
         .collect();
@@ -511,22 +514,29 @@ impl WasmIndex {
     /// * `query` - The query DSL string (e.g. `"title:hello"`).
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    /// * `highlight` - Optional highlight request (Issue #1134):
+    ///   `{ fields: ["body"], maxFragments?, fragmentSize?, tag?, cssClass?,
+    ///   requireFieldMatch? }`. Only `fields` is required. Highlighting
+    ///   follows this query, and only `stored: true` text fields can be
+    ///   highlighted.
     ///
     /// # Returns
     ///
-    /// A JS array of SearchResult objects `{ id, score, document }`.
+    /// A JS array of SearchResult objects `{ id, score, document, highlights }`.
     #[wasm_bindgen]
     pub async fn search(
         &self,
         query: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        highlight: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
-        let request = build_dsl_request(
+        let mut request = build_dsl_request(
             query,
             limit.unwrap_or(10) as usize,
             offset.unwrap_or(0) as usize,
         );
+        request.lexical_options.highlight = parse_highlight_options(highlight)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -539,6 +549,8 @@ impl WasmIndex {
     /// * `term` - The exact term to match.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    /// * `highlight` - Optional highlight request; same shape as `search`'s
+    ///   `highlight` argument (Issue #1134).
     #[wasm_bindgen(js_name = "searchTerm")]
     pub async fn search_term(
         &self,
@@ -546,13 +558,15 @@ impl WasmIndex {
         term: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        highlight: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
-        let request = build_lexical_request(
+        let mut request = build_lexical_request(
             &query,
             limit.unwrap_or(10) as usize,
             offset.unwrap_or(0) as usize,
         )?;
+        request.lexical_options.highlight = parse_highlight_options(highlight)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -820,5 +834,104 @@ mod tests {
             unused_embedder_names(&schema, registered.iter()),
             ["alpha".to_string(), "zeta".to_string()],
         );
+    }
+
+    // ── Highlighting (Issue #1134) ──────────────────────────────────────────
+
+    use wasm_bindgen::JsCast;
+
+    use super::WasmIndex;
+    use crate::schema::WasmSchema;
+
+    /// Build an in-memory index with one stored `body` text field and one
+    /// document, ready to commit and search.
+    async fn text_index() -> WasmIndex {
+        let mut schema = WasmSchema::new();
+        schema.add_text_field("body".to_string(), None, None, None, None, None);
+        let index = WasmIndex::create(Some(schema), None, None)
+            .await
+            .expect("index creation must succeed");
+        let doc = serde_wasm_bindgen::to_value(&serde_json::json!({
+            "body": "Rust is a systems programming language"
+        }))
+        .unwrap();
+        index
+            .put_document("doc1".to_string(), doc)
+            .await
+            .expect("put_document must succeed");
+        index.commit().await.expect("commit must succeed");
+        index
+    }
+
+    /// Build a genuine JS object (property access, not a `Map`) from a
+    /// `serde_json::Value` — matching what a real caller passes from JS.
+    /// `serde_wasm_bindgen::to_value` on a JSON object serializes to a JS
+    /// `Map` by default, which `serde_wasm_bindgen::from_value` cannot
+    /// deserialize into a plain struct the way `parse_highlight_options`
+    /// expects; going through `JSON.parse` (as `search_results_to_js` does
+    /// for its own output) sidesteps that entirely.
+    fn highlight_object(value: serde_json::Value) -> js_sys::Object {
+        let json = serde_json::to_string(&value).unwrap();
+        js_sys::JSON::parse(&json)
+            .unwrap()
+            .dyn_into::<js_sys::Object>()
+            .expect("highlight options must parse to a JS object")
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_with_highlight_returns_fragments_for_the_requested_field() {
+        let index = text_index().await;
+        let highlight = highlight_object(serde_json::json!({ "fields": ["body"] }));
+
+        let js_results = index
+            .search("body:rust".to_string(), None, None, Some(highlight))
+            .await
+            .expect("search must succeed");
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+
+        let fragments = results[0]["highlights"]["body"]
+            .as_array()
+            .expect("body must be highlighted");
+        assert!(
+            fragments[0].as_str().unwrap().contains("<mark>Rust</mark>"),
+            "{results:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_without_highlight_leaves_highlights_empty() {
+        let index = text_index().await;
+
+        let js_results = index
+            .search("body:rust".to_string(), None, None, None)
+            .await
+            .expect("search must succeed");
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+
+        assert_eq!(results[0]["highlights"], serde_json::json!({}));
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_term_with_highlight_config_applies_the_tag() {
+        let index = text_index().await;
+        let highlight = highlight_object(serde_json::json!({
+            "fields": ["body"],
+            "tag": "em",
+        }));
+
+        let js_results = index
+            .search_term(
+                "body".to_string(),
+                "rust".to_string(),
+                None,
+                None,
+                Some(highlight),
+            )
+            .await
+            .expect("searchTerm must succeed");
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+
+        let fragment = results[0]["highlights"]["body"][0].as_str().unwrap();
+        assert!(fragment.contains("<em>Rust</em>"), "{fragment}");
     }
 }

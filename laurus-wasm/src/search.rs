@@ -1,43 +1,70 @@
 //! WASM wrappers for search request/result and fusion algorithm types.
 
-use crate::convert::data_value_to_json;
 use crate::query::{
     JsQuery, JsVectorQuery, extract_lexical_query, query_to_lexical_search_query,
     vector_query_to_search_query,
 };
-use laurus::{FusionAlgorithm, LexicalSearchQuery, SearchRequestBuilder, SearchResult};
-use serde::Serialize;
+use laurus::{
+    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
+};
+use serde::Deserialize;
 use wasm_bindgen::JsValue;
 
 // ---------------------------------------------------------------------------
-// SearchResult
+// Highlighting (Issue #1134)
 // ---------------------------------------------------------------------------
 
-/// A single search result.
-#[derive(Serialize)]
-pub struct WasmSearchResult {
-    /// External document identifier.
-    pub id: String,
-    /// Relevance score.
-    pub score: f64,
-    /// Retrieved document fields as a key-value object, or null.
-    pub document: Option<serde_json::Value>,
+/// JS-facing shape of [`HighlightOptions`] plus the [`HighlightConfig`]
+/// knobs exposed to bindings: `fields` (required) and a reduced set of tag /
+/// fragment / field-match settings. `fragment_overlap`, `fragment_separator`
+/// and `max_analyzed_chars` are not exposed — they either have no effect
+/// (the first two, currently unused by fragment selection) or are unlikely
+/// to be worth tuning from JS (the last one).
+///
+/// Deserialized via `serde_wasm_bindgen` from a plain JS object, e.g.
+/// `{ fields: ["body"], maxFragments: 2, tag: "em" }`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmHighlightOptions {
+    fields: Vec<String>,
+    fragment_size: Option<u32>,
+    max_fragments: Option<u32>,
+    tag: Option<String>,
+    css_class: Option<String>,
+    require_field_match: Option<bool>,
 }
 
-/// Convert a [`SearchResult`] from the engine into a [`WasmSearchResult`].
-pub fn to_wasm_search_result(r: SearchResult) -> WasmSearchResult {
-    let document = r.document.map(|doc| {
-        let mut map = serde_json::Map::new();
-        for (field, value) in doc.fields {
-            map.insert(field, data_value_to_json(&value));
-        }
-        serde_json::Value::Object(map)
-    });
-    WasmSearchResult {
-        id: r.id,
-        score: r.score as f64,
-        document,
+/// Parse an optional highlight-options JS object into [`HighlightOptions`].
+/// `None` (no object passed) means "don't highlight" and returns `Ok(None)`.
+pub fn parse_highlight_options(
+    options: Option<js_sys::Object>,
+) -> Result<Option<HighlightOptions>, JsValue> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let parsed: WasmHighlightOptions = serde_wasm_bindgen::from_value(options.into())
+        .map_err(|e| JsValue::from_str(&format!("Invalid highlight options: {e}")))?;
+
+    let mut config = HighlightConfig::new();
+    if let Some(fragment_size) = parsed.fragment_size {
+        config = config.fragment_size(fragment_size as usize);
     }
+    if let Some(max_fragments) = parsed.max_fragments {
+        config = config.max_fragments(max_fragments as usize);
+    }
+    if let Some(tag) = parsed.tag {
+        config = config.tag(tag);
+    }
+    if let Some(css_class) = parsed.css_class {
+        config = config.css_class(css_class);
+    }
+    if let Some(require_field_match) = parsed.require_field_match {
+        config = config.require_field_match(require_field_match);
+    }
+
+    Ok(Some(
+        HighlightOptions::new(parsed.fields).with_config(config),
+    ))
 }
 
 // ---------------------------------------------------------------------------
