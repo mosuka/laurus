@@ -595,6 +595,98 @@ class LaurusTest extends TestCase
         }
     }
 
+    // ── Highlighting (Issue #1134) ─────────────────────────────────────────
+
+    /**
+     * Return a fresh in-memory index with one document whose body contains
+     * "Rust", for highlight assertions.
+     */
+    private function createHighlightIndex(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addTextField("body");
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("doc1", [
+            "title" => "Introduction to Rust",
+            "body" => "Rust is a systems programming language.",
+        ]);
+        $idx->commit();
+        return $idx;
+    }
+
+    public function testHighlightListReturnsFragments(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $results = $idx->search("body:rust", 10, 0, ["body"]);
+
+        $this->assertCount(1, $results);
+        $fragments = $results[0]->getHighlights()["body"];
+        $this->assertCount(1, $fragments);
+        $this->assertStringContainsString("<mark>Rust</mark>", $fragments[0]);
+    }
+
+    public function testHighlightOmittedLeavesHighlightsEmpty(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $results = $idx->search("body:rust");
+
+        $this->assertCount(1, $results);
+        $this->assertSame([], $results[0]->getHighlights());
+    }
+
+    public function testHighlightUnrequestedFieldIsAbsent(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $results = $idx->search("body:rust", 10, 0, ["body"]);
+
+        $this->assertArrayNotHasKey("title", $results[0]->getHighlights());
+    }
+
+    public function testHighlightAssociativeArrayAppliesConfig(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $results = $idx->search("body:rust", 10, 0, ["fields" => ["body"], "tag" => "em", "max_fragments" => 2]);
+
+        $fragment = $results[0]->getHighlights()["body"][0];
+        $this->assertStringContainsString("<em>Rust</em>", $fragment);
+        $this->assertStringNotContainsString("<mark>", $fragment);
+    }
+
+    public function testHighlightAssociativeArrayRequiresFieldsKey(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $this->expectException(\Exception::class);
+        $idx->search("body:rust", 10, 0, ["max_fragments" => 2]);
+    }
+
+    public function testSearchBatchAppliesHighlightToEveryQuery(): void
+    {
+        $idx = $this->createHighlightIndex();
+        // Both queries target "body" so the requested "body" highlight
+        // applies to both under the default requireFieldMatch = true.
+        $batch = $idx->searchBatch(["body:rust", "body:programming"], 10, 0, ["body"]);
+
+        $this->assertCount(2, $batch);
+        foreach ($batch as $results) {
+            $this->assertCount(1, $results);
+            $this->assertStringContainsString("<mark>", $results[0]->getHighlights()["body"][0]);
+        }
+    }
+
+    public function testSearchRequestHighlightMatchesSearchArgument(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $viaArgument = $idx->search("body:rust", 10, 0, ["body"]);
+        // SearchRequest's constructor args before `highlight` have no PHP
+        // default (only `limit`/`offset` do), so they must all be passed
+        // positionally here, same as the existing SearchRequest tests above.
+        $request = new Laurus\SearchRequest("body:rust", null, null, null, null, 10, 0, ["body"]);
+        $viaRequest = $idx->search($request);
+
+        $this->assertEquals($viaArgument[0]->getHighlights(), $viaRequest[0]->getHighlights());
+    }
+
     // ── HNSW quantizer / rerank_storage options (#797) ────────────────────
     //
     // These assert the values configured on addHnswField actually reach the
