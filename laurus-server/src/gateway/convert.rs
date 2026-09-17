@@ -849,6 +849,8 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         })
         .unwrap_or_default();
 
+    let highlight = json.get("highlight").and_then(json_to_highlight_params);
+
     Ok(v1::SearchRequest {
         query,
         query_vectors,
@@ -858,6 +860,7 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         lexical_params,
         vector_params,
         field_boosts,
+        highlight,
     })
 }
 
@@ -972,6 +975,67 @@ fn json_to_vector_params(json: &Value) -> Option<v1::VectorParams> {
     })
 }
 
+/// Converts a JSON `highlight` value to proto `HighlightParams` (Issue
+/// #1134). Accepts either the array shorthand (just a field list) —
+/// `["title", "body"]` — or the full object form —
+/// `{"fields": ["body"], "max_fragments": 2, "tag": "em", ...}`. Returns
+/// `None` for anything else (including an object with no usable `fields`),
+/// which `json_to_proto_search_request` treats the same as an absent
+/// `highlight` key; `from_proto` rejects an explicitly empty field list, but
+/// a malformed shorthand silently requesting nothing is not worth a hard
+/// gateway-level error.
+fn json_to_highlight_params(json: &Value) -> Option<v1::HighlightParams> {
+    if let Some(arr) = json.as_array() {
+        let fields: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        return if fields.is_empty() {
+            None
+        } else {
+            Some(v1::HighlightParams {
+                fields,
+                ..Default::default()
+            })
+        };
+    }
+
+    let obj = json.as_object()?;
+    let fields: Vec<String> = obj
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if fields.is_empty() {
+        return None;
+    }
+    Some(v1::HighlightParams {
+        fields,
+        max_fragments: obj
+            .get("max_fragments")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        fragment_size: obj
+            .get("fragment_size")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        tag: obj.get("tag").and_then(|v| v.as_str()).map(str::to_string),
+        css_class: obj
+            .get("css_class")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        require_field_match: obj.get("require_field_match").and_then(|v| v.as_bool()),
+        max_analyzed_chars: obj.get("max_analyzed_chars").and_then(|v| v.as_u64()),
+        return_entire_field_if_no_highlight: obj
+            .get("return_entire_field_if_no_highlight")
+            .and_then(|v| v.as_bool()),
+    })
+}
+
 /// Converts a proto `SearchResult` to a JSON value: `{"id", "score",
 /// "fields"}` — the same `"fields"` key (no `"document"` wrapper) that
 /// [`proto_document_to_json`] and laurus-cli's search output use, so a hit
@@ -983,6 +1047,26 @@ pub fn proto_search_result_to_json(result: &v1::SearchResult) -> Value {
     });
     if let Some(doc) = &result.document {
         obj["fields"] = Value::Object(proto_document_fields_to_json(doc));
+    }
+    if !result.highlights.is_empty() {
+        obj["highlights"] = Value::Object(
+            result
+                .highlights
+                .iter()
+                .map(|(field, highlights)| {
+                    (
+                        field.clone(),
+                        Value::Array(
+                            highlights
+                                .fragments
+                                .iter()
+                                .map(|fragment| Value::String(fragment.clone()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect(),
+        );
     }
     obj
 }
@@ -1359,12 +1443,52 @@ mod tests {
             id: "doc1".to_string(),
             score: 0.5,
             document: Some(doc),
+            highlights: Default::default(),
         };
         let json = proto_search_result_to_json(&result);
         assert_eq!(json["fields"]["title"], json!("hello"));
         assert!(
             json.get("document").is_none(),
             "search result JSON must not have a \"document\" key: {json}"
+        );
+    }
+
+    #[test]
+    fn test_proto_search_result_to_json_includes_highlights_when_present() {
+        let mut highlights = HashMap::new();
+        highlights.insert(
+            "body".to_string(),
+            v1::Highlights {
+                fragments: vec!["<mark>Rust</mark> is great".to_string()],
+            },
+        );
+        let result = v1::SearchResult {
+            id: "doc1".to_string(),
+            score: 0.5,
+            document: None,
+            highlights,
+        };
+
+        let json = proto_search_result_to_json(&result);
+        assert_eq!(
+            json["highlights"]["body"],
+            json!(["<mark>Rust</mark> is great"])
+        );
+    }
+
+    #[test]
+    fn test_proto_search_result_to_json_omits_highlights_key_when_empty() {
+        let result = v1::SearchResult {
+            id: "doc1".to_string(),
+            score: 0.5,
+            document: None,
+            highlights: HashMap::new(),
+        };
+
+        let json = proto_search_result_to_json(&result);
+        assert!(
+            json.get("highlights").is_none(),
+            "empty highlights must not add a key: {json}"
         );
     }
 
@@ -1523,6 +1647,63 @@ mod tests {
         assert_eq!(req.limit, 10);
         assert_eq!(req.offset, 0);
         assert_eq!(*req.field_boosts.get("title").unwrap(), 2.0);
+        assert!(req.highlight.is_none());
+    }
+
+    /// The array shorthand (`"highlight": ["title", "body"]`) is just a
+    /// field list — no extra config.
+    #[test]
+    fn test_json_to_proto_search_request_highlight_array_shorthand() {
+        let json = json!({
+            "query": "body:test",
+            "highlight": ["title", "body"],
+        });
+        let req = json_to_proto_search_request(&json).unwrap();
+        let highlight = req.highlight.expect("highlight set");
+        assert_eq!(highlight.fields, ["title", "body"]);
+        assert_eq!(highlight.max_fragments, None);
+    }
+
+    /// The full object form carries `fields` plus any of the optional
+    /// `HighlightConfig` knobs.
+    #[test]
+    fn test_json_to_proto_search_request_highlight_object_form() {
+        let json = json!({
+            "query": "body:test",
+            "highlight": {
+                "fields": ["body"],
+                "max_fragments": 2,
+                "fragment_size": 80,
+                "tag": "em",
+                "css_class": "hl",
+                "require_field_match": false,
+                "max_analyzed_chars": 500,
+                "return_entire_field_if_no_highlight": true,
+            },
+        });
+        let req = json_to_proto_search_request(&json).unwrap();
+        let highlight = req.highlight.expect("highlight set");
+        assert_eq!(highlight.fields, ["body"]);
+        assert_eq!(highlight.max_fragments, Some(2));
+        assert_eq!(highlight.fragment_size, Some(80));
+        assert_eq!(highlight.tag.as_deref(), Some("em"));
+        assert_eq!(highlight.css_class.as_deref(), Some("hl"));
+        assert_eq!(highlight.require_field_match, Some(false));
+        assert_eq!(highlight.max_analyzed_chars, Some(500));
+        assert_eq!(highlight.return_entire_field_if_no_highlight, Some(true));
+    }
+
+    /// An object with no (or an empty) `fields` list produces no
+    /// `HighlightParams` at all — `from_proto` treats that the same as the
+    /// key being absent, rather than surfacing a gateway-level error for a
+    /// shorthand that just requests nothing.
+    #[test]
+    fn test_json_to_proto_search_request_highlight_missing_fields_is_ignored() {
+        for highlight_json in [json!({}), json!({"fields": []}), json!([])] {
+            let json = json!({ "query": "body:test", "highlight": highlight_json });
+            let req = json_to_proto_search_request(&json).unwrap();
+            assert!(req.highlight.is_none(), "expected no highlight for {json}");
+        }
     }
 
     /// Every concrete `FieldChangeKind` value maps to its own distinct
