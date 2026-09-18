@@ -58,7 +58,18 @@ const PQ_FASTSCAN_MIN_TRAIN_VECTORS: usize = 16;
 
 /// Abstract trait to allow reading from both HnswGraph (serial) and ConcurrentHnswGraph (parallel)
 trait GraphView {
-    fn get_neighbors_view(&self, doc_id: u64, level: usize) -> Option<Vec<u64>>;
+    /// Copy `doc_id`'s neighbor list at `level` into `out` (`out` is always
+    /// cleared first, regardless of whether the node/level is found — an
+    /// absent list simply leaves `out` empty, which every caller already
+    /// treats identically to "nothing to iterate").
+    ///
+    /// Takes a caller-owned buffer instead of returning `Option<Vec<u64>>`
+    /// (Issue #1137): the build-time traversal loops that call this
+    /// (`search_layer`'s candidate loop, `insert_one`'s Phase A descent) do
+    /// so far more often per node insertion than the containers Issue #632
+    /// addressed, so a fresh `Vec` per call was actually the dominant
+    /// allocation source on this hot path.
+    fn copy_neighbors_into(&self, doc_id: u64, level: usize, out: &mut Vec<u64>);
 
     /// Whether a node may be traversed/selected during a build-time search.
     ///
@@ -74,8 +85,11 @@ trait GraphView {
 }
 
 impl GraphView for HnswGraph {
-    fn get_neighbors_view(&self, doc_id: u64, level: usize) -> Option<Vec<u64>> {
-        self.get_neighbors(doc_id, level).cloned()
+    fn copy_neighbors_into(&self, doc_id: u64, level: usize, out: &mut Vec<u64>) {
+        out.clear();
+        if let Some(neighbors) = self.get_neighbors(doc_id, level) {
+            out.extend_from_slice(neighbors);
+        }
     }
 }
 
@@ -187,12 +201,6 @@ impl ConcurrentHnswGraph {
         Ok(())
     }
 
-    fn get_neighbors_raw(&self, doc_id: u64, level: usize) -> Option<Vec<u64>> {
-        self.nodes
-            .get(&doc_id)
-            .and_then(|entry| entry.layers.get(level).map(|lock| lock.read().clone()))
-    }
-
     fn from_hnsw_graph(graph: HnswGraph, extended_max_level: usize) -> Self {
         let mut nodes = HashMap::with_capacity(graph.node_count());
         for (doc_id, layered_neighbors) in graph.into_iter_nodes() {
@@ -226,8 +234,15 @@ impl ConcurrentHnswGraph {
 }
 
 impl GraphView for ConcurrentHnswGraph {
-    fn get_neighbors_view(&self, doc_id: u64, level: usize) -> Option<Vec<u64>> {
-        self.get_neighbors_raw(doc_id, level)
+    fn copy_neighbors_into(&self, doc_id: u64, level: usize, out: &mut Vec<u64>) {
+        out.clear();
+        if let Some(lock) = self
+            .nodes
+            .get(&doc_id)
+            .and_then(|entry| entry.layers.get(level))
+        {
+            out.extend_from_slice(&lock.read());
+        }
     }
 
     #[inline]
@@ -334,7 +349,7 @@ impl PartialOrd for VisitorCandidate {
 /// - Invariant this design depends on: `search_layer` never reenters
 ///   itself on the same thread (no nested `rayon::join`/`par_iter` inside
 ///   it). Verified for the current body: `calc_dist`/`calc_dist_by_idx` is
-///   pure SIMD arithmetic and `GraphView::get_neighbors_view` only takes a
+///   pure SIMD arithmetic and `GraphView::copy_neighbors_into` only takes a
 ///   `parking_lot` read lock (never yields to a scheduler), so neither can
 ///   trigger a reentrant call. If `search_layer` ever gains internal
 ///   parallelism, revisit this — `RefCell::borrow_mut()` below would
@@ -344,6 +359,11 @@ struct SearchLayerArena {
     touched: Vec<usize>,
     to_visit: BinaryHeap<VisitorCandidate>,
     found: BinaryHeap<Candidate>,
+    /// Scratch buffer for `GraphView::copy_neighbors_into` (Issue #1137),
+    /// reused across calls instead of letting each call allocate its own
+    /// `Vec<u64>`. Cleared and refilled by `copy_neighbors_into` itself on
+    /// every use, so `reset` doesn't need to touch it.
+    neighbor_buf: Vec<u64>,
 }
 
 impl SearchLayerArena {
@@ -353,6 +373,7 @@ impl SearchLayerArena {
             touched: Vec::new(),
             to_visit: BinaryHeap::new(),
             found: BinaryHeap::new(),
+            neighbor_buf: Vec::new(),
         }
     }
 
@@ -1174,23 +1195,31 @@ impl HnswIndexWriter {
             let mut curr_obj = start_node;
             let mut dist = writer_ref.calc_dist(vector, curr_obj)?;
 
+            // Scratch buffer for `copy_neighbors_into` (Issue #1137), reused
+            // across every iteration of the descent loop below instead of
+            // allocating a fresh `Vec<u64>` per level. A plain local
+            // suffices here (no thread-local needed, unlike `search_layer`'s
+            // `SearchLayerArena`): Phase A never calls `search_layer`, so
+            // this buffer's lifetime never needs to span or nest with that
+            // arena's own borrow.
+            let mut neighbor_buf: Vec<u64> = Vec::new();
+
             // Phase A: Greedy descent from top layer down to level + 1
             for lc in (level + 1..=max_level).rev() {
                 let mut changed = true;
                 while changed {
                     changed = false;
-                    if let Some(neighbors) = graph.get_neighbors_view(curr_obj, lc) {
-                        for neighbor_id in neighbors {
-                            // Skip nodes still being inserted (Issue #868).
-                            if !graph.is_visible(neighbor_id) {
-                                continue;
-                            }
-                            let d = writer_ref.calc_dist(vector, neighbor_id)?;
-                            if d < dist {
-                                dist = d;
-                                curr_obj = neighbor_id;
-                                changed = true;
-                            }
+                    graph.copy_neighbors_into(curr_obj, lc, &mut neighbor_buf);
+                    for &neighbor_id in &neighbor_buf {
+                        // Skip nodes still being inserted (Issue #868).
+                        if !graph.is_visible(neighbor_id) {
+                            continue;
+                        }
+                        let d = writer_ref.calc_dist(vector, neighbor_id)?;
+                        if d < dist {
+                            dist = d;
+                            curr_obj = neighbor_id;
+                            changed = true;
                         }
                     }
                 }
@@ -1400,54 +1429,61 @@ impl HnswIndexWriter {
                     break;
                 }
 
-                if let Some(neighbors) = graph.get_neighbors_view(curr.id, level) {
-                    for neighbor_id in neighbors {
-                        // Skip nodes still being inserted (Issue #868). Checked
-                        // before the visited check so a node hidden now can still
-                        // be discovered later in the same search if it becomes
-                        // linked. A no-op for query-time / finished graphs
-                        // (`is_visible` defaults to `true`).
-                        if !graph.is_visible(neighbor_id) {
-                            continue;
-                        }
+                graph.copy_neighbors_into(curr.id, level, &mut arena.neighbor_buf);
+                // Indexed rather than `for x in &arena.neighbor_buf`: `arena`
+                // is a `RefMut`, so every field access goes through
+                // `DerefMut` and Rust's field-disjoint-borrow splitting does
+                // not apply — an iterator borrowing `neighbor_buf` would
+                // conflict with `arena.mark_visited`/`arena.found.push`
+                // below, which need a mutable borrow of the whole struct.
+                // Indexing only borrows for the instant of reading a `Copy`
+                // `u64`, which ends immediately (NLL), so it coexists fine.
+                for i in 0..arena.neighbor_buf.len() {
+                    let neighbor_id = arena.neighbor_buf[i];
+                    // Skip nodes still being inserted (Issue #868). Checked
+                    // before the visited check so a node hidden now can still
+                    // be discovered later in the same search if it becomes
+                    // linked. A no-op for query-time / finished graphs
+                    // (`is_visible` defaults to `true`).
+                    if !graph.is_visible(neighbor_id) {
+                        continue;
+                    }
 
-                        // Resolve the dense index once and reuse it for both the
-                        // visited-check and the distance calculation (Issue
-                        // #632) — this keeps the already-visited case at one
-                        // lookup (was zero) but the newly-visited case at one
-                        // lookup (was two: `visited.insert` here plus
-                        // `calc_dist`'s own lookup), so it doesn't regress net
-                        // lookup count. Resolved before the visited check so a
-                        // missing id still errors on first encounter, matching
-                        // today's behaviour.
-                        let idx = *self.doc_id_map.get(&neighbor_id).ok_or_else(|| {
-                            LaurusError::internal(format!(
-                                "Doc ID {} not found in doc_id_map",
-                                neighbor_id
-                            ))
-                        })?;
-                        if !arena.mark_visited(idx) {
-                            continue;
-                        }
+                    // Resolve the dense index once and reuse it for both the
+                    // visited-check and the distance calculation (Issue
+                    // #632) — this keeps the already-visited case at one
+                    // lookup (was zero) but the newly-visited case at one
+                    // lookup (was two: `visited.insert` here plus
+                    // `calc_dist`'s own lookup), so it doesn't regress net
+                    // lookup count. Resolved before the visited check so a
+                    // missing id still errors on first encounter, matching
+                    // today's behaviour.
+                    let idx = *self.doc_id_map.get(&neighbor_id).ok_or_else(|| {
+                        LaurusError::internal(format!(
+                            "Doc ID {} not found in doc_id_map",
+                            neighbor_id
+                        ))
+                    })?;
+                    if !arena.mark_visited(idx) {
+                        continue;
+                    }
 
-                        let neighbor_dist = self.calc_dist_by_idx(query, idx)?;
-                        let furthest_dist =
-                            arena.found.peek().map(|c| c.distance).unwrap_or(f32::MAX);
+                    let neighbor_dist = self.calc_dist_by_idx(query, idx)?;
+                    let furthest_dist = arena.found.peek().map(|c| c.distance).unwrap_or(f32::MAX);
 
-                        if neighbor_dist < furthest_dist || arena.found.len() < ef {
-                            arena.found.push(Candidate {
-                                id: neighbor_id,
-                                distance: neighbor_dist,
-                                similarity: 0.0,
-                            });
-                            arena.to_visit.push(VisitorCandidate {
-                                id: neighbor_id,
-                                distance: neighbor_dist,
-                            });
+                    if neighbor_dist < furthest_dist || arena.found.len() < ef {
+                        arena.found.push(Candidate {
+                            id: neighbor_id,
+                            distance: neighbor_dist,
+                            similarity: 0.0,
+                        });
+                        arena.to_visit.push(VisitorCandidate {
+                            id: neighbor_id,
+                            distance: neighbor_dist,
+                        });
 
-                            if arena.found.len() > ef {
-                                arena.found.pop();
-                            }
+                        if arena.found.len() > ef {
+                            arena.found.pop();
                         }
                     }
                 }
@@ -2458,5 +2494,46 @@ mod search_layer_arena_tests {
                 .expect("search_layer must succeed");
             assert_eq!(len, 3);
         }
+    }
+
+    // ── GraphView::copy_neighbors_into buffer reuse (Issue #1137) ───────────
+
+    #[test]
+    fn hnsw_graph_copy_neighbors_into_clears_buffer_between_calls() {
+        let mut nodes = HashMap::new();
+        nodes.insert(1u64, vec![vec![10u64, 20, 30]]);
+        nodes.insert(2u64, vec![vec![99u64]]);
+        let graph = HnswGraph::new(Some(1), 0, nodes, 4, 4, 8, 8, 1.0);
+
+        let mut buf = Vec::new();
+        graph.copy_neighbors_into(1, 0, &mut buf);
+        assert_eq!(buf, vec![10, 20, 30]);
+
+        // Reusing the same buffer for a node with FEWER neighbors must not
+        // retain any of the previous call's entries.
+        graph.copy_neighbors_into(2, 0, &mut buf);
+        assert_eq!(
+            buf,
+            vec![99],
+            "buffer must be cleared, not appended to, between calls"
+        );
+    }
+
+    #[test]
+    fn concurrent_hnsw_graph_copy_neighbors_into_clears_buffer_between_calls() {
+        let graph = ConcurrentHnswGraph::new(vec![(1, 0), (2, 0)], 0);
+        graph.set_neighbors(1, 0, vec![10, 20, 30]);
+        graph.set_neighbors(2, 0, vec![99]);
+
+        let mut buf = Vec::new();
+        graph.copy_neighbors_into(1, 0, &mut buf);
+        assert_eq!(buf, vec![10, 20, 30]);
+
+        graph.copy_neighbors_into(2, 0, &mut buf);
+        assert_eq!(
+            buf,
+            vec![99],
+            "buffer must be cleared, not appended to, between calls"
+        );
     }
 }
