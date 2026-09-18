@@ -190,6 +190,12 @@ Laurus::Schema.new
 | Method | Description |
 | :--- | :--- |
 | `add_embedder(name, config)` | Register a named embedder definition. `config` is a Hash with a `"type"` key (see below). |
+| `add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)` | Register a custom analyzer definition. `tokenizer` is required; `char_filters:`/`token_filters:` are optional Arrays of Hashes. Each Hash uses the same `{type: "..."}` shape as the schema TOML/JSON format (see below), with either String or Symbol keys. Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
+| `analyzer_names -> Array<String>` | Return the names of custom analyzers registered via `add_analyzer` or loaded from TOML. |
+| `Laurus::Schema.from_toml(toml_str) -> Schema` *(class method)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
+| `Laurus::Schema.from_toml_file(path) -> Schema` *(class method)* | Load a schema from a TOML file. |
+| `to_toml -> String` | Serialize this schema to a TOML string in the same format `laurus-cli` accepts. |
+| `to_toml_file(path)` | Write this schema to a TOML file. |
 | `set_default_fields(fields)` | Set the default fields used when no field is specified in a query. `fields` is an Array of Strings. |
 | `set_dynamic_field_policy(policy)` | Set how undeclared fields are handled. `policy` is `"strict"`, `"dynamic"` (default), or `"ignore"`. See notes below. |
 | `dynamic_field_policy -> String` | Return the current policy as a lowercase string. |
@@ -218,6 +224,59 @@ the full behaviour matrix.
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+
+### Analyzer components
+
+Used by `add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)`
+and by the `[analyzers.<name>]` TOML section. `tokenizer` is a single Hash;
+`char_filters:`/`token_filters:` are Arrays of Hashes, applied in Array order.
+
+**Tokenizers** (`tokenizer`, exactly one):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `pattern` (default `\w+`), `gaps` (default `false`) |
+| `"ngram"` | `min_gram`, `max_gram` | -- |
+| `"lindera"` | `mode`, `dict` | `user_dict` |
+| `"whole"` | -- | -- |
+
+**Char filters** (`char_filters`, applied to raw text before tokenization):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `form` (`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`) | -- |
+| `"pattern_replace"` | `pattern`, `replacement` | -- |
+| `"mapping"` | `mapping` (Hash of string replacements) | -- |
+| `"japanese_iteration_mark"` | -- | `kanji` (default `true`), `kana` (default `true`) |
+
+**Token filters** (`token_filters`, applied to the token stream after tokenization):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `words` (default: English stop words) |
+| `"stem"` | -- | `stem_type` (`"porter"`/`"simple"`/`"identity"`) |
+| `"boost"` | `boost` | -- |
+| `"limit"` | `limit` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_analyzer(
+  "ja_ipadic",
+  { type: "lindera", mode: "normal", dict: "/var/lib/lindera/ipadic" },
+  char_filters: [
+    { type: "unicode_normalization", form: "nfkc" },
+    { type: "japanese_iteration_mark" },
+  ],
+  token_filters: [{ type: "lowercase" }],
+)
+schema.add_text_field("title", analyzer: "ja_ipadic")
+```
 
 ### Distance metrics
 

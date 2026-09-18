@@ -4,13 +4,18 @@ use std::cell::RefCell;
 use std::str::FromStr;
 
 use laurus::{
-    BooleanOption, BytesOption, DateTimeOption, DistanceMetric, DynamicFieldPolicy,
-    EmbedderDefinition, FieldOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
+    DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
+    GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema,
+    TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use magnus::prelude::*;
+use magnus::r_hash::ForEach;
 use magnus::scan_args::{get_kwargs, scan_args};
-use magnus::{Error, RArray, RHash, RModule, Ruby, TryConvert, Value};
+use magnus::{Error, RArray, RHash, RModule, Ruby, Symbol, TryConvert, Value};
+
+use crate::errors::{io_err_with_path, laurus_err};
+use crate::gvl::without_gvl;
 
 /// Parse a distance metric string into [`DistanceMetric`].
 fn parse_distance(s: &str) -> Result<DistanceMetric, Error> {
@@ -104,6 +109,151 @@ fn parse_rerank_storage(name: Option<&str>) -> Result<Option<RerankStorageKind>,
             format!("Unknown rerank_storage: '{other}'. Valid: f32"),
         )),
     }
+}
+
+/// Convert a Ruby value into a [`serde_json::Value`], for decoding analyzer
+/// definition components (`tokenizer`/`char_filters`/`token_filters`) via
+/// `serde_json::from_value`.
+///
+/// Mirrors `laurus-python`'s `py_to_json_value`, but additionally accepts
+/// Symbol keys and values (both stringified) since a Ruby Hash literal like
+/// `{type: "ngram", min_gram: 3}` naturally uses Symbol keys.
+fn rb_to_json_value(ruby: &Ruby, value: Value) -> Result<serde_json::Value, Error> {
+    if value.is_nil() {
+        return Ok(serde_json::Value::Null);
+    }
+    // bool must come before Integer (Ruby true/false are not Integer)
+    if value.is_kind_of(ruby.class_true_class()) || value.is_kind_of(ruby.class_false_class()) {
+        let b: bool = TryConvert::try_convert(value)?;
+        return Ok(serde_json::Value::Bool(b));
+    }
+    if value.is_kind_of(ruby.class_integer()) {
+        let i: i64 = TryConvert::try_convert(value)?;
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    if value.is_kind_of(ruby.class_float()) {
+        let f: f64 = TryConvert::try_convert(value)?;
+        let n = serde_json::Number::from_f64(f).ok_or_else(|| {
+            Error::new(
+                ruby.exception_arg_error(),
+                "float value must be finite (not NaN/Infinity)",
+            )
+        })?;
+        return Ok(serde_json::Value::Number(n));
+    }
+    if value.is_kind_of(ruby.class_string()) {
+        let s: String = TryConvert::try_convert(value)?;
+        return Ok(serde_json::Value::String(s));
+    }
+    if value.is_kind_of(ruby.class_symbol()) {
+        let sym = Symbol::from_value(value)
+            .ok_or_else(|| Error::new(ruby.exception_type_error(), "expected Symbol"))?;
+        return Ok(serde_json::Value::String(sym.name()?.to_string()));
+    }
+    if value.is_kind_of(ruby.class_array()) {
+        let arr = RArray::from_value(value)
+            .ok_or_else(|| Error::new(ruby.exception_type_error(), "expected Array"))?;
+        let items = arr
+            .into_iter()
+            .map(|v| rb_to_json_value(ruby, v))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(serde_json::Value::Array(items));
+    }
+    if value.is_kind_of(ruby.class_hash()) {
+        let hash = RHash::from_value(value)
+            .ok_or_else(|| Error::new(ruby.exception_type_error(), "expected Hash"))?;
+        let mut map = serde_json::Map::new();
+        hash.foreach(|key: Value, v: Value| {
+            let key_str: String = if key.is_kind_of(ruby.class_symbol()) {
+                let sym = Symbol::from_value(key).ok_or_else(|| {
+                    Error::new(ruby.exception_type_error(), "expected Symbol key")
+                })?;
+                sym.name()?.to_string()
+            } else if key.is_kind_of(ruby.class_string()) {
+                String::try_convert(key)?
+            } else {
+                return Err(Error::new(
+                    ruby.exception_type_error(),
+                    "hash key must be String or Symbol",
+                ));
+            };
+            map.insert(key_str, rb_to_json_value(ruby, v)?);
+            Ok(ForEach::Continue)
+        })?;
+        return Ok(serde_json::Value::Object(map));
+    }
+    Err(Error::new(
+        ruby.exception_type_error(),
+        format!(
+            "cannot convert Ruby value of type {} to JSON",
+            value.class()
+        ),
+    ))
+}
+
+/// Convert a Ruby Hash into a [`TokenizerConfig`], using the same
+/// `{type: "..."}`-tagged shape as the schema TOML/JSON format.
+fn tokenizer_from_rb(ruby: &Ruby, value: Value) -> Result<TokenizerConfig, Error> {
+    let json = rb_to_json_value(ruby, value)?;
+    serde_json::from_value(json).map_err(|e| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("invalid tokenizer: {e}"),
+        )
+    })
+}
+
+/// Convert a Ruby Hash into a [`CharFilterConfig`].
+fn char_filter_from_rb(ruby: &Ruby, value: Value, index: usize) -> Result<CharFilterConfig, Error> {
+    let json = rb_to_json_value(ruby, value)?;
+    serde_json::from_value(json).map_err(|e| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("invalid char_filters[{index}]: {e}"),
+        )
+    })
+}
+
+/// Convert a Ruby Hash into a [`TokenFilterConfig`].
+fn token_filter_from_rb(
+    ruby: &Ruby,
+    value: Value,
+    index: usize,
+) -> Result<TokenFilterConfig, Error> {
+    let json = rb_to_json_value(ruby, value)?;
+    serde_json::from_value(json).map_err(|e| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("invalid token_filters[{index}]: {e}"),
+        )
+    })
+}
+
+/// Convert an optional Ruby `Array` of Hashes into a `Vec<T>`, defaulting to
+/// an empty vector when `None` or `nil` (mirroring the core's
+/// `#[serde(default)]` on `AnalyzerDefinition::char_filters`/`token_filters`).
+fn filter_list_from_rb<T>(
+    ruby: &Ruby,
+    value: Option<Value>,
+    label: &str,
+    convert: impl Fn(&Ruby, Value, usize) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_nil() {
+        return Ok(Vec::new());
+    }
+    let arr = RArray::from_value(value).ok_or_else(|| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("{label} must be an Array of Hashes"),
+        )
+    })?;
+    arr.into_iter()
+        .enumerate()
+        .map(|(i, v)| convert(ruby, v, i))
+        .collect()
 }
 
 /// Ruby-facing schema builder (`Laurus::Schema`).
@@ -679,6 +829,118 @@ impl RbSchema {
         Ok(())
     }
 
+    /// Register a custom analyzer definition, composed of a required
+    /// tokenizer plus optional char/token filter chains.
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Positional and keyword arguments:
+    ///   - `name` (String): Unique analyzer name, referenced from
+    ///     `add_text_field`'s `analyzer:` option.
+    ///   - `tokenizer` (Hash): Tokenizer configuration, e.g.
+    ///     `{type: "ngram", min_gram: 3, max_gram: 3}`.
+    ///   - `char_filters:` (Array of Hash, optional): Char filters applied
+    ///     to raw text before tokenization.
+    ///   - `token_filters:` (Array of Hash, optional): Token filters
+    ///     applied to the token stream after tokenization.
+    ///
+    /// # Example
+    ///
+    /// ```ruby
+    /// schema.add_analyzer(
+    ///   "ngram3",
+    ///   { type: "ngram", min_gram: 3, max_gram: 3 },
+    ///   char_filters: [{ type: "unicode_normalization", form: "nfkc" }],
+    ///   token_filters: [{ type: "lowercase" }],
+    /// )
+    /// schema.add_text_field("title", analyzer: "ngram3")
+    /// ```
+    fn add_analyzer(&self, args: &[Value]) -> Result<(), Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let args = scan_args::<(String, Value), (), (), (), RHash, ()>(args)?;
+        let (name, tokenizer) = args.required;
+        let kwargs = get_kwargs::<_, (), (Option<Value>, Option<Value>), ()>(
+            args.keywords,
+            &[],
+            &["char_filters", "token_filters"],
+        )?;
+        let (char_filters, token_filters) = kwargs.optional;
+
+        let definition = AnalyzerDefinition {
+            char_filters: filter_list_from_rb(
+                &ruby,
+                char_filters,
+                "char_filters",
+                char_filter_from_rb,
+            )?,
+            tokenizer: tokenizer_from_rb(&ruby, tokenizer)?,
+            token_filters: filter_list_from_rb(
+                &ruby,
+                token_filters,
+                "token_filters",
+                token_filter_from_rb,
+            )?,
+        };
+        self.inner.borrow_mut().analyzers.insert(name, definition);
+        Ok(())
+    }
+
+    /// Return the names of custom analyzers registered in this schema, via
+    /// `add_analyzer` or loaded from TOML.
+    fn analyzer_names(&self) -> Vec<String> {
+        self.inner.borrow().analyzers.keys().cloned().collect()
+    }
+
+    /// Parse a schema from a TOML string, using the same format accepted by
+    /// `laurus-cli create index --schema`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if the TOML is malformed or does not match
+    /// the schema shape.
+    fn from_toml(toml_str: String) -> Result<Self, Error> {
+        let inner = Schema::from_toml(&toml_str).map_err(laurus_err)?;
+        Ok(Self {
+            inner: RefCell::new(inner),
+        })
+    }
+
+    /// Load a schema from a TOML file, e.g. one written by
+    /// `laurus-cli create index --schema` or by `to_toml_file`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `IOError` if the file cannot be read, or `ArgumentError` if
+    /// its contents are not valid schema TOML.
+    fn from_toml_file(path: String) -> Result<Self, Error> {
+        let path_for_read = path.clone();
+        let content = without_gvl(move || std::fs::read_to_string(&path_for_read))
+            .map_err(|e| io_err_with_path(&path, e))?;
+        let inner = Schema::from_toml(&content).map_err(laurus_err)?;
+        Ok(Self {
+            inner: RefCell::new(inner),
+        })
+    }
+
+    /// Serialize this schema to a TOML string, in the same format
+    /// `laurus-cli create index --schema` accepts.
+    fn to_toml(&self) -> Result<String, Error> {
+        self.inner.borrow().to_toml().map_err(laurus_err)
+    }
+
+    /// Write this schema to a TOML file (see `to_toml`).
+    ///
+    /// # Errors
+    ///
+    /// Raises `IOError` if the file cannot be written, or `ArgumentError`
+    /// if TOML serialization fails.
+    fn to_toml_file(&self, path: String) -> Result<(), Error> {
+        let content = self.to_toml()?;
+        let path_for_write = path.clone();
+        without_gvl(move || std::fs::write(&path_for_write, &content))
+            .map_err(|e| io_err_with_path(&path, e))
+    }
+
     /// Set the default fields used when no field is specified in a query.
     ///
     /// # Arguments
@@ -794,6 +1056,18 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
         magnus::method!(RbSchema::add_ivf_field, -1),
     )?;
     class.define_method("add_embedder", magnus::method!(RbSchema::add_embedder, 2))?;
+    class.define_method("add_analyzer", magnus::method!(RbSchema::add_analyzer, -1))?;
+    class.define_method(
+        "analyzer_names",
+        magnus::method!(RbSchema::analyzer_names, 0),
+    )?;
+    class.define_singleton_method("from_toml", magnus::function!(RbSchema::from_toml, 1))?;
+    class.define_singleton_method(
+        "from_toml_file",
+        magnus::function!(RbSchema::from_toml_file, 1),
+    )?;
+    class.define_method("to_toml", magnus::method!(RbSchema::to_toml, 0))?;
+    class.define_method("to_toml_file", magnus::method!(RbSchema::to_toml_file, 1))?;
     class.define_method(
         "set_default_fields",
         magnus::method!(RbSchema::set_default_fields, 1),

@@ -192,6 +192,12 @@ Laurus::Schema.new
 | メソッド | 説明 |
 | :--- | :--- |
 | `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ Hash です（下記参照）。 |
+| `add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`char_filters:`/`token_filters:` は省略可能な Hash の配列です。各 Hash はスキーマ TOML/JSON 形式と同じ `{type: "..."}` 形式で、キーは String / Symbol どちらでも構いません（下記参照）。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
+| `analyzer_names -> Array<String>` | `add_analyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
+| `Laurus::Schema.from_toml(toml_str) -> Schema` *(クラスメソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
+| `Laurus::Schema.from_toml_file(path) -> Schema` *(クラスメソッド)* | TOML ファイルからスキーマを読み込みます。 |
+| `to_toml -> String` | このスキーマを `laurus-cli` と同じ形式の TOML 文字列にシリアライズします。 |
+| `to_toml_file(path)` | このスキーマを TOML ファイルに書き込みます。 |
 | `set_default_fields(fields)` | クエリでフィールドが指定されていない場合に使用するデフォルトフィールドを設定します。`fields` は文字列の配列です。 |
 | `set_dynamic_field_policy(policy)` | 未宣言フィールドの扱いを設定します。`policy` は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"`。詳細は下記を参照。 |
 | `dynamic_field_policy -> String` | 現在のポリシーを小文字の文字列で返します。 |
@@ -215,6 +221,59 @@ Laurus::Schema.new
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+
+### アナライザコンポーネント
+
+`add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)` と
+`[analyzers.<name>]` TOML セクションで使用します。`tokenizer` は単一の Hash、
+`char_filters:`/`token_filters:` は Hash の配列で、配列の順序どおりに適用されます。
+
+**トークナイザ**（`tokenizer`、必ず1つ）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `pattern`（デフォルト `\w+`）、`gaps`（デフォルト `false`） |
+| `"ngram"` | `min_gram`、`max_gram` | -- |
+| `"lindera"` | `mode`、`dict` | `user_dict` |
+| `"whole"` | -- | -- |
+
+**文字フィルタ**（`char_filters`、トークン化前の生テキストに適用）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `form`（`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`） | -- |
+| `"pattern_replace"` | `pattern`、`replacement` | -- |
+| `"mapping"` | `mapping`（置換用の Hash） | -- |
+| `"japanese_iteration_mark"` | -- | `kanji`（デフォルト `true`）、`kana`（デフォルト `true`） |
+
+**トークンフィルタ**（`token_filters`、トークン化後のトークン列に適用）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `words`（デフォルト: 英語のストップワード） |
+| `"stem"` | -- | `stem_type`（`"porter"`/`"simple"`/`"identity"`） |
+| `"boost"` | `boost` | -- |
+| `"limit"` | `limit` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_analyzer(
+  "ja_ipadic",
+  { type: "lindera", mode: "normal", dict: "/var/lib/lindera/ipadic" },
+  char_filters: [
+    { type: "unicode_normalization", form: "nfkc" },
+    { type: "japanese_iteration_mark" },
+  ],
+  token_filters: [{ type: "lowercase" }],
+)
+schema.add_text_field("title", analyzer: "ja_ipadic")
+```
 
 ### 距離メトリクス
 
