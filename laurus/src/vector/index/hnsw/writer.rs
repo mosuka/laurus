@@ -20,10 +20,12 @@ use crate::vector::index::quantized_io::{
 };
 use crate::vector::index::rerank_sidecar::{read_sidecar, write_sidecar};
 use crate::vector::writer::{VectorIndexWriter, VectorIndexWriterConfig};
+use bit_vec::BitVec;
 use parking_lot::RwLock;
 use rand::{RngExt, SeedableRng};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -279,6 +281,111 @@ impl Ord for Candidate {
         // If we want largest distance at top (to remove worst candidate), we use standard.
         self.distance.total_cmp(&other.distance)
     }
+}
+
+/// A node in `search_layer`'s to-visit frontier (min-heap by distance).
+///
+/// Hoisted out of `search_layer` (Issue #632) so it can be a field type of
+/// [`SearchLayerArena`] below.
+#[derive(Debug, Clone, PartialEq)]
+struct VisitorCandidate {
+    id: u64,
+    distance: f32,
+}
+impl Eq for VisitorCandidate {}
+impl Ord for VisitorCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap: smaller distance > larger distance
+        other.distance.total_cmp(&self.distance)
+    }
+}
+impl PartialOrd for VisitorCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `search_layer`-only scratch state, reused across calls on the same
+/// thread instead of allocating a fresh `HashSet` + two `BinaryHeap`s every
+/// call (Issue #632: at M=16/ef_construction=200/10M nodes, `search_layer`
+/// runs `O(top_level)` times per inserted node, so those three containers'
+/// growth-from-empty allocations add up to hundreds of millions of
+/// allocator calls under a parallel build).
+///
+/// Design notes:
+/// - `visited` is a `BitVec` indexed by the dense index `doc_id_map` maps
+///   each `doc_id` to (not the `doc_id` itself), mirroring the convention
+///   the read-side `HnswSearcher` (`searcher.rs`) already uses for its own
+///   visited bitmap.
+/// - Deliberately NOT the generation-counter `Vec<u32>` this issue
+///   originally proposed: that shape is retained per OS thread for the
+///   life of the process (rayon's global pool threads never die), so at
+///   10M nodes it would hold ~40 MB/thread (hundreds of MB across a
+///   thread pool) forever, versus the `HashSet` it replaces which only
+///   ever held the handful of actually-visited ids and was freed after
+///   each call. A `BitVec` (1 bit/node) plus `touched` — the list of
+///   indices set *this call*, used to undo exactly those bits — costs
+///   ~1.25 MB/thread at 10M nodes and resets in time proportional to what
+///   was actually visited, not the whole node count. It also has no
+///   wraparound case to handle, unlike a generation counter.
+/// - `reset` runs on entry, not on exit: if a previous call returned early
+///   via `?`, the next call still starts from a clean, fully-undone state
+///   without needing a cleanup-on-every-exit-path discipline.
+/// - Invariant this design depends on: `search_layer` never reenters
+///   itself on the same thread (no nested `rayon::join`/`par_iter` inside
+///   it). Verified for the current body: `calc_dist`/`calc_dist_by_idx` is
+///   pure SIMD arithmetic and `GraphView::get_neighbors_view` only takes a
+///   `parking_lot` read lock (never yields to a scheduler), so neither can
+///   trigger a reentrant call. If `search_layer` ever gains internal
+///   parallelism, revisit this — `RefCell::borrow_mut()` below would
+///   panic on reentry.
+struct SearchLayerArena {
+    visited: BitVec,
+    touched: Vec<usize>,
+    to_visit: BinaryHeap<VisitorCandidate>,
+    found: BinaryHeap<Candidate>,
+}
+
+impl SearchLayerArena {
+    fn new() -> Self {
+        Self {
+            visited: BitVec::new(),
+            touched: Vec::new(),
+            to_visit: BinaryHeap::new(),
+            found: BinaryHeap::new(),
+        }
+    }
+
+    /// Prepare the arena for a new `search_layer` call: grow `visited` if
+    /// the vector set has grown since last use, undo exactly the bits this
+    /// thread's *previous* call set (via `touched`), and clear the heaps.
+    fn reset(&mut self, node_capacity: usize) {
+        if self.visited.len() < node_capacity {
+            let grow_by = node_capacity - self.visited.len();
+            self.visited.grow(grow_by, false);
+        }
+        for idx in self.touched.drain(..) {
+            self.visited.set(idx, false);
+        }
+        self.to_visit.clear();
+        self.found.clear();
+    }
+
+    /// Same semantics as `HashSet::insert`: `true` if `idx` was not
+    /// already visited (and it is now), `false` if it already was.
+    fn mark_visited(&mut self, idx: usize) -> bool {
+        if self.visited.get(idx).unwrap_or(false) {
+            false
+        } else {
+            self.visited.set(idx, true);
+            self.touched.push(idx);
+            true
+        }
+    }
+}
+
+thread_local! {
+    static SEARCH_LAYER_ARENA: RefCell<SearchLayerArena> = RefCell::new(SearchLayerArena::new());
 }
 
 /// Result of parsing a serialized graph block back into the writer's
@@ -1227,19 +1334,31 @@ impl HnswIndexWriter {
         Ok(())
     }
 
-    // Calculates distance between a query vector and a document in the index
-    fn calc_dist(&self, query: &Vector, doc_id: u64) -> Result<f32> {
-        let idx = *self
-            .doc_id_map
-            .get(&doc_id)
-            .ok_or_else(|| LaurusError::internal(format!("Doc ID {} not found in map", doc_id)))?;
+    /// Calculate distance between a query vector and a document already
+    /// resolved to its dense `vectors`/`doc_id_map` index. Split out of
+    /// [`Self::calc_dist`] (Issue #632) so hot loops that already have the
+    /// index (e.g. `search_layer`'s neighbor traversal) don't pay for a
+    /// second `doc_id_map` lookup.
+    fn calc_dist_by_idx(&self, query: &Vector, idx: usize) -> Result<f32> {
         let target = &self.vectors[idx].2;
         self.index_config
             .distance_metric
             .distance(&query.data, &target.data)
     }
 
-    /// Search for nearest neighbors in a specific layer
+    // Calculates distance between a query vector and a document in the index
+    fn calc_dist(&self, query: &Vector, doc_id: u64) -> Result<f32> {
+        let idx = *self
+            .doc_id_map
+            .get(&doc_id)
+            .ok_or_else(|| LaurusError::internal(format!("Doc ID {} not found in map", doc_id)))?;
+        self.calc_dist_by_idx(query, idx)
+    }
+
+    /// Search for nearest neighbors in a specific layer.
+    ///
+    /// Uses the thread-local [`SearchLayerArena`] (Issue #632) instead of
+    /// allocating a fresh visited-set and two heaps on every call.
     fn search_layer<G: GraphView>(
         &self,
         graph: &G,
@@ -1247,113 +1366,107 @@ impl HnswIndexWriter {
         query: &Vector,
         ef: usize,
         level: usize,
-    ) -> Result<BinaryHeap<Candidate>> {
-        let mut visited = HashSet::new();
+    ) -> Result<Vec<Candidate>> {
+        SEARCH_LAYER_ARENA.with(|cell| {
+            let mut arena = cell.borrow_mut();
+            arena.reset(self.vectors.len());
 
-        let dist = self.calc_dist(query, entry_point)?;
-        // We use min-heap for "results" to keep track of nearest found?
-        // No, HNSW "v" list (candidates to visit) is min-heap (nearest first).
-        // "C" list (found candidates) is max-heap (furthest first) to keep ef smallest.
+            // We use min-heap for "results" to keep track of nearest found?
+            // No, HNSW "v" list (candidates to visit) is min-heap (nearest first).
+            // "C" list (found candidates) is max-heap (furthest first) to keep ef smallest.
 
-        // Let's use two heaps:
-        // 1. candidates_to_visit (min-heap by distance): nodes to explore
-        // 2. found_candidates (max-heap by distance): keeps `ef` nearest nodes found so far
+            let entry_idx = *self.doc_id_map.get(&entry_point).ok_or_else(|| {
+                LaurusError::internal(format!("Doc ID {} not found in map", entry_point))
+            })?;
+            let dist = self.calc_dist_by_idx(query, entry_idx)?;
 
-        #[derive(Debug, Clone, PartialEq)]
-        struct VisitorCandidate {
-            id: u64,
-            distance: f32,
-        }
-        impl Eq for VisitorCandidate {}
-        impl Ord for VisitorCandidate {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Min-heap: smaller distance > larger distance
-                other.distance.total_cmp(&self.distance)
-            }
-        }
-        impl PartialOrd for VisitorCandidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
+            arena.to_visit.push(VisitorCandidate {
+                id: entry_point,
+                distance: dist,
+            });
+            arena.found.push(Candidate {
+                id: entry_point,
+                distance: dist,
+                similarity: 0.0,
+            });
+            arena.mark_visited(entry_idx);
 
-        let mut to_visit = BinaryHeap::new();
-        let mut found = BinaryHeap::new(); // Max-heap (Candidate stores distance, PartialOrd is normal (larger > smaller))
+            while let Some(curr) = arena.to_visit.pop() {
+                // If closest candidate to visit is further than the furthest found candidate, and we found enough, stop
+                if let Some(furthest_found) = arena.found.peek()
+                    && curr.distance > furthest_found.distance
+                    && arena.found.len() >= ef
+                {
+                    break;
+                }
 
-        to_visit.push(VisitorCandidate {
-            id: entry_point,
-            distance: dist,
-        });
-        found.push(Candidate {
-            id: entry_point,
-            distance: dist,
-            similarity: 0.0,
-        });
-        visited.insert(entry_point);
+                if let Some(neighbors) = graph.get_neighbors_view(curr.id, level) {
+                    for neighbor_id in neighbors {
+                        // Skip nodes still being inserted (Issue #868). Checked
+                        // before the visited check so a node hidden now can still
+                        // be discovered later in the same search if it becomes
+                        // linked. A no-op for query-time / finished graphs
+                        // (`is_visible` defaults to `true`).
+                        if !graph.is_visible(neighbor_id) {
+                            continue;
+                        }
 
-        while let Some(curr) = to_visit.pop() {
-            // If closest candidate to visit is further than the furthest found candidate, and we found enough, stop
-            if let Some(furthest_found) = found.peek()
-                && curr.distance > furthest_found.distance
-                && found.len() >= ef
-            {
-                break;
-            }
+                        // Resolve the dense index once and reuse it for both the
+                        // visited-check and the distance calculation (Issue
+                        // #632) — this keeps the already-visited case at one
+                        // lookup (was zero) but the newly-visited case at one
+                        // lookup (was two: `visited.insert` here plus
+                        // `calc_dist`'s own lookup), so it doesn't regress net
+                        // lookup count. Resolved before the visited check so a
+                        // missing id still errors on first encounter, matching
+                        // today's behaviour.
+                        let idx = *self.doc_id_map.get(&neighbor_id).ok_or_else(|| {
+                            LaurusError::internal(format!(
+                                "Doc ID {} not found in doc_id_map",
+                                neighbor_id
+                            ))
+                        })?;
+                        if !arena.mark_visited(idx) {
+                            continue;
+                        }
 
-            if let Some(neighbors) = graph.get_neighbors_view(curr.id, level) {
-                for neighbor_id in neighbors {
-                    // Skip nodes still being inserted (Issue #868). Checked
-                    // before `visited` so a node hidden now can still be
-                    // discovered later in the same search if it becomes
-                    // linked. A no-op for query-time / finished graphs
-                    // (`is_visible` defaults to `true`).
-                    if !graph.is_visible(neighbor_id) {
-                        continue;
-                    }
-                    // Use insert() return value to avoid double hash lookup.
-                    if !visited.insert(neighbor_id) {
-                        continue;
-                    }
+                        let neighbor_dist = self.calc_dist_by_idx(query, idx)?;
+                        let furthest_dist =
+                            arena.found.peek().map(|c| c.distance).unwrap_or(f32::MAX);
 
-                    let neighbor_dist = self.calc_dist(query, neighbor_id)?;
-                    let furthest_dist = found.peek().map(|c| c.distance).unwrap_or(f32::MAX);
+                        if neighbor_dist < furthest_dist || arena.found.len() < ef {
+                            arena.found.push(Candidate {
+                                id: neighbor_id,
+                                distance: neighbor_dist,
+                                similarity: 0.0,
+                            });
+                            arena.to_visit.push(VisitorCandidate {
+                                id: neighbor_id,
+                                distance: neighbor_dist,
+                            });
 
-                    if neighbor_dist < furthest_dist || found.len() < ef {
-                        let c = Candidate {
-                            id: neighbor_id,
-                            distance: neighbor_dist,
-                            similarity: 0.0,
-                        };
-                        let vc = VisitorCandidate {
-                            id: neighbor_id,
-                            distance: neighbor_dist,
-                        };
-
-                        found.push(c);
-                        to_visit.push(vc);
-
-                        if found.len() > ef {
-                            found.pop();
+                            if arena.found.len() > ef {
+                                arena.found.pop();
+                            }
                         }
                     }
                 }
             }
-        }
 
-        Ok(found)
+            Ok(arena.found.iter().cloned().collect())
+        })
     }
 
     fn select_neighbors(
         &self,
-        candidates: &BinaryHeap<Candidate>,
+        candidates: &[Candidate],
         m: usize,
         _level: usize,
         _m_max: usize,
         _m_max_0: usize,
     ) -> Vec<u64> {
         // Simple heuristic: take M nearest.
-        // Collect without cloning the heap, then sort by ascending distance.
-        let mut sorted: Vec<_> = candidates.iter().cloned().collect();
+        let mut sorted: Vec<_> = candidates.to_vec();
         sorted.sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance));
         sorted.truncate(m);
         sorted.into_iter().map(|c| c.id).collect()
@@ -2181,5 +2294,169 @@ impl VectorIndexWriter for HnswIndexWriter {
         )?;
 
         Ok(Arc::new(reader))
+    }
+}
+
+/// Unit tests for the `SearchLayerArena` thread-local reuse introduced by
+/// Issue #632. `search_layer`/`SearchLayerArena`/`Candidate` are all private
+/// to this module, so these tests live here rather than in the sibling
+/// `hnsw::tests` module (`hnsw/tests.rs`, declared in `hnsw.rs`), which
+/// cannot reach them. Broader HNSW correctness (recall, reachability,
+/// incremental-append behaviour) is unaffected by this change and is
+/// covered by the existing `hnsw::tests`, `hnsw_reachability_test`,
+/// `hnsw_coldstart_recall_test`, and `vector_recall_test` suites — those
+/// are the regression net for "search results are byte-for-byte the same
+/// as before"; these tests specifically target bugs the arena-reuse
+/// refactor itself could introduce.
+#[cfg(test)]
+mod search_layer_arena_tests {
+    use super::*;
+    use crate::vector::core::distance::DistanceMetric;
+    use crate::vector::index::HnswIndexConfig;
+    use crate::vector::index::hnsw::graph::HnswGraph;
+
+    /// A minimal, storage-less writer with `vectors`/`doc_id_map` populated
+    /// directly (bypassing `build`/`add_vectors`, which need a `Storage`).
+    fn make_writer(vectors: Vec<(u64, String, Vector)>) -> HnswIndexWriter {
+        let config = HnswIndexConfig {
+            dimension: vectors.first().map(|(_, _, v)| v.data.len()).unwrap_or(2),
+            m: 4,
+            ef_construction: 8,
+            distance_metric: DistanceMetric::Euclidean,
+            ..Default::default()
+        };
+        let mut writer = HnswIndexWriter::new(config, VectorIndexWriterConfig::default(), "test")
+            .expect("writer construction must succeed");
+        writer.vectors = vectors;
+        writer.rebuild_doc_id_map();
+        writer
+    }
+
+    /// A single-level (level 0) line graph over `node_ids` in order:
+    /// `node_ids[0] - node_ids[1] - node_ids[2] - ...`.
+    fn line_graph(node_ids: &[u64]) -> HnswGraph {
+        let mut nodes = HashMap::new();
+        for (i, &id) in node_ids.iter().enumerate() {
+            let mut neighbors = Vec::new();
+            if i > 0 {
+                neighbors.push(node_ids[i - 1]);
+            }
+            if i + 1 < node_ids.len() {
+                neighbors.push(node_ids[i + 1]);
+            }
+            nodes.insert(id, vec![neighbors]);
+        }
+        HnswGraph::new(Some(node_ids[0]), 0, nodes, 4, 4, 8, 8, 1.0)
+    }
+
+    #[test]
+    fn search_layer_reuses_arena_without_leaking_visited_state() -> Result<()> {
+        let vectors = vec![
+            (1, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (2, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+            (3, "t".to_string(), Vector::new(vec![2.0, 0.0])),
+            (4, "t".to_string(), Vector::new(vec![3.0, 0.0])),
+        ];
+        let writer = make_writer(vectors);
+        let graph = line_graph(&[1, 2, 3, 4]);
+
+        let query_near_1 = Vector::new(vec![0.1, 0.0]);
+        let result1 = writer.search_layer(&graph, 1, &query_near_1, 10, 0)?;
+        assert_eq!(
+            result1.len(),
+            4,
+            "first call must discover all 4 connected nodes"
+        );
+
+        // Same thread, second call: if the arena's visited bits from the
+        // first call were not undone, this call would incorrectly treat
+        // every node as already visited and find only the entry point.
+        let query_near_4 = Vector::new(vec![2.9, 0.0]);
+        let result2 = writer.search_layer(&graph, 1, &query_near_4, 10, 0)?;
+        assert_eq!(
+            result2.len(),
+            4,
+            "second call must not be polluted by the first call's visited state"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_layer_grows_visited_buffer_when_vector_set_grows() -> Result<()> {
+        let vectors = vec![
+            (1, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (2, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+        ];
+        let mut writer = make_writer(vectors);
+        let small_graph = line_graph(&[1, 2]);
+        let query = Vector::new(vec![0.5, 0.0]);
+        let result = writer.search_layer(&small_graph, 1, &query, 10, 0)?;
+        assert_eq!(result.len(), 2);
+
+        // Grow the vector set as a real incremental build would, adding a
+        // node whose dense index exceeds the arena's previously-sized
+        // BitVec, then search a graph that includes it.
+        writer
+            .vectors
+            .push((3, "t".to_string(), Vector::new(vec![2.0, 0.0])));
+        writer.rebuild_doc_id_map();
+        let bigger_graph = line_graph(&[1, 2, 3]);
+        let result2 = writer.search_layer(&bigger_graph, 1, &query, 10, 0)?;
+        assert_eq!(
+            result2.len(),
+            3,
+            "the newly added node's dense index must be reachable after growth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_layer_errors_when_neighbor_missing_from_doc_id_map() {
+        let vectors = vec![(1, "t".to_string(), Vector::new(vec![0.0, 0.0]))];
+        let writer = make_writer(vectors);
+        // Node 1's neighbor list references doc_id 999, which has no entry
+        // in `vectors`/`doc_id_map` — this must error, not be silently
+        // skipped, matching pre-refactor behaviour.
+        let mut nodes = HashMap::new();
+        nodes.insert(1u64, vec![vec![999u64]]);
+        let graph = HnswGraph::new(Some(1), 0, nodes, 4, 4, 8, 8, 1.0);
+        let query = Vector::new(vec![0.0, 0.0]);
+        let err = writer
+            .search_layer(&graph, 1, &query, 10, 0)
+            .expect_err("a neighbor missing from doc_id_map must error");
+        assert!(err.to_string().contains("999"), "{err}");
+    }
+
+    #[test]
+    fn search_layer_arena_is_per_thread() {
+        // Each spawned OS thread gets its own fresh `SearchLayerArena` via
+        // `thread_local!`; this exercises that a brand-new (empty
+        // `BitVec`/`touched`) arena resets and searches correctly, and that
+        // two independently driven writers running concurrently on
+        // different threads don't panic or interfere with each other.
+        let handles: Vec<_> = (0..2)
+            .map(|offset: u64| {
+                std::thread::spawn(move || -> Result<usize> {
+                    let base = offset * 10;
+                    let vectors = vec![
+                        (base + 1, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+                        (base + 2, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+                        (base + 3, "t".to_string(), Vector::new(vec![2.0, 0.0])),
+                    ];
+                    let writer = make_writer(vectors);
+                    let graph = line_graph(&[base + 1, base + 2, base + 3]);
+                    let query = Vector::new(vec![1.0, 0.0]);
+                    let result = writer.search_layer(&graph, base + 1, &query, 10, 0)?;
+                    Ok(result.len())
+                })
+            })
+            .collect();
+        for handle in handles {
+            let len = handle
+                .join()
+                .expect("spawned thread must not panic")
+                .expect("search_layer must succeed");
+            assert_eq!(len, 3);
+        }
     }
 }
