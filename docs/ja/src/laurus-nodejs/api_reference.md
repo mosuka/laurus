@@ -208,6 +208,12 @@ class Schema {
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |
 | `addEmbedder(name, config)` | 名前付き Embedder を登録。 |
+| `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`charFilters`/`tokenFilters` は省略可能なオブジェクトの配列です。各オブジェクトはスキーマ TOML/JSON 形式と同じ `{ type: "...", ... }` 形式で、キーは snake_case のままです（下記参照）。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
+| `analyzerNames()` | `addAnalyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
+| `Schema.fromToml(tomlStr)` *(静的メソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
+| `Schema.fromTomlFile(path)` *(静的メソッド)* | TOML ファイルからスキーマを読み込みます。 |
+| `toToml()` | このスキーマを `laurus-cli` と同じ形式の TOML 文字列にシリアライズします。 |
+| `toTomlFile(path)` | このスキーマを TOML ファイルに書き込みます。 |
 | `setDefaultFields(fields)` | デフォルト検索フィールドを設定。 |
 | `setDynamicFieldPolicy(policy)` | 未宣言フィールドの扱いを設定。`policy` は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"`。詳細は下記を参照。 |
 | `dynamicFieldPolicy()` | 現在のポリシーを小文字の文字列で返す。 |
@@ -229,6 +235,59 @@ class Schema {
 - `"ignore"` — 未宣言フィールドを静かに破棄
 
 詳細な挙動マトリクスは [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
+
+### アナライザコンポーネント
+
+`addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` と
+`[analyzers.<name>]` TOML セクションで使用します。`tokenizer` は単一のオブジェクト、
+`charFilters`/`tokenFilters` はオブジェクトの配列で、配列の順序どおりに適用されます。
+
+**トークナイザ**（`tokenizer`、必ず1つ）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `pattern`（デフォルト `\w+`）、`gaps`（デフォルト `false`） |
+| `"ngram"` | `min_gram`、`max_gram` | -- |
+| `"lindera"` | `mode`、`dict` | `user_dict` |
+| `"whole"` | -- | -- |
+
+**文字フィルタ**（`charFilters`、トークン化前の生テキストに適用）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `form`（`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`） | -- |
+| `"pattern_replace"` | `pattern`、`replacement` | -- |
+| `"mapping"` | `mapping`（置換用のオブジェクト） | -- |
+| `"japanese_iteration_mark"` | -- | `kanji`（デフォルト `true`）、`kana`（デフォルト `true`） |
+
+**トークンフィルタ**（`tokenFilters`、トークン化後のトークン列に適用）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `words`（デフォルト: 英語のストップワード） |
+| `"stem"` | -- | `stem_type`（`"porter"`/`"simple"`/`"identity"`） |
+| `"boost"` | `boost` | -- |
+| `"limit"` | `limit` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```javascript
+const schema = new Schema();
+schema.addAnalyzer(
+  "ja_ipadic",
+  { type: "lindera", mode: "normal", dict: "/var/lib/lindera/ipadic" },
+  [
+    { type: "unicode_normalization", form: "nfkc" },
+    { type: "japanese_iteration_mark" },
+  ],
+  [{ type: "lowercase" }],
+);
+schema.addTextField("title", true, true, true, true, "ja_ipadic");
+```
 
 ### 距離指標
 

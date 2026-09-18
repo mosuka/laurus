@@ -206,6 +206,12 @@ class Schema {
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF vector field. |
 | `addEmbedder(name, config)` | Register a named embedder. |
+| `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | Register a custom analyzer definition. `tokenizer` is required; `charFilters`/`tokenFilters` are optional arrays of objects. Each object uses the same `{ type: "...", ... }` shape as the schema TOML/JSON format (see below) — keys stay snake_case, matching that wire format. Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
+| `analyzerNames()` | Return the names of custom analyzers registered via `addAnalyzer` or loaded from TOML. |
+| `Schema.fromToml(tomlStr)` *(static)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
+| `Schema.fromTomlFile(path)` *(static)* | Load a schema from a TOML file. |
+| `toToml()` | Serialize this schema to a TOML string in the same format `laurus-cli` accepts. |
+| `toTomlFile(path)` | Write this schema to a TOML file. |
 | `setDefaultFields(fields)` | Set default search fields. |
 | `setDynamicFieldPolicy(policy)` | Set how undeclared fields are handled. `policy` is `"strict"`, `"dynamic"` (default), or `"ignore"`. See notes below. |
 | `dynamicFieldPolicy()` | Return the current policy as a lowercase string. |
@@ -232,6 +238,59 @@ not declared in the schema:
 
 See [Schema & Fields](../concepts/schema_and_fields.md#dynamic-schema) for
 the full behaviour matrix.
+
+### Analyzer components
+
+Used by `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` and by
+the `[analyzers.<name>]` TOML section. `tokenizer` is a single object;
+`charFilters`/`tokenFilters` are arrays of objects, applied in array order.
+
+**Tokenizers** (`tokenizer`, exactly one):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `pattern` (default `\w+`), `gaps` (default `false`) |
+| `"ngram"` | `min_gram`, `max_gram` | -- |
+| `"lindera"` | `mode`, `dict` | `user_dict` |
+| `"whole"` | -- | -- |
+
+**Char filters** (`charFilters`, applied to raw text before tokenization):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `form` (`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`) | -- |
+| `"pattern_replace"` | `pattern`, `replacement` | -- |
+| `"mapping"` | `mapping` (object of string replacements) | -- |
+| `"japanese_iteration_mark"` | -- | `kanji` (default `true`), `kana` (default `true`) |
+
+**Token filters** (`tokenFilters`, applied to the token stream after tokenization):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `words` (default: English stop words) |
+| `"stem"` | -- | `stem_type` (`"porter"`/`"simple"`/`"identity"`) |
+| `"boost"` | `boost` | -- |
+| `"limit"` | `limit` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```javascript
+const schema = new Schema();
+schema.addAnalyzer(
+  "ja_ipadic",
+  { type: "lindera", mode: "normal", dict: "/var/lib/lindera/ipadic" },
+  [
+    { type: "unicode_normalization", form: "nfkc" },
+    { type: "japanese_iteration_mark" },
+  ],
+  [{ type: "lowercase" }],
+);
+schema.addTextField("title", true, true, true, true, "ja_ipadic");
+```
 
 ### Distance metrics
 
