@@ -530,6 +530,47 @@ schema.addEmbedder("callback-embedder", {
 });
 ```
 
+#### `addAnalyzerDefinition(name, definition)`
+
+Register a custom analyzer definition, composed of a required tokenizer
+plus optional char/token filter chains. This is a distinct concept from
+[`addAnalyzer`](#addanalyzername-analyzer) above: that method registers a
+pre-built runtime analyzer object (currently only `JapaneseAnalyzer`),
+while this one declares an analyzer from serializable JSON-shaped
+components — the same format `laurus-cli create index --schema` and the
+other language bindings use.
+
+`definition.tokenizer` is required; `definition.charFilters` and
+`definition.tokenFilters` are optional arrays. Each component uses the
+same `{ type: "...", ... }` shape as the schema TOML/JSON format (see
+below) — keys inside a component stay snake_case, matching that wire
+format. Only the two outer wrapper keys (`charFilters`/`tokenFilters`)
+follow this binding's own camelCase convention.
+
+```javascript
+const schema = new Schema();
+schema.addAnalyzerDefinition("ngram3", {
+  tokenizer: { type: "ngram", min_gram: 3, max_gram: 3 },
+});
+schema.addTextField("title", undefined, undefined, undefined, undefined, "ngram3");
+```
+
+#### `analyzerNames()`
+
+Returns the names of custom analyzers registered via
+`addAnalyzerDefinition` or loaded from TOML.
+
+#### `Schema.fromToml(tomlStr)` *(static)*
+
+Parse a schema from a TOML string, in the same format
+`laurus-cli create index --schema` accepts. No file-path variant is
+provided: the browser WASM target has no filesystem.
+
+#### `toToml()`
+
+Serialize this schema to a TOML string in the same format `laurus-cli`
+accepts.
+
 #### `setDefaultFields(fields)`
 
 Set the default search fields.
@@ -560,6 +601,53 @@ Returns an array of defined field names.
 #### `toString()`
 
 Returns a string representation of the schema (`"Schema(fields=[...])"`).
+
+### Analyzer components
+
+Used by `addAnalyzerDefinition(name, definition)` and by the
+`[analyzers.<name>]` TOML section. `definition.tokenizer` is a single
+object; `definition.charFilters`/`definition.tokenFilters` are arrays of
+objects, applied in array order.
+
+**Tokenizers** (`tokenizer`, exactly one):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `pattern` (default `\w+`), `gaps` (default `false`) |
+| `"ngram"` | `min_gram`, `max_gram` | -- |
+| `"lindera"` | `mode`, `dict` | `user_dict` |
+| `"whole"` | -- | -- |
+
+**Char filters** (`charFilters`, applied to raw text before tokenization):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `form` (`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`) | -- |
+| `"pattern_replace"` | `pattern`, `replacement` | -- |
+| `"mapping"` | `mapping` (object of string replacements) | -- |
+| `"japanese_iteration_mark"` | -- | `kanji` (default `true`), `kana` (default `true`) |
+
+**Token filters** (`tokenFilters`, applied to the token stream after tokenization):
+
+| `type` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `words` (default: English stop words) |
+| `"stem"` | -- | `stem_type` (`"porter"`/`"simple"`/`"identity"`) |
+| `"boost"` | `boost` | -- |
+| `"limit"` | `limit` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+Note that the `"lindera"` tokenizer here is a distinct path from the
+Japanese analyzer built via `JapaneseAnalyzer.fromBytes` (above): a
+`lindera` tokenizer definition sets `dict` to a *filesystem path*, which
+cannot resolve in a browser. It is only useful when `laurus-wasm` runs in
+a non-browser WASM host with a real filesystem; browser callers should
+continue to use `JapaneseAnalyzer.fromBytes` + `addAnalyzer`.
 
 ## SearchResult
 
