@@ -38,9 +38,6 @@ pub struct MergeConfig {
     /// Number of documents to process in each batch.
     pub batch_size: usize,
 
-    /// Enable compression during merge.
-    pub enable_compression: bool,
-
     /// Remove deleted documents during merge.
     pub remove_deleted_docs: bool,
 
@@ -85,7 +82,6 @@ impl Default for MergeConfig {
             use_compound: crate::lexical::index::inverted::compound::default_use_compound(),
             max_memory_mb: 256,
             batch_size: 10000,
-            enable_compression: true,
             remove_deleted_docs: true,
             sort_by_doc_id: true,
             verify_after_merge: true,
@@ -1208,7 +1204,6 @@ mod tests {
 
         assert_eq!(config.max_memory_mb, 256);
         assert_eq!(config.batch_size, 10000);
-        assert!(config.enable_compression);
         assert!(config.remove_deleted_docs);
         assert!(config.sort_by_doc_id);
         assert!(config.verify_after_merge);

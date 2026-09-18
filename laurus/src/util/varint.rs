@@ -84,6 +84,57 @@ pub fn decode_u64(bytes: &[u8]) -> Result<(u64, usize)> {
     Err(LaurusError::other("Incomplete VarInt"))
 }
 
+/// Append a variable-length encoding of `value` directly onto `buf`.
+///
+/// Unlike [`encode_u64`] (which allocates and returns a fresh `Vec<u8>` per
+/// call), this writes in place — useful in hot loops that incrementally
+/// build up one larger buffer, e.g. per-document/per-field encoding inside
+/// a stored-fields chunk (Issue #548) before the whole chunk is compressed.
+pub(crate) fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Read a variable-length integer from `bytes` starting at `*cursor`,
+/// advancing `*cursor` past the bytes consumed.
+///
+/// Unlike [`decode_u64`] (which always starts at the beginning of the
+/// slice), this reads from an arbitrary offset into a larger buffer —
+/// useful when parsing a sequence of varints out of one already-decoded
+/// chunk (Issue #548) without slicing/copying between each one.
+///
+/// # Arguments
+///
+/// * `container` - Names the enclosing structure in error messages
+///   (truncation / overflow), e.g. `"stored-fields chunk"`.
+pub(crate) fn read_varint(bytes: &[u8], cursor: &mut usize, container: &str) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    loop {
+        let byte = *bytes
+            .get(*cursor)
+            .ok_or_else(|| LaurusError::storage(format!("{container}: truncated varint")))?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(LaurusError::storage(format!(
+                "{container}: varint overflow"
+            )));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

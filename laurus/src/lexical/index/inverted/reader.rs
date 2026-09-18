@@ -692,114 +692,17 @@ impl SegmentReader {
     /// stored-documents file), so misses stay O(1) instead of re-probing
     /// storage on every lookup.
     fn load_stored_documents(&self) -> Result<()> {
-        // Primary: typed binary `.docs`, which records the real doc_id per
-        // document (correct for non-contiguous ids, e.g. merged segments).
+        // Primary: typed, chunked, LZ4-compressed `.docs` (Issue #548), which
+        // records the real doc_id per document (correct for non-contiguous
+        // ids, e.g. merged segments). See
+        // `crate::lexical::index::structures::stored_fields` for the format.
         let docs_file = format!("{}.docs", self.info.segment_id);
         if let Ok(input) = self.storage.open_input(&docs_file) {
             let mut reader = StructReader::new(input)?;
-            let doc_count = reader.read_varint()? as usize;
-            let mut documents = BTreeMap::new();
-
-            for _ in 0..doc_count {
-                let doc_id = reader.read_u64()?;
-                let field_count = reader.read_varint()? as usize;
-                let mut doc = Document::new();
-
-                for _ in 0..field_count {
-                    let field_name = reader.read_string()?;
-
-                    // Read type tag
-                    let type_tag = reader.read_u8()?;
-
-                    // Read value based on type tag
-                    let field_value = match type_tag {
-                        0 => {
-                            // Text
-                            let text = reader.read_string()?;
-                            FieldValue::Text(text)
-                        }
-                        1 => {
-                            // Integer
-                            // Stored as u64 via `i64 as u64` (bit-preserving). Reverse with `u64 as i64`.
-                            let num = reader.read_u64()? as i64;
-                            FieldValue::Int64(num)
-                        }
-                        2 => {
-                            // Float
-                            let num = reader.read_f64()?;
-                            FieldValue::Float64(num)
-                        }
-                        3 => {
-                            // Boolean
-                            let b = reader.read_u8()? != 0;
-                            FieldValue::Bool(b)
-                        }
-                        4 => {
-                            // Bytes (MIME type + Data)
-                            let mime = reader.read_string()?;
-                            let data = reader.read_bytes()?;
-                            FieldValue::Bytes(data, if mime.is_empty() { None } else { Some(mime) })
-                        }
-                        5 => {
-                            // DateTime
-                            let dt_str = reader.read_string()?;
-                            let dt = chrono::DateTime::parse_from_rfc3339(&dt_str)
-                                .map_err(|e| {
-                                    LaurusError::index(format!("Failed to parse DateTime: {e}"))
-                                })?
-                                .with_timezone(&chrono::Utc);
-                            FieldValue::DateTime(dt)
-                        }
-                        6 => {
-                            // Geo
-                            let lat = reader.read_f64()?;
-                            let lon = reader.read_f64()?;
-                            FieldValue::Geo(crate::data::GeoPoint::new(lat, lon))
-                        }
-                        7 => {
-                            // Null
-                            FieldValue::Null
-                        }
-                        10 => {
-                            // Int64Array
-                            let len = reader.read_varint()? as usize;
-                            let mut arr = Vec::with_capacity(len);
-                            for _ in 0..len {
-                                arr.push(reader.read_u64()? as i64);
-                            }
-                            FieldValue::Int64Array(arr)
-                        }
-                        11 => {
-                            // Float64Array
-                            let len = reader.read_varint()? as usize;
-                            let mut arr = Vec::with_capacity(len);
-                            for _ in 0..len {
-                                arr.push(reader.read_f64()?);
-                            }
-                            FieldValue::Float64Array(arr)
-                        }
-                        12 => {
-                            // 3D ECEF point. Tag 12 (not 11) — see the
-                            // matching writer comment for why ECEF was
-                            // remapped during #299.
-                            let x = reader.read_f64()?;
-                            let y = reader.read_f64()?;
-                            let z = reader.read_f64()?;
-                            FieldValue::GeoEcef(crate::data::GeoEcefPoint::new(x, y, z))
-                        }
-                        _ => {
-                            return Err(LaurusError::index(format!(
-                                "Unknown field type tag: {type_tag}"
-                            )));
-                        }
-                    };
-
-                    doc.fields.insert(field_name, field_value);
-                }
-
-                documents.insert(doc_id, doc);
-            }
-
+            let documents =
+                crate::lexical::index::structures::stored_fields::StoredFieldsReader::load(
+                    &mut reader,
+                )?;
             *self.stored_documents.write().unwrap() = Some(documents);
             return Ok(());
         }

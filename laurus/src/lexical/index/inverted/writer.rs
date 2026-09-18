@@ -1480,93 +1480,16 @@ impl InvertedIndexWriter {
         blocks
     }
 
-    /// Write stored documents to storage with type information preserved.
+    /// Write stored documents to storage, chunked and LZ4-compressed
+    /// (Issue #548). See
+    /// [`crate::lexical::index::structures::stored_fields`] for the format.
     fn write_stored_documents(&self, sink: &mut PartSink<'_>) -> Result<()> {
         let stored_output = sink.part("docs")?;
         let mut stored_writer = StructWriter::new(stored_output);
-
-        // Write document count
-        stored_writer.write_varint(self.buffered_docs.len() as u64)?;
-
-        // Write each document
-        for (doc_id, doc) in &self.buffered_docs {
-            stored_writer.write_u64(*doc_id)?;
-            stored_writer.write_varint(doc.stored_fields.len() as u64)?;
-
-            for (field_name, field_value) in &doc.stored_fields {
-                stored_writer.write_string(field_name)?;
-
-                // Write type tag and value
-                match field_value {
-                    crate::data::DataValue::Text(text) => {
-                        stored_writer.write_u8(0)?; // Type tag for Text
-                        stored_writer.write_string(text)?;
-                    }
-                    crate::data::DataValue::Int64(num) => {
-                        stored_writer.write_u8(1)?; // Type tag for Integer
-                        stored_writer.write_u64(*num as u64)?; // Store as u64, preserving bit pattern
-                    }
-                    crate::data::DataValue::Float64(num) => {
-                        stored_writer.write_u8(2)?; // Type tag for Float
-                        stored_writer.write_f64(*num)?;
-                    }
-                    crate::data::DataValue::Bool(b) => {
-                        stored_writer.write_u8(3)?; // Type tag for Boolean
-                        stored_writer.write_u8(if *b { 1 } else { 0 })?;
-                    }
-                    crate::data::DataValue::DateTime(dt) => {
-                        stored_writer.write_u8(5)?; // Type tag for DateTime
-                        stored_writer.write_string(&dt.to_rfc3339())?;
-                    }
-                    crate::data::DataValue::Geo(p) => {
-                        stored_writer.write_u8(6)?; // Type tag for Geo
-                        stored_writer.write_f64(p.lat)?;
-                        stored_writer.write_f64(p.lon)?;
-                    }
-                    crate::data::DataValue::GeoEcef(p) => {
-                        // Type tag 12 = 3D ECEF point. Tag 11 was originally
-                        // claimed for ECEF in #297 but collided with the
-                        // pre-existing Float64Array tag (also 11); #299
-                        // moves ECEF to tag 12 and wires reader support.
-                        stored_writer.write_u8(12)?;
-                        stored_writer.write_f64(p.x)?;
-                        stored_writer.write_f64(p.y)?;
-                        stored_writer.write_f64(p.z)?;
-                    }
-                    crate::data::DataValue::Bytes(bytes, mime) => {
-                        stored_writer.write_u8(4)?; // Type tag for Bytes
-                        stored_writer.write_string(mime.as_deref().unwrap_or(""))?;
-                        stored_writer.write_varint(bytes.len() as u64)?;
-                        stored_writer.write_bytes(bytes)?;
-                    }
-                    crate::data::DataValue::Null => {
-                        stored_writer.write_u8(7)?; // Type tag for Null
-                    }
-                    crate::data::DataValue::Vector(v) => {
-                        stored_writer.write_u8(9)?; // Type tag for Vector
-                        stored_writer.write_varint(v.len() as u64)?;
-                        for &f in v {
-                            stored_writer.write_f32(f)?;
-                        }
-                    }
-                    crate::data::DataValue::Int64Array(arr) => {
-                        stored_writer.write_u8(10)?; // Type tag for Int64Array
-                        stored_writer.write_varint(arr.len() as u64)?;
-                        for &v in arr {
-                            stored_writer.write_u64(v as u64)?;
-                        }
-                    }
-                    crate::data::DataValue::Float64Array(arr) => {
-                        stored_writer.write_u8(11)?; // Type tag for Float64Array
-                        stored_writer.write_varint(arr.len() as u64)?;
-                        for &v in arr {
-                            stored_writer.write_f64(v)?;
-                        }
-                    }
-                }
-            }
-        }
-
+        crate::lexical::index::structures::stored_fields::StoredFieldsWriter::write_to(
+            &mut stored_writer,
+            &self.buffered_docs,
+        )?;
         stored_writer.close()?;
         sink.seal()?;
         Ok(())
