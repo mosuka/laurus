@@ -849,6 +849,14 @@ impl HnswIndexReader {
         // of meta will be prefetched per neighbour. For Owned (legacy
         // f32, kept for symmetry), the address points to the Vec<f32>
         // data. Empty for OnDemand where CPU cache hints don't apply.
+        //
+        // On targets with no software-prefetch intrinsic (e.g. wasm32,
+        // Issue #657) this map's only consumer (`HnswSearcher::prefetch_addr`)
+        // is a no-op, so skip the O(n) build over every vector in the
+        // segment entirely rather than populate a map nothing will read.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let prefetch_index: HashMap<String, HashMap<u64, usize>> = HashMap::new();
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let prefetch_index: HashMap<String, HashMap<u64, usize>> = match &vectors {
             VectorStorage::Owned(map) => {
                 let mut idx: HashMap<String, HashMap<u64, usize>> = HashMap::new();

@@ -1299,8 +1299,13 @@ impl HnswSearcher {
     ///
     /// * `addr` - Base address of the record to prefetch.
     /// * `n_bytes` - Number of bytes the upcoming access will stream.
+    ///
+    /// No-ops on targets other than x86_64/aarch64 (e.g. wasm32, Issue
+    /// #657): there is no software-prefetch intrinsic there, so callers on
+    /// those targets would otherwise run this loop's bounds-check/increment
+    /// for zero benefit on every neighbor visited during search.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[inline]
-    #[allow(unused_variables)]
     fn prefetch_addr(addr: usize, n_bytes: usize) {
         let base_ptr = addr as *const i8;
         let mut offset = 0;
@@ -1323,6 +1328,11 @@ impl HnswSearcher {
             offset += 64;
         }
     }
+
+    /// See the primary definition above (Issue #657).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[inline]
+    fn prefetch_addr(_addr: usize, _n_bytes: usize) {}
 }
 
 #[cfg(test)]
