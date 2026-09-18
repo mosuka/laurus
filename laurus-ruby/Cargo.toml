@@ -27,3 +27,4 @@ magnus = { version = "0.8.2", features = ["rb-sys"] }
 rb-sys = "0.9"
 tokio = { workspace = true }
 chrono = { workspace = true }
+serde_json = { workspace = true }

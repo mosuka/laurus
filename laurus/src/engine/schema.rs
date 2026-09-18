@@ -188,7 +188,6 @@ impl Default for Schema {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Schema {
     /// Parse a schema from a TOML string, in the same format
     /// `laurus-cli create index --schema` accepts (and what

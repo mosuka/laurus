@@ -2929,6 +2929,7 @@ dependencies = [
  "laurus",
  "magnus",
  "rb-sys",
+ "serde_json",
  "tokio",
 ]
 

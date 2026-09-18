@@ -5,14 +5,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use laurus::{
-    Analyzer, BooleanOption, BytesOption, DateTimeOption, DistanceMetric, DynamicFieldPolicy,
-    EmbedderDefinition, FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    Analyzer, AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
+    DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
+    Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod,
+    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use wasm_bindgen::prelude::*;
 
 use crate::analysis::WasmJapaneseAnalyzer;
 use crate::embedder::JsCallbackEmbedder;
+use crate::errors::laurus_err;
 
 /// Parse a distance metric string into [`DistanceMetric`].
 ///
@@ -531,6 +533,124 @@ impl WasmSchema {
     #[wasm_bindgen(js_name = "addAnalyzer")]
     pub fn add_analyzer(&mut self, name: String, analyzer: &WasmJapaneseAnalyzer) {
         self.runtime_analyzers.insert(name, analyzer.analyzer());
+    }
+
+    /// Register a custom analyzer definition, composed of a required
+    /// tokenizer plus optional char/token filter chains.
+    ///
+    /// This is a distinct concept from [`Schema.addAnalyzer`](Self::add_analyzer):
+    /// that method registers a pre-built runtime analyzer object (currently
+    /// only [`JapaneseAnalyzer`](crate::analysis::WasmJapaneseAnalyzer)),
+    /// while this one declares an analyzer from serializable JSON-shaped
+    /// components — the same format `laurus-cli create index --schema` and
+    /// the other language bindings use.
+    ///
+    /// `definition.tokenizer` is required; `definition.charFilters` and
+    /// `definition.tokenFilters` are optional arrays. Each component uses
+    /// the same `{ type: "...", ... }` shape as the schema TOML/JSON
+    /// format (keys inside a component stay snake_case, matching that wire
+    /// format) — only the two outer wrapper keys (`charFilters`/
+    /// `tokenFilters`) follow this binding's own camelCase convention.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Unique analyzer name, referenced from `addTextField`'s
+    ///   `analyzer` option.
+    /// * `definition` - `{ tokenizer, charFilters?, tokenFilters? }`.
+    ///
+    /// # Example
+    ///
+    /// ```javascript
+    /// schema.addAnalyzerDefinition("ngram3", {
+    ///   tokenizer: { type: "ngram", min_gram: 3, max_gram: 3 },
+    /// });
+    /// schema.addTextField("title", undefined, undefined, undefined, undefined, "ngram3");
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS error if `tokenizer` is missing, or if `tokenizer`/
+    /// `charFilters`/`tokenFilters` do not match a known component shape.
+    #[wasm_bindgen(js_name = "addAnalyzerDefinition")]
+    pub fn add_analyzer_definition(
+        &mut self,
+        name: String,
+        definition: js_sys::Object,
+    ) -> Result<(), JsValue> {
+        let tokenizer_val = js_sys::Reflect::get(&definition, &JsValue::from_str("tokenizer"))
+            .unwrap_or(JsValue::UNDEFINED);
+        if tokenizer_val.is_undefined() {
+            return Err(JsValue::from_str(
+                "analyzer definition must have a 'tokenizer' key",
+            ));
+        }
+        let tokenizer: TokenizerConfig = serde_wasm_bindgen::from_value(tokenizer_val)
+            .map_err(|e| JsValue::from_str(&format!("invalid tokenizer: {e}")))?;
+
+        let char_filters_val = js_sys::Reflect::get(&definition, &JsValue::from_str("charFilters"))
+            .unwrap_or(JsValue::UNDEFINED);
+        let char_filters: Vec<CharFilterConfig> =
+            if char_filters_val.is_undefined() || char_filters_val.is_null() {
+                Vec::new()
+            } else {
+                serde_wasm_bindgen::from_value(char_filters_val)
+                    .map_err(|e| JsValue::from_str(&format!("invalid charFilters: {e}")))?
+            };
+
+        let token_filters_val =
+            js_sys::Reflect::get(&definition, &JsValue::from_str("tokenFilters"))
+                .unwrap_or(JsValue::UNDEFINED);
+        let token_filters: Vec<TokenFilterConfig> =
+            if token_filters_val.is_undefined() || token_filters_val.is_null() {
+                Vec::new()
+            } else {
+                serde_wasm_bindgen::from_value(token_filters_val)
+                    .map_err(|e| JsValue::from_str(&format!("invalid tokenFilters: {e}")))?
+            };
+
+        self.inner.analyzers.insert(
+            name,
+            AnalyzerDefinition {
+                char_filters,
+                tokenizer,
+                token_filters,
+            },
+        );
+        Ok(())
+    }
+
+    /// Return the names of custom analyzers registered via
+    /// `addAnalyzerDefinition` or loaded from TOML.
+    #[wasm_bindgen(js_name = "analyzerNames")]
+    pub fn analyzer_names(&self) -> Vec<String> {
+        self.inner.analyzers.keys().cloned().collect()
+    }
+
+    /// Parse a schema from a TOML string, using the same format accepted
+    /// by `laurus-cli create index --schema`.
+    ///
+    /// No file-path variant is provided: the browser WASM target has no
+    /// filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS error if the TOML is malformed or does not match the
+    /// schema shape.
+    #[wasm_bindgen(js_name = "fromToml")]
+    pub fn from_toml(toml_str: String) -> Result<WasmSchema, JsValue> {
+        let inner = Schema::from_toml(&toml_str).map_err(laurus_err)?;
+        Ok(Self {
+            inner,
+            js_embedders: HashMap::new(),
+            runtime_analyzers: HashMap::new(),
+        })
+    }
+
+    /// Serialize this schema to a TOML string, in the same format
+    /// `laurus-cli create index --schema` accepts.
+    #[wasm_bindgen(js_name = "toToml")]
+    pub fn to_toml(&self) -> Result<String, JsValue> {
+        self.inner.to_toml().map_err(laurus_err)
     }
 
     /// Set the default fields used when no field is specified in a query.

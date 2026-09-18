@@ -522,6 +522,43 @@ schema.addEmbedder("callback-embedder", {
 });
 ```
 
+#### `addAnalyzerDefinition(name, definition)`
+
+カスタムアナライザ定義を登録します。必須のトークナイザに加え、省略可能な文字フィルタ・
+トークンフィルタのチェーンで構成されます。上記の
+[`addAnalyzer`](#addanalyzername-analyzer) とは別概念です。あちらは事前構築済みの
+ランタイムアナライザオブジェクト（現状 `JapaneseAnalyzer` のみ）を登録するのに対し、
+こちらはシリアライズ可能な JSON 形式のコンポーネント（`laurus-cli create index --schema`
+や他の言語バインディングと同じ形式）からアナライザを宣言します。
+
+`definition.tokenizer` は必須、`definition.charFilters` と
+`definition.tokenFilters` は省略可能な配列です。各コンポーネントはスキーマ TOML/JSON
+形式と同じ `{ type: "...", ... }` 形式を使います（下記参照）。コンポーネント内部の
+キーはこのワイヤ形式に合わせて snake_case のままです。外側のラッパーキー
+（`charFilters`/`tokenFilters`）のみ、このバインディング独自の camelCase 規約に従います。
+
+```javascript
+const schema = new Schema();
+schema.addAnalyzerDefinition("ngram3", {
+  tokenizer: { type: "ngram", min_gram: 3, max_gram: 3 },
+});
+schema.addTextField("title", undefined, undefined, undefined, undefined, "ngram3");
+```
+
+#### `analyzerNames()`
+
+`addAnalyzerDefinition` で登録された、または TOML から読み込まれたカスタムアナライザの
+名前一覧を返します。
+
+#### `Schema.fromToml(tomlStr)` *(静的メソッド)*
+
+`laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。
+ファイルパス版は提供しません（ブラウザ WASM ターゲットにはファイルシステムがないため）。
+
+#### `toToml()`
+
+このスキーマを `laurus-cli` と同じ形式の TOML 文字列にシリアライズします。
+
 #### `setDefaultFields(fields)`
 
 デフォルト検索フィールドを設定します。
@@ -547,6 +584,53 @@ schema.addEmbedder("callback-embedder", {
 #### `toString()`
 
 スキーマの文字列表現（`"Schema(fields=[...])"` 形式）を返します。
+
+### アナライザコンポーネント
+
+`addAnalyzerDefinition(name, definition)` と `[analyzers.<name>]` TOML
+セクションで使用します。`definition.tokenizer` は単一のオブジェクト、
+`definition.charFilters`/`definition.tokenFilters` はオブジェクトの配列で、
+配列の順序どおりに適用されます。
+
+**トークナイザ**（`tokenizer`、必ず1つ）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `pattern`（デフォルト `\w+`）、`gaps`（デフォルト `false`） |
+| `"ngram"` | `min_gram`、`max_gram` | -- |
+| `"lindera"` | `mode`、`dict` | `user_dict` |
+| `"whole"` | -- | -- |
+
+**文字フィルタ**（`charFilters`、トークン化前の生テキストに適用）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `form`（`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`） | -- |
+| `"pattern_replace"` | `pattern`、`replacement` | -- |
+| `"mapping"` | `mapping`（置換用のオブジェクト） | -- |
+| `"japanese_iteration_mark"` | -- | `kanji`（デフォルト `true`）、`kana`（デフォルト `true`） |
+
+**トークンフィルタ**（`tokenFilters`、トークン化後のトークン列に適用）:
+
+| `type` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `words`（デフォルト: 英語のストップワード） |
+| `"stem"` | -- | `stem_type`（`"porter"`/`"simple"`/`"identity"`） |
+| `"boost"` | `boost` | -- |
+| `"limit"` | `limit` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+ここでの `"lindera"` トークナイザは、上記の `JapaneseAnalyzer.fromBytes` で構築する
+日本語アナライザとは別の経路である点に注意してください。`lindera` トークナイザ定義の
+`dict` は*ファイルシステムパス*を指定するため、ブラウザでは解決できません。
+`laurus-wasm` を実ファイルシステムを持つブラウザ以外の WASM ホストで動かす場合にのみ
+有用です。ブラウザから呼び出す場合は、引き続き `JapaneseAnalyzer.fromBytes` +
+`addAnalyzer` を使用してください。
 
 ## SearchResult
 

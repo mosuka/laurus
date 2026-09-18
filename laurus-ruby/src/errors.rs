@@ -38,6 +38,17 @@ pub fn laurus_err(err: LaurusError) -> Error {
     }
 }
 
+/// Wrap a filesystem I/O error with the path that caused it, then map it to
+/// an `IOError`.
+///
+/// Used by `Schema::from_toml_file`/`to_toml_file`, whose I/O happens in the
+/// binding layer (not through [`LaurusError::Io`], which doesn't carry a
+/// path) — mirrors `laurus-python`'s `io_err_with_path`.
+pub fn io_err_with_path(path: &str, e: std::io::Error) -> Error {
+    let ruby = Ruby::get().expect("called from Ruby thread");
+    Error::new(ruby.exception_io_error(), format!("{path}: {e}"))
+}
+
 /// Convert a [`laurus::index_dir::IndexDirError`] into a Ruby exception.
 ///
 /// # Mapping

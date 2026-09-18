@@ -3,12 +3,15 @@
 use std::str::FromStr;
 
 use laurus::{
-    BooleanOption, BytesOption, DateTimeOption, DistanceMetric, DynamicFieldPolicy,
-    EmbedderDefinition, FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
+    DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
+    Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod,
+    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+
+use crate::errors::laurus_err;
 
 /// Parse a distance metric string into [`DistanceMetric`].
 ///
@@ -543,6 +546,122 @@ impl JsSchema {
 
         self.inner.embedders.insert(name, definition);
         Ok(())
+    }
+
+    /// Register a custom analyzer definition, composed of a required
+    /// tokenizer plus optional char/token filter chains.
+    ///
+    /// Each of `tokenizer`/`charFilters[i]`/`tokenFilters[i]` uses the same
+    /// `{ type: "...", ... }` shape as the schema TOML/JSON format (keys
+    /// stay snake_case, matching the wire format shared with the other
+    /// bindings and `laurus-cli`).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Unique analyzer name, referenced from `addTextField`'s
+    ///   `analyzer` option.
+    /// * `tokenizer` - Tokenizer configuration, e.g.
+    ///   `{ type: "ngram", min_gram: 3, max_gram: 3 }`.
+    /// * `charFilters` - Optional char filters applied to raw text before
+    ///   tokenization.
+    /// * `tokenFilters` - Optional token filters applied to the token
+    ///   stream after tokenization.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `tokenizer` or any filter does not match a known
+    /// component shape.
+    #[napi]
+    pub fn add_analyzer(
+        &mut self,
+        name: String,
+        tokenizer: serde_json::Value,
+        char_filters: Option<Vec<serde_json::Value>>,
+        token_filters: Option<Vec<serde_json::Value>>,
+    ) -> Result<()> {
+        let tokenizer: TokenizerConfig = serde_json::from_value(tokenizer)
+            .map_err(|e| napi::Error::from_reason(format!("invalid tokenizer: {e}")))?;
+        let char_filters = char_filters
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| -> Result<CharFilterConfig> {
+                serde_json::from_value(v)
+                    .map_err(|e| napi::Error::from_reason(format!("invalid charFilters[{i}]: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let token_filters = token_filters
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| -> Result<TokenFilterConfig> {
+                serde_json::from_value(v).map_err(|e| {
+                    napi::Error::from_reason(format!("invalid tokenFilters[{i}]: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.inner.analyzers.insert(
+            name,
+            AnalyzerDefinition {
+                char_filters,
+                tokenizer,
+                token_filters,
+            },
+        );
+        Ok(())
+    }
+
+    /// Return the names of custom analyzers registered in this schema, via
+    /// `addAnalyzer` or loaded from TOML.
+    #[napi]
+    pub fn analyzer_names(&self) -> Vec<String> {
+        self.inner.analyzers.keys().cloned().collect()
+    }
+
+    /// Parse a schema from a TOML string, using the same format accepted
+    /// by `laurus-cli create index --schema`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if the TOML is malformed or does not match the schema shape.
+    #[napi(factory)]
+    pub fn from_toml(toml_str: String) -> Result<Self> {
+        let inner = Schema::from_toml(&toml_str).map_err(laurus_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Load a schema from a TOML file, e.g. one written by
+    /// `laurus-cli create index --schema` or by `toTomlFile`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if the file cannot be read, or its contents are not valid
+    /// schema TOML.
+    #[napi(factory)]
+    pub fn from_toml_file(path: String) -> Result<Self> {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| napi::Error::from_reason(format!("{path}: {e}")))?;
+        let inner = Schema::from_toml(&content).map_err(laurus_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Serialize this schema to a TOML string, in the same format
+    /// `laurus-cli create index --schema` accepts.
+    #[napi]
+    pub fn to_toml(&self) -> Result<String> {
+        self.inner.to_toml().map_err(laurus_err)
+    }
+
+    /// Write this schema to a TOML file (see `toToml`).
+    ///
+    /// # Errors
+    ///
+    /// Throws if the file cannot be written.
+    #[napi]
+    pub fn to_toml_file(&self, path: String) -> Result<()> {
+        let content = self.to_toml()?;
+        std::fs::write(&path, content).map_err(|e| napi::Error::from_reason(format!("{path}: {e}")))
     }
 
     /// Set the default fields used when no field is specified in a query.

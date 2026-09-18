@@ -934,4 +934,126 @@ mod tests {
         let fragment = results[0]["highlights"]["body"][0].as_str().unwrap();
         assert!(fragment.contains("<em>Rust</em>"), "{fragment}");
     }
+
+    // ── Analyzer definitions & TOML schema I/O (Issue #1062) ────────────────
+
+    #[wasm_bindgen_test]
+    async fn add_analyzer_definition_enables_ngram_substring_match() {
+        let mut schema = WasmSchema::new();
+        let definition = highlight_object(serde_json::json!({
+            "tokenizer": { "type": "ngram", "min_gram": 3, "max_gram": 3 }
+        }));
+        schema
+            .add_analyzer_definition("ngram3".to_string(), definition)
+            .expect("addAnalyzerDefinition must succeed");
+        schema.add_text_field(
+            "title".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some("ngram3".to_string()),
+        );
+        // Default "standard" analyzer: whole-word tokens only.
+        schema.add_text_field("plain".to_string(), None, None, None, None, None);
+
+        let index = WasmIndex::create(Some(schema), None, None)
+            .await
+            .expect("index creation must succeed");
+        let doc = serde_wasm_bindgen::to_value(&serde_json::json!({
+            "title": "hello",
+            "plain": "hello"
+        }))
+        .unwrap();
+        index
+            .put_document("doc1".to_string(), doc)
+            .await
+            .expect("put_document must succeed");
+        index.commit().await.expect("commit must succeed");
+
+        // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
+        let title_hits = index
+            .search("title:ell".to_string(), None, None, None)
+            .await
+            .expect("search must succeed");
+        let title_hits: serde_json::Value = serde_wasm_bindgen::from_value(title_hits).unwrap();
+        assert_eq!(title_hits.as_array().unwrap().len(), 1);
+
+        let plain_hits = index
+            .search("plain:ell".to_string(), None, None, None)
+            .await
+            .expect("search must succeed");
+        let plain_hits: serde_json::Value = serde_wasm_bindgen::from_value(plain_hits).unwrap();
+        assert_eq!(plain_hits.as_array().unwrap().len(), 0);
+    }
+
+    /// This is the most direct proof that lifting the core's wasm32 gate on
+    /// `Schema::from_toml`/`to_toml` (Issue #1062) actually took effect: if
+    /// the gate were still present, `WasmSchema::from_toml`/`to_toml`
+    /// wouldn't compile at all for this target.
+    #[wasm_bindgen_test]
+    async fn to_toml_then_from_toml_round_trip_preserves_fields_and_analyzers() {
+        let mut schema = WasmSchema::new();
+        let definition = highlight_object(serde_json::json!({
+            "tokenizer": { "type": "ngram", "min_gram": 3, "max_gram": 3 }
+        }));
+        schema
+            .add_analyzer_definition("ngram3".to_string(), definition)
+            .expect("addAnalyzerDefinition must succeed");
+        schema.add_text_field(
+            "title".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some("ngram3".to_string()),
+        );
+
+        let toml_str = schema.to_toml().expect("toToml must succeed");
+        let restored = WasmSchema::from_toml(toml_str).expect("fromToml must succeed");
+
+        assert_eq!(restored.field_names(), schema.field_names());
+        assert_eq!(restored.analyzer_names(), schema.analyzer_names());
+
+        let index = WasmIndex::create(Some(restored), None, None)
+            .await
+            .expect("index creation must succeed");
+        let doc = serde_wasm_bindgen::to_value(&serde_json::json!({ "title": "hello" })).unwrap();
+        index
+            .put_document("doc1".to_string(), doc)
+            .await
+            .expect("put_document must succeed");
+        index.commit().await.expect("commit must succeed");
+
+        let hits = index
+            .search("title:ell".to_string(), None, None, None)
+            .await
+            .expect("search must succeed");
+        let hits: serde_json::Value = serde_wasm_bindgen::from_value(hits).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn add_analyzer_definition_requires_a_tokenizer_key() {
+        let mut schema = WasmSchema::new();
+        let definition = highlight_object(serde_json::json!({}));
+        let err = schema
+            .add_analyzer_definition("bad".to_string(), definition)
+            .expect_err("missing tokenizer must be rejected");
+        let message = err.as_string().unwrap();
+        assert!(message.contains("tokenizer"), "{message}");
+    }
+
+    #[wasm_bindgen_test]
+    fn add_analyzer_definition_rejects_unknown_tokenizer_type() {
+        let mut schema = WasmSchema::new();
+        let definition = highlight_object(serde_json::json!({
+            "tokenizer": { "type": "kuromoji" }
+        }));
+        let err = schema
+            .add_analyzer_definition("bad".to_string(), definition)
+            .expect_err("unknown tokenizer type must be rejected");
+        let message = err.as_string().unwrap();
+        assert!(message.contains("tokenizer"), "{message}");
+    }
 }
