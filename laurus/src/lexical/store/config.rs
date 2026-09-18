@@ -39,7 +39,6 @@ use crate::lexical::index::config::InvertedIndexConfig;
 /// // Custom inverted index configuration
 /// let mut inverted_config = InvertedIndexConfig::default();
 /// inverted_config.max_docs_per_segment = 500_000;
-/// inverted_config.compress_stored_fields = true;
 /// let config = LexicalIndexConfig::Inverted(inverted_config);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +70,6 @@ impl LexicalIndexConfig {
     /// let config = LexicalIndexConfig::builder()
     ///     .analyzer(Arc::new(StandardAnalyzer::default()))
     ///     .max_docs_per_segment(500_000)
-    ///     .compress_stored_fields(true)
     ///     .build();
     /// ```
     pub fn builder() -> LexicalIndexConfigBuilder {
@@ -126,14 +124,12 @@ impl LexicalIndexConfig {
 /// let config = LexicalIndexConfig::builder()
 ///     .analyzer(Arc::new(per_field))
 ///     .max_docs_per_segment(500_000)
-///     .compress_stored_fields(true)
 ///     .build();
 /// ```
 pub struct LexicalIndexConfigBuilder {
     analyzer: Option<Arc<dyn Analyzer>>,
     max_docs_per_segment: Option<u64>,
     write_buffer_size: Option<usize>,
-    compress_stored_fields: Option<bool>,
     store_term_vectors: Option<bool>,
     store_doc_values: Option<bool>,
     merge_factor: Option<u32>,
@@ -159,7 +155,6 @@ impl LexicalIndexConfigBuilder {
             analyzer: None,
             max_docs_per_segment: None,
             write_buffer_size: None,
-            compress_stored_fields: None,
             store_term_vectors: None,
             store_doc_values: None,
             merge_factor: None,
@@ -218,16 +213,6 @@ impl LexicalIndexConfigBuilder {
     /// Default: 1MB (1,048,576 bytes)
     pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.write_buffer_size = Some(size);
-        self
-    }
-
-    /// Enable or disable compression for stored fields.
-    ///
-    /// Enabling compression reduces disk usage but increases CPU overhead
-    /// for indexing and retrieval operations.
-    /// Default: false
-    pub fn compress_stored_fields(mut self, compress: bool) -> Self {
-        self.compress_stored_fields = Some(compress);
         self
     }
 
@@ -340,9 +325,6 @@ impl LexicalIndexConfigBuilder {
         }
         if let Some(size) = self.write_buffer_size {
             config.write_buffer_size = size;
-        }
-        if let Some(compress) = self.compress_stored_fields {
-            config.compress_stored_fields = compress;
         }
         if let Some(store) = self.store_term_vectors {
             config.store_term_vectors = store;

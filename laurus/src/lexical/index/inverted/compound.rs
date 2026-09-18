@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::storage::{FileMetadata, LoadingMode, Storage, StorageInput, StorageOutput};
+use crate::util::varint::{read_varint, write_varint};
 use crate::{LaurusError, Result};
 
 /// File suffix of the container: `{segment_id}.cfs`.
@@ -702,39 +703,6 @@ fn parse_table(table: &[u8], table_offset: u64, container: &str) -> Result<Vec<P
         });
     }
     Ok(parts)
-}
-
-fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            buf.push(byte);
-            break;
-        }
-        buf.push(byte | 0x80);
-    }
-}
-
-fn read_varint(bytes: &[u8], cursor: &mut usize, container: &str) -> Result<u64> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    loop {
-        let byte = *bytes
-            .get(*cursor)
-            .ok_or_else(|| LaurusError::storage(format!("{container}: truncated varint")))?;
-        *cursor += 1;
-        value |= u64::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(LaurusError::storage(format!(
-                "{container}: varint overflow"
-            )));
-        }
-    }
 }
 
 #[cfg(test)]

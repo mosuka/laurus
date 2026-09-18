@@ -52,12 +52,6 @@ pub struct InvertedIndexConfig {
     /// Larger buffers improve write performance but use more memory.
     pub write_buffer_size: usize,
 
-    /// Whether to use compression for stored fields.
-    ///
-    /// Enabling compression reduces disk usage but increases CPU overhead
-    /// for indexing and retrieval operations.
-    pub compress_stored_fields: bool,
-
     /// Index-wide default for whether term positions are stored.
     ///
     /// Positions are what phrase (`PhraseQuery`) and span (`SpanNearQuery`
@@ -161,7 +155,6 @@ impl Default for InvertedIndexConfig {
             use_compound: default_use_compound(),
             max_docs_per_segment: 1000000,
             write_buffer_size: 1024 * 1024, // 1MB
-            compress_stored_fields: false,
             store_term_vectors: true,
             store_doc_values: true,
             merge_factor: 10,
@@ -184,7 +177,6 @@ impl std::fmt::Debug for InvertedIndexConfig {
         f.debug_struct("InvertedIndexConfig")
             .field("max_docs_per_segment", &self.max_docs_per_segment)
             .field("write_buffer_size", &self.write_buffer_size)
-            .field("compress_stored_fields", &self.compress_stored_fields)
             .field("store_term_vectors", &self.store_term_vectors)
             .field("store_doc_values", &self.store_doc_values)
             .field("merge_factor", &self.merge_factor)
