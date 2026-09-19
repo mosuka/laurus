@@ -190,3 +190,118 @@ fn collect_matcher_results(mut m: Box<dyn laurus::lexical::query::matcher::Match
     }
     docs
 }
+
+/// Regression test for Issue #557's `write_bkd_trees` rewrite: a field
+/// carrying an empty array (`Int64Array(vec![])`) contributes zero BKD
+/// points and must not produce a `.bkd` part at all. Before the rewrite
+/// this was enforced by an `if doc_ids.is_empty() { continue; }` guard that
+/// was, in practice, dead code (the single-pass loop only ever created a
+/// bucket from inside the per-point loop, so an empty array never created
+/// one to begin with) — the two-pass discovery/write split makes that
+/// guard load-bearing for the first time, so it needs its own coverage.
+#[test]
+fn empty_array_point_field_produces_no_bkd_part() {
+    let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let mut writer = index_writer(storage.clone());
+
+    writer
+        .add_document(
+            Document::builder()
+                .add_int64_array("scores", vec![])
+                .add_int64_array("never_populated", vec![])
+                .add_field("name", DataValue::Text("empty scores".into()))
+                .build(),
+        )
+        .unwrap();
+    writer
+        .add_document(
+            Document::builder()
+                .add_int64_array("scores", vec![10, 20])
+                .add_int64_array("never_populated", vec![])
+                .add_field("name", DataValue::Text("has scores".into()))
+                .build(),
+        )
+        .unwrap();
+    writer.commit().unwrap();
+
+    // The field itself does produce a `.bkd` part, since doc 1 has real
+    // points — this asserts the empty-array doc doesn't suppress that.
+    assert!(
+        storage.file_exists("segment_000000.scores.bkd"),
+        "a field with at least one real point must still get a .bkd part"
+    );
+    // `never_populated` is empty in EVERY document, so it must never
+    // produce a `.bkd` part at all (this is the case a mutation that
+    // registers a field from an empty array wouldn't catch if some other
+    // document happened to have real points for the same field name).
+    assert!(
+        !storage.file_exists("segment_000000.never_populated.bkd"),
+        "a field with no real points in any document must not get a .bkd part"
+    );
+
+    let reader = writer.build_reader().unwrap();
+    let query = NumericRangeQuery::new(
+        "scores",
+        NumericType::Integer,
+        Some(0.0),
+        Some(100.0),
+        true,
+        true,
+    );
+    let matched = collect_matcher_results(query.matcher(&*reader).unwrap());
+    assert_eq!(
+        matched,
+        vec![1],
+        "only the document with real points should match a range query"
+    );
+}
+
+/// Regression test for Issue #557's `write_bkd_trees` rewrite: with two
+/// distinct point-bearing fields on the same documents (an `Integer` field
+/// and a `Geo` field), each field's per-field buffer must hold exactly and
+/// only that field's points — no cross-contamination between fields
+/// processed in the same discovery/write pass.
+#[test]
+fn multiple_point_bearing_fields_do_not_cross_contaminate() {
+    let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let mut writer = index_writer(storage.clone());
+
+    let tokyo = GeoPoint::new(35.6812, 139.7671);
+    let osaka = GeoPoint::new(34.6937, 135.5023);
+
+    writer
+        .add_document(
+            Document::builder()
+                .add_field("price", DataValue::Int64(100))
+                .add_field("location", DataValue::Geo(tokyo))
+                .build(),
+        )
+        .unwrap();
+    writer
+        .add_document(
+            Document::builder()
+                .add_field("price", DataValue::Int64(200))
+                .add_field("location", DataValue::Geo(osaka))
+                .build(),
+        )
+        .unwrap();
+    writer.commit().unwrap();
+
+    assert!(storage.file_exists("segment_000000.price.bkd"));
+    assert!(storage.file_exists("segment_000000.location.bkd"));
+
+    let reader = writer.build_reader().unwrap();
+
+    let price_query =
+        NumericRangeQuery::new("price", NumericType::Integer, Some(150.0), None, true, true);
+    let matched_price = collect_matcher_results(price_query.matcher(&*reader).unwrap());
+    assert_eq!(matched_price, vec![1], "price field must hold only prices");
+
+    let geo_query = GeoDistanceQuery::new("location", tokyo, 50_000.0);
+    let matched_geo = collect_matcher_results(geo_query.matcher(&*reader).unwrap());
+    assert_eq!(
+        matched_geo,
+        vec![0],
+        "location field must hold only geo points, unaffected by price"
+    );
+}
