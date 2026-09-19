@@ -44,7 +44,7 @@ log = "0.4.33"
 # on a wrong size, the safe one returns a `DecompressError` instead. The
 # `frame`-format default feature is dropped (block framing is done by our own
 # chunk header) to avoid pulling in `twox-hash` for no reason.
-lz4_flex = { version = "0.13", default-features = false, features = [
+lz4_flex = { version = "0.14", default-features = false, features = [
     "std",
     "safe-encode",
     "safe-decode",
