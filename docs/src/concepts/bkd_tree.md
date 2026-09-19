@@ -19,7 +19,7 @@ dimensionality and writing a query-side
 [`IntersectVisitor`](#query-the-intersectvisitor-protocol) — the writer,
 reader, and on-disk layout are reused unchanged.
 
-## File Format (Version 2)
+## File Format (Version 3)
 
 A `.bkd` segment file is a self-contained binary blob made of three regions:
 
@@ -27,7 +27,7 @@ A `.bkd` segment file is a self-contained binary blob made of three regions:
 +----------------------------------------+
 | File Header                            |   fixed-size, version-tagged
 +----------------------------------------+
-| Leaf Blocks                            |   row-major points + doc_ids
+| Leaf Blocks                            |   bit-packed points + doc_ids
 |   leaf 0                               |
 |   leaf 1                               |
 |   ...                                  |
@@ -39,26 +39,47 @@ A `.bkd` segment file is a self-contained binary blob made of three regions:
 +----------------------------------------+
 ```
 
-The header (`BKDFileHeader`) records `magic`, `version` (currently `2`),
+The header (`BKDFileHeader`) records `magic`, `version` (currently `3`),
 `num_dims`, `bytes_per_dim`, the total point count, the number of leaf
 blocks, the **per-axis global min/max** for the whole tree, and offsets to
 the index region and the root node.
 
 ### Leaf Block Layout
 
-Each leaf block stores the points that fall inside its subtree:
+Each leaf block stores the points that fall inside its subtree, bit-packed
+(Issue #549) instead of raw:
 
 ```text
-count               u32                       — number of points in the leaf
-leaf_min            [f64; num_dims]           — leaf-level AABB minimum
-leaf_max            [f64; num_dims]           — leaf-level AABB maximum
-point_values        [f64; count * num_dims]   — row-major point coordinates
-doc_ids             [u64; count]              — parallel doc-id buffer
+count               u32               — number of points in the leaf
+leaf_min            [f64; num_dims]   — leaf-level AABB minimum
+leaf_max            [f64; num_dims]   — leaf-level AABB maximum
+doc_id_base         u64               — smallest doc_id in the leaf
+doc_id_bits         u8                — bit width of the packed doc_id deltas
+packed_dim[0]       byte-aligned      — bit-packed `sortable(point) - sortable(leaf_min[d])`
+packed_dim[1..]     ...               — one section per dimension
+packed_doc_ids      byte-aligned      — bit-packed `doc_id - doc_id_base`
 ```
 
-The per-leaf AABB lets the reader prune the leaf without scanning any of its
+Each dimension's bit width is *derived* from `leaf_min[d]`/`leaf_max[d]`
+(mapped into an IEEE-754 total-order-preserving `u64`, the same order
+`f64::total_cmp` computes) rather than stored — the writer and reader compute
+it with the same formula, so it cannot drift between the two sides. A
+dimension that is constant across the whole leaf derives a 0-bit width and
+contributes no bytes at all. `doc_id_bits` is the one width actually stored
+on disk, since there is no equivalent "doc_id_max" header field to derive it
+from; the reader rejects a value greater than `64` as corruption.
+
+Measured space savings depend on how correlated the data is: roughly
+2.0x/1.6x/1.4x smaller than the raw v2 leaf format for uniformly random
+1D/2D/3D points, and around 2.3-2.7x for a monotonically increasing field
+(timestamps, auto-incrementing counters). This is a lossless, delta-based
+packing scheme, not quantization — every point round-trips bit-for-bit,
+including `±0.0` and `±Infinity`.
+
+The per-leaf AABB lets the reader prune the leaf without decoding any of its
 points when the query region is fully outside (`Outside`) or fully inside
-(`Inside`) the leaf.
+(`Inside`) the leaf; on `Inside`, the packed point sections are skipped with
+a single seek and only `doc_ids` are decoded.
 
 ### Internal Index Node Layout
 
