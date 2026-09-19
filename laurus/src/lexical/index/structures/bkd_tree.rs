@@ -13,6 +13,7 @@ use super::visitor::{CellRelation, IntersectVisitor, RangeQueryVisitor};
 use crate::error::Result;
 use crate::storage::structured::{StructReader, StructWriter};
 use crate::storage::{Storage, StorageInput, StorageOutput};
+use crate::util::alloc_bounds::{checked_capacity, checked_len};
 use std::io::SeekFrom;
 use std::sync::Arc;
 
@@ -96,11 +97,15 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 
 /// Current on-disk format version.
 ///
-/// Version 2 (this revision): every internal index node and every leaf block
-/// carries its own axis-aligned bounding box (AABB) so the reader can prune
-/// subtrees with Inside/Outside/Crosses logic. The previous version 1 layout
-/// (no per-node AABB) is no longer supported — laurus is pre-release, so the
-/// format is broken intentionally rather than dual-supported.
+/// Version 3 (this revision, Issue #549): leaf blocks bit-pack `points` and
+/// `doc_ids` instead of storing them as raw `f64`/`u64`. Each dimension's
+/// per-point values are packed at a fixed bit width derived from
+/// `leaf_min`/`leaf_max` (delta-from-min in IEEE-754 total-order space, never
+/// stored on disk since writer and reader compute it identically); `doc_ids`
+/// use the same scheme anchored at an explicit `doc_id_base`. The previous
+/// version 2 layout (raw, unpacked leaves) is no longer supported — laurus is
+/// pre-release, so the format is broken intentionally rather than
+/// dual-supported.
 ///
 /// File layout (all integers little-endian):
 ///
@@ -121,10 +126,15 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 ///   count               u32
 ///   leaf_min            [f64; num_dims]
 ///   leaf_max            [f64; num_dims]
-///   point_values        [f64; count * num_dims]   (row-major)
-///   doc_ids             [u64; count]
+///   doc_id_base         u64
+///   doc_id_bits         u8               (0..=64; validated on read)
+///   packed_dim[0]       ceil(count * bits[0] / 8) bytes, byte-aligned
+///   packed_dim[1..]     ...  (one section per dimension; bits[d] is
+///                             derived from leaf_min[d]/leaf_max[d], not
+///                             stored)
+///   packed_doc_ids      ceil(count * doc_id_bits / 8) bytes, byte-aligned
 ///
-/// Internal Index Node (size = 28 + 32 * num_dims bytes):
+/// Internal Index Node (size = 28 + 32 * num_dims bytes, unchanged from v2):
 ///   split_dim           u32
 ///   split_value         f64
 ///   left_min            [f64; num_dims]
@@ -134,7 +144,7 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 ///   left_offset         u64
 ///   right_offset        u64
 /// ```
-pub const BKD_VERSION: u32 = 2;
+pub const BKD_VERSION: u32 = 3;
 
 /// BKD Tree File Header
 #[derive(Debug, Clone)]
@@ -214,6 +224,27 @@ impl BuildContext<'_> {
     }
 }
 
+/// Return whichever of `a`/`b` is smaller under IEEE-754 total order
+/// (`f64::total_cmp`), not plain IEEE `<`.
+///
+/// This matters because IEEE `<`/`>` treat `-0.0` and `+0.0` as equal, while
+/// the leaf bit-packing in [`BKDWriter::write_leaf_block`] needs `leaf_min`
+/// to be the true total-order minimum of the leaf's points — otherwise a
+/// point equal to the "wrong" zero can fall outside the `[leaf_min, leaf_max]`
+/// range the packer assumes, corrupting its reconstructed bit pattern (see
+/// the module-level format notes on [`BKD_VERSION`]).
+#[inline]
+fn total_min(a: f64, b: f64) -> f64 {
+    if a.total_cmp(&b).is_le() { a } else { b }
+}
+
+/// Return whichever of `a`/`b` is larger under IEEE-754 total order. See
+/// [`total_min`].
+#[inline]
+fn total_max(a: f64, b: f64) -> f64 {
+    if a.total_cmp(&b).is_ge() { a } else { b }
+}
+
 /// Compute the per-dimension axis-aligned bounding box that encloses every
 /// point referenced by `indices` in the underlying buffer.
 ///
@@ -228,12 +259,8 @@ fn compute_aabb(ctx: &BuildContext<'_>, indices: &[u32]) -> (Vec<f64>, Vec<f64>)
         let base = i as usize * ctx.num_dims;
         for d in 0..ctx.num_dims {
             let v = ctx.points[base + d];
-            if v < min[d] {
-                min[d] = v;
-            }
-            if v > max[d] {
-                max[d] = v;
-            }
+            min[d] = total_min(min[d], v);
+            max[d] = total_max(max[d], v);
         }
     }
     (min, max)
@@ -260,6 +287,149 @@ fn widest_axis(min: &[f64], max: &[f64]) -> u32 {
         }
     }
     best as u32
+}
+
+/// Map an `f64` to a `u64` whose *unsigned* ordering matches the value's
+/// IEEE-754 total order — the same order [`f64::total_cmp`] computes. More
+/// negative values map to smaller `u64`s, `-0.0` sorts just below `+0.0`, and
+/// `NEG_INFINITY`/`INFINITY` map to the smallest/largest non-NaN results.
+///
+/// `BKDWriter::write` rejects NaN coordinates up front, so this never has to
+/// define (or preserve) an ordering for NaN bit patterns. The unsigned form
+/// (as opposed to the signed/arithmetic-shift variant some implementations
+/// use) is deliberate: it lets [`write_leaf_block`](BKDWriter::write_leaf_block)
+/// and its reader counterpart compute `max - min` with plain `u64`
+/// subtraction, which never overflows because total order guarantees
+/// `sortable(leaf_min) <= sortable(leaf_max) <= sortable(any point in the leaf)`.
+#[inline]
+fn f64_to_sortable_u64(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits & (1 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+}
+
+/// Inverse of [`f64_to_sortable_u64`].
+#[inline]
+fn sortable_u64_to_f64(bits: u64) -> f64 {
+    let bits = if bits & (1 << 63) != 0 {
+        bits & !(1u64 << 63)
+    } else {
+        !bits
+    };
+    f64::from_bits(bits)
+}
+
+/// Number of bits needed to represent `v` in unsigned binary (`0` for `v ==
+/// 0`), i.e. `ceil(log2(v + 1))`.
+#[inline]
+fn bits_needed(v: u64) -> u8 {
+    (64 - v.leading_zeros()) as u8
+}
+
+/// Byte length of a packed run of `count` values at `bits` bits each.
+#[inline]
+fn packed_byte_len(count: usize, bits: u8) -> usize {
+    (count * bits as usize).div_ceil(8)
+}
+
+/// Sortable-space anchor and bit width for one dimension's delta-from-min
+/// packing, derived from that dimension's `leaf_min`/`leaf_max`.
+///
+/// Both [`BKDWriter::write_leaf_block`] and
+/// [`BKDReader::read_leaf_fixed_header`] call this — a dimension's bit width
+/// is never stored on disk, so having the two sides share one formula
+/// (rather than two independently written copies of the same arithmetic) is
+/// what guarantees they can't drift apart.
+#[inline]
+fn dim_point_bits(leaf_min_d: f64, leaf_max_d: f64) -> (u64, u8) {
+    let base = f64_to_sortable_u64(leaf_min_d);
+    let top = f64_to_sortable_u64(leaf_max_d);
+    (base, bits_needed(top.wrapping_sub(base)))
+}
+
+/// LSB-first fixed-width bit packer used for both leaf point deltas and
+/// doc_id deltas (see the [`BKD_VERSION`] format notes).
+///
+/// Widths `0..=64` are handled uniformly with no special-casing at either
+/// boundary because the accumulator is `u128`: `(1u128 << width) - 1` never
+/// overflows for `width` up to 64, unlike the `u64`-mask arithmetic a naive
+/// implementation would reach for (which panics at `width == 64` and needs an
+/// explicit branch at `width == 0`).
+struct BitWriter {
+    buf: Vec<u8>,
+    acc: u128,
+    acc_bits: u32,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        BitWriter {
+            buf: Vec::new(),
+            acc: 0,
+            acc_bits: 0,
+        }
+    }
+
+    /// Append the low `width` bits of `value`. `width == 0` is a no-op.
+    fn write(&mut self, value: u64, width: u8) {
+        let mask = (1u128 << width) - 1;
+        self.acc |= (value as u128 & mask) << self.acc_bits;
+        self.acc_bits += width as u32;
+        while self.acc_bits >= 8 {
+            self.buf.push((self.acc & 0xFF) as u8);
+            self.acc >>= 8;
+            self.acc_bits -= 8;
+        }
+    }
+
+    /// Flush any partial trailing byte and return the packed buffer.
+    fn finish(mut self) -> Vec<u8> {
+        if self.acc_bits > 0 {
+            self.buf.push((self.acc & 0xFF) as u8);
+        }
+        self.buf
+    }
+}
+
+/// Mirrors [`BitWriter`]; reads back exactly the sequence of `write` calls
+/// that produced `data`.
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_pos: usize,
+    acc: u128,
+    acc_bits: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        BitReader {
+            data,
+            byte_pos: 0,
+            acc: 0,
+            acc_bits: 0,
+        }
+    }
+
+    /// Read and return the next `width` bits (`0` for `width == 0`, no bytes
+    /// consumed). The caller must supply a `data` slice with enough bytes
+    /// for every `read` it intends to make — callers in this module size it
+    /// exactly via [`packed_byte_len`], validated up-front by
+    /// [`BKDReader::read_leaf_fixed_header`].
+    fn read(&mut self, width: u8) -> u64 {
+        while self.acc_bits < width as u32 {
+            self.acc |= (self.data[self.byte_pos] as u128) << self.acc_bits;
+            self.acc_bits += 8;
+            self.byte_pos += 1;
+        }
+        let mask = (1u128 << width) - 1;
+        let v = (self.acc & mask) as u64;
+        self.acc >>= width as u32;
+        self.acc_bits -= width as u32;
+        v
+    }
 }
 
 impl<W: StorageOutput> BKDWriter<W> {
@@ -346,13 +516,15 @@ impl<W: StorageOutput> BKDWriter<W> {
             }
         }
 
-        // Calculate global min/max
+        // Calculate global min/max. Uses total-order comparison (not `f64::min`/
+        // `f64::max`, which treat -0.0 and +0.0 as interchangeable) for the same
+        // reason `compute_aabb` does — see `total_min`/`total_max`.
         for i in 0..doc_ids.len() {
             let base = i * num_dims;
             for d in 0..num_dims {
                 let v = points[base + d];
-                self.min_values[d] = self.min_values[d].min(v);
-                self.max_values[d] = self.max_values[d].max(v);
+                self.min_values[d] = total_min(self.min_values[d], v);
+                self.max_values[d] = total_max(self.max_values[d], v);
             }
         }
 
@@ -552,7 +724,8 @@ impl<W: StorageOutput> BKDWriter<W> {
         self.writer.write_u32(count)?;
 
         // Per-leaf AABB, used by the reader for subtree pruning starting
-        // from #292.
+        // from #292, and (since #549) as the anchor for delta-from-min
+        // bit-packing below.
         for &v in leaf_min {
             self.writer.write_f64(v)?;
         }
@@ -560,17 +733,43 @@ impl<W: StorageOutput> BKDWriter<W> {
             self.writer.write_f64(v)?;
         }
 
-        // Write values for all dimensions, gathered through the permutation.
+        // doc_id_base / doc_id_bits: the one on-disk bit-width field (every
+        // other width is derived from leaf_min/leaf_max on both sides, see
+        // `BKD_VERSION`'s doc comment).
+        let mut doc_id_min = u64::MAX;
+        let mut doc_id_max = 0u64;
         for &i in indices {
-            let base = i as usize * ctx.num_dims;
-            for d in 0..ctx.num_dims {
-                self.writer.write_f64(ctx.points[base + d])?;
+            let d = ctx.doc_ids[i as usize];
+            doc_id_min = doc_id_min.min(d);
+            doc_id_max = doc_id_max.max(d);
+        }
+        let doc_id_bits = bits_needed(doc_id_max - doc_id_min);
+        self.writer.write_u64(doc_id_min)?;
+        self.writer.write_u8(doc_id_bits)?;
+
+        // Per-dimension packed points: delta from `leaf_min[d]` in sortable
+        // (total-order) space, fixed width. A constant dimension needs 0
+        // bits and contributes no bytes at all.
+        for d in 0..ctx.num_dims {
+            let (base, bits) = dim_point_bits(leaf_min[d], leaf_max[d]);
+            if bits == 0 {
+                continue;
             }
+            let mut bw = BitWriter::new();
+            for &i in indices {
+                let v = f64_to_sortable_u64(ctx.value(i, d));
+                bw.write(v - base, bits);
+            }
+            self.writer.write_raw(&bw.finish())?;
         }
 
-        // Write doc ids in the same order
-        for &i in indices {
-            self.writer.write_u64(ctx.doc_ids[i as usize])?;
+        // Packed doc_ids, same scheme.
+        if doc_id_bits > 0 {
+            let mut bw = BitWriter::new();
+            for &i in indices {
+                bw.write(ctx.doc_ids[i as usize] - doc_id_min, doc_id_bits);
+            }
+            self.writer.write_raw(&bw.finish())?;
         }
 
         Ok(())
@@ -665,6 +864,17 @@ impl BKDReader {
         }
         let num_dims = reader.read_u32()?;
         let bytes_per_dim = reader.read_u32()?;
+        if bytes_per_dim != 8 {
+            return Err(crate::error::LaurusError::storage(format!(
+                "Unsupported BKD bytes_per_dim: {bytes_per_dim} (expected 8) — segment is corrupted"
+            )));
+        }
+        // Each dimension contributes at least 8 bytes to `min_values` and 8
+        // to `max_values` before the header is fully read; bound `num_dims`
+        // against the file's remaining bytes so a corrupted header can't
+        // drive a multi-gigabyte `Vec::with_capacity` below.
+        let available = reader.size().saturating_sub(reader.position());
+        let num_dims = checked_capacity(num_dims as usize, 16, available, "BKD num_dims")? as u32;
         let total_point_count = reader.read_u64()?;
         let num_blocks = reader.read_u64()?;
         let mut min_values = Vec::with_capacity(num_dims as usize);
@@ -762,11 +972,10 @@ impl BKDReader {
     /// Walk a leaf at `offset`, classifying it via `visitor.compare` on the
     /// stored leaf AABB and dispatching points accordingly.
     ///
-    /// On `Crosses`, leaf points are read into the caller-supplied
+    /// On `Crosses`, leaf points are decoded into the caller-supplied
     /// `scratch.points` buffer (grown only on the first leaf large enough
-    /// to need it). The earlier implementation freshly allocated
-    /// `count * num_dims` f64s per leaf; this version performs at most
-    /// one growth per query.
+    /// to need it), so steady-state queries on similarly-sized leaves run
+    /// allocation-free after the first `Crosses` leaf.
     fn intersect_leaf<R: StorageInput>(
         &self,
         reader: &mut StructReader<R>,
@@ -775,34 +984,26 @@ impl BKDReader {
         scratch: &mut IntersectScratch,
     ) -> Result<()> {
         reader.seek(SeekFrom::Start(offset))?;
-        let count = reader.read_u32()? as usize;
         let num_dims = self.header.num_dims as usize;
-        let leaf_aabb = Self::read_child_aabb(reader, num_dims)?;
+        let leaf_header =
+            Self::read_leaf_fixed_header(reader, num_dims, self.header.total_point_count)?;
 
-        match visitor.compare(&leaf_aabb) {
+        match visitor.compare(&leaf_header.leaf_aabb) {
             CellRelation::Outside => Ok(()),
             CellRelation::Inside => {
-                // Skip the point bytes; we only need the doc ids.
-                let point_bytes = (count as u64) * (num_dims as u64) * 8;
-                reader.seek(SeekFrom::Current(point_bytes as i64))?;
-                for _ in 0..count {
-                    let doc_id = reader.read_u64()?;
-                    visitor.visit_inside(doc_id);
-                }
-                Ok(())
+                Self::skip_points(reader, &leaf_header)?;
+                Self::decode_doc_ids_and_dispatch(reader, &leaf_header, None, num_dims, visitor)
             }
             CellRelation::Crosses => {
-                let needed = count * num_dims;
-                let buf = scratch.point_slice(needed);
-                for slot in buf.iter_mut() {
-                    *slot = reader.read_f64()?;
-                }
-                for i in 0..count {
-                    let doc_id = reader.read_u64()?;
-                    let point = &buf[i * num_dims..(i + 1) * num_dims];
-                    visitor.visit(doc_id, point);
-                }
-                Ok(())
+                let points_buf = scratch.point_slice(leaf_header.count * num_dims);
+                Self::decode_points_into(reader, &leaf_header, num_dims, points_buf)?;
+                Self::decode_doc_ids_and_dispatch(
+                    reader,
+                    &leaf_header,
+                    Some(&*points_buf),
+                    num_dims,
+                    visitor,
+                )
             }
         }
     }
@@ -835,7 +1036,7 @@ impl BKDReader {
 
     /// Walk a leaf whose enclosing cell has already been classified as
     /// `Inside`. The leaf AABB and point bytes are skipped; only doc ids
-    /// are read and reported via `visit_inside`.
+    /// are decoded and reported via `visit_inside`.
     fn collect_leaf<R: StorageInput>(
         &self,
         reader: &mut StructReader<R>,
@@ -843,17 +1044,169 @@ impl BKDReader {
         visitor: &mut dyn IntersectVisitor,
     ) -> Result<()> {
         reader.seek(SeekFrom::Start(offset))?;
-        let count = reader.read_u32()? as usize;
         let num_dims = self.header.num_dims as usize;
-        // Skip leaf AABB (min + max) and all point bytes.
-        let skip_bytes = (num_dims as u64) * 16 + (count as u64) * (num_dims as u64) * 8;
-        reader.seek(SeekFrom::Current(skip_bytes as i64))?;
-        for _ in 0..count {
-            let doc_id = reader.read_u64()?;
-            visitor.visit_inside(doc_id);
+        let leaf_header =
+            Self::read_leaf_fixed_header(reader, num_dims, self.header.total_point_count)?;
+        Self::skip_points(reader, &leaf_header)?;
+        Self::decode_doc_ids_and_dispatch(reader, &leaf_header, None, num_dims, visitor)
+    }
+
+    /// Read a leaf's fixed-size header fields (`count`, AABB, doc_id
+    /// anchor), derive each dimension's bit width from the AABB, compute
+    /// every packed section's exact byte length, and bounds-check the total
+    /// against the bytes actually left in the file before any of it is
+    /// used to size a read or a buffer.
+    fn read_leaf_fixed_header<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        num_dims: usize,
+        total_point_count: u64,
+    ) -> Result<LeafHeader> {
+        let count = reader.read_u32()? as usize;
+        if count as u64 > total_point_count {
+            return Err(crate::error::LaurusError::index(format!(
+                "BKD leaf: declares {count} points but the tree has only \
+                 {total_point_count} total — segment is corrupted"
+            )));
+        }
+        let leaf_aabb = Self::read_child_aabb(reader, num_dims)?;
+        let doc_id_base = reader.read_u64()?;
+        let doc_id_bits = reader.read_u8()?;
+        if doc_id_bits > 64 {
+            return Err(crate::error::LaurusError::index(format!(
+                "BKD leaf: doc_id_bits = {doc_id_bits} exceeds 64 — segment is corrupted"
+            )));
+        }
+
+        let mut point_base = Vec::with_capacity(num_dims);
+        let mut point_bits = Vec::with_capacity(num_dims);
+        let mut point_section_lens = Vec::with_capacity(num_dims);
+        for d in 0..num_dims {
+            let (base, bits) = dim_point_bits(leaf_aabb.min()[d], leaf_aabb.max()[d]);
+            point_base.push(base);
+            point_bits.push(bits);
+            point_section_lens.push(packed_byte_len(count, bits));
+        }
+        let doc_id_section_len = packed_byte_len(count, doc_id_bits);
+
+        let total_packed_len: usize = point_section_lens.iter().sum::<usize>() + doc_id_section_len;
+        let available = reader.size().saturating_sub(reader.position());
+        checked_len(total_packed_len, available, "BKD leaf packed data")?;
+
+        Ok(LeafHeader {
+            count,
+            leaf_aabb,
+            doc_id_base,
+            doc_id_bits,
+            point_base,
+            point_bits,
+            point_section_lens,
+            doc_id_section_len,
+        })
+    }
+
+    /// Skip past a leaf's packed point sections in a single seek (the
+    /// `Inside` / `collect_leaf` path, which only needs doc ids).
+    fn skip_points<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        header: &LeafHeader,
+    ) -> Result<()> {
+        let total: usize = header.point_section_lens.iter().sum();
+        if total > 0 {
+            reader.seek(SeekFrom::Current(total as i64))?;
         }
         Ok(())
     }
+
+    /// Decode every dimension's packed point section into `points_buf`
+    /// (point-major, matching `IntersectScratch`'s layout).
+    fn decode_points_into<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        header: &LeafHeader,
+        num_dims: usize,
+        points_buf: &mut [f64],
+    ) -> Result<()> {
+        let count = header.count;
+        for d in 0..num_dims {
+            let len = header.point_section_lens[d];
+            let bits = header.point_bits[d];
+            let base = header.point_base[d];
+            if len == 0 {
+                // bits == 0: every point in this dimension equals leaf_min[d].
+                let v = sortable_u64_to_f64(base);
+                for i in 0..count {
+                    points_buf[i * num_dims + d] = v;
+                }
+                continue;
+            }
+            reader.read_raw_with(len, |raw: &[u8]| {
+                let mut bit_reader = BitReader::new(raw);
+                for i in 0..count {
+                    let delta = bit_reader.read(bits);
+                    points_buf[i * num_dims + d] = sortable_u64_to_f64(base.wrapping_add(delta));
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Decode a leaf's packed doc_id section and report each doc id via
+    /// `visitor.visit` (when `points_buf` is `Some`, i.e. the `Crosses`
+    /// path) or `visitor.visit_inside` (the `Inside` path, `points_buf`
+    /// is `None`).
+    fn decode_doc_ids_and_dispatch<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        header: &LeafHeader,
+        points_buf: Option<&[f64]>,
+        num_dims: usize,
+        visitor: &mut dyn IntersectVisitor,
+    ) -> Result<()> {
+        let count = header.count;
+        let base = header.doc_id_base;
+        let bits = header.doc_id_bits;
+        let len = header.doc_id_section_len;
+
+        let dispatch = |visitor: &mut dyn IntersectVisitor, doc_id: u64, i: usize| match points_buf
+        {
+            Some(buf) => visitor.visit(doc_id, &buf[i * num_dims..(i + 1) * num_dims]),
+            None => visitor.visit_inside(doc_id),
+        };
+
+        if len == 0 {
+            // bits == 0: every doc_id in this leaf equals doc_id_base.
+            for i in 0..count {
+                dispatch(visitor, base, i);
+            }
+            return Ok(());
+        }
+
+        reader.read_raw_with(len, |raw: &[u8]| {
+            let mut bit_reader = BitReader::new(raw);
+            for i in 0..count {
+                let delta = bit_reader.read(bits);
+                dispatch(visitor, base.wrapping_add(delta), i);
+            }
+        })
+    }
+}
+
+/// Fixed-size fields read from a leaf's header, plus the per-section byte
+/// lengths derived from them. See
+/// [`BKDReader::read_leaf_fixed_header`].
+struct LeafHeader {
+    count: usize,
+    leaf_aabb: AABB,
+    doc_id_base: u64,
+    doc_id_bits: u8,
+    /// Sortable-space anchor per dimension (`f64_to_sortable_u64(leaf_min[d])`).
+    point_base: Vec<u64>,
+    /// Bit width per dimension, derived from `leaf_aabb` (never stored on
+    /// disk — writer and reader compute it with the same formula, so the
+    /// two sides can't drift apart).
+    point_bits: Vec<u8>,
+    /// Byte length of each dimension's packed section, in order.
+    point_section_lens: Vec<usize>,
+    /// Byte length of the packed doc_id section.
+    doc_id_section_len: usize,
 }
 
 /// Per-query scratch buffer reused across every leaf visited by
@@ -1059,16 +1412,17 @@ mod tests {
 
     #[test]
     fn test_bkd_reader_rejects_version_mismatch() {
-        // Hand-craft a header that claims version 1 (the previous on-disk
-        // format) and confirm the reader refuses to open it.
+        // Hand-craft a header that claims version 2 (the raw, unpacked
+        // pre-#549 format this revision retires) and confirm the reader
+        // refuses to open it.
         use crate::storage::structured::StructWriter;
 
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
         {
-            let output = storage.create_output("v1.bkd").unwrap();
+            let output = storage.create_output("v2.bkd").unwrap();
             let mut writer = StructWriter::new(output);
             writer.write_u32(BKD_MAGIC).unwrap();
-            writer.write_u32(1).unwrap(); // legacy version
+            writer.write_u32(2).unwrap(); // retired version (pre-#549)
             writer.write_u32(2).unwrap(); // num_dims
             writer.write_u32(8).unwrap(); // bytes_per_dim
             writer.write_u64(0).unwrap(); // total_count
@@ -1082,7 +1436,7 @@ mod tests {
             writer.close().unwrap();
         }
 
-        let err = BKDReader::open(storage.clone(), "v1.bkd").unwrap_err();
+        let err = BKDReader::open(storage.clone(), "v2.bkd").unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("Unsupported BKD version"),
@@ -1529,6 +1883,12 @@ mod tests {
     fn write_accepts_infinity_and_round_trips() {
         // ±Infinity sort consistently against every finite f64, so the
         // writer must accept them and the reader must surface them.
+        //
+        // This is also the canary for a single-leaf tree spanning
+        // -INFINITY..+INFINITY: in sortable-u64 space that's the full
+        // width, i.e. `bits_needed(...) == 64` for this dimension — the
+        // exact boundary a naive `1u64 << width` bit-packer would panic on
+        // (see `BitWriter`/`BitReader`'s `u128` accumulator).
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
         let points: Vec<f64> = vec![f64::NEG_INFINITY, -10.0, 0.0, 10.0, f64::INFINITY];
         let doc_ids: Vec<u64> = vec![100, 200, 300, 400, 500];
@@ -1564,5 +1924,368 @@ mod tests {
             .range_search(&[Some(0.0)], &[Some(f64::INFINITY)], true, true)
             .unwrap();
         assert_eq!(upper_inf, vec![300, 400, 500]);
+    }
+
+    // ---- Issue #549: leaf bit-packing primitives ----
+
+    #[test]
+    fn bit_writer_reader_round_trip_various_widths() {
+        let widths: [u8; 8] = [0, 1, 7, 8, 9, 33, 63, 64];
+        for &width in &widths {
+            let values: Vec<u64> = if width == 64 {
+                vec![0, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX]
+            } else if width == 0 {
+                vec![0, 0, 0]
+            } else {
+                let max_value: u64 = (1u64 << width) - 1;
+                (0..64u64)
+                    .map(|i| i.wrapping_mul(2_654_435_761) % (max_value + 1))
+                    .collect()
+            };
+            let mut w = BitWriter::new();
+            for &v in &values {
+                w.write(v, width);
+            }
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            for &expected in &values {
+                assert_eq!(r.read(width), expected, "width={width} mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn bit_writer_reader_width_zero_consumes_no_bits() {
+        let mut w = BitWriter::new();
+        w.write(0, 0);
+        w.write(0, 0);
+        w.write(0, 0);
+        let bytes = w.finish();
+        assert!(bytes.is_empty(), "width-0 writes must not emit any bytes");
+
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read(0), 0);
+        assert_eq!(r.read(0), 0);
+    }
+
+    #[test]
+    fn bit_writer_reader_width_64_round_trips_full_range() {
+        let mut w = BitWriter::new();
+        w.write(0, 64);
+        w.write(u64::MAX, 64);
+        let bytes = w.finish();
+        assert_eq!(bytes.len(), 16);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read(64), 0);
+        assert_eq!(r.read(64), u64::MAX);
+    }
+
+    #[test]
+    fn sortable_u64_round_trips_and_preserves_total_order() {
+        let values: [f64; 10] = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324, // smallest positive subnormal
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for &v in &values {
+            let bits = f64_to_sortable_u64(v);
+            let back = sortable_u64_to_f64(bits);
+            assert_eq!(back.to_bits(), v.to_bits(), "bit-exact round trip for {v}");
+        }
+        // Order preservation: total_cmp order matches unsigned u64 order.
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let sortable: Vec<u64> = sorted.iter().map(|&v| f64_to_sortable_u64(v)).collect();
+        let mut expected = sortable.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            sortable, expected,
+            "sortable_u64 must preserve total_cmp order"
+        );
+    }
+
+    #[test]
+    fn bits_needed_matches_expected_widths() {
+        assert_eq!(bits_needed(0), 0);
+        assert_eq!(bits_needed(1), 1);
+        assert_eq!(bits_needed(2), 2);
+        assert_eq!(bits_needed(255), 8);
+        assert_eq!(bits_needed(256), 9);
+        assert_eq!(bits_needed(u64::MAX), 64);
+    }
+
+    // ---- Issue #549: leaf format round trips ----
+
+    /// Visitor that forces every leaf through the `Crosses` path (mirroring
+    /// `MergeEngine::CollectPointsVisitor`) and records exact bit patterns,
+    /// for round-trip tests that must distinguish `-0.0` from `+0.0`.
+    #[derive(Default)]
+    struct CollectAllVisitor {
+        entries: Vec<(u64, Vec<f64>)>,
+    }
+
+    impl IntersectVisitor for CollectAllVisitor {
+        fn compare(&self, _cell: &AABB) -> CellRelation {
+            CellRelation::Crosses
+        }
+        fn visit_inside(&mut self, _doc_id: u64) {
+            unreachable!("compare always returns Crosses");
+        }
+        fn visit(&mut self, doc_id: u64, point: &[f64]) {
+            self.entries.push((doc_id, point.to_vec()));
+        }
+    }
+
+    #[test]
+    fn leaf_with_negative_and_positive_zero_round_trips_exactly() {
+        // `+0.0` then `-0.0` then a positive value (and the mirrored
+        // order): naive `<`/`>` comparison in `compute_aabb` would keep
+        // `leaf_min = +0.0` even though `-0.0` (smaller in total order) is
+        // present, corrupting the delta-from-min reconstruction. Regression
+        // test for the design-review blocker (see `total_min`/`total_max`).
+        for points in [vec![0.0_f64, -0.0, 5.0], vec![-5.0_f64, -0.0, 0.0]] {
+            let doc_ids: Vec<u64> = (0..points.len() as u64).collect();
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            {
+                let output = storage.create_output("zero.bkd").unwrap();
+                let mut writer = BKDWriter::new(output, 1).with_block_size(16);
+                writer.write(&points, &doc_ids).unwrap();
+                writer.finish().unwrap();
+            }
+            let reader = BKDReader::open(storage.clone(), "zero.bkd").unwrap();
+            let mut visitor = CollectAllVisitor::default();
+            reader.intersect(&mut visitor).unwrap();
+            visitor.entries.sort_by_key(|(id, _)| *id);
+            assert_eq!(visitor.entries.len(), points.len());
+            for (doc_id, point) in &visitor.entries {
+                let expected = points[*doc_id as usize];
+                assert_eq!(
+                    point[0].to_bits(),
+                    expected.to_bits(),
+                    "doc {doc_id}: expected bit pattern {:x}, got {:x} (input {points:?})",
+                    expected.to_bits(),
+                    point[0].to_bits(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_with_constant_dimension_round_trips_through_crosses() {
+        // dim 1 is constant (5.0) across all points, so its derived bit
+        // width is 0 and its packed section is 0 bytes. Forced through
+        // `Crosses` (not `Inside`), the path that actually decodes point
+        // coordinates, unlike `build_subtree_root_split_is_widest_axis`
+        // which only exercises constant dimensions via the index node.
+        let n = 20usize;
+        let mut points = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            points.push(i as f64);
+            points.push(5.0);
+        }
+        let doc_ids: Vec<u64> = (0..n as u64).collect();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("const_dim.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 2).with_block_size(n);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = BKDReader::open(storage.clone(), "const_dim.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        reader.intersect(&mut visitor).unwrap();
+        assert_eq!(visitor.entries.len(), n);
+        for (doc_id, point) in &visitor.entries {
+            assert_eq!(point[0], *doc_id as f64);
+            assert_eq!(point[1], 5.0, "constant dimension must reconstruct exactly");
+        }
+    }
+
+    #[test]
+    fn leaf_with_extreme_doc_id_range_round_trips() {
+        let points = vec![0.0_f64, 1.0];
+        let doc_ids = vec![0u64, u64::MAX];
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("extreme_doc_id.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1).with_block_size(16);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = BKDReader::open(storage.clone(), "extreme_doc_id.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        reader.intersect(&mut visitor).unwrap();
+        let mut ids: Vec<u64> = visitor.entries.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, u64::MAX]);
+    }
+
+    #[test]
+    fn bkd_leaf_bytes_shrink_relative_to_raw_format() {
+        // A correlated field (monotonically increasing, like a timestamp)
+        // should compress well under delta-from-min bit-packing. Compares
+        // the on-disk file size against the pre-#549 raw-format byte count
+        // for the same point+doc_id data (ignoring header/index overhead,
+        // identical either way and negligible at this scale).
+        let n: u64 = 5000;
+        let points: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let doc_ids: Vec<u64> = (0..n).collect();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("shrink.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let on_disk = storage.metadata("shrink.bkd").unwrap().size;
+        let raw_points_and_doc_ids = n * (8 + 8); // pre-#549: f64 point + u64 doc_id per point
+        assert!(
+            on_disk < raw_points_and_doc_ids * 6 / 10,
+            "expected the packed leaf format to use well under 60% of the raw \
+             point+doc_id bytes for a correlated field: on_disk={on_disk}, \
+             raw={raw_points_and_doc_ids}"
+        );
+    }
+
+    // ---- Issue #549: corruption / bounds-check rejection ----
+
+    /// Hand-craft a single-leaf v3 BKD file with an explicit (possibly
+    /// invalid) leaf header, for exercising corruption-rejection paths a
+    /// well-formed `BKDWriter` would never itself produce. `index_start_offset`
+    /// is fixed at `u64::MAX` (no internal index nodes are ever written), so
+    /// `root_node_offset` (`header_size`) always compares as a leaf.
+    #[allow(clippy::too_many_arguments)]
+    fn write_hand_crafted_single_leaf_file(
+        storage: &Arc<MemoryStorage>,
+        path: &str,
+        num_dims: u32,
+        total_point_count: u64,
+        leaf_min: &[f64],
+        leaf_max: &[f64],
+        leaf_count: u32,
+        doc_id_base: u64,
+        doc_id_bits: u8,
+        packed_point_bytes: &[u8],
+        packed_doc_id_bytes: &[u8],
+    ) {
+        use crate::storage::structured::StructWriter;
+        let output = storage.create_output(path).unwrap();
+        let mut writer = StructWriter::new(output);
+
+        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + (num_dims as u64 * 8 * 2) + 8 + 8;
+        writer.write_u32(BKD_MAGIC).unwrap();
+        writer.write_u32(BKD_VERSION).unwrap();
+        writer.write_u32(num_dims).unwrap();
+        writer.write_u32(8).unwrap();
+        writer.write_u64(total_point_count).unwrap();
+        writer.write_u64(1).unwrap(); // num_blocks
+        for &v in leaf_min {
+            writer.write_f64(v).unwrap();
+        }
+        for &v in leaf_max {
+            writer.write_f64(v).unwrap();
+        }
+        writer.write_u64(u64::MAX).unwrap(); // index_start_offset
+        writer.write_u64(header_size).unwrap(); // root_node_offset
+
+        writer.write_u32(leaf_count).unwrap();
+        for &v in leaf_min {
+            writer.write_f64(v).unwrap();
+        }
+        for &v in leaf_max {
+            writer.write_f64(v).unwrap();
+        }
+        writer.write_u64(doc_id_base).unwrap();
+        writer.write_u8(doc_id_bits).unwrap();
+        writer.write_raw(packed_point_bytes).unwrap();
+        writer.write_raw(packed_doc_id_bytes).unwrap();
+
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn rejects_leaf_with_doc_id_bits_exceeding_64() {
+        // `doc_id_bits = 200` claims a 25-byte packed section for a single
+        // value (`ceil(200/8)`); the file supplies exactly that many bytes
+        // so `checked_len` alone would let it through — isolating this test
+        // to the dedicated `doc_id_bits <= 64` check, not the general
+        // packed-length bound (see `rejects_leaf_whose_packed_length_overruns_the_file`
+        // for that one). Without the dedicated check, `BitReader::read(200)`
+        // would panic on `1u128 << 200` (shift amount >= 128).
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        write_hand_crafted_single_leaf_file(
+            &storage,
+            "bad_doc_id_bits.bkd",
+            1,
+            1,
+            &[0.0],
+            &[0.0],
+            1,
+            0,
+            200,
+            &[],
+            &[0u8; 25],
+        );
+        let reader = BKDReader::open(storage.clone(), "bad_doc_id_bits.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        let err = reader.intersect(&mut visitor).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("doc_id_bits"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn rejects_leaf_with_count_exceeding_total_point_count() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        write_hand_crafted_single_leaf_file(
+            &storage,
+            "bad_count.bkd",
+            1,
+            1,
+            &[0.0],
+            &[0.0],
+            1000,
+            0,
+            0,
+            &[],
+            &[],
+        );
+        let reader = BKDReader::open(storage.clone(), "bad_count.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        let err = reader.intersect(&mut visitor).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("total"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn rejects_leaf_whose_packed_length_overruns_the_file() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        // leaf_min=0.0, leaf_max=1.0 gives a wide bit width; count=1_000_000
+        // claims a multi-megabyte packed section, but the file only
+        // actually contains a handful of bytes after the header.
+        write_hand_crafted_single_leaf_file(
+            &storage,
+            "overrun.bkd",
+            1,
+            1_000_000,
+            &[0.0],
+            &[1.0],
+            1_000_000,
+            0,
+            0,
+            &[0u8; 4],
+            &[],
+        );
+        let reader = BKDReader::open(storage.clone(), "overrun.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        let err = reader.intersect(&mut visitor).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("corrupted"), "unexpected error: {msg}");
     }
 }

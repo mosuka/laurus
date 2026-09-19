@@ -17,7 +17,7 @@ Laurus は数値・日時・地理ポイントなどのデータを **BKD-Tree**
 [`IntersectVisitor`](#intersectvisitor-プロトコル) を書くだけに帰着する。
 ライタ・リーダ・オンディスクレイアウトはそのまま再利用される。
 
-## ファイルフォーマット (Version 2)
+## ファイルフォーマット (Version 3)
 
 `.bkd` セグメントファイルは自己完結型のバイナリで、3 つの領域から成る：
 
@@ -25,7 +25,7 @@ Laurus は数値・日時・地理ポイントなどのデータを **BKD-Tree**
 +----------------------------------------+
 | File Header                            |   固定長・バージョンタグ付き
 +----------------------------------------+
-| Leaf Blocks                            |   row-major points + doc_ids
+| Leaf Blocks                            |   bit-packed points + doc_ids
 |   leaf 0                               |
 |   leaf 1                               |
 |   ...                                  |
@@ -37,25 +37,44 @@ Laurus は数値・日時・地理ポイントなどのデータを **BKD-Tree**
 +----------------------------------------+
 ```
 
-ヘッダ (`BKDFileHeader`) は `magic`、`version`（現在は `2`）、`num_dims`、
+ヘッダ (`BKDFileHeader`) は `magic`、`version`（現在は `3`）、`num_dims`、
 `bytes_per_dim`、総ポイント数、リーフブロック数、**全体の軸ごと min/max**、
 インデックス領域とルートノードへのオフセットを保持する。
 
 ### Leaf Block レイアウト
 
-各リーフブロックは、その部分木に属するポイントを格納する：
+各リーフブロックは、その部分木に属するポイントを bit-pack して格納する
+（Issue #549、以前は生の `f64`/`u64` だった）：
 
 ```text
-count               u32                       — リーフ内のポイント数
-leaf_min            [f64; num_dims]           — リーフレベルの AABB 下端
-leaf_max            [f64; num_dims]           — リーフレベルの AABB 上端
-point_values        [f64; count * num_dims]   — row-major のポイント座標
-doc_ids             [u64; count]              — ドキュメント ID の並列配列
+count               u32               — リーフ内のポイント数
+leaf_min            [f64; num_dims]   — リーフレベルの AABB 下端
+leaf_max            [f64; num_dims]   — リーフレベルの AABB 上端
+doc_id_base         u64               — リーフ内の doc_id の最小値
+doc_id_bits         u8                — doc_id 差分のbit幅
+packed_dim[0]       バイト整列        — `sortable(point) - sortable(leaf_min[d])` をbit-pack
+packed_dim[1..]     ...               — 次元ごとに1セクション
+packed_doc_ids      バイト整列        — `doc_id - doc_id_base` をbit-pack
 ```
 
+各次元のbit幅は、`leaf_min[d]`/`leaf_max[d]` を（`f64::total_cmp` と同じ
+IEEE 754 の全順序を保つ）`u64` に写像した値から**導出**され、ディスクには
+保存しない。書き込み側と読み込み側が同じ式で計算するため、両者がずれる
+心配がない。リーフ全体で定数の次元は幅0bitに導出され、1バイトも消費しない。
+`doc_id_bits` だけは唯一ディスクに保存される幅で（`doc_id`側には導出元と
+なる「最大値」ヘッダフィールドが無いため）、読み込み時に `64` を超える
+値は破損として拒否する。
+
+削減率はデータの相関度に依存する: 一様乱数の1次元/2次元/3次元データで
+旧v2形式（生のリーフフォーマット）に対しおよそ2.0倍/1.6倍/1.4倍、
+単調増加するフィールド（タイムスタンプや自動採番カウンタなど）では
+2.3〜2.7倍程度。これは量子化ではなく可逆な差分符号化方式であり、
+`±0.0` や `±Infinity` を含め全てのポイントがビット完全に往復する。
+
 リーフごとに AABB を持たせることで、クエリ領域がリーフの外側にある場合
-(`Outside`) や全内包される場合 (`Inside`) には、ポイントを 1 つも読まずに
-リーフ全体を判定できる。
+(`Outside`) や全内包される場合 (`Inside`) には、ポイントを1つもデコードせずに
+リーフ全体を判定できる。`Inside` の場合はpacked pointセクションを1回の
+シークでスキップし、`doc_ids` のみをデコードする。
 
 ### 内部 Index Node レイアウト
 

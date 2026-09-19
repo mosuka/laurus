@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use laurus::DataValue;
 use laurus::Document;
-use laurus::lexical::core::field::{FieldOption, IntegerOption};
+use laurus::lexical::core::field::{FieldOption, FloatOption, IntegerOption};
 use laurus::lexical::query::NumericRangeQuery;
 use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore};
 use laurus::storage::Storage;
@@ -81,5 +81,84 @@ fn merge_preserves_bkd_points_for_index_only_numeric_field() {
         count_in_range(&store, 15, 25),
         1,
         "merged BKD holds the real point values"
+    );
+}
+
+fn float_doc(v: f64) -> Document {
+    Document::builder()
+        .add_field("v", DataValue::Float64(v))
+        .build()
+}
+
+fn count_in_f64_range(store: &LexicalStore, lower: Option<f64>, upper: Option<f64>) -> usize {
+    let query = Box::new(NumericRangeQuery::f64_range("v", lower, upper));
+    store
+        .search(LexicalSearchRequest::new(query))
+        .unwrap()
+        .hits
+        .len()
+}
+
+/// Regression test for a BKD-leaf bit-packing blocker (Issue #549):
+/// `compute_aabb` used to compare with plain IEEE `<`/`>`, which does not
+/// distinguish `-0.0` from `+0.0`, so a leaf's `leaf_min`/`leaf_max` could
+/// fail to bound one of its own points in the sortable-integer order the
+/// packer relies on. `MergeEngine`'s point-collecting visitor always forces
+/// a full descent (`CellRelation::Crosses` unconditionally) and feeds every
+/// decoded point straight back into `BKDWriter::write`, which rejects NaN —
+/// so if that bound is wrong, a `-0.0`/`+0.0` mix (or `Infinity`, which
+/// pins the same `leaf_min`/`leaf_max` comparison at its widest) makes the
+/// merge itself fail, not just return a slightly wrong query result.
+#[test]
+fn merge_preserves_bkd_points_with_signed_zero_and_infinity() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder()
+        .add_field(
+            "v",
+            FieldOption::Float(FloatOption {
+                indexed: true,
+                stored: true,
+                multi_valued: false,
+                doc_values: true,
+            }),
+        )
+        .build();
+    let store = LexicalStore::new(storage, config).unwrap();
+
+    // Segment 1: +0.0 then -0.0 then a positive value, in the exact order
+    // that defeats a naive IEEE `<`/`>` AABB computation.
+    store.upsert_document(1, float_doc(0.0)).unwrap();
+    store.upsert_document(2, float_doc(-0.0)).unwrap();
+    store.upsert_document(3, float_doc(5.0)).unwrap();
+    store.commit().unwrap();
+
+    // Segment 2: both infinities.
+    store
+        .upsert_document(4, float_doc(f64::NEG_INFINITY))
+        .unwrap();
+    store.upsert_document(5, float_doc(f64::INFINITY)).unwrap();
+    store.commit().unwrap();
+
+    // The merge itself must not error (see doc comment above).
+    store.optimize().unwrap();
+
+    assert_eq!(
+        count_in_f64_range(&store, None, None),
+        5,
+        "all 5 docs survive the merge"
+    );
+    // +0.0 and -0.0 compare numerically equal, so both match [0.0, 0.0].
+    assert_eq!(
+        count_in_f64_range(&store, Some(0.0), Some(0.0)),
+        2,
+        "both signed zeros survive and match a [0.0, 0.0] range"
+    );
+    assert_eq!(
+        count_in_f64_range(&store, Some(f64::NEG_INFINITY), Some(f64::NEG_INFINITY)),
+        1
+    );
+    assert_eq!(
+        count_in_f64_range(&store, Some(f64::INFINITY), Some(f64::INFINITY)),
+        1
     );
 }
