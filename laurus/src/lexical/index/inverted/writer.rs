@@ -1518,41 +1518,65 @@ impl InvertedIndexWriter {
 
     /// Write BKD trees for numeric and geo fields.
     ///
-    /// Per-field state is accumulated into flat row-major coordinate buffers
-    /// (`points`) and parallel doc-id buffers (`doc_ids`) so the BKD writer
-    /// can be fed without re-allocating per point. The dimensionality is
-    /// captured from the first point seen for each field.
+    /// Processes one point-bearing field at a time: a discovery pass over
+    /// `self.buffered_docs` first counts each field's total point count and
+    /// captures its dimensionality (from the first point seen, matching
+    /// prior behavior), then a second pass builds and writes one field's
+    /// exactly-sized flat buffers before moving to the next. This keeps at
+    /// most one field's buffer resident at a time (rather than every
+    /// point-bearing field's buffer simultaneously) and avoids the
+    /// reallocation-doubling overhead of growing from `Vec::new()`
+    /// (Issue #557).
     fn write_bkd_trees(&self, sink: &mut PartSink<'_>) -> Result<()> {
-        // (flat points, doc_ids, num_dims)
-        let mut field_buckets: AHashMap<String, (Vec<f64>, Vec<u64>, usize)> = AHashMap::new();
-
-        for (doc_id, doc) in &self.buffered_docs {
+        // field -> (point_count, num_dims). `entry`'s key argument is
+        // evaluated even on a hit, so cloning is deferred to the `None`
+        // (first-seen) branch — one clone per distinct field, not per
+        // point. A field whose point list is empty (e.g. an empty
+        // `Int64Array`) is never registered here, matching the pre-#557
+        // behavior where such fields never produced a `.bkd` part.
+        let mut field_info: AHashMap<String, (usize, usize)> = AHashMap::new();
+        for (_, doc) in &self.buffered_docs {
             for (field, points) in &doc.point_values {
-                // Each `point` is one BKD entry. A single-valued field
-                // contributes one entry; a multi-valued field contributes
-                // one per element. The BKD reader's `range_search` already
-                // deduplicates `doc_id`s, so a multi-valued document is
-                // reported at most once per query.
-                for point in points {
-                    let bucket = field_buckets
-                        .entry(field.clone())
-                        .or_insert_with(|| (Vec::new(), Vec::new(), point.len()));
-                    bucket.0.extend_from_slice(point);
-                    bucket.1.push(*doc_id);
+                let Some(first) = points.first() else {
+                    continue;
+                };
+                match field_info.get_mut(field) {
+                    Some(entry) => entry.0 += points.len(),
+                    None => {
+                        field_info.insert(field.clone(), (points.len(), first.len()));
+                    }
                 }
             }
         }
 
-        for (field, (points, doc_ids, num_dims)) in field_buckets {
-            if doc_ids.is_empty() {
-                continue;
+        // Sorted for a deterministic `.cfs` part-write order; part lookup
+        // is by name, so this has no effect on correctness.
+        let mut fields: Vec<&String> = field_info.keys().collect();
+        fields.sort_unstable();
+
+        for field in fields {
+            let &(count, num_dims) = &field_info[field];
+
+            let mut points_buf: Vec<f64> = Vec::with_capacity(count * num_dims);
+            let mut doc_ids_buf: Vec<u64> = Vec::with_capacity(count);
+            for (doc_id, doc) in &self.buffered_docs {
+                if let Some(points) = doc.point_values.get(field) {
+                    for point in points {
+                        points_buf.extend_from_slice(point);
+                        doc_ids_buf.push(*doc_id);
+                    }
+                }
             }
+            debug_assert_eq!(points_buf.capacity(), count * num_dims);
+            debug_assert_eq!(doc_ids_buf.capacity(), count);
 
             let output = sink.part(&format!("{field}.bkd"))?;
             let mut writer = BKDWriter::new(output, num_dims as u32);
-            writer.write(&points, &doc_ids)?;
+            writer.write(&points_buf, &doc_ids_buf)?;
             writer.finish()?;
             sink.seal()?;
+            // `points_buf`/`doc_ids_buf` drop here, before the next field's
+            // buffers are allocated.
         }
         Ok(())
     }
@@ -2467,6 +2491,45 @@ mod tests {
         assert!(
             three_d > one_d,
             "3D points must estimate above 1D points, got {three_d} vs {one_d}"
+        );
+    }
+
+    /// #557: `write_bkd_trees`'s discovery pass must not register a field
+    /// whose point list is empty, even though no current production path
+    /// can construct one (`upsert_analyzed_document`'s ingestion and the
+    /// merge replay path both filter on `!points.is_empty()` before ever
+    /// inserting into `point_values` — see `writer.rs`'s field-analysis
+    /// loop and `merge_engine.rs`'s re-analysis block). This is
+    /// defense-in-depth, constructed directly here since the public
+    /// `Document`/`add_document` API cannot reach this state.
+    #[test]
+    fn write_bkd_trees_skips_a_field_whose_points_are_empty() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::memory::MemoryStorage::new(
+            crate::storage::memory::MemoryStorageConfig::default(),
+        ));
+        // Loose layout, explicitly: this test pins per-field `.bkd` FILE
+        // creation on disk, which only exists as standalone files under the
+        // loose layout (compound layout embeds parts inside one `.cfs`).
+        let config = InvertedIndexWriterConfig {
+            use_compound: false,
+            ..Default::default()
+        };
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+
+        let mut point_values = AHashMap::new();
+        point_values.insert("empty_field".to_string(), Vec::<Vec<f64>>::new());
+        let doc = AnalyzedDocument {
+            field_terms: AHashMap::new(),
+            stored_fields: AHashMap::new(),
+            field_lengths: AHashMap::new(),
+            point_values,
+        };
+        writer.buffered_docs.push((1, doc));
+        writer.flush_segment().unwrap();
+
+        assert!(
+            !storage.file_exists("segment_000000.empty_field.bkd"),
+            "a field with an empty point list must not produce a spurious .bkd part"
         );
     }
 
