@@ -672,6 +672,40 @@ impl HnswSearcher {
             }
         };
 
+        // Issue #656: speculative two-hop lookahead. Peeks the frontier
+        // heap's current top -- state as of the end of the *previous*
+        // iteration, since this iteration hasn't pushed anything yet -- and
+        // prefetches *its* neighbours' vector data, overlapping that fetch
+        // with the current iteration's own neighbour processing below.
+        //
+        // `candidates`/`visited` are taken as explicit parameters rather
+        // than captured: both are mutated elsewhere in the same loop
+        // (`candidates.push`, `visited.set`), and a closure holding `&`
+        // references to them for its whole lifetime would conflict with
+        // those later `&mut` accesses -- exactly why `prefetch_ord` above
+        // takes `ord` as a parameter instead of capturing "the current
+        // neighbour".
+        //
+        // This can never change search results: it only issues hardware
+        // prefetch hints (no dereference, no observable side effect on
+        // `candidates`/`found`/`visited`), and the popped candidate's own
+        // Pass 1 below still runs unconditionally as the ground-truth
+        // prefetch for whatever actually gets processed next iteration. A
+        // wrong guess here (the heap's top can change once this iteration's
+        // own discoveries are pushed) just touches cache lines that may or
+        // may not be used later -- never a correctness concern.
+        let prefetch_lookahead = |candidates: &BinaryHeap<Candidate>, visited: &BitVec| {
+            if let Some(next) = candidates.peek()
+                && let Some(next_neighbors) = graph.neighbors(next.ord, 0)
+            {
+                for &neighbor_ord in next_neighbors {
+                    if !visited.get(neighbor_ord as usize).unwrap_or(false) {
+                        prefetch_ord(neighbor_ord);
+                    }
+                }
+            }
+        };
+
         // Cardinality-driven mode (Issue #738): when the filter is selective
         // enough that fewer documents are allowed than the candidate-list size
         // (`ef_search`), scoring those documents directly is both cheaper and
@@ -867,6 +901,10 @@ impl HnswSearcher {
                     break;
                 }
 
+                if prefetch_enabled {
+                    prefetch_lookahead(&candidates, &visited);
+                }
+
                 if let Some(neighbors) = graph.neighbors(curr.ord, 0) {
                     if prefetch_enabled {
                         for &neighbor_ord in neighbors {
@@ -936,6 +974,10 @@ impl HnswSearcher {
                     && found.len() >= ef_search
                 {
                     break;
+                }
+
+                if prefetch_enabled {
+                    prefetch_lookahead(&candidates, &visited);
                 }
 
                 if let Some(neighbors) = graph.neighbors(curr.ord, 0) {

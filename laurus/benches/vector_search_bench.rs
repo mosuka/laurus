@@ -1906,6 +1906,67 @@ fn run_pq_fastscan_real_data_bench(c: &mut Criterion, params: PqFastScanRealData
     group.finish();
 }
 
+/// HNSW graph search with prefetch actually enabled (Issue #656).
+///
+/// Every other HNSW graph-search bench in this file uses the default
+/// `use_mmap = true` (`cached_vector_reader`), which loads segments as
+/// `VectorStorage::OnDemand` — the storage mode `search_graph`'s
+/// `prefetch_enabled` gate is *always false* for (no `sq_prefetch`, and
+/// `field_prefetch_index` returns an empty map unconditionally), so none
+/// of the other benches exercise the one-hop OR the new two-hop lookahead
+/// prefetch code at all. This bench forces eager loading
+/// (`cached_vector_reader_with_loading(..., false, ...)`), matching
+/// `bench_hnsw_graph_search_sparse_ids`'s int8-kernel setup but sweeping
+/// `hnsw_corpus_sizes()` (up to 100k with `LAURUS_BENCH_LARGE=1`) instead
+/// of a single fixed 10k count, since the two-hop lookahead's benefit (if
+/// any) is expected to show up once the working set exceeds L3.
+fn bench_hnsw_graph_search_eager_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("HNSW Graph Search eager (prefetch enabled)");
+    let dim = 128;
+
+    for &count in &hnsw_corpus_sizes() {
+        let config = HnswIndexConfig {
+            dimension: dim,
+            m: 16,
+            ef_construction: 200,
+            distance_metric: DistanceMetric::Cosine,
+            ..Default::default()
+        };
+        let slot = format!("hnsw_eager_n{count}_dim{dim}_m16_efc200_synthetic");
+        let reader = cached_vector_reader_with_loading(
+            &slot,
+            VectorIndexTypeConfig::HNSW(config),
+            false,
+            || generate_vectors(count, dim),
+        );
+        let searcher = HnswSearcher::new(reader).unwrap();
+        let query = generate_query(dim);
+
+        let probe = searcher
+            .search(
+                &VectorIndexQuery::new(query.clone())
+                    .top_k(10)
+                    .field_name("field".to_string()),
+            )
+            .unwrap();
+        assert!(
+            !probe.results.is_empty(),
+            "eager hnsw graph top-10 probe must return at least one hit at count={count}"
+        );
+
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::new("top10", count), &count, |b, _| {
+            b.iter(|| {
+                let request = VectorIndexQuery::new(query.clone())
+                    .top_k(10)
+                    .field_name("field".to_string());
+                searcher.search(&request).unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_flat_construction,
@@ -1919,6 +1980,7 @@ criterion_group!(
     bench_hnsw_fallback_search,
     bench_hnsw_graph_search,
     bench_hnsw_graph_search_sparse_ids,
+    bench_hnsw_graph_search_eager_large,
     bench_hnsw_graph_search_rerank,
     bench_hnsw_graph_search_rerank_real_data,
     bench_hnsw_graph_search_pq_rerank_real_data,
