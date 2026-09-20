@@ -89,6 +89,90 @@ fn test_hnsw_integration() -> Result<()> {
     Ok(())
 }
 
+/// Issue #656: speculative two-hop prefetch lookahead must never change
+/// search results — it only issues hardware prefetch hints (no
+/// dereference, no mutation of `candidates`/`found`/`visited`). This test
+/// uses a corpus large enough (300 points) that `ef_search`'s default of
+/// 50 forces many heap pops in `search_graph`, giving `candidates.peek()`
+/// real, varied data across many iterations, unlike `test_hnsw_integration`'s
+/// 4-point corpus. `HnswIndexConfig::default()` (`Scalar8Bit` +
+/// `InMemory`) is exactly the configuration that makes `prefetch_enabled`
+/// true and exercises the new lookahead code in both the pristine branch
+/// (plain query) and the bookkeeping branch (filtered query) below.
+#[test]
+fn two_hop_prefetch_lookahead_does_not_change_search_results() -> Result<()> {
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let config = HnswIndexConfig {
+        dimension: 3,
+        m: 16,
+        ef_construction: 100,
+        distance_metric: DistanceMetric::Cosine,
+        ..Default::default()
+    };
+    assert_eq!(
+        config.quantization_method,
+        crate::QuantizationMethod::Scalar8Bit,
+        "this test relies on the default (Scalar8Bit + InMemory) exercising \
+         prefetch_enabled = true"
+    );
+
+    let index = HnswIndex::create(storage.clone(), "default_index", config.clone())?;
+    let mut writer = index.writer()?;
+
+    // 300 points spread widely apart, plus one point placed very close to
+    // the query -- far enough from every other point that the true nearest
+    // neighbor is unambiguous regardless of the (randomized) graph build,
+    // matching `test_hnsw_integration`'s own exact-match precedent above.
+    let mut vectors = Vec::with_capacity(301);
+    for i in 0..300u64 {
+        let angle = i as f32;
+        vectors.push((
+            i,
+            "test".to_string(),
+            Vector::new(vec![angle.cos() * 100.0, angle.sin() * 100.0, i as f32]),
+        ));
+    }
+    vectors.push((300, "test".to_string(), Vector::new(vec![0.9, 0.1, 0.0])));
+
+    writer.build(vectors)?;
+    writer.finalize()?;
+    writer.commit()?;
+
+    let reader = index.reader()?;
+    use crate::vector::index::hnsw::searcher::HnswSearcher;
+    use crate::vector::search::searcher::{VectorIndexQuery, VectorIndexSearcher};
+    let searcher = HnswSearcher::new(reader.clone())?;
+
+    let query = Vector::new(vec![0.9, 0.1, 0.0]);
+
+    // Pristine branch (no filter): the planted near point must be found.
+    let request = VectorIndexQuery::new(query.clone())
+        .top_k(1)
+        .field_name("test".to_string());
+    let results = searcher.search(&request)?;
+    assert_eq!(results.results.len(), 1);
+    assert_eq!(results.results[0].doc_id, 300);
+
+    // Bookkeeping branch (filter present): restrict the allow-set to a
+    // sparse handful of ids, including the planted near point, so the
+    // frontier must cross rejected candidates to reach it (#645
+    // connectivity guarantee) -- this exercises `search_graph`'s other
+    // branch with the same lookahead code active.
+    use crate::vector::search::filter_set::FilterSet;
+    use ahash::AHashSet;
+    use std::sync::Arc;
+    let allow: AHashSet<u64> = [5u64, 50, 150, 250, 300].into_iter().collect();
+    let filtered_request = VectorIndexQuery::new(query)
+        .top_k(1)
+        .field_name("test".to_string())
+        .filter(Arc::new(FilterSet::Hash(allow)));
+    let filtered_results = searcher.search(&filtered_request)?;
+    assert_eq!(filtered_results.results.len(), 1);
+    assert_eq!(filtered_results.results[0].doc_id, 300);
+
+    Ok(())
+}
+
 #[test]
 fn writer_omits_sidecar_when_rerank_storage_is_none() -> Result<()> {
     let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
