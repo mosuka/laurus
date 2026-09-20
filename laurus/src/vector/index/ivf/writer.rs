@@ -34,6 +34,49 @@ use serde::{Deserialize, Serialize};
 /// construction benchmarks stable.
 const KMEANS_RNG_SEED: u64 = 42;
 
+/// CSR (compressed-sparse-row) view over the buffered vectors' cluster
+/// assignment (Issue #629). `order` is a permutation of indices into
+/// [`IvfIndexWriter::vectors`], grouped by cluster and sorted by `doc_id`
+/// within each cluster; `offsets[i]..offsets[i+1]` bounds cluster `i`'s
+/// slice of `order`. `offsets` always has length `cluster_count() + 1`
+/// (a single `0` when there are zero clusters), mirroring the on-disk CSR
+/// convention already used by [`BlockMaxData`](crate::lexical::index::structures::dictionary::block_max_data::BlockMaxData).
+///
+/// `order`'s indices are valid only while the `vectors` they index are
+/// still buffered — [`IvfIndexWriter::close`] clears this alongside
+/// `vectors` so a stale, unindexable permutation is never read (see its
+/// doc comment).
+#[derive(Debug, Default, Clone)]
+struct IvfInvertedLists {
+    offsets: Vec<usize>,
+    order: Vec<u32>,
+}
+
+impl IvfInvertedLists {
+    fn cluster_count(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    /// The `(u64, u16)`-index slice for cluster `idx`, or `&[]` if `idx`
+    /// is out of range.
+    fn cluster(&self, idx: usize) -> &[u32] {
+        match (self.offsets.get(idx), self.offsets.get(idx + 1)) {
+            (Some(&start), Some(&end)) => &self.order[start..end],
+            _ => &[],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.offsets.clear();
+        self.order.clear();
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.offsets.shrink_to_fit();
+        self.order.shrink_to_fit();
+    }
+}
+
 #[derive(Debug)]
 /// Builder for IVF vector indexes (memory-efficient search).
 pub struct IvfIndexWriter {
@@ -41,9 +84,9 @@ pub struct IvfIndexWriter {
     writer_config: VectorIndexWriterConfig,
     storage: Option<Arc<dyn Storage>>,
     path: String,
-    centroids: Vec<Vector>,                          // Cluster centroids
-    inverted_lists: Vec<Vec<(u64, String, Vector)>>, // Inverted lists for each cluster
-    vectors: Vec<(u64, String, Vector)>,             // All vectors (used during construction)
+    centroids: Vec<Vector>,              // Cluster centroids
+    inverted_lists: IvfInvertedLists,    // Per-cluster CSR view into `vectors`
+    vectors: Vec<(u64, String, Vector)>, // All vectors (used during construction)
     is_finalized: bool,
     total_vectors_to_add: Option<usize>,
     next_vec_id: u64,
@@ -80,7 +123,7 @@ impl IvfIndexWriter {
             path: path.into(),
 
             centroids: Vec::new(),
-            inverted_lists: Vec::new(),
+            inverted_lists: IvfInvertedLists::default(),
             vectors: Vec::new(),
             is_finalized: false,
             total_vectors_to_add: None,
@@ -114,7 +157,7 @@ impl IvfIndexWriter {
             storage: Some(storage),
             path,
             centroids: Vec::new(),
-            inverted_lists: Vec::new(),
+            inverted_lists: IvfInvertedLists::default(),
             vectors: Vec::new(),
             is_finalized: false,
             total_vectors_to_add: None,
@@ -231,8 +274,23 @@ impl IvfIndexWriter {
         let record_stride =
             record_prefix_size(header.version) + quantized_record_payload_size(dimension) as u64;
         checked_capacity(n_clusters, 4, lists_remaining, "ivf cluster lists")?;
-        let mut inverted_lists = vec![Vec::new(); n_clusters];
-        for list in &mut inverted_lists {
+        // `num_vectors` is a separate header field and is still unverified,
+        // so bound it against the same record section before reserving
+        // (Issue #806).
+        checked_capacity(
+            num_vectors,
+            record_stride,
+            lists_remaining,
+            "ivf num_vectors",
+        )?;
+        // Records are read directly into `vectors` in their on-disk order
+        // (cluster-grouped, doc_id-sorted within each cluster), so `order`
+        // is simply the identity permutation over that order — no
+        // separate per-cluster staging + flatten pass needed.
+        let mut vectors = Vec::with_capacity(num_vectors);
+        let mut offsets = Vec::with_capacity(n_clusters + 1);
+        offsets.push(0usize);
+        for _ in 0..n_clusters {
             let mut list_size_buf = [0u8; 4];
             input.read_exact(&mut list_size_buf)?;
             let list_size = u32::from_le_bytes(list_size_buf) as usize;
@@ -250,23 +308,12 @@ impl IvfIndexWriter {
                 // Read quantized payload + dequantize.
                 let values = read_dequantized_vector(&mut input, dimension, &params)?;
 
-                list.push((doc_id, field_name, Vector::new(values)));
+                vectors.push((doc_id, field_name, Vector::new(values)));
             }
+            offsets.push(vectors.len());
         }
-
-        // Reconstruct vectors from inverted lists. `num_vectors` is a separate
-        // header field and is still unverified, so bound it against the same
-        // record section before reserving (Issue #806).
-        checked_capacity(
-            num_vectors,
-            record_stride,
-            lists_remaining,
-            "ivf num_vectors",
-        )?;
-        let mut vectors = Vec::with_capacity(num_vectors);
-        for list in &inverted_lists {
-            vectors.extend(list.iter().cloned());
-        }
+        let order: Vec<u32> = (0..vectors.len() as u32).collect();
+        let inverted_lists = IvfInvertedLists { offsets, order };
 
         // Calculate next_vec_id from loaded vectors
         let max_id = vectors.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
@@ -680,25 +727,86 @@ impl IvfIndexWriter {
     }
 
     /// Build inverted lists by assigning vectors to clusters.
+    ///
+    /// Issue #629: represents the result as a CSR permutation
+    /// (`IvfInvertedLists`) instead of `n_clusters` owned
+    /// `Vec<(u64, String, Vector)>` copies. `self.vectors.len()` is
+    /// checked against `u32::MAX` here — before `IvfInvertedLists::order`
+    /// (a `Vec<u32>`) is built — because [`Self::write`]'s equivalent
+    /// guard runs too late to prevent a silent truncation at this point.
     fn build_inverted_lists(&mut self) -> Result<()> {
-        self.inverted_lists = vec![Vec::new(); self.index_config.n_clusters];
+        let n_clusters = self.index_config.n_clusters;
+        self.inverted_lists.clear();
 
-        for (doc_id, field_name, vector) in &self.vectors {
-            let cluster = self.find_nearest_centroid(vector);
-            self.inverted_lists[cluster].push((*doc_id, field_name.clone(), vector.clone()));
+        if self.vectors.is_empty() || n_clusters == 0 {
+            self.inverted_lists.offsets = vec![0; n_clusters + 1];
+            return Ok(());
         }
 
-        // Sort each inverted list by document ID
+        if self.vectors.len() > u32::MAX as usize {
+            return Err(LaurusError::InvalidOperation(format!(
+                "Vector count {} exceeds u32::MAX",
+                self.vectors.len()
+            )));
+        }
+
+        // Assignment pass: reuses the already-parallelized
+        // `assign_vectors_to_clusters` (previously only used by
+        // `train_centroids`'s Lloyd loop) instead of a serial
+        // `find_nearest_centroid` loop of its own.
+        let assignments = self.assign_vectors_to_clusters();
+
+        // Counting sort: one O(n) pass to count per-cluster membership,
+        // a prefix sum to derive `offsets` for free, then a second O(n)
+        // pass to scatter into `order`. Scattering in ascending original
+        // index preserves each cluster's relative input order, matching
+        // the previous "push in original order, then sort" behavior
+        // before the doc_id sort below.
+        let mut counts = vec![0usize; n_clusters];
+        for &cluster in &assignments {
+            counts[cluster] += 1;
+        }
+        let mut offsets = Vec::with_capacity(n_clusters + 1);
+        offsets.push(0usize);
+        for &count in &counts {
+            offsets.push(offsets.last().expect("just pushed") + count);
+        }
+        let mut cursor = offsets.clone();
+        let mut order = vec![0u32; self.vectors.len()];
+        for (i, &cluster) in assignments.iter().enumerate() {
+            order[cursor[cluster]] = i as u32;
+            cursor[cluster] += 1;
+        }
+        self.inverted_lists = IvfInvertedLists { offsets, order };
+
+        // Sort each cluster window by document ID. Must be a *stable*
+        // sort: multiple fields of the same doc_id (or exact duplicate
+        // records prior to merge-time dedup) can land in the same
+        // cluster, and the previous per-list `sort_by_key` (also stable)
+        // resolved ties by original insertion order.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.writer_config.parallel_build {
-            self.inverted_lists.par_iter_mut().for_each(|list| {
-                list.sort_by_key(|(doc_id, _, _)| *doc_id);
+        if self.writer_config.parallel_build && self.vectors.len() as u64 > 1000 {
+            let offsets = self.inverted_lists.offsets.clone();
+            let vectors = &self.vectors;
+            let mut rest = self.inverted_lists.order.as_mut_slice();
+            let mut windows: Vec<&mut [u32]> = Vec::with_capacity(n_clusters);
+            for i in 0..n_clusters {
+                let width = offsets[i + 1] - offsets[i];
+                let (window, remainder) = rest.split_at_mut(width);
+                windows.push(window);
+                rest = remainder;
+            }
+            windows.par_iter_mut().for_each(|window| {
+                window.sort_by_key(|&idx| vectors[idx as usize].0);
             });
             return Ok(());
         }
 
-        for list in &mut self.inverted_lists {
-            list.sort_by_key(|(doc_id, _, _)| *doc_id);
+        for i in 0..n_clusters {
+            let start = self.inverted_lists.offsets[i];
+            let end = self.inverted_lists.offsets[i + 1];
+            let vectors = &self.vectors;
+            self.inverted_lists.order[start..end].sort_by_key(|&idx| vectors[idx as usize].0);
         }
 
         Ok(())
@@ -731,19 +839,7 @@ impl IvfIndexWriter {
     pub fn centroids(&self) -> &[Vector] {
         &self.centroids
     }
-
-    /// Get inverted lists.
-    pub fn inverted_lists(&self) -> &[Vec<(u64, String, Vector)>] {
-        &self.inverted_lists
-    }
 }
-
-type SplitClusterResult = (
-    Vector,
-    Vec<(u64, String, Vector)>,
-    Vector,
-    Vec<(u64, String, Vector)>,
-);
 
 /// Statistics for a single IVF cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -762,16 +858,13 @@ impl IvfIndexWriter {
 
         let mut stats = Vec::with_capacity(self.centroids.len());
 
-        for (i, (centroid, list)) in self
-            .centroids
-            .iter()
-            .zip(self.inverted_lists.iter())
-            .enumerate()
-        {
-            let count = list.len();
-            let total_dist: f32 = list
+        for (i, centroid) in self.centroids.iter().enumerate() {
+            let window = self.inverted_lists.cluster(i);
+            let count = window.len();
+            let total_dist: f32 = window
                 .iter()
-                .map(|(_, _, vec)| {
+                .map(|&idx| {
+                    let vec = &self.vectors[idx as usize].2;
                     self.index_config
                         .distance_metric
                         .distance(&vec.data, &centroid.data)
@@ -838,38 +931,50 @@ impl IvfIndexWriter {
             moves.push((sparse_idx, best_target));
         }
 
-        // Apply moves
-        for (sparse_idx, target_idx) in moves {
-            let mut vectors_to_move = std::mem::take(&mut self.inverted_lists[sparse_idx]);
-            self.inverted_lists[target_idx].append(&mut vectors_to_move);
+        // Rebuild the CSR permutation: walk surviving (non-sparse)
+        // clusters in ascending old-index order; each survivor's new
+        // window is its own records followed by every sparse cluster
+        // absorbed into it (in ascending old sparse-index order, i.e.
+        // `moves`' own order) -- reproducing exactly the order the
+        // previous `Vec<Vec<_>>::append`-based implementation produced.
+        let mut new_offsets = Vec::with_capacity(non_sparse_indices.len() + 1);
+        let mut new_order = Vec::with_capacity(self.inverted_lists.order.len());
+        new_offsets.push(0);
+        for &target_idx in &non_sparse_indices {
+            new_order.extend_from_slice(self.inverted_lists.cluster(target_idx));
+            for &(sparse_idx, move_target) in &moves {
+                if move_target == target_idx {
+                    new_order.extend_from_slice(self.inverted_lists.cluster(sparse_idx));
+                }
+            }
+            new_offsets.push(new_order.len());
         }
 
-        // Rebuild centroids and inverted lists
-        let mut new_centroids = Vec::new();
-        let mut new_inverted_lists = Vec::new();
-
-        for i in 0..self.centroids.len() {
-            if !sparse_indices.contains(&i) {
-                new_centroids.push(self.centroids[i].clone());
-                new_inverted_lists.push(std::mem::take(&mut self.inverted_lists[i]));
-            }
+        let mut new_centroids = Vec::with_capacity(non_sparse_indices.len());
+        for &i in &non_sparse_indices {
+            new_centroids.push(self.centroids[i].clone());
         }
 
         self.centroids = new_centroids;
-        self.inverted_lists = new_inverted_lists;
+        self.inverted_lists = IvfInvertedLists {
+            offsets: new_offsets,
+            order: new_order,
+        };
         self.index_config.n_clusters = self.centroids.len();
 
         // Update centroids for the merged clusters (re-average)
-        for (i, list) in self.inverted_lists.iter().enumerate() {
-            if !list.is_empty() {
+        for i in 0..self.centroids.len() {
+            let window = self.inverted_lists.cluster(i);
+            if !window.is_empty() {
                 let dim = self.index_config.dimension;
                 let mut sum = vec![0.0; dim];
-                for (_, _, vec) in list {
+                for &idx in window {
+                    let vec = &self.vectors[idx as usize].2;
                     for (j, &val) in vec.data.iter().enumerate() {
                         sum[j] += val;
                     }
                 }
-                let new_data: Vec<f32> = sum.iter().map(|&s| s / list.len() as f32).collect();
+                let new_data: Vec<f32> = sum.iter().map(|&s| s / window.len() as f32).collect();
                 self.centroids[i] = Vector::new(new_data);
             }
         }
@@ -896,66 +1001,111 @@ impl IvfIndexWriter {
 
         let mut additional_clusters = 0;
         let mut new_centroids = Vec::new();
-        let mut new_inverted_lists = Vec::new();
+        let mut new_offsets = Vec::with_capacity(self.centroids.len() + dense_indices.len() + 1);
+        let mut new_order = Vec::with_capacity(self.inverted_lists.order.len());
+        new_offsets.push(0);
 
         for i in 0..self.centroids.len() {
             if dense_indices.contains(&i) {
-                let list = std::mem::take(&mut self.inverted_lists[i]);
-                if list.len() < 2 {
+                let window = self.inverted_lists.cluster(i);
+                if window.len() < 2 {
                     // Cannot split
                     new_centroids.push(self.centroids[i].clone());
-                    new_inverted_lists.push(list);
+                    new_order.extend_from_slice(window);
+                    new_offsets.push(new_order.len());
                     continue;
                 }
 
                 // Perform k=2 split
-                let (c1, l1, c2, l2) = self.split_cluster_kmeans_k2(list)?;
+                let (c1, c2, to_second) = self.split_cluster_kmeans_k2(window)?;
+
                 new_centroids.push(c1);
-                new_inverted_lists.push(l1);
+                for (&idx, &second) in window.iter().zip(&to_second) {
+                    if !second {
+                        new_order.push(idx);
+                    }
+                }
+                new_offsets.push(new_order.len());
+
                 new_centroids.push(c2);
-                new_inverted_lists.push(l2);
+                for (&idx, &second) in window.iter().zip(&to_second) {
+                    if second {
+                        new_order.push(idx);
+                    }
+                }
+                new_offsets.push(new_order.len());
+
                 additional_clusters += 1;
             } else {
                 new_centroids.push(self.centroids[i].clone());
-                new_inverted_lists.push(std::mem::take(&mut self.inverted_lists[i]));
+                new_order.extend_from_slice(self.inverted_lists.cluster(i));
+                new_offsets.push(new_order.len());
             }
         }
 
         self.centroids = new_centroids;
-        self.inverted_lists = new_inverted_lists;
+        self.inverted_lists = IvfInvertedLists {
+            offsets: new_offsets,
+            order: new_order,
+        };
         self.index_config.n_clusters = self.centroids.len();
 
         Ok(additional_clusters)
     }
 
     /// Split a cluster into two using K-means.
-    fn split_cluster_kmeans_k2(
-        &self,
-        vectors: Vec<(u64, String, Vector)>,
-    ) -> Result<SplitClusterResult> {
+    ///
+    /// `window` holds indices into `self.vectors` for the cluster being
+    /// split. Returns the two new centroids and a same-length,
+    /// same-order `Vec<bool>` saying whether each `window` entry belongs
+    /// to the second cluster (mirrors `window`'s indexing so the caller
+    /// can partition it with a single `zip`).
+    fn split_cluster_kmeans_k2(&self, window: &[u32]) -> Result<(Vector, Vector, Vec<bool>)> {
         use rand::prelude::*;
         // Deterministic training RNG (Issue #847); see KMEANS_RNG_SEED.
         let mut rng = rand::rngs::StdRng::seed_from_u64(KMEANS_RNG_SEED);
 
         // Pick two initial centroids
-        let idx1 = rng.random_range(0..vectors.len());
-        let mut idx2 = rng.random_range(0..vectors.len());
-        while idx1 == idx2 && vectors.len() > 1 {
-            idx2 = rng.random_range(0..vectors.len());
+        let idx1 = rng.random_range(0..window.len());
+        let mut idx2 = rng.random_range(0..window.len());
+        while idx1 == idx2 && window.len() > 1 {
+            idx2 = rng.random_range(0..window.len());
         }
 
-        let mut c1 = vectors[idx1].2.clone();
-        let mut c2 = vectors[idx2].2.clone();
+        let mut c1 = self.vectors[window[idx1] as usize].2.clone();
+        let mut c2 = self.vectors[window[idx2] as usize].2.clone();
 
-        let mut l1 = Vec::new();
-        let mut l2 = Vec::new();
-
-        // Simple 10 iterations of K-means
+        // Simple 10 iterations of K-means: assign against the current
+        // centroids, then recompute centroids from that assignment.
         for _ in 0..10 {
-            l1.clear();
-            l2.clear();
+            let assignment = self.assign_to_two(window, &c1, &c2);
+            if let Some(mean1) = self.mean_of_partition(window, &assignment, false) {
+                c1 = mean1;
+            }
+            if let Some(mean2) = self.mean_of_partition(window, &assignment, true) {
+                c2 = mean2;
+            }
+        }
 
-            for (_, _, vec) in &vectors {
+        // Final assignment against the fully-updated centroids (mirrors
+        // the previous implementation's separate post-loop pass).
+        let final_assignment = self.assign_to_two(window, &c1, &c2);
+        Ok((c1, c2, final_assignment))
+    }
+
+    /// Assign each `window` entry to `c1` (`false`) or `c2` (`true`).
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "intentionally mirrors the previous `if d1 < d2 { first } else { second }`, \
+                  which also puts a NaN distance (unreachable in practice: validate_vectors \
+                  rejects NaN/infinity input, and distance() errors are already replaced with \
+                  f32::INFINITY above) into the second partition"
+    )]
+    fn assign_to_two(&self, window: &[u32], c1: &Vector, c2: &Vector) -> Vec<bool> {
+        window
+            .iter()
+            .map(|&idx| {
+                let vec = &self.vectors[idx as usize].2;
                 let d1 = self
                     .index_config
                     .distance_metric
@@ -966,62 +1116,37 @@ impl IvfIndexWriter {
                     .distance_metric
                     .distance(&vec.data, &c2.data)
                     .unwrap_or(f32::INFINITY);
-
-                if d1 < d2 {
-                    l1.push((0, String::new(), vec.clone())); // We'll restore the actual IDs later
-                } else {
-                    l2.push((0, String::new(), vec.clone()));
-                }
-            }
-
-            // Update centroids
-            if !l1.is_empty() {
-                c1 = self.calculate_mean_vector(&l1);
-            }
-            if !l2.is_empty() {
-                c2 = self.calculate_mean_vector(&l2);
-            }
-        }
-
-        // Final assignment with original vectors to preserve IDs
-        l1.clear();
-        l2.clear();
-        for item in vectors {
-            let d1 = self
-                .index_config
-                .distance_metric
-                .distance(&item.2.data, &c1.data)
-                .unwrap_or(f32::INFINITY);
-            let d2 = self
-                .index_config
-                .distance_metric
-                .distance(&item.2.data, &c2.data)
-                .unwrap_or(f32::INFINITY);
-
-            if d1 < d2 {
-                l1.push(item);
-            } else {
-                l2.push(item);
-            }
-        }
-
-        Ok((c1, l1, c2, l2))
+                !(d1 < d2)
+            })
+            .collect()
     }
 
-    /// Calculate the mean vector for a list of vectors.
-    fn calculate_mean_vector(&self, list: &[(u64, String, Vector)]) -> Vector {
+    /// Mean vector of `window` entries whose `assignment` matches
+    /// `to_second`, or `None` if none match (mirrors the previous
+    /// "keep the old centroid when a partition is empty" behavior).
+    fn mean_of_partition(
+        &self,
+        window: &[u32],
+        assignment: &[bool],
+        to_second: bool,
+    ) -> Option<Vector> {
         let dim = self.index_config.dimension;
-        if list.is_empty() {
-            return Vector::new(vec![0.0; dim]);
-        }
-        let mut sum = vec![0.0; dim];
-        for (_, _, vec) in list {
-            for (j, &val) in vec.data.iter().enumerate() {
-                sum[j] += val;
+        let mut sum = vec![0.0f32; dim];
+        let mut count = 0usize;
+        for (&idx, &second) in window.iter().zip(assignment) {
+            if second == to_second {
+                let vec = &self.vectors[idx as usize].2;
+                for (j, &val) in vec.data.iter().enumerate() {
+                    sum[j] += val;
+                }
+                count += 1;
             }
         }
-        let data: Vec<f32> = sum.iter().map(|&s| s / list.len() as f32).collect();
-        Vector::new(data)
+        if count == 0 {
+            None
+        } else {
+            Some(Vector::new(sum.iter().map(|&s| s / count as f32).collect()))
+        }
     }
     // optimize method moved to VectorIndexWriter trait implementation
 }
@@ -1127,9 +1252,9 @@ impl VectorIndexWriter for IvfIndexWriter {
         let centroid_memory = self.centroids.len()
             * (self.index_config.dimension * 4 + std::mem::size_of::<Vector>());
 
-        // Inverted list overhead (pointers and metadata)
-        let inverted_list_memory =
-            self.inverted_lists.len() * (std::mem::size_of::<Vec<(u64, String, Vector)>>() + 64); // Rough estimate
+        // Inverted list overhead: the CSR permutation itself (Issue #629).
+        let inverted_list_memory = self.inverted_lists.offsets.len() * std::mem::size_of::<usize>()
+            + self.inverted_lists.order.len() * std::mem::size_of::<u32>();
 
         let metadata_memory = self.vectors.len() * 64;
 
@@ -1183,14 +1308,23 @@ impl VectorIndexWriter for IvfIndexWriter {
             }
         }
 
+        debug_assert_eq!(
+            self.centroids.len(),
+            self.inverted_lists.cluster_count(),
+            "centroid count must match the CSR cluster count"
+        );
+
         // Issue #481 Stage 1, Step 7: train per-segment SQ params on
         // ALL vectors across ALL inverted lists (segment-wide single
         // (offset, scale) pair) and emit the LVS1 header before the
-        // inverted-list data.
+        // inverted-list data. `self.inverted_lists.order` is already in
+        // cluster-grouped emission order (Issue #629), so this walks the
+        // permutation once instead of flattening a `Vec<Vec<_>>`.
         let all_vectors: Vec<Vector> = self
             .inverted_lists
+            .order
             .iter()
-            .flat_map(|list| list.iter().map(|(_, _, v)| v.clone()))
+            .map(|&idx| self.vectors[idx as usize].2.clone())
             .collect();
         let (params, records) = if all_vectors.is_empty() {
             (
@@ -1208,8 +1342,9 @@ impl VectorIndexWriter for IvfIndexWriter {
         // below (the same order the flatten above walked).
         let (field_dict, field_ids) = build_field_dict(
             self.inverted_lists
+                .order
                 .iter()
-                .flat_map(|list| list.iter().map(|(_, f, _)| f.as_str())),
+                .map(|&idx| self.vectors[idx as usize].1.as_str()),
         )?;
         VectorSegmentHeader::scalar_8bit(params)
             .with_version(VERSION_FIELD_DICT)
@@ -1218,11 +1353,13 @@ impl VectorIndexWriter for IvfIndexWriter {
 
         // Write inverted lists with quantized records. The records
         // were produced in flatten order, so we step through them in
-        // the same order while emitting each list.
+        // the same order while emitting each cluster's window.
         let mut record_iter = records.into_iter();
-        for list in &self.inverted_lists {
-            output.write_all(&(list.len() as u32).to_le_bytes())?;
-            for (doc_id, field_name, _) in list {
+        for i in 0..self.inverted_lists.cluster_count() {
+            let window = self.inverted_lists.cluster(i);
+            output.write_all(&(window.len() as u32).to_le_bytes())?;
+            for &idx in window {
+                let (doc_id, field_name, _) = &self.vectors[idx as usize];
                 output.write_all(&doc_id.to_le_bytes())?;
                 output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
 
@@ -1309,6 +1446,12 @@ impl VectorIndexWriter for IvfIndexWriter {
 
     fn close(&mut self) -> Result<()> {
         self.vectors.clear();
+        // `inverted_lists.order` permutes into `self.vectors` (Issue
+        // #629); clearing it here keeps `get_cluster_stats` (whose only
+        // guard is `is_finalized`, which this method sets to `true`
+        // without going through `build_inverted_lists`) from indexing
+        // the now-empty `vectors` with a stale permutation.
+        self.inverted_lists.clear();
         self.is_finalized = true;
         Ok(())
     }
@@ -1336,9 +1479,7 @@ impl VectorIndexWriter for IvfIndexWriter {
         // For now, just compact memory
         self.vectors.shrink_to_fit();
         self.centroids.shrink_to_fit();
-        for list in &mut self.inverted_lists {
-            list.shrink_to_fit();
-        }
+        self.inverted_lists.shrink_to_fit();
 
         Ok(())
     }
@@ -1413,11 +1554,14 @@ mod tests {
                 .iter()
                 .map(|c| c.data.iter().map(|f| f.to_bits()).collect())
                 .collect();
-            let assignments: Vec<Vec<u64>> = writer
-                .inverted_lists
-                .iter()
-                .map(|list| {
-                    let mut ids: Vec<u64> = list.iter().map(|(id, _, _)| *id).collect();
+            let assignments: Vec<Vec<u64>> = (0..writer.inverted_lists.cluster_count())
+                .map(|i| {
+                    let mut ids: Vec<u64> = writer
+                        .inverted_lists
+                        .cluster(i)
+                        .iter()
+                        .map(|&idx| writer.vectors[idx as usize].0)
+                        .collect();
                     ids.sort_unstable();
                     ids
                 })
@@ -1455,5 +1599,149 @@ mod tests {
         writer.finalize().unwrap();
         assert_eq!(writer.centroids().len(), 0);
         assert_eq!(writer.ivf_params().0, 0, "n_clusters must be reset to 0");
+    }
+
+    /// Issue #629: the per-cluster doc_id sort in `build_inverted_lists`
+    /// must be *stable* -- multiple records sharing a doc_id (distinct
+    /// fields of the same document, all landing in the same cluster)
+    /// must keep their original relative order, matching the previous
+    /// per-list `sort_by_key` (also stable).
+    #[test]
+    fn build_inverted_lists_sorts_stably_preserving_insertion_order_on_doc_id_ties() {
+        let config = IvfIndexConfig {
+            dimension: 1,
+            n_clusters: 1,
+            n_probe: 1,
+            normalize_vectors: false,
+            ..Default::default()
+        };
+        let mut writer =
+            IvfIndexWriter::new(config, VectorIndexWriterConfig::default(), "stability").unwrap();
+
+        // A run large enough to force real quicksort-style partitioning
+        // (a handful of elements can accidentally stay in order even
+        // under an unstable sort, e.g. via insertion-sort fallback for
+        // tiny slices). Interleave three duplicate doc_ids so ties are
+        // scattered across partitions, not adjacent.
+        let mut input = Vec::new();
+        let expected_tag_order_within_ties: Vec<u64> = (0..60).map(|i| i % 3).collect();
+        for (i, &tag) in expected_tag_order_within_ties.iter().enumerate() {
+            // doc_id cycles through {10, 20, 30}; `tag` (0/1/2) also
+            // tracks *which occurrence* of that doc_id this is, encoded
+            // into the field name so we can recover insertion order.
+            let doc_id = 10 * (tag + 1);
+            input.push((doc_id, format!("occ{i}"), Vector::new(vec![0.0])));
+        }
+        writer.add_vectors(input.clone()).unwrap();
+        writer.finalize().unwrap();
+
+        let window = writer.inverted_lists.cluster(0);
+        let occurrences: Vec<&str> = window
+            .iter()
+            .map(|&idx| writer.vectors[idx as usize].1.as_str())
+            .collect();
+        let expected: Vec<&str> = {
+            let mut by_doc_id: Vec<(u64, &str)> = input
+                .iter()
+                .map(|(id, field, _)| (*id, field.as_str()))
+                .collect();
+            by_doc_id.sort_by_key(|&(id, _)| id); // stable: ties keep insertion order
+            by_doc_id.into_iter().map(|(_, field)| field).collect()
+        };
+        assert_eq!(
+            occurrences, expected,
+            "records sharing a doc_id must stay in their original insertion order"
+        );
+    }
+
+    /// Issue #629: with zero clusters, `IvfInvertedLists::offsets` must be
+    /// `[0]` (length 1, `cluster_count() == 0`), not empty -- an empty
+    /// `offsets` would make `cluster_count()`'s `saturating_sub(1)` also
+    /// read `0` by luck, but `cluster(0)` would then read past the end
+    /// via `offsets.get(1)` returning `None` for the WRONG reason (no
+    /// element at all, rather than "index out of the valid range").
+    #[test]
+    fn build_inverted_lists_zero_clusters_has_single_offset() {
+        let config = IvfIndexConfig {
+            dimension: 4,
+            n_clusters: 8,
+            n_probe: 1,
+            ..Default::default()
+        };
+        let mut writer =
+            IvfIndexWriter::new(config, VectorIndexWriterConfig::default(), "zero_clusters")
+                .unwrap();
+
+        writer.finalize().unwrap();
+
+        assert_eq!(writer.inverted_lists.offsets, vec![0]);
+        assert_eq!(writer.inverted_lists.cluster_count(), 0);
+        assert_eq!(writer.inverted_lists.cluster(0), &[] as &[u32]);
+    }
+
+    /// Issue #629: `IvfInvertedLists::cluster` must return `&[]` for any
+    /// out-of-range index, including exactly `cluster_count()` (the
+    /// off-by-one a naive `offsets[idx]` would get wrong) and indices far
+    /// beyond it.
+    #[test]
+    fn cluster_out_of_range_returns_empty_slice() {
+        let config = IvfIndexConfig {
+            dimension: 2,
+            n_clusters: 3,
+            n_probe: 1,
+            normalize_vectors: false,
+            ..Default::default()
+        };
+        let mut writer =
+            IvfIndexWriter::new(config, VectorIndexWriterConfig::default(), "out_of_range")
+                .unwrap();
+        writer.add_vectors(lcg_vectors(30, 2)).expect("add_vectors");
+        writer.finalize().unwrap();
+
+        let cluster_count = writer.inverted_lists.cluster_count();
+        assert!(cluster_count > 0);
+        assert_eq!(writer.inverted_lists.cluster(cluster_count), &[] as &[u32]);
+        assert_eq!(
+            writer.inverted_lists.cluster(cluster_count + 1000),
+            &[] as &[u32]
+        );
+    }
+
+    /// Issue #629: `order` is a permutation into `self.vectors`, so
+    /// `close()` (which clears `vectors` while forcing `is_finalized =
+    /// true`, bypassing `build_inverted_lists`) must also clear the CSR --
+    /// otherwise `get_cluster_stats()` would index the now-empty `vectors`
+    /// with stale indices and panic. Before Issue #629 this was merely
+    /// stale-but-harmless (each cluster owned its own copy); the
+    /// permutation representation turns it into a real out-of-bounds risk.
+    #[test]
+    fn get_cluster_stats_after_close_does_not_panic() {
+        let config = IvfIndexConfig {
+            dimension: 2,
+            n_clusters: 3,
+            n_probe: 1,
+            normalize_vectors: false,
+            ..Default::default()
+        };
+        let mut writer =
+            IvfIndexWriter::new(config, VectorIndexWriterConfig::default(), "close_safety")
+                .unwrap();
+        writer.add_vectors(lcg_vectors(30, 2)).expect("add_vectors");
+        writer.finalize().unwrap();
+        assert!(!writer.get_cluster_stats().is_empty());
+
+        writer.close().unwrap();
+
+        // `close()` does not clear `centroids`, so `get_cluster_stats`'s
+        // `is_finalized`/`centroids.is_empty()` guard still lets it
+        // proceed -- the property under test is that it does not panic
+        // indexing the now-empty `vectors`, reporting zero members per
+        // cluster instead.
+        let stats = writer.get_cluster_stats();
+        assert!(!stats.is_empty());
+        assert!(
+            stats.iter().all(|s| s.count == 0),
+            "no vectors remain after close(), so every cluster must report zero members"
+        );
     }
 }
