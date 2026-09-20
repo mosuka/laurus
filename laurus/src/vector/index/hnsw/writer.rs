@@ -40,6 +40,33 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 /// Lucene's `HnswGraphBuilder` builds with `DEFAULT_RAND_SEED = 42`.
 const LEVEL_RNG_SEED: u64 = 42;
 
+/// Derive an independent, deterministic RNG seed for `doc_id`'s level
+/// assignment (Issue #637).
+///
+/// Advancing one shared sequential RNG across every node (the pre-#637
+/// approach) makes node N's draw depend on how many random numbers every
+/// prior node happened to consume, which serializes level assignment onto
+/// the main thread before the parallel insertion phase can even start.
+/// Seeding a fresh RNG per doc_id from a well-mixed hash of
+/// `(LEVEL_RNG_SEED, doc_id)` instead makes each node's level computable
+/// independently — and therefore in parallel via `rayon::par_iter` — while
+/// staying deterministic for that doc_id regardless of thread scheduling
+/// (preserving Issue #841's invariant under a different exact RNG stream;
+/// the specific levels a given corpus produces change, but build-to-build
+/// reproducibility for the same corpus does not).
+///
+/// The mixing step is the SplitMix64 finalizer: a plain `SEED ^ doc_id`
+/// would leave sequential doc_ids (0, 1, 2, ...) producing seeds that
+/// differ only in a few low bits, which does not scramble a PRNG's early
+/// output well.
+#[inline]
+fn level_rng_seed_for(doc_id: u64) -> u64 {
+    let mut z = LEVEL_RNG_SEED ^ doc_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Minimum vector count for training a PQ codebook (Issue #880).
 ///
 /// PQ k-means fits 256 centroids per sub-quantizer; training on fewer
@@ -921,9 +948,10 @@ impl HnswIndexWriter {
     ///
     /// # Arguments
     ///
-    /// * `rng` - The build-scoped level RNG, seeded with
-    ///   [`LEVEL_RNG_SEED`] so graph topology is deterministic for a
-    ///   given insertion order (Issue #841).
+    /// * `rng` - A caller-supplied RNG. Callers seed one independently per
+    ///   node via [`level_rng_seed_for`] so level assignment parallelizes
+    ///   across nodes (Issue #637) while staying deterministic for a given
+    ///   doc_id (Issue #841).
     ///
     /// # Returns
     ///
@@ -1036,12 +1064,7 @@ impl HnswIndexWriter {
         let ef_construction = self.index_config.ef_construction;
 
         // Determine which vectors are new and need insertion
-        let mut new_node_levels = Vec::new(); // (doc_id, level)
         let mut new_doc_ids_in_order = Vec::new();
-
-        // Deterministic level RNG (Issue #841): one seeded generator per
-        // build, threaded through the serial level-assignment loops below.
-        let mut level_rng = rand::rngs::StdRng::seed_from_u64(LEVEL_RNG_SEED);
 
         // Rebuild from scratch instead of appending when the loaded base is
         // too small to serve as a routing hierarchy for the new nodes (Issue
@@ -1069,11 +1092,18 @@ impl HnswIndexWriter {
                 }
                 new_doc_ids_in_order.sort_unstable();
 
-                // Assign levels to new vectors
-                for doc_id in &new_doc_ids_in_order {
-                    let level = self.select_layer(&mut level_rng);
-                    new_node_levels.push((*doc_id, level));
-                }
+                // Assign levels to new vectors. Parallel + per-doc-id-seeded
+                // (Issue #637): each node's level is computed independently,
+                // so this scales across threads instead of serializing ~N
+                // RNG calls on the main thread before the parallel insertion
+                // phase below even starts.
+                let new_node_levels: Vec<(u64, usize)> = new_doc_ids_in_order
+                    .par_iter()
+                    .map(|&doc_id| {
+                        let mut rng = rand::rngs::StdRng::seed_from_u64(level_rng_seed_for(doc_id));
+                        (doc_id, self.select_layer(&mut rng))
+                    })
+                    .collect();
 
                 let current_max_level = existing_graph.max_level;
                 let new_max_level = new_node_levels.iter().map(|(_, l)| *l).max().unwrap_or(0);
@@ -1123,10 +1153,15 @@ impl HnswIndexWriter {
                     self.vectors.iter().map(|(id, _, _)| *id).collect();
                 doc_ids_in_order.sort_unstable();
 
-                for doc_id in &doc_ids_in_order {
-                    let level = self.select_layer(&mut level_rng);
-                    new_node_levels.push((*doc_id, level));
-                }
+                // Parallel + per-doc-id-seeded, same as the incremental
+                // path above (Issue #637).
+                let new_node_levels: Vec<(u64, usize)> = doc_ids_in_order
+                    .par_iter()
+                    .map(|&doc_id| {
+                        let mut rng = rand::rngs::StdRng::seed_from_u64(level_rng_seed_for(doc_id));
+                        (doc_id, self.select_layer(&mut rng))
+                    })
+                    .collect();
 
                 let max_level = new_node_levels.iter().map(|(_, l)| *l).max().unwrap_or(0);
                 let ep = new_node_levels
