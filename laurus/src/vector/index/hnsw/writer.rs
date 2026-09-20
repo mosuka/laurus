@@ -967,6 +967,35 @@ impl HnswIndexWriter {
         layer
     }
 
+    /// Assign a level to each doc_id in `doc_ids`, in parallel when not
+    /// targeting wasm32 (Issue #637). `rayon` has no thread pool on
+    /// `wasm32-unknown-unknown`, so that target falls back to a plain
+    /// sequential loop; both paths use the same per-doc-id-seeded scheme
+    /// (`level_rng_seed_for`), so the result is identical either way, just
+    /// computed with or without threads.
+    fn assign_levels(&self, doc_ids: &[u64]) -> Vec<(u64, usize)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            doc_ids
+                .par_iter()
+                .map(|&doc_id| {
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(level_rng_seed_for(doc_id));
+                    (doc_id, self.select_layer(&mut rng))
+                })
+                .collect()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            doc_ids
+                .iter()
+                .map(|&doc_id| {
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(level_rng_seed_for(doc_id));
+                    (doc_id, self.select_layer(&mut rng))
+                })
+                .collect()
+        }
+    }
+
     /// Calculate the maximum level based on M and ef_construction.
     /// This is a heuristic, often 1/ln(M) or 1/ln(2) is used for probability.
     /// For simplicity, we can cap it or use a fixed formula.
@@ -1092,18 +1121,8 @@ impl HnswIndexWriter {
                 }
                 new_doc_ids_in_order.sort_unstable();
 
-                // Assign levels to new vectors. Parallel + per-doc-id-seeded
-                // (Issue #637): each node's level is computed independently,
-                // so this scales across threads instead of serializing ~N
-                // RNG calls on the main thread before the parallel insertion
-                // phase below even starts.
-                let new_node_levels: Vec<(u64, usize)> = new_doc_ids_in_order
-                    .par_iter()
-                    .map(|&doc_id| {
-                        let mut rng = rand::rngs::StdRng::seed_from_u64(level_rng_seed_for(doc_id));
-                        (doc_id, self.select_layer(&mut rng))
-                    })
-                    .collect();
+                // Assign levels to new vectors (Issue #637).
+                let new_node_levels: Vec<(u64, usize)> = self.assign_levels(&new_doc_ids_in_order);
 
                 let current_max_level = existing_graph.max_level;
                 let new_max_level = new_node_levels.iter().map(|(_, l)| *l).max().unwrap_or(0);
@@ -1153,15 +1172,8 @@ impl HnswIndexWriter {
                     self.vectors.iter().map(|(id, _, _)| *id).collect();
                 doc_ids_in_order.sort_unstable();
 
-                // Parallel + per-doc-id-seeded, same as the incremental
-                // path above (Issue #637).
-                let new_node_levels: Vec<(u64, usize)> = doc_ids_in_order
-                    .par_iter()
-                    .map(|&doc_id| {
-                        let mut rng = rand::rngs::StdRng::seed_from_u64(level_rng_seed_for(doc_id));
-                        (doc_id, self.select_layer(&mut rng))
-                    })
-                    .collect();
+                // Assign levels to all vectors (Issue #637).
+                let new_node_levels: Vec<(u64, usize)> = self.assign_levels(&doc_ids_in_order);
 
                 let max_level = new_node_levels.iter().map(|(_, l)| *l).max().unwrap_or(0);
                 let ep = new_node_levels
