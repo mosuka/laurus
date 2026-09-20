@@ -2823,7 +2823,7 @@ dependencies = [
  "lindera-dictionary",
  "log",
  "lru",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "memmap2",
  "num_cpus",
  "parking_lot",
@@ -3196,6 +3196,12 @@ checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 dependencies = [
  "twox-hash",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "lzma-rust2"
@@ -6994,7 +7000,7 @@ dependencies = [
  "getrandom 0.4.3",
  "heapify",
  "itertools 0.14.0",
- "lz4_flex",
+ "lz4_flex 0.13.1",
  "more-asserts",
  "rand 0.10.2",
  "regex",
