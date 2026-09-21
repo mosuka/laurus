@@ -432,3 +432,86 @@ fn optimize_write_load_round_trip_preserves_all_vectors() {
         "cluster membership must account for every loaded vector"
     );
 }
+
+/// Issue #1152: `IvfVectorIterator::skip_to` assumed `vector_ids` was
+/// globally ascending by `(doc_id, field_name)`, but it's only sorted
+/// *within* each cluster window. `next()` must yield doc_ids in global
+/// order regardless of the underlying cluster-grouped physical layout.
+#[test]
+fn vector_iterator_yields_globally_ascending_doc_ids_despite_cluster_grouped_storage() {
+    use crate::vector::index::ivf::reader::IvfIndexReader;
+    use crate::vector::reader::VectorIndexReader;
+
+    let storage = build_singleton_cluster_index("skip_to_ordering");
+    let reader =
+        IvfIndexReader::load(storage, "skip_to_ordering", DistanceMetric::Euclidean).unwrap();
+
+    // Precondition: the physical (cluster-grouped) layout must NOT
+    // already happen to be globally sorted by doc_id, or this fixture
+    // wouldn't actually exercise the bug.
+    let mut running_max: Option<u64> = None;
+    let mut scrambled = false;
+    for c in 0..12 {
+        for &(doc_id, _) in reader.cluster_vectors(c) {
+            if let Some(max_so_far) = running_max
+                && doc_id < max_so_far
+            {
+                scrambled = true;
+            }
+            running_max = Some(running_max.map_or(doc_id, |m| m.max(doc_id)));
+        }
+    }
+    assert!(
+        scrambled,
+        "fixture must straddle cluster boundaries out of doc_id order to exercise the bug"
+    );
+
+    let mut iter = reader.vector_iterator().unwrap();
+    let mut seen = Vec::new();
+    while let Some((doc_id, _, _)) = iter.next().unwrap() {
+        seen.push(doc_id);
+    }
+    assert_eq!(seen.len(), 12);
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        seen, sorted,
+        "vector_iterator must yield doc_ids in globally ascending order"
+    );
+}
+
+/// Issue #1152: `skip_to(doc_id, field)` must return the correct
+/// lower-bound key even when the sought key lies in a cluster whose
+/// physical position is earlier or later than clusters holding smaller
+/// doc_ids.
+#[test]
+fn skip_to_returns_correct_lower_bound_despite_cluster_grouped_storage() {
+    use crate::vector::index::ivf::reader::IvfIndexReader;
+    use crate::vector::reader::VectorIndexReader;
+
+    let storage = build_singleton_cluster_index("skip_to_lower_bound");
+    let reader =
+        IvfIndexReader::load(storage, "skip_to_lower_bound", DistanceMetric::Euclidean).unwrap();
+
+    // Brute-force expectation: doc_ids 0..12, each with field "f" (per
+    // build_singleton_cluster_index), globally sorted.
+    let expected_ids: Vec<u64> = (0..12).collect();
+
+    for target in 0..14u64 {
+        let mut iter = reader.vector_iterator().unwrap();
+        let found = iter.skip_to(target, "f").unwrap();
+        match expected_ids.iter().copied().find(|&id| id >= target) {
+            Some(expected_id) => {
+                assert!(found, "expected to find a key >= {target}");
+                assert_eq!(
+                    iter.position().0,
+                    expected_id,
+                    "skip_to({target}, _) landed on the wrong doc_id"
+                );
+            }
+            None => {
+                assert!(!found, "no key >= {target} should exist");
+            }
+        }
+    }
+}
