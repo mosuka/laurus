@@ -360,6 +360,20 @@ fn packed_byte_len(count: usize, bits: u8) -> usize {
     (count * bits as usize).div_ceil(8)
 }
 
+/// Validates that `len` (a point/doc_id count) fits in `u32`, the width
+/// [`BKDWriter::write`] uses for its index permutation.
+///
+/// Extracted from `write` as its own function so the `u32::MAX` boundary can
+/// be unit-tested directly on the `usize` value, without allocating the
+/// multi-gigabyte buffer a real out-of-range call would require.
+fn checked_point_count_u32(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        crate::error::LaurusError::index(format!(
+            "BKD point count {len} exceeds u32::MAX; cannot build index permutation"
+        ))
+    })
+}
+
 /// Sortable-space anchor and bit width for one dimension's delta-from-min
 /// packing, derived from that dimension's `leaf_min`/`leaf_max`.
 ///
@@ -521,6 +535,10 @@ impl<W: StorageOutput> BKDWriter<W> {
             )));
         }
 
+        // The index permutation built below is `Vec<u32>`; reject inputs that
+        // wouldn't fit before any I/O happens rather than silently truncating.
+        let point_count = checked_point_count_u32(doc_ids.len())?;
+
         if doc_ids.is_empty() {
             // Write basic header for empty tree
             self.write_header(0, 0, 0)?;
@@ -565,7 +583,7 @@ impl<W: StorageOutput> BKDWriter<W> {
 
         // Sort an index permutation instead of the data: this keeps the
         // point/doc_id buffers immutable and avoids per-point allocations.
-        let mut indices: Vec<u32> = (0..doc_ids.len() as u32).collect();
+        let mut indices: Vec<u32> = (0..point_count).collect();
         let ctx = BuildContext {
             points,
             doc_ids,
@@ -2655,5 +2673,26 @@ mod tests {
             msg.contains("first packed doc_id delta"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// Issue #1159: `checked_point_count_u32` must accept every length that
+    /// actually fits in a `u32`, including the boundary value itself.
+    #[test]
+    fn checked_point_count_u32_accepts_representable_lengths() {
+        assert_eq!(checked_point_count_u32(0).unwrap(), 0);
+        assert_eq!(checked_point_count_u32(5).unwrap(), 5);
+        assert_eq!(
+            checked_point_count_u32(u32::MAX as usize).unwrap(),
+            u32::MAX
+        );
+    }
+
+    /// Issue #1159: a length one past `u32::MAX` must be rejected with an
+    /// error, not silently truncated by an `as u32` cast.
+    #[test]
+    fn checked_point_count_u32_rejects_lengths_beyond_u32_max() {
+        let err = checked_point_count_u32(u32::MAX as usize + 1).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("exceeds u32::MAX"), "unexpected error: {msg}");
     }
 }
