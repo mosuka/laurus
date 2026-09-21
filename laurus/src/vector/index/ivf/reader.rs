@@ -21,14 +21,18 @@ use std::io::SeekFrom;
 
 /// Reader for IVF (Inverted File) vector indexes.
 ///
-/// Maintains a per-cluster inverted list (`cluster_to_vectors`) so that the
-/// [`IvfSearcher`](super::searcher::IvfSearcher) can restrict distance
-/// computations to vectors belonging to the `n_probe` nearest clusters.
+/// Maintains per-cluster boundaries (`cluster_offsets`) into the flat
+/// `vector_ids` so that the [`IvfSearcher`](super::searcher::IvfSearcher)
+/// can restrict distance computations to vectors belonging to the
+/// `n_probe` nearest clusters.
 #[derive(Debug)]
 pub struct IvfIndexReader {
     vectors: VectorStorage,
-    /// `(doc_id, field_id)` per record; ids index [`Self::field_dict`]
-    /// (Issue #633 PR-B — interned, no per-record heap `String`).
+    /// `(doc_id, field_id)` per record, in cluster-grouped order; ids
+    /// index [`Self::field_dict`] (Issue #633 PR-B — interned, no
+    /// per-record heap `String`). This order is load-bearing: it's the
+    /// same order the `.f32` rerank sidecar payload was written in
+    /// (see `rerank_storage`), and [`Self::cluster_offsets`] slices it.
     vector_ids: Vec<(u64, u16)>,
     /// Per-segment field-name dictionary (synthesized at load for
     /// v1/v2 segments, taken from the header for v3).
@@ -38,9 +42,15 @@ pub struct IvfIndexReader {
     n_clusters: usize,
     n_probe: usize,
     centroids: Vec<Vector>,
-    /// Per-cluster inverted list: `cluster_to_vectors[i]` contains the
-    /// `(doc_id, field_id)` pairs assigned to cluster `i`.
-    cluster_to_vectors: Vec<Vec<(u64, u16)>>,
+    /// CSR cluster boundaries into `vector_ids` (Issue #629):
+    /// `cluster_offsets[i]..cluster_offsets[i+1]` is cluster `i`'s slice.
+    /// Length is always `n_clusters + 1` (previously
+    /// `cluster_to_vectors: Vec<Vec<(u64, u16)>>` duplicated `vector_ids`
+    /// by re-chunking it per cluster; both loading branches already
+    /// pushed into `vector_ids` and the per-cluster list in the same
+    /// loop, so the per-cluster list carried no information `vector_ids`
+    /// plus these boundaries doesn't already have).
+    cluster_offsets: Vec<usize>,
     deletion_bitmap: Option<Arc<DeletionBitmap>>,
     /// Pre-built per-field doc-id list (`field_name → Arc<[u64]>`). Built
     /// once at load so `doc_ids_for_field` returns a refcount-shared
@@ -187,10 +197,14 @@ impl IvfIndexReader {
         let record_stride =
             record_prefix_size(header.version) + quantized_record_payload_size(dimension) as u64;
 
-        // Read inverted lists, preserving per-cluster grouping. Each cluster
-        // serializes at least its list_size (4 bytes).
+        // Read inverted lists, preserving per-cluster grouping via
+        // `cluster_offsets` (Issue #629) instead of a separate per-cluster
+        // `Vec` — `vector_ids` is already read in cluster-grouped order
+        // below, so the offsets alone are enough to slice it per cluster.
+        // Each cluster serializes at least its list_size (4 bytes).
         checked_capacity(n_clusters, 4, lists_remaining, "ivf cluster lists")?;
-        let mut cluster_to_vectors: Vec<Vec<(u64, u16)>> = Vec::with_capacity(n_clusters);
+        let mut cluster_offsets: Vec<usize> = Vec::with_capacity(n_clusters + 1);
+        cluster_offsets.push(0);
 
         // Interned field ids (Issue #633 PR-B): one shared dictionary per
         // segment instead of 3 retained `String`s per record.
@@ -213,7 +227,6 @@ impl IvfIndexReader {
                     input.read_exact(&mut list_size_buf)?;
                     let list_size = u32::from_le_bytes(list_size_buf) as usize;
                     checked_capacity(list_size, record_stride, lists_remaining, "ivf list_size")?;
-                    let mut cluster_vecs = Vec::with_capacity(list_size);
 
                     for _ in 0..list_size {
                         let mut doc_id_buf = [0u8; 8];
@@ -239,13 +252,12 @@ impl IvfIndexReader {
                             norm_q: f32::from_le_bytes(norm_q_buf),
                         };
 
-                        cluster_vecs.push((doc_id, fid));
                         vector_ids.push((doc_id, fid));
                         // Transient clone for the pool's String-shaped build
                         // input; the pool retains only per-field keys.
                         records.push((doc_id, interner.name(fid).to_string(), int8, meta));
                     }
-                    cluster_to_vectors.push(cluster_vecs);
+                    cluster_offsets.push(vector_ids.len());
                 }
                 let pool = QuantizedVectorPool::build(params, dimension, records);
                 (
@@ -270,7 +282,6 @@ impl IvfIndexReader {
                     input.read_exact(&mut list_size_buf)?;
                     let list_size = u32::from_le_bytes(list_size_buf) as usize;
                     checked_capacity(list_size, record_stride, lists_remaining, "ivf list_size")?;
-                    let mut cluster_vecs = Vec::with_capacity(list_size);
 
                     for _ in 0..list_size {
                         let mut doc_id_buf = [0u8; 8];
@@ -289,7 +300,6 @@ impl IvfIndexReader {
                         // straight to the int8 data (Issue #633).
                         let payload_offset = input.stream_position().map_err(LaurusError::Io)?;
                         offsets.insert((doc_id, fid), payload_offset);
-                        cluster_vecs.push((doc_id, fid));
                         vector_ids.push((doc_id, fid));
 
                         // Skip int8 payload + per-vector meta.
@@ -297,7 +307,7 @@ impl IvfIndexReader {
                             .seek(SeekFrom::Current(quant_payload_size))
                             .map_err(LaurusError::Io)?;
                     }
-                    cluster_to_vectors.push(cluster_vecs);
+                    cluster_offsets.push(vector_ids.len());
                 }
                 let field_dict = interner.into_dict();
                 (
@@ -338,7 +348,7 @@ impl IvfIndexReader {
             n_clusters,
             n_probe,
             centroids,
-            cluster_to_vectors,
+            cluster_offsets,
             field_dict,
             deletion_bitmap: None,
             vector_ids_by_field,
@@ -405,10 +415,13 @@ impl IvfIndexReader {
     }
 
     pub fn cluster_vectors(&self, cluster_idx: usize) -> &[(u64, u16)] {
-        self.cluster_to_vectors
-            .get(cluster_idx)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        let (Some(&start), Some(&end)) = (
+            self.cluster_offsets.get(cluster_idx),
+            self.cluster_offsets.get(cluster_idx + 1),
+        ) else {
+            return &[];
+        };
+        &self.vector_ids[start..end]
     }
 }
 

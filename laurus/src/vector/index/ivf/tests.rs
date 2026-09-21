@@ -1,3 +1,4 @@
+use crate::storage::Storage;
 use crate::storage::memory::MemoryStorage;
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::vector::Vector;
@@ -269,5 +270,165 @@ fn test_ivf_index_searcher_uses_configured_n_probe() {
     assert_eq!(
         results.candidates_examined, 5,
         "IvfIndex::searcher() should probe the configured n_probe (5) clusters"
+    );
+}
+
+/// Read a whole file back out of a [`MemoryStorage`] for byte-identity
+/// comparisons.
+fn read_file_bytes(storage: &Arc<MemoryStorage>, name: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut input = storage.open_input(name).unwrap();
+    let mut buf = Vec::new();
+    input.read_to_end(&mut buf).unwrap();
+    buf
+}
+
+/// Issue #629: the CSR-permutation rewrite of `inverted_lists` must not
+/// introduce any nondeterminism into `write()`'s on-disk byte layout.
+/// Two independently-built writers over the same corpus (multi-field,
+/// including a repeated doc_id across fields to exercise the CSR sort's
+/// tie-breaking) must serialize to byte-identical `.ivf` files.
+#[test]
+fn write_output_is_byte_identical_across_independent_builds() {
+    fn build_and_write(name: &str) -> (Arc<MemoryStorage>, Vec<u8>) {
+        let storage = Arc::new(MemoryStorage::default());
+        let config = IvfIndexConfig {
+            dimension: 3,
+            distance_metric: DistanceMetric::Euclidean,
+            n_clusters: 4,
+            n_probe: 2,
+            normalize_vectors: false,
+            ..IvfIndexConfig::default()
+        };
+        let mut writer = IvfIndexWriter::with_storage(
+            config,
+            VectorIndexWriterConfig::default(),
+            name,
+            storage.clone(),
+        )
+        .unwrap();
+
+        let mut vectors = Vec::new();
+        for i in 0..40u64 {
+            let base = (i % 7) as f32 * 10.0;
+            vectors.push((
+                i,
+                "embedding".to_string(),
+                Vector::new(vec![base, base + 1.0, base + 2.0]),
+            ));
+            // Same doc_id, different field, landing in the same cluster as
+            // its sibling above -- exercises the CSR build's stable sort
+            // tie-breaking on equal doc_id.
+            vectors.push((
+                i,
+                "summary".to_string(),
+                Vector::new(vec![base, base + 1.0, base + 2.0]),
+            ));
+        }
+
+        writer.build(vectors).unwrap();
+        writer.finalize().unwrap();
+        writer.write().unwrap();
+
+        let bytes = read_file_bytes(&storage, &format!("{name}.ivf"));
+        (storage, bytes)
+    }
+
+    let (_storage_a, bytes_a) = build_and_write("byte_identity_a");
+    let (_storage_b, bytes_b) = build_and_write("byte_identity_b");
+
+    assert!(!bytes_a.is_empty());
+    assert_eq!(
+        bytes_a, bytes_b,
+        "identical input must serialize to identical .ivf bytes"
+    );
+}
+
+/// Issue #629: `optimize()` (merge_sparse_clusters + split_dense_clusters)
+/// followed by `write()` and `load()` was previously uncovered by any
+/// test -- the permutation-based CSR rewrite makes this path load-bearing
+/// (a wrong offset/order here would corrupt or lose records), so this
+/// round-trips it and checks every vector survives with its cluster
+/// membership intact.
+#[test]
+fn optimize_write_load_round_trip_preserves_all_vectors() {
+    let storage = Arc::new(MemoryStorage::default());
+    let config = IvfIndexConfig {
+        dimension: 2,
+        distance_metric: DistanceMetric::Euclidean,
+        n_clusters: 4,
+        n_probe: 2,
+        normalize_vectors: false,
+        ..IvfIndexConfig::default()
+    };
+    let writer_config = VectorIndexWriterConfig::default();
+
+    let mut writer = IvfIndexWriter::with_storage(
+        config,
+        writer_config.clone(),
+        "optimize_round_trip",
+        storage.clone(),
+    )
+    .unwrap();
+
+    // Same imbalanced-cluster shape as `test_ivf_partition_rebalancing`,
+    // so `optimize()` (default thresholds) actually merges and splits.
+    let mut vectors = Vec::new();
+    vectors.push((0, "f".to_string(), Vector::new(vec![0.0, 0.0])));
+    for i in 0..10 {
+        vectors.push((
+            i + 1,
+            "f".to_string(),
+            Vector::new(vec![100.0 + i as f32 * 0.1, 100.0 + i as f32 * 0.1]),
+        ));
+    }
+    for i in 0..4 {
+        vectors.push((
+            i + 11,
+            "f".to_string(),
+            Vector::new(vec![0.0 + i as f32 * 0.1, 100.0 + i as f32 * 0.1]),
+        ));
+    }
+    for i in 0..4 {
+        vectors.push((
+            i + 15,
+            "f".to_string(),
+            Vector::new(vec![100.0 + i as f32 * 0.1, 0.0 + i as f32 * 0.1]),
+        ));
+    }
+    let expected_count = vectors.len();
+    let mut expected_ids: Vec<u64> = vectors.iter().map(|(id, _, _)| *id).collect();
+    expected_ids.sort_unstable();
+
+    writer.build(vectors).unwrap();
+    writer.finalize().unwrap();
+    writer.optimize().unwrap();
+    writer.write().unwrap();
+
+    let loaded = IvfIndexWriter::with_storage(
+        IvfIndexConfig {
+            dimension: 2,
+            distance_metric: DistanceMetric::Euclidean,
+            n_clusters: 4,
+            n_probe: 2,
+            normalize_vectors: false,
+            ..IvfIndexConfig::default()
+        },
+        writer_config,
+        "optimize_round_trip",
+        storage,
+    )
+    .unwrap();
+
+    assert_eq!(loaded.vectors().len(), expected_count);
+    let mut loaded_ids: Vec<u64> = loaded.vectors().iter().map(|(id, _, _)| *id).collect();
+    loaded_ids.sort_unstable();
+    assert_eq!(loaded_ids, expected_ids);
+
+    let stats = loaded.get_cluster_stats();
+    assert_eq!(
+        stats.iter().map(|s| s.count).sum::<usize>(),
+        expected_count,
+        "cluster membership must account for every loaded vector"
     );
 }
