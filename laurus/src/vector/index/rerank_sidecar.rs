@@ -329,15 +329,80 @@ pub fn write_sidecar<W: Write>(
             vectors.len()
         )));
     }
-    let vector_count = (vectors.len() / dim_usize) as u32;
+    // `dim > 0` and `len % dim == 0` are both established above, so
+    // `chunks_exact` never has a leftover partial chunk to silently
+    // drop -- this is byte-identical to iterating `vectors` directly.
+    write_sidecar_streaming(writer, storage_kind, dim, vectors.chunks_exact(dim_usize))
+}
+
+/// Write the `.f32` rerank sidecar directly from an iterator over
+/// per-vector f32 slices, without requiring the caller to first
+/// flatten every vector into one contiguous `Vec<f32>` (Issue #1151).
+///
+/// `vector_count` is derived from `vectors.len()` (an
+/// [`ExactSizeIterator`]) rather than accepted as a separate argument:
+/// a caller-supplied count that disagreed with the actual number of
+/// vectors written would silently produce a header/payload mismatch
+/// that only surfaces later, as a read failure. The actual number of
+/// items iterated is also verified against that count before the
+/// footer is written, so a violation of the `ExactSizeIterator`
+/// contract itself is caught here rather than producing a corrupt
+/// file.
+///
+/// # Errors
+///
+/// * [`LaurusError::InvalidOperation`] if `dim == 0`.
+/// * [`LaurusError::InvalidOperation`] if any yielded slice's length
+///   does not equal `dim`.
+/// * [`LaurusError::InvalidOperation`] if the iterator yields a
+///   different number of items than its own `len()` reported.
+pub(super) fn write_sidecar_streaming<'a, W: Write>(
+    writer: &mut W,
+    storage_kind: RerankStorageKind,
+    dim: u32,
+    vectors: impl ExactSizeIterator<Item = &'a [f32]>,
+) -> Result<()> {
+    if dim == 0 {
+        return Err(LaurusError::InvalidOperation(
+            "rerank sidecar dim must be > 0".to_string(),
+        ));
+    }
+    let dim_usize = dim as usize;
+    let vector_count: u32 = vectors.len().try_into().map_err(|_| {
+        LaurusError::InvalidOperation(format!(
+            "rerank sidecar vector count {} exceeds u32::MAX",
+            vectors.len()
+        ))
+    })?;
     let header = RerankSidecarHeader::new(storage_kind, dim, vector_count);
+    // One scratch buffer reused for every vector instead of flattening
+    // the whole segment into a single `Vec<f32>` up front, and written
+    // in one `write_all` per vector rather than one per f32 element.
+    let mut scratch = vec![0u8; dim_usize * 4];
+    let mut written: u32 = 0;
     let content_crc = {
         let mut crc_writer = crate::storage::checksum::CrcWriter::new(&mut *writer);
         header.write_to(&mut crc_writer)?;
         match storage_kind {
             RerankStorageKind::F32 => {
                 for v in vectors {
-                    crc_writer.write_all(&v.to_le_bytes())?;
+                    if v.len() != dim_usize {
+                        return Err(LaurusError::InvalidOperation(format!(
+                            "rerank sidecar vector length {} does not match dim {dim}",
+                            v.len()
+                        )));
+                    }
+                    for (chunk, &f) in scratch.as_chunks_mut::<4>().0.iter_mut().zip(v) {
+                        *chunk = f.to_le_bytes();
+                    }
+                    crc_writer.write_all(&scratch)?;
+                    written += 1;
+                }
+                if written != vector_count {
+                    return Err(LaurusError::InvalidOperation(format!(
+                        "rerank sidecar iterator yielded {written} vectors but its \
+                         ExactSizeIterator::len() reported {vector_count}"
+                    )));
                 }
             }
         }
@@ -707,6 +772,68 @@ mod tests {
     fn write_sidecar_rejects_misaligned_payload() {
         let mut buf: Vec<u8> = Vec::new();
         let err = write_sidecar(&mut buf, RerankStorageKind::F32, 4, &[1.0, 2.0, 3.0]).unwrap_err();
+        assert!(matches!(err, LaurusError::InvalidOperation(_)));
+    }
+
+    /// Issue #1151: `write_sidecar_streaming` must produce byte-identical
+    /// output to `write_sidecar` for the same logical input, across the
+    /// empty / single-vector / multi-vector cases.
+    #[test]
+    fn write_sidecar_streaming_matches_write_sidecar_byte_for_byte() {
+        let dim = 4u32;
+        for vectors in [
+            Vec::<f32>::new(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, -1.0, -2.0, -3.0, -4.0,
+            ],
+        ] {
+            let mut buf_a: Vec<u8> = Vec::new();
+            write_sidecar(&mut buf_a, RerankStorageKind::F32, dim, &vectors).unwrap();
+
+            let mut buf_b: Vec<u8> = Vec::new();
+            write_sidecar_streaming(
+                &mut buf_b,
+                RerankStorageKind::F32,
+                dim,
+                vectors.chunks_exact(dim as usize),
+            )
+            .unwrap();
+
+            assert_eq!(buf_a, buf_b, "vectors = {vectors:?}");
+        }
+    }
+
+    /// Issue #1151: an `ExactSizeIterator` that lies about its own
+    /// length (yields fewer items than `len()` reports) must not
+    /// silently produce a header/payload mismatch -- the write must
+    /// fail loudly instead.
+    #[test]
+    fn write_sidecar_streaming_rejects_iterator_that_lies_about_its_length() {
+        struct LyingIter<'a> {
+            remaining: std::slice::Iter<'a, [f32; 4]>,
+            claimed_len: usize,
+        }
+        impl<'a> Iterator for LyingIter<'a> {
+            type Item = &'a [f32];
+            fn next(&mut self) -> Option<Self::Item> {
+                self.remaining.next().map(|v| v.as_slice())
+            }
+        }
+        impl<'a> ExactSizeIterator for LyingIter<'a> {
+            fn len(&self) -> usize {
+                self.claimed_len
+            }
+        }
+
+        let data: [[f32; 4]; 1] = [[1.0, 2.0, 3.0, 4.0]];
+        let lying = LyingIter {
+            remaining: data.iter(),
+            claimed_len: 2, // actually yields only 1 item
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_sidecar_streaming(&mut buf, RerankStorageKind::F32, 4, lying).unwrap_err();
         assert!(matches!(err, LaurusError::InvalidOperation(_)));
     }
 

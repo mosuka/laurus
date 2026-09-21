@@ -25,15 +25,8 @@
 
 use std::io::{Read, Write};
 
-use crate::error::Result;
-use crate::vector::core::quantization::{
-    QuantizationMethod, QuantizedVectorMeta, ScalarQuantParams, VectorQuantizer,
-};
-use crate::vector::core::vector::Vector;
-
-/// One quantized vector record returned by [`quantize_segment`]:
-/// the int8 payload bytes paired with their per-vector meta.
-pub(super) type QuantizedRecord = (Vec<u8>, QuantizedVectorMeta);
+use crate::error::{LaurusError, Result};
+use crate::vector::core::quantization::{QuantizedVectorMeta, ScalarQuantParams};
 
 /// Bytes consumed by the int8 + meta portion of one vector record
 /// (everything after the field_name string ends).
@@ -42,31 +35,59 @@ pub(super) const fn quantized_record_payload_size(dim: usize) -> usize {
     dim + QuantizedVectorMeta::SERIALIZED_SIZE
 }
 
-/// Train segment-level [`ScalarQuantParams`] on the given vectors and
-/// quantize each one.
+/// Train segment-level [`ScalarQuantParams`] from an iterator over each
+/// vector's raw f32 slice, substituting neutral `(0.0, 1.0)` defaults
+/// for an empty segment instead of propagating
+/// [`ScalarQuantParams::train_from_slices`]'s "empty input" error --
+/// every caller still needs *some* params to serialize an empty
+/// segment's header (Issue #1151: centralizes the
+/// `if is_empty { defaults } else { train(...) }` pattern each writer
+/// previously duplicated around the old `quantize_segment`).
 ///
-/// The returned records are in the same order as the input, so the
-/// caller can pair them back with `(doc_id, field_name)` triples.
+/// Does NOT substitute defaults for a non-empty iterator whose vectors
+/// are all zero-dimensional (`train_from_slices`'s other error
+/// condition) -- that case is left erroring, matching prior behavior.
+pub(super) fn train_quant_params_or_neutral<'a>(
+    slices: impl ExactSizeIterator<Item = &'a [f32]>,
+) -> Result<ScalarQuantParams> {
+    if slices.len() == 0 {
+        return Ok(ScalarQuantParams {
+            offset: 0.0,
+            scale: 1.0,
+        });
+    }
+    ScalarQuantParams::train_from_slices(slices)
+}
+
+/// Quantize one vector's raw f32 data into `out` and return its
+/// per-vector meta, without allocating a new `Vec<u8>` per call --
+/// `out` is cleared and reused, so a caller can hoist one scratch
+/// buffer across an entire segment's emission loop instead of
+/// collecting a `Vec<QuantizedRecord>` up front (Issue #1151).
+///
+/// Mirrors `VectorQuantizer::quantize`'s Scalar8Bit arm exactly,
+/// including its dimension check -- [`ScalarQuantParams::quantize`]
+/// itself does not check, so reproducing it here is the one guard this
+/// split must not drop.
 ///
 /// # Errors
 ///
-/// Forwards any error from [`VectorQuantizer::train`] /
-/// [`VectorQuantizer::quantize`] (e.g. empty input, dimension mismatch,
-/// non-finite values).
-pub(super) fn quantize_segment(
-    vectors: &[Vector],
+/// [`LaurusError::InvalidOperation`] if `data.len() != dim`.
+pub(super) fn quantize_into(
+    params: &ScalarQuantParams,
     dim: usize,
-) -> Result<(ScalarQuantParams, Vec<QuantizedRecord>)> {
-    let mut quantizer = VectorQuantizer::new(QuantizationMethod::Scalar8Bit, dim);
-    quantizer.train(vectors)?;
-    let params = *quantizer
-        .params()
-        .expect("quantizer trained successfully implies params are set");
-    let records: Vec<QuantizedRecord> = vectors
-        .iter()
-        .map(|v| quantizer.quantize(v))
-        .collect::<Result<_>>()?;
-    Ok((params, records))
+    data: &[f32],
+    out: &mut Vec<u8>,
+) -> Result<QuantizedVectorMeta> {
+    if data.len() != dim {
+        return Err(LaurusError::InvalidOperation(format!(
+            "Vector dimension mismatch: expected {dim}, got {}",
+            data.len()
+        )));
+    }
+    out.clear();
+    out.extend(data.iter().map(|&v| params.quantize_value(v)));
+    Ok(QuantizedVectorMeta::from_quantized(out, params))
 }
 
 /// Write the int8 + meta tail of one vector record.
@@ -111,45 +132,81 @@ pub(super) fn read_dequantized_vector<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::core::quantization::{QuantizationMethod, VectorQuantizer};
+    use crate::vector::core::vector::Vector;
     use std::io::Cursor;
 
-    fn vec_of(values: &[f32]) -> Vector {
-        Vector::new(values.to_vec())
+    /// Issue #1151: `train_quant_params_or_neutral` + `quantize_into`
+    /// (the streaming replacement) must produce results identical to
+    /// `VectorQuantizer` (the non-streaming API that is NOT being
+    /// removed) for the same input -- this is the invariant the split
+    /// must preserve forever.
+    #[test]
+    fn streaming_primitives_match_vector_quantizer() {
+        let dim = 3;
+        let vectors = vec![
+            Vector::new(vec![-1.0, 0.0, 1.0]),
+            Vector::new(vec![-0.5, 0.5, 0.25]),
+            Vector::new(vec![0.1, -0.4, 0.9]),
+        ];
+
+        let params =
+            train_quant_params_or_neutral(vectors.iter().map(|v| v.data.as_slice())).unwrap();
+
+        let mut quantizer = VectorQuantizer::new(QuantizationMethod::Scalar8Bit, dim);
+        quantizer.train(&vectors).unwrap();
+        let expected_params = *quantizer.params().unwrap();
+        assert_eq!(params, expected_params);
+
+        let mut scratch = Vec::new();
+        for (i, v) in vectors.iter().enumerate() {
+            let meta = quantize_into(&params, dim, &v.data, &mut scratch).unwrap();
+            let (expected_q, expected_meta) = quantizer.quantize(v).unwrap();
+            assert_eq!(scratch, expected_q, "vector {i}");
+            assert_eq!(meta.sum_q, expected_meta.sum_q, "vector {i}");
+            assert_eq!(
+                meta.norm_q.to_bits(),
+                expected_meta.norm_q.to_bits(),
+                "vector {i}: norm_q must be bit-identical"
+            );
+        }
     }
 
+    /// Issue #1151: an empty segment must not error, matching the
+    /// `if is_empty { defaults } else { train(...) }` convention every
+    /// writer previously duplicated around `quantize_segment`.
     #[test]
-    fn quantize_segment_returns_params_and_records() {
-        let vectors = vec![
-            vec_of(&[-1.0, 0.0, 1.0]),
-            vec_of(&[-0.5, 0.5, 0.25]),
-            vec_of(&[0.1, -0.4, 0.9]),
-        ];
-        let (params, records) = quantize_segment(&vectors, 3).unwrap();
-        assert!(params.scale > 0.0);
-        assert_eq!(records.len(), 3);
-        for (i, (q, meta)) in records.iter().enumerate() {
-            assert_eq!(q.len(), 3, "vector {i}");
-            let expected = QuantizedVectorMeta::from_quantized(q, &params);
-            assert_eq!(meta.sum_q, expected.sum_q);
-            assert!((meta.norm_q - expected.norm_q).abs() < 1e-5);
-        }
+    fn train_quant_params_or_neutral_returns_defaults_for_empty_input() {
+        let empty: Vec<&[f32]> = Vec::new();
+        let params = train_quant_params_or_neutral(empty.into_iter()).unwrap();
+        assert_eq!(
+            params,
+            ScalarQuantParams {
+                offset: 0.0,
+                scale: 1.0
+            }
+        );
     }
 
     #[test]
     fn write_then_read_dequantized_roundtrips_within_scale() {
         let dim = 8;
         let vectors = vec![
-            vec_of(&[-1.0, -0.7, -0.3, 0.0, 0.2, 0.5, 0.8, 1.0]),
-            vec_of(&[0.1, 0.2, 0.3, 0.4, -0.4, -0.3, -0.2, -0.1]),
+            Vector::new(vec![-1.0, -0.7, -0.3, 0.0, 0.2, 0.5, 0.8, 1.0]),
+            Vector::new(vec![0.1, 0.2, 0.3, 0.4, -0.4, -0.3, -0.2, -0.1]),
         ];
-        let (params, records) = quantize_segment(&vectors, dim).unwrap();
+        let params =
+            train_quant_params_or_neutral(vectors.iter().map(|v| v.data.as_slice())).unwrap();
+
         let mut buf = Vec::new();
-        for (q, meta) in &records {
-            write_quantized_record(&mut buf, q, *meta).unwrap();
+        let mut scratch = Vec::new();
+        for v in &vectors {
+            let meta = quantize_into(&params, dim, &v.data, &mut scratch).unwrap();
+            write_quantized_record(&mut buf, &scratch, meta).unwrap();
         }
         assert_eq!(
             buf.len(),
-            records.len() * quantized_record_payload_size(dim)
+            vectors.len() * quantized_record_payload_size(dim)
         );
 
         let mut cursor = Cursor::new(&buf);

@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::util::alloc_bounds::checked_capacity;
-use crate::vector::core::quantization::ScalarQuantParams;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::FlatIndexConfig;
 use crate::vector::index::field::LegacyVectorFieldWriter;
@@ -16,9 +15,10 @@ use crate::vector::index::format::{
     QuantHeader, VERSION_FIELD_DICT, VectorSegmentHeader, build_field_dict, record_prefix_size,
 };
 use crate::vector::index::quantized_io::{
-    quantize_segment, quantized_record_payload_size, read_dequantized_vector,
-    write_quantized_record,
+    quantize_into, quantized_record_payload_size, read_dequantized_vector,
+    train_quant_params_or_neutral, write_quantized_record,
 };
+use crate::vector::index::rerank_sidecar::write_sidecar_streaming;
 use crate::vector::writer::{VectorIndexWriter, VectorIndexWriterConfig};
 
 /// Builder for flat vector indexes (exact search).
@@ -450,18 +450,13 @@ impl VectorIndexWriter for FlatIndexWriter {
         // segments fall back to neutral (0.0, 1.0) params so the
         // header is still emitted (test_put_document_* exercise this
         // path).
-        let f32_vectors: Vec<Vector> = self.vectors.iter().map(|(_, _, v)| v.clone()).collect();
-        let (params, records) = if f32_vectors.is_empty() {
-            (
-                ScalarQuantParams {
-                    offset: 0.0,
-                    scale: 1.0,
-                },
-                Vec::new(),
-            )
-        } else {
-            quantize_segment(&f32_vectors, self.index_config.dimension)?
-        };
+        //
+        // Issue #1151: quantizes and writes each record immediately as
+        // the segment is walked, instead of collecting a
+        // `Vec<QuantizedRecord>` (one heap allocation per vector) up
+        // front just to zip it back with this same iteration order.
+        let params =
+            train_quant_params_or_neutral(self.vectors.iter().map(|(_, _, v)| v.data.as_slice()))?;
         // Per-segment field-name dictionary (Issue #633): ids assigned in
         // first-appearance order over the exact emission order below.
         let (field_dict, field_ids) =
@@ -472,12 +467,14 @@ impl VectorIndexWriter for FlatIndexWriter {
             .write_to(&mut output)?;
 
         // Write vectors with dictionary field ids and quantized records.
-        for ((doc_id, field_name, _), (int8, meta)) in self.vectors.iter().zip(records.iter()) {
+        let mut scratch = Vec::with_capacity(self.index_config.dimension);
+        for (doc_id, field_name, v) in &self.vectors {
             output.write_all(&doc_id.to_le_bytes())?;
             output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
 
             // Write quantized payload (dim int8 + sum_q + norm_q).
-            write_quantized_record(&mut output, int8, *meta)?;
+            let meta = quantize_into(&params, self.index_config.dimension, &v.data, &mut scratch)?;
+            write_quantized_record(&mut output, &scratch, meta)?;
         }
 
         // Close with an fsync BEFORE the rename (mirrors HNSW's #882 review
@@ -495,16 +492,11 @@ impl VectorIndexWriter for FlatIndexWriter {
             let sidecar_name = format!("{}.f32", file_name);
             let sidecar_tmp = format!("{}.f32.tmp", file_name);
             let mut sidecar_out = storage.create_output(&sidecar_tmp)?;
-            let mut payload: Vec<f32> =
-                Vec::with_capacity(self.vectors.len() * self.index_config.dimension);
-            for (_, _, v) in &self.vectors {
-                payload.extend_from_slice(&v.data);
-            }
-            crate::vector::index::rerank_sidecar::write_sidecar(
+            write_sidecar_streaming(
                 &mut sidecar_out,
                 rerank_kind,
                 self.index_config.dimension as u32,
-                &payload,
+                self.vectors.iter().map(|(_, _, v)| v.data.as_slice()),
             )?;
             sidecar_out.flush()?;
             drop(sidecar_out);
