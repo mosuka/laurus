@@ -97,15 +97,30 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 
 /// Current on-disk format version.
 ///
-/// Version 3 (this revision, Issue #549): leaf blocks bit-pack `points` and
-/// `doc_ids` instead of storing them as raw `f64`/`u64`. Each dimension's
-/// per-point values are packed at a fixed bit width derived from
-/// `leaf_min`/`leaf_max` (delta-from-min in IEEE-754 total-order space, never
-/// stored on disk since writer and reader compute it identically); `doc_ids`
-/// use the same scheme anchored at an explicit `doc_id_base`. The previous
-/// version 2 layout (raw, unpacked leaves) is no longer supported — laurus is
-/// pre-release, so the format is broken intentionally rather than
-/// dual-supported.
+/// Version 4 (this revision, Issue #1142): within each leaf, points are now
+/// stored in **doc_id-ascending order** (a stable sort — see
+/// [`BKDWriter::write_leaf_block`] for why stability matters), and
+/// `doc_ids` are packed as **consecutive deltas** (`doc_id[i] - doc_id[i-1]`,
+/// with `doc_id[-1] := doc_id_base`, so the first packed delta is always
+/// `0`) instead of independent deltas from `doc_id_base`. This shrinks
+/// `doc_id_bits` to `bits_needed(max consecutive gap)` rather than
+/// `bits_needed(max - min)`, which is never larger and often much smaller
+/// for locally-clustered doc_id distributions. `doc_id_base`/`doc_id_bits`
+/// keep the same on-disk types and positions as version 3; only what they
+/// mean changes. The file header also now carries `block_size`, used to
+/// bound a leaf's `count` on read (version 3 lacked this bound).
+///
+/// Version 3 (Issue #549): leaf blocks bit-pack `points` and `doc_ids`
+/// instead of storing them as raw `f64`/`u64`. Each dimension's per-point
+/// values are packed at a fixed bit width derived from `leaf_min`/`leaf_max`
+/// (delta-from-min in IEEE-754 total-order space, never stored on disk since
+/// writer and reader compute it identically); `doc_ids` used the same
+/// scheme, independently anchored at `doc_id_base` per point (no sort, no
+/// running delta). The previous version 2 layout (raw, unpacked leaves) is
+/// no longer supported, and version 3 itself is no longer supported by this
+/// revision — laurus is pre-release, so the format is broken intentionally
+/// rather than dual-supported (Issue #1040 tracks these one-way breaks for
+/// release notes).
 ///
 /// File layout (all integers little-endian):
 ///
@@ -117,22 +132,28 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 ///   bytes_per_dim       u32   (always 8 today: f64)
 ///   total_point_count   u64
 ///   num_blocks          u64
+///   block_size          u32   (max points per leaf; bounds a leaf's `count`)
 ///   global_min          [f64; num_dims]
 ///   global_max          [f64; num_dims]
 ///   index_start_offset  u64
 ///   root_node_offset    u64
 ///
-/// Leaf Block:
+/// Leaf Block (points stored in doc_id-ascending order):
 ///   count               u32
 ///   leaf_min            [f64; num_dims]
 ///   leaf_max            [f64; num_dims]
-///   doc_id_base         u64
-///   doc_id_bits         u8               (0..=64; validated on read)
+///   doc_id_base         u64   (= the leaf's minimum doc_id)
+///   doc_id_bits         u8    (0..=64; validated on read; width of the
+///                              largest consecutive doc_id gap in the leaf)
 ///   packed_dim[0]       ceil(count * bits[0] / 8) bytes, byte-aligned
 ///   packed_dim[1..]     ...  (one section per dimension; bits[d] is
 ///                             derived from leaf_min[d]/leaf_max[d], not
 ///                             stored)
-///   packed_doc_ids      ceil(count * doc_id_bits / 8) bytes, byte-aligned
+///   packed_doc_ids      ceil(count * doc_id_bits / 8) bytes, byte-aligned;
+///                       value i is `doc_id[i-1] + delta[i]` with
+///                       `doc_id[-1] := doc_id_base`, so `delta[0]` is
+///                       always 0 (the reader treats a nonzero leading
+///                       delta as corruption)
 ///
 /// Internal Index Node (size = 28 + 32 * num_dims bytes, unchanged from v2):
 ///   split_dim           u32
@@ -144,7 +165,7 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 ///   left_offset         u64
 ///   right_offset        u64
 /// ```
-pub const BKD_VERSION: u32 = 3;
+pub const BKD_VERSION: u32 = 4;
 
 /// BKD Tree File Header
 #[derive(Debug, Clone)]
@@ -155,6 +176,10 @@ pub struct BKDFileHeader {
     pub bytes_per_dim: u32,
     pub total_point_count: u64,
     pub num_blocks: u64,
+    /// Max points per leaf, as configured on the writer (`BKDWriter::
+    /// with_block_size`, default 512). Bounds a leaf's `count` on read
+    /// (Issue #1142).
+    pub block_size: u32,
     pub min_values: Vec<f64>,
     pub max_values: Vec<f64>,
     pub index_start_offset: u64,
@@ -532,8 +557,8 @@ impl<W: StorageOutput> BKDWriter<W> {
 
         // Reserve space for header:
         // Magic(4) + Version(4) + num_dims(4) + bytes_per_dim(4) + total_count(8) + num_blocks(8)
-        // + min_values(num_dims * 8) + max_values(num_dims * 8) + index_start(8) + root_offset(8)
-        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + (self.num_dims as u64 * 8 * 2) + 8 + 8;
+        // + block_size(4) + min_values(num_dims * 8) + max_values(num_dims * 8) + index_start(8) + root_offset(8)
+        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 4 + (self.num_dims as u64 * 8 * 2) + 8 + 8;
 
         self.writer.write_u32(0)?; // Placeholder
         self.writer.seek(SeekFrom::Start(header_size))?;
@@ -578,6 +603,12 @@ impl<W: StorageOutput> BKDWriter<W> {
         self.writer.write_u32(8)?; // Bytes per dim (f64)
         self.writer.write_u64(total_count)?;
         self.writer.write_u64(self.num_blocks)?;
+        // Issue #1142: bounds a leaf's `count` on read against the writer's
+        // actual per-leaf cap, tightening the pre-existing (and, since this
+        // revision shrinks `doc_id_bits`, more reachable) gap where a leaf
+        // with zero point bits and zero doc_id bits left `count` completely
+        // unchecked.
+        self.writer.write_u32(self.block_size as u32)?;
         for &v in &self.min_values {
             self.writer.write_f64(v)?;
         }
@@ -716,7 +747,7 @@ impl<W: StorageOutput> BKDWriter<W> {
     fn write_leaf_block(
         &mut self,
         ctx: &BuildContext<'_>,
-        indices: &[u32],
+        indices: &mut [u32],
         leaf_min: &[f64],
         leaf_max: &[f64],
     ) -> Result<()> {
@@ -725,7 +756,9 @@ impl<W: StorageOutput> BKDWriter<W> {
 
         // Per-leaf AABB, used by the reader for subtree pruning starting
         // from #292, and (since #549) as the anchor for delta-from-min
-        // bit-packing below.
+        // bit-packing below. Computed by `compute_aabb` over `indices` in
+        // `build_subtree` *before* this function's doc_id sort below runs
+        // (order-independent min/max scan), so the sort cannot affect it.
         for &v in leaf_min {
             self.writer.write_f64(v)?;
         }
@@ -733,41 +766,74 @@ impl<W: StorageOutput> BKDWriter<W> {
             self.writer.write_f64(v)?;
         }
 
+        // Issue #1142: sort this leaf's indices by doc_id so doc_ids can be
+        // packed as consecutive deltas (`bits_needed(max consecutive gap)`)
+        // instead of independent deltas from a single anchor
+        // (`bits_needed(max - min)`) -- the former is never larger and often
+        // much smaller for locally-clustered doc_id distributions, since
+        // deltas telescope-sum to exactly `max - min`.
+        //
+        // This MUST be a stable sort, not `sort_unstable_by_key`: when the
+        // same doc_id contributes more than one point to this leaf (a
+        // multi-valued field), `GeoBoxPointsVisitor::into_candidates`
+        // (`lexical/query/geo.rs`) dedups by "first one seen in leaf
+        // traversal order wins". A stable sort preserves each doc's
+        // duplicate points in their original (split-dimension-sorted)
+        // relative order, so which point wins is unchanged by this
+        // revision; an unstable sort could silently change it.
+        //
+        // The point-packing loop below iterates `indices` after this sort,
+        // so it inherits doc_id order automatically -- nothing else reads
+        // `indices` between here and the end of this function.
+        indices.sort_by_key(|&i| ctx.doc_ids[i as usize]);
+
         // doc_id_base / doc_id_bits: the one on-disk bit-width field (every
         // other width is derived from leaf_min/leaf_max on both sides, see
-        // `BKD_VERSION`'s doc comment).
-        let mut doc_id_min = u64::MAX;
-        let mut doc_id_max = 0u64;
-        for &i in indices {
-            let d = ctx.doc_ids[i as usize];
-            doc_id_min = doc_id_min.min(d);
-            doc_id_max = doc_id_max.max(d);
+        // `BKD_VERSION`'s doc comment). `indices` is now sorted ascending by
+        // doc_id, so the endpoints give min/max in O(1).
+        let doc_id_min = ctx.doc_ids[indices[0] as usize];
+        let mut max_delta = 0u64;
+        for w in indices.windows(2) {
+            let d = ctx.doc_ids[w[1] as usize] - ctx.doc_ids[w[0] as usize];
+            max_delta = max_delta.max(d);
         }
-        let doc_id_bits = bits_needed(doc_id_max - doc_id_min);
+        let doc_id_bits = bits_needed(max_delta);
         self.writer.write_u64(doc_id_min)?;
         self.writer.write_u8(doc_id_bits)?;
 
         // Per-dimension packed points: delta from `leaf_min[d]` in sortable
         // (total-order) space, fixed width. A constant dimension needs 0
-        // bits and contributes no bytes at all.
+        // bits and contributes no bytes at all. Iterates the now doc_id
+        // -sorted `indices`, so points are stored in doc_id-ascending order.
         for d in 0..ctx.num_dims {
             let (base, bits) = dim_point_bits(leaf_min[d], leaf_max[d]);
             if bits == 0 {
                 continue;
             }
             let mut bw = BitWriter::new();
-            for &i in indices {
+            for &i in indices.iter() {
                 let v = f64_to_sortable_u64(ctx.value(i, d));
                 bw.write(v - base, bits);
             }
             self.writer.write_raw(&bw.finish())?;
         }
 
-        // Packed doc_ids, same scheme.
+        // Packed doc_ids as consecutive deltas: value 0 is always
+        // `doc_id_min - doc_id_min == 0` (the leading delta the reader
+        // treats as a corruption signal if it's ever nonzero), and each
+        // subsequent value is the gap from its immediate predecessor.
         if doc_id_bits > 0 {
             let mut bw = BitWriter::new();
-            for &i in indices {
-                bw.write(ctx.doc_ids[i as usize] - doc_id_min, doc_id_bits);
+            let mut prev = doc_id_min;
+            for &i in indices.iter() {
+                let d = ctx.doc_ids[i as usize];
+                debug_assert!(
+                    d >= prev,
+                    "write_leaf_block: indices must be sorted ascending by doc_id \
+                     before this loop runs"
+                );
+                bw.write(d - prev, doc_id_bits);
+                prev = d;
             }
             self.writer.write_raw(&bw.finish())?;
         }
@@ -877,6 +943,7 @@ impl BKDReader {
         let num_dims = checked_capacity(num_dims as usize, 16, available, "BKD num_dims")? as u32;
         let total_point_count = reader.read_u64()?;
         let num_blocks = reader.read_u64()?;
+        let block_size = reader.read_u32()?;
         let mut min_values = Vec::with_capacity(num_dims as usize);
         for _ in 0..num_dims {
             min_values.push(reader.read_f64()?);
@@ -895,6 +962,7 @@ impl BKDReader {
             bytes_per_dim,
             total_point_count,
             num_blocks,
+            block_size,
             min_values,
             max_values,
             index_start_offset,
@@ -985,8 +1053,12 @@ impl BKDReader {
     ) -> Result<()> {
         reader.seek(SeekFrom::Start(offset))?;
         let num_dims = self.header.num_dims as usize;
-        let leaf_header =
-            Self::read_leaf_fixed_header(reader, num_dims, self.header.total_point_count)?;
+        let leaf_header = Self::read_leaf_fixed_header(
+            reader,
+            num_dims,
+            self.header.total_point_count,
+            self.header.block_size,
+        )?;
 
         match visitor.compare(&leaf_header.leaf_aabb) {
             CellRelation::Outside => Ok(()),
@@ -1045,8 +1117,12 @@ impl BKDReader {
     ) -> Result<()> {
         reader.seek(SeekFrom::Start(offset))?;
         let num_dims = self.header.num_dims as usize;
-        let leaf_header =
-            Self::read_leaf_fixed_header(reader, num_dims, self.header.total_point_count)?;
+        let leaf_header = Self::read_leaf_fixed_header(
+            reader,
+            num_dims,
+            self.header.total_point_count,
+            self.header.block_size,
+        )?;
         Self::skip_points(reader, &leaf_header)?;
         Self::decode_doc_ids_and_dispatch(reader, &leaf_header, None, num_dims, visitor)
     }
@@ -1060,12 +1136,23 @@ impl BKDReader {
         reader: &mut StructReader<R>,
         num_dims: usize,
         total_point_count: u64,
+        block_size: u32,
     ) -> Result<LeafHeader> {
         let count = reader.read_u32()? as usize;
         if count as u64 > total_point_count {
             return Err(crate::error::LaurusError::index(format!(
                 "BKD leaf: declares {count} points but the tree has only \
                  {total_point_count} total — segment is corrupted"
+            )));
+        }
+        // Issue #1142: independent of the packed-length bound below, which
+        // this revision's smaller `doc_id_bits` values weaken (a leaf with
+        // zero point bits and zero doc_id bits has `total_packed_len == 0`,
+        // leaving `count` otherwise unchecked against physical file size).
+        if count as u64 > block_size as u64 {
+            return Err(crate::error::LaurusError::index(format!(
+                "BKD leaf: declares {count} points but block_size is only \
+                 {block_size} — segment is corrupted"
             )));
         }
         let leaf_aabb = Self::read_child_aabb(reader, num_dims)?;
@@ -1179,13 +1266,31 @@ impl BKDReader {
             return Ok(());
         }
 
-        reader.read_raw_with(len, |raw: &[u8]| {
+        reader.read_raw_with(len, |raw: &[u8]| -> Result<()> {
             let mut bit_reader = BitReader::new(raw);
+            let mut running = base;
             for i in 0..count {
                 let delta = bit_reader.read(bits);
-                dispatch(visitor, base.wrapping_add(delta), i);
+                // Issue #1142: doc_ids are packed as consecutive deltas
+                // (value i is `doc_id[i-1] + delta`, with `doc_id[-1] :=
+                // base`), so decoding accumulates rather than adding to a
+                // fixed anchor. The very first delta is always 0 by
+                // construction (the leaf's smallest doc_id, sorted to
+                // position 0, has nothing before it to differ from) --
+                // a nonzero value here can only mean the file is
+                // corrupted or was written by a non-conforming encoder,
+                // since a conforming writer can never produce one.
+                if i == 0 && delta != 0 {
+                    return Err(crate::error::LaurusError::index(
+                        "BKD leaf: first packed doc_id delta must be 0 — segment is corrupted"
+                            .to_string(),
+                    ));
+                }
+                running = running.wrapping_add(delta);
+                dispatch(visitor, running, i);
             }
-        })
+            Ok(())
+        })?
     }
 }
 
@@ -1412,17 +1517,20 @@ mod tests {
 
     #[test]
     fn test_bkd_reader_rejects_version_mismatch() {
-        // Hand-craft a header that claims version 2 (the raw, unpacked
-        // pre-#549 format this revision retires) and confirm the reader
-        // refuses to open it.
+        // Hand-craft a header that claims version 3 (the independent-delta
+        // doc_id layout this revision, #1142, retires in favor of
+        // consecutive deltas) and confirm the reader refuses to open it.
+        // The version check runs immediately after reading `version` --
+        // before `block_size` or anything else -- so this file need not
+        // carry a `block_size` field to exercise it.
         use crate::storage::structured::StructWriter;
 
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
         {
-            let output = storage.create_output("v2.bkd").unwrap();
+            let output = storage.create_output("v3.bkd").unwrap();
             let mut writer = StructWriter::new(output);
             writer.write_u32(BKD_MAGIC).unwrap();
-            writer.write_u32(2).unwrap(); // retired version (pre-#549)
+            writer.write_u32(3).unwrap(); // retired version (pre-#1142)
             writer.write_u32(2).unwrap(); // num_dims
             writer.write_u32(8).unwrap(); // bytes_per_dim
             writer.write_u64(0).unwrap(); // total_count
@@ -1436,7 +1544,7 @@ mod tests {
             writer.close().unwrap();
         }
 
-        let err = BKDReader::open(storage.clone(), "v2.bkd").unwrap_err();
+        let err = BKDReader::open(storage.clone(), "v3.bkd").unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("Unsupported BKD version"),
@@ -2127,13 +2235,168 @@ mod tests {
         assert_eq!(ids, vec![0, u64::MAX]);
     }
 
+    /// Issue #1142: `GeoBoxPointsVisitor::into_candidates` (`lexical/
+    /// query/geo.rs`) dedups multiple points sharing a doc_id by "first
+    /// one seen in leaf traversal order wins" -- the new doc_id sort in
+    /// `write_leaf_block` MUST be stable (`sort_by_key`, not
+    /// `sort_unstable_by_key`) or this convention could silently change.
+    /// Uses enough elements and interleaved duplicate keys that a small
+    /// slice's tiny-array insertion-sort fallback can't accidentally
+    /// mask an unstable sort (a handful of elements can stay in order by
+    /// luck even under `sort_unstable_by_key`).
+    #[test]
+    fn duplicate_doc_ids_preserve_relative_point_order() {
+        let n = 60usize;
+        // doc_id cycles through {10, 20, 30}; the coordinate directly
+        // encodes each point's original insertion index so the expected
+        // post-sort order can be computed independently of the visitor.
+        let doc_ids: Vec<u64> = (0..n).map(|i| 10 * ((i % 3) as u64 + 1)).collect();
+        let points: Vec<f64> = (0..n as u64).map(|i| i as f64).collect();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("dup_stable.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1).with_block_size(n);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = BKDReader::open(storage.clone(), "dup_stable.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        reader.intersect(&mut visitor).unwrap();
+        assert_eq!(visitor.entries.len(), n);
+
+        // Expected: stable sort by doc_id, ties broken by original
+        // insertion order (the index encoded in the coordinate).
+        let mut expected: Vec<(u64, f64)> = (0..n)
+            .map(|i| (10 * ((i % 3) as u64 + 1), i as f64))
+            .collect();
+        expected.sort_by_key(|&(doc_id, _)| doc_id);
+
+        // A single leaf (block_size == n, no splitting), so the visitor's
+        // arrival order reflects the on-disk point order directly.
+        let actual: Vec<(u64, f64)> = visitor.entries.iter().map(|(id, p)| (*id, p[0])).collect();
+        assert_eq!(
+            actual, expected,
+            "doc_id sort must be stable: points sharing a doc_id must keep \
+             their original relative order"
+        );
+    }
+
+    /// Issue #1142: pins the new format invariant directly -- a leaf's
+    /// points are always decoded in doc_id-ascending order, regardless of
+    /// insertion order.
+    #[test]
+    fn leaf_points_are_emitted_in_doc_id_ascending_order() {
+        let n = 50usize;
+        // Insert in reverse order so ascending output can only come from
+        // the writer's sort, never from insertion order happening to
+        // already be sorted.
+        let doc_ids: Vec<u64> = (0..n as u64).rev().collect();
+        let points: Vec<f64> = (0..n as u64).map(|i| i as f64).collect();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("ascending.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1).with_block_size(n);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = BKDReader::open(storage.clone(), "ascending.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        reader.intersect(&mut visitor).unwrap();
+        let ids: Vec<u64> = visitor.entries.iter().map(|(id, _)| *id).collect();
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort_unstable();
+        assert_eq!(
+            ids, sorted_ids,
+            "leaf points must be emitted in doc_id-ascending order"
+        );
+    }
+
+    /// Issue #1142: all doc_ids equal in a leaf must still round-trip
+    /// exactly, and must pack strictly fewer bytes than an otherwise
+    /// identical leaf needing at least 1 doc_id bit (confirms
+    /// `doc_id_bits == 0` -- i.e. a genuinely zero-byte packed doc_id
+    /// section -- rather than merely "small").
+    #[test]
+    fn leaf_with_all_identical_doc_ids_packs_zero_bits() {
+        let n = 10usize;
+        let points: Vec<f64> = (0..n as u64).map(|i| i as f64).collect();
+
+        let all_same: Vec<u64> = vec![42u64; n];
+        let storage_a = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage_a.create_output("same.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1).with_block_size(n);
+            writer.write(&points, &all_same).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = BKDReader::open(storage_a.clone(), "same.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        reader.intersect(&mut visitor).unwrap();
+        assert_eq!(visitor.entries.len(), n);
+        for (doc_id, _) in &visitor.entries {
+            assert_eq!(*doc_id, 42);
+        }
+
+        let mut one_different = all_same;
+        one_different[n - 1] = 43;
+        let storage_b = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage_b.create_output("diff.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1).with_block_size(n);
+            writer.write(&points, &one_different).unwrap();
+            writer.finish().unwrap();
+        }
+        let same_size = storage_a.metadata("same.bkd").unwrap().size;
+        let diff_size = storage_b.metadata("diff.bkd").unwrap().size;
+        assert!(
+            same_size < diff_size,
+            "all-identical doc_ids should pack strictly fewer bytes than a leaf \
+             needing at least 1 doc_id bit: same={same_size}, diff={diff_size}"
+        );
+    }
+
+    /// Issue #1142: small consecutive gaps among nine values, then one
+    /// huge jump -- the one shape the empirical experiment found doesn't
+    /// improve over the old fixed-width-from-range scheme (the outlier
+    /// gap nearly spans the leaf's full range, so `bits_needed(max_delta)`
+    /// and `bits_needed(max - min)` end up close). Must still round-trip
+    /// exactly.
+    #[test]
+    fn leaf_with_one_large_gap_among_small_gaps() {
+        let doc_ids: Vec<u64> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 1_000_000];
+        let n = doc_ids.len();
+        let points: Vec<f64> = (0..n as u64).map(|i| i as f64).collect();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("gap.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1).with_block_size(n);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = BKDReader::open(storage.clone(), "gap.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        reader.intersect(&mut visitor).unwrap();
+        let mut ids: Vec<u64> = visitor.entries.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        let mut expected = doc_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
     #[test]
     fn bkd_leaf_bytes_shrink_relative_to_raw_format() {
         // A correlated field (monotonically increasing, like a timestamp)
-        // should compress well under delta-from-min bit-packing. Compares
-        // the on-disk file size against the pre-#549 raw-format byte count
-        // for the same point+doc_id data (ignoring header/index overhead,
+        // should compress well under bit-packing. Compares the on-disk
+        // file size against the pre-#549 raw-format byte count for the
+        // same point+doc_id data (ignoring header/index overhead,
         // identical either way and negligible at this scale).
+        //
+        // Issue #1142 tightens this bound: consecutive-delta doc_id
+        // packing measures ~42.5% (34026 bytes) for this exact corpus,
+        // versus the pre-#1142 (v3, independent-delta) ~53% this test
+        // used to bound against (60% threshold). 45% leaves headroom for
+        // build non-determinism (e.g. a future k-means-style leaf
+        // assignment change) without being as loose as the old bound.
         let n: u64 = 5000;
         let points: Vec<f64> = (0..n).map(|i| i as f64).collect();
         let doc_ids: Vec<u64> = (0..n).collect();
@@ -2147,10 +2410,43 @@ mod tests {
         let on_disk = storage.metadata("shrink.bkd").unwrap().size;
         let raw_points_and_doc_ids = n * (8 + 8); // pre-#549: f64 point + u64 doc_id per point
         assert!(
-            on_disk < raw_points_and_doc_ids * 6 / 10,
-            "expected the packed leaf format to use well under 60% of the raw \
+            on_disk < raw_points_and_doc_ids * 45 / 100,
+            "expected the packed leaf format to use well under 45% of the raw \
              point+doc_id bytes for a correlated field: on_disk={on_disk}, \
              raw={raw_points_and_doc_ids}"
+        );
+    }
+
+    /// Issue #1142: a fixed corpus's on-disk size must never exceed a
+    /// golden upper bound, pinning the consecutive-delta doc_id packing's
+    /// measured output size so a future regression (e.g. accidentally
+    /// reverting to independent-delta packing) is caught immediately
+    /// rather than only via a loose ratio check.
+    #[test]
+    fn bkd_file_size_has_golden_upper_bound() {
+        let n: u64 = 5000;
+        // Uniform-ish 1D data (not perfectly correlated with doc_id, unlike
+        // `bkd_leaf_bytes_shrink_relative_to_raw_format`'s corpus) so this
+        // pins a second, independent point on the compression curve.
+        let points: Vec<f64> = (0..n).map(|i| ((i * 2654435761) % 100000) as f64).collect();
+        let doc_ids: Vec<u64> = (0..n).collect();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("golden.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 1);
+            writer.write(&points, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let on_disk = storage.metadata("golden.bkd").unwrap().size;
+        // Measured at 36990 bytes when this test was written (Issue #1142).
+        // A future change that legitimately shrinks this further should
+        // lower GOLDEN_V4; one that grows it should be treated as a
+        // regression unless deliberately justified.
+        const GOLDEN_V4: u64 = 37200;
+        assert!(
+            on_disk <= GOLDEN_V4,
+            "on-disk size {on_disk} exceeds the golden upper bound {GOLDEN_V4} -- \
+             if this is an intentional format change, update GOLDEN_V4"
         );
     }
 
@@ -2167,6 +2463,7 @@ mod tests {
         path: &str,
         num_dims: u32,
         total_point_count: u64,
+        block_size: u32,
         leaf_min: &[f64],
         leaf_max: &[f64],
         leaf_count: u32,
@@ -2179,13 +2476,14 @@ mod tests {
         let output = storage.create_output(path).unwrap();
         let mut writer = StructWriter::new(output);
 
-        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + (num_dims as u64 * 8 * 2) + 8 + 8;
+        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 4 + (num_dims as u64 * 8 * 2) + 8 + 8;
         writer.write_u32(BKD_MAGIC).unwrap();
         writer.write_u32(BKD_VERSION).unwrap();
         writer.write_u32(num_dims).unwrap();
         writer.write_u32(8).unwrap();
         writer.write_u64(total_point_count).unwrap();
         writer.write_u64(1).unwrap(); // num_blocks
+        writer.write_u32(block_size).unwrap();
         for &v in leaf_min {
             writer.write_f64(v).unwrap();
         }
@@ -2225,6 +2523,7 @@ mod tests {
             "bad_doc_id_bits.bkd",
             1,
             1,
+            512,
             &[0.0],
             &[0.0],
             1,
@@ -2248,6 +2547,7 @@ mod tests {
             "bad_count.bkd",
             1,
             1,
+            512,
             &[0.0],
             &[0.0],
             1000,
@@ -2274,6 +2574,7 @@ mod tests {
             "overrun.bkd",
             1,
             1_000_000,
+            1_000_000,
             &[0.0],
             &[1.0],
             1_000_000,
@@ -2287,5 +2588,72 @@ mod tests {
         let err = reader.intersect(&mut visitor).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("corrupted"), "unexpected error: {msg}");
+    }
+
+    /// Issue #1142: shrinking `doc_id_bits` (this revision's whole point)
+    /// weakens `rejects_leaf_whose_packed_length_overruns_the_file`'s
+    /// packed-length bound proportionally -- a leaf with zero point bits
+    /// and zero doc_id bits leaves that bound completely unable to reject
+    /// an oversized `count` at all. `block_size` closes this independent
+    /// of the packed-length arithmetic.
+    #[test]
+    fn rejects_leaf_with_count_exceeding_block_size() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        // leaf_min == leaf_max (0 point bits) and doc_id_bits == 0 together
+        // make `total_packed_len == 0`, so only the `block_size` bound (not
+        // the packed-length one) can reject this.
+        write_hand_crafted_single_leaf_file(
+            &storage,
+            "count_exceeds_block_size.bkd",
+            1,
+            1_000_000,
+            512,
+            &[0.0],
+            &[0.0],
+            1_000_000,
+            0,
+            0,
+            &[],
+            &[],
+        );
+        let reader = BKDReader::open(storage.clone(), "count_exceeds_block_size.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        let err = reader.intersect(&mut visitor).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("block_size"), "unexpected error: {msg}");
+    }
+
+    /// Issue #1142: the first packed doc_id delta must always be 0 by
+    /// construction (the leaf's smallest doc_id, sorted to position 0,
+    /// has nothing before it to differ from). A hand-crafted leaf with a
+    /// nonzero leading delta can only be corrupt or written by a
+    /// non-conforming encoder, and must be rejected rather than silently
+    /// decoded into a wrong doc_id (which would also offset every
+    /// subsequent doc_id in the leaf via the running accumulator).
+    #[test]
+    fn rejects_leaf_with_nonzero_leading_doc_id_delta() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        write_hand_crafted_single_leaf_file(
+            &storage,
+            "bad_leading_delta.bkd",
+            1,
+            2,
+            512,
+            &[0.0],
+            &[0.0], // constant dimension -> 0 point bits, no packed point bytes needed
+            2,
+            100, // doc_id_base
+            8,   // doc_id_bits (1 byte/value)
+            &[],
+            &[5u8, 3u8], // first delta = 5 (must be 0), second = 3
+        );
+        let reader = BKDReader::open(storage.clone(), "bad_leading_delta.bkd").unwrap();
+        let mut visitor = CollectAllVisitor::default();
+        let err = reader.intersect(&mut visitor).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("first packed doc_id delta"),
+            "unexpected error: {msg}"
+        );
     }
 }
