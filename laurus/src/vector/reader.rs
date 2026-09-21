@@ -313,12 +313,20 @@ impl VectorIndexReader for SimpleVectorReader {
     }
 
     fn vector_iterator(&self) -> Result<Box<dyn VectorIterator>> {
-        Ok(Box::new(SimpleVectorIterator::new(
-            self.vectors
-                .iter()
-                .map(|((id, field), v)| (*id, field.clone(), v.clone()))
-                .collect(),
-        )))
+        // Issue #1155 (mirrors #1152's IVF fix): `self.vectors` is a
+        // `HashMap`, so iterating it directly yields an arbitrary,
+        // unspecified order -- but `SimpleVectorIterator::skip_to`
+        // assumes global ascending `(doc_id, field_name)` order. Sort
+        // the collected `Vec` before constructing the iterator.
+        let mut entries: Vec<(u64, String, Vector)> = self
+            .vectors
+            .iter()
+            .map(|((id, field), v)| (*id, field.clone(), v.clone()))
+            .collect();
+        entries.sort_by(|(id_a, field_a, _), (id_b, field_b, _)| {
+            id_a.cmp(id_b).then_with(|| field_a.cmp(field_b))
+        });
+        Ok(Box::new(SimpleVectorIterator::new(entries)))
     }
 
     fn metadata(&self) -> Result<VectorIndexMetadata> {
@@ -438,6 +446,102 @@ impl VectorIndexReaderFactory {
             _ => Err(crate::error::LaurusError::InvalidOperation(format!(
                 "Unknown index type: {index_type}"
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A corpus spread across enough distinct doc_id/field pairs that
+    /// `HashMap` iteration order is vanishingly unlikely to coincidentally
+    /// already be `(doc_id, field)`-sorted, so these tests reliably
+    /// exercise Issue #1155's bug rather than passing by luck.
+    fn build_multi_field_reader() -> SimpleVectorReader {
+        let mut vectors = Vec::new();
+        for doc_id in 0..10u64 {
+            for field in ["alpha", "beta", "gamma"] {
+                vectors.push((doc_id, field.to_string(), Vector::new(vec![doc_id as f32])));
+            }
+        }
+        SimpleVectorReader::new(vectors, 1, DistanceMetric::Euclidean).unwrap()
+    }
+
+    /// Issue #1155: `SimpleVectorIterator`'s backing `Vec` was built by
+    /// iterating a `HashMap` directly, giving an arbitrary order --
+    /// `.next()` must yield entries in globally ascending `(doc_id,
+    /// field)` order regardless.
+    #[test]
+    fn vector_iterator_yields_globally_ascending_doc_id_and_field_despite_hashmap_order() {
+        let reader = build_multi_field_reader();
+
+        let mut iter = reader.vector_iterator().unwrap();
+        let mut seen = Vec::new();
+        while let Some((doc_id, field, _)) = iter.next().unwrap() {
+            seen.push((doc_id, field));
+        }
+        assert_eq!(seen.len(), 30);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(
+            seen, sorted,
+            "vector_iterator must yield (doc_id, field) pairs in globally ascending order"
+        );
+    }
+
+    /// Issue #1155: `skip_to(doc_id, field)` must return the correct
+    /// lower-bound key regardless of the backing `HashMap`'s iteration
+    /// order.
+    #[test]
+    fn skip_to_returns_correct_lower_bound_despite_hashmap_order() {
+        let reader = build_multi_field_reader();
+
+        // Brute-force expectation: every (doc_id, field) pair, globally
+        // sorted (matches build_multi_field_reader's construction).
+        let mut expected: Vec<(u64, &str)> = Vec::new();
+        for doc_id in 0..10u64 {
+            for field in ["alpha", "beta", "gamma"] {
+                expected.push((doc_id, field));
+            }
+        }
+        expected.sort();
+
+        let targets: Vec<(u64, &str)> = vec![
+            (0, "alpha"),
+            (0, "aardvark"), // before "alpha" for doc_id 0
+            (0, "zzz"),      // after "gamma" for doc_id 0 -> next is (1, "alpha")
+            (4, "beta"),
+            (9, "gamma"),
+            (9, "zzz"), // past the last entry entirely
+            (10, "alpha"),
+        ];
+
+        for (target_id, target_field) in targets {
+            let mut iter = reader.vector_iterator().unwrap();
+            let found = iter.skip_to(target_id, target_field).unwrap();
+            let expected_next = expected
+                .iter()
+                .find(|&&(id, field)| (id, field) >= (target_id, target_field));
+            match expected_next {
+                Some(&(expected_id, expected_field)) => {
+                    assert!(
+                        found,
+                        "expected to find a key >= ({target_id}, {target_field})"
+                    );
+                    assert_eq!(
+                        iter.position(),
+                        (expected_id, expected_field.to_string()),
+                        "skip_to({target_id}, {target_field}) landed on the wrong key"
+                    );
+                }
+                None => {
+                    assert!(
+                        !found,
+                        "no key >= ({target_id}, {target_field}) should exist"
+                    );
+                }
+            }
         }
     }
 }
