@@ -549,9 +549,24 @@ impl VectorIndexReader for IvfIndexReader {
     }
 
     fn vector_iterator(&self) -> Result<Box<dyn VectorIterator>> {
+        // Issue #1152: `vector_ids` is only sorted *within* each IVF
+        // cluster window (see ivf/writer.rs's build_inverted_lists), not
+        // globally -- but `IvfVectorIterator::skip_to` assumes a global
+        // (doc_id, field_name) ascending order (the same assumption
+        // Flat's/HNSW's copies of this logic correctly rely on, because
+        // *their* writers do sort the whole segment). Sorting a local
+        // copy here is safe and cheap: `VectorStorage::get` is a keyed
+        // lookup, not positional, so this never touches `vector_ids`,
+        // `cluster_offsets`, or the rerank sidecar's cluster-grouped
+        // order that the searcher depends on.
+        let mut keys = self.vector_ids.clone();
+        keys.sort_by(|&(id_a, fid_a), &(id_b, fid_b)| {
+            id_a.cmp(&id_b)
+                .then_with(|| self.field_dict[fid_a as usize].cmp(&self.field_dict[fid_b as usize]))
+        });
         Ok(Box::new(IvfVectorIterator {
             storage: self.vectors.clone(),
-            keys: self.vector_ids.clone(),
+            keys,
             field_dict: self.field_dict.clone(),
             current: 0,
             dimension: self.dimension,
