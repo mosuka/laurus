@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::util::alloc_bounds::checked_capacity;
-use crate::vector::core::quantization::ScalarQuantParams;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::IvfIndexConfig;
 use crate::vector::index::field::LegacyVectorFieldWriter;
@@ -16,9 +15,10 @@ use crate::vector::index::format::{
     QuantHeader, VERSION_FIELD_DICT, VectorSegmentHeader, build_field_dict, record_prefix_size,
 };
 use crate::vector::index::quantized_io::{
-    quantize_segment, quantized_record_payload_size, read_dequantized_vector,
-    write_quantized_record,
+    quantize_into, quantized_record_payload_size, read_dequantized_vector,
+    train_quant_params_or_neutral, write_quantized_record,
 };
+use crate::vector::index::rerank_sidecar::write_sidecar_streaming;
 use crate::vector::writer::{VectorIndexWriter, VectorIndexWriterConfig};
 use serde::{Deserialize, Serialize};
 
@@ -1313,33 +1313,39 @@ impl VectorIndexWriter for IvfIndexWriter {
             self.inverted_lists.cluster_count(),
             "centroid count must match the CSR cluster count"
         );
+        // The LVS1 header's `vector_count` (written above from
+        // `self.vectors.len()`) and every downstream count derived from
+        // `self.inverted_lists.order` (the record count below, and the
+        // rerank sidecar's vector count) must agree, or the segment or
+        // its sidecar becomes unreadable. Today they agree only via a
+        // non-local invariant in `build_inverted_lists` (`order` is
+        // always sized to `self.vectors.len()`); this documents and
+        // enforces it (Issue #1151).
+        debug_assert_eq!(
+            self.inverted_lists.order.len(),
+            self.vectors.len(),
+            "CSR order must cover every buffered vector exactly once"
+        );
 
         // Issue #481 Stage 1, Step 7: train per-segment SQ params on
         // ALL vectors across ALL inverted lists (segment-wide single
         // (offset, scale) pair) and emit the LVS1 header before the
         // inverted-list data. `self.inverted_lists.order` is already in
-        // cluster-grouped emission order (Issue #629), so this walks the
-        // permutation once instead of flattening a `Vec<Vec<_>>`.
-        let all_vectors: Vec<Vector> = self
-            .inverted_lists
-            .order
-            .iter()
-            .map(|&idx| self.vectors[idx as usize].2.clone())
-            .collect();
-        let (params, records) = if all_vectors.is_empty() {
-            (
-                ScalarQuantParams {
-                    offset: 0.0,
-                    scale: 1.0,
-                },
-                Vec::new(),
-            )
-        } else {
-            quantize_segment(&all_vectors, self.index_config.dimension)?
-        };
+        // cluster-grouped emission order (Issue #629).
+        //
+        // Issue #1151: quantizes and writes each record immediately as
+        // `order` is walked a second time below, instead of collecting
+        // a `Vec<QuantizedRecord>` (one heap allocation per vector) up
+        // front just to zip it back with that same order.
+        let params = train_quant_params_or_neutral(
+            self.inverted_lists
+                .order
+                .iter()
+                .map(|&idx| self.vectors[idx as usize].2.data.as_slice()),
+        )?;
         // Per-segment field-name dictionary (Issue #633): ids assigned in
         // first-appearance order over the cluster-grouped emission order
-        // below (the same order the flatten above walked).
+        // below (the same order training above walked).
         let (field_dict, field_ids) = build_field_dict(
             self.inverted_lists
                 .order
@@ -1351,23 +1357,21 @@ impl VectorIndexWriter for IvfIndexWriter {
             .with_field_dict(field_dict)
             .write_to(&mut output)?;
 
-        // Write inverted lists with quantized records. The records
-        // were produced in flatten order, so we step through them in
-        // the same order while emitting each cluster's window.
-        let mut record_iter = records.into_iter();
+        // Write inverted lists with quantized records, quantizing each
+        // one in place as its cluster window is walked.
+        let mut scratch = Vec::with_capacity(self.index_config.dimension);
         for i in 0..self.inverted_lists.cluster_count() {
             let window = self.inverted_lists.cluster(i);
             output.write_all(&(window.len() as u32).to_le_bytes())?;
             for &idx in window {
-                let (doc_id, field_name, _) = &self.vectors[idx as usize];
+                let (doc_id, field_name, v) = &self.vectors[idx as usize];
                 output.write_all(&doc_id.to_le_bytes())?;
                 output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
 
                 // Write quantized payload (dim int8 + sum_q + norm_q).
-                let (int8, meta) = record_iter
-                    .next()
-                    .expect("records vector length matches the sum of inverted_lists lengths");
-                write_quantized_record(&mut output, &int8, meta)?;
+                let meta =
+                    quantize_into(&params, self.index_config.dimension, &v.data, &mut scratch)?;
+                write_quantized_record(&mut output, &scratch, meta)?;
             }
         }
 
@@ -1379,24 +1383,22 @@ impl VectorIndexWriter for IvfIndexWriter {
 
         // Stage 2 (Issue #481, extended to IVF by #650 PR-2 / #932): emit
         // the optional LRS1 rerank sidecar alongside the main int8 segment.
-        // The payload reuses `all_vectors` — materialized above in the same
-        // cluster-grouped flatten order the records were emitted in — so
+        // The payload walks `self.inverted_lists.order` again — the same
+        // cluster-grouped order the records above were emitted in — so
         // the reader's (sidecar position) -> (record position) mapping is
         // the identity, mirroring HNSW.
         if let Some(rerank_kind) = self.index_config.rerank_storage {
             let sidecar_name = format!("{}.f32", file_name);
             let sidecar_tmp = format!("{}.f32.tmp", file_name);
             let mut sidecar_out = storage.create_output(&sidecar_tmp)?;
-            let mut payload: Vec<f32> =
-                Vec::with_capacity(all_vectors.len() * self.index_config.dimension);
-            for v in &all_vectors {
-                payload.extend_from_slice(&v.data);
-            }
-            crate::vector::index::rerank_sidecar::write_sidecar(
+            write_sidecar_streaming(
                 &mut sidecar_out,
                 rerank_kind,
                 self.index_config.dimension as u32,
-                &payload,
+                self.inverted_lists
+                    .order
+                    .iter()
+                    .map(|&idx| self.vectors[idx as usize].2.data.as_slice()),
             )?;
             sidecar_out.flush()?;
             drop(sidecar_out);

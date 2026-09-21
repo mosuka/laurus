@@ -15,10 +15,10 @@ use crate::vector::index::format::{
 };
 use crate::vector::index::hnsw::graph::HnswGraph;
 use crate::vector::index::quantized_io::{
-    quantize_segment, quantized_record_payload_size, read_dequantized_vector,
-    write_quantized_record,
+    quantize_into, quantized_record_payload_size, read_dequantized_vector,
+    train_quant_params_or_neutral, write_quantized_record,
 };
-use crate::vector::index::rerank_sidecar::{read_sidecar, write_sidecar};
+use crate::vector::index::rerank_sidecar::{read_sidecar, write_sidecar_streaming};
 use crate::vector::writer::{VectorIndexWriter, VectorIndexWriterConfig};
 use bit_vec::BitVec;
 use parking_lot::RwLock;
@@ -1935,11 +1935,6 @@ impl VectorIndexWriter for HnswIndexWriter {
         let (field_dict, field_ids) =
             build_field_dict(sorted_vectors.iter().map(|(_, f, _)| f.as_str()))?;
 
-        let f32_vectors: Vec<Vector> = sorted_vectors
-            .iter()
-            .map(|(_, _, v)| (*v).clone())
-            .collect();
-
         // PQ min-train guard (Issue #880): PQ k-means trains 256 centroids
         // per sub-quantizer (16 for FastScan) — training on fewer vectors
         // than centroids produces a degenerate codebook with meaningless
@@ -1966,7 +1961,7 @@ impl VectorIndexWriter for HnswIndexWriter {
             self.index_config.pq_codebook.is_some() || self.index_config.pq_codebook_path.is_some();
         let effective_quantization = {
             use crate::vector::core::quantization::QuantizationMethod as Qm;
-            let n = f32_vectors.len();
+            let n = sorted_vectors.len();
             match self.index_config.quantization_method {
                 Qm::ProductQuantization { subvector_count }
                     if n > 0 && n < PQ_MIN_TRAIN_VECTORS && !has_shared_pq_codebook =>
@@ -2008,32 +2003,37 @@ impl VectorIndexWriter for HnswIndexWriter {
                 // since there is nothing to train on; the LVS1 header
                 // is still emitted so readers can dispatch on
                 // quant_kind uniformly.
-                let (params, records) = if f32_vectors.is_empty() {
-                    (
-                        crate::vector::core::quantization::ScalarQuantParams {
-                            offset: 0.0,
-                            scale: 1.0,
-                        },
-                        Vec::new(),
-                    )
-                } else {
-                    quantize_segment(&f32_vectors, self.index_config.dimension)?
-                };
+                //
+                // Issue #1151: quantizes and writes each record
+                // immediately as `sorted_vectors` is walked, instead of
+                // collecting a `Vec<QuantizedRecord>` (one heap
+                // allocation per vector) up front just to zip it back
+                // with this same iteration order.
+                let params = train_quant_params_or_neutral(
+                    sorted_vectors.iter().map(|(_, _, v)| v.data.as_slice()),
+                )?;
                 VectorSegmentHeader::scalar_8bit(params)
                     .with_version(VERSION_FIELD_DICT)
                     .with_field_dict(field_dict.clone())
                     .write_to(&mut output)?;
-                for ((doc_id, field_name, _), (int8, meta)) in
-                    sorted_vectors.iter().zip(records.iter())
-                {
+                let mut scratch = Vec::with_capacity(self.index_config.dimension);
+                for (doc_id, field_name, v) in &sorted_vectors {
                     output.write_all(&doc_id.to_le_bytes())?;
                     output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
-                    write_quantized_record(&mut output, int8, *meta)?;
+                    let meta =
+                        quantize_into(&params, self.index_config.dimension, &v.data, &mut scratch)?;
+                    write_quantized_record(&mut output, &scratch, meta)?;
                 }
             }
             crate::vector::core::quantization::QuantizationMethod::ProductQuantization {
                 subvector_count,
             } => {
+                // PQ genuinely needs the whole corpus at once for
+                // k-means training (unlike Scalar8Bit above), so
+                // `f32_vectors` is built here rather than unconditionally
+                // before the match (Issue #1151).
+                let f32_vectors: Vec<Vector> =
+                    sorted_vectors.iter().map(|(_, _, v)| (*v).clone()).collect();
                 if f32_vectors.is_empty() {
                     // An empty segment still needs a well-formed LVS1
                     // header so the reader can dispatch on quant_kind.
@@ -2099,6 +2099,11 @@ impl VectorIndexWriter for HnswIndexWriter {
             crate::vector::core::quantization::QuantizationMethod::ProductQuantizationFastScan {
                 subvector_count,
             } => {
+                // Same rationale as the PQ arm above: FastScan also
+                // needs the whole corpus at once for k-means training
+                // (Issue #1151).
+                let f32_vectors: Vec<Vector> =
+                    sorted_vectors.iter().map(|(_, _, v)| (*v).clone()).collect();
                 if f32_vectors.is_empty() {
                     // Empty segment: emit a well-formed LVS1 header with a
                     // minimal zero-centroid K=16 codebook so the reader can
@@ -2270,16 +2275,11 @@ impl VectorIndexWriter for HnswIndexWriter {
             let sidecar_name = format!("{}.f32", file_name);
             let sidecar_tmp = format!("{}.f32.tmp", file_name);
             let mut sidecar_out = storage.create_output(&sidecar_tmp)?;
-            let mut payload: Vec<f32> =
-                Vec::with_capacity(sorted_vectors.len() * self.index_config.dimension);
-            for (_, _, v) in &sorted_vectors {
-                payload.extend_from_slice(&v.data);
-            }
-            write_sidecar(
+            write_sidecar_streaming(
                 &mut sidecar_out,
                 rerank_kind,
                 self.index_config.dimension as u32,
-                &payload,
+                sorted_vectors.iter().map(|(_, _, v)| v.data.as_slice()),
             )?;
             sidecar_out.flush()?;
             drop(sidecar_out);
