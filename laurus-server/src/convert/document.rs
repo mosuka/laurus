@@ -69,6 +69,25 @@ pub fn data_value_to_proto(val: &DataValue) -> v1::Value {
         DataValue::Float64Array(arr) => Some(Kind::Float64ArrayValue(v1::Float64ArrayValue {
             values: arr.clone(),
         })),
+        DataValue::GeoArray(arr) => Some(Kind::GeoArrayValue(v1::GeoArrayValue {
+            values: arr
+                .iter()
+                .map(|p| v1::GeoPoint {
+                    latitude: p.lat,
+                    longitude: p.lon,
+                })
+                .collect(),
+        })),
+        DataValue::GeoEcefArray(arr) => Some(Kind::Geo3dArrayValue(v1::Geo3dArrayValue {
+            values: arr
+                .iter()
+                .map(|p| v1::Geo3dPoint {
+                    x: p.x,
+                    y: p.y,
+                    z: p.z,
+                })
+                .collect(),
+        })),
     };
     v1::Value { kind }
 }
@@ -94,15 +113,30 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
             let dt = chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default();
             DataValue::DateTime(dt)
         }
-        Some(Kind::GeoValue(g)) => DataValue::Geo(
-            laurus::lexical::GeoPoint::try_new(g.latitude, g.longitude)
-                .unwrap_or_else(|_| laurus::lexical::GeoPoint::new(0.0, 0.0)),
-        ),
+        Some(Kind::GeoValue(g)) => DataValue::Geo(geo_point_from_proto(g)),
         Some(Kind::Geo3dValue(p)) => DataValue::GeoEcef(laurus::GeoEcefPoint::new(p.x, p.y, p.z)),
         Some(Kind::Int64ArrayValue(arr)) => DataValue::Int64Array(arr.values.clone()),
         Some(Kind::Float64ArrayValue(arr)) => DataValue::Float64Array(arr.values.clone()),
+        Some(Kind::GeoArrayValue(arr)) => {
+            DataValue::GeoArray(arr.values.iter().map(geo_point_from_proto).collect())
+        }
+        Some(Kind::Geo3dArrayValue(arr)) => DataValue::GeoEcefArray(
+            arr.values
+                .iter()
+                .map(|p| laurus::GeoEcefPoint::new(p.x, p.y, p.z))
+                .collect(),
+        ),
         None => DataValue::Null,
     }
+}
+
+/// Convert a proto `GeoPoint` into a [`laurus::GeoPoint`], falling back to
+/// `(0, 0)` for out-of-range coordinates — the lenient behavior the
+/// single-valued `GeoValue` arm has always had; each element of a
+/// `GeoArrayValue` is treated the same way.
+fn geo_point_from_proto(g: &v1::GeoPoint) -> laurus::GeoPoint {
+    laurus::GeoPoint::try_new(g.latitude, g.longitude)
+        .unwrap_or_else(|_| laurus::GeoPoint::new(0.0, 0.0))
 }
 
 #[cfg(test)]
@@ -128,6 +162,52 @@ mod tests {
         }
         let back = data_value_from_proto(&proto);
         assert_eq!(back, original);
+    }
+
+    /// #1174: multi-valued geo values use the dedicated `GeoArrayValue` /
+    /// `Geo3dArrayValue` kinds and round-trip element-wise, including the
+    /// empty list.
+    #[test]
+    fn data_value_geo_arrays_round_trip() {
+        let geo = DataValue::GeoArray(vec![
+            laurus::GeoPoint::new(35.1, 139.0),
+            laurus::GeoPoint::new(-33.9, 151.2),
+        ]);
+        let proto = data_value_to_proto(&geo);
+        match &proto.kind {
+            Some(v1::value::Kind::GeoArrayValue(a)) => {
+                assert_eq!(a.values.len(), 2);
+                assert_eq!(a.values[1].latitude, -33.9);
+                assert_eq!(a.values[1].longitude, 151.2);
+            }
+            other => panic!("expected GeoArrayValue, got {other:?}"),
+        }
+        assert_eq!(data_value_from_proto(&proto), geo);
+
+        let ecef = DataValue::GeoEcefArray(vec![
+            GeoEcefPoint::new(1.0, 2.0, 3.0),
+            GeoEcefPoint::new(-4.0, 5.0, -6.0),
+        ]);
+        let proto = data_value_to_proto(&ecef);
+        match &proto.kind {
+            Some(v1::value::Kind::Geo3dArrayValue(a)) => {
+                assert_eq!(a.values.len(), 2);
+                assert_eq!(a.values[1].z, -6.0);
+            }
+            other => panic!("expected Geo3dArrayValue, got {other:?}"),
+        }
+        assert_eq!(data_value_from_proto(&ecef_proto_clone(&proto)), ecef);
+
+        for empty in [
+            DataValue::GeoArray(Vec::new()),
+            DataValue::GeoEcefArray(Vec::new()),
+        ] {
+            assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
+        }
+    }
+
+    fn ecef_proto_clone(v: &v1::Value) -> v1::Value {
+        v.clone()
     }
 
     /// `DataValue::Geo` continues to use the 2D `GeoValue` proto kind,

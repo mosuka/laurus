@@ -85,6 +85,18 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
         Some(Kind::Geo3dValue(p)) => json!({ "x": p.x, "y": p.y, "z": p.z }),
         Some(Kind::Int64ArrayValue(arr)) => json!(arr.values),
         Some(Kind::Float64ArrayValue(arr)) => json!(arr.values),
+        Some(Kind::GeoArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|g| json!({ "lat": g.latitude, "lon": g.longitude }))
+                .collect(),
+        ),
+        Some(Kind::Geo3dArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|p| json!({ "x": p.x, "y": p.y, "z": p.z }))
+                .collect(),
+        ),
     }
 }
 
@@ -535,6 +547,41 @@ mod tests {
         assert_eq!(
             json["fields"]["position"],
             json!({"x": 4.0, "y": 5.0, "z": 6.0})
+        );
+    }
+
+    #[test]
+    fn json_to_proto_geo_arrays_and_back() {
+        // #1174: an array of geo objects becomes a `GeoArrayValue` (or
+        // `Geo3dArrayValue`) and is surfaced back to MCP clients as an
+        // array of `{ lat, lon }` / `{ x, y, z }` objects.
+        let json_val = json!({
+            "fields": {
+                "spots": [
+                    { "lat": 35.6, "lon": 139.7 },
+                    { "latitude": -33.86, "longitude": 151.21 },
+                ],
+                "positions": [{ "x": 1.0, "y": 2.0, "z": 3.0 }],
+            }
+        });
+        let doc = json_to_document(&json_val).unwrap();
+        assert!(matches!(
+            doc.fields["spots"].kind,
+            Some(v1::value::Kind::GeoArrayValue(_))
+        ));
+        assert!(matches!(
+            doc.fields["positions"].kind,
+            Some(v1::value::Kind::Geo3dArrayValue(_))
+        ));
+
+        let json = document_to_json(&doc);
+        assert_eq!(
+            json["fields"]["spots"],
+            json!([{ "lat": 35.6, "lon": 139.7 }, { "lat": -33.86, "lon": 151.21 }])
+        );
+        assert_eq!(
+            json["fields"]["positions"],
+            json!([{ "x": 1.0, "y": 2.0, "z": 3.0 }])
         );
     }
 

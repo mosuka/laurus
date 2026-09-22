@@ -154,11 +154,13 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::Geo(o) => Some(Opt::Geo(v1::GeoOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Geo3d(o) => Some(Opt::Geo3d(v1::Geo3dOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Bytes(o) => Some(Opt::Bytes(v1::BytesOption { stored: o.stored })),
@@ -241,12 +243,16 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
         Some(Opt::Geo(o)) => Some(FieldOption::Geo(GeoOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Geo3d(o)) => Some(FieldOption::Geo3d(Geo3dOption {
             indexed: o.indexed,
             stored: o.stored,
-            doc_values: true,
+            multi_valued: o.multi_valued,
+            // Same tri-state treatment as every other lexical option; this
+            // arm used to hardcode `true` and drop an explicit `false`.
+            doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Bytes(o)) => Some(FieldOption::Bytes(BytesOption { stored: o.stored })),
         Some(Opt::Hnsw(o)) => Some(FieldOption::Hnsw(HnswOption {
@@ -1192,6 +1198,7 @@ mod tests {
                 Geo3dOption {
                     indexed: true,
                     stored: false,
+                    multi_valued: false,
                     doc_values: true,
                 },
             )
@@ -1204,6 +1211,53 @@ mod tests {
             Some(FieldOption::Geo3d(o)) => {
                 assert!(o.indexed);
                 assert!(!o.stored);
+                assert!(!o.multi_valued);
+            }
+            other => panic!("expected FieldOption::Geo3d, got {other:?}"),
+        }
+    }
+
+    /// #1174: `multi_valued` round-trips for Geo and Geo3d (proto field 4),
+    /// and `Geo3dOption.doc_values = false` survives the trip — the reverse
+    /// conversion used to hardcode `true`.
+    #[test]
+    fn schema_field_option_geo_multi_valued_round_trip() {
+        let schema = Schema::builder()
+            .add_field(
+                "locations",
+                FieldOption::Geo(GeoOption {
+                    indexed: true,
+                    stored: true,
+                    multi_valued: true,
+                    doc_values: false,
+                }),
+            )
+            .add_field(
+                "positions",
+                FieldOption::Geo3d(Geo3dOption {
+                    indexed: true,
+                    stored: true,
+                    multi_valued: true,
+                    doc_values: false,
+                }),
+            )
+            .build();
+
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("locations") {
+            Some(FieldOption::Geo(o)) => {
+                assert!(o.multi_valued);
+                assert!(!o.doc_values);
+            }
+            other => panic!("expected FieldOption::Geo, got {other:?}"),
+        }
+        match back.fields.get("positions") {
+            Some(FieldOption::Geo3d(o)) => {
+                assert!(o.multi_valued);
+                assert!(
+                    !o.doc_values,
+                    "explicit doc_values=false must not be coerced to true"
+                );
             }
             other => panic!("expected FieldOption::Geo3d, got {other:?}"),
         }
