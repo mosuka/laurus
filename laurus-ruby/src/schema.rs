@@ -478,23 +478,30 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `multi_valued:` (bool, default false): When true, the field
+    ///     accepts an Array of `{ "lat" => .., "lon" => .. }` Hashes and
+    ///     distance / bounding-box queries match if any point satisfies
+    ///     the predicate (Lucene-style "any match"), scoring the document
+    ///     by its closest point.
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
     fn add_geo_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
-            args.keywords,
-            &[],
-            &["stored", "indexed", "doc_values"],
-        )?;
-        let (stored, indexed, doc_values) = kwargs.optional;
+        let kwargs =
+            get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>, Option<bool>), ()>(
+                args.keywords,
+                &[],
+                &["stored", "indexed", "multi_valued", "doc_values"],
+            )?;
+        let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );
@@ -514,23 +521,30 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `multi_valued:` (bool, default false): When true, the field
+    ///     accepts an Array of `{ "x" => .., "y" => .., "z" => .. }` Hashes
+    ///     and the geo3d queries match if any point satisfies the
+    ///     predicate (Lucene-style "any match"), scoring the document by
+    ///     its closest point.
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
     fn add_geo3d_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
-            args.keywords,
-            &[],
-            &["stored", "indexed", "doc_values"],
-        )?;
-        let (stored, indexed, doc_values) = kwargs.optional;
+        let kwargs =
+            get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>, Option<bool>), ()>(
+                args.keywords,
+                &[],
+                &["stored", "indexed", "multi_valued", "doc_values"],
+            )?;
+        let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );

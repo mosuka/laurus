@@ -52,6 +52,8 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 /// | `string`                                  | `Text`               |
 /// | `array` of ints (sequential)              | `Int64Array`         |
 /// | `array` of numerics (sequential)          | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
+/// | `array` of `lat`/`lon` arrays (sequential) | `GeoArray` (multi-valued geo, #1174) |
+/// | `array` of `x`/`y`/`z` arrays (sequential) | `GeoEcefArray`      |
 /// | `array` with `"lat"`, `"lon"` keys        | `Geo`                |
 /// | `array` with `"x"`, `"y"`, `"z"` keys     | `GeoEcef`            |
 /// | ISO 8601 string (fallback)                | `DateTime`           |
@@ -127,6 +129,13 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         if ht.is_empty() {
             return Ok(DataValue::Int64Array(Vec::new()));
         }
+        // A sequential array of arrays is a multi-valued geo field (#1174):
+        // the outer array has no `lat`/`x` keys so the marker checks above
+        // fall through to here, and each element takes the same
+        // associative-array path as a single point.
+        if ht.iter().all(|(_, val)| val.is_array()) {
+            return zval_array_of_arrays_to_geo_array(ht);
+        }
         if ht.iter().all(|(_, val)| val.is_long()) {
             let mut ints = Vec::with_capacity(ht.len());
             for (_, val) in ht.iter() {
@@ -153,6 +162,28 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         zv.get_type()
     )
     .into())
+}
+
+/// Convert a non-empty array whose elements are all arrays into a
+/// [`DataValue::GeoArray`] (all `lat`/`lon`) or [`DataValue::GeoEcefArray`]
+/// (all `x`/`y`/`z`), rejecting a mix or an element of any other shape.
+fn zval_array_of_arrays_to_geo_array(ht: &ZendHashTable) -> PhpResult<DataValue> {
+    const MIXED: &str =
+        "an array of arrays must be all ['lat', 'lon'] or all ['x', 'y', 'z'] geo points";
+    let mut geo = Vec::with_capacity(ht.len());
+    let mut ecef = Vec::with_capacity(ht.len());
+    for (_, val) in ht.iter() {
+        match zval_to_data_value(val)? {
+            DataValue::Geo(p) => geo.push(p),
+            DataValue::GeoEcef(p) => ecef.push(p),
+            _ => return Err(MIXED.into()),
+        }
+    }
+    match (geo.is_empty(), ecef.is_empty()) {
+        (false, true) => Ok(DataValue::GeoArray(geo)),
+        (true, false) => Ok(DataValue::GeoEcefArray(ecef)),
+        _ => Err(MIXED.into()),
+    }
 }
 
 /// Convert a [`Document`] to a PHP associative array (HashTable).
@@ -259,6 +290,24 @@ pub fn data_value_to_zval(value: &DataValue) -> PhpResult<Zval> {
                 let mut item = Zval::new();
                 item.set_double(*v);
                 arr.push(item).map_err(|_| "failed to push float")?;
+            }
+            zv.set_hashtable(arr);
+        }
+        // Arrays of the same associative arrays the single-valued arms
+        // produce, so the output feeds back into `zval_to_data_value`.
+        DataValue::GeoArray(points) => {
+            let mut arr = ZendHashTable::new();
+            for p in points {
+                arr.push(data_value_to_zval(&DataValue::Geo(*p))?)
+                    .map_err(|_| "failed to push geo point")?;
+            }
+            zv.set_hashtable(arr);
+        }
+        DataValue::GeoEcefArray(points) => {
+            let mut arr = ZendHashTable::new();
+            for p in points {
+                arr.push(data_value_to_zval(&DataValue::GeoEcef(*p))?)
+                    .map_err(|_| "failed to push geo3d point")?;
             }
             zv.set_hashtable(arr);
         }

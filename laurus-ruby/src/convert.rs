@@ -55,6 +55,8 @@ pub fn hash_to_document(ruby: &Ruby, hash: RHash) -> Result<Document, Error> {
 /// | `String`                      | `Text`               |
 /// | `Array` of `Integer`          | `Int64Array`         |
 /// | `Array` of numerics           | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
+/// | `Array` of `lat`/`lon` Hashes | `GeoArray` (multi-valued geo, #1174) |
+/// | `Array` of `x`/`y`/`z` Hashes | `GeoEcefArray`       |
 /// | `Hash` with `"lat"`, `"lon"`  | `Geo`                |
 /// | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` (3D ECEF Cartesian, meters) |
 /// | `Time` / ISO 8601 string      | `DateTime`           |
@@ -111,6 +113,12 @@ pub fn rb_to_data_value(ruby: &Ruby, value: Value) -> Result<DataValue, Error> {
         // `Value` is a GC-tracked handle, not `TryConvertOwned`, so iterate
         // rather than `to_vec::<Value>()`.
         let elements: Vec<Value> = arr.into_iter().collect();
+        // An Array of Hashes is a multi-valued geo field (#1174). Each Hash
+        // goes through the same lat/lon and x/y/z checks as a single point
+        // below, so key semantics and range validation are shared.
+        if elements.iter().all(|v| v.is_kind_of(ruby.class_hash())) {
+            return rb_hash_array_to_geo_array(ruby, &elements);
+        }
         if elements.iter().all(|v| v.is_kind_of(ruby.class_integer())) {
             let ints = elements
                 .iter()
@@ -171,6 +179,32 @@ pub fn rb_to_data_value(ruby: &Ruby, value: Value) -> Result<DataValue, Error> {
             value.class()
         ),
     ))
+}
+
+/// Convert a non-empty Array whose elements are all Hashes into a
+/// [`DataValue::GeoArray`] (all `lat`/`lon`) or [`DataValue::GeoEcefArray`]
+/// (all `x`/`y`/`z`), rejecting a mix or a Hash of any other shape.
+fn rb_hash_array_to_geo_array(ruby: &Ruby, elements: &[Value]) -> Result<DataValue, Error> {
+    let mixed = || {
+        Error::new(
+            ruby.exception_arg_error(),
+            "an Array of Hashes must be all { lat, lon } or all { x, y, z } geo points",
+        )
+    };
+    let mut geo = Vec::with_capacity(elements.len());
+    let mut ecef = Vec::with_capacity(elements.len());
+    for &element in elements {
+        match rb_to_data_value(ruby, element)? {
+            DataValue::Geo(p) => geo.push(p),
+            DataValue::GeoEcef(p) => ecef.push(p),
+            _ => return Err(mixed()),
+        }
+    }
+    match (geo.is_empty(), ecef.is_empty()) {
+        (false, true) => Ok(DataValue::GeoArray(geo)),
+        (true, false) => Ok(DataValue::GeoEcefArray(ecef)),
+        _ => Err(mixed()),
+    }
 }
 
 /// Convert a [`Document`] to a Ruby `Hash`.
@@ -246,6 +280,22 @@ pub fn data_value_to_rb(ruby: &Ruby, value: &DataValue) -> Result<Value, Error> 
             let out = ruby.ary_new_capa(arr.len());
             for &v in arr {
                 out.push(ruby.float_from_f64(v))?;
+            }
+            Ok(out.as_value())
+        }
+        // Arrays of the same Hashes the single-valued arms produce, so the
+        // output feeds back into `rb_to_data_value` unchanged.
+        DataValue::GeoArray(arr) => {
+            let out = ruby.ary_new_capa(arr.len());
+            for &p in arr {
+                out.push(data_value_to_rb(ruby, &DataValue::Geo(p))?)?;
+            }
+            Ok(out.as_value())
+        }
+        DataValue::GeoEcefArray(arr) => {
+            let out = ruby.ary_new_capa(arr.len());
+            for &p in arr {
+                out.push(data_value_to_rb(ruby, &DataValue::GeoEcef(p))?)?;
             }
             Ok(out.as_value())
         }

@@ -83,3 +83,77 @@ describe("multi-valued numeric arrays from JS (#1178)", () => {
     ).rejects.toThrow();
   });
 });
+
+async function indexWithGeoField(multiValued) {
+  const schema = new Schema();
+  schema.addTextField("title");
+  // (name, stored, indexed, multiValued)
+  schema.addGeoField("spots", true, true, multiValued);
+  return Index.create(null, schema);
+}
+
+describe("multi-valued geo arrays from JS (#1174)", () => {
+  it("round-trips an array of { lat, lon } objects through a multiValued geo field", async () => {
+    const index = await indexWithGeoField(true);
+    const spots = [
+      { lat: 35.68, lon: 139.76 },
+      { lat: 34.69, lon: 135.5 },
+    ];
+    await index.putDocument("doc1", { title: "t", spots });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].spots).toEqual(spots);
+  });
+
+  it("round-trips an array of { x, y, z } objects through a multiValued geo3d field", async () => {
+    const schema = new Schema();
+    schema.addTextField("title");
+    schema.addGeo3dField("positions", true, true, true);
+    const index = await Index.create(null, schema);
+    const positions = [
+      { x: 1.0, y: 2.0, z: 3.0 },
+      { x: -4.0, y: 5.0, z: -6.0 },
+    ];
+    await index.putDocument("doc1", { title: "t", positions });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].positions).toEqual(positions);
+  });
+
+  it("wraps a single { lat, lon } object on a multiValued geo field", async () => {
+    const index = await indexWithGeoField(true);
+    await index.putDocument("doc1", { title: "t", spots: { lat: 35.68, lon: 139.76 } });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].spots).toEqual([{ lat: 35.68, lon: 139.76 }]);
+  });
+
+  it("accepts an empty array on a multiValued geo field", async () => {
+    const index = await indexWithGeoField(true);
+    await index.putDocument("doc1", { title: "t", spots: [] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].spots).toEqual([]);
+  });
+
+  it("rejects an array sent to a single-valued geo field", async () => {
+    const index = await indexWithGeoField(false);
+    await expect(
+      index.putDocument("doc1", { title: "t", spots: [{ lat: 35.68, lon: 139.76 }] }),
+    ).rejects.toThrow(/multi_valued/);
+  });
+
+  it("rejects an array mixing 2D and 3D points", async () => {
+    const index = await indexWithGeoField(true);
+    await expect(
+      index.putDocument("doc1", {
+        title: "t",
+        spots: [{ lat: 35.68, lon: 139.76 }, { x: 1, y: 2, z: 3 }],
+      }),
+    ).rejects.toThrow();
+  });
+});

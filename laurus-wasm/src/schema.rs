@@ -261,6 +261,10 @@ impl WasmSchema {
 
     /// Add a geographic coordinate field (latitude, longitude).
     ///
+    /// * `multi_valued` - When `true`, the field accepts arrays of
+    ///   `{ lat, lon }` objects and distance / bounding-box queries match if
+    ///   any point satisfies the predicate (Lucene-style "any match"),
+    ///   scoring the document by its closest point. Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addGeoField")]
@@ -269,6 +273,7 @@ impl WasmSchema {
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        multi_valued: Option<bool>,
         doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
@@ -276,6 +281,7 @@ impl WasmSchema {
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );
@@ -288,6 +294,10 @@ impl WasmSchema {
     /// and `searchGeo3dNearest` on `Index`. See the conceptual docs at
     /// `docs/src/concepts/geo3d.md`.
     ///
+    /// * `multi_valued` - When `true`, the field accepts arrays of
+    ///   `{ x, y, z }` objects and the geo3d queries match if any point
+    ///   satisfies the predicate (Lucene-style "any match"), scoring the
+    ///   document by its closest point. Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addGeo3dField")]
@@ -296,6 +306,7 @@ impl WasmSchema {
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        multi_valued: Option<bool>,
         doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
@@ -303,6 +314,7 @@ impl WasmSchema {
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );

@@ -80,3 +80,65 @@ def test_list_into_single_valued_integer_field_is_still_rejected():
     idx = _index_with(laurus.Schema.add_integer_field, "year")
     with pytest.raises(Exception):
         idx.put_document("doc1", {"title": "t", "year": [2020, 2021]})
+
+
+# ---- Multi-valued geo (Issue #1174) ----
+
+
+def test_tuple_list_round_trips_through_multi_valued_geo_field():
+    """A list of ``(lat, lon)`` tuples is a multi-valued geo field and reads
+    back as the same list of tuples."""
+    idx = _index_with(laurus.Schema.add_geo_field, "spots", multi_valued=True)
+    idx.put_document(
+        "doc1", {"title": "t", "spots": [(35.68, 139.76), (34.69, 135.50)]}
+    )
+    idx.commit()
+
+    docs = idx.get_documents("doc1")
+    assert docs[0]["spots"] == [(35.68, 139.76), (34.69, 135.50)]
+
+
+def test_tuple_list_round_trips_through_multi_valued_geo3d_field():
+    idx = _index_with(laurus.Schema.add_geo3d_field, "positions", multi_valued=True)
+    idx.put_document(
+        "doc1", {"title": "t", "positions": [(1.0, 2.0, 3.0), (-4.0, 5.0, -6.0)]}
+    )
+    idx.commit()
+
+    docs = idx.get_documents("doc1")
+    assert docs[0]["positions"] == [(1.0, 2.0, 3.0), (-4.0, 5.0, -6.0)]
+
+
+def test_single_tuple_is_wrapped_on_multi_valued_geo_field():
+    idx = _index_with(laurus.Schema.add_geo_field, "spots", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "spots": (35.68, 139.76)})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["spots"] == [(35.68, 139.76)]
+
+
+def test_empty_list_is_accepted_by_multi_valued_geo_field():
+    idx = _index_with(laurus.Schema.add_geo_field, "spots", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "spots": []})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["spots"] == []
+
+
+def test_tuple_list_into_single_valued_geo_field_is_rejected():
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_geo_field, "spot")
+    with pytest.raises(Exception, match="multi_valued"):
+        idx.put_document("doc1", {"title": "t", "spot": [(35.68, 139.76)]})
+
+
+def test_mixed_tuple_arities_are_rejected():
+    """2-tuples and 3-tuples in one list are neither a 2D nor a 3D array."""
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_geo_field, "spots", multi_valued=True)
+    with pytest.raises(Exception):
+        idx.put_document(
+            "doc1", {"title": "t", "spots": [(35.68, 139.76), (1.0, 2.0, 3.0)]}
+        )

@@ -279,6 +279,10 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `multiValued` - When `true`, the field accepts arrays of
+    ///   `{ lat, lon }` objects and distance / bounding-box queries match if
+    ///   any point satisfies the predicate (Lucene-style "any match"),
+    ///   scoring the document by its closest point. Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
@@ -287,6 +291,7 @@ impl JsSchema {
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        multi_valued: Option<bool>,
         doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
@@ -294,6 +299,7 @@ impl JsSchema {
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );
@@ -311,6 +317,10 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `multiValued` - When `true`, the field accepts arrays of
+    ///   `{ x, y, z }` objects and the geo3d queries match if any point
+    ///   satisfies the predicate (Lucene-style "any match"), scoring the
+    ///   document by its closest point. Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi(js_name = "addGeo3dField")]
@@ -319,6 +329,7 @@ impl JsSchema {
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        multi_valued: Option<bool>,
         doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
@@ -326,6 +337,7 @@ impl JsSchema {
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );

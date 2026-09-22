@@ -317,6 +317,20 @@ fn format_data_value(value: &DataValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        DataValue::GeoArray(arr) => format!(
+            "[{}]",
+            arr.iter()
+                .map(|p| format!("({}, {})", p.lat, p.lon))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DataValue::GeoEcefArray(arr) => format!(
+            "[{}]",
+            arr.iter()
+                .map(|p| format!("({}, {}, {})", p.x, p.y, p.z))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -344,6 +358,18 @@ fn data_value_to_json(value: &DataValue) -> serde_json::Value {
         DataValue::GeoEcef(p) => json!({"x": p.x, "y": p.y, "z": p.z}),
         DataValue::Int64Array(arr) => json!(arr),
         DataValue::Float64Array(arr) => json!(arr),
+        // Same per-point object shape as the single-valued arms, so the
+        // output feeds back into `json_to_document`'s geo-array inference.
+        DataValue::GeoArray(arr) => json!(
+            arr.iter()
+                .map(|p| json!({"lat": p.lat, "lon": p.lon}))
+                .collect::<Vec<_>>()
+        ),
+        DataValue::GeoEcefArray(arr) => json!(
+            arr.iter()
+                .map(|p| json!({"x": p.x, "y": p.y, "z": p.z}))
+                .collect::<Vec<_>>()
+        ),
     }
 }
 

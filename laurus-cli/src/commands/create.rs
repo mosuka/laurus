@@ -416,7 +416,8 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
         .default(true)
         .interact()?;
 
-    let multi_valued = if matches!(type_name, "Integer" | "Float") {
+    // The BKD-backed types (#281 numeric, #1174 geo).
+    let multi_valued = if matches!(type_name, "Integer" | "Float" | "Geo" | "Geo3d") {
         Confirm::new()
             .with_prompt("Multi-valued? (accepts arrays of values)")
             .default(false)
@@ -456,11 +457,13 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
         "Geo" => FieldOption::Geo(GeoOption {
             indexed,
             stored,
+            multi_valued,
             doc_values,
         }),
         "Geo3d" => FieldOption::Geo3d(Geo3dOption {
             indexed,
             stored,
+            multi_valued,
             doc_values,
         }),
         _ => unreachable!(),
@@ -736,6 +739,7 @@ mod tests {
         let opt = FieldOption::Geo3d(Geo3dOption {
             indexed: true,
             stored: true,
+            multi_valued: false,
             doc_values: true,
         });
         assert_eq!(field_type_label(&opt), "Geo3d");
