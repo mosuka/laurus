@@ -174,6 +174,7 @@ warrant a dedicated harness. Single-shot perf benches don't need it.
 | `text_analysis_bench`         | Microbench     | n/a        | Analyzer pipeline |
 | `vector_indexing_bench`       | Phase 2-like   | n/a        | Vector index build |
 | `vector_search_bench`         | Phase 3        | Yes        | Vector kNN (search-only benches cached via `cached_vector_reader`, #513 Stage 2; construction benches unchanged) |
+| `merge_stress_bench`          | Phase 2-like   | No         | `MergeEngine::perform_merge` via `optimize()`; own `TrackingAllocator` global allocator for peak-byte reports (#1167) |
 
 Items marked "(own setup)" use a smaller corpus shape or a different
 setup pattern that does not need a generalised cache. With #513
@@ -206,6 +207,25 @@ When changing anything that would alter the resulting index — schema,
 analyzer, corpus synthesis, segment format — bump
 `BENCH_INDEX_FORMAT_VERSION` in `lexical_search_bench.rs`. Stale
 caches will be auto-rebuilt on the next run.
+
+## Peak-memory measurement (`merge_stress_bench`)
+
+`merge_stress_bench` is the first bench in this suite to instrument the
+allocator: it defines a `TrackingAllocator` (`#[global_allocator]`) that
+tracks a high-water mark of net allocated bytes, reported via `println!`
+once per size before the timed Criterion loop starts. A
+`#[global_allocator]` applies per compiled binary, and each `[[bench]]`
+entry is its own binary, so this has zero effect on any other bench,
+on `cargo test`, or on the library itself when used elsewhere — it is
+safe to define independently in future benches that need the same
+signal, without touching `common.rs`.
+
+This is a directional proxy for A/B comparisons (e.g. before/after a
+memory-focused perf PR on the same machine), not publication-grade
+profiling, and it assumes the code under measurement is single-threaded
+(concurrent allocation activity would corrupt the single global
+high-water mark) — check for `rayon`/thread spawning in whatever you
+point it at before reusing the pattern.
 
 ## Background
 
