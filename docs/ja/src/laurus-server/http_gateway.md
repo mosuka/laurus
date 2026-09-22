@@ -83,6 +83,8 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
+レスポンスの `integer` / `float` / `geo` / `geo3d` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:
@@ -285,11 +287,13 @@ HTTP・gRPC・CLI・MCP のすべての経路で挙動が一致します。
 | `{"latitude": ..., "longitude": ...}` | `geo` | |
 | `{"lat": ..., "lon": ...}` / `{"lat": ..., "lng": ...}` | `geo` | latitude / longitude の短縮別名を受け付けます。 |
 | `{"x": ..., "y": ..., "z": ...}` | `geo3d` | 3 キーすべて必須、有限な数値、ECEF メートル単位。`lat`/`lon` キーとの混在は拒否されます。 |
+| `[{"latitude": 35.6, "longitude": 139.7}, ...]`（全要素が地理 object） | `geo`（`multi_valued: true`） | 多値地理フィールド。`lat` / `lon` / `lng` の別名も受け付けます。ドキュメント取得時は `{"latitude", "longitude"}` object の配列として返されます。 |
+| `[{"x": ..., "y": ..., "z": ...}, ...]`（全要素が 3D object） | `geo3d`（`multi_valued: true`） | 多値 3D 地理フィールド。取得時は `{"x", "y", "z"}` object の配列として返されます。1 つの配列に 2D と 3D の object を混在させると拒否されます。 |
 | `{"data": "<base64>", "mime": "..."}` | `bytes` | `mime` は省略可能。マルチモーダルなベクトルフィールド（`Text` と `Bytes` の両方を受け付ける embedder）に対して、素の文字列と画像バイト列を区別するために使います — 詳細は [スキーマとフィールド](../concepts/schema_and_fields.md) を参照してください。 |
 
 以下の場合、ゲートウェイは HTTP 400（`Bad Request`）を返します:
 
-- 配列が混在型もしくは非数値要素を含む（例: `[1, "x"]`）
+- 配列が混在型もしくは非数値要素を含む（例: `[1, "x"]`）、または 2D と 3D の地理 object を混在させている（例: `[{"lat": ...}, {"x": ...}]`）
 - オブジェクトが上記のいずれの形にも一致しない（2D は latitude/longitude
   キーが、3D は `x`/`y`/`z` のいずれかが欠けている、または `data` が
   文字列でない、など）

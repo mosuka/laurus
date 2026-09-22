@@ -416,15 +416,21 @@ Add a boolean field. See `docValues` above.
 
 Add a date/time field. See `docValues` above.
 
-#### `addGeoField(name, stored?, indexed?, docValues?)`
+#### `addGeoField(name, stored?, indexed?, multiValued?, docValues?)`
 
-Add a geographic coordinate field. See `docValues` above.
+Add a geographic coordinate field. Pass `multiValued: true` to accept arrays
+of `{ lat, lon }` objects; distance and bounding-box queries then match if
+any point satisfies the predicate (Lucene-style "any match"), scoring the
+document by its closest point. See `docValues` above.
 
-#### `addGeo3dField(name, stored?, indexed?, docValues?)`
+#### `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)`
 
 Add a 3D ECEF Cartesian point field. Values are submitted as a `{ x, y, z }`
-object with metres units. See [Geo3d concepts](../concepts/geo3d.md) for
-ECEF theory, and `docValues` above.
+object with metres units. Pass `multiValued: true` to accept arrays of
+`{ x, y, z }` objects; the 3D queries then match if any point satisfies the
+predicate (Lucene-style "any match"), scoring the document by its closest
+point. See [Geo3d concepts](../concepts/geo3d.md) for ECEF theory, and
+`docValues` above.
 
 The WASM binding does not expose `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery`
 / `Geo3dNearestQuery` as JS classes (wasm-bindgen cannot expose `dyn Query`

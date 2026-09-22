@@ -133,6 +133,7 @@ doc_values = true
 [fields.location.Geo]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -140,6 +141,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Geo クエリ（半径、バウンディングボックス）を有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
+| `multi_valued` | `bool` | `false` | ポイントの配列を受け付け、距離 / バウンディングボックスクエリは**いずれかのポイント**が条件を満たせばマッチ（Lucene 流の "any match"）。スコアはドキュメント内で最も近いポイントで決まる |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Geo3d
@@ -150,6 +152,7 @@ doc_values = true
 [fields.position.Geo3d]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -157,6 +160,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | 3D 地理クエリ（`geo3d_distance`、`geo3d_bbox`、`geo3d_nearest`）を有効にする |
 | `stored` | `bool` | `true` | 元の `(x, y, z)` 値を保存する |
+| `multi_valued` | `bool` | `false` | ポイントの配列を受け付け、`geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` クエリは**いずれかのポイント**が条件を満たせばマッチ（Lucene 流の "any match"）。スコアはドキュメント内で最も近いポイントで決まる |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Bytes

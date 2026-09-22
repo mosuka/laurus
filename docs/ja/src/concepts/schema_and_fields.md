@@ -241,6 +241,8 @@ pub enum DataValue {
     GeoEcef(GeoEcefPoint),           // 3D ECEF 直交座標ポイント (x, y, z)、メートル
     Int64Array(Vec<i64>),            // 多値整数フィールド
     Float64Array(Vec<f64>),          // 多値浮動小数点フィールド
+    GeoArray(Vec<GeoPoint>),         // 多値 2D 地理フィールド
+    GeoEcefArray(Vec<GeoEcefPoint>), // 多値 3D ECEF フィールド
 }
 ```
 
@@ -303,6 +305,8 @@ let schema = Schema::builder()
 | 浮動小数点を含む数値配列（例: `[1.5, 2.0, 3]`） | `Float`（`multi_valued = true`） |
 | 緯度キー（`lat` または `latitude`）と経度キー（`lon`、`lng`、`longitude` のいずれか）を持ち、値が範囲内の object | `Geo` |
 | 数値の `x`、`y`、`z` の 3 キーをすべて持つ object（有限値、ECEF メートル単位） | `Geo3d` |
+| 地理 object の配列（例: `[{"lat": 35.6, "lon": 139.7}, ...]`） | `Geo`（`multi_valued = true`） |
+| `x`/`y`/`z` object の配列 | `Geo3d`（`multi_valued = true`） |
 | `data` キー（base64 エンコードされた文字列）と任意の `mime` キーを持つ object | `Bytes` 値 |
 
 ベクトルフィールド（`Hnsw` / `Flat` / `Ivf`）は **自動推論の対象外**です。
@@ -316,14 +320,31 @@ let schema = Schema::builder()
 混在させた場合は曖昧と判定してエラーとなります。いずれか一方の
 形式のみ使用してください。
 
-### 多値数値フィールド
+### 多値（multi-valued）フィールド
 
 `Integer` と `Float` フィールドは `multi_valued = true` を指定することで、
 1 ドキュメントに複数の値を保持できます。範囲クエリは**いずれかの値が条件を満たせばマッチ**
 する Lucene 流の挙動で、スコアは constant（マッチ件数による加点なし）です。
 
+`Geo` と `Geo3d` フィールドも同様に `multi_valued = true` を指定できます。
+多値地理フィールドの各ポイントは、それぞれ独立したエントリとしてフィールドの
+BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。そのため距離クエリと
+バウンディングボックスクエリ（`Geo3d` では nearest クエリも）は、**いずれかのポイント**が
+条件を満たせばドキュメントにマッチします。ドキュメントは 1 回だけ報告され、
+スコアは条件を満たすポイントのうち最も近いもの（2D バウンディングボックスクエリでは
+ボックス中心に最も近いポイント）で決まります。`Dynamic` ポリシーでは、2D object と
+3D object を 1 つの配列に混在させた場合、および数値と object を混在させた場合は
+エラーになります。各要素には単一ポイントと同じ範囲検証が適用されます。
+
 多値フィールドに単一値を送った場合は要素 1 個の配列に自動ラップされます。
-逆に単一値フィールドに配列を送ると、暗黙の切り捨てではなくエラーになります。
+逆に単一値フィールドに配列を送ると、暗黙の切り捨てではなくエラーになります
+（エラーメッセージは `multi_valued = true` でフィールドを宣言するよう案内します）。
+多値地理フィールドに空配列を送った場合は受理され、ポイントを持たないフィールドになります
+（どの空間クエリにもマッチしません）。
+
+多値地理の値を含むセグメントは新しい stored-field 型タグを使用するため、
+この機能より前のビルドでは読み込めません。フォーマットのバージョンは上げていないため、
+古いリーダーはデータを誤読するのではなく、明示的なエラーで失敗します。
 
 ### 型衝突
 
@@ -343,6 +364,10 @@ let schema = Schema::builder()
 | `Text` | 任意のスカラー値 | 文字列化 |
 | `Bytes` | `Text(s)` | base64 としてデコード（`s` が不正な base64 ならエラー） |
 | `Geo` / `Geo3d` | 対応 variant 以外 | エラー |
+| `Geo` / `Geo3d`（単一値） | `GeoArray` / `GeoEcefArray` | エラー（`multi_valued = true` を宣言する） |
+| `Geo` / `Geo3d`（`multi_valued = true`） | `GeoArray` / `GeoEcefArray` | そのまま格納 |
+| `Geo` / `Geo3d`（`multi_valued = true`） | 対応する単一ポイント | 要素 1 個の配列にラップ |
+| `Geo` / `Geo3d`（`multi_valued = true`） | 空の数値配列（`[]`） | 空のポイントリスト |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | `Text` または `Bytes` | フィールドの embedder にそのまま渡す |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | 数値配列 | 要素ごとに `f32` へキャスト |
 

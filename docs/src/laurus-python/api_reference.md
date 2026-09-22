@@ -208,8 +208,8 @@ class Schema:
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64-bit float field. Set `multi_valued=True` to accept arrays of floats (range queries match if any value satisfies the predicate). See `doc_values` above. |
 | `add_boolean_field(name, *, stored=True, indexed=True, doc_values=True)` | Boolean field. See `doc_values` above. |
 | `add_bytes_field(name, *, stored=True)` | Raw bytes field. No `doc_values` option: a `Bytes` value is never written to DocValues regardless. |
-| `add_geo_field(name, *, stored=True, indexed=True, doc_values=True)` | Geographic coordinate field (lat/lon). See `doc_values` above. |
-| `add_geo3d_field(name, *, stored=True, indexed=True, doc_values=True)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values` above. |
+| `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | Geographic coordinate field (lat/lon). Set `multi_valued=True` to accept a list of `(lat, lon)` tuples (distance / bounding-box queries match if any point satisfies the predicate; values are read back as a list of tuples). See `doc_values` above. |
+| `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF Cartesian point field (x, y, z in metres). Set `multi_valued=True` to accept a list of `(x, y, z)` tuples (distance / bounding-box / nearest queries match if any point satisfies the predicate; values are read back as a list of tuples). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values` above. |
 | `add_datetime_field(name, *, stored=True, indexed=True, doc_values=True)` | UTC datetime field. See `doc_values` above. |
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat (brute-force) vector field. |
@@ -623,7 +623,10 @@ Python values are automatically converted to Laurus `DataValue` types:
 | `float` | `Float64` | |
 | `str` | `Text` | |
 | `bytes` | `Bytes` | |
-| `list[float]` | `Vector` | Elements coerced to `f32` |
+| `list[int]` | `Int64Array` | Multi-valued integer field (`bool` elements are not integers); vector fields cast the list to `f32`. An empty list is an empty `Int64Array` |
+| `list[float \| int]` | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the list to `f32` |
 | `(lat, lon)` tuple | `Geo` | Two `float` values |
 | `(x, y, z)` tuple | `Geo3d` | Three `float` values (ECEF Cartesian, metres) |
+| `list[(lat, lon)]` | `GeoArray` | List of `(lat, lon)` tuples; requires `multi_valued=True` on the field |
+| `list[(x, y, z)]` | `GeoEcefArray` | List of `(x, y, z)` tuples; requires `multi_valued=True` on the field |
 | `datetime.datetime` | `DateTime` | Converted via `isoformat()` |

@@ -105,13 +105,15 @@ Each `FieldOption` is a `oneof` with one of the following field types:
 | `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `BooleanOption` (`indexed`, `stored`, `doc_values`) | |
 | `DateTimeOption` (`indexed`, `stored`, `doc_values`) | |
-| `GeoOption` (`indexed`, `stored`, `doc_values`) | |
-| `Geo3dOption` (`indexed`, `stored`, `doc_values`) | |
+| `GeoOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
+| `Geo3dOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `BytesOption` (`stored`) | |
 
 The `embedder` field in vector options specifies the name of an embedder defined in `Schema.embedders`. When set, the server automatically generates vectors from document text fields at index time. Leave empty to supply pre-computed vectors directly.
 
 **Doc values:** `doc_values` (Issue #1047) is `optional bool` on every lexical option above except `BytesOption`, following the same tri-state contract as `term_vectors`: a client that omits it gets the engine's default (`true`), distinguishable from an explicit `false`. It controls whether the field's value is also copied into DocValues, the column-oriented store sorting and faceting/aggregation read from — a DocValues column is written only when `stored` and `doc_values` are both `true`. `BytesOption` carries no such field: a `Bytes` value is never written to DocValues regardless. Turning `doc_values` off for a field that is never sorted or faceted on shrinks its segment footprint; the field remains fully searchable and retrievable either way.
+
+**Multi-valued geo:** `multi_valued` on `GeoOption` / `Geo3dOption` (Issue #1174) is proto field number `4` — `3` is already taken by `doc_values` there, unlike `IntegerOption` / `FloatOption`. When `true`, the field accepts `GeoArrayValue` / `Geo3dArrayValue` (see the `Value` table below) and distance / bounding-box queries (plus `geo3d_nearest`) match a document if **any** of its points satisfies the predicate, scoring it by its closest point.
 
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
@@ -268,6 +270,8 @@ Each `Value` is a `oneof` with these types:
 | Int64Array | `int64_array_value` | `Int64ArrayValue` (multi-valued integers; requires `IntegerOption.multi_valued = true`) |
 | Float64Array | `float64_array_value` | `Float64ArrayValue` (multi-valued floats; requires `FloatOption.multi_valued = true`) |
 | Geo3d | `geo3d_value` | `Geo3dPoint` (x, y, z meters; ECEF Cartesian) |
+| GeoArray | `geo_array_value` | `GeoArrayValue` (`repeated GeoPoint`; multi-valued 2D points; requires `GeoOption.multi_valued = true`) |
+| Geo3dArray | `geo3d_array_value` | `Geo3dArrayValue` (`repeated Geo3dPoint`; multi-valued 3D points; requires `Geo3dOption.multi_valued = true`) |
 
 **Geo3dPoint:**
 

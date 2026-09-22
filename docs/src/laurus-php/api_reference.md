@@ -180,8 +180,8 @@ new \Laurus\Schema()
 | `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64-bit float field. Pass `$multiValued = true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `$docValues` above. |
 | `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $docValues = true): void` | Boolean field. See `$docValues` above. |
 | `addBytesField(string $name, bool $stored = true): void` | Raw bytes field. No `$docValues` option: a `Bytes` value is never written to DocValues regardless. |
-| `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $docValues = true): void` | Geographic coordinate field (lat/lon). See `$docValues` above. |
-| `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $docValues = true): void` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `$docValues` above. |
+| `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | Geographic coordinate field (lat/lon). Pass `$multiValued = true` to accept an array of `["lat" => .., "lon" => ..]` arrays (distance / bounding-box queries match if any point satisfies the predicate). See `$docValues` above. |
+| `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `$multiValued = true` to accept an array of `["x" => .., "y" => .., "z" => ..]` arrays (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `$docValues` above. |
 | `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $docValues = true): void` | UTC datetime field. See `$docValues` above. |
 | `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW approximate nearest-neighbor vector field. `$baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0): void` | Flat (brute-force) vector field. |
@@ -529,7 +529,10 @@ PHP values are automatically converted to Laurus `DataValue` types:
 | `int` | `Int64` | |
 | `float` | `Float64` | |
 | `string` | `Text` | |
-| `array` of numerics | `Vector` | Elements coerced to `f32` |
+| `array` of `int` (sequential) | `Int64Array` | Multi-valued integer field; vector fields cast the array to `f32`. An empty `array` is an empty `Int64Array` |
+| `array` of numerics (sequential) | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the array to `f32` |
 | `array` with `"lat"`, `"lon"` | `Geo` | Two `float` values |
 | `array` with `"x"`, `"y"`, `"z"` | `GeoEcef` | Three `float` values, meters (3D ECEF Cartesian) |
+| `array` of `["lat" => .., "lon" => ..]` arrays | `GeoArray` | Sequential array; requires `$multiValued = true` on the field |
+| `array` of `["x" => .., "y" => .., "z" => ..]` arrays | `GeoEcefArray` | Sequential array; requires `$multiValued = true` on the field |
 | `string` (ISO 8601) | `DateTime` | Parsed from ISO 8601 format |

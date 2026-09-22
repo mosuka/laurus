@@ -133,6 +133,7 @@ Geographic point field (latitude/longitude). Supports radius and bounding box qu
 [fields.location.Geo]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -140,6 +141,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables geo queries (radius, bounding box) |
 | `stored` | `bool` | `true` | Stores the original value |
+| `multi_valued` | `bool` | `false` | Accept arrays of points; distance / bounding-box queries match if **any** point satisfies the predicate (Lucene-style "any match"), scoring the document by its closest point |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Geo3d
@@ -150,6 +152,7 @@ doc_values = true
 [fields.position.Geo3d]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -157,6 +160,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables 3D geo queries (`geo3d_distance`, `geo3d_bbox`, `geo3d_nearest`) |
 | `stored` | `bool` | `true` | Stores the original `(x, y, z)` value |
+| `multi_valued` | `bool` | `false` | Accept arrays of points; `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` queries match if **any** point satisfies the predicate (Lucene-style "any match"), scoring the document by its closest point |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Bytes

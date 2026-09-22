@@ -199,8 +199,8 @@ class Schema {
 | `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64-bit float field. Pass `multiValued: true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `docValues` above. |
 | `addBooleanField(name, stored?, indexed?, docValues?)` | Boolean field. See `docValues` above. |
 | `addBytesField(name, stored?)` | Raw bytes field. No `docValues` option: a `Bytes` value is never written to DocValues regardless. |
-| `addGeoField(name, stored?, indexed?, docValues?)` | Geographic coordinate field. See `docValues` above. |
-| `addGeo3dField(name, stored?, indexed?, docValues?)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `docValues` above. |
+| `addGeoField(name, stored?, indexed?, multiValued?, docValues?)` | Geographic coordinate field. Pass `multiValued: true` to accept an array of `{ lat, lon }` objects (distance / bounding-box queries match if any point satisfies the predicate). See `docValues` above. |
+| `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `multiValued: true` to accept an array of `{ x, y, z }` objects (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `docValues` above. |
 | `addDatetimeField(name, stored?, indexed?, docValues?)` | UTC datetime field. See `docValues` above. |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW vector field. `baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
@@ -685,6 +685,9 @@ JavaScript values are automatically converted to Laurus
 | `number` (integer) | `Int64` | |
 | `number` (float) | `Float64` | |
 | `string` | `Text` | ISO 8601 strings become `DateTime` |
-| `number[]` | `Vector` | Coerced to `f32` |
+| `number[]` (all integers) | `Int64Array` | Multi-valued integer field; vector fields cast the array to `f32`. An empty array is an empty `Int64Array` |
+| `number[]` | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the array to `f32` |
 | `{ lat, lon }` | `Geo` | Two `number` values |
 | `{ x, y, z }` | `GeoEcef` | Three `number` values, meters (3D ECEF Cartesian) |
+| `{ lat, lon }[]` | `GeoArray` | Array of `{ lat, lon }` objects; requires `multiValued: true` on the field |
+| `{ x, y, z }[]` | `GeoEcefArray` | Array of `{ x, y, z }` objects; requires `multiValued: true` on the field |

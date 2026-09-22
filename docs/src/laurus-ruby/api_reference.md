@@ -172,8 +172,8 @@ Laurus::Schema.new
 | `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64-bit float field. Pass `multi_valued: true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `doc_values:` above. |
 | `add_boolean_field(name, stored: true, indexed: true, doc_values: true)` | Boolean field. See `doc_values:` above. |
 | `add_bytes_field(name, stored: true)` | Raw bytes field. No `doc_values:` option: a `Bytes` value is never written to DocValues regardless. |
-| `add_geo_field(name, stored: true, indexed: true, doc_values: true)` | Geographic coordinate field (lat/lon). See `doc_values:` above. |
-| `add_geo3d_field(name, stored: true, indexed: true, doc_values: true)` | 3D ECEF Cartesian point field (x, y, z in metres). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values:` above. |
+| `add_geo_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | Geographic coordinate field (lat/lon). Pass `multi_valued: true` to accept an Array of `{ "lat" => .., "lon" => .. }` Hashes (distance / bounding-box queries match if any point satisfies the predicate). See `doc_values:` above. |
+| `add_geo3d_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `multi_valued: true` to accept an Array of `{ "x" => .., "y" => .., "z" => .. }` Hashes (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values:` above. |
 | `add_datetime_field(name, stored: true, indexed: true, doc_values: true)` | UTC datetime field. See `doc_values:` above. |
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat (brute-force) vector field. |
@@ -558,7 +558,10 @@ Ruby values are automatically converted to Laurus `DataValue` types:
 | `Integer` | `Int64` | |
 | `Float` | `Float64` | |
 | `String` | `Text` | |
-| `Array` of numerics | `Vector` | Elements coerced to `f32` |
+| `Array` of `Integer` | `Int64Array` | Multi-valued integer field; vector fields cast the array to `f32`. An empty `Array` is an empty `Int64Array` |
+| `Array` of numerics | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the array to `f32` |
 | `Hash` with `"lat"`, `"lon"` | `Geo` | Two `Float` values |
 | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` | Three `Float` values, meters (3D ECEF Cartesian) |
+| `Array` of `Hash` with `"lat"`, `"lon"` | `GeoArray` | Requires `multi_valued: true` on the field |
+| `Array` of `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcefArray` | Requires `multi_valued: true` on the field |
 | `Time` / `String` responding to `iso8601` | `DateTime` | Converted via `iso8601` |
