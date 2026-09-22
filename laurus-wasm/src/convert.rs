@@ -40,6 +40,8 @@ pub fn json_to_document(value: &Value) -> Result<Document, JsValue> {
 /// - `array` of integers     -> `DataValue::Int64Array`
 /// - `array` of numbers      -> `DataValue::Float64Array` (vector fields
 ///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
+/// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
+/// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -74,6 +76,7 @@ pub fn json_to_data_value(value: &Value) -> Result<DataValue, JsValue> {
             // Non-empty arrays go through the same inference the server
             // gateway and CLI already use (`laurus::infer_from_json`):
             // all-integer -> `Int64Array`, otherwise numeric -> `Float64Array`,
+            // all geo objects -> `GeoArray` / `GeoEcefArray` (#1174),
             // non-numeric elements -> error. The core's schema-aware
             // `coerce_value` then routes the result — vector fields cast it
             // to `Vector`, multi-valued numeric fields keep it, single-valued
@@ -168,6 +171,18 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
         DataValue::Float64Array(arr) => {
             Value::Array(arr.iter().map(|v| serde_json::json!(*v)).collect())
         }
+        // Arrays of the same objects the single-valued arms produce, so the
+        // output feeds back into `json_to_data_value` unchanged.
+        DataValue::GeoArray(arr) => Value::Array(
+            arr.iter()
+                .map(|p| serde_json::json!({ "lat": p.lat, "lon": p.lon }))
+                .collect(),
+        ),
+        DataValue::GeoEcefArray(arr) => Value::Array(
+            arr.iter()
+                .map(|p| serde_json::json!({ "x": p.x, "y": p.y, "z": p.z }))
+                .collect(),
+        ),
     }
 }
 
@@ -219,5 +234,39 @@ mod tests {
     #[wasm_bindgen_test]
     fn non_numeric_array_is_rejected() {
         assert!(json_to_data_value(&json!([1, "x"])).is_err());
+    }
+
+    /// Issue #1174: an array of geo objects is a multi-valued geo value and
+    /// renders back as the same array of `{ lat, lon }` objects.
+    #[wasm_bindgen_test]
+    fn geo_object_array_round_trips_as_geo_array() {
+        let json = json!([{ "lat": 35.68, "lon": 139.76 }, { "lat": 34.69, "lon": 135.5 }]);
+        let dv = json_to_data_value(&json).unwrap();
+        match &dv {
+            DataValue::GeoArray(pts) => {
+                assert_eq!(pts.len(), 2);
+                assert_eq!(pts[1].lon, 135.5);
+            }
+            other => panic!("expected GeoArray, got {other:?}"),
+        }
+        assert_eq!(data_value_to_json(&dv), json);
+    }
+
+    #[wasm_bindgen_test]
+    fn geo3d_object_array_round_trips_as_geo_ecef_array() {
+        let json = json!([{ "x": 1.0, "y": 2.0, "z": 3.0 }, { "x": -4.0, "y": 5.0, "z": -6.0 }]);
+        let dv = json_to_data_value(&json).unwrap();
+        assert!(matches!(&dv, DataValue::GeoEcefArray(pts) if pts.len() == 2));
+        assert_eq!(data_value_to_json(&dv), json);
+    }
+
+    #[wasm_bindgen_test]
+    fn mixed_geo_dimension_array_is_rejected() {
+        assert!(
+            json_to_data_value(
+                &json!([{ "lat": 35.0, "lon": 139.0 }, { "x": 1.0, "y": 2.0, "z": 3.0 }])
+            )
+            .is_err()
+        );
     }
 }

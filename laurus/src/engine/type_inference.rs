@@ -115,6 +115,16 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
             multi_valued: true,
             ..Default::default()
         }))),
+        DataValue::GeoArray(_) => Ok(Some(FieldOption::Geo(GeoOption {
+            multi_valued: true,
+            ..Default::default()
+        }))),
+        DataValue::GeoEcefArray(_) => Ok(Some(FieldOption::Geo3d(
+            crate::lexical::core::field::Geo3dOption {
+                multi_valued: true,
+                ..Default::default()
+            },
+        ))),
         DataValue::Vector(_) => Err(LaurusError::invalid_argument(
             "vector values require an explicit vector field declaration \
              (Hnsw, Flat, or Ivf) in the schema",
@@ -141,6 +151,8 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
 /// | `null` | (none) | (none) — returns [`InferredValue::Skip`] |
 /// | `array` of integers | [`DataValue::Int64Array`] | [`FieldOption::Integer`] with `multi_valued = true` |
 /// | `array` containing any non-i64 number | [`DataValue::Float64Array`] | [`FieldOption::Float`] with `multi_valued = true` |
+/// | `array` of `lat`/`lon` objects | [`DataValue::GeoArray`] | [`FieldOption::Geo`] with `multi_valued = true` |
+/// | `array` of `x`/`y`/`z` objects | [`DataValue::GeoEcefArray`] | [`FieldOption::Geo3d`] with `multi_valued = true` |
 /// | empty `array` | (none) | (none) — returns [`InferredValue::Skip`] |
 ///
 /// # Arguments
@@ -190,8 +202,13 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 /// elements all fit in `i64` map to [`DataValue::Int64Array`] backed by an
 /// [`IntegerOption`] with `multi_valued = true`. Arrays containing any
 /// non-`i64` number map to [`DataValue::Float64Array`] backed by a
-/// [`FloatOption`] with `multi_valued = true`. Empty arrays return
-/// [`InferredValue::Skip`] because their element type cannot be determined.
+/// [`FloatOption`] with `multi_valued = true`. Arrays whose elements are all
+/// geo objects — every element inferring, via [`infer_from_object`], to the
+/// same one of [`DataValue::Geo`] / [`DataValue::GeoEcef`] — map to
+/// [`DataValue::GeoArray`] / [`DataValue::GeoEcefArray`] backed by a
+/// [`GeoOption`] / `Geo3dOption` with `multi_valued = true` (Issue #1174).
+/// Empty arrays return [`InferredValue::Skip`] because their element type
+/// cannot be determined.
 ///
 /// # Arguments
 ///
@@ -199,11 +216,19 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 ///
 /// # Errors
 ///
-/// Returns [`LaurusError::invalid_argument`] when the array contains a
-/// non-numeric or mixed-type element.
+/// Returns [`LaurusError::invalid_argument`] when the array mixes numbers
+/// with non-numbers, mixes 2D and 3D geo objects, or contains an object
+/// that is not a geo point.
 fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
     if arr.is_empty() {
         return Ok(InferredValue::Skip);
+    }
+
+    // Gated on *every* element being an object so a mixed array such as
+    // `[1, {"lat": ..}]` still falls through to the numeric path's error
+    // below, which existing callers and tests rely on.
+    if arr.iter().all(JsonValue::is_object) {
+        return infer_geo_array(arr);
     }
 
     let mut all_i64 = true;
@@ -256,6 +281,53 @@ fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
                 ..Default::default()
             }),
         })
+    }
+}
+
+/// Infer a multi-valued geo field from an array whose elements are all
+/// objects (Issue #1174). Each element goes through [`infer_from_object`],
+/// so key aliases, range validation, and the mixed-marker rejection are
+/// exactly those of a single-valued geo object.
+fn infer_geo_array(arr: &[JsonValue]) -> Result<InferredValue> {
+    let mixed = || {
+        LaurusError::invalid_argument(
+            "array of objects must be all 2D geo points or all 3D ECEF points",
+        )
+    };
+    let mut geo: Vec<crate::data::GeoPoint> = Vec::with_capacity(arr.len());
+    let mut ecef: Vec<crate::data::GeoEcefPoint> = Vec::with_capacity(arr.len());
+    for elem in arr {
+        let map = elem
+            .as_object()
+            .expect("gated on all-objects by the caller");
+        match infer_from_object(map)? {
+            InferredValue::Inferred {
+                value: DataValue::Geo(p),
+                ..
+            } => geo.push(p),
+            InferredValue::Inferred {
+                value: DataValue::GeoEcef(p),
+                ..
+            } => ecef.push(p),
+            _ => return Err(mixed()),
+        }
+    }
+    match (geo.is_empty(), ecef.is_empty()) {
+        (false, true) => Ok(InferredValue::Inferred {
+            value: DataValue::GeoArray(geo),
+            option: FieldOption::Geo(GeoOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        }),
+        (true, false) => Ok(InferredValue::Inferred {
+            value: DataValue::GeoEcefArray(ecef),
+            option: FieldOption::Geo3d(crate::lexical::core::field::Geo3dOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        }),
+        _ => Err(mixed()),
     }
 }
 
@@ -686,5 +758,86 @@ mod tests {
         // misinterpreted as some other shape.
         let err = infer_from_json(&json!({"Text": "hello"})).unwrap_err();
         assert!(err.to_string().contains("geographic"));
+    }
+
+    // ---- Multi-valued geo arrays (#1174) ----
+
+    #[test]
+    fn infer_geo_object_array_to_geo_array() {
+        // Key aliases are those of a single geo object.
+        let (v, o) = inferred(
+            infer_from_json(&json!([
+                {"lat": 35.1, "lon": 139.0},
+                {"latitude": -33.9, "longitude": 151.2},
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(
+            v,
+            DataValue::GeoArray(vec![
+                crate::data::GeoPoint::new(35.1, 139.0),
+                crate::data::GeoPoint::new(-33.9, 151.2),
+            ])
+        );
+        assert!(matches!(
+            o,
+            FieldOption::Geo(GeoOption {
+                multi_valued: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn infer_geo3d_object_array_to_geo_ecef_array() {
+        let (v, o) = inferred(
+            infer_from_json(&json!([{"x": 1.0, "y": 2.0, "z": 3.0}, {"x": 4, "y": 5, "z": 6}]))
+                .unwrap(),
+        );
+        assert_eq!(
+            v,
+            DataValue::GeoEcefArray(vec![
+                crate::data::GeoEcefPoint::new(1.0, 2.0, 3.0),
+                crate::data::GeoEcefPoint::new(4.0, 5.0, 6.0),
+            ])
+        );
+        assert!(matches!(
+            o,
+            FieldOption::Geo3d(crate::lexical::core::field::Geo3dOption {
+                multi_valued: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn infer_mixed_geo_dimension_array_rejected() {
+        let err = infer_from_json(&json!([
+            {"lat": 35.1, "lon": 139.0},
+            {"x": 1.0, "y": 2.0, "z": 3.0},
+        ]))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("all 2D geo points or all 3D ECEF points"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn infer_array_with_non_geo_object_rejected() {
+        // The per-element check is `infer_from_object`, so a non-geo object
+        // fails the same way it would on its own.
+        assert!(infer_from_json(&json!([{"lat": 35.1, "lon": 139.0}, {"foo": 1}])).is_err());
+        // ...including its range validation.
+        assert!(infer_from_json(&json!([{"lat": 95.0, "lon": 0.0}])).is_err());
+    }
+
+    #[test]
+    fn infer_number_and_object_mix_still_reports_numeric_error() {
+        // The geo branch is gated on *every* element being an object, so a
+        // number/object mix keeps the pre-#1174 numeric-array error text.
+        let err = infer_from_json(&json!([1, {"lat": 35.1, "lon": 139.0}])).unwrap_err();
+        assert!(err.to_string().contains("only numeric"), "{err}");
     }
 }

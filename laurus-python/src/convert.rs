@@ -29,9 +29,11 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 /// - `list[int]`           → `DataValue::Int64Array`
 /// - `list[float|int]`     → `DataValue::Float64Array` (vector fields cast
 ///   either array to `Vector` downstream; an empty list is an empty `Int64Array`)
+/// - `list[(lat, lon)]`    → `DataValue::GeoArray` (multi-valued geo, #1174)
+/// - `list[(x, y, z)]`     → `DataValue::GeoEcefArray`
 /// - `(lat, lon)` tuple    → `DataValue::Geo`
 /// - `(x, y, z)` tuple     → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
-pub fn py_to_data_value(_py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
+pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
     if obj.is_none() {
         return Ok(DataValue::Null);
     }
@@ -70,6 +72,13 @@ pub fn py_to_data_value(_py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> 
         // — now accept it.
         if list.is_empty() {
             return Ok(DataValue::Int64Array(Vec::new()));
+        }
+        // A list of tuples is a multi-valued geo field (#1174). Each tuple
+        // goes through the same 2-/3-tuple checks as a single point below,
+        // so key semantics and range validation are shared; lists of lists
+        // are not treated as geo.
+        if list.iter().all(|item| item.is_instance_of::<PyTuple>()) {
+            return py_tuple_list_to_geo_array(py, list);
         }
         let all_ints = list
             .iter()
@@ -131,6 +140,29 @@ pub fn py_to_data_value(_py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> 
     )))
 }
 
+/// Convert a non-empty list whose elements are all tuples into a
+/// [`DataValue::GeoArray`] (all `(lat, lon)`) or [`DataValue::GeoEcefArray`]
+/// (all `(x, y, z)`), rejecting a mix or a tuple of any other arity.
+fn py_tuple_list_to_geo_array(py: Python, list: &Bound<PyList>) -> PyResult<DataValue> {
+    let mixed = || {
+        PyValueError::new_err("a list of tuples must be all (lat, lon) or all (x, y, z) geo points")
+    };
+    let mut geo = Vec::with_capacity(list.len());
+    let mut ecef = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        match py_to_data_value(py, &item)? {
+            DataValue::Geo(p) => geo.push(p),
+            DataValue::GeoEcef(p) => ecef.push(p),
+            _ => return Err(mixed()),
+        }
+    }
+    match (geo.is_empty(), ecef.is_empty()) {
+        (false, true) => Ok(DataValue::GeoArray(geo)),
+        (true, false) => Ok(DataValue::GeoEcefArray(ecef)),
+        _ => Err(mixed()),
+    }
+}
+
 /// Convert a [`Document`] to a Python `dict`.
 pub fn document_to_dict(py: Python, doc: &Document) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
@@ -162,6 +194,22 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
         }
         DataValue::Int64Array(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
         DataValue::Float64Array(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
+        // Lists of the same tuples the single-valued arms produce, so the
+        // output feeds back into `py_to_data_value` unchanged.
+        DataValue::GeoArray(arr) => {
+            let items = arr
+                .iter()
+                .map(|p| PyTuple::new(py, [p.lat, p.lon]))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, items)?.unbind().into_any())
+        }
+        DataValue::GeoEcefArray(arr) => {
+            let items = arr
+                .iter()
+                .map(|p| PyTuple::new(py, [p.x, p.y, p.z]))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, items)?.unbind().into_any())
+        }
     }
 }
 

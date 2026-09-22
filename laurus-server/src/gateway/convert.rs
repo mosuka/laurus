@@ -50,6 +50,18 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
         Some(Kind::Float64ArrayValue(arr)) => {
             Value::Array(arr.values.iter().map(|v| json!(*v)).collect())
         }
+        Some(Kind::GeoArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|g| json!({"latitude": g.latitude, "longitude": g.longitude}))
+                .collect(),
+        ),
+        Some(Kind::Geo3dArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|p| json!({"x": p.x, "y": p.y, "z": p.z}))
+                .collect(),
+        ),
         None => Value::Null,
     }
 }
@@ -464,12 +476,20 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         Opt::Geo(v1::GeoOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            multi_valued: v
+                .get("multi_valued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("geo3d") {
         Opt::Geo3d(v1::Geo3dOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            multi_valued: v
+                .get("multi_valued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("bytes") {
@@ -514,15 +534,27 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             }
             json!({ "text": text_obj })
         }
+        // `multi_valued` is a plain (non-optional) proto bool on the four
+        // BKD-backed options, so it is always surfaced, like `indexed` and
+        // `stored`. Integer/Float used to omit it, so `GET .../schema` could
+        // not tell a multi-valued field from a single-valued one (#1174).
         Some(Opt::Integer(v)) => {
-            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            let mut obj = json!({
+                "indexed": v.indexed,
+                "stored": v.stored,
+                "multi_valued": v.multi_valued,
+            });
             if let Some(doc_values) = v.doc_values {
                 obj["doc_values"] = json!(doc_values);
             }
             json!({ "integer": obj })
         }
         Some(Opt::Float(v)) => {
-            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            let mut obj = json!({
+                "indexed": v.indexed,
+                "stored": v.stored,
+                "multi_valued": v.multi_valued,
+            });
             if let Some(doc_values) = v.doc_values {
                 obj["doc_values"] = json!(doc_values);
             }
@@ -543,14 +575,22 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             json!({ "date_time": obj })
         }
         Some(Opt::Geo(v)) => {
-            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            let mut obj = json!({
+                "indexed": v.indexed,
+                "stored": v.stored,
+                "multi_valued": v.multi_valued,
+            });
             if let Some(doc_values) = v.doc_values {
                 obj["doc_values"] = json!(doc_values);
             }
             json!({ "geo": obj })
         }
         Some(Opt::Geo3d(v)) => {
-            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            let mut obj = json!({
+                "indexed": v.indexed,
+                "stored": v.stored,
+                "multi_valued": v.multi_valued,
+            });
             if let Some(doc_values) = v.doc_values {
                 obj["doc_values"] = json!(doc_values);
             }
@@ -1393,6 +1433,68 @@ mod tests {
         let json = json!({"lat": 35.0, "x": 1.0, "y": 2.0, "z": 3.0});
         let err = json_value_to_proto(&json).unwrap_err();
         assert!(err.contains("mix"), "unexpected error: {err}");
+    }
+
+    /// #1174: an array of geo objects is inferred as a multi-valued geo
+    /// value (`GeoArrayValue`) and rendered back as an array of
+    /// canonical-key objects; aliases are accepted per element.
+    #[test]
+    fn test_json_value_geo_array_roundtrip() {
+        let json = json!([
+            {"lat": 35.6762, "lon": 139.6503},
+            {"latitude": -33.86, "longitude": 151.21},
+        ]);
+        let proto = json_value_to_proto(&json).unwrap();
+        assert!(matches!(
+            proto.kind,
+            Some(v1::value::Kind::GeoArrayValue(_))
+        ));
+        let back = proto_value_to_json(&proto);
+        assert_eq!(
+            back,
+            json!([
+                {"latitude": 35.6762, "longitude": 139.6503},
+                {"latitude": -33.86, "longitude": 151.21},
+            ])
+        );
+    }
+
+    #[test]
+    fn test_json_value_geo3d_array_roundtrip() {
+        let json = json!([{"x": 1.0, "y": 2.0, "z": 3.0}, {"x": -4.0, "y": 5.0, "z": -6.0}]);
+        let proto = json_value_to_proto(&json).unwrap();
+        assert!(matches!(
+            proto.kind,
+            Some(v1::value::Kind::Geo3dArrayValue(_))
+        ));
+        assert_eq!(proto_value_to_json(&proto), json);
+    }
+
+    #[test]
+    fn test_json_value_mixed_geo_dimension_array_errors() {
+        let json = json!([{"lat": 35.0, "lon": 139.0}, {"x": 1.0, "y": 2.0, "z": 3.0}]);
+        let err = json_value_to_proto(&json).unwrap_err();
+        assert!(err.contains("2D geo points"), "unexpected error: {err}");
+    }
+
+    /// #1174: `multi_valued` is read from and written to the JSON schema
+    /// shape for every BKD-backed option. Integer/Float used to accept it
+    /// on input but never surface it on output.
+    #[test]
+    fn test_field_option_multi_valued_round_trips_through_json() {
+        for kind in ["integer", "float", "geo", "geo3d"] {
+            let json = json!({ kind: {"indexed": true, "stored": true, "multi_valued": true} });
+            let proto = json_to_proto_field_option(&json).unwrap();
+            let back = proto_field_option_to_json(&proto);
+            assert_eq!(back[kind]["multi_valued"], json!(true), "{kind}");
+            assert_eq!(back[kind]["indexed"], json!(true), "{kind}");
+
+            // Absent on input means single-valued, and is still surfaced.
+            let json = json!({ kind: {"indexed": true, "stored": true} });
+            let proto = json_to_proto_field_option(&json).unwrap();
+            let back = proto_field_option_to_json(&proto);
+            assert_eq!(back[kind]["multi_valued"], json!(false), "{kind}");
+        }
     }
 
     #[test]

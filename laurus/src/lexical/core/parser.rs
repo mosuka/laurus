@@ -430,6 +430,48 @@ impl DocumentParser {
                         field_terms.insert(field_name.clone(), terms);
                         point_values.insert(field_name.clone(), points);
                     }
+                    FieldValue::GeoArray(arr) => {
+                        // Multi-valued geo (#1174): one 2-D BKD point per
+                        // element, same shape as Int64Array.
+                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
+                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
+                        let mut offset = 0usize;
+                        for (idx, p) in arr.iter().enumerate() {
+                            let text = format!("{},{}", p.lat, p.lon);
+                            let len = text.len();
+                            terms.push(AnalyzedTerm {
+                                term: text,
+                                position: idx as u32,
+                                frequency: 1,
+                                offset: (offset, offset + len),
+                            });
+                            offset += len + 1;
+                            points.push(vec![p.lat, p.lon]);
+                        }
+                        field_terms.insert(field_name.clone(), terms);
+                        point_values.insert(field_name.clone(), points);
+                    }
+                    FieldValue::GeoEcefArray(arr) => {
+                        // Multi-valued ECEF (#1174): one 3-D BKD point per
+                        // element.
+                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
+                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
+                        let mut offset = 0usize;
+                        for (idx, p) in arr.iter().enumerate() {
+                            let text = format!("{},{},{}", p.x, p.y, p.z);
+                            let len = text.len();
+                            terms.push(AnalyzedTerm {
+                                term: text,
+                                position: idx as u32,
+                                frequency: 1,
+                                offset: (offset, offset + len),
+                            });
+                            offset += len + 1;
+                            points.push(vec![p.x, p.y, p.z]);
+                        }
+                        field_terms.insert(field_name.clone(), terms);
+                        point_values.insert(field_name.clone(), points);
+                    }
                     // Not lexically indexable: no term representation
                     // exists for these, regardless of `should_index`.
                     // Spelled out rather than a wildcard `_ =>` so a new

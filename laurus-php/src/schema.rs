@@ -261,15 +261,28 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
+    /// * `multi_valued` - When true, the field accepts an array of
+    ///   `["lat" => .., "lon" => ..]` arrays and distance / bounding-box
+    ///   queries match if any point satisfies the predicate (Lucene-style
+    ///   "any match"), scoring the document by its closest point. Default:
+    ///   false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
-    #[php(defaults(stored = true, indexed = true, doc_values = true))]
-    pub fn add_geo_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
+    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    pub fn add_geo_field(
+        &self,
+        name: String,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Geo(GeoOption {
                 indexed,
                 stored,
+                multi_valued,
                 doc_values,
             }),
         );
@@ -287,15 +300,27 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
+    /// * `multi_valued` - When true, the field accepts an array of
+    ///   `["x" => .., "y" => .., "z" => ..]` arrays and the geo3d queries
+    ///   match if any point satisfies the predicate (Lucene-style "any
+    ///   match"), scoring the document by its closest point. Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
-    #[php(defaults(stored = true, indexed = true, doc_values = true))]
-    pub fn add_geo3d_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
+    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    pub fn add_geo3d_field(
+        &self,
+        name: String,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed,
                 stored,
+                multi_valued,
                 doc_values,
             }),
         );

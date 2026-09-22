@@ -368,16 +368,29 @@ impl PySchema {
     /// Add a geographic coordinate field (latitude, longitude).
     ///
     /// Args:
+    ///     multi_valued: When True, the field accepts a list of
+    ///         ``(lat, lon)`` tuples and distance / bounding-box queries
+    ///         match if any point satisfies the predicate (Lucene-style
+    ///         "any match"), scoring the document by its closest point.
+    ///         Default False.
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
-    pub fn add_geo_field(&mut self, name: &str, stored: bool, indexed: bool, doc_values: bool) {
+    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
+    pub fn add_geo_field(
+        &mut self,
+        name: &str,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.fields.insert(
             name.to_string(),
             FieldOption::Geo(GeoOption {
                 indexed,
                 stored,
+                multi_valued,
                 doc_values,
             }),
         );
@@ -391,16 +404,28 @@ impl PySchema {
     /// `docs/src/concepts/geo3d.md` for the coordinate system.
     ///
     /// Args:
+    ///     multi_valued: When True, the field accepts a list of
+    ///         ``(x, y, z)`` tuples and the geo3d queries match if any
+    ///         point satisfies the predicate (Lucene-style "any match"),
+    ///         scoring the document by its closest point. Default False.
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
-    pub fn add_geo3d_field(&mut self, name: &str, stored: bool, indexed: bool, doc_values: bool) {
+    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
+    pub fn add_geo3d_field(
+        &mut self,
+        name: &str,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.fields.insert(
             name.to_string(),
             FieldOption::Geo3d(Geo3dOption {
                 indexed,
                 stored,
+                multi_valued,
                 doc_values,
             }),
         );

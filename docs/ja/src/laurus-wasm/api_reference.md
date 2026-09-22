@@ -417,14 +417,18 @@ for (let i = 0; i < 10000; i++) {
 
 日時フィールドを追加します。`docValues` は上記を参照。
 
-#### `addGeoField(name, stored?, indexed?, docValues?)`
+#### `addGeoField(name, stored?, indexed?, multiValued?, docValues?)`
 
-地理座標フィールドを追加します。`docValues` は上記を参照。
+地理座標フィールドを追加します。`multiValued: true` を指定すると `{ lat, lon }` オブジェクトの配列を受け付け、
+距離 / バウンディングボックスクエリは**いずれかのポイント**が条件を満たせばマッチ（Lucene 流の "any match"）し、
+スコアはドキュメント内で最も近いポイントで決まります。`docValues` は上記を参照。
 
-#### `addGeo3dField(name, stored?, indexed?, docValues?)`
+#### `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)`
 
 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）を追加します。値は
-`{ x, y, z }` オブジェクトで投入します。詳細は
+`{ x, y, z }` オブジェクトで投入します。`multiValued: true` を指定すると `{ x, y, z }` オブジェクトの配列を受け付け、
+3D クエリは**いずれかのポイント**が条件を満たせばマッチ（Lucene 流の "any match"）し、
+スコアはドキュメント内で最も近いポイントで決まります。詳細は
 [Geo3d の概念](../concepts/geo3d.md) を参照。`docValues` は上記を参照。
 
 WASM バインディングは `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` /

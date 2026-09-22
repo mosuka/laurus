@@ -253,6 +253,8 @@ pub enum DataValue {
     GeoEcef(GeoEcefPoint),           // 3D ECEF Cartesian point (x, y, z) in metres
     Int64Array(Vec<i64>),            // multi-valued integer field
     Float64Array(Vec<f64>),          // multi-valued float field
+    GeoArray(Vec<GeoPoint>),         // multi-valued 2D geo field
+    GeoEcefArray(Vec<GeoEcefPoint>), // multi-valued 3D ECEF field
 }
 ```
 
@@ -317,6 +319,8 @@ let schema = Schema::builder()
 | array of floats / mixed numeric (e.g. `[1.5, 2.0, 3]`) | `Float` with `multi_valued = true` |
 | object with a latitude key (`lat` or `latitude`) and a longitude key (`lon`, `lng`, or `longitude`), values in range | `Geo` |
 | object with all three numeric keys `x`, `y`, `z` (finite values, ECEF meters) | `Geo3d` |
+| array of geo objects (e.g. `[{"lat": 35.6, "lon": 139.7}, ...]`) | `Geo` with `multi_valued = true` |
+| array of `x`/`y`/`z` objects | `Geo3d` with `multi_valued = true` |
 | object with a `data` key (base64-encoded string) and an optional `mime` string key | `Bytes` value |
 
 Vector fields (`Hnsw`, `Flat`, `Ivf`) are **never** inferred: they must be
@@ -329,16 +333,34 @@ vector fields. Mixing markers from more than one shape (2D `lat`/`lon`, 3D
 `x`/`y`/`z`, or bytes `data`) in a single object is rejected as ambiguous;
 use exactly one shape per object.
 
-### Multi-valued numeric fields
+### Multi-valued fields
 
 Integer and Float fields can be declared with `multi_valued = true` to
 hold multiple values per document. A range query matches a document if
 **any** of its values satisfies the predicate (Lucene-style "any match"
 semantics with constant scoring — there is no per-match BM25 weighting).
 
+Geo and Geo3d fields accept `multi_valued = true` as well. Every point of
+a multi-valued geo field becomes its own entry in the field's BKD tree
+(2 dimensions for `Geo`, 3 for `Geo3d`), so distance and bounding-box
+queries — and, for `Geo3d`, nearest queries — match a document if **any**
+of its points satisfies the predicate. A document is reported once,
+scored by its closest matching point (for the 2D bounding-box query, the
+point closest to the box centre). Under the `Dynamic` policy an array
+that mixes 2D and 3D objects, or numbers and objects, is rejected; each
+element gets the same range validation as a single point.
+
 Single values sent to a multi-valued field are auto-wrapped into a
 one-element array; arrays sent to a single-valued field are rejected
-rather than silently truncating.
+rather than silently truncating (the error tells you to declare the field
+with `multi_valued = true`). An empty array sent to a multi-valued geo
+field is accepted and simply has no points, so it matches no spatial
+query.
+
+Segments that contain multi-valued geo values use new stored-field type
+tags and cannot be read by builds that predate this feature; there is no
+format version bump, so an older reader fails loudly instead of
+misreading the data.
 
 ### Type conflicts
 
@@ -358,6 +380,10 @@ to coerce the value to the declared type. The coercion rules are:
 | `Text` | any scalar | stringified |
 | `Bytes` | `Text(s)` | decoded as base64 (error if `s` is not valid base64) |
 | `Geo` / `Geo3d` | anything other than matching variant | error |
+| `Geo` / `Geo3d` (single-valued) | `GeoArray` / `GeoEcefArray` | error (declare `multi_valued = true`) |
+| `Geo` / `Geo3d` with `multi_valued = true` | `GeoArray` / `GeoEcefArray` | stored as-is |
+| `Geo` / `Geo3d` with `multi_valued = true` | matching single point | wrapped into a one-element array |
+| `Geo` / `Geo3d` with `multi_valued = true` | empty numeric array (`[]`) | empty point list |
 | vector (`Hnsw`/`Flat`/`Ivf`) | `Text` or `Bytes` | passed through unchanged for the field's embedder |
 | vector (`Hnsw`/`Flat`/`Ivf`) | numeric array | cast element-wise to `f32` |
 

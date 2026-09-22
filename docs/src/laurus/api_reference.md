@@ -58,8 +58,8 @@ Defines document structure.
 | `.add_float_field(name, FloatOption)` | Add a float field (set `FloatOption::multi_valued = true` for arrays) |
 | `.add_boolean_field(name, BooleanOption)` | Add a boolean field |
 | `.add_datetime_field(name, DateTimeOption)` | Add a datetime field |
-| `.add_geo_field(name, GeoOption)` | Add a 2D geographic (lat/lon) field |
-| `.add_geo3d_field(name, Geo3dOption)` | Add a 3D ECEF Cartesian point field (x, y, z in metres) |
+| `.add_geo_field(name, GeoOption)` | Add a 2D geographic (lat/lon) field (set `GeoOption::multi_valued = true` for arrays of points) |
+| `.add_geo3d_field(name, Geo3dOption)` | Add a 3D ECEF Cartesian point field (x, y, z in metres; set `Geo3dOption::multi_valued = true` for arrays of points) |
 | `.add_bytes_field(name, BytesOption)` | Add a binary field |
 | `.add_hnsw_field(name, HnswOption)` | Add an HNSW vector field |
 | `.add_flat_field(name, FlatOption)` | Add a Flat vector field |
@@ -96,6 +96,8 @@ A collection of named field values.
 | `.add_geo_ecef(name, x, y, z)` | Add a 3D ECEF Cartesian point (metres) |
 | `.add_int64_array(name, values)` | Add a multi-valued integer field |
 | `.add_float64_array(name, values)` | Add a multi-valued float field |
+| `.add_geo_array(name, points)` | Add a multi-valued 2D geographic field (`Vec<GeoPoint>`) |
+| `.add_geo_ecef_array(name, points)` | Add a multi-valued 3D ECEF field (`Vec<GeoEcefPoint>`) |
 | `.add_bytes(name, data)` | Add binary data |
 | `.build()` | Build the `Document` |
 
@@ -227,3 +229,5 @@ A collection of named field values.
 | `DataValue::GeoEcef(GeoEcefPoint)` | `(x, y, z)` ECEF Cartesian (metres) |
 | `DataValue::Int64Array(Vec<i64>)` | Multi-valued integers (requires `multi_valued` field option) |
 | `DataValue::Float64Array(Vec<f64>)` | Multi-valued floats (requires `multi_valued` field option) |
+| `DataValue::GeoArray(Vec<GeoPoint>)` | Multi-valued 2D geographic points (requires `multi_valued` field option) |
+| `DataValue::GeoEcefArray(Vec<GeoEcefPoint>)` | Multi-valued 3D ECEF points (requires `multi_valued` field option) |

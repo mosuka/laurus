@@ -205,6 +205,11 @@ message GeoOption {
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
   optional bool doc_values = 3;
+  // When true, the field accepts `GeoArrayValue` (arrays of points) and
+  // distance / bounding-box queries match a document if any point satisfies
+  // the predicate (Lucene-style). Field number 4 rather than 3 as in
+  // `IntegerOption`: 3 was already taken by `doc_values` here.
+  bool multi_valued = 4;
 }
 
 // Options for 3D ECEF (Earth-Centered Earth-Fixed) geographic point fields.
@@ -217,6 +222,10 @@ message Geo3dOption {
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
   optional bool doc_values = 3;
+  // When true, the field accepts `Geo3dArrayValue` (arrays of points) and
+  // the geo3d queries match a document if any point satisfies the
+  // predicate (Lucene-style). Field number 4; see `GeoOption.multi_valued`.
+  bool multi_valued = 4;
 }
 
 message BytesOption {

@@ -42,6 +42,8 @@ pub fn json_to_document(value: &Value) -> napi::Result<Document> {
 /// - `array` of integers     -> `DataValue::Int64Array`
 /// - `array` of numbers      -> `DataValue::Float64Array` (vector fields
 ///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
+/// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
+/// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -76,6 +78,7 @@ pub fn json_to_data_value(value: &Value) -> napi::Result<DataValue> {
             // Non-empty arrays go through the same inference the server
             // gateway and CLI already use (`laurus::infer_from_json`):
             // all-integer -> `Int64Array`, otherwise numeric -> `Float64Array`,
+            // all geo objects -> `GeoArray` / `GeoEcefArray` (#1174),
             // non-numeric elements -> error. The core's schema-aware
             // `coerce_value` then routes the result — vector fields cast it
             // to `Vector`, multi-valued numeric fields keep it, single-valued
@@ -172,5 +175,17 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
         DataValue::Float64Array(arr) => {
             Value::Array(arr.iter().map(|v| serde_json::json!(*v)).collect())
         }
+        // Arrays of the same objects the single-valued arms produce, so the
+        // output feeds back into `json_to_data_value` unchanged.
+        DataValue::GeoArray(arr) => Value::Array(
+            arr.iter()
+                .map(|p| serde_json::json!({ "lat": p.lat, "lon": p.lon }))
+                .collect(),
+        ),
+        DataValue::GeoEcefArray(arr) => Value::Array(
+            arr.iter()
+                .map(|p| serde_json::json!({ "x": p.x, "y": p.y, "z": p.z }))
+                .collect(),
+        ),
     }
 }

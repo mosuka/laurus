@@ -156,5 +156,19 @@ fn format_data_value(value: &DataValue) -> String {
         DataValue::Null => "null".to_string(),
         DataValue::Int64Array(arr) => format!("{arr:?}"),
         DataValue::Float64Array(arr) => format!("{arr:?}"),
+        DataValue::GeoArray(arr) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|p| format!("({:.4}, {:.4})", p.lat, p.lon))
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
+        DataValue::GeoEcefArray(arr) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|p| format!("({:.2}, {:.2}, {:.2})", p.x, p.y, p.z))
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
     }
 }

@@ -125,12 +125,15 @@ impl GeoBoxPointsVisitor {
     }
 
     /// Consume the visitor and return the collected `(doc_id, point)`
-    /// pairs, sorted by doc id and deduplicated (first occurrence wins)
-    /// so callers observe the same order/uniqueness the previous
-    /// `range_search`-based path produced.
+    /// pairs, sorted by doc id. Deliberately **not** deduplicated: a
+    /// multi-valued field (#1174) legitimately contributes several points
+    /// per document, and the distance query pre-filters by a rectangle
+    /// around the circle, so keeping only the first BKD-traversal point
+    /// could drop a document whose first point lies in a rectangle corner
+    /// while a later one lies inside the circle. `find_matches` dedups
+    /// after evaluating every point, keeping the closest.
     fn into_candidates(mut self) -> Vec<(u64, GeoPoint)> {
         self.hits.sort_by_key(|(doc_id, _)| *doc_id);
-        self.hits.dedup_by_key(|(doc_id, _)| *doc_id);
         self.hits
     }
 }
@@ -244,21 +247,17 @@ impl GeoDistanceQuery {
     /// Find matching documents and their distances using spatial indexing.
     pub fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<GeoMatch>> {
         let mut matches = Vec::new();
-        let mut seen_docs = std::collections::HashSet::new();
 
         // Create a bounding box for efficient filtering
         let bounding_box = self.create_bounding_box();
 
-        // Get candidates from the index
+        // Get candidates from the index. Every point is evaluated — a
+        // document may appear several times (multi-valued field, #1174;
+        // multi-segment reader) and is deduplicated *after* the radius
+        // test below so a far-away point never shadows a matching one.
         let candidates = self.get_spatial_candidates(reader, &bounding_box)?;
 
         for (doc_id, point) in candidates {
-            // Skip if we've already processed this document
-            if seen_docs.contains(&doc_id) {
-                continue;
-            }
-            seen_docs.insert(doc_id);
-
             let distance = self.center.distance_to(&point);
             if distance <= self.distance_m {
                 let score = if distance == 0.0 {
@@ -276,6 +275,15 @@ impl GeoDistanceQuery {
                 });
             }
         }
+
+        // Multi-segment readers and multi-valued fields can produce
+        // duplicates; keep the closest point per document.
+        matches.sort_by(|a, b| {
+            a.doc_id
+                .cmp(&b.doc_id)
+                .then_with(|| a.distance_m.total_cmp(&b.distance_m))
+        });
+        matches.dedup_by_key(|m| m.doc_id);
 
         // Sort by distance (closest first), then by relevance score
         matches.sort_by(|a, b| {
@@ -357,8 +365,9 @@ impl GeoDistanceQuery {
             if let Some(doc) = reader.document(doc_id)? {
                 // Get the geo field value
                 if let Some(field_value) = doc.get_field(&self.field) {
-                    // Extract the GeoPoint from the field value
-                    if let Some(geo_point) = field_value.as_geo() {
+                    // A multi-valued field (#1174) contributes every point;
+                    // `find_matches` keeps the closest one per document.
+                    for geo_point in stored_geo_points(field_value) {
                         // First check bounding box for efficiency, then exact distance
                         if bounding_box.contains(&geo_point) {
                             let distance = self.center.distance_to(&geo_point);
@@ -374,6 +383,22 @@ impl GeoDistanceQuery {
 
         Ok(candidates)
     }
+}
+
+/// The 2-D points held by a stored geo field value: one for
+/// [`DataValue::Geo`](crate::data::DataValue::Geo), each element of a
+/// [`DataValue::GeoArray`](crate::data::DataValue::GeoArray) (#1174), and
+/// none for any other variant. Shared by the stored-fields fallbacks of the
+/// distance and bounding-box queries.
+fn stored_geo_points(value: &crate::data::DataValue) -> impl Iterator<Item = GeoPoint> + '_ {
+    use crate::data::DataValue;
+
+    let points: &[GeoPoint] = match value {
+        DataValue::Geo(p) => std::slice::from_ref(p),
+        DataValue::GeoArray(arr) => arr,
+        _ => &[],
+    };
+    points.iter().copied()
 }
 
 #[cfg(test)]
@@ -615,18 +640,13 @@ impl GeoBoundingBoxQuery {
     /// Find matching documents within the bounding box.
     pub fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<GeoMatch>> {
         let mut matches = Vec::new();
-        let mut seen_docs = std::collections::HashSet::new();
 
-        // Get candidates from the spatial index
+        // Get candidates from the spatial index. Every point is evaluated
+        // and documents are deduplicated afterwards (see the distance
+        // query for why).
         let candidates = self.get_candidates_in_bounds(reader)?;
 
         for (doc_id, point) in candidates {
-            // Skip if we've already processed this document
-            if seen_docs.contains(&doc_id) {
-                continue;
-            }
-            seen_docs.insert(doc_id);
-
             if self.bounding_box.contains(&point) {
                 let center = self.bounding_box.center();
                 let distance = center.distance_to(&point);
@@ -648,6 +668,16 @@ impl GeoBoundingBoxQuery {
                 });
             }
         }
+
+        // Multi-segment readers and multi-valued fields can produce
+        // duplicates; keep the point closest to the box center per
+        // document (the same distance the score is derived from).
+        matches.sort_by(|a, b| {
+            a.doc_id
+                .cmp(&b.doc_id)
+                .then_with(|| a.distance_m.total_cmp(&b.distance_m))
+        });
+        matches.dedup_by_key(|m| m.doc_id);
 
         // Sort by relevance score (highest first), then by distance to center
         matches.sort_by(|a, b| {
@@ -689,8 +719,9 @@ impl GeoBoundingBoxQuery {
             if let Some(doc) = reader.document(doc_id)? {
                 // Get the geo field value
                 if let Some(field_value) = doc.get_field(&self.field) {
-                    // Extract the GeoPoint from the field value
-                    if let Some(geo_point) = field_value.as_geo() {
+                    // A multi-valued field (#1174) contributes every point;
+                    // `find_matches` keeps the closest one per document.
+                    for geo_point in stored_geo_points(field_value) {
                         // Check if the point is within the bounding box
                         if self.bounding_box.contains(&geo_point) {
                             candidates.push((doc_id, geo_point));
@@ -1497,7 +1528,10 @@ mod tests {
 
     /// #1000: `visit` records only in-box points, with closed bounds on
     /// both ends (matching the previous `range_search(.., true, true)`),
-    /// and `into_candidates` sorts by doc id and deduplicates.
+    /// and `into_candidates` sorts by doc id. Since #1174 it keeps every
+    /// point of a document (multi-valued fields); the per-document dedup
+    /// happens in `find_matches`, after the radius / box test, keeping the
+    /// closest point.
     #[test]
     fn geo_box_points_visitor_filters_and_orders() {
         let mut visitor = GeoBoxPointsVisitor::new(0.0, 0.0, 10.0, 10.0);
@@ -1506,12 +1540,46 @@ mod tests {
         visitor.visit(3, &[0.0, 10.0]); // on the boundary — inclusive
         visitor.visit(9, &[10.5, 5.0]); // outside (lat)
         visitor.visit(1, &[5.0, -0.1]); // outside (lon)
-        visitor.visit(7, &[5.0, 5.0]); // duplicate doc id
+        visitor.visit(7, &[6.0, 6.0]); // second point of doc 7 — kept
         visitor.visit_inside(2); // must be ignored (no coordinates)
 
         let candidates = visitor.into_candidates();
         let ids: Vec<u64> = candidates.iter().map(|(doc_id, _)| *doc_id).collect();
-        assert_eq!(ids, vec![3, 7], "sorted, deduped, boundary-inclusive");
+        assert_eq!(
+            ids,
+            vec![3, 7, 7],
+            "sorted, boundary-inclusive, every point kept"
+        );
+    }
+
+    /// #1174: the distance query must not lose a document whose first
+    /// traversed point lies inside the enclosing rectangle but outside the
+    /// circle while a later point lies inside the circle — and it reports
+    /// each document once, by its closest point.
+    #[test]
+    fn distance_query_keeps_the_closest_point_per_document() {
+        let center = GeoPoint::new(0.0, 0.0);
+        let query = GeoDistanceQuery::new("location", center, 150_000.0);
+        let bbox = query.create_bounding_box();
+        // A rectangle corner: inside the bbox, outside the circle.
+        let corner = [bbox.max.lat - 1e-6, bbox.max.lon - 1e-6];
+        assert!(center.distance_to(&GeoPoint::new(corner[0], corner[1])) > 150_000.0);
+
+        let reader = BkdBackedReader::new(vec![
+            (1, corner),
+            (1, [0.5, 0.0]), // ≈ 55 km — the closest point of doc 1
+            (1, [1.0, 0.0]), // ≈ 111 km
+            (2, corner),     // doc 2 has no in-circle point
+            (3, [1.0, 0.0]), // single point, ≈ 111 km
+        ]);
+
+        let matches = query.find_matches(&reader).unwrap();
+        let ids: Vec<u64> = matches.iter().map(|m| m.doc_id).collect();
+        assert_eq!(ids, vec![1, 3], "closest first, doc 1 once, doc 2 absent");
+        assert!(
+            (matches[0].distance_m - center.distance_to(&GeoPoint::new(0.5, 0.0))).abs() < 1e-6,
+            "doc 1 is reported by its closest point"
+        );
     }
 
     /// In-memory `BKDTree` that streams its fixed points through

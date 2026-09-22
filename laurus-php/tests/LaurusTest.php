@@ -342,6 +342,76 @@ class LaurusTest extends TestCase
         $idx->putDocument("doc1", ["title" => "t", "tags" => [2020, 2021]]);
     }
 
+    // ── Multi-valued geo arrays (Issue #1174) ────────────────────────────
+    //
+    // A sequential array of `["lat" => .., "lon" => ..]` arrays is a
+    // multi-valued geo field; each element takes the same associative-array
+    // path as a single point.
+
+    private function indexWithGeoField(bool $multiValued): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        // (name, stored, indexed, multi_valued)
+        $schema->addGeoField("spots", true, true, $multiValued);
+        return new Laurus\Index(null, $schema);
+    }
+
+    public function testGeoArrayRoundTripsThroughMultiValuedGeoField(): void
+    {
+        $idx = $this->indexWithGeoField(true);
+        $spots = [["lat" => 35.68, "lon" => 139.76], ["lat" => 34.69, "lon" => 135.5]];
+        $idx->putDocument("doc1", ["title" => "t", "spots" => $spots]);
+        $idx->commit();
+        $this->assertSame($spots, $idx->getDocuments("doc1")[0]["spots"]);
+    }
+
+    public function testGeo3dArrayRoundTripsThroughMultiValuedGeo3dField(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addGeo3dField("positions", true, true, true);
+        $idx = new Laurus\Index(null, $schema);
+        $positions = [["x" => 1.0, "y" => 2.0, "z" => 3.0], ["x" => -4.0, "y" => 5.0, "z" => -6.0]];
+        $idx->putDocument("doc1", ["title" => "t", "positions" => $positions]);
+        $idx->commit();
+        $this->assertSame($positions, $idx->getDocuments("doc1")[0]["positions"]);
+    }
+
+    public function testSinglePointIsWrappedOnMultiValuedGeoField(): void
+    {
+        $idx = $this->indexWithGeoField(true);
+        $idx->putDocument("doc1", ["title" => "t", "spots" => ["lat" => 35.68, "lon" => 139.76]]);
+        $idx->commit();
+        $this->assertSame([["lat" => 35.68, "lon" => 139.76]], $idx->getDocuments("doc1")[0]["spots"]);
+    }
+
+    public function testEmptyArrayIsAcceptedByMultiValuedGeoField(): void
+    {
+        $idx = $this->indexWithGeoField(true);
+        $idx->putDocument("doc1", ["title" => "t", "spots" => []]);
+        $idx->commit();
+        $this->assertSame([], $idx->getDocuments("doc1")[0]["spots"]);
+    }
+
+    public function testGeoArrayIntoSingleValuedGeoFieldIsRejected(): void
+    {
+        $idx = $this->indexWithGeoField(false);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/multi_valued/');
+        $idx->putDocument("doc1", ["title" => "t", "spots" => [["lat" => 35.68, "lon" => 139.76]]]);
+    }
+
+    public function testMixedGeoDimensionArrayIsRejected(): void
+    {
+        $idx = $this->indexWithGeoField(true);
+        $this->expectException(\Throwable::class);
+        $idx->putDocument("doc1", [
+            "title" => "t",
+            "spots" => [["lat" => 35.68, "lon" => 139.76], ["x" => 1.0, "y" => 2.0, "z" => 3.0]],
+        ]);
+    }
+
     public function testNumericRangeQuery(): void
     {
         $schema = new Laurus\Schema();

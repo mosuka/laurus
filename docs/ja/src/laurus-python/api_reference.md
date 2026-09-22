@@ -211,8 +211,8 @@ class Schema:
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット浮動小数点フィールド。`multi_valued=True` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_boolean_field(name, *, stored=True, indexed=True, doc_values=True)` | ブールフィールド。`doc_values` は上記を参照。 |
 | `add_bytes_field(name, *, stored=True)` | 生バイトフィールド。`doc_values` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
-| `add_geo_field(name, *, stored=True, indexed=True, doc_values=True)` | 地理座標フィールド（緯度/経度）。`doc_values` は上記を参照。 |
-| `add_geo3d_field(name, *, stored=True, indexed=True, doc_values=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values` は上記を参照。 |
+| `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 地理座標フィールド（緯度/経度）。`multi_valued=True` で `(lat, lon)` タプルのリストを受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。`doc_values` は上記を参照。 |
+| `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued=True` で `(x, y, z)` タプルのリストを受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values` は上記を参照。 |
 | `add_datetime_field(name, *, stored=True, indexed=True, doc_values=True)` | UTC 日時フィールド。`doc_values` は上記を参照。 |
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat（総当たり）ベクトルフィールド。 |
@@ -562,7 +562,10 @@ Python の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `float` | `Float64` | |
 | `str` | `Text` | |
 | `bytes` | `Bytes` | |
-| `list[float]` | `Vector` | 要素は `f32` に変換 |
+| `list[int]` | `Int64Array` | 多値整数フィールド（`bool` 要素は整数として扱わない）。ベクトルフィールドではリストを `f32` にキャスト。空リストは空の `Int64Array` |
+| `list[float \| int]` | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドではリストを `f32` にキャスト |
 | `(lat, lon)` タプル | `Geo` | 2 つの `float` 値 |
 | `(x, y, z)` タプル | `Geo3d` | 3 つの `float` 値（ECEF 直交座標系、メートル単位） |
+| `list[(lat, lon)]` | `GeoArray` | `(lat, lon)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
+| `list[(x, y, z)]` | `GeoEcefArray` | `(x, y, z)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
 | `datetime.datetime` | `DateTime` | `isoformat()` 経由で変換 |

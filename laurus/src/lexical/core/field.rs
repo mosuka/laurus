@@ -626,6 +626,15 @@ pub struct GeoOption {
     #[serde(default = "default_true")]
     pub stored: bool,
 
+    /// Whether this field can hold multiple points per document (Issue #1174).
+    ///
+    /// When `true`, the field accepts [`DataValue::GeoArray`](crate::data::DataValue::GeoArray)
+    /// (and auto-wraps a single point) and distance / bounding-box queries
+    /// match a document if **any** point satisfies the predicate, scoring
+    /// it by its closest matching point. Defaults to `false`.
+    #[serde(default)]
+    pub multi_valued: bool,
+
     /// Whether this field's value is also copied into DocValues, the
     /// column-oriented store `SortField::Field`, faceting, and
     /// aggregations read from (Issue #1047).
@@ -678,6 +687,15 @@ pub struct Geo3dOption {
     #[serde(default = "default_true")]
     pub stored: bool,
 
+    /// Whether this field can hold multiple points per document (Issue #1174).
+    ///
+    /// When `true`, the field accepts [`DataValue::GeoEcefArray`](crate::data::DataValue::GeoEcefArray)
+    /// (and auto-wraps a single point) and distance / bounding-box / nearest
+    /// queries match a document if **any** point satisfies the predicate,
+    /// scoring it by its closest matching point. Defaults to `false`.
+    #[serde(default)]
+    pub multi_valued: bool,
+
     /// Whether this field's value is also copied into DocValues, the
     /// column-oriented store `SortField::Field`, faceting, and
     /// aggregations read from (Issue #1047).
@@ -716,6 +734,7 @@ impl Default for Geo3dOption {
         Self {
             indexed: true,
             stored: true,
+            multi_valued: false,
             doc_values: true,
         }
     }
@@ -805,6 +824,14 @@ impl FieldOption {
                 multi_valued: true,
                 ..Default::default()
             }),
+            FieldValue::GeoArray(_) => FieldOption::Geo(GeoOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+            FieldValue::GeoEcefArray(_) => FieldOption::Geo3d(Geo3dOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
         }
     }
 
@@ -879,6 +906,7 @@ impl Default for GeoOption {
         Self {
             indexed: true,
             stored: true,
+            multi_valued: false,
             doc_values: true,
         }
     }

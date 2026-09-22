@@ -11,8 +11,8 @@ The BKD primitive is shared by every "spatial-shaped" field type:
 | :--- | :---: | :--- |
 | `Integer` / `Float` (single- or multi-valued) | 1 | scalar |
 | `DateTime` | 1 | Unix microseconds (UTC) |
-| `Geo` | 2 | latitude / longitude (degrees) |
-| `Geo3d` | 3 | ECEF Cartesian (metres) |
+| `Geo` (single- or multi-valued) | 2 | latitude / longitude (degrees) |
+| `Geo3d` (single- or multi-valued) | 3 | ECEF Cartesian (metres) |
 
 Adding a new spatial field type therefore boils down to picking a
 dimensionality and writing a query-side
@@ -82,7 +82,7 @@ than spread evenly across the leaf's full range. `doc_id_bits` is the one
 width actually stored on disk, since there is no equivalent "doc_id_max"
 header field to derive it from; the reader rejects a value greater than `64`
 as corruption. Sorting by doc_id before packing is a **stable** sort, so
-multiple points sharing a doc_id (a multi-valued field) keep their original
+multiple points sharing a doc_id (a multi-valued numeric or geo field) keep their original
 relative order — this is depended on by `GeoBoxPointsVisitor`'s "first
 point seen wins" deduplication.
 

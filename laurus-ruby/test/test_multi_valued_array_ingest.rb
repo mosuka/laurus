@@ -72,4 +72,70 @@ class TestMultiValuedArrayIngest < Minitest::Test
       idx.put_document("doc1", { "title" => "t", "tags" => [2020, 2021] })
     end
   end
+
+  # ---- Multi-valued geo (Issue #1174) ----
+
+  def index_with_geo_field(multi_valued:)
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    schema.add_geo_field("spots", multi_valued: multi_valued)
+    Laurus::Index.new(schema: schema)
+  end
+
+  # An Array of { "lat", "lon" } Hashes is a multi-valued geo field and reads
+  # back as the same Array of Hashes.
+  def test_hash_array_round_trips_through_multi_valued_geo_field
+    idx = index_with_geo_field(multi_valued: true)
+    spots = [{ "lat" => 35.68, "lon" => 139.76 }, { "lat" => 34.69, "lon" => 135.5 }]
+    idx.put_document("doc1", { "title" => "t", "spots" => spots })
+    idx.commit
+
+    assert_equal spots, idx.get_documents("doc1").first["spots"]
+  end
+
+  def test_hash_array_round_trips_through_multi_valued_geo3d_field
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    schema.add_geo3d_field("positions", multi_valued: true)
+    idx = Laurus::Index.new(schema: schema)
+    positions = [{ "x" => 1.0, "y" => 2.0, "z" => 3.0 }, { "x" => -4.0, "y" => 5.0, "z" => -6.0 }]
+    idx.put_document("doc1", { "title" => "t", "positions" => positions })
+    idx.commit
+
+    assert_equal positions, idx.get_documents("doc1").first["positions"]
+  end
+
+  def test_single_hash_is_wrapped_on_multi_valued_geo_field
+    idx = index_with_geo_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "spots" => { "lat" => 35.68, "lon" => 139.76 } })
+    idx.commit
+
+    assert_equal [{ "lat" => 35.68, "lon" => 139.76 }], idx.get_documents("doc1").first["spots"]
+  end
+
+  def test_empty_array_is_accepted_by_multi_valued_geo_field
+    idx = index_with_geo_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "spots" => [] })
+    idx.commit
+
+    assert_equal [], idx.get_documents("doc1").first["spots"]
+  end
+
+  def test_hash_array_into_single_valued_geo_field_is_rejected
+    idx = index_with_geo_field(multi_valued: false)
+    err = assert_raises(StandardError) do
+      idx.put_document("doc1", { "title" => "t", "spots" => [{ "lat" => 35.68, "lon" => 139.76 }] })
+    end
+    assert_match(/multi_valued/, err.message)
+  end
+
+  def test_mixed_geo_dimension_array_is_rejected
+    idx = index_with_geo_field(multi_valued: true)
+    assert_raises(StandardError) do
+      idx.put_document(
+        "doc1",
+        { "title" => "t", "spots" => [{ "lat" => 35.68, "lon" => 139.76 }, { "x" => 1.0, "y" => 2.0, "z" => 3.0 }] }
+      )
+    end
+  end
 end

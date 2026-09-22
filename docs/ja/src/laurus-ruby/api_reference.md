@@ -174,8 +174,8 @@ Laurus::Schema.new
 | `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット浮動小数点フィールド。`multi_valued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
 | `add_boolean_field(name, stored: true, indexed: true, doc_values: true)` | ブールフィールド。`doc_values:` は上記を参照。 |
 | `add_bytes_field(name, stored: true)` | 生バイトフィールド。`doc_values:` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
-| `add_geo_field(name, stored: true, indexed: true, doc_values: true)` | 地理座標フィールド（緯度/経度）。`doc_values:` は上記を参照。 |
-| `add_geo3d_field(name, stored: true, indexed: true, doc_values: true)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values:` は上記を参照。 |
+| `add_geo_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 地理座標フィールド（緯度/経度）。`multi_valued: true` で `{ "lat" => .., "lon" => .. }` Hash の Array を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`doc_values:` は上記を参照。 |
+| `add_geo3d_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued: true` で `{ "x" => .., "y" => .., "z" => .. }` Hash の Array を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values:` は上記を参照。 |
 | `add_datetime_field(name, stored: true, indexed: true, doc_values: true)` | UTC 日時フィールド。`doc_values:` は上記を参照。 |
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat（総当たり）ベクトルフィールド。 |
@@ -554,7 +554,10 @@ Ruby の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `Integer` | `Int64` | |
 | `Float` | `Float64` | |
 | `String` | `Text` | |
-| `Array`（数値） | `Vector` | 要素は `f32` に変換 |
+| `Array`（`Integer`） | `Int64Array` | 多値整数フィールド。ベクトルフィールドでは配列を `f32` にキャスト。空の `Array` は空の `Int64Array` |
+| `Array`（数値） | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドでは配列を `f32` にキャスト |
 | `Hash`（`"lat"`, `"lon"`） | `Geo` | 2 つの `Float` 値 |
 | `Hash`（`"x"`, `"y"`, `"z"`） | `GeoEcef` | 3 つの `Float` 値（メートル単位、3D ECEF 直交座標） |
+| `Array`（`"lat"`, `"lon"` を持つ `Hash` の配列） | `GeoArray` | フィールドに `multi_valued: true` が必要 |
+| `Array`（`"x"`, `"y"`, `"z"` を持つ `Hash` の配列） | `GeoEcefArray` | フィールドに `multi_valued: true` が必要 |
 | `Time` / `String`（`iso8601` に応答） | `DateTime` | `iso8601` 経由で変換 |

@@ -16,6 +16,8 @@ message Value {
     Int64ArrayValue int64_array_value = 10;
     Float64ArrayValue float64_array_value = 11;
     Geo3dPoint geo3d_value = 12;
+    GeoArrayValue geo_array_value = 13;
+    Geo3dArrayValue geo3d_array_value = 14;
   }
 }
 
@@ -49,6 +51,20 @@ message Geo3dPoint {
   double x = 1;
   double y = 2;
   double z = 3;
+}
+
+// A multi-valued geographic point field (Lucene-style "any match" semantics:
+// a document matches a distance / bounding-box query if any of its points
+// does, scored by its closest point). Requires `GeoOption.multi_valued`.
+message GeoArrayValue {
+  repeated GeoPoint values = 1;
+}
+
+// A multi-valued 3D ECEF point field (same "any match" semantics for
+// `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest`). Requires
+// `Geo3dOption.multi_valued`.
+message Geo3dArrayValue {
+  repeated Geo3dPoint values = 1;
 }
 
 // A document consisting of named fields.

@@ -201,8 +201,8 @@ class Schema {
 | `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット浮動小数点フィールド。`multiValued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
 | `addBooleanField(name, stored?, indexed?, docValues?)` | 真偽値フィールド。`docValues` は上記を参照。 |
 | `addBytesField(name, stored?)` | バイナリデータフィールド。`docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
-| `addGeoField(name, stored?, indexed?, docValues?)` | 地理座標フィールド。`docValues` は上記を参照。 |
-| `addGeo3dField(name, stored?, indexed?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
+| `addGeoField(name, stored?, indexed?, multiValued?, docValues?)` | 地理座標フィールド。`multiValued: true` で `{ lat, lon }` オブジェクトの配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`docValues` は上記を参照。 |
+| `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multiValued: true` で `{ x, y, z }` オブジェクトの配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
 | `addDatetimeField(name, stored?, indexed?, docValues?)` | UTC 日時フィールド。`docValues` は上記を参照。 |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW ベクトルフィールド。`baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
@@ -678,6 +678,9 @@ JavaScript の値は自動的に Laurus の `DataValue` 型に変換されます
 | `number`（整数） | `Int64` | |
 | `number`（浮動小数点） | `Float64` | |
 | `string` | `Text` | ISO 8601 文字列は `DateTime` になる |
-| `number[]` | `Vector` | `f32` に変換 |
+| `number[]`（すべて整数） | `Int64Array` | 多値整数フィールド。ベクトルフィールドでは配列を `f32` にキャスト。空配列は空の `Int64Array` |
+| `number[]` | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドでは配列を `f32` にキャスト |
 | `{ lat, lon }` | `Geo` | 2 つの `number` 値 |
 | `{ x, y, z }` | `GeoEcef` | 3 つの `number` 値（メートル単位、3D ECEF 直交座標） |
+| `{ lat, lon }[]` | `GeoArray` | `{ lat, lon }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
+| `{ x, y, z }[]` | `GeoEcefArray` | `{ x, y, z }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
