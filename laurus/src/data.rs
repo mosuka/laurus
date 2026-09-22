@@ -223,6 +223,28 @@ pub enum DataValue {
     /// the array satisfies the predicate (Lucene-style "any match"
     /// semantics with constant scoring).
     Float64Array(Vec<f64>),
+
+    // New variants must be APPENDED here, never inserted above: this enum is
+    // rkyv-archived on disk (DocValues `.dv`, WAL v3) and rkyv numbers the
+    // archived discriminants in declaration order, so inserting a variant
+    // mid-enum would make existing segments decode as the wrong variant.
+    /// Multi-valued 2D geographical points (Issue #1174).
+    ///
+    /// Used by fields declared with
+    /// [`GeoOption::multi_valued`](crate::lexical::core::field::GeoOption::multi_valued)
+    /// set to `true`. Distance and bounding-box queries match a document if
+    /// **any** point satisfies the predicate, scoring it by its closest
+    /// matching point.
+    GeoArray(Vec<GeoPoint>),
+
+    /// Multi-valued 3D ECEF Cartesian points (Issue #1174).
+    ///
+    /// Used by fields declared with
+    /// [`Geo3dOption::multi_valued`](crate::lexical::core::field::Geo3dOption::multi_valued)
+    /// set to `true`. Distance, bounding-box, and nearest queries match a
+    /// document if **any** point satisfies the predicate, scoring it by its
+    /// closest matching point.
+    GeoEcefArray(Vec<GeoEcefPoint>),
 }
 
 impl DataValue {
@@ -313,6 +335,22 @@ impl DataValue {
             _ => None,
         }
     }
+
+    /// Returns the multi-valued geo point slice if this is a `GeoArray` variant.
+    pub fn as_geo_array(&self) -> Option<&[GeoPoint]> {
+        match self {
+            DataValue::GeoArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    /// Returns the multi-valued ECEF point slice if this is a `GeoEcefArray` variant.
+    pub fn as_geo_ecef_array(&self) -> Option<&[GeoEcefPoint]> {
+        match self {
+            DataValue::GeoEcefArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 // --- Conversions ---
@@ -380,6 +418,18 @@ impl From<Vec<i64>> for DataValue {
 impl From<Vec<f64>> for DataValue {
     fn from(v: Vec<f64>) -> Self {
         DataValue::Float64Array(v)
+    }
+}
+
+impl From<Vec<GeoPoint>> for DataValue {
+    fn from(v: Vec<GeoPoint>) -> Self {
+        DataValue::GeoArray(v)
+    }
+}
+
+impl From<Vec<GeoEcefPoint>> for DataValue {
+    fn from(v: Vec<GeoEcefPoint>) -> Self {
+        DataValue::GeoEcefArray(v)
     }
 }
 
@@ -534,6 +584,26 @@ impl DocumentBuilder {
         self.add_field(name.into(), DataValue::Float64Array(values))
     }
 
+    /// Add a multi-valued 2D geographical field.
+    ///
+    /// The schema field must be declared with
+    /// [`GeoOption::multi_valued`](crate::lexical::core::field::GeoOption::multi_valued)
+    /// set to `true`. Distance and bounding-box queries match if any point
+    /// satisfies the predicate.
+    pub fn add_geo_array(self, name: impl Into<String>, points: Vec<GeoPoint>) -> Self {
+        self.add_field(name.into(), DataValue::GeoArray(points))
+    }
+
+    /// Add a multi-valued 3D ECEF Cartesian field.
+    ///
+    /// The schema field must be declared with
+    /// [`Geo3dOption::multi_valued`](crate::lexical::core::field::Geo3dOption::multi_valued)
+    /// set to `true`. Distance, bounding-box, and nearest queries match if
+    /// any point satisfies the predicate.
+    pub fn add_geo_ecef_array(self, name: impl Into<String>, points: Vec<GeoEcefPoint>) -> Self {
+        self.add_field(name.into(), DataValue::GeoEcefArray(points))
+    }
+
     /// Add a binary data field with no MIME type.
     ///
     /// The MIME type is set to `None`. If a MIME type is needed (e.g. for
@@ -547,5 +617,140 @@ impl DocumentBuilder {
         Document {
             fields: self.fields,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive(value: &DataValue) -> Vec<u8> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
+            .expect("rkyv serialization")
+            .to_vec()
+    }
+
+    /// `DataValue` is rkyv-archived on disk (DocValues `.dv`, WAL v3), so
+    /// its archived layout is a persistence contract. The archived size is
+    /// pinned so a variant with a wider payload trips a test instead of
+    /// silently changing the layout of every persisted value.
+    #[test]
+    fn archived_data_value_size_is_pinned() {
+        assert_eq!(std::mem::size_of::<ArchivedDataValue>(), 32);
+    }
+
+    /// Golden bytes for the variants adjacent to the #1174 additions. rkyv
+    /// numbers archived discriminants in declaration order, so inserting a
+    /// variant anywhere but at the end of the enum renumbers the ones after
+    /// it and makes existing segments decode as the wrong variant — a
+    /// mistake `size_of` cannot see. If this fails after a deliberate
+    /// format change, update the bytes together with a note on Issue #1040.
+    #[test]
+    fn archived_discriminant_order_is_pinned() {
+        let snapshots: Vec<(&str, Vec<u8>)> = vec![
+            ("Geo", archive(&DataValue::Geo(GeoPoint::new(1.0, 2.0)))),
+            ("Int64Array", archive(&DataValue::Int64Array(vec![7]))),
+            ("Float64Array", archive(&DataValue::Float64Array(vec![1.5]))),
+            (
+                "GeoArray",
+                archive(&DataValue::GeoArray(vec![GeoPoint::new(1.0, 2.0)])),
+            ),
+            (
+                "GeoEcefArray",
+                archive(&DataValue::GeoEcefArray(vec![GeoEcefPoint::new(
+                    1.0, 2.0, 3.0,
+                )])),
+            ),
+        ];
+        // Little-endian rkyv 0.8 layout: the root enum sits at the end of
+        // the buffer, its first byte being the archived discriminant (Geo =
+        // 8, Int64Array = 10, Float64Array = 11, GeoArray = 12, GeoEcefArray
+        // = 13), followed by the payload — `ArchivedVec` is a relative
+        // pointer to the element data written before the root, plus a
+        // length.
+        let expected: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "Geo",
+                vec![
+                    8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64, 0,
+                    0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "Int64Array",
+                vec![
+                    7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 244, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "Float64Array",
+                vec![
+                    0, 0, 0, 0, 0, 0, 248, 63, 11, 0, 0, 0, 244, 255, 255, 255, 1, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "GeoArray",
+                vec![
+                    0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64, 12, 0, 0, 0, 236, 255, 255,
+                    255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "GeoEcefArray",
+                vec![
+                    0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 8, 64,
+                    13, 0, 0, 0, 228, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+        ];
+        assert_eq!(snapshots, expected);
+    }
+
+    #[test]
+    fn geo_arrays_round_trip_through_rkyv() {
+        for value in [
+            DataValue::GeoArray(vec![
+                GeoPoint::new(35.6, 139.7),
+                GeoPoint::new(-33.9, 151.2),
+            ]),
+            DataValue::GeoArray(Vec::new()),
+            DataValue::GeoEcefArray(vec![
+                GeoEcefPoint::new(1.0, 2.0, 3.0),
+                GeoEcefPoint::new(-4.0, 5.0, -6.0),
+            ]),
+            DataValue::GeoEcefArray(Vec::new()),
+        ] {
+            let bytes = archive(&value);
+            let back = rkyv::from_bytes::<DataValue, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialization");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn geo_array_accessors_and_builders() {
+        let pts = vec![GeoPoint::new(35.6, 139.7)];
+        let ecef = vec![GeoEcefPoint::new(1.0, 2.0, 3.0)];
+        let doc = Document::builder()
+            .add_geo_array("locations", pts.clone())
+            .add_geo_ecef_array("positions", ecef.clone())
+            .build();
+        assert_eq!(
+            doc.get_field("locations").and_then(DataValue::as_geo_array),
+            Some(pts.as_slice())
+        );
+        assert_eq!(
+            doc.get_field("positions")
+                .and_then(DataValue::as_geo_ecef_array),
+            Some(ecef.as_slice())
+        );
+        // Single-valued accessors do not see arrays and vice versa.
+        assert_eq!(doc.get_field("locations").and_then(DataValue::as_geo), None);
+        assert_eq!(DataValue::Geo(pts[0]).as_geo_array(), None);
+        assert_eq!(DataValue::from(pts.clone()), DataValue::GeoArray(pts));
+        assert_eq!(DataValue::from(ecef.clone()), DataValue::GeoEcefArray(ecef));
     }
 }

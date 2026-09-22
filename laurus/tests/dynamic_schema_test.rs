@@ -5,11 +5,12 @@
 //! the type-conflict coercion rules exercised during document ingestion.
 
 use laurus::lexical::TextOption;
-use laurus::lexical::core::field::IntegerOption;
+use laurus::lexical::core::field::{GeoOption, IntegerOption};
 use laurus::storage::memory::MemoryStorageConfig;
 use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::{
-    DataValue, Document, DynamicFieldPolicy, Engine, FieldOption, LaurusError, Result, Schema,
+    DataValue, Document, DynamicFieldPolicy, Engine, FieldOption, GeoEcefPoint, GeoPoint,
+    LaurusError, Result, Schema,
 };
 
 async fn engine_with_policy(policy: DynamicFieldPolicy) -> Result<Engine> {
@@ -137,6 +138,118 @@ async fn dynamic_auto_adds_int64_array_field() -> Result<()> {
     assert_eq!(
         docs[0].get("scores").and_then(|v| v.as_int64_array()),
         Some(&[85, 72, 95][..])
+    );
+    Ok(())
+}
+
+/// Dynamic (#1174): a geo point array on an undeclared field is auto-added
+/// as a multi-valued Geo field, and the array reads back intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_auto_adds_geo_array_field() -> Result<()> {
+    let engine = engine_with_policy(DynamicFieldPolicy::Dynamic).await?;
+
+    let points = vec![GeoPoint::new(35.1, 139.0), GeoPoint::new(-33.9, 151.2)];
+    let doc = Document::builder()
+        .add_geo_array("locations", points.clone())
+        .build();
+    engine.put_document("doc1", doc).await?;
+    engine.commit().await?;
+
+    let schema = engine.schema();
+    match schema.fields.get("locations") {
+        Some(FieldOption::Geo(opt)) => assert!(
+            opt.multi_valued,
+            "locations should be Geo with multi_valued=true"
+        ),
+        other => panic!("expected Geo field for 'locations', got {other:?}"),
+    }
+
+    let docs = engine.get_documents("doc1").await?;
+    assert_eq!(
+        docs[0].get("locations").and_then(|v| v.as_geo_array()),
+        Some(points.as_slice())
+    );
+    Ok(())
+}
+
+/// Dynamic (#1174): an ECEF point array is auto-added as a multi-valued
+/// Geo3d field.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_auto_adds_geo_ecef_array_field() -> Result<()> {
+    let engine = engine_with_policy(DynamicFieldPolicy::Dynamic).await?;
+
+    let points = vec![
+        GeoEcefPoint::new(1.0, 2.0, 3.0),
+        GeoEcefPoint::new(-4.0, 5.0, -6.0),
+    ];
+    let doc = Document::builder()
+        .add_geo_ecef_array("positions", points.clone())
+        .build();
+    engine.put_document("doc1", doc).await?;
+    engine.commit().await?;
+
+    let schema = engine.schema();
+    match schema.fields.get("positions") {
+        Some(FieldOption::Geo3d(opt)) => assert!(
+            opt.multi_valued,
+            "positions should be Geo3d with multi_valued=true"
+        ),
+        other => panic!("expected Geo3d field for 'positions', got {other:?}"),
+    }
+
+    let docs = engine.get_documents("doc1").await?;
+    assert_eq!(
+        docs[0].get("positions").and_then(|v| v.as_geo_ecef_array()),
+        Some(points.as_slice())
+    );
+    Ok(())
+}
+
+/// #1174: a declared single-valued Geo field rejects an array instead of
+/// silently truncating it, and a declared multi-valued Geo field wraps a
+/// single point into a one-element array.
+#[tokio::test(flavor = "multi_thread")]
+async fn geo_multi_valued_coercion_at_ingest() -> Result<()> {
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let schema = Schema::builder()
+        .add_field("single", FieldOption::Geo(GeoOption::default()))
+        .add_field(
+            "multi",
+            FieldOption::Geo(GeoOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        )
+        .dynamic_field_policy(DynamicFieldPolicy::Strict)
+        .build();
+    let engine = Engine::new(storage, schema).await?;
+
+    let err = engine
+        .put_document(
+            "bad",
+            Document::builder()
+                .add_geo_array("single", vec![GeoPoint::new(35.1, 139.0)])
+                .build(),
+        )
+        .await
+        .expect_err("array into a single-valued Geo field must be rejected");
+    assert!(
+        err.to_string().contains("multi_valued = true"),
+        "error should point at the fix: {err}"
+    );
+
+    engine
+        .put_document(
+            "ok",
+            Document::builder().add_geo("multi", 35.1, 139.0).build(),
+        )
+        .await?;
+    engine.commit().await?;
+    let docs = engine.get_documents("ok").await?;
+    assert_eq!(
+        docs[0].get("multi").and_then(|v| v.as_geo_array()),
+        Some(&[GeoPoint::new(35.1, 139.0)][..]),
+        "a single point is auto-wrapped on a multi-valued field"
     );
     Ok(())
 }

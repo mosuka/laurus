@@ -55,8 +55,8 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
         FieldOption::Float(opt) => coerce_to_float(field_name, opt, value),
         FieldOption::Boolean(_) => coerce_to_boolean(field_name, value),
         FieldOption::DateTime(_) => coerce_to_datetime(field_name, value),
-        FieldOption::Geo(_) => coerce_to_geo(field_name, value),
-        FieldOption::Geo3d(_) => coerce_to_geo3d(field_name, value),
+        FieldOption::Geo(opt) => coerce_to_geo(field_name, opt, value),
+        FieldOption::Geo3d(opt) => coerce_to_geo3d(field_name, opt, value),
         FieldOption::Bytes(_) => coerce_to_bytes(field_name, value),
         FieldOption::Hnsw(_) | FieldOption::Flat(_) | FieldOption::Ivf(_) => {
             coerce_to_vector(field_name, value)
@@ -237,23 +237,73 @@ fn coerce_to_datetime(field_name: &str, value: DataValue) -> Result<DataValue> {
     }
 }
 
-fn coerce_to_geo(field_name: &str, value: DataValue) -> Result<DataValue> {
-    match value {
-        DataValue::Geo(p) => Ok(DataValue::Geo(p)),
-        other => Err(LaurusError::invalid_argument(format!(
-            "field '{field_name}': cannot coerce {} to a geographic point",
-            describe(&other)
-        ))),
+fn coerce_to_geo(
+    field_name: &str,
+    option: &crate::lexical::core::field::GeoOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    if option.multi_valued {
+        // Multi-valued geo field (#1174). A single point is auto-wrapped
+        // into a one-element array. An empty *numeric* array is accepted as
+        // an empty point list: every binding turns `[]` into
+        // `Int64Array(vec![])` before the field type is known (#1178), the
+        // same shape `coerce_to_vector` accommodates.
+        match value {
+            DataValue::GeoArray(arr) => Ok(DataValue::GeoArray(arr)),
+            DataValue::Geo(p) => Ok(DataValue::GeoArray(vec![p])),
+            DataValue::Int64Array(a) if a.is_empty() => Ok(DataValue::GeoArray(Vec::new())),
+            DataValue::Float64Array(a) if a.is_empty() => Ok(DataValue::GeoArray(Vec::new())),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a multi-valued geographic point",
+                describe(&other)
+            ))),
+        }
+    } else {
+        match value {
+            DataValue::Geo(p) => Ok(DataValue::Geo(p)),
+            // Multi-valued input to a single-valued field is rejected
+            // rather than silently truncating to one element.
+            DataValue::GeoArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a geographic point",
+                describe(&other)
+            ))),
+        }
     }
 }
 
-fn coerce_to_geo3d(field_name: &str, value: DataValue) -> Result<DataValue> {
-    match value {
-        DataValue::GeoEcef(p) => Ok(DataValue::GeoEcef(p)),
-        other => Err(LaurusError::invalid_argument(format!(
-            "field '{field_name}': cannot coerce {} to a 3D ECEF geo point",
-            describe(&other)
-        ))),
+fn coerce_to_geo3d(
+    field_name: &str,
+    option: &crate::lexical::core::field::Geo3dOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    if option.multi_valued {
+        // See `coerce_to_geo` for the empty-numeric-array accommodation.
+        match value {
+            DataValue::GeoEcefArray(arr) => Ok(DataValue::GeoEcefArray(arr)),
+            DataValue::GeoEcef(p) => Ok(DataValue::GeoEcefArray(vec![p])),
+            DataValue::Int64Array(a) if a.is_empty() => Ok(DataValue::GeoEcefArray(Vec::new())),
+            DataValue::Float64Array(a) if a.is_empty() => Ok(DataValue::GeoEcefArray(Vec::new())),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a multi-valued 3D ECEF geo point",
+                describe(&other)
+            ))),
+        }
+    } else {
+        match value {
+            DataValue::GeoEcef(p) => Ok(DataValue::GeoEcef(p)),
+            DataValue::GeoEcefArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a 3D ECEF geo point",
+                describe(&other)
+            ))),
+        }
     }
 }
 
@@ -326,6 +376,8 @@ fn describe(value: &DataValue) -> &'static str {
         DataValue::GeoEcef(_) => "geo3d",
         DataValue::Int64Array(_) => "integer array",
         DataValue::Float64Array(_) => "float array",
+        DataValue::GeoArray(_) => "geo array",
+        DataValue::GeoEcefArray(_) => "geo3d array",
     }
 }
 
@@ -358,6 +410,20 @@ mod tests {
 
     fn geo3d() -> FieldOption {
         FieldOption::Geo3d(Geo3dOption::default())
+    }
+
+    fn geo_multi() -> FieldOption {
+        FieldOption::Geo(GeoOption {
+            multi_valued: true,
+            ..Default::default()
+        })
+    }
+
+    fn geo3d_multi() -> FieldOption {
+        FieldOption::Geo3d(Geo3dOption {
+            multi_valued: true,
+            ..Default::default()
+        })
     }
 
     fn bytes() -> FieldOption {
@@ -503,6 +569,118 @@ mod tests {
         let p2d = crate::data::GeoPoint::new(35.1, 139.0);
         assert!(coerce_value("g3", &geo3d(), DataValue::Geo(p2d)).is_err());
         assert!(coerce_value("g3", &geo3d(), DataValue::Int64(35)).is_err());
+    }
+
+    // ---- Multi-valued geo (#1174) ----
+
+    #[test]
+    fn multi_valued_geo_accepts_arrays_and_wraps_singles() {
+        use crate::data::GeoPoint;
+        let pts = vec![GeoPoint::new(35.1, 139.0), GeoPoint::new(-33.9, 151.2)];
+        assert_eq!(
+            coerce_value("g", &geo_multi(), DataValue::GeoArray(pts.clone())).unwrap(),
+            DataValue::GeoArray(pts)
+        );
+        // A single point is auto-wrapped, mirroring Integer/Float.
+        assert_eq!(
+            coerce_value(
+                "g",
+                &geo_multi(),
+                DataValue::Geo(GeoPoint::new(35.1, 139.0))
+            )
+            .unwrap(),
+            DataValue::GeoArray(vec![GeoPoint::new(35.1, 139.0)])
+        );
+        // Bindings turn `[]` into an empty numeric array before the field
+        // type is known (#1178); that must read as "no points", not an error.
+        assert_eq!(
+            coerce_value("g", &geo_multi(), DataValue::Int64Array(Vec::new())).unwrap(),
+            DataValue::GeoArray(Vec::new())
+        );
+        assert_eq!(
+            coerce_value("g", &geo_multi(), DataValue::Float64Array(Vec::new())).unwrap(),
+            DataValue::GeoArray(Vec::new())
+        );
+        // ...but a non-empty numeric array is not a point list.
+        assert!(coerce_value("g", &geo_multi(), DataValue::Int64Array(vec![35, 139])).is_err());
+        assert!(coerce_value("g", &geo_multi(), DataValue::Text("x".into())).is_err());
+        // Dimension mismatch is rejected rather than truncated.
+        assert!(
+            coerce_value(
+                "g",
+                &geo_multi(),
+                DataValue::GeoEcefArray(vec![crate::data::GeoEcefPoint::new(1.0, 2.0, 3.0)])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn single_valued_geo_rejects_arrays() {
+        let err = coerce_value(
+            "g",
+            &geo(),
+            DataValue::GeoArray(vec![crate::data::GeoPoint::new(35.1, 139.0)]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("multi_valued = true"), "{err}");
+    }
+
+    #[test]
+    fn multi_valued_geo3d_accepts_arrays_and_wraps_singles() {
+        use crate::data::GeoEcefPoint;
+        let pts = vec![
+            GeoEcefPoint::new(1.0, 2.0, 3.0),
+            GeoEcefPoint::new(-4.0, 5.0, -6.0),
+        ];
+        assert_eq!(
+            coerce_value("g3", &geo3d_multi(), DataValue::GeoEcefArray(pts.clone())).unwrap(),
+            DataValue::GeoEcefArray(pts)
+        );
+        assert_eq!(
+            coerce_value(
+                "g3",
+                &geo3d_multi(),
+                DataValue::GeoEcef(GeoEcefPoint::new(1.0, 2.0, 3.0))
+            )
+            .unwrap(),
+            DataValue::GeoEcefArray(vec![GeoEcefPoint::new(1.0, 2.0, 3.0)])
+        );
+        assert_eq!(
+            coerce_value("g3", &geo3d_multi(), DataValue::Int64Array(Vec::new())).unwrap(),
+            DataValue::GeoEcefArray(Vec::new())
+        );
+        assert_eq!(
+            coerce_value("g3", &geo3d_multi(), DataValue::Float64Array(Vec::new())).unwrap(),
+            DataValue::GeoEcefArray(Vec::new())
+        );
+        assert!(
+            coerce_value(
+                "g3",
+                &geo3d_multi(),
+                DataValue::Float64Array(vec![1.0, 2.0, 3.0])
+            )
+            .is_err()
+        );
+        assert!(
+            coerce_value(
+                "g3",
+                &geo3d_multi(),
+                DataValue::GeoArray(vec![crate::data::GeoPoint::new(35.1, 139.0)])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn single_valued_geo3d_rejects_arrays() {
+        let err = coerce_value(
+            "g3",
+            &geo3d(),
+            DataValue::GeoEcefArray(vec![crate::data::GeoEcefPoint::new(1.0, 2.0, 3.0)]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("multi_valued = true"), "{err}");
     }
 
     #[test]

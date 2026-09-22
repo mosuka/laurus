@@ -534,8 +534,44 @@ pub(crate) fn analyze_field_value(
                 points.push(vec![*num]);
             }
         }
-        // Handle other variants (Bytes, Vector, Null) — not lexically indexed.
-        _ => {}
+        DataValue::GeoArray(arr) => {
+            // Multi-valued geo field (#1174): one 2-D BKD point per element,
+            // same shape as Int64Array.
+            let mut offset = 0usize;
+            for (idx, p) in arr.iter().enumerate() {
+                let text = format!("{},{}", p.lat, p.lon);
+                let len = text.len();
+                terms.push(AnalyzedTerm {
+                    term: text,
+                    position: idx as u32,
+                    frequency: 1,
+                    offset: (offset, offset + len),
+                });
+                offset += len + 1;
+                points.push(vec![p.lat, p.lon]);
+            }
+        }
+        DataValue::GeoEcefArray(arr) => {
+            // Multi-valued ECEF field (#1174): one 3-D BKD point per element.
+            let mut offset = 0usize;
+            for (idx, p) in arr.iter().enumerate() {
+                let text = format!("{},{},{}", p.x, p.y, p.z);
+                let len = text.len();
+                terms.push(AnalyzedTerm {
+                    term: text,
+                    position: idx as u32,
+                    frequency: 1,
+                    offset: (offset, offset + len),
+                });
+                offset += len + 1;
+                points.push(vec![p.x, p.y, p.z]);
+            }
+        }
+        // Not lexically indexable: no term representation exists for these.
+        // Spelled out rather than a wildcard `_ =>` so a new `DataValue`
+        // variant fails exhaustiveness checking here instead of being
+        // silently skipped at indexing time.
+        DataValue::Bytes(_, _) | DataValue::Vector(_) | DataValue::Null => {}
     }
     Ok((terms, points))
 }
@@ -1142,6 +1178,10 @@ impl InvertedIndexWriter {
             DataValue::Vector(v) => v.len() * std::mem::size_of::<f32>(),
             DataValue::Int64Array(v) => v.len() * std::mem::size_of::<i64>(),
             DataValue::Float64Array(v) => v.len() * std::mem::size_of::<f64>(),
+            DataValue::GeoArray(v) => v.len() * std::mem::size_of::<crate::data::GeoPoint>(),
+            DataValue::GeoEcefArray(v) => {
+                v.len() * std::mem::size_of::<crate::data::GeoEcefPoint>()
+            }
             // The remaining variants are fixed-size and already covered by
             // `size_of::<DataValue>()`.
             _ => 0,

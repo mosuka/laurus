@@ -106,6 +106,12 @@ const TAG_VECTOR: u8 = 9;
 const TAG_INT64_ARRAY: u8 = 10;
 const TAG_FLOAT64_ARRAY: u8 = 11;
 const TAG_GEO_ECEF: u8 = 12;
+// Multi-valued geo (#1174). Tag 8 is skipped for historical reasons and is
+// deliberately not reused. Like tags 10–12 these were added without a
+// format-version bump: a pre-#1174 reader rejects a segment containing them
+// with `Unknown field type tag` (loud, recorded on Issue #1040).
+const TAG_GEO_ARRAY: u8 = 13;
+const TAG_GEO_ECEF_ARRAY: u8 = 14;
 
 // ---------------------------------------------------------------------------
 // Encoding (document -> plain bytes, before compression)
@@ -191,6 +197,23 @@ fn encode_document(buf: &mut Vec<u8>, doc_id: u64, fields: &AHashMap<String, Dat
                 write_varint(buf, arr.len() as u64);
                 for &v in arr {
                     buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            DataValue::GeoArray(arr) => {
+                buf.push(TAG_GEO_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for p in arr {
+                    buf.extend_from_slice(&p.lat.to_le_bytes());
+                    buf.extend_from_slice(&p.lon.to_le_bytes());
+                }
+            }
+            DataValue::GeoEcefArray(arr) => {
+                buf.push(TAG_GEO_ECEF_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for p in arr {
+                    buf.extend_from_slice(&p.x.to_le_bytes());
+                    buf.extend_from_slice(&p.y.to_le_bytes());
+                    buf.extend_from_slice(&p.z.to_le_bytes());
                 }
             }
         }
@@ -343,6 +366,39 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                     )?);
                 }
                 DataValue::Float64Array(arr)
+            }
+            TAG_GEO_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored GeoArray field length")? as usize;
+                let len = checked_capacity(
+                    len,
+                    16,
+                    (bytes.len() - *cursor) as u64,
+                    "stored GeoArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let lat = read_f64_le(bytes, cursor, "stored GeoArray field lat")?;
+                    let lon = read_f64_le(bytes, cursor, "stored GeoArray field lon")?;
+                    arr.push(GeoPoint::new(lat, lon));
+                }
+                DataValue::GeoArray(arr)
+            }
+            TAG_GEO_ECEF_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored GeoEcefArray field length")? as usize;
+                let len = checked_capacity(
+                    len,
+                    24,
+                    (bytes.len() - *cursor) as u64,
+                    "stored GeoEcefArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let x = read_f64_le(bytes, cursor, "stored GeoEcefArray field x")?;
+                    let y = read_f64_le(bytes, cursor, "stored GeoEcefArray field y")?;
+                    let z = read_f64_le(bytes, cursor, "stored GeoEcefArray field z")?;
+                    arr.push(GeoEcefPoint::new(x, y, z));
+                }
+                DataValue::GeoEcefArray(arr)
             }
             other => {
                 return Err(LaurusError::index(format!(
@@ -693,6 +749,26 @@ mod tests {
                 ("k_vector", DataValue::Vector(vec![0.1, 0.2, 0.3])),
                 ("l_int_array", DataValue::Int64Array(vec![1, 2, 3])),
                 ("m_float_array", DataValue::Float64Array(vec![1.5, 2.5])),
+                (
+                    "n_geo_array",
+                    DataValue::GeoArray(vec![
+                        GeoPoint::new(35.6, 139.7),
+                        GeoPoint::new(-33.9, 151.2),
+                    ]),
+                ),
+                (
+                    "o_geo_ecef_array",
+                    DataValue::GeoEcefArray(vec![
+                        GeoEcefPoint::new(1.0, 2.0, 3.0),
+                        GeoEcefPoint::new(-4.0, 5.0, -6.0),
+                    ]),
+                ),
+                // Empty point lists take the length-0 path (#1174).
+                ("p_geo_array_empty", DataValue::GeoArray(Vec::new())),
+                (
+                    "q_geo_ecef_array_empty",
+                    DataValue::GeoEcefArray(Vec::new()),
+                ),
             ]),
         )];
 
@@ -740,6 +816,28 @@ mod tests {
         assert_eq!(
             d.fields.get("m_float_array"),
             Some(&DataValue::Float64Array(vec![1.5, 2.5]))
+        );
+        assert_eq!(
+            d.fields.get("n_geo_array"),
+            Some(&DataValue::GeoArray(vec![
+                GeoPoint::new(35.6, 139.7),
+                GeoPoint::new(-33.9, 151.2),
+            ]))
+        );
+        assert_eq!(
+            d.fields.get("o_geo_ecef_array"),
+            Some(&DataValue::GeoEcefArray(vec![
+                GeoEcefPoint::new(1.0, 2.0, 3.0),
+                GeoEcefPoint::new(-4.0, 5.0, -6.0),
+            ]))
+        );
+        assert_eq!(
+            d.fields.get("p_geo_array_empty"),
+            Some(&DataValue::GeoArray(Vec::new()))
+        );
+        assert_eq!(
+            d.fields.get("q_geo_ecef_array_empty"),
+            Some(&DataValue::GeoEcefArray(Vec::new()))
         );
     }
 

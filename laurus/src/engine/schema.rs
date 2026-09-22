@@ -365,7 +365,7 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         (FieldOption::Text(o), FieldOption::Text(n)) => {
             classify_text(o, n).max(classify_doc_values(o.doc_values, n.doc_values, o.stored))
         }
-        (FieldOption::Integer(o), FieldOption::Integer(n)) => classify_numeric_lexical(
+        (FieldOption::Integer(o), FieldOption::Integer(n)) => classify_bkd_lexical(
             o.indexed,
             n.indexed,
             o.stored,
@@ -373,7 +373,7 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
             n.multi_valued,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
-        (FieldOption::Float(o), FieldOption::Float(n)) => classify_numeric_lexical(
+        (FieldOption::Float(o), FieldOption::Float(n)) => classify_bkd_lexical(
             o.indexed,
             n.indexed,
             o.stored,
@@ -389,12 +389,20 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
             o.indexed, n.indexed, o.stored,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
-        (FieldOption::Geo(o), FieldOption::Geo(n)) => classify_indexed_only(
-            o.indexed, n.indexed, o.stored,
+        (FieldOption::Geo(o), FieldOption::Geo(n)) => classify_bkd_lexical(
+            o.indexed,
+            n.indexed,
+            o.stored,
+            o.multi_valued,
+            n.multi_valued,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
-        (FieldOption::Geo3d(o), FieldOption::Geo3d(n)) => classify_indexed_only(
-            o.indexed, n.indexed, o.stored,
+        (FieldOption::Geo3d(o), FieldOption::Geo3d(n)) => classify_bkd_lexical(
+            o.indexed,
+            n.indexed,
+            o.stored,
+            o.multi_valued,
+            n.multi_valued,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
         // `stored` changes (for every lexical variant, including Bytes) are
@@ -423,7 +431,8 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
 }
 
 /// Shared classification for `indexed`-only lexical options (Boolean,
-/// DateTime, Geo, Geo3d).
+/// DateTime); the BKD-backed options (Integer, Float, Geo, Geo3d) layer
+/// their `multi_valued` rule on top of this in [`classify_bkd_lexical`].
 ///
 /// Only the `false -> true` transition requires rebuilding: documents
 /// ingested while the field was `indexed: false` have no postings to
@@ -516,18 +525,20 @@ fn classify_text(old: &TextOption, new: &TextOption) -> FieldChangeKind {
     kind
 }
 
-/// Classification shared by `IntegerOption`/`FloatOption`: `indexed`
-/// follows [`classify_indexed_only`] (`stored`-dependent, since turning
-/// indexing on has no BKD points to source from for a `stored: false`
-/// field that was never indexed). `multi_valued: false -> true` is
-/// metadata-only (existing single values are still valid single-element
-/// matches under "any match" semantics); the reverse could leave stale
-/// multi-value postings misread as single-valued, so it conservatively
-/// requires a reindex — always `Reindex`, never `Destructive`, regardless
-/// of `stored`: numeric points are read back from the segment's BKD tree
-/// (the authoritative source, Issue #758), not from stored fields, so a
-/// field that was already `indexed: true` always has a rebuild source.
-fn classify_numeric_lexical(
+/// Classification shared by the BKD-backed lexical options
+/// (`IntegerOption`/`FloatOption`, and since #1174 `GeoOption`/`Geo3dOption`):
+/// `indexed` follows [`classify_indexed_only`] (`stored`-dependent, since
+/// turning indexing on has no BKD points to source from for a
+/// `stored: false` field that was never indexed). `multi_valued: false ->
+/// true` is metadata-only (existing single values are still valid
+/// single-element matches under "any match" semantics); the reverse could
+/// leave stale multi-value postings misread as single-valued, so it
+/// conservatively requires a reindex — always `Reindex`, never
+/// `Destructive`, regardless of `stored`: numeric and geo points are read
+/// back from the segment's BKD tree (the authoritative source, Issue #758),
+/// not from stored fields, so a field that was already `indexed: true`
+/// always has a rebuild source.
+fn classify_bkd_lexical(
     old_indexed: bool,
     new_indexed: bool,
     old_stored: bool,
@@ -1133,6 +1144,34 @@ mod tests {
                 geo(|o| o.indexed(true)),
                 Reindex,
             ),
+            (
+                "geo: multi_valued false->true is metadata-only",
+                geo(|o| o),
+                geo(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                MetadataOnly,
+            ),
+            (
+                "geo: multi_valued true->false requires reindex",
+                geo(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                geo(|o| o),
+                Reindex,
+            ),
+            (
+                "geo: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                geo(|mut o| {
+                    o.stored = false;
+                    o.multi_valued = true;
+                    o
+                }),
+                geo(|o| o.stored(false)),
+                Reindex,
+            ),
             // ---- Geo3d ----
             (
                 "geo3d: stored toggle is metadata-only",
@@ -1144,6 +1183,34 @@ mod tests {
                 "geo3d: indexed false->true requires reindex",
                 geo3d(|o| o.indexed(false)),
                 geo3d(|o| o.indexed(true)),
+                Reindex,
+            ),
+            (
+                "geo3d: multi_valued false->true is metadata-only",
+                geo3d(|o| o),
+                geo3d(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                MetadataOnly,
+            ),
+            (
+                "geo3d: multi_valued true->false requires reindex",
+                geo3d(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                geo3d(|o| o),
+                Reindex,
+            ),
+            (
+                "geo3d: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                geo3d(|mut o| {
+                    o.stored = false;
+                    o.multi_valued = true;
+                    o
+                }),
+                geo3d(|o| o.stored(false)),
                 Reindex,
             ),
             // ---- Bytes (no `indexed`; only `stored`) ----
