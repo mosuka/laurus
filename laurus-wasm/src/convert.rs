@@ -37,7 +37,9 @@ pub fn json_to_document(value: &Value) -> Result<Document, JsValue> {
 /// - `number` (integer)      -> `DataValue::Int64`
 /// - `number` (float)        -> `DataValue::Float64`
 /// - `string`                -> `DataValue::Text` (or `DateTime` if ISO8601)
-/// - `array` of numbers      -> `DataValue::Vector`
+/// - `array` of integers     -> `DataValue::Int64Array`
+/// - `array` of numbers      -> `DataValue::Float64Array` (vector fields
+///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -69,16 +71,26 @@ pub fn json_to_data_value(value: &Value) -> Result<DataValue, JsValue> {
             Ok(DataValue::Text(s.clone()))
         }
         Value::Array(arr) => {
-            // Try as vector of numbers
-            let vec: Result<Vec<f32>, _> = arr
-                .iter()
-                .map(|v| {
-                    v.as_f64().map(|f| f as f32).ok_or_else(|| {
-                        JsValue::from_str("Array elements must be numbers for vector fields")
-                    })
-                })
-                .collect();
-            Ok(DataValue::Vector(vec?))
+            // Non-empty arrays go through the same inference the server
+            // gateway and CLI already use (`laurus::infer_from_json`):
+            // all-integer -> `Int64Array`, otherwise numeric -> `Float64Array`,
+            // non-numeric elements -> error. The core's schema-aware
+            // `coerce_value` then routes the result — vector fields cast it
+            // to `Vector`, multi-valued numeric fields keep it, single-valued
+            // fields reject it (#1178). Emitting `Vector` here unconditionally
+            // made multi-valued numeric fields unreachable from this binding.
+            // An empty array becomes an empty `Int64Array`: `coerce_to_vector`
+            // casts it to the same empty `Vector` as before, while multi-valued
+            // numeric fields — which reject `Vector` outright — now accept it.
+            if arr.is_empty() {
+                return Ok(DataValue::Int64Array(Vec::new()));
+            }
+            match laurus::infer_from_json(value).map_err(|e| JsValue::from_str(&e.to_string()))? {
+                laurus::InferredValue::Inferred {
+                    value: inferred, ..
+                } => Ok(inferred),
+                laurus::InferredValue::Skip => Ok(DataValue::Vector(Vec::new())),
+            }
         }
         Value::Object(obj) => {
             // Check for geo { lat, lon }
@@ -156,5 +168,56 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
         DataValue::Float64Array(arr) => {
             Value::Array(arr.iter().map(|v| serde_json::json!(*v)).collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Issue #1178: arrays used to become `Vector` unconditionally, which the
+    /// core's multi-valued integer/float coercion rejects. They must now
+    /// arrive as the most informative numeric array shape instead.
+    #[wasm_bindgen_test]
+    fn integer_array_becomes_int64_array() {
+        match json_to_data_value(&json!([1, 2, 3])) {
+            Ok(DataValue::Int64Array(v)) => assert_eq!(v, vec![1, 2, 3]),
+            other => panic!("expected Int64Array, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn float_array_becomes_float64_array() {
+        match json_to_data_value(&json!([1.5, 2.0])) {
+            Ok(DataValue::Float64Array(v)) => assert_eq!(v, vec![1.5, 2.0]),
+            other => panic!("expected Float64Array, got {other:?}"),
+        }
+    }
+
+    /// One non-integer element widens the whole array to floats.
+    #[wasm_bindgen_test]
+    fn mixed_array_becomes_float64_array() {
+        match json_to_data_value(&json!([1, 2.5])) {
+            Ok(DataValue::Float64Array(v)) => assert_eq!(v, vec![1.0, 2.5]),
+            other => panic!("expected Float64Array, got {other:?}"),
+        }
+    }
+
+    /// An empty array is an empty `Int64Array`: vector fields cast it to the
+    /// same empty `Vector` as before, and multi-valued numeric fields (which
+    /// reject `Vector`) now accept it.
+    #[wasm_bindgen_test]
+    fn empty_array_becomes_empty_int64_array() {
+        match json_to_data_value(&json!([])) {
+            Ok(DataValue::Int64Array(v)) => assert!(v.is_empty()),
+            other => panic!("expected empty Int64Array, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn non_numeric_array_is_rejected() {
+        assert!(json_to_data_value(&json!([1, "x"])).is_err());
     }
 }

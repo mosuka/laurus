@@ -39,7 +39,9 @@ pub fn json_to_document(value: &Value) -> napi::Result<Document> {
 /// - `number` (integer)      -> `DataValue::Int64`
 /// - `number` (float)        -> `DataValue::Float64`
 /// - `string`                -> `DataValue::Text` (or `DateTime` if ISO8601)
-/// - `array` of numbers      -> `DataValue::Vector`
+/// - `array` of integers     -> `DataValue::Int64Array`
+/// - `array` of numbers      -> `DataValue::Float64Array` (vector fields
+///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -71,16 +73,28 @@ pub fn json_to_data_value(value: &Value) -> napi::Result<DataValue> {
             Ok(DataValue::Text(s.clone()))
         }
         Value::Array(arr) => {
-            // Try as vector of numbers
-            let vec: Result<Vec<f32>, _> = arr
-                .iter()
-                .map(|v| {
-                    v.as_f64().map(|f| f as f32).ok_or_else(|| {
-                        napi::Error::from_reason("Array elements must be numbers for vector fields")
-                    })
-                })
-                .collect();
-            Ok(DataValue::Vector(vec?))
+            // Non-empty arrays go through the same inference the server
+            // gateway and CLI already use (`laurus::infer_from_json`):
+            // all-integer -> `Int64Array`, otherwise numeric -> `Float64Array`,
+            // non-numeric elements -> error. The core's schema-aware
+            // `coerce_value` then routes the result — vector fields cast it
+            // to `Vector`, multi-valued numeric fields keep it, single-valued
+            // fields reject it (#1178). Emitting `Vector` here unconditionally
+            // made multi-valued numeric fields unreachable from this binding.
+            // An empty array becomes an empty `Int64Array`: `coerce_to_vector`
+            // casts it to the same empty `Vector` as before, while multi-valued
+            // numeric fields — which reject `Vector` outright — now accept it.
+            if arr.is_empty() {
+                return Ok(DataValue::Int64Array(Vec::new()));
+            }
+            match laurus::infer_from_json(value)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?
+            {
+                laurus::InferredValue::Inferred {
+                    value: inferred, ..
+                } => Ok(inferred),
+                laurus::InferredValue::Skip => Ok(DataValue::Vector(Vec::new())),
+            }
         }
         Value::Object(obj) => {
             // Check for geo { lat, lon }

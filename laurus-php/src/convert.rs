@@ -50,7 +50,8 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 /// | `int`                                     | `Int64`              |
 /// | `float`                                   | `Float64`            |
 /// | `string`                                  | `Text`               |
-/// | `array` of floats (sequential)            | `Vector`             |
+/// | `array` of ints (sequential)              | `Int64Array`         |
+/// | `array` of numerics (sequential)          | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
 /// | `array` with `"lat"`, `"lon"` keys        | `Geo`                |
 /// | `array` with `"x"`, `"y"`, `"z"` keys     | `GeoEcef`            |
 /// | ISO 8601 string (fallback)                | `DateTime`           |
@@ -114,13 +115,37 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
             return Ok(DataValue::GeoEcef(laurus::GeoEcefPoint::new(x, y, z)));
         }
 
-        // Otherwise treat as vector (sequential array of floats)
-        let mut vec = Vec::with_capacity(ht.len());
-        for (_, val) in ht.iter() {
-            let f = f64::from_zval(val).ok_or("vector array elements must be numeric")?;
-            vec.push(f as f32);
+        // Otherwise a sequential numeric array. It becomes the most
+        // informative array shape and the core's schema-aware `coerce_value`
+        // routes it: vector fields cast to `Vector`, multi-valued numeric
+        // fields keep the array, single-valued fields reject it (#1178).
+        // Emitting `Vector` here unconditionally made multi-valued numeric
+        // fields unreachable from PHP. An empty array becomes an empty
+        // `Int64Array`: `coerce_to_vector` casts it to the same empty `Vector`
+        // as before, while multi-valued numeric fields — which reject `Vector`
+        // outright — now accept it.
+        if ht.is_empty() {
+            return Ok(DataValue::Int64Array(Vec::new()));
         }
-        return Ok(DataValue::Vector(vec));
+        if ht.iter().all(|(_, val)| val.is_long()) {
+            let mut ints = Vec::with_capacity(ht.len());
+            for (_, val) in ht.iter() {
+                ints.push(i64::from_zval(val).ok_or("integer array elements must be int")?);
+            }
+            return Ok(DataValue::Int64Array(ints));
+        }
+        // `f64::from_zval` only accepts PHP doubles, so a mixed `[1, 2.5]`
+        // array needs its int elements widened explicitly.
+        let mut floats = Vec::with_capacity(ht.len());
+        for (_, val) in ht.iter() {
+            let f = if val.is_long() {
+                i64::from_zval(val).map(|i| i as f64)
+            } else {
+                f64::from_zval(val)
+            };
+            floats.push(f.ok_or("numeric array elements must be numeric")?);
+        }
+        return Ok(DataValue::Float64Array(floats));
     }
 
     Err(format!(

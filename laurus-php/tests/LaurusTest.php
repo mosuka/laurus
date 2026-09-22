@@ -274,6 +274,74 @@ class LaurusTest extends TestCase
         $this->assertCount(1, $results);
     }
 
+    // ── Multi-valued numeric arrays (Issue #1178) ────────────────────────
+    //
+    // `zval_to_data_value` used to turn every sequential array into
+    // `DataValue::Vector`, which the core's multi-valued integer/float
+    // coercion rejects — so a `multi_valued` field could be read from PHP
+    // but never written from it. Arrays now arrive as Int64Array (all int)
+    // or Float64Array (otherwise numeric).
+
+    private function indexWithIntegerField(bool $multiValued): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        // (name, stored, indexed, multi_valued)
+        $schema->addIntegerField("tags", true, true, $multiValued);
+        return new Laurus\Index(null, $schema);
+    }
+
+    private function indexWithFloatField(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addFloatField("scores", true, true, true);
+        return new Laurus\Index(null, $schema);
+    }
+
+    public function testIntArrayRoundTripsThroughMultiValuedIntegerField(): void
+    {
+        $idx = $this->indexWithIntegerField(true);
+        // Before #1178 this putDocument threw: the array arrived as a Vector,
+        // which a multi-valued integer field does not accept.
+        $idx->putDocument("doc1", ["title" => "t", "tags" => [1, 2, 3]]);
+        $idx->commit();
+        $docs = $idx->getDocuments("doc1");
+        $this->assertCount(1, $docs);
+        $this->assertSame([1, 2, 3], $docs[0]["tags"]);
+    }
+
+    public function testFloatArrayRoundTripsThroughMultiValuedFloatField(): void
+    {
+        $idx = $this->indexWithFloatField();
+        $idx->putDocument("doc1", ["title" => "t", "scores" => [1.5, 2.0]]);
+        $idx->commit();
+        $this->assertSame([1.5, 2.0], $idx->getDocuments("doc1")[0]["scores"]);
+    }
+
+    public function testMixedIntAndFloatArrayBecomesFloatArray(): void
+    {
+        $idx = $this->indexWithFloatField();
+        $idx->putDocument("doc1", ["title" => "t", "scores" => [1, 2.5]]);
+        $idx->commit();
+        $this->assertSame([1.0, 2.5], $idx->getDocuments("doc1")[0]["scores"]);
+    }
+
+    public function testEmptyArrayIsAcceptedByMultiValuedIntegerField(): void
+    {
+        $idx = $this->indexWithIntegerField(true);
+        $idx->putDocument("doc1", ["title" => "t", "tags" => []]);
+        $idx->commit();
+        $this->assertSame([], $idx->getDocuments("doc1")[0]["tags"]);
+    }
+
+    public function testArrayIntoSingleValuedIntegerFieldIsStillRejected(): void
+    {
+        $idx = $this->indexWithIntegerField(false);
+        $this->expectException(\Throwable::class);
+        $idx->putDocument("doc1", ["title" => "t", "tags" => [2020, 2021]]);
+    }
+
     public function testNumericRangeQuery(): void
     {
         $schema = new Laurus\Schema();
