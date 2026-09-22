@@ -53,7 +53,8 @@ pub fn hash_to_document(ruby: &Ruby, hash: RHash) -> Result<Document, Error> {
 /// | `Integer`                     | `Int64`              |
 /// | `Float`                       | `Float64`            |
 /// | `String`                      | `Text`               |
-/// | `Array` of numerics           | `Vector`             |
+/// | `Array` of `Integer`          | `Int64Array`         |
+/// | `Array` of numerics           | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
 /// | `Hash` with `"lat"`, `"lon"`  | `Geo`                |
 /// | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` (3D ECEF Cartesian, meters) |
 /// | `Time` / ISO 8601 string      | `DateTime`           |
@@ -91,12 +92,37 @@ pub fn rb_to_data_value(ruby: &Ruby, value: Value) -> Result<DataValue, Error> {
         let s: String = magnus::TryConvert::try_convert(value)?;
         return Ok(DataValue::Text(s));
     }
-    // Array → Vector (array of numerics) or check for Geo hash below
+    // Array of numerics → Int64Array / Float64Array (Geo hashes are handled below)
     if value.is_kind_of(ruby.class_array()) {
         let arr = RArray::from_value(value)
             .ok_or_else(|| Error::new(ruby.exception_type_error(), "expected Array"))?;
-        let vec: Vec<f32> = arr.to_vec()?;
-        return Ok(DataValue::Vector(vec));
+        // Numeric arrays become the most informative array shape and let the
+        // core's schema-aware `coerce_value` route them: vector fields cast
+        // to `Vector`, multi-valued numeric fields keep the array,
+        // single-valued fields reject it (#1178). Emitting `Vector` here
+        // unconditionally made multi-valued numeric fields unreachable from
+        // Ruby. An empty array becomes an empty `Int64Array`:
+        // `coerce_to_vector` casts it to the same empty `Vector` as before,
+        // while multi-valued numeric fields — which reject `Vector` outright
+        // — now accept it.
+        if arr.is_empty() {
+            return Ok(DataValue::Int64Array(Vec::new()));
+        }
+        // `Value` is a GC-tracked handle, not `TryConvertOwned`, so iterate
+        // rather than `to_vec::<Value>()`.
+        let elements: Vec<Value> = arr.into_iter().collect();
+        if elements.iter().all(|v| v.is_kind_of(ruby.class_integer())) {
+            let ints = elements
+                .iter()
+                .map(|v| magnus::TryConvert::try_convert(*v))
+                .collect::<Result<Vec<i64>, Error>>()?;
+            return Ok(DataValue::Int64Array(ints));
+        }
+        let floats = elements
+            .iter()
+            .map(|v| magnus::TryConvert::try_convert(*v))
+            .collect::<Result<Vec<f64>, Error>>()?;
+        return Ok(DataValue::Float64Array(floats));
     }
     // Hash with "lat"/"lon" → Geo, or with "x"/"y"/"z" → Geo3d
     if value.is_kind_of(ruby.class_hash()) {

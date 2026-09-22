@@ -26,7 +26,9 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 /// - `float`               → `DataValue::Float64`
 /// - `str`                 → `DataValue::Text`
 /// - `bytes`               → `DataValue::Bytes`
-/// - `list[float|int]`     → `DataValue::Vector`
+/// - `list[int]`           → `DataValue::Int64Array`
+/// - `list[float|int]`     → `DataValue::Float64Array` (vector fields cast
+///   either array to `Vector` downstream; an empty list is an empty `Int64Array`)
 /// - `(lat, lon)` tuple    → `DataValue::Geo`
 /// - `(x, y, z)` tuple     → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 pub fn py_to_data_value(_py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
@@ -56,11 +58,34 @@ pub fn py_to_data_value(_py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> 
     }
     if obj.is_instance_of::<PyList>() {
         let list = obj.cast::<PyList>()?;
-        let vec: Vec<f32> = list
+        // Numeric lists become the most informative array shape and let the
+        // core's schema-aware `coerce_value` route them: vector fields cast
+        // to `Vector`, multi-valued numeric fields keep the array,
+        // single-valued fields reject it (#1178). Emitting `Vector` here
+        // unconditionally made multi-valued numeric fields unreachable from
+        // Python. `bool` is a subclass of `int`, so it is excluded from the
+        // all-integer check. An empty list becomes an empty `Int64Array`:
+        // `coerce_to_vector` casts it to the same empty `Vector` as before,
+        // while multi-valued numeric fields — which reject `Vector` outright
+        // — now accept it.
+        if list.is_empty() {
+            return Ok(DataValue::Int64Array(Vec::new()));
+        }
+        let all_ints = list
             .iter()
-            .map(|item| item.extract::<f32>())
+            .all(|item| item.is_instance_of::<PyInt>() && !item.is_instance_of::<PyBool>());
+        if all_ints {
+            let ints: Vec<i64> = list
+                .iter()
+                .map(|item| item.extract::<i64>())
+                .collect::<PyResult<_>>()?;
+            return Ok(DataValue::Int64Array(ints));
+        }
+        let floats: Vec<f64> = list
+            .iter()
+            .map(|item| item.extract::<f64>())
             .collect::<PyResult<_>>()?;
-        return Ok(DataValue::Vector(vec));
+        return Ok(DataValue::Float64Array(floats));
     }
     // Try tuple (lat, lon) for Geo
     if let Ok(tup) = obj.cast::<pyo3::types::PyTuple>()
