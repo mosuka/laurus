@@ -1963,25 +1963,39 @@ impl InvertedIndexWriter {
         self.stats.unique_terms = 0;
         self.stats.total_postings = 0;
 
-        // Re-add all buffered analyzed docs
-        let buffered_snapshot = self.buffered_docs.clone();
-        for (id, analyzed_doc) in buffered_snapshot {
-            // Re-add stored fields to DocValues, under the same filter as
-            // the ingest path (#1047) so a rebuild cannot reintroduce them.
-            for (field_name, value) in &analyzed_doc.stored_fields {
-                if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name)
-                {
-                    self.doc_values_writer
-                        .add_value(id, field_name, value.clone());
+        // Re-add all buffered analyzed docs. `buffered_docs` is moved out
+        // rather than cloned (Issue #1169): `add_analyzed_document_to_index`
+        // only needs `&AnalyzedDocument`, and this function never changes
+        // `buffered_docs`'s contents, so there is nothing a clone buys here
+        // over borrowing `self` and `buffered_docs` separately via
+        // `mem::take` -- for a large buffer, a full deep clone of every
+        // `field_terms`/`stored_fields`/`point_values`/`field_lengths` was
+        // pure waste. Restored before returning on every path, including
+        // error, so a future fallible change to the loop body can't lose
+        // the buffer.
+        let buffered = std::mem::take(&mut self.buffered_docs);
+        let result = (|| -> Result<()> {
+            for (id, analyzed_doc) in &buffered {
+                // Re-add stored fields to DocValues, under the same filter
+                // as the ingest path (#1047) so a rebuild cannot
+                // reintroduce them.
+                for (field_name, value) in &analyzed_doc.stored_fields {
+                    if Self::is_doc_values_candidate(value)
+                        && self.config.stores_doc_values(field_name)
+                    {
+                        self.doc_values_writer
+                            .add_value(*id, field_name, value.clone());
+                    }
                 }
+
+                // Re-add postings
+                self.add_analyzed_document_to_index(*id, analyzed_doc)?;
+                // stats.docs_added is ALREADY accounting for these docs (except the one removed)
             }
-
-            // Re-add postings
-            self.add_analyzed_document_to_index(id, &analyzed_doc)?;
-            // stats.docs_added is ALREADY accounting for these docs (except the one removed)
-        }
-
-        Ok(())
+            Ok(())
+        })();
+        self.buffered_docs = buffered;
+        result
     }
 
     /// Mark a persisted document as deleted.
