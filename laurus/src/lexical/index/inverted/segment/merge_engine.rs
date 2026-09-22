@@ -42,6 +42,16 @@ pub struct MergeConfig {
     pub remove_deleted_docs: bool,
 
     /// Sort documents by ID during merge for better locality.
+    ///
+    /// Issue #1163: `perform_merge` no longer builds an intermediate
+    /// `order: Vec<u64>` to sort — it streams each source segment's
+    /// documents straight into the writer as they're reconstructed, so
+    /// this field no longer affects replay order. Every merged-segment
+    /// output part is written in doc_id order unconditionally regardless
+    /// (`.docs`/`.dv`/`.post`/`.norms` sort internally; `.bkd` sorts via
+    /// `InvertedIndexWriter::write_bkd_trees`'s doc_id permutation) — this
+    /// field is kept only because [`MergeConfig::default`] and existing
+    /// callers still reference it, not because it changes behavior.
     pub sort_by_doc_id: bool,
 
     /// Verify integrity after merge.
@@ -308,63 +318,36 @@ impl MergeEngine {
             ..Default::default()
         };
 
-        // Reconstruct every live document's analyzed form from each source
-        // segment's postings + stored fields (no re-tokenization; #753). The
-        // postings are the source of truth for the inverted index, so
-        // index-only (non-stored) fields are preserved, and original doc_ids
-        // are kept (they encode the shard and are referenced by deletion
-        // bitmaps / external-id maps).
+        // Issue #1163: which doc_ids each source segment is authoritative
+        // for (last-processed segment wins, matching this function's
+        // long-standing collision policy), so each segment's live documents
+        // can stream straight into the writer as they're reconstructed
+        // instead of accumulating in an intermediate `docs`/`order` pair
+        // first. `None` in the common case (no two segments' doc_id ranges
+        // overlap) — every live doc_id then belongs to its only segment,
+        // with zero extra I/O.
+        let owned_doc_ids = self.resolve_owned_doc_ids(segments)?;
+
+        // Replay each source segment's live documents (no re-tokenization;
+        // #753 — the postings are the source of truth for the inverted
+        // index, so index-only (non-stored) fields are preserved, and
+        // original doc_ids are kept: they encode the shard and are
+        // referenced by deletion bitmaps / external-id maps) through a
+        // writer so the merged segment is written by the same complete,
+        // typed write path as a normal flush, then flush to the merged
+        // segment's name. Buffers are unbounded so the merge produces
+        // exactly one output segment.
         //
-        // `docs` keyed by doc_id with `order` tracking first-seen order makes
-        // doc_id collisions across segments (an update re-wrote a doc in a
-        // newer segment) resolve to the last-processed version.
-        let mut order: Vec<u64> = Vec::new();
-        let mut docs: AHashMap<u64, AnalyzedDocument> = AHashMap::new();
-        // Whether the source segments stored term positions, per field;
-        // detected from the first posting seen for each field so the merged
-        // segment reproduces every field's positions state independently
-        // (#1083).
-        let mut positions_by_field: HashMap<String, bool> = HashMap::new();
-        // Whether the merged segment should write a DocValues column, per
-        // field (#1047). Seeded from the CURRENT schema so it wins over
-        // whatever a source segment happens to have on disk; a field the
-        // schema does not mention falls back to detection inside
-        // `reconstruct_segment` (`.entry().or_insert_with()` only fills
-        // gaps `field_doc_values` left open).
-        let mut doc_values_by_field: HashMap<String, bool> = self.config.field_doc_values.clone();
-
-        for segment in segments {
-            let reader = SegmentReader::open(segment.segment_info.clone(), self.storage.clone())?;
-            let deleted = self.load_deleted_docs(&segment.segment_info)?;
-            let reconstructed = self.reconstruct_segment(
-                &reader,
-                &deleted,
-                &mut positions_by_field,
-                &mut doc_values_by_field,
-            )?;
-            stats.deleted_docs_removed += deleted.len();
-            for (doc_id, analyzed) in reconstructed {
-                if docs.insert(doc_id, analyzed).is_none() {
-                    order.push(doc_id);
-                }
-            }
-        }
-
-        if self.config.sort_by_doc_id {
-            order.sort_unstable();
-        }
-
-        let doc_count = order.len() as u64;
-        let min_doc_id = order.iter().copied().min().unwrap_or(0);
-        let max_doc_id = order.iter().copied().max().unwrap_or(0);
-
-        // Replay the reconstructed analyzed documents through a writer so the
-        // merged segment is written by the same complete, typed write path as a
-        // normal flush, then flush to the merged segment's name. Buffers are
-        // unbounded so the merge produces exactly one output segment.
+        // `field_term_positions`/`field_doc_values` start empty (aside from
+        // the schema seed) and get pinned lazily, per field, the moment
+        // `replay_segment_into_writer` first encounters that field — sound
+        // because both are resolved per document at upsert time, never
+        // cached at construction (see
+        // `InvertedIndexWriter::pin_field_term_positions`/
+        // `pin_field_doc_values`).
         let writer_config = InvertedIndexWriterConfig {
-            field_term_positions: positions_by_field,
-            field_doc_values: doc_values_by_field,
+            field_term_positions: HashMap::new(),
+            field_doc_values: self.config.field_doc_values.clone(),
             store_doc_values: self.config.default_doc_values,
             shard_id: stats.shard_id,
             max_buffered_docs: usize::MAX,
@@ -379,16 +362,32 @@ impl MergeEngine {
         // here re-added the whole merged output to `doc_count` on every
         // merge, compounding on each auto-merging commit.
         let mut writer = InvertedIndexWriter::new(self.storage.clone(), writer_config)?;
-        // Replay + flush as one fallible unit. On ANY error the writer is
-        // aborted before it can drop: `Drop` would otherwise commit the
-        // partially replayed buffer into a fresh `segment_*` and publish it
-        // (#1032) — silent document duplication, since the source segments
-        // are only deleted after a successful merge.
+
+        // Reconstruct + replay + flush as one fallible unit. On ANY error
+        // the writer is aborted before it can drop: `Drop` would otherwise
+        // commit the partially replayed buffer into a fresh `segment_*` and
+        // publish it (#1032) — silent document duplication, since the
+        // source segments are only deleted after a successful merge. This
+        // closure's scope is wider than it used to be (Issue #1163):
+        // reconstruction errors used to surface before the writer existed;
+        // streaming interleaves them with replay, so they need the same
+        // abort coverage.
+        let mut emitted = RoaringTreemap::new();
+        let mut deleted_docs_removed: u64 = 0;
         let replayed = (|| -> Result<Vec<String>> {
-            for doc_id in &order {
-                if let Some(analyzed) = docs.remove(doc_id) {
-                    writer.upsert_analyzed_document(*doc_id, analyzed)?;
-                }
+            for (i, segment) in segments.iter().enumerate() {
+                let reader =
+                    SegmentReader::open(segment.segment_info.clone(), self.storage.clone())?;
+                let deleted = self.load_deleted_docs(&segment.segment_info)?;
+                deleted_docs_removed += deleted.len();
+                let owned = owned_doc_ids.as_ref().map(|o| &o[i]);
+                self.replay_segment_into_writer(
+                    &reader,
+                    &deleted,
+                    owned,
+                    &mut emitted,
+                    &mut writer,
+                )?;
             }
             writer.flush_buffered_to_segment(new_segment_id)
         })();
@@ -400,6 +399,10 @@ impl MergeEngine {
             }
         };
 
+        stats.deleted_docs_removed = deleted_docs_removed;
+        let doc_count = emitted.len();
+        let min_doc_id = emitted.min().unwrap_or(0);
+        let max_doc_id = emitted.max().unwrap_or(0);
         stats.docs_processed = doc_count;
         stats.postings_merged = doc_count;
 
@@ -592,6 +595,72 @@ impl MergeEngine {
         Ok(results)
     }
 
+    /// Whether any two of `segments`' doc_id ranges overlap, from
+    /// [`SegmentInfo::min_doc_id`]/[`SegmentInfo::max_doc_id`] alone (no
+    /// I/O). A segment with `doc_count == 0` is skipped: its `(0, 0)` range
+    /// is a placeholder, not a real one, and would otherwise spuriously
+    /// "overlap" every other segment.
+    fn doc_id_ranges_overlap(segments: &[&ManagedSegmentInfo]) -> bool {
+        let mut ranges: Vec<(u64, u64)> = segments
+            .iter()
+            .map(|s| &s.segment_info)
+            .filter(|info| info.doc_count > 0)
+            .map(|info| (info.min_doc_id, info.max_doc_id))
+            .collect();
+        ranges.sort_unstable();
+        ranges.windows(2).any(|w| w[0].1 >= w[1].0)
+    }
+
+    /// Per-segment bitmaps of the doc_ids each source segment is
+    /// authoritative for, replicating `perform_merge`'s "last-processed
+    /// segment wins" doc_id-collision semantics (Issue #1163). Returns
+    /// `None` when [`Self::doc_id_ranges_overlap`] is `false` — every live
+    /// doc_id then belongs to its only segment, and
+    /// [`Self::replay_segment_into_writer`] skips its `owned`-membership
+    /// check entirely, with zero extra I/O.
+    ///
+    /// A same-doc_id collision between live documents in different segments
+    /// is not currently reachable through `Engine`'s update path (it
+    /// deletes the old document via `mark_persisted_doc_deleted` —
+    /// recording it in the `.delmap` this reads — before assigning a fresh
+    /// doc_id to the new version), but this stays as a defensive fallback
+    /// matching `perform_merge`'s existing (previously untested)
+    /// collision-handling intent, at the cost of one extra `.docs` decode
+    /// per segment, and only when ranges actually overlap.
+    fn resolve_owned_doc_ids(
+        &self,
+        segments: &[&ManagedSegmentInfo],
+    ) -> Result<Option<Vec<RoaringTreemap>>> {
+        if !Self::doc_id_ranges_overlap(segments) {
+            return Ok(None);
+        }
+
+        let mut live: Vec<RoaringTreemap> = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let reader = SegmentReader::open(segment.segment_info.clone(), self.storage.clone())?;
+            let deleted = self.load_deleted_docs(&segment.segment_info)?;
+            let mut ids = RoaringTreemap::new();
+            for doc_id in reader.doc_ids()? {
+                if !deleted.contains(doc_id) {
+                    ids.insert(doc_id);
+                }
+            }
+            live.push(ids);
+            // `reader` drops here, before the next segment's `.docs` is
+            // decoded — holding every segment's stored documents resident
+            // simultaneously would be worse than the peak this function
+            // exists to avoid.
+        }
+
+        let mut owned: Vec<RoaringTreemap> = vec![RoaringTreemap::new(); segments.len()];
+        let mut seen = RoaringTreemap::new();
+        for i in (0..segments.len()).rev() {
+            owned[i] = &live[i] - &seen;
+            seen |= &live[i];
+        }
+        Ok(Some(owned))
+    }
+
     /// Load the set of deleted doc_ids for a segment from its `.delmap`.
     fn load_deleted_docs(&self, segment_info: &SegmentInfo) -> Result<RoaringTreemap> {
         if !segment_info.has_deletions {
@@ -634,7 +703,9 @@ impl MergeEngine {
     }
 
     /// Reconstruct every live document's [`AnalyzedDocument`] from one source
-    /// segment, without re-tokenizing (Issue #753).
+    /// segment, without re-tokenizing (Issue #753), and hand each one this
+    /// segment is authoritative for straight to `writer` — never collecting
+    /// them into an intermediate map (Issue #1163).
     ///
     /// `field_terms` are rebuilt from the segment's postings (the authoritative
     /// source for the inverted index, so index-only fields survive);
@@ -644,26 +715,41 @@ impl MergeEngine {
     /// numeric fields are preserved (Issue #758); `field_lengths` are read back
     /// from the segment. Deleted docs are excluded.
     ///
-    /// `positions_by_field` is populated, per field, from the first posting
-    /// seen for that field (whether the source stored term positions) so
+    /// `owned` is this segment's slice of [`Self::resolve_owned_doc_ids`]
+    /// (`None` when every live doc_id in the whole merge belongs to only
+    /// one segment — the common case). A doc_id `owned` excludes is a
+    /// "losing" copy superseded by a later-processed segment: its full
+    /// `AnalyzedDocument` is never built and it is never upserted, but
+    /// field-setting detection (below) still runs over it, unconditionally,
+    /// exactly as if it were kept.
+    ///
+    /// `writer.pin_field_term_positions` is called from the first posting
+    /// seen for each field (whether the source stored term positions) so
     /// the merged segment reproduces each field's positions state
     /// independently — fields can disagree, e.g. one `term_vectors: true`
-    /// and one `false` (#1083).
+    /// and one `false` (#1083). This runs for EVERY live document's
+    /// postings, owned or not: the setting is a property of the field
+    /// within this segment, not of which specific document triggers its
+    /// detection.
     ///
-    /// `doc_values_by_field` (#1047) works the same way but only fills
-    /// gaps the caller's schema-derived seed left open (see
-    /// [`MergeConfig::field_doc_values`]): for a field this map does not
-    /// already mention, the first document in *this* segment with a
-    /// DocValues-candidate value for it records whether this segment's
-    /// `.dv` currently has a column for that field.
-    fn reconstruct_segment(
+    /// `writer.pin_field_doc_values` (#1047) works the same way, and is
+    /// itself a no-op once a field is already pinned (by the caller's
+    /// schema-derived seed, or by an earlier-processed segment) — for a
+    /// field not yet pinned, the first live document (owned or not) in
+    /// *this* segment with a DocValues-candidate value for it records
+    /// whether this segment's `.dv` currently has a column for that field.
+    fn replay_segment_into_writer(
         &self,
         reader: &SegmentReader,
         deleted: &RoaringTreemap,
-        positions_by_field: &mut HashMap<String, bool>,
-        doc_values_by_field: &mut HashMap<String, bool>,
-    ) -> Result<Vec<(u64, AnalyzedDocument)>> {
-        // Pass 1: bucket postings into per-doc analyzed terms.
+        owned: Option<&RoaringTreemap>,
+        emitted: &mut RoaringTreemap,
+        writer: &mut InvertedIndexWriter,
+    ) -> Result<()> {
+        // Pass 1: bucket postings into per-doc analyzed terms, for owned
+        // doc_ids only — a non-owned doc_id's terms are never referenced
+        // again after this loop (Pass 2 only assembles owned documents), so
+        // building them would be pure waste.
         let mut field_terms: AHashMap<u64, AHashMap<String, Vec<AnalyzedTerm>>> = AHashMap::new();
         if let Some(dict) = reader.term_dictionary()? {
             for (term_key, _info) in dict.iter() {
@@ -689,9 +775,10 @@ impl MergeEngine {
                         let doc_id = iter.doc_id();
                         let positions = iter.positions()?;
                         let freq = iter.term_freq();
-                        positions_by_field
-                            .entry(field.to_string())
-                            .or_insert_with(|| !positions.is_empty());
+                        writer.pin_field_term_positions(field, || !positions.is_empty());
+                        if owned.is_some_and(|o| !o.contains(doc_id)) {
+                            continue;
+                        }
                         let terms = field_terms
                             .entry(doc_id)
                             .or_default()
@@ -726,7 +813,8 @@ impl MergeEngine {
         // Collect BKD points per (doc, field) straight from the segment's BKD
         // trees — the authoritative source for numeric/geo points. This keeps
         // index-only (`stored=false`) and multi-valued numeric fields, which a
-        // stored-field derivation would miss (Issue #758).
+        // stored-field derivation would miss (Issue #758). Owned doc_ids only,
+        // for the same reason as Pass 1.
         let mut points: AHashMap<u64, AHashMap<String, Vec<Vec<f64>>>> = AHashMap::new();
         // Enumerate through the reader (#554): a raw `list_files` scan
         // finds no `.bkd` files once the parts live inside a compound
@@ -741,6 +829,9 @@ impl MergeEngine {
                     // Load-bearing: `get_bkd_tree` hands back the raw
                     // `BKDReader`, which knows nothing about deletions.
                     if deleted.contains(doc_id) {
+                        continue;
+                    }
+                    if owned.is_some_and(|o| !o.contains(doc_id)) {
                         continue;
                     }
                     points
@@ -763,8 +854,7 @@ impl MergeEngine {
         // doesn't have, so unioning this segment-wide set in is safe.
         let recorded_length_fields = reader.norms_field_names()?;
 
-        // Pass 2: assemble each live document.
-        let mut out = Vec::new();
+        // Pass 2: assemble and upsert each document this segment owns.
         for doc_id in reader.doc_ids()? {
             // Load-bearing: `doc_ids()` returns every stored key, deleted
             // ones included.
@@ -775,24 +865,28 @@ impl MergeEngine {
                 continue;
             };
 
+            // DocValues detection runs for every live document, owned or
+            // not (Issue #1163): `reader.has_doc_values` is a per-segment,
+            // not per-document, property, so which specific document
+            // triggers it is incidental — but some live document must
+            // trigger it, matching today's exact semantics.
+            for (field_name, value) in &stored.fields {
+                if InvertedIndexWriter::is_doc_values_candidate(value) {
+                    writer.pin_field_doc_values(field_name, || reader.has_doc_values(field_name));
+                }
+            }
+
+            if owned.is_some_and(|o| !o.contains(doc_id)) {
+                continue;
+            }
+
             let mut analyzed = AnalyzedDocument::new();
             analyzed.field_terms = field_terms.remove(&doc_id).unwrap_or_default();
             analyzed.point_values = points.remove(&doc_id).unwrap_or_default();
-
-            for (field_name, value) in &stored.fields {
-                if InvertedIndexWriter::is_doc_values_candidate(value) {
-                    // Only fills a gap the schema-derived seed left open
-                    // (#1047) -- a field `doc_values_by_field` already
-                    // covers (the current schema decided it) is never
-                    // touched here.
-                    doc_values_by_field
-                        .entry(field_name.clone())
-                        .or_insert_with(|| reader.has_doc_values(field_name));
-                }
-                analyzed
-                    .stored_fields
-                    .insert(field_name.clone(), value.clone());
-            }
+            // `stored` is already an owned, per-call clone out of the
+            // reader's cache (Issue #1163) — moving its fields straight in
+            // avoids cloning every value a second time.
+            analyzed.stored_fields = stored.fields.into_iter().collect();
 
             // Field lengths are read back from the segment so BM25 length
             // normalization is preserved -- exactly for a source segment
@@ -809,19 +903,31 @@ impl MergeEngine {
                 }
             }
 
-            out.push((doc_id, analyzed));
+            if !emitted.insert(doc_id) {
+                // Belt-and-braces (Issue #1163): `owned` should make this
+                // unreachable, but a silent duplicate document in the
+                // merged output is far worse than a loud failure here.
+                return Err(LaurusError::index(format!(
+                    "merge: doc_id {doc_id} emitted twice across source segments \
+                     (corrupt segment metadata or a bug in owned-doc-id resolution)"
+                )));
+            }
+            writer.upsert_analyzed_document(doc_id, analyzed)?;
         }
 
-        Ok(out)
+        Ok(())
     }
 
     /// Reconstruct a segment's analyzed documents like
-    /// [`Self::reconstruct_segment`], but with `target_field`'s existing
-    /// postings/BKD points discarded and re-derived from its stored value
-    /// using `analyzer` (Issue #1081).
+    /// [`Self::replay_segment_into_writer`] did before Issue #1163 (this
+    /// function still returns a `Vec` and is unaffected by that streaming
+    /// change — see [`Self::rebuild_field_across_segments`]'s doc comment
+    /// for why: it is a 1:1 transform with no doc_id-collision question),
+    /// but with `target_field`'s existing postings/BKD points discarded and
+    /// re-derived from its stored value using `analyzer` (Issue #1081).
     ///
     /// Every other field is carried over unchanged, exactly as
-    /// [`Self::reconstruct_segment`] does — this is the "field-conversion
+    /// [`Self::replay_segment_into_writer`] does — this is the "field-conversion
     /// hook" that lets a rebuild change one field's analyzer/indexed
     /// setting without perturbing the rest of the segment. `analyzer` is
     /// `None` when the field is being switched to `indexed: false`: its
@@ -1846,6 +1952,474 @@ mod tests {
             None,
             "a document that never had target_field must not gain a \
              phantom Some(0) from being in the segment's recorded-length set"
+        );
+    }
+
+    /// Issue #1163: `resolve_owned_doc_ids` must replicate `perform_merge`'s
+    /// long-standing "last-processed segment wins" collision policy exactly
+    /// -- a doc_id belongs to the LAST segment (in processing order) that
+    /// has it live; a doc_id live in only one segment belongs to that
+    /// segment alone. Also confirms the disjoint-ranges fast path returns
+    /// `None` (no resolution I/O) when no two segments could possibly
+    /// collide.
+    #[test]
+    fn resolve_owned_doc_ids_matches_last_processed_segment_wins() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        // seg0 live {1, 5}, seg1 live {7}, seg2 live {5, 9} -- doc_id 5
+        // collides between seg0 and seg2; the LAST one processed (seg2)
+        // must own it.
+        let build_segment = |name: &str, doc_ids: &[u64]| {
+            let mut writer =
+                InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                    .unwrap();
+            for &doc_id in doc_ids {
+                writer
+                    .upsert_analyzed_document(doc_id, AnalyzedDocument::new())
+                    .unwrap();
+            }
+            writer.flush_buffered_to_segment(name).unwrap();
+        };
+        build_segment("seg0", &[1, 5]);
+        build_segment("seg1", &[7]);
+        build_segment("seg2", &[5, 9]);
+
+        let seg0 = ManagedSegmentInfo::new(segment_info("seg0", 2, 1, 5, 0));
+        let seg1 = ManagedSegmentInfo::new(segment_info("seg1", 1, 7, 7, 1));
+        let seg2 = ManagedSegmentInfo::new(segment_info("seg2", 2, 5, 9, 2));
+
+        assert!(
+            MergeEngine::doc_id_ranges_overlap(&[&seg0, &seg1, &seg2]),
+            "seg0's [1,5] and seg2's [5,9] ranges overlap"
+        );
+
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let owned = engine
+            .resolve_owned_doc_ids(&[&seg0, &seg1, &seg2])
+            .unwrap()
+            .expect("overlapping ranges must trigger resolution, not the None fast path");
+
+        assert_eq!(owned[0].iter().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(owned[1].iter().collect::<Vec<_>>(), vec![7]);
+        assert_eq!(owned[2].iter().collect::<Vec<_>>(), vec![5, 9]);
+
+        // Disjoint ranges: the common case must short-circuit to `None`
+        // without ever opening a reader (these segment names deliberately
+        // do not exist in storage -- opening one would panic/error).
+        let disjoint_a = ManagedSegmentInfo::new(segment_info("nonexistent_a", 1, 100, 100, 0));
+        let disjoint_b = ManagedSegmentInfo::new(segment_info("nonexistent_b", 1, 200, 200, 1));
+        assert!(!MergeEngine::doc_id_ranges_overlap(&[
+            &disjoint_a,
+            &disjoint_b
+        ]));
+        assert!(
+            engine
+                .resolve_owned_doc_ids(&[&disjoint_a, &disjoint_b])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Issue #1163: an end-to-end regression for `perform_merge`'s doc_id
+    /// collision policy -- previously completely untested anywhere in the
+    /// repo, despite the function's own long-standing comment documenting
+    /// the intended "last-processed segment wins" behavior. The collision
+    /// is constructed directly (two independent handle-less writers, each
+    /// upserting the same doc_id) since `Engine`'s update path cannot
+    /// produce live cross-segment doc_id collisions in production -- see
+    /// `resolve_owned_doc_ids`'s doc comment -- but the streaming rewrite's
+    /// `owned`/`emitted` machinery must still handle it correctly as a
+    /// defensive fallback.
+    #[test]
+    fn merge_with_overlapping_doc_ids_keeps_the_last_processed_copy() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let build_segment = |name: &str, value: &str| {
+            let mut writer =
+                InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                    .unwrap();
+            let mut doc = AnalyzedDocument::new();
+            doc.stored_fields
+                .insert("title".to_string(), DataValue::Text(value.to_string()));
+            doc.field_terms.insert(
+                "title".to_string(),
+                vec![AnalyzedTerm {
+                    term: value.to_string(),
+                    position: 0,
+                    frequency: 1,
+                    offset: (0, 0),
+                }],
+            );
+            writer.upsert_analyzed_document(5, doc).unwrap();
+            writer.flush_buffered_to_segment(name).unwrap();
+        };
+        build_segment("seg_a", "alpha");
+        build_segment("seg_b", "bravo");
+
+        let seg_a = segment_info("seg_a", 1, 5, 5, 0);
+        let seg_b = segment_info("seg_b", 1, 5, 5, 1);
+        let candidate = MergeCandidate {
+            segments: vec![seg_a.segment_id.clone(), seg_b.segment_id.clone()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine
+            .merge_segments(
+                &candidate,
+                &[
+                    ManagedSegmentInfo::new(seg_a),
+                    ManagedSegmentInfo::new(seg_b),
+                ],
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.new_segment.segment_info.doc_count, 1,
+            "the collision must resolve to exactly one surviving document"
+        );
+        let merged =
+            SegmentReader::open(result.new_segment.segment_info.clone(), storage.clone()).unwrap();
+        let doc = merged.document(5).unwrap().unwrap();
+        match doc.fields.get("title") {
+            Some(DataValue::Text(t)) => assert_eq!(
+                t, "bravo",
+                "the later-processed segment's copy must win a doc_id collision"
+            ),
+            other => panic!("unexpected title field after merge: {other:?}"),
+        }
+
+        let reader = InvertedIndexReader::new(
+            vec![result.new_segment.segment_info.clone()],
+            storage.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut got_bravo = Vec::new();
+        if let Some(mut it) = reader.postings("title", "bravo").unwrap() {
+            while it.next().unwrap() {
+                got_bravo.push(it.doc_id());
+            }
+        }
+        assert_eq!(got_bravo, vec![5]);
+
+        let alpha_survives = match reader.postings("title", "alpha").unwrap() {
+            Some(mut it) => it.next().unwrap(),
+            None => false,
+        };
+        assert!(
+            !alpha_survives,
+            "the losing segment's postings must not appear in the merged output"
+        );
+    }
+
+    /// Issue #1163: field-setting detection (now `writer.pin_field_*`) must
+    /// keep running over EVERY live document in a segment, including one
+    /// that turns out to be a "losing" copy superseded by a
+    /// later-processed segment -- the `owned` filter must only gate the
+    /// expensive `AnalyzedDocument` assembly, never the cheap
+    /// per-posting/per-value detection side effects. A regression that
+    /// gated detection on `owned` would detect "title"'s positions state
+    /// from seg_b (the winner) instead of seg_a (the loser, processed
+    /// first), flipping the assertion below.
+    ///
+    /// Calls `replay_segment_into_writer` directly (bypassing
+    /// `perform_merge`) for precise control over which segment "owns"
+    /// doc 5.
+    #[test]
+    fn merge_detects_field_settings_from_a_losing_copy() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        // seg_a: doc 5's "title:widget" genuinely carries positions
+        // (default `store_term_positions: true`). This is seg_a's only
+        // document, so if detection were gated on ownership, seg_a would
+        // contribute nothing.
+        let mut writer_a =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let mut doc_a = AnalyzedDocument::new();
+        doc_a.field_terms.insert(
+            "title".to_string(),
+            vec![
+                AnalyzedTerm {
+                    term: "widget".to_string(),
+                    position: 0,
+                    frequency: 1,
+                    offset: (0, 0),
+                },
+                AnalyzedTerm {
+                    term: "widget".to_string(),
+                    position: 1,
+                    frequency: 1,
+                    offset: (0, 0),
+                },
+            ],
+        );
+        writer_a.upsert_analyzed_document(5, doc_a).unwrap();
+        writer_a.flush_buffered_to_segment("seg_a").unwrap();
+
+        // seg_b: doc 5 (collides with seg_a, and wins) is written with
+        // positions disabled -- if this segment's copy drove detection,
+        // "title" would pin to `false`.
+        let seg_b_config = InvertedIndexWriterConfig {
+            store_term_positions: false,
+            ..Default::default()
+        };
+        let mut writer_b = InvertedIndexWriter::new(storage.clone(), seg_b_config).unwrap();
+        let mut doc_b = AnalyzedDocument::new();
+        doc_b.field_terms.insert(
+            "title".to_string(),
+            vec![AnalyzedTerm {
+                term: "gadget".to_string(),
+                position: 0,
+                frequency: 1,
+                offset: (0, 0),
+            }],
+        );
+        writer_b.upsert_analyzed_document(5, doc_b).unwrap();
+        writer_b.flush_buffered_to_segment("seg_b").unwrap();
+
+        let reader_a =
+            SegmentReader::open(segment_info("seg_a", 1, 5, 5, 0), storage.clone()).unwrap();
+        let reader_b =
+            SegmentReader::open(segment_info("seg_b", 1, 5, 5, 1), storage.clone()).unwrap();
+
+        // seg_a does not own doc 5 (seg_b, processed after it, does).
+        let not_owned_by_a = RoaringTreemap::new();
+        let mut owned_by_b = RoaringTreemap::new();
+        owned_by_b.insert(5);
+
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let mut out_writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let mut emitted = RoaringTreemap::new();
+        engine
+            .replay_segment_into_writer(
+                &reader_a,
+                &RoaringTreemap::new(),
+                Some(&not_owned_by_a),
+                &mut emitted,
+                &mut out_writer,
+            )
+            .unwrap();
+        engine
+            .replay_segment_into_writer(
+                &reader_b,
+                &RoaringTreemap::new(),
+                Some(&owned_by_b),
+                &mut emitted,
+                &mut out_writer,
+            )
+            .unwrap();
+        out_writer.flush_buffered_to_segment("merged").unwrap();
+
+        let reader = InvertedIndexReader::new(
+            vec![segment_info("merged", 1, 5, 5, 2)],
+            storage.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut it = reader
+            .postings("title", "gadget")
+            .unwrap()
+            .expect("doc 5's surviving term (from seg_b) must be present");
+        assert!(it.next().unwrap());
+        assert_eq!(it.doc_id(), 5);
+        assert!(
+            !it.positions().unwrap().is_empty(),
+            "\"title\" must be detected as positions=true from seg_a's losing copy, \
+             even though the surviving document came from seg_b (built with \
+             positions disabled)"
+        );
+    }
+
+    /// Issue #1163: `emitted` is a belt-and-braces safety net independent
+    /// of `resolve_owned_doc_ids` -- if two segments were ever
+    /// (mis-)configured to both own the same doc_id, the second attempt to
+    /// emit it must be a hard error, not a silent duplicate in the merged
+    /// output.
+    #[test]
+    fn replay_segment_into_writer_rejects_a_doc_id_emitted_twice() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        writer
+            .upsert_analyzed_document(5, AnalyzedDocument::new())
+            .unwrap();
+        writer.flush_buffered_to_segment("seg").unwrap();
+
+        let reader = SegmentReader::open(segment_info("seg", 1, 5, 5, 0), storage.clone()).unwrap();
+        let mut owned = RoaringTreemap::new();
+        owned.insert(5);
+
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let mut out_writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let mut emitted = RoaringTreemap::new();
+        engine
+            .replay_segment_into_writer(
+                &reader,
+                &RoaringTreemap::new(),
+                Some(&owned),
+                &mut emitted,
+                &mut out_writer,
+            )
+            .unwrap();
+
+        let err = engine
+            .replay_segment_into_writer(
+                &reader,
+                &RoaringTreemap::new(),
+                Some(&owned),
+                &mut emitted,
+                &mut out_writer,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("emitted twice"),
+            "a doc_id emitted by two (mis-)owned segments must be a hard error: {err:?}"
+        );
+    }
+
+    /// Issue #1163: `perform_merge`'s abort-on-error coverage widened to
+    /// include source-segment reconstruction (previously, only the final
+    /// `flush_buffered_to_segment` could fail while the writer existed --
+    /// reconstruction ran entirely before the writer was even constructed).
+    /// A read failure partway through the SECOND source segment, after the
+    /// first has already been replayed into the writer's buffer, must
+    /// still abort cleanly with no merged segment published.
+    #[test]
+    fn merge_aborts_without_publishing_when_a_source_read_fails() {
+        use crate::storage::{StorageInput, StorageOutput};
+
+        /// Storage decorator that fails the next `open_input` whose name
+        /// has the armed prefix -- simulates a source-segment read failure
+        /// partway through a merge.
+        #[derive(Debug)]
+        struct FailingReadStorage {
+            inner: Arc<dyn Storage>,
+            fail_open_with_prefix: parking_lot::Mutex<Option<String>>,
+        }
+
+        impl FailingReadStorage {
+            fn fail_next_open_with_prefix(&self, prefix: &str) {
+                *self.fail_open_with_prefix.lock() = Some(prefix.to_string());
+            }
+        }
+
+        impl Storage for FailingReadStorage {
+            fn open_input(&self, name: &str) -> Result<Box<dyn StorageInput>> {
+                let armed = {
+                    let mut guard = self.fail_open_with_prefix.lock();
+                    if guard.as_ref().is_some_and(|p| name.starts_with(p)) {
+                        *guard = None;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if armed {
+                    return Err(LaurusError::storage(format!(
+                        "injected read failure opening {name}"
+                    )));
+                }
+                self.inner.open_input(name)
+            }
+            fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+                self.inner.create_output(name)
+            }
+            fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+                self.inner.create_output_append(name)
+            }
+            fn file_exists(&self, name: &str) -> bool {
+                self.inner.file_exists(name)
+            }
+            fn delete_file(&self, name: &str) -> Result<()> {
+                self.inner.delete_file(name)
+            }
+            fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+                self.inner.rename_file(old_name, new_name)
+            }
+            fn list_files(&self) -> Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn file_size(&self, name: &str) -> Result<u64> {
+                self.inner.file_size(name)
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+            fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+                self.inner.metadata(name)
+            }
+            fn create_temp_output(&self, prefix: &str) -> Result<(String, Box<dyn StorageOutput>)> {
+                self.inner.create_temp_output(prefix)
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let mut writer =
+            InvertedIndexWriter::new(inner.clone(), InvertedIndexWriterConfig::default()).unwrap();
+        let d0 = writer
+            .add_document(text_int_doc("alpha bravo", 10))
+            .unwrap();
+        writer.commit().unwrap(); // segment_000000
+        let d1 = writer
+            .add_document(text_int_doc("charlie delta", 20))
+            .unwrap();
+        writer.commit().unwrap(); // segment_000001
+        drop(writer);
+
+        let si0 = segment_info("segment_000000", 1, d0, d0, 0);
+        let si1 = segment_info("segment_000001", 1, d1, d1, 1);
+        let candidate = MergeCandidate {
+            segments: vec![si0.segment_id.clone(), si1.segment_id.clone()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+
+        let failing = Arc::new(FailingReadStorage {
+            inner: inner.clone(),
+            fail_open_with_prefix: parking_lot::Mutex::new(None),
+        });
+        // Fail opening the SECOND source segment's compound container --
+        // by the time this fires, the first segment must already have been
+        // replayed into the writer's buffer.
+        failing.fail_next_open_with_prefix("segment_000001");
+        let storage: Arc<dyn Storage> = failing;
+
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine.merge_segments(
+            &candidate,
+            &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
+            1,
+        );
+        assert!(result.is_err(), "the injected read failure must surface");
+
+        let leaked: Vec<String> = storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.starts_with("merged_"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a merge that fails during source reconstruction must not publish \
+             any merged_* file: {leaked:?}"
         );
     }
 }
