@@ -126,6 +126,7 @@ laurus は Criterion を素の Rust 関数形式で使います。理由:
 | `text_analysis_bench`         | Microbench     | n/a           | Analyzer パイプライン |
 | `vector_indexing_bench`       | Phase 2 相当   | n/a           | Vector index build |
 | `vector_search_bench`         | Phase 3        | 使う           | Vector kNN（検索系 bench は `cached_vector_reader` で cache 化、#513 Stage 2。Construction 系は変更なし）|
+| `merge_stress_bench`          | Phase 2 相当   | 使わない        | `optimize()` 経由の `MergeEngine::perform_merge`。独自の `TrackingAllocator` グローバルアロケータでピークバイトを報告（#1167）|
 
 「独自 setup」は小さなコーパス形か、汎用キャッシュを必要としない別の setup パターンを使うもの。#513 Stage 1 (`hybrid_search_bench`) と Stage 2 (`vector_search_bench`) の merge により、上表の検索系 bench はすべて on-disk cache を再利用するようになった。cache helper は各 bench ファイルに同居しており、`benches/common.rs` への抽出は別途設計議論が必要（issue #513 本文参照）。
 
@@ -141,6 +142,24 @@ laurus は Criterion を素の Rust 関数形式で使います。理由:
 5. `b.to_async(&rt).iter(|| { let engine = &engine; async move { … } })` のパターンを使う。`Arc<Engine>` を参照キャプチャすれば auto-deref でメソッド呼び出しが通る
 
 索引内容を変える変更（schema・analyzer・corpus 合成・segment format）を入れたら `BENCH_INDEX_FORMAT_VERSION` を bump。stale な cache は次回 run で自動再構築される。
+
+## ピークメモリ計測（`merge_stress_bench`）
+
+`merge_stress_bench` は本スイート初のアロケータ計装 bench。
+`TrackingAllocator`（`#[global_allocator]`）でネット割り当てバイト数の
+ハイウォーターマークを追跡し、タイムド Criterion ループの開始前に
+サイズごとに1回`println!`で報告する。`#[global_allocator]`はコンパイル
+済みバイナリ単位で適用され、各`[[bench]]`エントリは独立したバイナリの
+ため、他のbench・`cargo test`・ライブラリ本体には一切影響しない —
+同じシグナルが必要な将来のbenchで、`common.rs`に触れずに独立して
+安全に再利用できる。
+
+これは（同一マシン上でのメモリ関連perf PRの前後比較のような）A/B比較
+用の方向性を示すプロキシであり、出版品質のプロファイリングではない。
+また計測対象がシングルスレッドであることを前提とする（並行アロケー
+ション活動があると単一のグローバルハイウォーターマークが壊れる）
+— このパターンを再利用する前に、対象コードに`rayon`/スレッド生成が
+無いことを確認すること。
 
 ## 背景
 
