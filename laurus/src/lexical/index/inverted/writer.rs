@@ -603,6 +603,44 @@ impl InvertedIndexWriter {
         Self::build(storage, config, Some(metadata), Some(segment_manifest))
     }
 
+    /// Pin `field_name`'s term-positions setting for every document upserted
+    /// from here on, unless it is already pinned. `detect` runs only on the
+    /// first call for a field (Issue #1163: lets a segment merge decide a
+    /// field's setting the moment it first encounters that field, streaming
+    /// documents straight into the writer, instead of pre-computing every
+    /// field's setting across all source segments before any document can
+    /// be written).
+    ///
+    /// Sound because [`InvertedIndexWriterConfig::stores_term_positions`] is
+    /// resolved per document at upsert time
+    /// ([`Self::add_analyzed_document_to_index`]), never cached at
+    /// construction — a value pinned here takes effect starting with the
+    /// very next document that carries this field.
+    pub(crate) fn pin_field_term_positions(
+        &mut self,
+        field_name: &str,
+        detect: impl FnOnce() -> bool,
+    ) {
+        if !self.config.field_term_positions.contains_key(field_name) {
+            let value = detect();
+            self.config
+                .field_term_positions
+                .insert(field_name.to_string(), value);
+        }
+    }
+
+    /// Same idea as [`Self::pin_field_term_positions`], for DocValues (see
+    /// [`InvertedIndexWriterConfig::stores_doc_values`], resolved per
+    /// document at [`Self::upsert_analyzed_document`] time).
+    pub(crate) fn pin_field_doc_values(&mut self, field_name: &str, detect: impl FnOnce() -> bool) {
+        if !self.config.field_doc_values.contains_key(field_name) {
+            let value = detect();
+            self.config
+                .field_doc_values
+                .insert(field_name.to_string(), value);
+        }
+    }
+
     /// Shared constructor body behind [`Self::new`] and
     /// [`Self::with_shared_state`].
     fn build(
@@ -1554,12 +1592,23 @@ impl InvertedIndexWriter {
         let mut fields: Vec<&String> = field_info.keys().collect();
         fields.sort_unstable();
 
+        // Issue #1163: visit `buffered_docs` in doc_id order regardless of
+        // its underlying push order, so `.bkd` output is byte-identical
+        // whether documents arrived via the normal flush path (already
+        // doc_id-ascending) or a segment-grouped merge replay. `buffered_docs`
+        // never holds two entries for the same doc_id (`RoaringTreemap`
+        // dedup in the merge path; single-writer upsert dedup otherwise),
+        // so this sort has no ties to break.
+        let mut doc_id_order: Vec<usize> = (0..self.buffered_docs.len()).collect();
+        doc_id_order.sort_by_key(|&i| self.buffered_docs[i].0);
+
         for field in fields {
             let &(count, num_dims) = &field_info[field];
 
             let mut points_buf: Vec<f64> = Vec::with_capacity(count * num_dims);
             let mut doc_ids_buf: Vec<u64> = Vec::with_capacity(count);
-            for (doc_id, doc) in &self.buffered_docs {
+            for &i in &doc_id_order {
+                let (doc_id, doc) = &self.buffered_docs[i];
                 if let Some(points) = doc.point_values.get(field) {
                     for point in points {
                         points_buf.extend_from_slice(point);
@@ -2462,6 +2511,60 @@ mod tests {
             field_lengths: AHashMap::new(),
             point_values,
         }
+    }
+
+    /// Issue #1163: `pin_field_term_positions`/`pin_field_doc_values` are
+    /// only sound because a field's setting is consulted fresh at EVERY
+    /// upsert (`stores_term_positions`/`stores_doc_values`), never cached
+    /// once at writer construction — this test is the regression guard for
+    /// that assumption. Without it, a future refactor that reads
+    /// `field_term_positions`/`field_doc_values` once up front would
+    /// silently corrupt any merge relying on lazy, mid-replay pinning.
+    #[test]
+    fn late_pinned_field_config_applies_to_subsequent_documents() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::memory::MemoryStorage::new(
+            crate::storage::memory::MemoryStorageConfig::default(),
+        ));
+        // The index-wide default is `true`
+        // (`InvertedIndexWriterConfig::default`), so if pinning were read
+        // only at construction rather than at upsert time, this document's
+        // "body" field would still end up with positions.
+        let mut writer =
+            InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+
+        writer.pin_field_term_positions("body", || false);
+
+        let mut doc = AnalyzedDocument::new();
+        doc.field_terms.insert(
+            "body".to_string(),
+            vec![
+                AnalyzedTerm {
+                    term: "widget".to_string(),
+                    position: 0,
+                    frequency: 1,
+                    offset: (0, 0),
+                },
+                AnalyzedTerm {
+                    term: "widget".to_string(),
+                    position: 1,
+                    frequency: 1,
+                    offset: (0, 0),
+                },
+            ],
+        );
+        writer.upsert_analyzed_document(1, doc).unwrap();
+
+        let list = writer
+            .inverted_index
+            .get_posting_list("body:widget")
+            .unwrap();
+        assert_eq!(list.postings.len(), 1);
+        assert!(
+            list.postings[0].positions.is_none(),
+            "a field pinned to `false` before the document arrives must not carry \
+             positions, proving the setting is read at upsert time, not at writer \
+             construction"
+        );
     }
 
     /// #557: the size estimate must scale with the number of BKD points.
