@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
-    BooleanQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery,
-    GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery, TermQuery,
-    WildcardQuery,
+    BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
+    TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -56,6 +56,11 @@ pub fn extract_lexical_query(value: Value) -> Result<Box<dyn laurus::lexical::Qu
     }
     if let Ok(q) = <&RbNumericRangeQuery>::try_convert(value) {
         return Ok(q.build());
+    }
+    if let Ok(q) = <&RbDateTimeRangeQuery>::try_convert(value) {
+        return q
+            .build()
+            .map_err(|e| Error::new(ruby.exception_arg_error(), e.to_string()));
     }
     if let Ok(q) = <&RbGeoDistanceQuery>::try_convert(value) {
         return q
@@ -429,6 +434,102 @@ impl RbNumericRangeQuery {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DateTimeRangeQuery
+// ---------------------------------------------------------------------------
+
+/// DateTime range filter query (`Laurus::DateTimeRangeQuery`, Issue #1179).
+///
+/// Both bounds are inclusive; omit a keyword (or pass `nil`) to leave that
+/// side open. A bound is a `String` in any form the query DSL accepts —
+/// RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), a naive
+/// `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or a date `"YYYY-MM-DD"` (midnight
+/// UTC) — or any object responding to `iso8601` (`Time`, `DateTime`), the
+/// same conversion document ingestion uses.
+#[magnus::wrap(class = "Laurus::DateTimeRangeQuery")]
+pub struct RbDateTimeRangeQuery {
+    pub field: String,
+    pub min: Option<String>,
+    pub max: Option<String>,
+}
+
+impl RbDateTimeRangeQuery {
+    /// Create a new datetime range query.
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Positional and keyword arguments:
+    ///   - `field` (String): Field name.
+    ///   - `min:` (String or Time, optional): Lower bound (inclusive).
+    ///   - `max:` (String or Time, optional): Upper bound (inclusive).
+    fn new(args: &[Value]) -> Result<Self, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+        let (field,) = args.required;
+        let kwargs = get_kwargs::<_, (), (Option<Value>, Option<Value>), ()>(
+            args.keywords,
+            &[],
+            &["min", "max"],
+        )?;
+        let (min_val, max_val) = kwargs.optional;
+        let query = Self {
+            field,
+            min: min_val
+                .map(|v| datetime_literal(&ruby, v))
+                .transpose()?
+                .flatten(),
+            max: max_val
+                .map(|v| datetime_literal(&ruby, v))
+                .transpose()?
+                .flatten(),
+        };
+        // Validate eagerly so a bad bound raises at construction, not at search.
+        query
+            .build()
+            .map_err(|e| Error::new(ruby.exception_arg_error(), e.to_string()))?;
+        Ok(query)
+    }
+
+    fn inspect(&self) -> String {
+        format!(
+            "DateTimeRangeQuery(field='{}', min={:?}, max={:?})",
+            self.field, self.min, self.max
+        )
+    }
+
+    /// Build the underlying Rust `DateTimeRangeQuery`.
+    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
+        Ok(Box::new(DateTimeRangeQuery::from_literals(
+            &self.field,
+            self.min.as_deref(),
+            self.max.as_deref(),
+            true,
+            true,
+        )?))
+    }
+}
+
+/// A datetime bound as text: a `String` as given, or the `iso8601` of any
+/// object responding to it (`Time`, `DateTime`). `nil` means "open".
+fn datetime_literal(ruby: &Ruby, value: Value) -> Result<Option<String>, Error> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    if value.is_kind_of(ruby.class_string()) {
+        return Ok(Some(String::try_convert(value)?));
+    }
+    if let Ok(s) = value.funcall::<_, _, String>("iso8601", ()) {
+        return Ok(Some(s));
+    }
+    Err(Error::new(
+        ruby.exception_type_error(),
+        format!(
+            "DateTimeRangeQuery: min/max must be a String or respond to iso8601, got {}",
+            value.class()
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1150,12 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
     nr_q.define_singleton_method("new", magnus::function!(RbNumericRangeQuery::new, -1))?;
     nr_q.define_method("inspect", magnus::method!(RbNumericRangeQuery::inspect, 0))?;
     nr_q.define_method("to_s", magnus::method!(RbNumericRangeQuery::inspect, 0))?;
+
+    // DateTimeRangeQuery
+    let dt_q = module.define_class("DateTimeRangeQuery", ruby.class_object())?;
+    dt_q.define_singleton_method("new", magnus::function!(RbDateTimeRangeQuery::new, -1))?;
+    dt_q.define_method("inspect", magnus::method!(RbDateTimeRangeQuery::inspect, 0))?;
+    dt_q.define_method("to_s", magnus::method!(RbDateTimeRangeQuery::inspect, 0))?;
 
     // GeoDistanceQuery
     let geo_dist_q = module.define_class("GeoDistanceQuery", ruby.class_object())?;

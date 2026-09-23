@@ -5,9 +5,9 @@
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
-    BooleanQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery,
-    GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery, TermQuery,
-    WildcardQuery,
+    BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
+    TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -25,6 +25,7 @@ pub enum JsQuery {
     FuzzyQuery(JsFuzzyQuery),
     WildcardQuery(JsWildcardQuery),
     NumericRangeQuery(JsNumericRangeQuery),
+    DateTimeRangeQuery(JsDateTimeRangeQuery),
     GeoDistanceQuery(JsGeoDistanceQuery),
     GeoBoundingBoxQuery(JsGeoBoundingBoxQuery),
     Geo3dDistanceQuery(JsGeo3dDistanceQuery),
@@ -57,6 +58,7 @@ pub fn extract_lexical_query(query: &JsQuery) -> Result<Box<dyn laurus::lexical:
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         )),
         JsQuery::NumericRangeQuery(q) => Ok(q.build()),
+        JsQuery::DateTimeRangeQuery(q) => q.build().map_err(|e| JsValue::from_str(&e.to_string())),
         JsQuery::GeoDistanceQuery(q) => q.build().map_err(|e| JsValue::from_str(&e.to_string())),
         JsQuery::GeoBoundingBoxQuery(q) => q.build().map_err(|e| JsValue::from_str(&e.to_string())),
         JsQuery::Geo3dDistanceQuery(q) => Ok(q.build()),
@@ -168,6 +170,28 @@ impl JsNumericRangeQuery {
                 self.max.map(|v| v as i64),
             ))
         }
+    }
+}
+
+/// DateTime range query (internal; reached through `Index.searchDateTimeRange`,
+/// Issue #1179). Bounds are inclusive datetime literals in any form the
+/// query DSL accepts (RFC 3339, naive `YYYY-MM-DDTHH:MM:SS[.fff]` as UTC,
+/// or `YYYY-MM-DD` as midnight UTC); `None` leaves a side open.
+pub struct JsDateTimeRangeQuery {
+    pub field: String,
+    pub min: Option<String>,
+    pub max: Option<String>,
+}
+
+impl JsDateTimeRangeQuery {
+    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
+        Ok(Box::new(DateTimeRangeQuery::from_literals(
+            &self.field,
+            self.min.as_deref(),
+            self.max.as_deref(),
+            true,
+            true,
+        )?))
     }
 }
 
@@ -326,4 +350,38 @@ pub struct JsVectorQueryInner {
 pub struct JsVectorTextQuery {
     pub field: String,
     pub text: String,
+}
+
+#[cfg(test)]
+mod datetime_range_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Issue #1179: literals in every accepted form build a query; a bad
+    /// bound surfaces as an error rather than a silent empty result.
+    #[wasm_bindgen_test]
+    fn datetime_range_builds_from_literals() {
+        for (min, max) in [
+            (Some("2024-01-01"), Some("2024-12-31")),
+            (Some("2024-01-01T09:00:00+09:00"), None),
+            (None, Some("2024-06-15T12:34:56.5")),
+        ] {
+            let query = JsDateTimeRangeQuery {
+                field: "created_at".to_string(),
+                min: min.map(str::to_string),
+                max: max.map(str::to_string),
+            };
+            assert!(query.build().is_ok(), "{min:?}..{max:?}");
+        }
+        let bad = JsDateTimeRangeQuery {
+            field: "created_at".to_string(),
+            min: Some("yesterday".to_string()),
+            max: None,
+        };
+        assert!(bad.build().is_err());
+        assert!(
+            extract_lexical_query(&JsQuery::DateTimeRangeQuery(bad)).is_err(),
+            "the dispatcher must surface the error"
+        );
+    }
 }

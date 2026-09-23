@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use crate::convert::data_value_to_json;
 use crate::query::{
-    JsBooleanQuery, JsFuzzyQuery, JsGeo3dBoundingBoxQuery, JsGeo3dDistanceQuery,
-    JsGeo3dNearestQuery, JsGeoBoundingBoxQuery, JsGeoDistanceQuery, JsNumericRangeQuery,
-    JsPhraseQuery, JsQuery, JsSpanQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner,
-    JsVectorTextQuery, JsWildcardQuery, extract_lexical_query, query_to_lexical_search_query,
-    vector_query_to_search_query,
+    JsBooleanQuery, JsDateTimeRangeQuery, JsFuzzyQuery, JsGeo3dBoundingBoxQuery,
+    JsGeo3dDistanceQuery, JsGeo3dNearestQuery, JsGeoBoundingBoxQuery, JsGeoDistanceQuery,
+    JsNumericRangeQuery, JsPhraseQuery, JsQuery, JsSpanQuery, JsTermQuery, JsVectorQuery,
+    JsVectorQueryInner, JsVectorTextQuery, JsWildcardQuery, extract_lexical_query,
+    query_to_lexical_search_query, vector_query_to_search_query,
 };
 use laurus::{
     FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
@@ -331,6 +331,12 @@ impl JsSearchRequest {
         self.lexical_query = Some(JsQuery::NumericRangeQuery(query.clone()));
     }
 
+    /// Set a [`JsDateTimeRangeQuery`] as the lexical clause.
+    #[napi]
+    pub fn set_lexical_date_time_range(&mut self, query: &JsDateTimeRangeQuery) {
+        self.lexical_query = Some(JsQuery::DateTimeRangeQuery(query.clone()));
+    }
+
     /// Set a [`JsGeoDistanceQuery`] as the lexical clause.
     #[napi]
     pub fn set_lexical_geo_distance(&mut self, query: &JsGeoDistanceQuery) {
@@ -403,6 +409,12 @@ impl JsSearchRequest {
     #[napi]
     pub fn set_filter_numeric_range(&mut self, query: &JsNumericRangeQuery) {
         self.filter_query = Some(JsQuery::NumericRangeQuery(query.clone()));
+    }
+
+    /// Set a [`JsDateTimeRangeQuery`] as the filter clause.
+    #[napi]
+    pub fn set_filter_date_time_range(&mut self, query: &JsDateTimeRangeQuery) {
+        self.filter_query = Some(JsQuery::DateTimeRangeQuery(query.clone()));
     }
 
     /// Set a [`JsGeoDistanceQuery`] as the filter clause.

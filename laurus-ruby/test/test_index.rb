@@ -269,6 +269,48 @@ class TestIndex < Minitest::Test
     assert_equal "doc2", results[0].id
   end
 
+  def datetime_index
+    schema = Laurus::Schema.new
+    schema.add_datetime_field("created_at")
+    idx = Laurus::Index.new(schema: schema)
+    idx.put_document("jan", { "created_at" => "2024-01-01T00:00:00Z" })
+    idx.put_document("jun", { "created_at" => "2024-06-15T12:00:00Z" })
+    idx.put_document("next", { "created_at" => "2025-01-01T00:00:00Z" })
+    idx.commit
+    idx
+  end
+
+  # Issue #1179: date-only bounds are midnight UTC, inclusive on both ends.
+  def test_datetime_range_query_with_date_only_bounds
+    idx = datetime_index
+    q = Laurus::DateTimeRangeQuery.new("created_at", min: "2024-01-01", max: "2024-12-31")
+    assert_equal %w[jan jun], idx.search(q, limit: 5).map(&:id).sort
+    assert_includes q.inspect, "DateTimeRangeQuery"
+  end
+
+  def test_datetime_range_query_accepts_time_objects_and_open_bounds
+    idx = datetime_index
+    # A Time with an offset is normalized to UTC (21:00+09:00 == 12:00Z).
+    q = Laurus::DateTimeRangeQuery.new("created_at", min: Time.new(2024, 6, 15, 21, 0, 0, "+09:00"))
+    assert_equal %w[jun next], idx.search(q, limit: 5).map(&:id).sort
+    q = Laurus::DateTimeRangeQuery.new("created_at", max: "2024-06-15T12:00:00")
+    assert_equal %w[jan jun], idx.search(q, limit: 5).map(&:id).sort
+  end
+
+  def test_datetime_range_query_dsl_form_reaches_the_index
+    idx = datetime_index
+    assert_equal ["jun"], idx.search("created_at:{2024-01-01 TO 2024-12-31}", limit: 5).map(&:id)
+  end
+
+  def test_datetime_range_query_rejects_malformed_bound
+    assert_raises(ArgumentError) do
+      Laurus::DateTimeRangeQuery.new("created_at", min: "yesterday")
+    end
+    assert_raises(TypeError) do
+      Laurus::DateTimeRangeQuery.new("created_at", min: 42)
+    end
+  end
+
   def test_boolean_query
     idx = create_index
     q = Laurus::BooleanQuery.new

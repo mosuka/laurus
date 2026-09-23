@@ -43,6 +43,7 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<query::PhpFuzzyQuery>()
         .class::<query::PhpWildcardQuery>()
         .class::<query::PhpNumericRangeQuery>()
+        .class::<query::PhpDateTimeRangeQuery>()
         .class::<query::PhpGeoDistanceQuery>()
         .class::<query::PhpGeoBoundingBoxQuery>()
         .class::<query::PhpGeo3dDistanceQuery>()

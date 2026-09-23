@@ -7,9 +7,9 @@
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
-    BooleanQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery,
-    GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery, TermQuery,
-    WildcardQuery,
+    BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
+    TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -50,6 +50,9 @@ pub fn extract_lexical_query(
     }
     if let Ok(q) = obj.extract::<PyRef<PyNumericRangeQuery>>() {
         return Ok(q.build());
+    }
+    if let Ok(q) = obj.extract::<PyRef<PyDateTimeRangeQuery>>() {
+        return q.build().map_err(|e| PyValueError::new_err(e.to_string()));
     }
     if let Ok(q) = obj.extract::<PyRef<PyGeoDistanceQuery>>() {
         return q.build().map_err(|e| PyValueError::new_err(e.to_string()));
@@ -364,6 +367,88 @@ impl PyNumericRangeQuery {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DateTimeRangeQuery
+// ---------------------------------------------------------------------------
+
+/// Python wrapper for a DateTime range query (Issue #1179).
+///
+/// Both bounds are inclusive; pass `None` to leave a side open. A bound may
+/// be a `str` in any form the query DSL accepts — RFC 3339
+/// (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), a naive
+/// `"YYYY-MM-DDTHH:MM:SS[.fff]"` (interpreted as UTC), or a date
+/// `"YYYY-MM-DD"` (midnight UTC) — or a `datetime.datetime` / `datetime.date`
+/// object, converted through `isoformat()` like document ingestion does.
+///
+/// ```python
+/// q = laurus.DateTimeRangeQuery("created_at", min="2024-01-01", max="2024-12-31")
+/// q = laurus.DateTimeRangeQuery("created_at", min=datetime(2024, 1, 1, tzinfo=timezone.utc))
+/// ```
+#[pyclass(name = "DateTimeRangeQuery")]
+pub struct PyDateTimeRangeQuery {
+    pub field: String,
+    pub min: Option<String>,
+    pub max: Option<String>,
+}
+
+#[pymethods]
+impl PyDateTimeRangeQuery {
+    #[new]
+    #[pyo3(signature = (field, *, min=None, max=None))]
+    pub fn new(
+        field: String,
+        min: Option<&Bound<PyAny>>,
+        max: Option<&Bound<PyAny>>,
+    ) -> PyResult<Self> {
+        let query = Self {
+            field,
+            min: min.map(datetime_literal).transpose()?,
+            max: max.map(datetime_literal).transpose()?,
+        };
+        // Validate eagerly so a bad bound raises at construction, not at search.
+        query
+            .build()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(query)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DateTimeRangeQuery(field='{}', min={:?}, max={:?})",
+            self.field, self.min, self.max
+        )
+    }
+}
+
+impl PyDateTimeRangeQuery {
+    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
+        Ok(Box::new(DateTimeRangeQuery::from_literals(
+            &self.field,
+            self.min.as_deref(),
+            self.max.as_deref(),
+            true,
+            true,
+        )?))
+    }
+}
+
+/// A datetime bound as text: a `str` as given, or any object exposing
+/// `isoformat()` (`datetime.datetime`, `datetime.date`).
+fn datetime_literal(obj: &Bound<PyAny>) -> PyResult<String> {
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(s);
+    }
+    if let Ok(iso) = obj.call_method0("isoformat")
+        && let Ok(s) = iso.extract::<String>()
+    {
+        return Ok(s);
+    }
+    Err(PyValueError::new_err(format!(
+        "DateTimeRangeQuery: min/max must be a str or a datetime, got {}",
+        obj.get_type().name()?
+    )))
 }
 
 // ---------------------------------------------------------------------------

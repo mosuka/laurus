@@ -13,6 +13,7 @@ import {
   FuzzyQuery,
   WildcardQuery,
   NumericRangeQuery,
+  DateTimeRangeQuery,
   BooleanQuery,
   VectorQuery,
   SearchRequest,
@@ -370,6 +371,41 @@ describe("Query types", () => {
     expect(new NumericRangeQuery("price", 1.5, 9.5, "float")).toBeDefined();
     // Anything else throws.
     expect(() => new NumericRangeQuery("year", 0, 1, "double")).toThrow();
+  });
+
+  it("datetime range query (#1179)", async () => {
+    const schema = new Schema();
+    schema.addDatetimeField("createdAt");
+    const index = await Index.create(null, schema);
+    await index.putDocument("jan", { createdAt: "2024-01-01T00:00:00Z" });
+    await index.putDocument("jun", { createdAt: "2024-06-15T12:00:00Z" });
+    await index.putDocument("next", { createdAt: "2025-01-01T00:00:00Z" });
+    await index.commit();
+
+    const ids = (results) => results.map((r) => r.id).sort();
+
+    // Date-only bounds are midnight UTC, inclusive on both ends.
+    const req = new SearchRequest({ limit: 5 });
+    req.setLexicalDateTimeRange(new DateTimeRangeQuery("createdAt", "2024-01-01", "2024-12-31"));
+    expect(ids(await index.searchWithRequest(req))).toEqual(["jan", "jun"]);
+
+    // RFC 3339 with an offset is normalized to UTC; `null` leaves a side open.
+    const open = new SearchRequest({ limit: 5 });
+    open.setLexicalDateTimeRange(new DateTimeRangeQuery("createdAt", "2024-06-15T21:00:00+09:00", null));
+    expect(ids(await index.searchWithRequest(open))).toEqual(["jun", "next"]);
+
+    // Works as a boolean clause and as a filter too.
+    const bq = new BooleanQuery();
+    bq.mustDateTimeRange(new DateTimeRangeQuery("createdAt", null, "2024-06-15T12:00:00"));
+    const viaBool = new SearchRequest({ limit: 5 });
+    viaBool.setLexicalBoolean(bq);
+    expect(ids(await index.searchWithRequest(viaBool))).toEqual(["jan", "jun"]);
+
+    // The documented DSL form reaches the index as well.
+    expect(ids(await index.search("createdAt:{2024-01-01 TO 2024-12-31}", 5))).toEqual(["jun"]);
+
+    // A malformed bound throws at construction.
+    expect(() => new DateTimeRangeQuery("createdAt", "yesterday", null)).toThrow(/datetime/);
   });
 
   it("boolean query accepts any clause type via mustX/shouldX/mustNotX", async () => {
