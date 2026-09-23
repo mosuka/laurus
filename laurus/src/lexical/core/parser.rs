@@ -256,6 +256,16 @@ impl DocumentParser {
         }
     }
 
+    /// The position-increment gap for `field_name` (Issue #1175), resolved
+    /// through the same helper the writer uses so a multi-valued Text field
+    /// parsed here is numbered exactly as `InvertedIndexWriter` would
+    /// number it (the equivalence [`Self::with_fields`] documents).
+    fn position_increment_gap(&self, field_name: &str) -> u32 {
+        crate::lexical::index::inverted::writer::position_increment_gap_for(
+            self.fields.get(field_name),
+        )
+    }
+
     /// Parse a document into an AnalyzedDocument.
     ///
     /// This converts text fields into tokenized terms with position information,
@@ -510,6 +520,36 @@ impl DocumentParser {
                                 offset: (offset, offset + len),
                             });
                             offset += len + 1;
+                        }
+                        field_terms.insert(field_name.clone(), terms);
+                    }
+                    FieldValue::TextArray(arr) => {
+                        // Multi-valued text (#1175): each element analyzed
+                        // separately onto one ascending position sequence,
+                        // separated by the field's position-increment gap.
+                        // Mirrors `analyze_field_value`'s arm; see it for
+                        // why the sequence must stay contiguous.
+                        let gap = self.position_increment_gap(field_name);
+                        let mut terms: Vec<AnalyzedTerm> = Vec::new();
+                        let mut base = 0u32;
+                        for (idx, text) in arr.iter().enumerate() {
+                            if idx > 0 {
+                                base = base.saturating_add(gap);
+                            }
+                            let tokens = if let Some(per_field) =
+                                self.analyzer.as_any().downcast_ref::<PerFieldAnalyzer>()
+                            {
+                                per_field.analyze_field(field_name.as_str(), text.as_str())?
+                            } else {
+                                self.analyzer.analyze(text.as_str())?
+                            };
+                            let token_vec: Vec<Token> = tokens.collect();
+                            let token_count = token_vec.len() as u32;
+                            for mut term in self.tokens_to_analyzed_terms(token_vec) {
+                                term.position = term.position.saturating_add(base);
+                                terms.push(term);
+                            }
+                            base = base.saturating_add(token_count);
                         }
                         field_terms.insert(field_name.clone(), terms);
                     }

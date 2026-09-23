@@ -175,5 +175,6 @@ fn format_data_value(value: &DataValue) -> String {
             format!("[{}]", parts.join(", "))
         }
         DataValue::BoolArray(arr) => format!("{arr:?}"),
+        DataValue::TextArray(arr) => format!("[{}]", arr.join(", ")),
     }
 }

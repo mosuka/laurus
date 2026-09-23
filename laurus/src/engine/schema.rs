@@ -516,7 +516,29 @@ fn classify_doc_values(
 /// header, so leftover positions on disk are simply never read once the
 /// field's setting is `false` — no correctness risk either way (#1083).
 fn classify_text(old: &TextOption, new: &TextOption) -> FieldChangeKind {
-    let mut kind = classify_indexed_only(old.indexed, new.indexed, old.stored);
+    // Text indexes terms only (no BKD points), so its `multi_valued` rule is
+    // the term-only one: a rebuild can only source the field's original
+    // values from stored fields (#1175).
+    let mut kind = classify_term_lexical(
+        old.indexed,
+        new.indexed,
+        old.stored,
+        old.multi_valued,
+        new.multi_valued,
+    );
+    // A `position_increment_gap` change re-numbers the positions a
+    // multi-valued field wrote, so existing postings disagree with the new
+    // setting. Gated on `old.term_vectors` for the same reason
+    // `term_vectors: true -> false` is metadata-only: with no positions on
+    // disk the gap is unobservable, and `false -> true` already forces a
+    // rebuild that applies the new gap.
+    if old.position_increment_gap != new.position_increment_gap && old.term_vectors {
+        kind = kind.max(if old.stored {
+            FieldChangeKind::Reindex
+        } else {
+            FieldChangeKind::Destructive
+        });
+    }
     if old.analyzer != new.analyzer {
         kind = kind.max(if old.stored {
             FieldChangeKind::Reindex
@@ -1046,6 +1068,40 @@ mod tests {
                 text(|o| o.stored(false).term_vectors(false)),
                 text(|o| o.stored(false).term_vectors(true)),
                 Destructive,
+            ),
+            (
+                "text: multi_valued false->true is metadata-only",
+                text(|o| o),
+                text(|o| o.multi_valued(true)),
+                MetadataOnly,
+            ),
+            (
+                "text: multi_valued true->false requires reindex (stored fields are the only source)",
+                text(|o| o.multi_valued(true)),
+                text(|o| o),
+                Reindex,
+            ),
+            (
+                "text: multi_valued true->false on a stored:false field is destructive (no points to rebuild from)",
+                text(|o| o.stored(false).multi_valued(true)),
+                text(|o| o.stored(false)),
+                Destructive,
+            ),
+            (
+                "text: position_increment_gap change requires reindex (existing positions used the old gap)",
+                text(|o| o.multi_valued(true)),
+                text(|o| o.multi_valued(true).position_increment_gap(0)),
+                Reindex,
+            ),
+            (
+                "text: position_increment_gap change without term_vectors is metadata-only (no positions on disk)",
+                text(|o| o.multi_valued(true).term_vectors(false)),
+                text(|o| {
+                    o.multi_valued(true)
+                        .term_vectors(false)
+                        .position_increment_gap(0)
+                }),
+                MetadataOnly,
             ),
             (
                 "text: doc_values false->true requires reindex",

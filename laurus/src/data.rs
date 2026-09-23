@@ -266,6 +266,18 @@ pub enum DataValue {
     /// equals the queried value, and repeated elements raise the term
     /// frequency (Lucene multi-valued parity) rather than the hit count.
     BoolArray(Vec<bool>),
+
+    /// Multi-valued text (Issue #1175).
+    ///
+    /// Used by fields declared with
+    /// [`TextOption::multi_valued`](crate::lexical::core::field::TextOption::multi_valued)
+    /// set to `true`. Every element is analyzed on its own and its tokens
+    /// are appended to one position sequence, separated by
+    /// [`TextOption::position_increment_gap`](crate::lexical::core::field::TextOption::position_increment_gap)
+    /// positions, so a term query matches if **any** element contains the
+    /// term while a phrase query cannot span two elements (unless its slop
+    /// reaches the gap).
+    TextArray(Vec<String>),
 }
 
 impl DataValue {
@@ -388,6 +400,14 @@ impl DataValue {
             _ => None,
         }
     }
+
+    /// Returns the multi-valued text slice if this is a `TextArray` variant.
+    pub fn as_text_array(&self) -> Option<&[String]> {
+        match self {
+            DataValue::TextArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 // --- Conversions ---
@@ -479,6 +499,12 @@ impl From<Vec<DateTime<Utc>>> for DataValue {
 impl From<Vec<bool>> for DataValue {
     fn from(v: Vec<bool>) -> Self {
         DataValue::BoolArray(v)
+    }
+}
+
+impl From<Vec<String>> for DataValue {
+    fn from(v: Vec<String>) -> Self {
+        DataValue::TextArray(v)
     }
 }
 
@@ -673,6 +699,17 @@ impl DocumentBuilder {
         self.add_field(name.into(), DataValue::BoolArray(values))
     }
 
+    /// Add a multi-valued text field.
+    ///
+    /// The schema field must be declared with
+    /// [`TextOption::multi_valued`](crate::lexical::core::field::TextOption::multi_valued)
+    /// set to `true`. Each element is analyzed separately, so a term query
+    /// matches if any element contains the term and a phrase query does not
+    /// span two elements.
+    pub fn add_text_array(self, name: impl Into<String>, values: Vec<String>) -> Self {
+        self.add_field(name.into(), DataValue::TextArray(values))
+    }
+
     /// Add a binary data field with no MIME type.
     ///
     /// The MIME type is set to `None`. If a MIME type is needed (e.g. for
@@ -737,17 +774,24 @@ mod tests {
                 ])),
             ),
             ("BoolArray", archive(&DataValue::BoolArray(vec![true]))),
+            (
+                "TextArray",
+                archive(&DataValue::TextArray(vec!["a".to_string()])),
+            ),
         ];
         // Little-endian rkyv 0.8 layout: the root enum sits at the end of
         // the buffer, its first byte being the archived discriminant (Geo =
         // 8, Int64Array = 10, Float64Array = 11, GeoArray = 12, GeoEcefArray
-        // = 13, DateTimeArray = 14, BoolArray = 15), followed by the payload
-        // — `ArchivedVec` is a relative pointer to the element data written
-        // before the root, plus a length. `DateTimeArray` archives its
-        // elements as micro-second `i64`s, so its bytes are `Int64Array`'s
-        // with the discriminant changed; a `bool` element is a single byte,
-        // so `BoolArray`'s element data is followed by seven padding bytes
-        // before the 8-aligned root.
+        // = 13, DateTimeArray = 14, BoolArray = 15, TextArray = 16),
+        // followed by the payload — `ArchivedVec` is a relative pointer to
+        // the element data written before the root, plus a length.
+        // `DateTimeArray` archives its elements as micro-second `i64`s, so
+        // its bytes are `Int64Array`'s with the discriminant changed; a
+        // `bool` element is a single byte, so `BoolArray`'s element data is
+        // followed by seven padding bytes before the 8-aligned root. A
+        // `String` element archives as an 8-byte `ArchivedString`, inline
+        // for the 8 bytes or fewer this row uses (`0xff` fill past the
+        // content), so `TextArray` needs no padding of its own.
         let expected: Vec<(&str, Vec<u8>)> = vec![
             (
                 "Geo",
@@ -797,6 +841,13 @@ mod tests {
                 vec![
                     1, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 244, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "TextArray",
+                vec![
+                    97, 255, 255, 255, 255, 255, 255, 255, 16, 0, 0, 0, 244, 255, 255, 255, 1, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ],
             ),
         ];
@@ -861,6 +912,45 @@ mod tests {
                 .expect("rkyv deserialization");
             assert_eq!(back, value);
         }
+    }
+
+    /// #1175: `String` is rkyv-native, so a `Vec<String>` round-trips
+    /// element-wise — including a string longer than the 8-byte inline
+    /// capacity, an empty string, and the empty list.
+    #[test]
+    fn text_arrays_round_trip_through_rkyv() {
+        for value in [
+            DataValue::TextArray(vec![
+                "a".to_string(),
+                "a much longer string than the inline capacity".to_string(),
+                String::new(),
+                "日本語".to_string(),
+            ]),
+            DataValue::TextArray(Vec::new()),
+        ] {
+            let bytes = archive(&value);
+            let back = rkyv::from_bytes::<DataValue, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialization");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn text_array_accessors_and_builders() {
+        let values = vec!["hello world".to_string(), "foo bar".to_string()];
+        let doc = Document::builder()
+            .add_text_array("notes", values.clone())
+            .build();
+        assert_eq!(
+            doc.get_field("notes").and_then(DataValue::as_text_array),
+            Some(values.as_slice())
+        );
+        assert_eq!(doc.get_field("notes").and_then(DataValue::as_text), None);
+        assert_eq!(DataValue::Text("x".to_string()).as_text_array(), None);
+        assert_eq!(
+            DataValue::from(values.clone()),
+            DataValue::TextArray(values)
+        );
     }
 
     #[test]

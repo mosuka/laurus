@@ -2953,21 +2953,43 @@ impl Engine {
                 continue;
             };
             for (field, highlighter) in &highlighters {
-                let Some(text) = document.get(field).and_then(|value| value.as_text()) else {
+                let Some(value) = document.get(field) else {
                     continue;
                 };
-                let highlight = highlighter.highlight(query, field, text)?;
-                if highlight.fragments.is_empty() {
+                // A multi-valued text field is highlighted element by
+                // element (#1175), so a fragment can never straddle two
+                // elements. `is_entire_field` results are dropped: with
+                // `return_entire_field_if_no_highlight` every non-matching
+                // element would otherwise come back verbatim. The
+                // concatenated list is capped at `max_fragments`, which
+                // `Highlighter::highlight` enforces per call.
+                let fragments: Vec<String> = match value {
+                    crate::data::DataValue::Text(text) => {
+                        let highlight = highlighter.highlight(query, field, text)?;
+                        highlight
+                            .fragments
+                            .into_iter()
+                            .map(|fragment| fragment.text)
+                            .collect()
+                    }
+                    crate::data::DataValue::TextArray(values) => {
+                        let mut collected = Vec::new();
+                        for text in values {
+                            let highlight = highlighter.highlight(query, field, text)?;
+                            if highlight.is_entire_field {
+                                continue;
+                            }
+                            collected.extend(highlight.fragments.into_iter().map(|f| f.text));
+                        }
+                        collected.truncate(options.config.max_fragments);
+                        collected
+                    }
+                    _ => continue,
+                };
+                if fragments.is_empty() {
                     continue;
                 }
-                result.highlights.insert(
-                    (*field).to_string(),
-                    highlight
-                        .fragments
-                        .into_iter()
-                        .map(|fragment| fragment.text)
-                        .collect(),
-                );
+                result.highlights.insert((*field).to_string(), fragments);
             }
         }
 

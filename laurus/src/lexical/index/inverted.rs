@@ -891,6 +891,11 @@ impl LexicalIndex for InvertedIndex {
             FieldOption::Text(text_option) => text_option.term_vectors,
             _ => self.config.store_term_vectors,
         };
+        // #1175: same shape again -- the NEW gap must win, so a rebuild
+        // triggered by a `position_increment_gap` change re-numbers the
+        // field's multi-valued positions under the new value instead of
+        // silently falling back to the default.
+        let target_position_increment_gap = self::writer::position_increment_gap_for(Some(&option));
         // #1047: same idea for DocValues -- `option.doc_values()` is
         // `None` only for `Bytes` (which has no such flag), so this falls
         // back to the index-wide default in exactly that one case.
@@ -941,6 +946,7 @@ impl LexicalIndex for InvertedIndex {
                 analyzer.as_ref(),
                 target_term_vectors,
                 target_doc_values,
+                target_position_increment_gap,
                 &new_segment_ids,
             )?;
 

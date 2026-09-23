@@ -412,10 +412,17 @@ impl std::fmt::Debug for InvertedIndexWriter {
 /// Returns `(terms, points)`; either may be empty (e.g. a `Bool` or
 /// `BoolArray` value produces terms but no points; an unindexable value
 /// like `Bytes` produces neither).
+///
+/// `position_increment_gap` applies only to [`DataValue::TextArray`]
+/// (Issue #1175) and should come from
+/// [`position_increment_gap_for`] so every ingestion path — fresh writes,
+/// the standalone `DocumentParser`, and the merge engine's field rebuild —
+/// derives it the same way.
 pub(crate) fn analyze_field_value(
     field_name: &str,
     val: &DataValue,
     analyzer: &Arc<dyn Analyzer>,
+    position_increment_gap: u32,
 ) -> Result<(Vec<AnalyzedTerm>, Vec<Vec<f64>>)> {
     let mut terms = Vec::new();
     let mut points = Vec::new();
@@ -607,6 +614,38 @@ pub(crate) fn analyze_field_value(
                 offset += text.len() + 1;
             }
         }
+        DataValue::TextArray(arr) => {
+            // Multi-valued text field (#1175): every element is analyzed on
+            // its own and its tokens are appended to ONE ascending position
+            // sequence, `position_increment_gap` positions past the previous
+            // element's last token. The continuity matters beyond the gap
+            // itself: positions are delta-encoded on write
+            // (`posting.rs`'s `pos.saturating_sub(prev_pos)`), so restarting
+            // each element at 0 would silently corrupt the posting list.
+            // A gap of 0 therefore means "numbered as if concatenated", not
+            // "restart". The gap is charged per element, including one that
+            // analyzes to no tokens, matching Lucene's per-value
+            // `positionIncrementGap`.
+            let mut base = 0u32;
+            for (idx, text) in arr.iter().enumerate() {
+                if idx > 0 {
+                    base = base.saturating_add(position_increment_gap);
+                }
+                let tokens =
+                    if let Some(per_field) = analyzer.as_any().downcast_ref::<PerFieldAnalyzer>() {
+                        per_field.analyze_field(field_name, text)?
+                    } else {
+                        analyzer.analyze(text)?
+                    };
+                let token_vec: Vec<Token> = tokens.collect();
+                let token_count = token_vec.len() as u32;
+                for mut term in tokens_to_analyzed_terms(token_vec) {
+                    term.position = term.position.saturating_add(base);
+                    terms.push(term);
+                }
+                base = base.saturating_add(token_count);
+            }
+        }
         // Not lexically indexable: no term representation exists for these.
         // Spelled out rather than a wildcard `_ =>` so a new `DataValue`
         // variant fails exhaustiveness checking here instead of being
@@ -614,6 +653,21 @@ pub(crate) fn analyze_field_value(
         DataValue::Bytes(_, _) | DataValue::Vector(_) | DataValue::Null => {}
     }
     Ok((terms, points))
+}
+
+/// The position-increment gap [`analyze_field_value`] must use for
+/// `field_name`, given that field's schema option (Issue #1175).
+///
+/// Single-sourced so the fresh-ingest path, the standalone
+/// [`DocumentParser`](crate::lexical::core::parser::DocumentParser) and the
+/// merge engine's field rebuild cannot drift apart — in particular, none of
+/// them can accidentally index a multi-valued Text field at gap 0, which
+/// would let phrase queries span element boundaries.
+pub(crate) fn position_increment_gap_for(option: Option<&FieldOption>) -> u32 {
+    match option {
+        Some(FieldOption::Text(opt)) => opt.position_increment_gap,
+        _ => crate::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP,
+    }
 }
 
 /// Convert tokens to analyzed terms.
@@ -1072,7 +1126,12 @@ impl InvertedIndexWriter {
 
             // Index the field if enabled
             if should_index {
-                let (terms, points) = analyze_field_value(field_name, val, &self.config.analyzer)?;
+                let (terms, points) = analyze_field_value(
+                    field_name,
+                    val,
+                    &self.config.analyzer,
+                    position_increment_gap_for(option),
+                )?;
                 if !terms.is_empty() {
                     field_terms.insert(field_name.clone(), terms);
                 }
@@ -1226,6 +1285,9 @@ impl InvertedIndexWriter {
                 v.len() * std::mem::size_of::<chrono::DateTime<chrono::Utc>>()
             }
             DataValue::BoolArray(v) => v.len(),
+            DataValue::TextArray(v) => {
+                v.iter().map(String::len).sum::<usize>() + v.len() * std::mem::size_of::<String>()
+            }
             // The remaining variants are fixed-size and already covered by
             // `size_of::<DataValue>()`.
             _ => 0,

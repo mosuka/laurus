@@ -431,3 +431,69 @@ async fn search_batch_propagates_highlights() -> Result<()> {
     assert!(only(&batches[1], "doc1").highlights.is_empty());
     Ok(())
 }
+
+/// #1175: a multi-valued Text field is highlighted element by element —
+/// only the elements that match contribute fragments, and a fragment never
+/// straddles two elements.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_valued_text_field_is_highlighted_per_element() -> Result<()> {
+    let schema = Schema::builder()
+        .add_field(
+            "notes",
+            FieldOption::Text(TextOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        )
+        .build();
+    let engine = engine_with(schema).await?;
+    engine
+        .put_document(
+            "doc1",
+            Document::builder()
+                .add_text_array(
+                    "notes",
+                    vec![
+                        "the quick brown fox".to_string(),
+                        "a lazy dog".to_string(),
+                        "fox again".to_string(),
+                    ],
+                )
+                .build(),
+        )
+        .await?;
+    engine.commit().await?;
+
+    let request = SearchRequestBuilder::new()
+        .lexical_query(term("notes", "fox"))
+        .highlight(vec!["notes".to_string()])
+        .build();
+    let results = engine.search(request).await?;
+    let notes = &only(&results, "doc1").highlights["notes"];
+    assert_eq!(
+        notes.len(),
+        2,
+        "one fragment per matching element: {notes:?}"
+    );
+    assert!(
+        notes.iter().all(|f| f.contains("<mark>fox</mark>")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().all(|f| !f.contains("lazy")),
+        "the non-matching element must not leak into a fragment: {notes:?}"
+    );
+
+    // The concatenated list honours `max_fragments`.
+    let capped = SearchRequestBuilder::new()
+        .lexical_query(term("notes", "fox"))
+        .highlight(vec!["notes".to_string()])
+        .highlight_config(HighlightConfig {
+            max_fragments: 1,
+            ..HighlightConfig::default()
+        })
+        .build();
+    let results = engine.search(capped).await?;
+    assert_eq!(only(&results, "doc1").highlights["notes"].len(), 1);
+    Ok(())
+}

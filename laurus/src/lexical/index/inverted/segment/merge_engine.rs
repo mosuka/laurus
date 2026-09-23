@@ -483,6 +483,7 @@ impl MergeEngine {
     /// # Panics
     ///
     /// Panics if `new_segment_ids.len() != segments.len()`.
+    #[allow(clippy::too_many_arguments)]
     pub fn rebuild_field_across_segments(
         &self,
         segments: &[ManagedSegmentInfo],
@@ -490,6 +491,7 @@ impl MergeEngine {
         analyzer: Option<&Arc<dyn Analyzer>>,
         target_term_vectors: bool,
         target_doc_values: bool,
+        target_position_increment_gap: u32,
         new_segment_ids: &[String],
     ) -> Result<Vec<MergeResult>> {
         assert_eq!(
@@ -524,6 +526,7 @@ impl MergeEngine {
                 &mut doc_values_by_field,
                 target_field,
                 analyzer,
+                target_position_increment_gap,
             )?;
 
             let doc_count = reconstructed.len() as u64;
@@ -942,6 +945,7 @@ impl MergeEngine {
     /// schema; callers (`InvertedIndex::rebuild_field`, gated by
     /// `Engine::update_field`'s `classify_change` call) are responsible
     /// for that.
+    #[allow(clippy::too_many_arguments)]
     fn reconstruct_segment_with_field_override(
         &self,
         reader: &SegmentReader,
@@ -950,6 +954,7 @@ impl MergeEngine {
         doc_values_by_field: &mut HashMap<String, bool>,
         target_field: &str,
         analyzer: Option<&Arc<dyn Analyzer>>,
+        target_position_increment_gap: u32,
     ) -> Result<Vec<(u64, AnalyzedDocument)>> {
         // Pass 1: bucket postings into per-doc analyzed terms, EXCEPT
         // `target_field` — its old postings were built under the previous
@@ -1075,7 +1080,12 @@ impl MergeEngine {
             if let (Some(analyzer), Some(target_value)) =
                 (analyzer, stored.fields.get(target_field))
             {
-                let (terms, pts) = analyze_field_value(target_field, target_value, analyzer)?;
+                let (terms, pts) = analyze_field_value(
+                    target_field,
+                    target_value,
+                    analyzer,
+                    target_position_increment_gap,
+                )?;
                 if !terms.is_empty() {
                     analyzed.field_terms.insert(target_field.to_string(), terms);
                 }
@@ -1934,6 +1944,7 @@ mod tests {
                 Some(&rebuild_analyzer),
                 false,
                 false,
+                crate::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP,
                 &["segment_rebuilt".to_string()],
             )
             .unwrap();
