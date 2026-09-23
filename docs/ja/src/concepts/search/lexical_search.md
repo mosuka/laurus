@@ -163,6 +163,49 @@ let query = NumericRangeQuery::new(
 `indexed = false, stored = true` と設定されたフィールド）では、そのセグメントに
 実際に存在する保存済みドキュメントのみを走査するフォールバックを使用します。
 
+### DateTimeRangeQuery
+
+`DateTime` フィールドの値が指定された範囲内にあるドキュメントをマッチングします。
+
+```rust
+use chrono::{TimeZone, Utc};
+use laurus::lexical::DateTimeRangeQuery;
+
+// Find documents where "created_at" is within 2024 (both bounds inclusive)
+let query = DateTimeRangeQuery::between(
+    "created_at",
+    Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+    Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap(),
+);
+
+// Open-ended range: created_at > 2024-06-15T12:00:00Z (exclusive)
+let query = DateTimeRangeQuery::after(
+    "created_at",
+    Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap(),
+);
+
+// From textual bounds, using the same literal grammar as the query DSL
+let query = DateTimeRangeQuery::from_literals(
+    "created_at",
+    Some("2024-01-01"),            // min (date only = midnight UTC)
+    Some("2024-12-31T23:59:59Z"),  // max
+    true,                          // include min
+    true,                          // include max
+)?;
+```
+
+`new(field, lower, upper, lower_inclusive, upper_inclusive)` は境界を
+`Option<DateTime<Utc>>` で受け取ります。片側だけのヘルパーとして
+`on_or_after`・`before`・`on_or_before` もあり、`.with_boost()` で定数スコアを
+設定します。クエリはフィールドの 1 次元 BKD ポイント（マイクロ秒の小数部を持つ秒。
+秒未満の境界も正確に比較されます）に対して評価され、定数スコアと保存済み
+ドキュメントへのフォールバックは `NumericRangeQuery` と同じです。`from_literals` は
+RFC 3339、オフセットなしの `YYYY-MM-DDTHH:MM:SS[.fff]`（UTC）、`YYYY-MM-DD`
+（その日の 0 時 UTC）を受け付け、DSL の `created_at:[2024-01-01 TO 2024-12-31]` が
+構築するクエリと同一です（[Query DSL](../query_dsl.md#範囲クエリ) 参照）。
+`DateTime` フィールドに対してエポック秒を境界とする `NumericRangeQuery` も
+従来どおり動作します。
+
 ### GeoDistanceQuery / GeoBoundingBoxQuery
 
 2D 地理座標（WGS84 緯度・経度）に基づいてドキュメントをマッチングします。
@@ -348,6 +391,9 @@ let query = parser.parse("programing~2")?;
 
 // Range
 let query = parser.parse("year:[2020 TO 2024]")?;
+
+// DateTime range (date-only bounds are midnight UTC)
+let query = parser.parse("created_at:[2024-01-01 TO 2024-12-31]")?;
 ```
 
 完全な構文リファレンスは [Query DSL](../query_dsl.md) を参照してください。

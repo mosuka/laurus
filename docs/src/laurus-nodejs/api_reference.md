@@ -355,6 +355,26 @@ Matches numeric values in `[min, max]`. Pass `null` (or omit) for an
 open bound. `numericType` selects the underlying range type
 (`"integer"` (default) or `"float"`); other values throw.
 
+### DateTimeRangeQuery
+
+```typescript
+new DateTimeRangeQuery(
+  field: string,
+  min?: string | null,
+  max?: string | null,
+)
+```
+
+Matches `DateTime` values in `[min, max]` (both bounds inclusive). Pass
+`null` (or omit) for an open bound. Bounds are string literals in any form
+the query DSL accepts: RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized
+to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"`
+(midnight UTC); pass `date.toISOString()` for a `Date`. A malformed bound
+throws an `Error` at construction. Attach it with
+`BooleanQuery.mustDateTimeRange` / `shouldDateTimeRange` /
+`mustNotDateTimeRange` and `SearchRequest.setLexicalDateTimeRange` /
+`setFilterDateTimeRange`.
+
 ### GeoDistanceQuery
 
 ```typescript
@@ -425,7 +445,7 @@ search cone.
 class BooleanQuery {
   constructor();
   // For each query type X in
-  //   { Term, Phrase, Fuzzy, Wildcard, NumericRange,
+  //   { Term, Phrase, Fuzzy, Wildcard, NumericRange, DateTimeRange,
   //     GeoDistance, GeoBoundingBox,
   //     Geo3dDistance, Geo3dBoundingBox, Geo3dNearest,
   //     Boolean, Span }:
@@ -440,7 +460,7 @@ takes an instance of a specific query class — for example,
 `mustTerm(new TermQuery("body", "rust"))` or
 `shouldGeo3dNearest(Geo3dNearestQuery.kNearest(...))`.
 
-The Node.js binding exposes 36 per-type methods (12 query types × 3
+The Node.js binding exposes 39 per-type methods (13 query types × 3
 polarities) instead of a single polymorphic `must(query)` because of a
 limitation in `napi-derive`'s validation of `Either<&T, ...>` arguments
 for classes with `js_name` overrides.
@@ -539,16 +559,18 @@ lives directly on `SearchRequestOptions` rather than behind a setter.
 ### Lexical setters (per type)
 
 For each query type `X` in `{ Term, Phrase, Fuzzy, Wildcard, NumericRange,
-GeoDistance, GeoBoundingBox, Geo3dDistance, Geo3dBoundingBox, Geo3dNearest,
-Boolean, Span }`, the request exposes:
+DateTimeRange, GeoDistance, GeoBoundingBox, Geo3dDistance, Geo3dBoundingBox,
+Geo3dNearest, Boolean, Span }`, the request exposes:
 
 | Method | Description |
 | :--- | :--- |
 | `setLexicalX(query: X)` | Set the lexical component for an explicit hybrid request. |
 | `setFilterX(query: X)` | Set the post-scoring filter component. |
 
-That is, 24 per-type setters in total (12 lexical + 12 filter), in addition
-to the DSL, vector, and fusion setters above.
+That is, 26 per-type setters in total (13 lexical + 13 filter), in addition
+to the DSL, vector, and fusion setters above — for example
+`setLexicalNumericRange(q)` / `setFilterNumericRange(q)` and
+`setLexicalDateTimeRange(q)` / `setFilterDateTimeRange(q)`.
 
 ```javascript
 const req = new SearchRequest({ limit: 5 });

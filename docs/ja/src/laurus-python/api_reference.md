@@ -309,6 +309,27 @@ NumericRangeQuery(field: str, *, min: int | float | None = None, max: int | floa
 （または省略する）と開放されます。`min` と `max` はキーワード専用引数です。
 数値型（整数または浮動小数点）は `min`/`max` の Python 型から推論されます。
 
+### DateTimeRangeQuery
+
+```python
+DateTimeRangeQuery(
+    field: str, *,
+    min: str | datetime.datetime | datetime.date | None = None,
+    max: str | datetime.datetime | datetime.date | None = None,
+)
+```
+
+`[min, max]` の範囲内（両端を含む）の `DateTime` 値を検索します。開いた境界には
+`None` を指定する（または省略する）と開放されます。`min` と `max` はキーワード
+専用引数です。境界は Query DSL が受け付ける任意の形式の `str` リテラル（RFC 3339 の
+`"2024-01-01T09:00:00+09:00"`（UTC に正規化）、オフセットなしの
+`"YYYY-MM-DDTHH:MM:SS[.fff]"`（UTC）、`"YYYY-MM-DD"`（その日の 0 時 UTC））、
+または `datetime.datetime` / `datetime.date`（`isoformat()` で変換。naive な
+`datetime` は UTC として扱われます）です。不正な境界は構築時に `ValueError` を
+送出します。クエリオブジェクトを受け付ける場所（`Index.search`、`BooleanQuery`、
+`SearchRequest`）ならどこでも使用できます。例:
+`index.search(laurus.DateTimeRangeQuery("created_at", min="2024-01-01", max="2024-12-31"))`
+
 ### GeoDistanceQuery
 
 ```python

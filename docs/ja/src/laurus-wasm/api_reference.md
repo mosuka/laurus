@@ -139,9 +139,21 @@ DSL 文字列クエリで検索します。
   - `highlight` (`HighlightOptions`, 省略可) -- `search` の `highlight` 引数と同じ
 - **戻り値:** `Promise<SearchResult[]>`
 
+#### `searchDateTimeRange(field, min?, max?, limit?, offset?, highlight?)`
+
+`DateTime` フィールドを両端を含む範囲で検索します（Issue #1179）。クエリクラスは JS に公開されていないため、これは `created_at:[2024-01-01 TO 2024-12-31]` のような DSL の範囲指定（`search()` でも使用可能）に対応する、クエリオブジェクト不要の検索メソッドです。
+
+- **引数:**
+  - `field` (string) -- DateTime フィールド名
+  - `min`, `max` (string, 省略可) -- 両端を含む境界。省略（または `null`/`undefined`）でその側を開放。DSL の日時リテラルのいずれか: RFC 3339（`"2024-01-01T09:00:00+09:00"`、UTC に正規化）、オフセットなしの `"YYYY-MM-DDTHH:MM:SS[.fff]"`（UTC）、または `"YYYY-MM-DD"`（その日の 0 時 UTC）。`Date` は `date.toISOString()` で渡す
+  - `limit`, `offset` (number, 省略可)
+  - `highlight` (`HighlightOptions`, 省略可) -- `search` の `highlight` 引数と同じ
+- **戻り値:** `Promise<SearchResult[]>`
+- **例外:** 境界が認識できる日時リテラルでない場合、エラーで reject されます
+
 #### ハイライト
 
-`search` と `searchTerm` は省略可能な `highlight` 引数を受け付けます。以下の形の単純なオブジェクトです。
+`search`、`searchTerm`、`searchDateTimeRange` は省略可能な `highlight` 引数を受け付けます。以下の形の単純なオブジェクトです。
 
 ```typescript
 interface HighlightOptions {

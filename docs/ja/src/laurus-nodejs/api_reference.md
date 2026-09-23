@@ -350,6 +350,25 @@ new NumericRangeQuery(
 `numericType` は内部の範囲型を選択します（`"integer"`（デフォルト）または
 `"float"`）。それ以外の値は例外をスローします。
 
+### DateTimeRangeQuery
+
+```typescript
+new DateTimeRangeQuery(
+  field: string,
+  min?: string | null,
+  max?: string | null,
+)
+```
+
+`[min, max]` 範囲（両端を含む）の `DateTime` 値にマッチします。`null`（または省略）で
+開放端。境界は Query DSL が受け付ける任意の形式の文字列リテラルです: RFC 3339
+（`"2024-01-01T09:00:00+09:00"`、UTC に正規化）、オフセットなしの
+`"YYYY-MM-DDTHH:MM:SS[.fff]"`（UTC）、または `"YYYY-MM-DD"`（その日の 0 時 UTC）。
+`Date` は `date.toISOString()` で渡します。不正な境界は構築時に `Error` を
+スローします。`BooleanQuery.mustDateTimeRange` / `shouldDateTimeRange` /
+`mustNotDateTimeRange` および `SearchRequest.setLexicalDateTimeRange` /
+`setFilterDateTimeRange` で句として設定します。
+
 ### GeoDistanceQuery
 
 ```typescript
@@ -419,7 +438,7 @@ Geo3dNearestQuery.kNearest(
 class BooleanQuery {
   constructor();
   // 各クエリタイプ X について（X は次のいずれか）:
-  //   { Term, Phrase, Fuzzy, Wildcard, NumericRange,
+  //   { Term, Phrase, Fuzzy, Wildcard, NumericRange, DateTimeRange,
   //     GeoDistance, GeoBoundingBox,
   //     Geo3dDistance, Geo3dBoundingBox, Geo3dNearest,
   //     Boolean, Span }
@@ -434,8 +453,8 @@ MUST / SHOULD / MUST_NOT 句による複合ブーリアンクエリ。各句は�
 `mustTerm(new TermQuery("body", "rust"))` や
 `shouldGeo3dNearest(Geo3dNearestQuery.kNearest(...))`。
 
-Node.js バインディングは多態 `must(query)` ではなく 36 個の per-type メソッド
-（12 クエリタイプ × 3 極性）を公開しています。これは `js_name` を上書きした
+Node.js バインディングは多態 `must(query)` ではなく 39 個の per-type メソッド
+（13 クエリタイプ × 3 極性）を公開しています。これは `js_name` を上書きした
 クラスに対する `napi-derive` の `Either<&T, ...>` 引数バリデーションの制限を
 回避するためです。
 
@@ -532,17 +551,19 @@ per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` 
 
 ### Lexical セッター（per-type）
 
-`X` を `{ Term, Phrase, Fuzzy, Wildcard, NumericRange, GeoDistance,
-GeoBoundingBox, Geo3dDistance, Geo3dBoundingBox, Geo3dNearest, Boolean,
-Span }` の各クエリタイプとして、以下のメソッドが公開されています:
+`X` を `{ Term, Phrase, Fuzzy, Wildcard, NumericRange, DateTimeRange,
+GeoDistance, GeoBoundingBox, Geo3dDistance, Geo3dBoundingBox, Geo3dNearest,
+Boolean, Span }` の各クエリタイプとして、以下のメソッドが公開されています:
 
 | メソッド | 説明 |
 | :--- | :--- |
 | `setLexicalX(query: X)` | 明示的なハイブリッドリクエストの Lexical コンポーネントを設定。 |
 | `setFilterX(query: X)` | スコアリング後のフィルタコンポーネントを設定。 |
 
-合計 24 個の per-type セッター（12 lexical + 12 filter）に加え、上記の DSL /
-ベクトル / フュージョンセッターが利用可能です。
+合計 26 個の per-type セッター（13 lexical + 13 filter）に加え、上記の DSL /
+ベクトル / フュージョンセッターが利用可能です。例:
+`setLexicalNumericRange(q)` / `setFilterNumericRange(q)`、
+`setLexicalDateTimeRange(q)` / `setFilterDateTimeRange(q)`。
 
 ```javascript
 const req = new SearchRequest({ limit: 5 });

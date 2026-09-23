@@ -163,6 +163,49 @@ when the segment has one; segments without a BKD tree for the field
 field configured `indexed = false, stored = true`) fall back to scanning
 only the stored documents actually present in that segment.
 
+### DateTimeRangeQuery
+
+Matches documents whose `DateTime` field value falls within a range.
+
+```rust
+use chrono::{TimeZone, Utc};
+use laurus::lexical::DateTimeRangeQuery;
+
+// Find documents where "created_at" is within 2024 (both bounds inclusive)
+let query = DateTimeRangeQuery::between(
+    "created_at",
+    Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+    Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap(),
+);
+
+// Open-ended range: created_at > 2024-06-15T12:00:00Z (exclusive)
+let query = DateTimeRangeQuery::after(
+    "created_at",
+    Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap(),
+);
+
+// From textual bounds, using the same literal grammar as the query DSL
+let query = DateTimeRangeQuery::from_literals(
+    "created_at",
+    Some("2024-01-01"),            // min (date only = midnight UTC)
+    Some("2024-12-31T23:59:59Z"),  // max
+    true,                          // include min
+    true,                          // include max
+)?;
+```
+
+`new(field, lower, upper, lower_inclusive, upper_inclusive)` takes
+`Option<DateTime<Utc>>` bounds; `on_or_after`, `before` and `on_or_before`
+complete the one-sided helpers, and `.with_boost()` sets the constant score.
+The query is evaluated against the field's one-dimensional BKD point
+(seconds with a microsecond fraction, so sub-second bounds compare exactly)
+with the same constant scoring and stored-document fallback as
+`NumericRangeQuery`. `from_literals` accepts RFC 3339, naive
+`YYYY-MM-DDTHH:MM:SS[.fff]` (UTC) and `YYYY-MM-DD` (midnight UTC) — the
+query the DSL builds for `created_at:[2024-01-01 TO 2024-12-31]` (see
+[Query DSL](../query_dsl.md#range-query)). A `NumericRangeQuery` over a
+`DateTime` field with epoch-second bounds keeps working.
+
 ### GeoDistanceQuery / GeoBoundingBoxQuery
 
 Match documents by 2D geographic location (WGS84 latitude / longitude).
@@ -353,6 +396,9 @@ let query = parser.parse("programing~2")?;
 
 // Range
 let query = parser.parse("year:[2020 TO 2024]")?;
+
+// DateTime range (date-only bounds are midnight UTC)
+let query = parser.parse("created_at:[2024-01-01 TO 2024-12-31]")?;
 ```
 
 See [Query DSL](../query_dsl.md) for the complete syntax reference.
