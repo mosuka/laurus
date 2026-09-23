@@ -206,7 +206,7 @@ class Schema:
 | `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, doc_values=True, analyzer=None)` | Full-text field (inverted index, BM25). `term_vectors` controls whether term positions are stored, read by phrase and span queries. `doc_values` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `stored=True`. `analyzer` accepts a built-in name (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`, or any custom name registered via `add_analyzer`) or a dict configuring a parameterised preset such as `{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}`. The bare string `"japanese"` is rejected because the preset requires a Lindera dictionary path. |
 | `add_integer_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64-bit integer field. Set `multi_valued=True` to accept arrays of integers (range queries match if any value satisfies the predicate). See `doc_values` above. |
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64-bit float field. Set `multi_valued=True` to accept arrays of floats (range queries match if any value satisfies the predicate). See `doc_values` above. |
-| `add_boolean_field(name, *, stored=True, indexed=True, doc_values=True)` | Boolean field. See `doc_values` above. |
+| `add_boolean_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | Boolean field. Set `multi_valued=True` to accept a `list[bool]` (a term query such as `flags:true` matches if any element equals the value; values are read back as a `list[bool]`). See `doc_values` above. |
 | `add_bytes_field(name, *, stored=True)` | Raw bytes field. No `doc_values` option: a `Bytes` value is never written to DocValues regardless. |
 | `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | Geographic coordinate field (lat/lon). Set `multi_valued=True` to accept a list of `(lat, lon)` tuples (distance / bounding-box queries match if any point satisfies the predicate; values are read back as a list of tuples). See `doc_values` above. |
 | `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF Cartesian point field (x, y, z in metres). Set `multi_valued=True` to accept a list of `(x, y, z)` tuples (distance / bounding-box / nearest queries match if any point satisfies the predicate; values are read back as a list of tuples). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values` above. |
@@ -644,7 +644,8 @@ Python values are automatically converted to Laurus `DataValue` types:
 | `float` | `Float64` | |
 | `str` | `Text` | |
 | `bytes` | `Bytes` | |
-| `list[int]` | `Int64Array` | Multi-valued integer field (`bool` elements are not integers); vector fields cast the list to `f32`. An empty list is an empty `Int64Array` |
+| `list[bool]` | `BoolArray` | Multi-valued boolean field; checked before the `list[int]` rule because `bool` is a subclass of `int`. Requires `multi_valued=True` on the field |
+| `list[int]` | `Int64Array` | Multi-valued integer field (a list of `bool` becomes a `BoolArray` instead, which a multi-valued Float / Integer field widens to 0/1 in the core); vector fields cast the list to `f32`. An empty list is an empty `Int64Array` |
 | `list[float \| int]` | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the list to `f32` |
 | `(lat, lon)` tuple | `Geo` | Two `float` values |
 | `(x, y, z)` tuple | `Geo3d` | Three `float` values (ECEF Cartesian, metres) |

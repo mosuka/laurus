@@ -421,9 +421,12 @@ for (let i = 0; i < 10000; i++) {
 範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア）します。
 `docValues` は上記を参照。
 
-#### `addBooleanField(name, stored?, indexed?, docValues?)`
+#### `addBooleanField(name, stored?, indexed?, multiValued?, docValues?)`
 
-真偽値フィールドを追加します。`docValues` は上記を参照。
+真偽値フィールドを追加します。`multiValued: true` を指定すると真偽値の配列を受け付け、
+`flags:true` のような term クエリは**いずれかの要素**がクエリの値と等しければマッチ
+（Lucene 流の "any match"。各要素が独立した term posting になるため、要素の重複はヒット数ではなく
+term frequency を増やします）します。値は真偽値の配列として読み戻されます。`docValues` は上記を参照。
 
 #### `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)`
 

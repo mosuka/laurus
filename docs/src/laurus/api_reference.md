@@ -56,7 +56,7 @@ Defines document structure.
 | `.add_text_field(name, TextOption)` | Add a full-text field |
 | `.add_integer_field(name, IntegerOption)` | Add an integer field (set `IntegerOption::multi_valued = true` for arrays) |
 | `.add_float_field(name, FloatOption)` | Add a float field (set `FloatOption::multi_valued = true` for arrays) |
-| `.add_boolean_field(name, BooleanOption)` | Add a boolean field |
+| `.add_boolean_field(name, BooleanOption)` | Add a boolean field (set `BooleanOption::multi_valued = true` for arrays of booleans) |
 | `.add_datetime_field(name, DateTimeOption)` | Add a datetime field (set `DateTimeOption::multi_valued = true` for arrays of instants) |
 | `.add_geo_field(name, GeoOption)` | Add a 2D geographic (lat/lon) field (set `GeoOption::multi_valued = true` for arrays of points) |
 | `.add_geo3d_field(name, Geo3dOption)` | Add a 3D ECEF Cartesian point field (x, y, z in metres; set `Geo3dOption::multi_valued = true` for arrays of points) |
@@ -99,6 +99,7 @@ A collection of named field values.
 | `.add_geo_array(name, points)` | Add a multi-valued 2D geographic field (`Vec<GeoPoint>`) |
 | `.add_geo_ecef_array(name, points)` | Add a multi-valued 3D ECEF field (`Vec<GeoEcefPoint>`) |
 | `.add_datetime_array(name, values)` | Add a multi-valued datetime field (`Vec<DateTime<Utc>>`) |
+| `.add_bool_array(name, values)` | Add a multi-valued boolean field (`Vec<bool>`) |
 | `.add_bytes(name, data)` | Add binary data |
 | `.build()` | Build the `Document` |
 
@@ -234,3 +235,4 @@ A collection of named field values.
 | `DataValue::GeoArray(Vec<GeoPoint>)` | Multi-valued 2D geographic points (requires `multi_valued` field option) |
 | `DataValue::GeoEcefArray(Vec<GeoEcefPoint>)` | Multi-valued 3D ECEF points (requires `multi_valued` field option) |
 | `DataValue::DateTimeArray(Vec<DateTime<Utc>>)` | Multi-valued instants (requires `multi_valued` field option) |
+| `DataValue::BoolArray(Vec<bool>)` | Multi-valued booleans (requires `multi_valued` field option) |

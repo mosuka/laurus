@@ -420,9 +420,13 @@ Add a 64-bit float field. Pass `multiValued: true` to accept arrays of
 floats; range queries then match if any value satisfies the predicate
 (Lucene-style "any match" with constant scoring). See `docValues` above.
 
-#### `addBooleanField(name, stored?, indexed?, docValues?)`
+#### `addBooleanField(name, stored?, indexed?, multiValued?, docValues?)`
 
-Add a boolean field. See `docValues` above.
+Add a boolean field. Pass `multiValued: true` to accept arrays of booleans;
+a term query such as `flags:true` then matches if any element equals the
+queried value (Lucene-style "any match" — each element is its own term
+posting, so repeated elements raise the term frequency, not the hit count).
+Values are read back as an array of booleans. See `docValues` above.
 
 #### `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)`
 

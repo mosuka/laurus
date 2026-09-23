@@ -199,7 +199,7 @@ class Schema {
 | `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)` | 全文検索フィールド（転置インデックス、BM25）。`docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047、デフォルト `true`）。`stored` も `true` の場合のみ有効です。`analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットを使う場合は、`lindera` tokenizer を含むカスタム analyzer を登録して、その名前を参照してください。 |
 | `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット整数フィールド。`multiValued: true` で整数配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
 | `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット浮動小数点フィールド。`multiValued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
-| `addBooleanField(name, stored?, indexed?, docValues?)` | 真偽値フィールド。`docValues` は上記を参照。 |
+| `addBooleanField(name, stored?, indexed?, multiValued?, docValues?)` | 真偽値フィールド。`multiValued: true` で真偽値の配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は真偽値の配列として読み戻されます）。`docValues` は上記を参照。 |
 | `addBytesField(name, stored?)` | バイナリデータフィールド。`docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
 | `addGeoField(name, stored?, indexed?, multiValued?, docValues?)` | 地理座標フィールド。`multiValued: true` で `{ lat, lon }` オブジェクトの配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`docValues` は上記を参照。 |
 | `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multiValued: true` で `{ x, y, z }` オブジェクトの配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
@@ -706,3 +706,4 @@ JavaScript の値は自動的に Laurus の `DataValue` 型に変換されます
 | `{ lat, lon }[]` | `GeoArray` | `{ lat, lon }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `{ x, y, z }[]` | `GeoEcefArray` | `{ x, y, z }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `string[]`（すべて RFC 3339） | `DateTimeArray` | RFC 3339 日時文字列の配列。フィールドに `multiValued: true` が必要。RFC 3339 でない要素を含む文字列配列は拒否される |
+| `boolean[]` | `BoolArray` | 真偽値の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要。`[true, 1]` のような混在配列は拒否される |
