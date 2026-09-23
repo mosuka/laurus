@@ -409,9 +409,9 @@ impl std::fmt::Debug for InvertedIndexWriter {
 /// analyzer/option is indistinguishable from one indexed fresh under it —
 /// both paths derive a field's analyzed form through this one function.
 ///
-/// Returns `(terms, points)`; either may be empty (e.g. a `Bool` value
-/// produces terms but no points; an unindexable value like `Bytes`
-/// produces neither).
+/// Returns `(terms, points)`; either may be empty (e.g. a `Bool` or
+/// `BoolArray` value produces terms but no points; an unindexable value
+/// like `Bytes` produces neither).
 pub(crate) fn analyze_field_value(
     field_name: &str,
     val: &DataValue,
@@ -466,8 +466,9 @@ pub(crate) fn analyze_field_value(
             points.push(vec![crate::lexical::core::datetime::datetime_to_point(dt)]);
         }
         DataValue::Bool(b) => {
-            // bool is indexed as "true"/"false" text for lexical queries,
-            // and also stored as a point value (1.0/0.0) for numeric range queries
+            // A bool is indexed as a single "true"/"false" term and nothing
+            // else: no BKD point, so it is term-queryable (`flag:true`) but
+            // not range-queryable.
             let text = if *b { "true" } else { "false" };
             terms.push(AnalyzedTerm {
                 term: text.to_string(),
@@ -586,6 +587,24 @@ pub(crate) fn analyze_field_value(
                 });
                 offset += len + 1;
                 points.push(vec![crate::lexical::core::datetime::datetime_to_point(dt)]);
+            }
+        }
+        DataValue::BoolArray(arr) => {
+            // Multi-valued boolean field (#1180): one "true"/"false" term per
+            // element and, like the scalar arm, no BKD point. A term query
+            // matches the document if any element carries that term;
+            // repeated elements accumulate into the term frequency (Lucene
+            // multi-valued parity) rather than producing extra hits.
+            let mut offset = 0usize;
+            for (idx, b) in arr.iter().enumerate() {
+                let text = if *b { "true" } else { "false" };
+                terms.push(AnalyzedTerm {
+                    term: text.to_string(),
+                    position: idx as u32,
+                    frequency: 1,
+                    offset: (offset, offset + text.len()),
+                });
+                offset += text.len() + 1;
             }
         }
         // Not lexically indexable: no term representation exists for these.
@@ -1206,6 +1225,7 @@ impl InvertedIndexWriter {
             DataValue::DateTimeArray(v) => {
                 v.len() * std::mem::size_of::<chrono::DateTime<chrono::Utc>>()
             }
+            DataValue::BoolArray(v) => v.len(),
             // The remaining variants are fixed-size and already covered by
             // `size_of::<DataValue>()`.
             _ => 0,

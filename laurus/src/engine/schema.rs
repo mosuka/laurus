@@ -381,8 +381,12 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
             n.multi_valued,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
-        (FieldOption::Boolean(o), FieldOption::Boolean(n)) => classify_indexed_only(
-            o.indexed, n.indexed, o.stored,
+        (FieldOption::Boolean(o), FieldOption::Boolean(n)) => classify_term_lexical(
+            o.indexed,
+            n.indexed,
+            o.stored,
+            o.multi_valued,
+            n.multi_valued,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
         (FieldOption::DateTime(o), FieldOption::DateTime(n)) => classify_bkd_lexical(
@@ -434,9 +438,10 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
     }
 }
 
-/// Shared classification for `indexed`-only lexical options (Boolean); the
-/// BKD-backed options (Integer, Float, Geo, Geo3d, DateTime) layer their
-/// `multi_valued` rule on top of this in [`classify_bkd_lexical`].
+/// Shared classification for the `indexed` flag of every lexical option.
+/// The BKD-backed options (Integer, Float, Geo, Geo3d, DateTime) layer
+/// their `multi_valued` rule on top of this in [`classify_bkd_lexical`],
+/// and the term-only Boolean option does so in [`classify_term_lexical`].
 ///
 /// Only the `false -> true` transition requires rebuilding: documents
 /// ingested while the field was `indexed: false` have no postings to
@@ -542,7 +547,8 @@ fn classify_text(old: &TextOption, new: &TextOption) -> FieldChangeKind {
 /// `Destructive`, regardless of `stored`: numeric and geo points are read
 /// back from the segment's BKD tree (the authoritative source, Issue #758),
 /// not from stored fields, so a field that was already `indexed: true`
-/// always has a rebuild source.
+/// always has a rebuild source. Boolean, which indexes terms only, uses
+/// [`classify_term_lexical`] instead.
 fn classify_bkd_lexical(
     old_indexed: bool,
     new_indexed: bool,
@@ -553,6 +559,36 @@ fn classify_bkd_lexical(
     let mut kind = classify_indexed_only(old_indexed, new_indexed, old_stored);
     if old_multi_valued && !new_multi_valued {
         kind = kind.max(FieldChangeKind::Reindex);
+    }
+    kind
+}
+
+/// Classification for the term-only lexical option (`BooleanOption`, since
+/// #1180): `indexed` follows [`classify_indexed_only`], and `multi_valued`
+/// follows the same shape as [`classify_bkd_lexical`] — `false -> true` is
+/// metadata-only (an existing single value is a valid one-element match),
+/// `true -> false` needs a rebuild so stale multi-value postings are not
+/// misread as single-valued. Unlike the BKD-backed options there is no
+/// point tree to rebuild from: a Boolean field's on-disk data is one
+/// `"true"` / `"false"` posting per element, and the rebuild path
+/// re-derives a field from its stored value. So the rebuild is `Reindex`
+/// only when `old_stored`, and `Destructive` otherwise (the field's
+/// existing data is discarded) — the same `stored`-dependence
+/// [`classify_indexed_only`] applies to turning `indexed` on.
+fn classify_term_lexical(
+    old_indexed: bool,
+    new_indexed: bool,
+    old_stored: bool,
+    old_multi_valued: bool,
+    new_multi_valued: bool,
+) -> FieldChangeKind {
+    let mut kind = classify_indexed_only(old_indexed, new_indexed, old_stored);
+    if old_multi_valued && !new_multi_valued {
+        kind = kind.max(if old_stored {
+            FieldChangeKind::Reindex
+        } else {
+            FieldChangeKind::Destructive
+        });
     }
     kind
 }
@@ -1122,6 +1158,34 @@ mod tests {
                 boolean(|o| o.doc_values(true)),
                 boolean(|o| o.doc_values(false)),
                 MetadataOnly,
+            ),
+            (
+                "boolean: multi_valued false->true is metadata-only",
+                boolean(|o| o),
+                boolean(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                MetadataOnly,
+            ),
+            (
+                "boolean: multi_valued true->false requires reindex (stored fields are the only source)",
+                boolean(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                boolean(|o| o),
+                Reindex,
+            ),
+            (
+                "boolean: multi_valued true->false on a stored:false field is destructive (no BKD points to rebuild from)",
+                boolean(|mut o| {
+                    o.stored = false;
+                    o.multi_valued = true;
+                    o
+                }),
+                boolean(|o| o.stored(false)),
+                Destructive,
             ),
             // ---- DateTime ----
             (
