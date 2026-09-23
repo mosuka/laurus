@@ -166,6 +166,7 @@ cargo doc --open
 | `FuzzyQuery::new(field, term)` | あいまい一致（デフォルト max_edits=2） | `FuzzyQuery::new("body", "programing").max_edits(1)` |
 | `WildcardQuery::new(field, pattern)` | ワイルドカード | `WildcardQuery::new("file", "*.pdf")` |
 | `NumericRangeQuery::new(...)` | 数値範囲 | [Lexical Search](../concepts/search.md) を参照 |
+| `DateTimeRangeQuery::between(field, start, end)` | 日時範囲（`new(...)` は `Option<DateTime<Utc>>` の境界、`from_literals(...)?` は DSL リテラルを受け取る） | [Lexical Search](../concepts/search.md) を参照 |
 | `GeoDistanceQuery::within_radius(...)` | 2D 地理半径 | [Lexical Search](../concepts/search.md) を参照 |
 | `GeoBoundingBoxQuery::within_bounding_box(...)` | 2D 地理バウンディングボックス | [Lexical Search](../concepts/search.md) を参照 |
 | `Geo3dDistanceQuery::within_sphere(...)` | 3D ECEF 球 | [3D 地理検索](../concepts/geo3d.md) を参照 |

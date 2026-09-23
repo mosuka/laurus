@@ -101,6 +101,40 @@ date:{2024-01-01 TO 2024-12-31}
 price:[* TO 100]
 ```
 
+#### Date and datetime bounds
+
+A range whose bounds are datetime literals builds a `DateTimeRangeQuery`,
+evaluated against the field's BKD tree with constant scoring like a numeric
+range. A bound that is not a bare number is tried as, in order:
+
+| Form | Example | Interpretation |
+| :--- | :--- | :--- |
+| RFC 3339 | `2024-01-01T00:00:00Z`, `2024-01-01T09:00:00.5+09:00` | Fractional seconds allowed; an offset is normalized to UTC |
+| Naive datetime | `2024-01-01T09:00:00`, `2024-01-01T09:00:00.5` | `YYYY-MM-DDTHH:MM:SS[.fff]`, interpreted as UTC |
+| Date only | `2024-01-01` | `YYYY-MM-DD`, meaning `00:00:00` UTC of that day (the Lucene / Elasticsearch default) |
+
+```text
+# Date-only bounds (upper bound is 2024-12-31T00:00:00Z, see below)
+created_at:[2024-01-01 TO 2024-12-31]
+
+# RFC 3339 with an offset (09:00+09:00 is 00:00Z)
+created_at:[2024-06-15T09:00:00+09:00 TO 2024-06-16T09:00:00+09:00]
+
+# Naive datetime is UTC; * leaves the upper side open
+created_at:[2024-06-15T12:34:56 TO *]
+
+# Exclusive on both sides
+created_at:{2024-01-01 TO 2025-01-01}
+```
+
+- A date-only bound is midnight UTC, so `[2024-01-01 TO 2024-12-31]` includes `2024-12-31T00:00:00Z` and nothing later that day. To cover the whole year, give the upper bound a time (`[2024-01-01 TO 2024-12-31T23:59:59.999999]`) or end an exclusive range on the next day (`{2024-01-01 TO 2025-01-01}` — note that `{}` also excludes the exact instant `2024-01-01T00:00:00Z`).
+- `*` leaves a side open.
+- Bare numbers are still numeric bounds: on a `DateTime` field they are epoch seconds and build a `NumericRangeQuery`.
+- Mixing a numeric bound with a datetime bound (`[1704067200 TO 2024-12-31]`), or a datetime bound with a string that is not a datetime literal (`[2024-01-01 TO tomorrow]`), is a parse error rather than a silent empty result. A range whose bounds are neither numbers nor datetime literals (`title:[A TO Z]`) still parses but matches nothing, as before.
+
+> Document ingestion coerces text into a `DateTime` field only from RFC 3339;
+> the naive and date-only forms are accepted for query literals only.
+
 ### 2D Geographic Queries (`geo_*`)
 
 Two function-style forms target `Geo` (2D latitude / longitude) fields. All

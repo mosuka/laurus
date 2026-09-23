@@ -293,6 +293,58 @@ def test_numeric_range_query():
     assert results[0].id == "doc2"
 
 
+def _datetime_index():
+    schema = laurus.Schema()
+    schema.add_datetime_field("created_at")
+    idx = laurus.Index(schema=schema)
+    idx.put_document("jan", {"created_at": "2024-01-01T00:00:00Z"})
+    idx.put_document("jun", {"created_at": "2024-06-15T12:00:00Z"})
+    idx.put_document("next", {"created_at": "2025-01-01T00:00:00Z"})
+    idx.commit()
+    return idx
+
+
+def _ids(results):
+    return sorted(r.id for r in results)
+
+
+def test_datetime_range_query_with_date_only_bounds():
+    """Issue #1179: date-only bounds are midnight UTC, inclusive on both ends."""
+    idx = _datetime_index()
+    q = laurus.DateTimeRangeQuery("created_at", min="2024-01-01", max="2024-12-31")
+    assert _ids(idx.search(q, limit=5)) == ["jan", "jun"]
+    assert "DateTimeRangeQuery" in repr(q)
+
+
+def test_datetime_range_query_accepts_datetime_objects_and_open_bounds():
+    from datetime import datetime, timedelta, timezone
+
+    idx = _datetime_index()
+    # A timezone-aware datetime is normalized to UTC: 21:00+09:00 == 12:00Z.
+    tokyo = timezone(timedelta(hours=9))
+    lower = datetime(2024, 6, 15, 21, 0, 0, tzinfo=tokyo)
+    q = laurus.DateTimeRangeQuery("created_at", min=lower)
+    assert _ids(idx.search(q, limit=5)) == ["jun", "next"]
+    # A naive datetime is interpreted as UTC.
+    q = laurus.DateTimeRangeQuery("created_at", max=datetime(2024, 6, 15, 12, 0, 0))
+    assert _ids(idx.search(q, limit=5)) == ["jan", "jun"]
+
+
+def test_datetime_range_query_dsl_form_reaches_the_index():
+    idx = _datetime_index()
+    # The documented DSL form (exclusive braces).
+    assert _ids(idx.search("created_at:{2024-01-01 TO 2024-12-31}", limit=5)) == ["jun"]
+
+
+def test_datetime_range_query_rejects_malformed_bound():
+    import pytest
+
+    with pytest.raises(ValueError):
+        laurus.DateTimeRangeQuery("created_at", min="yesterday")
+    with pytest.raises(ValueError):
+        laurus.DateTimeRangeQuery("created_at", min=42)
+
+
 def test_boolean_query(index):
     q = laurus.BooleanQuery()
     q.must(laurus.TermQuery("body", "programming"))

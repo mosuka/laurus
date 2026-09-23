@@ -278,6 +278,14 @@ new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $nu
 
 `[$min, $max]` の範囲内の数値を検索します。開いた境界には `null` を指定します。`$numericType` には `"integer"` または `"float"` を設定します。
 
+### DateTimeRangeQuery
+
+```php
+new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max = null)
+```
+
+`[$min, $max]` の範囲内（両端を含む）の `DateTime` 値を検索します。開いた境界には `null` を指定します。境界は Query DSL が受け付ける任意の形式の文字列リテラルです: RFC 3339（`"2024-01-01T09:00:00+09:00"`、UTC に正規化）、オフセットなしの `"YYYY-MM-DDTHH:MM:SS[.fff]"`（UTC）、または `"YYYY-MM-DD"`（その日の 0 時 UTC）。`DateTimeInterface` は `$dt->format(DATE_RFC3339)` で渡します。ext-php-rs のコンストラクタは失敗できないため、不正な境界はクエリの使用時（`Index::search`、`BooleanQuery`、`SearchRequest`）に `\Throwable` として報告されます。
+
 ### GeoDistanceQuery
 
 ```php

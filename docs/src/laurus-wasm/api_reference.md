@@ -142,9 +142,21 @@ Search for an exact term.
   - `highlight` (`HighlightOptions`, optional) -- Same as `search`'s `highlight` argument.
 - **Returns:** `Promise<SearchResult[]>`
 
+#### `searchDateTimeRange(field, min?, max?, limit?, offset?, highlight?)`
+
+Search a `DateTime` field for values within an inclusive range (Issue #1179). Query classes are not exposed to JS, so this is the object-free counterpart of a DSL range such as `created_at:[2024-01-01 TO 2024-12-31]`, which `search()` also accepts.
+
+- **Parameters:**
+  - `field` (string) -- DateTime field name.
+  - `min`, `max` (string, optional) -- Inclusive bounds; omit (or pass `null`/`undefined`) to leave a side open. Any DSL datetime literal: RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC). Pass `date.toISOString()` for a `Date`.
+  - `limit`, `offset` (number, optional)
+  - `highlight` (`HighlightOptions`, optional) -- Same as `search`'s `highlight` argument.
+- **Returns:** `Promise<SearchResult[]>`
+- **Throws:** rejects with an error when a bound is not a recognized datetime literal.
+
 #### Highlighting
 
-`search` and `searchTerm` accept an optional `highlight` argument — a plain object shaped like:
+`search`, `searchTerm` and `searchDateTimeRange` accept an optional `highlight` argument — a plain object shaped like:
 
 ```typescript
 interface HighlightOptions {

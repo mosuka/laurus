@@ -6,9 +6,9 @@
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
-    BooleanQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery,
-    GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery, TermQuery,
-    WildcardQuery,
+    BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
+    TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -41,6 +41,9 @@ pub fn extract_lexical_query(query: &JsQuery) -> Result<Box<dyn laurus::lexical:
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?,
         )),
         JsQuery::NumericRangeQuery(q) => Ok(q.build()),
+        JsQuery::DateTimeRangeQuery(q) => q
+            .build()
+            .map_err(|e| napi::Error::from_reason(e.to_string())),
         JsQuery::GeoDistanceQuery(q) => q
             .build()
             .map_err(|e| napi::Error::from_reason(e.to_string())),
@@ -107,6 +110,7 @@ pub enum JsQuery {
     FuzzyQuery(JsFuzzyQuery),
     WildcardQuery(JsWildcardQuery),
     NumericRangeQuery(JsNumericRangeQuery),
+    DateTimeRangeQuery(JsDateTimeRangeQuery),
     GeoDistanceQuery(JsGeoDistanceQuery),
     GeoBoundingBoxQuery(JsGeoBoundingBoxQuery),
     Geo3dDistanceQuery(JsGeo3dDistanceQuery),
@@ -376,6 +380,64 @@ impl JsNumericRangeQuery {
                 self.max.map(|v| v as i64),
             ))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DateTimeRangeQuery
+// ---------------------------------------------------------------------------
+
+/// DateTime range query (Issue #1179).
+///
+/// Both bounds are inclusive; pass `null` to leave a side open. Bounds are
+/// strings in any form the query DSL accepts: RFC 3339
+/// (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), a naive
+/// `"YYYY-MM-DDTHH:MM:SS[.fff]"` (interpreted as UTC), or a date
+/// `"YYYY-MM-DD"` (midnight UTC). A JS `Date` can be passed as
+/// `date.toISOString()`.
+///
+/// ```javascript
+/// const q = new DateTimeRangeQuery("createdAt", "2024-01-01", "2024-12-31");
+/// const open = new DateTimeRangeQuery("createdAt", "2024-06-01T00:00:00Z", null);
+/// ```
+#[derive(Clone)]
+#[napi(js_name = "DateTimeRangeQuery")]
+pub struct JsDateTimeRangeQuery {
+    pub(crate) field: String,
+    pub(crate) min: Option<String>,
+    pub(crate) max: Option<String>,
+}
+
+#[napi]
+impl JsDateTimeRangeQuery {
+    /// Create a new datetime range query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The DateTime field name to filter on.
+    /// * `min` - Lower bound (inclusive), or `null` for unbounded.
+    /// * `max` - Upper bound (inclusive), or `null` for unbounded.
+    ///
+    /// Throws an `Error` when a bound is not a recognized datetime literal.
+    #[napi(constructor)]
+    pub fn new(field: String, min: Option<String>, max: Option<String>) -> Result<Self> {
+        let query = Self { field, min, max };
+        query
+            .build()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(query)
+    }
+}
+
+impl JsDateTimeRangeQuery {
+    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
+        Ok(Box::new(DateTimeRangeQuery::from_literals(
+            &self.field,
+            self.min.as_deref(),
+            self.max.as_deref(),
+            true,
+            true,
+        )?))
     }
 }
 
@@ -780,6 +842,12 @@ impl JsBooleanQuery {
         self.musts.push(JsQuery::NumericRangeQuery(query.clone()));
     }
 
+    /// Add a MUST clause from a [`JsDateTimeRangeQuery`].
+    #[napi]
+    pub fn must_date_time_range(&mut self, query: &JsDateTimeRangeQuery) {
+        self.musts.push(JsQuery::DateTimeRangeQuery(query.clone()));
+    }
+
     /// Add a MUST clause from a [`JsGeoDistanceQuery`].
     #[napi]
     pub fn must_geo_distance(&mut self, query: &JsGeoDistanceQuery) {
@@ -851,6 +919,13 @@ impl JsBooleanQuery {
     #[napi]
     pub fn should_numeric_range(&mut self, query: &JsNumericRangeQuery) {
         self.shoulds.push(JsQuery::NumericRangeQuery(query.clone()));
+    }
+
+    /// Add a SHOULD clause from a [`JsDateTimeRangeQuery`].
+    #[napi]
+    pub fn should_date_time_range(&mut self, query: &JsDateTimeRangeQuery) {
+        self.shoulds
+            .push(JsQuery::DateTimeRangeQuery(query.clone()));
     }
 
     /// Add a SHOULD clause from a [`JsGeoDistanceQuery`].
@@ -927,6 +1002,13 @@ impl JsBooleanQuery {
     pub fn must_not_numeric_range(&mut self, query: &JsNumericRangeQuery) {
         self.must_nots
             .push(JsQuery::NumericRangeQuery(query.clone()));
+    }
+
+    /// Add a MUST_NOT clause from a [`JsDateTimeRangeQuery`].
+    #[napi]
+    pub fn must_not_date_time_range(&mut self, query: &JsDateTimeRangeQuery) {
+        self.must_nots
+            .push(JsQuery::DateTimeRangeQuery(query.clone()));
     }
 
     /// Add a MUST_NOT clause from a [`JsGeoDistanceQuery`].

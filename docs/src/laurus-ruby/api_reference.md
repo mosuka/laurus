@@ -332,6 +332,14 @@ Laurus::NumericRangeQuery.new(field, min: nil, max: nil)
 
 Matches numeric values in the range `[min, max]`. Pass `nil` for an open bound. The type (integer or float) is inferred from the Ruby type of `min`/`max`.
 
+### DateTimeRangeQuery
+
+```ruby
+Laurus::DateTimeRangeQuery.new(field, min: nil, max: nil)
+```
+
+Matches `DateTime` values in the range `[min, max]` (both bounds inclusive). Pass `nil` (or omit the keyword) for an open bound. A bound is a `String` literal in any form the query DSL accepts — RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC) — or any object responding to `iso8601` (`Time`, `DateTime`). A malformed bound raises `ArgumentError` at construction. Usable wherever a query object is accepted (`Index#search`, `BooleanQuery`, `SearchRequest`).
+
 ### GeoDistanceQuery
 
 ```ruby

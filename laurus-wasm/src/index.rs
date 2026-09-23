@@ -6,8 +6,8 @@ use crate::commit::WasmCommitPolicy;
 use crate::convert::{data_value_to_json, json_to_document};
 use crate::errors::laurus_err;
 use crate::query::{
-    JsGeo3dBoundingBoxQuery, JsGeo3dDistanceQuery, JsGeo3dNearestQuery, JsQuery, JsTermQuery,
-    JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery,
+    JsDateTimeRangeQuery, JsGeo3dBoundingBoxQuery, JsGeo3dDistanceQuery, JsGeo3dNearestQuery,
+    JsQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery,
 };
 use crate::schema::WasmSchema;
 use crate::search::{
@@ -561,6 +561,45 @@ impl WasmIndex {
         highlight: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
+        let mut request = build_lexical_request(
+            &query,
+            limit.unwrap_or(10) as usize,
+            offset.unwrap_or(0) as usize,
+        )?;
+        request.lexical_options.highlight = parse_highlight_options(highlight)?;
+        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        search_results_to_js(results)
+    }
+
+    /// Search a DateTime field for values within an inclusive range
+    /// (Issue #1179).
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The DateTime field name.
+    /// * `min` - Lower bound (inclusive) or `null`/`undefined` for unbounded.
+    /// * `max` - Upper bound (inclusive) or `null`/`undefined` for unbounded.
+    ///   Bounds are datetime literals in any form the query DSL accepts:
+    ///   RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), a naive
+    ///   `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or a date `"YYYY-MM-DD"`
+    ///   (midnight UTC). A `Date` can be passed as `date.toISOString()`.
+    /// * `limit` - Maximum number of results (default 10).
+    /// * `offset` - Pagination offset (default 0).
+    /// * `highlight` - Optional highlight request; same shape as `search`'s
+    ///   `highlight` argument.
+    ///
+    /// Rejects with an error when a bound is not a recognized literal.
+    #[wasm_bindgen(js_name = "searchDateTimeRange")]
+    pub async fn search_date_time_range(
+        &self,
+        field: String,
+        min: Option<String>,
+        max: Option<String>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        highlight: Option<js_sys::Object>,
+    ) -> Result<JsValue, JsValue> {
+        let query = JsQuery::DateTimeRangeQuery(JsDateTimeRangeQuery { field, min, max });
         let mut request = build_lexical_request(
             &query,
             limit.unwrap_or(10) as usize,

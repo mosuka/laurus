@@ -412,6 +412,61 @@ class LaurusTest extends TestCase
         ]);
     }
 
+    // ── DateTimeRangeQuery (Issue #1179) ────────────────────────────────
+
+    private function indexWithDateField(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addDatetimeField("created_at");
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("d1", ["title" => "jan", "created_at" => "2024-01-01T00:00:00Z"]);
+        $idx->putDocument("d2", ["title" => "jun", "created_at" => "2024-06-15T12:00:00Z"]);
+        $idx->putDocument("d3", ["title" => "next", "created_at" => "2025-01-01T00:00:00Z"]);
+        $idx->commit();
+        return $idx;
+    }
+
+    private function idsOf(array $results): array
+    {
+        $ids = array_map(fn ($r) => $r->getId(), $results);
+        sort($ids);
+        return $ids;
+    }
+
+    public function testDateTimeRangeQueryWithDateOnlyBounds(): void
+    {
+        $idx = $this->indexWithDateField();
+        $q = new Laurus\DateTimeRangeQuery("created_at", "2024-01-01", "2024-12-31");
+        $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)));
+        $this->assertStringContainsString("DateTimeRangeQuery", (string) $q);
+    }
+
+    public function testDateTimeRangeQueryWithRfc3339AndOpenBound(): void
+    {
+        $idx = $this->indexWithDateField();
+        // +09:00 is normalized to UTC: 2024-06-15T21:00:00+09:00 == 12:00Z.
+        $q = new Laurus\DateTimeRangeQuery("created_at", "2024-06-15T21:00:00+09:00", null);
+        $this->assertSame(["d2", "d3"], $this->idsOf($idx->search($q)));
+        $q = new Laurus\DateTimeRangeQuery("created_at", null, "2024-06-15T12:00:00");
+        $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)));
+    }
+
+    public function testDateTimeRangeQueryDslFormReachesTheIndex(): void
+    {
+        $idx = $this->indexWithDateField();
+        $results = $idx->search("created_at:{2024-01-01 TO 2024-12-31}");
+        $this->assertSame(["d2"], $this->idsOf($results));
+    }
+
+    public function testDateTimeRangeQueryRejectsMalformedBound(): void
+    {
+        $idx = $this->indexWithDateField();
+        $q = new Laurus\DateTimeRangeQuery("created_at", "yesterday", null);
+        $this->expectException(\Throwable::class);
+        $idx->search($q);
+    }
+
     public function testNumericRangeQuery(): void
     {
         $schema = new Laurus\Schema();

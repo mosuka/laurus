@@ -166,6 +166,7 @@ A collection of named field values.
 | `FuzzyQuery::new(field, term)` | Fuzzy match (default max_edits=2) | `FuzzyQuery::new("body", "programing").max_edits(1)` |
 | `WildcardQuery::new(field, pattern)` | Wildcard | `WildcardQuery::new("file", "*.pdf")` |
 | `NumericRangeQuery::new(...)` | Numeric range | See [Lexical Search](../concepts/search.md) |
+| `DateTimeRangeQuery::between(field, start, end)` | DateTime range (`new(...)` takes `Option<DateTime<Utc>>` bounds; `from_literals(...)?` takes DSL literals) | See [Lexical Search](../concepts/search.md) |
 | `GeoDistanceQuery::within_radius(...)` | 2D geo radius | See [Lexical Search](../concepts/search.md) |
 | `GeoBoundingBoxQuery::within_bounding_box(...)` | 2D geo bounding box | See [Lexical Search](../concepts/search.md) |
 | `Geo3dDistanceQuery::within_sphere(...)` | 3D ECEF sphere | See [3D Geographic Search](../concepts/geo3d.md) |

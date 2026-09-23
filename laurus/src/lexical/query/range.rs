@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use chrono::{DateTime, Utc};
 
 use crate::error::{LaurusError, Result};
+use crate::lexical::core::datetime::{datetime_to_point, parse_datetime_literal};
 use crate::lexical::core::field::NumericType;
 use crate::lexical::query::Query;
 use crate::lexical::query::matcher::{EmptyMatcher, Matcher, PreComputedMatcher};
@@ -515,7 +516,10 @@ impl NumericRangeQuery {
     ///
     /// Single-valued fields contribute one numeric value; multi-valued
     /// (`Int64Array` / `Float64Array`) fields are scanned for any element
-    /// that satisfies the predicate. Non-numeric variants return `false`.
+    /// that satisfies the predicate. A `DateTime` contributes its BKD point
+    /// (#1179), so the stored-document fallback agrees with the tree.
+    /// `Text` is parsed as a number because stored docs lose type info in
+    /// some paths. Other variants return `false`.
     fn value_matches_any(&self, val: &crate::data::DataValue) -> bool {
         match val {
             crate::data::DataValue::Int64(i) => self.contains_numeric(*i as f64),
@@ -526,6 +530,11 @@ impl NumericRangeQuery {
             crate::data::DataValue::Float64Array(arr) => {
                 arr.iter().any(|f| self.contains_numeric(*f))
             }
+            crate::data::DataValue::DateTime(dt) => self.contains_numeric(datetime_to_point(dt)),
+            crate::data::DataValue::Text(s) => s
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|n| self.contains_numeric(n)),
             _ => false,
         }
     }
@@ -637,34 +646,16 @@ impl Query for NumericRangeQuery {
         // Fallback: scan the stored documents present in this reader and
         // filter by numeric range. Multi-valued fields match if ANY value
         // falls in the range (Lucene-style "any match"), and the document
-        // is recorded at most once per query.
+        // is recorded at most once per query. The predicate is shared with
+        // `count_matching_documents` so the two can never disagree.
         let mut matching_docs = Vec::new();
 
         for doc_id in scan_doc_ids(reader)? {
             if let Ok(Some(doc)) = reader.document(doc_id)
                 && let Some(val) = doc.get(&self.field)
+                && self.value_matches_any(val)
             {
-                let matched = match val {
-                    crate::data::DataValue::Float64(f) => self.contains_numeric(*f),
-                    crate::data::DataValue::Int64(i) => self.contains_numeric(*i as f64),
-                    crate::data::DataValue::Int64Array(arr) => {
-                        arr.iter().any(|i| self.contains_numeric(*i as f64))
-                    }
-                    crate::data::DataValue::Float64Array(arr) => {
-                        arr.iter().any(|f| self.contains_numeric(*f))
-                    }
-                    // WORKAROUND: Parse text values as numbers (needed
-                    // because stored docs lose type info in some paths).
-                    crate::data::DataValue::Text(s) => s
-                        .parse::<f64>()
-                        .ok()
-                        .is_some_and(|n| self.contains_numeric(n)),
-                    _ => false,
-                };
-
-                if matched {
-                    matching_docs.push(doc_id);
-                }
+                matching_docs.push(doc_id);
             }
         }
 
@@ -839,15 +830,28 @@ impl Matcher for NumericRangeMatcher {
     }
 }
 
-/// Specialized datetime range query for optimal performance.
+/// Range query over a `DateTime` field (Issue #1179).
+///
+/// Bounds are kept as [`DateTime<Utc>`] and encoded with the same
+/// [`datetime_to_point`] the writer uses for the field's one-dimensional
+/// BKD point, so a bound and a stored value denoting the same instant
+/// compare equal down to the persisted microsecond. Matching and scoring
+/// delegate to [`NumericRangeQuery`] with [`NumericType::Float`]
+/// (`Integer` would truncate sub-second bounds): the BKD tree is used when
+/// the field is indexed, the stored-document fallback otherwise, and every
+/// hit gets the same constant score like any other range query.
+///
+/// The query DSL builds this for bounds that parse as datetime literals
+/// (see [`DateTimeRangeQuery::from_literals`]); the language bindings use
+/// the same constructor.
 #[derive(Debug, Clone)]
 pub struct DateTimeRangeQuery {
     /// The field to search in.
     field: String,
-    /// Lower bound as timestamp.
-    lower_bound: Option<i64>,
-    /// Upper bound as timestamp.
-    upper_bound: Option<i64>,
+    /// Lower bound, if any.
+    lower_bound: Option<DateTime<Utc>>,
+    /// Upper bound, if any.
+    upper_bound: Option<DateTime<Utc>>,
     /// Whether lower bound is inclusive.
     lower_inclusive: bool,
     /// Whether upper bound is inclusive.
@@ -867,12 +871,51 @@ impl DateTimeRangeQuery {
     ) -> Self {
         DateTimeRangeQuery {
             field: field.into(),
-            lower_bound: lower.map(|dt| dt.timestamp()),
-            upper_bound: upper.map(|dt| dt.timestamp()),
+            lower_bound: lower,
+            upper_bound: upper,
             lower_inclusive,
             upper_inclusive,
             boost: 1.0,
         }
+    }
+
+    /// Create a datetime range query from textual bounds.
+    ///
+    /// Each bound is parsed with the query-literal grammar shared with the
+    /// query DSL: RFC 3339 (normalized to UTC), naive
+    /// `YYYY-MM-DDTHH:MM:SS[.fff]` (UTC), or `YYYY-MM-DD` (midnight UTC).
+    /// `None` leaves that side open.
+    ///
+    /// # Errors
+    ///
+    /// Returns a query error ([`LaurusError::parse`]) when a bound does not
+    /// match any accepted form.
+    pub fn from_literals<S: Into<String>>(
+        field: S,
+        lower: Option<&str>,
+        upper: Option<&str>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Result<Self> {
+        let parse = |bound: Option<&str>| -> Result<Option<DateTime<Utc>>> {
+            match bound {
+                None => Ok(None),
+                Some(s) => parse_datetime_literal(s).map(Some).ok_or_else(|| {
+                    LaurusError::parse(format!(
+                        "invalid datetime bound {s:?}: expected RFC 3339 \
+                         (e.g. 2024-01-01T00:00:00Z), YYYY-MM-DDTHH:MM:SS[.fff], \
+                         or YYYY-MM-DD"
+                    ))
+                }),
+            }
+        };
+        Ok(Self::new(
+            field,
+            parse(lower)?,
+            parse(upper)?,
+            lower_inclusive,
+            upper_inclusive,
+        ))
     }
 
     /// Create a datetime range with both bounds inclusive.
@@ -911,36 +954,80 @@ impl DateTimeRangeQuery {
         &self.field
     }
 
-    /// Check if a timestamp falls within the range.
-    pub fn contains_timestamp(&self, timestamp: i64) -> bool {
-        // Check lower bound
-        if let Some(lower) = self.lower_bound {
+    /// Get the lower bound, if any.
+    pub fn lower_bound(&self) -> Option<DateTime<Utc>> {
+        self.lower_bound
+    }
+
+    /// Get the upper bound, if any.
+    pub fn upper_bound(&self) -> Option<DateTime<Utc>> {
+        self.upper_bound
+    }
+
+    /// Whether the lower bound is inclusive.
+    pub fn lower_inclusive(&self) -> bool {
+        self.lower_inclusive
+    }
+
+    /// Whether the upper bound is inclusive.
+    pub fn upper_inclusive(&self) -> bool {
+        self.upper_inclusive
+    }
+
+    /// The lower bound in BKD point space (see [`datetime_to_point`]).
+    pub fn min_point(&self) -> Option<f64> {
+        self.lower_bound.as_ref().map(datetime_to_point)
+    }
+
+    /// The upper bound in BKD point space (see [`datetime_to_point`]).
+    pub fn max_point(&self) -> Option<f64> {
+        self.upper_bound.as_ref().map(datetime_to_point)
+    }
+
+    /// The equivalent numeric range query over the field's BKD point.
+    fn as_numeric(&self) -> NumericRangeQuery {
+        NumericRangeQuery::new(
+            self.field.clone(),
+            NumericType::Float,
+            self.min_point(),
+            self.max_point(),
+            self.lower_inclusive,
+            self.upper_inclusive,
+        )
+        .with_boost(self.boost)
+    }
+
+    /// Check if a BKD point value falls within the range.
+    pub fn contains_point(&self, point: f64) -> bool {
+        if let Some(lower) = self.min_point() {
             if self.lower_inclusive {
-                if timestamp < lower {
+                if point < lower {
                     return false;
                 }
-            } else if timestamp <= lower {
+            } else if point <= lower {
                 return false;
             }
         }
-
-        // Check upper bound
-        if let Some(upper) = self.upper_bound {
+        if let Some(upper) = self.max_point() {
             if self.upper_inclusive {
-                if timestamp > upper {
+                if point > upper {
                     return false;
                 }
-            } else if timestamp >= upper {
+            } else if point >= upper {
                 return false;
             }
         }
-
         true
+    }
+
+    /// Check if a whole-second Unix timestamp falls within the range.
+    pub fn contains_timestamp(&self, timestamp: i64) -> bool {
+        self.contains_point(timestamp as f64)
     }
 
     /// Check if a datetime falls within the range.
     pub fn contains_datetime(&self, datetime: &DateTime<Utc>) -> bool {
-        self.contains_timestamp(datetime.timestamp())
+        self.contains_point(datetime_to_point(datetime))
     }
 }
 
@@ -949,30 +1036,15 @@ impl Query for DateTimeRangeQuery {
         Some(&self.field)
     }
 
-    fn matcher(&self, _reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        Ok(Box::new(DateTimeRangeMatcher::new(
-            self.lower_bound,
-            self.upper_bound,
-            self.lower_inclusive,
-            self.upper_inclusive,
-            self.boost,
-        )))
+    fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
+        // BKD tree when the field is indexed, stored-document fallback
+        // (which understands `DataValue::DateTime`) otherwise.
+        self.as_numeric().matcher(reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        // Range queries typically match fewer documents than term queries
-        let total_docs = reader.doc_count();
-        let estimated_doc_freq = total_docs / 10; // Estimate: 10% of docs might match a range
-        let estimated_term_freq = estimated_doc_freq * 2; // Average 2 occurrences per doc
-
-        Ok(Box::new(BM25Scorer::new(
-            estimated_doc_freq.max(1),
-            estimated_term_freq.max(1),
-            total_docs,
-            10.0, // Estimated average field length
-            total_docs,
-            self.boost,
-        )))
+        // Constant scoring, like every other range query.
+        self.as_numeric().scorer(reader)
     }
 
     fn boost(&self) -> f32 {
@@ -985,8 +1057,12 @@ impl Query for DateTimeRangeQuery {
 
     fn description(&self) -> String {
         format!(
-            "DateTimeRangeQuery(field:{}, lower:{:?}, upper:{:?})",
-            self.field, self.lower_bound, self.upper_bound
+            "DateTimeRangeQuery(field:{}, lower:{}{:?}, upper:{:?}{})",
+            self.field,
+            if self.lower_inclusive { "[" } else { "{" },
+            self.lower_bound.map(|dt| dt.to_rfc3339()),
+            self.upper_bound.map(|dt| dt.to_rfc3339()),
+            if self.upper_inclusive { "]" } else { "}" },
         )
     }
 
@@ -1007,118 +1083,16 @@ impl Query for DateTimeRangeQuery {
     }
 
     fn cache_key(&self) -> Option<String> {
-        // Field + both timestamp bounds + inclusivity flags determine the
-        // matched set; boost is score-only and excluded.
+        // Field + both bounds (exact micros) + inclusivity flags determine
+        // the matched set; boost is score-only and excluded.
         Some(format!(
             "dtrange|{:?}|{:?}|{:?}|{}|{}",
             self.field,
-            self.lower_bound,
-            self.upper_bound,
+            self.lower_bound.map(|dt| dt.timestamp_micros()),
+            self.upper_bound.map(|dt| dt.timestamp_micros()),
             self.lower_inclusive,
             self.upper_inclusive
         ))
-    }
-}
-
-/// Optimized matcher for datetime range queries.
-#[derive(Debug)]
-pub struct DateTimeRangeMatcher {
-    /// Lower bound as timestamp.
-    lower_bound: Option<i64>,
-    /// Upper bound as timestamp.
-    upper_bound: Option<i64>,
-    /// Whether lower bound is inclusive.
-    lower_inclusive: bool,
-    /// Whether upper bound is inclusive.
-    upper_inclusive: bool,
-    /// Current document ID.
-    current_doc: u64,
-    /// Boost factor for scoring.
-    #[allow(dead_code)]
-    boost: f32,
-    /// Whether we've reached the end.
-    exhausted: bool,
-}
-
-impl DateTimeRangeMatcher {
-    /// Create a new datetime range matcher.
-    pub fn new(
-        lower_bound: Option<i64>,
-        upper_bound: Option<i64>,
-        lower_inclusive: bool,
-        upper_inclusive: bool,
-        boost: f32,
-    ) -> Self {
-        DateTimeRangeMatcher {
-            lower_bound,
-            upper_bound,
-            lower_inclusive,
-            upper_inclusive,
-            current_doc: 0,
-            boost,
-            exhausted: true, // Will be set to false when actual matching is implemented
-        }
-    }
-
-    /// Check if a timestamp falls within the range.
-    pub fn contains_timestamp(&self, timestamp: i64) -> bool {
-        // Check lower bound
-        if let Some(lower) = self.lower_bound {
-            if self.lower_inclusive {
-                if timestamp < lower {
-                    return false;
-                }
-            } else if timestamp <= lower {
-                return false;
-            }
-        }
-
-        // Check upper bound
-        if let Some(upper) = self.upper_bound {
-            if self.upper_inclusive {
-                if timestamp > upper {
-                    return false;
-                }
-            } else if timestamp >= upper {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-impl Matcher for DateTimeRangeMatcher {
-    fn doc_id(&self) -> u64 {
-        if self.exhausted {
-            u64::MAX
-        } else {
-            self.current_doc
-        }
-    }
-
-    fn next(&mut self) -> Result<bool> {
-        Err(LaurusError::InvalidOperation(
-            "DateTime range matching is not yet implemented".to_string(),
-        ))
-    }
-
-    fn skip_to(&mut self, _target: u64) -> Result<bool> {
-        Err(LaurusError::InvalidOperation(
-            "DateTime range matching is not yet implemented".to_string(),
-        ))
-    }
-
-    fn cost(&self) -> u64 {
-        // DateTime range queries are typically efficient
-        100
-    }
-
-    fn is_exhausted(&self) -> bool {
-        self.exhausted
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -1295,6 +1269,228 @@ mod tests {
         assert!(query.contains_datetime(&Utc.with_ymd_and_hms(2023, 6, 15, 11, 59, 59).unwrap()));
         assert!(query.contains_datetime(&Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap()));
         assert!(!query.contains_datetime(&Utc.with_ymd_and_hms(2023, 6, 15, 12, 0, 1).unwrap()));
+    }
+
+    /// #1179: bounds keep their sub-second part, so two instants inside the
+    /// same second are distinguishable.
+    #[test]
+    fn datetime_range_sub_second_bounds() {
+        use chrono::{TimeZone, Utc};
+
+        let base = 1_700_000_000;
+        let lower = Utc.timestamp_opt(base, 400_000_000).unwrap();
+        let upper = Utc.timestamp_opt(base, 600_000_000).unwrap();
+        let query = DateTimeRangeQuery::between("created_at", lower, upper);
+
+        assert!(query.contains_datetime(&Utc.timestamp_opt(base, 500_000_000).unwrap()));
+        assert!(query.contains_datetime(&lower));
+        assert!(query.contains_datetime(&upper));
+        assert!(!query.contains_datetime(&Utc.timestamp_opt(base, 250_000_000).unwrap()));
+        assert!(!query.contains_datetime(&Utc.timestamp_opt(base, 750_000_000).unwrap()));
+        // Point space carries the fraction too.
+        assert_eq!(query.min_point(), Some(1_700_000_000.4));
+        assert_eq!(query.max_point(), Some(1_700_000_000.6));
+        // Exclusive edges are exclusive at micro-second precision.
+        let exclusive =
+            DateTimeRangeQuery::new("created_at", Some(lower), Some(upper), false, false);
+        assert!(!exclusive.contains_datetime(&lower));
+        assert!(!exclusive.contains_datetime(&upper));
+        assert!(exclusive.contains_datetime(&Utc.timestamp_opt(base, 400_001_000).unwrap()));
+    }
+
+    #[test]
+    fn from_literals_accepts_all_literal_forms() {
+        use chrono::{TimeZone, Utc};
+
+        let q = DateTimeRangeQuery::from_literals(
+            "created_at",
+            Some("2024-01-01"),
+            Some("2024-12-31T00:00:00Z"),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            q.lower_bound(),
+            Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap())
+        );
+        assert_eq!(
+            q.upper_bound(),
+            Some(Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap())
+        );
+        assert!(q.lower_inclusive());
+        assert!(!q.upper_inclusive());
+
+        let q = DateTimeRangeQuery::from_literals(
+            "created_at",
+            None,
+            Some("2024-01-01T09:00:00+09:00"),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(q.lower_bound(), None);
+        assert_eq!(
+            q.upper_bound(),
+            Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap())
+        );
+
+        let q = DateTimeRangeQuery::from_literals(
+            "created_at",
+            Some("2024-06-15T12:34:56"),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            q.lower_bound(),
+            Some(Utc.with_ymd_and_hms(2024, 6, 15, 12, 34, 56).unwrap())
+        );
+    }
+
+    #[test]
+    fn from_literals_rejects_garbage() {
+        for bad in ["yesterday", "1700000000", "*", "", "2024-13-01"] {
+            let err = DateTimeRangeQuery::from_literals("created_at", Some(bad), None, true, true)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid datetime bound"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    /// Reader whose stored documents carry a `created_at` DateTime and no
+    /// BKD tree, exercising the stored-document fallback (#1179).
+    #[derive(Debug)]
+    struct DateTimeReader {
+        docs: Vec<(u64, chrono::DateTime<chrono::Utc>)>,
+    }
+
+    impl LexicalIndexReader for DateTimeReader {
+        fn doc_count(&self) -> u64 {
+            self.docs.len() as u64
+        }
+        fn max_doc(&self) -> u64 {
+            self.docs.iter().map(|(id, _)| id + 1).max().unwrap_or(0)
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(
+            &self,
+            doc_id: u64,
+        ) -> crate::error::Result<Option<crate::lexical::core::document::Document>> {
+            Ok(self
+                .docs
+                .iter()
+                .find(|(id, _)| *id == doc_id)
+                .map(|(_, dt)| {
+                    crate::data::Document::builder()
+                        .add_field("created_at", crate::data::DataValue::DateTime(*dt))
+                        .build()
+                }))
+        }
+        fn doc_ids(&self) -> crate::error::Result<Vec<u64>> {
+            Ok(self.docs.iter().map(|(id, _)| *id).collect())
+        }
+        fn term_info(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(None)
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>>
+        {
+            Ok(None)
+        }
+        fn field_stats(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn drain(mut matcher: Box<dyn Matcher>) -> Vec<u64> {
+        let mut ids = Vec::new();
+        while !matcher.is_exhausted() {
+            ids.push(matcher.doc_id());
+            if !matcher.next().unwrap() {
+                break;
+            }
+        }
+        ids
+    }
+
+    fn datetime_reader() -> DateTimeReader {
+        use chrono::{TimeZone, Utc};
+        DateTimeReader {
+            docs: vec![
+                (1, Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+                (2, Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap()),
+                (3, Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap()),
+                (4, Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()),
+            ],
+        }
+    }
+
+    /// #1179: the numeric fallback understands stored `DateTime` values
+    /// (it used to fall into `_ => false` and match nothing).
+    #[test]
+    fn matcher_fallback_matches_stored_datetime_values() {
+        let reader = datetime_reader();
+        let june = datetime_to_point(&reader.docs[1].1);
+        let query = NumericRangeQuery::new(
+            "created_at",
+            NumericType::Float,
+            Some(june),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(drain(query.matcher(&reader).unwrap()), vec![2, 3, 4]);
+        assert_eq!(query.count_matching_documents(&reader).unwrap(), 3);
+    }
+
+    /// #1179: `DateTimeRangeQuery::matcher` used to error unconditionally;
+    /// it now resolves through the same fallback as numeric ranges.
+    #[test]
+    fn datetime_range_query_matcher_uses_stored_fallback() {
+        use chrono::{TimeZone, Utc};
+        let reader = datetime_reader();
+        let query = DateTimeRangeQuery::between(
+            "created_at",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(drain(query.matcher(&reader).unwrap()), vec![1, 2, 3]);
+        let exclusive = DateTimeRangeQuery::new(
+            "created_at",
+            Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap()),
+            false,
+            false,
+        );
+        assert_eq!(drain(exclusive.matcher(&reader).unwrap()), vec![2]);
+        // Constant scoring, like every other range query.
+        let scorer = query.scorer(&reader).unwrap();
+        assert!(scorer.as_any().downcast_ref::<RangeScorer>().is_some());
     }
 
     #[test]

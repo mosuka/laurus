@@ -329,6 +329,14 @@ Laurus::NumericRangeQuery.new(field, min: nil, max: nil)
 
 `[min, max]` の範囲内の数値を検索します。開いた境界には `nil` を指定します。型（整数または浮動小数点）は `min`/`max` の Ruby 型から推論されます。
 
+### DateTimeRangeQuery
+
+```ruby
+Laurus::DateTimeRangeQuery.new(field, min: nil, max: nil)
+```
+
+`[min, max]` の範囲内（両端を含む）の `DateTime` 値を検索します。開いた境界には `nil` を指定する（またはキーワードを省略する）と開放されます。境界は Query DSL が受け付ける任意の形式の `String` リテラル（RFC 3339 の `"2024-01-01T09:00:00+09:00"`（UTC に正規化）、オフセットなしの `"YYYY-MM-DDTHH:MM:SS[.fff]"`（UTC）、`"YYYY-MM-DD"`（その日の 0 時 UTC））、または `iso8601` に応答する任意のオブジェクト（`Time`、`DateTime`）です。不正な境界は構築時に `ArgumentError` を発生させます。クエリオブジェクトを受け付ける場所（`Index#search`、`BooleanQuery`、`SearchRequest`）ならどこでも使用できます。
+
 ### GeoDistanceQuery
 
 ```ruby

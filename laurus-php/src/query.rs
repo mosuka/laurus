@@ -11,9 +11,9 @@ use ext_php_rs::types::{ZendClassObject, Zval};
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
-    BooleanQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery,
-    GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery, TermQuery,
-    WildcardQuery,
+    BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
+    TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -60,6 +60,12 @@ pub fn extract_lexical_query(zv: &Zval) -> PhpResult<Box<dyn laurus::lexical::Qu
     if let Some(obj) = <&ZendClassObject<PhpNumericRangeQuery>>::from_zval(zv) {
         let q: &PhpNumericRangeQuery = obj;
         return Ok(q.build());
+    }
+    if let Some(obj) = <&ZendClassObject<PhpDateTimeRangeQuery>>::from_zval(zv) {
+        let q: &PhpDateTimeRangeQuery = obj;
+        return q
+            .build()
+            .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()));
     }
     if let Some(obj) = <&ZendClassObject<PhpGeoDistanceQuery>>::from_zval(zv) {
         let q: &PhpGeoDistanceQuery = obj;
@@ -431,6 +437,74 @@ impl PhpNumericRangeQuery {
                 Box::new(NumericRangeQuery::i64_range(&self.field, *min, *max))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DateTimeRangeQuery
+// ---------------------------------------------------------------------------
+
+/// DateTime range filter query (`Laurus\DateTimeRangeQuery`, Issue #1179).
+///
+/// Both bounds are inclusive; pass `null` to leave a side open. Bounds are
+/// strings in any form the query DSL accepts: RFC 3339
+/// (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), a naive
+/// `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or a date `"YYYY-MM-DD"` (midnight
+/// UTC). A `DateTimeInterface` can be passed as `$dt->format(DATE_RFC3339)`.
+///
+/// Constructors cannot fail in ext-php-rs, so a malformed bound is reported
+/// when the query is used (`Index::search`, `BooleanQuery` clauses).
+#[php_class]
+#[php(name = "Laurus\\DateTimeRangeQuery")]
+pub struct PhpDateTimeRangeQuery {
+    pub field: String,
+    pub min: Option<String>,
+    pub max: Option<String>,
+}
+
+#[php_impl]
+impl PhpDateTimeRangeQuery {
+    /// Create a new datetime range query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Field name.
+    /// * `min` - Lower bound literal (optional, pass null for unbounded).
+    /// * `max` - Upper bound literal (optional, pass null for unbounded).
+    pub fn __construct(field: String, min: &Zval, max: &Zval) -> Self {
+        let literal = |zv: &Zval| {
+            if zv.is_null() {
+                None
+            } else {
+                String::from_zval(zv)
+            }
+        };
+        Self {
+            field,
+            min: literal(min),
+            max: literal(max),
+        }
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        format!(
+            "DateTimeRangeQuery(field='{}', min={:?}, max={:?})",
+            self.field, self.min, self.max
+        )
+    }
+}
+
+impl PhpDateTimeRangeQuery {
+    /// Build the underlying Rust `DateTimeRangeQuery`.
+    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
+        Ok(Box::new(DateTimeRangeQuery::from_literals(
+            &self.field,
+            self.min.as_deref(),
+            self.max.as_deref(),
+            true,
+            true,
+        )?))
     }
 }
 

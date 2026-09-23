@@ -370,6 +370,27 @@ Matches numeric values in the range `[min, max]`. Pass `None` (or omit) for
 an open bound. `min` and `max` are keyword-only. The numeric type (integer or
 float) is inferred from the Python type of `min`/`max`.
 
+### DateTimeRangeQuery
+
+```python
+DateTimeRangeQuery(
+    field: str, *,
+    min: str | datetime.datetime | datetime.date | None = None,
+    max: str | datetime.datetime | datetime.date | None = None,
+)
+```
+
+Matches `DateTime` values in the range `[min, max]` (both bounds inclusive).
+Pass `None` (or omit) for an open bound; `min` and `max` are keyword-only. A
+bound is a `str` literal in any form the query DSL accepts — RFC 3339
+(`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive
+`"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC) — or a
+`datetime.datetime` / `datetime.date`, converted via `isoformat()` (a naive
+`datetime` is UTC). A malformed bound raises `ValueError` at construction.
+Usable anywhere a query object is accepted (`Index.search`, `BooleanQuery`,
+`SearchRequest`), e.g.
+`index.search(laurus.DateTimeRangeQuery("created_at", min="2024-01-01", max="2024-12-31"))`.
+
 ### GeoDistanceQuery
 
 ```python

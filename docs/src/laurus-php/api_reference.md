@@ -281,6 +281,14 @@ new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $nu
 
 Matches numeric values in the range `[$min, $max]`. Pass `null` for an open bound. Set `$numericType` to `"integer"` or `"float"`.
 
+### DateTimeRangeQuery
+
+```php
+new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max = null)
+```
+
+Matches `DateTime` values in the range `[$min, $max]` (both bounds inclusive). Pass `null` for an open bound. Bounds are string literals in any form the query DSL accepts: RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC); pass `$dt->format(DATE_RFC3339)` for a `DateTimeInterface`. Because ext-php-rs constructors cannot fail, a malformed bound is reported as a `\Throwable` when the query is used (`Index::search`, `BooleanQuery`, `SearchRequest`).
+
 ### GeoDistanceQuery
 
 ```php
