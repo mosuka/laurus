@@ -54,6 +54,7 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 /// | `array` of numerics (sequential)          | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
 /// | `array` of `lat`/`lon` arrays (sequential) | `GeoArray` (multi-valued geo, #1174) |
 /// | `array` of `x`/`y`/`z` arrays (sequential) | `GeoEcefArray`      |
+/// | `array` of RFC 3339 strings (sequential)  | `DateTimeArray` (multi-valued datetime, #1184) |
 /// | `array` with `"lat"`, `"lon"` keys        | `Geo`                |
 /// | `array` with `"x"`, `"y"`, `"z"` keys     | `GeoEcef`            |
 /// | ISO 8601 string (fallback)                | `DateTime`           |
@@ -135,6 +136,22 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         // associative-array path as a single point.
         if ht.iter().all(|(_, val)| val.is_array()) {
             return zval_array_of_arrays_to_geo_array(ht);
+        }
+        // A sequential array of strings is a multi-valued datetime field
+        // (#1184); each element must parse like a single ISO 8601 string.
+        if ht.iter().all(|(_, val)| val.is_string()) {
+            let mut out = Vec::with_capacity(ht.len());
+            for (_, val) in ht.iter() {
+                let s = String::from_zval(val).ok_or("failed to convert string")?;
+                let dt = s.parse::<DateTime<Utc>>().map_err(|e| {
+                    format!(
+                        "an array of strings must be all RFC 3339 / ISO 8601 datetimes \
+                         (multi-valued text fields are not supported): {s:?}: {e}"
+                    )
+                })?;
+                out.push(dt);
+            }
+            return Ok(DataValue::DateTimeArray(out));
         }
         if ht.iter().all(|(_, val)| val.is_long()) {
             let mut ints = Vec::with_capacity(ht.len());
@@ -308,6 +325,18 @@ pub fn data_value_to_zval(value: &DataValue) -> PhpResult<Zval> {
             for p in points {
                 arr.push(data_value_to_zval(&DataValue::GeoEcef(*p))?)
                     .map_err(|_| "failed to push geo3d point")?;
+            }
+            zv.set_hashtable(arr);
+        }
+        // An array of the same RFC 3339 strings the single-valued arm
+        // produces (#1184).
+        DataValue::DateTimeArray(instants) => {
+            let mut arr = ZendHashTable::new();
+            for dt in instants {
+                let mut item = Zval::new();
+                item.set_string(&dt.to_rfc3339(), false)
+                    .map_err(|_| "failed to set datetime string")?;
+                arr.push(item).map_err(|_| "failed to push datetime")?;
             }
             zv.set_hashtable(arr);
         }

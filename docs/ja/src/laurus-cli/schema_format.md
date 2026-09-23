@@ -116,6 +116,7 @@ UTC タイムスタンプフィールド。範囲クエリをサポートしま�
 [fields.created_at.DateTime]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -123,6 +124,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | 日時の範囲クエリを有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
+| `multi_valued` | `bool` | `false` | 時刻の配列を受け付け、範囲クエリは**いずれかの時刻**が条件を満たせばマッチ（Lucene 流の "any match"） |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Geo

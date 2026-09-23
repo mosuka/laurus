@@ -184,7 +184,7 @@ new \Laurus\Schema()
 | `addBytesField(string $name, bool $stored = true): void` | 生バイトフィールド。`$docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
 | `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 地理座標フィールド（緯度/経度）。`$multiValued = true` で `["lat" => .., "lon" => ..]` 配列の配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`$docValues` は上記を参照。 |
 | `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`$multiValued = true` で `["x" => .., "y" => .., "z" => ..]` 配列の配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`$docValues` は上記を参照。 |
-| `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $docValues = true): void` | UTC 日時フィールド。`$docValues` は上記を参照。 |
+| `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | UTC 日時フィールド。`$multiValued = true` で RFC 3339 文字列のシーケンシャル配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`$docValues` は上記を参照。 |
 | `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW 近似最近傍ベクトルフィールド。`$baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0): void` | Flat（総当たり）ベクトルフィールド。 |
 | `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0): void` | IVF 近似最近傍ベクトルフィールド。 |
@@ -540,3 +540,4 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（`["lat" => .., "lon" => ..]` 配列の配列） | `GeoArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
+| `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 各要素を RFC 3339 としてパース。日時でない文字列はエラー。フィールドに `$multiValued = true` が必要 |

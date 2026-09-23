@@ -245,6 +245,16 @@ pub enum DataValue {
     /// document if **any** point satisfies the predicate, scoring it by its
     /// closest matching point.
     GeoEcefArray(Vec<GeoEcefPoint>),
+
+    /// Multi-valued UTC datetimes (Issue #1184).
+    ///
+    /// Used by fields declared with
+    /// [`DateTimeOption::multi_valued`](crate::lexical::core::field::DateTimeOption::multi_valued)
+    /// set to `true`. Range queries match a document if **any** instant
+    /// satisfies the predicate (Lucene-style "any match" semantics with
+    /// constant scoring). Archived element-wise with the same
+    /// micro-second wrapper as [`DataValue::DateTime`].
+    DateTimeArray(#[rkyv(with = rkyv::with::Map<MicroSeconds>)] Vec<DateTime<Utc>>),
 }
 
 impl DataValue {
@@ -351,6 +361,14 @@ impl DataValue {
             _ => None,
         }
     }
+
+    /// Returns the multi-valued datetime slice if this is a `DateTimeArray` variant.
+    pub fn as_datetime_array(&self) -> Option<&[DateTime<Utc>]> {
+        match self {
+            DataValue::DateTimeArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 // --- Conversions ---
@@ -430,6 +448,12 @@ impl From<Vec<GeoPoint>> for DataValue {
 impl From<Vec<GeoEcefPoint>> for DataValue {
     fn from(v: Vec<GeoEcefPoint>) -> Self {
         DataValue::GeoEcefArray(v)
+    }
+}
+
+impl From<Vec<DateTime<Utc>>> for DataValue {
+    fn from(v: Vec<DateTime<Utc>>) -> Self {
+        DataValue::DateTimeArray(v)
     }
 }
 
@@ -604,6 +628,16 @@ impl DocumentBuilder {
         self.add_field(name.into(), DataValue::GeoEcefArray(points))
     }
 
+    /// Add a multi-valued datetime field.
+    ///
+    /// The schema field must be declared with
+    /// [`DateTimeOption::multi_valued`](crate::lexical::core::field::DateTimeOption::multi_valued)
+    /// set to `true`. Range queries match if any instant satisfies the
+    /// predicate.
+    pub fn add_datetime_array(self, name: impl Into<String>, values: Vec<DateTime<Utc>>) -> Self {
+        self.add_field(name.into(), DataValue::DateTimeArray(values))
+    }
+
     /// Add a binary data field with no MIME type.
     ///
     /// The MIME type is set to `None`. If a MIME type is needed (e.g. for
@@ -661,13 +695,21 @@ mod tests {
                     1.0, 2.0, 3.0,
                 )])),
             ),
+            (
+                "DateTimeArray",
+                archive(&DataValue::DateTimeArray(vec![
+                    DateTime::from_timestamp_micros(7).unwrap(),
+                ])),
+            ),
         ];
         // Little-endian rkyv 0.8 layout: the root enum sits at the end of
         // the buffer, its first byte being the archived discriminant (Geo =
         // 8, Int64Array = 10, Float64Array = 11, GeoArray = 12, GeoEcefArray
-        // = 13), followed by the payload — `ArchivedVec` is a relative
-        // pointer to the element data written before the root, plus a
-        // length.
+        // = 13, DateTimeArray = 14), followed by the payload — `ArchivedVec`
+        // is a relative pointer to the element data written before the
+        // root, plus a length. `DateTimeArray` archives its elements as
+        // micro-second `i64`s, so its bytes are `Int64Array`'s with the
+        // discriminant changed.
         let expected: Vec<(&str, Vec<u8>)> = vec![
             (
                 "Geo",
@@ -705,8 +747,60 @@ mod tests {
                     0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ],
             ),
+            (
+                "DateTimeArray",
+                vec![
+                    7, 0, 0, 0, 0, 0, 0, 0, 14, 0, 0, 0, 244, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
         ];
         assert_eq!(snapshots, expected);
+    }
+
+    /// #1184: instants round-trip at micro-second precision (the persisted
+    /// precision of a scalar `DateTime`), including pre-1970 and empty.
+    #[test]
+    fn datetime_arrays_round_trip_through_rkyv() {
+        use chrono::TimeZone;
+        for value in [
+            DataValue::DateTimeArray(vec![
+                Utc.timestamp_opt(1_700_000_000, 500_000).unwrap(),
+                Utc.timestamp_opt(-86_400, 0).unwrap(),
+            ]),
+            DataValue::DateTimeArray(Vec::new()),
+        ] {
+            let bytes = archive(&value);
+            let back = rkyv::from_bytes::<DataValue, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialization");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn datetime_array_accessors_and_builders() {
+        use chrono::TimeZone;
+        let instants = vec![
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            Utc.timestamp_opt(1_700_003_600, 0).unwrap(),
+        ];
+        let doc = Document::builder()
+            .add_datetime_array("times", instants.clone())
+            .build();
+        assert_eq!(
+            doc.get_field("times")
+                .and_then(DataValue::as_datetime_array),
+            Some(instants.as_slice())
+        );
+        assert_eq!(
+            doc.get_field("times").and_then(DataValue::as_datetime),
+            None
+        );
+        assert_eq!(DataValue::DateTime(instants[0]).as_datetime_array(), None);
+        assert_eq!(
+            DataValue::from(instants.clone()),
+            DataValue::DateTimeArray(instants)
+        );
     }
 
     #[test]

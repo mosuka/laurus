@@ -425,9 +425,12 @@ for (let i = 0; i < 10000; i++) {
 
 真偽値フィールドを追加します。`docValues` は上記を参照。
 
-#### `addDatetimeField(name, stored?, indexed?, docValues?)`
+#### `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)`
 
-日時フィールドを追加します。`docValues` は上記を参照。
+日時フィールドを追加します。`multiValued: true` を指定すると RFC 3339 文字列の配列を受け付け、
+範囲クエリ（`searchDateTimeRange` および DSL の日付範囲）は**いずれかの時刻**が条件を満たせばマッチ
+（Lucene 流の "any match"、constant スコア）します。値は UTC に正規化した RFC 3339 文字列の配列として
+読み戻されます。`docValues` は上記を参照。
 
 #### `addGeoField(name, stored?, indexed?, multiValued?, docValues?)`
 

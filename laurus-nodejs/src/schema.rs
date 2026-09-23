@@ -252,6 +252,9 @@ impl JsSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `indexed` - Whether the field is searchable (default `true`).
+    /// * `multiValued` - When `true`, the field accepts arrays of RFC 3339
+    ///   strings and range queries match if any instant satisfies the
+    ///   predicate (Lucene-style "any match"). Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[napi]
@@ -260,6 +263,7 @@ impl JsSchema {
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        multi_valued: Option<bool>,
         doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
@@ -267,6 +271,7 @@ impl JsSchema {
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );

@@ -213,7 +213,7 @@ class Schema:
 | `add_bytes_field(name, *, stored=True)` | 生バイトフィールド。`doc_values` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
 | `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 地理座標フィールド（緯度/経度）。`multi_valued=True` で `(lat, lon)` タプルのリストを受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。`doc_values` は上記を参照。 |
 | `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued=True` で `(x, y, z)` タプルのリストを受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values` は上記を参照。 |
-| `add_datetime_field(name, *, stored=True, indexed=True, doc_values=True)` | UTC 日時フィールド。`doc_values` は上記を参照。 |
+| `add_datetime_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | UTC 日時フィールド。`multi_valued=True` で `datetime.datetime` / `str` のリストを受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC の RFC 3339 文字列の `list[str]` として読み戻されます）。`doc_values` は上記を参照。 |
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat（総当たり）ベクトルフィールド。 |
 | `add_ivf_field(name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0)` | IVF 近似最近傍ベクトルフィールド。 |
@@ -590,3 +590,4 @@ Python の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `list[(lat, lon)]` | `GeoArray` | `(lat, lon)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
 | `list[(x, y, z)]` | `GeoEcefArray` | `(x, y, z)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
 | `datetime.datetime` | `DateTime` | `isoformat()` 経由で変換 |
+| `list[datetime.datetime \| str]` | `DateTimeArray` | 各要素を単一の日時と同じ規則でパース（オフセット付き RFC 3339 / ISO 8601、または naive な `YYYY-MM-DDTHH:MM:SS` を UTC として扱う。`isoformat()` を持つオブジェクトは先に変換）。日時でない `str` は `ValueError`。フィールドに `multi_valued=True` が必要 |

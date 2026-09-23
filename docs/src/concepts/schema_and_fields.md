@@ -255,6 +255,7 @@ pub enum DataValue {
     Float64Array(Vec<f64>),          // multi-valued float field
     GeoArray(Vec<GeoPoint>),         // multi-valued 2D geo field
     GeoEcefArray(Vec<GeoEcefPoint>), // multi-valued 3D ECEF field
+    DateTimeArray(Vec<DateTime<Utc>>), // multi-valued datetime field
 }
 ```
 
@@ -321,6 +322,7 @@ let schema = Schema::builder()
 | object with all three numeric keys `x`, `y`, `z` (finite values, ECEF meters) | `Geo3d` |
 | array of geo objects (e.g. `[{"lat": 35.6, "lon": 139.7}, ...]`) | `Geo` with `multi_valued = true` |
 | array of `x`/`y`/`z` objects | `Geo3d` with `multi_valued = true` |
+| array of RFC 3339 strings (e.g. `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`) | `DateTime` with `multi_valued = true` |
 | object with a `data` key (base64-encoded string) and an optional `mime` string key | `Bytes` value |
 
 Vector fields (`Hnsw`, `Flat`, `Ivf`) are **never** inferred: they must be
@@ -350,17 +352,39 @@ point closest to the box centre). Under the `Dynamic` policy an array
 that mixes 2D and 3D objects, or numbers and objects, is rejected; each
 element gets the same range validation as a single point.
 
+DateTime fields accept `multi_valued = true` as well (Issue #1184). Every
+instant of a multi-valued datetime field becomes its own 1-dimensional
+entry in the field's BKD tree, so `DateTimeRangeQuery`, a
+`NumericRangeQuery` on the field, and DSL date ranges such as
+`seen_at:[2024-06-01 TO 2024-12-31]` match a document if **any** of its
+instants is in range (Lucene-style "any match" with constant scoring —
+there is no per-match BM25 weighting). A document is reported once even
+when several of its instants match, and sub-second instants are honored
+(the bounds are encoded as fractional seconds). Under the `Dynamic`
+policy an array whose elements are all RFC 3339 strings infers a
+multi-valued `DateTime`; only RFC 3339 is accepted here (not the naive or
+date-only forms the query DSL accepts), and an array of strings where any
+element is not RFC 3339 is rejected with an error saying that multi-valued
+text fields are not supported (Issue #1175). Note the asymmetry: a
+*single* RFC 3339 string still infers `Text` (unchanged, so existing text
+fields keep their behaviour), while an *array* of RFC 3339 strings infers
+a multi-valued `DateTime` — declare the field in the schema if you want a
+single-valued `DateTime`.
+
 Single values sent to a multi-valued field are auto-wrapped into a
 one-element array; arrays sent to a single-valued field are rejected
 rather than silently truncating (the error tells you to declare the field
-with `multi_valued = true`). An empty array sent to a multi-valued geo
-field is accepted and simply has no points, so it matches no spatial
-query.
+with `multi_valued = true`). An empty array sent to a multi-valued geo or
+datetime field is accepted and simply has no points (or instants), so it
+matches no spatial or range query.
 
-Segments that contain multi-valued geo values use new stored-field type
-tags and cannot be read by builds that predate this feature; there is no
-format version bump, so an older reader fails loudly instead of
-misreading the data.
+Segments that contain multi-valued geo or datetime values use new
+stored-field type tags and cannot be read by builds that predate these
+features; there is no format version bump, so an older reader fails
+loudly instead of misreading the data. Stored multi-valued datetimes are
+kept at microsecond precision (one `i64` Unix microsecond per instant, so
+sub-microsecond digits are truncated), whereas a single-valued `DateTime`
+keeps its full precision.
 
 ### Type conflicts
 
@@ -384,6 +408,11 @@ to coerce the value to the declared type. The coercion rules are:
 | `Geo` / `Geo3d` with `multi_valued = true` | `GeoArray` / `GeoEcefArray` | stored as-is |
 | `Geo` / `Geo3d` with `multi_valued = true` | matching single point | wrapped into a one-element array |
 | `Geo` / `Geo3d` with `multi_valued = true` | empty numeric array (`[]`) | empty point list |
+| `DateTime` (single-valued) | `DateTimeArray` | error (declare `multi_valued = true`) |
+| `DateTime` with `multi_valued = true` | `DateTimeArray` | stored as-is |
+| `DateTime` with `multi_valued = true` | single `DateTime` or RFC 3339 `Text` | wrapped into a one-element array |
+| `DateTime` with `multi_valued = true` | empty numeric array (`[]`) | empty instant list |
+| `DateTime` with `multi_valued = true` | anything else | error |
 | vector (`Hnsw`/`Flat`/`Ivf`) | `Text` or `Bytes` | passed through unchanged for the field's embedder |
 | vector (`Hnsw`/`Flat`/`Ivf`) | numeric array | cast element-wise to `f32` |
 

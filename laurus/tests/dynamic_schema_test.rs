@@ -5,7 +5,7 @@
 //! the type-conflict coercion rules exercised during document ingestion.
 
 use laurus::lexical::TextOption;
-use laurus::lexical::core::field::{GeoOption, IntegerOption};
+use laurus::lexical::core::field::{DateTimeOption, GeoOption, IntegerOption};
 use laurus::storage::memory::MemoryStorageConfig;
 use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::{
@@ -251,6 +251,103 @@ async fn geo_multi_valued_coercion_at_ingest() -> Result<()> {
         Some(&[GeoPoint::new(35.1, 139.0)][..]),
         "a single point is auto-wrapped on a multi-valued field"
     );
+    Ok(())
+}
+
+/// Dynamic (#1184): a datetime array on an undeclared field is auto-added
+/// as a multi-valued DateTime field, and the array reads back intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_auto_adds_datetime_array_field() -> Result<()> {
+    use chrono::TimeZone;
+    let engine = engine_with_policy(DynamicFieldPolicy::Dynamic).await?;
+
+    let instants = vec![
+        chrono::Utc.timestamp_opt(1_700_000_000, 500_000).unwrap(),
+        chrono::Utc.timestamp_opt(1_700_003_600, 0).unwrap(),
+    ];
+    let doc = Document::builder()
+        .add_datetime_array("times", instants.clone())
+        .build();
+    engine.put_document("doc1", doc).await?;
+    engine.commit().await?;
+
+    let schema = engine.schema();
+    match schema.fields.get("times") {
+        Some(FieldOption::DateTime(opt)) => assert!(
+            opt.multi_valued,
+            "times should be DateTime with multi_valued=true"
+        ),
+        other => panic!("expected DateTime field for 'times', got {other:?}"),
+    }
+
+    let docs = engine.get_documents("doc1").await?;
+    assert_eq!(
+        docs[0].get("times").and_then(|v| v.as_datetime_array()),
+        Some(instants.as_slice())
+    );
+    Ok(())
+}
+
+/// #1184: a declared single-valued DateTime field rejects an array instead
+/// of silently truncating it; a declared multi-valued DateTime field wraps
+/// a single instant — typed or RFC 3339 text — into a one-element array.
+#[tokio::test(flavor = "multi_thread")]
+async fn datetime_multi_valued_coercion_at_ingest() -> Result<()> {
+    use chrono::TimeZone;
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let schema = Schema::builder()
+        .add_field("single", FieldOption::DateTime(DateTimeOption::default()))
+        .add_field(
+            "multi",
+            FieldOption::DateTime(DateTimeOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        )
+        .dynamic_field_policy(DynamicFieldPolicy::Strict)
+        .build();
+    let engine = Engine::new(storage, schema).await?;
+
+    let instant = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let err = engine
+        .put_document(
+            "bad",
+            Document::builder()
+                .add_datetime_array("single", vec![instant])
+                .build(),
+        )
+        .await
+        .expect_err("array into a single-valued DateTime field must be rejected");
+    assert!(
+        err.to_string().contains("multi_valued = true"),
+        "error should point at the fix: {err}"
+    );
+
+    engine
+        .put_document(
+            "typed",
+            Document::builder()
+                .add_field("multi", DataValue::DateTime(instant))
+                .build(),
+        )
+        .await?;
+    engine
+        .put_document(
+            "text",
+            Document::builder()
+                .add_field("multi", DataValue::Text("2023-11-14T22:13:20Z".to_string()))
+                .build(),
+        )
+        .await?;
+    engine.commit().await?;
+    for id in ["typed", "text"] {
+        let docs = engine.get_documents(id).await?;
+        assert_eq!(
+            docs[0].get("multi").and_then(|v| v.as_datetime_array()),
+            Some(&[instant][..]),
+            "{id}: a single instant is auto-wrapped on a multi-valued field"
+        );
+    }
     Ok(())
 }
 

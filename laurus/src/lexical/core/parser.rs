@@ -472,6 +472,28 @@ impl DocumentParser {
                         field_terms.insert(field_name.clone(), terms);
                         point_values.insert(field_name.clone(), points);
                     }
+                    FieldValue::DateTimeArray(arr) => {
+                        // Multi-valued datetime (#1184): one 1-D BKD point
+                        // per element, same shape as Int64Array.
+                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
+                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
+                        let mut offset = 0usize;
+                        for (idx, dt) in arr.iter().enumerate() {
+                            let text = dt.to_rfc3339();
+                            let len = text.len();
+                            terms.push(AnalyzedTerm {
+                                term: text,
+                                position: idx as u32,
+                                frequency: 1,
+                                offset: (offset, offset + len),
+                            });
+                            offset += len + 1;
+                            points
+                                .push(vec![crate::lexical::core::datetime::datetime_to_point(dt)]);
+                        }
+                        field_terms.insert(field_name.clone(), terms);
+                        point_values.insert(field_name.clone(), points);
+                    }
                     // Not lexically indexable: no term representation
                     // exists for these, regardless of `should_index`.
                     // Spelled out rather than a wildcard `_ =>` so a new

@@ -174,7 +174,7 @@ Laurus::Schema.new
 | `add_bytes_field(name, stored: true)` | Raw bytes field. No `doc_values:` option: a `Bytes` value is never written to DocValues regardless. |
 | `add_geo_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | Geographic coordinate field (lat/lon). Pass `multi_valued: true` to accept an Array of `{ "lat" => .., "lon" => .. }` Hashes (distance / bounding-box queries match if any point satisfies the predicate). See `doc_values:` above. |
 | `add_geo3d_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `multi_valued: true` to accept an Array of `{ "x" => .., "y" => .., "z" => .. }` Hashes (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `doc_values:` above. |
-| `add_datetime_field(name, stored: true, indexed: true, doc_values: true)` | UTC datetime field. See `doc_values:` above. |
+| `add_datetime_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | UTC datetime field. Pass `multi_valued: true` to accept an Array of `Time` / `DateTime` / RFC 3339 `String` values (range queries match if any instant satisfies the predicate; values are read back as an Array of RFC 3339 Strings in UTC). See `doc_values:` above. |
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat (brute-force) vector field. |
 | `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil, base_weight: 1.0)` | IVF approximate nearest-neighbor vector field. |
@@ -573,3 +573,4 @@ Ruby values are automatically converted to Laurus `DataValue` types:
 | `Array` of `Hash` with `"lat"`, `"lon"` | `GeoArray` | Requires `multi_valued: true` on the field |
 | `Array` of `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcefArray` | Requires `multi_valued: true` on the field |
 | `Time` / `String` responding to `iso8601` | `DateTime` | Converted via `iso8601` |
+| `Array` of `Time` / `String` responding to `iso8601` | `DateTimeArray` | Each element parsed as RFC 3339 (objects responding to `iso8601` are converted first); a non-datetime `String` raises `ArgumentError`. Requires `multi_valued: true` on the field |

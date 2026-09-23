@@ -129,6 +129,63 @@ class TestMultiValuedArrayIngest < Minitest::Test
     assert_match(/multi_valued/, err.message)
   end
 
+  # ---- Multi-valued datetime (Issue #1184) ----
+
+  def index_with_datetime_field(multi_valued:)
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    schema.add_datetime_field("seen_at", multi_valued: multi_valued)
+    Laurus::Index.new(schema: schema)
+  end
+
+  # An Array of RFC 3339 Strings / Time objects is a multi-valued datetime
+  # field; it reads back as RFC 3339 Strings (UTC) and any instant matches.
+  def test_datetime_array_round_trips_through_multi_valued_datetime_field
+    idx = index_with_datetime_field(multi_valued: true)
+    idx.put_document(
+      "doc1",
+      { "title" => "t", "seen_at" => ["2024-01-01T00:00:00Z", Time.new(2024, 6, 15, 21, 0, 0, "+09:00")] }
+    )
+    idx.put_document("doc2", { "title" => "t", "seen_at" => ["2025-03-01T00:00:00Z"] })
+    idx.commit
+
+    assert_equal ["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"],
+                 idx.get_documents("doc1").first["seen_at"]
+    assert_equal ["doc1"], idx.search("seen_at:[2024-06-01 TO 2024-12-31]", limit: 5).map(&:id)
+  end
+
+  def test_single_datetime_is_wrapped_on_multi_valued_datetime_field
+    idx = index_with_datetime_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "seen_at" => "2024-01-01T00:00:00Z" })
+    idx.commit
+
+    assert_equal ["2024-01-01T00:00:00+00:00"], idx.get_documents("doc1").first["seen_at"]
+  end
+
+  def test_empty_array_is_accepted_by_multi_valued_datetime_field
+    idx = index_with_datetime_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "seen_at" => [] })
+    idx.commit
+
+    assert_equal [], idx.get_documents("doc1").first["seen_at"]
+  end
+
+  def test_datetime_array_into_single_valued_datetime_field_is_rejected
+    idx = index_with_datetime_field(multi_valued: false)
+    err = assert_raises(StandardError) do
+      idx.put_document("doc1", { "title" => "t", "seen_at" => ["2024-01-01T00:00:00Z"] })
+    end
+    assert_match(/multi_valued/, err.message)
+  end
+
+  def test_non_datetime_string_array_is_rejected
+    idx = index_with_datetime_field(multi_valued: true)
+    err = assert_raises(ArgumentError) do
+      idx.put_document("doc1", { "title" => "t", "seen_at" => ["2024-01-01T00:00:00Z", "tomorrow"] })
+    end
+    assert_match(/datetimes/, err.message)
+  end
+
   def test_mixed_geo_dimension_array_is_rejected
     idx = index_with_geo_field(multi_valued: true)
     assert_raises(StandardError) do

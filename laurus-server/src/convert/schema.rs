@@ -149,6 +149,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::DateTime(o) => Some(Opt::DateTime(v1::DateTimeOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Geo(o) => Some(Opt::Geo(v1::GeoOption {
@@ -238,6 +239,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
         Some(Opt::DateTime(o)) => Some(FieldOption::DateTime(DateTimeOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::Geo(o)) => Some(FieldOption::Geo(GeoOption {
@@ -1220,6 +1222,30 @@ mod tests {
     /// #1174: `multi_valued` round-trips for Geo and Geo3d (proto field 4),
     /// and `Geo3dOption.doc_values = false` survives the trip — the reverse
     /// conversion used to hardcode `true`.
+    /// #1184: `DateTimeOption.multi_valued` (proto field 4) round-trips.
+    #[test]
+    fn schema_field_option_datetime_multi_valued_round_trip() {
+        let schema = Schema::builder()
+            .add_field(
+                "times",
+                FieldOption::DateTime(DateTimeOption {
+                    indexed: true,
+                    stored: true,
+                    multi_valued: true,
+                    doc_values: false,
+                }),
+            )
+            .build();
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("times") {
+            Some(FieldOption::DateTime(o)) => {
+                assert!(o.multi_valued);
+                assert!(!o.doc_values);
+            }
+            other => panic!("expected FieldOption::DateTime, got {other:?}"),
+        }
+    }
+
     #[test]
     fn schema_field_option_geo_multi_valued_round_trip() {
         let schema = Schema::builder()

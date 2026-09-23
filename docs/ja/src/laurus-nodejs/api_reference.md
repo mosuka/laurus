@@ -203,7 +203,7 @@ class Schema {
 | `addBytesField(name, stored?)` | バイナリデータフィールド。`docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
 | `addGeoField(name, stored?, indexed?, multiValued?, docValues?)` | 地理座標フィールド。`multiValued: true` で `{ lat, lon }` オブジェクトの配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`docValues` は上記を参照。 |
 | `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multiValued: true` で `{ x, y, z }` オブジェクトの配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
-| `addDatetimeField(name, stored?, indexed?, docValues?)` | UTC 日時フィールド。`docValues` は上記を参照。 |
+| `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)` | UTC 日時フィールド。`multiValued: true` で RFC 3339 文字列の配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`docValues` は上記を参照。 |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW ベクトルフィールド。`baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |
@@ -705,3 +705,4 @@ JavaScript の値は自動的に Laurus の `DataValue` 型に変換されます
 | `{ x, y, z }` | `GeoEcef` | 3 つの `number` 値（メートル単位、3D ECEF 直交座標） |
 | `{ lat, lon }[]` | `GeoArray` | `{ lat, lon }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `{ x, y, z }[]` | `GeoEcefArray` | `{ x, y, z }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
+| `string[]`（すべて RFC 3339） | `DateTimeArray` | RFC 3339 日時文字列の配列。フィールドに `multiValued: true` が必要。RFC 3339 でない要素を含む文字列配列は拒否される |

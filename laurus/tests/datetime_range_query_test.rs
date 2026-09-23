@@ -42,6 +42,7 @@ fn store(indexed: bool) -> LexicalStore {
             FieldOption::DateTime(DateTimeOption {
                 indexed,
                 stored: true,
+                multi_valued: false,
                 doc_values: true,
             }),
         )

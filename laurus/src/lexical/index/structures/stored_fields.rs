@@ -112,6 +112,12 @@ const TAG_GEO_ECEF: u8 = 12;
 // with `Unknown field type tag` (loud, recorded on Issue #1040).
 const TAG_GEO_ARRAY: u8 = 13;
 const TAG_GEO_ECEF_ARRAY: u8 = 14;
+// Multi-valued datetime (#1184): varint length + i64 LE Unix micro-seconds
+// per element — the persisted precision of a `DataValue::DateTime` (rkyv
+// `MicroSeconds`) and the proto representation. Unlike the scalar tag 5,
+// which stores RFC 3339 text, sub-microsecond detail is truncated. Same
+// no-version-bump policy as tags 10–14 (recorded on Issue #1040).
+const TAG_DATETIME_ARRAY: u8 = 15;
 
 // ---------------------------------------------------------------------------
 // Encoding (document -> plain bytes, before compression)
@@ -214,6 +220,13 @@ fn encode_document(buf: &mut Vec<u8>, doc_id: u64, fields: &AHashMap<String, Dat
                     buf.extend_from_slice(&p.x.to_le_bytes());
                     buf.extend_from_slice(&p.y.to_le_bytes());
                     buf.extend_from_slice(&p.z.to_le_bytes());
+                }
+            }
+            DataValue::DateTimeArray(arr) => {
+                buf.push(TAG_DATETIME_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for dt in arr {
+                    buf.extend_from_slice(&dt.timestamp_micros().to_le_bytes());
                 }
             }
         }
@@ -399,6 +412,30 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                     arr.push(GeoEcefPoint::new(x, y, z));
                 }
                 DataValue::GeoEcefArray(arr)
+            }
+            TAG_DATETIME_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored DateTimeArray field length")? as usize;
+                let len = checked_capacity(
+                    len,
+                    8,
+                    (bytes.len() - *cursor) as u64,
+                    "stored DateTimeArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let micros =
+                        read_u64_le(bytes, cursor, "stored DateTimeArray field element")? as i64;
+                    // Every value the encoder writes is representable; a
+                    // failure here is corruption and must not decode as the
+                    // epoch silently.
+                    let dt = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+                        LaurusError::index(format!(
+                            "stored DateTimeArray element out of range: {micros} µs"
+                        ))
+                    })?;
+                    arr.push(dt);
+                }
+                DataValue::DateTimeArray(arr)
             }
             other => {
                 return Err(LaurusError::index(format!(
@@ -769,6 +806,19 @@ mod tests {
                     "q_geo_ecef_array_empty",
                     DataValue::GeoEcefArray(Vec::new()),
                 ),
+                // Multi-valued datetimes (#1184): micro-second precision,
+                // pre-1970 instants, and the empty list.
+                (
+                    "r_datetime_array",
+                    DataValue::DateTimeArray(vec![
+                        chrono::DateTime::from_timestamp_micros(1_700_000_000_500_000).unwrap(),
+                        chrono::DateTime::from_timestamp_micros(-86_400_000_001).unwrap(),
+                    ]),
+                ),
+                (
+                    "s_datetime_array_empty",
+                    DataValue::DateTimeArray(Vec::new()),
+                ),
             ]),
         )];
 
@@ -838,6 +888,61 @@ mod tests {
         assert_eq!(
             d.fields.get("q_geo_ecef_array_empty"),
             Some(&DataValue::GeoEcefArray(Vec::new()))
+        );
+        assert_eq!(
+            d.fields.get("r_datetime_array"),
+            Some(&DataValue::DateTimeArray(vec![
+                chrono::DateTime::from_timestamp_micros(1_700_000_000_500_000).unwrap(),
+                chrono::DateTime::from_timestamp_micros(-86_400_000_001).unwrap(),
+            ]))
+        );
+        assert_eq!(
+            d.fields.get("s_datetime_array_empty"),
+            Some(&DataValue::DateTimeArray(Vec::new()))
+        );
+    }
+
+    /// #1184: tag 15 stores micro-seconds, so sub-microsecond detail is
+    /// truncated (the scalar tag 5 keeps nanoseconds via RFC 3339). Pinned so
+    /// a change of encoding is a deliberate decision.
+    #[test]
+    fn datetime_array_truncates_sub_microsecond_precision() {
+        use chrono::TimeZone;
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let precise = chrono::Utc
+            .timestamp_opt(1_700_000_000, 123_456_789)
+            .unwrap();
+        let docs = vec![(1u64, doc(&[("t", DataValue::DateTimeArray(vec![precise]))]))];
+        let documents = round_trip(&storage, "seg", &docs);
+        assert_eq!(
+            documents[&1].fields.get("t"),
+            Some(&DataValue::DateTimeArray(vec![
+                chrono::Utc
+                    .timestamp_opt(1_700_000_000, 123_456_000)
+                    .unwrap(),
+            ]))
+        );
+    }
+
+    /// #1184: a micro-second value outside chrono's range can only come from
+    /// corruption; it must be a loud decode error, never a silent epoch.
+    #[test]
+    fn rejects_a_corrupted_datetime_array_element() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // doc id
+        write_varint(&mut buf, 1); // field count
+        write_varint(&mut buf, 1); // name length
+        buf.extend_from_slice(b"t");
+        buf.push(TAG_DATETIME_ARRAY);
+        write_varint(&mut buf, 1); // element count
+        buf.extend_from_slice(&i64::MAX.to_le_bytes());
+
+        let mut cursor = 0;
+        let err = decode_document(&buf, &mut cursor).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DateTimeArray element out of range"),
+            "{err}"
         );
     }
 

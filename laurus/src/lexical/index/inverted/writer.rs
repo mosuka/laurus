@@ -570,6 +570,24 @@ pub(crate) fn analyze_field_value(
                 points.push(vec![p.x, p.y, p.z]);
             }
         }
+        DataValue::DateTimeArray(arr) => {
+            // Multi-valued datetime field (#1184): one 1-D BKD point per
+            // element, same shape as Int64Array; the term keeps the single
+            // arm's whole-second epoch text.
+            let mut offset = 0usize;
+            for (idx, dt) in arr.iter().enumerate() {
+                let text = dt.timestamp().to_string();
+                let len = text.len();
+                terms.push(AnalyzedTerm {
+                    term: text,
+                    position: idx as u32,
+                    frequency: 1,
+                    offset: (offset, offset + len),
+                });
+                offset += len + 1;
+                points.push(vec![crate::lexical::core::datetime::datetime_to_point(dt)]);
+            }
+        }
         // Not lexically indexable: no term representation exists for these.
         // Spelled out rather than a wildcard `_ =>` so a new `DataValue`
         // variant fails exhaustiveness checking here instead of being
@@ -1184,6 +1202,9 @@ impl InvertedIndexWriter {
             DataValue::GeoArray(v) => v.len() * std::mem::size_of::<crate::data::GeoPoint>(),
             DataValue::GeoEcefArray(v) => {
                 v.len() * std::mem::size_of::<crate::data::GeoEcefPoint>()
+            }
+            DataValue::DateTimeArray(v) => {
+                v.len() * std::mem::size_of::<chrono::DateTime<chrono::Utc>>()
             }
             // The remaining variants are fixed-size and already covered by
             // `size_of::<DataValue>()`.

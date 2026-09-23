@@ -44,6 +44,7 @@ pub fn json_to_document(value: &Value) -> napi::Result<Document> {
 ///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
 /// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
+/// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -185,6 +186,13 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
         DataValue::GeoEcefArray(arr) => Value::Array(
             arr.iter()
                 .map(|p| serde_json::json!({ "x": p.x, "y": p.y, "z": p.z }))
+                .collect(),
+        ),
+        // RFC 3339 strings, which `infer_from_json` reads back as a
+        // multi-valued datetime (#1184).
+        DataValue::DateTimeArray(arr) => Value::Array(
+            arr.iter()
+                .map(|dt| Value::String(dt.to_rfc3339()))
                 .collect(),
         ),
     }

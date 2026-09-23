@@ -54,7 +54,7 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
         FieldOption::Integer(opt) => coerce_to_integer(field_name, opt, value),
         FieldOption::Float(opt) => coerce_to_float(field_name, opt, value),
         FieldOption::Boolean(_) => coerce_to_boolean(field_name, value),
-        FieldOption::DateTime(_) => coerce_to_datetime(field_name, value),
+        FieldOption::DateTime(opt) => coerce_to_datetime(field_name, opt, value),
         FieldOption::Geo(opt) => coerce_to_geo(field_name, opt, value),
         FieldOption::Geo3d(opt) => coerce_to_geo3d(field_name, opt, value),
         FieldOption::Bytes(_) => coerce_to_bytes(field_name, value),
@@ -219,21 +219,51 @@ fn coerce_to_boolean(field_name: &str, value: DataValue) -> Result<DataValue> {
     }
 }
 
-fn coerce_to_datetime(field_name: &str, value: DataValue) -> Result<DataValue> {
-    match value {
-        DataValue::DateTime(dt) => Ok(DataValue::DateTime(dt)),
-        DataValue::Text(s) => {
-            let parsed = chrono::DateTime::parse_from_rfc3339(s.trim()).map_err(|e| {
+fn coerce_to_datetime(
+    field_name: &str,
+    option: &crate::lexical::core::field::DateTimeOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s.trim())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| {
                 LaurusError::invalid_argument(format!(
                     "field '{field_name}': cannot parse '{s}' as an RFC 3339 datetime: {e}"
                 ))
-            })?;
-            Ok(DataValue::DateTime(parsed.with_timezone(&chrono::Utc)))
+            })
+    };
+    if option.multi_valued {
+        // Multi-valued datetime field (#1184). A single instant (typed or
+        // RFC 3339 text) is auto-wrapped; an empty *numeric* array is an
+        // empty instant list because every binding turns `[]` into
+        // `Int64Array(vec![])` before the field type is known (#1178).
+        match value {
+            DataValue::DateTimeArray(arr) => Ok(DataValue::DateTimeArray(arr)),
+            DataValue::DateTime(dt) => Ok(DataValue::DateTimeArray(vec![dt])),
+            DataValue::Text(s) => Ok(DataValue::DateTimeArray(vec![parse(&s)?])),
+            DataValue::Int64Array(a) if a.is_empty() => Ok(DataValue::DateTimeArray(Vec::new())),
+            DataValue::Float64Array(a) if a.is_empty() => Ok(DataValue::DateTimeArray(Vec::new())),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a multi-valued datetime",
+                describe(&other)
+            ))),
         }
-        other => Err(LaurusError::invalid_argument(format!(
-            "field '{field_name}': cannot coerce {} to a datetime",
-            describe(&other)
-        ))),
+    } else {
+        match value {
+            DataValue::DateTime(dt) => Ok(DataValue::DateTime(dt)),
+            DataValue::Text(s) => Ok(DataValue::DateTime(parse(&s)?)),
+            // Multi-valued input to a single-valued field is rejected
+            // rather than silently truncating to one element.
+            DataValue::DateTimeArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a datetime",
+                describe(&other)
+            ))),
+        }
     }
 }
 
@@ -378,6 +408,7 @@ fn describe(value: &DataValue) -> &'static str {
         DataValue::Float64Array(_) => "float array",
         DataValue::GeoArray(_) => "geo array",
         DataValue::GeoEcefArray(_) => "geo3d array",
+        DataValue::DateTimeArray(_) => "datetime array",
     }
 }
 
@@ -424,6 +455,86 @@ mod tests {
             multi_valued: true,
             ..Default::default()
         })
+    }
+
+    fn dt_single() -> FieldOption {
+        FieldOption::DateTime(crate::lexical::core::field::DateTimeOption::default())
+    }
+
+    fn dt_multi() -> FieldOption {
+        FieldOption::DateTime(crate::lexical::core::field::DateTimeOption {
+            multi_valued: true,
+            ..Default::default()
+        })
+    }
+
+    // ---- Multi-valued datetime (#1184) ----
+
+    #[test]
+    fn datetime_multi_valued_accepts_array_and_wraps_single() {
+        use chrono::TimeZone;
+        let a = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let b = chrono::Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap();
+        assert_eq!(
+            coerce_value("t", &dt_multi(), DataValue::DateTimeArray(vec![a, b])).unwrap(),
+            DataValue::DateTimeArray(vec![a, b])
+        );
+        assert_eq!(
+            coerce_value("t", &dt_multi(), DataValue::DateTime(a)).unwrap(),
+            DataValue::DateTimeArray(vec![a])
+        );
+        // RFC 3339 text is parsed like the single-valued path, then wrapped.
+        assert_eq!(
+            coerce_value(
+                "t",
+                &dt_multi(),
+                DataValue::Text("2024-06-15T21:00:00+09:00".to_string())
+            )
+            .unwrap(),
+            DataValue::DateTimeArray(vec![b])
+        );
+        assert!(coerce_value("t", &dt_multi(), DataValue::Text("yesterday".to_string())).is_err());
+    }
+
+    #[test]
+    fn datetime_multi_valued_accepts_empty_numeric_array_only() {
+        // Bindings turn `[]` into an empty numeric array before the field
+        // type is known (#1178); that must read as "no instants".
+        assert_eq!(
+            coerce_value("t", &dt_multi(), DataValue::Int64Array(Vec::new())).unwrap(),
+            DataValue::DateTimeArray(Vec::new())
+        );
+        assert_eq!(
+            coerce_value("t", &dt_multi(), DataValue::Float64Array(Vec::new())).unwrap(),
+            DataValue::DateTimeArray(Vec::new())
+        );
+        assert!(
+            coerce_value("t", &dt_multi(), DataValue::Int64Array(vec![1_700_000_000])).is_err(),
+            "a non-empty numeric array is not an instant list"
+        );
+        assert!(coerce_value("t", &dt_multi(), DataValue::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn datetime_single_valued_rejects_arrays() {
+        use chrono::TimeZone;
+        let a = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let err = coerce_value("t", &dt_single(), DataValue::DateTimeArray(vec![a])).unwrap_err();
+        assert!(err.to_string().contains("multi_valued = true"), "{err}");
+        // The single-valued contract is otherwise untouched.
+        assert_eq!(
+            coerce_value("t", &dt_single(), DataValue::DateTime(a)).unwrap(),
+            DataValue::DateTime(a)
+        );
+        assert_eq!(
+            coerce_value(
+                "t",
+                &dt_single(),
+                DataValue::Text("2024-01-01T00:00:00Z".to_string())
+            )
+            .unwrap(),
+            DataValue::DateTime(a)
+        );
     }
 
     fn bytes() -> FieldOption {

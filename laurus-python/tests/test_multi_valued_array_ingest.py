@@ -142,3 +142,62 @@ def test_mixed_tuple_arities_are_rejected():
         idx.put_document(
             "doc1", {"title": "t", "spots": [(35.68, 139.76), (1.0, 2.0, 3.0)]}
         )
+
+
+# ---- Multi-valued datetime (Issue #1184) ----
+
+
+def test_datetime_list_round_trips_through_multi_valued_datetime_field():
+    """A list of RFC 3339 strings or ``datetime`` objects is a multi-valued
+    datetime field; it reads back as RFC 3339 strings (UTC) and any instant
+    matches a range query."""
+    from datetime import datetime, timedelta, timezone
+
+    idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
+    tokyo = timezone(timedelta(hours=9))
+    idx.put_document(
+        "doc1",
+        {
+            "title": "t",
+            "seen_at": ["2024-01-01T00:00:00Z", datetime(2024, 6, 15, 21, 0, 0, tzinfo=tokyo)],
+        },
+    )
+    idx.put_document("doc2", {"title": "t", "seen_at": ["2025-03-01T00:00:00Z"]})
+    idx.commit()
+
+    docs = idx.get_documents("doc1")
+    assert docs[0]["seen_at"] == ["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"]
+    hits = idx.search("seen_at:[2024-06-01 TO 2024-12-31]", limit=5)
+    assert [h.id for h in hits] == ["doc1"]
+
+
+def test_single_datetime_is_wrapped_on_multi_valued_datetime_field():
+    idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "seen_at": "2024-01-01T00:00:00Z"})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["seen_at"] == ["2024-01-01T00:00:00+00:00"]
+
+
+def test_empty_list_is_accepted_by_multi_valued_datetime_field():
+    idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "seen_at": []})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["seen_at"] == []
+
+
+def test_datetime_list_into_single_valued_datetime_field_is_rejected():
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_datetime_field, "seen_at")
+    with pytest.raises(Exception, match="multi_valued"):
+        idx.put_document("doc1", {"title": "t", "seen_at": ["2024-01-01T00:00:00Z"]})
+
+
+def test_non_datetime_string_list_is_rejected():
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
+    with pytest.raises(ValueError, match="datetimes"):
+        idx.put_document("doc1", {"title": "t", "seen_at": ["2024-01-01T00:00:00Z", "tomorrow"]})

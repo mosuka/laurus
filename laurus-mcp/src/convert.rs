@@ -71,16 +71,7 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
             Value::String(base64::engine::general_purpose::STANDARD.encode(b))
         }
         Some(Kind::VectorValue(v)) => json!(v.values),
-        Some(Kind::DatetimeValue(us)) => {
-            // Convert Unix microseconds to ISO 8601.
-            let secs = us / 1_000_000;
-            let nanos = ((us % 1_000_000) * 1_000) as u32;
-            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                Value::String(dt.to_rfc3339())
-            } else {
-                json!(us)
-            }
-        }
+        Some(Kind::DatetimeValue(us)) => datetime_micros_to_json(*us),
         Some(Kind::GeoValue(g)) => json!({ "lat": g.latitude, "lon": g.longitude }),
         Some(Kind::Geo3dValue(p)) => json!({ "x": p.x, "y": p.y, "z": p.z }),
         Some(Kind::Int64ArrayValue(arr)) => json!(arr.values),
@@ -97,6 +88,23 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|p| json!({ "x": p.x, "y": p.y, "z": p.z }))
                 .collect(),
         ),
+        Some(Kind::DatetimeArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|us| datetime_micros_to_json(*us))
+                .collect(),
+        ),
+    }
+}
+
+/// Convert Unix microseconds to an ISO 8601 / RFC 3339 string, or the raw
+/// number when the value is outside chrono's range. `from_timestamp_micros`
+/// handles pre-1970 values correctly, unlike the previous truncating
+/// seconds/nanos split.
+fn datetime_micros_to_json(us: i64) -> Value {
+    match chrono::DateTime::from_timestamp_micros(us) {
+        Some(dt) => Value::String(dt.to_rfc3339()),
+        None => json!(us),
     }
 }
 
@@ -582,6 +590,47 @@ mod tests {
         assert_eq!(
             json["fields"]["positions"],
             json!([{ "x": 1.0, "y": 2.0, "z": 3.0 }])
+        );
+    }
+
+    #[test]
+    fn json_to_proto_datetime_array_and_back() {
+        // #1184: an array of RFC 3339 strings becomes a `DatetimeArrayValue`
+        // and is surfaced back to MCP clients as RFC 3339 strings (UTC).
+        let json_val = json!({
+            "fields": {
+                "times": ["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"],
+            }
+        });
+        let doc = json_to_document(&json_val).unwrap();
+        match &doc.fields["times"].kind {
+            Some(v1::value::Kind::DatetimeArrayValue(a)) => {
+                assert_eq!(a.values, vec![1_704_067_200_000_000, 1_718_452_800_000_000]);
+            }
+            other => panic!("expected DatetimeArrayValue, got {other:?}"),
+        }
+        let json = document_to_json(&doc);
+        assert_eq!(
+            json["fields"]["times"],
+            json!(["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"])
+        );
+    }
+
+    /// Regression: pre-1970 micros used to collapse onto the epoch because
+    /// the seconds/nanos split truncated toward zero.
+    #[test]
+    fn proto_to_json_datetime_pre_1970() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "t".to_string(),
+            v1::Value {
+                kind: Some(v1::value::Kind::DatetimeValue(-86_400_000_001)),
+            },
+        );
+        let json = document_to_json(&v1::Document { fields });
+        assert_eq!(
+            json["fields"]["t"],
+            json!("1969-12-30T23:59:59.999999+00:00")
         );
     }
 

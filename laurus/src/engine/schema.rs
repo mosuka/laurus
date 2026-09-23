@@ -385,8 +385,12 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
             o.indexed, n.indexed, o.stored,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
-        (FieldOption::DateTime(o), FieldOption::DateTime(n)) => classify_indexed_only(
-            o.indexed, n.indexed, o.stored,
+        (FieldOption::DateTime(o), FieldOption::DateTime(n)) => classify_bkd_lexical(
+            o.indexed,
+            n.indexed,
+            o.stored,
+            o.multi_valued,
+            n.multi_valued,
         )
         .max(classify_doc_values(o.doc_values, n.doc_values, o.stored)),
         (FieldOption::Geo(o), FieldOption::Geo(n)) => classify_bkd_lexical(
@@ -430,9 +434,9 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
     }
 }
 
-/// Shared classification for `indexed`-only lexical options (Boolean,
-/// DateTime); the BKD-backed options (Integer, Float, Geo, Geo3d) layer
-/// their `multi_valued` rule on top of this in [`classify_bkd_lexical`].
+/// Shared classification for `indexed`-only lexical options (Boolean); the
+/// BKD-backed options (Integer, Float, Geo, Geo3d, DateTime) layer their
+/// `multi_valued` rule on top of this in [`classify_bkd_lexical`].
 ///
 /// Only the `false -> true` transition requires rebuilding: documents
 /// ingested while the field was `indexed: false` have no postings to
@@ -526,7 +530,8 @@ fn classify_text(old: &TextOption, new: &TextOption) -> FieldChangeKind {
 }
 
 /// Classification shared by the BKD-backed lexical options
-/// (`IntegerOption`/`FloatOption`, and since #1174 `GeoOption`/`Geo3dOption`):
+/// (`IntegerOption`/`FloatOption`, since #1174 `GeoOption`/`Geo3dOption`,
+/// and since #1184 `DateTimeOption`):
 /// `indexed` follows [`classify_indexed_only`] (`stored`-dependent, since
 /// turning indexing on has no BKD points to source from for a
 /// `stored: false` field that was never indexed). `multi_valued: false ->
@@ -1129,6 +1134,34 @@ mod tests {
                 "datetime: indexed false->true requires reindex",
                 datetime(|o| o.indexed(false)),
                 datetime(|o| o.indexed(true)),
+                Reindex,
+            ),
+            (
+                "datetime: multi_valued false->true is metadata-only",
+                datetime(|o| o),
+                datetime(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                MetadataOnly,
+            ),
+            (
+                "datetime: multi_valued true->false requires reindex",
+                datetime(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                datetime(|o| o),
+                Reindex,
+            ),
+            (
+                "datetime: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                datetime(|mut o| {
+                    o.stored = false;
+                    o.multi_valued = true;
+                    o
+                }),
+                datetime(|o| o.stored(false)),
                 Reindex,
             ),
             // ---- Geo ----
