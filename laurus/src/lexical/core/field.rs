@@ -570,6 +570,15 @@ pub struct DateTimeOption {
     #[serde(default = "default_true")]
     pub stored: bool,
 
+    /// Whether this field can hold multiple instants per document (Issue #1184).
+    ///
+    /// When `true`, the field accepts [`DataValue::DateTimeArray`](crate::data::DataValue::DateTimeArray)
+    /// (and auto-wraps a single datetime) and range queries match a
+    /// document if **any** instant satisfies the predicate. Defaults to
+    /// `false`.
+    #[serde(default)]
+    pub multi_valued: bool,
+
     /// Whether this field's value is also copied into DocValues, the
     /// column-oriented store `SortField::Field`, faceting, and
     /// aggregations read from (Issue #1047).
@@ -608,6 +617,7 @@ impl Default for DateTimeOption {
         Self {
             indexed: true,
             stored: true,
+            multi_valued: false,
             doc_values: true,
         }
     }
@@ -829,6 +839,10 @@ impl FieldOption {
                 ..Default::default()
             }),
             FieldValue::GeoEcefArray(_) => FieldOption::Geo3d(Geo3dOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+            FieldValue::DateTimeArray(_) => FieldOption::DateTime(DateTimeOption {
                 multi_valued: true,
                 ..Default::default()
             }),

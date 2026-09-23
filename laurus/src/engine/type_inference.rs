@@ -125,6 +125,12 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
                 ..Default::default()
             },
         ))),
+        DataValue::DateTimeArray(_) => Ok(Some(FieldOption::DateTime(
+            crate::lexical::core::field::DateTimeOption {
+                multi_valued: true,
+                ..Default::default()
+            },
+        ))),
         DataValue::Vector(_) => Err(LaurusError::invalid_argument(
             "vector values require an explicit vector field declaration \
              (Hnsw, Flat, or Ivf) in the schema",
@@ -153,6 +159,7 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
 /// | `array` containing any non-i64 number | [`DataValue::Float64Array`] | [`FieldOption::Float`] with `multi_valued = true` |
 /// | `array` of `lat`/`lon` objects | [`DataValue::GeoArray`] | [`FieldOption::Geo`] with `multi_valued = true` |
 /// | `array` of `x`/`y`/`z` objects | [`DataValue::GeoEcefArray`] | [`FieldOption::Geo3d`] with `multi_valued = true` |
+/// | `array` of RFC 3339 strings | [`DataValue::DateTimeArray`] | [`FieldOption::DateTime`] with `multi_valued = true` (a *single* string stays `Text`) |
 /// | empty `array` | (none) | (none) — returns [`InferredValue::Skip`] |
 ///
 /// # Arguments
@@ -207,8 +214,11 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 /// same one of [`DataValue::Geo`] / [`DataValue::GeoEcef`] — map to
 /// [`DataValue::GeoArray`] / [`DataValue::GeoEcefArray`] backed by a
 /// [`GeoOption`] / `Geo3dOption` with `multi_valued = true` (Issue #1174).
-/// Empty arrays return [`InferredValue::Skip`] because their element type
-/// cannot be determined.
+/// Arrays whose elements are all RFC 3339 strings map to
+/// [`DataValue::DateTimeArray`] backed by a `DateTimeOption` with
+/// `multi_valued = true` (Issue #1184; a single string still infers
+/// [`DataValue::Text`]). Empty arrays return [`InferredValue::Skip`]
+/// because their element type cannot be determined.
 ///
 /// # Arguments
 ///
@@ -217,18 +227,22 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 /// # Errors
 ///
 /// Returns [`LaurusError::invalid_argument`] when the array mixes numbers
-/// with non-numbers, mixes 2D and 3D geo objects, or contains an object
-/// that is not a geo point.
+/// with non-numbers, mixes 2D and 3D geo objects, contains an object that
+/// is not a geo point, or contains a string that is not an RFC 3339
+/// datetime.
 fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
     if arr.is_empty() {
         return Ok(InferredValue::Skip);
     }
 
-    // Gated on *every* element being an object so a mixed array such as
-    // `[1, {"lat": ..}]` still falls through to the numeric path's error
-    // below, which existing callers and tests rely on.
+    // Gated on *every* element being an object (or, below, a string) so a
+    // mixed array such as `[1, {"lat": ..}]` still falls through to the
+    // numeric path's error below, which existing callers and tests rely on.
     if arr.iter().all(JsonValue::is_object) {
         return infer_geo_array(arr);
+    }
+    if arr.iter().all(JsonValue::is_string) {
+        return infer_datetime_array(arr);
     }
 
     let mut all_i64 = true;
@@ -282,6 +296,35 @@ fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
             }),
         })
     }
+}
+
+/// Infer a multi-valued datetime field from an array whose elements are all
+/// strings (Issue #1184). Every element must be an RFC 3339 datetime — the
+/// same grammar the single-value coercion accepts — and offsets are
+/// normalized to UTC. This is deliberately the only string shape that
+/// infers a `DateTime`: a single string keeps inferring `Text` (changing
+/// that would re-type existing Text fields under the Dynamic policy), and
+/// there is no multi-valued text field for other string arrays to fall
+/// back to yet (#1175).
+fn infer_datetime_array(arr: &[JsonValue]) -> Result<InferredValue> {
+    let mut values = Vec::with_capacity(arr.len());
+    for elem in arr {
+        let s = elem.as_str().expect("gated on all-strings by the caller");
+        let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).map_err(|e| {
+            LaurusError::invalid_argument(format!(
+                "array of strings must be all RFC 3339 datetimes \
+                 (multi-valued text fields are not supported): {s:?}: {e}"
+            ))
+        })?;
+        values.push(dt.with_timezone(&chrono::Utc));
+    }
+    Ok(InferredValue::Inferred {
+        value: DataValue::DateTimeArray(values),
+        option: FieldOption::DateTime(crate::lexical::core::field::DateTimeOption {
+            multi_valued: true,
+            ..Default::default()
+        }),
+    })
 }
 
 /// Infer a multi-valued geo field from an array whose elements are all
@@ -839,5 +882,75 @@ mod tests {
         // number/object mix keeps the pre-#1174 numeric-array error text.
         let err = infer_from_json(&json!([1, {"lat": 35.1, "lon": 139.0}])).unwrap_err();
         assert!(err.to_string().contains("only numeric"), "{err}");
+    }
+
+    // ---- Multi-valued datetime arrays (#1184) ----
+
+    #[test]
+    fn infer_rfc3339_string_array_to_datetime_array() {
+        use chrono::TimeZone;
+        let (v, o) = inferred(
+            infer_from_json(&json!([
+                "2024-01-01T00:00:00Z",
+                "2024-06-15T21:00:00+09:00",
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(
+            v,
+            DataValue::DateTimeArray(vec![
+                chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                // Offsets are normalized to UTC.
+                chrono::Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap(),
+            ])
+        );
+        assert!(matches!(
+            o,
+            FieldOption::DateTime(crate::lexical::core::field::DateTimeOption {
+                multi_valued: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn infer_string_array_with_non_datetime_rejected() {
+        // Every element must be RFC 3339; naive / date-only forms are query
+        // literals, not ingestion values.
+        for bad in [
+            json!(["2024-01-01T00:00:00Z", "yesterday"]),
+            json!(["2024-01-01"]),
+            json!(["2024-01-01T00:00:00"]),
+            json!(["a", "b"]),
+        ] {
+            let err = infer_from_json(&bad).unwrap_err();
+            assert!(
+                err.to_string().contains("all RFC 3339 datetimes"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_single_rfc3339_string_still_infers_text() {
+        // The documented asymmetry: only *arrays* of RFC 3339 strings infer
+        // a DateTime; a lone string keeps inferring Text.
+        let (v, o) = inferred(infer_from_json(&json!("2024-01-01T00:00:00Z")).unwrap());
+        assert_eq!(v, DataValue::Text("2024-01-01T00:00:00Z".into()));
+        assert!(matches!(o, FieldOption::Text(_)));
+    }
+
+    #[test]
+    fn infer_option_from_datetime_array_is_multi_valued_datetime() {
+        let opt = infer_option_from_data_value(&DataValue::DateTimeArray(Vec::new())).unwrap();
+        assert!(matches!(
+            opt,
+            Some(FieldOption::DateTime(
+                crate::lexical::core::field::DateTimeOption {
+                    multi_valued: true,
+                    ..
+                }
+            ))
+        ));
     }
 }

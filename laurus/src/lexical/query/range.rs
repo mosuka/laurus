@@ -515,11 +515,11 @@ impl NumericRangeQuery {
     /// Returns `true` if any numeric component of `val` is in this range.
     ///
     /// Single-valued fields contribute one numeric value; multi-valued
-    /// (`Int64Array` / `Float64Array`) fields are scanned for any element
-    /// that satisfies the predicate. A `DateTime` contributes its BKD point
-    /// (#1179), so the stored-document fallback agrees with the tree.
-    /// `Text` is parsed as a number because stored docs lose type info in
-    /// some paths. Other variants return `false`.
+    /// (`Int64Array` / `Float64Array` / `DateTimeArray`) fields are scanned
+    /// for any element that satisfies the predicate. A `DateTime`
+    /// contributes its BKD point (#1179), so the stored-document fallback
+    /// agrees with the tree. `Text` is parsed as a number because stored
+    /// docs lose type info in some paths. Other variants return `false`.
     fn value_matches_any(&self, val: &crate::data::DataValue) -> bool {
         match val {
             crate::data::DataValue::Int64(i) => self.contains_numeric(*i as f64),
@@ -531,6 +531,9 @@ impl NumericRangeQuery {
                 arr.iter().any(|f| self.contains_numeric(*f))
             }
             crate::data::DataValue::DateTime(dt) => self.contains_numeric(datetime_to_point(dt)),
+            crate::data::DataValue::DateTimeArray(arr) => arr
+                .iter()
+                .any(|dt| self.contains_numeric(datetime_to_point(dt))),
             crate::data::DataValue::Text(s) => s
                 .parse::<f64>()
                 .ok()

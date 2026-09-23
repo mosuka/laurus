@@ -170,5 +170,9 @@ fn format_data_value(value: &DataValue) -> String {
                 .collect();
             format!("[{}]", parts.join(", "))
         }
+        DataValue::DateTimeArray(arr) => {
+            let parts: Vec<String> = arr.iter().map(|dt| dt.to_rfc3339()).collect();
+            format!("[{}]", parts.join(", "))
+        }
     }
 }
