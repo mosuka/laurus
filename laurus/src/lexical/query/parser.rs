@@ -11,7 +11,8 @@
 //! - Terms removed entirely by analysis match no documents in that field.
 //! - Proximity search: `"hello world"~10`
 //! - Fuzzy search: `roam~2`
-//! - Range queries: `[100 TO 500]`, `{A TO Z}`
+//! - Range queries: `[100 TO 500]`, `{A TO Z}`, and datetime ranges such as
+//!   `[2024-01-01 TO 2024-12-31]` or `[2024-01-01T00:00:00Z TO *]` (#1179)
 //! - Wildcards: `te?t`, `test*`
 //! - Boosting: `jakarta^4`
 //! - Grouping: `(title:hello OR body:world)`
@@ -26,6 +27,7 @@ use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::data::GeoEcefPoint;
 use crate::error::{LaurusError, Result};
+use crate::lexical::core::datetime::parse_datetime_literal;
 use crate::lexical::core::field::NumericType;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
@@ -33,7 +35,7 @@ use crate::lexical::query::fuzzy::FuzzyQuery;
 use crate::lexical::query::geo::{GeoBoundingBoxQuery, GeoDistanceQuery};
 use crate::lexical::query::geo3d::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery};
 use crate::lexical::query::phrase::PhraseQuery;
-use crate::lexical::query::range::NumericRangeQuery;
+use crate::lexical::query::range::{Bound, DateTimeRangeQuery, NumericRangeQuery, RangeQuery};
 use crate::lexical::query::term::TermQuery;
 use crate::lexical::query::wildcard::WildcardQuery;
 
@@ -616,11 +618,39 @@ impl LexicalQueryParser {
             }
         }
 
+        // Bound shape is inferred from the literal (the parser has no schema):
+        // numeric first, so `[100 TO 500]` and epoch-second bounds keep their
+        // meaning, then datetime literals (#1179), then plain strings.
         let lower_num = lower.as_ref().and_then(|s| s.parse::<f64>().ok());
         let upper_num = upper.as_ref().and_then(|s| s.parse::<f64>().ok());
+        let is_open = |bound: &Option<String>| bound.as_deref().is_none_or(|s| s == "*");
+        let datetime_bound = |bound: &Option<String>| {
+            bound
+                .as_deref()
+                .filter(|s| *s != "*")
+                .and_then(parse_datetime_literal)
+        };
+        let lower_dt = datetime_bound(&lower);
+        let upper_dt = datetime_bound(&upper);
+        let describe = || {
+            format!(
+                "{}{} TO {}{}",
+                if lower_inclusive { "[" } else { "{" },
+                lower.as_deref().unwrap_or("*"),
+                upper.as_deref().unwrap_or("*"),
+                if upper_inclusive { "]" } else { "}" }
+            )
+        };
 
         self.create_query_over_fields(field, |field_name| {
             if lower_num.is_some() || upper_num.is_some() {
+                if lower_dt.is_some() || upper_dt.is_some() {
+                    return Err(crate::error::LaurusError::parse(format!(
+                        "range {} on field '{field_name}' mixes a numeric bound with a \
+                         datetime bound",
+                        describe()
+                    )));
+                }
                 // Numeric range query
                 let query = NumericRangeQuery::new(
                     field_name,
@@ -631,16 +661,42 @@ impl LexicalQueryParser {
                     upper_inclusive,
                 );
                 Ok(Box::new(query))
+            } else if lower_dt.is_some() || upper_dt.is_some() {
+                // Datetime range (#1179): every non-open bound must be a
+                // datetime literal — a silent "matches nothing" would be
+                // worse than an error here.
+                if (!is_open(&lower) && lower_dt.is_none())
+                    || (!is_open(&upper) && upper_dt.is_none())
+                {
+                    return Err(crate::error::LaurusError::parse(format!(
+                        "range {} on field '{field_name}' mixes a datetime bound with a \
+                         bound that is not a datetime literal (expected RFC 3339, \
+                         YYYY-MM-DDTHH:MM:SS[.fff], YYYY-MM-DD, or *)",
+                        describe()
+                    )));
+                }
+                Ok(Box::new(DateTimeRangeQuery::new(
+                    field_name,
+                    lower_dt,
+                    upper_dt,
+                    lower_inclusive,
+                    upper_inclusive,
+                )))
             } else {
-                // Text range - use a term query as fallback
-                let term = format!(
-                    "{}{} TO {}{}",
-                    if lower_inclusive { "[" } else { "{" },
-                    lower.as_deref().unwrap_or("*"),
-                    upper.as_deref().unwrap_or("*"),
-                    if upper_inclusive { "]" } else { "}" }
-                );
-                Ok(Box::new(TermQuery::new(field_name, &term)))
+                // String range. `RangeQuery`'s matcher is currently empty, so
+                // this matches nothing (as the previous literal `TermQuery`
+                // fallback did), but the parsed tree now reports the field
+                // and bounds honestly.
+                let to_bound = |bound: &Option<String>, inclusive: bool| match bound.as_deref() {
+                    None | Some("*") => Bound::Unbounded,
+                    Some(s) if inclusive => Bound::Included(s.to_string()),
+                    Some(s) => Bound::Excluded(s.to_string()),
+                };
+                Ok(Box::new(RangeQuery::with_bounds(
+                    field_name,
+                    to_bound(&lower, lower_inclusive),
+                    to_bound(&upper, upper_inclusive),
+                )))
             }
         })
     }
@@ -938,6 +994,112 @@ mod tests {
     fn create_test_parser() -> LexicalQueryParser {
         let analyzer = Arc::new(StandardAnalyzer::new().unwrap());
         LexicalQueryParser::new(analyzer)
+    }
+
+    // ---- Range queries (#1179: datetime bounds) ----
+
+    fn utc(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(y, m, d, hh, mm, ss).unwrap()
+    }
+
+    fn parse_datetime_range(dsl: &str) -> DateTimeRangeQuery {
+        let query = create_test_parser().parse(dsl).unwrap();
+        query
+            .as_any()
+            .downcast_ref::<DateTimeRangeQuery>()
+            .unwrap_or_else(|| panic!("{dsl} must parse to a DateTimeRangeQuery: {query:?}"))
+            .clone()
+    }
+
+    #[test]
+    fn range_date_only_bounds_build_datetime_range_query() {
+        let q = parse_datetime_range("created_at:[2024-01-01 TO 2024-12-31]");
+        assert_eq!(q.field(), "created_at");
+        assert_eq!(q.lower_bound(), Some(utc(2024, 1, 1, 0, 0, 0)));
+        assert_eq!(q.upper_bound(), Some(utc(2024, 12, 31, 0, 0, 0)));
+        assert!(q.lower_inclusive());
+        assert!(q.upper_inclusive());
+    }
+
+    #[test]
+    fn range_rfc3339_offset_is_normalized_to_utc() {
+        let q = parse_datetime_range(
+            "created_at:[2024-01-01T09:00:00+09:00 TO 2024-01-02T00:00:00.5Z]",
+        );
+        assert_eq!(q.lower_bound(), Some(utc(2024, 1, 1, 0, 0, 0)));
+        assert_eq!(
+            q.upper_bound().unwrap().timestamp_subsec_millis(),
+            500,
+            "fractional seconds survive"
+        );
+        // Naive datetimes are UTC.
+        let q = parse_datetime_range("created_at:[2024-06-15T12:34:56 TO *]");
+        assert_eq!(q.lower_bound(), Some(utc(2024, 6, 15, 12, 34, 56)));
+    }
+
+    #[test]
+    fn range_star_lower_with_date_upper() {
+        let q = parse_datetime_range("created_at:[* TO 2024-12-31]");
+        assert_eq!(q.lower_bound(), None);
+        assert_eq!(q.upper_bound(), Some(utc(2024, 12, 31, 0, 0, 0)));
+        let q = parse_datetime_range("created_at:[2024-12-31 TO *]");
+        assert_eq!(q.lower_bound(), Some(utc(2024, 12, 31, 0, 0, 0)));
+        assert_eq!(q.upper_bound(), None);
+    }
+
+    #[test]
+    fn range_exclusive_braces_set_exclusive_flags() {
+        let q = parse_datetime_range("created_at:{2024-01-01 TO 2024-12-31}");
+        assert!(!q.lower_inclusive());
+        assert!(!q.upper_inclusive());
+    }
+
+    #[test]
+    fn range_mixed_numeric_and_date_is_an_error() {
+        let err = create_test_parser()
+            .parse("created_at:[100 TO 2024-12-31]")
+            .unwrap_err();
+        assert!(err.to_string().contains("numeric bound"), "{err}");
+    }
+
+    #[test]
+    fn range_date_and_garbage_is_an_error() {
+        let err = create_test_parser()
+            .parse("created_at:[2024-01-01 TO yesterday]")
+            .unwrap_err();
+        assert!(err.to_string().contains("datetime literal"), "{err}");
+    }
+
+    #[test]
+    fn range_numeric_bounds_still_build_numeric_range_query() {
+        for dsl in [
+            "price:[100 TO 500]",
+            "price:[* TO 100]",
+            "ts:[1700000000 TO *]",
+        ] {
+            let query = create_test_parser().parse(dsl).unwrap();
+            assert!(
+                query.as_any().downcast_ref::<NumericRangeQuery>().is_some(),
+                "{dsl} must stay a NumericRangeQuery: {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_text_bounds_build_string_range_query() {
+        let query = create_test_parser().parse("title:[A TO Z]").unwrap();
+        let range = query
+            .as_any()
+            .downcast_ref::<RangeQuery>()
+            .unwrap_or_else(|| panic!("expected a RangeQuery: {query:?}"));
+        assert_eq!(range.field(), "title");
+        assert_eq!(range.lower_bound(), &Bound::Included("A".to_string()));
+        assert_eq!(range.upper_bound(), &Bound::Included("Z".to_string()));
+        let query = create_test_parser().parse("title:{A TO *}").unwrap();
+        let range = query.as_any().downcast_ref::<RangeQuery>().unwrap();
+        assert_eq!(range.lower_bound(), &Bound::Excluded("A".to_string()));
+        assert_eq!(range.upper_bound(), &Bound::Unbounded);
     }
 
     #[test]
