@@ -80,6 +80,9 @@ pub enum InferredValue {
 /// - [`DataValue::Bool`] → [`FieldOption::Boolean`]
 /// - [`DataValue::DateTime`] → [`FieldOption::DateTime`]
 /// - [`DataValue::Geo`] → [`FieldOption::Geo`]
+/// - the array variants (`Int64Array`, `Float64Array`, `GeoArray`,
+///   `GeoEcefArray`, `DateTimeArray`, `BoolArray`) → the matching option
+///   with `multi_valued = true`
 /// - [`DataValue::Null`] → `Ok(None)` (caller should skip the field)
 ///
 /// # Arguments
@@ -131,6 +134,10 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
                 ..Default::default()
             },
         ))),
+        DataValue::BoolArray(_) => Ok(Some(FieldOption::Boolean(BooleanOption {
+            multi_valued: true,
+            ..Default::default()
+        }))),
         DataValue::Vector(_) => Err(LaurusError::invalid_argument(
             "vector values require an explicit vector field declaration \
              (Hnsw, Flat, or Ivf) in the schema",
@@ -160,6 +167,7 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
 /// | `array` of `lat`/`lon` objects | [`DataValue::GeoArray`] | [`FieldOption::Geo`] with `multi_valued = true` |
 /// | `array` of `x`/`y`/`z` objects | [`DataValue::GeoEcefArray`] | [`FieldOption::Geo3d`] with `multi_valued = true` |
 /// | `array` of RFC 3339 strings | [`DataValue::DateTimeArray`] | [`FieldOption::DateTime`] with `multi_valued = true` (a *single* string stays `Text`) |
+/// | `array` of booleans | [`DataValue::BoolArray`] | [`FieldOption::Boolean`] with `multi_valued = true` |
 /// | empty `array` | (none) | (none) — returns [`InferredValue::Skip`] |
 ///
 /// # Arguments
@@ -217,8 +225,10 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 /// Arrays whose elements are all RFC 3339 strings map to
 /// [`DataValue::DateTimeArray`] backed by a `DateTimeOption` with
 /// `multi_valued = true` (Issue #1184; a single string still infers
-/// [`DataValue::Text`]). Empty arrays return [`InferredValue::Skip`]
-/// because their element type cannot be determined.
+/// [`DataValue::Text`]). Arrays whose elements are all booleans map to
+/// [`DataValue::BoolArray`] backed by a [`BooleanOption`] with
+/// `multi_valued = true` (Issue #1180). Empty arrays return
+/// [`InferredValue::Skip`] because their element type cannot be determined.
 ///
 /// # Arguments
 ///
@@ -227,22 +237,36 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 /// # Errors
 ///
 /// Returns [`LaurusError::invalid_argument`] when the array mixes numbers
-/// with non-numbers, mixes 2D and 3D geo objects, contains an object that
-/// is not a geo point, or contains a string that is not an RFC 3339
-/// datetime.
+/// with non-numbers (booleans included), mixes 2D and 3D geo objects,
+/// contains an object that is not a geo point, or contains a string that
+/// is not an RFC 3339 datetime.
 fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
     if arr.is_empty() {
         return Ok(InferredValue::Skip);
     }
 
-    // Gated on *every* element being an object (or, below, a string) so a
-    // mixed array such as `[1, {"lat": ..}]` still falls through to the
-    // numeric path's error below, which existing callers and tests rely on.
+    // Gated on *every* element being an object (or, below, a string or a
+    // boolean) so a mixed array such as `[1, {"lat": ..}]` or `[true, 1]`
+    // still falls through to the numeric path's error below, which existing
+    // callers and tests rely on.
     if arr.iter().all(JsonValue::is_object) {
         return infer_geo_array(arr);
     }
     if arr.iter().all(JsonValue::is_string) {
         return infer_datetime_array(arr);
+    }
+    if arr.iter().all(JsonValue::is_boolean) {
+        return Ok(InferredValue::Inferred {
+            value: DataValue::BoolArray(
+                arr.iter()
+                    .map(|v| v.as_bool().expect("gated on all-booleans above"))
+                    .collect(),
+            ),
+            option: FieldOption::Boolean(BooleanOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        });
     }
 
     let mut all_i64 = true;
@@ -951,6 +975,43 @@ mod tests {
                     ..
                 }
             ))
+        ));
+    }
+
+    // ---- Multi-valued boolean arrays (#1180) ----
+
+    #[test]
+    fn infer_bool_array_to_multi_valued_boolean() {
+        let (v, o) = inferred(infer_from_json(&json!([true, false, true])).unwrap());
+        assert_eq!(v, DataValue::BoolArray(vec![true, false, true]));
+        assert!(matches!(
+            o,
+            FieldOption::Boolean(BooleanOption {
+                multi_valued: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn infer_mixed_bool_and_number_array_rejected() {
+        // The boolean gate needs *every* element to be a boolean; a mix
+        // keeps the pre-#1180 numeric-array error text.
+        for bad in [json!([true, 1]), json!([0, false]), json!([true, "x"])] {
+            let err = infer_from_json(&bad).unwrap_err();
+            assert!(err.to_string().contains("only numeric"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn infer_option_from_bool_array_is_multi_valued_boolean() {
+        let opt = infer_option_from_data_value(&DataValue::BoolArray(Vec::new())).unwrap();
+        assert!(matches!(
+            opt,
+            Some(FieldOption::Boolean(BooleanOption {
+                multi_valued: true,
+                ..
+            }))
         ));
     }
 }

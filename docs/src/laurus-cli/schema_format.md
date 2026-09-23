@@ -99,6 +99,7 @@ Boolean field (`true` / `false`).
 [fields.published.Boolean]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -106,6 +107,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables filtering by boolean value |
 | `stored` | `bool` | `true` | Stores the original value |
+| `multi_valued` | `bool` | `false` | Accept arrays of booleans; a term query (`flags:true`) matches if **any** element equals the queried value (Lucene-style "any match"); repeated elements raise the term frequency, not the hit count |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### DateTime

@@ -5,7 +5,7 @@
 //! the type-conflict coercion rules exercised during document ingestion.
 
 use laurus::lexical::TextOption;
-use laurus::lexical::core::field::{DateTimeOption, GeoOption, IntegerOption};
+use laurus::lexical::core::field::{BooleanOption, DateTimeOption, GeoOption, IntegerOption};
 use laurus::storage::memory::MemoryStorageConfig;
 use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::{
@@ -348,6 +348,121 @@ async fn datetime_multi_valued_coercion_at_ingest() -> Result<()> {
             "{id}: a single instant is auto-wrapped on a multi-valued field"
         );
     }
+    Ok(())
+}
+
+/// Dynamic (#1180): a boolean array on an undeclared field is auto-added
+/// as a multi-valued Boolean field, and the array reads back intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_auto_adds_bool_array_field() -> Result<()> {
+    let engine = engine_with_policy(DynamicFieldPolicy::Dynamic).await?;
+
+    let doc = Document::builder()
+        .add_bool_array("flags", vec![true, false])
+        .build();
+    engine.put_document("doc1", doc).await?;
+    engine.commit().await?;
+
+    let schema = engine.schema();
+    match schema.fields.get("flags") {
+        Some(FieldOption::Boolean(opt)) => assert!(
+            opt.multi_valued,
+            "flags should be Boolean with multi_valued=true"
+        ),
+        other => panic!("expected Boolean field for 'flags', got {other:?}"),
+    }
+
+    let docs = engine.get_documents("doc1").await?;
+    assert_eq!(
+        docs[0].get("flags").and_then(|v| v.as_bool_array()),
+        Some(&[true, false][..])
+    );
+    Ok(())
+}
+
+/// #1180: a declared single-valued Boolean field rejects an array instead
+/// of silently truncating it; a declared multi-valued Boolean field wraps a
+/// single value (typed, `0`/`1`, or text) into a one-element array and
+/// widens an integer array of `0`/`1` element-wise.
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_multi_valued_coercion_at_ingest() -> Result<()> {
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let schema = Schema::builder()
+        .add_field("single", FieldOption::Boolean(BooleanOption::default()))
+        .add_field(
+            "multi",
+            FieldOption::Boolean(BooleanOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        )
+        .dynamic_field_policy(DynamicFieldPolicy::Strict)
+        .build();
+    let engine = Engine::new(storage, schema).await?;
+
+    let err = engine
+        .put_document(
+            "bad",
+            Document::builder()
+                .add_bool_array("single", vec![true])
+                .build(),
+        )
+        .await
+        .expect_err("array into a single-valued Boolean field must be rejected");
+    assert!(
+        err.to_string().contains("multi_valued = true"),
+        "error should point at the fix: {err}"
+    );
+
+    for (id, value) in [
+        ("typed", DataValue::Bool(true)),
+        ("int", DataValue::Int64(1)),
+        ("text", DataValue::Text("true".to_string())),
+    ] {
+        engine
+            .put_document(id, Document::builder().add_field("multi", value).build())
+            .await?;
+    }
+    engine
+        .put_document(
+            "ints",
+            Document::builder()
+                .add_int64_array("multi", vec![0, 1])
+                .build(),
+        )
+        .await?;
+    engine
+        .put_document(
+            "empty",
+            Document::builder()
+                .add_int64_array("multi", Vec::new())
+                .build(),
+        )
+        .await?;
+    engine.commit().await?;
+
+    for id in ["typed", "int", "text"] {
+        let docs = engine.get_documents(id).await?;
+        assert_eq!(
+            docs[0].get("multi").and_then(|v| v.as_bool_array()),
+            Some(&[true][..]),
+            "{id}: a single value is auto-wrapped on a multi-valued field"
+        );
+    }
+    assert_eq!(
+        engine.get_documents("ints").await?[0]
+            .get("multi")
+            .and_then(|v| v.as_bool_array()),
+        Some(&[false, true][..]),
+        "an integer array of 0/1 is widened element-wise"
+    );
+    assert_eq!(
+        engine.get_documents("empty").await?[0]
+            .get("multi")
+            .and_then(|v| v.as_bool_array()),
+        Some(&[][..]),
+        "the empty numeric array every binding sends for [] is an empty flag list"
+    );
     Ok(())
 }
 

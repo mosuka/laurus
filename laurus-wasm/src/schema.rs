@@ -217,6 +217,9 @@ impl WasmSchema {
 
     /// Add a boolean field.
     ///
+    /// * `multi_valued` - When `true`, the field accepts arrays of booleans
+    ///   and a term query / DSL `flags:true` matches if any element is
+    ///   `true` (Lucene-style "any match"). Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
     #[wasm_bindgen(js_name = "addBooleanField")]
@@ -225,6 +228,7 @@ impl WasmSchema {
         name: String,
         stored: Option<bool>,
         indexed: Option<bool>,
+        multi_valued: Option<bool>,
         doc_values: Option<bool>,
     ) {
         self.inner.fields.insert(
@@ -232,6 +236,7 @@ impl WasmSchema {
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );

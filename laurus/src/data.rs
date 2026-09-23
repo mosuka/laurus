@@ -255,6 +255,17 @@ pub enum DataValue {
     /// constant scoring). Archived element-wise with the same
     /// micro-second wrapper as [`DataValue::DateTime`].
     DateTimeArray(#[rkyv(with = rkyv::with::Map<MicroSeconds>)] Vec<DateTime<Utc>>),
+
+    /// Multi-valued booleans (Issue #1180).
+    ///
+    /// Used by fields declared with
+    /// [`BooleanOption::multi_valued`](crate::lexical::core::field::BooleanOption::multi_valued)
+    /// set to `true`. Unlike the other multi-valued types there are no BKD
+    /// points: every element is indexed as its own `"true"` / `"false"`
+    /// term posting, so a term query matches a document if **any** element
+    /// equals the queried value, and repeated elements raise the term
+    /// frequency (Lucene multi-valued parity) rather than the hit count.
+    BoolArray(Vec<bool>),
 }
 
 impl DataValue {
@@ -369,6 +380,14 @@ impl DataValue {
             _ => None,
         }
     }
+
+    /// Returns the multi-valued boolean slice if this is a `BoolArray` variant.
+    pub fn as_bool_array(&self) -> Option<&[bool]> {
+        match self {
+            DataValue::BoolArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 // --- Conversions ---
@@ -454,6 +473,12 @@ impl From<Vec<GeoEcefPoint>> for DataValue {
 impl From<Vec<DateTime<Utc>>> for DataValue {
     fn from(v: Vec<DateTime<Utc>>) -> Self {
         DataValue::DateTimeArray(v)
+    }
+}
+
+impl From<Vec<bool>> for DataValue {
+    fn from(v: Vec<bool>) -> Self {
+        DataValue::BoolArray(v)
     }
 }
 
@@ -638,6 +663,16 @@ impl DocumentBuilder {
         self.add_field(name.into(), DataValue::DateTimeArray(values))
     }
 
+    /// Add a multi-valued boolean field.
+    ///
+    /// The schema field must be declared with
+    /// [`BooleanOption::multi_valued`](crate::lexical::core::field::BooleanOption::multi_valued)
+    /// set to `true`. A term query matches if any element equals the
+    /// queried value.
+    pub fn add_bool_array(self, name: impl Into<String>, values: Vec<bool>) -> Self {
+        self.add_field(name.into(), DataValue::BoolArray(values))
+    }
+
     /// Add a binary data field with no MIME type.
     ///
     /// The MIME type is set to `None`. If a MIME type is needed (e.g. for
@@ -701,15 +736,18 @@ mod tests {
                     DateTime::from_timestamp_micros(7).unwrap(),
                 ])),
             ),
+            ("BoolArray", archive(&DataValue::BoolArray(vec![true]))),
         ];
         // Little-endian rkyv 0.8 layout: the root enum sits at the end of
         // the buffer, its first byte being the archived discriminant (Geo =
         // 8, Int64Array = 10, Float64Array = 11, GeoArray = 12, GeoEcefArray
-        // = 13, DateTimeArray = 14), followed by the payload — `ArchivedVec`
-        // is a relative pointer to the element data written before the
-        // root, plus a length. `DateTimeArray` archives its elements as
-        // micro-second `i64`s, so its bytes are `Int64Array`'s with the
-        // discriminant changed.
+        // = 13, DateTimeArray = 14, BoolArray = 15), followed by the payload
+        // — `ArchivedVec` is a relative pointer to the element data written
+        // before the root, plus a length. `DateTimeArray` archives its
+        // elements as micro-second `i64`s, so its bytes are `Int64Array`'s
+        // with the discriminant changed; a `bool` element is a single byte,
+        // so `BoolArray`'s element data is followed by seven padding bytes
+        // before the 8-aligned root.
         let expected: Vec<(&str, Vec<u8>)> = vec![
             (
                 "Geo",
@@ -751,6 +789,13 @@ mod tests {
                 "DateTimeArray",
                 vec![
                     7, 0, 0, 0, 0, 0, 0, 0, 14, 0, 0, 0, 244, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "BoolArray",
+                vec![
+                    1, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 244, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ],
             ),
@@ -801,6 +846,36 @@ mod tests {
             DataValue::from(instants.clone()),
             DataValue::DateTimeArray(instants)
         );
+    }
+
+    /// #1180: `bool` is an rkyv archive-self primitive, so a `Vec<bool>`
+    /// round-trips element-wise with no wrapper, including the empty list.
+    #[test]
+    fn bool_arrays_round_trip_through_rkyv() {
+        for value in [
+            DataValue::BoolArray(vec![true, false, true]),
+            DataValue::BoolArray(Vec::new()),
+        ] {
+            let bytes = archive(&value);
+            let back = rkyv::from_bytes::<DataValue, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialization");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn bool_array_accessors_and_builders() {
+        let flags = vec![true, false];
+        let doc = Document::builder()
+            .add_bool_array("flags", flags.clone())
+            .build();
+        assert_eq!(
+            doc.get_field("flags").and_then(DataValue::as_bool_array),
+            Some(flags.as_slice())
+        );
+        assert_eq!(doc.get_field("flags").and_then(DataValue::as_boolean), None);
+        assert_eq!(DataValue::Bool(true).as_bool_array(), None);
+        assert_eq!(DataValue::from(flags.clone()), DataValue::BoolArray(flags));
     }
 
     #[test]

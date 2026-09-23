@@ -514,6 +514,22 @@ pub struct BooleanOption {
     #[serde(default = "default_true")]
     pub stored: bool,
 
+    /// Whether this field accepts multiple values per document
+    /// (Issue #1180).
+    ///
+    /// When `true`, the field accepts [`DataValue::BoolArray`] (a single
+    /// `Bool` is auto-wrapped into a one-element array). Every element is
+    /// indexed as its own `"true"` / `"false"` term posting — Boolean fields
+    /// have no BKD points — so a term query such as `flags:true` matches a
+    /// document if **any** element equals the queried value. Repeated
+    /// elements raise the term frequency, not the hit count (Lucene
+    /// multi-valued parity).
+    ///
+    /// When `false` (the default), a `BoolArray` value is rejected at
+    /// ingestion instead of being silently truncated.
+    #[serde(default)]
+    pub multi_valued: bool,
+
     /// Whether this field's value is also copied into DocValues, the
     /// column-oriented store `SortField::Field`, faceting, and
     /// aggregations read from (Issue #1047).
@@ -552,6 +568,7 @@ impl Default for BooleanOption {
         Self {
             indexed: true,
             stored: true,
+            multi_valued: false,
             doc_values: true,
         }
     }
@@ -843,6 +860,10 @@ impl FieldOption {
                 ..Default::default()
             }),
             FieldValue::DateTimeArray(_) => FieldOption::DateTime(DateTimeOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+            FieldValue::BoolArray(_) => FieldOption::Boolean(BooleanOption {
                 multi_valued: true,
                 ..Default::default()
             }),

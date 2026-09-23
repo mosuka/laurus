@@ -53,8 +53,9 @@ def test_mixed_int_and_float_list_becomes_float_array():
 
 def test_bool_elements_are_not_treated_as_integers():
     """`bool` is a subclass of `int` in Python; a list of bools must not be
-    silently mistaken for an all-integer list. It falls through to the float
-    path (Python allows `float(True)`), so the field sees `[1.0, 0.0]`."""
+    silently mistaken for an all-integer list. Since #1180 it arrives as a
+    `BoolArray`, which the core widens element-wise to `[1.0, 0.0]` on a
+    multi-valued Float field (the same 0/1 rule a scalar `bool` follows)."""
     idx = _index_with(laurus.Schema.add_float_field, "flags", multi_valued=True)
     idx.put_document("doc1", {"title": "t", "flags": [True, False]})
     idx.commit()
@@ -201,3 +202,53 @@ def test_non_datetime_string_list_is_rejected():
     idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
     with pytest.raises(ValueError, match="datetimes"):
         idx.put_document("doc1", {"title": "t", "seen_at": ["2024-01-01T00:00:00Z", "tomorrow"]})
+
+
+# ---- Multi-valued boolean (Issue #1180) ----
+
+
+def test_bool_list_round_trips_through_multi_valued_boolean_field():
+    """A list of bools is a multi-valued boolean field; it reads back as a
+    list of bools and a term query matches if any element carries the value."""
+    idx = _index_with(laurus.Schema.add_boolean_field, "flags", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "flags": [True, False]})
+    idx.put_document("doc2", {"title": "t", "flags": [False]})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["flags"] == [True, False]
+    assert [h.id for h in idx.search("flags:true", limit=5)] == ["doc1"]
+    assert sorted(h.id for h in idx.search("flags:false", limit=5)) == ["doc1", "doc2"]
+
+
+def test_single_bool_is_wrapped_on_multi_valued_boolean_field():
+    idx = _index_with(laurus.Schema.add_boolean_field, "flags", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "flags": True})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["flags"] == [True]
+
+
+def test_empty_list_is_accepted_by_multi_valued_boolean_field():
+    idx = _index_with(laurus.Schema.add_boolean_field, "flags", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "flags": []})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["flags"] == []
+
+
+def test_bool_list_into_single_valued_boolean_field_is_rejected():
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_boolean_field, "flags")
+    with pytest.raises(Exception, match="multi_valued"):
+        idx.put_document("doc1", {"title": "t", "flags": [True]})
+
+
+def test_mixed_bool_and_int_list_into_boolean_field_is_rejected():
+    """`[True, 1]` is not all-bool, so it takes the numeric path (a float
+    array), which a multi-valued Boolean field rejects."""
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_boolean_field, "flags", multi_valued=True)
+    with pytest.raises(Exception):
+        idx.put_document("doc1", {"title": "t", "flags": [True, 1]})

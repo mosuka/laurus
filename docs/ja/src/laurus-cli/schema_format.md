@@ -99,6 +99,7 @@ doc_values = true
 [fields.published.Boolean]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -106,6 +107,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | ブーリアン値によるフィルタリングを有効にする |
 | `stored` | `bool` | `true` | 元の値を保存する |
+| `multi_valued` | `bool` | `false` | ブール値の配列を受け付け、term クエリ（`flags:true`）は**いずれかの要素**がクエリの値と等しければマッチ（Lucene 流の "any match"）。要素の重複はヒット数ではなく term frequency を増やす |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### DateTime

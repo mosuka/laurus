@@ -103,7 +103,7 @@ Each `FieldOption` is a `oneof` with one of the following field types:
 | `TextOption` (`indexed`, `stored`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
 | `IntegerOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
-| `BooleanOption` (`indexed`, `stored`, `doc_values`) | |
+| `BooleanOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `DateTimeOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `GeoOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `Geo3dOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
@@ -113,7 +113,7 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Doc values:** `doc_values` (Issue #1047) is `optional bool` on every lexical option above except `BytesOption`, following the same tri-state contract as `term_vectors`: a client that omits it gets the engine's default (`true`), distinguishable from an explicit `false`. It controls whether the field's value is also copied into DocValues, the column-oriented store sorting and faceting/aggregation read from — a DocValues column is written only when `stored` and `doc_values` are both `true`. `BytesOption` carries no such field: a `Bytes` value is never written to DocValues regardless. Turning `doc_values` off for a field that is never sorted or faceted on shrinks its segment footprint; the field remains fully searchable and retrievable either way.
 
-**Multi-valued geo and datetime:** `multi_valued` on `GeoOption` / `Geo3dOption` (Issue #1174) and on `DateTimeOption` (Issue #1184) is proto field number `4` — `3` is already taken by `doc_values` there, unlike `IntegerOption` / `FloatOption`. When `true`, a geo field accepts `GeoArrayValue` / `Geo3dArrayValue` (see the `Value` table below) and distance / bounding-box queries (plus `geo3d_nearest`) match a document if **any** of its points satisfies the predicate, scoring it by its closest point. A datetime field accepts `DatetimeArrayValue` (`repeated int64` Unix microseconds UTC, the same encoding as `datetime_value`) and range queries match a document if **any** of its instants is in range, with constant scoring; a document is reported once even when several instants match.
+**Multi-valued geo, datetime and boolean:** `multi_valued` on `GeoOption` / `Geo3dOption` (Issue #1174), on `DateTimeOption` (Issue #1184) and on `BooleanOption` (Issue #1180) is proto field number `4` — `3` is already taken by `doc_values` there, unlike `IntegerOption` / `FloatOption`. When `true`, a geo field accepts `GeoArrayValue` / `Geo3dArrayValue` (see the `Value` table below) and distance / bounding-box queries (plus `geo3d_nearest`) match a document if **any** of its points satisfies the predicate, scoring it by its closest point. A datetime field accepts `DatetimeArrayValue` (`repeated int64` Unix microseconds UTC, the same encoding as `datetime_value`) and range queries match a document if **any** of its instants is in range, with constant scoring; a document is reported once even when several instants match. A boolean field accepts `BoolArrayValue` (`repeated bool`) and a term query matches a document if **any** element equals the queried value; each element is indexed as its own `true` / `false` term posting — there are no BKD points for booleans — so repeated elements raise the term frequency (and hence the BM25 score), not the hit count.
 
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
@@ -273,6 +273,7 @@ Each `Value` is a `oneof` with these types:
 | GeoArray | `geo_array_value` | `GeoArrayValue` (`repeated GeoPoint`; multi-valued 2D points; requires `GeoOption.multi_valued = true`) |
 | Geo3dArray | `geo3d_array_value` | `Geo3dArrayValue` (`repeated Geo3dPoint`; multi-valued 3D points; requires `Geo3dOption.multi_valued = true`) |
 | DateTimeArray | `datetime_array_value` | `DatetimeArrayValue` (`repeated int64` Unix microseconds; multi-valued instants; requires `DateTimeOption.multi_valued = true`) |
+| BoolArray | `bool_array_value` | `BoolArrayValue` (`repeated bool`; multi-valued booleans; requires `BooleanOption.multi_valued = true`) |
 
 **Geo3dPoint:**
 

@@ -91,6 +91,9 @@ pub fn data_value_to_proto(val: &DataValue) -> v1::Value {
         DataValue::DateTimeArray(arr) => Some(Kind::DatetimeArrayValue(v1::DatetimeArrayValue {
             values: arr.iter().map(|dt| dt.timestamp_micros()).collect(),
         })),
+        DataValue::BoolArray(arr) => Some(Kind::BoolArrayValue(v1::BoolArrayValue {
+            values: arr.clone(),
+        })),
     };
     v1::Value { kind }
 }
@@ -130,6 +133,7 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
                 .map(|us| datetime_from_micros(*us))
                 .collect(),
         ),
+        Some(Kind::BoolArrayValue(arr)) => DataValue::BoolArray(arr.values.clone()),
         None => DataValue::Null,
     }
 }
@@ -254,6 +258,24 @@ mod tests {
             DataValue::DateTime(chrono::DateTime::from_timestamp_micros(-86_400_000_001).unwrap());
         let back = data_value_from_proto(&data_value_to_proto(&original));
         assert_eq!(back, original);
+    }
+
+    /// #1180: multi-valued booleans use the dedicated `BoolArrayValue` kind
+    /// and round-trip element-wise, including the empty list.
+    #[test]
+    fn data_value_bool_arrays_round_trip() {
+        let value = DataValue::BoolArray(vec![true, false, true]);
+        let proto = data_value_to_proto(&value);
+        match &proto.kind {
+            Some(v1::value::Kind::BoolArrayValue(a)) => {
+                assert_eq!(a.values, vec![true, false, true]);
+            }
+            other => panic!("expected BoolArrayValue, got {other:?}"),
+        }
+        assert_eq!(data_value_from_proto(&proto), value);
+
+        let empty = DataValue::BoolArray(Vec::new());
+        assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
     }
 
     /// `DataValue::Geo` continues to use the 2D `GeoValue` proto kind,

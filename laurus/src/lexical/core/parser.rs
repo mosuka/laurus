@@ -494,6 +494,25 @@ impl DocumentParser {
                         field_terms.insert(field_name.clone(), terms);
                         point_values.insert(field_name.clone(), points);
                     }
+                    FieldValue::BoolArray(arr) => {
+                        // Multi-valued boolean (#1180): one "true"/"false"
+                        // term per element and, like the scalar `Bool` arm,
+                        // no BKD point.
+                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
+                        let mut offset = 0usize;
+                        for (idx, b) in arr.iter().enumerate() {
+                            let text = b.to_string();
+                            let len = text.len();
+                            terms.push(AnalyzedTerm {
+                                term: text,
+                                position: idx as u32,
+                                frequency: 1,
+                                offset: (offset, offset + len),
+                            });
+                            offset += len + 1;
+                        }
+                        field_terms.insert(field_name.clone(), terms);
+                    }
                     // Not lexically indexable: no term representation
                     // exists for these, regardless of `should_index`.
                     // Spelled out rather than a wildcard `_ =>` so a new

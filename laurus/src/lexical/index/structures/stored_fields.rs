@@ -118,6 +118,10 @@ const TAG_GEO_ECEF_ARRAY: u8 = 14;
 // which stores RFC 3339 text, sub-microsecond detail is truncated. Same
 // no-version-bump policy as tags 10–14 (recorded on Issue #1040).
 const TAG_DATETIME_ARRAY: u8 = 15;
+// Multi-valued boolean (#1180): varint length + one byte per element (`0` /
+// `1`, the same representation as the scalar tag 3 — not bit-packed). Same
+// no-version-bump policy as tags 10–15 (recorded on Issue #1040).
+const TAG_BOOL_ARRAY: u8 = 16;
 
 // ---------------------------------------------------------------------------
 // Encoding (document -> plain bytes, before compression)
@@ -227,6 +231,13 @@ fn encode_document(buf: &mut Vec<u8>, doc_id: u64, fields: &AHashMap<String, Dat
                 write_varint(buf, arr.len() as u64);
                 for dt in arr {
                     buf.extend_from_slice(&dt.timestamp_micros().to_le_bytes());
+                }
+            }
+            DataValue::BoolArray(arr) => {
+                buf.push(TAG_BOOL_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for &b in arr {
+                    buf.push(u8::from(b));
                 }
             }
         }
@@ -436,6 +447,20 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                     arr.push(dt);
                 }
                 DataValue::DateTimeArray(arr)
+            }
+            TAG_BOOL_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored BoolArray field length")? as usize;
+                let len = checked_capacity(
+                    len,
+                    1,
+                    (bytes.len() - *cursor) as u64,
+                    "stored BoolArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    arr.push(read_u8(bytes, cursor, "stored BoolArray field element")? != 0);
+                }
+                DataValue::BoolArray(arr)
             }
             other => {
                 return Err(LaurusError::index(format!(
@@ -819,6 +844,13 @@ mod tests {
                     "s_datetime_array_empty",
                     DataValue::DateTimeArray(Vec::new()),
                 ),
+                // Multi-valued booleans (#1180): one byte per element, and
+                // the empty list.
+                (
+                    "t_bool_array",
+                    DataValue::BoolArray(vec![true, false, true]),
+                ),
+                ("u_bool_array_empty", DataValue::BoolArray(Vec::new())),
             ]),
         )];
 
@@ -900,6 +932,34 @@ mod tests {
             d.fields.get("s_datetime_array_empty"),
             Some(&DataValue::DateTimeArray(Vec::new()))
         );
+        assert_eq!(
+            d.fields.get("t_bool_array"),
+            Some(&DataValue::BoolArray(vec![true, false, true]))
+        );
+        assert_eq!(
+            d.fields.get("u_bool_array_empty"),
+            Some(&DataValue::BoolArray(Vec::new()))
+        );
+    }
+
+    /// #1180: tag 16 has no "impossible element" (every byte decodes as a
+    /// bool), so the loud-failure pin is a length header that overshoots the
+    /// bytes left — `checked_capacity` must reject it up front, before any
+    /// allocation, rather than the element loop merely running out of input.
+    #[test]
+    fn rejects_a_truncated_bool_array() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // doc id
+        write_varint(&mut buf, 1); // field count
+        write_varint(&mut buf, 1); // name length
+        buf.extend_from_slice(b"t");
+        buf.push(TAG_BOOL_ARRAY);
+        write_varint(&mut buf, 8); // declares 8 elements ...
+        buf.extend_from_slice(&[1, 0]); // ... but only 2 bytes follow
+
+        let mut cursor = 0;
+        let err = decode_document(&buf, &mut cursor).unwrap_err();
+        assert!(err.to_string().contains("header declares"), "{err}");
     }
 
     /// #1184: tag 15 stores micro-seconds, so sub-microsecond detail is

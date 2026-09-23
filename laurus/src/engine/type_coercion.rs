@@ -53,7 +53,7 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
         FieldOption::Text(_) => coerce_to_text(field_name, value),
         FieldOption::Integer(opt) => coerce_to_integer(field_name, opt, value),
         FieldOption::Float(opt) => coerce_to_float(field_name, opt, value),
-        FieldOption::Boolean(_) => coerce_to_boolean(field_name, value),
+        FieldOption::Boolean(opt) => coerce_to_boolean(field_name, opt, value),
         FieldOption::DateTime(opt) => coerce_to_datetime(field_name, opt, value),
         FieldOption::Geo(opt) => coerce_to_geo(field_name, opt, value),
         FieldOption::Geo3d(opt) => coerce_to_geo3d(field_name, opt, value),
@@ -100,6 +100,12 @@ fn coerce_to_integer(
             DataValue::Int64(i) => Ok(DataValue::Int64Array(vec![i])),
             DataValue::Float64(f) => Ok(DataValue::Int64Array(vec![f as i64])),
             DataValue::Bool(b) => Ok(DataValue::Int64Array(vec![if b { 1 } else { 0 }])),
+            // Element-wise extension of the scalar `Bool` -> 0 / 1 rule
+            // above (#1180): bindings hand a list of bools over as a
+            // `BoolArray` before the field type is known.
+            DataValue::BoolArray(arr) => Ok(DataValue::Int64Array(
+                arr.iter().map(|b| i64::from(*b)).collect(),
+            )),
             DataValue::Text(s) => s
                 .trim()
                 .parse::<i64>()
@@ -127,7 +133,7 @@ fn coerce_to_integer(
             }),
             // Multi-valued input to a single-valued field is rejected
             // rather than silently truncating to one element.
-            DataValue::Int64Array(_) | DataValue::Float64Array(_) => {
+            DataValue::Int64Array(_) | DataValue::Float64Array(_) | DataValue::BoolArray(_) => {
                 Err(LaurusError::invalid_argument(format!(
                     "field '{field_name}': received an array but the field is single-valued; \
                      declare the field with multi_valued = true to accept arrays"
@@ -155,6 +161,11 @@ fn coerce_to_float(
             DataValue::Float64(f) => Ok(DataValue::Float64Array(vec![f])),
             DataValue::Int64(i) => Ok(DataValue::Float64Array(vec![i as f64])),
             DataValue::Bool(b) => Ok(DataValue::Float64Array(vec![if b { 1.0 } else { 0.0 }])),
+            // Element-wise extension of the scalar `Bool` -> 0.0 / 1.0 rule
+            // above (#1180).
+            DataValue::BoolArray(arr) => Ok(DataValue::Float64Array(
+                arr.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
+            )),
             DataValue::Text(s) => s
                 .trim()
                 .parse::<f64>()
@@ -183,7 +194,7 @@ fn coerce_to_float(
                         "field '{field_name}': cannot parse '{s}' as a float"
                     ))
                 }),
-            DataValue::Int64Array(_) | DataValue::Float64Array(_) => {
+            DataValue::Int64Array(_) | DataValue::Float64Array(_) | DataValue::BoolArray(_) => {
                 Err(LaurusError::invalid_argument(format!(
                     "field '{field_name}': received an array but the field is single-valued; \
                      declare the field with multi_valued = true to accept arrays"
@@ -197,25 +208,69 @@ fn coerce_to_float(
     }
 }
 
-fn coerce_to_boolean(field_name: &str, value: DataValue) -> Result<DataValue> {
+/// The scalar Boolean rule shared by both [`coerce_to_boolean`] branches
+/// (#1180): a typed bool, the integers `0` / `1`, or the text `true` /
+/// `false` (trimmed, case-insensitive). Anything else is an error naming
+/// the field.
+fn parse_bool_scalar(field_name: &str, value: &DataValue) -> Result<bool> {
     match value {
-        DataValue::Bool(b) => Ok(DataValue::Bool(b)),
-        DataValue::Int64(0) => Ok(DataValue::Bool(false)),
-        DataValue::Int64(1) => Ok(DataValue::Bool(true)),
+        DataValue::Bool(b) => Ok(*b),
+        DataValue::Int64(0) => Ok(false),
+        DataValue::Int64(1) => Ok(true),
         DataValue::Int64(n) => Err(LaurusError::invalid_argument(format!(
             "field '{field_name}': cannot coerce integer {n} to bool (only 0 and 1 are accepted)"
         ))),
         DataValue::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" => Ok(DataValue::Bool(true)),
-            "false" => Ok(DataValue::Bool(false)),
+            "true" => Ok(true),
+            "false" => Ok(false),
             _ => Err(LaurusError::invalid_argument(format!(
                 "field '{field_name}': cannot parse '{s}' as a bool (expected 'true' or 'false')"
             ))),
         },
         other => Err(LaurusError::invalid_argument(format!(
             "field '{field_name}': cannot coerce {} to a bool",
-            describe(&other)
+            describe(other)
         ))),
+    }
+}
+
+fn coerce_to_boolean(
+    field_name: &str,
+    option: &crate::lexical::core::field::BooleanOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    if option.multi_valued {
+        // Multi-valued boolean field (#1180). A single value is auto-wrapped
+        // under the scalar rule; an integer array is widened element-wise
+        // under the same 0 / 1 rule — which also covers the empty
+        // `Int64Array` every binding sends for `[]` before the field type
+        // is known (#1178); an empty float array is that same `[]`.
+        match value {
+            DataValue::BoolArray(arr) => Ok(DataValue::BoolArray(arr)),
+            DataValue::Int64Array(arr) => arr
+                .iter()
+                .map(|i| parse_bool_scalar(field_name, &DataValue::Int64(*i)))
+                .collect::<Result<Vec<bool>>>()
+                .map(DataValue::BoolArray),
+            DataValue::Float64Array(a) if a.is_empty() => Ok(DataValue::BoolArray(Vec::new())),
+            scalar @ (DataValue::Bool(_) | DataValue::Int64(_) | DataValue::Text(_)) => Ok(
+                DataValue::BoolArray(vec![parse_bool_scalar(field_name, &scalar)?]),
+            ),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a multi-valued bool",
+                describe(&other)
+            ))),
+        }
+    } else {
+        match value {
+            // Multi-valued input to a single-valued field is rejected
+            // rather than silently truncating to one element.
+            DataValue::BoolArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
+            other => Ok(DataValue::Bool(parse_bool_scalar(field_name, &other)?)),
+        }
     }
 }
 
@@ -409,6 +464,7 @@ fn describe(value: &DataValue) -> &'static str {
         DataValue::GeoArray(_) => "geo array",
         DataValue::GeoEcefArray(_) => "geo3d array",
         DataValue::DateTimeArray(_) => "datetime array",
+        DataValue::BoolArray(_) => "bool array",
     }
 }
 
@@ -535,6 +591,130 @@ mod tests {
             .unwrap(),
             DataValue::DateTime(a)
         );
+    }
+
+    // ---- Multi-valued boolean (#1180) ----
+
+    fn multi_boolean() -> FieldOption {
+        FieldOption::Boolean(BooleanOption {
+            multi_valued: true,
+            ..Default::default()
+        })
+    }
+
+    fn multi_integer() -> FieldOption {
+        FieldOption::Integer(IntegerOption {
+            multi_valued: true,
+            ..Default::default()
+        })
+    }
+
+    fn multi_float() -> FieldOption {
+        FieldOption::Float(FloatOption {
+            multi_valued: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn boolean_multi_valued_accepts_array_and_wraps_single() {
+        assert_eq!(
+            coerce_value(
+                "f",
+                &multi_boolean(),
+                DataValue::BoolArray(vec![true, false])
+            )
+            .unwrap(),
+            DataValue::BoolArray(vec![true, false])
+        );
+        // Every scalar the single-valued path accepts is wrapped.
+        assert_eq!(
+            coerce_value("f", &multi_boolean(), DataValue::Bool(true)).unwrap(),
+            DataValue::BoolArray(vec![true])
+        );
+        assert_eq!(
+            coerce_value("f", &multi_boolean(), DataValue::Int64(1)).unwrap(),
+            DataValue::BoolArray(vec![true])
+        );
+        assert_eq!(
+            coerce_value("f", &multi_boolean(), DataValue::Text(" TRUE ".to_string())).unwrap(),
+            DataValue::BoolArray(vec![true])
+        );
+        assert!(coerce_value("f", &multi_boolean(), DataValue::Text("yes".to_string())).is_err());
+        assert!(coerce_value("f", &multi_boolean(), DataValue::Float64(1.0)).is_err());
+    }
+
+    #[test]
+    fn boolean_multi_valued_accepts_int_array_of_zero_one() {
+        assert_eq!(
+            coerce_value("f", &multi_boolean(), DataValue::Int64Array(vec![0, 1, 1])).unwrap(),
+            DataValue::BoolArray(vec![false, true, true])
+        );
+        let err =
+            coerce_value("f", &multi_boolean(), DataValue::Int64Array(vec![0, 2])).unwrap_err();
+        assert!(err.to_string().contains("only 0 and 1"), "{err}");
+        // Bindings turn `[]` into an empty numeric array before the field
+        // type is known (#1178); that must read as "no flags".
+        assert_eq!(
+            coerce_value("f", &multi_boolean(), DataValue::Int64Array(Vec::new())).unwrap(),
+            DataValue::BoolArray(Vec::new())
+        );
+        assert_eq!(
+            coerce_value("f", &multi_boolean(), DataValue::Float64Array(Vec::new())).unwrap(),
+            DataValue::BoolArray(Vec::new())
+        );
+        assert!(
+            coerce_value("f", &multi_boolean(), DataValue::Float64Array(vec![1.0])).is_err(),
+            "a non-empty float array is not a flag list (the scalar rule rejects floats too)"
+        );
+    }
+
+    #[test]
+    fn boolean_single_valued_rejects_arrays() {
+        let err = coerce_value("f", &boolean(), DataValue::BoolArray(vec![true])).unwrap_err();
+        assert!(err.to_string().contains("multi_valued = true"), "{err}");
+        // The single-valued contract is otherwise untouched.
+        assert_eq!(
+            coerce_value("f", &boolean(), DataValue::Bool(false)).unwrap(),
+            DataValue::Bool(false)
+        );
+        assert_eq!(
+            coerce_value("f", &boolean(), DataValue::Int64(0)).unwrap(),
+            DataValue::Bool(false)
+        );
+        assert_eq!(
+            coerce_value("f", &boolean(), DataValue::Text("false".to_string())).unwrap(),
+            DataValue::Bool(false)
+        );
+        let err = coerce_value("f", &boolean(), DataValue::Int64(2)).unwrap_err();
+        assert!(err.to_string().contains("only 0 and 1"), "{err}");
+    }
+
+    /// A `BoolArray` arriving at a multi-valued numeric field is widened
+    /// element-wise, exactly like a scalar `Bool` is today.
+    #[test]
+    fn numeric_multi_valued_widens_bool_array() {
+        assert_eq!(
+            coerce_value(
+                "n",
+                &multi_integer(),
+                DataValue::BoolArray(vec![true, false])
+            )
+            .unwrap(),
+            DataValue::Int64Array(vec![1, 0])
+        );
+        assert_eq!(
+            coerce_value("n", &multi_float(), DataValue::BoolArray(vec![true, false])).unwrap(),
+            DataValue::Float64Array(vec![1.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn numeric_single_valued_rejects_bool_array_with_hint() {
+        for opt in [integer(), float()] {
+            let err = coerce_value("n", &opt, DataValue::BoolArray(vec![true])).unwrap_err();
+            assert!(err.to_string().contains("multi_valued = true"), "{err}");
+        }
     }
 
     fn bytes() -> FieldOption {

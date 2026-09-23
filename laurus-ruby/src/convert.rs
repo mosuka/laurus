@@ -58,6 +58,7 @@ pub fn hash_to_document(ruby: &Ruby, hash: RHash) -> Result<Document, Error> {
 /// | `Array` of `lat`/`lon` Hashes | `GeoArray` (multi-valued geo, #1174) |
 /// | `Array` of `x`/`y`/`z` Hashes | `GeoEcefArray`       |
 /// | `Array` of `Time` / RFC 3339 Strings | `DateTimeArray` (multi-valued datetime, #1184) |
+/// | `Array` of `true` / `false`   | `BoolArray` (multi-valued boolean, #1180) |
 /// | `Hash` with `"lat"`, `"lon"`  | `Geo`                |
 /// | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` (3D ECEF Cartesian, meters) |
 /// | `Time` / ISO 8601 string      | `DateTime`           |
@@ -127,6 +128,18 @@ pub fn rb_to_data_value(ruby: &Ruby, value: Value) -> Result<DataValue, Error> {
             v.is_kind_of(ruby.class_string()) || v.respond_to("iso8601", false).unwrap_or(false)
         }) {
             return rb_datetime_array(ruby, &elements);
+        }
+        // An Array of `true` / `false` is a multi-valued boolean field
+        // (#1180). Ruby booleans are not Integers, so before this gate the
+        // Array fell through to the Float path and raised a TypeError.
+        if elements.iter().all(|v| {
+            v.is_kind_of(ruby.class_true_class()) || v.is_kind_of(ruby.class_false_class())
+        }) {
+            let flags = elements
+                .iter()
+                .map(|v| magnus::TryConvert::try_convert(*v))
+                .collect::<Result<Vec<bool>, Error>>()?;
+            return Ok(DataValue::BoolArray(flags));
         }
         if elements.iter().all(|v| v.is_kind_of(ruby.class_integer())) {
             let ints = elements
@@ -340,6 +353,15 @@ pub fn data_value_to_rb(ruby: &Ruby, value: &DataValue) -> Result<Value, Error> 
             let out = ruby.ary_new_capa(arr.len());
             for dt in arr {
                 out.push(ruby.str_new(&dt.to_rfc3339()))?;
+            }
+            Ok(out.as_value())
+        }
+        // An Array of the same `true` / `false` values the single-valued
+        // arm produces (#1180).
+        DataValue::BoolArray(arr) => {
+            let out = ruby.ary_new_capa(arr.len());
+            for &b in arr {
+                out.push(data_value_to_rb(ruby, &DataValue::Bool(b))?)?;
             }
             Ok(out.as_value())
         }

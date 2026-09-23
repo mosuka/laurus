@@ -180,7 +180,7 @@ new \Laurus\Schema()
 | `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null): void` | 全文フィールド（転置インデックス、BM25）。`$docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
 | `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット整数フィールド。`$multiValued = true` で整数配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット浮動小数点フィールド。`$multiValued = true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
-| `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $docValues = true): void` | ブールフィールド。`$docValues` は上記を参照。 |
+| `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | ブールフィールド。`$multiValued = true` で `bool` のシーケンシャル配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `bool` の配列として読み戻されます）。`$docValues` は上記を参照。 |
 | `addBytesField(string $name, bool $stored = true): void` | 生バイトフィールド。`$docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
 | `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 地理座標フィールド（緯度/経度）。`$multiValued = true` で `["lat" => .., "lon" => ..]` 配列の配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`$docValues` は上記を参照。 |
 | `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`$multiValued = true` で `["x" => .., "y" => .., "z" => ..]` 配列の配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`$docValues` は上記を参照。 |
@@ -541,3 +541,4 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
 | `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 各要素を RFC 3339 としてパース。日時でない文字列はエラー。フィールドに `$multiValued = true` が必要 |
+| `array`（`bool`、シーケンシャル） | `BoolArray` | 全要素が `bool` であること。`[true, 1]` のような混在配列はエラー（"numeric array elements must be numeric"）。フィールドに `$multiValued = true` が必要 |

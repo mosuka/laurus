@@ -186,6 +186,62 @@ class TestMultiValuedArrayIngest < Minitest::Test
     assert_match(/datetimes/, err.message)
   end
 
+  # ---- Multi-valued boolean (Issue #1180) ----
+
+  def index_with_boolean_field(multi_valued:)
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    schema.add_boolean_field("flags", multi_valued: multi_valued)
+    Laurus::Index.new(schema: schema)
+  end
+
+  # An Array of true / false is a multi-valued boolean field; it reads back
+  # as the same Array and a term query matches if any element carries the
+  # value.
+  def test_bool_array_round_trips_through_multi_valued_boolean_field
+    idx = index_with_boolean_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "flags" => [true, false] })
+    idx.put_document("doc2", { "title" => "t", "flags" => [false] })
+    idx.commit
+
+    assert_equal [true, false], idx.get_documents("doc1").first["flags"]
+    assert_equal ["doc1"], idx.search("flags:true", limit: 5).map(&:id)
+    assert_equal %w[doc1 doc2], idx.search("flags:false", limit: 5).map(&:id).sort
+  end
+
+  def test_single_bool_is_wrapped_on_multi_valued_boolean_field
+    idx = index_with_boolean_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "flags" => true })
+    idx.commit
+
+    assert_equal [true], idx.get_documents("doc1").first["flags"]
+  end
+
+  def test_empty_array_is_accepted_by_multi_valued_boolean_field
+    idx = index_with_boolean_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "flags" => [] })
+    idx.commit
+
+    assert_equal [], idx.get_documents("doc1").first["flags"]
+  end
+
+  def test_bool_array_into_single_valued_boolean_field_is_rejected
+    idx = index_with_boolean_field(multi_valued: false)
+    err = assert_raises(StandardError) do
+      idx.put_document("doc1", { "title" => "t", "flags" => [true] })
+    end
+    assert_match(/multi_valued/, err.message)
+  end
+
+  # `[true, 1]` is neither all-bool nor all-Integer, so it takes the Float
+  # path, where `true` has no Float conversion.
+  def test_mixed_bool_and_integer_array_is_rejected
+    idx = index_with_boolean_field(multi_valued: true)
+    assert_raises(TypeError) do
+      idx.put_document("doc1", { "title" => "t", "flags" => [true, 1] })
+    end
+  end
+
   def test_mixed_geo_dimension_array_is_rejected
     idx = index_with_geo_field(multi_valued: true)
     assert_raises(StandardError) do

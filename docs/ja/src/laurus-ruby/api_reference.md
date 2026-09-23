@@ -172,7 +172,7 @@ Laurus::Schema.new
 | `add_text_field(name, stored: true, indexed: true, term_vectors: true, doc_values: true, analyzer: nil)` | 全文フィールド（転置インデックス、BM25）。`term_vectors:` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values:` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored: true` の場合のみ有効です。`analyzer:` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
 | `add_integer_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット整数フィールド。`multi_valued: true` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
 | `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット浮動小数点フィールド。`multi_valued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
-| `add_boolean_field(name, stored: true, indexed: true, doc_values: true)` | ブールフィールド。`doc_values:` は上記を参照。 |
+| `add_boolean_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | ブールフィールド。`multi_valued: true` で `true` / `false` の Array を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `true` / `false` の Array として読み戻されます）。`doc_values:` は上記を参照。 |
 | `add_bytes_field(name, stored: true)` | 生バイトフィールド。`doc_values:` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
 | `add_geo_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 地理座標フィールド（緯度/経度）。`multi_valued: true` で `{ "lat" => .., "lon" => .. }` Hash の Array を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`doc_values:` は上記を参照。 |
 | `add_geo3d_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued: true` で `{ "x" => .., "y" => .., "z" => .. }` Hash の Array を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values:` は上記を参照。 |
@@ -570,3 +570,4 @@ Ruby の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `Array`（`"x"`, `"y"`, `"z"` を持つ `Hash` の配列） | `GeoEcefArray` | フィールドに `multi_valued: true` が必要 |
 | `Time` / `String`（`iso8601` に応答） | `DateTime` | `iso8601` 経由で変換 |
 | `Array`（`Time` / `iso8601` に応答する `String`） | `DateTimeArray` | 各要素を RFC 3339 としてパース（`iso8601` に応答するオブジェクトは先に変換）。日時でない `String` は `ArgumentError`。フィールドに `multi_valued: true` が必要 |
+| `Array`（`true` / `false`） | `BoolArray` | 全要素が `true` または `false` であること。`[true, 1]` のような混在 Array は `TypeError`。フィールドに `multi_valued: true` が必要 |

@@ -326,16 +326,27 @@ impl PySchema {
     /// Add a boolean field.
     ///
     /// Args:
+    ///     multi_valued: When True, the field accepts a ``list[bool]`` and a
+    ///         term query / DSL ``flags:true`` matches if any element is
+    ///         ``True`` (Lucene-style "any match"). Default False.
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, doc_values=true))]
-    pub fn add_boolean_field(&mut self, name: &str, stored: bool, indexed: bool, doc_values: bool) {
+    #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
+    pub fn add_boolean_field(
+        &mut self,
+        name: &str,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.fields.insert(
             name.to_string(),
             FieldOption::Boolean(BooleanOption {
                 indexed,
                 stored,
+                multi_valued,
                 doc_values,
             }),
         );

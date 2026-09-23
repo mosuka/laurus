@@ -256,6 +256,7 @@ pub enum DataValue {
     GeoArray(Vec<GeoPoint>),         // multi-valued 2D geo field
     GeoEcefArray(Vec<GeoEcefPoint>), // multi-valued 3D ECEF field
     DateTimeArray(Vec<DateTime<Utc>>), // multi-valued datetime field
+    BoolArray(Vec<bool>),            // multi-valued boolean field
 }
 ```
 
@@ -323,6 +324,7 @@ let schema = Schema::builder()
 | array of geo objects (e.g. `[{"lat": 35.6, "lon": 139.7}, ...]`) | `Geo` with `multi_valued = true` |
 | array of `x`/`y`/`z` objects | `Geo3d` with `multi_valued = true` |
 | array of RFC 3339 strings (e.g. `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`) | `DateTime` with `multi_valued = true` |
+| array of booleans (e.g. `[true, false]`) | `Boolean` with `multi_valued = true` |
 | object with a `data` key (base64-encoded string) and an optional `mime` string key | `Bytes` value |
 
 Vector fields (`Hnsw`, `Flat`, `Ivf`) are **never** inferred: they must be
@@ -371,20 +373,48 @@ fields keep their behaviour), while an *array* of RFC 3339 strings infers
 a multi-valued `DateTime` — declare the field in the schema if you want a
 single-valued `DateTime`.
 
+Boolean fields accept `multi_valued = true` as well (Issue #1180), but the
+mechanism differs from every other multi-valued type: a Boolean field has
+no BKD points. Every element of a multi-valued boolean field is indexed as
+its own `"true"` / `"false"` **term posting**, so `TermQuery` and DSL term
+queries such as `flags:true` match a document if **any** element equals
+the queried value (Lucene-style "any match"). A document is reported once
+for a given term even when several of its elements equal it (postings are
+aggregated per document and term), and Boolean fields remain not
+range-queryable. Because these are ordinary term postings, repeated
+elements affect BM25 scoring the way they do in Lucene: `[true, true]`
+yields one posting with term frequency 2 and field length 2, so it scores
+higher than `[true]` for `flags:true`, while `[true, false]` scores
+slightly lower than `[true]` because of length normalization. There is no
+dedupe and no constant scoring for term queries (constant-scored term
+queries are tracked in Issue #580). Under the `Dynamic` policy a JSON
+array whose elements are all booleans (e.g. `[true, false]`) infers a
+multi-valued `Boolean`; a mixed array such as `[true, 1]` is rejected with
+the existing error that array fields must contain only numeric values.
+Note the asymmetry with scalars: a *single* `"true"` string coerces to a
+`Bool` on a declared Boolean field, but a string array such as
+`["true", "false"]` still hits the RFC 3339 datetime gate and is rejected —
+use JSON booleans for arrays. Turning `multi_valued` on for an existing
+Boolean field is a metadata-only change; turning it off requires a reindex
+when the field is `stored`, and is **Destructive** when the field is
+`stored: false` — unlike the BKD-backed types there is no point tree to
+rebuild from, only the stored value.
+
 Single values sent to a multi-valued field are auto-wrapped into a
 one-element array; arrays sent to a single-valued field are rejected
 rather than silently truncating (the error tells you to declare the field
-with `multi_valued = true`). An empty array sent to a multi-valued geo or
-datetime field is accepted and simply has no points (or instants), so it
-matches no spatial or range query.
+with `multi_valued = true`). An empty array sent to a multi-valued geo,
+datetime or boolean field is accepted and simply has no points, instants
+or terms, so it matches no spatial, range or term query.
 
-Segments that contain multi-valued geo or datetime values use new
+Segments that contain multi-valued geo, datetime or boolean values use new
 stored-field type tags and cannot be read by builds that predate these
 features; there is no format version bump, so an older reader fails
 loudly instead of misreading the data. Stored multi-valued datetimes are
 kept at microsecond precision (one `i64` Unix microsecond per instant, so
 sub-microsecond digits are truncated), whereas a single-valued `DateTime`
-keeps its full precision.
+keeps its full precision. Stored multi-valued booleans are written one
+byte per element (not bit-packed).
 
 ### Type conflicts
 
@@ -413,6 +443,13 @@ to coerce the value to the declared type. The coercion rules are:
 | `DateTime` with `multi_valued = true` | single `DateTime` or RFC 3339 `Text` | wrapped into a one-element array |
 | `DateTime` with `multi_valued = true` | empty numeric array (`[]`) | empty instant list |
 | `DateTime` with `multi_valued = true` | anything else | error |
+| `Boolean` (single-valued) | `BoolArray` | error (declare `multi_valued = true`) |
+| `Boolean` with `multi_valued = true` | `BoolArray` | stored as-is |
+| `Boolean` with `multi_valued = true` | single `Bool`, `Int64(0)` / `Int64(1)` or `Text("true"/"false")` | wrapped into a one-element array (same scalar rule as above) |
+| `Boolean` with `multi_valued = true` | `Int64Array` | widened element-wise under the same `0` / `1` rule (`[0, 1]` → `[false, true]`; `[0, 2]` is an error: only 0 and 1 are accepted) |
+| `Boolean` with `multi_valued = true` | empty numeric array (`[]`) | empty boolean list (matches no term query) |
+| `Boolean` with `multi_valued = true` | anything else | error |
+| `Integer` / `Float` with `multi_valued = true` | `BoolArray` | widened element-wise to `0` / `1` (a single-valued `Integer` / `Float` rejects it, asking for `multi_valued = true`) |
 | vector (`Hnsw`/`Flat`/`Ivf`) | `Text` or `Bytes` | passed through unchanged for the field's embedder |
 | vector (`Hnsw`/`Flat`/`Ivf`) | numeric array | cast element-wise to `f32` |
 
@@ -525,7 +562,8 @@ The requested change is classified into one of three kinds, reported as
   field's `m`/`ef_construction`).
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
-  `distance`, or a type change on a `stored: false` field).
+  `distance`, a type change on a `stored: false` field, or turning
+  `multi_valued` off on a `stored: false` Boolean field).
 
 `Reindex` and `Destructive` changes are rejected unless you explicitly
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against

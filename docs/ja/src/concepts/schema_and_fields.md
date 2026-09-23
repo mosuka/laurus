@@ -244,6 +244,7 @@ pub enum DataValue {
     GeoArray(Vec<GeoPoint>),         // 多値 2D 地理フィールド
     GeoEcefArray(Vec<GeoEcefPoint>), // 多値 3D ECEF フィールド
     DateTimeArray(Vec<DateTime<Utc>>), // 多値日時フィールド
+    BoolArray(Vec<bool>),            // 多値ブールフィールド
 }
 ```
 
@@ -309,6 +310,7 @@ let schema = Schema::builder()
 | 地理 object の配列（例: `[{"lat": 35.6, "lon": 139.7}, ...]`） | `Geo`（`multi_valued = true`） |
 | `x`/`y`/`z` object の配列 | `Geo3d`（`multi_valued = true`） |
 | RFC 3339 文字列の配列（例: `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`） | `DateTime`（`multi_valued = true`） |
+| ブール値の配列（例: `[true, false]`） | `Boolean`（`multi_valued = true`） |
 | `data` キー（base64 エンコードされた文字列）と任意の `mime` キーを持つ object | `Bytes` 値 |
 
 ベクトルフィールド（`Hnsw` / `Flat` / `Ivf`）は **自動推論の対象外**です。
@@ -353,17 +355,39 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 挙動を変えないため）が、RFC 3339 文字列の*配列*は多値 `DateTime` と推論されます。
 単一値の `DateTime` フィールドが必要な場合はスキーマで明示的に宣言してください。
 
+`Boolean` フィールドも同様に `multi_valued = true` を指定できます（Issue #1180）。
+ただし仕組みは他の多値型とは異なり、`Boolean` フィールドは BKD ポイントを持ちません。
+多値ブールフィールドの各要素は、それぞれ独立した `"true"` / `"false"` の **term posting**
+としてインデックスされます。そのため `TermQuery` や `flags:true` のような DSL の term クエリは、
+**いずれかの要素**がクエリの値と等しければドキュメントにマッチします（Lucene 流の "any match"）。
+複数の要素が同じ値でも、その term についてドキュメントは 1 回だけ報告されます
+（posting はドキュメント・term ごとに集約されます）。`Boolean` フィールドが範囲クエリの対象外である点は
+従来どおりです。通常の term posting であるため、要素の重複は Lucene と同じように BM25 スコアに影響します:
+`[true, true]` は term frequency 2・フィールド長 2 の posting 1 件になるため、`flags:true` に対して
+`[true]` より高くスコアリングされ、`[true, false]` は長さ正規化（length normalization）のため
+`[true]` よりわずかに低くスコアリングされます。重複排除は行わず、term クエリの constant スコアリングも
+ありません（constant スコアの term クエリは Issue #580 で追跡しています）。
+`Dynamic` ポリシーでは、全要素がブール値である JSON 配列（例: `[true, false]`）は多値 `Boolean` と
+推論されます。`[true, 1]` のような混在配列は、既存の「配列フィールドは数値のみ」という趣旨のエラーで
+拒否されます。スカラーとの非対称性に注意してください: *単一*の `"true"` 文字列は宣言済みの `Boolean`
+フィールドに対して `Bool` に変換されますが、`["true", "false"]` のような文字列*配列*は RFC 3339 日時の
+判定に引っかかって拒否されます —— 配列には JSON のブール値を使ってください。
+既存の `Boolean` フィールドで `multi_valued` を有効にする変更は metadata-only です。無効にする変更は、
+フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら **`Destructive`**
+になります —— BKD ベースの型と異なり、再構築の元になるポイントツリーがなく、保存された値しかないためです。
+
 多値フィールドに単一値を送った場合は要素 1 個の配列に自動ラップされます。
 逆に単一値フィールドに配列を送ると、暗黙の切り捨てではなくエラーになります
 （エラーメッセージは `multi_valued = true` でフィールドを宣言するよう案内します）。
-多値地理フィールドまたは多値日時フィールドに空配列を送った場合は受理され、
-ポイント（時刻）を持たないフィールドになります（どの空間クエリ・範囲クエリにもマッチしません）。
+多値地理・多値日時・多値ブールフィールドに空配列を送った場合は受理され、
+ポイント・時刻・term を持たないフィールドになります（どの空間クエリ・範囲クエリ・term クエリにもマッチしません）。
 
-多値地理または多値日時の値を含むセグメントは新しい stored-field 型タグを使用するため、
+多値地理・多値日時・多値ブールの値を含むセグメントは新しい stored-field 型タグを使用するため、
 これらの機能より前のビルドでは読み込めません。フォーマットのバージョンは上げていないため、
 古いリーダーはデータを誤読するのではなく、明示的なエラーで失敗します。
 保存される多値日時はマイクロ秒精度（時刻ごとに 1 つの `i64` Unix マイクロ秒。マイクロ秒未満の桁は
 切り捨て）で保持され、単一値の `DateTime` は完全な精度を保ちます。
+保存される多値ブールは要素ごとに 1 バイト（ビットパックなし）で書き込まれます。
 
 ### 型衝突
 
@@ -392,6 +416,13 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 | `DateTime`（`multi_valued = true`） | 単一の `DateTime` または RFC 3339 の `Text` | 要素 1 個の配列にラップ |
 | `DateTime`（`multi_valued = true`） | 空の数値配列（`[]`） | 空の時刻リスト |
 | `DateTime`（`multi_valued = true`） | 上記以外 | エラー |
+| `Boolean`（単一値） | `BoolArray` | エラー（`multi_valued = true` を宣言する） |
+| `Boolean`（`multi_valued = true`） | `BoolArray` | そのまま格納 |
+| `Boolean`（`multi_valued = true`） | 単一の `Bool`、`Int64(0)` / `Int64(1)`、または `Text("true"/"false")` | 要素 1 個の配列にラップ（スカラーと同じ規則） |
+| `Boolean`（`multi_valued = true`） | `Int64Array` | 同じ `0` / `1` の規則で要素ごとに変換（`[0, 1]` → `[false, true]`。`[0, 2]` は「0 と 1 のみ受け付ける」エラー） |
+| `Boolean`（`multi_valued = true`） | 空の数値配列（`[]`） | 空のブールリスト（どの term クエリにもマッチしない） |
+| `Boolean`（`multi_valued = true`） | 上記以外 | エラー |
+| `Integer` / `Float`（`multi_valued = true`） | `BoolArray` | 要素ごとに `0` / `1` へ拡張（単一値の `Integer` / `Float` は `multi_valued = true` を案内するエラーで拒否） |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | `Text` または `Bytes` | フィールドの embedder にそのまま渡す |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | 数値配列 | 要素ごとに `f32` へキャスト |
 
@@ -480,7 +511,7 @@ let outcome = engine.update_field(
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
 - **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`indexed: false → true`、HNSW の `m`/`ef_construction` 変更）。
-- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更）。
+- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` フィールドの `multi_valued` を無効にする変更）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 

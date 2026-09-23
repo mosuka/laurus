@@ -94,6 +94,7 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|us| datetime_micros_to_json(*us))
                 .collect(),
         ),
+        Some(Kind::BoolArrayValue(arr)) => json!(arr.values),
     }
 }
 
@@ -614,6 +615,22 @@ mod tests {
             json["fields"]["times"],
             json!(["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"])
         );
+    }
+
+    #[test]
+    fn json_to_proto_bool_array_and_back() {
+        // #1180: an array of booleans becomes a `BoolArrayValue` and is
+        // surfaced back to MCP clients as JSON booleans.
+        let json_val = json!({ "fields": { "flags": [true, false] } });
+        let doc = json_to_document(&json_val).unwrap();
+        match &doc.fields["flags"].kind {
+            Some(v1::value::Kind::BoolArrayValue(a)) => {
+                assert_eq!(a.values, vec![true, false]);
+            }
+            other => panic!("expected BoolArrayValue, got {other:?}"),
+        }
+        let json = document_to_json(&doc);
+        assert_eq!(json["fields"]["flags"], json!([true, false]));
     }
 
     /// Regression: pre-1970 micros used to collapse onto the epoch because
