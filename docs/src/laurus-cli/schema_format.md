@@ -116,6 +116,7 @@ UTC timestamp field. Supports range queries.
 [fields.created_at.DateTime]
 indexed = true
 stored = true
+multi_valued = false
 doc_values = true
 ```
 
@@ -123,6 +124,7 @@ doc_values = true
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables range queries on date/time |
 | `stored` | `bool` | `true` | Stores the original value |
+| `multi_valued` | `bool` | `false` | Accept arrays of instants; range queries match if **any** instant satisfies the predicate (Lucene-style "any match") |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Geo

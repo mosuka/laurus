@@ -57,7 +57,7 @@ cargo doc --open
 | `.add_integer_field(name, IntegerOption)` | 整数フィールドを追加（`IntegerOption::multi_valued = true` で多値配列対応） |
 | `.add_float_field(name, FloatOption)` | 浮動小数点フィールドを追加（`FloatOption::multi_valued = true` で多値配列対応） |
 | `.add_boolean_field(name, BooleanOption)` | 真偽値フィールドを追加 |
-| `.add_datetime_field(name, DateTimeOption)` | 日時フィールドを追加 |
+| `.add_datetime_field(name, DateTimeOption)` | 日時フィールドを追加（`DateTimeOption::multi_valued = true` で時刻配列対応） |
 | `.add_geo_field(name, GeoOption)` | 2D 地理（緯度/経度）フィールドを追加（`GeoOption::multi_valued = true` でポイント配列対応） |
 | `.add_geo3d_field(name, Geo3dOption)` | 3D ECEF 直交座標系の点フィールド（x, y, z メートル単位）を追加（`Geo3dOption::multi_valued = true` でポイント配列対応） |
 | `.add_bytes_field(name, BytesOption)` | バイナリフィールドを追加 |
@@ -98,6 +98,7 @@ cargo doc --open
 | `.add_float64_array(name, values)` | 多値浮動小数点フィールドを追加 |
 | `.add_geo_array(name, points)` | 多値 2D 地理フィールドを追加（`Vec<GeoPoint>`） |
 | `.add_geo_ecef_array(name, points)` | 多値 3D ECEF フィールドを追加（`Vec<GeoEcefPoint>`） |
+| `.add_datetime_array(name, values)` | 多値日時フィールドを追加（`Vec<DateTime<Utc>>`） |
 | `.add_bytes(name, data)` | バイナリデータを追加 |
 | `.build()` | `Document` を構築 |
 
@@ -232,3 +233,4 @@ cargo doc --open
 | `DataValue::Float64Array(Vec<f64>)` | 多値浮動小数点数（`multi_valued` フィールドオプションが必要） |
 | `DataValue::GeoArray(Vec<GeoPoint>)` | 多値 2D 地理ポイント（`multi_valued` フィールドオプションが必要） |
 | `DataValue::GeoEcefArray(Vec<GeoEcefPoint>)` | 多値 3D ECEF ポイント（`multi_valued` フィールドオプションが必要） |
+| `DataValue::DateTimeArray(Vec<DateTime<Utc>>)` | 多値の時刻（`multi_valued` フィールドオプションが必要） |

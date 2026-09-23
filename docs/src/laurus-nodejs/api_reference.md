@@ -201,7 +201,7 @@ class Schema {
 | `addBytesField(name, stored?)` | Raw bytes field. No `docValues` option: a `Bytes` value is never written to DocValues regardless. |
 | `addGeoField(name, stored?, indexed?, multiValued?, docValues?)` | Geographic coordinate field. Pass `multiValued: true` to accept an array of `{ lat, lon }` objects (distance / bounding-box queries match if any point satisfies the predicate). See `docValues` above. |
 | `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `multiValued: true` to accept an array of `{ x, y, z }` objects (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `docValues` above. |
-| `addDatetimeField(name, stored?, indexed?, docValues?)` | UTC datetime field. See `docValues` above. |
+| `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)` | UTC datetime field. Pass `multiValued: true` to accept an array of RFC 3339 strings (range queries match if any instant satisfies the predicate; values are read back as an array of RFC 3339 strings normalized to UTC). See `docValues` above. |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW vector field. `baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF vector field. |
@@ -713,3 +713,4 @@ JavaScript values are automatically converted to Laurus
 | `{ x, y, z }` | `GeoEcef` | Three `number` values, meters (3D ECEF Cartesian) |
 | `{ lat, lon }[]` | `GeoArray` | Array of `{ lat, lon }` objects; requires `multiValued: true` on the field |
 | `{ x, y, z }[]` | `GeoEcefArray` | Array of `{ x, y, z }` objects; requires `multiValued: true` on the field |
+| `string[]` (all RFC 3339) | `DateTimeArray` | Array of RFC 3339 datetime strings; requires `multiValued: true` on the field. An array of strings that are not all RFC 3339 is rejected |

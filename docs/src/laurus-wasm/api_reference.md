@@ -424,9 +424,13 @@ floats; range queries then match if any value satisfies the predicate
 
 Add a boolean field. See `docValues` above.
 
-#### `addDatetimeField(name, stored?, indexed?, docValues?)`
+#### `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)`
 
-Add a date/time field. See `docValues` above.
+Add a date/time field. Pass `multiValued: true` to accept arrays of RFC 3339
+strings; range queries (`searchDateTimeRange` and DSL date ranges) then match
+if any instant satisfies the predicate (Lucene-style "any match" with constant
+scoring). Values are read back as an array of RFC 3339 strings normalized to
+UTC. See `docValues` above.
 
 #### `addGeoField(name, stored?, indexed?, multiValued?, docValues?)`
 

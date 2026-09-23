@@ -87,7 +87,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-The response always includes `multi_valued` for `integer`, `float`, `geo`, and `geo3d` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`); the same key is accepted on `POST /v1/index` and `POST /v1/schema/fields`.
+The response always includes `multi_valued` for `integer`, `float`, `date_time`, `geo`, and `geo3d` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}` or `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`); the same key is accepted on `POST /v1/index` and `POST /v1/schema/fields`.
 
 ### Add a Field (Dynamic Schema)
 
@@ -308,6 +308,7 @@ paths in sync.
 | `{"x": ..., "y": ..., "z": ...}` | `geo3d` | All three keys required, finite numbers, ECEF meters. Mixing with `lat`/`lon` keys is rejected. |
 | `[{"latitude": 35.6, "longitude": 139.7}, ...]` (all geo objects) | `geo` with `multi_valued: true` | Multi-valued geo field; the `lat` / `lon` / `lng` aliases are accepted. Documents are returned with the field rendered as an array of `{"latitude", "longitude"}` objects. |
 | `[{"x": ..., "y": ..., "z": ...}, ...]` (all 3D objects) | `geo3d` with `multi_valued: true` | Multi-valued 3D geo field, returned as an array of `{"x", "y", "z"}` objects. Mixing 2D and 3D objects in one array is rejected. |
+| `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]` (all RFC 3339 strings) | `date_time` with `multi_valued: true` | Multi-valued datetime field (Issue #1184). Only RFC 3339 strings are accepted here. Documents are returned with the field rendered as an array of RFC 3339 strings normalized to UTC (e.g. `"2024-06-15T12:00:00+00:00"`). |
 | `{"data": "<base64>", "mime": "..."}` | `bytes` | `mime` is optional. Disambiguates a bytes payload from a plain string on a multimodal vector field's `Text`-or-`Bytes` embedder input — see [Schema and Fields](../concepts/schema_and_fields.md). |
 
 The gateway returns an HTTP 400 (`Bad Request`) when:
@@ -315,6 +316,9 @@ The gateway returns an HTTP 400 (`Bad Request`) when:
 - An array contains mixed types or non-numeric elements
   (e.g. `[1, "x"]`), or mixes 2D and 3D geo objects
   (e.g. `[{"lat": ...}, {"x": ...}]`).
+- An array of strings where any element is not an RFC 3339 datetime
+  (e.g. `["2024-01-01T00:00:00Z", "tomorrow"]`) — multi-valued text
+  fields are not supported (Issue #1175).
 - An object does not match any of the supported shapes above (e.g. missing
   latitude / longitude keys for 2D geo, missing any of `x` / `y` / `z` for
   3D geo, or a non-string `data` key).
