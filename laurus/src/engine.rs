@@ -5507,6 +5507,63 @@ mod tests {
         );
     }
 
+    /// Regression for #1179: the documented `date:{2024-01-01 TO 2024-12-31}`
+    /// DSL form used to parse into a literal `TermQuery` and return nothing.
+    /// It must now reach the field's BKD tree across segments.
+    #[tokio::test]
+    async fn test_datetime_range_dsl_multi_segment_returns_hits() {
+        use crate::data::DataValue;
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::DateTimeOption;
+        use crate::lexical::search::searcher::LexicalSearchQuery;
+        use chrono::TimeZone;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field("date", FieldOption::DateTime(DateTimeOption::default()))
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+
+        let put = |id: &'static str, y: i32, m: u32| {
+            let mut doc = crate::data::Document::new();
+            doc.fields.insert(
+                "date".into(),
+                DataValue::DateTime(chrono::Utc.with_ymd_and_hms(y, m, 1, 0, 0, 0).unwrap()),
+            );
+            (id, doc)
+        };
+        let (id, doc) = put("A", 2024, 3);
+        engine.put_document(id, doc).await.unwrap();
+        engine.commit().await.unwrap();
+        let (id, doc) = put("B", 2024, 9);
+        engine.put_document(id, doc).await.unwrap();
+        let (id, doc) = put("C", 2025, 3);
+        engine.put_document(id, doc).await.unwrap();
+        engine.commit().await.unwrap();
+
+        let search = |dsl: &str| {
+            crate::engine::search::SearchRequestBuilder::new()
+                .lexical_query(LexicalSearchQuery::from(dsl))
+                .limit(10)
+                .build()
+        };
+        let hits = engine
+            .search(search("date:{2024-01-01 TO 2024-12-31}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "date range must find both 2024 docs across two segments; got {}",
+            hits.len()
+        );
+        let hits = engine
+            .search(search("date:[2024-06-01 TO 2024-12-31]"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
     /// Build an engine with `body` (text) + `popularity` (integer) and
     /// four docs whose popularity order differs from doc order (#942).
     async fn options_test_engine() -> Engine {
