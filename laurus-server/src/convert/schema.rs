@@ -144,6 +144,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::Boolean(o) => Some(Opt::Boolean(v1::BooleanOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::DateTime(o) => Some(Opt::DateTime(v1::DateTimeOption {
@@ -234,6 +235,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
         Some(Opt::Boolean(o)) => Some(FieldOption::Boolean(BooleanOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
         })),
         Some(Opt::DateTime(o)) => Some(FieldOption::DateTime(DateTimeOption {
@@ -1219,9 +1221,31 @@ mod tests {
         }
     }
 
-    /// #1174: `multi_valued` round-trips for Geo and Geo3d (proto field 4),
-    /// and `Geo3dOption.doc_values = false` survives the trip — the reverse
-    /// conversion used to hardcode `true`.
+    /// #1180: `BooleanOption.multi_valued` (proto field 4) round-trips, and
+    /// `doc_values = false` survives the trip.
+    #[test]
+    fn schema_field_option_boolean_multi_valued_round_trip() {
+        let schema = Schema::builder()
+            .add_field(
+                "flags",
+                FieldOption::Boolean(BooleanOption {
+                    indexed: true,
+                    stored: true,
+                    multi_valued: true,
+                    doc_values: false,
+                }),
+            )
+            .build();
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("flags") {
+            Some(FieldOption::Boolean(o)) => {
+                assert!(o.multi_valued);
+                assert!(!o.doc_values);
+            }
+            other => panic!("expected FieldOption::Boolean, got {other:?}"),
+        }
+    }
+
     /// #1184: `DateTimeOption.multi_valued` (proto field 4) round-trips.
     #[test]
     fn schema_field_option_datetime_multi_valued_round_trip() {
@@ -1246,6 +1270,9 @@ mod tests {
         }
     }
 
+    /// #1174: `multi_valued` round-trips for Geo and Geo3d (proto field 4),
+    /// and `Geo3dOption.doc_values = false` survives the trip — the reverse
+    /// conversion used to hardcode `true`.
     #[test]
     fn schema_field_option_geo_multi_valued_round_trip() {
         let schema = Schema::builder()

@@ -60,6 +60,9 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|us| datetime_micros_to_json(*us))
                 .collect(),
         ),
+        Some(Kind::BoolArrayValue(arr)) => {
+            Value::Array(arr.values.iter().map(|b| Value::Bool(*b)).collect())
+        }
         None => Value::Null,
     }
 }
@@ -473,6 +476,10 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         Opt::Boolean(v1::BooleanOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            multi_valued: v
+                .get("multi_valued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("date_time") {
@@ -547,10 +554,12 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             }
             json!({ "text": text_obj })
         }
-        // `multi_valued` is a plain (non-optional) proto bool on the four
-        // BKD-backed options, so it is always surfaced, like `indexed` and
-        // `stored`. Integer/Float used to omit it, so `GET .../schema` could
-        // not tell a multi-valued field from a single-valued one (#1174).
+        // `multi_valued` is a plain (non-optional) proto bool on every option
+        // that carries it (the BKD-backed Integer/Float/Geo/Geo3d/DateTime
+        // and, since #1180, the term-only Boolean), so it is always surfaced,
+        // like `indexed` and `stored`. Integer/Float used to omit it, so
+        // `GET .../schema` could not tell a multi-valued field from a
+        // single-valued one (#1174).
         Some(Opt::Integer(v)) => {
             let mut obj = json!({
                 "indexed": v.indexed,
@@ -574,7 +583,11 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             json!({ "float": obj })
         }
         Some(Opt::Boolean(v)) => {
-            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            let mut obj = json!({
+                "indexed": v.indexed,
+                "stored": v.stored,
+                "multi_valued": v.multi_valued,
+            });
             if let Some(doc_values) = v.doc_values {
                 obj["doc_values"] = json!(doc_values);
             }
@@ -1549,12 +1562,36 @@ mod tests {
         );
     }
 
+    /// #1180: an array of JSON booleans is inferred as a multi-valued boolean
+    /// (`BoolArrayValue`) and renders back as JSON booleans.
+    #[test]
+    fn test_json_value_bool_array_roundtrip() {
+        let json = json!([true, false]);
+        let proto = json_value_to_proto(&json).unwrap();
+        match &proto.kind {
+            Some(v1::value::Kind::BoolArrayValue(a)) => {
+                assert_eq!(a.values, vec![true, false]);
+            }
+            other => panic!("expected BoolArrayValue, got {other:?}"),
+        }
+        assert_eq!(proto_value_to_json(&proto), json);
+    }
+
+    #[test]
+    fn test_json_value_mixed_bool_array_errors() {
+        // The boolean gate needs every element to be a boolean; a mix keeps
+        // the numeric-array error.
+        let err = json_value_to_proto(&json!([true, 1])).unwrap_err();
+        assert!(err.contains("numeric"), "unexpected error: {err}");
+    }
+
     /// #1174: `multi_valued` is read from and written to the JSON schema
-    /// shape for every BKD-backed option. Integer/Float used to accept it
-    /// on input but never surface it on output.
+    /// shape for every option that carries it (the BKD-backed ones and,
+    /// since #1180, Boolean). Integer/Float used to accept it on input but
+    /// never surface it on output.
     #[test]
     fn test_field_option_multi_valued_round_trips_through_json() {
-        for kind in ["integer", "float", "geo", "geo3d", "date_time"] {
+        for kind in ["integer", "float", "geo", "geo3d", "date_time", "boolean"] {
             let json = json!({ kind: {"indexed": true, "stored": true, "multi_valued": true} });
             let proto = json_to_proto_field_option(&json).unwrap();
             let back = proto_field_option_to_json(&proto);

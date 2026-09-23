@@ -187,6 +187,10 @@ message BooleanOption {
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
   optional bool doc_values = 3;
+  // When true, the field accepts `BoolArrayValue` (arrays of booleans) and
+  // a term query matches a document if any element equals the queried
+  // value (Lucene-style). Field number 4; see `GeoOption.multi_valued`.
+  bool multi_valued = 4;
 }
 
 message DateTimeOption {
