@@ -29,15 +29,7 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
             Value::String(String::from_utf8_lossy(&buf).into_owned())
         }
         Some(Kind::VectorValue(v)) => Value::Array(v.values.iter().map(|f| json!(*f)).collect()),
-        Some(Kind::DatetimeValue(us)) => {
-            let secs = us / 1_000_000;
-            let nanos = ((us % 1_000_000) * 1_000) as u32;
-            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                Value::String(dt.to_rfc3339())
-            } else {
-                json!(*us)
-            }
-        }
+        Some(Kind::DatetimeValue(us)) => datetime_micros_to_json(*us),
         Some(Kind::GeoValue(g)) => {
             json!({"latitude": g.latitude, "longitude": g.longitude})
         }
@@ -62,7 +54,24 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|p| json!({"x": p.x, "y": p.y, "z": p.z}))
                 .collect(),
         ),
+        Some(Kind::DatetimeArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|us| datetime_micros_to_json(*us))
+                .collect(),
+        ),
         None => Value::Null,
+    }
+}
+
+/// Render proto Unix micro-seconds as an RFC 3339 string, or as the raw
+/// number when the value is outside chrono's range. `from_timestamp_micros`
+/// handles negative (pre-1970) values correctly, unlike the previous `/` +
+/// `%` split, which truncated toward zero and wrapped the nanosecond part.
+fn datetime_micros_to_json(us: i64) -> Value {
+    match chrono::DateTime::from_timestamp_micros(us) {
+        Some(dt) => Value::String(dt.to_rfc3339()),
+        None => json!(us),
     }
 }
 
@@ -470,6 +479,10 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         Opt::DateTime(v1::DateTimeOption {
             indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            multi_valued: v
+                .get("multi_valued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
         })
     } else if let Some(v) = obj.get("geo") {
@@ -568,7 +581,11 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             json!({ "boolean": obj })
         }
         Some(Opt::DateTime(v)) => {
-            let mut obj = json!({ "indexed": v.indexed, "stored": v.stored });
+            let mut obj = json!({
+                "indexed": v.indexed,
+                "stored": v.stored,
+                "multi_valued": v.multi_valued,
+            });
             if let Some(doc_values) = v.doc_values {
                 obj["doc_values"] = json!(doc_values);
             }
@@ -1477,12 +1494,67 @@ mod tests {
         assert!(err.contains("2D geo points"), "unexpected error: {err}");
     }
 
+    /// #1184: an array of RFC 3339 strings is inferred as a multi-valued
+    /// datetime (`DatetimeArrayValue`, Unix micros) and renders back as RFC
+    /// 3339 strings normalized to UTC.
+    #[test]
+    fn test_json_value_datetime_array_roundtrip() {
+        let json = json!(["2024-01-01T00:00:00Z", "2024-06-15T21:00:00.5+09:00"]);
+        let proto = json_value_to_proto(&json).unwrap();
+        match &proto.kind {
+            Some(v1::value::Kind::DatetimeArrayValue(a)) => {
+                assert_eq!(a.values, vec![1_704_067_200_000_000, 1_718_452_800_500_000]);
+            }
+            other => panic!("expected DatetimeArrayValue, got {other:?}"),
+        }
+        let back = proto_value_to_json(&proto);
+        let rendered: Vec<chrono::DateTime<chrono::Utc>> = back
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                chrono::DateTime::from_timestamp_micros(1_704_067_200_000_000).unwrap(),
+                chrono::DateTime::from_timestamp_micros(1_718_452_800_500_000).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_value_non_datetime_string_array_errors() {
+        // A single date string is Text; an array must be *all* RFC 3339.
+        let err = json_value_to_proto(&json!(["2024-01-01T00:00:00Z", "tomorrow"])).unwrap_err();
+        assert!(err.contains("RFC 3339"), "unexpected error: {err}");
+        let err = json_value_to_proto(&json!(["a", "b"])).unwrap_err();
+        assert!(err.contains("RFC 3339"), "unexpected error: {err}");
+    }
+
+    /// Regression: pre-1970 micros used to render as the epoch (or the raw
+    /// number) because the seconds/nanos split truncated toward zero.
+    #[test]
+    fn test_proto_datetime_pre_1970_renders_rfc3339() {
+        let proto = v1::Value {
+            kind: Some(v1::value::Kind::DatetimeValue(-86_400_000_001)),
+        };
+        assert_eq!(
+            proto_value_to_json(&proto),
+            json!("1969-12-30T23:59:59.999999+00:00")
+        );
+    }
+
     /// #1174: `multi_valued` is read from and written to the JSON schema
     /// shape for every BKD-backed option. Integer/Float used to accept it
     /// on input but never surface it on output.
     #[test]
     fn test_field_option_multi_valued_round_trips_through_json() {
-        for kind in ["integer", "float", "geo", "geo3d"] {
+        for kind in ["integer", "float", "geo", "geo3d", "date_time"] {
             let json = json!({ kind: {"indexed": true, "stored": true, "multi_valued": true} });
             let proto = json_to_proto_field_option(&json).unwrap();
             let back = proto_field_option_to_json(&proto);

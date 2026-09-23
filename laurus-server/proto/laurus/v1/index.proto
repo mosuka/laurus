@@ -196,6 +196,10 @@ message DateTimeOption {
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
   optional bool doc_values = 3;
+  // When true, the field accepts `DatetimeArrayValue` (arrays of instants)
+  // and range queries match a document if any instant satisfies the
+  // predicate (Lucene-style). Field number 4; see `GeoOption.multi_valued`.
+  bool multi_valued = 4;
 }
 
 message GeoOption {

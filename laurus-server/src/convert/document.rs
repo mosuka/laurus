@@ -88,6 +88,9 @@ pub fn data_value_to_proto(val: &DataValue) -> v1::Value {
                 })
                 .collect(),
         })),
+        DataValue::DateTimeArray(arr) => Some(Kind::DatetimeArrayValue(v1::DatetimeArrayValue {
+            values: arr.iter().map(|dt| dt.timestamp_micros()).collect(),
+        })),
     };
     v1::Value { kind }
 }
@@ -107,12 +110,7 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
         Some(Kind::TextValue(s)) => DataValue::Text(s.clone()),
         Some(Kind::BytesValue(b)) => DataValue::Bytes(b.clone(), None),
         Some(Kind::VectorValue(v)) => DataValue::Vector(v.values.clone()),
-        Some(Kind::DatetimeValue(us)) => {
-            let secs = us / 1_000_000;
-            let nanos = ((us % 1_000_000) * 1_000) as u32;
-            let dt = chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default();
-            DataValue::DateTime(dt)
-        }
+        Some(Kind::DatetimeValue(us)) => DataValue::DateTime(datetime_from_micros(*us)),
         Some(Kind::GeoValue(g)) => DataValue::Geo(geo_point_from_proto(g)),
         Some(Kind::Geo3dValue(p)) => DataValue::GeoEcef(laurus::GeoEcefPoint::new(p.x, p.y, p.z)),
         Some(Kind::Int64ArrayValue(arr)) => DataValue::Int64Array(arr.values.clone()),
@@ -126,8 +124,23 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
                 .map(|p| laurus::GeoEcefPoint::new(p.x, p.y, p.z))
                 .collect(),
         ),
+        Some(Kind::DatetimeArrayValue(arr)) => DataValue::DateTimeArray(
+            arr.values
+                .iter()
+                .map(|us| datetime_from_micros(*us))
+                .collect(),
+        ),
         None => DataValue::Null,
     }
+}
+
+/// Convert proto Unix micro-seconds into a UTC datetime, falling back to the
+/// epoch for a value outside chrono's range — the lenient behavior the
+/// `DatetimeValue` arm has always had. Uses `from_timestamp_micros` rather
+/// than a hand-rolled `/` + `%` split, which truncated toward zero and
+/// collapsed every pre-1970 instant onto the epoch.
+fn datetime_from_micros(us: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()
 }
 
 /// Convert a proto `GeoPoint` into a [`laurus::GeoPoint`], falling back to
@@ -208,6 +221,39 @@ mod tests {
 
     fn ecef_proto_clone(v: &v1::Value) -> v1::Value {
         v.clone()
+    }
+
+    /// #1184: multi-valued datetimes use the dedicated `DatetimeArrayValue`
+    /// kind (Unix micros per element) and round-trip element-wise, including
+    /// sub-second, pre-1970 and empty.
+    #[test]
+    fn data_value_datetime_arrays_round_trip() {
+        let value = DataValue::DateTimeArray(vec![
+            chrono::DateTime::from_timestamp_micros(1_700_000_000_500_000).unwrap(),
+            chrono::DateTime::from_timestamp_micros(-86_400_000_001).unwrap(),
+        ]);
+        let proto = data_value_to_proto(&value);
+        match &proto.kind {
+            Some(v1::value::Kind::DatetimeArrayValue(a)) => {
+                assert_eq!(a.values, vec![1_700_000_000_500_000, -86_400_000_001]);
+            }
+            other => panic!("expected DatetimeArrayValue, got {other:?}"),
+        }
+        assert_eq!(data_value_from_proto(&proto), value);
+
+        let empty = DataValue::DateTimeArray(Vec::new());
+        assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
+    }
+
+    /// Regression: the scalar `DatetimeValue` decoder split micros with
+    /// truncating `/` and `%`, so any pre-1970 instant produced a negative
+    /// nanosecond count and collapsed onto the epoch.
+    #[test]
+    fn data_value_datetime_pre_1970_round_trips() {
+        let original =
+            DataValue::DateTime(chrono::DateTime::from_timestamp_micros(-86_400_000_001).unwrap());
+        let back = data_value_from_proto(&data_value_to_proto(&original));
+        assert_eq!(back, original);
     }
 
     /// `DataValue::Geo` continues to use the 2D `GeoValue` proto kind,

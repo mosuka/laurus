@@ -18,6 +18,7 @@ message Value {
     Geo3dPoint geo3d_value = 12;
     GeoArrayValue geo_array_value = 13;
     Geo3dArrayValue geo3d_array_value = 14;
+    DatetimeArrayValue datetime_array_value = 15;
   }
 }
 
@@ -65,6 +66,14 @@ message GeoArrayValue {
 // `Geo3dOption.multi_valued`.
 message Geo3dArrayValue {
   repeated Geo3dPoint values = 1;
+}
+
+// A multi-valued datetime field (Lucene-style "any match" semantics: a
+// document matches a range query if any of its instants does). Elements are
+// Unix microseconds (UTC), like `datetime_value`. Requires
+// `DateTimeOption.multi_valued`.
+message DatetimeArrayValue {
+  repeated int64 values = 1;
 }
 
 // A document consisting of named fields.
