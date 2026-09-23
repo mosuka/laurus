@@ -128,6 +128,8 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             term_vectors: Some(o.term_vectors),
             analyzer: o.analyzer.as_ref().map(analyzer_spec_to_proto),
             doc_values: Some(o.doc_values),
+            multi_valued: o.multi_valued,
+            position_increment_gap: Some(o.position_increment_gap),
         })),
         FieldOption::Integer(o) => Some(Opt::Integer(v1::IntegerOption {
             indexed: o.indexed,
@@ -213,6 +215,12 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
         Some(Opt::Text(o)) => Some(FieldOption::Text(TextOption {
             indexed: o.indexed,
             stored: o.stored,
+            multi_valued: o.multi_valued,
+            // Same tri-state treatment as `term_vectors` below (#1175): an
+            // omitted gap is the engine default, not 0.
+            position_increment_gap: o
+                .position_increment_gap
+                .unwrap_or(laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP),
             // Unset means "use the engine's default", matching
             // `TextOption::default()` (#1083).
             term_vectors: o.term_vectors.unwrap_or(true),
@@ -1243,6 +1251,53 @@ mod tests {
                 assert!(!o.doc_values);
             }
             other => panic!("expected FieldOption::Boolean, got {other:?}"),
+        }
+    }
+
+    /// #1175: `TextOption.multi_valued` (proto field 6) and
+    /// `position_increment_gap` (proto field 7) round-trip, and an omitted
+    /// gap on the wire means the engine default rather than 0.
+    #[test]
+    fn schema_field_option_text_multi_valued_round_trip() {
+        let schema = Schema::builder()
+            .add_field(
+                "notes",
+                FieldOption::Text(TextOption {
+                    multi_valued: true,
+                    position_increment_gap: 5,
+                    doc_values: false,
+                    ..Default::default()
+                }),
+            )
+            .build();
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("notes") {
+            Some(FieldOption::Text(o)) => {
+                assert!(o.multi_valued);
+                assert_eq!(o.position_increment_gap, 5);
+                assert!(!o.doc_values);
+            }
+            other => panic!("expected FieldOption::Text, got {other:?}"),
+        }
+
+        // A client that predates #1175 omits the gap entirely.
+        let proto = v1::FieldOption {
+            option: Some(v1::field_option::Option::Text(v1::TextOption {
+                indexed: true,
+                stored: true,
+                term_vectors: None,
+                analyzer: None,
+                doc_values: None,
+                multi_valued: true,
+                position_increment_gap: None,
+            })),
+        };
+        match field_option_from_proto(&proto) {
+            Some(FieldOption::Text(o)) => assert_eq!(
+                o.position_increment_gap,
+                laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP
+            ),
+            other => panic!("expected FieldOption::Text, got {other:?}"),
         }
     }
 

@@ -119,6 +119,18 @@ message TextOption {
   // "use the engine's default" (currently `true`), for the same reason
   // as `term_vectors` above.
   optional bool doc_values = 5;
+  // When true, the field accepts `TextArrayValue` (arrays of strings);
+  // a term query matches a document if any element contains the term
+  // (Lucene-style). Field number 6; `1`-`5` were already taken.
+  bool multi_valued = 6;
+  // Positions skipped between the elements of a multi-valued text field
+  // (Lucene's `positionIncrementGap`), so a phrase query does not match
+  // across two elements unless its slop reaches this value. Unset means
+  // "use the engine's default" (currently 100) — `optional` for the same
+  // reason as `term_vectors`: a plain `uint32` would read an omitted gap
+  // as 0, which lets phrases cross element boundaries. `0` is a legal
+  // explicit value meaning "number the elements as if concatenated".
+  optional uint32 position_increment_gap = 7;
 }
 
 // Reference to an analyzer for a text field.

@@ -94,6 +94,9 @@ pub fn data_value_to_proto(val: &DataValue) -> v1::Value {
         DataValue::BoolArray(arr) => Some(Kind::BoolArrayValue(v1::BoolArrayValue {
             values: arr.clone(),
         })),
+        DataValue::TextArray(arr) => Some(Kind::TextArrayValue(v1::TextArrayValue {
+            values: arr.clone(),
+        })),
     };
     v1::Value { kind }
 }
@@ -134,6 +137,7 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
                 .collect(),
         ),
         Some(Kind::BoolArrayValue(arr)) => DataValue::BoolArray(arr.values.clone()),
+        Some(Kind::TextArrayValue(arr)) => DataValue::TextArray(arr.values.clone()),
         None => DataValue::Null,
     }
 }
@@ -275,6 +279,29 @@ mod tests {
         assert_eq!(data_value_from_proto(&proto), value);
 
         let empty = DataValue::BoolArray(Vec::new());
+        assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
+    }
+
+    /// #1175: multi-valued text uses the dedicated `TextArrayValue` kind and
+    /// round-trips element-wise, including Unicode, an empty string and the
+    /// empty list.
+    #[test]
+    fn data_value_text_arrays_round_trip() {
+        let value = DataValue::TextArray(vec![
+            "hello world".to_string(),
+            String::new(),
+            "日本語".to_string(),
+        ]);
+        let proto = data_value_to_proto(&value);
+        match &proto.kind {
+            Some(v1::value::Kind::TextArrayValue(a)) => {
+                assert_eq!(a.values, vec!["hello world", "", "日本語"]);
+            }
+            other => panic!("expected TextArrayValue, got {other:?}"),
+        }
+        assert_eq!(data_value_from_proto(&proto), value);
+
+        let empty = DataValue::TextArray(Vec::new());
         assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
     }
 

@@ -95,6 +95,7 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
                 .collect(),
         ),
         Some(Kind::BoolArrayValue(arr)) => json!(arr.values),
+        Some(Kind::TextArrayValue(arr)) => json!(arr.values),
     }
 }
 
@@ -631,6 +632,25 @@ mod tests {
         }
         let json = document_to_json(&doc);
         assert_eq!(json["fields"]["flags"], json!([true, false]));
+    }
+
+    #[test]
+    fn json_to_proto_text_array_and_back() {
+        // #1175: a string array that is not all RFC 3339 becomes a
+        // `TextArrayValue` and is surfaced back to MCP clients as strings.
+        let json_val = json!({ "fields": { "links": ["https://a.example", "https://b.example"] } });
+        let doc = json_to_document(&json_val).unwrap();
+        match &doc.fields["links"].kind {
+            Some(v1::value::Kind::TextArrayValue(a)) => {
+                assert_eq!(a.values, vec!["https://a.example", "https://b.example"]);
+            }
+            other => panic!("expected TextArrayValue, got {other:?}"),
+        }
+        let json = document_to_json(&doc);
+        assert_eq!(
+            json["fields"]["links"],
+            json!(["https://a.example", "https://b.example"])
+        );
     }
 
     /// Regression: pre-1970 micros used to collapse onto the epoch because

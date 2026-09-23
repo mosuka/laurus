@@ -63,6 +63,12 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
         Some(Kind::BoolArrayValue(arr)) => {
             Value::Array(arr.values.iter().map(|b| Value::Bool(*b)).collect())
         }
+        Some(Kind::TextArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|s| Value::String(s.clone()))
+                .collect(),
+        ),
         None => Value::Null,
     }
 }
@@ -451,6 +457,16 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             // Same tri-state treatment for the same reason (#1047).
             doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
             analyzer: v.get("analyzer").map(json_to_analyzer_spec).transpose()?,
+            multi_valued: v
+                .get("multi_valued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            // Tri-state like `term_vectors` (#1175): an omitted gap means the
+            // engine default, never 0.
+            position_increment_gap: v
+                .get("position_increment_gap")
+                .and_then(|v| v.as_u64())
+                .and_then(|g| u32::try_from(g).ok()),
         })
     } else if let Some(v) = obj.get("integer") {
         Opt::Integer(v1::IntegerOption {
@@ -535,9 +551,13 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
     use v1::field_option::Option as Opt;
     match &opt.option {
         Some(Opt::Text(v)) => {
+            // `multi_valued` is always surfaced, like on every other option
+            // that carries it (#1175; see the comment on the BKD-backed arms
+            // below).
             let mut text_obj = json!({
                 "indexed": v.indexed,
                 "stored": v.stored,
+                "multi_valued": v.multi_valued,
             });
             // Surfaced only when explicitly set (#1083): an absent
             // `term_vectors` means "use the engine's default", same as
@@ -548,6 +568,11 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             // Same tri-state treatment for the same reason (#1047).
             if let Some(doc_values) = v.doc_values {
                 text_obj["doc_values"] = json!(doc_values);
+            }
+            // Same tri-state treatment again (#1175): `None` is the engine
+            // default, and `0` is a deliberate, meaningful setting.
+            if let Some(gap) = v.position_increment_gap {
+                text_obj["position_increment_gap"] = json!(gap);
             }
             if let Some(spec) = v.analyzer.as_ref().and_then(analyzer_spec_to_json) {
                 text_obj["analyzer"] = spec;
@@ -1540,13 +1565,44 @@ mod tests {
         );
     }
 
+    /// #1175: a string array that is not entirely RFC 3339 is a multi-valued
+    /// text field (`TextArrayValue`) rather than an error, and renders back
+    /// as the same JSON strings. An all-RFC-3339 array still infers a
+    /// datetime array (see `test_json_value_datetime_array_roundtrip`).
     #[test]
-    fn test_json_value_non_datetime_string_array_errors() {
-        // A single date string is Text; an array must be *all* RFC 3339.
-        let err = json_value_to_proto(&json!(["2024-01-01T00:00:00Z", "tomorrow"])).unwrap_err();
-        assert!(err.contains("RFC 3339"), "unexpected error: {err}");
-        let err = json_value_to_proto(&json!(["a", "b"])).unwrap_err();
-        assert!(err.contains("RFC 3339"), "unexpected error: {err}");
+    fn test_json_value_non_datetime_string_array_infers_text_array() {
+        for json in [
+            json!(["2024-01-01T00:00:00Z", "tomorrow"]),
+            json!(["a", "b"]),
+            json!(["https://example.com/a", "https://example.com/b"]),
+        ] {
+            let proto = json_value_to_proto(&json).unwrap();
+            match &proto.kind {
+                Some(v1::value::Kind::TextArrayValue(a)) => {
+                    assert_eq!(json!(a.values), json, "{json}");
+                }
+                other => panic!("{json}: expected TextArrayValue, got {other:?}"),
+            }
+            assert_eq!(proto_value_to_json(&proto), json);
+        }
+    }
+
+    /// #1175: the `text` option reads `multi_valued` and the tri-state
+    /// `position_increment_gap`, and surfaces the gap only when set.
+    #[test]
+    fn test_text_option_position_increment_gap_round_trips_through_json() {
+        let json = json!({ "text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 0} });
+        let proto = json_to_proto_field_option(&json).unwrap();
+        let back = proto_field_option_to_json(&proto);
+        assert_eq!(back["text"]["multi_valued"], json!(true));
+        assert_eq!(back["text"]["position_increment_gap"], json!(0));
+
+        // Omitted on input: engine default, so nothing is surfaced.
+        let json = json!({ "text": {"indexed": true, "stored": true} });
+        let proto = json_to_proto_field_option(&json).unwrap();
+        let back = proto_field_option_to_json(&proto);
+        assert_eq!(back["text"]["multi_valued"], json!(false));
+        assert!(back["text"].get("position_increment_gap").is_none());
     }
 
     /// Regression: pre-1970 micros used to render as the epoch (or the raw
@@ -1591,7 +1647,15 @@ mod tests {
     /// never surface it on output.
     #[test]
     fn test_field_option_multi_valued_round_trips_through_json() {
-        for kind in ["integer", "float", "geo", "geo3d", "date_time", "boolean"] {
+        for kind in [
+            "integer",
+            "float",
+            "geo",
+            "geo3d",
+            "date_time",
+            "boolean",
+            "text",
+        ] {
             let json = json!({ kind: {"indexed": true, "stored": true, "multi_valued": true} });
             let proto = json_to_proto_field_option(&json).unwrap();
             let back = proto_field_option_to_json(&proto);
