@@ -453,14 +453,17 @@ pub(crate) fn analyze_field_value(
             points.push(vec![*num]);
         }
         DataValue::DateTime(dt) => {
-            let ts = dt.timestamp() as f64;
+            // The term keeps its historical whole-second epoch text; the
+            // BKD point uses the shared micro-second encoding (#1179) so
+            // range bounds compare like-for-like with indexed values.
+            let text = dt.timestamp().to_string();
             terms.push(AnalyzedTerm {
-                term: ts.to_string(),
+                term: text.clone(),
                 position: 0,
                 frequency: 1,
-                offset: (0, ts.to_string().len()),
+                offset: (0, text.len()),
             });
-            points.push(vec![ts]);
+            points.push(vec![crate::lexical::core::datetime::datetime_to_point(dt)]);
         }
         DataValue::Bool(b) => {
             // bool is indexed as "true"/"false" text for lexical queries,

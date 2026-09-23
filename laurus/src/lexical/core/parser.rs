@@ -349,8 +349,8 @@ impl DocumentParser {
                         };
 
                         field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                        let ts = dt.timestamp() as f64
-                            + dt.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+                        // Same BKD encoding as the inverted-index writer (#1179).
+                        let ts = crate::lexical::core::datetime::datetime_to_point(dt);
                         point_values.insert(field_name.clone(), vec![vec![ts]]);
                     }
                     FieldValue::Geo(point) => {

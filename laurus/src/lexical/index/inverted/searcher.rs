@@ -78,7 +78,9 @@ fn sort_key_as_point(value: &crate::lexical::core::field::FieldValue) -> Option<
     match value {
         FieldValue::Int64(v) => Some(*v as f64),
         FieldValue::Float64(v) => Some(*v),
-        FieldValue::DateTime(dt) => Some(dt.timestamp() as f64),
+        // Same encoding the BKD point uses (#1179), so the pruning floor
+        // compares like-for-like with the indexed values.
+        FieldValue::DateTime(dt) => Some(crate::lexical::core::datetime::datetime_to_point(dt)),
         _ => None,
     }
 }
