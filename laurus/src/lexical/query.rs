@@ -31,7 +31,7 @@ pub use multi_term::MultiTermQuery;
 pub use parser::LexicalQueryParser;
 pub use phrase::PhraseQuery;
 pub use prefix::PrefixQuery;
-pub use range::NumericRangeQuery;
+pub use range::{DateTimeRangeQuery, NumericRangeQuery};
 pub use regexp::RegexpQuery;
 pub use span::{SpanNearQuery, SpanQuery, SpanTermQuery};
 pub use term::TermQuery;
