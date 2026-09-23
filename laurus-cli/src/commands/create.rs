@@ -416,10 +416,11 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
         .default(true)
         .interact()?;
 
-    // The BKD-backed types (#281 numeric, #1174 geo, #1184 datetime).
+    // Types whose values may be arrays: the BKD-backed ones (#281 numeric,
+    // #1174 geo, #1184 datetime) and the term-only Boolean (#1180).
     let multi_valued = if matches!(
         type_name,
-        "Integer" | "Float" | "Geo" | "Geo3d" | "DateTime"
+        "Integer" | "Float" | "Geo" | "Geo3d" | "DateTime" | "Boolean"
     ) {
         Confirm::new()
             .with_prompt("Multi-valued? (accepts arrays of values)")
@@ -450,6 +451,7 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
         "Boolean" => FieldOption::Boolean(BooleanOption {
             indexed,
             stored,
+            multi_valued,
             doc_values,
         }),
         "DateTime" => FieldOption::DateTime(DateTimeOption {

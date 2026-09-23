@@ -45,6 +45,7 @@ pub fn json_to_document(value: &Value) -> napi::Result<Document> {
 /// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
 /// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
+/// - `array` of booleans     -> `DataValue::BoolArray` (multi-valued boolean, #1180)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -195,5 +196,8 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
                 .map(|dt| Value::String(dt.to_rfc3339()))
                 .collect(),
         ),
+        // JSON booleans, which `infer_from_json` reads back as a
+        // multi-valued boolean (#1180).
+        DataValue::BoolArray(arr) => Value::Array(arr.iter().map(|b| Value::Bool(*b)).collect()),
     }
 }

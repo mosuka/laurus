@@ -215,3 +215,60 @@ describe("multi-valued datetime arrays from JS (#1184)", () => {
     ).rejects.toThrow(/RFC 3339/);
   });
 });
+
+async function indexWithBooleanField(multiValued) {
+  const schema = new Schema();
+  schema.addTextField("title");
+  // (name, stored, indexed, multiValued)
+  schema.addBooleanField("flags", true, true, multiValued);
+  return Index.create(null, schema);
+}
+
+describe("multi-valued boolean arrays from JS (#1180)", () => {
+  it("round-trips an array of booleans through a multiValued boolean field", async () => {
+    const index = await indexWithBooleanField(true);
+    await index.putDocument("doc1", { title: "t", flags: [true, false] });
+    await index.putDocument("doc2", { title: "t", flags: [false] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].flags).toEqual([true, false]);
+    // Any element matches a term query.
+    const trues = await index.search("flags:true", 5);
+    expect(trues.map((h) => h.id)).toEqual(["doc1"]);
+    const falses = await index.search("flags:false", 5);
+    expect(falses.map((h) => h.id).sort()).toEqual(["doc1", "doc2"]);
+  });
+
+  it("wraps a single boolean on a multiValued boolean field", async () => {
+    const index = await indexWithBooleanField(true);
+    await index.putDocument("doc1", { title: "t", flags: true });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].flags).toEqual([true]);
+  });
+
+  it("accepts an empty array on a multiValued boolean field", async () => {
+    const index = await indexWithBooleanField(true);
+    await index.putDocument("doc1", { title: "t", flags: [] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].flags).toEqual([]);
+  });
+
+  it("rejects an array sent to a single-valued boolean field", async () => {
+    const index = await indexWithBooleanField(false);
+    await expect(
+      index.putDocument("doc1", { title: "t", flags: [true] }),
+    ).rejects.toThrow(/multi_valued/);
+  });
+
+  it("rejects an array mixing booleans and numbers", async () => {
+    const index = await indexWithBooleanField(true);
+    await expect(
+      index.putDocument("doc1", { title: "t", flags: [true, 1] }),
+    ).rejects.toThrow(/numeric/);
+  });
+});

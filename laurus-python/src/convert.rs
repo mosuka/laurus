@@ -32,6 +32,7 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 /// - `list[(lat, lon)]`    → `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `list[(x, y, z)]`     → `DataValue::GeoEcefArray`
 /// - `list[datetime | str]` → `DataValue::DateTimeArray` (multi-valued datetime, #1184)
+/// - `list[bool]`          → `DataValue::BoolArray` (multi-valued boolean, #1180)
 /// - `(lat, lon)` tuple    → `DataValue::Geo`
 /// - `(x, y, z)` tuple     → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
@@ -87,6 +88,17 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
             item.is_instance_of::<PyString>() || item.hasattr("isoformat").unwrap_or(false)
         }) {
             return py_datetime_list_to_datetime_array(list);
+        }
+        // A list of bools is a multi-valued boolean field (#1180). Checked
+        // before the integer gate — `bool` is a subclass of `int` — so it no
+        // longer falls through to the float path as `[1.0, 0.0]`; the core
+        // still widens a `BoolArray` element-wise for numeric fields.
+        if list.iter().all(|item| item.is_instance_of::<PyBool>()) {
+            let flags: Vec<bool> = list
+                .iter()
+                .map(|item| item.extract::<bool>())
+                .collect::<PyResult<_>>()?;
+            return Ok(DataValue::BoolArray(flags));
         }
         let all_ints = list
             .iter()
@@ -250,6 +262,8 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
             let items: Vec<String> = arr.iter().map(|dt| dt.to_rfc3339()).collect();
             Ok(PyList::new(py, items)?.unbind().into_any())
         }
+        // A list of Python bools (#1180).
+        DataValue::BoolArray(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
     }
 }
 

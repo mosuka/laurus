@@ -43,6 +43,7 @@ pub fn json_to_document(value: &Value) -> Result<Document, JsValue> {
 /// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
 /// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
+/// - `array` of booleans     -> `DataValue::BoolArray` (multi-valued boolean, #1180)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -191,6 +192,9 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
                 .map(|dt| Value::String(dt.to_rfc3339()))
                 .collect(),
         ),
+        // JSON booleans, which `infer_from_json` reads back as a
+        // multi-valued boolean (#1180).
+        DataValue::BoolArray(arr) => Value::Array(arr.iter().map(|b| Value::Bool(*b)).collect()),
     }
 }
 
@@ -301,5 +305,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Issue #1180: an array of booleans is a multi-valued boolean and
+    /// renders back as the same array.
+    #[wasm_bindgen_test]
+    fn bool_array_round_trips_as_bool_array() {
+        let json = json!([true, false]);
+        let dv = json_to_data_value(&json).unwrap();
+        assert_eq!(dv, DataValue::BoolArray(vec![true, false]));
+        assert_eq!(data_value_to_json(&dv), json);
+    }
+
+    #[wasm_bindgen_test]
+    fn mixed_bool_and_number_array_is_rejected() {
+        assert!(json_to_data_value(&json!([true, 1])).is_err());
     }
 }

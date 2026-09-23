@@ -55,6 +55,7 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 /// | `array` of `lat`/`lon` arrays (sequential) | `GeoArray` (multi-valued geo, #1174) |
 /// | `array` of `x`/`y`/`z` arrays (sequential) | `GeoEcefArray`      |
 /// | `array` of RFC 3339 strings (sequential)  | `DateTimeArray` (multi-valued datetime, #1184) |
+/// | `array` of bools (sequential)             | `BoolArray` (multi-valued boolean, #1180) |
 /// | `array` with `"lat"`, `"lon"` keys        | `Geo`                |
 /// | `array` with `"x"`, `"y"`, `"z"` keys     | `GeoEcef`            |
 /// | ISO 8601 string (fallback)                | `DateTime`           |
@@ -152,6 +153,15 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
                 out.push(dt);
             }
             return Ok(DataValue::DateTimeArray(out));
+        }
+        // A sequential array of bools is a multi-valued boolean field
+        // (#1180); checked before the int gate.
+        if ht.iter().all(|(_, val)| val.is_bool()) {
+            let mut flags = Vec::with_capacity(ht.len());
+            for (_, val) in ht.iter() {
+                flags.push(bool::from_zval(val).ok_or("boolean array elements must be bool")?);
+            }
+            return Ok(DataValue::BoolArray(flags));
         }
         if ht.iter().all(|(_, val)| val.is_long()) {
             let mut ints = Vec::with_capacity(ht.len());
@@ -337,6 +347,16 @@ pub fn data_value_to_zval(value: &DataValue) -> PhpResult<Zval> {
                 item.set_string(&dt.to_rfc3339(), false)
                     .map_err(|_| "failed to set datetime string")?;
                 arr.push(item).map_err(|_| "failed to push datetime")?;
+            }
+            zv.set_hashtable(arr);
+        }
+        // An array of the same bools the single-valued arm produces (#1180).
+        DataValue::BoolArray(flags) => {
+            let mut arr = ZendHashTable::new();
+            for &b in flags {
+                let mut item = Zval::new();
+                item.set_bool(b);
+                arr.push(item).map_err(|_| "failed to push bool")?;
             }
             zv.set_hashtable(arr);
         }

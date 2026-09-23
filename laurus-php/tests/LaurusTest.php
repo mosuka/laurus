@@ -462,6 +462,63 @@ class LaurusTest extends TestCase
         $idx->putDocument("doc1", ["title" => "t", "seen_at" => ["2024-01-01T00:00:00Z", "tomorrow"]]);
     }
 
+    // ── Multi-valued boolean arrays (Issue #1180) ────────────────────────
+
+    private function indexWithMultiValuedBooleanField(bool $multiValued): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        // (name, stored, indexed, multi_valued)
+        $schema->addBooleanField("flags", true, true, $multiValued);
+        return new Laurus\Index(null, $schema);
+    }
+
+    public function testBoolArrayRoundTripsThroughMultiValuedBooleanField(): void
+    {
+        $idx = $this->indexWithMultiValuedBooleanField(true);
+        $idx->putDocument("doc1", ["title" => "t", "flags" => [true, false]]);
+        $idx->putDocument("doc2", ["title" => "t", "flags" => [false]]);
+        $idx->commit();
+        $this->assertSame([true, false], $idx->getDocuments("doc1")[0]["flags"]);
+        // Any element matches a term query.
+        $this->assertSame(["doc1"], $this->idsOf($idx->search("flags:true")));
+        $falses = $this->idsOf($idx->search("flags:false"));
+        sort($falses);
+        $this->assertSame(["doc1", "doc2"], $falses);
+    }
+
+    public function testSingleBoolIsWrappedOnMultiValuedBooleanField(): void
+    {
+        $idx = $this->indexWithMultiValuedBooleanField(true);
+        $idx->putDocument("doc1", ["title" => "t", "flags" => true]);
+        $idx->commit();
+        $this->assertSame([true], $idx->getDocuments("doc1")[0]["flags"]);
+    }
+
+    public function testEmptyArrayIsAcceptedByMultiValuedBooleanField(): void
+    {
+        $idx = $this->indexWithMultiValuedBooleanField(true);
+        $idx->putDocument("doc1", ["title" => "t", "flags" => []]);
+        $idx->commit();
+        $this->assertSame([], $idx->getDocuments("doc1")[0]["flags"]);
+    }
+
+    public function testBoolArrayIntoSingleValuedBooleanFieldIsRejected(): void
+    {
+        $idx = $this->indexWithMultiValuedBooleanField(false);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/multi_valued/');
+        $idx->putDocument("doc1", ["title" => "t", "flags" => [true]]);
+    }
+
+    public function testMixedBoolAndIntArrayIsRejected(): void
+    {
+        $idx = $this->indexWithMultiValuedBooleanField(true);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/numeric/');
+        $idx->putDocument("doc1", ["title" => "t", "flags" => [true, 1]]);
+    }
+
     public function testMixedGeoDimensionArrayIsRejected(): void
     {
         $idx = $this->indexWithGeoField(true);

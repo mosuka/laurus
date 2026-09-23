@@ -219,15 +219,26 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
+    /// * `multi_valued` - When true, the field accepts an array of bools and
+    ///   a term query / DSL `flags:true` matches if any element is `true`
+    ///   (Lucene-style "any match"). Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
-    #[php(defaults(stored = true, indexed = true, doc_values = true))]
-    pub fn add_boolean_field(&self, name: String, stored: bool, indexed: bool, doc_values: bool) {
+    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    pub fn add_boolean_field(
+        &self,
+        name: String,
+        stored: bool,
+        indexed: bool,
+        multi_valued: bool,
+        doc_values: bool,
+    ) {
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed,
                 stored,
+                multi_valued,
                 doc_values,
             }),
         );
