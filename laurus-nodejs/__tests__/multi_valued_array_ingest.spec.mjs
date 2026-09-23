@@ -157,3 +157,61 @@ describe("multi-valued geo arrays from JS (#1174)", () => {
     ).rejects.toThrow();
   });
 });
+
+async function indexWithDatetimeField(multiValued) {
+  const schema = new Schema();
+  schema.addTextField("title");
+  // (name, stored, indexed, multiValued)
+  schema.addDatetimeField("seenAt", true, true, multiValued);
+  return Index.create(null, schema);
+}
+
+describe("multi-valued datetime arrays from JS (#1184)", () => {
+  it("round-trips an array of RFC 3339 strings through a multiValued datetime field", async () => {
+    const index = await indexWithDatetimeField(true);
+    await index.putDocument("doc1", {
+      title: "t",
+      seenAt: ["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"],
+    });
+    await index.putDocument("doc2", { title: "t", seenAt: ["2025-03-01T00:00:00Z"] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].seenAt).toEqual(["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"]);
+    // Any instant matches a range query.
+    const hits = await index.search("seenAt:[2024-06-01 TO 2024-12-31]", 5);
+    expect(hits.map((h) => h.id)).toEqual(["doc1"]);
+  });
+
+  it("wraps a single string on a multiValued datetime field", async () => {
+    const index = await indexWithDatetimeField(true);
+    await index.putDocument("doc1", { title: "t", seenAt: "2024-01-01T00:00:00Z" });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].seenAt).toEqual(["2024-01-01T00:00:00+00:00"]);
+  });
+
+  it("accepts an empty array on a multiValued datetime field", async () => {
+    const index = await indexWithDatetimeField(true);
+    await index.putDocument("doc1", { title: "t", seenAt: [] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].seenAt).toEqual([]);
+  });
+
+  it("rejects an array sent to a single-valued datetime field", async () => {
+    const index = await indexWithDatetimeField(false);
+    await expect(
+      index.putDocument("doc1", { title: "t", seenAt: ["2024-01-01T00:00:00Z"] }),
+    ).rejects.toThrow(/multi_valued/);
+  });
+
+  it("rejects an array with a non-datetime string", async () => {
+    const index = await indexWithDatetimeField(true);
+    await expect(
+      index.putDocument("doc1", { title: "t", seenAt: ["2024-01-01T00:00:00Z", "tomorrow"] }),
+    ).rejects.toThrow(/RFC 3339/);
+  });
+});

@@ -42,6 +42,7 @@ pub fn json_to_document(value: &Value) -> Result<Document, JsValue> {
 ///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
 /// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
+/// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -183,6 +184,13 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
                 .map(|p| serde_json::json!({ "x": p.x, "y": p.y, "z": p.z }))
                 .collect(),
         ),
+        // RFC 3339 strings, which `infer_from_json` reads back as a
+        // multi-valued datetime (#1184).
+        DataValue::DateTimeArray(arr) => Value::Array(
+            arr.iter()
+                .map(|dt| Value::String(dt.to_rfc3339()))
+                .collect(),
+        ),
     }
 }
 
@@ -191,6 +199,31 @@ mod tests {
     use super::*;
     use serde_json::json;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Issue #1184: an array of RFC 3339 strings is a multi-valued datetime
+    /// and renders back as RFC 3339 strings normalized to UTC.
+    #[wasm_bindgen_test]
+    fn datetime_string_array_round_trips_as_datetime_array() {
+        let json = json!(["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]);
+        let dv = json_to_data_value(&json).unwrap();
+        match &dv {
+            DataValue::DateTimeArray(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!(v[1].timestamp(), 1_718_452_800);
+            }
+            other => panic!("expected DateTimeArray, got {other:?}"),
+        }
+        assert_eq!(
+            data_value_to_json(&dv),
+            json!(["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"])
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn non_datetime_string_array_is_rejected() {
+        assert!(json_to_data_value(&json!(["2024-01-01T00:00:00Z", "tomorrow"])).is_err());
+        assert!(json_to_data_value(&json!(["a", "b"])).is_err());
+    }
 
     /// Issue #1178: arrays used to become `Vector` unconditionally, which the
     /// core's multi-valued integer/float coercion rejects. They must now

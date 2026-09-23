@@ -447,23 +447,29 @@ impl RbSchema {
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
     ///   - `indexed:` (bool, default true): Whether the field is searchable.
+    ///   - `multi_valued:` (bool, default false): When true, the field
+    ///     accepts an Array of `Time` objects / RFC 3339 Strings and range
+    ///     queries match if any instant satisfies the predicate
+    ///     (Lucene-style "any match").
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
     fn add_datetime_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>), ()>(
-            args.keywords,
-            &[],
-            &["stored", "indexed", "doc_values"],
-        )?;
-        let (stored, indexed, doc_values) = kwargs.optional;
+        let kwargs =
+            get_kwargs::<_, (), (Option<bool>, Option<bool>, Option<bool>, Option<bool>), ()>(
+                args.keywords,
+                &[],
+                &["stored", "indexed", "multi_valued", "doc_values"],
+            )?;
+        let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
         );

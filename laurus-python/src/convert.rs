@@ -31,6 +31,7 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 ///   either array to `Vector` downstream; an empty list is an empty `Int64Array`)
 /// - `list[(lat, lon)]`    → `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `list[(x, y, z)]`     → `DataValue::GeoEcefArray`
+/// - `list[datetime | str]` → `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `(lat, lon)` tuple    → `DataValue::Geo`
 /// - `(x, y, z)` tuple     → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
@@ -80,6 +81,13 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
         if list.iter().all(|item| item.is_instance_of::<PyTuple>()) {
             return py_tuple_list_to_geo_array(py, list);
         }
+        // A list of `str` / `datetime` objects is a multi-valued datetime
+        // field (#1184); each element is parsed like a single datetime.
+        if list.iter().all(|item| {
+            item.is_instance_of::<PyString>() || item.hasattr("isoformat").unwrap_or(false)
+        }) {
+            return py_datetime_list_to_datetime_array(list);
+        }
         let all_ints = list
             .iter()
             .all(|item| item.is_instance_of::<PyInt>() && !item.is_instance_of::<PyBool>());
@@ -120,24 +128,51 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
     {
         return Ok(DataValue::GeoEcef(laurus::GeoEcefPoint::new(x, y, z)));
     }
-    // Try Python datetime.datetime
+    // Try Python datetime.datetime (anything exposing `isoformat()`).
     if let Ok(dt_str) = obj.call_method0("isoformat")
         && let Ok(s) = dt_str.extract::<String>()
+        && let Some(dt) = parse_py_datetime_text(&s)
     {
-        if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-            return Ok(DataValue::DateTime(dt));
-        }
-        // Try without timezone suffix
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S")
-            .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
-        {
-            return Ok(DataValue::DateTime(dt));
-        }
+        return Ok(DataValue::DateTime(dt));
     }
     Err(PyValueError::new_err(format!(
         "Cannot convert Python value of type {} to DataValue",
         obj.get_type().name()?
     )))
+}
+
+/// Parse the text form Python hands us for a datetime: an RFC 3339 / ISO
+/// 8601 string with an offset, then a naive `YYYY-MM-DDTHH:MM:SS` (as UTC).
+fn parse_py_datetime_text(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = s.parse::<DateTime<Utc>>() {
+        return Some(dt);
+    }
+    // Try without timezone suffix
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+}
+
+/// Convert a non-empty list whose elements are all `str` or expose
+/// `isoformat()` into a [`DataValue::DateTimeArray`] (#1184). Each element
+/// is parsed exactly like a single datetime; anything else is an error.
+fn py_datetime_list_to_datetime_array(list: &Bound<PyList>) -> PyResult<DataValue> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let text: String = if let Ok(s) = item.extract::<String>() {
+            s
+        } else {
+            item.call_method0("isoformat")?.extract()?
+        };
+        let dt = parse_py_datetime_text(&text).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "a list of datetimes must be all RFC 3339 / ISO 8601 datetimes \
+                 (multi-valued text fields are not supported), got {text:?}"
+            ))
+        })?;
+        out.push(dt);
+    }
+    Ok(DataValue::DateTimeArray(out))
 }
 
 /// Convert a non-empty list whose elements are all tuples into a
@@ -208,6 +243,11 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
                 .iter()
                 .map(|p| PyTuple::new(py, [p.x, p.y, p.z]))
                 .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, items)?.unbind().into_any())
+        }
+        // A list of the same RFC 3339 strings the single-valued arm produces.
+        DataValue::DateTimeArray(arr) => {
+            let items: Vec<String> = arr.iter().map(|dt| dt.to_rfc3339()).collect();
             Ok(PyList::new(py, items)?.unbind().into_any())
         }
     }

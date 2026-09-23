@@ -331,6 +331,13 @@ fn format_data_value(value: &DataValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        DataValue::DateTimeArray(arr) => format!(
+            "[{}]",
+            arr.iter()
+                .map(|dt| dt.to_rfc3339())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -370,6 +377,11 @@ fn data_value_to_json(value: &DataValue) -> serde_json::Value {
                 .map(|p| json!({"x": p.x, "y": p.y, "z": p.z}))
                 .collect::<Vec<_>>()
         ),
+        // RFC 3339 strings, the shape `json_to_document` infers back into a
+        // multi-valued datetime (#1184).
+        DataValue::DateTimeArray(arr) => {
+            json!(arr.iter().map(|dt| dt.to_rfc3339()).collect::<Vec<_>>())
+        }
     }
 }
 

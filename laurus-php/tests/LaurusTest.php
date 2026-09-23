@@ -402,6 +402,66 @@ class LaurusTest extends TestCase
         $idx->putDocument("doc1", ["title" => "t", "spots" => [["lat" => 35.68, "lon" => 139.76]]]);
     }
 
+    // ── Multi-valued datetime arrays (Issue #1184) ───────────────────────
+
+    private function indexWithMultiValuedDatetimeField(bool $multiValued): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        // (name, stored, indexed, multi_valued)
+        $schema->addDatetimeField("seen_at", true, true, $multiValued);
+        return new Laurus\Index(null, $schema);
+    }
+
+    public function testDatetimeArrayRoundTripsThroughMultiValuedDatetimeField(): void
+    {
+        $idx = $this->indexWithMultiValuedDatetimeField(true);
+        $idx->putDocument("doc1", [
+            "title" => "t",
+            "seen_at" => ["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"],
+        ]);
+        $idx->putDocument("doc2", ["title" => "t", "seen_at" => ["2025-03-01T00:00:00Z"]]);
+        $idx->commit();
+        $this->assertSame(
+            ["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"],
+            $idx->getDocuments("doc1")[0]["seen_at"]
+        );
+        // Any instant matches a range query.
+        $this->assertSame(["doc1"], $this->idsOf($idx->search("seen_at:[2024-06-01 TO 2024-12-31]")));
+    }
+
+    public function testSingleDatetimeIsWrappedOnMultiValuedDatetimeField(): void
+    {
+        $idx = $this->indexWithMultiValuedDatetimeField(true);
+        $idx->putDocument("doc1", ["title" => "t", "seen_at" => "2024-01-01T00:00:00Z"]);
+        $idx->commit();
+        $this->assertSame(["2024-01-01T00:00:00+00:00"], $idx->getDocuments("doc1")[0]["seen_at"]);
+    }
+
+    public function testEmptyArrayIsAcceptedByMultiValuedDatetimeField(): void
+    {
+        $idx = $this->indexWithMultiValuedDatetimeField(true);
+        $idx->putDocument("doc1", ["title" => "t", "seen_at" => []]);
+        $idx->commit();
+        $this->assertSame([], $idx->getDocuments("doc1")[0]["seen_at"]);
+    }
+
+    public function testDatetimeArrayIntoSingleValuedDatetimeFieldIsRejected(): void
+    {
+        $idx = $this->indexWithMultiValuedDatetimeField(false);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/multi_valued/');
+        $idx->putDocument("doc1", ["title" => "t", "seen_at" => ["2024-01-01T00:00:00Z"]]);
+    }
+
+    public function testNonDatetimeStringArrayIsRejected(): void
+    {
+        $idx = $this->indexWithMultiValuedDatetimeField(true);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/datetimes/');
+        $idx->putDocument("doc1", ["title" => "t", "seen_at" => ["2024-01-01T00:00:00Z", "tomorrow"]]);
+    }
+
     public function testMixedGeoDimensionArrayIsRejected(): void
     {
         $idx = $this->indexWithGeoField(true);
