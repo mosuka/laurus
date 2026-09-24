@@ -18,7 +18,7 @@
  *     node examples/multimodal-search.mjs
  */
 
-import { Index, Schema, SearchRequest } from "../index.js";
+import { Index, Schema, SearchRequest, TermQuery, VectorQuery } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // CLIP embedding helper
@@ -217,9 +217,9 @@ printResults(await index.searchVector("content_vec", queryVecA, 3));
 console.log("\n" + "=".repeat(60));
 console.log("[B] Text-to-Text: query='ORM database', filter type='text'");
 console.log("=".repeat(60));
-const reqB = new SearchRequest(3);
-reqB.setVectorQuery("content_vec", await embedText("ORM database"));
-reqB.setFilterQuery("type", "text");
+const reqB = new SearchRequest({ limit: 3 });
+reqB.setVectorQuery(new VectorQuery("content_vec", await embedText("ORM database")));
+reqB.setFilterTerm(new TermQuery("type", "text"));
 printResults(await index.searchWithRequest(reqB));
 
 // =====================================================================

@@ -141,18 +141,21 @@ The `Schema` class defines the structure of your index. Use the following method
 
 | Method | Description |
 | :--- | :--- |
-| `addTextField(name, stored, indexed, termVectors, analyzer)` | Full-text searchable text field |
-| `addIntegerField(name, stored, indexed)` | Integer (i64) field |
-| `addFloatField(name, stored, indexed)` | Float (f64) field |
-| `addBooleanField(name, stored, indexed)` | Boolean field |
-| `addDatetimeField(name, stored, indexed)` | Date/time field |
-| `addGeoField(name, stored, indexed)` | Geographic coordinate field (lat/lon) |
+| `addTextField(name, stored, indexed, termVectors, docValues, analyzer, multiValued, positionIncrementGap)` | Full-text searchable text field (`analyzer` is a built-in name: `standard`, `english`, `keyword`, `simple`, `noop`) |
+| `addIntegerField(name, stored, indexed, multiValued, docValues)` | Integer (i64) field |
+| `addFloatField(name, stored, indexed, multiValued, docValues)` | Float (f64) field |
+| `addBooleanField(name, stored, indexed, multiValued, docValues)` | Boolean field |
+| `addDatetimeField(name, stored, indexed, multiValued, docValues)` | Date/time field |
+| `addGeoField(name, stored, indexed, multiValued, docValues)` | Geographic coordinate field (lat/lon) |
+| `addGeo3dField(name, stored, indexed, multiValued, docValues)` | 3D ECEF Cartesian point field (x, y, z in metres) |
 | `addBytesField(name, stored)` | Binary data field |
-| `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, ...)` | HNSW vector index field |
-| `addFlatField(name, dimension, distance)` | Flat (brute-force) vector index field |
-| `addIvfField(name, dimension, distance, nClusters, nProbe)` | IVF vector index field |
+| `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, quantizer, subvectorCount, rerankStorage, pqCodebookPath, baseWeight)` | HNSW vector index field |
+| `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat (brute-force) vector index field |
+| `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF vector index field |
 | `addEmbedder(name, config)` | Register a named embedder |
 | `setDefaultFields(fieldNames)` | Set default search fields |
+
+Every parameter after `name` (and `dimension` for vector fields) has a default, so trailing arguments can be omitted; the arguments are positional, so keep the order above when passing a later one. Types and defaults are listed in the [API reference](../docs/src/laurus-php/api_reference.md).
 
 ## Query Types
 

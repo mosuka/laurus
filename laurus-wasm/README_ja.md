@@ -114,7 +114,9 @@ WASM の注意点: `maxIntervalMs` のバックグラウンドタイマーは wa
 
 ```javascript
 const schema = new Schema();
-schema.addTextField("title", true, true, false, "lindera-ipadic");
+// 第 6 引数が analyzer。ここでは組込名を指定。Japanese などのカスタム analyzer は
+// 先に addAnalyzer で登録し、その名前で参照する（API リファレンス参照）。
+schema.addTextField("title", true, true, false, true, "english");
 schema.addIntegerField("year");
 schema.addFloatField("price");
 schema.addBooleanField("active");

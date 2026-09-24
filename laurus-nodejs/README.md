@@ -140,7 +140,9 @@ per-record durability.
 
 ```javascript
 const schema = new Schema();
-schema.addTextField("title", true, true, false, "lindera-ipadic");
+// 6th argument = analyzer: a built-in name here; custom analyzers (e.g. Japanese)
+// are registered with addAnalyzer first and referenced by name (see the API reference).
+schema.addTextField("title", true, true, false, true, "english");
 schema.addIntegerField("year");
 schema.addFloatField("price");
 schema.addBooleanField("active");
@@ -160,17 +162,25 @@ schema.setDefaultFields(["title", "body"]);
 ### Search Request (Advanced)
 
 ```javascript
-import { SearchRequest } from "laurus-nodejs";
+import {
+  PhraseQuery,
+  RRF,
+  SearchRequest,
+  TermQuery,
+  VectorQuery,
+  VectorTextQuery,
+  WeightedSum,
+} from "laurus-nodejs";
 
-const req = new SearchRequest(10, 0);  // limit, offset
+const req = new SearchRequest({ limit: 10, offset: 0 });
 req.setQueryDsl("title:hello");
-req.setLexicalTermQuery("body", "programming");
-req.setLexicalPhraseQuery("title", ["machine", "learning"]);
-req.setVectorQuery("embedding", [0.1, 0.2, ...]);
-req.setVectorTextQuery("embedding", "query text");
-req.setFilterQuery("category", "tech");
-req.setRrfFusion(60.0);
-req.setWeightedSumFusion(0.3, 0.7);
+req.setLexicalTerm(new TermQuery("body", "programming"));
+req.setLexicalPhrase(new PhraseQuery("title", ["machine", "learning"]));
+req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, ...]));
+req.setVectorTextQuery(new VectorTextQuery("embedding", "query text"));
+req.setFilterTerm(new TermQuery("category", "tech"));
+req.setRrfFusion(new RRF(60.0));
+req.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
 
 const results = await index.searchWithRequest(req);
 ```

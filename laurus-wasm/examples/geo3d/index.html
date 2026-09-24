@@ -1227,11 +1227,11 @@
 
         const schema = new Schema();
         schema.addAnalyzer(ANALYZER_NAME, analyzer);
-        schema.addTextField('callsign', undefined, undefined, undefined, ANALYZER_NAME);
-        schema.addTextField('registration', undefined, undefined, undefined, ANALYZER_NAME);
-        schema.addTextField('satellite_type', undefined, undefined, undefined, ANALYZER_NAME);
-        schema.addTextField('description', undefined, undefined, undefined, ANALYZER_NAME);
-        schema.addTextField('category', undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('callsign', undefined, undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('registration', undefined, undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('satellite_type', undefined, undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('description', undefined, undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('category', undefined, undefined, undefined, undefined, ANALYZER_NAME);
         schema.addFloatField('altitude_m', undefined, undefined);
         schema.addGeo3dField(POSITION_FIELD, true, true);
         schema.setDefaultFields([

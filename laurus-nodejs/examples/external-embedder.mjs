@@ -15,7 +15,7 @@
  *     node examples/external-embedder.mjs
  */
 
-import { Index, Schema, SearchRequest } from "../index.js";
+import { Index, RRF, Schema, SearchRequest, TermQuery, VectorQuery, WeightedSum } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Embedding helper
@@ -107,7 +107,7 @@ console.log(`Embedding model dimension: ${DIM}\n`);
 const schema = new Schema();
 schema.addTextField("title");
 schema.addTextField("text");
-schema.addTextField("category", null, null, null, "keyword");
+schema.addTextField("category", null, null, null, null, "keyword");
 schema.addIntegerField("page");
 schema.addFlatField("text_vec", DIM, "cosine");
 schema.setDefaultFields(["text"]);
@@ -145,9 +145,9 @@ printResults(
 console.log("\n" + "=".repeat(60));
 console.log("[B] Filtered vector: 'database ORM queries' + category='testing'");
 console.log("=".repeat(60));
-const reqB = new SearchRequest(3);
-reqB.setVectorQuery("text_vec", await embed("database ORM queries"));
-reqB.setFilterQuery("category", "testing");
+const reqB = new SearchRequest({ limit: 3 });
+reqB.setVectorQuery(new VectorQuery("text_vec", await embed("database ORM queries")));
+reqB.setFilterTerm(new TermQuery("category", "testing"));
 printResults(await index.searchWithRequest(reqB));
 
 // =====================================================================
@@ -156,10 +156,10 @@ printResults(await index.searchWithRequest(reqB));
 console.log("\n" + "=".repeat(60));
 console.log("[C] Hybrid (RRF k=60): vector='middleware pipeline' + lexical='middleware'");
 console.log("=".repeat(60));
-const reqC = new SearchRequest(3);
-reqC.setLexicalTermQuery("text", "middleware");
-reqC.setVectorQuery("text_vec", await embed("middleware pipeline"));
-reqC.setRrfFusion(60.0);
+const reqC = new SearchRequest({ limit: 3 });
+reqC.setLexicalTerm(new TermQuery("text", "middleware"));
+reqC.setVectorQuery(new VectorQuery("text_vec", await embed("middleware pipeline")));
+reqC.setRrfFusion(new RRF(60.0));
 printResults(await index.searchWithRequest(reqC));
 
 // =====================================================================
@@ -168,10 +168,10 @@ printResults(await index.searchWithRequest(reqC));
 console.log("\n" + "=".repeat(60));
 console.log("[D] Hybrid (WeightedSum 0.3/0.7): vector='fast bundler' + lexical='typescript'");
 console.log("=".repeat(60));
-const reqD = new SearchRequest(3);
-reqD.setLexicalTermQuery("text", "typescript");
-reqD.setVectorQuery("text_vec", await embed("fast bundler"));
-reqD.setWeightedSumFusion(0.3, 0.7);
+const reqD = new SearchRequest({ limit: 3 });
+reqD.setLexicalTerm(new TermQuery("text", "typescript"));
+reqD.setVectorQuery(new VectorQuery("text_vec", await embed("fast bundler")));
+reqD.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
 printResults(await index.searchWithRequest(reqD));
 
 // =====================================================================
@@ -180,11 +180,11 @@ printResults(await index.searchWithRequest(reqD));
 console.log("\n" + "=".repeat(60));
 console.log("[E] Hybrid + filter: vector='test automation' + lexical='snapshot' + category='testing'");
 console.log("=".repeat(60));
-const reqE = new SearchRequest(3);
-reqE.setLexicalTermQuery("text", "snapshot");
-reqE.setVectorQuery("text_vec", await embed("test automation"));
-reqE.setFilterQuery("category", "testing");
-reqE.setRrfFusion(60.0);
+const reqE = new SearchRequest({ limit: 3 });
+reqE.setLexicalTerm(new TermQuery("text", "snapshot"));
+reqE.setVectorQuery(new VectorQuery("text_vec", await embed("test automation")));
+reqE.setFilterTerm(new TermQuery("category", "testing"));
+reqE.setRrfFusion(new RRF(60.0));
 printResults(await index.searchWithRequest(reqE));
 
 console.log("\nExternal embedder example completed!");

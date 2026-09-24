@@ -68,8 +68,9 @@ format-laurus-php: ## Format laurus-php
 
 # ── Lint ───────────────────────────────────────────────────────────────────
 
-lint: ## Lint all crates
+lint: ## Lint all crates and the binding snippets
 	cargo clippy --workspace --all-targets -- -D warnings
+	python3 scripts/check-binding-snippets.py
 
 lint-laurus: ## Lint laurus
 	cargo clippy -p laurus --all-targets -- -D warnings
@@ -97,6 +98,9 @@ lint-laurus-ruby: ## Lint laurus-ruby
 
 lint-laurus-php: ## Lint laurus-php
 	cargo clippy -p laurus-php -- -D warnings
+
+lint-snippets: ## Check binding README / docs / example snippets against the current signatures
+	python3 scripts/check-binding-snippets.py
 
 # ── Test ───────────────────────────────────────────────────────────────────
 

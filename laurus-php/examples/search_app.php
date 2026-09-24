@@ -40,7 +40,7 @@ function create_index(): Index
     $schema->addEmbedder(EMBEDDER_NAME, ["type" => "candle_bert", "model" => EMBEDDER_MODEL]);
     $schema->addTextField("title");
     $schema->addTextField("body");
-    $schema->addTextField("category", true, true, false, "keyword");
+    $schema->addTextField("category", true, true, false, true, "keyword");
     $schema->addIntegerField("year");
     $schema->addFlatField("body_vec", DIM, "cosine", EMBEDDER_NAME);
     $schema->setDefaultFields(["title", "body"]);

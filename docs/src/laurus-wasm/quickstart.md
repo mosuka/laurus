@@ -109,8 +109,8 @@ const ja = JapaneseAnalyzer.fromBytes(
 // 3. Register the analyzer on the schema and reference it from text fields.
 const schema = new Schema();
 schema.addAnalyzer("ja-ipadic", ja);
-schema.addTextField("title", undefined, undefined, undefined, "ja-ipadic");
-schema.addTextField("body", undefined, undefined, undefined, "ja-ipadic");
+schema.addTextField("title", undefined, undefined, undefined, undefined, "ja-ipadic");
+schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipadic");
 schema.setDefaultFields(["title", "body"]);
 
 const index = await Index.create(schema);

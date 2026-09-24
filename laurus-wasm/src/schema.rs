@@ -564,7 +564,7 @@ impl WasmSchema {
     /// ```javascript
     /// const ja = JapaneseAnalyzer.fromBytes(...);
     /// schema.addAnalyzer("ja-ipadic", ja);
-    /// schema.addTextField("body", undefined, undefined, undefined, "ja-ipadic");
+    /// schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipadic");
     /// ```
     ///
     /// [`JapaneseAnalyzer.fromBytes`]: crate::analysis::WasmJapaneseAnalyzer::from_bytes
