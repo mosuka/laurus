@@ -354,6 +354,22 @@ fn prompt_text_option() -> Result<FieldOption> {
         .default(true)
         .interact()?;
 
+    // #1175: Text is term-only (no BKD points) and has its own wizard, so
+    // its multi-valued prompt lives here rather than in the shared
+    // `matches!` list of `prompt_indexed_stored_option`.
+    let multi_valued = Confirm::new()
+        .with_prompt("Multi-valued? (accepts arrays of strings)")
+        .default(false)
+        .interact()?;
+    let position_increment_gap = if multi_valued {
+        Input::<u32>::new()
+            .with_prompt("Position increment gap (positions between elements; phrases need this much slop to cross)")
+            .default(laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP)
+            .interact_text()?
+    } else {
+        laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP
+    };
+
     let analyzer_choices = [
         "standard", "keyword", "english", "japanese", "simple", "noop",
     ];
@@ -398,6 +414,8 @@ fn prompt_text_option() -> Result<FieldOption> {
     Ok(FieldOption::Text(TextOption {
         indexed,
         stored,
+        multi_valued,
+        position_increment_gap,
         term_vectors,
         doc_values,
         analyzer,

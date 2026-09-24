@@ -178,12 +178,15 @@ class TestMultiValuedArrayIngest < Minitest::Test
     assert_match(/multi_valued/, err.message)
   end
 
-  def test_non_datetime_string_array_is_rejected
+  # Since #1175 a non-datetime String Array arrives as a multi-valued text
+  # value; a declared multi-valued DateTime field still rejects it, naming
+  # the element that failed to parse.
+  def test_non_datetime_string_array_into_datetime_field_names_the_bad_element
     idx = index_with_datetime_field(multi_valued: true)
-    err = assert_raises(ArgumentError) do
+    err = assert_raises(StandardError) do
       idx.put_document("doc1", { "title" => "t", "seen_at" => ["2024-01-01T00:00:00Z", "tomorrow"] })
     end
-    assert_match(/datetimes/, err.message)
+    assert_match(/tomorrow/, err.message)
   end
 
   # ---- Multi-valued boolean (Issue #1180) ----
@@ -240,6 +243,81 @@ class TestMultiValuedArrayIngest < Minitest::Test
     assert_raises(TypeError) do
       idx.put_document("doc1", { "title" => "t", "flags" => [true, 1] })
     end
+  end
+
+  # ---- Multi-valued text (Issue #1175) ----
+
+  def index_with_text_field(multi_valued:, position_increment_gap: nil)
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    if position_increment_gap.nil?
+      schema.add_text_field("notes", multi_valued: multi_valued)
+    else
+      schema.add_text_field("notes", multi_valued: multi_valued, position_increment_gap: position_increment_gap)
+    end
+    Laurus::Index.new(schema: schema)
+  end
+
+  # An Array of Strings is a multi-valued text field; it reads back as the
+  # same Array and a term query matches if any element contains the term.
+  def test_string_array_round_trips_through_multi_valued_text_field
+    idx = index_with_text_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "notes" => ["hello world", "foo bar"] })
+    idx.put_document("doc2", { "title" => "t", "notes" => ["foo bar"] })
+    idx.commit
+
+    assert_equal ["hello world", "foo bar"], idx.get_documents("doc1").first["notes"]
+    assert_equal ["doc1"], idx.search("notes:hello", limit: 5).map(&:id)
+    assert_equal %w[doc1 doc2], idx.search("notes:bar", limit: 5).map(&:id).sort
+  end
+
+  def test_single_string_is_wrapped_on_multi_valued_text_field
+    idx = index_with_text_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "notes" => "hello world" })
+    idx.commit
+
+    assert_equal ["hello world"], idx.get_documents("doc1").first["notes"]
+  end
+
+  def test_empty_array_is_accepted_by_multi_valued_text_field
+    idx = index_with_text_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "notes" => [] })
+    idx.commit
+
+    assert_equal [], idx.get_documents("doc1").first["notes"]
+  end
+
+  def test_string_array_into_single_valued_text_field_is_rejected
+    idx = index_with_text_field(multi_valued: false)
+    err = assert_raises(StandardError) do
+      idx.put_document("doc1", { "title" => "t", "notes" => %w[a b] })
+    end
+    assert_match(/multi_valued/, err.message)
+  end
+
+  # The datetime path keeps precedence: an all-RFC 3339 String Array is a
+  # DateTimeArray, so a datetime field's output round-trips.
+  def test_rfc3339_string_array_still_becomes_datetime_array
+    idx = index_with_datetime_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "seen_at" => ["2024-01-01T00:00:00Z"] })
+    idx.commit
+
+    assert_equal ["2024-01-01T00:00:00+00:00"], idx.get_documents("doc1").first["seen_at"]
+  end
+
+  # With the default gap a phrase cannot span two elements; with a gap of 0
+  # the elements are numbered as if concatenated and it can.
+  def test_position_increment_gap_keeps_phrases_inside_one_element
+    idx = index_with_text_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "notes" => ["hello world", "foo bar"] })
+    idx.commit
+    assert_equal ["doc1"], idx.search('notes:"hello world"', limit: 5).map(&:id)
+    assert_empty idx.search('notes:"world foo"', limit: 5)
+
+    contiguous = index_with_text_field(multi_valued: true, position_increment_gap: 0)
+    contiguous.put_document("doc1", { "title" => "t", "notes" => ["hello world", "foo bar"] })
+    contiguous.commit
+    assert_equal ["doc1"], contiguous.search('notes:"world foo"', limit: 5).map(&:id)
   end
 
   def test_mixed_geo_dimension_array_is_rejected

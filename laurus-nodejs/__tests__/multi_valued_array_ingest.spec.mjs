@@ -208,11 +208,13 @@ describe("multi-valued datetime arrays from JS (#1184)", () => {
     ).rejects.toThrow(/multi_valued/);
   });
 
-  it("rejects an array with a non-datetime string", async () => {
+  it("names the bad element when a non-datetime string array hits a datetime field", async () => {
+    // Since #1175 the array arrives as a multi-valued text value; the
+    // declared datetime field still rejects it, naming the element.
     const index = await indexWithDatetimeField(true);
     await expect(
       index.putDocument("doc1", { title: "t", seenAt: ["2024-01-01T00:00:00Z", "tomorrow"] }),
-    ).rejects.toThrow(/RFC 3339/);
+    ).rejects.toThrow(/tomorrow/);
   });
 });
 
@@ -270,5 +272,77 @@ describe("multi-valued boolean arrays from JS (#1180)", () => {
     await expect(
       index.putDocument("doc1", { title: "t", flags: [true, 1] }),
     ).rejects.toThrow(/numeric/);
+  });
+});
+
+async function indexWithTextField(multiValued, positionIncrementGap) {
+  const schema = new Schema();
+  schema.addTextField("title");
+  // (name, stored, indexed, termVectors, docValues, analyzer, multiValued, positionIncrementGap)
+  schema.addTextField("notes", true, true, true, true, undefined, multiValued, positionIncrementGap);
+  return Index.create(null, schema);
+}
+
+describe("multi-valued text arrays from JS (#1175)", () => {
+  it("round-trips an array of strings through a multiValued text field", async () => {
+    const index = await indexWithTextField(true);
+    await index.putDocument("doc1", { title: "t", notes: ["hello world", "foo bar"] });
+    await index.putDocument("doc2", { title: "t", notes: ["foo bar"] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].notes).toEqual(["hello world", "foo bar"]);
+    // Any element matches a term query.
+    const hello = await index.search("notes:hello", 5);
+    expect(hello.map((h) => h.id)).toEqual(["doc1"]);
+    const bar = await index.search("notes:bar", 5);
+    expect(bar.map((h) => h.id).sort()).toEqual(["doc1", "doc2"]);
+  });
+
+  it("wraps a single string on a multiValued text field", async () => {
+    const index = await indexWithTextField(true);
+    await index.putDocument("doc1", { title: "t", notes: "hello world" });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].notes).toEqual(["hello world"]);
+  });
+
+  it("accepts an empty array on a multiValued text field", async () => {
+    const index = await indexWithTextField(true);
+    await index.putDocument("doc1", { title: "t", notes: [] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].notes).toEqual([]);
+  });
+
+  it("rejects an array sent to a single-valued text field", async () => {
+    const index = await indexWithTextField(false);
+    await expect(
+      index.putDocument("doc1", { title: "t", notes: ["a", "b"] }),
+    ).rejects.toThrow(/multi_valued/);
+  });
+
+  it("still infers a datetime array from an all-RFC-3339 string array", async () => {
+    const index = await indexWithDatetimeField(true);
+    await index.putDocument("doc1", { title: "t", seenAt: ["2024-01-01T00:00:00Z"] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].seenAt).toEqual(["2024-01-01T00:00:00+00:00"]);
+  });
+
+  it("keeps phrases inside one element unless the gap is 0", async () => {
+    const index = await indexWithTextField(true);
+    await index.putDocument("doc1", { title: "t", notes: ["hello world", "foo bar"] });
+    await index.commit();
+    expect((await index.search('notes:"hello world"', 5)).map((h) => h.id)).toEqual(["doc1"]);
+    expect(await index.search('notes:"world foo"', 5)).toEqual([]);
+
+    const contiguous = await indexWithTextField(true, 0);
+    await contiguous.putDocument("doc1", { title: "t", notes: ["hello world", "foo bar"] });
+    await contiguous.commit();
+    expect((await contiguous.search('notes:"world foo"', 5)).map((h) => h.id)).toEqual(["doc1"]);
   });
 });

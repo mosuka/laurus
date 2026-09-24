@@ -59,6 +59,7 @@ pub fn hash_to_document(ruby: &Ruby, hash: RHash) -> Result<Document, Error> {
 /// | `Array` of `x`/`y`/`z` Hashes | `GeoEcefArray`       |
 /// | `Array` of `Time` / RFC 3339 Strings | `DateTimeArray` (multi-valued datetime, #1184) |
 /// | `Array` of `true` / `false`   | `BoolArray` (multi-valued boolean, #1180) |
+/// | `Array` of Strings            | `TextArray` (multi-valued text, #1175), or `DateTimeArray` when every element parses as a datetime |
 /// | `Hash` with `"lat"`, `"lon"`  | `Geo`                |
 /// | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` (3D ECEF Cartesian, meters) |
 /// | `Time` / ISO 8601 string      | `DateTime`           |
@@ -121,13 +122,23 @@ pub fn rb_to_data_value(ruby: &Ruby, value: Value) -> Result<DataValue, Error> {
         if elements.iter().all(|v| v.is_kind_of(ruby.class_hash())) {
             return rb_hash_array_to_geo_array(ruby, &elements);
         }
-        // An Array of Strings / `iso8601`-responding objects (`Time`) is a
-        // multi-valued datetime field (#1184); each element is parsed like
-        // a single datetime.
-        if elements.iter().all(|v| {
-            v.is_kind_of(ruby.class_string()) || v.respond_to("iso8601", false).unwrap_or(false)
-        }) {
+        // An Array of Strings / `iso8601`-responding objects (`Time`)
+        // (#1184, #1175). Any `Time`-like element keeps the datetime path,
+        // where a non-datetime element is an `ArgumentError`; an all-String
+        // Array is a datetime array only when every element parses as one,
+        // and a multi-valued text field otherwise.
+        let is_time_object = |v: &Value| {
+            !v.is_kind_of(ruby.class_string()) && v.respond_to("iso8601", false).unwrap_or(false)
+        };
+        if elements.iter().any(is_time_object)
+            && elements
+                .iter()
+                .all(|v| v.is_kind_of(ruby.class_string()) || is_time_object(v))
+        {
             return rb_datetime_array(ruby, &elements);
+        }
+        if elements.iter().all(|v| v.is_kind_of(ruby.class_string())) {
+            return rb_string_array(ruby, &elements);
         }
         // An Array of `true` / `false` is a multi-valued boolean field
         // (#1180). Ruby booleans are not Integers, so before this gate the
@@ -219,8 +230,7 @@ fn rb_datetime_array(ruby: &Ruby, elements: &[Value]) -> Result<DataValue, Error
             Error::new(
                 ruby.exception_arg_error(),
                 format!(
-                    "an Array of datetimes must be all RFC 3339 / ISO 8601 datetimes \
-                     (multi-valued text fields are not supported): {text:?}: {e}"
+                    "an Array of datetimes must be all RFC 3339 / ISO 8601 datetimes: {text:?}: {e}"
                 ),
             )
         })?;
@@ -232,6 +242,24 @@ fn rb_datetime_array(ruby: &Ruby, elements: &[Value]) -> Result<DataValue, Error
 /// Convert a non-empty Array whose elements are all Hashes into a
 /// [`DataValue::GeoArray`] (all `lat`/`lon`) or [`DataValue::GeoEcefArray`]
 /// (all `x`/`y`/`z`), rejecting a mix or a Hash of any other shape.
+/// Convert a non-empty Array of Strings into a [`DataValue::DateTimeArray`]
+/// when every element parses as RFC 3339 / ISO 8601, and into a
+/// [`DataValue::TextArray`] otherwise (#1175). Never fails.
+fn rb_string_array(_ruby: &Ruby, elements: &[Value]) -> Result<DataValue, Error> {
+    let strings = elements
+        .iter()
+        .map(|&v| String::try_convert(v))
+        .collect::<Result<Vec<String>, Error>>()?;
+    let instants: Option<Vec<DateTime<Utc>>> = strings
+        .iter()
+        .map(|s| s.parse::<DateTime<Utc>>().ok())
+        .collect();
+    Ok(match instants {
+        Some(dts) => DataValue::DateTimeArray(dts),
+        None => DataValue::TextArray(strings),
+    })
+}
+
 fn rb_hash_array_to_geo_array(ruby: &Ruby, elements: &[Value]) -> Result<DataValue, Error> {
     let mixed = || {
         Error::new(
@@ -362,6 +390,14 @@ pub fn data_value_to_rb(ruby: &Ruby, value: &DataValue) -> Result<Value, Error> 
             let out = ruby.ary_new_capa(arr.len());
             for &b in arr {
                 out.push(data_value_to_rb(ruby, &DataValue::Bool(b))?)?;
+            }
+            Ok(out.as_value())
+        }
+        // An Array of Strings (#1175).
+        DataValue::TextArray(arr) => {
+            let out = ruby.ary_new_capa(arr.len());
+            for s in arr {
+                out.push(ruby.str_new(s))?;
             }
             Ok(out.as_value())
         }

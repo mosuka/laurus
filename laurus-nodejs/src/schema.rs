@@ -132,7 +132,18 @@ impl JsSchema {
     ///   Japanese analyzer (which requires a Lindera dictionary path),
     ///   register a custom analyzer via `addAnalyzer` and reference it
     ///   here by name.
+    /// * `multiValued` - When `true`, the field accepts arrays of strings;
+    ///   a term query matches if any element contains the term, and a
+    ///   phrase query never spans two elements (Lucene-style). Default
+    ///   `false`. Appended after `analyzer` so existing positional callers
+    ///   keep working.
+    /// * `positionIncrementGap` - Positions skipped between the elements of
+    ///   a multi-valued field, so a phrase needs a slop of at least this
+    ///   value to cross an element boundary (default 100; `0` numbers the
+    ///   elements as if concatenated). Ignored unless `multiValued` is
+    ///   `true`.
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
         &mut self,
         name: String,
@@ -141,12 +152,17 @@ impl JsSchema {
         term_vectors: Option<bool>,
         doc_values: Option<bool>,
         analyzer: Option<String>,
+        multi_valued: Option<bool>,
+        position_increment_gap: Option<u32>,
     ) {
         self.inner.fields.insert(
             name,
             FieldOption::Text(TextOption {
                 indexed: indexed.unwrap_or(true),
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
+                position_increment_gap: position_increment_gap
+                    .unwrap_or(laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP),
                 term_vectors: term_vectors.unwrap_or(true),
                 doc_values: doc_values.unwrap_or(true),
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),

@@ -304,6 +304,8 @@ impl RbSchema {
                 Option<bool>,
                 Option<bool>,
                 Option<Option<String>>,
+                Option<bool>,
+                Option<u32>,
             ),
             (),
         >(
@@ -315,19 +317,32 @@ impl RbSchema {
                 "term_vectors",
                 "doc_values",
                 "analyzer",
+                "multi_valued",
+                "position_increment_gap",
             ],
         )?;
-        let (stored, indexed, term_vectors, doc_values, analyzer) = kwargs.optional;
+        let (stored, indexed, term_vectors, doc_values, analyzer, multi_valued, gap) =
+            kwargs.optional;
         let stored = stored.unwrap_or(true);
         let indexed = indexed.unwrap_or(true);
         let term_vectors = term_vectors.unwrap_or(true);
         let doc_values = doc_values.unwrap_or(true);
         let analyzer = analyzer.flatten().map(laurus::AnalyzerSpec::Named);
+        // #1175: `multi_valued:` accepts an Array of Strings (a term query
+        // matches if any element contains the term; a phrase never spans two
+        // elements). `position_increment_gap:` (default 100) is the number
+        // of positions skipped between elements; `0` numbers them as if
+        // concatenated.
+        let multi_valued = multi_valued.unwrap_or(false);
+        let position_increment_gap =
+            gap.unwrap_or(laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP);
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Text(TextOption {
                 indexed,
                 stored,
+                multi_valued,
+                position_increment_gap,
                 term_vectors,
                 doc_values,
                 analyzer,

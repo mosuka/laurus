@@ -33,6 +33,8 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 /// - `list[(x, y, z)]`     → `DataValue::GeoEcefArray`
 /// - `list[datetime | str]` → `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `list[bool]`          → `DataValue::BoolArray` (multi-valued boolean, #1180)
+/// - `list[str]`           → `DataValue::TextArray` (multi-valued text, #1175) —
+///   or `DateTimeArray` when every element parses as a datetime
 /// - `(lat, lon)` tuple    → `DataValue::Geo`
 /// - `(x, y, z)` tuple     → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
@@ -82,12 +84,23 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
         if list.iter().all(|item| item.is_instance_of::<PyTuple>()) {
             return py_tuple_list_to_geo_array(py, list);
         }
-        // A list of `str` / `datetime` objects is a multi-valued datetime
-        // field (#1184); each element is parsed like a single datetime.
-        if list.iter().all(|item| {
-            item.is_instance_of::<PyString>() || item.hasattr("isoformat").unwrap_or(false)
-        }) {
+        // A list of `str` / `datetime` objects (#1184, #1175). Any element
+        // that is a `datetime` (exposes `isoformat()`) keeps the datetime
+        // path, where a non-datetime element is an error; an all-`str` list
+        // is a datetime array only when every element parses as one, and a
+        // multi-valued text field otherwise.
+        let is_datetime_object = |item: &Bound<PyAny>| {
+            !item.is_instance_of::<PyString>() && item.hasattr("isoformat").unwrap_or(false)
+        };
+        if list.iter().any(|item| is_datetime_object(&item))
+            && list
+                .iter()
+                .all(|item| item.is_instance_of::<PyString>() || is_datetime_object(&item))
+        {
             return py_datetime_list_to_datetime_array(list);
+        }
+        if list.iter().all(|item| item.is_instance_of::<PyString>()) {
+            return py_string_list_to_data_value(list);
         }
         // A list of bools is a multi-valued boolean field (#1180). Checked
         // before the integer gate — `bool` is a subclass of `int` — so it no
@@ -178,8 +191,7 @@ fn py_datetime_list_to_datetime_array(list: &Bound<PyList>) -> PyResult<DataValu
         };
         let dt = parse_py_datetime_text(&text).ok_or_else(|| {
             PyValueError::new_err(format!(
-                "a list of datetimes must be all RFC 3339 / ISO 8601 datetimes \
-                 (multi-valued text fields are not supported), got {text:?}"
+                "a list of datetimes must be all RFC 3339 / ISO 8601 datetimes, got {text:?}"
             ))
         })?;
         out.push(dt);
@@ -190,6 +202,24 @@ fn py_datetime_list_to_datetime_array(list: &Bound<PyList>) -> PyResult<DataValu
 /// Convert a non-empty list whose elements are all tuples into a
 /// [`DataValue::GeoArray`] (all `(lat, lon)`) or [`DataValue::GeoEcefArray`]
 /// (all `(x, y, z)`), rejecting a mix or a tuple of any other arity.
+/// Convert a non-empty list of `str` into a [`DataValue::DateTimeArray`]
+/// when every element parses as a datetime (the same grammar the single
+/// value and the datetime-object list use), and into a
+/// [`DataValue::TextArray`] otherwise (#1175). Never fails: a list of
+/// strings always has a home now.
+fn py_string_list_to_data_value(list: &Bound<PyList>) -> PyResult<DataValue> {
+    let strings: Vec<String> = list
+        .iter()
+        .map(|item| item.extract::<String>())
+        .collect::<PyResult<_>>()?;
+    let instants: Option<Vec<DateTime<Utc>>> =
+        strings.iter().map(|s| parse_py_datetime_text(s)).collect();
+    Ok(match instants {
+        Some(dts) => DataValue::DateTimeArray(dts),
+        None => DataValue::TextArray(strings),
+    })
+}
+
 fn py_tuple_list_to_geo_array(py: Python, list: &Bound<PyList>) -> PyResult<DataValue> {
     let mixed = || {
         PyValueError::new_err("a list of tuples must be all (lat, lon) or all (x, y, z) geo points")
@@ -264,6 +294,8 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
         }
         // A list of Python bools (#1180).
         DataValue::BoolArray(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
+        // A list of Python strs (#1175).
+        DataValue::TextArray(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
     }
 }
 

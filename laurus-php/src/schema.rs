@@ -126,7 +126,25 @@ impl PhpSchema {
     ///   `"noop"`) pass the name directly. Parameterized presets such as
     ///   the Japanese analyzer (which needs a Lindera dictionary path)
     ///   should be registered via `addAnalyzer` and referenced by name.
-    #[php(defaults(stored = true, indexed = true, term_vectors = true, doc_values = true))]
+    /// * `multi_valued` - When true, the field accepts a sequential array of
+    ///   strings; a term query matches if any element contains the term,
+    ///   and a phrase query never spans two elements (Lucene-style).
+    ///   Default: false. Appended after `analyzer` so existing positional
+    ///   callers keep working.
+    /// * `position_increment_gap` - Positions skipped between the elements
+    ///   of a multi-valued field, so a phrase needs a slop of at least this
+    ///   value to cross an element boundary (default 100; `0` numbers the
+    ///   elements as if concatenated). Ignored unless `multi_valued` is
+    ///   true.
+    #[php(defaults(
+        stored = true,
+        indexed = true,
+        term_vectors = true,
+        doc_values = true,
+        multi_valued = false,
+        position_increment_gap = 100
+    ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
         &self,
         name: String,
@@ -135,17 +153,24 @@ impl PhpSchema {
         term_vectors: bool,
         doc_values: bool,
         analyzer: Option<String>,
-    ) {
+        multi_valued: bool,
+        position_increment_gap: i64,
+    ) -> PhpResult<()> {
+        let position_increment_gap = u32::try_from(position_increment_gap)
+            .map_err(|_| "position_increment_gap must be between 0 and 4294967295")?;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Text(TextOption {
                 indexed,
                 stored,
+                multi_valued,
+                position_increment_gap,
                 term_vectors,
                 doc_values,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         );
+        Ok(())
     }
 
     /// Add an integer (i64) field.

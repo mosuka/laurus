@@ -345,6 +345,7 @@ fn format_data_value(value: &DataValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        DataValue::TextArray(arr) => format!("[{}]", arr.join(", ")),
     }
 }
 
@@ -392,6 +393,10 @@ fn data_value_to_json(value: &DataValue) -> serde_json::Value {
         // JSON booleans, the shape `json_to_document` infers back into a
         // multi-valued boolean (#1180).
         DataValue::BoolArray(arr) => json!(arr),
+        // JSON strings, the shape `json_to_document` infers back into a
+        // multi-valued text field (#1175) — or a datetime array when every
+        // element is RFC 3339.
+        DataValue::TextArray(arr) => json!(arr),
     }
 }
 

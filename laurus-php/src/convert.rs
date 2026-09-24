@@ -56,6 +56,7 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 /// | `array` of `x`/`y`/`z` arrays (sequential) | `GeoEcefArray`      |
 /// | `array` of RFC 3339 strings (sequential)  | `DateTimeArray` (multi-valued datetime, #1184) |
 /// | `array` of bools (sequential)             | `BoolArray` (multi-valued boolean, #1180) |
+/// | `array` of strings (sequential)           | `TextArray` (multi-valued text, #1175), or `DateTimeArray` when every element parses as ISO 8601 |
 /// | `array` with `"lat"`, `"lon"` keys        | `Geo`                |
 /// | `array` with `"x"`, `"y"`, `"z"` keys     | `GeoEcef`            |
 /// | ISO 8601 string (fallback)                | `DateTime`           |
@@ -138,21 +139,22 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         if ht.iter().all(|(_, val)| val.is_array()) {
             return zval_array_of_arrays_to_geo_array(ht);
         }
-        // A sequential array of strings is a multi-valued datetime field
-        // (#1184); each element must parse like a single ISO 8601 string.
+        // A sequential array of strings (#1184, #1175): a multi-valued
+        // datetime field when every element parses as ISO 8601, and a
+        // multi-valued text field otherwise. Never an error.
         if ht.iter().all(|(_, val)| val.is_string()) {
-            let mut out = Vec::with_capacity(ht.len());
+            let mut strings = Vec::with_capacity(ht.len());
             for (_, val) in ht.iter() {
-                let s = String::from_zval(val).ok_or("failed to convert string")?;
-                let dt = s.parse::<DateTime<Utc>>().map_err(|e| {
-                    format!(
-                        "an array of strings must be all RFC 3339 / ISO 8601 datetimes \
-                         (multi-valued text fields are not supported): {s:?}: {e}"
-                    )
-                })?;
-                out.push(dt);
+                strings.push(String::from_zval(val).ok_or("failed to convert string")?);
             }
-            return Ok(DataValue::DateTimeArray(out));
+            let instants: Option<Vec<DateTime<Utc>>> = strings
+                .iter()
+                .map(|s| s.parse::<DateTime<Utc>>().ok())
+                .collect();
+            return Ok(match instants {
+                Some(dts) => DataValue::DateTimeArray(dts),
+                None => DataValue::TextArray(strings),
+            });
         }
         // A sequential array of bools is a multi-valued boolean field
         // (#1180); checked before the int gate.
@@ -357,6 +359,17 @@ pub fn data_value_to_zval(value: &DataValue) -> PhpResult<Zval> {
                 let mut item = Zval::new();
                 item.set_bool(b);
                 arr.push(item).map_err(|_| "failed to push bool")?;
+            }
+            zv.set_hashtable(arr);
+        }
+        // An array of strings (#1175).
+        DataValue::TextArray(values) => {
+            let mut arr = ZendHashTable::new();
+            for s in values {
+                let mut item = Zval::new();
+                item.set_string(s, false)
+                    .map_err(|_| "failed to set text string")?;
+                arr.push(item).map_err(|_| "failed to push text")?;
             }
             zv.set_hashtable(arr);
         }
