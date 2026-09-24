@@ -18,6 +18,10 @@
 //!    `region/country/state/city` path layout (depth 4, 50 leaf paths).
 //!    Each `collect_doc` call walks `parent()` four times, exercising the
 //!    repeated-clone / repeated-hash-insert pattern that #409 will fix.
+//! 4. **`bench_multi_valued`** — one facet field holding a three-element
+//!    `TextArray` per document (Issue #1187). Each element expands to its
+//!    own facet path, so the per-doc work is three flat increments plus the
+//!    generation-stamp check that keeps counts per document.
 //!
 //! Each scenario sweeps `doc_count ∈ {1k, 10k, 100k}` so the gain at scale
 //! is visible. The same 100k-document mock reader is reused across sweep
@@ -232,6 +236,26 @@ fn build_hierarchical_documents(n: usize) -> Vec<Document> {
         .collect()
 }
 
+/// Build `n` documents whose facet field is a three-element `TextArray`
+/// drawn from the same 50-value pool as `build_flat_documents` (Issue
+/// #1187). The three elements of a document are distinct, so each expands
+/// to its own facet path and the collector's generation stamp only has to
+/// confirm — never refuse — an increment.
+fn build_multi_valued_documents(n: usize) -> Vec<Document> {
+    (0..n)
+        .map(|i| {
+            let tags: Vec<String> = (0..3)
+                .map(|k| format!("value_{}", (i + k * 17) % FACET_VALUES_PER_FIELD))
+                .collect();
+            Document::builder()
+                .add_text_array("field_a", tags)
+                .add_text("title", format!("Title {i}"))
+                .add_text("body", payload(i))
+                .build()
+        })
+        .collect()
+}
+
 /// Materialise the doc list into a mock reader.
 fn make_reader(documents: Vec<Document>) -> Arc<MockFacetReader> {
     Arc::new(MockFacetReader::new(documents))
@@ -245,8 +269,11 @@ fn make_reader(documents: Vec<Document>) -> Arc<MockFacetReader> {
 /// `FacetPath` keys across all fields, not the sum of their doc counts.
 /// We instead sum every `FacetCount::count` per field and assert
 /// `>= n * fields.len()`. Hierarchical paths additionally contribute to
-/// each ancestor, so the actual sum is `>= n * fields.len() * depth`,
-/// but the lower bound is sufficient for catching empty-result regressions.
+/// each ancestor and multi-valued arrays to each element, so the actual
+/// sum is larger, but the lower bound is sufficient for catching
+/// empty-result regressions. (It holds because every bench corpus gives
+/// each document a facetable, non-empty value; a geo value or an empty
+/// array would contribute nothing — Issue #1187.)
 fn assert_collector_probe(fields: &[String], reader: &MockFacetReader, n: usize, label: &str) {
     let mut probe = FacetCollector::new(FacetConfig::default(), fields.to_vec());
     for doc_id in 0..n as u64 {
@@ -356,10 +383,39 @@ fn bench_hierarchical(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_multi_valued(c: &mut Criterion) {
+    let mut group = c.benchmark_group("facet/multi_valued");
+    let reader = make_reader(build_multi_valued_documents(MAX_DOCS));
+    let fields = vec!["field_a".to_string()];
+
+    for &n in &[1000usize, 10_000, 100_000] {
+        assert_collector_probe(&fields, &reader, n, "multi_valued");
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_batched(
+                || FacetCollector::new(FacetConfig::default(), fields.clone()),
+                |mut collector| {
+                    for doc_id in 0..n as u64 {
+                        collector
+                            .collect_doc(black_box(doc_id), reader.as_ref())
+                            .unwrap();
+                    }
+                    black_box(collector);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_flat_single_field,
     bench_multi_field,
     bench_hierarchical,
+    bench_multi_valued,
 );
 criterion_main!(benches);

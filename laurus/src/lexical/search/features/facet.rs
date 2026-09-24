@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -88,7 +89,9 @@ impl FacetPath {
 pub struct FacetCount {
     /// The facet path.
     pub path: FacetPath,
-    /// Number of documents matching this facet.
+    /// Number of documents matching this facet. A document is counted once
+    /// per path even when a multi-valued field repeats the element or
+    /// several elements share a hierarchical ancestor (Issue #1187).
     pub count: u64,
     /// Child facets (for hierarchical display).
     pub children: Vec<FacetCount>,
@@ -161,13 +164,23 @@ impl Default for FacetConfig {
 /// Two specialised counter maps keep keys cheap to hash and parent walks
 /// allocation-free:
 ///
-/// - `flat_counts: HashMap<u64, u64>` — depth-1 paths. The 64-bit key
+/// - `flat_counts: HashMap<u64, Slot>` — depth-1 paths. The 64-bit key
 ///   packs `(field_id << 32) | value_id`, so each increment hashes a
 ///   single `u64` instead of a `String + Vec<String>` pair.
-/// - `hier_counts: HashMap<Box<[u32]>, u64>` — depth-N paths. The boxed
+/// - `hier_counts: HashMap<Box<[u32]>, Slot>` — depth-N paths. The boxed
 ///   slice stores `[field_id, level0_id, level1_id, …]`; the parent walk
 ///   shrinks a local `Vec<u32>` by `pop()` at each level and only pays a
 ///   single `Box<[u32]>` allocation when the entry doesn't yet exist.
+///
+/// A multi-valued field value expands to one path per element (Issue
+/// #1187), so a single document can reach the same key more than once —
+/// through a repeated element (`["rust", "rust"]`) or through the shared
+/// ancestor of two hierarchical elements (`["a/b", "a/c"]` → `a`). Every
+/// [`Slot`] remembers the generation (`doc_gen`, advanced once per
+/// `collect_doc`) of its last increment and refuses a second increment in
+/// the same generation, so counts stay per document — Lucene's
+/// `SortedSetDocValuesFacetCounts` semantics — at the cost of one compare
+/// on the scalar hot path.
 ///
 /// Field names and value strings are interned in two `String → u32`
 /// maps owned by the collector and decoded back to strings only at
@@ -194,40 +207,162 @@ pub struct FacetCollector {
     value_names: Vec<String>,
     /// Counter map for depth-1 paths. Key encodes
     /// `(field_id << 32) | value_id`.
-    flat_counts: HashMap<u64, u64>,
+    flat_counts: HashMap<u64, Slot>,
     /// Counter map for depth ≥ 2 paths. Key is `[field_id, level0_id,
     /// level1_id, …]`.
-    hier_counts: HashMap<Box<[u32]>, u64>,
+    hier_counts: HashMap<Box<[u32]>, Slot>,
     /// Per-field DocValues availability, parallel to `facet_fields`
     /// (Issue #597). Lazily populated on the first `collect_doc` call from
     /// `reader.has_doc_values(field)` — availability is doc-independent, so
     /// it is resolved once instead of re-probing the (lock-guarded) reader
     /// for every collected hit. Empty until the first call.
     field_has_dv: Vec<bool>,
+    /// Generation counter, advanced at the start of every `collect_doc`
+    /// (Issue #1187). `Slot::generation == doc_gen` means "already counted
+    /// for the document being collected"; `0` is never a live generation.
+    doc_gen: u64,
 }
 
-/// Append the facet path components of a single field `value` to `out`.
+/// Counter slot for one facet key: the document count and the generation
+/// of the last increment (Issue #1187).
+#[derive(Debug, Clone, Copy, Default)]
+struct Slot {
+    count: u64,
+    /// `FacetCollector::doc_gen` at the last increment; `0` = never.
+    generation: u64,
+}
+
+impl Slot {
+    /// Increment at most once per generation. Returns `false` when the key
+    /// was already counted for the current document.
+    #[inline]
+    fn bump(&mut self, generation: u64) -> bool {
+        if self.generation == generation {
+            return false;
+        }
+        self.generation = generation;
+        self.count += 1;
+        true
+    }
+}
+
+/// Reusable scratch holding the facet paths derived from one field value
+/// (Issue #1187): `components` concatenates every path's components and
+/// `ends[i]` is the end index of path `i`. A scalar yields one path, an
+/// array one path per element. `clear` keeps the allocated capacity so the
+/// per-field loop in [`FacetCollector::collect_doc`] stays allocation-free
+/// once warmed up.
+#[derive(Debug, Default)]
+struct FacetPaths {
+    components: Vec<String>,
+    ends: Vec<usize>,
+}
+
+impl FacetPaths {
+    fn clear(&mut self) {
+        self.components.clear();
+        self.ends.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// Start a new path and let `fill` push its components. A path that
+    /// ends up with no components is discarded.
+    fn push_path(&mut self, fill: impl FnOnce(&mut Vec<String>)) {
+        let start = self.components.len();
+        fill(&mut self.components);
+        if self.components.len() > start {
+            self.ends.push(self.components.len());
+        }
+    }
+
+    /// The paths in insertion order, each as its component slice.
+    fn paths(&self) -> impl Iterator<Item = &[String]> + '_ {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let path = &self.components[start..end];
+            start = end;
+            path
+        })
+    }
+}
+
+/// Push the facet path of one text value: a `/`-delimited string becomes a
+/// hierarchical path, anything else a single component. Empty components
+/// (`""`, `"a/"`) are kept as they always were (tracked in Issue #1192).
+fn push_text_path(text: &str, out: &mut FacetPaths) {
+    out.push_path(|components| {
+        if text.contains('/') {
+            components.extend(text.split('/').map(str::to_string));
+        } else {
+            components.push(text.to_string());
+        }
+    });
+}
+
+/// Facet label of a float: always carries a fraction (`2.0`, `2.5`) so a
+/// float facet never shares a label with an integer one. Non-finite values
+/// keep their `Display` form (`NaN`, `inf`).
+fn format_facet_float(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
+/// Facet label of a datetime: RFC 3339 in UTC (`+00:00`), floored to
+/// microseconds. DocValues archive datetimes at microsecond precision
+/// (`MicroSeconds` in `data.rs`) while the stored document keeps the full
+/// precision, so without the floor one instant could get two labels
+/// depending on which copy the collector read (Issue #1187).
+fn format_facet_datetime(value: &DateTime<Utc>) -> String {
+    DateTime::<Utc>::from_timestamp_micros(value.timestamp_micros())
+        .unwrap_or(*value)
+        .to_rfc3339()
+}
+
+/// Append the facet paths of one field `value` to `out` (Issue #1187).
 ///
 /// Shared by the DocValues fast path and the stored-document fallback in
 /// [`FacetCollector::collect_doc`] so both derive identical facet paths
-/// (Issue #597). A `Text` value containing `/` is split into a hierarchical
-/// path; scalar values stringify to a single component; any other variant
-/// falls back to its `Debug` form, matching the original inline behaviour.
-fn push_path_components(value: &crate::data::DataValue, out: &mut Vec<String>) {
+/// (Issue #597). A scalar yields one path — a `Text` containing `/` is
+/// split into a hierarchical path — and an array yields one path per
+/// element, rendered exactly like the scalar of the same type. `Null`, geo
+/// points, vectors and bytes are not facetable and yield nothing. The match
+/// is exhaustive on purpose: a new `DataValue` variant has to decide here
+/// whether, and how, it facets.
+fn push_facet_paths(value: &crate::data::DataValue, out: &mut FacetPaths) {
+    use crate::data::DataValue as V;
+
+    fn scalar(out: &mut FacetPaths, label: String) {
+        out.push_path(|components| components.push(label));
+    }
+
     match value {
-        crate::data::DataValue::Text(value) => {
-            if value.contains('/') {
-                for s in value.split('/') {
-                    out.push(s.to_string());
-                }
-            } else {
-                out.push(value.clone());
-            }
-        }
-        crate::data::DataValue::Int64(v) => out.push(v.to_string()),
-        crate::data::DataValue::Float64(v) => out.push(v.to_string()),
-        crate::data::DataValue::Bool(v) => out.push(v.to_string()),
-        _ => out.push(format!("{value:?}")),
+        V::Text(text) => push_text_path(text, out),
+        V::Int64(v) => scalar(out, v.to_string()),
+        V::Float64(v) => scalar(out, format_facet_float(*v)),
+        V::Bool(v) => scalar(out, v.to_string()),
+        V::DateTime(dt) => scalar(out, format_facet_datetime(dt)),
+        V::TextArray(items) => items.iter().for_each(|text| push_text_path(text, out)),
+        V::Int64Array(items) => items.iter().for_each(|v| scalar(out, v.to_string())),
+        V::Float64Array(items) => items
+            .iter()
+            .for_each(|v| scalar(out, format_facet_float(*v))),
+        V::BoolArray(items) => items.iter().for_each(|v| scalar(out, v.to_string())),
+        V::DateTimeArray(items) => items
+            .iter()
+            .for_each(|dt| scalar(out, format_facet_datetime(dt))),
+        V::Null
+        | V::Geo(_)
+        | V::GeoEcef(_)
+        | V::GeoArray(_)
+        | V::GeoEcefArray(_)
+        | V::Vector(_)
+        | V::Bytes(_, _) => {}
     }
 }
 
@@ -261,6 +396,7 @@ impl FacetCollector {
             flat_counts: HashMap::new(),
             hier_counts: HashMap::new(),
             field_has_dv: Vec::new(),
+            doc_gen: 0,
         }
     }
 
@@ -278,8 +414,15 @@ impl FacetCollector {
         id
     }
 
-    /// Add a document to the facet counts.
+    /// Add a document to the facet counts. Every facet key is incremented at
+    /// most once per call, however many paths the document's values expand
+    /// to (Issue #1187).
     pub fn collect_doc(&mut self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<()> {
+        // One generation per document: `Slot::bump` refuses a second
+        // increment of the same key in the same generation.
+        self.doc_gen += 1;
+        let generation = self.doc_gen;
+
         // Resolve per-field DocValues availability once (Issue #597). It is
         // doc-independent, so caching it here keeps `collect_doc` free of a
         // lock-guarded `has_doc_values` probe per hit. NOTE: `true` here
@@ -312,29 +455,31 @@ impl FacetCollector {
         // each field iteration. Avoids per-field `Vec` reallocations that
         // dominated the per-doc cost on flat fields where the HashMap
         // hot path is otherwise tight.
-        let mut path_components: Vec<String> = Vec::new();
+        let mut paths = FacetPaths::default();
         let mut path_ids: Vec<u32> = Vec::new();
 
         for field_idx in 0..self.facet_fields.len() {
             let field_id = self.field_ids[field_idx];
             let has_dv = self.field_has_dv[field_idx];
 
-            // Phase 1: extract path components. Borrows
-            // `self.facet_fields[field_idx]` only until the end of this
-            // block, so `intern_value` (which needs `&mut self`) is free to
-            // run in phase 2 without a conflict.
-            path_components.clear();
+            // Phase 1: derive the facet paths of this field's value.
+            // Borrows `self.facet_fields[field_idx]` only until the end of
+            // this block, so `intern_value` (which needs `&mut self`) is
+            // free to run in phase 2 without a conflict.
+            paths.clear();
             {
                 let field_name: &str = &self.facet_fields[field_idx];
                 // DocValues fast path (#597). `FieldValue` is `DataValue`,
-                // so the value maps to facet path components exactly as
-                // the stored document would.
+                // so the value maps to facet paths exactly as the stored
+                // document would. A hit that yields no path (a geo value,
+                // an empty array, `Null`) is final: the stored document
+                // holds the same value, so there is nothing to fall back to.
                 let dv_hit = has_dv
                     .then(|| reader.get_doc_value(field_name, doc_id).ok().flatten())
                     .flatten();
 
                 if let Some(value) = dv_hit {
-                    push_path_components(&value, &mut path_components);
+                    push_facet_paths(&value, &mut paths);
                 } else {
                     // No DocValues column, or a miss despite `has_dv`
                     // (#1047) -- fall back to the stored document.
@@ -346,7 +491,7 @@ impl FacetCollector {
                     match result {
                         Ok(Some(fields)) => {
                             if let Some(val) = fields.get(field_name) {
-                                push_path_components(val, &mut path_components);
+                                push_facet_paths(val, &mut paths);
                             }
                         }
                         Ok(None) => {
@@ -356,44 +501,54 @@ impl FacetCollector {
                             // Synthetic fallback preserved from the pre-#409
                             // implementation: 5 distinct values stratified
                             // by `doc_id`.
-                            path_components.push(format!("value_{}", doc_id % 5));
+                            paths.push_path(|components| {
+                                components.push(format!("value_{}", doc_id % 5))
+                            });
                         }
                     }
                 }
             }
 
-            if path_components.is_empty() {
+            if paths.is_empty() {
                 continue;
             }
 
-            // Phase 2: intern path components and bump counters.
-            let depth = path_components.len();
-            if depth == 1 {
-                // Depth-1 fast path. Single hash on a `u64` key, no
-                // boxed-slice allocation.
-                let value_id = self.intern_value(&path_components[0]);
-                let key = ((field_id as u64) << 32) | (value_id as u64);
-                *self.flat_counts.entry(key).or_insert(0) += 1;
-            } else {
-                // Depth-N path. Build `[field_id, level0_id, …]` once
-                // into the scratch `Vec<u32>`, then `pop()` the last id
-                // at each step of the parent walk.
-                path_ids.clear();
-                path_ids.push(field_id);
-                for component in &path_components {
-                    let id = self.intern_value(component);
-                    path_ids.push(id);
-                }
-                while path_ids.len() > 1 {
-                    // Allocates a fresh `Box<[u32]>` per `entry()` —
-                    // unavoidable with the std `HashMap::entry` API, but
-                    // the box is `4 + 4*depth` bytes and hashes an
-                    // integer slice rather than a string, so the
-                    // per-step cost is ~30-40 ns vs the ~160-200 ns of
-                    // cloning + hashing a `FacetPath`.
-                    let key: Box<[u32]> = path_ids.as_slice().into();
-                    *self.hier_counts.entry(key).or_insert(0) += 1;
-                    path_ids.pop();
+            // Phase 2: intern path components and bump counters, once per
+            // key per document (Issue #1187).
+            for path in paths.paths() {
+                if path.len() == 1 {
+                    // Depth-1 fast path. Single hash on a `u64` key, no
+                    // boxed-slice allocation.
+                    let value_id = self.intern_value(&path[0]);
+                    let key = ((field_id as u64) << 32) | (value_id as u64);
+                    self.flat_counts.entry(key).or_default().bump(generation);
+                } else {
+                    // Depth-N path. Build `[field_id, level0_id, …]` once
+                    // into the scratch `Vec<u32>`, then `pop()` the last id
+                    // at each step of the parent walk.
+                    path_ids.clear();
+                    path_ids.push(field_id);
+                    for component in path {
+                        let id = self.intern_value(component);
+                        path_ids.push(id);
+                    }
+                    while path_ids.len() > 1 {
+                        // Allocates a fresh `Box<[u32]>` per `entry()` —
+                        // unavoidable with the std `HashMap::entry` API, but
+                        // the box is `4 + 4*depth` bytes and hashes an
+                        // integer slice rather than a string, so the
+                        // per-step cost is ~30-40 ns vs the ~160-200 ns of
+                        // cloning + hashing a `FacetPath`.
+                        let key: Box<[u32]> = path_ids.as_slice().into();
+                        if !self.hier_counts.entry(key).or_default().bump(generation) {
+                            // Already counted for this document by an earlier
+                            // element of the same value — and so is every
+                            // ancestor, because each walk stamps leaf-to-root
+                            // in one go before stopping.
+                            break;
+                        }
+                        path_ids.pop();
+                    }
                 }
             }
         }
@@ -409,8 +564,8 @@ impl FacetCollector {
         // into `(field_id << 32) | value_id`; both ids index into the
         // collector's reverse-name maps so we can reconstruct the
         // original `FacetPath`.
-        for (key, count) in &self.flat_counts {
-            if *count < self.config.min_count {
+        for (key, slot) in &self.flat_counts {
+            if slot.count < self.config.min_count {
                 continue;
             }
             let field_id = (key >> 32) as u32;
@@ -421,13 +576,13 @@ impl FacetCollector {
             field_facets
                 .entry(field_name.clone())
                 .or_default()
-                .push(FacetCount::new(facet_path, *count));
+                .push(FacetCount::new(facet_path, slot.count));
         }
 
         // Decode the depth ≥ 2 (`hier_counts`) tier. Slot 0 is the
         // `field_id`; slots 1.. are interned path components in order.
-        for (key, count) in &self.hier_counts {
-            if *count < self.config.min_count {
+        for (key, slot) in &self.hier_counts {
+            if slot.count < self.config.min_count {
                 continue;
             }
             let field_id = key[0];
@@ -440,7 +595,7 @@ impl FacetCollector {
             field_facets
                 .entry(field_name.clone())
                 .or_default()
-                .push(FacetCount::new(facet_path, *count));
+                .push(FacetCount::new(facet_path, slot.count));
         }
 
         // Build hierarchical structure and sort
@@ -1062,7 +1217,7 @@ mod tests {
     use super::*;
 
     use crate::Document;
-    use crate::data::DataValue;
+    use crate::data::{DataValue, GeoEcefPoint, GeoPoint};
     use crate::lexical::index::structures::bkd_tree::BKDTree;
     use crate::lexical::reader::{FieldStats, PostingIterator, ReaderTermInfo};
     use std::any::Any;
@@ -1167,6 +1322,26 @@ mod tests {
         b.build()
     }
 
+    /// Build a document from `(field, value)` pairs of any `DataValue`
+    /// (Issue #1187 array tests).
+    fn doc(pairs: &[(&str, DataValue)]) -> Document {
+        let mut b = Document::builder();
+        for (f, v) in pairs {
+            b = b.add_field(*f, v.clone());
+        }
+        b.build()
+    }
+
+    /// `DataValue::TextArray` from string slices.
+    fn texts(items: &[&str]) -> DataValue {
+        DataValue::TextArray(items.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    /// Facet path from string slices, for `flatten` comparisons.
+    fn p(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
     /// Recursively flatten a field's facet counts into sorted `(path, count)`
     /// pairs, so two collection runs can be compared for exact equivalence.
     fn flatten(results: &FacetResults, field: &str) -> Vec<(Vec<String>, u64)> {
@@ -1186,20 +1361,30 @@ mod tests {
         out
     }
 
-    /// Run a full facet collection over `docs` and return the results.
-    fn collect(docs: Vec<Document>, fields: &[&str], dv: &[&str], panic_doc: bool) -> FacetResults {
+    /// Run a full facet collection over `docs` with `config` and return
+    /// the results.
+    fn collect_with(
+        config: FacetConfig,
+        docs: Vec<Document>,
+        fields: &[&str],
+        dv: &[&str],
+        panic_doc: bool,
+    ) -> FacetResults {
         let n = docs.len() as u64;
         let reader = DvMockReader::new(docs, dv, panic_doc);
-        let mut collector = FacetCollector::new(
-            FacetConfig::default(),
-            fields.iter().map(|s| s.to_string()).collect(),
-        );
+        let mut collector =
+            FacetCollector::new(config, fields.iter().map(|s| s.to_string()).collect());
         for doc_id in 0..n {
             collector
                 .collect_doc(doc_id, &reader)
                 .expect("collect_doc must not error");
         }
         collector.finalize().expect("finalize must not error")
+    }
+
+    /// Run a full facet collection over `docs` and return the results.
+    fn collect(docs: Vec<Document>, fields: &[&str], dv: &[&str], panic_doc: bool) -> FacetResults {
+        collect_with(FacetConfig::default(), docs, fields, dv, panic_doc)
     }
 
     #[test]
@@ -1226,6 +1411,307 @@ mod tests {
                 (vec!["dell".to_string()], 1),
             ]
         );
+    }
+
+    // ---- Multi-valued (array) values, Issue #1187 -----------------------
+
+    #[test]
+    fn facet_expands_text_array_elements() {
+        let docs = vec![doc(&[("tags", texts(&["rust", "search"]))])];
+        let results = collect(docs, &["tags"], &["tags"], true);
+        // Exact match: no `TextArray([...])` label and no `rust/search`
+        // hierarchical path.
+        assert_eq!(
+            flatten(&results, "tags"),
+            vec![(p(&["rust"]), 1), (p(&["search"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_text_array_counts_across_documents() {
+        // The generation must advance per `collect_doc`, or the second
+        // document's `a` would be refused as "already counted".
+        let docs = vec![
+            doc(&[("tags", texts(&["a"]))]),
+            doc(&[("tags", texts(&["a"]))]),
+            doc(&[("tags", texts(&["a", "b"]))]),
+        ];
+        let results = collect(docs, &["tags"], &["tags"], true);
+        assert_eq!(
+            flatten(&results, "tags"),
+            vec![(p(&["a"]), 3), (p(&["b"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_arrays_do_not_bleed_across_fields() {
+        let docs = vec![doc(&[("tags", texts(&["a"])), ("cats", texts(&["a"]))])];
+        let results = collect(docs, &["tags", "cats"], &["tags", "cats"], true);
+        assert_eq!(flatten(&results, "tags"), vec![(p(&["a"]), 1)]);
+        assert_eq!(flatten(&results, "cats"), vec![(p(&["a"]), 1)]);
+    }
+
+    /// The array corpus shared by the parity test and the per-rule tests:
+    /// a plain array, a duplicate element, two hierarchical elements with a
+    /// shared ancestor, and an empty array.
+    fn array_corpus() -> Vec<Document> {
+        vec![
+            doc(&[("tags", texts(&["rust", "search"]))]),
+            doc(&[("tags", texts(&["rust", "rust"]))]),
+            doc(&[("tags", texts(&["a/b", "a/c"]))]),
+            doc(&[("tags", texts(&[]))]),
+        ]
+    }
+
+    fn array_corpus_expected() -> Vec<(Vec<String>, u64)> {
+        vec![
+            (p(&["a"]), 1),
+            (p(&["a", "b"]), 1),
+            (p(&["a", "c"]), 1),
+            (p(&["rust"]), 2),
+            (p(&["search"]), 1),
+        ]
+    }
+
+    #[test]
+    fn facet_text_array_docvalues_matches_stored_doc() {
+        // #597 parity for arrays: the DocValues path (`document()` would
+        // panic) and the stored-document fallback must agree exactly.
+        let via_dv = collect(array_corpus(), &["tags"], &["tags"], true);
+        let via_doc = collect(array_corpus(), &["tags"], &[], false);
+        assert_eq!(flatten(&via_dv, "tags"), flatten(&via_doc, "tags"));
+        assert_eq!(flatten(&via_dv, "tags"), array_corpus_expected());
+    }
+
+    #[test]
+    fn facet_repeated_array_element_counts_once() {
+        let docs = vec![doc(&[("tags", texts(&["rust", "rust", "rust"]))])];
+        let results = collect(docs, &["tags"], &["tags"], true);
+        assert_eq!(flatten(&results, "tags"), vec![(p(&["rust"]), 1)]);
+    }
+
+    #[test]
+    fn facet_shared_ancestor_counts_once_per_document() {
+        let docs = vec![doc(&[("cat", texts(&["a/b", "a/c"]))])];
+        let results = collect(docs, &["cat"], &["cat"], true);
+        assert_eq!(
+            flatten(&results, "cat"),
+            vec![(p(&["a"]), 1), (p(&["a", "b"]), 1), (p(&["a", "c"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_hierarchical_text_array_elements() {
+        // Each element is its own path: a hierarchical one and a flat one.
+        let docs = vec![doc(&[("cat", texts(&["a/b", "c"]))])];
+        let results = collect(docs, &["cat"], &["cat"], true);
+        assert_eq!(
+            flatten(&results, "cat"),
+            vec![(p(&["a"]), 1), (p(&["a", "b"]), 1), (p(&["c"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_flat_and_hierarchical_tiers_emit_separate_entries() {
+        // Characterization of a pre-existing quirk (Issue #1192): the
+        // depth-1 tier and the hierarchical tier are decoded independently,
+        // so `a` from the flat element and `a` as the ancestor of `a/b`
+        // come back as two `FacetCount` entries with the same path. The
+        // generation stamp keeps each of them at 1 — no double counting.
+        let docs = vec![doc(&[("cat", texts(&["a", "a/b"]))])];
+        let results = collect(docs, &["cat"], &["cat"], true);
+        assert_eq!(
+            flatten(&results, "cat"),
+            vec![(p(&["a"]), 1), (p(&["a"]), 1), (p(&["a", "b"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_empty_components_keep_scalar_parity() {
+        // `""` is one empty component and `"a/"` is `["a", ""]`, exactly as
+        // for scalar `Text` (Issue #1192 tracks whether to reject them).
+        let array = collect(
+            vec![doc(&[("cat", texts(&["", "a/"]))])],
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        let scalars = collect(
+            vec![text_doc(&[("cat", "")]), text_doc(&[("cat", "a/")])],
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        assert_eq!(flatten(&array, "cat"), flatten(&scalars, "cat"));
+        assert_eq!(
+            flatten(&array, "cat"),
+            vec![(p(&[""]), 1), (p(&["a"]), 1), (p(&["a", ""]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_int64_and_bool_arrays_expand() {
+        let docs = vec![doc(&[
+            ("n", DataValue::Int64Array(vec![1, 2, 2])),
+            ("flags", DataValue::BoolArray(vec![true, false, true])),
+        ])];
+        let results = collect(docs, &["n", "flags"], &["n", "flags"], true);
+        assert_eq!(flatten(&results, "n"), vec![(p(&["1"]), 1), (p(&["2"]), 1)]);
+        assert_eq!(
+            flatten(&results, "flags"),
+            vec![(p(&["false"]), 1), (p(&["true"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_float_values_always_carry_a_fraction() {
+        // One document carrying every field, so the all-DocValues run never
+        // misses a value (a miss falls back to `document()`, which the mock
+        // turns into a panic by design).
+        let docs = vec![doc(&[
+            ("price", DataValue::Float64(1.0)),
+            ("count", DataValue::Int64(1)),
+            ("prices", DataValue::Float64Array(vec![1.5, 2.0, f64::NAN])),
+        ])];
+        let fields = ["price", "prices", "count"];
+        let results = collect(docs, &fields, &fields, true);
+        // `1.0` and `1` are different labels: the float carries a fraction.
+        assert_eq!(flatten(&results, "price"), vec![(p(&["1.0"]), 1)]);
+        assert_eq!(flatten(&results, "count"), vec![(p(&["1"]), 1)]);
+        assert_eq!(
+            flatten(&results, "prices"),
+            vec![(p(&["1.5"]), 1), (p(&["2.0"]), 1), (p(&["NaN"]), 1)]
+        );
+    }
+
+    #[test]
+    fn facet_datetime_values_render_as_rfc3339() {
+        let jan: DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();
+        // Nanoseconds are floored to microseconds, matching the DocValues
+        // encoding, so both copies of an instant get one label.
+        let nanos = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        let docs = vec![
+            doc(&[("ts", DataValue::DateTime(jan))]),
+            doc(&[("ts", DataValue::DateTimeArray(vec![jan, nanos]))]),
+        ];
+        let results = collect(docs, &["ts"], &["ts"], true);
+        assert_eq!(
+            flatten(&results, "ts"),
+            vec![
+                (p(&["2023-11-14T22:13:20.123456+00:00"]), 1),
+                (p(&["2024-01-01T00:00:00+00:00"]), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn facet_non_facetable_values_are_skipped() {
+        // Reached through the stored-document fallback (no DocValues),
+        // which is the only way `Vector` / `Bytes` can get here at all.
+        let docs = vec![doc(&[
+            ("loc", DataValue::Geo(GeoPoint::new(35.68, 139.77))),
+            (
+                "locs",
+                DataValue::GeoArray(vec![GeoPoint::new(35.68, 139.77)]),
+            ),
+            (
+                "ecef",
+                DataValue::GeoEcefArray(vec![GeoEcefPoint {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                }]),
+            ),
+            ("vec", DataValue::Vector(vec![0.1, 0.2])),
+            ("blob", DataValue::Bytes(vec![1, 2, 3], None)),
+            ("nothing", DataValue::Null),
+            ("tags", texts(&["kept"])),
+        ])];
+        let fields = ["loc", "locs", "ecef", "vec", "blob", "nothing", "tags"];
+        let results = collect(docs, &fields, &[], false);
+        for field in &fields[..6] {
+            assert!(
+                results.get_field_facets(field).is_none(),
+                "{field} must contribute no facet value, got {:?}",
+                flatten(&results, field)
+            );
+        }
+        assert_eq!(flatten(&results, "tags"), vec![(p(&["kept"]), 1)]);
+    }
+
+    #[test]
+    fn facet_docvalues_hit_with_no_paths_does_not_fall_back() {
+        // A DocValues hit that yields no path is final: `document()` must
+        // not be called (the mock panics if it is).
+        let docs = vec![doc(&[
+            ("tags", texts(&[])),
+            ("loc", DataValue::Geo(GeoPoint::new(35.68, 139.77))),
+            ("nothing", DataValue::Null),
+        ])];
+        let fields = ["tags", "loc", "nothing"];
+        let results = collect(docs, &fields, &fields, true);
+        for field in &fields {
+            assert!(results.get_field_facets(field).is_none(), "{field}");
+        }
+    }
+
+    #[test]
+    fn facet_mixed_scalar_and_array_fields() {
+        // One scalar field with DocValues, one array field without.
+        let docs = vec![
+            doc(&[
+                ("brand", DataValue::Text("apple".into())),
+                ("tags", texts(&["x", "y"])),
+            ]),
+            doc(&[
+                ("brand", DataValue::Text("apple".into())),
+                ("tags", texts(&["y"])),
+            ]),
+        ];
+        let results = collect(docs, &["brand", "tags"], &["brand"], false);
+        assert_eq!(flatten(&results, "brand"), vec![(p(&["apple"]), 2)]);
+        assert_eq!(
+            flatten(&results, "tags"),
+            vec![(p(&["x"]), 1), (p(&["y"]), 2)]
+        );
+    }
+
+    #[test]
+    fn facet_arrays_respect_min_count_and_max_facets_per_field() {
+        // Distinct counts (a: 3, b: 2, c: 1) so the count-sorted truncation
+        // is deterministic.
+        let corpus = || {
+            vec![
+                doc(&[("tags", texts(&["a", "b", "c"]))]),
+                doc(&[("tags", texts(&["a", "b"]))]),
+                doc(&[("tags", texts(&["a"]))]),
+            ]
+        };
+        let min_two = collect_with(
+            FacetConfig {
+                min_count: 2,
+                ..Default::default()
+            },
+            corpus(),
+            &["tags"],
+            &["tags"],
+            true,
+        );
+        assert_eq!(
+            flatten(&min_two, "tags"),
+            vec![(p(&["a"]), 3), (p(&["b"]), 2)]
+        );
+        let top_one = collect_with(
+            FacetConfig {
+                max_facets_per_field: 1,
+                ..Default::default()
+            },
+            corpus(),
+            &["tags"],
+            &["tags"],
+            true,
+        );
+        assert_eq!(flatten(&top_one, "tags"), vec![(p(&["a"]), 3)]);
     }
 
     #[test]
