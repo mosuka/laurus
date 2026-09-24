@@ -521,6 +521,19 @@ pub struct SegmentReader {
     /// immutable for a reader snapshot.
     posting_cache: PostingCache,
 
+    /// Index-time analyzer used by the `.post`-less scan fallback (Issue
+    /// #1196). `None` (the state `open` leaves) falls back to
+    /// `StandardAnalyzer`; query and merge readers chain
+    /// [`Self::with_analyzer`] so the scan analyzes stored values exactly
+    /// like the writer did — including per-field analyzers and the
+    /// `_id → KeywordAnalyzer` mapping the engine installs.
+    analyzer: Option<Arc<dyn Analyzer>>,
+
+    /// Set once the first `postings` call found no `.post` file and logged
+    /// the warning (Issue #1196), so a damaged segment warns once per reader
+    /// instance instead of once per term.
+    warned_missing_postings: AtomicBool,
+
     /// Whether the segment is loaded.
     loaded: AtomicBool,
 }
@@ -535,6 +548,11 @@ impl SegmentReader {
     }
 
     /// Open a segment reader (schema-less mode).
+    ///
+    /// Readers that answer queries or feed a merge should chain
+    /// [`Self::with_analyzer`] with the index analyzer so the `.post`-less
+    /// scan fallback analyzes stored values like the writer did (Issue
+    /// #1196); without it the fallback uses `StandardAnalyzer`.
     pub fn open(info: SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
         // Layout detection (#554): a `{segment_id}.cfs` container routes
         // every part read through a windowed facade; its absence means a
@@ -560,6 +578,8 @@ impl SegmentReader {
             bkd_trees: RwLock::new(AHashMap::new()),
             // Disabled by default; query readers enable it (Issue #612).
             posting_cache: PostingCache::new(0),
+            analyzer: None,
+            warned_missing_postings: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
         };
 
@@ -609,6 +629,23 @@ impl SegmentReader {
     pub fn with_posting_cache_bytes(mut self, max_bytes: usize) -> Self {
         self.posting_cache = PostingCache::new(max_bytes);
         self
+    }
+
+    /// Set the index analyzer the `.post`-less scan fallback analyzes stored
+    /// values with (Issue #1196). Pass the same `Arc<dyn Analyzer>` the
+    /// writer indexed with — a `PerFieldAnalyzer` is resolved per field, so
+    /// custom field analyzers and `_id → KeywordAnalyzer` match the
+    /// postings. Returns `self` for chaining after [`Self::open`].
+    pub fn with_analyzer(mut self, analyzer: Arc<dyn Analyzer>) -> Self {
+        self.analyzer = Some(analyzer);
+        self
+    }
+
+    /// Whether the `.post`-missing warning has been logged by this reader
+    /// instance (test hook for the once-per-segment guard, Issue #1196).
+    #[cfg(test)]
+    pub(crate) fn has_warned_missing_postings(&self) -> bool {
+        self.warned_missing_postings.load(Ordering::Relaxed)
     }
 
     /// Snapshot of this segment's posting-cache hit / miss counters (Issue #612).
@@ -1118,7 +1155,16 @@ impl SegmentReader {
         let postings_file = format!("{}.post", self.info.segment_id);
 
         if !self.storage.file_exists(&postings_file) {
-            // No inverted index, fall back to document scanning
+            // No postings part: answer from the stored documents. Warn once
+            // per reader instance (a reader is rebuilt on every commit, so a
+            // damaged segment keeps reminding without flooding per term).
+            if !self.warned_missing_postings.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "segment {} has no .post file; term queries against it are answered by \
+                     scanning its stored documents (Issue #1196)",
+                    self.info.segment_id
+                );
+            }
             return self.scan_documents_for_term(field, term);
         }
 
@@ -1216,11 +1262,18 @@ impl SegmentReader {
     /// `Text`, a multi-valued `TextArray` with its position-increment gap,
     /// `Bool` / `BoolArray` as `"true"` / `"false"`, numeric and datetime
     /// terms — yields exactly the terms and dense positions its postings
-    /// would have carried. Because the segment reader is schema-less the
-    /// analyzer is the default `StandardAnalyzer`, the gap is
-    /// `position_increment_gap_for(None)`, and `indexed: false` cannot be
-    /// honoured; the result is not cached and scores are zero without a
-    /// `.dict` (tracked in Issue #1196).
+    /// would have carried. The analyzer is the one chained through
+    /// [`Self::with_analyzer`] — the index analyzer, so a `PerFieldAnalyzer`
+    /// resolves per field and `_id` is analyzed as a keyword (Issue #1196) —
+    /// or `StandardAnalyzer` for a reader opened without one.
+    ///
+    /// Remaining limitations, because the segment reader is schema-less:
+    /// the position gap is `position_increment_gap_for(None)` rather than
+    /// the field's own, `indexed: false` cannot be honoured, the result is
+    /// not cached (a phrase query rescans once per term), scores are zero
+    /// without a `.dict`, and prefix / wildcard / fuzzy / regexp queries —
+    /// which expand through dictionary enumeration — never see the scanned
+    /// terms.
     fn scan_documents_for_term(
         &self,
         field: &str,
@@ -1236,7 +1289,10 @@ impl SegmentReader {
 
         if let Some(ref documents) = *docs {
             let mut postings = Vec::new();
-            let analyzer: Arc<dyn Analyzer> = Arc::new(StandardAnalyzer::new()?);
+            let analyzer: Arc<dyn Analyzer> = match &self.analyzer {
+                Some(analyzer) => Arc::clone(analyzer),
+                None => Arc::new(StandardAnalyzer::new()?),
+            };
             let position_increment_gap = super::writer::position_increment_gap_for(None);
 
             for (doc_id, doc) in documents.iter() {
@@ -1681,7 +1737,11 @@ impl InvertedIndexReader {
         for segment_info in &segments {
             total_doc_count += segment_info.doc_count;
             let mut reader = SegmentReader::open(segment_info.clone(), storage.clone())?
-                .with_posting_cache_bytes(posting_cache_bytes);
+                .with_posting_cache_bytes(posting_cache_bytes)
+                // The `.post`-less scan fallback must analyze like the
+                // writer did (Issue #1196); the per-segment fanout shares
+                // these same readers, so this covers every query path.
+                .with_analyzer(config.analyzer.clone());
 
             if config.preload_segments {
                 reader.load()?;
@@ -2763,6 +2823,83 @@ mod tests {
             scan_hits(&reader, "body", "alpha"),
             vec![(0, 1, vec![0]), (2, 1, vec![0])]
         );
+    }
+
+    // ---- Analyzer wiring and the once-per-segment warning, Issue #1196 --
+
+    #[test]
+    fn scan_fallback_uses_the_configured_analyzer() {
+        use crate::analysis::analyzer::keyword::KeywordAnalyzer;
+
+        // Under `KeywordAnalyzer` the whole value is one term, so the scan
+        // must hit `"rust search"` and miss `"rust"` — the inverse of the
+        // standard-analyzer result the other tests assert.
+        let (storage, info) = docs_only_segment(
+            "scan_keyword",
+            &[(0, vec![("tags", text("rust search"))])],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage)
+            .unwrap()
+            .with_analyzer(Arc::new(KeywordAnalyzer::new()));
+        assert_eq!(
+            scan_hits(&reader, "tags", "rust search"),
+            vec![(0, 1, vec![0])]
+        );
+        assert!(scan_hits(&reader, "tags", "rust").is_empty());
+    }
+
+    #[test]
+    fn scan_fallback_defaults_to_standard_without_an_analyzer() {
+        // A reader opened without `with_analyzer` keeps the historical
+        // `StandardAnalyzer` behaviour.
+        let (storage, info) = docs_only_segment(
+            "scan_default",
+            &[(0, vec![("tags", text("rust search"))])],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(scan_hits(&reader, "tags", "rust"), vec![(0, 1, vec![0])]);
+        assert_eq!(scan_hits(&reader, "tags", "search"), vec![(0, 1, vec![1])]);
+        assert!(scan_hits(&reader, "tags", "rust search").is_empty());
+    }
+
+    #[test]
+    fn scan_fallback_resolves_a_per_field_analyzer() {
+        use crate::analysis::analyzer::keyword::KeywordAnalyzer;
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+
+        // The engine's analyzer: standard by default, keyword for `_id`
+        // (`Engine::split_schema`). `_id` lookups against a `.post`-less
+        // segment must match the whole id while other fields tokenize.
+        let per_field = PerFieldAnalyzer::new(Arc::new(StandardAnalyzer::new().unwrap()));
+        per_field.add_analyzer("_id", Arc::new(KeywordAnalyzer::new()));
+        let (storage, info) = docs_only_segment(
+            "scan_per_field",
+            &[(0, vec![("_id", text("doc-1")), ("body", text("doc-1"))])],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage)
+            .unwrap()
+            .with_analyzer(Arc::new(per_field));
+        assert_eq!(scan_hits(&reader, "_id", "doc-1"), vec![(0, 1, vec![0])]);
+        assert!(scan_hits(&reader, "_id", "doc").is_empty());
+        assert_eq!(scan_hits(&reader, "body", "doc"), vec![(0, 1, vec![0])]);
+        assert!(scan_hits(&reader, "body", "doc-1").is_empty());
+    }
+
+    #[test]
+    fn scan_fallback_warns_once_per_segment() {
+        let (storage, info) =
+            docs_only_segment("scan_warn", &[(0, vec![("tags", text("rust"))])], false);
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert!(!reader.has_warned_missing_postings());
+        let _ = reader.postings("tags", "rust").unwrap();
+        assert!(reader.has_warned_missing_postings());
+        // A second lookup must not re-arm the warning: the flag is a
+        // one-way latch per reader instance.
+        let _ = reader.postings("tags", "missing").unwrap();
+        assert!(reader.has_warned_missing_postings());
     }
 
     /// #1047: `has_doc_values` must reflect the schema's per-field

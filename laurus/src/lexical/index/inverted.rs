@@ -605,6 +605,7 @@ impl InvertedIndex {
                 use_compound: self.config.use_compound,
                 field_doc_values: self.current_field_doc_values(),
                 default_doc_values: self.config.store_doc_values,
+                index_analyzer: Some(self.config.analyzer.clone()),
                 ..MergeConfig::default()
             },
             self.storage.clone(),
@@ -930,6 +931,7 @@ impl LexicalIndex for InvertedIndex {
                     use_compound: self.config.use_compound,
                     field_doc_values: self.current_field_doc_values(),
                     default_doc_values: self.config.store_doc_values,
+                    index_analyzer: Some(self.config.analyzer.clone()),
                     ..MergeConfig::default()
                 },
                 self.storage.clone(),
