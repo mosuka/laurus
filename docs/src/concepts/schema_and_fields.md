@@ -454,6 +454,13 @@ stores positions (`term_vectors: true`) — `Reindex` when `stored`,
 under the old gap; when `term_vectors` is `false` the gap is unobservable
 and the change is metadata-only.
 
+Faceting expands every multi-valued type element by element (Issue #1187):
+each integer, float, boolean, datetime or text element becomes its own facet
+value (a text element containing `/` becomes a hierarchical path), counted
+once per document even when an element repeats; geo arrays are not
+facetable and contribute nothing. See
+[Faceting](../laurus/faceting.md#multi-valued-fields) for the element formats.
+
 Single values sent to a multi-valued field are auto-wrapped into a
 one-element array; arrays sent to a single-valued field are rejected
 rather than silently truncating (the error tells you to declare the field
