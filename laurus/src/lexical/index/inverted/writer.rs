@@ -1357,10 +1357,13 @@ impl InvertedIndexWriter {
         // survive the buffer being emptied below (#1016). Built from the
         // same `SegmentInfo` the `.meta` was serialised from, and before
         // the buffers that description is computed from are cleared.
-        self.flushed_segments.push(SegmentReader::open(
-            self.segment_info_for(&segment_name),
-            self.storage.clone(),
-        )?);
+        self.flushed_segments.push(
+            SegmentReader::open(self.segment_info_for(&segment_name), self.storage.clone())?
+                // `_id` lookups against this segment take the `.post`-less
+                // scan only if the part is lost, but keep the analyzer
+                // invariant uniform (Issue #1196).
+                .with_analyzer(self.config.analyzer.clone()),
+        );
 
         // Remember to publish it at the next commit (#1017). The full
         // description is retained so publication needs no `.meta` re-read

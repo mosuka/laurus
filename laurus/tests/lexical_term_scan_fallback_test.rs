@@ -9,17 +9,18 @@
 //! `.post` **and** `.dict` are deleted outright. Two consequences shape the
 //! assertions below:
 //!
-//! - `TermQuery::is_empty` consults the term dictionary, and
-//!   `LexicalStore::search` / `count` short-circuit on it. Segment 1's
-//!   `.dict` is therefore load-bearing: it is what lets a term query reach
-//!   the matcher at all. A term that exists only in the index-less segment
-//!   is still found by `matching_doc_ids`, which bypasses `is_empty`.
+//! - `TermQuery::is_empty` and `count`'s `doc_freq` fast path consult the
+//!   term dictionaries, which the index-less segment is absent from. Since
+//!   #1196 the reader reports `term_info_is_authoritative() == false` in
+//!   that state, so both fall through to the matcher and the scanned
+//!   documents are found and counted like any other.
 //! - A scan hit has no `term_info`, so it scores 0.0. It is collected as
 //!   long as the top-k heap is not full, hence the generous `limit`.
 
 use std::sync::Arc;
 
 use laurus::Document;
+use laurus::analysis::analyzer::keyword::KeywordAnalyzer;
 use laurus::lexical::index::config::InvertedIndexConfig;
 use laurus::lexical::query::{PhraseQuery, TermQuery};
 use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore};
@@ -128,10 +129,9 @@ fn phrase(terms: &[&str], slop: u32) -> Box<PhraseQuery> {
 fn term_query_reaches_a_multi_valued_document_through_the_scan_fallback() {
     let (_storage, store) = store_with_an_index_less_first_segment();
 
-    // `rust` is in segment 1's dictionary, so the query is not empty; the
-    // multi-valued document then comes from segment 0's scan. Before
-    // #1194 the scan skipped `TextArray` and only the scalar document was
-    // found.
+    // The multi-valued document comes from segment 0's scan, the scalar one
+    // from segment 1's postings. Before #1194 the scan skipped `TextArray`
+    // and only the scalar document was found.
     assert_eq!(
         hit_ids(&store, LexicalSearchRequest::new(term("rust")).limit(100)),
         vec![MULTI_VALUED_DOC, SCALAR_DOC]
@@ -139,28 +139,37 @@ fn term_query_reaches_a_multi_valued_document_through_the_scan_fallback() {
     let ids = store.matching_doc_ids(term("rust")).unwrap();
     assert!(ids.contains(MULTI_VALUED_DOC) && ids.contains(SCALAR_DOC));
 
-    // Characterization: `count` takes the #610 fast path for a bare
-    // `TermQuery` without deletions and returns the dictionary's
-    // `doc_freq`, which the index-less segment cannot contribute to — so
-    // it stays at 1 while `search` finds 2. Tracked with the fallback's
-    // other limitations in #1196.
+    // `count` would take the #610 `doc_freq` fast path, which the
+    // index-less segment cannot contribute to; the reader is not
+    // authoritative here (#1196), so `count` walks the matcher and agrees
+    // with `search`.
     assert_eq!(
         store
             .count(LexicalSearchRequest::new(term("rust")).limit(100))
             .unwrap(),
-        1
+        2
     );
 }
 
 #[test]
-fn a_term_known_only_to_the_index_less_segment_is_found_by_matching_doc_ids() {
+fn a_term_known_only_to_the_index_less_segment_is_found() {
     let (_storage, store) = store_with_an_index_less_first_segment();
 
-    // `search` short-circuits on `TermQuery::is_empty`, which only sees
-    // segment 1's dictionary — characterization of the current behaviour,
-    // tracked with the fallback's other limitations in #1196.
-    assert!(hit_ids(&store, LexicalSearchRequest::new(term("search")).limit(100)).is_empty());
-    // `matching_doc_ids` runs the matcher directly and reaches the scan.
+    // `search` short-circuits on `TermQuery::is_empty`, which no dictionary
+    // can answer for this term. With a segment lacking its dictionary the
+    // reader is not authoritative (#1196), so the query is not considered
+    // empty and the scan finds the document.
+    assert_eq!(
+        hit_ids(&store, LexicalSearchRequest::new(term("search")).limit(100)),
+        vec![MULTI_VALUED_DOC]
+    );
+    assert_eq!(
+        store
+            .count(LexicalSearchRequest::new(term("search")).limit(100))
+            .unwrap(),
+        1
+    );
+    // `matching_doc_ids` runs the matcher directly and reaches the scan too.
     let ids = store.matching_doc_ids(term("search")).unwrap();
     assert!(ids.contains(MULTI_VALUED_DOC));
     assert!(!ids.contains(SCALAR_DOC));
@@ -202,6 +211,116 @@ fn phrase_query_honours_the_position_gap_through_the_scan_fallback() {
             &store,
             LexicalSearchRequest::new(phrase(&["world", "rust"], 100)).limit(100)
         ),
+        vec![MULTI_VALUED_DOC]
+    );
+}
+
+// ---- The index analyzer on the scan path, Issue #1196 ----------------------
+
+/// The two-segment shape above, on an index whose analyzer is
+/// `KeywordAnalyzer`: a whole value is one term, so `"rust search"` is a
+/// term and `"rust"` is not. Segment 0 holds `body = ["rust search", "foo"]`
+/// and loses its `.post` (and, when `strip_dict` is set, its `.dict`);
+/// segment 1 holds the scalar `body = "rust search"`.
+fn keyword_store(strip_dict: bool) -> (Arc<dyn Storage>, LexicalStore) {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::Inverted(InvertedIndexConfig {
+        analyzer: Arc::new(KeywordAnalyzer::new()),
+        use_compound: false,
+        max_segments: 1000,
+        ..Default::default()
+    });
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+
+    store
+        .upsert_document(
+            MULTI_VALUED_DOC,
+            Document::builder()
+                .add_text_array("body", vec!["rust search".to_string(), "foo".to_string()])
+                .build(),
+        )
+        .unwrap();
+    store.commit().unwrap();
+    store
+        .upsert_document(
+            SCALAR_DOC,
+            Document::builder().add_text("body", "rust search").build(),
+        )
+        .unwrap();
+    store.commit().unwrap();
+
+    let post_files = files_with_suffix(&storage, ".post");
+    assert_eq!(
+        post_files.len(),
+        2,
+        "one .post per segment, found {post_files:?}"
+    );
+    storage.delete_file(&post_files[0]).unwrap();
+    if strip_dict {
+        let dict_files = files_with_suffix(&storage, ".dict");
+        assert_eq!(
+            dict_files.len(),
+            2,
+            "one .dict per segment, found {dict_files:?}"
+        );
+        storage.delete_file(&dict_files[0]).unwrap();
+    }
+    (storage, store)
+}
+
+#[test]
+fn scan_fallback_uses_the_index_analyzer_end_to_end() {
+    let (_storage, store) = keyword_store(true);
+
+    // Under the keyword analyzer both documents carry the single term
+    // `rust search` — the index-less one through the scan, which must
+    // analyze with the index analyzer `InvertedIndexReader::new` hands the
+    // segment readers ...
+    assert_eq!(
+        hit_ids(
+            &store,
+            LexicalSearchRequest::new(term("rust search")).limit(100)
+        ),
+        vec![MULTI_VALUED_DOC, SCALAR_DOC]
+    );
+    assert_eq!(
+        hit_ids(&store, LexicalSearchRequest::new(term("foo")).limit(100)),
+        vec![MULTI_VALUED_DOC]
+    );
+    // ... and neither carries `rust`. A scan analyzing with
+    // `StandardAnalyzer` (the pre-#1196 behaviour) would have found the
+    // multi-valued document here.
+    assert!(hit_ids(&store, LexicalSearchRequest::new(term("rust")).limit(100)).is_empty());
+}
+
+#[test]
+fn merge_replays_a_post_less_segment_with_the_index_analyzer() {
+    let (storage, store) = keyword_store(false);
+
+    // Segment 0 kept its `.dict`, so the merge replay enumerates
+    // `rust search` and `foo` and re-reads each through `postings` — the
+    // scan, driven by `MergeConfig::index_analyzer`. Force-merge both
+    // segments into one.
+    store.optimize().unwrap();
+    assert_eq!(
+        files_with_suffix(&storage, ".post").len(),
+        1,
+        "the force-merge must leave one segment with a real postings part"
+    );
+
+    // Both documents now come from the merged postings ...
+    assert_eq!(
+        hit_ids(
+            &store,
+            LexicalSearchRequest::new(term("rust search")).limit(100)
+        ),
+        vec![MULTI_VALUED_DOC, SCALAR_DOC]
+    );
+    // ... and document 0's own term survived the replay. A replay scanning
+    // with `StandardAnalyzer` would have produced `rust` / `search`, matched
+    // nothing for either dictionary key, and dropped both terms.
+    assert_eq!(
+        hit_ids(&store, LexicalSearchRequest::new(term("foo")).limit(100)),
         vec![MULTI_VALUED_DOC]
     );
 }

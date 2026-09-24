@@ -209,6 +209,14 @@ impl LexicalIndexReader for PerSegmentReaderView {
         seg.has_doc_values(field)
     }
 
+    fn term_info_is_authoritative(&self) -> bool {
+        // This view answers `term_info` from its own segment's dictionary
+        // (Issue #1196); without one, the segment's documents are only
+        // reachable through the stored-document scan.
+        let seg = self.segment.read().unwrap();
+        seg.has_term_dictionary()
+    }
+
     fn term_info(&self, field: &str, term: &str) -> Result<Option<ReaderTermInfo>> {
         // Combine: global doc_freq / total_freq + per-segment posting
         // offset, max_score_factor, and (critically) the per-segment

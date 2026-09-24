@@ -84,6 +84,14 @@ pub struct MergeConfig {
     /// actually consulted). Mirrors
     /// [`InvertedIndexConfig::store_doc_values`](crate::lexical::index::config::InvertedIndexConfig::store_doc_values).
     pub default_doc_values: bool,
+
+    /// The index analyzer, handed to every source `SegmentReader` so the
+    /// `.post`-less scan fallback the replay may take analyzes stored values
+    /// like the writer did (Issue #1196). `None` (the `Default`) leaves the
+    /// fallback on `StandardAnalyzer`. Not to be confused with the *target
+    /// field's* new analyzer that `rebuild_field_across_segments` takes as a
+    /// parameter.
+    pub index_analyzer: Option<Arc<dyn Analyzer>>,
 }
 
 impl Default for MergeConfig {
@@ -97,6 +105,7 @@ impl Default for MergeConfig {
             verify_after_merge: true,
             field_doc_values: HashMap::new(),
             default_doc_values: true,
+            index_analyzer: None,
         }
     }
 }
@@ -376,8 +385,7 @@ impl MergeEngine {
         let mut deleted_docs_removed: u64 = 0;
         let replayed = (|| -> Result<Vec<String>> {
             for (i, segment) in segments.iter().enumerate() {
-                let reader =
-                    SegmentReader::open(segment.segment_info.clone(), self.storage.clone())?;
+                let reader = self.open_source_segment(&segment.segment_info)?;
                 let deleted = self.load_deleted_docs(&segment.segment_info)?;
                 deleted_docs_removed += deleted.len();
                 let owned = owned_doc_ids.as_ref().map(|o| &o[i]);
@@ -517,7 +525,7 @@ impl MergeEngine {
         let mut results = Vec::with_capacity(segments.len());
 
         for (segment, new_segment_id) in segments.iter().zip(new_segment_ids) {
-            let reader = SegmentReader::open(segment.segment_info.clone(), self.storage.clone())?;
+            let reader = self.open_source_segment(&segment.segment_info)?;
             let deleted = self.load_deleted_docs(&segment.segment_info)?;
             let reconstructed = self.reconstruct_segment_with_field_override(
                 &reader,
@@ -1176,6 +1184,22 @@ impl IntersectVisitor for CollectPointsVisitor {
 
     fn visit(&mut self, doc_id: u64, point: &[f64]) {
         self.entries.push((doc_id, point.to_vec()));
+    }
+}
+
+impl MergeEngine {
+    /// Open a source segment for replay or reconstruction, carrying the index
+    /// analyzer into the reader so a `.post`-less segment's terms are derived
+    /// like the writer derived them (Issue #1196).
+    fn open_source_segment(
+        &self,
+        info: &crate::lexical::index::inverted::segment::SegmentInfo,
+    ) -> Result<SegmentReader> {
+        let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
+        Ok(match &self.config.index_analyzer {
+            Some(analyzer) => reader.with_analyzer(Arc::clone(analyzer)),
+            None => reader,
+        })
     }
 }
 
