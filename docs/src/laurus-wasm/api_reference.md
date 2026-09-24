@@ -394,14 +394,19 @@ Create an empty schema.
 
 ### Methods
 
-#### `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)`
+#### `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?, multiValued?, positionIncrementGap?)`
 
 Add a full-text field. `docValues` controls whether the value is also
 copied into DocValues, the column-oriented store sort/facet/aggregation
 read from (Issue #1047, default `true`); takes effect only when `stored`
 is also `true`. `analyzer` is the name of a parameter-less built-in
 (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or the
-name of a runtime analyzer registered via `addAnalyzer()`.
+name of a runtime analyzer registered via `addAnalyzer()`. Pass
+`multiValued: true` to accept arrays of strings (Issue #1175); a term
+query then matches if any element contains the term, and a phrase query
+never spans two elements unless its slop reaches `positionIncrementGap`
+(default `100`; `0` numbers the elements as if concatenated). Values are
+read back as an array of strings.
 
 For Japanese morphological analysis, build a `JapaneseAnalyzer` from
 raw IPADIC bytes and register it with `addAnalyzer()` first; see

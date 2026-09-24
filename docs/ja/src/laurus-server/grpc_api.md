@@ -100,7 +100,7 @@ message AnalyzerDefinition {
 
 | Lexical フィールド | Vector フィールド |
 | :--- | :--- |
-| `TextOption` (`indexed`, `stored`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
+| `TextOption` (`indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
 | `IntegerOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `BooleanOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
@@ -113,7 +113,7 @@ message AnalyzerDefinition {
 
 **Doc values:** `doc_values`（Issue #1047）は、上記の `BytesOption` を除く全ての lexical オプションで `optional bool` であり、`term_vectors` と同じ tri-state の契約に従います。クライアントが省略するとエンジンのデフォルト（`true`）になり、明示的な `false` とは区別されます。フィールドの値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御し、DocValues 列が書き込まれるのは `stored` と `doc_values` の両方が `true` の場合のみです。`BytesOption` にはこのフィールドがありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。ソートにもファセットにも使わないフィールドで `doc_values` を無効にするとセグメントの使用容量が削減されます。フィールド自体は引き続き完全に検索・取得可能です。
 
-**多値地理・多値日時・多値ブール（multi-valued geo, datetime and boolean）:** `GeoOption` / `Geo3dOption`（Issue #1174）、`DateTimeOption`（Issue #1184）、および `BooleanOption`（Issue #1180）の `multi_valued` は proto のフィールド番号 `4` です（`IntegerOption` / `FloatOption` と異なり、`3` は既に `doc_values` が使用しているため）。`true` にすると地理フィールドは `GeoArrayValue` / `Geo3dArrayValue`（後述の `Value` 表を参照）を受け付け、距離 / バウンディングボックスクエリ（および `geo3d_nearest`）は**いずれかのポイント**が条件を満たせばドキュメントにマッチし、最も近いポイントでスコアリングされます。日時フィールドは `DatetimeArrayValue`（`repeated int64`。`datetime_value` と同じ UTC の Unix マイクロ秒）を受け付け、範囲クエリは**いずれかの時刻**が範囲内にあればドキュメントにマッチします（スコアは constant。複数の時刻がマッチしてもドキュメントは 1 回だけ報告されます）。ブールフィールドは `BoolArrayValue`（`repeated bool`）を受け付け、term クエリは**いずれかの要素**がクエリの値と等しければドキュメントにマッチします。各要素はそれぞれ独立した `true` / `false` の term posting としてインデックスされ（ブールに BKD ポイントはありません）、要素の重複はヒット数ではなく term frequency（したがって BM25 スコア）を増やします。
+**多値地理・多値日時・多値ブール・多値テキスト（multi-valued geo, datetime, boolean and text）:** `GeoOption` / `Geo3dOption`（Issue #1174）、`DateTimeOption`（Issue #1184）、および `BooleanOption`（Issue #1180）の `multi_valued` は proto のフィールド番号 `4` です（`IntegerOption` / `FloatOption` と異なり、`3` は既に `doc_values` が使用しているため）。`TextOption`（Issue #1175）ではフィールド番号 `6` です（Text は `3`〜`5` を既に `term_vectors`・`analyzer`・`doc_values` に使用しているため）。`true` にすると地理フィールドは `GeoArrayValue` / `Geo3dArrayValue`（後述の `Value` 表を参照）を受け付け、距離 / バウンディングボックスクエリ（および `geo3d_nearest`）は**いずれかのポイント**が条件を満たせばドキュメントにマッチし、最も近いポイントでスコアリングされます。日時フィールドは `DatetimeArrayValue`（`repeated int64`。`datetime_value` と同じ UTC の Unix マイクロ秒）を受け付け、範囲クエリは**いずれかの時刻**が範囲内にあればドキュメントにマッチします（スコアは constant。複数の時刻がマッチしてもドキュメントは 1 回だけ報告されます）。ブールフィールドは `BoolArrayValue`（`repeated bool`）を受け付け、term クエリは**いずれかの要素**がクエリの値と等しければドキュメントにマッチします。各要素はそれぞれ独立した `true` / `false` の term posting としてインデックスされ（ブールに BKD ポイントはありません）、要素の重複はヒット数ではなく term frequency（したがって BM25 スコア）を増やします。テキストフィールドは `TextArrayValue`（`repeated string`）を受け付け、term クエリは**いずれかの要素**がタームを含めばドキュメントにマッチします。`position_increment_gap`（フィールド `7`、`optional uint32`）は連続する要素の間に挿入される位置数で、slop がこの値に達しない限りフレーズクエリが 2 つの要素をまたがないようにします。`term_vectors` / `doc_values` と同じ理由で `optional` になっており、省略時は `0` ではなくエンジンのデフォルト（`100`）を意味します。
 
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
@@ -273,6 +273,7 @@ message Document {
 | Geo3dArray | `geo3d_array_value` | `Geo3dArrayValue`（`repeated Geo3dPoint`。多値 3D ポイント。`Geo3dOption.multi_valued = true` を要求） |
 | DateTimeArray | `datetime_array_value` | `DatetimeArrayValue`（`repeated int64` Unix マイクロ秒。多値の時刻。`DateTimeOption.multi_valued = true` を要求） |
 | BoolArray | `bool_array_value` | `BoolArrayValue`（`repeated bool`。多値ブール。`BooleanOption.multi_valued = true` を要求） |
+| TextArray | `text_array_value` | `TextArrayValue`（`repeated string`。多値テキスト。`TextOption.multi_valued = true` を要求） |
 
 **Geo3dPoint:**
 

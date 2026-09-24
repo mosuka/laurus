@@ -196,11 +196,14 @@ def test_datetime_list_into_single_valued_datetime_field_is_rejected():
         idx.put_document("doc1", {"title": "t", "seen_at": ["2024-01-01T00:00:00Z"]})
 
 
-def test_non_datetime_string_list_is_rejected():
+def test_non_datetime_string_list_into_datetime_field_names_the_bad_element():
+    """Since #1175 a non-datetime string list arrives as a `TextArray`; a
+    declared multi-valued DateTime field still rejects it, naming the
+    element that failed to parse."""
     import pytest
 
     idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
-    with pytest.raises(ValueError, match="datetimes"):
+    with pytest.raises(Exception, match="tomorrow"):
         idx.put_document("doc1", {"title": "t", "seen_at": ["2024-01-01T00:00:00Z", "tomorrow"]})
 
 
@@ -252,3 +255,71 @@ def test_mixed_bool_and_int_list_into_boolean_field_is_rejected():
     idx = _index_with(laurus.Schema.add_boolean_field, "flags", multi_valued=True)
     with pytest.raises(Exception):
         idx.put_document("doc1", {"title": "t", "flags": [True, 1]})
+
+
+# ---- Multi-valued text (Issue #1175) ----
+
+
+def test_str_list_round_trips_through_multi_valued_text_field():
+    """A list of strs is a multi-valued text field; it reads back as a list
+    of strs and a term query matches if any element contains the term."""
+    idx = _index_with(laurus.Schema.add_text_field, "notes", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "notes": ["hello world", "foo bar"]})
+    idx.put_document("doc2", {"title": "t", "notes": ["foo bar"]})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["notes"] == ["hello world", "foo bar"]
+    assert [h.id for h in idx.search("notes:hello", limit=5)] == ["doc1"]
+    assert sorted(h.id for h in idx.search("notes:bar", limit=5)) == ["doc1", "doc2"]
+
+
+def test_single_str_is_wrapped_on_multi_valued_text_field():
+    idx = _index_with(laurus.Schema.add_text_field, "notes", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "notes": "hello world"})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["notes"] == ["hello world"]
+
+
+def test_empty_list_is_accepted_by_multi_valued_text_field():
+    idx = _index_with(laurus.Schema.add_text_field, "notes", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "notes": []})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["notes"] == []
+
+
+def test_str_list_into_single_valued_text_field_is_rejected():
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_text_field, "notes")
+    with pytest.raises(Exception, match="multi_valued"):
+        idx.put_document("doc1", {"title": "t", "notes": ["a", "b"]})
+
+
+def test_rfc3339_str_list_still_becomes_datetime_array():
+    """The datetime path keeps precedence: a list whose strs all parse as
+    datetimes is a `DateTimeArray`, so a datetime field's RFC 3339 output
+    round-trips."""
+    idx = _index_with(laurus.Schema.add_datetime_field, "seen_at", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "seen_at": ["2024-01-01T00:00:00Z"]})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["seen_at"] == ["2024-01-01T00:00:00+00:00"]
+
+
+def test_position_increment_gap_keeps_phrases_inside_one_element():
+    """With the default gap a phrase cannot span two elements; with a gap of
+    0 the elements are numbered as if concatenated and it can."""
+    idx = _index_with(laurus.Schema.add_text_field, "notes", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "notes": ["hello world", "foo bar"]})
+    idx.commit()
+    assert [h.id for h in idx.search('notes:"hello world"', limit=5)] == ["doc1"]
+    assert idx.search('notes:"world foo"', limit=5) == []
+
+    contiguous = _index_with(
+        laurus.Schema.add_text_field, "notes", multi_valued=True, position_increment_gap=0
+    )
+    contiguous.put_document("doc1", {"title": "t", "notes": ["hello world", "foo bar"]})
+    contiguous.commit()
+    assert [h.id for h in contiguous.search('notes:"world foo"', limit=5)] == ["doc1"]

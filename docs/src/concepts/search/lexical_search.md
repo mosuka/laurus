@@ -50,7 +50,7 @@ let query = PhraseQuery::new("body", vec!["machine".to_string(), "learning".to_s
 let query = PhraseQuery::from_phrase("body", "machine learning");
 ```
 
-Phrase queries require term positions to be stored (the default for `TextOption`).
+Phrase queries require term positions to be stored (the default for `TextOption`). On a multi-valued text field (`multi_valued = true`) the elements share one position sequence separated by the field's `position_increment_gap` (default 100), so a phrase never spans two elements unless its slop reaches that gap — see [Schema and Fields](../schema_and_fields.md#multi-valued-fields).
 
 ### BooleanQuery
 

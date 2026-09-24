@@ -886,7 +886,7 @@ mod tests {
     /// document, ready to commit and search.
     async fn text_index() -> WasmIndex {
         let mut schema = WasmSchema::new();
-        schema.add_text_field("body".to_string(), None, None, None, None, None);
+        schema.add_text_field("body".to_string(), None, None, None, None, None, None, None);
         let index = WasmIndex::create(Some(schema), None, None)
             .await
             .expect("index creation must succeed");
@@ -992,9 +992,20 @@ mod tests {
             None,
             None,
             Some("ngram3".to_string()),
+            None,
+            None,
         );
         // Default "standard" analyzer: whole-word tokens only.
-        schema.add_text_field("plain".to_string(), None, None, None, None, None);
+        schema.add_text_field(
+            "plain".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let index = WasmIndex::create(Some(schema), None, None)
             .await
@@ -1046,6 +1057,8 @@ mod tests {
             None,
             None,
             Some("ngram3".to_string()),
+            None,
+            None,
         );
 
         let toml_str = schema.to_toml().expect("toToml must succeed");

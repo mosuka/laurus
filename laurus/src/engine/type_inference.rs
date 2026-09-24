@@ -138,6 +138,10 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
             multi_valued: true,
             ..Default::default()
         }))),
+        DataValue::TextArray(_) => Ok(Some(FieldOption::Text(TextOption {
+            multi_valued: true,
+            ..Default::default()
+        }))),
         DataValue::Vector(_) => Err(LaurusError::invalid_argument(
             "vector values require an explicit vector field declaration \
              (Hnsw, Flat, or Ivf) in the schema",
@@ -253,7 +257,7 @@ fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
         return infer_geo_array(arr);
     }
     if arr.iter().all(JsonValue::is_string) {
-        return infer_datetime_array(arr);
+        return Ok(infer_string_array(arr));
     }
     if arr.iter().all(JsonValue::is_boolean) {
         return Ok(InferredValue::Inferred {
@@ -322,33 +326,48 @@ fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
     }
 }
 
-/// Infer a multi-valued datetime field from an array whose elements are all
-/// strings (Issue #1184). Every element must be an RFC 3339 datetime — the
-/// same grammar the single-value coercion accepts — and offsets are
-/// normalized to UTC. This is deliberately the only string shape that
-/// infers a `DateTime`: a single string keeps inferring `Text` (changing
-/// that would re-type existing Text fields under the Dynamic policy), and
-/// there is no multi-valued text field for other string arrays to fall
-/// back to yet (#1175).
-fn infer_datetime_array(arr: &[JsonValue]) -> Result<InferredValue> {
-    let mut values = Vec::with_capacity(arr.len());
-    for elem in arr {
-        let s = elem.as_str().expect("gated on all-strings by the caller");
-        let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).map_err(|e| {
-            LaurusError::invalid_argument(format!(
-                "array of strings must be all RFC 3339 datetimes \
-                 (multi-valued text fields are not supported): {s:?}: {e}"
-            ))
-        })?;
-        values.push(dt.with_timezone(&chrono::Utc));
+/// Infer a multi-valued field from an array whose elements are all strings.
+///
+/// Every element being an RFC 3339 datetime — the same grammar the
+/// single-value coercion accepts, with offsets normalized to UTC — infers a
+/// multi-valued `DateTime` (Issue #1184), which is what keeps a
+/// `DateTimeArray` round-tripping through the RFC 3339 strings every
+/// surface renders it as. Any other string array infers a multi-valued
+/// `Text` (Issue #1175). Never fails: a string array always has a home now.
+///
+/// A *single* string still infers `Text`, not a datetime — changing that
+/// would re-type existing Text fields under the Dynamic policy.
+fn infer_string_array(arr: &[JsonValue]) -> InferredValue {
+    let strings: Vec<&str> = arr
+        .iter()
+        .map(|elem| elem.as_str().expect("gated on all-strings by the caller"))
+        .collect();
+
+    let instants: Option<Vec<chrono::DateTime<chrono::Utc>>> = strings
+        .iter()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s.trim())
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        })
+        .collect();
+
+    match instants {
+        Some(values) => InferredValue::Inferred {
+            value: DataValue::DateTimeArray(values),
+            option: FieldOption::DateTime(crate::lexical::core::field::DateTimeOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        },
+        None => InferredValue::Inferred {
+            value: DataValue::TextArray(strings.into_iter().map(str::to_string).collect()),
+            option: FieldOption::Text(TextOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        },
     }
-    Ok(InferredValue::Inferred {
-        value: DataValue::DateTimeArray(values),
-        option: FieldOption::DateTime(crate::lexical::core::field::DateTimeOption {
-            multi_valued: true,
-            ..Default::default()
-        }),
-    })
 }
 
 /// Infer a multi-valued geo field from an array whose elements are all
@@ -938,21 +957,49 @@ mod tests {
     }
 
     #[test]
-    fn infer_string_array_with_non_datetime_rejected() {
-        // Every element must be RFC 3339; naive / date-only forms are query
-        // literals, not ingestion values.
-        for bad in [
-            json!(["2024-01-01T00:00:00Z", "yesterday"]),
-            json!(["2024-01-01"]),
-            json!(["2024-01-01T00:00:00"]),
-            json!(["a", "b"]),
+    fn infer_non_datetime_string_array_infers_text_array() {
+        // #1175: a string array that is not *entirely* RFC 3339 is a
+        // multi-valued Text field rather than an error. Naive and date-only
+        // forms are query literals, not ingestion values, so they land here
+        // too.
+        for (input, expected) in [
+            (
+                json!(["2024-01-01T00:00:00Z", "yesterday"]),
+                vec!["2024-01-01T00:00:00Z", "yesterday"],
+            ),
+            (json!(["2024-01-01"]), vec!["2024-01-01"]),
+            (json!(["2024-01-01T00:00:00"]), vec!["2024-01-01T00:00:00"]),
+            (json!(["a", "b"]), vec!["a", "b"]),
         ] {
-            let err = infer_from_json(&bad).unwrap_err();
+            let (v, o) = inferred(infer_from_json(&input).unwrap());
+            assert_eq!(
+                v,
+                DataValue::TextArray(expected.iter().map(|s| s.to_string()).collect()),
+                "{input}"
+            );
             assert!(
-                err.to_string().contains("all RFC 3339 datetimes"),
-                "{bad}: {err}"
+                matches!(
+                    o,
+                    FieldOption::Text(TextOption {
+                        multi_valued: true,
+                        ..
+                    })
+                ),
+                "{input}: {o:?}"
             );
         }
+    }
+
+    #[test]
+    fn infer_option_from_text_array_is_multi_valued_text() {
+        let opt = infer_option_from_data_value(&DataValue::TextArray(Vec::new())).unwrap();
+        assert!(matches!(
+            opt,
+            Some(FieldOption::Text(TextOption {
+                multi_valued: true,
+                ..
+            }))
+        ));
     }
 
     #[test]

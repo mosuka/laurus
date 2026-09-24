@@ -177,7 +177,7 @@ new \Laurus\Schema()
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null): void` | 全文フィールド（転置インデックス、BM25）。`$docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
+| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | 全文フィールド（転置インデックス、BM25）。`$docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$multiValued = true` で文字列のシーケンシャル配列を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `$positionIncrementGap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
 | `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット整数フィールド。`$multiValued = true` で整数配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット浮動小数点フィールド。`$multiValued = true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | ブールフィールド。`$multiValued = true` で `bool` のシーケンシャル配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `bool` の配列として読み戻されます）。`$docValues` は上記を参照。 |
@@ -540,5 +540,6 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（`["lat" => .., "lon" => ..]` 配列の配列） | `GeoArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
-| `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 各要素を RFC 3339 としてパース。日時でない文字列はエラー。フィールドに `$multiValued = true` が必要 |
+| `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 全要素が ISO 8601 としてパースできる場合のみ選ばれる。フィールドに `$multiValued = true` が必要 |
+| `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multiValued = true` が必要 |
 | `array`（`bool`、シーケンシャル） | `BoolArray` | 全要素が `bool` であること。`[true, 1]` のような混在配列はエラー（"numeric array elements must be numeric"）。フィールドに `$multiValued = true` が必要 |

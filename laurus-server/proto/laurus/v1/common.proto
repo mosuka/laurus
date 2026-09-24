@@ -20,6 +20,7 @@ message Value {
     Geo3dArrayValue geo3d_array_value = 14;
     DatetimeArrayValue datetime_array_value = 15;
     BoolArrayValue bool_array_value = 16;
+    TextArrayValue text_array_value = 17;
   }
 }
 
@@ -84,6 +85,16 @@ message DatetimeArrayValue {
 // `BooleanOption.multi_valued`.
 message BoolArrayValue {
   repeated bool values = 1;
+}
+
+// A multi-valued text field (Lucene-style "any match" semantics: a
+// document matches a term query if any of its elements contains the term).
+// Each element is analyzed on its own and its tokens are appended to one
+// position sequence, `TextOption.position_increment_gap` positions apart,
+// so a phrase query does not match across two elements. Requires
+// `TextOption.multi_valued`.
+message TextArrayValue {
+  repeated string values = 1;
 }
 
 // A document consisting of named fields.

@@ -76,6 +76,8 @@ let opt = TextOption::default();
 let opt = TextOption::default()
     .indexed(true)
     .stored(true)
+    .multi_valued(false)
+    .position_increment_gap(100)
     .term_vectors(true)
     .doc_values(true);
 ```
@@ -84,6 +86,8 @@ let opt = TextOption::default()
 | :--- | :--- | :--- |
 | `indexed` | `true` | Whether the field is searchable |
 | `stored` | `true` | Whether the original value is stored for retrieval |
+| `multi_valued` | `false` | Whether the field accepts arrays of strings (Issue #1175); a term query matches if **any** element contains the term. See [Multi-valued fields](#multi-valued-fields) |
+| `position_increment_gap` | `100` | Positions skipped between the elements of a multi-valued field (Lucene `positionIncrementGap`), so that a phrase query never spans two elements unless its slop reaches the gap; `0` numbers the elements as if concatenated. Ignored unless `multi_valued` is `true` |
 | `term_vectors` | `true` | Whether term positions are stored (needed for phrase and span queries; highlighting always re-tokenizes the stored text and does not use them) |
 | `doc_values` | `true` | Whether the value is also copied into DocValues, the column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation read from |
 
@@ -257,6 +261,7 @@ pub enum DataValue {
     GeoEcefArray(Vec<GeoEcefPoint>), // multi-valued 3D ECEF field
     DateTimeArray(Vec<DateTime<Utc>>), // multi-valued datetime field
     BoolArray(Vec<bool>),            // multi-valued boolean field
+    TextArray(Vec<String>),          // multi-valued text field
 }
 ```
 
@@ -323,7 +328,8 @@ let schema = Schema::builder()
 | object with all three numeric keys `x`, `y`, `z` (finite values, ECEF meters) | `Geo3d` |
 | array of geo objects (e.g. `[{"lat": 35.6, "lon": 139.7}, ...]`) | `Geo` with `multi_valued = true` |
 | array of `x`/`y`/`z` objects | `Geo3d` with `multi_valued = true` |
-| array of RFC 3339 strings (e.g. `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`) | `DateTime` with `multi_valued = true` |
+| array of strings that are all RFC 3339 (e.g. `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`) | `DateTime` with `multi_valued = true` |
+| any other array of strings (e.g. `["rust", "search"]`) | `Text` with `multi_valued = true` |
 | array of booleans (e.g. `[true, false]`) | `Boolean` with `multi_valued = true` |
 | object with a `data` key (base64-encoded string) and an optional `mime` string key | `Bytes` value |
 
@@ -364,13 +370,13 @@ there is no per-match BM25 weighting). A document is reported once even
 when several of its instants match, and sub-second instants are honored
 (the bounds are encoded as fractional seconds). Under the `Dynamic`
 policy an array whose elements are all RFC 3339 strings infers a
-multi-valued `DateTime`; only RFC 3339 is accepted here (not the naive or
-date-only forms the query DSL accepts), and an array of strings where any
-element is not RFC 3339 is rejected with an error saying that multi-valued
-text fields are not supported (Issue #1175). Note the asymmetry: a
-*single* RFC 3339 string still infers `Text` (unchanged, so existing text
-fields keep their behaviour), while an *array* of RFC 3339 strings infers
-a multi-valued `DateTime` — declare the field in the schema if you want a
+multi-valued `DateTime`; only RFC 3339 is recognised here (not the naive
+or date-only forms the query DSL accepts), and an array of strings where
+any element is not RFC 3339 infers a multi-valued `Text` instead
+(Issue #1175) — it is not an error. Note the asymmetry: a *single*
+RFC 3339 string still infers `Text` (unchanged, so existing text fields
+keep their behaviour), while an *array* of RFC 3339 strings infers a
+multi-valued `DateTime` — declare the field in the schema if you want a
 single-valued `DateTime`.
 
 Boolean fields accept `multi_valued = true` as well (Issue #1180), but the
@@ -392,29 +398,79 @@ array whose elements are all booleans (e.g. `[true, false]`) infers a
 multi-valued `Boolean`; a mixed array such as `[true, 1]` is rejected with
 the existing error that array fields must contain only numeric values.
 Note the asymmetry with scalars: a *single* `"true"` string coerces to a
-`Bool` on a declared Boolean field, but a string array such as
-`["true", "false"]` still hits the RFC 3339 datetime gate and is rejected —
-use JSON booleans for arrays. Turning `multi_valued` on for an existing
-Boolean field is a metadata-only change; turning it off requires a reindex
-when the field is `stored`, and is **Destructive** when the field is
-`stored: false` — unlike the BKD-backed types there is no point tree to
-rebuild from, only the stored value.
+`Bool` on a declared Boolean field, and a string array such as
+`["true", "false"]` sent to a *declared* multi-valued Boolean field is
+parsed element-wise under the same rule; on an *undeclared* field,
+however, that array infers a multi-valued `Text` (Issue #1175), not a
+`Boolean` — use JSON booleans for arrays you want inferred as booleans.
+Turning `multi_valued` on for an existing Boolean field is a
+metadata-only change; turning it off requires a reindex when the field is
+`stored`, and is **Destructive** when the field is `stored: false` —
+unlike the BKD-backed types there is no point tree to rebuild from, only
+the stored value.
+
+Text fields accept `multi_valued = true` as well (Issue #1175), together
+with a second option, `position_increment_gap` (default `100`, matching
+Lucene and Elasticsearch). Every element of a multi-valued text field is
+analyzed on its own by the field's analyzer, and the tokens of all
+elements are appended to **one ascending position sequence**: the first
+token of element `n + 1` is placed `position_increment_gap` positions
+after the last token of element `n`. The gap is charged per element, even
+for an element that analyzes to no tokens. Everything else follows from
+that numbering:
+
+- A `TermQuery` (or a DSL term such as `tags:rust`) matches a document if
+  **any** element contains the term (Lucene-style "any match").
+- A `PhraseQuery` cannot span two elements unless its slop is at least
+  `position_increment_gap` — the threshold is exactly `slop == gap`. With
+  the default gap, `["hello world", "foo bar"]` does **not** match the
+  phrase `"world foo"` at slop 0 through 99 and **does** match at slop
+  100. Span queries (`SpanNearQuery`) inherit the same protection.
+- A gap of `0` numbers the elements as if they had been concatenated, so
+  phrases then match across element boundaries. The gap is never a
+  "restart at 0".
+- Repeated terms across elements raise the term frequency (and hence the
+  BM25 score) but not the hit count, like the other multi-valued types.
+  The field length is the total token count, so the gap itself does not
+  inflate BM25 length normalization.
+- Positions must be stored for phrase queries to work at all
+  (`term_vectors: true`, the default); without them a phrase query
+  silently matches nothing, for multi-valued and single-valued fields
+  alike.
+
+A multi-valued text field is highlighted element by element — only the
+elements that match contribute fragments, and a fragment never straddles
+two elements; see [Highlighting](../laurus/highlighting.md). Under the
+`Dynamic` policy a JSON array whose elements are all strings infers a
+multi-valued `DateTime` when every element parses as RFC 3339 and a
+multi-valued `Text` otherwise (e.g. `["rust", "search"]`); a *single*
+string still infers `Text`, never a datetime. Turning `multi_valued` on
+for an existing Text field is a metadata-only change; turning it off
+requires a reindex when the field is `stored` and is **Destructive** when
+it is `stored: false` — like Boolean, there is no BKD tree to rebuild
+from. Changing `position_increment_gap` requires a reindex when the field
+stores positions (`term_vectors: true`) — `Reindex` when `stored`,
+`Destructive` otherwise — because the existing postings were numbered
+under the old gap; when `term_vectors` is `false` the gap is unobservable
+and the change is metadata-only.
 
 Single values sent to a multi-valued field are auto-wrapped into a
 one-element array; arrays sent to a single-valued field are rejected
 rather than silently truncating (the error tells you to declare the field
 with `multi_valued = true`). An empty array sent to a multi-valued geo,
-datetime or boolean field is accepted and simply has no points, instants
-or terms, so it matches no spatial, range or term query.
+datetime, boolean or text field is accepted and simply has no points,
+instants or terms, so it matches no spatial, range, term or phrase query.
 
-Segments that contain multi-valued geo, datetime or boolean values use new
-stored-field type tags and cannot be read by builds that predate these
-features; there is no format version bump, so an older reader fails
+Segments that contain multi-valued geo, datetime, boolean or text values
+use new stored-field type tags and cannot be read by builds that predate
+these features; there is no format version bump, so an older reader fails
 loudly instead of misreading the data. Stored multi-valued datetimes are
 kept at microsecond precision (one `i64` Unix microsecond per instant, so
 sub-microsecond digits are truncated), whereas a single-valued `DateTime`
 keeps its full precision. Stored multi-valued booleans are written one
-byte per element (not bit-packed).
+byte per element (not bit-packed). Stored multi-valued text values are
+written as an element count followed by each string with its length
+prefix — the same body as a single-valued text value.
 
 ### Type conflicts
 
@@ -450,6 +506,13 @@ to coerce the value to the declared type. The coercion rules are:
 | `Boolean` with `multi_valued = true` | empty numeric array (`[]`) | empty boolean list (matches no term query) |
 | `Boolean` with `multi_valued = true` | anything else | error |
 | `Integer` / `Float` with `multi_valued = true` | `BoolArray` | widened element-wise to `0` / `1` (a single-valued `Integer` / `Float` rejects it, asking for `multi_valued = true`) |
+| `Text` (single-valued) | `TextArray` | error (declare `multi_valued = true`) |
+| `Text` with `multi_valued = true` | `TextArray` | stored as-is |
+| `Text` with `multi_valued = true` | single `Text`, `Int64`, `Float64`, `Bool` or `DateTime` | stringified and wrapped into a one-element array (same scalar rule as above) |
+| `Text` with `multi_valued = true` | `Int64Array` / `Float64Array` / `BoolArray` / `DateTimeArray` | stringified element-wise (datetimes as RFC 3339) |
+| `Text` with `multi_valued = true` | `Null` or empty numeric array (`[]`) | empty string list (matches no term or phrase query) |
+| `Text` with `multi_valued = true` | anything else (geo arrays, vectors, bytes) | error |
+| `Integer` / `Float` / `Boolean` / `DateTime` with `multi_valued = true` | `TextArray` | parsed element-wise under the same rule as a scalar `Text` (`["1", "2"]` → `[1, 2]`; a bad element is an error naming it). A single-valued `Integer` / `Float` / `Boolean` / `DateTime` rejects it, asking for `multi_valued = true` |
 | vector (`Hnsw`/`Flat`/`Ivf`) | `Text` or `Bytes` | passed through unchanged for the field's embedder |
 | vector (`Hnsw`/`Flat`/`Ivf`) | numeric array | cast element-wise to `f32` |
 
@@ -558,12 +621,13 @@ The requested change is classified into one of three kinds, reported as
 - **`MetadataOnly`** — no existing data is affected; always applied (e.g.
   an HNSW field's `default_ef_search`).
 - **`Reindex`** — can be rebuilt from the field's already-stored values
-  (e.g. a text field's `analyzer`, `indexed: false → true`, or an HNSW
-  field's `m`/`ef_construction`).
+  (e.g. a text field's `analyzer` or — while `term_vectors` is on — its
+  `position_increment_gap`, `indexed: false → true`, or an HNSW field's
+  `m`/`ef_construction`).
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
   `distance`, a type change on a `stored: false` field, or turning
-  `multi_valued` off on a `stored: false` Boolean field).
+  `multi_valued` off on a `stored: false` Boolean or Text field).
 
 `Reindex` and `Destructive` changes are rejected unless you explicitly
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against

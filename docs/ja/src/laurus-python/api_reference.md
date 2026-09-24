@@ -206,7 +206,7 @@ class Schema:
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, doc_values=True, analyzer=None)` | 全文フィールド（転置インデックス、BM25）。`term_vectors` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored=True` の場合のみ有効です。`analyzer` には組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）か、`{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}` のようなパラメータ付きプリセットの dict を渡せます。文字列単独の `"japanese"` は Lindera 辞書パスが必須なため拒否されます。 |
+| `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, doc_values=True, multi_valued=False, position_increment_gap=100, analyzer=None)` | 全文フィールド（転置インデックス、BM25）。`term_vectors` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored=True` の場合のみ有効です。`multi_valued=True` で `list[str]` を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `position_increment_gap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は `list[str]` として読み戻されます。`analyzer` には組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）か、`{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}` のようなパラメータ付きプリセットの dict を渡せます。文字列単独の `"japanese"` は Lindera 辞書パスが必須なため拒否されます。 |
 | `add_integer_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット整数フィールド。`multi_valued=True` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット浮動小数点フィールド。`multi_valued=True` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_boolean_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | ブールフィールド。`multi_valued=True` で `list[bool]` を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `list[bool]` として読み戻されます）。`doc_values` は上記を参照。 |
@@ -591,4 +591,5 @@ Python の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `list[(lat, lon)]` | `GeoArray` | `(lat, lon)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
 | `list[(x, y, z)]` | `GeoEcefArray` | `(x, y, z)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
 | `datetime.datetime` | `DateTime` | `isoformat()` 経由で変換 |
-| `list[datetime.datetime \| str]` | `DateTimeArray` | 各要素を単一の日時と同じ規則でパース（オフセット付き RFC 3339 / ISO 8601、または naive な `YYYY-MM-DDTHH:MM:SS` を UTC として扱う。`isoformat()` を持つオブジェクトは先に変換）。日時でない `str` は `ValueError`。フィールドに `multi_valued=True` が必要 |
+| `list[datetime.datetime \| str]`（`datetime` を 1 つ以上含む） | `DateTimeArray` | 各要素を単一の日時と同じ規則でパース（オフセット付き RFC 3339 / ISO 8601、または naive な `YYYY-MM-DDTHH:MM:SS` を UTC として扱う。`isoformat()` を持つオブジェクトは先に変換）。日時でない要素は `ValueError`。フィールドに `multi_valued=True` が必要 |
+| `list[str]` | `DateTimeArray` または `TextArray` | 全要素が日時としてパースできれば（上記と同じ形式）`DateTimeArray`、そうでなければ `TextArray`（Issue #1175。`list[str]` として読み戻される）。フィールドに `multi_valued=True` が必要 |

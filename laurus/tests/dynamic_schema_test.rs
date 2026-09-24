@@ -663,3 +663,157 @@ async fn reserved_prefix_rejected() -> Result<()> {
     }
     Ok(())
 }
+
+/// Dynamic (#1175): a text array on an undeclared field is auto-added as a
+/// multi-valued Text field, and the array reads back intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_auto_adds_text_array_field() -> Result<()> {
+    let engine = engine_with_policy(DynamicFieldPolicy::Dynamic).await?;
+
+    let values = vec!["hello world".to_string(), "foo bar".to_string()];
+    let doc = Document::builder()
+        .add_text_array("notes", values.clone())
+        .build();
+    engine.put_document("doc1", doc).await?;
+    engine.commit().await?;
+
+    let schema = engine.schema();
+    match schema.fields.get("notes") {
+        Some(FieldOption::Text(opt)) => {
+            assert!(
+                opt.multi_valued,
+                "notes should be Text with multi_valued=true"
+            );
+            assert_eq!(
+                opt.position_increment_gap,
+                laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP
+            );
+        }
+        other => panic!("expected Text field for 'notes', got {other:?}"),
+    }
+
+    let docs = engine.get_documents("doc1").await?;
+    assert_eq!(
+        docs[0].get("notes").and_then(|v| v.as_text_array()),
+        Some(values.as_slice())
+    );
+    Ok(())
+}
+
+/// #1175: the JSON path still infers a multi-valued DateTime from an array
+/// whose elements are all RFC 3339 (so the round trip through RFC 3339
+/// strings keeps working), and a multi-valued Text from any other string
+/// array — which used to be an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_string_array_infers_datetime_when_all_rfc3339_else_text() -> Result<()> {
+    let engine = engine_with_policy(DynamicFieldPolicy::Dynamic).await?;
+
+    let doc = laurus::json_to_document(&serde_json::json!({
+        "fields": {
+            "times": ["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"],
+            "links": ["https://example.com/a", "https://example.com/b"],
+        }
+    }))?;
+    engine.put_document("doc1", doc).await?;
+    engine.commit().await?;
+
+    let schema = engine.schema();
+    assert!(
+        matches!(schema.fields.get("times"), Some(FieldOption::DateTime(o)) if o.multi_valued),
+        "{:?}",
+        schema.fields.get("times")
+    );
+    assert!(
+        matches!(schema.fields.get("links"), Some(FieldOption::Text(o)) if o.multi_valued),
+        "{:?}",
+        schema.fields.get("links")
+    );
+
+    let docs = engine.get_documents("doc1").await?;
+    assert_eq!(
+        docs[0]
+            .get("times")
+            .and_then(|v| v.as_datetime_array())
+            .map(|a| a.len()),
+        Some(2)
+    );
+    assert_eq!(
+        docs[0].get("links").and_then(|v| v.as_text_array()),
+        Some(
+            &[
+                "https://example.com/a".to_string(),
+                "https://example.com/b".to_string()
+            ][..]
+        )
+    );
+    Ok(())
+}
+
+/// #1175: a declared single-valued Text field rejects an array instead of
+/// silently joining or truncating it; a declared multi-valued Text field
+/// wraps a scalar, stringifies other arrays element-wise, and treats `Null`
+/// as an empty list.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_multi_valued_coercion_at_ingest() -> Result<()> {
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let schema = Schema::builder()
+        .add_field("single", FieldOption::Text(TextOption::default()))
+        .add_field(
+            "multi",
+            FieldOption::Text(TextOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+        )
+        .dynamic_field_policy(DynamicFieldPolicy::Strict)
+        .build();
+    let engine = Engine::new(storage, schema).await?;
+
+    let err = engine
+        .put_document(
+            "bad",
+            Document::builder()
+                .add_text_array("single", vec!["a".into()])
+                .build(),
+        )
+        .await
+        .expect_err("array into a single-valued Text field must be rejected");
+    assert!(
+        err.to_string().contains("multi_valued = true"),
+        "error should point at the fix: {err}"
+    );
+
+    for (id, value) in [
+        ("text", DataValue::Text("hello".to_string())),
+        ("int", DataValue::Int64(7)),
+        ("ints", DataValue::Int64Array(vec![1, 2])),
+        ("null", DataValue::Null),
+        ("empty", DataValue::Int64Array(Vec::new())),
+    ] {
+        engine
+            .put_document(id, Document::builder().add_field("multi", value).build())
+            .await?;
+    }
+    engine.commit().await?;
+
+    let get = |id: &str| {
+        let engine = &engine;
+        let id = id.to_string();
+        async move {
+            let docs = engine.get_documents(&id).await?;
+            Ok::<Vec<String>, LaurusError>(
+                docs[0]
+                    .get("multi")
+                    .and_then(|v| v.as_text_array())
+                    .map(|a| a.to_vec())
+                    .unwrap_or_else(|| panic!("{id}: expected a TextArray, got {:?}", docs[0])),
+            )
+        }
+    };
+    assert_eq!(get("text").await?, vec!["hello".to_string()]);
+    assert_eq!(get("int").await?, vec!["7".to_string()]);
+    assert_eq!(get("ints").await?, vec!["1".to_string(), "2".to_string()]);
+    assert_eq!(get("null").await?, Vec::<String>::new());
+    assert_eq!(get("empty").await?, Vec::<String>::new());
+    Ok(())
+}

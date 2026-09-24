@@ -454,11 +454,14 @@ class LaurusTest extends TestCase
         $idx->putDocument("doc1", ["title" => "t", "seen_at" => ["2024-01-01T00:00:00Z"]]);
     }
 
-    public function testNonDatetimeStringArrayIsRejected(): void
+    // Since #1175 a non-datetime string array arrives as a multi-valued text
+    // value; a declared multi-valued DateTime field still rejects it, naming
+    // the element that failed to parse.
+    public function testNonDatetimeStringArrayIntoDatetimeFieldNamesTheBadElement(): void
     {
         $idx = $this->indexWithMultiValuedDatetimeField(true);
         $this->expectException(\Throwable::class);
-        $this->expectExceptionMessageMatches('/datetimes/');
+        $this->expectExceptionMessageMatches('/tomorrow/');
         $idx->putDocument("doc1", ["title" => "t", "seen_at" => ["2024-01-01T00:00:00Z", "tomorrow"]]);
     }
 
@@ -517,6 +520,85 @@ class LaurusTest extends TestCase
         $this->expectException(\Throwable::class);
         $this->expectExceptionMessageMatches('/numeric/');
         $idx->putDocument("doc1", ["title" => "t", "flags" => [true, 1]]);
+    }
+
+    // ── Multi-valued text arrays (Issue #1175) ───────────────────────────
+
+    private function indexWithMultiValuedTextField(bool $multiValued, ?int $gap = null): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        // (name, stored, indexed, term_vectors, doc_values, analyzer, multi_valued, position_increment_gap)
+        if ($gap === null) {
+            $schema->addTextField("notes", true, true, true, true, null, $multiValued);
+        } else {
+            $schema->addTextField("notes", true, true, true, true, null, $multiValued, $gap);
+        }
+        return new Laurus\Index(null, $schema);
+    }
+
+    public function testStringArrayRoundTripsThroughMultiValuedTextField(): void
+    {
+        $idx = $this->indexWithMultiValuedTextField(true);
+        $idx->putDocument("doc1", ["title" => "t", "notes" => ["hello world", "foo bar"]]);
+        $idx->putDocument("doc2", ["title" => "t", "notes" => ["foo bar"]]);
+        $idx->commit();
+        $this->assertSame(["hello world", "foo bar"], $idx->getDocuments("doc1")[0]["notes"]);
+        // Any element matches a term query.
+        $this->assertSame(["doc1"], $this->idsOf($idx->search("notes:hello")));
+        $bar = $this->idsOf($idx->search("notes:bar"));
+        sort($bar);
+        $this->assertSame(["doc1", "doc2"], $bar);
+    }
+
+    public function testSingleStringIsWrappedOnMultiValuedTextField(): void
+    {
+        $idx = $this->indexWithMultiValuedTextField(true);
+        $idx->putDocument("doc1", ["title" => "t", "notes" => "hello world"]);
+        $idx->commit();
+        $this->assertSame(["hello world"], $idx->getDocuments("doc1")[0]["notes"]);
+    }
+
+    public function testEmptyArrayIsAcceptedByMultiValuedTextField(): void
+    {
+        $idx = $this->indexWithMultiValuedTextField(true);
+        $idx->putDocument("doc1", ["title" => "t", "notes" => []]);
+        $idx->commit();
+        $this->assertSame([], $idx->getDocuments("doc1")[0]["notes"]);
+    }
+
+    public function testStringArrayIntoSingleValuedTextFieldIsRejected(): void
+    {
+        $idx = $this->indexWithMultiValuedTextField(false);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/multi_valued/');
+        $idx->putDocument("doc1", ["title" => "t", "notes" => ["a", "b"]]);
+    }
+
+    // The datetime path keeps precedence: an all-ISO 8601 string array is a
+    // datetime array, so a datetime field's output round-trips.
+    public function testRfc3339StringArrayStillBecomesDatetimeArray(): void
+    {
+        $idx = $this->indexWithMultiValuedDatetimeField(true);
+        $idx->putDocument("doc1", ["title" => "t", "seen_at" => ["2024-01-01T00:00:00Z"]]);
+        $idx->commit();
+        $this->assertSame(["2024-01-01T00:00:00+00:00"], $idx->getDocuments("doc1")[0]["seen_at"]);
+    }
+
+    // With the default gap a phrase cannot span two elements; with a gap of
+    // 0 the elements are numbered as if concatenated and it can.
+    public function testPositionIncrementGapKeepsPhrasesInsideOneElement(): void
+    {
+        $idx = $this->indexWithMultiValuedTextField(true);
+        $idx->putDocument("doc1", ["title" => "t", "notes" => ["hello world", "foo bar"]]);
+        $idx->commit();
+        $this->assertSame(["doc1"], $this->idsOf($idx->search('notes:"hello world"')));
+        $this->assertSame([], $this->idsOf($idx->search('notes:"world foo"')));
+
+        $contiguous = $this->indexWithMultiValuedTextField(true, 0);
+        $contiguous->putDocument("doc1", ["title" => "t", "notes" => ["hello world", "foo bar"]]);
+        $contiguous->commit();
+        $this->assertSame(["doc1"], $this->idsOf($contiguous->search('notes:"world foo"')));
     }
 
     public function testMixedGeoDimensionArrayIsRejected(): void

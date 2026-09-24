@@ -50,7 +50,7 @@ use super::schema::FieldOption;
 /// to the field's declared type.
 pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) -> Result<DataValue> {
     match option {
-        FieldOption::Text(_) => coerce_to_text(field_name, value),
+        FieldOption::Text(opt) => coerce_to_text(field_name, opt, value),
         FieldOption::Integer(opt) => coerce_to_integer(field_name, opt, value),
         FieldOption::Float(opt) => coerce_to_float(field_name, opt, value),
         FieldOption::Boolean(opt) => coerce_to_boolean(field_name, opt, value),
@@ -64,23 +64,77 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
     }
 }
 
-fn coerce_to_text(_field_name: &str, value: DataValue) -> Result<DataValue> {
-    Ok(match value {
-        DataValue::Text(s) => DataValue::Text(s),
-        DataValue::Int64(i) => DataValue::Text(i.to_string()),
-        DataValue::Float64(f) => DataValue::Text(f.to_string()),
-        DataValue::Bool(b) => DataValue::Text(b.to_string()),
-        DataValue::DateTime(dt) => DataValue::Text(dt.to_rfc3339()),
-        DataValue::Null => DataValue::Text(String::new()),
-        // Other variants (Bytes, Vector, Geo, arrays) don't have a meaningful
-        // string representation for a text field.
-        other => {
-            return Err(LaurusError::invalid_argument(format!(
-                "cannot coerce {} to a text value",
-                describe(&other)
-            )));
+/// The scalar Text rule shared by both [`coerce_to_text`] branches
+/// (#1175): anything with a meaningful string form. `None` for the
+/// variants that have none (Bytes, Vector, Geo, arrays).
+fn text_scalar(value: &DataValue) -> Option<String> {
+    match value {
+        DataValue::Text(s) => Some(s.clone()),
+        DataValue::Int64(i) => Some(i.to_string()),
+        DataValue::Float64(f) => Some(f.to_string()),
+        DataValue::Bool(b) => Some(b.to_string()),
+        DataValue::DateTime(dt) => Some(dt.to_rfc3339()),
+        DataValue::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn coerce_to_text(
+    field_name: &str,
+    option: &crate::lexical::core::field::TextOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    if option.multi_valued {
+        // Multi-valued text field (#1175). A single value is auto-wrapped
+        // under the scalar rule; the other arrays are stringified
+        // element-wise for the same reason the scalar arm stringifies
+        // scalars. An empty *numeric* array is an empty list because every
+        // binding turns `[]` into `Int64Array(vec![])` before the field
+        // type is known (#1178).
+        match value {
+            DataValue::TextArray(arr) => Ok(DataValue::TextArray(arr)),
+            // `Null` means "no value", so on a multi-valued field it is an
+            // empty list rather than the one-element `[""]` the scalar rule
+            // would produce -- an empty string would round-trip into the
+            // stored document as a phantom element.
+            DataValue::Null => Ok(DataValue::TextArray(Vec::new())),
+            DataValue::Int64Array(arr) => Ok(DataValue::TextArray(
+                arr.iter().map(i64::to_string).collect(),
+            )),
+            DataValue::Float64Array(arr) => Ok(DataValue::TextArray(
+                arr.iter().map(f64::to_string).collect(),
+            )),
+            DataValue::BoolArray(arr) => Ok(DataValue::TextArray(
+                arr.iter().map(bool::to_string).collect(),
+            )),
+            DataValue::DateTimeArray(arr) => Ok(DataValue::TextArray(
+                arr.iter().map(chrono::DateTime::to_rfc3339).collect(),
+            )),
+            other => match text_scalar(&other) {
+                Some(s) => Ok(DataValue::TextArray(vec![s])),
+                None => Err(LaurusError::invalid_argument(format!(
+                    "field '{field_name}': cannot coerce {} to a multi-valued text value",
+                    describe(&other)
+                ))),
+            },
         }
-    })
+    } else {
+        match value {
+            // Multi-valued input to a single-valued field is rejected
+            // rather than silently joining or truncating.
+            DataValue::TextArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
+            other => match text_scalar(&other) {
+                Some(s) => Ok(DataValue::Text(s)),
+                None => Err(LaurusError::invalid_argument(format!(
+                    "field '{field_name}': cannot coerce {} to a text value",
+                    describe(&other)
+                ))),
+            },
+        }
+    }
 }
 
 fn coerce_to_integer(
@@ -106,6 +160,19 @@ fn coerce_to_integer(
             DataValue::BoolArray(arr) => Ok(DataValue::Int64Array(
                 arr.iter().map(|b| i64::from(*b)).collect(),
             )),
+            // Element-wise extension of the scalar `Text` parse below
+            // (#1175).
+            DataValue::TextArray(arr) => arr
+                .iter()
+                .map(|s| {
+                    s.trim().parse::<i64>().map_err(|_| {
+                        LaurusError::invalid_argument(format!(
+                            "field '{field_name}': cannot parse '{s}' as an integer"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i64>>>()
+                .map(DataValue::Int64Array),
             DataValue::Text(s) => s
                 .trim()
                 .parse::<i64>()
@@ -133,12 +200,13 @@ fn coerce_to_integer(
             }),
             // Multi-valued input to a single-valued field is rejected
             // rather than silently truncating to one element.
-            DataValue::Int64Array(_) | DataValue::Float64Array(_) | DataValue::BoolArray(_) => {
-                Err(LaurusError::invalid_argument(format!(
-                    "field '{field_name}': received an array but the field is single-valued; \
-                     declare the field with multi_valued = true to accept arrays"
-                )))
-            }
+            DataValue::Int64Array(_)
+            | DataValue::Float64Array(_)
+            | DataValue::BoolArray(_)
+            | DataValue::TextArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
             other => Err(LaurusError::invalid_argument(format!(
                 "field '{field_name}': cannot coerce {} to an integer",
                 describe(&other)
@@ -166,6 +234,19 @@ fn coerce_to_float(
             DataValue::BoolArray(arr) => Ok(DataValue::Float64Array(
                 arr.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
             )),
+            // Element-wise extension of the scalar `Text` parse below
+            // (#1175).
+            DataValue::TextArray(arr) => arr
+                .iter()
+                .map(|s| {
+                    s.trim().parse::<f64>().map_err(|_| {
+                        LaurusError::invalid_argument(format!(
+                            "field '{field_name}': cannot parse '{s}' as a float"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<f64>>>()
+                .map(DataValue::Float64Array),
             DataValue::Text(s) => s
                 .trim()
                 .parse::<f64>()
@@ -194,12 +275,13 @@ fn coerce_to_float(
                         "field '{field_name}': cannot parse '{s}' as a float"
                     ))
                 }),
-            DataValue::Int64Array(_) | DataValue::Float64Array(_) | DataValue::BoolArray(_) => {
-                Err(LaurusError::invalid_argument(format!(
-                    "field '{field_name}': received an array but the field is single-valued; \
-                     declare the field with multi_valued = true to accept arrays"
-                )))
-            }
+            DataValue::Int64Array(_)
+            | DataValue::Float64Array(_)
+            | DataValue::BoolArray(_)
+            | DataValue::TextArray(_) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': received an array but the field is single-valued; \
+                 declare the field with multi_valued = true to accept arrays"
+            ))),
             other => Err(LaurusError::invalid_argument(format!(
                 "field '{field_name}': cannot coerce {} to a float",
                 describe(&other)
@@ -253,6 +335,12 @@ fn coerce_to_boolean(
                 .collect::<Result<Vec<bool>>>()
                 .map(DataValue::BoolArray),
             DataValue::Float64Array(a) if a.is_empty() => Ok(DataValue::BoolArray(Vec::new())),
+            // Element-wise extension of the scalar `Text` rule (#1175).
+            DataValue::TextArray(arr) => arr
+                .iter()
+                .map(|s| parse_bool_scalar(field_name, &DataValue::Text(s.clone())))
+                .collect::<Result<Vec<bool>>>()
+                .map(DataValue::BoolArray),
             scalar @ (DataValue::Bool(_) | DataValue::Int64(_) | DataValue::Text(_)) => Ok(
                 DataValue::BoolArray(vec![parse_bool_scalar(field_name, &scalar)?]),
             ),
@@ -265,10 +353,12 @@ fn coerce_to_boolean(
         match value {
             // Multi-valued input to a single-valued field is rejected
             // rather than silently truncating to one element.
-            DataValue::BoolArray(_) => Err(LaurusError::invalid_argument(format!(
-                "field '{field_name}': received an array but the field is single-valued; \
-                 declare the field with multi_valued = true to accept arrays"
-            ))),
+            DataValue::BoolArray(_) | DataValue::TextArray(_) => {
+                Err(LaurusError::invalid_argument(format!(
+                    "field '{field_name}': received an array but the field is single-valued; \
+                     declare the field with multi_valued = true to accept arrays"
+                )))
+            }
             other => Ok(DataValue::Bool(parse_bool_scalar(field_name, &other)?)),
         }
     }
@@ -297,6 +387,17 @@ fn coerce_to_datetime(
             DataValue::DateTimeArray(arr) => Ok(DataValue::DateTimeArray(arr)),
             DataValue::DateTime(dt) => Ok(DataValue::DateTimeArray(vec![dt])),
             DataValue::Text(s) => Ok(DataValue::DateTimeArray(vec![parse(&s)?])),
+            // Element-wise extension of the scalar `Text` parse (#1175).
+            // Required, not cosmetic: since #1175 a JSON array of strings
+            // that is not all-RFC-3339 infers a `TextArray`, and inference
+            // runs before the schema lookup — without this arm a declared
+            // multi-valued DateTime field would report the generic "cannot
+            // coerce text array" instead of naming the offending element.
+            DataValue::TextArray(arr) => arr
+                .iter()
+                .map(|s| parse(s))
+                .collect::<Result<Vec<_>>>()
+                .map(DataValue::DateTimeArray),
             DataValue::Int64Array(a) if a.is_empty() => Ok(DataValue::DateTimeArray(Vec::new())),
             DataValue::Float64Array(a) if a.is_empty() => Ok(DataValue::DateTimeArray(Vec::new())),
             other => Err(LaurusError::invalid_argument(format!(
@@ -310,10 +411,12 @@ fn coerce_to_datetime(
             DataValue::Text(s) => Ok(DataValue::DateTime(parse(&s)?)),
             // Multi-valued input to a single-valued field is rejected
             // rather than silently truncating to one element.
-            DataValue::DateTimeArray(_) => Err(LaurusError::invalid_argument(format!(
-                "field '{field_name}': received an array but the field is single-valued; \
-                 declare the field with multi_valued = true to accept arrays"
-            ))),
+            DataValue::DateTimeArray(_) | DataValue::TextArray(_) => {
+                Err(LaurusError::invalid_argument(format!(
+                    "field '{field_name}': received an array but the field is single-valued; \
+                     declare the field with multi_valued = true to accept arrays"
+                )))
+            }
             other => Err(LaurusError::invalid_argument(format!(
                 "field '{field_name}': cannot coerce {} to a datetime",
                 describe(&other)
@@ -465,6 +568,7 @@ fn describe(value: &DataValue) -> &'static str {
         DataValue::GeoEcefArray(_) => "geo3d array",
         DataValue::DateTimeArray(_) => "datetime array",
         DataValue::BoolArray(_) => "bool array",
+        DataValue::TextArray(_) => "text array",
     }
 }
 
@@ -713,6 +817,120 @@ mod tests {
     fn numeric_single_valued_rejects_bool_array_with_hint() {
         for opt in [integer(), float()] {
             let err = coerce_value("n", &opt, DataValue::BoolArray(vec![true])).unwrap_err();
+            assert!(err.to_string().contains("multi_valued = true"), "{err}");
+        }
+    }
+
+    // ---- Multi-valued text (#1175) ----
+
+    fn multi_text() -> FieldOption {
+        FieldOption::Text(TextOption {
+            multi_valued: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn text_multi_valued_accepts_array_and_wraps_single() {
+        assert_eq!(
+            coerce_value(
+                "n",
+                &multi_text(),
+                DataValue::TextArray(vec!["a".into(), "b c".into()])
+            )
+            .unwrap(),
+            DataValue::TextArray(vec!["a".into(), "b c".into()])
+        );
+        // Every scalar the single-valued path stringifies is wrapped.
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::Text("a".into())).unwrap(),
+            DataValue::TextArray(vec!["a".into()])
+        );
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::Int64(7)).unwrap(),
+            DataValue::TextArray(vec!["7".into()])
+        );
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::Bool(true)).unwrap(),
+            DataValue::TextArray(vec!["true".into()])
+        );
+        // `Null` is "no values", not a phantom empty element.
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::Null).unwrap(),
+            DataValue::TextArray(Vec::new())
+        );
+        assert!(coerce_value("n", &multi_text(), DataValue::Vector(vec![1.0])).is_err());
+    }
+
+    #[test]
+    fn text_multi_valued_stringifies_other_arrays() {
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::Int64Array(vec![1, 2])).unwrap(),
+            DataValue::TextArray(vec!["1".into(), "2".into()])
+        );
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::BoolArray(vec![true, false])).unwrap(),
+            DataValue::TextArray(vec!["true".into(), "false".into()])
+        );
+        // The `[]` every binding sends before the field type is known.
+        assert_eq!(
+            coerce_value("n", &multi_text(), DataValue::Int64Array(Vec::new())).unwrap(),
+            DataValue::TextArray(Vec::new())
+        );
+    }
+
+    #[test]
+    fn text_single_valued_rejects_arrays() {
+        let err = coerce_value("n", &text(), DataValue::TextArray(vec!["a".into()])).unwrap_err();
+        assert!(err.to_string().contains("multi_valued = true"), "{err}");
+        // The single-valued contract is otherwise untouched.
+        assert_eq!(
+            coerce_value("n", &text(), DataValue::Int64(7)).unwrap(),
+            DataValue::Text("7".into())
+        );
+        assert_eq!(
+            coerce_value("n", &text(), DataValue::Null).unwrap(),
+            DataValue::Text(String::new())
+        );
+    }
+
+    /// A `TextArray` reaching a declared multi-valued field of another type
+    /// is parsed element-wise, exactly as a scalar `Text` already is.
+    #[test]
+    fn typed_multi_valued_fields_parse_text_arrays() {
+        assert_eq!(
+            coerce_value(
+                "n",
+                &multi_integer(),
+                DataValue::TextArray(vec!["1".into(), "2".into()])
+            )
+            .unwrap(),
+            DataValue::Int64Array(vec![1, 2])
+        );
+        assert_eq!(
+            coerce_value(
+                "n",
+                &multi_boolean(),
+                DataValue::TextArray(vec!["true".into()])
+            )
+            .unwrap(),
+            DataValue::BoolArray(vec![true])
+        );
+        // #1175 turns a mixed string array into a `TextArray`, so the
+        // datetime field must still name the offending element.
+        let dt_err = coerce_value(
+            "n",
+            &dt_multi(),
+            DataValue::TextArray(vec!["2024-01-01T00:00:00Z".into(), "oops".into()]),
+        )
+        .unwrap_err();
+        assert!(dt_err.to_string().contains("oops"), "{dt_err}");
+    }
+
+    #[test]
+    fn typed_single_valued_fields_reject_text_arrays_with_hint() {
+        for opt in [integer(), float(), boolean(), dt_single()] {
+            let err = coerce_value("n", &opt, DataValue::TextArray(vec!["1".into()])).unwrap_err();
             assert!(err.to_string().contains("multi_valued = true"), "{err}");
         }
     }

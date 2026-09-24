@@ -229,7 +229,16 @@ impl PySchema {
     ///         a custom name registered via ``add_analyzer``), or a dict
     ///         configuring a parameterized built-in preset such as
     ///         ``{"language": "japanese", "dict": "/var/lib/lindera/ipadic"}``.
-    #[pyo3(signature = (name, *, stored=true, indexed=true, term_vectors=true, doc_values=true, analyzer=None))]
+    ///     multi_valued: When True, the field accepts a ``list[str]``; a
+    ///         term query matches if any element contains the term, and a
+    ///         phrase query never spans two elements (Lucene-style). Default
+    ///         False.
+    ///     position_increment_gap: Positions skipped between the elements
+    ///         of a multi-valued field, so a phrase needs a slop of at least
+    ///         this value to cross an element boundary (default 100; ``0``
+    ///         numbers the elements as if concatenated). Ignored unless
+    ///         ``multi_valued`` is True.
+    #[pyo3(signature = (name, *, stored=true, indexed=true, term_vectors=true, doc_values=true, multi_valued=false, position_increment_gap=laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP, analyzer=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
         &mut self,
@@ -239,6 +248,8 @@ impl PySchema {
         indexed: bool,
         term_vectors: bool,
         doc_values: bool,
+        multi_valued: bool,
+        position_increment_gap: u32,
         analyzer: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         let analyzer = analyzer
@@ -249,6 +260,8 @@ impl PySchema {
             FieldOption::Text(TextOption {
                 indexed,
                 stored,
+                multi_valued,
+                position_increment_gap,
                 term_vectors,
                 doc_values,
                 analyzer,

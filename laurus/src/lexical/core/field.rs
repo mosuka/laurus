@@ -107,9 +107,7 @@ impl<D: rkyv::rancor::Fallible + ?Sized>
 ///     option: FieldOption::Text(TextOption {
 ///         indexed: true,
 ///         stored: true,
-///         term_vectors: true,
-///         doc_values: true,
-///         analyzer: None,
+///         ..Default::default()
 ///     }),
 /// };
 /// ```
@@ -170,6 +168,17 @@ fn default_true() -> bool {
     true
 }
 
+/// Positions inserted between the elements of a multi-valued Text field
+/// (Issue #1175), matching Lucene's and Elasticsearch's default.
+///
+/// Large enough that no realistic phrase or span query spans two elements:
+/// crossing the boundary needs a slop of at least this many positions.
+pub const DEFAULT_POSITION_INCREMENT_GAP: u32 = 100;
+
+fn default_position_increment_gap() -> u32 {
+    DEFAULT_POSITION_INCREMENT_GAP
+}
+
 // FieldValue (alias to DataValue) methods moved to src/data.rs
 
 // ============================================================================
@@ -190,6 +199,39 @@ pub struct TextOption {
     /// Whether to store the original field value.
     #[serde(default = "default_true")]
     pub stored: bool,
+
+    /// Whether this field accepts multiple values per document
+    /// (Issue #1175).
+    ///
+    /// When `true`, the field accepts [`DataValue::TextArray`] (a single
+    /// `Text` is auto-wrapped into a one-element array). Every element is
+    /// analyzed on its own and its tokens are appended to one position
+    /// sequence, separated by [`Self::position_increment_gap`] positions,
+    /// so a term query matches if **any** element contains the term while
+    /// a phrase query cannot span two elements. Repeated terms across
+    /// elements raise the term frequency, not the hit count.
+    ///
+    /// When `false` (the default), a `TextArray` value is rejected at
+    /// ingestion instead of being silently truncated.
+    ///
+    /// [`DataValue::TextArray`]: crate::data::DataValue::TextArray
+    #[serde(default)]
+    pub multi_valued: bool,
+
+    /// Positions skipped between the elements of a multi-valued Text field
+    /// (Issue #1175); Lucene's `positionIncrementGap`. Ignored unless
+    /// [`Self::multi_valued`] is `true`.
+    ///
+    /// Element `n + 1`'s first token is placed this many positions past
+    /// element `n`'s last token, so a phrase query needs a slop of at
+    /// least this value to match across the boundary. The default
+    /// ([`DEFAULT_POSITION_INCREMENT_GAP`], 100) is larger than any
+    /// realistic slop.
+    ///
+    /// `0` means the elements are numbered contiguously, as if they had
+    /// been concatenated — phrases then match across element boundaries.
+    #[serde(default = "default_position_increment_gap")]
+    pub position_increment_gap: u32,
 
     /// Whether to store term positions for this field ("term vectors").
     ///
@@ -317,6 +359,38 @@ impl TextOption {
         self.analyzer = Some(spec.into());
         self
     }
+
+    /// Set whether the field accepts multiple values per document
+    /// (Issue #1175).
+    ///
+    /// # Arguments
+    ///
+    /// * `multi_valued` - Whether arrays of strings are accepted.
+    ///
+    /// # Returns
+    ///
+    /// The modified `TextOption` for method chaining.
+    pub fn multi_valued(mut self, multi_valued: bool) -> Self {
+        self.multi_valued = multi_valued;
+        self
+    }
+
+    /// Set the positions skipped between the elements of a multi-valued
+    /// field (Issue #1175).
+    ///
+    /// Takes effect only when [`Self::multi_valued`] is `true`.
+    ///
+    /// # Arguments
+    ///
+    /// * `gap` - Positions between elements; `0` numbers them contiguously.
+    ///
+    /// # Returns
+    ///
+    /// The modified `TextOption` for method chaining.
+    pub fn position_increment_gap(mut self, gap: u32) -> Self {
+        self.position_increment_gap = gap;
+        self
+    }
 }
 
 impl Default for TextOption {
@@ -324,6 +398,8 @@ impl Default for TextOption {
         Self {
             indexed: true,
             stored: true,
+            multi_valued: false,
+            position_increment_gap: DEFAULT_POSITION_INCREMENT_GAP,
             term_vectors: true,
             doc_values: true,
             analyzer: None,
@@ -781,9 +857,7 @@ impl Default for Geo3dOption {
 /// let text_opt = FieldOption::Text(TextOption {
 ///     indexed: true,
 ///     stored: true,
-///     term_vectors: true,
-///     doc_values: true,
-///     analyzer: None,
+///     ..Default::default()
 /// });
 ///
 /// // Bytes field (e.g. for binary data)
@@ -864,6 +938,10 @@ impl FieldOption {
                 ..Default::default()
             }),
             FieldValue::BoolArray(_) => FieldOption::Boolean(BooleanOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
+            FieldValue::TextArray(_) => FieldOption::Text(TextOption {
                 multi_valued: true,
                 ..Default::default()
             }),

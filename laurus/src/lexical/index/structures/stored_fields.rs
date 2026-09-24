@@ -122,6 +122,10 @@ const TAG_DATETIME_ARRAY: u8 = 15;
 // `1`, the same representation as the scalar tag 3 — not bit-packed). Same
 // no-version-bump policy as tags 10–15 (recorded on Issue #1040).
 const TAG_BOOL_ARRAY: u8 = 16;
+// Multi-valued text (#1175): varint element count + per element the same
+// varint-length-prefixed UTF-8 body the scalar tag 0 uses. Same
+// no-version-bump policy as tags 10–16 (recorded on Issue #1040).
+const TAG_TEXT_ARRAY: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // Encoding (document -> plain bytes, before compression)
@@ -238,6 +242,14 @@ fn encode_document(buf: &mut Vec<u8>, doc_id: u64, fields: &AHashMap<String, Dat
                 write_varint(buf, arr.len() as u64);
                 for &b in arr {
                     buf.push(u8::from(b));
+                }
+            }
+            DataValue::TextArray(arr) => {
+                buf.push(TAG_TEXT_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for text in arr {
+                    write_varint(buf, text.len() as u64);
+                    buf.extend_from_slice(text.as_bytes());
                 }
             }
         }
@@ -461,6 +473,26 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                     arr.push(read_u8(bytes, cursor, "stored BoolArray field element")? != 0);
                 }
                 DataValue::BoolArray(arr)
+            }
+            TAG_TEXT_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored TextArray field length")? as usize;
+                // Elements are variable-width, so the only honest bound is
+                // the 1-byte minimum a zero-length element occupies.
+                let len = checked_capacity(
+                    len,
+                    1,
+                    (bytes.len() - *cursor) as u64,
+                    "stored TextArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    arr.push(read_len_prefixed_str(
+                        bytes,
+                        cursor,
+                        "stored TextArray field element",
+                    )?);
+                }
+                DataValue::TextArray(arr)
             }
             other => {
                 return Err(LaurusError::index(format!(
@@ -851,6 +883,17 @@ mod tests {
                     DataValue::BoolArray(vec![true, false, true]),
                 ),
                 ("u_bool_array_empty", DataValue::BoolArray(Vec::new())),
+                // Multi-valued text (#1175): a long element, an empty one
+                // and multi-byte UTF-8, plus the empty list.
+                (
+                    "v_text_array",
+                    DataValue::TextArray(vec![
+                        "hello world".to_string(),
+                        String::new(),
+                        "日本語のテキスト".to_string(),
+                    ]),
+                ),
+                ("w_text_array_empty", DataValue::TextArray(Vec::new())),
             ]),
         )];
 
@@ -940,6 +983,55 @@ mod tests {
             d.fields.get("u_bool_array_empty"),
             Some(&DataValue::BoolArray(Vec::new()))
         );
+        assert_eq!(
+            d.fields.get("v_text_array"),
+            Some(&DataValue::TextArray(vec![
+                "hello world".to_string(),
+                String::new(),
+                "日本語のテキスト".to_string(),
+            ]))
+        );
+        assert_eq!(
+            d.fields.get("w_text_array_empty"),
+            Some(&DataValue::TextArray(Vec::new()))
+        );
+    }
+
+    /// #1175: a length header that overshoots the bytes left must be
+    /// rejected by `checked_capacity` up front, before any allocation.
+    #[test]
+    fn rejects_a_truncated_text_array() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // doc id
+        write_varint(&mut buf, 1); // field count
+        write_varint(&mut buf, 1); // name length
+        buf.extend_from_slice(b"t");
+        buf.push(TAG_TEXT_ARRAY);
+        write_varint(&mut buf, 64); // declares 64 elements ...
+        buf.extend_from_slice(&[1, b'a']); // ... but only one 1-byte element
+
+        let mut cursor = 0;
+        let err = decode_document(&buf, &mut cursor).unwrap_err();
+        assert!(err.to_string().contains("header declares"), "{err}");
+    }
+
+    /// #1175: unlike a bool array, a text element can be structurally
+    /// impossible — invalid UTF-8 must be a loud decode error.
+    #[test]
+    fn rejects_invalid_utf8_in_a_text_array_element() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // doc id
+        write_varint(&mut buf, 1); // field count
+        write_varint(&mut buf, 1); // name length
+        buf.extend_from_slice(b"t");
+        buf.push(TAG_TEXT_ARRAY);
+        write_varint(&mut buf, 1); // one element ...
+        write_varint(&mut buf, 2); // ... of two bytes
+        buf.extend_from_slice(&[0xff, 0xfe]); // not valid UTF-8
+
+        let mut cursor = 0;
+        let err = decode_document(&buf, &mut cursor).unwrap_err();
+        assert!(err.to_string().contains("invalid utf-8"), "{err}");
     }
 
     /// #1180: tag 16 has no "impossible element" (every byte decodes as a

@@ -53,7 +53,7 @@ Defines document structure.
 
 | Method | Description |
 | :--- | :--- |
-| `.add_text_field(name, TextOption)` | Add a full-text field |
+| `.add_text_field(name, TextOption)` | Add a full-text field (set `TextOption::multi_valued = true` for arrays of strings; `TextOption::position_increment_gap`, default `100`, is the number of positions skipped between elements so that phrase queries do not span them) |
 | `.add_integer_field(name, IntegerOption)` | Add an integer field (set `IntegerOption::multi_valued = true` for arrays) |
 | `.add_float_field(name, FloatOption)` | Add a float field (set `FloatOption::multi_valued = true` for arrays) |
 | `.add_boolean_field(name, BooleanOption)` | Add a boolean field (set `BooleanOption::multi_valued = true` for arrays of booleans) |
@@ -100,6 +100,7 @@ A collection of named field values.
 | `.add_geo_ecef_array(name, points)` | Add a multi-valued 3D ECEF field (`Vec<GeoEcefPoint>`) |
 | `.add_datetime_array(name, values)` | Add a multi-valued datetime field (`Vec<DateTime<Utc>>`) |
 | `.add_bool_array(name, values)` | Add a multi-valued boolean field (`Vec<bool>`) |
+| `.add_text_array(name, values)` | Add a multi-valued text field (`Vec<String>`) |
 | `.add_bytes(name, data)` | Add binary data |
 | `.build()` | Build the `Document` |
 
@@ -236,3 +237,4 @@ A collection of named field values.
 | `DataValue::GeoEcefArray(Vec<GeoEcefPoint>)` | Multi-valued 3D ECEF points (requires `multi_valued` field option) |
 | `DataValue::DateTimeArray(Vec<DateTime<Utc>>)` | Multi-valued instants (requires `multi_valued` field option) |
 | `DataValue::BoolArray(Vec<bool>)` | Multi-valued booleans (requires `multi_valued` field option) |
+| `DataValue::TextArray(Vec<String>)` | Multi-valued strings (requires `multi_valued` field option) |

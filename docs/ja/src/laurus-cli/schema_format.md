@@ -40,18 +40,24 @@ default_fields = ["title", "body"]
 
 ```toml
 [fields.title.Text]
-indexed = true      # このフィールドを検索用にインデックスするかどうか
-stored = true       # 取得用に元の値を保存するかどうか
-term_vectors = true # タームの位置を保存するかどうか（フレーズクエリ・スパンクエリ用）
-doc_values = true   # 値を DocValues にもコピーするかどうか（ソート・ファセット用）
+indexed = true               # このフィールドを検索用にインデックスするかどうか
+stored = true                # 取得用に元の値を保存するかどうか
+multi_valued = false         # 文字列の配列を受け付けるかどうか（Issue #1175）
+position_increment_gap = 100 # 多値フィールドの要素間で読み飛ばす位置数
+term_vectors = true          # タームの位置を保存するかどうか（フレーズクエリ・スパンクエリ用）
+doc_values = true            # 値を DocValues にもコピーするかどうか（ソート・ファセット用）
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | このフィールドの検索を有効にする |
 | `stored` | `bool` | `true` | 結果に返せるよう元の値を保存する |
+| `multi_valued` | `bool` | `false` | 文字列の配列を受け付け、term クエリは**いずれかの要素**がタームを含めばマッチ（Lucene 流の "any match"）。フレーズクエリは slop が `position_increment_gap` に達しない限り 2 つの要素をまたがない |
+| `position_increment_gap` | `integer` | `100` | 多値フィールドの要素間で読み飛ばす位置数（Lucene の `positionIncrementGap`）。`0` にすると要素を連結したものとして付番する。`multi_valued = true` でなければ無視される |
 | `term_vectors` | `bool` | `true` | フレーズクエリ・スパンクエリが読み取るタームの位置を保存する。ハイライトは常に保存済みテキストを再トークナイズするため使用しない |
 | `doc_values` | `bool` | `true` | 値を DocValues（[ソート](../laurus/faceting.md)・ファセット・集計が読み取る列指向ストア）にもコピーする。`stored` も `true` の場合のみ有効 —— 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
+
+対話的なスキーマジェネレータ（`laurus create schema`。[スキーマの生成](#スキーマの生成) を参照）は、Text フィールドについて多値にするかどうかを尋ね、多値にする場合は position increment gap も尋ねます。
 
 #### Integer
 

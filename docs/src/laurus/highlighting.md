@@ -27,7 +27,7 @@ for result in &results {
 
 Semantics to keep in mind:
 
-- **Field selection.** Only fields named in `highlight(fields)` are considered, and only when they are `stored: true` text fields. A field that is absent from the document, not stored, or not a text field is silently skipped — it never appears as a key in `highlights`.
+- **Field selection.** Only fields named in `highlight(fields)` are considered, and only when they are `stored: true` text fields. A field that is absent from the document, not stored, or not a text field is silently skipped — it never appears as a key in `highlights`. A multi-valued text field (`multi_valued: true`, Issue #1175) is highlighted element by element: only the elements that match contribute fragments, a fragment never straddles two elements, and the concatenated fragment list honours `max_fragments`.
 - **Analyzer.** Each field is tokenized with its own index-time analyzer (per-field analyzers apply automatically), so highlighting reflects what actually matched at index time — not a generic tokenizer.
 - **Which query is highlighted.** The request's lexical query drives highlighting, including in hybrid search — a vector-only request produces no highlights. Terms contributed only by the request-level `filter_query` are never highlighted, since they describe eligibility, not relevance to what was searched for.
 - **Empty result.** A field with no highlight fragments (no match, or `return_entire_field_if_no_highlight` not set) is omitted from `highlights` entirely rather than mapped to an empty list.
@@ -125,5 +125,7 @@ When a field is long, Laurus selects the most relevant fragments:
 1. The text is split into windows of `fragment_size` characters
 2. Each fragment is scored by how many query terms it contains
 3. The top `max_fragments` fragments are returned, in original order, as a `Vec<HighlightFragment>` (callers join or render the list themselves)
+
+For a multi-valued text field these steps run per element, so a fragment never straddles two elements; `max_fragments` caps the list concatenated across all elements.
 
 If no fragments contain matches and `return_entire_field_if_no_highlight` is true, the full field value is returned instead.

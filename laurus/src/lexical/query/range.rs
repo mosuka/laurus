@@ -518,8 +518,9 @@ impl NumericRangeQuery {
     /// (`Int64Array` / `Float64Array` / `DateTimeArray`) fields are scanned
     /// for any element that satisfies the predicate. A `DateTime`
     /// contributes its BKD point (#1179), so the stored-document fallback
-    /// agrees with the tree. `Text` is parsed as a number because stored
-    /// docs lose type info in some paths. Other variants return `false`.
+    /// agrees with the tree. `Text` (and, since #1175, `TextArray`
+    /// element-wise) is parsed as a number because stored docs lose type
+    /// info in some paths. Other variants return `false`.
     fn value_matches_any(&self, val: &crate::data::DataValue) -> bool {
         match val {
             crate::data::DataValue::Int64(i) => self.contains_numeric(*i as f64),
@@ -538,6 +539,12 @@ impl NumericRangeQuery {
                 .parse::<f64>()
                 .ok()
                 .is_some_and(|n| self.contains_numeric(n)),
+            // Symmetric with the scalar `Text` arm above (#1175).
+            crate::data::DataValue::TextArray(arr) => arr.iter().any(|s| {
+                s.parse::<f64>()
+                    .ok()
+                    .is_some_and(|n| self.contains_numeric(n))
+            }),
             _ => false,
         }
     }
