@@ -87,7 +87,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-The response always includes `multi_valued` for `integer`, `float`, `boolean`, `date_time`, `geo`, and `geo3d` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}` or `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`); the same key is accepted on `POST /v1/index` and `POST /v1/schema/fields`.
+The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, and `geo3d` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}` or `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response.
 
 ### Add a Field (Dynamic Schema)
 
@@ -308,7 +308,8 @@ paths in sync.
 | `{"x": ..., "y": ..., "z": ...}` | `geo3d` | All three keys required, finite numbers, ECEF meters. Mixing with `lat`/`lon` keys is rejected. |
 | `[{"latitude": 35.6, "longitude": 139.7}, ...]` (all geo objects) | `geo` with `multi_valued: true` | Multi-valued geo field; the `lat` / `lon` / `lng` aliases are accepted. Documents are returned with the field rendered as an array of `{"latitude", "longitude"}` objects. |
 | `[{"x": ..., "y": ..., "z": ...}, ...]` (all 3D objects) | `geo3d` with `multi_valued: true` | Multi-valued 3D geo field, returned as an array of `{"x", "y", "z"}` objects. Mixing 2D and 3D objects in one array is rejected. |
-| `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]` (all RFC 3339 strings) | `date_time` with `multi_valued: true` | Multi-valued datetime field (Issue #1184). Only RFC 3339 strings are accepted here. Documents are returned with the field rendered as an array of RFC 3339 strings normalized to UTC (e.g. `"2024-06-15T12:00:00+00:00"`). |
+| `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]` (all RFC 3339 strings) | `date_time` with `multi_valued: true` | Multi-valued datetime field (Issue #1184). Only RFC 3339 strings are recognized as datetimes here. Documents are returned with the field rendered as an array of RFC 3339 strings normalized to UTC (e.g. `"2024-06-15T12:00:00+00:00"`). |
+| `["a", "b"]` (all strings, not all RFC 3339) | `text` with `multi_valued: true` | Multi-valued text field (Issue #1175). Each element is analyzed on its own; a term query matches if any element contains the term, and a phrase query does not span two elements unless its slop reaches the field's `position_increment_gap` (default 100). Documents are returned with the field rendered as an array of strings. |
 | `[true, false]` (all booleans) | `boolean` with `multi_valued: true` | Multi-valued boolean field (Issue #1180). A term query such as `flags:true` matches if any element equals the value. Documents are returned with the field rendered as an array of booleans. |
 | `{"data": "<base64>", "mime": "..."}` | `bytes` | `mime` is optional. Disambiguates a bytes payload from a plain string on a multimodal vector field's `Text`-or-`Bytes` embedder input — see [Schema and Fields](../concepts/schema_and_fields.md). |
 
@@ -317,9 +318,6 @@ The gateway returns an HTTP 400 (`Bad Request`) when:
 - An array contains mixed types or non-numeric elements
   (e.g. `[1, "x"]` or `[true, 1]`), or mixes 2D and 3D geo objects
   (e.g. `[{"lat": ...}, {"x": ...}]`).
-- An array of strings where any element is not an RFC 3339 datetime
-  (e.g. `["2024-01-01T00:00:00Z", "tomorrow"]`) — multi-valued text
-  fields are not supported (Issue #1175).
 - An object does not match any of the supported shapes above (e.g. missing
   latitude / longitude keys for 2D geo, missing any of `x` / `y` / `z` for
   3D geo, or a non-string `data` key).

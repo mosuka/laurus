@@ -196,7 +196,7 @@ class Schema {
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)` | 全文検索フィールド（転置インデックス、BM25）。`docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047、デフォルト `true`）。`stored` も `true` の場合のみ有効です。`analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットを使う場合は、`lindera` tokenizer を含むカスタム analyzer を登録して、その名前を参照してください。 |
+| `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?, multiValued?, positionIncrementGap?)` | 全文検索フィールド（転置インデックス、BM25）。`docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047、デフォルト `true`）。`stored` も `true` の場合のみ有効です。`multiValued: true` で文字列の配列を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `positionIncrementGap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。`analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `addAnalyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットを使う場合は、`lindera` tokenizer を含むカスタム analyzer を登録して、その名前を参照してください。 |
 | `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット整数フィールド。`multiValued: true` で整数配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
 | `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット浮動小数点フィールド。`multiValued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
 | `addBooleanField(name, stored?, indexed?, multiValued?, docValues?)` | 真偽値フィールド。`multiValued: true` で真偽値の配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は真偽値の配列として読み戻されます）。`docValues` は上記を参照。 |
@@ -705,5 +705,6 @@ JavaScript の値は自動的に Laurus の `DataValue` 型に変換されます
 | `{ x, y, z }` | `GeoEcef` | 3 つの `number` 値（メートル単位、3D ECEF 直交座標） |
 | `{ lat, lon }[]` | `GeoArray` | `{ lat, lon }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `{ x, y, z }[]` | `GeoEcefArray` | `{ x, y, z }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
-| `string[]`（すべて RFC 3339） | `DateTimeArray` | RFC 3339 日時文字列の配列。フィールドに `multiValued: true` が必要。RFC 3339 でない要素を含む文字列配列は拒否される |
+| `string[]`（すべて RFC 3339） | `DateTimeArray` | RFC 3339 日時文字列の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要 |
+| `string[]`（すべてが RFC 3339 ではない） | `TextArray` | 文字列の配列（Issue #1175）。フィールドに `multiValued: true` が必要。`string[]` として読み戻される |
 | `boolean[]` | `BoolArray` | 真偽値の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要。`[true, 1]` のような混在配列は拒否される |

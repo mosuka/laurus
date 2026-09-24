@@ -73,6 +73,8 @@ Match an exact phrase using double quotes. Optional proximity (`~N`) allows N wo
 "hello world"~2
 ```
 
+On a multi-valued text field the phrase (or its `~N` proximity window) never crosses from one element into the next unless `N` reaches the field's `position_increment_gap` (default 100).
+
 ### Fuzzy Query
 
 Approximate matching with edit distance. Append `~` and optionally the maximum edit distance:

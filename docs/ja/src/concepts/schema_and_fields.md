@@ -76,6 +76,8 @@ let opt = TextOption::default();
 let opt = TextOption::default()
     .indexed(true)
     .stored(true)
+    .multi_valued(false)
+    .position_increment_gap(100)
     .term_vectors(true)
     .doc_values(true);
 ```
@@ -84,6 +86,8 @@ let opt = TextOption::default()
 | :--- | :--- | :--- |
 | `indexed` | `true` | フィールドが検索可能かどうか |
 | `stored` | `true` | 元の値が取得用に保存されるかどうか |
+| `multi_valued` | `false` | 文字列の配列を受け付けるかどうか（Issue #1175）。term クエリは**いずれかの要素**がタームを含めばマッチ。詳細は後述の「多値（multi-valued）フィールド」を参照 |
+| `position_increment_gap` | `100` | 多値フィールドの要素間で読み飛ばす位置数（Lucene の `positionIncrementGap`）。slop がこの値に達しない限り、フレーズクエリが 2 つの要素をまたぐことはない。`0` にすると要素を連結したものとして位置を付番する。`multi_valued` が `true` でなければ無視される |
 | `term_vectors` | `true` | ターム位置が保存されるかどうか（フレーズクエリ・スパンクエリで使用。ハイライトは常に保存済みテキストを再トークナイズするため使用しない） |
 | `doc_values` | `true` | 値を DocValues（[ソート](../laurus/faceting.md)・ファセット・集計が読み取る列指向ストア）にもコピーするかどうか |
 
@@ -245,6 +249,7 @@ pub enum DataValue {
     GeoEcefArray(Vec<GeoEcefPoint>), // 多値 3D ECEF フィールド
     DateTimeArray(Vec<DateTime<Utc>>), // 多値日時フィールド
     BoolArray(Vec<bool>),            // 多値ブールフィールド
+    TextArray(Vec<String>),          // 多値テキストフィールド
 }
 ```
 
@@ -309,7 +314,8 @@ let schema = Schema::builder()
 | 数値の `x`、`y`、`z` の 3 キーをすべて持つ object（有限値、ECEF メートル単位） | `Geo3d` |
 | 地理 object の配列（例: `[{"lat": 35.6, "lon": 139.7}, ...]`） | `Geo`（`multi_valued = true`） |
 | `x`/`y`/`z` object の配列 | `Geo3d`（`multi_valued = true`） |
-| RFC 3339 文字列の配列（例: `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`） | `DateTime`（`multi_valued = true`） |
+| 全要素が RFC 3339 である文字列の配列（例: `["2024-01-01T00:00:00Z", "2024-06-15T21:00:00+09:00"]`） | `DateTime`（`multi_valued = true`） |
+| それ以外の文字列の配列（例: `["rust", "search"]`） | `Text`（`multi_valued = true`） |
 | ブール値の配列（例: `[true, false]`） | `Boolean`（`multi_valued = true`） |
 | `data` キー（base64 エンコードされた文字列）と任意の `mime` キーを持つ object | `Bytes` 値 |
 
@@ -348,9 +354,9 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 スコアは constant でマッチ件数による加点なし）。複数の時刻がマッチしてもドキュメントは
 1 回だけ報告され、秒未満の時刻も尊重されます（境界は小数秒としてエンコードされます）。
 `Dynamic` ポリシーでは、全要素が RFC 3339 文字列である配列は多値 `DateTime` と推論されます。
-ここで受け付けるのは RFC 3339 のみで（クエリ DSL が受け付けるオフセットなし・日付のみの形式は
-対象外）、RFC 3339 でない要素を含む文字列配列は「多値テキストフィールドは未サポート」
-（Issue #1175）という趣旨のエラーで拒否されます。なお非対称性に注意してください:
+ここで日時として認識されるのは RFC 3339 のみで（クエリ DSL が受け付けるオフセットなし・日付のみの形式は
+対象外）、RFC 3339 でない要素を含む文字列配列は代わりに多値 `Text` と推論されます（Issue #1175）——
+エラーにはなりません。なお非対称性に注意してください:
 *単一*の RFC 3339 文字列は従来どおり `Text` と推論されます（既存のテキストフィールドの
 挙動を変えないため）が、RFC 3339 文字列の*配列*は多値 `DateTime` と推論されます。
 単一値の `DateTime` フィールドが必要な場合はスキーマで明示的に宣言してください。
@@ -370,24 +376,51 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 `Dynamic` ポリシーでは、全要素がブール値である JSON 配列（例: `[true, false]`）は多値 `Boolean` と
 推論されます。`[true, 1]` のような混在配列は、既存の「配列フィールドは数値のみ」という趣旨のエラーで
 拒否されます。スカラーとの非対称性に注意してください: *単一*の `"true"` 文字列は宣言済みの `Boolean`
-フィールドに対して `Bool` に変換されますが、`["true", "false"]` のような文字列*配列*は RFC 3339 日時の
-判定に引っかかって拒否されます —— 配列には JSON のブール値を使ってください。
+フィールドに対して `Bool` に変換され、`["true", "false"]` のような文字列*配列*も*宣言済み*の多値 `Boolean`
+フィールドに送れば同じ規則で要素ごとにパースされます。しかし*未宣言*のフィールドでは、この配列は `Boolean`
+ではなく多値 `Text` と推論されます（Issue #1175）—— ブールとして推論させたい配列には JSON のブール値を使ってください。
 既存の `Boolean` フィールドで `multi_valued` を有効にする変更は metadata-only です。無効にする変更は、
 フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら **`Destructive`**
 になります —— BKD ベースの型と異なり、再構築の元になるポイントツリーがなく、保存された値しかないためです。
 
+`Text` フィールドも同様に `multi_valued = true` を指定できます（Issue #1175）。あわせて
+`position_increment_gap` オプション（デフォルト `100`。Lucene / Elasticsearch と同じ値）が追加されています。
+多値テキストフィールドの各要素はフィールドの analyzer でそれぞれ独立に解析され、全要素のトークンは
+**1 本の昇順の位置列（position sequence）**に追記されます: 要素 `n + 1` の最初のトークンは、要素 `n` の
+最後のトークンから `position_increment_gap` 個後ろの位置に置かれます。gap は要素ごとに加算され、
+トークンを 1 つも生成しない要素に対しても加算されます。以下の挙動はすべてこの付番から導かれます:
+
+- `TermQuery`（または `tags:rust` のような DSL の term）は、**いずれかの要素**がタームを含めばドキュメントにマッチします（Lucene 流の "any match"）。
+- `PhraseQuery` は、slop が `position_increment_gap` 以上でない限り 2 つの要素をまたぐことができません —— 閾値はちょうど `slop == gap` です。デフォルトの gap では、`["hello world", "foo bar"]` はフレーズ `"world foo"` に slop 0〜99 では**マッチせず**、slop 100 で**マッチします**。スパンクエリ（`SpanNearQuery`）も同じ保護を受けます。
+- gap を `0` にすると要素を連結したものとして付番されるため、フレーズは要素境界をまたいでマッチします。gap が「0 から付番し直す」という意味になることはありません。
+- 複数の要素にまたがるタームの重複は、他の多値型と同じくヒット数ではなく term frequency（したがって BM25 スコア）を増やします。フィールド長は総トークン数なので、gap 自体が BM25 の長さ正規化（length normalization）を膨らませることはありません。
+- フレーズクエリが機能するには位置が保存されている必要があります（`term_vectors: true`。デフォルト）。位置がなければフレーズクエリは何にもマッチせず、これは多値・単一値のどちらのフィールドでも同じです。
+
+多値テキストフィールドのハイライトは要素ごとに行われます —— マッチした要素だけがフラグメントを生成し、
+フラグメントが 2 つの要素をまたぐことはありません。詳細は [ハイライト](../laurus/highlighting.md) を参照してください。
+`Dynamic` ポリシーでは、全要素が文字列である JSON 配列は、全要素が RFC 3339 としてパースできれば多値 `DateTime`、
+そうでなければ多値 `Text` と推論されます（例: `["rust", "search"]`）。*単一*の文字列は従来どおり `Text` と推論され、
+日時と判定されることはありません。既存の `Text` フィールドで `multi_valued` を有効にする変更は metadata-only です。
+無効にする変更は、フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら
+**`Destructive`** になります —— `Boolean` と同じく、再構築の元になる BKD tree がないためです。
+`position_increment_gap` の変更は、フィールドが位置を保存している（`term_vectors: true`）場合に再インデックスが
+必要です（`stored` なら `Reindex`、そうでなければ `Destructive`）。既存の posting は古い gap で付番されているためです。
+`term_vectors` が `false` なら gap は観測できないため、変更は metadata-only です。
+
 多値フィールドに単一値を送った場合は要素 1 個の配列に自動ラップされます。
 逆に単一値フィールドに配列を送ると、暗黙の切り捨てではなくエラーになります
 （エラーメッセージは `multi_valued = true` でフィールドを宣言するよう案内します）。
-多値地理・多値日時・多値ブールフィールドに空配列を送った場合は受理され、
-ポイント・時刻・term を持たないフィールドになります（どの空間クエリ・範囲クエリ・term クエリにもマッチしません）。
+多値地理・多値日時・多値ブール・多値テキストフィールドに空配列を送った場合は受理され、
+ポイント・時刻・term を持たないフィールドになります（どの空間クエリ・範囲クエリ・term クエリ・フレーズクエリにもマッチしません）。
 
-多値地理・多値日時・多値ブールの値を含むセグメントは新しい stored-field 型タグを使用するため、
+多値地理・多値日時・多値ブール・多値テキストの値を含むセグメントは新しい stored-field 型タグを使用するため、
 これらの機能より前のビルドでは読み込めません。フォーマットのバージョンは上げていないため、
 古いリーダーはデータを誤読するのではなく、明示的なエラーで失敗します。
 保存される多値日時はマイクロ秒精度（時刻ごとに 1 つの `i64` Unix マイクロ秒。マイクロ秒未満の桁は
 切り捨て）で保持され、単一値の `DateTime` は完全な精度を保ちます。
 保存される多値ブールは要素ごとに 1 バイト（ビットパックなし）で書き込まれます。
+保存される多値テキストは、要素数に続けて各文字列を長さプレフィックス付きで書き込みます
+（本体は単一値のテキストと同じ形式です）。
 
 ### 型衝突
 
@@ -423,6 +456,13 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 | `Boolean`（`multi_valued = true`） | 空の数値配列（`[]`） | 空のブールリスト（どの term クエリにもマッチしない） |
 | `Boolean`（`multi_valued = true`） | 上記以外 | エラー |
 | `Integer` / `Float`（`multi_valued = true`） | `BoolArray` | 要素ごとに `0` / `1` へ拡張（単一値の `Integer` / `Float` は `multi_valued = true` を案内するエラーで拒否） |
+| `Text`（単一値） | `TextArray` | エラー（`multi_valued = true` を宣言する） |
+| `Text`（`multi_valued = true`） | `TextArray` | そのまま格納 |
+| `Text`（`multi_valued = true`） | 単一の `Text`、`Int64`、`Float64`、`Bool`、または `DateTime` | 文字列化して要素 1 個の配列にラップ（スカラーと同じ規則） |
+| `Text`（`multi_valued = true`） | `Int64Array` / `Float64Array` / `BoolArray` / `DateTimeArray` | 要素ごとに文字列化（日時は RFC 3339） |
+| `Text`（`multi_valued = true`） | `Null` または空の数値配列（`[]`） | 空の文字列リスト（どの term クエリ・フレーズクエリにもマッチしない） |
+| `Text`（`multi_valued = true`） | 上記以外（地理配列・ベクトル・バイト列） | エラー |
+| `Integer` / `Float` / `Boolean` / `DateTime`（`multi_valued = true`） | `TextArray` | スカラーの `Text` と同じ規則で要素ごとにパース（`["1", "2"]` → `[1, 2]`。不正な要素はその要素を示すエラー）。単一値の `Integer` / `Float` / `Boolean` / `DateTime` は `multi_valued = true` を案内するエラーで拒否 |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | `Text` または `Bytes` | フィールドの embedder にそのまま渡す |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | 数値配列 | 要素ごとに `f32` へキャスト |
 
@@ -510,8 +550,8 @@ let outcome = engine.update_field(
 変更内容は次の3種類に分類され、`outcome.classification` で確認できます。
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
-- **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`indexed: false → true`、HNSW の `m`/`ef_construction` 変更）。
-- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` フィールドの `multi_valued` を無効にする変更）。
+- **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、HNSW の `m`/`ef_construction` 変更）。
+- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` フィールドの `multi_valued` を無効にする変更）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 

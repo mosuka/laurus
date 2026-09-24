@@ -50,7 +50,7 @@ let query = PhraseQuery::new("body", vec!["machine".to_string(), "learning".to_s
 let query = PhraseQuery::from_phrase("body", "machine learning");
 ```
 
-フレーズクエリは、ターム位置情報が格納されている必要があります（`TextOption` のデフォルト設定）。
+フレーズクエリは、ターム位置情報が格納されている必要があります（`TextOption` のデフォルト設定）。多値テキストフィールド（`multi_valued = true`）では、各要素がフィールドの `position_increment_gap`（デフォルト 100）で区切られた 1 本の位置列を共有するため、slop がその gap に達しない限りフレーズが 2 つの要素をまたぐことはありません —— 詳細は [スキーマとフィールド](../schema_and_fields.md) を参照してください。
 
 ### BooleanQuery
 

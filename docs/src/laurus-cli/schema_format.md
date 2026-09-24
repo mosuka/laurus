@@ -40,18 +40,24 @@ Full-text searchable field. Text is processed by the analysis pipeline (tokeniza
 
 ```toml
 [fields.title.Text]
-indexed = true      # Whether to index this field for search
-stored = true       # Whether to store the original value for retrieval
-term_vectors = true # Whether to store term positions (for phrase and span queries)
-doc_values = true   # Whether to also copy the value into DocValues (for sorting/faceting)
+indexed = true               # Whether to index this field for search
+stored = true                # Whether to store the original value for retrieval
+multi_valued = false         # Whether to accept arrays of strings (Issue #1175)
+position_increment_gap = 100 # Positions skipped between the elements of a multi-valued field
+term_vectors = true          # Whether to store term positions (for phrase and span queries)
+doc_values = true            # Whether to also copy the value into DocValues (for sorting/faceting)
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `indexed` | `bool` | `true` | Enables searching this field |
 | `stored` | `bool` | `true` | Stores the original value so it can be returned in results |
+| `multi_valued` | `bool` | `false` | Accept arrays of strings; a term query matches if **any** element contains the term (Lucene-style "any match"); a phrase query never spans two elements unless its slop reaches `position_increment_gap` |
+| `position_increment_gap` | `integer` | `100` | Positions skipped between the elements of a multi-valued field (Lucene `positionIncrementGap`); `0` numbers the elements as if concatenated. Ignored unless `multi_valued = true` |
 | `term_vectors` | `bool` | `true` | Stores term positions, read by phrase and span queries; highlighting always re-tokenizes the stored text and does not use them |
 | `doc_values` | `bool` | `true` | Copies the value into DocValues, the column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation read from. Takes effect only when `stored` is also `true` — see [Common option: `doc_values`](#common-option-doc_values) below |
+
+The interactive generator (`laurus create schema`, see [Generating a Schema](#generating-a-schema)) asks whether a Text field is multi-valued and, when it is, for its position increment gap.
 
 #### Integer
 

@@ -395,14 +395,17 @@ for (let i = 0; i < 10000; i++) {
 
 ### メソッド
 
-#### `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?)`
+#### `addTextField(name, stored?, indexed?, termVectors?, docValues?, analyzer?, multiValued?, positionIncrementGap?)`
 
 全文検索テキストフィールドを追加します。`docValues` は値を DocValues
 （ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを
 制御します（Issue #1047、デフォルト `true`）。`stored` も `true` の場合のみ
 有効です。`analyzer` にはパラメータ不要の組込名（`"standard"` /
 `"english"` / `"keyword"` / `"simple"` / `"noop"`）または `addAnalyzer()`
-で登録したランタイム analyzer 名を指定します。
+で登録したランタイム analyzer 名を指定します。`multiValued: true` を指定すると
+文字列の配列を受け付け（Issue #1175）、term クエリは**いずれかの要素**がタームを含めばマッチし、
+フレーズクエリは slop が `positionIncrementGap`（デフォルト `100`。`0` にすると要素を連結したものとして付番）
+に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。
 
 日本語の形態素解析を行う場合は、まず `JapaneseAnalyzer` を IPADIC の
 バイト列から構築し、`addAnalyzer()` で登録してください。

@@ -169,7 +169,7 @@ Laurus::Schema.new
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `add_text_field(name, stored: true, indexed: true, term_vectors: true, doc_values: true, analyzer: nil)` | 全文フィールド（転置インデックス、BM25）。`term_vectors:` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values:` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored: true` の場合のみ有効です。`analyzer:` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
+| `add_text_field(name, stored: true, indexed: true, term_vectors: true, doc_values: true, analyzer: nil, multi_valued: false, position_increment_gap: 100)` | 全文フィールド（転置インデックス、BM25）。`term_vectors:` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values:` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored: true` の場合のみ有効です。`multi_valued: true` で String の Array を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `position_increment_gap:`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は String の Array として読み戻されます。`analyzer:` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）を指定します。Lindera 辞書パスが必要な Japanese プリセットは、`lindera` tokenizer を含むカスタム analyzer として登録し、名前で参照してください。 |
 | `add_integer_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット整数フィールド。`multi_valued: true` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
 | `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット浮動小数点フィールド。`multi_valued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
 | `add_boolean_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | ブールフィールド。`multi_valued: true` で `true` / `false` の Array を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `true` / `false` の Array として読み戻されます）。`doc_values:` は上記を参照。 |
@@ -569,5 +569,6 @@ Ruby の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `Array`（`"lat"`, `"lon"` を持つ `Hash` の配列） | `GeoArray` | フィールドに `multi_valued: true` が必要 |
 | `Array`（`"x"`, `"y"`, `"z"` を持つ `Hash` の配列） | `GeoEcefArray` | フィールドに `multi_valued: true` が必要 |
 | `Time` / `String`（`iso8601` に応答） | `DateTime` | `iso8601` 経由で変換 |
-| `Array`（`Time` / `iso8601` に応答する `String`） | `DateTimeArray` | 各要素を RFC 3339 としてパース（`iso8601` に応答するオブジェクトは先に変換）。日時でない `String` は `ArgumentError`。フィールドに `multi_valued: true` が必要 |
+| `Array`（`Time`、または `iso8601` に応答する他のオブジェクトを含む） | `DateTimeArray` | 各要素を RFC 3339 としてパース（`iso8601` に応答するオブジェクトは先に変換）。日時でない要素は `ArgumentError`。フィールドに `multi_valued: true` が必要 |
+| `Array`（`String`） | `DateTimeArray` または `TextArray` | 全要素が RFC 3339 としてパースできれば `DateTimeArray`、そうでなければ `TextArray`（Issue #1175。String の Array として読み戻される）。フィールドに `multi_valued: true` が必要 |
 | `Array`（`true` / `false`） | `BoolArray` | 全要素が `true` または `false` であること。`[true, 1]` のような混在 Array は `TypeError`。フィールドに `multi_valued: true` が必要 |

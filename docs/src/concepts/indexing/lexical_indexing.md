@@ -64,7 +64,7 @@ Each entry in a posting list contains:
 | :--- | :--- |
 | Document ID | Internal `u64` identifier (per-segment value must fit in `u32`) |
 | Term Frequency | How many times the term appears in this document |
-| Positions (optional) | Where in the document the term appears (needed for phrase queries) |
+| Positions (optional) | Where in the document the term appears (needed for phrase queries). The elements of a multi-valued text field share one ascending sequence, separated by the field's `position_increment_gap` |
 | Weight | Score weight for this posting. Defaults to `1.0`, which is what every posting written by Laurus carries; a list in which every weight is `1.0` omits the weights section from disk entirely (v3) |
 
 ### On-Disk Posting Layout
