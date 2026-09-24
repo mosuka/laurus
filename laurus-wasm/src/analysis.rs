@@ -212,7 +212,7 @@ impl WasmSynonymGraphFilter {
 /// );
 /// const schema = new Schema();
 /// schema.addAnalyzer("ja-ipadic", ja);
-/// schema.addTextField("body", undefined, undefined, undefined, "ja-ipadic");
+/// schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipadic");
 /// const index = await Index.create(schema);
 /// ```
 #[wasm_bindgen(js_name = "JapaneseAnalyzer")]

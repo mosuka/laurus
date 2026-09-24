@@ -5,7 +5,7 @@
  * NumericRange, Boolean, and SearchRequest.
  */
 
-import { Index, Schema, SearchRequest } from "../index.js";
+import { Index, PhraseQuery, Schema, SearchRequest } from "../index.js";
 
 // Create schema and index
 const schema = new Schema();
@@ -52,8 +52,8 @@ for (const r of await index.searchTerm("description", "framework", 5)) {
 
 // Phrase query via SearchRequest
 console.log("\n=== Phrase: description='web framework' ===");
-const phraseReq = new SearchRequest(5);
-phraseReq.setLexicalPhraseQuery("description", ["web", "framework"]);
+const phraseReq = new SearchRequest({ limit: 5 });
+phraseReq.setLexicalPhrase(new PhraseQuery("description", ["web", "framework"]));
 for (const r of await index.searchWithRequest(phraseReq)) {
   console.log(`  ${r.id}  ${r.document.name}`);
 }

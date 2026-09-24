@@ -93,7 +93,7 @@ const ja = JapaneseAnalyzer.fromBytes(
 
 const schema = new Schema();
 schema.addAnalyzer("ja-ipadic", ja);
-schema.addTextField("body", undefined, undefined, undefined, "ja-ipadic");
+schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipadic");
 ```
 
 The OPFS helpers (`downloadDictionary`, `getDictionaryVersion`, `loadDictionaryFiles`, `hasDictionary`, `listDictionaries`, `removeDictionary`) live in [`js/opfs.js`](https://github.com/mosuka/laurus/blob/main/laurus-wasm/js/opfs.js) and are re-exported as the `laurus-wasm/opfs` subpath in `package.json`. See [API Reference → JapaneseAnalyzer](api_reference.md#japaneseanalyzer) for the argument table.

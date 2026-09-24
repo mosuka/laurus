@@ -139,7 +139,9 @@ await index.commit();   // WAL もフラッシュされます
 
 ```javascript
 const schema = new Schema();
-schema.addTextField("title", true, true, false, "lindera-ipadic");
+// 第 6 引数が analyzer。ここでは組込名を指定。Japanese などのカスタム analyzer は
+// 先に addAnalyzer で登録し、その名前で参照する（API リファレンス参照）。
+schema.addTextField("title", true, true, false, true, "english");
 schema.addIntegerField("year");
 schema.addFloatField("price");
 schema.addBooleanField("active");
@@ -159,17 +161,25 @@ schema.setDefaultFields(["title", "body"]);
 ### SearchRequest（高度な検索）
 
 ```javascript
-import { SearchRequest } from "laurus-nodejs";
+import {
+  PhraseQuery,
+  RRF,
+  SearchRequest,
+  TermQuery,
+  VectorQuery,
+  VectorTextQuery,
+  WeightedSum,
+} from "laurus-nodejs";
 
-const req = new SearchRequest(10, 0);  // limit, offset
+const req = new SearchRequest({ limit: 10, offset: 0 });
 req.setQueryDsl("title:hello");
-req.setLexicalTermQuery("body", "programming");
-req.setLexicalPhraseQuery("title", ["machine", "learning"]);
-req.setVectorQuery("embedding", [0.1, 0.2, ...]);
-req.setVectorTextQuery("embedding", "クエリテキスト");
-req.setFilterQuery("category", "tech");
-req.setRrfFusion(60.0);
-req.setWeightedSumFusion(0.3, 0.7);
+req.setLexicalTerm(new TermQuery("body", "programming"));
+req.setLexicalPhrase(new PhraseQuery("title", ["machine", "learning"]));
+req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, ...]));
+req.setVectorTextQuery(new VectorTextQuery("embedding", "クエリテキスト"));
+req.setFilterTerm(new TermQuery("category", "tech"));
+req.setRrfFusion(new RRF(60.0));
+req.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
 
 const results = await index.searchWithRequest(req);
 ```

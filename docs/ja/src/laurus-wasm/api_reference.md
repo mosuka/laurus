@@ -519,7 +519,7 @@ const ja = JapaneseAnalyzer.fromBytes(
 
 const schema = new Schema();
 schema.addAnalyzer("ja-ipadic", ja);
-schema.addTextField("body", undefined, undefined, undefined, "ja-ipadic");
+schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipadic");
 ```
 
 #### `addEmbedder(name, config)`

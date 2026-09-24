@@ -112,7 +112,9 @@ the default per-record behaviour.
 
 ```javascript
 const schema = new Schema();
-schema.addTextField("title", true, true, false, "lindera-ipadic");
+// 6th argument = analyzer: a built-in name here; custom analyzers (e.g. Japanese)
+// are registered with addAnalyzer first and referenced by name (see the API reference).
+schema.addTextField("title", true, true, false, true, "english");
 schema.addIntegerField("year");
 schema.addFloatField("price");
 schema.addBooleanField("active");

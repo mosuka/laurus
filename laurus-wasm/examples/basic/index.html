@@ -144,8 +144,8 @@
 
         const schema = new Schema();
         schema.addAnalyzer(ANALYZER_NAME, analyzer);
-        schema.addTextField('title', undefined, undefined, undefined, ANALYZER_NAME);
-        schema.addTextField('body', undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('title', undefined, undefined, undefined, undefined, ANALYZER_NAME);
+        schema.addTextField('body', undefined, undefined, undefined, undefined, ANALYZER_NAME);
         schema.addEmbedder(EMBEDDER_NAME, {
           type: 'callback',
           embed,

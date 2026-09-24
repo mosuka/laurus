@@ -58,8 +58,8 @@ use serde_json::Value;
 ///
 /// // Via SearchRequest for full control
 /// const req = new SearchRequest();
-/// req.setVectorTextQuery("embedding", "concurrent");
-/// req.setRrfFusion();
+/// req.setVectorTextQuery(new VectorTextQuery("embedding", "concurrent"));
+/// req.setRrfFusion(new RRF(60.0));
 /// const results = await index.searchWithRequest(req);
 /// ```
 #[napi(js_name = "Index")]

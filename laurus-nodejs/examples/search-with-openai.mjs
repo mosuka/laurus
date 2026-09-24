@@ -12,7 +12,7 @@
  *     node examples/search-with-openai.mjs
  */
 
-import { Index, Schema, SearchRequest } from "../index.js";
+import { Index, RRF, Schema, SearchRequest, TermQuery, VectorQuery, WeightedSum } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // OpenAI embedding helper
@@ -118,9 +118,9 @@ printResults(
 console.log("\n" + "=".repeat(60));
 console.log("[B] Filtered Vector Search: 'database ORM queries' + category='testing'");
 console.log("=".repeat(60));
-const reqB = new SearchRequest(3);
-reqB.setVectorQuery("text_vec", await embed("database ORM queries"));
-reqB.setFilterQuery("category", "testing");
+const reqB = new SearchRequest({ limit: 3 });
+reqB.setVectorQuery(new VectorQuery("text_vec", await embed("database ORM queries")));
+reqB.setFilterTerm(new TermQuery("category", "testing"));
 printResults(await index.searchWithRequest(reqB));
 
 // =====================================================================
@@ -137,10 +137,10 @@ printResults(await index.searchTerm("text", "middleware", 3));
 console.log("\n" + "=".repeat(60));
 console.log("[D] Hybrid Search (RRF): vector='server-side rendering' + lexical='server'");
 console.log("=".repeat(60));
-const reqD = new SearchRequest(3);
-reqD.setLexicalTermQuery("text", "server");
-reqD.setVectorQuery("text_vec", await embed("server-side rendering"));
-reqD.setRrfFusion(60.0);
+const reqD = new SearchRequest({ limit: 3 });
+reqD.setLexicalTerm(new TermQuery("text", "server"));
+reqD.setVectorQuery(new VectorQuery("text_vec", await embed("server-side rendering")));
+reqD.setRrfFusion(new RRF(60.0));
 printResults(await index.searchWithRequest(reqD));
 
 // =====================================================================
@@ -149,10 +149,10 @@ printResults(await index.searchWithRequest(reqD));
 console.log("\n" + "=".repeat(60));
 console.log("[E] Hybrid Search (WeightedSum 0.3/0.7): vector='fast bundler' + lexical='typescript'");
 console.log("=".repeat(60));
-const reqE = new SearchRequest(3);
-reqE.setLexicalTermQuery("text", "typescript");
-reqE.setVectorQuery("text_vec", await embed("fast bundler"));
-reqE.setWeightedSumFusion(0.3, 0.7);
+const reqE = new SearchRequest({ limit: 3 });
+reqE.setLexicalTerm(new TermQuery("text", "typescript"));
+reqE.setVectorQuery(new VectorQuery("text_vec", await embed("fast bundler")));
+reqE.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
 printResults(await index.searchWithRequest(reqE));
 
 console.log("\nSearch with OpenAI example completed!");
