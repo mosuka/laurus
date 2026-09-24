@@ -203,6 +203,20 @@ pub trait LexicalIndexReader: Send + Sync + std::fmt::Debug {
         }
     }
 
+    /// Whether [`Self::term_info`] and [`Self::term_doc_freq`] account for
+    /// every document this reader can match (Issue #1196).
+    ///
+    /// `false` when part of the index has no term dictionary and answers
+    /// term queries by scanning stored documents instead: such documents are
+    /// reachable through `postings` but invisible to the dictionary, so a
+    /// missing entry no longer proves a term matches nothing. Callers that
+    /// short-circuit on the dictionary — `TermQuery::is_empty`, the `count`
+    /// fast path — must fall through to the matcher when this is `false`.
+    /// Readers without such partial-index states keep the default `true`.
+    fn term_info_is_authoritative(&self) -> bool {
+        true
+    }
+
     /// Get field statistics including average field length.
     ///
     /// If the requested field is not found in the index, this default implementation

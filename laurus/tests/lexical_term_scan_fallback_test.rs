@@ -9,11 +9,11 @@
 //! `.post` **and** `.dict` are deleted outright. Two consequences shape the
 //! assertions below:
 //!
-//! - `TermQuery::is_empty` consults the term dictionary, and
-//!   `LexicalStore::search` / `count` short-circuit on it. Segment 1's
-//!   `.dict` is therefore load-bearing: it is what lets a term query reach
-//!   the matcher at all. A term that exists only in the index-less segment
-//!   is still found by `matching_doc_ids`, which bypasses `is_empty`.
+//! - `TermQuery::is_empty` and `count`'s `doc_freq` fast path consult the
+//!   term dictionaries, which the index-less segment is absent from. Since
+//!   #1196 the reader reports `term_info_is_authoritative() == false` in
+//!   that state, so both fall through to the matcher and the scanned
+//!   documents are found and counted like any other.
 //! - A scan hit has no `term_info`, so it scores 0.0. It is collected as
 //!   long as the top-k heap is not full, hence the generous `limit`.
 
@@ -128,10 +128,9 @@ fn phrase(terms: &[&str], slop: u32) -> Box<PhraseQuery> {
 fn term_query_reaches_a_multi_valued_document_through_the_scan_fallback() {
     let (_storage, store) = store_with_an_index_less_first_segment();
 
-    // `rust` is in segment 1's dictionary, so the query is not empty; the
-    // multi-valued document then comes from segment 0's scan. Before
-    // #1194 the scan skipped `TextArray` and only the scalar document was
-    // found.
+    // The multi-valued document comes from segment 0's scan, the scalar one
+    // from segment 1's postings. Before #1194 the scan skipped `TextArray`
+    // and only the scalar document was found.
     assert_eq!(
         hit_ids(&store, LexicalSearchRequest::new(term("rust")).limit(100)),
         vec![MULTI_VALUED_DOC, SCALAR_DOC]
@@ -139,28 +138,37 @@ fn term_query_reaches_a_multi_valued_document_through_the_scan_fallback() {
     let ids = store.matching_doc_ids(term("rust")).unwrap();
     assert!(ids.contains(MULTI_VALUED_DOC) && ids.contains(SCALAR_DOC));
 
-    // Characterization: `count` takes the #610 fast path for a bare
-    // `TermQuery` without deletions and returns the dictionary's
-    // `doc_freq`, which the index-less segment cannot contribute to — so
-    // it stays at 1 while `search` finds 2. Tracked with the fallback's
-    // other limitations in #1196.
+    // `count` would take the #610 `doc_freq` fast path, which the
+    // index-less segment cannot contribute to; the reader is not
+    // authoritative here (#1196), so `count` walks the matcher and agrees
+    // with `search`.
     assert_eq!(
         store
             .count(LexicalSearchRequest::new(term("rust")).limit(100))
             .unwrap(),
-        1
+        2
     );
 }
 
 #[test]
-fn a_term_known_only_to_the_index_less_segment_is_found_by_matching_doc_ids() {
+fn a_term_known_only_to_the_index_less_segment_is_found() {
     let (_storage, store) = store_with_an_index_less_first_segment();
 
-    // `search` short-circuits on `TermQuery::is_empty`, which only sees
-    // segment 1's dictionary — characterization of the current behaviour,
-    // tracked with the fallback's other limitations in #1196.
-    assert!(hit_ids(&store, LexicalSearchRequest::new(term("search")).limit(100)).is_empty());
-    // `matching_doc_ids` runs the matcher directly and reaches the scan.
+    // `search` short-circuits on `TermQuery::is_empty`, which no dictionary
+    // can answer for this term. With a segment lacking its dictionary the
+    // reader is not authoritative (#1196), so the query is not considered
+    // empty and the scan finds the document.
+    assert_eq!(
+        hit_ids(&store, LexicalSearchRequest::new(term("search")).limit(100)),
+        vec![MULTI_VALUED_DOC]
+    );
+    assert_eq!(
+        store
+            .count(LexicalSearchRequest::new(term("search")).limit(100))
+            .unwrap(),
+        1
+    );
+    // `matching_doc_ids` runs the matcher directly and reaches the scan too.
     let ids = store.matching_doc_ids(term("search")).unwrap();
     assert!(ids.contains(MULTI_VALUED_DOC));
     assert!(!ids.contains(SCALAR_DOC));

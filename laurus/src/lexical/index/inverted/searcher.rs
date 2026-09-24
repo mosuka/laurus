@@ -1461,8 +1461,13 @@ impl InvertedIndexSearcher {
         //   in which case the two agree. (Conservative: any inequality, for any
         //   reason, just keeps the slow path.)
         // - the query is exactly a `TermQuery` (not a Boolean/phrase/etc.).
+        // - `term_info_is_authoritative()`: a segment without a term
+        //   dictionary matches through the stored-document scan but is
+        //   absent from `doc_freq` (Issue #1196), so only a fully indexed
+        //   reader may answer from the dictionary.
         if request.params.min_score <= 0.0
             && self.reader.doc_count() == self.reader.max_doc()
+            && self.reader.term_info_is_authoritative()
             && let Some(term_query) = query.as_any().downcast_ref::<TermQuery>()
         {
             return self

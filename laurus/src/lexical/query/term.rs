@@ -125,6 +125,12 @@ impl Query for TermQuery {
     }
 
     fn is_empty(&self, reader: &dyn LexicalIndexReader) -> Result<bool> {
+        // A segment without a term dictionary still matches through the
+        // stored-document scan (Issue #1196), so the dictionary cannot prove
+        // emptiness; let the matcher decide.
+        if !reader.term_info_is_authoritative() {
+            return Ok(false);
+        }
         // Schema-less: no field validation needed
         match reader.term_info(&self.field, &self.term)? {
             Some(term_info) => Ok(term_info.doc_freq == 0),

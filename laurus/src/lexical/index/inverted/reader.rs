@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use ahash::AHashMap;
 use lru::LruCache;
@@ -1150,6 +1150,20 @@ impl SegmentReader {
         Ok(self.term_dictionary.read().unwrap().clone())
     }
 
+    /// Whether this segment has an on-disk term dictionary (Issue #1196).
+    ///
+    /// A segment without one still answers `postings` through the
+    /// stored-document scan, but contributes nothing to `term_info`, so a
+    /// reader containing such a segment cannot treat `term_info` as the
+    /// authority on which terms exist — see
+    /// [`InvertedIndexReader::term_info_is_authoritative`]. A dictionary that
+    /// fails to load counts as absent.
+    pub fn has_term_dictionary(&self) -> bool {
+        self.term_dictionary()
+            .map(|dict| dict.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn postings(&self, field: &str, term: &str) -> Result<Option<Box<dyn PostingIterator>>> {
         // Load postings from storage
         let postings_file = format!("{}.post", self.info.segment_id);
@@ -1713,9 +1727,33 @@ pub struct InvertedIndexReader {
 
     /// Total document count across all segments.
     total_doc_count: u64,
+
+    /// Lazily computed: does every segment have a term dictionary, so that
+    /// `term_info` / `term_doc_freq` account for every document (Issue
+    /// #1196)? Filled on first use — the first `is_empty` of a search
+    /// already loads every segment's `.dict`, so this costs no extra I/O —
+    /// and shared by clones like the other snapshot-scoped state.
+    term_info_complete: Arc<OnceLock<bool>>,
 }
 
 impl InvertedIndexReader {
+    /// Whether `term_info` and `term_doc_freq` reflect every document in this
+    /// reader (Issue #1196).
+    ///
+    /// `false` when some segment has no term dictionary: its documents are
+    /// still reachable through `postings` (the stored-document scan) but are
+    /// absent from the dictionaries, so "the term has no entry" no longer
+    /// means "the term matches nothing". `TermQuery::is_empty` and the
+    /// `count` fast path consult this before trusting the dictionary.
+    /// Vacuously `true` for a reader with no segments.
+    pub fn term_info_is_authoritative(&self) -> bool {
+        *self.term_info_complete.get_or_init(|| {
+            self.segment_readers
+                .iter()
+                .all(|segment| segment.read().unwrap().has_term_dictionary())
+        })
+    }
+
     /// Create a new advanced index reader (schema-less mode).
     pub fn new(
         segments: Vec<SegmentInfo>,
@@ -1758,6 +1796,7 @@ impl InvertedIndexReader {
             config,
             closed: Arc::new(AtomicBool::new(false)),
             total_doc_count,
+            term_info_complete: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1877,6 +1916,10 @@ impl InvertedIndexReader {
 }
 
 impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
+    fn term_info_is_authoritative(&self) -> bool {
+        InvertedIndexReader::term_info_is_authoritative(self)
+    }
+
     fn doc_count(&self) -> u64 {
         // Sum live doc counts from each segment (accounts for deletions).
         self.segment_readers
@@ -2900,6 +2943,77 @@ mod tests {
         // one-way latch per reader instance.
         let _ = reader.postings("tags", "missing").unwrap();
         assert!(reader.has_warned_missing_postings());
+    }
+
+    // ---- Term-dictionary authority, Issue #1196 ---------------------------
+
+    #[test]
+    fn has_term_dictionary_reflects_the_dict_file() {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        // The `.docs`-only fixture has no dictionary ...
+        let (storage, info) =
+            docs_only_segment("scan_no_dict", &[(0, vec![("tags", text("rust"))])], false);
+        assert!(
+            !SegmentReader::open(info, storage)
+                .unwrap()
+                .has_term_dictionary()
+        );
+
+        // ... while a writer-built segment always carries one, so a reader
+        // over it stays authoritative.
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document(crate::Document::builder().add_text("body", "alpha").build())
+            .unwrap();
+        writer.commit().unwrap();
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert!(
+            inverted.segment_readers()[0]
+                .read()
+                .unwrap()
+                .has_term_dictionary()
+        );
+        assert!(inverted.term_info_is_authoritative());
+    }
+
+    #[test]
+    fn reader_with_a_dictionary_less_segment_is_not_authoritative() {
+        use crate::lexical::query::term::TermQuery;
+
+        let (storage, info) =
+            docs_only_segment("scan_partial", &[(0, vec![("tags", text("rust"))])], false);
+        let partial = InvertedIndexReader::new(
+            vec![info],
+            storage.clone(),
+            InvertedIndexReaderConfig::default(),
+        )
+        .unwrap();
+        assert!(!partial.term_info_is_authoritative());
+        // The dictionary cannot prove emptiness here, so the query must be
+        // handed to the matcher (which then takes the scan).
+        assert!(!TermQuery::new("tags", "rust").is_empty(&partial).unwrap());
+        assert!(
+            !TermQuery::new("tags", "missing")
+                .is_empty(&partial)
+                .unwrap()
+        );
+
+        // No segments at all: vacuously authoritative, and an unknown term
+        // is empty as before.
+        let empty = InvertedIndexReader::new(vec![], storage, InvertedIndexReaderConfig::default())
+            .unwrap();
+        assert!(empty.term_info_is_authoritative());
+        assert!(TermQuery::new("tags", "rust").is_empty(&empty).unwrap());
     }
 
     /// #1047: `has_doc_values` must reflect the schema's per-field
