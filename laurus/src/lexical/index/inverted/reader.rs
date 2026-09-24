@@ -15,7 +15,6 @@ use roaring::RoaringTreemap;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::Token;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::document::Document;
 use crate::lexical::core::field::FieldValue;
@@ -1204,7 +1203,24 @@ impl SegmentReader {
         }
     }
 
-    /// Scan documents for a term (fallback when no inverted index).
+    /// Answer a term query from the stored documents when this segment has
+    /// no `.post` file (the only condition under which [`Self::postings`]
+    /// calls this). The writer always emits the postings part and compound
+    /// segments are the default, so the path is reached only for a loose
+    /// segment whose `.post` was lost or a pre-compound stored-only segment
+    /// — and, through the merge engine's replay, for carrying such a
+    /// segment's terms into a merged segment.
+    ///
+    /// Every stored value is re-analyzed with the writer's own
+    /// `analyze_field_value` (Issue #1194), so each `DataValue` variant —
+    /// `Text`, a multi-valued `TextArray` with its position-increment gap,
+    /// `Bool` / `BoolArray` as `"true"` / `"false"`, numeric and datetime
+    /// terms — yields exactly the terms and dense positions its postings
+    /// would have carried. Because the segment reader is schema-less the
+    /// analyzer is the default `StandardAnalyzer`, the gap is
+    /// `position_increment_gap_for(None)`, and `indexed: false` cannot be
+    /// honoured; the result is not cached and scores are zero without a
+    /// `.dict` (tracked in Issue #1196).
     fn scan_documents_for_term(
         &self,
         field: &str,
@@ -1220,35 +1236,40 @@ impl SegmentReader {
 
         if let Some(ref documents) = *docs {
             let mut postings = Vec::new();
-            let default_analyzer = StandardAnalyzer::new()?;
+            let analyzer: Arc<dyn Analyzer> = Arc::new(StandardAnalyzer::new()?);
+            let position_increment_gap = super::writer::position_increment_gap_for(None);
 
             for (doc_id, doc) in documents.iter() {
                 if self.is_deleted(*doc_id)? {
                     continue;
                 }
+                let Some(field_value) = doc.get_field(field) else {
+                    continue;
+                };
 
-                if let Some(field_value) = doc.get_field(field)
-                    && let Some(text) = field_value.as_text()
-                {
-                    // Use default analyzer (analyzers are configured at writer level)
-                    let token_stream = default_analyzer.analyze(text)?;
-                    let tokens: Vec<Token> = token_stream.collect();
+                // Same term derivation as indexing; the BKD points half of
+                // the tuple has no meaning for a term lookup.
+                let (terms, _points) = super::writer::analyze_field_value(
+                    field,
+                    field_value,
+                    &analyzer,
+                    position_increment_gap,
+                )?;
+                // `AnalyzedTerm::frequency` is a running count per token, so
+                // the term frequency is the number of matching entries.
+                let positions: Vec<u32> = terms
+                    .iter()
+                    .filter(|analyzed| analyzed.term == term)
+                    .map(|analyzed| analyzed.position)
+                    .collect();
 
-                    let mut positions = Vec::new();
-                    for token in tokens.iter() {
-                        if token.text == term {
-                            positions.push(token.position as u32);
-                        }
-                    }
-
-                    if !positions.is_empty() {
-                        postings.push(Posting {
-                            doc_id: *doc_id,
-                            frequency: positions.len() as u32,
-                            positions: Some(positions),
-                            weight: 1.0,
-                        });
-                    }
+                if !positions.is_empty() {
+                    postings.push(Posting {
+                        doc_id: *doc_id,
+                        frequency: positions.len() as u32,
+                        positions: Some(positions),
+                        weight: 1.0,
+                    });
                 }
             }
 
@@ -2514,6 +2535,236 @@ mod tests {
     use super::*;
     use crate::lexical::reader::PostingIterator;
 
+    // ---- `.post`-less segments: the `scan_documents_for_term` fallback,
+    // ---- Issue #1194 ---------------------------------------------------
+
+    /// Hand-build a segment holding ONLY a `.docs` part — no `.post`, `.dict`
+    /// or `.norms` — so [`SegmentReader::postings`] has to take the
+    /// `scan_documents_for_term` fallback. `docs` are
+    /// `(doc_id, [(field, stored value)])`. Returns the storage and the
+    /// `SegmentInfo` so a test can add a `.delmap` before opening the reader.
+    fn docs_only_segment(
+        segment_id: &str,
+        docs: &[(u64, Vec<(&str, crate::data::DataValue)>)],
+        has_deletions: bool,
+    ) -> (Arc<dyn crate::storage::Storage>, SegmentInfo) {
+        use crate::lexical::core::analyzed::AnalyzedDocument;
+        use crate::lexical::index::structures::stored_fields::StoredFieldsWriter;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::storage::structured::StructWriter;
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let analyzed: Vec<(u64, AnalyzedDocument)> = docs
+            .iter()
+            .map(|(doc_id, fields)| {
+                let mut doc = AnalyzedDocument::new();
+                for (field, value) in fields {
+                    doc.stored_fields
+                        .insert((*field).to_string(), value.clone());
+                }
+                (*doc_id, doc)
+            })
+            .collect();
+        {
+            let output = storage
+                .create_output(&format!("{segment_id}.docs"))
+                .unwrap();
+            let mut w = StructWriter::new(output);
+            StoredFieldsWriter::write_to(&mut w, &analyzed).unwrap();
+            w.close().unwrap();
+        }
+        assert!(
+            !storage.file_exists(&format!("{segment_id}.post")),
+            "the fixture must not have a postings part, or the scan fallback is never taken"
+        );
+        let info = SegmentInfo {
+            segment_id: segment_id.to_string(),
+            doc_count: docs.len() as u64,
+            min_doc_id: docs.iter().map(|d| d.0).min().unwrap_or(0),
+            max_doc_id: docs.iter().map(|d| d.0).max().unwrap_or(0),
+            generation: 0,
+            has_deletions,
+            shard_id: 0,
+        };
+        (storage, info)
+    }
+
+    /// `(doc_id, term_freq, positions)` for every posting `postings(field, term)`
+    /// yields on `reader`, in doc-id order.
+    fn scan_hits(reader: &SegmentReader, field: &str, term: &str) -> Vec<(u64, u64, Vec<u64>)> {
+        let mut hits = Vec::new();
+        if let Some(mut iter) = reader.postings(field, term).unwrap() {
+            while iter.next().unwrap() {
+                hits.push((iter.doc_id(), iter.term_freq(), iter.positions().unwrap()));
+            }
+        }
+        hits
+    }
+
+    fn texts(items: &[&str]) -> crate::data::DataValue {
+        crate::data::DataValue::TextArray(items.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn text(s: &str) -> crate::data::DataValue {
+        crate::data::DataValue::Text(s.to_string())
+    }
+
+    #[test]
+    fn scan_fallback_matches_any_element_of_a_text_array() {
+        let (storage, info) = docs_only_segment(
+            "scan_any",
+            &[
+                (0, vec![("tags", texts(&["rust", "search engine"]))]),
+                (1, vec![("tags", text("rust"))]),
+                (2, vec![("other", text("rust"))]),
+            ],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage).unwrap();
+
+        // Array element and scalar both match; another field does not.
+        assert_eq!(
+            scan_hits(&reader, "tags", "rust"),
+            vec![(0, 1, vec![0]), (1, 1, vec![0])]
+        );
+        // Elements are analyzed individually; the second element's tokens
+        // start `position_increment_gap` past the first element's last one.
+        assert_eq!(
+            scan_hits(&reader, "tags", "search"),
+            vec![(0, 1, vec![101])]
+        );
+        assert_eq!(
+            scan_hits(&reader, "tags", "engine"),
+            vec![(0, 1, vec![102])]
+        );
+        assert!(scan_hits(&reader, "tags", "missing").is_empty());
+        assert!(reader.postings("tags", "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn scan_fallback_positions_span_elements_with_the_gap() {
+        // Parity with the writer's `TextArray` arm: `foo` sits at
+        // 2 (tokens of "hello world") + 100 (gap) = 102, so a phrase across
+        // the element boundary needs slop >= gap exactly as on the indexed
+        // path (multi_valued_text_test.rs).
+        let (storage, info) = docs_only_segment(
+            "scan_gap",
+            &[(0, vec![("body", texts(&["hello world", "foo bar"]))])],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(scan_hits(&reader, "body", "hello"), vec![(0, 1, vec![0])]);
+        assert_eq!(scan_hits(&reader, "body", "world"), vec![(0, 1, vec![1])]);
+        assert_eq!(scan_hits(&reader, "body", "foo"), vec![(0, 1, vec![102])]);
+        assert_eq!(scan_hits(&reader, "body", "bar"), vec![(0, 1, vec![103])]);
+    }
+
+    #[test]
+    fn scan_fallback_tf_accumulates_across_elements() {
+        // One posting per document; repeated elements raise the term
+        // frequency, not the hit count.
+        let (storage, info) = docs_only_segment(
+            "scan_tf",
+            &[(0, vec![("tags", texts(&["rust", "rust tooling"]))])],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(
+            scan_hits(&reader, "tags", "rust"),
+            vec![(0, 2, vec![0, 101])]
+        );
+    }
+
+    #[test]
+    fn scan_fallback_matches_bool_and_numeric_terms_like_the_writer() {
+        use crate::data::DataValue;
+        // Before #1194 only `Text` could match on this path; the writer
+        // indexes booleans and numbers as terms, so the scan must too.
+        let (storage, info) = docs_only_segment(
+            "scan_terms",
+            &[
+                (
+                    0,
+                    vec![("flag", DataValue::Bool(true)), ("n", DataValue::Int64(42))],
+                ),
+                (1, vec![("flags", DataValue::BoolArray(vec![true, false]))]),
+                (
+                    2,
+                    vec![
+                        ("flags", DataValue::BoolArray(vec![false])),
+                        ("f", DataValue::Float64(2.5)),
+                    ],
+                ),
+            ],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(scan_hits(&reader, "flag", "true"), vec![(0, 1, vec![0])]);
+        assert_eq!(scan_hits(&reader, "flags", "true"), vec![(1, 1, vec![0])]);
+        assert_eq!(
+            scan_hits(&reader, "flags", "false"),
+            vec![(1, 1, vec![1]), (2, 1, vec![0])]
+        );
+        assert_eq!(scan_hits(&reader, "n", "42"), vec![(0, 1, vec![0])]);
+        assert_eq!(scan_hits(&reader, "f", "2.5"), vec![(2, 1, vec![0])]);
+    }
+
+    #[test]
+    fn scan_fallback_renumbers_positions_like_the_writer() {
+        // `StandardAnalyzer` drops "the" as a stop word; the writer then
+        // renumbers the surviving tokens densely (`tokens_to_analyzed_terms`),
+        // so `search` is at 1, not at the tokenizer's 2. The old scan used
+        // the tokenizer positions and disagreed with the postings.
+        let (storage, info) = docs_only_segment(
+            "scan_renumber",
+            &[(0, vec![("body", text("the rust search"))])],
+            false,
+        );
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(scan_hits(&reader, "body", "rust"), vec![(0, 1, vec![0])]);
+        assert_eq!(scan_hits(&reader, "body", "search"), vec![(0, 1, vec![1])]);
+        assert!(scan_hits(&reader, "body", "the").is_empty());
+    }
+
+    /// The `.post`-less half of the #541 invariant (see
+    /// `postings_never_yields_a_deleted_document` for the normal path).
+    #[test]
+    fn scan_fallback_never_yields_a_deleted_document() {
+        use crate::maintenance::deletion::{DeletionConfig, DeletionManager};
+
+        let (storage, info) = docs_only_segment(
+            "scan_deleted",
+            &[
+                (0, vec![("body", text("alpha"))]),
+                (1, vec![("body", text("alpha"))]),
+                (2, vec![("body", texts(&["alpha", "beta"]))]),
+            ],
+            true,
+        );
+        let manager = DeletionManager::new(
+            DeletionConfig {
+                enable_deletion_log: false,
+                ..Default::default()
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        manager
+            .initialize_segment(&info.segment_id, info.min_doc_id, info.max_doc_id)
+            .unwrap();
+        manager
+            .delete_document(&info.segment_id, 1, "test")
+            .unwrap();
+        manager.flush().unwrap();
+
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(
+            scan_hits(&reader, "body", "alpha"),
+            vec![(0, 1, vec![0]), (2, 1, vec![0])]
+        );
+    }
+
     /// #1047: `has_doc_values` must reflect the schema's per-field
     /// `doc_values` flag on a real, on-disk segment -- a field declared
     /// `doc_values: false` gets no column, one left at the default does.
@@ -2583,9 +2834,12 @@ mod tests {
     /// pinned here — a test that fails when the invariant breaks is
     /// stronger protection than a runtime check that cannot.
     ///
-    /// Both paths are covered: the normal one through `filter_deleted_soa`,
-    /// and the `scan_documents_for_term` fallback taken when a segment has
-    /// no `.post` file.
+    /// This test covers the normal path through `filter_deleted_soa`: the
+    /// fixture is written by the real writer, which always emits a `.post`
+    /// part, so the `scan_documents_for_term` fallback never runs here. The
+    /// fallback's half of the invariant is pinned by
+    /// `scan_fallback_never_yields_a_deleted_document` on a hand-built
+    /// segment without a `.post` file (Issue #1194).
     #[test]
     fn postings_never_yields_a_deleted_document() {
         use crate::lexical::index::LexicalIndex;

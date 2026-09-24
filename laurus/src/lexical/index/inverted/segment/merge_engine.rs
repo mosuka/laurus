@@ -769,12 +769,13 @@ impl MergeEngine {
                         // and the same `.delmap` this merge reads.
                         //
                         // That invariant is pinned by
-                        // `postings_never_yields_a_deleted_document` in
-                        // reader.rs, which is stronger protection than a
-                        // second test that can never fire, on the innermost
-                        // loop of the merge. The BKD and stored-document
-                        // loops below get no such filtering and do check
-                        // (#541).
+                        // `postings_never_yields_a_deleted_document` (normal
+                        // path) and `scan_fallback_never_yields_a_deleted_document`
+                        // (`.post`-less fallback, #1194) in reader.rs, which
+                        // is stronger protection than a second test that can
+                        // never fire, on the innermost loop of the merge. The
+                        // BKD and stored-document loops below get no such
+                        // filtering and do check (#541).
                         let doc_id = iter.doc_id();
                         let positions = iter.positions()?;
                         let freq = iter.term_freq();
