@@ -140,18 +140,21 @@ if (Laurus\peek_commit_generation($path) !== $before) {
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addTextField(name, stored, indexed, termVectors, analyzer)` | 全文検索可能なテキストフィールド |
-| `addIntegerField(name, stored, indexed)` | 整数（i64）フィールド |
-| `addFloatField(name, stored, indexed)` | 浮動小数点（f64）フィールド |
-| `addBooleanField(name, stored, indexed)` | ブーリアンフィールド |
-| `addDatetimeField(name, stored, indexed)` | 日時フィールド |
-| `addGeoField(name, stored, indexed)` | 地理座標フィールド（緯度/経度） |
+| `addTextField(name, stored, indexed, termVectors, docValues, analyzer, multiValued, positionIncrementGap)` | 全文検索可能なテキストフィールド（`analyzer` は組込名: `standard` / `english` / `keyword` / `simple` / `noop`） |
+| `addIntegerField(name, stored, indexed, multiValued, docValues)` | 整数（i64）フィールド |
+| `addFloatField(name, stored, indexed, multiValued, docValues)` | 浮動小数点（f64）フィールド |
+| `addBooleanField(name, stored, indexed, multiValued, docValues)` | ブーリアンフィールド |
+| `addDatetimeField(name, stored, indexed, multiValued, docValues)` | 日時フィールド |
+| `addGeoField(name, stored, indexed, multiValued, docValues)` | 地理座標フィールド（緯度/経度） |
+| `addGeo3dField(name, stored, indexed, multiValued, docValues)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル） |
 | `addBytesField(name, stored)` | バイナリデータフィールド |
-| `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, ...)` | HNSW ベクトルインデックスフィールド |
-| `addFlatField(name, dimension, distance)` | Flat（総当たり）ベクトルインデックスフィールド |
-| `addIvfField(name, dimension, distance, nClusters, nProbe)` | IVF ベクトルインデックスフィールド |
+| `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, quantizer, subvectorCount, rerankStorage, pqCodebookPath, baseWeight)` | HNSW ベクトルインデックスフィールド |
+| `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat（総当たり）ベクトルインデックスフィールド |
+| `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF ベクトルインデックスフィールド |
 | `addEmbedder(name, config)` | 名前付きエンベダーの登録 |
 | `setDefaultFields(fieldNames)` | デフォルト検索フィールドの設定 |
+
+`name`（ベクトルフィールドでは `dimension` も）以降の引数にはすべてデフォルト値があるため、末尾の引数は省略できます。引数は位置引数なので、後ろの引数を渡すときは上記の順序を守ってください。型とデフォルト値は [API リファレンス](../docs/ja/src/laurus-php/api_reference.md) を参照してください。
 
 ## クエリタイプ
 

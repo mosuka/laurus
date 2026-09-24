@@ -124,8 +124,9 @@ impl PhpSchema {
     /// * `analyzer` - Optional analyzer name. For parameter-less built-in
     ///   analyzers (`"standard"`, `"english"`, `"keyword"`, `"simple"`,
     ///   `"noop"`) pass the name directly. Parameterized presets such as
-    ///   the Japanese analyzer (which needs a Lindera dictionary path)
-    ///   should be registered via `addAnalyzer` and referenced by name.
+    ///   the Japanese analyzer (which needs a Lindera dictionary path) are
+    ///   not available from PHP yet: the binding has no analyzer
+    ///   registration API (Issue #1190).
     /// * `multi_valued` - When true, the field accepts a sequential array of
     ///   strings; a term query matches if any element contains the term,
     ///   and a phrase query never spans two elements (Lucene-style).
