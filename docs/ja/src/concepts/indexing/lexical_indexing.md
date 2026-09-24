@@ -230,7 +230,7 @@ graph TB
 | ファイル拡張子 | 内容 |
 | :--- | :--- |
 | `.dict` | Term Dictionary。v3 `LTDD` ブロックツリーレイアウト（FST + 128 ターム単位の front-coded ブロック + bit-packed `TermInfo`）。セグメント open 時に `AHashMap` バックの in-memory クエリ層へ展開 |
-| `.post` | Posting Lists（ドキュメント ID、ターム頻度、位置情報） |
+| `.post` | Posting Lists（ドキュメント ID、ターム頻度、位置情報）。このファイルを失ったセグメントは、索引の analyzer で stored document をスキャンして term クエリに答え（ヒットのスコアは 0）、警告ログを出す |
 | `.bkd` | 数値・日付・`Geo`（2D）・`Geo3d`（3D ECEF）フィールドの [BKD ツリー](../bkd_tree.md) データ |
 | `.docs` | 格納されたフィールド値（元のドキュメント内容）。チャンク単位（未圧縮で約16KiBまたは128ドキュメントのいずれか早い方）でLZ4圧縮され、圧縮による効果がないチャンクは無圧縮のままフォールバックする（`SDOC` v1、Issue #548） |
 | `.dv` | ソートおよびフィルタリング用の Doc Values |

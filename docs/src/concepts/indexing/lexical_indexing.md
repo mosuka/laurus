@@ -239,7 +239,7 @@ graph TB
 | File Extension | Contents |
 | :--- | :--- |
 | `.dict` | Term dictionary in the v3 `LTDD` block-tree layout (FST over per-block representative terms + 128-term blocks of front-coded term bytes + bit-packed `TermInfo`). Loaded into an `AHashMap`-backed in-memory query layer at segment open. |
-| `.post` | Posting lists (document IDs, term frequencies, positions) |
+| `.post` | Posting lists (document IDs, term frequencies, positions). A segment missing this file answers term queries by scanning its stored documents with the index analyzer (such hits score 0) and logs a warning |
 | `.bkd` | [BKD tree](../bkd_tree.md) data for numeric, date, `Geo` (2D), and `Geo3d` (3D ECEF) fields |
 | `.docs` | Stored field values (the original document content), chunked (~16 KiB uncompressed, or 128 documents, whichever comes first) and LZ4-compressed per chunk, with a per-chunk raw fallback when compression doesn't help (`SDOC` v1, Issue #548) |
 | `.dv` | Doc values for sorting and filtering |
