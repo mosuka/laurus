@@ -142,4 +142,8 @@ mdbook serve docs
 
 # Markdown ファイルを Lint
 markdownlint-cli2 "docs/src/**/*.md"
+
+# バインディングの README / docs / examples のスニペットが Node.js / WASM / PHP の
+# 現行シグネチャと一致しているか確認（`make lint` と CI でも実行）
+python3 scripts/check-binding-snippets.py
 ```

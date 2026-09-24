@@ -143,4 +143,8 @@ mdbook serve docs
 
 # Lint markdown files
 markdownlint-cli2 "docs/src/**/*.md"
+
+# Check binding README / docs / example snippets against the current
+# Node.js / WASM / PHP signatures (also run by `make lint` and CI)
+python3 scripts/check-binding-snippets.py
 ```

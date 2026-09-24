@@ -37,6 +37,7 @@ jobs:
       ruby: ${{ steps.resolve.outputs.ruby }}
       php: ${{ steps.resolve.outputs.php }}
       interop: ${{ steps.resolve.outputs.interop }}
+      snippets: ${{ steps.resolve.outputs.snippets }}
     steps:
       - name: Run checkout
         uses: actions/checkout@v7
@@ -129,6 +130,21 @@ jobs:
               - '.github/interop/**'
               - '.github/workflows/index-interop.yml'
               - '.github/workflows/regression.yml'
+            # snippets: binding README / docs / example calls checked against
+            # the current positional signatures (Issue #1188)
+            snippets:
+              - '**/*.md'
+              - '**/*.html'
+              - '**/*.mjs'
+              - '**/*.js'
+              - '**/*.cjs'
+              - '**/*.ts'
+              - '**/*.php'
+              - 'laurus-nodejs/src/**'
+              - 'laurus-wasm/src/**'
+              - 'laurus-php/src/**'
+              - 'scripts/check-binding-snippets.py'
+              - '.github/workflows/regression.yml'
 
       # For non-PR events (push / workflow_dispatch), filter outputs are empty.
       # Default to true so all jobs run.
@@ -146,6 +162,7 @@ jobs:
           RUBY: ${{ steps.filter.outputs.ruby }}
           PHP: ${{ steps.filter.outputs.php }}
           INTEROP: ${{ steps.filter.outputs.interop }}
+          SNIPPETS: ${{ steps.filter.outputs.snippets }}
         run: |
           echo "code=${CODE:-true}" >> "$GITHUB_OUTPUT"
           echo "laurus=${LAURUS:-true}" >> "$GITHUB_OUTPUT"
@@ -158,6 +175,24 @@ jobs:
           echo "ruby=${RUBY:-true}" >> "$GITHUB_OUTPUT"
           echo "php=${PHP:-true}" >> "$GITHUB_OUTPUT"
           echo "interop=${INTEROP:-true}" >> "$GITHUB_OUTPUT"
+          echo "snippets=${SNIPPETS:-true}" >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # Binding snippet guard (Issue #1188): README / docs / example calls
+  # to the Node.js, WASM and PHP bindings must match the current
+  # positional signatures
+  # ============================================================
+  snippets:
+    name: Binding Snippets
+    needs: [changes]
+    if: needs.changes.outputs.snippets == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v7
+
+      - name: Check binding snippet argument positions
+        run: python3 scripts/check-binding-snippets.py
 
   # ============================================================
   # Format code with rustfmt
@@ -560,6 +595,15 @@ jobs:
           npm run build:debug
           npm test
 
+      # Offline examples (Issue #1188): they exercise the public API the
+      # way the README shows it, and fail loudly when a snippet drifts.
+      - name: Run offline examples
+        working-directory: laurus-nodejs
+        shell: bash
+        run: |
+          node examples/quickstart.mjs
+          node examples/external-embedder.mjs
+
   # ============================================================
   # Test laurus-wasm
   # ============================================================
@@ -701,6 +745,13 @@ jobs:
         run: |
           composer install
           php -d extension=../target/ci/liblaurus_php.so vendor/bin/phpunit tests/LaurusTest.php
+
+      # Offline example (Issue #1188): runs against the extension built
+      # above and fails loudly when a snippet drifts from the API.
+      - name: Run offline example
+        working-directory: laurus-php
+        shell: bash
+        run: php -d extension=../target/ci/liblaurus_php.so examples/lexical_search.php
 
   # ============================================================
   # Cross-platform index interop (Issue #947)
