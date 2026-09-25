@@ -1156,7 +1156,8 @@ mod tests {
 
         writer.rollback().unwrap();
         assert_eq!(writer.pending_docs(), 0);
-        assert_eq!(writer.stats().docs_added, 1); // Stats don't rollback
+        // A rolled-back document is not counted as added (Issue #1204).
+        assert_eq!(writer.stats().docs_added, 0);
     }
 
     #[test]
@@ -1355,5 +1356,161 @@ mod tests {
             0,
             "a commit publishes every pending document"
         );
+    }
+
+    /// Stems (`segment_NNNNNN`) of every flushed segment on `storage`.
+    fn flushed_segment_ids(storage: &Arc<MemoryStorage>) -> Vec<String> {
+        let mut ids: Vec<String> = storage
+            .list_files()
+            .unwrap()
+            .iter()
+            .filter(|f| f.starts_with("segment_"))
+            .map(|f| f.split('.').next().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// An index whose writer flushes after every second document.
+    fn index_flushing_every_two_docs() -> (Arc<MemoryStorage>, InvertedIndex) {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_buffered_docs: 2,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        (storage, index)
+    }
+
+    /// `rollback()` discards a segment an automatic flush wrote but no commit
+    /// published (Issue #1204): its files are deleted, the following commit
+    /// publishes and counts nothing, and the writer keeps working. It used to
+    /// clear only the buffer, so that commit published the flushed documents.
+    #[test]
+    fn rollback_discards_auto_flushed_segments() {
+        let (storage, index) = index_flushing_every_two_docs();
+        let mut writer = index.writer().unwrap();
+        for i in 0..3 {
+            writer
+                .add_document(create_test_document(&format!("Doc {i}"), "Content"))
+                .unwrap();
+        }
+        assert!(
+            has_flushed_segment(&storage),
+            "the first two documents flushed"
+        );
+
+        writer.rollback().unwrap();
+        assert!(
+            !has_flushed_segment(&storage),
+            "the discarded segment's files are deleted"
+        );
+        assert_eq!(writer.pending_docs(), 0);
+
+        writer.commit().unwrap();
+        assert_eq!(index.stats().unwrap().doc_count, 0);
+        assert_eq!(index.reader().unwrap().doc_count(), 0);
+
+        // The writer stays usable.
+        writer
+            .add_document(create_test_document("Kept", "Content"))
+            .unwrap();
+        writer.commit().unwrap();
+        assert_eq!(index.stats().unwrap().doc_count, 1);
+        assert_eq!(index.reader().unwrap().doc_count(), 1);
+    }
+
+    /// A rolled-back batch is not counted by the next commit (Issue #1204),
+    /// even when nothing was flushed: `rollback()` left the writer's
+    /// `docs_added` delta in place, so the commit added the discarded
+    /// documents to the index's `doc_count`.
+    #[test]
+    fn rollback_does_not_inflate_doc_count() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..2 {
+            writer
+                .add_document(create_test_document(&format!("Doc {i}"), "Content"))
+                .unwrap();
+        }
+        writer.rollback().unwrap();
+
+        writer
+            .add_document(create_test_document("Kept", "Content"))
+            .unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(index.stats().unwrap().doc_count, 1);
+        assert_eq!(index.reader().unwrap().doc_count(), 1);
+    }
+
+    /// Deletions recorded against a discarded segment are discarded with it
+    /// (Issue #1204): upserting a document that sits in the flushed segment
+    /// deletes it there, and after the rollback the commit neither writes
+    /// that segment's `.delmap` nor counts the deletion.
+    #[test]
+    fn rollback_forgets_deletions_against_discarded_segments() {
+        let (storage, index) = index_flushing_every_two_docs();
+        let mut writer = index.writer().unwrap();
+        for i in 0..2 {
+            writer
+                .add_document(create_test_document(&format!("Doc {i}"), "Content"))
+                .unwrap();
+        }
+        let flushed = flushed_segment_ids(&storage);
+        assert_eq!(flushed.len(), 1, "both documents flushed into one segment");
+
+        // Supersede doc 0, whose copy is in the flushed segment.
+        writer
+            .upsert_document(0, create_test_document("Doc 0 v2", "Content"))
+            .unwrap();
+
+        writer.rollback().unwrap();
+        writer.commit().unwrap();
+
+        assert!(!storage.file_exists(&format!("{}.delmap", flushed[0])));
+        let stats = index.stats().unwrap();
+        assert_eq!((stats.doc_count, stats.deleted_count), (0, 0));
+    }
+
+    /// A commit whose manifest rename landed but whose directory sync failed
+    /// leaves a `segments.json` on storage that already lists the flushed
+    /// segment, while the in-memory manifest never took it. `rollback()` must
+    /// rewrite that manifest before deleting the segment's files, or it would
+    /// point at missing files after a restart (Issue #1204). The state is
+    /// reproduced by saving such a manifest directly.
+    #[test]
+    fn rollback_rewrites_a_manifest_that_already_lists_the_discarded_segment() {
+        let (storage, index) = index_flushing_every_two_docs();
+        let mut writer = index.writer().unwrap();
+        for i in 0..2 {
+            writer
+                .add_document(create_test_document(&format!("Doc {i}"), "Content"))
+                .unwrap();
+        }
+        let flushed = flushed_segment_ids(&storage);
+        assert_eq!(flushed.len(), 1);
+
+        let landed = vec![SegmentInfo {
+            segment_id: flushed[0].clone(),
+            doc_count: 2,
+            min_doc_id: 0,
+            max_doc_id: 1,
+            generation: segment_manifest::stem_ordinal(&flushed[0]).unwrap(),
+            has_deletions: false,
+            shard_id: 0,
+        }];
+        segment_manifest::save(storage.as_ref(), &landed).unwrap();
+
+        writer.rollback().unwrap();
+
+        let (_, on_storage) = segment_manifest::load(storage.as_ref()).unwrap().unwrap();
+        assert!(
+            on_storage.iter().all(|s| s.segment_id != flushed[0]),
+            "the manifest on storage must not list the discarded segment: {on_storage:?}"
+        );
+        assert!(!has_flushed_segment(&storage));
     }
 }

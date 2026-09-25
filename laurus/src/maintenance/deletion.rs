@@ -729,6 +729,23 @@ impl DeletionManager {
         Ok(was_deleted)
     }
 
+    /// Forget a segment's in-memory deletion state without persisting it.
+    ///
+    /// For a segment the caller is discarding — the lexical writer's
+    /// `rollback()` drops segments an automatic flush wrote but no commit
+    /// published (Issue #1204). The bitmap and its pending
+    /// [`flush`](Self::flush) are dropped; a `.delmap` already on storage is
+    /// left for the caller, which deletes the segment's files itself.
+    /// Forgetting an unknown segment is a no-op.
+    pub fn forget_segment(&self, segment_id: &str) {
+        let removed = self.bitmaps.write().unwrap().remove(segment_id).is_some();
+        self.dirty_segments.write().unwrap().remove(segment_id);
+        if removed {
+            self.update_stats();
+            let _ = self.update_global_state();
+        }
+    }
+
     /// Record that a segment's in-memory bitmap diverged from its `.delmap`
     /// file and needs persisting by the next [`flush`](Self::flush).
     fn mark_dirty(&self, segment_id: &str) {
@@ -1039,5 +1056,28 @@ mod tests {
         );
         // Idempotent: a second flush finds nothing dirty and succeeds.
         manager.flush().unwrap();
+    }
+
+    /// `forget_segment` drops a segment's unflushed deletions (Issue #1204):
+    /// a later flush writes no `.delmap` for it, and deleting from it again
+    /// is an error until it is re-initialised — while another segment's
+    /// pending deletions still flush.
+    #[test]
+    fn forget_segment_drops_unflushed_deletions() {
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let manager = DeletionManager::new(DeletionConfig::default(), storage.clone()).unwrap();
+        manager.initialize_segment("seg001", 0, 999).unwrap();
+        manager.initialize_segment("seg002", 1000, 1999).unwrap();
+        manager.delete_document("seg001", 5, "test").unwrap();
+        manager.delete_document("seg002", 1005, "test").unwrap();
+
+        manager.forget_segment("seg001");
+        manager.forget_segment("unknown"); // no-op
+        manager.flush().unwrap();
+
+        assert!(!storage.file_exists("seg001.delmap"));
+        assert!(storage.file_exists("seg002.delmap"));
+        assert!(manager.delete_document("seg001", 6, "test").is_err());
     }
 }
