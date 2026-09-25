@@ -32,28 +32,6 @@ pub struct MergeConfig {
     /// follows the same layout as fresh flushes.
     pub use_compound: bool,
 
-    /// Maximum memory usage during merge (in bytes).
-    pub max_memory_mb: u64,
-
-    /// Number of documents to process in each batch.
-    pub batch_size: usize,
-
-    /// Remove deleted documents during merge.
-    pub remove_deleted_docs: bool,
-
-    /// Sort documents by ID during merge for better locality.
-    ///
-    /// Issue #1163: `perform_merge` no longer builds an intermediate
-    /// `order: Vec<u64>` to sort — it streams each source segment's
-    /// documents straight into the writer as they're reconstructed, so
-    /// this field no longer affects replay order. Every merged-segment
-    /// output part is written in doc_id order unconditionally regardless
-    /// (`.docs`/`.dv`/`.post`/`.norms` sort internally; `.bkd` sorts via
-    /// `InvertedIndexWriter::write_bkd_trees`'s doc_id permutation) — this
-    /// field is kept only because [`MergeConfig::default`] and existing
-    /// callers still reference it, not because it changes behavior.
-    pub sort_by_doc_id: bool,
-
     /// Verify integrity after merge.
     pub verify_after_merge: bool,
 
@@ -98,10 +76,6 @@ impl Default for MergeConfig {
     fn default() -> Self {
         MergeConfig {
             use_compound: crate::lexical::index::inverted::compound::default_use_compound(),
-            max_memory_mb: 256,
-            batch_size: 10000,
-            remove_deleted_docs: true,
-            sort_by_doc_id: true,
             verify_after_merge: true,
             field_doc_values: HashMap::new(),
             default_doc_values: true,
@@ -1335,19 +1309,22 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
 
         let engine = MergeEngine::new(config, storage);
-        assert_eq!(engine.config.batch_size, 10000);
-        assert!(engine.config.remove_deleted_docs);
+        assert!(engine.config.verify_after_merge);
+        assert!(engine.config.default_doc_values);
     }
 
     #[test]
     fn test_merge_config_default() {
         let config = MergeConfig::default();
 
-        assert_eq!(config.max_memory_mb, 256);
-        assert_eq!(config.batch_size, 10000);
-        assert!(config.remove_deleted_docs);
-        assert!(config.sort_by_doc_id);
+        assert_eq!(
+            config.use_compound,
+            crate::lexical::index::inverted::compound::default_use_compound()
+        );
         assert!(config.verify_after_merge);
+        assert!(config.default_doc_values);
+        assert!(config.field_doc_values.is_empty());
+        assert!(config.index_analyzer.is_none());
     }
 
     #[test]
