@@ -477,16 +477,20 @@ Because a segment is immutable for a reader snapshot, the cached list is always 
 its deletions; a commit builds new segment readers with empty caches. The cache is **byte-budget
 bounded** (posting lists vary widely in size) — least-recently-used lists are evicted once the
 budget is exceeded, and a single list larger than the whole budget is not cached. It is enabled
-by default and shares the `max_cache_memory` budget; control it via the index config:
+by default, and each segment's cache gets its own `max_cache_memory` budget (default 128 MiB, which
+also bounds the reader's term-info cache), so the worst case grows with the segment count. Control
+it via the index config:
 
 ```rust
 use laurus::lexical::store::config::LexicalIndexConfig;
-use laurus::lexical::index::config::InvertedIndexConfig;
 
-let mut inverted = InvertedIndexConfig::default();
-inverted.enable_posting_cache = false;        // disable entirely
-inverted.max_cache_memory = 256 * 1024 * 1024; // or resize the cache budget (bytes)
-let config = LexicalIndexConfig::Inverted(inverted);
+let config = LexicalIndexConfig::builder()
+    .enable_posting_cache(false) // disable entirely
+    .build();
+
+let config = LexicalIndexConfig::builder()
+    .max_cache_memory(256 * 1024 * 1024) // or resize the per-segment budget (bytes)
+    .build();
 ```
 
 ## Next Steps

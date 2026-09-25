@@ -148,7 +148,7 @@ Key semantics:
 ```rust
 let docs: Vec<(String, Document)> = build_batch();
 engine.put_documents(docs).await?; // one fsync, all docs as durable as singular puts
-engine.commit().await?;            // one segment flush for the whole batch
+engine.commit().await?;            // one commit publishes the whole batch
 ```
 
 Semantics to be aware of:

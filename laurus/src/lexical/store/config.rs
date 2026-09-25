@@ -38,7 +38,7 @@ use crate::lexical::index::config::InvertedIndexConfig;
 ///
 /// // Custom inverted index configuration
 /// let mut inverted_config = InvertedIndexConfig::default();
-/// inverted_config.max_docs_per_segment = 500_000;
+/// inverted_config.max_buffered_docs = 50_000;
 /// let config = LexicalIndexConfig::Inverted(inverted_config);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ impl LexicalIndexConfig {
     ///
     /// let config = LexicalIndexConfig::builder()
     ///     .analyzer(Arc::new(StandardAnalyzer::default()))
-    ///     .max_docs_per_segment(500_000)
+    ///     .max_buffered_docs(50_000)
     ///     .build();
     /// ```
     pub fn builder() -> LexicalIndexConfigBuilder {
@@ -123,13 +123,13 @@ impl LexicalIndexConfig {
 /// let per_field = PerFieldAnalyzer::new(default_analyzer);
 /// let config = LexicalIndexConfig::builder()
 ///     .analyzer(Arc::new(per_field))
-///     .max_docs_per_segment(500_000)
+///     .max_buffered_docs(50_000)
 ///     .build();
 /// ```
 pub struct LexicalIndexConfigBuilder {
     analyzer: Option<Arc<dyn Analyzer>>,
-    max_docs_per_segment: Option<u64>,
-    write_buffer_size: Option<usize>,
+    max_buffered_docs: Option<usize>,
+    max_buffer_memory: Option<usize>,
     store_term_vectors: Option<bool>,
     store_doc_values: Option<bool>,
     merge_factor: Option<u32>,
@@ -138,6 +138,8 @@ pub struct LexicalIndexConfigBuilder {
     fields: HashMap<String, FieldOption>,
     query_filter_cache_capacity: Option<usize>,
     parsed_query_cache_capacity: Option<usize>,
+    enable_posting_cache: Option<bool>,
+    max_cache_memory: Option<usize>,
 }
 
 use crate::lexical::core::field::FieldOption;
@@ -153,8 +155,8 @@ impl LexicalIndexConfigBuilder {
     pub fn new() -> Self {
         Self {
             analyzer: None,
-            max_docs_per_segment: None,
-            write_buffer_size: None,
+            max_buffered_docs: None,
+            max_buffer_memory: None,
             store_term_vectors: None,
             store_doc_values: None,
             merge_factor: None,
@@ -163,6 +165,8 @@ impl LexicalIndexConfigBuilder {
             fields: HashMap::new(),
             query_filter_cache_capacity: None,
             parsed_query_cache_capacity: None,
+            enable_posting_cache: None,
+            max_cache_memory: None,
         }
     }
 
@@ -196,23 +200,25 @@ impl LexicalIndexConfigBuilder {
         self
     }
 
-    /// Set the maximum number of documents per segment.
+    /// Set how many documents the writer buffers before flushing them to a
+    /// new, uncommitted segment (Issue #1200).
     ///
-    /// When a segment reaches this size, it will be considered for merging.
-    /// Larger values reduce merge overhead but increase memory usage.
-    /// Default: 1,000,000
-    pub fn max_docs_per_segment(mut self, max_docs: u64) -> Self {
-        self.max_docs_per_segment = Some(max_docs);
+    /// Lower values bound ingestion memory more tightly but publish more
+    /// segments per commit. See [`InvertedIndexConfig::max_buffered_docs`].
+    /// Default: 10,000
+    pub fn max_buffered_docs(mut self, max_docs: usize) -> Self {
+        self.max_buffered_docs = Some(max_docs);
         self
     }
 
-    /// Set the buffer size for writing operations (in bytes).
+    /// Set the estimated memory, in bytes, the writer buffers before
+    /// flushing to a new, uncommitted segment (Issue #1200).
     ///
-    /// Controls how much data is buffered in memory before being flushed to disk.
-    /// Larger buffers improve write performance but use more memory.
-    /// Default: 1MB (1,048,576 bytes)
-    pub fn write_buffer_size(mut self, size: usize) -> Self {
-        self.write_buffer_size = Some(size);
+    /// Whichever of this and [`Self::max_buffered_docs`] is reached first
+    /// triggers the flush. See [`InvertedIndexConfig::max_buffer_memory`].
+    /// Default: 64 MiB (67,108,864 bytes)
+    pub fn max_buffer_memory(mut self, bytes: usize) -> Self {
+        self.max_buffer_memory = Some(bytes);
         self
     }
 
@@ -304,6 +310,27 @@ impl LexicalIndexConfigBuilder {
         self
     }
 
+    /// Enable or disable the per-segment cache of decoded posting lists
+    /// (Issue #612).
+    ///
+    /// A repeated term lookup within a reader snapshot reuses the decoded
+    /// list. See [`InvertedIndexConfig::enable_posting_cache`].
+    /// Default: true
+    pub fn enable_posting_cache(mut self, enable: bool) -> Self {
+        self.enable_posting_cache = Some(enable);
+        self
+    }
+
+    /// Set the cache budget of query readers, in bytes (Issue #1200).
+    ///
+    /// It bounds the term-info cache and each segment's posting cache
+    /// separately. See [`InvertedIndexConfig::max_cache_memory`].
+    /// Default: 128 MiB (134,217,728 bytes)
+    pub fn max_cache_memory(mut self, bytes: usize) -> Self {
+        self.max_cache_memory = Some(bytes);
+        self
+    }
+
     /// Add a field-specific configuration.
     pub fn add_field(mut self, name: impl Into<String>, option: FieldOption) -> Self {
         self.fields.insert(name.into(), option);
@@ -320,11 +347,11 @@ impl LexicalIndexConfigBuilder {
         if let Some(analyzer) = self.analyzer {
             config.analyzer = analyzer;
         }
-        if let Some(max_docs) = self.max_docs_per_segment {
-            config.max_docs_per_segment = max_docs;
+        if let Some(max_docs) = self.max_buffered_docs {
+            config.max_buffered_docs = max_docs;
         }
-        if let Some(size) = self.write_buffer_size {
-            config.write_buffer_size = size;
+        if let Some(bytes) = self.max_buffer_memory {
+            config.max_buffer_memory = bytes;
         }
         if let Some(store) = self.store_term_vectors {
             config.store_term_vectors = store;
@@ -349,6 +376,12 @@ impl LexicalIndexConfigBuilder {
         }
         if let Some(capacity) = self.parsed_query_cache_capacity {
             config.parsed_query_cache_capacity = capacity;
+        }
+        if let Some(enable) = self.enable_posting_cache {
+            config.enable_posting_cache = enable;
+        }
+        if let Some(bytes) = self.max_cache_memory {
+            config.max_cache_memory = bytes;
         }
 
         LexicalIndexConfig::Inverted(config)

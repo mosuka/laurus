@@ -34,6 +34,15 @@ use crate::storage::structured::StructWriter;
 // Inverted index writer implementation
 // ============================================================================
 
+/// Default [`InvertedIndexWriterConfig::max_buffered_docs`], shared with
+/// `InvertedIndexConfig` so the index-level default cannot drift from the
+/// writer's (Issue #1200).
+pub(crate) const DEFAULT_MAX_BUFFERED_DOCS: usize = 10_000;
+
+/// Default [`InvertedIndexWriterConfig::max_buffer_memory`] (64 MiB), shared
+/// with `InvertedIndexConfig` like [`DEFAULT_MAX_BUFFERED_DOCS`].
+pub(crate) const DEFAULT_MAX_BUFFER_MEMORY: usize = 64 * 1024 * 1024;
+
 /// Inverted index writer configuration.
 #[derive(Clone)]
 pub struct InvertedIndexWriterConfig {
@@ -48,9 +57,11 @@ pub struct InvertedIndexWriterConfig {
     pub use_compound: bool,
 
     /// Maximum number of documents to buffer before flushing to disk.
+    /// Default: 10,000.
     pub max_buffered_docs: usize,
 
     /// Maximum memory usage for buffering (in bytes).
+    /// Default: 64 MiB.
     pub max_buffer_memory: usize,
 
     /// Segment name prefix.
@@ -114,8 +125,8 @@ impl Default for InvertedIndexWriterConfig {
     fn default() -> Self {
         InvertedIndexWriterConfig {
             use_compound: super::compound::default_use_compound(),
-            max_buffered_docs: 10000,
-            max_buffer_memory: 64 * 1024 * 1024, // 64MB
+            max_buffered_docs: DEFAULT_MAX_BUFFERED_DOCS,
+            max_buffer_memory: DEFAULT_MAX_BUFFER_MEMORY,
             segment_prefix: "segment".to_string(),
             store_term_positions: true,
             store_doc_values: true,

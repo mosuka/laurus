@@ -154,7 +154,7 @@ engine.put_documents(one_thousand_docs).await?;
 ```rust
 let docs: Vec<(String, Document)> = build_batch();
 engine.put_documents(docs).await?; // fsync 1 回で、全ドキュメントが単発 put と同等に durable
-engine.commit().await?;            // バッチ全体で 1 回のセグメントフラッシュ
+engine.commit().await?;            // バッチ全体を 1 回のコミットで公開
 ```
 
 留意すべき意味論:

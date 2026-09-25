@@ -36,10 +36,17 @@ use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::storage::structured::StructReader;
 
+/// Default [`InvertedIndexReaderConfig::max_cache_memory`] (128 MiB), shared
+/// with `InvertedIndexConfig` so the index-level default cannot drift from
+/// the reader's (Issue #1200).
+pub(crate) const DEFAULT_MAX_CACHE_MEMORY: usize = 128 * 1024 * 1024;
+
 /// Advanced index reader configuration.
 #[derive(Clone)]
 pub struct InvertedIndexReaderConfig {
-    /// Maximum memory for caching (in bytes).
+    /// Maximum memory for caching (in bytes): the budget of the reader's
+    /// term-info cache, and of each segment reader's posting cache.
+    /// Default: 128 MiB.
     pub max_cache_memory: usize,
 
     /// Enable term caching.
@@ -86,7 +93,7 @@ impl std::fmt::Debug for InvertedIndexReaderConfig {
 impl Default for InvertedIndexReaderConfig {
     fn default() -> Self {
         InvertedIndexReaderConfig {
-            max_cache_memory: 128 * 1024 * 1024, // 128MB
+            max_cache_memory: DEFAULT_MAX_CACHE_MEMORY,
             enable_term_cache: true,
             enable_posting_cache: true,
             preload_segments: false,

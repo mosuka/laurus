@@ -232,8 +232,8 @@ mod tests {
         // Test that default is Inverted and check its configuration
         match config {
             LexicalIndexConfig::Inverted(inverted) => {
-                assert_eq!(inverted.max_docs_per_segment, 1000000);
-                assert_eq!(inverted.write_buffer_size, 1024 * 1024);
+                assert_eq!(inverted.max_buffered_docs, 10_000);
+                assert_eq!(inverted.max_buffer_memory, 64 * 1024 * 1024);
                 assert!(inverted.store_term_vectors);
                 assert_eq!(inverted.merge_factor, 10);
                 assert_eq!(inverted.max_segments, 100);

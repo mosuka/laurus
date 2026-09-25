@@ -735,12 +735,15 @@ impl LexicalIndex for InvertedIndex {
 
         let segments = self.load_segments()?;
 
-        // Use analyzer from index config. The query/filter cache capacity must
-        // be set explicitly here: `InvertedIndexReaderConfig::default()` would
-        // otherwise mask the value configured on the index (Issue #578).
+        // Use analyzer from index config. The query/filter cache capacity
+        // (Issue #578) and the posting-cache settings (Issue #1200) must be
+        // set explicitly here: `InvertedIndexReaderConfig::default()` would
+        // otherwise mask the values configured on the index.
         let reader_config = InvertedIndexReaderConfig {
             analyzer: self.config.analyzer.clone(),
             query_filter_cache_capacity: self.config.query_filter_cache_capacity,
+            enable_posting_cache: self.config.enable_posting_cache,
+            max_cache_memory: self.config.max_cache_memory,
             ..InvertedIndexReaderConfig::default()
         };
 
@@ -760,12 +763,16 @@ impl LexicalIndex for InvertedIndex {
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
 
-        // Use analyzer and shard_id from index config
+        // Every writer setting the index config carries must be set here:
+        // `..Default::default()` would otherwise mask it — the flush
+        // thresholds were silently ignored until Issue #1200.
         let writer_config = InvertedIndexWriterConfig {
             analyzer: self.config.analyzer.clone(),
             shard_id: self.config.shard_id,
             fields,
             use_compound: self.config.use_compound,
+            max_buffered_docs: self.config.max_buffered_docs,
+            max_buffer_memory: self.config.max_buffer_memory,
             store_term_positions: self.config.store_term_vectors,
             store_doc_values: self.config.store_doc_values,
             ..Default::default()
@@ -1169,5 +1176,145 @@ mod tests {
 
         assert_eq!(writer.stats().docs_added, 1);
         assert!(writer.stats().unique_terms >= 3); // At least title, id, count fields
+    }
+
+    /// Whether a flushed segment — committed or not — exists on `storage`.
+    fn has_flushed_segment(storage: &Arc<MemoryStorage>) -> bool {
+        storage
+            .list_files()
+            .unwrap()
+            .iter()
+            .any(|f| f.starts_with("segment_"))
+    }
+
+    /// The index config's document threshold reaches the writer `writer()`
+    /// builds (Issue #1200): with `max_buffered_docs: 2` the second document
+    /// flushes an uncommitted segment. Were it ignored, the writer's
+    /// 10,000-document default would keep both documents in memory.
+    #[test]
+    fn writer_honours_the_index_max_buffered_docs() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_buffered_docs: 2,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        writer
+            .add_document(create_test_document("Doc 1", "Content 1"))
+            .unwrap();
+        assert!(
+            !has_flushed_segment(&storage),
+            "one document stays buffered"
+        );
+
+        writer
+            .add_document(create_test_document("Doc 2", "Content 2"))
+            .unwrap();
+        assert!(
+            has_flushed_segment(&storage),
+            "the second document reaches max_buffered_docs and flushes a segment before commit"
+        );
+    }
+
+    /// Likewise for the memory threshold (Issue #1200): any document exceeds
+    /// a one-byte budget, so the first one flushes. Ignored, the writer's
+    /// 64 MiB default would keep it in memory.
+    #[test]
+    fn writer_honours_the_index_max_buffer_memory() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_buffer_memory: 1,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        writer
+            .add_document(create_test_document("Doc 1", "Content 1"))
+            .unwrap();
+        assert!(
+            has_flushed_segment(&storage),
+            "a document over max_buffer_memory flushes a segment before commit"
+        );
+    }
+
+    /// The index-level flush thresholds default to the writer's own values
+    /// (Issue #1200), so wiring them changed nothing for a config that does
+    /// not set them.
+    #[test]
+    fn index_flush_threshold_defaults_match_the_writer() {
+        let index = InvertedIndexConfig::default();
+        let writer = InvertedIndexWriterConfig::default();
+        assert_eq!(index.max_buffered_docs, writer.max_buffered_docs);
+        assert_eq!(index.max_buffer_memory, writer.max_buffer_memory);
+    }
+
+    /// Commit three documents whose `body` holds "shared" into an index built
+    /// from `config` (one segment), and return the index's query reader.
+    fn committed_reader(config: InvertedIndexConfig) -> Arc<dyn LexicalIndexReader> {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, config).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..3 {
+            writer
+                .add_document(create_test_document(&format!("Doc {i}"), "shared term"))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        index.reader().unwrap()
+    }
+
+    /// `max_cache_memory` on the index config reaches the reader `reader()`
+    /// builds (Issue #1200). Ignored, the reader's 128 MiB default applies.
+    #[test]
+    fn reader_honours_the_index_max_cache_memory() {
+        let reader = committed_reader(InvertedIndexConfig {
+            max_cache_memory: 4096,
+            ..Default::default()
+        });
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert_eq!(inverted.cache_stats().memory_limit, 4096);
+    }
+
+    /// `enable_posting_cache: false` on the index config reaches the reader
+    /// (Issue #1200): a repeated lookup decodes again and never consults the
+    /// cache. Ignored, the default-on cache records a miss and then a hit.
+    #[test]
+    fn reader_honours_the_index_enable_posting_cache() {
+        let reader = committed_reader(InvertedIndexConfig {
+            enable_posting_cache: false,
+            ..Default::default()
+        });
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let segment = inverted.segment_readers()[0].read().unwrap();
+
+        for _ in 0..2 {
+            // A non-empty result rules out a term that simply does not exist
+            // (which would leave the counters at zero with the cache on).
+            let mut postings = segment
+                .postings("body", "shared")
+                .unwrap()
+                .expect("the term is indexed");
+            let mut docs = 0;
+            while postings.next().unwrap() {
+                docs += 1;
+            }
+            assert_eq!(docs, 3);
+        }
+
+        let stats = segment.posting_cache_stats();
+        assert_eq!(
+            (stats.hits, stats.misses),
+            (0, 0),
+            "a disabled posting cache is never consulted"
+        );
     }
 }

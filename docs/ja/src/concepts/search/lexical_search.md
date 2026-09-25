@@ -466,16 +466,20 @@ let config = LexicalIndexConfig::builder()
 します。commit すると空キャッシュの新しいセグメントリーダーが構築されます。キャッシュは
 **byte-budget で上限制御**され（posting list はサイズ分散が大きい）、予算超過で
 least-recently-used リストを退避し、予算全体より大きい単一リストはキャッシュしません。
-デフォルトで有効で `max_cache_memory` の予算を共有します。インデックス設定で制御できます。
+デフォルトで有効です。セグメントごとのキャッシュがそれぞれ `max_cache_memory` の予算（デフォルト
+128 MiB。reader の term-info キャッシュの上限も兼ねる）を持つため、最悪の使用量はセグメント数に比例して
+増えます。インデックス設定で制御できます。
 
 ```rust
 use laurus::lexical::store::config::LexicalIndexConfig;
-use laurus::lexical::index::config::InvertedIndexConfig;
 
-let mut inverted = InvertedIndexConfig::default();
-inverted.enable_posting_cache = false;        // 完全に無効化
-inverted.max_cache_memory = 256 * 1024 * 1024; // またはキャッシュ予算（バイト）を変更
-let config = LexicalIndexConfig::Inverted(inverted);
+let config = LexicalIndexConfig::builder()
+    .enable_posting_cache(false) // 完全に無効化
+    .build();
+
+let config = LexicalIndexConfig::builder()
+    .max_cache_memory(256 * 1024 * 1024) // またはセグメントごとの予算（バイト）を変更
+    .build();
 ```
 
 ## 次のステップ

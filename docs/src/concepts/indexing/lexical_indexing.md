@@ -15,14 +15,14 @@ sequenceDiagram
     Analyzer->>Analyzer: Tokenize + Filter
     Analyzer-->>Writer: ["quick", "brown", "fox"]
     Writer->>Writer: Buffer in memory
-    Writer->>Seg: Flush to segment on commit()
+    Writer->>Seg: Flush to segment when the buffer fills, and on commit()
 ```
 
 ### Step by Step
 
 1. **Analyze**: The text passes through the configured analyzer (tokenizer + filters), producing a stream of normalized terms
 2. **Buffer**: Terms are stored in an in-memory write buffer, organized by field
-3. **Commit**: On `commit()`, the buffer is flushed to a new segment on storage
+3. **Flush and commit**: When the buffer reaches `max_buffered_docs` (default 10,000) or `max_buffer_memory` (default 64 MiB) of estimated memory, it is flushed to a new, not yet visible segment; `commit()` flushes what remains and publishes those segments together
 
 ## The Inverted Index
 
@@ -248,7 +248,7 @@ graph TB
 
 ### Segment Lifecycle
 
-1. **Create**: A new segment is created each time `commit()` is called
+1. **Create**: A new segment is flushed each time the writer's buffer reaches `max_buffered_docs` (default 10,000) or `max_buffer_memory` (default 64 MiB), and once more by `commit()` for what remains; `commit()` publishes them all at once, so one commit can add several segments. Both thresholds are set on the index config (`LexicalIndexConfig::builder().max_buffered_docs(..)` / `.max_buffer_memory(..)`)
 2. **Search**: All segments are searched in parallel and results are merged
 3. **Merge**: After each `commit()`, an auto-merge merges the smallest segments once the count exceeds `max_segments`, keeping the segment count bounded; a manual `optimize()` force-merges everything into one segment
 4. **Delete**: When a document is deleted, its ID is added to a deletion bitmap rather than physically removed (see [Deletions & Compaction](../../laurus/deletions.md))
