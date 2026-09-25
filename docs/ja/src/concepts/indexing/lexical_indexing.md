@@ -15,14 +15,14 @@ sequenceDiagram
     Analyzer->>Analyzer: Tokenize + Filter
     Analyzer-->>Writer: ["quick", "brown", "fox"]
     Writer->>Writer: Buffer in memory
-    Writer->>Seg: Flush to segment on commit()
+    Writer->>Seg: Flush to segment when the buffer fills, and on commit()
 ```
 
 ### ステップごとの流れ
 
 1. **解析（Analyze）**: テキストが設定されたアナライザー（トークナイザー + フィルター）を通過し、正規化されたタームのストリームが生成される
 2. **バッファリング（Buffer）**: タームはフィールドごとに整理され、インメモリの書き込みバッファに格納される
-3. **コミット（Commit）**: `commit()` の呼び出し時に、バッファがストレージ上の新しいセグメントにフラッシュされる
+3. **フラッシュとコミット（Flush and commit）**: バッファが `max_buffered_docs`（デフォルト 10,000 件）か推定メモリ `max_buffer_memory`（デフォルト 64 MiB）に達すると、まだ見えない新しいセグメントにフラッシュされる。`commit()` は残りをフラッシュし、それらのセグメントをまとめて公開する
 
 ## 転置インデックス（Inverted Index）
 
@@ -239,7 +239,7 @@ graph TB
 
 ### セグメントのライフサイクル
 
-1. **作成（Create）**: `commit()` が呼び出されるたびに新しいセグメントが作成される
+1. **作成（Create）**: writer のバッファが `max_buffered_docs`（デフォルト 10,000 件）か `max_buffer_memory`（デフォルト 64 MiB）に達するたびに新しいセグメントがフラッシュされ、`commit()` が残りをもう 1 つフラッシュする。`commit()` はそれらを一度に公開するので、1 回のコミットで複数のセグメントが増えることがある。両方の閾値はインデックス設定で指定する（`LexicalIndexConfig::builder().max_buffered_docs(..)` / `.max_buffer_memory(..)`）
 2. **検索（Search）**: すべてのセグメントが並列に検索され、結果がマージされる
 3. **マージ（Merge）**: 各 `commit()` 後に自動マージが走り、セグメント数が `max_segments` を超えると最小のセグメント群がマージされて数が有界に保たれる。手動 `optimize()` は全セグメントを 1 つに強制マージする
 4. **削除（Delete）**: ドキュメントが削除された場合、物理的に削除されるのではなく、削除ビットマップに ID が追加される（[Deletions & Compaction](../../laurus/deletions.md) を参照）

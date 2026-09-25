@@ -138,6 +138,8 @@ pub struct LexicalIndexConfigBuilder {
     fields: HashMap<String, FieldOption>,
     query_filter_cache_capacity: Option<usize>,
     parsed_query_cache_capacity: Option<usize>,
+    enable_posting_cache: Option<bool>,
+    max_cache_memory: Option<usize>,
 }
 
 use crate::lexical::core::field::FieldOption;
@@ -163,6 +165,8 @@ impl LexicalIndexConfigBuilder {
             fields: HashMap::new(),
             query_filter_cache_capacity: None,
             parsed_query_cache_capacity: None,
+            enable_posting_cache: None,
+            max_cache_memory: None,
         }
     }
 
@@ -306,6 +310,27 @@ impl LexicalIndexConfigBuilder {
         self
     }
 
+    /// Enable or disable the per-segment cache of decoded posting lists
+    /// (Issue #612).
+    ///
+    /// A repeated term lookup within a reader snapshot reuses the decoded
+    /// list. See [`InvertedIndexConfig::enable_posting_cache`].
+    /// Default: true
+    pub fn enable_posting_cache(mut self, enable: bool) -> Self {
+        self.enable_posting_cache = Some(enable);
+        self
+    }
+
+    /// Set the cache budget of query readers, in bytes (Issue #1200).
+    ///
+    /// It bounds the term-info cache and each segment's posting cache
+    /// separately. See [`InvertedIndexConfig::max_cache_memory`].
+    /// Default: 128 MiB (134,217,728 bytes)
+    pub fn max_cache_memory(mut self, bytes: usize) -> Self {
+        self.max_cache_memory = Some(bytes);
+        self
+    }
+
     /// Add a field-specific configuration.
     pub fn add_field(mut self, name: impl Into<String>, option: FieldOption) -> Self {
         self.fields.insert(name.into(), option);
@@ -351,6 +376,12 @@ impl LexicalIndexConfigBuilder {
         }
         if let Some(capacity) = self.parsed_query_cache_capacity {
             config.parsed_query_cache_capacity = capacity;
+        }
+        if let Some(enable) = self.enable_posting_cache {
+            config.enable_posting_cache = enable;
+        }
+        if let Some(bytes) = self.max_cache_memory {
+            config.max_cache_memory = bytes;
         }
 
         LexicalIndexConfig::Inverted(config)

@@ -29,9 +29,16 @@ fn default_max_buffer_memory() -> usize {
     crate::lexical::index::inverted::writer::DEFAULT_MAX_BUFFER_MEMORY
 }
 
-/// serde default for [`InvertedIndexConfig::store_doc_values`] -- a
-/// config missing the field (every index created before Issue #1047)
-/// must behave exactly as it did before the flag existed.
+/// serde default for [`InvertedIndexConfig::max_cache_memory`] -- the
+/// reader's own default, like [`default_max_buffered_docs`] is the writer's.
+fn default_max_cache_memory() -> usize {
+    crate::lexical::index::inverted::reader::DEFAULT_MAX_CACHE_MEMORY
+}
+
+/// serde default for the flags that default on:
+/// [`InvertedIndexConfig::store_doc_values`] -- a config missing the field
+/// (every index created before Issue #1047) must behave exactly as it did
+/// before the flag existed -- and [`InvertedIndexConfig::enable_posting_cache`].
 fn default_true() -> bool {
     true
 }
@@ -161,6 +168,29 @@ pub struct InvertedIndexConfig {
     /// `0` disables the cache. Defaults to `1024`.
     #[serde(default = "default_parsed_query_cache_capacity")]
     pub parsed_query_cache_capacity: usize,
+
+    /// Whether query readers cache decoded posting lists per segment
+    /// (Issue #612). Defaults to `true`.
+    ///
+    /// A repeated `(field, term)` lookup within a reader snapshot reuses the
+    /// decoded, deletion-filtered list instead of re-reading and re-decoding
+    /// the segment's `.post`. Each segment's cache is bounded by
+    /// [`Self::max_cache_memory`]; a commit builds new segment readers with
+    /// empty caches.
+    #[serde(default = "default_true")]
+    pub enable_posting_cache: bool,
+
+    /// Cache budget of query readers, in bytes (Issue #1200). Defaults to
+    /// 128 MiB.
+    ///
+    /// It bounds the reader's term-info cache and, while
+    /// [`Self::enable_posting_cache`] is on, **each** segment reader's
+    /// posting cache: the posting caches do not share one budget, so the
+    /// worst case is `(1 + segment count) × max_cache_memory`. `0`
+    /// effectively disables the posting cache; the term-info cache still
+    /// keeps one entry.
+    #[serde(default = "default_max_cache_memory")]
+    pub max_cache_memory: usize,
 }
 
 fn default_analyzer() -> Arc<dyn Analyzer> {
@@ -194,6 +224,8 @@ impl Default for InvertedIndexConfig {
             fields: HashMap::new(),
             query_filter_cache_capacity: default_query_filter_cache_capacity(),
             parsed_query_cache_capacity: default_parsed_query_cache_capacity(),
+            enable_posting_cache: default_true(),
+            max_cache_memory: default_max_cache_memory(),
         }
     }
 }
@@ -217,6 +249,8 @@ impl std::fmt::Debug for InvertedIndexConfig {
                 "parsed_query_cache_capacity",
                 &self.parsed_query_cache_capacity,
             )
+            .field("enable_posting_cache", &self.enable_posting_cache)
+            .field("max_cache_memory", &self.max_cache_memory)
             .finish()
     }
 }
