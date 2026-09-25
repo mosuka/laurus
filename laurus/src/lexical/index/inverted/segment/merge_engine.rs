@@ -12,7 +12,7 @@ use roaring::RoaringTreemap;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm};
-use crate::lexical::index::inverted::reader::{InvertedIndexReader, SegmentReader};
+use crate::lexical::index::inverted::reader::SegmentReader;
 use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::inverted::segment::{ManagedSegmentInfo, MergeCandidate, MergeStrategy};
 use crate::lexical::index::inverted::writer::{
@@ -20,7 +20,6 @@ use crate::lexical::index::inverted::writer::{
 };
 use crate::lexical::index::structures::aabb::AABB;
 use crate::lexical::index::structures::visitor::{CellRelation, IntersectVisitor};
-use crate::lexical::reader::LexicalIndexReader;
 use crate::storage::Storage;
 
 /// Configuration for merge operations.
@@ -31,28 +30,6 @@ pub struct MergeConfig {
     /// Set from the owning index's `use_compound`, so the merged output
     /// follows the same layout as fresh flushes.
     pub use_compound: bool,
-
-    /// Maximum memory usage during merge (in bytes).
-    pub max_memory_mb: u64,
-
-    /// Number of documents to process in each batch.
-    pub batch_size: usize,
-
-    /// Remove deleted documents during merge.
-    pub remove_deleted_docs: bool,
-
-    /// Sort documents by ID during merge for better locality.
-    ///
-    /// Issue #1163: `perform_merge` no longer builds an intermediate
-    /// `order: Vec<u64>` to sort — it streams each source segment's
-    /// documents straight into the writer as they're reconstructed, so
-    /// this field no longer affects replay order. Every merged-segment
-    /// output part is written in doc_id order unconditionally regardless
-    /// (`.docs`/`.dv`/`.post`/`.norms` sort internally; `.bkd` sorts via
-    /// `InvertedIndexWriter::write_bkd_trees`'s doc_id permutation) — this
-    /// field is kept only because [`MergeConfig::default`] and existing
-    /// callers still reference it, not because it changes behavior.
-    pub sort_by_doc_id: bool,
 
     /// Verify integrity after merge.
     pub verify_after_merge: bool,
@@ -98,10 +75,6 @@ impl Default for MergeConfig {
     fn default() -> Self {
         MergeConfig {
             use_compound: crate::lexical::index::inverted::compound::default_use_compound(),
-            max_memory_mb: 256,
-            batch_size: 10000,
-            remove_deleted_docs: true,
-            sort_by_doc_id: true,
             verify_after_merge: true,
             field_doc_values: HashMap::new(),
             default_doc_values: true,
@@ -698,21 +671,6 @@ impl MergeEngine {
         Ok(RoaringTreemap::new())
     }
 
-    /// Load a segment reader for the given segment.
-    fn load_segment_reader(
-        &self,
-        segment_info: &SegmentInfo,
-    ) -> Result<Box<dyn LexicalIndexReader>> {
-        // Create segment list with single segment
-        let segments = vec![segment_info.clone()];
-
-        // Use default config for reader
-        let config = crate::lexical::index::inverted::reader::InvertedIndexReaderConfig::default();
-
-        let reader = InvertedIndexReader::new(segments, self.storage.clone(), config)?;
-        Ok(Box::new(reader) as Box<dyn LexicalIndexReader>)
-    }
-
     /// Reconstruct every live document's [`AnalyzedDocument`] from one source
     /// segment, without re-tokenizing (Issue #753), and hand each one this
     /// segment is authoritative for straight to `writer` — never collecting
@@ -1137,20 +1095,37 @@ impl MergeEngine {
 
     /// Verify the integrity of a merged segment.
     fn verify_merged_segment(&self, segment: &ManagedSegmentInfo) -> Result<()> {
-        // Load the segment and perform basic checks
-        let reader = self.load_segment_reader(&segment.segment_info)?;
-
-        // Check document count matches
-        if reader.doc_count() != segment.segment_info.doc_count {
-            return Err(LaurusError::index("Document count mismatch after merge"));
+        // The segment metadata's `doc_count` is `emitted.len()`, the number
+        // of documents the replay *handed* to the writer; a merged segment
+        // has no deletions, so `SegmentReader::doc_count` would just echo
+        // that same number back. Compare it against the stored-fields
+        // header instead — the number of documents that actually reached
+        // disk (Issue #1166). A flush that wrote only part of the replay
+        // (e.g. a mid-replay auto-flush into unregistered files) shows up
+        // here as a mismatch rather than as silently lost documents.
+        let info = &segment.segment_info;
+        let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
+        match reader.stored_doc_count()? {
+            Some(written) if written != info.doc_count => Err(LaurusError::index(format!(
+                "Document count mismatch after merge: segment {} claims {} documents but its \
+                 stored-fields part holds {written}",
+                info.segment_id, info.doc_count
+            ))),
+            // A merge whose every source document was deleted writes no
+            // files at all (`flush_buffered_to_segment` returns early on an
+            // empty buffer), so "no `.docs`" is correct exactly when nothing
+            // was emitted.
+            None if info.doc_count > 0 => Err(LaurusError::index(format!(
+                "merged segment {} claims {} documents but has no stored-fields part",
+                info.segment_id, info.doc_count
+            ))),
+            _ => Ok(()),
         }
 
         // TODO: Add more verification checks
         // - Term dictionary integrity
         // - Posting list consistency
         // - Document field validation
-
-        Ok(())
     }
 
     /// Get merge configuration.
@@ -1335,19 +1310,22 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
 
         let engine = MergeEngine::new(config, storage);
-        assert_eq!(engine.config.batch_size, 10000);
-        assert!(engine.config.remove_deleted_docs);
+        assert!(engine.config.verify_after_merge);
+        assert!(engine.config.default_doc_values);
     }
 
     #[test]
     fn test_merge_config_default() {
         let config = MergeConfig::default();
 
-        assert_eq!(config.max_memory_mb, 256);
-        assert_eq!(config.batch_size, 10000);
-        assert!(config.remove_deleted_docs);
-        assert!(config.sort_by_doc_id);
+        assert_eq!(
+            config.use_compound,
+            crate::lexical::index::inverted::compound::default_use_compound()
+        );
         assert!(config.verify_after_merge);
+        assert!(config.default_doc_values);
+        assert!(config.field_doc_values.is_empty());
+        assert!(config.index_analyzer.is_none());
     }
 
     #[test]
@@ -2457,5 +2435,163 @@ mod tests {
             "a merge that fails during source reconstruction must not publish \
              any merged_* file: {leaked:?}"
         );
+    }
+
+    // ---- `verify_after_merge` checks what reached disk, Issue #1166 ------
+
+    fn two_segment_candidate() -> MergeCandidate {
+        MergeCandidate {
+            segments: vec!["segment_000000".to_string(), "segment_000001".to_string()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        }
+    }
+
+    /// Two committed source segments holding three documents, merged with
+    /// the given output layout. Returns the storage, the engine and the
+    /// merged segment's descriptor.
+    fn merged_two_segments(
+        use_compound: bool,
+    ) -> (Arc<dyn Storage>, MergeEngine, ManagedSegmentInfo) {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let d0 = writer
+            .add_document(text_int_doc("alpha bravo", 10))
+            .unwrap();
+        let d1 = writer
+            .add_document(text_int_doc("bravo charlie", 20))
+            .unwrap();
+        writer.commit().unwrap();
+        let d2 = writer
+            .add_document(text_int_doc("charlie delta", 30))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let engine = MergeEngine::new(
+            MergeConfig {
+                use_compound,
+                ..MergeConfig::default()
+            },
+            storage.clone(),
+        );
+        let result = engine
+            .merge_segments(
+                &two_segment_candidate(),
+                &[
+                    ManagedSegmentInfo::new(segment_info("segment_000000", 2, d0, d1, 0)),
+                    ManagedSegmentInfo::new(segment_info("segment_000001", 1, d2, d2, 1)),
+                ],
+                1,
+            )
+            .unwrap();
+        (storage, engine, result.new_segment)
+    }
+
+    #[test]
+    fn verify_merged_segment_accepts_the_segment_it_wrote() {
+        for use_compound in [false, true] {
+            let (storage, engine, merged) = merged_two_segments(use_compound);
+            let id = &merged.segment_info.segment_id;
+            assert_eq!(merged.segment_info.doc_count, 3);
+            // Both layouts are really exercised: the stored-fields part is a
+            // standalone file or lives inside the compound container.
+            assert_eq!(
+                storage.file_exists(&format!("{id}.cfs")),
+                use_compound,
+                "layout of {id}"
+            );
+            engine
+                .verify_merged_segment(&merged)
+                .unwrap_or_else(|e| panic!("use_compound={use_compound}: {e}"));
+        }
+    }
+
+    #[test]
+    fn verify_merged_segment_rejects_an_overstated_doc_count() {
+        // The state a merge writer that flushed part of its replay elsewhere
+        // would leave: the metadata claims more documents than the segment
+        // holds. The old check compared the claim with itself and passed.
+        let (_storage, engine, merged) = merged_two_segments(false);
+        let overstated = ManagedSegmentInfo::new(SegmentInfo {
+            doc_count: merged.segment_info.doc_count + 1,
+            ..merged.segment_info.clone()
+        });
+        let err = engine.verify_merged_segment(&overstated).unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verify_merged_segment_rejects_a_missing_stored_fields_part() {
+        let (storage, engine, merged) = merged_two_segments(false);
+        let docs = format!("{}.docs", merged.segment_info.segment_id);
+        storage.delete_file(&docs).unwrap();
+        let err = engine.verify_merged_segment(&merged).unwrap_err();
+        assert!(err.to_string().contains("no stored-fields part"), "{err}");
+    }
+
+    #[test]
+    fn merge_of_fully_deleted_segments_verifies_as_empty() {
+        use crate::maintenance::deletion::{DeletionConfig, DeletionManager};
+
+        // Every source document is deleted, so the replay emits nothing and
+        // the merge writes no files at all. The verification must accept
+        // that: rejecting it would fail the merge and, through auto-merge,
+        // every later commit.
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let d0 = writer.add_document(text_int_doc("alpha", 1)).unwrap();
+        writer.commit().unwrap();
+        let d1 = writer.add_document(text_int_doc("bravo", 2)).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let manager = DeletionManager::new(
+            DeletionConfig {
+                enable_deletion_log: false,
+                ..Default::default()
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        for (segment_id, doc_id) in [("segment_000000", d0), ("segment_000001", d1)] {
+            manager
+                .initialize_segment(segment_id, doc_id, doc_id)
+                .unwrap();
+            manager.delete_document(segment_id, doc_id, "test").unwrap();
+        }
+        manager.flush().unwrap();
+
+        let deleted = |id: &str, doc_id: u64, generation: u64| {
+            ManagedSegmentInfo::new(SegmentInfo {
+                has_deletions: true,
+                ..segment_info(id, 1, doc_id, doc_id, generation)
+            })
+        };
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine
+            .merge_segments(
+                &two_segment_candidate(),
+                &[
+                    deleted("segment_000000", d0, 0),
+                    deleted("segment_000001", d1, 1),
+                ],
+                1,
+            )
+            .expect("a merge of fully deleted segments must not fail verification");
+        // Had the deletions not been applied, both documents would have
+        // been emitted and the merged segment would claim 2.
+        assert_eq!(result.new_segment.segment_info.doc_count, 0);
+        let id = &result.new_segment.segment_info.segment_id;
+        assert!(!storage.file_exists(&format!("{id}.docs")));
+        assert!(!storage.file_exists(&format!("{id}.cfs")));
+        engine.verify_merged_segment(&result.new_segment).unwrap();
     }
 }

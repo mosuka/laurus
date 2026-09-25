@@ -590,18 +590,24 @@ impl StoredFieldsWriter {
 pub(crate) struct StoredFieldsReader;
 
 impl StoredFieldsReader {
-    /// Read the chunked `.docs` format from `reader`, decoding every chunk
-    /// into an in-memory map (see module docs for why this stays eager
-    /// rather than lazy/random-access).
+    /// Read only the header of a `.docs` stream and return the total number
+    /// of documents it declares, without decoding any chunk (Issue #1166).
+    ///
+    /// The merge verification uses this to compare what a merged segment's
+    /// metadata claims against what was actually written, at the cost of a
+    /// few header bytes rather than a full decode.
     ///
     /// # Errors
     ///
-    /// Returns an error if the magic/version don't match (format break, no
-    /// legacy support — see module docs), or if any chunk fails its CRC,
-    /// bounds, or decompression checks.
-    pub(crate) fn load<R: StorageInput>(
-        reader: &mut StructReader<R>,
-    ) -> Result<BTreeMap<u64, Document>> {
+    /// Returns the same errors as [`Self::load`] for a foreign magic or an
+    /// unsupported major version.
+    pub(crate) fn read_doc_count<R: StorageInput>(reader: &mut StructReader<R>) -> Result<u64> {
+        Self::read_header(reader)
+    }
+
+    /// Validate the magic and version at the start of a `.docs` stream and
+    /// return the total document count that follows them.
+    fn read_header<R: StorageInput>(reader: &mut StructReader<R>) -> Result<u64> {
         let magic: [u8; 4] = reader
             .read_raw(4)?
             .try_into()
@@ -620,8 +626,22 @@ impl StoredFieldsReader {
                  Pre-release format changes do not support older revisions; rebuild the index."
             )));
         }
+        reader.read_varint()
+    }
 
-        let total_doc_count = reader.read_varint()?;
+    /// Read the chunked `.docs` format from `reader`, decoding every chunk
+    /// into an in-memory map (see module docs for why this stays eager
+    /// rather than lazy/random-access).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the magic/version don't match (format break, no
+    /// legacy support — see module docs), or if any chunk fails its CRC,
+    /// bounds, or decompression checks.
+    pub(crate) fn load<R: StorageInput>(
+        reader: &mut StructReader<R>,
+    ) -> Result<BTreeMap<u64, Document>> {
+        let total_doc_count = Self::read_header(reader)?;
         let mut documents = BTreeMap::new();
         let mut decoded_count = 0u64;
         let mut scratch = Vec::new();
@@ -1157,6 +1177,37 @@ mod tests {
         let docs = vec![(1u64, AnalyzedDocument::new())];
         let documents = round_trip(&storage, "seg", &docs);
         assert!(documents[&1].fields.is_empty());
+    }
+
+    #[test]
+    fn read_doc_count_reads_only_the_header() {
+        // Enough documents to span several chunks: the count comes from the
+        // header, not from walking them.
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs: Vec<(u64, AnalyzedDocument)> = (0..300u64)
+            .map(|id| (id, doc(&[("body", DataValue::Text(format!("doc {id}")))])))
+            .collect();
+        round_trip(&storage, "seg", &docs);
+        let input = storage.open_input("seg.docs").unwrap();
+        let mut reader = StructReader::new(input).unwrap();
+        assert_eq!(
+            StoredFieldsReader::read_doc_count(&mut reader).unwrap(),
+            300
+        );
+
+        // A foreign magic is rejected exactly as `load` rejects it.
+        let output = storage.create_output("bad.docs").unwrap();
+        let mut writer = StructWriter::new(output);
+        writer.write_raw(b"XXXX").unwrap();
+        writer.write_raw(&[VERSION_MAJOR, VERSION_MINOR]).unwrap();
+        writer.write_varint(0).unwrap();
+        writer.close().unwrap();
+        let input = storage.open_input("bad.docs").unwrap();
+        let mut reader = StructReader::new(input).unwrap();
+        match StoredFieldsReader::read_doc_count(&mut reader).unwrap_err() {
+            LaurusError::Index(msg) => assert!(msg.contains("SDOC"), "{msg}"),
+            other => panic!("expected Index error, got {other:?}"),
+        }
     }
 
     #[test]
