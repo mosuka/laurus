@@ -160,3 +160,27 @@ async fn upsert_across_auto_flush_leaves_no_duplicate() -> laurus::Result<()> {
 
     Ok(())
 }
+
+/// Before a commit, the engine's document count must include the documents
+/// the automatic flush already wrote (Issue #1204). The count adds the
+/// lexical writer's pending documents to the committed total, and those
+/// used to cover only the in-memory buffer — so it reported the 50 buffered
+/// documents and dropped the 10 000 flushed ones until the commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_count_documents_written_before_auto_flush() -> laurus::Result<()> {
+    let (engine, _storage) = engine_past_auto_flush().await?;
+
+    assert_eq!(
+        engine.stats()?.document_count,
+        (MAX_BUFFERED_DOCS + 50) as u64,
+        "flushed-but-uncommitted documents must be counted before the commit"
+    );
+
+    engine.commit().await?;
+    assert_eq!(
+        engine.stats()?.document_count,
+        (MAX_BUFFERED_DOCS + 50) as u64
+    );
+
+    Ok(())
+}

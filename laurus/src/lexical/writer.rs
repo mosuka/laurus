@@ -118,15 +118,22 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
 
     /// Rollback all pending changes.
     ///
-    /// Discards all buffered documents and in-memory index data that have not
-    /// yet been committed. Already-committed data is not affected.
+    /// Discards every document added since the last commit — the in-memory
+    /// buffer and any segment an automatic flush already wrote but no commit
+    /// published — so the next commit publishes none of them. Deletions of
+    /// already-committed documents are kept and persisted by the next commit;
+    /// committed data is otherwise not affected, and the writer stays usable.
     ///
     /// # Errors
     ///
     /// Returns an error if the writer is closed.
     fn rollback(&mut self) -> Result<()>;
 
-    /// Get the number of documents buffered since the last commit.
+    /// Get the number of documents added since the last commit.
+    ///
+    /// Includes documents an automatic flush has already written to a
+    /// segment that no commit has published yet, not only the in-memory
+    /// buffer.
     fn pending_docs(&self) -> u64;
 
     /// Close the writer and release resources.

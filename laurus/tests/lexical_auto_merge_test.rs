@@ -188,3 +188,25 @@ fn optimize_ignores_the_flush_thresholds() {
     assert_eq!(hits(&store, "body", "lorem"), TITLES.len());
     assert_eq!(hits(&store, "title", "bravo"), 1);
 }
+
+/// `LexicalStore::stats` counts documents an automatic flush has already
+/// written to an unpublished segment (Issue #1204): before the commit, five
+/// upserts under a threshold of 2 are all counted, not just the one still
+/// buffered.
+#[test]
+fn stats_count_documents_flushed_before_commit() {
+    let config = LexicalIndexConfig::builder()
+        .max_buffered_docs(2)
+        .max_segments(1000)
+        .build();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+    for (i, title) in TITLES.iter().enumerate() {
+        store.upsert_document((i + 1) as u64, doc(title)).unwrap();
+    }
+
+    assert_eq!(store.stats().unwrap().doc_count, TITLES.len() as u64);
+
+    store.commit().unwrap();
+    assert_eq!(store.stats().unwrap().doc_count, TITLES.len() as u64);
+}

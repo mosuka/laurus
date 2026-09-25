@@ -393,6 +393,17 @@ pub struct InvertedIndexWriter {
     /// deletion bitmaps — `.delmap` first, then `.meta` — so a reader that
     /// sees the flag always finds the bitmap.
     pending_meta_deletions: AHashSet<String>,
+
+    /// Deletions counted into [`WriterStats::deleted_count`] against
+    /// segments still in [`Self::pending_publish`], per segment (Issue
+    /// #1204).
+    ///
+    /// [`Self::rollback`] discards those segments and must take exactly this
+    /// share back out of the count. The segment's bitmap cannot tell it: a
+    /// repeated upsert of one id counts a deletion each time but sets one
+    /// bit. Cleared together with `pending_publish` once the segments are
+    /// published.
+    pending_segment_deletions: AHashMap<String, u64>,
 }
 
 impl std::fmt::Debug for InvertedIndexWriter {
@@ -860,6 +871,7 @@ impl InvertedIndexWriter {
             max_committed_doc_id,
             deletion_manager: None,
             pending_meta_deletions: AHashSet::new(),
+            pending_segment_deletions: AHashMap::new(),
         })
     }
 
@@ -1992,21 +2004,103 @@ impl InvertedIndexWriter {
 
     /// Rollback all pending changes.
     ///
-    /// Buffered deletion state (deferred bitmap writes and `has_deletions`
-    /// meta flips, Issue #875) is intentionally NOT discarded: deletions were
-    /// never rollback-able (they used to be persisted synchronously at delete
-    /// time) and their WAL records are already acknowledged, so they are kept
-    /// and persisted by the next [`Self::flush_deletions`].
+    /// Discards every document added since the last commit: the in-memory
+    /// buffer, and every segment an automatic flush wrote but no commit has
+    /// published yet (Issue #1204). Those segments' files are deleted along
+    /// with the deletions recorded against them, and the batch's share of the
+    /// document and deletion counts is taken back out, so the next commit
+    /// neither publishes the discarded documents nor counts them. The writer
+    /// stays usable.
+    ///
+    /// Deletion state for **committed** segments (deferred bitmap writes and
+    /// `has_deletions` meta flips, Issue #875) is intentionally NOT
+    /// discarded: deletions were never rollback-able (they used to be
+    /// persisted synchronously at delete time) and their WAL records are
+    /// already acknowledged, so they are kept and persisted by the next
+    /// [`Self::flush_deletions`]. Rolling back an upsert of a committed
+    /// document therefore still removes its old version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer is closed, or if rewriting the segment
+    /// manifest or deleting a discarded segment's files fails. The in-memory
+    /// rollback is complete by then — no later commit can publish the
+    /// discarded segments — and files left behind are reclaimed by the orphan
+    /// sweep when the index is next opened.
     pub fn rollback(&mut self) -> Result<()> {
         self.check_closed()?;
 
-        // Clear all buffers
+        // Every document this rollback discards, buffered or flushed —
+        // counted before the buffer is cleared.
+        let rolled_back = self.pending_docs() as u64;
+
+        // Forget the flushed-but-unpublished segments first, so from here on
+        // no commit (including the implicit one `Drop` runs) can publish them.
+        let dropped: Vec<String> = std::mem::take(&mut self.pending_publish)
+            .into_iter()
+            .map(|info| info.segment_id)
+            .collect();
+        self.flushed_segments.clear();
+        let dropped_ids: AHashSet<&str> = dropped.iter().map(String::as_str).collect();
+        // `max_committed_doc_id` keeps its value: an over-estimate only
+        // disables the fast path that skips this range lookup.
+        self.segment_ranges
+            .retain(|(segment_id, _, _)| !dropped_ids.contains(segment_id.as_str()));
+        for segment_id in &dropped {
+            self.pending_meta_deletions.remove(segment_id);
+            if let Some(manager) = &self.deletion_manager {
+                manager.forget_segment(segment_id);
+            }
+        }
+
+        // Undo the batch's accounting: left in place, the next commit would
+        // add the discarded documents to the index's `doc_count` (and their
+        // deletions to `deleted_count`). Only unpublished segments are keyed
+        // in `pending_segment_deletions`, and all of them were just dropped.
+        let dropped_deletions: u64 = self.pending_segment_deletions.drain().map(|(_, n)| n).sum();
+        self.stats.docs_added = self.stats.docs_added.saturating_sub(rolled_back);
+        self.stats.deleted_count = self.stats.deleted_count.saturating_sub(dropped_deletions);
+
+        // Clear all buffers — the DocValues included, which would otherwise
+        // be written into the next segment's `.dv`.
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
         self.index_dirty = false;
         self.inverted_index = TermPostingIndex::new();
+        let segment_name = format!("{}_{:06}", self.config.segment_prefix, self.current_segment);
+        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), segment_name);
 
+        if dropped.is_empty() {
+            return Ok(());
+        }
+
+        // A commit whose manifest rename landed but whose directory sync
+        // failed left a `segments.json` on storage that already lists these
+        // segments, while the in-memory manifest never took them — the state
+        // #875's commit retry relies on. Rewrite the manifest from memory
+        // before deleting their files, or it could point at missing files
+        // after a restart. If the rewrite fails the files stay: the next
+        // commit rewrites the manifest and the orphan sweep reclaims them.
+        if let Some(manifest) = &self.segment_manifest {
+            super::segment_manifest::publish_with(self.storage.as_ref(), manifest, |_| {})?;
+        }
+        self.delete_segment_files(&dropped)
+    }
+
+    /// Delete every file belonging to `segment_ids` (`{segment}.*`, the
+    /// compound `.cfs`, loose parts and `.delmap` alike), listing the storage
+    /// once.
+    fn delete_segment_files(&self, segment_ids: &[String]) -> Result<()> {
+        let prefixes: Vec<String> = segment_ids.iter().map(|id| format!("{id}.")).collect();
+        for file in self.storage.list_files()? {
+            if prefixes
+                .iter()
+                .any(|prefix| file.starts_with(prefix.as_str()))
+            {
+                self.storage.delete_file(&file)?;
+            }
+        }
         Ok(())
     }
 
@@ -2024,9 +2118,10 @@ impl InvertedIndexWriter {
     /// Buffered deletion state is untouched, exactly as `rollback`
     /// documents; the merge replay never creates any.
     pub(crate) fn abort(&mut self) {
-        // Infallible in practice: `rollback` only clears in-memory buffers
-        // after the `check_closed` guard, and the writer cannot be closed
-        // here — `abort` is what closes it.
+        // Infallible in practice: the callers are merge writers, whose
+        // unbounded flush thresholds mean they never hold a flushed segment,
+        // so `rollback` only clears in-memory state — and the writer cannot
+        // be closed here, since `abort` is what closes it.
         let _ = self.rollback();
         self.closed = true;
     }
@@ -2054,9 +2149,17 @@ impl InvertedIndexWriter {
         }
     }
 
-    /// Get the number of pending documents.
+    /// Get the number of documents added since the last commit.
+    ///
+    /// Counts both the in-memory buffer and every segment an automatic
+    /// flush has written but no commit has published yet (Issue #1204):
+    /// until the commit, those documents are just as pending as the
+    /// buffered ones. Like the buffered count, it includes a document whose
+    /// newer version was upserted before the commit — the superseding
+    /// deletion is only applied to the index's counts at commit time.
     pub fn pending_docs(&self) -> usize {
-        self.buffered_docs.len()
+        let flushed: u64 = self.pending_publish.iter().map(|s| s.doc_count).sum();
+        self.buffered_docs.len() + flushed as usize
     }
 
     /// Check if the writer is closed.
@@ -2203,6 +2306,20 @@ impl InvertedIndexWriter {
                 // `flush_deletions` at commit (Issue #875).
                 self.update_segment_meta_deletions(segment_id);
 
+                // A segment still waiting for publication may be discarded
+                // by `rollback`, which then takes this deletion back out of
+                // `deleted_count` (Issue #1204).
+                if self
+                    .pending_publish
+                    .iter()
+                    .any(|info| &info.segment_id == segment_id)
+                {
+                    *self
+                        .pending_segment_deletions
+                        .entry(segment_id.clone())
+                        .or_insert(0) += 1;
+                }
+
                 deleted += 1;
             }
             // Track globally
@@ -2345,6 +2462,8 @@ impl InvertedIndexWriter {
             })?;
         }
         self.pending_publish.clear();
+        // Published segments can no longer be rolled back (Issue #1204).
+        self.pending_segment_deletions.clear();
         Ok(())
     }
 
@@ -2841,6 +2960,41 @@ mod tests {
             small, large,
             "the DocValues payload must be identical regardless of binary field size, \
              got {small} vs {large}"
+        );
+    }
+
+    /// `rollback()` discards the buffered documents' DocValues too (Issue
+    /// #1204). They used to stay in the DocValues writer and be written into
+    /// the next flushed segment's `.dv`, under ids that segment does not hold.
+    #[test]
+    fn rollback_discards_buffered_doc_values() {
+        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
+            crate::storage::memory::MemoryStorageConfig::default(),
+        ));
+        let mut writer =
+            InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+        writer
+            .add_document(
+                Document::builder()
+                    .add_text("rolled_back_field", "discarded")
+                    .build(),
+            )
+            .unwrap();
+        writer.rollback().unwrap();
+        writer
+            .add_document(Document::builder().add_text("title", "kept").build())
+            .unwrap();
+
+        let mut serialized: Vec<u8> = Vec::new();
+        writer
+            .doc_values_writer
+            .write_to_output(&mut serialized)
+            .unwrap();
+        let names = String::from_utf8_lossy(&serialized).to_string();
+        assert!(names.contains("title"));
+        assert!(
+            !names.contains("rolled_back_field"),
+            "a rolled-back document's DocValues must not reach the next segment"
         );
     }
 
