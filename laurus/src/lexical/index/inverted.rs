@@ -1060,7 +1060,9 @@ mod tests {
         writer
             .add_document(create_test_document("Doc 2", "Content 2"))
             .unwrap();
-        assert_eq!(writer.pending_docs(), 0); // Flushed
+        // Flushed to a segment, but not committed: both documents are still
+        // pending (Issue #1204).
+        assert_eq!(writer.pending_docs(), 2);
         assert_eq!(writer.stats().segments_created, 1);
 
         // Check that files were created
@@ -1315,6 +1317,43 @@ mod tests {
             (stats.hits, stats.misses),
             (0, 0),
             "a disabled posting cache is never consulted"
+        );
+    }
+
+    /// `pending_docs()` counts documents an automatic flush has written to a
+    /// segment no commit has published yet (Issue #1204). It used to count
+    /// only the buffer, so the store / engine stats built on it dropped the
+    /// flushed documents until the commit.
+    #[test]
+    fn pending_docs_counts_flushed_unpublished_documents() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_buffered_docs: 2,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        for i in 0..3 {
+            writer
+                .add_document(create_test_document(&format!("Doc {i}"), "Content"))
+                .unwrap();
+        }
+        assert!(
+            has_flushed_segment(&storage),
+            "the first two documents flushed"
+        );
+        assert_eq!(
+            writer.pending_docs(),
+            3,
+            "flushed + buffered, all uncommitted"
+        );
+
+        writer.commit().unwrap();
+        assert_eq!(
+            writer.pending_docs(),
+            0,
+            "a commit publishes every pending document"
         );
     }
 }

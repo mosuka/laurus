@@ -126,7 +126,11 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
     /// Returns an error if the writer is closed.
     fn rollback(&mut self) -> Result<()>;
 
-    /// Get the number of documents buffered since the last commit.
+    /// Get the number of documents added since the last commit.
+    ///
+    /// Includes documents an automatic flush has already written to a
+    /// segment that no commit has published yet, not only the in-memory
+    /// buffer.
     fn pending_docs(&self) -> u64;
 
     /// Close the writer and release resources.

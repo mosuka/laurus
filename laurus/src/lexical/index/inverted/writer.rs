@@ -2054,9 +2054,17 @@ impl InvertedIndexWriter {
         }
     }
 
-    /// Get the number of pending documents.
+    /// Get the number of documents added since the last commit.
+    ///
+    /// Counts both the in-memory buffer and every segment an automatic
+    /// flush has written but no commit has published yet (Issue #1204):
+    /// until the commit, those documents are just as pending as the
+    /// buffered ones. Like the buffered count, it includes a document whose
+    /// newer version was upserted before the commit — the superseding
+    /// deletion is only applied to the index's counts at commit time.
     pub fn pending_docs(&self) -> usize {
-        self.buffered_docs.len()
+        let flushed: u64 = self.pending_publish.iter().map(|s| s.doc_count).sum();
+        self.buffered_docs.len() + flushed as usize
     }
 
     /// Check if the writer is closed.
