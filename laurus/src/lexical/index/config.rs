@@ -11,13 +11,22 @@ use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::lexical::core::field::FieldOption;
 
-/// Configuration specific to inverted index.
-///
-/// These settings control the behavior of the inverted index implementation,
-/// including segment management, buffering, compression, and term storage options.
 /// serde default for [`InvertedIndexConfig::use_compound`].
 fn default_use_compound() -> bool {
     crate::lexical::index::inverted::compound::default_use_compound()
+}
+
+/// serde default for [`InvertedIndexConfig::max_buffered_docs`] -- the
+/// writer's own default, so wiring the field (Issue #1200) changed nothing
+/// for a config that does not set it.
+fn default_max_buffered_docs() -> usize {
+    crate::lexical::index::inverted::writer::DEFAULT_MAX_BUFFERED_DOCS
+}
+
+/// serde default for [`InvertedIndexConfig::max_buffer_memory`]; see
+/// [`default_max_buffered_docs`].
+fn default_max_buffer_memory() -> usize {
+    crate::lexical::index::inverted::writer::DEFAULT_MAX_BUFFER_MEMORY
 }
 
 /// serde default for [`InvertedIndexConfig::store_doc_values`] -- a
@@ -27,6 +36,10 @@ fn default_true() -> bool {
     true
 }
 
+/// Configuration specific to inverted index.
+///
+/// These settings control the behavior of the inverted index implementation,
+/// including segment management, buffering, compression, and term storage options.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InvertedIndexConfig {
     /// Write flushed segments as one compound `.cfs` container instead of
@@ -40,17 +53,30 @@ pub struct InvertedIndexConfig {
     #[serde(default = "default_use_compound")]
     pub use_compound: bool,
 
-    /// Maximum number of documents per segment.
+    /// Maximum number of documents the writer buffers in memory before
+    /// flushing them to a new segment (Issue #1200). Defaults to `10_000`.
     ///
-    /// When a segment reaches this size, it will be considered for merging.
-    /// Larger values reduce merge overhead but increase memory usage.
-    pub max_docs_per_segment: u64,
+    /// Reaching this or [`Self::max_buffer_memory`], whichever comes first,
+    /// writes the buffer out as an uncommitted segment; `commit()` flushes
+    /// what remains and publishes all of them at once. Lower values bound
+    /// ingestion memory more tightly, but one commit then publishes more
+    /// segments, each flush pays its own write and fsync, and every query
+    /// searches every segment. Auto-merge merges only
+    /// [`Self::merge_factor`] segments per commit, so the count can stay
+    /// above [`Self::max_segments`] for several commits. `0` flushes after
+    /// every document. Merges are unaffected: their writers are unbounded.
+    #[serde(default = "default_max_buffered_docs")]
+    pub max_buffered_docs: usize,
 
-    /// Buffer size for writing operations (in bytes).
+    /// Estimated memory, in bytes, the writer buffers before flushing to a
+    /// new segment (Issue #1200). Defaults to 64 MiB.
     ///
-    /// Controls how much data is buffered in memory before being flushed to disk.
-    /// Larger buffers improve write performance but use more memory.
-    pub write_buffer_size: usize,
+    /// The estimate is the buffered documents' analyzed size plus 256 bytes
+    /// per distinct term in the in-memory posting index. Otherwise this
+    /// behaves like [`Self::max_buffered_docs`]: whichever threshold is
+    /// reached first triggers the flush.
+    #[serde(default = "default_max_buffer_memory")]
+    pub max_buffer_memory: usize,
 
     /// Index-wide default for whether term positions are stored.
     ///
@@ -153,8 +179,8 @@ impl Default for InvertedIndexConfig {
     fn default() -> Self {
         InvertedIndexConfig {
             use_compound: default_use_compound(),
-            max_docs_per_segment: 1000000,
-            write_buffer_size: 1024 * 1024, // 1MB
+            max_buffered_docs: default_max_buffered_docs(),
+            max_buffer_memory: default_max_buffer_memory(),
             store_term_vectors: true,
             store_doc_values: true,
             merge_factor: 10,
@@ -175,8 +201,8 @@ impl Default for InvertedIndexConfig {
 impl std::fmt::Debug for InvertedIndexConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedIndexConfig")
-            .field("max_docs_per_segment", &self.max_docs_per_segment)
-            .field("write_buffer_size", &self.write_buffer_size)
+            .field("max_buffered_docs", &self.max_buffered_docs)
+            .field("max_buffer_memory", &self.max_buffer_memory)
             .field("store_term_vectors", &self.store_term_vectors)
             .field("store_doc_values", &self.store_doc_values)
             .field("merge_factor", &self.merge_factor)

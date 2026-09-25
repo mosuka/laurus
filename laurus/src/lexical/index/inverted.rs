@@ -760,12 +760,16 @@ impl LexicalIndex for InvertedIndex {
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
 
-        // Use analyzer and shard_id from index config
+        // Every writer setting the index config carries must be set here:
+        // `..Default::default()` would otherwise mask it — the flush
+        // thresholds were silently ignored until Issue #1200.
         let writer_config = InvertedIndexWriterConfig {
             analyzer: self.config.analyzer.clone(),
             shard_id: self.config.shard_id,
             fields,
             use_compound: self.config.use_compound,
+            max_buffered_docs: self.config.max_buffered_docs,
+            max_buffer_memory: self.config.max_buffer_memory,
             store_term_positions: self.config.store_term_vectors,
             store_doc_values: self.config.store_doc_values,
             ..Default::default()
@@ -1169,5 +1173,78 @@ mod tests {
 
         assert_eq!(writer.stats().docs_added, 1);
         assert!(writer.stats().unique_terms >= 3); // At least title, id, count fields
+    }
+
+    /// Whether a flushed segment — committed or not — exists on `storage`.
+    fn has_flushed_segment(storage: &Arc<MemoryStorage>) -> bool {
+        storage
+            .list_files()
+            .unwrap()
+            .iter()
+            .any(|f| f.starts_with("segment_"))
+    }
+
+    /// The index config's document threshold reaches the writer `writer()`
+    /// builds (Issue #1200): with `max_buffered_docs: 2` the second document
+    /// flushes an uncommitted segment. Were it ignored, the writer's
+    /// 10,000-document default would keep both documents in memory.
+    #[test]
+    fn writer_honours_the_index_max_buffered_docs() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_buffered_docs: 2,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        writer
+            .add_document(create_test_document("Doc 1", "Content 1"))
+            .unwrap();
+        assert!(
+            !has_flushed_segment(&storage),
+            "one document stays buffered"
+        );
+
+        writer
+            .add_document(create_test_document("Doc 2", "Content 2"))
+            .unwrap();
+        assert!(
+            has_flushed_segment(&storage),
+            "the second document reaches max_buffered_docs and flushes a segment before commit"
+        );
+    }
+
+    /// Likewise for the memory threshold (Issue #1200): any document exceeds
+    /// a one-byte budget, so the first one flushes. Ignored, the writer's
+    /// 64 MiB default would keep it in memory.
+    #[test]
+    fn writer_honours_the_index_max_buffer_memory() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_buffer_memory: 1,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        writer
+            .add_document(create_test_document("Doc 1", "Content 1"))
+            .unwrap();
+        assert!(
+            has_flushed_segment(&storage),
+            "a document over max_buffer_memory flushes a segment before commit"
+        );
+    }
+
+    /// The index-level flush thresholds default to the writer's own values
+    /// (Issue #1200), so wiring them changed nothing for a config that does
+    /// not set them.
+    #[test]
+    fn index_flush_threshold_defaults_match_the_writer() {
+        let index = InvertedIndexConfig::default();
+        let writer = InvertedIndexWriterConfig::default();
+        assert_eq!(index.max_buffered_docs, writer.max_buffered_docs);
+        assert_eq!(index.max_buffer_memory, writer.max_buffer_memory);
     }
 }

@@ -4,6 +4,10 @@
 //! smallest `merge_factor` segments once the segment count exceeds
 //! `max_segments`. This keeps the segment count bounded without a manual
 //! `optimize()`, and is a no-op below the threshold.
+//!
+//! The writer's flush thresholds (`max_buffered_docs` / `max_buffer_memory`,
+//! Issue #1200) decide how many segments one commit publishes, so they are
+//! pinned here too, together with the guarantee that a merge ignores them.
 
 use std::sync::Arc;
 
@@ -107,4 +111,80 @@ fn auto_merge_noop_above_threshold() {
         "no merge below threshold => one segment per commit"
     );
     assert_eq!(hits(&store, "body", "lorem"), 4);
+}
+
+const TITLES: [&str; 5] = ["alpha", "bravo", "charlie", "delta", "echo"];
+
+/// Upsert one document per entry of [`TITLES`] into a store built from
+/// `config`, then commit once.
+fn store_with_one_commit(config: LexicalIndexConfig) -> (Arc<dyn Storage>, LexicalStore) {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+    for (i, title) in TITLES.iter().enumerate() {
+        store.upsert_document((i + 1) as u64, doc(title)).unwrap();
+    }
+    store.commit().unwrap();
+    (storage, store)
+}
+
+/// `max_buffered_docs` set through the builder reaches the writer (Issue
+/// #1200): five documents under a threshold of 2 flush after the second and
+/// the fourth, and `commit()` flushes the fifth, so one commit publishes
+/// three segments. Ignored, the 10,000-document default publishes one.
+#[test]
+fn max_buffered_docs_splits_one_commit_into_segments() {
+    let config = LexicalIndexConfig::builder()
+        .max_buffered_docs(2)
+        .max_segments(1000)
+        .build();
+    let (storage, store) = store_with_one_commit(config);
+
+    assert_eq!(segment_count(&storage), 3, "ceil(5 / 2) segments");
+    assert_eq!(hits(&store, "body", "lorem"), TITLES.len());
+    assert_eq!(hits(&store, "title", "echo"), 1);
+}
+
+/// `max_buffer_memory` set through the builder reaches the writer (Issue
+/// #1200): every document exceeds a one-byte budget and flushes on its own,
+/// leaving `commit()` nothing to flush — five segments, all searchable.
+#[test]
+fn max_buffer_memory_splits_one_commit_into_segments() {
+    let config = LexicalIndexConfig::builder()
+        .max_buffer_memory(1)
+        .max_segments(1000)
+        .build();
+    let (storage, store) = store_with_one_commit(config);
+
+    assert_eq!(
+        segment_count(&storage),
+        TITLES.len(),
+        "one segment per document"
+    );
+    assert_eq!(hits(&store, "body", "lorem"), TITLES.len());
+    assert_eq!(hits(&store, "title", "charlie"), 1);
+}
+
+/// A merge is not bound by the flush thresholds (Issue #1200): its writer is
+/// unbounded, so `optimize()` still produces a single segment holding every
+/// document. Were the threshold inherited, the merge would flush part of its
+/// replay into unregistered files, and the #1166 check that the merged
+/// segment holds every document it claims would fail the merge.
+#[test]
+fn optimize_ignores_the_flush_thresholds() {
+    let config = LexicalIndexConfig::builder()
+        .max_buffered_docs(2)
+        .max_segments(1000)
+        .build();
+    let (storage, store) = store_with_one_commit(config);
+    assert_eq!(segment_count(&storage), 3);
+
+    store.optimize().unwrap();
+
+    assert_eq!(
+        segment_count(&storage),
+        1,
+        "optimize merges into one segment"
+    );
+    assert_eq!(hits(&store, "body", "lorem"), TITLES.len());
+    assert_eq!(hits(&store, "title", "bravo"), 1);
 }
