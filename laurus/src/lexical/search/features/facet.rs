@@ -6,8 +6,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::lexical::query::Hit;
-use crate::lexical::query::Query;
 use crate::lexical::reader::LexicalIndexReader;
 
 /// Represents a facet field and its hierarchical structure.
@@ -728,111 +726,6 @@ impl FacetFilter {
 impl Default for FacetFilter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Faceted search engine that combines full-text search with facet collection.
-#[derive(Debug)]
-pub struct FacetedSearchEngine {
-    /// Configuration for facet collection.
-    facet_config: FacetConfig,
-}
-
-impl FacetedSearchEngine {
-    /// Create a new faceted search engine.
-    pub fn new(facet_config: FacetConfig) -> Self {
-        FacetedSearchEngine { facet_config }
-    }
-
-    /// Perform a faceted search.
-    pub fn search<Q: Query>(
-        &self,
-        query: Q,
-        facet_fields: Vec<String>,
-        facet_filter: Option<FacetFilter>,
-        reader: &dyn LexicalIndexReader,
-    ) -> Result<FacetedSearchResults> {
-        // Execute the base query
-        let _matcher = query.matcher(reader)?;
-        let _scorer = query.scorer(reader)?;
-
-        let mut hits = Vec::new();
-        let mut facet_collector = FacetCollector::new(self.facet_config.clone(), facet_fields);
-
-        // Collect matching documents
-        // Note: Simplified implementation as matcher.next() returns bool not Option<u32>
-        for doc_id in 0..10u64 {
-            // Placeholder logic
-            let score = 1.0f32; // Placeholder score as scorer.score needs different arguments
-
-            // Apply facet filter if provided
-            if let Some(ref filter) = facet_filter {
-                let doc_facets = self.get_document_facets(doc_id, reader)?;
-                if !filter.matches_doc(&doc_facets) {
-                    continue;
-                }
-            }
-
-            hits.push(Hit {
-                doc_id,
-                score,
-                fields: HashMap::new(), // TODO: Load actual field values
-            });
-
-            // Collect facets for this document
-            facet_collector.collect_doc(doc_id, reader)?;
-        }
-
-        // Sort hits by score
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-        // Finalize facet collection
-        let facet_results = facet_collector.finalize()?;
-
-        let total_hits = hits.len() as u64;
-        Ok(FacetedSearchResults {
-            hits,
-            facets: facet_results,
-            total_hits,
-        })
-    }
-
-    /// Get facet paths for a document.
-    fn get_document_facets(
-        &self,
-        _doc_id: u64,
-        _reader: &dyn LexicalIndexReader,
-    ) -> Result<Vec<FacetPath>> {
-        // This is a simplified implementation
-        // In a real implementation, we would:
-        // 1. Load the document from the index
-        // 2. Extract facet field values
-        // 3. Parse them into FacetPath objects
-
-        // For now, return empty list
-        Ok(vec![])
-    }
-}
-
-/// Results of a faceted search.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FacetedSearchResults {
-    /// Search hits.
-    pub hits: Vec<Hit>,
-    /// Facet results.
-    pub facets: FacetResults,
-    /// Total number of hits.
-    pub total_hits: u64,
-}
-
-impl FacetedSearchResults {
-    /// Create empty faceted search results.
-    pub fn empty() -> Self {
-        FacetedSearchResults {
-            hits: Vec::new(),
-            facets: FacetResults::empty(),
-            total_hits: 0,
-        }
     }
 }
 
