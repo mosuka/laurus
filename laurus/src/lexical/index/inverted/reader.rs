@@ -1150,6 +1150,33 @@ impl SegmentReader {
         Ok(self.term_dictionary.read().unwrap().clone())
     }
 
+    /// The number of documents this segment's stored-fields part declares,
+    /// read from the `.docs` header only (Issue #1166). `None` when the
+    /// segment has no `.docs` part — which is what a merge writes when every
+    /// source document was deleted, or a pre-`.docs` legacy segment.
+    ///
+    /// Unlike [`Self::doc_count`], which reports the segment metadata's own
+    /// `doc_count` whenever the segment has no deletions, this reflects what
+    /// was actually written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the part exists but cannot be opened or its
+    /// header is not a supported stored-fields header.
+    pub fn stored_doc_count(&self) -> Result<Option<u64>> {
+        let docs_file = format!("{}.docs", self.info.segment_id);
+        if !self.storage.file_exists(&docs_file) {
+            return Ok(None);
+        }
+        let input = self.storage.open_input(&docs_file)?;
+        let mut reader = StructReader::new(input)?;
+        Ok(Some(
+            crate::lexical::index::structures::stored_fields::StoredFieldsReader::read_doc_count(
+                &mut reader,
+            )?,
+        ))
+    }
+
     /// Whether this segment has an on-disk term dictionary (Issue #1196).
     ///
     /// A segment without one still answers `postings` through the
