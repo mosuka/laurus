@@ -388,6 +388,20 @@ pub(crate) fn read_doc_ids(
     else {
         return Ok(None);
     };
+    read_doc_ids_from(input).map(Some)
+}
+
+/// [`read_doc_ids`] over an already opened `.norms` input — for a caller
+/// that holds the segment's own storage, such as a `SegmentReader` reading
+/// through its compound facade (Issue #1211).
+///
+/// # Errors
+///
+/// Returns an error when the part has a foreign magic or version, or its
+/// slot map is inconsistent with its header.
+pub(crate) fn read_doc_ids_from<R: crate::storage::StorageInput>(
+    input: R,
+) -> Result<roaring::RoaringTreemap> {
     let mut reader = StructReader::new(input)?;
     let file_size = reader.size();
 
@@ -411,7 +425,7 @@ pub(crate) fn read_doc_ids(
 
     let mut ids = roaring::RoaringTreemap::new();
     if doc_count == 0 {
-        return Ok(Some(ids));
+        return Ok(ids);
     }
     if flags & FLAG_SLOT_MAP_CONTIGUOUS != 0 {
         let end = min_doc_id.checked_add(doc_count).ok_or_else(|| {
@@ -438,7 +452,7 @@ pub(crate) fn read_doc_ids(
             ".norms slot map does not end at the header's max_doc_id — segment is corrupted",
         ));
     }
-    Ok(Some(ids))
+    Ok(ids)
 }
 
 impl NormsReader {

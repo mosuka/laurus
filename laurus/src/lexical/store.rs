@@ -1363,6 +1363,70 @@ mod tests {
         assert_eq!(term_count(&store, "title", "nonexistent"), 0);
     }
 
+    /// Issue #1211: a segment with gaps in its id range reports its true live
+    /// count once it has a deletion, and the count fast path does not return
+    /// the deleted document. `optimize` merges {1,2,3} (2 deleted) and {4}
+    /// into {1,3,4} over range 1..4; deleting 3 then made the range width
+    /// minus the deletions (3) equal `max_doc`, so the fast path answered
+    /// from `doc_freq`, which still counts doc 3.
+    #[test]
+    fn a_gapped_segment_counts_its_live_documents() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for id in 1..=3u64 {
+            store
+                .upsert_document(id, create_test_document("world", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+        store
+            .upsert_document(4, create_test_document("world", "body"))
+            .unwrap();
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(2).unwrap();
+        store.commit().unwrap();
+        store.optimize().unwrap();
+        store.delete_document_by_internal_id(3).unwrap();
+        store.commit().unwrap();
+
+        assert_eq!(store.reader_for_tests().unwrap().doc_count(), 2);
+        assert_eq!(term_count(&store, "title", "world"), 2);
+    }
+
+    /// Issue #1211: when a segment's membership is unknown (no `.ids` and no
+    /// `.norms`, as before #555), its live count is an upper bound that never
+    /// under-counts — and the count fast path does not take that bound for
+    /// "no deletions". Segment {1, 3} with 3 deleted: the bound is 2 (it
+    /// cannot tell whether the bit is on a held id), which equals `max_doc`.
+    #[test]
+    fn unknown_membership_bounds_the_live_count_and_skips_the_fast_path() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config =
+            LexicalIndexConfig::Inverted(crate::lexical::index::config::InvertedIndexConfig {
+                use_compound: false,
+                ..Default::default()
+            });
+        let store = LexicalStore::new(storage.clone(), config).unwrap();
+        for id in [1u64, 3] {
+            store
+                .upsert_document(id, create_test_document("world", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(3).unwrap();
+        store.commit().unwrap();
+        for file in storage.list_files().unwrap() {
+            if file.ends_with(".ids") || file.ends_with(".norms") {
+                storage.delete_file(&file).unwrap();
+            }
+        }
+        store.refresh().unwrap();
+
+        let live = store.reader_for_tests().unwrap().doc_count();
+        assert!(live >= 1, "the bound must not under-count: {live}");
+        assert_eq!(term_count(&store, "title", "world"), 1);
+    }
+
     #[test]
     fn test_engine_refresh() {
         let temp_dir = TempDir::new().unwrap();

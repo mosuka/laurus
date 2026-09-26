@@ -487,6 +487,34 @@ impl SegmentNorms {
     }
 }
 
+/// What a segment is known to hold (Issue #1211).
+///
+/// Deletions and counts address global doc ids, and a segment's
+/// `[min_doc_id, max_doc_id]` range can contain ids it does not hold — a
+/// merge drops deleted documents and can span segments it left out — so the
+/// range alone does not say which ids are the segment's.
+#[derive(Debug, Clone)]
+pub(crate) enum Membership {
+    /// No documents: a merge whose every source document was deleted.
+    Empty,
+    /// Every id of the range: the range has no gaps.
+    Range,
+    /// Exactly these ids, from the `.ids` part (or `.norms` for a segment
+    /// written before it existed).
+    Set(Arc<RoaringTreemap>),
+    /// Not recorded (a pre-#555 segment), or a recorded set that disagrees
+    /// with the segment and so is not trusted.
+    Unknown,
+}
+
+/// Width of a segment's id range, `max − min + 1`; `None` on overflow or an
+/// inverted range.
+fn range_width(info: &SegmentInfo) -> Option<u64> {
+    info.max_doc_id
+        .checked_sub(info.min_doc_id)
+        .and_then(|w| w.checked_add(1))
+}
+
 /// Reader for a single segment (schema-less mode).
 #[derive(Debug)]
 pub struct SegmentReader {
@@ -543,6 +571,15 @@ pub struct SegmentReader {
 
     /// Whether the segment is loaded.
     loaded: AtomicBool,
+
+    /// What the segment holds, resolved once per reader (Issue #1211) — see
+    /// [`Self::membership`]. A reader describes one snapshot, whose segment
+    /// files never change, so the answer cannot go stale.
+    membership: OnceLock<Membership>,
+
+    /// The live document count, computed once per reader (Issue #1211) —
+    /// see [`Self::doc_count`].
+    live_doc_count: OnceLock<u64>,
 }
 
 impl SegmentReader {
@@ -588,6 +625,8 @@ impl SegmentReader {
             analyzer: None,
             warned_missing_postings: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
+            membership: OnceLock::new(),
+            live_doc_count: OnceLock::new(),
         };
 
         Ok(reader)
@@ -814,8 +853,103 @@ impl SegmentReader {
         let input = self.storage.open_input(&bitmap_file)?;
         let mut reader = StructReader::new(input)?;
         let bitmap = DeletionBitmap::read_from_storage(&mut reader)?;
-        *self.deletion_bitmap.write().unwrap() = Some(Arc::new(bitmap));
+        // Re-check under the write lock: two first loads racing here must
+        // install one bitmap, or the cached live count and `is_deleted`
+        // could each answer from a different one (Issue #1211).
+        let mut slot = self.deletion_bitmap.write().unwrap();
+        if slot.is_none() {
+            *slot = Some(Arc::new(bitmap));
+        }
         Ok(())
+    }
+
+    /// The segment's deletion bitmap, loaded on first use; `None` when it
+    /// has no deletions (or its bitmap is missing or unreadable, which the
+    /// deletion checks also treat as none).
+    fn deletions(&self) -> Option<Arc<DeletionBitmap>> {
+        if !self.info.has_deletions {
+            return None;
+        }
+        if let Some(bitmap) = self.deletion_bitmap.read().unwrap().clone() {
+            return Some(bitmap);
+        }
+        self.load_deletion_bitmap().ok()?;
+        self.deletion_bitmap.read().unwrap().clone()
+    }
+
+    /// What this segment holds (Issue #1211), resolved once per reader.
+    ///
+    /// Most segments answer without I/O: an empty one holds nothing and one
+    /// without gaps holds its whole range. Only a segment with gaps reads its
+    /// doc-id set — `.ids`, or `.norms` for a segment written before that
+    /// part existed — through the segment's own storage (the compound facade
+    /// windows the part without copying the container). A set that
+    /// disagrees with the segment's recorded count and range is not trusted.
+    pub(crate) fn membership(&self) -> &Membership {
+        self.membership.get_or_init(|| {
+            let info = &self.info;
+            if info.doc_count == 0 {
+                return Membership::Empty;
+            }
+            if range_width(info) == Some(info.doc_count) {
+                return Membership::Range;
+            }
+            match crate::lexical::index::structures::doc_id_set::load_doc_ids_from_segment_storage(
+                self.storage.as_ref(),
+                &info.segment_id,
+            ) {
+                Ok(Some(ids))
+                    if ids.len() == info.doc_count
+                        && ids.min() == Some(info.min_doc_id)
+                        && ids.max() == Some(info.max_doc_id) =>
+                {
+                    Membership::Set(Arc::new(ids))
+                }
+                Ok(Some(ids)) => {
+                    log::warn!(
+                        "segment {} records {} doc ids in [{:?}, {:?}] but claims {} in [{}, {}]; \
+                         its live count falls back to an upper bound",
+                        info.segment_id,
+                        ids.len(),
+                        ids.min(),
+                        ids.max(),
+                        info.doc_count,
+                        info.min_doc_id,
+                        info.max_doc_id
+                    );
+                    Membership::Unknown
+                }
+                Ok(None) => Membership::Unknown,
+                Err(e) => {
+                    log::warn!(
+                        "cannot read the doc-id set of segment {}: {e}; its live count falls back \
+                         to an upper bound",
+                        info.segment_id
+                    );
+                    Membership::Unknown
+                }
+            }
+        })
+    }
+
+    /// Whether any document this segment holds is deleted (Issue #1211).
+    ///
+    /// Exact where the live count may only be a bound: a segment whose
+    /// membership is unknown reports `true` as soon as its range carries a
+    /// bit, so a caller relying on "no deletions" (the count fast path)
+    /// never takes a bound for the truth.
+    pub(crate) fn has_effective_deletions(&self) -> bool {
+        let Some(bitmap) = self.deletions() else {
+            return false;
+        };
+        let info = &self.info;
+        match self.membership() {
+            Membership::Empty => false,
+            Membership::Range | Membership::Unknown => {
+                bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id) > 0
+            }
+            Membership::Set(ids) => bitmap.deleted_count_in(ids) > 0,
+        }
     }
 
     /// Check whether a global doc_id is marked as deleted in this segment.
@@ -1389,24 +1523,39 @@ impl SegmentReader {
         }
     }
 
-    /// Get the number of documents in this segment.
+    /// Get the number of live documents in this segment.
+    ///
+    /// The documents the segment holds minus the deleted ones (Issue #1211).
+    /// It used to be the bitmap's `live_count`, the id-range width minus the
+    /// deletions, which over-counts a segment with gaps in its range (a merge
+    /// drops deleted documents) — skewing BM25's N, and satisfying the count
+    /// fast path's "no deletions" test while deletions existed.
+    ///
+    /// When the segment's membership is unknown, the value is an upper bound
+    /// that never under-counts: at most `width − doc_count` bits can sit on
+    /// ids the segment does not hold, so at least `bits − gaps` deletions are
+    /// real. Computed once per reader.
     pub fn doc_count(&self) -> u64 {
-        if !self.info.has_deletions {
-            return self.info.doc_count;
-        }
-
-        if let Some(bitmap) = self.deletion_bitmap.read().unwrap().clone() {
-            return bitmap.live_count();
-        }
-
-        // Lazy load bitmap if needed
-        if self.load_deletion_bitmap().is_ok()
-            && let Some(bitmap) = self.deletion_bitmap.read().unwrap().clone()
-        {
-            return bitmap.live_count();
-        }
-
-        self.info.doc_count
+        *self.live_doc_count.get_or_init(|| {
+            let info = &self.info;
+            let Some(bitmap) = self.deletions() else {
+                return info.doc_count;
+            };
+            match self.membership() {
+                Membership::Empty => 0,
+                Membership::Range => info
+                    .doc_count
+                    .saturating_sub(bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id)),
+                Membership::Set(ids) => info.doc_count.saturating_sub(bitmap.deleted_count_in(ids)),
+                Membership::Unknown => {
+                    let bits = bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id);
+                    let gaps = range_width(info)
+                        .unwrap_or(u64::MAX)
+                        .saturating_sub(info.doc_count);
+                    info.doc_count.saturating_sub(bits.saturating_sub(gaps))
+                }
+            }
+        })
     }
 
     /// Get BKD Tree for a field, loading it if necessary.
@@ -1762,6 +1911,10 @@ pub struct InvertedIndexReader {
     /// Total document count across all segments.
     total_doc_count: u64,
 
+    /// Live document count summed over the segments, computed once per
+    /// reader (Issue #1211). `Arc` so clones share it.
+    live_doc_count: Arc<OnceLock<u64>>,
+
     /// Lazily computed: does every segment have a term dictionary, so that
     /// `term_info` / `term_doc_freq` account for every document (Issue
     /// #1196)? Filled on first use — the first `is_empty` of a search
@@ -1831,6 +1984,7 @@ impl InvertedIndexReader {
             closed: Arc::new(AtomicBool::new(false)),
             total_doc_count,
             term_info_complete: Arc::new(OnceLock::new()),
+            live_doc_count: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1956,10 +2110,20 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
 
     fn doc_count(&self) -> u64 {
         // Sum live doc counts from each segment (accounts for deletions).
+        // Computed once per reader: a scorer asks for it per clause, and
+        // every segment's count is fixed for the snapshot (Issue #1211).
+        *self.live_doc_count.get_or_init(|| {
+            self.segment_readers
+                .iter()
+                .map(|sr| sr.read().unwrap().doc_count())
+                .sum()
+        })
+    }
+
+    fn has_effective_deletions(&self) -> bool {
         self.segment_readers
             .iter()
-            .map(|sr| sr.read().unwrap().doc_count())
-            .sum()
+            .any(|sr| sr.read().unwrap().has_effective_deletions())
     }
 
     fn max_doc(&self) -> u64 {

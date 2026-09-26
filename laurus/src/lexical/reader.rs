@@ -107,6 +107,17 @@ pub trait LexicalIndexReader: Send + Sync + std::fmt::Debug {
     /// for iterating over all possible document slots.
     fn max_doc(&self) -> u64;
 
+    /// Whether any document the index holds is deleted (Issue #1211).
+    ///
+    /// The count fast path answers a term count from the term dictionary's
+    /// `doc_freq`, which still counts deleted documents, so it may run only
+    /// when this is `false`. The default compares the live count with
+    /// [`Self::max_doc`]; a reader whose live count can be an upper bound
+    /// overrides it with an exact test.
+    fn has_effective_deletions(&self) -> bool {
+        self.doc_count() != self.max_doc()
+    }
+
     /// Check if a document has been deleted.
     ///
     /// Returns `true` if the document with the given `doc_id` has been marked
