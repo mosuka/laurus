@@ -61,15 +61,35 @@ pub(crate) fn checked_capacity(
     available: u64,
     what: &str,
 ) -> Result<usize> {
+    checked_capacity_u64(count as u64, min_stride, available, what)
+}
+
+/// [`checked_capacity`] for a `count` still in its on-disk `u64` form
+/// (Issue #1218).
+///
+/// The count is compared before it is narrowed to `usize`: on a 32-bit
+/// target, `count as usize` would first truncate a corrupt count into a
+/// small, plausible one that the bound then lets through.
+///
+/// # Errors
+///
+/// [`LaurusError::Index`] when `count` exceeds what `available` bytes can
+/// hold (the segment is corrupted).
+pub(crate) fn checked_capacity_u64(
+    count: u64,
+    min_stride: u64,
+    available: u64,
+    what: &str,
+) -> Result<usize> {
     let stride = min_stride.max(1);
     let max_elements = available / stride;
-    if count as u64 > max_elements {
+    if count > max_elements {
         return Err(LaurusError::index(format!(
             "{what}: header declares {count} elements but at most {max_elements} can fit in the \
              {available} bytes left in the file — segment is corrupted"
         )));
     }
-    Ok(count)
+    narrow(count, what)
 }
 
 /// Bound a header-declared byte `len` against the bytes available in the
@@ -96,13 +116,36 @@ pub(crate) fn checked_capacity(
 /// [`LaurusError::Index`] when `len` exceeds `available` (the segment is
 /// corrupted).
 pub(crate) fn checked_len(len: usize, available: u64, what: &str) -> Result<usize> {
-    if len as u64 > available {
+    checked_len_u64(len as u64, available, what)
+}
+
+/// [`checked_len`] for a `len` still in its on-disk `u64` form (Issue
+/// #1218), compared before it is narrowed to `usize` for the same reason as
+/// [`checked_capacity_u64`].
+///
+/// # Errors
+///
+/// [`LaurusError::Index`] when `len` exceeds `available` (the segment is
+/// corrupted).
+pub(crate) fn checked_len_u64(len: u64, available: u64, what: &str) -> Result<usize> {
+    if len > available {
         return Err(LaurusError::index(format!(
             "{what}: header declares {len} bytes but only {available} bytes are left in the file \
              — segment is corrupted"
         )));
     }
-    Ok(len)
+    narrow(len, what)
+}
+
+/// Narrow a size already bounded by the bytes left in the file. It cannot
+/// fail for an input the platform can address; a size that still does not
+/// fit is reported as corruption rather than truncated.
+fn narrow(value: u64, what: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        LaurusError::index(format!(
+            "{what}: {value} exceeds this platform's address space — segment is corrupted"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +189,29 @@ mod tests {
     fn checked_len_accepts_a_length_that_fits() {
         assert_eq!(checked_len(16, 16, "field_name_len").unwrap(), 16);
         assert_eq!(checked_len(0, 16, "field_name_len").unwrap(), 0);
+    }
+
+    #[test]
+    fn u64_bounds_accept_what_fits_and_reject_what_does_not() {
+        assert_eq!(checked_len_u64(16, 16, "len").unwrap(), 16);
+        assert_eq!(checked_len_u64(0, 0, "len").unwrap(), 0);
+        assert!(checked_len_u64(17, 16, "len").is_err());
+        assert!(checked_len_u64(u64::MAX, 16, "len").is_err());
+
+        assert_eq!(checked_capacity_u64(5, 8, 40, "n").unwrap(), 5);
+        assert!(checked_capacity_u64(6, 8, 40, "n").is_err());
+        let err = checked_capacity_u64(u64::MAX, 1, 40, "num_entries").unwrap_err();
+        match err {
+            LaurusError::Index(msg) => {
+                assert!(msg.contains("num_entries"));
+                assert!(
+                    msg.contains(&u64::MAX.to_string()),
+                    "the real count is reported"
+                );
+                assert!(msg.contains("corrupted"));
+            }
+            other => panic!("expected Index error, got {other:?}"),
+        }
     }
 
     #[test]
