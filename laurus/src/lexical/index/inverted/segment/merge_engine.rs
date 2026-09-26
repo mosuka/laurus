@@ -19,6 +19,7 @@ use crate::lexical::index::inverted::writer::{
     InvertedIndexWriter, InvertedIndexWriterConfig, analyze_field_value,
 };
 use crate::lexical::index::structures::aabb::AABB;
+use crate::lexical::index::structures::doc_id_set::read_doc_id_set;
 use crate::lexical::index::structures::visitor::{CellRelation, IntersectVisitor};
 use crate::storage::Storage;
 
@@ -1106,21 +1107,58 @@ impl MergeEngine {
         let info = &segment.segment_info;
         let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
         match reader.stored_doc_count()? {
-            Some(written) if written != info.doc_count => Err(LaurusError::index(format!(
-                "Document count mismatch after merge: segment {} claims {} documents but its \
-                 stored-fields part holds {written}",
-                info.segment_id, info.doc_count
-            ))),
+            Some(written) if written != info.doc_count => {
+                return Err(LaurusError::index(format!(
+                    "Document count mismatch after merge: segment {} claims {} documents but \
+                     its stored-fields part holds {written}",
+                    info.segment_id, info.doc_count
+                )));
+            }
             // A merge whose every source document was deleted writes no
             // files at all (`flush_buffered_to_segment` returns early on an
             // empty buffer), so "no `.docs`" is correct exactly when nothing
             // was emitted.
-            None if info.doc_count > 0 => Err(LaurusError::index(format!(
-                "merged segment {} claims {} documents but has no stored-fields part",
-                info.segment_id, info.doc_count
-            ))),
-            _ => Ok(()),
+            None if info.doc_count > 0 => {
+                return Err(LaurusError::index(format!(
+                    "merged segment {} claims {} documents but has no stored-fields part",
+                    info.segment_id, info.doc_count
+                )));
+            }
+            _ => {}
         }
+
+        // The `.ids` part must list exactly the documents the segment claims
+        // (Issue #1210): a later deletion trusts it to decide whether this
+        // segment holds a doc, and a set missing one would make that
+        // deletion skip a live copy.
+        if info.doc_count > 0 {
+            match read_doc_id_set(self.storage.as_ref(), &info.segment_id)? {
+                Some(ids)
+                    if ids.len() == info.doc_count
+                        && ids.min() == Some(info.min_doc_id)
+                        && ids.max() == Some(info.max_doc_id) => {}
+                Some(ids) => {
+                    return Err(LaurusError::index(format!(
+                        "merged segment {} claims {} documents in [{}, {}] but its doc-id set \
+                         holds {} in [{:?}, {:?}]",
+                        info.segment_id,
+                        info.doc_count,
+                        info.min_doc_id,
+                        info.max_doc_id,
+                        ids.len(),
+                        ids.min(),
+                        ids.max()
+                    )));
+                }
+                None => {
+                    return Err(LaurusError::index(format!(
+                        "merged segment {} claims {} documents but has no doc-id set",
+                        info.segment_id, info.doc_count
+                    )));
+                }
+            }
+        }
+        Ok(())
 
         // TODO: Add more verification checks
         // - Term dictionary integrity
@@ -2509,6 +2547,50 @@ mod tests {
                 .verify_merged_segment(&merged)
                 .unwrap_or_else(|e| panic!("use_compound={use_compound}: {e}"));
         }
+    }
+
+    /// A merge writes the `.ids` part (Issue #1210), in both layouts, and
+    /// it lists exactly the documents the merged segment holds.
+    #[test]
+    fn merged_segment_records_the_doc_ids_it_holds() {
+        for use_compound in [false, true] {
+            let (storage, _engine, merged) = merged_two_segments(use_compound);
+            let info = &merged.segment_info;
+            let ids = read_doc_id_set(storage.as_ref(), &info.segment_id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("use_compound={use_compound}: no doc-id set"));
+            assert_eq!(ids.len(), info.doc_count);
+            assert_eq!(ids.min(), Some(info.min_doc_id));
+            assert_eq!(ids.max(), Some(info.max_doc_id));
+        }
+    }
+
+    /// The merged segment's doc-id set must match its claim (Issue #1210):
+    /// a set missing a document would make a later deletion skip that copy.
+    #[test]
+    fn verify_merged_segment_rejects_a_doc_id_set_that_disagrees() {
+        let (storage, engine, merged) = merged_two_segments(false);
+        let info = &merged.segment_info;
+        let name = format!("{}.ids", info.segment_id);
+        crate::lexical::index::structures::doc_id_set::write_doc_id_set(
+            storage.create_output(&name).unwrap(),
+            &[info.min_doc_id, info.max_doc_id],
+        )
+        .unwrap();
+
+        let err = engine.verify_merged_segment(&merged).unwrap_err();
+        assert!(err.to_string().contains("doc-id set"), "{err}");
+    }
+
+    #[test]
+    fn verify_merged_segment_rejects_a_missing_doc_id_set() {
+        let (storage, engine, merged) = merged_two_segments(false);
+        storage
+            .delete_file(&format!("{}.ids", merged.segment_info.segment_id))
+            .unwrap();
+
+        let err = engine.verify_merged_segment(&merged).unwrap_err();
+        assert!(err.to_string().contains("no doc-id set"), "{err}");
     }
 
     #[test]

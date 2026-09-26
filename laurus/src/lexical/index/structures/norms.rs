@@ -178,6 +178,11 @@ impl NormsBuilder {
     pub(crate) fn from_buffered(docs: &[(u64, AnalyzedDocument)]) -> Self {
         let mut doc_ids: Vec<u64> = docs.iter().map(|(id, _)| *id).collect();
         doc_ids.sort_unstable();
+        // The field promises deduplicated ids, and `write_to`'s delta
+        // encoding underflows on a repeat. A buffer holds one entry per id
+        // on every production path, but the public
+        // `upsert_analyzed_document` can add a second (Issue #1210).
+        doc_ids.dedup();
 
         let mut fields: BTreeMap<String, AHashMap<u64, u32>> = BTreeMap::new();
         for (doc_id, doc) in docs {
@@ -190,6 +195,13 @@ impl NormsBuilder {
         }
 
         NormsBuilder { doc_ids, fields }
+    }
+
+    /// The segment's doc ids, sorted and deduplicated — the ids the
+    /// `.norms` slot map records and the `.ids` part is written from, so the
+    /// two can never disagree (Issue #1210).
+    pub(crate) fn doc_ids(&self) -> &[u64] {
+        &self.doc_ids
     }
 
     /// The decoded (quantised, then decoded back) length for `(doc_id,
@@ -346,6 +358,87 @@ struct NormsField {
 pub(crate) struct NormsReader {
     slot_map: SlotMap,
     fields: AHashMap<String, NormsField>,
+}
+
+/// Read only the doc ids a segment's `.norms` part covers (Issue #1210).
+///
+/// The slot map is exactly the set of doc ids the segment holds, so a
+/// segment written before the `.ids` part existed (Issue #1210) can still
+/// answer "does this segment hold doc X?". Only the header and the slot map
+/// are parsed; the field directory and the per-document norms are never
+/// read. Unlike [`NormsReader::load`], `doc_count` is not bounded by one byte
+/// per document: a contiguous `.norms` has no per-document bytes before its
+/// fields, and a field-less one none at all (Issue #1213).
+///
+/// # Returns
+///
+/// `Ok(None)` when the segment has no `.norms` part (a pre-#555 segment).
+///
+/// # Errors
+///
+/// Returns an error when the part is unreadable, has a foreign magic or
+/// version, or its slot map is inconsistent with its header.
+pub(crate) fn read_doc_ids(
+    storage: &dyn Storage,
+    segment_id: &str,
+) -> Result<Option<roaring::RoaringTreemap>> {
+    let suffix = NORMS_EXTENSION.trim_start_matches('.');
+    let Some(input) =
+        crate::lexical::index::inverted::compound::open_part(storage, segment_id, suffix)?
+    else {
+        return Ok(None);
+    };
+    let mut reader = StructReader::new(input)?;
+    let file_size = reader.size();
+
+    let magic = reader.read_raw(MAGIC.len())?;
+    if magic != MAGIC {
+        return Err(LaurusError::index("Invalid .norms file format"));
+    }
+    let version = reader.read_raw(VERSION.len())?;
+    if version[0] != VERSION[0] {
+        return Err(LaurusError::index(format!(
+            "Unsupported .norms version: {}.{}",
+            version[0], version[1]
+        )));
+    }
+    let _codec_id = reader.read_u8()?;
+    let flags = reader.read_u8()?;
+    let doc_count = reader.read_varint()?;
+    let min_doc_id = reader.read_u64()?;
+    let max_doc_id = reader.read_u64()?;
+    let _num_fields = reader.read_varint()?;
+
+    let mut ids = roaring::RoaringTreemap::new();
+    if doc_count == 0 {
+        return Ok(Some(ids));
+    }
+    if flags & FLAG_SLOT_MAP_CONTIGUOUS != 0 {
+        let end = min_doc_id.checked_add(doc_count).ok_or_else(|| {
+            LaurusError::index("doc id overflow in .norms header — segment is corrupted")
+        })?;
+        ids.insert_range(min_doc_id..end);
+    } else {
+        // Each of the `doc_count - 1` deltas takes at least one byte.
+        let available = file_size.saturating_sub(reader.position());
+        checked_capacity((doc_count - 1) as usize, 1, available, "doc_count")?;
+        ids.insert(min_doc_id);
+        let mut prev = min_doc_id;
+        for _ in 1..doc_count {
+            let delta = reader.read_varint()?;
+            let next = prev.checked_add(delta + 1).ok_or_else(|| {
+                LaurusError::index("doc id overflow in .norms slot map — segment is corrupted")
+            })?;
+            ids.insert(next);
+            prev = next;
+        }
+    }
+    if ids.max() != Some(max_doc_id) {
+        return Err(LaurusError::index(
+            ".norms slot map does not end at the header's max_doc_id — segment is corrupted",
+        ));
+    }
+    Ok(Some(ids))
 }
 
 impl NormsReader {
@@ -551,6 +644,77 @@ mod format_tests {
         assert_eq!(reader.field_length(2, "body"), Some(200));
         assert_eq!(reader.field_length(3, "title"), None); // doc doesn't exist
         assert_eq!(reader.field_length(0, "unknown"), None); // field doesn't exist
+    }
+
+    /// `read_doc_ids` recovers exactly the ids the slot map records, for a
+    /// contiguous and a sparse segment (Issue #1210).
+    #[test]
+    fn read_doc_ids_recovers_the_slot_map() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let dense = vec![
+            (4u64, doc(&[("title", 1)])),
+            (5u64, doc(&[("title", 1)])),
+            (6u64, doc(&[("title", 1)])),
+        ];
+        round_trip(&storage, "seg_dense", &NormsBuilder::from_buffered(&dense));
+        let sparse = vec![
+            (1u64, doc(&[("title", 1)])),
+            (10u64, doc(&[("title", 1)])),
+            (1u64 << 33, doc(&[("title", 1)])),
+        ];
+        round_trip(
+            &storage,
+            "seg_sparse",
+            &NormsBuilder::from_buffered(&sparse),
+        );
+
+        let ids = |seg| {
+            read_doc_ids(&storage, seg)
+                .unwrap()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("seg_dense"), vec![4, 5, 6]);
+        assert_eq!(ids("seg_sparse"), vec![1, 10, 1 << 33]);
+        assert!(read_doc_ids(&storage, "missing").unwrap().is_none());
+    }
+
+    /// A contiguous `.norms` whose documents record no field lengths has no
+    /// per-document bytes at all; `read_doc_ids` must not reject it for
+    /// that, as `NormsReader::load` does past 21 documents (Issue #1213).
+    #[test]
+    fn read_doc_ids_accepts_a_large_field_less_segment() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs: Vec<_> = (0..30u64).map(|id| (id, doc(&[]))).collect();
+        let builder = NormsBuilder::from_buffered(&docs);
+        let output = storage.create_output("seg_bare.norms").unwrap();
+        let mut writer = StructWriter::new(output);
+        builder.write_to(&mut writer).unwrap();
+        writer.close().unwrap();
+
+        let ids = read_doc_ids(&storage, "seg_bare").unwrap().unwrap();
+        assert_eq!(ids.len(), 30);
+        assert_eq!((ids.min(), ids.max()), (Some(0), Some(29)));
+    }
+
+    /// A buffer holding one id twice records it once (Issue #1210): the
+    /// field promised deduplicated ids, and the slot map's delta encoding
+    /// underflowed on the repeat.
+    #[test]
+    fn duplicate_buffered_ids_are_recorded_once() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs = vec![
+            (1u64, doc(&[("title", 3)])),
+            (5u64, doc(&[("title", 4)])),
+            (5u64, doc(&[("title", 6)])),
+        ];
+        let builder = NormsBuilder::from_buffered(&docs);
+        assert_eq!(builder.doc_ids(), &[1, 5]);
+
+        let reader = round_trip(&storage, "seg_dup", &builder);
+        assert_eq!(reader.field_length(1, "title"), Some(3));
+        assert!(reader.field_length(5, "title").is_some());
     }
 
     #[test]

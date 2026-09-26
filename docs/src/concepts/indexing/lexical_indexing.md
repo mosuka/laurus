@@ -234,6 +234,7 @@ graph TB
     S1 --- F5[".dv (doc values)"]
     S1 --- F6[".meta (metadata)"]
     S1 --- F7[".norms (field-length norms)"]
+    S1 --- F8[".ids (doc ids)"]
 ```
 
 | File Extension | Contents |
@@ -245,6 +246,7 @@ graph TB
 | `.dv` | Doc values for sorting and filtering |
 | `.meta` | Segment metadata (doc count, term count, etc.) |
 | `.norms` | 1-byte-quantised field-length norms (for BM25 scoring), one byte per (document, field) |
+| `.ids` | The exact set of document IDs the segment holds (a Roaring bitmap). Deletions address global document IDs, and a segment's ID range can contain IDs it does not hold (after a merge of non-adjacent segments, for example), so a deletion checks this set before marking the segment. Segments written before it existed answer from `.norms` |
 
 ### Segment Lifecycle
 

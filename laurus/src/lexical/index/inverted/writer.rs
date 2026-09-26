@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
+use roaring::RoaringTreemap;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
@@ -23,6 +24,9 @@ use crate::lexical::index::inverted::reader::SegmentReader;
 use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::structures::bkd_tree::BKDWriter;
 use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermInfo};
+use crate::lexical::index::structures::doc_id_set::{
+    DOC_ID_SET_SUFFIX, load_segment_doc_ids, write_doc_id_set,
+};
 use crate::lexical::index::structures::doc_values::DocValuesWriter;
 use crate::lexical::index::structures::norms::NormsBuilder;
 use crate::lexical::writer::LexicalIndexWriter;
@@ -217,6 +221,32 @@ pub struct WriterStats {
     pub deleted_count: u64,
 }
 
+/// One entry of the writer's segment-range cache: a segment's doc-id range
+/// and how many documents it holds (Issue #1210).
+#[derive(Debug, Clone)]
+struct SegmentRange {
+    segment_id: String,
+    min_doc_id: u64,
+    max_doc_id: u64,
+    /// Documents the segment holds — its [`SegmentInfo::doc_count`].
+    doc_count: u64,
+}
+
+impl SegmentRange {
+    fn from_info(info: &SegmentInfo) -> Self {
+        SegmentRange {
+            segment_id: info.segment_id.clone(),
+            min_doc_id: info.min_doc_id,
+            max_doc_id: info.max_doc_id,
+            doc_count: info.doc_count,
+        }
+    }
+
+    fn covers(&self, doc_id: u64) -> bool {
+        doc_id >= self.min_doc_id && doc_id <= self.max_doc_id
+    }
+}
+
 /// Inverted index writer implementation (schema-less mode).
 pub struct InvertedIndexWriter {
     /// The storage backend.
@@ -368,7 +398,18 @@ pub struct InvertedIndexWriter {
     /// writer; `LexicalStore::commit` drops the writer before it merges).
     /// Lets [`Self::find_segments_for_doc`] answer from memory instead of
     /// listing + JSON-parsing every `.meta` file per upsert.
-    segment_ranges: Vec<(String, u64, u64)>,
+    segment_ranges: Vec<SegmentRange>,
+
+    /// Exact doc-id sets of the segments whose range alone cannot tell
+    /// which ids they hold (Issue #1210), keyed by segment id.
+    ///
+    /// Filled from memory for every segment this writer flushes, and
+    /// loaded lazily from a committed segment's `.ids` part (or its `.norms`
+    /// slot map) the first time a deletion's range lookup lands on it with
+    /// gaps in its range. `None` records a segment whose set is unavailable
+    /// or untrustworthy, which then falls back to range matching. Kept in
+    /// step with [`Self::segment_ranges`].
+    segment_members: AHashMap<String, Option<Arc<RoaringTreemap>>>,
 
     /// Highest `max_doc_id` across [`Self::segment_ranges`] (0 when no
     /// segments exist). Fresh doc IDs handed out by the WAL are strictly
@@ -832,7 +873,7 @@ impl InvertedIndexWriter {
                     next_doc_id = next_doc_id.max(local_id + 1);
                 }
                 max_committed_doc_id = max_committed_doc_id.max(entry.max_doc_id);
-                segment_ranges.push((entry.segment_id.clone(), entry.min_doc_id, entry.max_doc_id));
+                segment_ranges.push(SegmentRange::from_info(entry));
             }
             // Advisory only — the real ordinal is reserved at flush time.
             current_segment = state.next_generation;
@@ -876,6 +917,7 @@ impl InvertedIndexWriter {
             flushed_segments: Vec::new(),
             pending_publish: Vec::new(),
             segment_ranges,
+            segment_members: AHashMap::new(),
             max_committed_doc_id,
             deletion_manager: None,
             pending_meta_deletions: AHashSet::new(),
@@ -1480,6 +1522,8 @@ impl InvertedIndexWriter {
         // segments that still carry `.lens`/`.fstats` remain readable via
         // `SegmentNorms::Legacy` until their next merge.
         self.write_norms(&mut sink, &norms)?;
+        // The same sorted, deduplicated ids the `.norms` slot map records.
+        self.write_doc_ids(&mut sink, norms.doc_ids())?;
         self.write_doc_values(&mut sink)?;
         self.write_bkd_trees(&mut sink)?;
         sink.finish()
@@ -1734,6 +1778,15 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
+    /// Write the `.ids` part: exactly the doc ids this segment holds, which
+    /// a deletion consults before marking a document in it (Issue #1210).
+    fn write_doc_ids(&self, sink: &mut PartSink<'_>, doc_ids: &[u64]) -> Result<()> {
+        let output = sink.part(DOC_ID_SET_SUFFIX)?;
+        write_doc_id_set(output, doc_ids)?;
+        sink.seal()?;
+        Ok(())
+    }
+
     /// Write DocValues to storage.
     fn write_doc_values(&self, sink: &mut PartSink<'_>) -> Result<()> {
         let mut output = sink.part("dv")?;
@@ -1852,8 +1905,18 @@ impl InvertedIndexWriter {
     fn extend_segment_cache(&mut self, segment_name: &str) {
         let (min_id, max_id) = self.buffered_doc_id_range();
         self.max_committed_doc_id = self.max_committed_doc_id.max(max_id);
-        self.segment_ranges
-            .push((segment_name.to_string(), min_id, max_id));
+        self.segment_ranges.push(SegmentRange {
+            segment_id: segment_name.to_string(),
+            min_doc_id: min_id,
+            max_doc_id: max_id,
+            // What `segment_info_for` records for the same buffer.
+            doc_count: self.buffered_docs.len() as u64,
+        });
+        // The exact ids are in hand: no later deletion needs to read the
+        // `.ids` part back (Issue #1210).
+        let ids: RoaringTreemap = self.buffered_docs.iter().map(|(id, _)| *id).collect();
+        self.segment_members
+            .insert(segment_name.to_string(), Some(Arc::new(ids)));
     }
 
     /// Describe the segment about to be written from the current buffer.
@@ -2067,8 +2130,9 @@ impl InvertedIndexWriter {
         // `max_committed_doc_id` keeps its value: an over-estimate only
         // disables the fast path that skips this range lookup.
         self.segment_ranges
-            .retain(|(segment_id, _, _)| !dropped_ids.contains(segment_id.as_str()));
+            .retain(|range| !dropped_ids.contains(range.segment_id.as_str()));
         for segment_id in &dropped {
+            self.segment_members.remove(segment_id);
             self.pending_meta_deletions.remove(segment_id);
             if let Some(manager) = &self.deletion_manager {
                 manager.forget_segment(segment_id);
@@ -2378,31 +2442,112 @@ impl InvertedIndexWriter {
         self.pending_deletions.contains(&doc_id)
     }
 
-    /// Find all segments containing the global doc_id.
+    /// Find all segments holding the global doc_id.
     /// Returns a list of (segment_id, min_doc_id, max_doc_id).
     ///
     /// Served from [`Self::segment_ranges`] (Issue #559 / #864) — the cache
-    /// mirrors the on-storage `*.meta` files, so this no longer lists and
-    /// JSON-parses them per call. Fresh doc IDs (the steady-state ingest
-    /// path) are rejected with a single compare against
+    /// mirrors the committed segment set, so this no longer lists and
+    /// JSON-parses segment metadata per call. Fresh doc IDs (the
+    /// steady-state ingest path) are rejected with a single compare against
     /// [`Self::max_committed_doc_id`].
-    fn find_segments_for_doc(&self, doc_id: u64) -> Result<Vec<(String, u64, u64)>> {
+    ///
+    /// A segment's id range is only a prefilter (Issue #1210): a merge of
+    /// non-adjacent segments spans the ones it left out, concurrent puts can
+    /// reach the writer out of id order, and callers may choose ids, so a
+    /// range can contain ids the segment does not hold. Each candidate is
+    /// kept only if it holds the id ([`Self::segment_holds`]); a deletion
+    /// then never sets a bit in a segment that does not hold the document.
+    fn find_segments_for_doc(&mut self, doc_id: u64) -> Result<Vec<(String, u64, u64)>> {
         // Fast path: WAL doc IDs are monotonic, so an ID above every
         // committed segment's max cannot be in any of them.
         if doc_id > self.max_committed_doc_id {
             return Ok(Vec::new());
         }
-        // In Stable ID mode, we check if the ID is within the min/max range.
-        // Note: This might match multiple segments if ranges overlap across shards,
-        // or if we have multiple versions of the same document (upserts).
-        // To be 100% sure, we should check if the document actually exists in
-        // the segment. For now, assume the range is specific enough.
-        Ok(self
+        let candidates: Vec<SegmentRange> = self
             .segment_ranges
             .iter()
-            .filter(|(_, min_doc_id, max_doc_id)| doc_id >= *min_doc_id && doc_id <= *max_doc_id)
+            .filter(|range| range.covers(doc_id))
             .cloned()
-            .collect())
+            .collect();
+        let mut holding = Vec::with_capacity(candidates.len());
+        for range in candidates {
+            if self.segment_holds(&range, doc_id) {
+                holding.push((range.segment_id, range.min_doc_id, range.max_doc_id));
+            }
+        }
+        Ok(holding)
+    }
+
+    /// Whether the segment described by `range`, whose range already covers
+    /// `doc_id`, holds it (Issue #1210).
+    ///
+    /// Most segments answer without I/O: an empty one (a merge whose every
+    /// source document was deleted publishes range `(0, 0)`) holds nothing,
+    /// and one without gaps holds its whole range. Only a segment with gaps
+    /// consults its exact doc-id set.
+    fn segment_holds(&mut self, range: &SegmentRange, doc_id: u64) -> bool {
+        if let Some(Some(ids)) = self.segment_members.get(&range.segment_id) {
+            return ids.contains(doc_id);
+        }
+        if range.doc_count == 0 {
+            return false;
+        }
+        if range.max_doc_id - range.min_doc_id + 1 == range.doc_count {
+            return true;
+        }
+        match self.segment_member_set(range) {
+            Some(ids) => ids.contains(doc_id),
+            None => true,
+        }
+    }
+
+    /// The exact doc-id set of a committed segment, loaded once and cached
+    /// (Issue #1210).
+    ///
+    /// `None` when the segment predates both the `.ids` part and `.norms`,
+    /// or when the loaded set is unreadable or disagrees with the segment's
+    /// recorded count and range. The caller then keeps range matching: a
+    /// set trusted wrongly would skip a real copy's deletion and leave a
+    /// duplicate, which is worse than an extra deletion bit.
+    fn segment_member_set(&mut self, range: &SegmentRange) -> Option<Arc<RoaringTreemap>> {
+        if let Some(cached) = self.segment_members.get(&range.segment_id) {
+            return cached.clone();
+        }
+        let loaded = match load_segment_doc_ids(self.storage.as_ref(), &range.segment_id) {
+            Ok(Some(ids))
+                if ids.len() == range.doc_count
+                    && ids.min() == Some(range.min_doc_id)
+                    && ids.max() == Some(range.max_doc_id) =>
+            {
+                Some(Arc::new(ids))
+            }
+            Ok(Some(ids)) => {
+                log::warn!(
+                    "segment {} records {} doc ids in [{:?}, {:?}] but claims {} in [{}, {}]; \
+                     deletions fall back to its id range",
+                    range.segment_id,
+                    ids.len(),
+                    ids.min(),
+                    ids.max(),
+                    range.doc_count,
+                    range.min_doc_id,
+                    range.max_doc_id
+                );
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!(
+                    "cannot read the doc-id set of segment {}: {e}; deletions fall back to its id \
+                     range",
+                    range.segment_id
+                );
+                None
+            }
+        };
+        self.segment_members
+            .insert(range.segment_id.clone(), loaded.clone());
+        loaded
     }
 
     /// Rebuild [`Self::segment_ranges`] / [`Self::max_committed_doc_id`]
@@ -2430,11 +2575,7 @@ impl InvertedIndexWriter {
             // The merge published its transition to the shared manifest
             // before this call, so memory is already the post-merge truth.
             let state = manifest.read();
-            self.segment_ranges = state
-                .segments
-                .iter()
-                .map(|entry| (entry.segment_id.clone(), entry.min_doc_id, entry.max_doc_id))
-                .collect();
+            self.segment_ranges = state.segments.iter().map(SegmentRange::from_info).collect();
             self.max_committed_doc_id = state
                 .segments
                 .iter()
@@ -2442,6 +2583,7 @@ impl InvertedIndexWriter {
                 .max()
                 .unwrap_or(0);
             drop(state);
+            self.segment_members.clear();
             self.deletion_manager = None;
             self.pending_meta_deletions.clear();
             self.flushed_segments.clear();
@@ -2452,6 +2594,7 @@ impl InvertedIndexWriter {
         // registered nowhere, so after an external rewrite there is no
         // record to rebuild from — clear to empty.
         self.segment_ranges = Vec::new();
+        self.segment_members.clear();
         self.max_committed_doc_id = 0;
         self.deletion_manager = None;
         self.pending_meta_deletions.clear();
@@ -2995,6 +3138,36 @@ mod tests {
             "the DocValues payload must be identical regardless of binary field size, \
              got {small} vs {large}"
         );
+    }
+
+    /// A flushed segment records exactly the doc ids it holds in its `.ids`
+    /// part (Issue #1210), gaps included, in both layouts.
+    #[test]
+    fn flush_writes_the_segment_doc_id_set() {
+        for use_compound in [false, true] {
+            let storage: Arc<dyn Storage> = Arc::new(crate::storage::memory::MemoryStorage::new(
+                crate::storage::memory::MemoryStorageConfig::default(),
+            ));
+            let config = InvertedIndexWriterConfig {
+                use_compound,
+                ..InvertedIndexWriterConfig::default()
+            };
+            let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+            for id in [1u64, 5, 9] {
+                writer
+                    .upsert_document(id, Document::builder().add_text("title", "x").build())
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+
+            let ids = crate::lexical::index::structures::doc_id_set::read_doc_id_set(
+                storage.as_ref(),
+                "segment_000000",
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("use_compound={use_compound}: no doc-id set"));
+            assert_eq!(ids.iter().collect::<Vec<_>>(), vec![1, 5, 9]);
+        }
     }
 
     /// `rollback()` discards the buffered documents' DocValues too (Issue

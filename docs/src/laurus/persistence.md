@@ -243,7 +243,8 @@ is migrated by a one-time read of its legacy `.meta` files when opened.
 
 Segment data itself is written as one **compound container** per segment
 (`segment_<N>.cfs` — postings, term dictionary, stored documents, field
-lengths and statistics, doc values and per-field BKD trees, concatenated
+lengths and statistics, the segment's doc-id set, doc values and per-field
+BKD trees, concatenated
 with a trailing part table): one file create and one fsync per flush instead
 of one per part. The deletion bitmap (`.delmap`) stays a separate file, as
 the only per-segment data rewritten after sealing. Readers detect the layout
