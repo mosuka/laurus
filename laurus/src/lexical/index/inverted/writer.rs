@@ -308,7 +308,15 @@ pub struct InvertedIndexWriter {
     /// Last processed WAL sequence number.
     last_wal_seq: u64,
 
-    /// Pending deletions that are not yet reflected in the reader (NRT).
+    /// Ids whose persisted copy this writer superseded since the last
+    /// commit (NRT).
+    ///
+    /// `LexicalStore` filters hits from its cached searcher with this set
+    /// ([`Self::is_updated_deleted`]): that searcher predates the deletions
+    /// this writer has only buffered. Cleared once a commit publishes them
+    /// (Issue #1207). Flushed-but-unpublished segments are not checked
+    /// against it — the set names an id, not a copy — but against their own
+    /// deletion bitmap.
     pending_deletions: std::collections::HashSet<u64>,
 
     /// Readers for the segments this writer has flushed but not yet
@@ -1092,16 +1100,25 @@ impl InvertedIndexWriter {
         }
 
         // 2. Segments flushed but not yet committed. Usually empty, in
-        // which case this loop costs nothing. Ids whose persisted copy has
-        // since been superseded are skipped — that is exactly what
-        // `pending_deletions` records.
+        // which case this loop costs nothing. A copy superseded since its
+        // flush is skipped by asking this segment's own deletion bitmap
+        // (Issue #1207). The flat `pending_deletions` set used here named
+        // the id rather than the copy, so it also hid a newer version of the
+        // id that a later flush had written. No deletion manager means
+        // nothing was superseded: it is created before the first bit is
+        // set, and never on this lookup path.
         for segment in &self.flushed_segments {
             let Some(mut postings) = segment.postings(field, term)? else {
                 continue;
             };
+            let segment_id = &segment.segment_info().segment_id;
             while postings.next()? {
                 let doc_id = postings.doc_id();
-                if !self.pending_deletions.contains(&doc_id) && seen.insert(doc_id) {
+                let superseded = self
+                    .deletion_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.is_deleted(segment_id, doc_id));
+                if !superseded && seen.insert(doc_id) {
                     ids.push(doc_id);
                 }
             }
@@ -1916,6 +1933,11 @@ impl InvertedIndexWriter {
         // drops the cached searcher right after this, so the next one is
         // rebuilt over the full committed set.
         self.flushed_segments.clear();
+        // Every copy this writer superseded is now recorded where that
+        // searcher looks — the published `.delmap` files and manifest flags —
+        // so the NRT filter set has nothing left to add (Issue #1207). A
+        // failed commit returns above and keeps it for the retry.
+        self.pending_deletions.clear();
 
         Ok(())
     }
@@ -2320,26 +2342,38 @@ impl InvertedIndexWriter {
                         .or_insert(0) += 1;
                 }
 
+                // Counted even when the bit was already set: WAL replay after
+                // a crash between a commit's `.delmap` write and its
+                // `metadata.json` write re-deletes copies whose bit is
+                // persisted but whose deletion was never counted. The price is
+                // a double count when one caller-chosen id is re-upserted
+                // before a commit; exact counts need persisted-state
+                // derivation (Issue #1208).
                 deleted += 1;
             }
             // Track globally
             self.stats.deleted_count += deleted;
 
-            // Record that this id's *persisted* copy is superseded, so an
-            // NRT `_id` lookup does not hand back the stale version.
+            // Record that this id's *persisted* copy is superseded, so the
+            // store's filter over its pre-commit searcher does not hand back
+            // the stale version.
             //
             // Scoped to the branch that actually deleted something. It used
             // to run unconditionally, which flagged every freshly inserted
-            // document with its own id — nothing had been deleted, and the
-            // set is never cleared, so after an automatic flush the lookup
-            // discarded the document it was looking for (#1016).
+            // document with its own id — nothing had been deleted, so after an
+            // automatic flush the lookup discarded the document it was looking
+            // for (#1016).
             self.pending_deletions.insert(doc_id);
         }
 
         Ok(())
     }
 
-    /// Check if a document is marked as deleted in the pending set.
+    /// Whether this writer superseded `doc_id`'s persisted copy since the
+    /// last commit, a deletion a searcher built before it cannot see yet.
+    ///
+    /// Returns `false` for every id once a commit has published the
+    /// deletions (Issue #1207).
     pub fn is_updated_deleted(&self, doc_id: u64) -> bool {
         self.pending_deletions.contains(&doc_id)
     }

@@ -194,10 +194,12 @@ impl LexicalStore {
             .limit(usize::MAX) // Retrieve all matches
             .load_documents(false);
 
-        // Safe to call search while holding writer lock as long as lock order is respected (Writer -> Searcher)
-        // search() acquires searcher_cache lock.
-        // commit() acquires writer_cache lock THEN searcher_cache lock (via refresh).
-        // So we are consistent.
+        // Safe to call search while holding the writer lock: the lock order
+        // is writer_cache -> searcher_cache everywhere, and search() takes
+        // only searcher_cache. Every path that retires the writer (commit,
+        // optimize, the field operations, close) also drops the cached
+        // searcher before releasing the writer lock (Issue #1207), so this
+        // search never pairs a pre-commit snapshot with a missing writer.
         let results = self.search(request)?;
         for hit in results.hits {
             if !ids.contains(&hit.doc_id) {
@@ -282,6 +284,20 @@ impl LexicalStore {
             writer.commit()?;
         }
         *writer_guard = None;
+        let finished = self.finish_commit();
+        // Drop the cached searcher BEFORE releasing the writer lock, on the
+        // error path too (Issue #1207). The writer is gone, so an `_id`
+        // lookup that took the lock in between would search this pre-commit
+        // snapshot with no pending-deletion filter: it would return the
+        // superseded copy and miss the version just committed, and a
+        // concurrent put of that `_id` would then leave a duplicate.
+        *self.searcher_cache.write() = None;
+        drop(writer_guard);
+        finished
+    }
+
+    /// The steps of [`Self::commit`] that follow the writer's commit.
+    fn finish_commit(&self) -> Result<()> {
         // Sync storage to ensure all file metadata (creation, rename, size) is
         // flushed to disk. This is critical on Windows where directory listings
         // and file visibility may be cached until the directory is synced.
@@ -296,10 +312,7 @@ impl LexicalStore {
         // its commit deltas straight to the index's shared metadata, so
         // there is nothing fresher on disk. Kept for other `LexicalIndex`
         // implementations whose refresh does real work.
-        self.index.refresh()?;
-        drop(writer_guard);
-        *self.searcher_cache.write() = None;
-        Ok(())
+        self.index.refresh()
     }
 
     /// Optimize the index by force-merging all segments into one (Issue #754).
@@ -382,13 +395,14 @@ impl LexicalStore {
             && let Err(e) = writer.invalidate_segment_cache()
         {
             *writer_guard = None;
-            drop(writer_guard);
             *self.searcher_cache.write() = None;
+            drop(writer_guard);
             merge_result?;
             return Err(e);
         }
-        drop(writer_guard);
+        // Before the writer lock is released, as in `commit` (Issue #1207).
         *self.searcher_cache.write() = None;
+        drop(writer_guard);
         merge_result
     }
 
@@ -638,8 +652,10 @@ impl LexicalStore {
     ///
     /// `Ok(())` on success, or an error if the underlying index fails to close.
     pub fn close(&self) -> Result<()> {
-        *self.writer_cache.lock() = None;
+        let mut writer_guard = self.writer_cache.lock();
+        *writer_guard = None;
         *self.searcher_cache.write() = None;
+        drop(writer_guard);
         self.index.close()
     }
 
@@ -773,8 +789,9 @@ impl LexicalStore {
                 writer.commit()?;
             }
             *writer_guard = None;
+            // Before the writer lock is released, as in `commit` (Issue #1207).
+            *self.searcher_cache.write() = None;
         }
-        *self.searcher_cache.write() = None;
 
         Ok(())
     }
@@ -854,13 +871,14 @@ impl LexicalStore {
             && let Err(e) = writer.invalidate_segment_cache()
         {
             *writer_guard = None;
-            drop(writer_guard);
             *self.searcher_cache.write() = None;
+            drop(writer_guard);
             return Err(e);
         }
         *writer_guard = None;
-        drop(writer_guard);
+        // Before the writer lock is released, as in `commit` (Issue #1207).
         *self.searcher_cache.write() = None;
+        drop(writer_guard);
 
         Ok(())
     }
@@ -904,8 +922,9 @@ impl LexicalStore {
                 writer.commit()?;
             }
             *writer_guard = None;
+            // Before the writer lock is released, as in `commit` (Issue #1207).
+            *self.searcher_cache.write() = None;
         }
-        *self.searcher_cache.write() = None;
 
         Ok(())
     }
@@ -927,6 +946,56 @@ mod tests {
             .add_text("title", title)
             .add_text("body", body)
             .build()
+    }
+
+    /// A store whose writer flushes after every second document.
+    fn store_flushing_every_two_docs() -> LexicalStore {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = LexicalIndexConfig::builder().max_buffered_docs(2).build();
+        LexicalStore::new(storage, config).unwrap()
+    }
+
+    fn id_doc(id: &str) -> Document {
+        Document::builder().add_text("_id", id).build()
+    }
+
+    /// Issue #1207 — re-upserting a doc id whose flushed copy was superseded
+    /// must still resolve the new version once that version is flushed too.
+    ///
+    /// The flushed-segment lookup skipped every id in the writer's flat
+    /// `pending_deletions` set, so it hid the new copy along with the old
+    /// one. It now asks each flushed segment's own deletion bitmap.
+    #[test]
+    fn reupserted_version_resolves_after_its_own_flush() {
+        let store = store_flushing_every_two_docs();
+        store.upsert_document(1, id_doc("ida")).unwrap();
+        store.upsert_document(2, id_doc("idb")).unwrap(); // flushes 1, 2
+        store.upsert_document(1, id_doc("ida2")).unwrap(); // supersedes 1
+        store.upsert_document(3, id_doc("idc")).unwrap(); // flushes 1 (new), 3
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida2").unwrap(), vec![1]);
+        assert!(
+            store.find_doc_ids_by_term("_id", "ida").unwrap().is_empty(),
+            "the superseded copy must stay hidden"
+        );
+    }
+
+    /// Issue #1207 — a re-upserted version published by `optimize()` must
+    /// resolve right away. `optimize` commits but keeps its writer, whose
+    /// `pending_deletions` still named the id and so filtered the new,
+    /// committed copy out of the lookup until the next commit.
+    #[test]
+    fn reupserted_version_resolves_after_optimize() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        store.upsert_document(1, id_doc("ida")).unwrap();
+        store.commit().unwrap();
+
+        store.upsert_document(1, id_doc("ida2")).unwrap();
+        store.optimize().unwrap();
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida2").unwrap(), vec![1]);
+        assert!(store.find_doc_ids_by_term("_id", "ida").unwrap().is_empty());
     }
 
     /// #1016 — a document written before the writer's automatic

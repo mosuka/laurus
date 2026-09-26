@@ -202,7 +202,9 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Check if a document is marked as deleted in the pending deletion set.
+    /// Whether this writer superseded the persisted copy of `doc_id` since
+    /// the last commit — a deletion a searcher built before it cannot see
+    /// yet. `false` again once a commit has published the deletions.
     ///
     /// The default implementation always returns `false`. Override this if the
     /// writer tracks pending deletions.
