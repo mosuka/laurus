@@ -78,12 +78,16 @@ impl<'a> BlockReader<'a> {
             return Err(LaurusError::index("BlockReader: empty block"));
         }
 
-        let fc_len = read_varint(bytes, &mut c)? as usize;
-        if c + fc_len > bytes.len() {
+        let fc_len = read_varint(bytes, &mut c)?;
+        // Compared before it is narrowed, which would truncate it on a
+        // 32-bit target, and without `c + fc_len`, which could overflow
+        // (Issue #1220).
+        if fc_len > bytes.len().saturating_sub(c) as u64 {
             return Err(LaurusError::index(
                 "BlockReader: front-coded section overruns BlockSection",
             ));
         }
+        let fc_len = fc_len as usize;
         let term_bytes = &bytes[c..c + fc_len];
         c += fc_len;
 

@@ -24,7 +24,7 @@ use crate::error::{LaurusError, Result};
 use crate::lexical::index::inverted::compound::open_part;
 use crate::storage::structured::{StructReader, StructWriter};
 use crate::storage::{Storage, StorageInput, StorageOutput};
-use crate::util::alloc_bounds::checked_len;
+use crate::util::alloc_bounds::checked_len_u64;
 
 /// Part suffix of the doc-id set: `{segment}.ids`.
 pub(crate) const DOC_ID_SET_SUFFIX: &str = "ids";
@@ -149,9 +149,9 @@ fn decode<R: StorageInput>(input: R, segment_id: &str) -> Result<RoaringTreemap>
             "{segment_id}.{DOC_ID_SET_SUFFIX}: unsupported version {version}"
         )));
     }
-    let len = reader.read_varint()? as usize;
+    let len = reader.read_varint()?;
     let available = reader.size().saturating_sub(reader.position());
-    let len = checked_len(len, available, "segment doc-id set")?;
+    let len = checked_len_u64(len, available, "segment doc-id set")?;
     let payload = reader.read_raw(len)?;
     if !reader.verify_checksum()? {
         return Err(LaurusError::index(format!(
