@@ -24,7 +24,7 @@ use crate::lexical::index::structures::dictionary::BlockMax;
 
 /// Bytes per [`BlockMax`] entry on the wire (`u64 last_doc_id` +
 /// `f32 max_factor`).
-const BLOCK_MAX_BYTES: usize = 12;
+pub(super) const BLOCK_MAX_BYTES: usize = 12;
 
 /// Variable-length per-term `BlockMax` data for a single dictionary
 /// block.

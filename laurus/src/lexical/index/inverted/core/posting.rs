@@ -9,6 +9,7 @@ use bitpacking::{BitPacker, BitPacker4x};
 use crate::error::{LaurusError, Result};
 use crate::storage::structured::{StructReader, StructWriter};
 use crate::storage::{StorageInput, StorageOutput};
+use crate::util::alloc_bounds::{checked_capacity_u64, checked_usize};
 
 /// Block length for `BitPacker4x` (SSE3 / scalar fallback): 128 ints per block.
 const POSTING_BLOCK_LEN: usize = BitPacker4x::BLOCK_LEN;
@@ -904,7 +905,7 @@ impl PostingList {
     /// * `reader` - The structured input reader positioned at a posting-list
     ///   header.
     pub fn decode_soa<R: StorageInput>(reader: &mut StructReader<R>) -> Result<DecodedPostingList> {
-        Self::decode_soa_inner(reader, PostingFormat::V1)
+        Self::decode_soa_inner(reader, PostingFormat::V1, None)
     }
 
     /// Decode a posting list previously written by [`Self::encode_v2`]
@@ -919,7 +920,7 @@ impl PostingList {
     pub fn decode_soa_v2<R: StorageInput>(
         reader: &mut StructReader<R>,
     ) -> Result<DecodedPostingList> {
-        Self::decode_soa_inner(reader, PostingFormat::V2)
+        Self::decode_soa_inner(reader, PostingFormat::V2, None)
     }
 
     /// Decode a posting list previously written by [`Self::encode_v3`]
@@ -941,7 +942,93 @@ impl PostingList {
     pub fn decode_soa_v3<R: StorageInput>(
         reader: &mut StructReader<R>,
     ) -> Result<DecodedPostingList> {
-        Self::decode_soa_inner(reader, PostingFormat::V3)
+        Self::decode_soa_inner(reader, PostingFormat::V3, None)
+    }
+
+    /// Decode a posting list of a segment that holds `max_postings`
+    /// documents (Issue #1220), dispatching on the dictionary's
+    /// posting-format `version`: 1 and 2 by number, anything else as v3.
+    ///
+    /// A posting list cannot hold more postings than its segment has
+    /// documents, so a larger `n` is rejected as corruption before anything
+    /// is allocated for it. The byte count cannot give this bound: a
+    /// bit-packed block whose `num_bits` is 0 holds 128 postings in a single
+    /// byte. It holds for every segment that reaches this decoder:
+    ///
+    /// - a flush builds its lists from the buffered documents, and
+    ///   `add_posting` folds repeats of one document into a single posting;
+    /// - a merge writes only the documents it emits;
+    /// - `max_postings` counts deleted documents too, which stay in the
+    ///   postings until the reader filters them out.
+    ///
+    /// Writers before #400 could leave postings of deleted buffered
+    /// documents behind, but their dictionaries (HTDC / STDC) are rejected
+    /// before any posting list is decoded.
+    pub(crate) fn decode_soa_for_segment<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        version: u32,
+        max_postings: u64,
+    ) -> Result<DecodedPostingList> {
+        let format = match version {
+            1 => PostingFormat::V1,
+            2 => PostingFormat::V2,
+            _ => PostingFormat::V3,
+        };
+        Self::decode_soa_inner(reader, format, Some(max_postings))
+    }
+
+    /// Bound a posting list's declared count `n` before anything is
+    /// allocated for it, and narrow it to `usize` (Issue #1220).
+    ///
+    /// Two bounds apply: the segment's document count, when the caller
+    /// knows it (see [`Self::decode_soa_for_segment`]), and the fewest bytes
+    /// the rest of the list can occupy. Each full block of 128 postings
+    /// costs at least its two `num_bits` bytes (doc ids and frequencies, the
+    /// packed payloads possibly empty); each tail posting at least a
+    /// one-byte doc-id delta and a one-byte frequency; each weight four
+    /// bytes; and each posting's positions at least their presence byte. A
+    /// valid list always fits both.
+    fn bounded_posting_count<R: StorageInput>(
+        reader: &StructReader<R>,
+        n: u64,
+        any_weights: bool,
+        any_positions: bool,
+        max_postings: Option<u64>,
+    ) -> Result<usize> {
+        if let Some(max_postings) = max_postings
+            && n > max_postings
+        {
+            return Err(LaurusError::index(format!(
+                "posting list: header declares {n} postings but the segment holds only \
+                 {max_postings} documents — segment is corrupted"
+            )));
+        }
+        let block = POSTING_BLOCK_LEN as u64;
+        let per_posting = if any_weights { 4 } else { 0 } + u64::from(any_positions);
+        let min_bytes = (n / block)
+            .saturating_mul(2)
+            .saturating_add((n % block).saturating_mul(2))
+            .saturating_add(n.saturating_mul(per_posting));
+        let available = reader.remaining();
+        if min_bytes > available {
+            return Err(LaurusError::index(format!(
+                "posting list: header declares {n} postings, which take at least {min_bytes} \
+                 bytes, but only {available} bytes are left in the file — segment is corrupted"
+            )));
+        }
+        checked_usize(n, "posting list posting count")
+    }
+
+    /// A block's `num_bits` byte, rejected above 32 (Issue #1220): no `u32`
+    /// needs more, and `bitpacking` panics on a wider one.
+    fn checked_num_bits(num_bits: u8) -> Result<u8> {
+        if num_bits > 32 {
+            return Err(LaurusError::index(format!(
+                "posting list: a block declares {num_bits} bits per value, more than 32 — \
+                 segment is corrupted"
+            )));
+        }
+        Ok(num_bits)
     }
 
     /// Shared decoder for every on-disk version.
@@ -958,14 +1045,17 @@ impl PostingList {
     /// * `reader` - The structured input reader positioned at a
     ///   posting-list header.
     /// * `format` - The on-disk version the stream is known to be in.
+    /// * `max_postings` - The segment's document count, when known: an upper
+    ///   bound on the list's postings (see [`Self::decode_soa_for_segment`]).
     fn decode_soa_inner<R: StorageInput>(
         reader: &mut StructReader<R>,
         format: PostingFormat,
+        max_postings: Option<u64>,
     ) -> Result<DecodedPostingList> {
         let term = reader.read_string()?;
         let total_frequency = reader.read_varint()?;
         let doc_frequency = reader.read_varint()?;
-        let n = reader.read_varint()? as usize;
+        let n = reader.read_varint()?;
         let any_positions = reader.read_u8()? != 0;
 
         // v3 onward: does Section 3 exist at all? Older versions always
@@ -984,7 +1074,14 @@ impl PostingList {
             let num_levels = reader.read_u8()? as usize;
             disk_skip_levels.reserve(num_levels);
             for _ in 0..num_levels {
-                let level_len = reader.read_varint()? as usize;
+                let level_len = reader.read_varint()?;
+                // Each skip entry is a fixed-width u32 (Issue #1220).
+                let level_len = checked_capacity_u64(
+                    level_len,
+                    4,
+                    reader.remaining(),
+                    "posting skip level length",
+                )?;
                 let mut level = Vec::with_capacity(level_len);
                 for _ in 0..level_len {
                     level.push(reader.read_u32()?);
@@ -993,6 +1090,7 @@ impl PostingList {
             }
         }
 
+        let n = Self::bounded_posting_count(reader, n, any_weights, any_positions, max_postings)?;
         if n == 0 {
             return Ok(DecodedPostingList {
                 term,
@@ -1026,7 +1124,7 @@ impl PostingList {
         let mut buf = [0u32; POSTING_BLOCK_LEN];
         let mut initial: u32 = 0;
         for _ in 0..full_blocks {
-            let num_bits = reader.read_u8()?;
+            let num_bits = Self::checked_num_bits(reader.read_u8()?)?;
             let bytes = num_bits as usize * POSTING_BLOCK_LEN / 8;
             reader.read_raw_with(bytes, |compressed| {
                 bitpacker.decompress_sorted(initial, compressed, &mut buf, num_bits);
@@ -1049,7 +1147,7 @@ impl PostingList {
         // Section 2: frequencies (same zero-copy block path).
         let mut frequencies: Vec<u32> = Vec::with_capacity(n);
         for _ in 0..full_blocks {
-            let num_bits = reader.read_u8()?;
+            let num_bits = Self::checked_num_bits(reader.read_u8()?)?;
             let bytes = num_bits as usize * POSTING_BLOCK_LEN / 8;
             reader.read_raw_with(bytes, |compressed| {
                 bitpacker.decompress(compressed, &mut buf, num_bits);
@@ -1079,7 +1177,15 @@ impl PostingList {
             for _ in 0..n {
                 let has = reader.read_u8()? != 0;
                 if has {
-                    let count = reader.read_varint()? as usize;
+                    let count = reader.read_varint()?;
+                    // Each position is a varint of at least one byte (Issue
+                    // #1220).
+                    let count = checked_capacity_u64(
+                        count,
+                        1,
+                        reader.remaining(),
+                        "posting position count",
+                    )?;
                     let mut p = Vec::with_capacity(count);
                     let mut prev_pos = 0u32;
                     for _ in 0..count {
@@ -1399,7 +1505,16 @@ impl TermPostingIndex {
 
         let doc_count = reader.read_varint()?;
         let term_count = reader.read_varint()?;
-        let posting_list_count = reader.read_varint()? as usize;
+        let posting_list_count = reader.read_varint()?;
+        // A v1 list takes at least five bytes — an empty term's length,
+        // three varints and the positions flag — and later versions more
+        // (Issue #1220).
+        let posting_list_count = checked_capacity_u64(
+            posting_list_count,
+            5,
+            reader.remaining(),
+            "posting list count",
+        )?;
 
         let mut terms = AHashMap::with_capacity(posting_list_count);
 
@@ -2593,6 +2708,174 @@ mod tests {
         assert!(
             msg.contains("exceeds u32::MAX"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    // Issue #1220: every count the decoder reads is bounded before it sizes
+    // an allocation. `u64::MAX` counts make an unbounded decoder panic with a
+    // capacity overflow, where a smaller impossible count would abort.
+
+    /// Writes `build` into `name` and opens a reader over it.
+    fn reader_over(
+        storage: &MemoryStorage,
+        name: &str,
+        build: impl FnOnce(&mut StructWriter<Box<dyn StorageOutput>>),
+    ) -> StructReader<Box<dyn StorageInput>> {
+        let output = storage.create_output(name).unwrap();
+        let mut writer = StructWriter::new(output);
+        build(&mut writer);
+        writer.close().unwrap();
+        StructReader::new(storage.open_input(name).unwrap()).unwrap()
+    }
+
+    /// A v3 posting-list header declaring `n` postings, up to its skip-level
+    /// count (not included).
+    fn write_v3_header(
+        writer: &mut StructWriter<Box<dyn StorageOutput>>,
+        n: u64,
+        any_positions: bool,
+        any_weights: bool,
+    ) {
+        writer.write_string("t").unwrap();
+        writer.write_varint(1).unwrap(); // total_frequency
+        writer.write_varint(1).unwrap(); // doc_frequency
+        writer.write_varint(n).unwrap();
+        writer.write_u8(u8::from(any_positions)).unwrap();
+        writer.write_u8(u8::from(any_weights)).unwrap();
+    }
+
+    fn assert_corrupted<T>(result: Result<T>, label: &str) {
+        match result {
+            Ok(_) => panic!("expected a corruption error mentioning {label:?}"),
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("corrupted") && msg.contains(label), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_posting_count_the_file_cannot_hold_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        // Weights cost four bytes per posting.
+        let mut reader = reader_over(&storage, "weighted", |w| {
+            write_v3_header(w, u64::MAX, false, true);
+            w.write_u8(0).unwrap(); // num_levels
+        });
+        assert_corrupted(PostingList::decode_soa_v3(&mut reader), "postings");
+        // With neither weights nor positions, each block still costs its
+        // two `num_bits` bytes.
+        let mut reader = reader_over(&storage, "bare", |w| {
+            write_v3_header(w, u64::MAX, false, false);
+            w.write_u8(0).unwrap();
+        });
+        assert_corrupted(PostingList::decode_soa_v3(&mut reader), "postings");
+    }
+
+    /// A list cannot hold more postings than its segment has documents —
+    /// the bound bytes cannot give, since an all-zero block encodes 128
+    /// postings in one byte.
+    #[test]
+    fn a_posting_count_above_the_segments_documents_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let n = 1000u64;
+        let mut reader = reader_over(&storage, "capped", |w| {
+            write_v3_header(w, n, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            // The fewest bytes 1000 bare postings take: 7 blocks and 104
+            // tail postings, twice (doc ids, frequencies). Enough to pass
+            // the byte bound, so only the segment's count rejects it.
+            let min = 2 * (n / 128) + 2 * (n % 128);
+            w.write_raw(&vec![0u8; min as usize]).unwrap();
+        });
+        assert_corrupted(
+            PostingList::decode_soa_for_segment(&mut reader, 3, 10),
+            "segment holds only 10 documents",
+        );
+    }
+
+    #[test]
+    fn a_skip_level_longer_than_the_file_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "levels", |w| {
+            write_v3_header(w, 0, false, false);
+            w.write_u8(1).unwrap(); // num_levels
+            w.write_varint(u64::MAX).unwrap(); // level_len
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "posting skip level length",
+        );
+    }
+
+    #[test]
+    fn a_position_count_longer_than_the_file_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "positions", |w| {
+            write_v3_header(w, 1, true, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_varint(5).unwrap(); // doc-id delta
+            w.write_varint(1).unwrap(); // frequency
+            w.write_u8(1).unwrap(); // has positions
+            w.write_varint(u64::MAX).unwrap(); // position count
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "posting position count",
+        );
+    }
+
+    /// `bitpacking` panics on more than 32 bits per value; the decoder
+    /// rejects such a block instead.
+    #[test]
+    fn a_block_wider_than_32_bits_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "wide", |w| {
+            write_v3_header(w, 128, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_u8(33).unwrap(); // num_bits of the doc-id block
+            // The packed bytes a 33-bit block would span, so an unchecked
+            // decoder reaches `bitpacking` rather than the end of the file.
+            w.write_raw(&[0u8; 33 * POSTING_BLOCK_LEN / 8]).unwrap();
+        });
+        assert_corrupted(PostingList::decode_soa_v3(&mut reader), "bits per value");
+    }
+
+    /// The byte bound never rejects a valid list: bare v3 lists (no weights,
+    /// no positions — the smallest encoding) round-trip at block boundaries,
+    /// each alone in its file, so the bound is as tight as it gets.
+    #[test]
+    fn bare_v3_lists_round_trip_under_the_byte_bound() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        for n in [1u64, 127, 128, 129, 256, 1000] {
+            let mut list = PostingList::new("t".to_string());
+            for doc_id in 0..n {
+                list.add_posting(Posting::with_frequency(doc_id, 1));
+            }
+            let name = format!("bare_{n}");
+            let mut reader = reader_over(&storage, &name, |w| list.encode_v3(w).unwrap());
+            let decoded = PostingList::decode_soa_v3(&mut reader).unwrap();
+            assert_eq!(decoded.doc_ids.len() as u64, n);
+
+            let mut reader = StructReader::new(storage.open_input(&name).unwrap()).unwrap();
+            let decoded = PostingList::decode_soa_for_segment(&mut reader, 3, n).unwrap();
+            assert_eq!(decoded.doc_ids, (0..n as u32).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn a_posting_list_count_the_file_cannot_hold_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "index", |w| {
+            w.write_u32(0x494E5658).unwrap(); // magic
+            w.write_u32(3).unwrap(); // version
+            w.write_varint(1).unwrap(); // doc_count
+            w.write_varint(1).unwrap(); // term_count
+            w.write_varint(u64::MAX).unwrap(); // posting_list_count
+        });
+        assert_corrupted(
+            TermPostingIndex::read_from_storage(&mut reader),
+            "posting list count",
         );
     }
 }

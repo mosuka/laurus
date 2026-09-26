@@ -89,7 +89,7 @@ pub(crate) fn checked_capacity_u64(
              {available} bytes left in the file — segment is corrupted"
         )));
     }
-    narrow(count, what)
+    checked_usize(count, what)
 }
 
 /// Bound a header-declared byte `len` against the bytes available in the
@@ -134,13 +134,19 @@ pub(crate) fn checked_len_u64(len: u64, available: u64, what: &str) -> Result<us
              — segment is corrupted"
         )));
     }
-    narrow(len, what)
+    checked_usize(len, what)
 }
 
-/// Narrow a size already bounded by the bytes left in the file. It cannot
-/// fail for an input the platform can address; a size that still does not
-/// fit is reported as corruption rather than truncated.
-fn narrow(value: u64, what: &str) -> Result<usize> {
+/// Narrow an on-disk `u64` size to `usize` without losing bits (Issue
+/// #1220): on a 32-bit target a value that does not fit is reported as
+/// corruption rather than truncated into a small, plausible one. It cannot
+/// fail for a size already bounded by the bytes left in an input the
+/// platform can address.
+///
+/// # Errors
+///
+/// [`LaurusError::Index`] when `value` exceeds `usize::MAX`.
+pub(crate) fn checked_usize(value: u64, what: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
         LaurusError::index(format!(
             "{what}: {value} exceeds this platform's address space — segment is corrupted"
@@ -212,6 +218,17 @@ mod tests {
             }
             other => panic!("expected Index error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn checked_usize_narrows_what_the_platform_can_address() {
+        assert_eq!(checked_usize(0, "n").unwrap(), 0);
+        assert_eq!(
+            checked_usize(u64::from(u32::MAX), "n").unwrap(),
+            u32::MAX as usize
+        );
+        #[cfg(target_pointer_width = "32")]
+        assert!(checked_usize(u64::from(u32::MAX) + 1, "n").is_err());
     }
 
     #[test]

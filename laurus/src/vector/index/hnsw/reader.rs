@@ -254,7 +254,7 @@ impl HnswIndexReader {
         file_size: u64,
         doc_ids: Arc<[u64]>,
     ) -> Result<Option<Arc<OrdinalHnswGraph>>> {
-        use crate::util::alloc_bounds::checked_capacity;
+        use crate::util::alloc_bounds::{checked_capacity, checked_capacity_u64};
         use ahash::AHashMap;
 
         let mut has_graph_buf = [0u8; 1];
@@ -277,7 +277,7 @@ impl HnswIndexReader {
 
         let mut node_count_buf = [0u8; 8];
         input.read_exact(&mut node_count_buf)?;
-        let node_count = u64::from_le_bytes(node_count_buf) as usize;
+        let node_count = u64::from_le_bytes(node_count_buf);
 
         // Bound every graph allocation by the bytes left in the file
         // (Issue #806). The graph trails the vector payload, so this
@@ -288,7 +288,8 @@ impl HnswIndexReader {
         let graph_remaining =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
         // Each v1 node serializes at least doc_id (8) + layer_count (4).
-        checked_capacity(node_count, 12, graph_remaining, "hnsw node_count")?;
+        // Compared before it is narrowed (Issue #1220).
+        let node_count = checked_capacity_u64(node_count, 12, graph_remaining, "hnsw node_count")?;
 
         let rank: AHashMap<u64, u32> = doc_ids
             .iter()
@@ -480,7 +481,7 @@ impl HnswIndexReader {
         path: &str,
         distance_metric: DistanceMetric,
     ) -> Result<Self> {
-        use crate::util::alloc_bounds::{checked_capacity, checked_len};
+        use crate::util::alloc_bounds::{checked_capacity, checked_len, checked_usize};
         use std::io::{Read, Seek};
 
         // Open the index file
@@ -520,7 +521,9 @@ impl HnswIndexReader {
         // Read metadata (vector count stored as u64)
         let mut num_vectors_buf = [0u8; 8];
         input.read_exact(&mut num_vectors_buf)?;
-        let num_vectors = u64::from_le_bytes(num_vectors_buf) as usize;
+        // Narrowed losslessly; bounded against the file where it sizes
+        // something (Issue #1220).
+        let num_vectors = checked_usize(u64::from_le_bytes(num_vectors_buf), "hnsw num_vectors")?;
 
         // We already have dimension from argument, but file has it too.
         // Let's read it to advance cursor, and verify?
