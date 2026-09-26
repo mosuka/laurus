@@ -192,6 +192,15 @@ impl LexicalIndexReader for PerSegmentReaderView {
         seg.doc_ids()
     }
 
+    fn live_doc_ids(&self) -> Result<Vec<u64>> {
+        // This segment's live documents only (Issue #1211). The trait
+        // default would probe `scan_doc_ids`, which falls back to
+        // `0..global_max_doc` when this segment lists no ids — an empty
+        // segment then contributed phantom ids to a MustNot-only query.
+        let seg = self.segment.read().unwrap();
+        Ok(seg.live_doc_ids()?.iter().collect())
+    }
+
     fn get_doc_value(
         &self,
         field: &str,

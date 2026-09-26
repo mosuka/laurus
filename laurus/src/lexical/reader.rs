@@ -107,11 +107,40 @@ pub trait LexicalIndexReader: Send + Sync + std::fmt::Debug {
     /// for iterating over all possible document slots.
     fn max_doc(&self) -> u64;
 
+    /// Whether any document the index holds is deleted (Issue #1211).
+    ///
+    /// The count fast path answers a term count from the term dictionary's
+    /// `doc_freq`, which still counts deleted documents, so it may run only
+    /// when this is `false`. The default compares the live count with
+    /// [`Self::max_doc`]; a reader whose live count can be an upper bound
+    /// overrides it with an exact test.
+    fn has_effective_deletions(&self) -> bool {
+        self.doc_count() != self.max_doc()
+    }
+
     /// Check if a document has been deleted.
     ///
     /// Returns `true` if the document with the given `doc_id` has been marked
     /// as deleted, `false` otherwise.
     fn is_deleted(&self, doc_id: u64) -> bool;
+
+    /// The ids of every live document, ascending and without duplicates
+    /// (Issue #1211).
+    ///
+    /// The default probes the ids `doc_ids` lists (or `0..max_doc` when it
+    /// lists none) and filters them with [`Self::is_deleted`]. A reader that
+    /// knows which segment holds each document checks it against that
+    /// segment's own deletions instead, so a bit left in another segment (the
+    /// old copy of a re-added id, or a stray bit) cannot hide it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document ids cannot be read.
+    fn live_doc_ids(&self) -> Result<Vec<u64>> {
+        Ok(scan_doc_ids(self)?
+            .filter(|&doc_id| !self.is_deleted(doc_id))
+            .collect())
+    }
 
     /// Get a document's stored fields by ID.
     ///
@@ -283,8 +312,8 @@ pub trait LexicalIndexReader: Send + Sync + std::fmt::Debug {
 /// # Returns
 ///
 /// An iterator over the document ids to probe, in ascending order.
-pub(crate) fn scan_doc_ids(
-    reader: &dyn LexicalIndexReader,
+pub(crate) fn scan_doc_ids<R: LexicalIndexReader + ?Sized>(
+    reader: &R,
 ) -> Result<Box<dyn Iterator<Item = u64>>> {
     let mut ids = reader.doc_ids()?;
     if ids.is_empty() && reader.max_doc() > 0 {

@@ -1363,6 +1363,192 @@ mod tests {
         assert_eq!(term_count(&store, "title", "nonexistent"), 0);
     }
 
+    /// Issue #1211: a segment with gaps in its id range reports its true live
+    /// count once it has a deletion, and the count fast path does not return
+    /// the deleted document. `optimize` merges {1,2,3} (2 deleted) and {4}
+    /// into {1,3,4} over range 1..4; deleting 3 then made the range width
+    /// minus the deletions (3) equal `max_doc`, so the fast path answered
+    /// from `doc_freq`, which still counts doc 3.
+    #[test]
+    fn a_gapped_segment_counts_its_live_documents() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for id in 1..=3u64 {
+            store
+                .upsert_document(id, create_test_document("world", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+        store
+            .upsert_document(4, create_test_document("world", "body"))
+            .unwrap();
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(2).unwrap();
+        store.commit().unwrap();
+        store.optimize().unwrap();
+        store.delete_document_by_internal_id(3).unwrap();
+        store.commit().unwrap();
+
+        assert_eq!(store.reader_for_tests().unwrap().doc_count(), 2);
+        assert_eq!(term_count(&store, "title", "world"), 2);
+    }
+
+    /// Issue #1211: when a segment's membership is unknown (no `.ids` and no
+    /// `.norms`, as before #555), its live count is an upper bound that never
+    /// under-counts — and the count fast path does not take that bound for
+    /// "no deletions". Segment {1, 3} with 3 deleted: the bound is 2 (it
+    /// cannot tell whether the bit is on a held id), which equals `max_doc`.
+    #[test]
+    fn unknown_membership_bounds_the_live_count_and_skips_the_fast_path() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config =
+            LexicalIndexConfig::Inverted(crate::lexical::index::config::InvertedIndexConfig {
+                use_compound: false,
+                ..Default::default()
+            });
+        let store = LexicalStore::new(storage.clone(), config).unwrap();
+        for id in [1u64, 3] {
+            store
+                .upsert_document(id, create_test_document("world", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(3).unwrap();
+        store.commit().unwrap();
+        for file in storage.list_files().unwrap() {
+            if file.ends_with(".ids") || file.ends_with(".norms") {
+                storage.delete_file(&file).unwrap();
+            }
+        }
+        store.refresh().unwrap();
+
+        let live = store.reader_for_tests().unwrap().doc_count();
+        assert!(live >= 1, "the bound must not under-count: {live}");
+        assert_eq!(term_count(&store, "title", "world"), 1);
+    }
+
+    fn must_not_alpha() -> Box<dyn Query> {
+        Box::new(
+            crate::lexical::query::BooleanQueryBuilder::new()
+                .must_not(Box::new(TermQuery::new("title", "alpha")))
+                .build(),
+        )
+    }
+
+    /// Issue #1211: re-adding an id leaves the old copy's deletion bit in its
+    /// segment, and that bit must not hide the live copy in the new segment.
+    /// The MustNot-only universe and the numeric-range BKD filter both OR'd
+    /// every segment's bits, so both counts came back 0.
+    #[test]
+    fn a_re_added_id_is_not_hidden_by_its_old_copy() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let doc = |title: &str| {
+            Document::builder()
+                .add_text("title", title)
+                .add_integer("n", 5)
+                .build()
+        };
+        store.upsert_document(1, doc("bravo")).unwrap();
+        store.commit().unwrap();
+        store.upsert_document(1, doc("bravo2")).unwrap();
+        store.commit().unwrap();
+
+        assert_eq!(
+            store
+                .count(LexicalSearchRequest::new(must_not_alpha()))
+                .unwrap(),
+            1
+        );
+        let range = Box::new(crate::lexical::query::NumericRangeQuery::i64_range(
+            "n",
+            Some(0),
+            Some(10),
+        )) as Box<dyn Query>;
+        assert_eq!(store.count(LexicalSearchRequest::new(range)).unwrap(), 1);
+        assert!(!store.reader_for_tests().unwrap().is_deleted(1));
+    }
+
+    /// Issue #1211: under the per-segment fanout, an empty segment (a merge
+    /// whose every source document was deleted) lists no ids, and the
+    /// MustNot-only universe fell back to `0..global_max_doc`, returning ids
+    /// no segment holds.
+    #[test]
+    fn a_must_not_only_search_returns_no_phantom_ids() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for batch in [[1u64, 2], [3, 4]] {
+            for id in batch {
+                store
+                    .upsert_document(id, create_test_document("bravo", "body"))
+                    .unwrap();
+            }
+            store.commit().unwrap();
+        }
+        for id in 1..=4 {
+            store.delete_document_by_internal_id(id).unwrap();
+        }
+        store.commit().unwrap();
+        store.optimize().unwrap();
+        for id in [5u64, 6] {
+            store
+                .upsert_document(id, create_test_document("bravo", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+
+        let mut ids: Vec<u64> = store
+            .search(LexicalSearchRequest::new(must_not_alpha()).limit(100))
+            .unwrap()
+            .hits
+            .iter()
+            .map(|hit| hit.doc_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![5, 6]);
+    }
+
+    /// Issue #1211: a doc-id set that disagrees with its segment is not
+    /// trusted — the universe then comes from the stored documents rather
+    /// than from a set that lists an id the segment never held.
+    #[test]
+    fn an_untrusted_doc_id_set_adds_no_phantom_ids() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config =
+            LexicalIndexConfig::Inverted(crate::lexical::index::config::InvertedIndexConfig {
+                use_compound: false,
+                ..Default::default()
+            });
+        let store = LexicalStore::new(storage.clone(), config).unwrap();
+        for id in [1u64, 10] {
+            store
+                .upsert_document(id, create_test_document("bravo", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(10).unwrap();
+        store.commit().unwrap();
+        let ids_part = storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.ends_with(".ids"))
+            .unwrap();
+        crate::lexical::index::structures::doc_id_set::write_doc_id_set(
+            storage.create_output(&ids_part).unwrap(),
+            &[1, 5],
+        )
+        .unwrap();
+        store.refresh().unwrap();
+
+        assert_eq!(
+            store
+                .count(LexicalSearchRequest::new(must_not_alpha()))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn test_engine_refresh() {
         let temp_dir = TempDir::new().unwrap();

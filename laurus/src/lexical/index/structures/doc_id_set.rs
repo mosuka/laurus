@@ -103,6 +103,38 @@ pub(crate) fn load_segment_doc_ids(
     super::norms::read_doc_ids(storage, segment_id)
 }
 
+/// A segment's doc-id set, read through the segment's own storage — its
+/// compound facade, or the index storage for a loose segment (Issue #1211).
+///
+/// [`load_segment_doc_ids`] opens a compound container from scratch, which
+/// on an eager in-memory backend copies the whole container; a
+/// `SegmentReader` already holds a facade whose part windows share one
+/// buffered copy, so it reads through that instead. Existence is checked
+/// first: the facade passes a missing part through to the inner storage,
+/// whose `open_input` fails.
+///
+/// # Returns
+///
+/// `Ok(None)` when the segment has neither `.ids` nor `.norms`.
+///
+/// # Errors
+///
+/// Returns an error when the part that exists is unreadable or corrupt.
+pub(crate) fn load_doc_ids_from_segment_storage(
+    storage: &dyn Storage,
+    segment_id: &str,
+) -> Result<Option<RoaringTreemap>> {
+    let ids = format!("{segment_id}.{DOC_ID_SET_SUFFIX}");
+    if storage.file_exists(&ids) {
+        return decode(storage.open_input(&ids)?, segment_id).map(Some);
+    }
+    let norms = format!("{segment_id}.norms");
+    if storage.file_exists(&norms) {
+        return super::norms::read_doc_ids_from(storage.open_input(&norms)?).map(Some);
+    }
+    Ok(None)
+}
+
 fn decode<R: StorageInput>(input: R, segment_id: &str) -> Result<RoaringTreemap> {
     let mut reader = StructReader::new(input)?;
     let magic = reader.read_u32()?;

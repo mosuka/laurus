@@ -198,7 +198,31 @@ impl DeletionBitmap {
         }
     }
 
-    /// Get number of live (non-deleted) documents.
+    /// Number of deleted ids inside `[min_doc_id, max_doc_id]` (Issue #1211).
+    ///
+    /// Counted from the set itself, not from the header's `deleted_count`: a
+    /// v1/v2 `.delmap` infers its range from its own bits, and nothing checks
+    /// a loaded bitmap against its segment's range, so bits outside it (or a
+    /// stale counter) are possible.
+    pub fn deleted_in_range(&self, min_doc_id: u64, max_doc_id: u64) -> u64 {
+        self.deleted_docs
+            .read()
+            .unwrap()
+            .range_cardinality(min_doc_id..=max_doc_id)
+    }
+
+    /// Number of `ids` marked deleted — the deletions that hit documents a
+    /// segment actually holds, when `ids` is its doc-id set (Issue #1211).
+    pub fn deleted_count_in(&self, ids: &RoaringTreemap) -> u64 {
+        self.deleted_docs.read().unwrap().intersection_len(ids)
+    }
+
+    /// Get number of live (non-deleted) documents, assuming the segment
+    /// holds every id of its range.
+    ///
+    /// `total_docs` is the range width, so this over-counts a segment whose
+    /// ids have gaps; `SegmentReader::doc_count` computes the live count from
+    /// the documents the segment holds instead (Issue #1211).
     pub fn live_count(&self) -> u64 {
         self.total_docs.load(Ordering::SeqCst) - self.deleted_count.load(Ordering::SeqCst)
     }
@@ -911,6 +935,20 @@ mod tests {
         );
         // Idempotent: a second flush finds nothing dirty and succeeds.
         manager.flush().unwrap();
+    }
+
+    /// `deleted_in_range` counts the set's bits inside the range, not the
+    /// header counter (Issue #1211): a v1/v2 `.delmap` infers its range from
+    /// its own bits, so a loaded bitmap can hold ids outside the segment's.
+    #[test]
+    fn deleted_in_range_counts_only_the_range() {
+        let bitmap = DeletionBitmap::new("seg".to_string(), 0, 9);
+        bitmap.delete_document(3).unwrap();
+        bitmap.deleted_docs.write().unwrap().insert(50);
+
+        assert_eq!(bitmap.deleted_in_range(0, 9), 1);
+        let held: RoaringTreemap = [3u64, 4].into_iter().collect();
+        assert_eq!(bitmap.deleted_count_in(&held), 1);
     }
 
     /// `forget_segment` drops a segment's unflushed deletions (Issue #1204):
