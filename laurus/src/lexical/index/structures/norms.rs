@@ -29,6 +29,12 @@
 //! -- trailer: u32 CRC-32 checksum (StructWriter::close) --
 //! ```
 //!
+//! A contiguous file satisfies `max_doc_id == min_doc_id + N - 1`, and a
+//! sparse file's slot map ends at `max_doc_id`. A contiguous file stores no
+//! byte per document before its fields, so one whose documents record no
+//! field lengths ends right after `num_fields`, whatever `N` is (Issue
+//! #1213). See `NormsHeader` for how a reader checks each layout.
+//!
 //! `sum_length`/`present_count`/`min_length`/`max_length` are the *exact*,
 //! pre-quantisation aggregates -- this is what lets `avg_length` (fed into
 //! BM25's global length normalisation) stay bit-identical to what `.fstats`
@@ -52,8 +58,8 @@ use crate::error::{LaurusError, Result};
 use crate::lexical::core::analyzed::AnalyzedDocument;
 use crate::lexical::reader::FieldStats;
 use crate::storage::Storage;
-use crate::storage::StorageOutput;
 use crate::storage::structured::{StructReader, StructWriter};
+use crate::storage::{StorageInput, StorageOutput};
 use crate::util::alloc_bounds::{checked_capacity, checked_len};
 
 /// `.norms` segment part file extension.
@@ -360,15 +366,147 @@ pub(crate) struct NormsReader {
     fields: AHashMap<String, NormsField>,
 }
 
+/// A `.norms` header, read and checked by [`NormsHeader::read`] for both
+/// readers — [`NormsReader::load`] and [`read_doc_ids_from`].
+///
+/// `doc_count` is bounded by what each layout actually stores (Issue
+/// #1213):
+///
+/// - **Contiguous:** `max_doc_id == min_doc_id + doc_count - 1`, and no
+///   bytes per document. Nothing is allocated in proportion to `doc_count`
+///   for this layout — [`SlotMap::Contiguous`] keeps only the count, and each
+///   field's norm column is bounded on its own before it is read — so a
+///   field-less file, which ends right after `num_fields`, is valid at any
+///   size. Bounding it by one byte per document rejected every such file
+///   past 21 documents, failing merges and term queries.
+/// - **Sparse:** the slot map's `doc_count - 1` deltas take at least one
+///   byte each, and [`read_sparse_ids`] checks that they end at
+///   `max_doc_id`.
+struct NormsHeader {
+    contiguous: bool,
+    doc_count: u32,
+    min_doc_id: u64,
+    max_doc_id: u64,
+    num_fields: usize,
+}
+
+impl NormsHeader {
+    /// Read the header through `num_fields`, leaving `reader` at the sparse
+    /// slot map, or at the field directory when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the part has a foreign magic or version, or its
+    /// header is inconsistent with itself or with the file's size.
+    fn read<R: StorageInput>(reader: &mut StructReader<R>) -> Result<Self> {
+        let file_size = reader.size();
+
+        let magic = reader.read_raw(MAGIC.len())?;
+        if magic != MAGIC {
+            return Err(LaurusError::index("Invalid .norms file format"));
+        }
+        let version = reader.read_raw(VERSION.len())?;
+        if version[0] != VERSION[0] {
+            return Err(LaurusError::index(format!(
+                "Unsupported .norms version: {}.{}",
+                version[0], version[1]
+            )));
+        }
+        let _codec_id = reader.read_u8()?;
+        let flags = reader.read_u8()?;
+        let contiguous = flags & FLAG_SLOT_MAP_CONTIGUOUS != 0;
+
+        // The slot map's count type; checked before anything else is read.
+        let doc_count = reader.read_varint()?;
+        let doc_count = u32::try_from(doc_count).map_err(|_| {
+            LaurusError::index(format!(
+                "doc_count: header declares {doc_count} documents, more than a segment can \
+                 hold — segment is corrupted"
+            ))
+        })?;
+
+        let min_doc_id = reader.read_u64()?;
+        let max_doc_id = reader.read_u64()?;
+
+        let num_fields = reader.read_varint()?;
+        let num_fields = usize::try_from(num_fields).map_err(|_| {
+            LaurusError::index(format!(
+                "num_fields: header declares {num_fields} fields, more than this platform can \
+                 address — segment is corrupted"
+            ))
+        })?;
+        let available = file_size.saturating_sub(reader.position());
+        let num_fields =
+            checked_capacity(num_fields, MIN_FIELD_RECORD_SIZE, available, "num_fields")?;
+
+        if doc_count > 0 {
+            if contiguous {
+                if min_doc_id.checked_add(u64::from(doc_count) - 1) != Some(max_doc_id) {
+                    return Err(LaurusError::index(format!(
+                        ".norms header declares {doc_count} contiguous doc ids from \
+                         {min_doc_id}, which do not end at max_doc_id {max_doc_id} — segment \
+                         is corrupted"
+                    )));
+                }
+            } else {
+                // Each of the `doc_count - 1` deltas takes at least one byte.
+                checked_capacity(doc_count as usize - 1, 1, available, "doc_count")?;
+            }
+        }
+
+        Ok(Self {
+            contiguous,
+            doc_count,
+            min_doc_id,
+            max_doc_id,
+            num_fields,
+        })
+    }
+}
+
+/// Decode a sparse slot map, handing each doc id to `sink` in slot order.
+/// Called only for a sparse header with `doc_count > 0`, with `reader`
+/// where [`NormsHeader::read`] left it.
+///
+/// # Errors
+///
+/// Returns an error when the slot map overflows the doc-id space, does not
+/// end at the header's `max_doc_id`, or runs past the end of the file.
+fn read_sparse_ids<R: StorageInput>(
+    reader: &mut StructReader<R>,
+    header: &NormsHeader,
+    mut sink: impl FnMut(u64),
+) -> Result<()> {
+    sink(header.min_doc_id);
+    let mut prev = header.min_doc_id;
+    for _ in 1..header.doc_count {
+        let delta = reader.read_varint()?;
+        // `wrapping_add`, not `+`: before the dedup of #1210, a release build
+        // wrote `u64::MAX` for a repeated id, which release decoding has
+        // always wrapped into a duplicate slot. Such files keep loading; only
+        // a debug build used to panic on them.
+        let next = prev.checked_add(delta.wrapping_add(1)).ok_or_else(|| {
+            LaurusError::index("doc id overflow in .norms slot map — segment is corrupted")
+        })?;
+        sink(next);
+        prev = next;
+    }
+    if prev != header.max_doc_id {
+        return Err(LaurusError::index(
+            ".norms slot map does not end at the header's max_doc_id — segment is corrupted",
+        ));
+    }
+    Ok(())
+}
+
 /// Read only the doc ids a segment's `.norms` part covers (Issue #1210).
 ///
 /// The slot map is exactly the set of doc ids the segment holds, so a
 /// segment written before the `.ids` part existed (Issue #1210) can still
 /// answer "does this segment hold doc X?". Only the header and the slot map
 /// are parsed; the field directory and the per-document norms are never
-/// read. Unlike [`NormsReader::load`], `doc_count` is not bounded by one byte
-/// per document: a contiguous `.norms` has no per-document bytes before its
-/// fields, and a field-less one none at all (Issue #1213).
+/// read. The header is checked as [`NormsReader::load`] checks it — see
+/// [`NormsHeader`].
 ///
 /// # Returns
 ///
@@ -399,66 +537,38 @@ pub(crate) fn read_doc_ids(
 ///
 /// Returns an error when the part has a foreign magic or version, or its
 /// slot map is inconsistent with its header.
-pub(crate) fn read_doc_ids_from<R: crate::storage::StorageInput>(
-    input: R,
-) -> Result<roaring::RoaringTreemap> {
+pub(crate) fn read_doc_ids_from<R: StorageInput>(input: R) -> Result<roaring::RoaringTreemap> {
     let mut reader = StructReader::new(input)?;
-    let file_size = reader.size();
-
-    let magic = reader.read_raw(MAGIC.len())?;
-    if magic != MAGIC {
-        return Err(LaurusError::index("Invalid .norms file format"));
-    }
-    let version = reader.read_raw(VERSION.len())?;
-    if version[0] != VERSION[0] {
-        return Err(LaurusError::index(format!(
-            "Unsupported .norms version: {}.{}",
-            version[0], version[1]
-        )));
-    }
-    let _codec_id = reader.read_u8()?;
-    let flags = reader.read_u8()?;
-    let doc_count = reader.read_varint()?;
-    let min_doc_id = reader.read_u64()?;
-    let max_doc_id = reader.read_u64()?;
-    let _num_fields = reader.read_varint()?;
+    let header = NormsHeader::read(&mut reader)?;
 
     let mut ids = roaring::RoaringTreemap::new();
-    if doc_count == 0 {
+    if header.doc_count == 0 {
         return Ok(ids);
     }
-    if flags & FLAG_SLOT_MAP_CONTIGUOUS != 0 {
-        let end = min_doc_id.checked_add(doc_count).ok_or_else(|| {
-            LaurusError::index("doc id overflow in .norms header — segment is corrupted")
-        })?;
-        ids.insert_range(min_doc_id..end);
+    if header.contiguous {
+        ids.insert_range(header.min_doc_id..=header.max_doc_id);
     } else {
-        // Each of the `doc_count - 1` deltas takes at least one byte.
-        let available = file_size.saturating_sub(reader.position());
-        checked_capacity((doc_count - 1) as usize, 1, available, "doc_count")?;
-        ids.insert(min_doc_id);
-        let mut prev = min_doc_id;
-        for _ in 1..doc_count {
-            let delta = reader.read_varint()?;
-            let next = prev.checked_add(delta + 1).ok_or_else(|| {
-                LaurusError::index("doc id overflow in .norms slot map — segment is corrupted")
-            })?;
-            ids.insert(next);
-            prev = next;
-        }
-    }
-    if ids.max() != Some(max_doc_id) {
-        return Err(LaurusError::index(
-            ".norms slot map does not end at the header's max_doc_id — segment is corrupted",
-        ));
+        // `insert`, not `from_sorted_iter`: a pre-#1210 slot map may repeat
+        // an id (see `read_sparse_ids`).
+        read_sparse_ids(&mut reader, &header, |id| {
+            ids.insert(id);
+        })?;
     }
     Ok(ids)
 }
 
 impl NormsReader {
-    /// Load `{segment_id}.norms` from `storage`. `Ok(None)` means the file
-    /// does not exist (a pre-#555 segment, or one with no indexed fields
-    /// yet) -- not an error.
+    /// Load `{segment_id}.norms` from `storage`.
+    ///
+    /// `Ok(None)` means the file does not exist — a segment written before
+    /// #555 — and is not an error. Every segment written since has one,
+    /// including a segment whose documents record no field lengths at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file has a foreign magic or version, or its
+    /// header, slot map or field directory is inconsistent with itself or
+    /// with the file's size — see [`NormsHeader`].
     pub(crate) fn load(storage: &dyn Storage, segment_id: &str) -> Result<Option<Self>> {
         let file_name = format!("{segment_id}{NORMS_EXTENSION}");
         let input = match storage.open_input(&file_name) {
@@ -467,64 +577,24 @@ impl NormsReader {
         };
         let mut reader = StructReader::new(input)?;
         let file_size = reader.size();
+        let header = NormsHeader::read(&mut reader)?;
+        let doc_count = header.doc_count;
 
-        let magic = reader.read_raw(MAGIC.len())?;
-        if magic != MAGIC {
-            return Err(LaurusError::index("Invalid .norms file format"));
-        }
-        let version = reader.read_raw(VERSION.len())?;
-        if version[0] != VERSION[0] {
-            return Err(LaurusError::index(format!(
-                "Unsupported .norms version: {}.{}",
-                version[0], version[1]
-            )));
-        }
-        let _codec_id = reader.read_u8()?;
-        let flags = reader.read_u8()?;
-
-        let doc_count = reader.read_varint()?;
-        let available = file_size.saturating_sub(reader.position());
-        let doc_count = checked_capacity(doc_count as usize, 1, available, "doc_count")? as u32;
-
-        let min_doc_id = reader.read_u64()?;
-        let _max_doc_id = reader.read_u64()?;
-
-        let num_fields = reader.read_varint()?;
-        let available = file_size.saturating_sub(reader.position());
-        let num_fields = checked_capacity(
-            num_fields as usize,
-            MIN_FIELD_RECORD_SIZE,
-            available,
-            "num_fields",
-        )?;
-
-        let contiguous = flags & FLAG_SLOT_MAP_CONTIGUOUS != 0;
-        let slot_map = if contiguous {
+        let slot_map = if header.contiguous {
             SlotMap::Contiguous {
-                min_doc_id,
+                min_doc_id: header.min_doc_id,
                 count: doc_count,
             }
         } else {
             let mut ids = Vec::with_capacity(doc_count as usize);
             if doc_count > 0 {
-                ids.push(min_doc_id);
-                let mut prev = min_doc_id;
-                for _ in 1..doc_count {
-                    let delta = reader.read_varint()?;
-                    let next = prev.checked_add(delta + 1).ok_or_else(|| {
-                        LaurusError::index(
-                            "doc id overflow in .norms slot map — segment is corrupted",
-                        )
-                    })?;
-                    ids.push(next);
-                    prev = next;
-                }
+                read_sparse_ids(&mut reader, &header, |id| ids.push(id))?;
             }
             SlotMap::Sparse(ids)
         };
 
         let mut fields = AHashMap::new();
-        for _ in 0..num_fields {
+        for _ in 0..header.num_fields {
             let name = reader.read_string()?;
             let present_count = reader.read_varint()?;
             let sum_length = reader.read_varint()?;
@@ -695,8 +765,8 @@ mod format_tests {
     }
 
     /// A contiguous `.norms` whose documents record no field lengths has no
-    /// per-document bytes at all; `read_doc_ids` must not reject it for
-    /// that, as `NormsReader::load` does past 21 documents (Issue #1213).
+    /// per-document bytes at all; `read_doc_ids` must not reject it for that
+    /// (Issue #1213).
     #[test]
     fn read_doc_ids_accepts_a_large_field_less_segment() {
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
@@ -710,6 +780,136 @@ mod format_tests {
         let ids = read_doc_ids(&storage, "seg_bare").unwrap().unwrap();
         assert_eq!(ids.len(), 30);
         assert_eq!((ids.min(), ids.max()), (Some(0), Some(29)));
+    }
+
+    /// Writes a hand-made `.norms` header with no field directory, followed
+    /// by `deltas` as its slot map, to `{segment_id}.norms`.
+    fn write_header(
+        storage: &MemoryStorage,
+        segment_id: &str,
+        flags: u8,
+        doc_count: u64,
+        (min_doc_id, max_doc_id): (u64, u64),
+        deltas: &[u64],
+    ) {
+        let output = storage
+            .create_output(&format!("{segment_id}{NORMS_EXTENSION}"))
+            .unwrap();
+        let mut writer = StructWriter::new(output);
+        writer.write_raw(MAGIC).unwrap();
+        writer.write_raw(&VERSION).unwrap();
+        writer.write_u8(CODEC_TANTIVY_TABLE_V1).unwrap();
+        writer.write_u8(flags).unwrap();
+        writer.write_varint(doc_count).unwrap();
+        writer.write_u64(min_doc_id).unwrap();
+        writer.write_u64(max_doc_id).unwrap();
+        writer.write_varint(0).unwrap(); // num_fields
+        for &delta in deltas {
+            writer.write_varint(delta).unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    /// Both readers must reject `{segment_id}.norms` as corrupted.
+    fn assert_both_readers_reject(storage: &MemoryStorage, segment_id: &str) {
+        let errors = [
+            NormsReader::load(storage, segment_id).expect_err("load must reject the file"),
+            read_doc_ids(storage, segment_id).expect_err("read_doc_ids must reject the file"),
+        ];
+        for err in errors {
+            match err {
+                LaurusError::Index(msg) => assert!(msg.contains("corrupted"), "{msg}"),
+                other => panic!("expected Index error, got {other:?}"),
+            }
+        }
+    }
+
+    /// A contiguous `.norms` whose documents record no field lengths ends
+    /// right after `num_fields`, however many documents it covers. `load`
+    /// used to bound `doc_count` by one byte per document and reject it past
+    /// 21 documents, failing merges and term queries (Issue #1213).
+    #[test]
+    fn load_accepts_a_large_contiguous_field_less_segment() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs: Vec<_> = (0..30u64).map(|id| (id, doc(&[]))).collect();
+        let reader = round_trip(&storage, "seg_bare", &NormsBuilder::from_buffered(&docs));
+
+        assert!(reader.field_names().is_empty());
+        assert_eq!(reader.field_length(29, "body"), None);
+        assert!(reader.field_stats("body").is_none());
+        assert_eq!(reader.slot_map.slot_of(29), Some(29));
+    }
+
+    /// The sparse counterpart: one slot-map delta per document after the
+    /// first, and no field directory.
+    #[test]
+    fn load_accepts_a_large_sparse_field_less_segment() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs: Vec<_> = (0..30u64).map(|i| (i * 2, doc(&[]))).collect();
+        let reader = round_trip(
+            &storage,
+            "seg_bare_sparse",
+            &NormsBuilder::from_buffered(&docs),
+        );
+
+        assert!(reader.field_names().is_empty());
+        assert_eq!(reader.slot_map.slot_of(58), Some(29));
+        assert_eq!(reader.slot_map.slot_of(57), None);
+        let ids = read_doc_ids(&storage, "seg_bare_sparse").unwrap().unwrap();
+        assert_eq!(ids.len(), 30);
+        assert_eq!((ids.min(), ids.max()), (Some(0), Some(58)));
+    }
+
+    /// An empty segment writes a contiguous header covering no ids, which
+    /// both readers accept.
+    #[test]
+    fn an_empty_segment_round_trips_through_both_readers() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs: Vec<(u64, AnalyzedDocument)> = Vec::new();
+        let reader = round_trip(&storage, "seg_empty", &NormsBuilder::from_buffered(&docs));
+
+        assert!(reader.field_names().is_empty());
+        assert_eq!(reader.slot_map.slot_of(0), None);
+        assert!(
+            read_doc_ids(&storage, "seg_empty")
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A sparse slot map the file is too short to hold is rejected before
+    /// its ids are allocated for.
+    #[test]
+    fn rejects_a_sparse_slot_map_the_file_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        write_header(&storage, "seg_short", 0, 1000, (0, 1998), &[]);
+        assert_both_readers_reject(&storage, "seg_short");
+    }
+
+    /// A contiguous header must span exactly its documents; `load` used to
+    /// ignore `max_doc_id` altogether.
+    #[test]
+    fn rejects_a_contiguous_header_whose_range_disagrees_with_its_count() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        write_header(
+            &storage,
+            "seg_range",
+            FLAG_SLOT_MAP_CONTIGUOUS,
+            5,
+            (0, 10),
+            &[],
+        );
+        assert_both_readers_reject(&storage, "seg_range");
+    }
+
+    /// A sparse slot map must end at the header's `max_doc_id`.
+    #[test]
+    fn rejects_a_slot_map_that_does_not_end_at_max_doc_id() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        // Ids 0 and 2 (one delta of 1), but the header claims a max of 9.
+        write_header(&storage, "seg_end", 0, 2, (0, 9), &[1]);
+        assert_both_readers_reject(&storage, "seg_end");
     }
 
     /// A buffer holding one id twice records it once (Issue #1210): the

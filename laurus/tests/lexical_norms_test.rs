@@ -3,16 +3,28 @@
 //! documents, and merging segments that mix long (quantised) and short
 //! (exact) fields must not change hit counts or drift scores for the
 //! documents whose lengths were never quantised in the first place.
+//!
+//! Also Issue #1213: a segment whose documents record no field lengths
+//! must stay readable at any size.
 
 use std::sync::Arc;
 
 use laurus::Document;
+use laurus::lexical::query::BooleanQueryBuilder;
 use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore, TermQuery};
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 
 fn doc_with_body(body: &str) -> Document {
     Document::builder().add_text("body", body).build()
+}
+
+/// A document that records no field length: `Bytes` fields are never
+/// indexed.
+fn bytes_doc(id: u64) -> Document {
+    Document::builder()
+        .add_bytes("blob", id.to_le_bytes().to_vec())
+        .build()
 }
 
 fn search(store: &LexicalStore, term: &str) -> Vec<(u64, f32)> {
@@ -134,4 +146,75 @@ fn merged_short_fields_score_the_same_as_a_fresh_single_segment_build() {
          exactly what a fresh single-segment build of the same documents \
          would score"
     );
+}
+
+/// Merging segments whose documents record no field lengths must succeed at
+/// any size (Issue #1213). Such a contiguous segment's `.norms` ends right
+/// after its header, and the reader used to reject it as corrupted past 21
+/// documents — the merge reads every source segment's norms.
+#[test]
+fn optimize_merges_field_less_segments_of_any_size() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+    for batch in [1..=30u64, 31..=60] {
+        for id in batch {
+            store.upsert_document(id, bytes_doc(id)).unwrap();
+        }
+        store.commit().unwrap();
+    }
+
+    store.optimize().unwrap();
+
+    assert_eq!(store.stats().unwrap().doc_count, 60);
+    // No term reaches a `Bytes`-only document; a MustNot-only query matches
+    // every live one.
+    let everything = Box::new(
+        BooleanQueryBuilder::new()
+            .must_not(Box::new(TermQuery::new("body", "absent")))
+            .build(),
+    );
+    let request = LexicalSearchRequest::new(everything)
+        .limit(100)
+        .load_documents(true);
+    let mut blobs: Vec<(u64, Vec<u8>)> = store
+        .search(request)
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|hit| {
+            let document = hit.document.expect("documents were requested");
+            let blob = document.get("blob").and_then(|v| v.as_bytes()).unwrap();
+            (hit.doc_id, blob.to_vec())
+        })
+        .collect();
+    blobs.sort();
+    let expected: Vec<(u64, Vec<u8>)> = (1..=60u64)
+        .map(|id| (id, id.to_le_bytes().to_vec()))
+        .collect();
+    assert_eq!(blobs, expected, "every document survives the merge intact");
+}
+
+/// A term query reads the field statistics of every segment, so a single
+/// unreadable field-less `.norms` used to fail the whole query — search and
+/// count alike — whenever the term existed elsewhere (Issue #1213).
+#[test]
+fn a_field_less_segment_does_not_fail_term_queries() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+    for id in 1..=30u64 {
+        store.upsert_document(id, bytes_doc(id)).unwrap();
+    }
+    store.commit().unwrap();
+    // A separate commit: in the same segment, `body`'s norm column would
+    // back one byte per document and hide the defect.
+    store.upsert_document(100, doc_with_body("widget")).unwrap();
+    store.commit().unwrap();
+
+    assert_eq!(search(&store, "widget").len(), 1);
+    let count = store
+        .count(LexicalSearchRequest::new(Box::new(TermQuery::new(
+            "body", "widget",
+        ))))
+        .unwrap();
+    assert_eq!(count, 1);
 }
