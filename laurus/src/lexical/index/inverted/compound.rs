@@ -305,6 +305,107 @@ enum ContainerHandle {
     Buffered(Arc<Vec<u8>>),
 }
 
+/// Read and validate a container's trailer and part table.
+///
+/// Shared by [`CompoundSegmentStorage::try_open`] and [`open_part`]; leaves
+/// `input` positioned after the table.
+///
+/// # Errors
+///
+/// Returns an error when the trailer or table is invalid.
+fn read_part_table(input: &mut Box<dyn StorageInput>, container: &str) -> Result<Vec<PartEntry>> {
+    let size = input.size()?;
+    if size < TRAILER_LEN {
+        return Err(LaurusError::storage(format!(
+            "{container}: too short for a compound trailer ({size} bytes)"
+        )));
+    }
+    input.seek(SeekFrom::Start(size - TRAILER_LEN))?;
+    let mut trailer = [0u8; TRAILER_LEN as usize];
+    input.read_exact(&mut trailer)?;
+    let table_offset = u64::from_le_bytes(trailer[0..8].try_into().expect("fixed len"));
+    let table_crc = u32::from_le_bytes(trailer[8..12].try_into().expect("fixed len"));
+    let version = u32::from_le_bytes(trailer[12..16].try_into().expect("fixed len"));
+    let magic = u32::from_le_bytes(trailer[16..20].try_into().expect("fixed len"));
+    if magic != COMPOUND_MAGIC {
+        return Err(LaurusError::storage(format!(
+            "{container}: bad compound magic {magic:#010x}"
+        )));
+    }
+    if version != COMPOUND_VERSION {
+        return Err(LaurusError::storage(format!(
+            "{container}: unsupported compound version {version}"
+        )));
+    }
+    if table_offset > size - TRAILER_LEN {
+        return Err(LaurusError::storage(format!(
+            "{container}: table offset {table_offset} out of bounds"
+        )));
+    }
+    let table_len = (size - TRAILER_LEN - table_offset) as usize;
+    input.seek(SeekFrom::Start(table_offset))?;
+    let mut table = vec![0u8; table_len];
+    input.read_exact(&mut table)?;
+    if crc32fast::hash(&table) != table_crc {
+        return Err(LaurusError::storage(format!(
+            "{container}: compound table checksum mismatch — the file is corrupted"
+        )));
+    }
+    parse_table(&table, table_offset, container)
+}
+
+/// Open one part of a segment, compound or loose, without building a
+/// [`CompoundSegmentStorage`] (Issue #1210).
+///
+/// The facade buffers the whole container on eager in-memory backends so
+/// that repeated part opens stay cheap; a caller that needs a single small
+/// part once — the writer checking whether a segment holds a doc id —
+/// would pay that copy for nothing. This reads the container's table and
+/// windows the one part over the same handle instead.
+///
+/// # Arguments
+///
+/// * `storage` - The index storage the segment lives in.
+/// * `segment_id` - The segment whose part to open.
+/// * `suffix` - The part's suffix, e.g. `"ids"` for `{segment}.ids`.
+///
+/// # Returns
+///
+/// `Ok(None)` when the segment has no such part in either layout.
+///
+/// # Errors
+///
+/// Returns an error when the container exists but is invalid, or the
+/// part cannot be opened.
+pub(crate) fn open_part(
+    storage: &dyn Storage,
+    segment_id: &str,
+    suffix: &str,
+) -> Result<Option<Box<dyn StorageInput>>> {
+    let container = container_name(segment_id);
+    if storage.file_exists(&container) {
+        let mut input = storage.open_input(&container)?;
+        let parts = read_part_table(&mut input, &container)?;
+        let Some(entry) = parts.into_iter().find(|p| p.suffix == suffix) else {
+            return Ok(None);
+        };
+        // Same alignment invariant as `open_window`'s per-open handle.
+        input.seek(SeekFrom::Start(entry.offset))?;
+        return Ok(Some(Box::new(PartInput {
+            backing: WindowBacking::Handle(input),
+            base: entry.offset,
+            len: entry.len,
+            pos: 0,
+            handle_pos: entry.offset,
+        })));
+    }
+    let loose = format!("{segment_id}.{suffix}");
+    if storage.file_exists(&loose) {
+        return Ok(Some(storage.open_input(&loose)?));
+    }
+    Ok(None)
+}
+
 /// Per-segment [`Storage`] facade resolving part names to windowed views
 /// over the container; every miss passes through to the inner storage.
 #[derive(Debug)]
@@ -336,43 +437,7 @@ impl CompoundSegmentStorage {
         }
         let mut input = inner.open_input(&container)?;
         let size = input.size()?;
-        if size < TRAILER_LEN {
-            return Err(LaurusError::storage(format!(
-                "{container}: too short for a compound trailer ({size} bytes)"
-            )));
-        }
-        input.seek(SeekFrom::Start(size - TRAILER_LEN))?;
-        let mut trailer = [0u8; TRAILER_LEN as usize];
-        input.read_exact(&mut trailer)?;
-        let table_offset = u64::from_le_bytes(trailer[0..8].try_into().expect("fixed len"));
-        let table_crc = u32::from_le_bytes(trailer[8..12].try_into().expect("fixed len"));
-        let version = u32::from_le_bytes(trailer[12..16].try_into().expect("fixed len"));
-        let magic = u32::from_le_bytes(trailer[16..20].try_into().expect("fixed len"));
-        if magic != COMPOUND_MAGIC {
-            return Err(LaurusError::storage(format!(
-                "{container}: bad compound magic {magic:#010x}"
-            )));
-        }
-        if version != COMPOUND_VERSION {
-            return Err(LaurusError::storage(format!(
-                "{container}: unsupported compound version {version}"
-            )));
-        }
-        if table_offset > size - TRAILER_LEN {
-            return Err(LaurusError::storage(format!(
-                "{container}: table offset {table_offset} out of bounds"
-            )));
-        }
-        let table_len = (size - TRAILER_LEN - table_offset) as usize;
-        input.seek(SeekFrom::Start(table_offset))?;
-        let mut table = vec![0u8; table_len];
-        input.read_exact(&mut table)?;
-        if crc32fast::hash(&table) != table_crc {
-            return Err(LaurusError::storage(format!(
-                "{container}: compound table checksum mismatch — the file is corrupted"
-            )));
-        }
-        let parts = parse_table(&table, table_offset, &container)?;
+        let parts = read_part_table(&mut input, &container)?;
 
         // Handle strategy (see `ContainerHandle`). `loading_mode` is what
         // separates paging-friendly backends from eager ones; the slice

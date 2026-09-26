@@ -23,6 +23,7 @@ use crate::lexical::index::inverted::reader::SegmentReader;
 use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::structures::bkd_tree::BKDWriter;
 use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermInfo};
+use crate::lexical::index::structures::doc_id_set::{DOC_ID_SET_SUFFIX, write_doc_id_set};
 use crate::lexical::index::structures::doc_values::DocValuesWriter;
 use crate::lexical::index::structures::norms::NormsBuilder;
 use crate::lexical::writer::LexicalIndexWriter;
@@ -1480,6 +1481,8 @@ impl InvertedIndexWriter {
         // segments that still carry `.lens`/`.fstats` remain readable via
         // `SegmentNorms::Legacy` until their next merge.
         self.write_norms(&mut sink, &norms)?;
+        // The same sorted, deduplicated ids the `.norms` slot map records.
+        self.write_doc_ids(&mut sink, norms.doc_ids())?;
         self.write_doc_values(&mut sink)?;
         self.write_bkd_trees(&mut sink)?;
         sink.finish()
@@ -1730,6 +1733,15 @@ impl InvertedIndexWriter {
         let mut norms_writer = StructWriter::new(norms_output);
         norms.write_to(&mut norms_writer)?;
         norms_writer.close()?;
+        sink.seal()?;
+        Ok(())
+    }
+
+    /// Write the `.ids` part: exactly the doc ids this segment holds, which
+    /// a deletion consults before marking a document in it (Issue #1210).
+    fn write_doc_ids(&self, sink: &mut PartSink<'_>, doc_ids: &[u64]) -> Result<()> {
+        let output = sink.part(DOC_ID_SET_SUFFIX)?;
+        write_doc_id_set(output, doc_ids)?;
         sink.seal()?;
         Ok(())
     }
@@ -2995,6 +3007,36 @@ mod tests {
             "the DocValues payload must be identical regardless of binary field size, \
              got {small} vs {large}"
         );
+    }
+
+    /// A flushed segment records exactly the doc ids it holds in its `.ids`
+    /// part (Issue #1210), gaps included, in both layouts.
+    #[test]
+    fn flush_writes_the_segment_doc_id_set() {
+        for use_compound in [false, true] {
+            let storage: Arc<dyn Storage> = Arc::new(crate::storage::memory::MemoryStorage::new(
+                crate::storage::memory::MemoryStorageConfig::default(),
+            ));
+            let config = InvertedIndexWriterConfig {
+                use_compound,
+                ..InvertedIndexWriterConfig::default()
+            };
+            let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+            for id in [1u64, 5, 9] {
+                writer
+                    .upsert_document(id, Document::builder().add_text("title", "x").build())
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+
+            let ids = crate::lexical::index::structures::doc_id_set::read_doc_id_set(
+                storage.as_ref(),
+                "segment_000000",
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("use_compound={use_compound}: no doc-id set"));
+            assert_eq!(ids.iter().collect::<Vec<_>>(), vec![1, 5, 9]);
+        }
     }
 
     /// `rollback()` discards the buffered documents' DocValues too (Issue

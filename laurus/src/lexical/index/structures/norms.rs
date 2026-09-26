@@ -178,6 +178,11 @@ impl NormsBuilder {
     pub(crate) fn from_buffered(docs: &[(u64, AnalyzedDocument)]) -> Self {
         let mut doc_ids: Vec<u64> = docs.iter().map(|(id, _)| *id).collect();
         doc_ids.sort_unstable();
+        // The field promises deduplicated ids, and `write_to`'s delta
+        // encoding underflows on a repeat. A buffer holds one entry per id
+        // on every production path, but the public
+        // `upsert_analyzed_document` can add a second (Issue #1210).
+        doc_ids.dedup();
 
         let mut fields: BTreeMap<String, AHashMap<u64, u32>> = BTreeMap::new();
         for (doc_id, doc) in docs {
@@ -190,6 +195,13 @@ impl NormsBuilder {
         }
 
         NormsBuilder { doc_ids, fields }
+    }
+
+    /// The segment's doc ids, sorted and deduplicated — the ids the
+    /// `.norms` slot map records and the `.ids` part is written from, so the
+    /// two can never disagree (Issue #1210).
+    pub(crate) fn doc_ids(&self) -> &[u64] {
+        &self.doc_ids
     }
 
     /// The decoded (quantised, then decoded back) length for `(doc_id,
@@ -551,6 +563,25 @@ mod format_tests {
         assert_eq!(reader.field_length(2, "body"), Some(200));
         assert_eq!(reader.field_length(3, "title"), None); // doc doesn't exist
         assert_eq!(reader.field_length(0, "unknown"), None); // field doesn't exist
+    }
+
+    /// A buffer holding one id twice records it once (Issue #1210): the
+    /// field promised deduplicated ids, and the slot map's delta encoding
+    /// underflowed on the repeat.
+    #[test]
+    fn duplicate_buffered_ids_are_recorded_once() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs = vec![
+            (1u64, doc(&[("title", 3)])),
+            (5u64, doc(&[("title", 4)])),
+            (5u64, doc(&[("title", 6)])),
+        ];
+        let builder = NormsBuilder::from_buffered(&docs);
+        assert_eq!(builder.doc_ids(), &[1, 5]);
+
+        let reader = round_trip(&storage, "seg_dup", &builder);
+        assert_eq!(reader.field_length(1, "title"), Some(3));
+        assert!(reader.field_length(5, "title").is_some());
     }
 
     #[test]
