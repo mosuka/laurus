@@ -15,6 +15,7 @@ use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::storage::manifest as manifest_io;
 use crate::storage::structured::{StructReader, StructWriter};
+use crate::util::alloc_bounds::checked_capacity_u64;
 
 /// Default capacity for the document LRU cache.
 const DEFAULT_DOC_CACHE_CAPACITY: usize = 1024;
@@ -222,8 +223,16 @@ impl DocumentSegmentReader {
         let input = storage.open_input(&segment.file_name())?;
         let mut reader = StructReader::new(input)?;
         let doc_count = reader.read_u32()?;
+        // Each entry is at least a u64 doc id and a one-byte length prefix
+        // (Issue #1220).
+        let doc_count = checked_capacity_u64(
+            u64::from(doc_count),
+            8 + 1,
+            reader.remaining(),
+            "document segment doc count",
+        )?;
 
-        let mut offsets = HashMap::with_capacity(doc_count as usize);
+        let mut offsets = HashMap::with_capacity(doc_count);
         for _ in 0..doc_count {
             let offset = reader.stream_position()?;
             let doc_id = reader.read_u64()?;
@@ -914,5 +923,47 @@ impl UnifiedDocumentStore {
             self.storage.delete_file(&segment.file_name())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+    /// A segment file's document count is bounded by the file before the
+    /// offset index is sized from it (Issue #1220). One million documents
+    /// cannot fit in a file holding one; an unbounded reader reserves the
+    /// index and then runs out of file instead.
+    #[test]
+    fn a_doc_count_the_segment_file_cannot_hold_is_rejected() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let docs = HashMap::from([(1u64, Document::builder().add_text("title", "a").build())]);
+        let segment = DocumentSegmentWriter::new(storage.clone())
+            .write_segment(0, &docs)
+            .unwrap();
+        assert!(DocumentSegmentReader::with_index(storage.clone(), segment.clone()).is_ok());
+
+        let mut bytes = Vec::new();
+        storage
+            .open_input(&segment.file_name())
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes[0..4].copy_from_slice(&1_000_000u32.to_le_bytes());
+        let mut output = storage.create_output(&segment.file_name()).unwrap();
+        output.write_all(&bytes).unwrap();
+        output.close().unwrap();
+
+        match DocumentSegmentReader::with_index(storage, segment) {
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("document segment doc count"), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+            Ok(_) => panic!("a doc count the file cannot hold must be rejected"),
+        }
     }
 }

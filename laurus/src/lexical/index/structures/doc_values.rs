@@ -30,7 +30,7 @@ use std::sync::{Arc, RwLock};
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::field::FieldValue;
 use crate::storage::Storage;
-use crate::util::alloc_bounds::{checked_capacity, checked_len};
+use crate::util::alloc_bounds::{checked_capacity, checked_len, checked_len_u64};
 
 /// DocValues file extension
 const DOC_VALUES_EXTENSION: &str = ".dv";
@@ -322,7 +322,7 @@ impl DocValuesReader {
             let data_len = u64::from_le_bytes(data_len_bytes);
 
             let available = file_size.saturating_sub(input.stream_position()?);
-            let data_len = checked_len(data_len as usize, available, "field data length")? as u64;
+            let data_len = checked_len_u64(data_len, available, "field data length")? as u64;
 
             let offset = input.stream_position()?;
             directory.insert(

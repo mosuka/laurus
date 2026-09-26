@@ -1353,11 +1353,11 @@ impl SegmentReader {
 
             // Decode the posting list in SoA-native form to skip the
             // intermediate `Vec<Posting>` reassembly and keep the iterator
-            // backed by parallel `Vec<u32>` slices. Dispatch by on-disk
+            // backed by parallel `Vec<u32>` slices. Dispatched by on-disk
             // posting format version: v2 segments carry the multi-level
             // skip table inline (#503) while v1 segments rebuild it from
-            // `doc_ids` at load time inside `decode_soa`; v3 additionally
-            // gates the weights section on a header byte (#553).
+            // `doc_ids` at load time; v3 additionally gates the weights
+            // section on a header byte (#553).
             //
             // Matched exactly rather than with an ordered comparison. A
             // `>=` would route a newer payload into an older decoder,
@@ -1370,11 +1370,25 @@ impl SegmentReader {
                 .as_ref()
                 .map(|dict| dict.posting_format_version())
                 .unwrap_or(3);
-            let decoded = match posting_format {
-                1 => PostingList::decode_soa(&mut reader)?,
-                2 => PostingList::decode_soa_v2(&mut reader)?,
-                _ => PostingList::decode_soa_v3(&mut reader)?,
-            };
+            // Capped by the documents the segment holds, deleted ones
+            // included — they stay in the postings until
+            // `filter_deleted_soa` below — so a corrupt count cannot size
+            // the decode buffers (Issue #1220). Not `self.doc_count()`,
+            // which is the live count.
+            let decoded = PostingList::decode_soa_for_segment(
+                &mut reader,
+                posting_format,
+                self.info.doc_count,
+            )
+            // Name the segment and term a corruption was found in; other
+            // errors (I/O) keep their variant.
+            .map_err(|e| match e {
+                LaurusError::Index(msg) => LaurusError::Index(format!(
+                    "segment {}: {field}:{term}: {msg}",
+                    self.info.segment_id
+                )),
+                other => other,
+            })?;
             let filtered = self.filter_deleted_soa(decoded)?;
 
             if filtered.is_empty() {
@@ -3360,6 +3374,59 @@ mod tests {
     /// reader dispatches on the dictionary version to decode it back.
     /// The unit tests around `encode_v3` / `decode_soa_v3` never touch
     /// this wiring.
+    /// A posting list cannot hold more postings than its segment has
+    /// documents. The reader caps the decode by the segment's document
+    /// count — deleted documents included — so a list longer than that is
+    /// refused as corruption before its buffers are sized (Issue #1220).
+    #[test]
+    fn postings_are_capped_by_the_segments_document_count() {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for _ in 0..3 {
+            writer
+                .add_document(crate::Document::builder().add_text("body", "alpha").build())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let info = inverted.segment_readers()[0].read().unwrap().info.clone();
+        assert!(
+            SegmentReader::open(info.clone(), storage.clone())
+                .unwrap()
+                .postings("body", "alpha")
+                .unwrap()
+                .is_some(),
+            "the segment as written decodes"
+        );
+
+        let understated = SegmentInfo {
+            doc_count: 1,
+            ..info
+        };
+        let segment = SegmentReader::open(understated, storage).unwrap();
+        match segment.postings("body", "alpha") {
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("segment holds only 1 documents"), "{msg}");
+                assert!(
+                    msg.contains("body:alpha"),
+                    "the error names the term: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+            Ok(_) => panic!("a list longer than its segment must be rejected"),
+        }
+    }
+
     #[test]
     fn segment_reader_decodes_postings_written_by_the_writer() {
         use crate::lexical::index::LexicalIndex;

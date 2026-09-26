@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
-use crate::util::alloc_bounds::checked_capacity;
+use crate::util::alloc_bounds::{checked_capacity, checked_capacity_u64, checked_usize};
 use crate::vector::core::rerank::RerankStorageKind;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::HnswIndexConfig;
@@ -554,7 +554,7 @@ impl HnswIndexWriter {
         // Read nodes (u64 to match the v1 write format)
         let mut node_count_buf = [0u8; 8];
         input.read_exact(&mut node_count_buf)?;
-        let node_count = u64::from_le_bytes(node_count_buf) as usize;
+        let node_count = u64::from_le_bytes(node_count_buf);
 
         // Bound every graph allocation by the bytes left in the file
         // (Issue #806). Reused for the inner layer / neighbor counts so
@@ -563,7 +563,8 @@ impl HnswIndexWriter {
         let graph_remaining =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
         // Each node serializes at least doc_id (8) + layer_count (4).
-        checked_capacity(node_count, 12, graph_remaining, "hnsw node_count")?;
+        // Compared before it is narrowed (Issue #1220).
+        let node_count = checked_capacity_u64(node_count, 12, graph_remaining, "hnsw node_count")?;
         let mut nodes = HashMap::with_capacity(node_count);
 
         for _ in 0..node_count {
@@ -726,7 +727,9 @@ impl HnswIndexWriter {
         // Read metadata (vector count stored as u64)
         let mut num_vectors_buf = [0u8; 8];
         input.read_exact(&mut num_vectors_buf)?;
-        let num_vectors = u64::from_le_bytes(num_vectors_buf) as usize;
+        // Narrowed losslessly; bounded against the file where it sizes
+        // something (Issue #1220).
+        let num_vectors = checked_usize(u64::from_le_bytes(num_vectors_buf), "hnsw num_vectors")?;
 
         let mut dimension_buf = [0u8; 4];
         input.read_exact(&mut dimension_buf)?;

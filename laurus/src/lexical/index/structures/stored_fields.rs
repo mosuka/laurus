@@ -61,7 +61,7 @@ use crate::error::{LaurusError, Result};
 use crate::lexical::core::analyzed::AnalyzedDocument;
 use crate::storage::structured::{StructReader, StructWriter};
 use crate::storage::{StorageInput, StorageOutput};
-use crate::util::alloc_bounds::{checked_capacity, checked_len};
+use crate::util::alloc_bounds::{checked_capacity_u64, checked_len_u64, checked_usize};
 use crate::util::varint::{read_varint, write_varint};
 
 const MAGIC: &[u8; 4] = b"SDOC";
@@ -292,8 +292,8 @@ fn read_f64_le(bytes: &[u8], cursor: &mut usize, what: &str) -> Result<f64> {
 }
 
 fn read_len_prefixed_str(bytes: &[u8], cursor: &mut usize, what: &str) -> Result<String> {
-    let len = read_varint(bytes, cursor, what)? as usize;
-    let len = checked_len(len, (bytes.len() - *cursor) as u64, what)?;
+    let len = read_varint(bytes, cursor, what)?;
+    let len = checked_len_u64(len, (bytes.len() - *cursor) as u64, what)?;
     let slice = bytes
         .get(*cursor..*cursor + len)
         .ok_or_else(|| LaurusError::index(format!("{what}: truncated")))?;
@@ -303,8 +303,8 @@ fn read_len_prefixed_str(bytes: &[u8], cursor: &mut usize, what: &str) -> Result
 }
 
 fn read_len_prefixed_bytes(bytes: &[u8], cursor: &mut usize, what: &str) -> Result<Vec<u8>> {
-    let len = read_varint(bytes, cursor, what)? as usize;
-    let len = checked_len(len, (bytes.len() - *cursor) as u64, what)?;
+    let len = read_varint(bytes, cursor, what)?;
+    let len = checked_len_u64(len, (bytes.len() - *cursor) as u64, what)?;
     let slice = bytes
         .get(*cursor..*cursor + len)
         .ok_or_else(|| LaurusError::index(format!("{what}: truncated")))?;
@@ -316,8 +316,8 @@ fn read_len_prefixed_bytes(bytes: &[u8], cursor: &mut usize, what: &str) -> Resu
 /// `*cursor` past the bytes consumed.
 fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> {
     let doc_id = read_u64_le(bytes, cursor, "stored-fields document id")?;
-    let field_count = read_varint(bytes, cursor, "stored-fields field count")? as usize;
-    let field_count = checked_capacity(
+    let field_count = read_varint(bytes, cursor, "stored-fields field count")?;
+    let field_count = checked_capacity_u64(
         field_count,
         2,
         (bytes.len() - *cursor) as u64,
@@ -358,8 +358,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
             }
             TAG_NULL => DataValue::Null,
             TAG_VECTOR => {
-                let len = read_varint(bytes, cursor, "stored Vector field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored Vector field length")?;
+                let len = checked_capacity_u64(
                     len,
                     4,
                     (bytes.len() - *cursor) as u64,
@@ -372,8 +372,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::Vector(v)
             }
             TAG_INT64_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored Int64Array field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored Int64Array field length")?;
+                let len = checked_capacity_u64(
                     len,
                     8,
                     (bytes.len() - *cursor) as u64,
@@ -386,8 +386,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::Int64Array(arr)
             }
             TAG_FLOAT64_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored Float64Array field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored Float64Array field length")?;
+                let len = checked_capacity_u64(
                     len,
                     8,
                     (bytes.len() - *cursor) as u64,
@@ -404,8 +404,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::Float64Array(arr)
             }
             TAG_GEO_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored GeoArray field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored GeoArray field length")?;
+                let len = checked_capacity_u64(
                     len,
                     16,
                     (bytes.len() - *cursor) as u64,
@@ -420,8 +420,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::GeoArray(arr)
             }
             TAG_GEO_ECEF_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored GeoEcefArray field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored GeoEcefArray field length")?;
+                let len = checked_capacity_u64(
                     len,
                     24,
                     (bytes.len() - *cursor) as u64,
@@ -437,8 +437,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::GeoEcefArray(arr)
             }
             TAG_DATETIME_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored DateTimeArray field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored DateTimeArray field length")?;
+                let len = checked_capacity_u64(
                     len,
                     8,
                     (bytes.len() - *cursor) as u64,
@@ -461,8 +461,8 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::DateTimeArray(arr)
             }
             TAG_BOOL_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored BoolArray field length")? as usize;
-                let len = checked_capacity(
+                let len = read_varint(bytes, cursor, "stored BoolArray field length")?;
+                let len = checked_capacity_u64(
                     len,
                     1,
                     (bytes.len() - *cursor) as u64,
@@ -475,10 +475,10 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                 DataValue::BoolArray(arr)
             }
             TAG_TEXT_ARRAY => {
-                let len = read_varint(bytes, cursor, "stored TextArray field length")? as usize;
+                let len = read_varint(bytes, cursor, "stored TextArray field length")?;
                 // Elements are variable-width, so the only honest bound is
                 // the 1-byte minimum a zero-length element occupies.
-                let len = checked_capacity(
+                let len = checked_capacity_u64(
                     len,
                     1,
                     (bytes.len() - *cursor) as u64,
@@ -651,10 +651,10 @@ impl StoredFieldsReader {
             let position = reader.position();
             let available = file_size.saturating_sub(position);
 
-            let chunk_doc_count = reader.read_varint()? as usize;
+            let chunk_doc_count = reader.read_varint()?;
             let codec = reader.read_u8()?;
-            let uncompressed_size = reader.read_varint()? as usize;
-            let payload_size = reader.read_varint()? as usize;
+            let uncompressed_size = reader.read_varint()?;
+            let payload_size = reader.read_varint()?;
             let stored_crc = reader.read_u32()?;
 
             // `payload_size` is bounded against the file: compressed bytes
@@ -662,15 +662,20 @@ impl StoredFieldsReader {
             // against the file — a compressed chunk's declared uncompressed
             // size is larger than its on-disk footprint by design. Bound it
             // against LZ4's documented maximum expansion ratio instead.
-            let payload_size = checked_len(payload_size, available, "stored-fields chunk payload")?;
+            let payload_size =
+                checked_len_u64(payload_size, available, "stored-fields chunk payload")?;
             let max_uncompressed = (payload_size as u64).saturating_mul(LZ4_MAX_EXPANSION_RATIO);
-            if uncompressed_size as u64 > max_uncompressed.max(payload_size as u64) {
+            if uncompressed_size > max_uncompressed.max(payload_size as u64) {
                 return Err(LaurusError::index(format!(
                     "stored-fields chunk: declares {uncompressed_size} uncompressed bytes, \
                      impossible for a {payload_size}-byte payload — segment is corrupted"
                 )));
             }
-            let chunk_doc_count = checked_capacity(
+            // Bounded by the payload above, but 255 times a payload can
+            // still exceed a 32-bit `usize` (Issue #1220).
+            let uncompressed_size =
+                checked_usize(uncompressed_size, "stored-fields chunk uncompressed size")?;
+            let chunk_doc_count = checked_capacity_u64(
                 chunk_doc_count,
                 MIN_DOC_RECORD_SIZE,
                 uncompressed_size as u64,

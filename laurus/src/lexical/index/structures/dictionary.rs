@@ -19,6 +19,7 @@ use fst::Map as FstMap;
 use crate::error::{LaurusError, Result};
 use crate::storage::structured::{StructReader, StructWriter};
 use crate::storage::{StorageInput, StorageOutput};
+use crate::util::alloc_bounds::checked_capacity_u64;
 
 // Sub-modules backing the new Lucene BlockTreeTerms-style
 // implementation (Issue #487). These will gradually take over as the
@@ -415,13 +416,21 @@ impl BlockTermDictionary {
         let _reserved = reader.read_u32()?;
 
         let block_section: Arc<[u8]> = Arc::from(block_section_vec.into_boxed_slice());
+        // Every term costs at least its 4-byte block-max offset, so the
+        // count cannot exceed a quarter of the BlockSection (Issue #1220).
+        let expected_terms = checked_capacity_u64(
+            total_term_count,
+            4,
+            block_section.len() as u64,
+            "term dictionary term count",
+        )?;
 
         // Populate the in-memory query layer by streaming the
         // BlockSection once. After this point, all hot-path queries go
         // through the in-memory structures; the FST + block_section
         // remain only for `write_to_storage`.
         let (map, sorted_terms, term_infos) =
-            populate_in_memory_layer(&block_section, block_count, total_term_count);
+            populate_in_memory_layer(&block_section, block_count, expected_terms)?;
 
         Ok(BlockTermDictionary {
             fst: Arc::new(fst),
@@ -659,6 +668,10 @@ impl Default for TermDictionaryBuilder {
     }
 }
 
+/// A loaded dictionary's in-memory query layer: the term → ordinal map,
+/// the terms in sorted order, and their [`TermInfo`]s by ordinal.
+type InMemoryLayer = (AHashMap<String, u32>, Vec<String>, Arc<[TermInfo]>);
+
 /// Stream the BlockSection bytes once, building the in-memory query
 /// layer (`map`, `sorted_terms`, `term_infos`) for a freshly-loaded
 /// [`BlockTermDictionary`].
@@ -666,15 +679,19 @@ impl Default for TermDictionaryBuilder {
 /// Used by [`BlockTermDictionary::read_from_storage`] only. Build-time
 /// population happens inline in [`TermDictionaryBuilder::build`] to
 /// avoid a redundant BlockSection walk.
+///
+/// # Errors
+///
+/// Returns an error when the BlockSection yields a different number of
+/// terms than `total_term_count`, the header's count.
 fn populate_in_memory_layer(
     block_section: &[u8],
     block_count: u32,
-    total_term_count: u64,
-) -> (AHashMap<String, u32>, Vec<String>, Arc<[TermInfo]>) {
-    let cap = total_term_count as usize;
-    let mut map = AHashMap::with_capacity(cap);
-    let mut sorted_terms: Vec<String> = Vec::with_capacity(cap);
-    let mut term_infos: Vec<TermInfo> = Vec::with_capacity(cap);
+    total_term_count: usize,
+) -> Result<InMemoryLayer> {
+    let mut map = AHashMap::with_capacity(total_term_count);
+    let mut sorted_terms: Vec<String> = Vec::with_capacity(total_term_count);
+    let mut term_infos: Vec<TermInfo> = Vec::with_capacity(total_term_count);
 
     let iter = block_reader::BlockSectionIter::new(block_section, block_count);
     for (ordinal, (term, info)) in iter.enumerate() {
@@ -683,7 +700,19 @@ fn populate_in_memory_layer(
         term_infos.push(info);
     }
 
-    (map, sorted_terms, Arc::from(term_infos.into_boxed_slice()))
+    // `BlockSectionIter` ends silently at a block it cannot parse, and the
+    // writer records exactly the terms it encodes. A dictionary cut short
+    // would otherwise load without its later terms — and a merge walking
+    // it would drop them for good (Issue #1220).
+    if sorted_terms.len() != total_term_count {
+        return Err(LaurusError::index(format!(
+            "term dictionary: read {} terms but the header declares {total_term_count} — \
+             segment is corrupted",
+            sorted_terms.len()
+        )));
+    }
+
+    Ok((map, sorted_terms, Arc::from(term_infos.into_boxed_slice())))
 }
 
 /// Dictionary statistics.
@@ -1134,6 +1163,76 @@ mod tests {
         assert_eq!(stats.total_doc_frequency, 9); // 1 + 5 + 3
         assert_eq!(stats.total_term_frequency, 19); // 1 + 10 + 8
         assert!(stats.memory_size > 0);
+    }
+
+    /// Writes a 200-term dictionary to `name` and returns its bytes.
+    fn written_dictionary_bytes(storage: &Arc<MemoryStorage>, name: &str) -> Vec<u8> {
+        use std::io::Read;
+
+        let mut builder = TermDictionaryBuilder::new();
+        for i in 0..200u64 {
+            builder.add_term(format!("term{i:04}"), create_test_term_info(i * 16));
+        }
+        let dict = builder.build().unwrap();
+        let output = storage.create_output(name).unwrap();
+        let mut writer = StructWriter::new(output);
+        dict.write_to_storage(&mut writer).unwrap();
+        writer.close().unwrap();
+
+        let mut bytes = Vec::new();
+        storage
+            .open_input(name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// Stores `total_term_count` into a dictionary file's trailer — the u64
+    /// before `block_count`, `reserved` and the CRC — and loads it back.
+    fn load_with_term_count(total_term_count: u64) -> Result<BlockTermDictionary> {
+        use std::io::Write;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut bytes = written_dictionary_bytes(&storage, "dict.bin");
+        let at = bytes.len() - 20;
+        bytes[at..at + 8].copy_from_slice(&total_term_count.to_le_bytes());
+        let mut output = storage.create_output("patched.bin").unwrap();
+        output.write_all(&bytes).unwrap();
+        output.close().unwrap();
+
+        let input = storage.open_input("patched.bin").unwrap();
+        BlockTermDictionary::read_from_storage(&mut StructReader::new(input).unwrap())
+    }
+
+    fn assert_corrupted<T>(result: Result<T>, label: &str) {
+        match result {
+            Ok(_) => panic!("expected a corruption error mentioning {label:?}"),
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("corrupted") && msg.contains(label), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// The term count sizes three in-memory tables, so it is bounded by the
+    /// BlockSection before they are allocated (Issue #1220).
+    #[test]
+    fn a_term_count_the_block_section_cannot_hold_is_rejected() {
+        assert!(
+            load_with_term_count(200).is_ok(),
+            "the file as written loads"
+        );
+        assert_corrupted(load_with_term_count(u64::MAX), "term dictionary term count");
+    }
+
+    /// A dictionary must yield every term its header declares. The block
+    /// walk stops silently at a block it cannot parse, so a dictionary cut
+    /// short would load without its later terms — and a merge walking it
+    /// would drop them for good (Issue #1220).
+    #[test]
+    fn a_dictionary_yielding_fewer_terms_than_declared_is_rejected() {
+        assert_corrupted(load_with_term_count(201), "read 200 terms");
     }
 
     #[test]
