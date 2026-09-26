@@ -929,6 +929,56 @@ mod tests {
             .build()
     }
 
+    /// A store whose writer flushes after every second document.
+    fn store_flushing_every_two_docs() -> LexicalStore {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = LexicalIndexConfig::builder().max_buffered_docs(2).build();
+        LexicalStore::new(storage, config).unwrap()
+    }
+
+    fn id_doc(id: &str) -> Document {
+        Document::builder().add_text("_id", id).build()
+    }
+
+    /// Issue #1207 — re-upserting a doc id whose flushed copy was superseded
+    /// must still resolve the new version once that version is flushed too.
+    ///
+    /// The flushed-segment lookup skipped every id in the writer's flat
+    /// `pending_deletions` set, so it hid the new copy along with the old
+    /// one. It now asks each flushed segment's own deletion bitmap.
+    #[test]
+    fn reupserted_version_resolves_after_its_own_flush() {
+        let store = store_flushing_every_two_docs();
+        store.upsert_document(1, id_doc("ida")).unwrap();
+        store.upsert_document(2, id_doc("idb")).unwrap(); // flushes 1, 2
+        store.upsert_document(1, id_doc("ida2")).unwrap(); // supersedes 1
+        store.upsert_document(3, id_doc("idc")).unwrap(); // flushes 1 (new), 3
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida2").unwrap(), vec![1]);
+        assert!(
+            store.find_doc_ids_by_term("_id", "ida").unwrap().is_empty(),
+            "the superseded copy must stay hidden"
+        );
+    }
+
+    /// Issue #1207 — a re-upserted version published by `optimize()` must
+    /// resolve right away. `optimize` commits but keeps its writer, whose
+    /// `pending_deletions` still named the id and so filtered the new,
+    /// committed copy out of the lookup until the next commit.
+    #[test]
+    fn reupserted_version_resolves_after_optimize() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        store.upsert_document(1, id_doc("ida")).unwrap();
+        store.commit().unwrap();
+
+        store.upsert_document(1, id_doc("ida2")).unwrap();
+        store.optimize().unwrap();
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida2").unwrap(), vec![1]);
+        assert!(store.find_doc_ids_by_term("_id", "ida").unwrap().is_empty());
+    }
+
     /// #1016 — a document written before the writer's automatic
     /// `flush_segment` must still resolve by `_id` before commit.
     ///

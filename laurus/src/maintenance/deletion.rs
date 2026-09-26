@@ -746,6 +746,20 @@ impl DeletionManager {
         }
     }
 
+    /// Whether `doc_id` is marked deleted in `segment_id`'s bitmap.
+    ///
+    /// `false` for a segment this manager tracks no bitmap for — nothing has
+    /// been deleted from it. The lexical writer asks this of the segments it
+    /// flushed but has not committed, to skip exactly the copies superseded
+    /// since the flush (Issue #1207).
+    pub fn is_deleted(&self, segment_id: &str, doc_id: u64) -> bool {
+        self.bitmaps
+            .read()
+            .unwrap()
+            .get(segment_id)
+            .is_some_and(|bitmap| bitmap.is_deleted(doc_id))
+    }
+
     /// Record that a segment's in-memory bitmap diverged from its `.delmap`
     /// file and needs persisting by the next [`flush`](Self::flush).
     fn mark_dirty(&self, segment_id: &str) {
@@ -1079,5 +1093,23 @@ mod tests {
         assert!(!storage.file_exists("seg001.delmap"));
         assert!(storage.file_exists("seg002.delmap"));
         assert!(manager.delete_document("seg001", 6, "test").is_err());
+    }
+
+    /// `is_deleted` answers per segment (Issue #1207): the same id can be
+    /// deleted in one segment and live in another, and an untracked segment
+    /// has nothing deleted.
+    #[test]
+    fn is_deleted_is_scoped_to_the_segment() {
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let manager = DeletionManager::new(DeletionConfig::default(), storage).unwrap();
+        manager.initialize_segment("seg001", 0, 999).unwrap();
+        manager.initialize_segment("seg002", 0, 999).unwrap();
+        manager.delete_document("seg001", 5, "test").unwrap();
+
+        assert!(manager.is_deleted("seg001", 5));
+        assert!(!manager.is_deleted("seg001", 6));
+        assert!(!manager.is_deleted("seg002", 5));
+        assert!(!manager.is_deleted("untracked", 5));
     }
 }
