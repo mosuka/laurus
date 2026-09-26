@@ -220,14 +220,13 @@ the store's on-disk metadata and is written **only** during the store's commit.
 
 The lexical control file (`metadata.json`) has a **single authority**: the
 in-memory copy owned by the index. The writer the store commits through holds a
-shared handle to it, applies its per-commit deltas (documents added, documents
-deleted, the WAL checkpoint) under that lock, and persists a snapshot — so no
+shared handle to it, records the commit's state (the document and deletion
+counts, the WAL checkpoint) under that lock, and persists a snapshot — so no
 code path can overwrite the file from a stale copy, and internal writers (such
 as the merge engine's segment-replay writer) have no handle and cannot touch
 the file at all. A pass with nothing to record skips the persist, and a failed
-persist rolls the in-memory copy back to the persisted state with the deltas
-retained — the retry re-applies them exactly once, mirroring the manifest's
-failure contract below.
+persist rolls the in-memory copy back to the persisted state — the retry
+records the commit again, mirroring the manifest's failure contract below.
 
 Lexical segment **discovery** follows the same authority model through
 `segments.json`, an atomically replaced, checksummed manifest of the committed
@@ -240,6 +239,17 @@ listing, no per-segment metadata parse. There are no per-segment `.meta`
 files any more: the manifest is the only record, files it does not list are
 reclaimed at the next open, and an index written before the manifest existed
 is migrated by a one-time read of its legacy `.meta` files when opened.
+
+The index's document and deletion counts are **derived from the manifest**.
+Each entry records its segment's document count and how many of those
+documents are deleted — recounted from the segment's deletion bitmap by every
+commit that deletes from it — and the index's counts are the sums. The counts
+in `metadata.json` are those sums as of the last commit; the index never reads
+them back, so a crash between the manifest save and the metadata write, a
+repeated upsert of one id, or a merge that drops deleted documents cannot skew
+them. A manifest written by an older build records no deletion counts: opening
+it recounts them from the bitmaps without writing anything, and the next
+manifest write persists them.
 
 Segment data itself is written as one **compound container** per segment
 (`segment_<N>.cfs` — postings, term dictionary, stored documents, field

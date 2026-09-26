@@ -49,7 +49,7 @@ pub mod writer;
 
 use self::reader::{InvertedIndexReader, InvertedIndexReaderConfig};
 use self::searcher::InvertedIndexSearcher;
-use self::segment::SegmentInfo;
+use self::segment::{Membership, SegmentInfo};
 use self::writer::{InvertedIndexWriter, InvertedIndexWriterConfig};
 
 /// Metadata about an inverted index.
@@ -64,13 +64,19 @@ pub struct IndexMetadata {
     /// Last modified time (seconds since epoch).
     pub modified: u64,
 
-    /// Number of documents indexed.
+    /// Number of documents the committed segments hold, deleted ones
+    /// included.
+    ///
+    /// Derived from the segment manifest at every commit and after a merge
+    /// (Issue #1212); it used to be a running total of documents ever added,
+    /// which merges never reduced.
     pub doc_count: u64,
 
     /// Generation number for updates.
     pub generation: u64,
 
-    /// Number of deleted documents.
+    /// Number of those documents that are deleted, summed from the segment
+    /// manifest's per-segment counts (Issue #1212).
     #[serde(default)]
     pub deleted_count: u64,
 
@@ -136,9 +142,11 @@ pub struct InvertedIndex {
     ///
     /// This in-memory copy is the AUTHORITY over `metadata.json` (#1023):
     /// the handle is cloned into every writer this index constructs (see
-    /// [`Self::writer`]), which applies its per-commit deltas under this
-    /// lock and persists a snapshot of it. Nothing re-reads the file into
-    /// this lock after `open`, so disk can never clobber fresher state.
+    /// [`Self::writer`]), which updates it under this lock and persists a
+    /// snapshot of it. Nothing re-reads the file into this lock after
+    /// `open`, so disk can never clobber fresher state. Its document and
+    /// deletion counts mirror sums over the manifest (Issue #1212), which is
+    /// what [`LexicalIndex::stats`] reads.
     metadata: Arc<RwLock<IndexMetadata>>,
 
     /// The committed segment set, mirroring `segments.json` (#1021).
@@ -245,6 +253,7 @@ impl InvertedIndex {
                 Self::scan_segment_metas_from(storage.as_ref())?
             }
         };
+        let segments = Self::recount_unrecorded_deletions(storage.as_ref(), segments);
         let next_generation = segment_manifest::derive_next_generation(&segments, &files);
 
         // Orphan sweep (#1021): reclaim segment files the manifest does not
@@ -326,13 +335,83 @@ impl InvertedIndex {
     }
 
     /// Update metadata and write to storage.
+    ///
+    /// The counts are refreshed from the manifest too (Issue #1212): this
+    /// runs after `optimize`'s force-merge, which drops deleted documents,
+    /// and would otherwise persist the counts from before the merge.
     fn update_metadata(&self) -> Result<()> {
+        let (doc_count, deleted_count) = segment_manifest::index_counts(&self.segment_manifest);
         {
             let mut metadata = self.metadata.write();
             metadata.modified = crate::util::time::now_secs();
+            metadata.doc_count = doc_count;
+            metadata.deleted_count = deleted_count;
         }
 
         self.write_metadata()
+    }
+
+    /// Fill in the per-segment deletion count of manifest entries that do
+    /// not record one (Issue #1212) — entries written by an older build,
+    /// which also drops the field when it rewrites the manifest.
+    ///
+    /// Read-only and in memory: `open` writes nothing, and the next manifest
+    /// write persists the filled-in list as it is. An entry without
+    /// deletions holds none; otherwise its `.delmap` is read and counted
+    /// against the ids the segment holds. An unreadable bitmap is warned
+    /// about and left unrecorded, so a transient read error is never
+    /// persisted as zero deletions; the next open retries it.
+    fn recount_unrecorded_deletions(
+        storage: &dyn Storage,
+        mut segments: Vec<SegmentInfo>,
+    ) -> Vec<SegmentInfo> {
+        for info in segments.iter_mut().filter(|s| s.deleted_count.is_none()) {
+            info.deleted_count = Self::recount_deletions(storage, info);
+        }
+        segments
+    }
+
+    /// Recount one segment's deletions (Issue #1212): the bits of its
+    /// `.delmap` that fall on documents it holds. `Some(0)` without
+    /// deletions or without a bitmap, which its readers also treat as none;
+    /// `None` when the bitmap cannot be read.
+    fn recount_deletions(storage: &dyn Storage, info: &SegmentInfo) -> Option<u64> {
+        if !info.has_deletions {
+            return Some(0);
+        }
+        let name = format!("{}.delmap", info.segment_id);
+        if !storage.file_exists(&name) {
+            return Some(0);
+        }
+        let bitmap = storage.open_input(&name).and_then(|input| {
+            let mut reader = crate::storage::structured::StructReader::new(input)?;
+            crate::maintenance::deletion::DeletionBitmap::read_from_storage(&mut reader)
+        });
+        let bitmap = match bitmap {
+            Ok(bitmap) => bitmap,
+            Err(e) => {
+                log::warn!(
+                    "cannot read the deletion bitmap of segment {}: {e}; its deletions are left \
+                     uncounted until the index is next opened",
+                    info.segment_id
+                );
+                return None;
+            }
+        };
+        let membership = Membership::from_shape(info.min_doc_id, info.max_doc_id, info.doc_count)
+            .unwrap_or_else(|| {
+                Membership::from_loaded(
+                    &info.segment_id,
+                    info.min_doc_id,
+                    info.max_doc_id,
+                    info.doc_count,
+                    crate::lexical::index::structures::doc_id_set::load_segment_doc_ids(
+                        storage,
+                        &info.segment_id,
+                    ),
+                )
+            });
+        Some(membership.held_deletions(&bitmap, info.min_doc_id, info.max_doc_id, info.doc_count))
     }
 
     /// Check if the index is closed.
@@ -462,6 +541,7 @@ impl InvertedIndex {
                     max_doc_id: record.max_doc_id,
                     generation: record.generation,
                     has_deletions: record.has_deletions,
+                    deleted_count: None,
                     shard_id: record.shard_id,
                 });
             }
@@ -808,13 +888,17 @@ impl LexicalIndex for InvertedIndex {
     fn stats(&self) -> Result<InvertedIndexStats> {
         self.check_closed()?;
 
+        // Summed from the manifest, not read from the metadata counters
+        // (Issue #1212): the manifest records each segment's documents and
+        // deletions as they are persisted, so the counts cannot drift.
+        let (doc_count, deleted_count) = segment_manifest::index_counts(&self.segment_manifest);
         let metadata = self.metadata.read();
         Ok(InvertedIndexStats {
-            doc_count: metadata.doc_count,
+            doc_count,
             term_count: 0,
             segment_count: 0,
             total_size: 0,
-            deleted_count: metadata.deleted_count,
+            deleted_count,
             last_modified: metadata.modified,
         })
     }
@@ -1500,6 +1584,7 @@ mod tests {
             max_doc_id: 1,
             generation: segment_manifest::stem_ordinal(&flushed[0]).unwrap(),
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         }];
         segment_manifest::save(storage.as_ref(), &landed).unwrap();
@@ -1727,5 +1812,208 @@ mod tests {
             marks_deleted(&storage, &s.segment_id, 10),
             "the untrusted set must not make the deletion skip doc 10"
         );
+    }
+
+    // ---- Per-segment deletion counts in the manifest, Issue #1212 --------
+
+    fn manifest_entry(index: &InvertedIndex, ids: &[u64]) -> SegmentInfo {
+        segment_holding(index, ids)
+    }
+
+    /// `flush_deletions` records each touched segment's deletion count in the
+    /// manifest, counted from its bitmap: a repeated upsert of one id sets
+    /// one bit, so it counts once (the writer's delta counted it twice).
+    #[test]
+    fn flush_deletions_records_each_segments_deletion_count() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..4 {
+            writer
+                .add_document(doc_with_body(&format!("doc {i}")))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        assert_eq!(manifest_entry(&index, &[0, 1, 2, 3]).deleted_count, Some(0));
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(1).unwrap();
+        writer.upsert_document(2, doc_with_body("v2")).unwrap();
+        writer.upsert_document(2, doc_with_body("v3")).unwrap();
+        writer.commit().unwrap();
+
+        let entry = manifest_entry(&index, &[0, 1, 2, 3]);
+        assert!(entry.has_deletions);
+        assert_eq!(entry.deleted_count, Some(2), "docs 1 and 2, each once");
+    }
+
+    /// A segment flushed and deleted from within one commit enters the
+    /// manifest with its deletion count already recorded.
+    #[test]
+    fn a_segment_deleted_from_before_publication_records_its_count() {
+        let (_storage, index) = index_flushing_every_two_docs();
+        let mut writer = index.writer().unwrap();
+        for i in 0..2 {
+            writer
+                .add_document(doc_with_body(&format!("doc {i}")))
+                .unwrap();
+        }
+        writer.upsert_document(0, doc_with_body("v2")).unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(manifest_entry(&index, &[0, 1]).deleted_count, Some(1));
+    }
+
+    /// A merge drops deleted documents, so its output records no deletions.
+    #[test]
+    fn a_merged_segment_records_no_deletions() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for _ in 0..2 {
+            for _ in 0..2 {
+                writer.add_document(doc_with_body("x")).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        writer.delete_document(0).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        index.optimize().unwrap();
+
+        let merged = manifest_entry(&index, &[1, 2, 3]);
+        assert_eq!(
+            (merged.has_deletions, merged.deleted_count),
+            (false, Some(0))
+        );
+    }
+
+    /// The index's counts are summed from the manifest (Issue #1212): a
+    /// repeated upsert of one id deletes its committed copy once, so it is
+    /// counted once — in the stats and in `metadata.json`. The running delta
+    /// counted it twice, leaving 0 live.
+    #[test]
+    fn stats_count_a_reupserted_document_once() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(0, doc_with_body("v1")).unwrap();
+        writer.commit().unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(0, doc_with_body("v2")).unwrap();
+        writer.upsert_document(0, doc_with_body("v3")).unwrap();
+        writer.commit().unwrap();
+
+        let stats = index.stats().unwrap();
+        assert_eq!(stats.deleted_count, 1);
+        assert_eq!(stats.doc_count - stats.deleted_count, 1, "one live copy");
+        let on_disk = InvertedIndex::read_metadata(storage.as_ref()).unwrap();
+        assert_eq!(
+            (on_disk.doc_count, on_disk.deleted_count),
+            (stats.doc_count, stats.deleted_count),
+            "the commit persists the derived counts"
+        );
+    }
+
+    /// Stats come from the manifest, not from `metadata.json`'s counters, so
+    /// counters left wrong on disk — by a crash between the manifest save and
+    /// the metadata write, or by an older build — cannot skew them.
+    #[test]
+    fn stats_ignore_the_metadata_counters_on_disk() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..3 {
+            writer
+                .add_document(doc_with_body(&format!("doc {i}")))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(1).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        let mut wrong = index.metadata.read().clone();
+        wrong.doc_count = 999;
+        wrong.deleted_count = 0;
+        crate::storage::manifest::save_checksummed_json(
+            storage.as_ref(),
+            "metadata.json",
+            None,
+            &wrong,
+        )
+        .unwrap();
+        drop(index);
+
+        let reopened = InvertedIndex::open(storage, InvertedIndexConfig::default()).unwrap();
+        let stats = reopened.stats().unwrap();
+        assert_eq!((stats.doc_count, stats.deleted_count), (3, 1));
+    }
+
+    /// A merge drops deleted documents, and the counts follow — in the stats
+    /// and in `metadata.json`. Both used to keep the running totals.
+    #[test]
+    fn counts_after_optimize_drop_the_merged_away_deletions() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for _ in 0..2 {
+            for _ in 0..2 {
+                writer.add_document(doc_with_body("x")).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        writer.delete_document(0).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        assert_eq!(index.stats().unwrap().deleted_count, 1);
+
+        index.optimize().unwrap();
+
+        let stats = index.stats().unwrap();
+        assert_eq!((stats.doc_count, stats.deleted_count), (3, 0));
+        let on_disk = InvertedIndex::read_metadata(storage.as_ref()).unwrap();
+        assert_eq!((on_disk.doc_count, on_disk.deleted_count), (3, 0));
+    }
+
+    /// A manifest written by an older build records no per-segment deletion
+    /// counts; open recounts them from the segments' bitmaps (read-only),
+    /// and the next manifest write persists them.
+    #[test]
+    fn open_recounts_deletions_an_older_manifest_did_not_record() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..4 {
+            writer
+                .add_document(doc_with_body(&format!("doc {i}")))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(1).unwrap();
+        writer.delete_document(2).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        let unrecorded: Vec<SegmentInfo> = committed_segments(&index)
+            .into_iter()
+            .map(|s| SegmentInfo {
+                deleted_count: None,
+                ..s
+            })
+            .collect();
+        segment_manifest::save(storage.as_ref(), &unrecorded).unwrap();
+        drop(index);
+
+        let reopened =
+            InvertedIndex::open(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        assert_eq!(reopened.stats().unwrap().deleted_count, 2);
+
+        let mut writer = reopened.writer().unwrap();
+        writer.add_document(doc_with_body("more")).unwrap();
+        writer.commit().unwrap();
+        let (_, on_disk) = segment_manifest::load(storage.as_ref()).unwrap().unwrap();
+        let first = on_disk.iter().find(|s| s.min_doc_id == 0).unwrap();
+        assert_eq!(first.deleted_count, Some(2), "persisted by the next write");
     }
 }

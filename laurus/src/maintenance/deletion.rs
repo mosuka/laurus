@@ -686,6 +686,13 @@ impl DeletionManager {
         self.dirty_segments.write().unwrap().remove(segment_id);
     }
 
+    /// `segment_id`'s deletion bitmap — its persisted `.delmap` plus every
+    /// deletion made through this manager since — if it tracks one (Issue
+    /// #1212).
+    pub fn bitmap(&self, segment_id: &str) -> Option<Arc<DeletionBitmap>> {
+        self.bitmaps.read().unwrap().get(segment_id).cloned()
+    }
+
     /// Whether `doc_id` is marked deleted in `segment_id`'s bitmap.
     ///
     /// `false` for a segment this manager tracks no bitmap for — nothing has

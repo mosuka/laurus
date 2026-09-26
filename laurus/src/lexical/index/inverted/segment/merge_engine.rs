@@ -396,6 +396,7 @@ impl MergeEngine {
             max_doc_id,
             generation: 0,        // Will be assigned by segment manager
             has_deletions: false, // New merged segment has no deleted docs until updated
+            deleted_count: Some(0),
             shard_id: stats.shard_id,
         };
 
@@ -549,6 +550,7 @@ impl MergeEngine {
                 max_doc_id,
                 generation: 0, // The caller assigns the final generation.
                 has_deletions: false,
+                deleted_count: Some(0),
                 shard_id: segment.segment_info.shard_id,
             };
             let size_bytes = file_paths
@@ -1336,6 +1338,7 @@ mod tests {
             max_doc_id: doc_count.saturating_sub(1),
             generation: 1,
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0, // Added shard_id for test segments
         };
 
@@ -1413,6 +1416,7 @@ mod tests {
             max_doc_id: max,
             generation,
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         }
     }
@@ -2654,6 +2658,7 @@ mod tests {
         let deleted = |id: &str, doc_id: u64, generation: u64| {
             ManagedSegmentInfo::new(SegmentInfo {
                 has_deletions: true,
+                deleted_count: None,
                 ..segment_info(id, 1, doc_id, doc_id, generation)
             })
         };

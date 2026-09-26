@@ -21,7 +21,7 @@ use crate::lexical::core::field::FieldOption;
 use crate::lexical::index::inverted::IndexMetadata;
 use crate::lexical::index::inverted::core::posting::{Posting, TermPostingIndex};
 use crate::lexical::index::inverted::reader::SegmentReader;
-use crate::lexical::index::inverted::segment::SegmentInfo;
+use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
 use crate::lexical::index::structures::bkd_tree::BKDWriter;
 use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermInfo};
 use crate::lexical::index::structures::doc_id_set::{
@@ -201,10 +201,11 @@ pub struct WriterStats {
     /// Number of documents added.
     ///
     /// For a writer that maintains the index's shared metadata (built via
-    /// `InvertedIndex::writer`), this is the delta **since the last
-    /// successful commit**: applying it to the shared metadata consumes it
-    /// (#1023). For a stand-alone writer (built via
-    /// [`InvertedIndexWriter::new`]) it is a lifetime total.
+    /// `InvertedIndex::writer`), this is the tally **since the last
+    /// successful commit**, reset by it. For a stand-alone writer (built
+    /// via [`InvertedIndexWriter::new`]) it is a lifetime total. The index's
+    /// counts do not come from it: they are summed from the segment manifest
+    /// (Issue #1212).
     pub docs_added: u64,
     /// Number of unique terms indexed.
     pub unique_terms: u64,
@@ -214,10 +215,12 @@ pub struct WriterStats {
     pub memory_used: usize,
     /// Number of segments created.
     pub segments_created: u32,
-    /// Number of deleted documents (from persisted segments).
+    /// Deletion marks recorded against persisted segments — a diagnostic
+    /// tally, counting a repeated mark of one copy each time.
     ///
-    /// Delta-since-last-commit for a metadata-maintaining writer, lifetime
-    /// total for a stand-alone one — see [`WriterStats::docs_added`].
+    /// Since-last-commit for a metadata-maintaining writer, lifetime total
+    /// for a stand-alone one — see [`WriterStats::docs_added`]. The index's
+    /// deletion count comes from the manifest instead (Issue #1212).
     pub deleted_count: u64,
 }
 
@@ -409,7 +412,7 @@ pub struct InvertedIndexWriter {
     /// gaps in its range. `None` records a segment whose set is unavailable
     /// or untrustworthy, which then falls back to range matching. Kept in
     /// step with [`Self::segment_ranges`].
-    segment_members: AHashMap<String, Option<Arc<RoaringTreemap>>>,
+    segment_members: AHashMap<String, Membership>,
 
     /// Highest `max_doc_id` across [`Self::segment_ranges`] (0 when no
     /// segments exist). Fresh doc IDs handed out by the WAL are strictly
@@ -442,17 +445,6 @@ pub struct InvertedIndexWriter {
     /// deletion bitmaps — `.delmap` first, then `.meta` — so a reader that
     /// sees the flag always finds the bitmap.
     pending_meta_deletions: AHashSet<String>,
-
-    /// Deletions counted into [`WriterStats::deleted_count`] against
-    /// segments still in [`Self::pending_publish`], per segment (Issue
-    /// #1204).
-    ///
-    /// [`Self::rollback`] discards those segments and must take exactly this
-    /// share back out of the count. The segment's bitmap cannot tell it: a
-    /// repeated upsert of one id counts a deletion each time but sets one
-    /// bit. Cleared together with `pending_publish` once the segments are
-    /// published.
-    pending_segment_deletions: AHashMap<String, u64>,
 }
 
 impl std::fmt::Debug for InvertedIndexWriter {
@@ -921,7 +913,6 @@ impl InvertedIndexWriter {
             max_committed_doc_id,
             deletion_manager: None,
             pending_meta_deletions: AHashSet::new(),
-            pending_segment_deletions: AHashMap::new(),
         })
     }
 
@@ -1916,7 +1907,7 @@ impl InvertedIndexWriter {
         // `.ids` part back (Issue #1210).
         let ids: RoaringTreemap = self.buffered_docs.iter().map(|(id, _)| *id).collect();
         self.segment_members
-            .insert(segment_name.to_string(), Some(Arc::new(ids)));
+            .insert(segment_name.to_string(), Membership::Set(Arc::new(ids)));
     }
 
     /// Describe the segment about to be written from the current buffer.
@@ -1953,6 +1944,7 @@ impl InvertedIndexWriter {
             max_doc_id: max_id,
             generation: self.current_segment,
             has_deletions: false, // New segments initially have no deletions
+            deleted_count: Some(0),
             shard_id: self.config.shard_id,
         }
     }
@@ -2012,21 +2004,22 @@ impl InvertedIndexWriter {
     /// `Drop`'s `let _ = self.close()` at exactly the call site this guard
     /// protects — the merge engine's internal replay writer.
     ///
-    /// The deltas are applied under the lock and CONSUMED (reset) only
-    /// after the persist succeeds, inside this method, because `Drop` runs
-    /// the whole commit ladder a second time after every explicit
-    /// [`Self::commit`] — a delta applied twice would double every count.
-    /// On a failed persist the shared metadata is rolled back to its
-    /// persisted state and the deltas survive, so the retry re-applies
-    /// them exactly once (#1044).
+    /// The document and deletion counts are sums over the segment manifest
+    /// this commit has just published (Issue #1212), not deltas: each
+    /// manifest entry records its segment's documents and deletions as they
+    /// are persisted, so a re-upsert, a crash-recovery replay or a merge can
+    /// no longer make the counts drift. `Drop` runs the whole commit ladder
+    /// a second time after every explicit [`Self::commit`]; writing a sum
+    /// again is idempotent. On a failed persist the shared metadata is
+    /// rolled back to its persisted state, so the retry finds the change
+    /// still to record (#1044).
     ///
-    /// A pass with nothing to record — zero deltas and the shared WAL
-    /// checkpoint already at or ahead of the writer's — skips the persist
-    /// entirely (#1041): `Drop`'s second ladder run and idle closes used
-    /// to rewrite a byte-equivalent file (one create + rename + fsync per
-    /// commit) whose only changes were `generation`, which nothing reads,
-    /// and the `modified` timestamp. The failed-persist retry is never
-    /// skipped: the rollback leaves its deltas unconsumed.
+    /// A pass with nothing to record — the counts already persisted and the
+    /// shared WAL checkpoint already at or ahead of the writer's — skips the
+    /// persist entirely (#1041): `Drop`'s second ladder run and idle closes
+    /// used to rewrite a byte-equivalent file (one create + rename + fsync
+    /// per commit) whose only changes were `generation`, which nothing
+    /// reads, and the `modified` timestamp.
     ///
     /// # Errors
     ///
@@ -2036,7 +2029,19 @@ impl InvertedIndexWriter {
             return Ok(());
         };
 
-        // Apply deltas under the lock, snapshot, and RELEASE before I/O:
+        // The counts are sums over the manifest, which this commit has just
+        // published (Issue #1212), not deltas: a delta drifted on re-upserts,
+        // on crash-recovery replays and on merges, and nothing corrected it.
+        // Read before taking the metadata lock; the manifest lock is a leaf.
+        let (doc_count, deleted_count) = match &self.segment_manifest {
+            Some(manifest) => super::segment_manifest::index_counts(manifest),
+            None => {
+                let meta = handle.read();
+                (meta.doc_count, meta.deleted_count)
+            }
+        };
+
+        // Update under the lock, snapshot, and RELEASE before I/O:
         // `parking_lot::RwLock` is not reentrant and the `Debug` impls read
         // this lock, so holding it across a failing write would deadlock
         // the moment an error path formatted the index or store.
@@ -2044,15 +2049,15 @@ impl InvertedIndexWriter {
             let mut meta = handle.write();
             // Nothing to record: skip the persist (#1041). `generation` and
             // `modified` intentionally do not advance on a skipped pass.
-            if self.stats.docs_added == 0
-                && self.stats.deleted_count == 0
+            if meta.doc_count == doc_count
+                && meta.deleted_count == deleted_count
                 && meta.last_wal_seq >= self.last_wal_seq
             {
                 return Ok(());
             }
             let previous = meta.clone();
-            meta.doc_count += self.stats.docs_added;
-            meta.deleted_count += self.stats.deleted_count;
+            meta.doc_count = doc_count;
+            meta.deleted_count = deleted_count;
             meta.modified = crate::util::time::now_secs();
             meta.generation += 1;
             // Monotonic: the writer's local value can only be at or ahead
@@ -2071,8 +2076,8 @@ impl InvertedIndexWriter {
             &snapshot,
         ) {
             // Roll the shared state back to what the file still holds, so
-            // the retained deltas are re-applied exactly once by the retry
-            // (#1044). Restoring wholesale is race-free: `LexicalStore`
+            // the retry sees a change to record and persists it (#1044).
+            // Restoring wholesale is race-free: `LexicalStore`
             // holds the writer-cache lock across the whole commit ladder,
             // and every other mutation path (`set_last_wal_seq`,
             // `optimize`/`update_metadata`) takes that same lock.
@@ -2080,8 +2085,7 @@ impl InvertedIndexWriter {
             return Err(e);
         }
 
-        // Consume the applied deltas so the next commit — including the
-        // implicit one `Drop` runs — starts from zero.
+        // Reset the since-last-commit tallies.
         self.stats.docs_added = 0;
         self.stats.deleted_count = 0;
         Ok(())
@@ -2092,10 +2096,10 @@ impl InvertedIndexWriter {
     /// Discards every document added since the last commit: the in-memory
     /// buffer, and every segment an automatic flush wrote but no commit has
     /// published yet (Issue #1204). Those segments' files are deleted along
-    /// with the deletions recorded against them, and the batch's share of the
-    /// document and deletion counts is taken back out, so the next commit
-    /// neither publishes the discarded documents nor counts them. The writer
-    /// stays usable.
+    /// with the deletions recorded against them, so the next commit neither
+    /// publishes the discarded documents nor counts them: the index's counts
+    /// are summed from the manifest, which never listed them (Issue #1212).
+    /// The writer stays usable.
     ///
     /// Deletion state for **committed** segments (deferred bitmap writes and
     /// `has_deletions` meta flips, Issue #875) is intentionally NOT
@@ -2139,13 +2143,10 @@ impl InvertedIndexWriter {
             }
         }
 
-        // Undo the batch's accounting: left in place, the next commit would
-        // add the discarded documents to the index's `doc_count` (and their
-        // deletions to `deleted_count`). Only unpublished segments are keyed
-        // in `pending_segment_deletions`, and all of them were just dropped.
-        let dropped_deletions: u64 = self.pending_segment_deletions.drain().map(|(_, n)| n).sum();
+        // Undo the batch's tally. The index's counts need no correction:
+        // they are summed from the manifest, which never saw the dropped
+        // segments (Issue #1212).
         self.stats.docs_added = self.stats.docs_added.saturating_sub(rolled_back);
-        self.stats.deleted_count = self.stats.deleted_count.saturating_sub(dropped_deletions);
 
         // Clear all buffers — the DocValues included, which would otherwise
         // be written into the next segment's `.dv`.
@@ -2389,30 +2390,18 @@ impl InvertedIndexWriter {
                 }
 
                 // Queue the segment's `has_deletions` meta flip; persisted by
-                // `flush_deletions` at commit (Issue #875).
+                // `flush_deletions` at commit (Issue #875), which also
+                // recounts the segment's deletions for the manifest (Issue
+                // #1212). Queued even when the bit was already set: WAL
+                // replay after a crash between a commit's `.delmap` write and
+                // its manifest save re-deletes copies whose bit is persisted
+                // but whose count the manifest never recorded, and only this
+                // queueing makes that replay recount them.
                 self.update_segment_meta_deletions(segment_id);
 
-                // A segment still waiting for publication may be discarded
-                // by `rollback`, which then takes this deletion back out of
-                // `deleted_count` (Issue #1204).
-                if self
-                    .pending_publish
-                    .iter()
-                    .any(|info| &info.segment_id == segment_id)
-                {
-                    *self
-                        .pending_segment_deletions
-                        .entry(segment_id.clone())
-                        .or_insert(0) += 1;
-                }
-
-                // Counted even when the bit was already set: WAL replay after
-                // a crash between a commit's `.delmap` write and its
-                // `metadata.json` write re-deletes copies whose bit is
-                // persisted but whose deletion was never counted. The price is
-                // a double count when one caller-chosen id is re-upserted
-                // before a commit; exact counts need persisted-state
-                // derivation (Issue #1208).
+                // A diagnostic tally: every mark counts, including a repeated
+                // one. The index's counts come from the manifest's
+                // per-segment counts instead (Issue #1212).
                 deleted += 1;
             }
             // Track globally
@@ -2486,68 +2475,58 @@ impl InvertedIndexWriter {
     /// and one without gaps holds its whole range. Only a segment with gaps
     /// consults its exact doc-id set.
     fn segment_holds(&mut self, range: &SegmentRange, doc_id: u64) -> bool {
-        if let Some(Some(ids)) = self.segment_members.get(&range.segment_id) {
-            return ids.contains(doc_id);
-        }
-        if range.doc_count == 0 {
-            return false;
-        }
-        if range.max_doc_id - range.min_doc_id + 1 == range.doc_count {
-            return true;
-        }
-        match self.segment_member_set(range) {
-            Some(ids) => ids.contains(doc_id),
-            None => true,
-        }
+        // Unknown membership keeps range matching: a set trusted wrongly
+        // would skip a real copy's deletion and leave a duplicate, which is
+        // worse than an extra deletion bit.
+        self.segment_membership(range).holds(doc_id).unwrap_or(true)
     }
 
-    /// The exact doc-id set of a committed segment, loaded once and cached
-    /// (Issue #1210).
+    /// What the segment described by `range` holds (Issues #1210 / #1212),
+    /// resolved once and cached.
     ///
-    /// `None` when the segment predates both the `.ids` part and `.norms`,
-    /// or when the loaded set is unreadable or disagrees with the segment's
-    /// recorded count and range. The caller then keeps range matching: a
-    /// set trusted wrongly would skip a real copy's deletion and leave a
-    /// duplicate, which is worse than an extra deletion bit.
-    fn segment_member_set(&mut self, range: &SegmentRange) -> Option<Arc<RoaringTreemap>> {
+    /// Answered from the segment's shape when it decides (empty, or no
+    /// gaps); otherwise from its doc-id set — in memory for a segment this
+    /// writer flushed, loaded from `.ids` (or `.norms`) for a committed one.
+    /// A set that is missing, unreadable or disagrees with the segment's
+    /// recorded count and range yields [`Membership::Unknown`].
+    fn segment_membership(&mut self, range: &SegmentRange) -> Membership {
         if let Some(cached) = self.segment_members.get(&range.segment_id) {
             return cached.clone();
         }
-        let loaded = match load_segment_doc_ids(self.storage.as_ref(), &range.segment_id) {
-            Ok(Some(ids))
-                if ids.len() == range.doc_count
-                    && ids.min() == Some(range.min_doc_id)
-                    && ids.max() == Some(range.max_doc_id) =>
-            {
-                Some(Arc::new(ids))
-            }
-            Ok(Some(ids)) => {
-                log::warn!(
-                    "segment {} records {} doc ids in [{:?}, {:?}] but claims {} in [{}, {}]; \
-                     deletions fall back to its id range",
-                    range.segment_id,
-                    ids.len(),
-                    ids.min(),
-                    ids.max(),
-                    range.doc_count,
-                    range.min_doc_id,
-                    range.max_doc_id
-                );
-                None
-            }
-            Ok(None) => None,
-            Err(e) => {
-                log::warn!(
-                    "cannot read the doc-id set of segment {}: {e}; deletions fall back to its id \
-                     range",
-                    range.segment_id
-                );
-                None
-            }
-        };
+        let membership =
+            Membership::from_shape(range.min_doc_id, range.max_doc_id, range.doc_count)
+                .unwrap_or_else(|| {
+                    Membership::from_loaded(
+                        &range.segment_id,
+                        range.min_doc_id,
+                        range.max_doc_id,
+                        range.doc_count,
+                        load_segment_doc_ids(self.storage.as_ref(), &range.segment_id),
+                    )
+                });
         self.segment_members
-            .insert(range.segment_id.clone(), loaded.clone());
-        loaded
+            .insert(range.segment_id.clone(), membership.clone());
+        membership
+    }
+
+    /// How many documents of `segment_id` are deleted, as the manifest
+    /// records it (Issue #1212): the deletions its bitmap holds for
+    /// documents the segment holds. `None` when it cannot be counted — no
+    /// cached range or no bitmap — which the index then recounts.
+    fn segment_deletion_count(&mut self, segment_id: &str) -> Option<u64> {
+        let range = self
+            .segment_ranges
+            .iter()
+            .find(|range| range.segment_id == segment_id)?
+            .clone();
+        let bitmap = self.deletion_manager.as_ref()?.bitmap(segment_id)?;
+        let membership = self.segment_membership(&range);
+        Some(membership.held_deletions(
+            &bitmap,
+            range.min_doc_id,
+            range.max_doc_id,
+            range.doc_count,
+        ))
     }
 
     /// Rebuild [`Self::segment_ranges`] / [`Self::max_committed_doc_id`]
@@ -2639,8 +2618,6 @@ impl InvertedIndexWriter {
             })?;
         }
         self.pending_publish.clear();
-        // Published segments can no longer be rolled back (Issue #1204).
-        self.pending_segment_deletions.clear();
         Ok(())
     }
 
@@ -2654,12 +2631,13 @@ impl InvertedIndexWriter {
     ///
     /// Called from [`Self::commit`] before the `metadata.json` /
     /// `last_wal_seq` checkpoint (a crash before the checkpoint keeps the WAL
-    /// delete records replayable), and from
-    /// [`LexicalStore::optimize`](crate::lexical::store::LexicalStore::optimize)
-    /// before its force-merge (the merge engine reads deletions from the
-    /// on-disk `.delmap`, so unflushed deletions would be resurrected into
-    /// the merged segment). Idempotent — a second call without intervening
-    /// deletions writes nothing.
+    /// delete records replayable). `LexicalStore::optimize` commits before
+    /// its force-merge, which is what persists deletions ahead of the merge
+    /// engine reading them from the on-disk `.delmap`. Idempotent — a
+    /// second call without intervening deletions writes nothing.
+    ///
+    /// Also records each flipped segment's deletion count in the manifest
+    /// (Issue #1212), recounted in full from its bitmap.
     ///
     /// # Errors
     ///
@@ -2674,6 +2652,13 @@ impl InvertedIndexWriter {
             return Ok(());
         }
         let pending: Vec<String> = self.pending_meta_deletions.iter().cloned().collect();
+        // Each flipped segment's deletion count, recounted in full from its
+        // bitmap (Issue #1212): the manifest records it so the index's
+        // counts are sums over persisted state instead of drifting deltas.
+        let counts: Vec<(String, Option<u64>)> = pending
+            .iter()
+            .map(|segment_id| (segment_id.clone(), self.segment_deletion_count(segment_id)))
+            .collect();
 
         // Apply the flips to the manifest (#1021), AFTER the bitmaps above
         // are durable (#875's contract: a reader that sees the flag always
@@ -2683,9 +2668,10 @@ impl InvertedIndexWriter {
         // after a partial advisory failure is idempotent.
         if let Some(manifest) = &self.segment_manifest {
             super::segment_manifest::publish_with(self.storage.as_ref(), manifest, |list| {
-                for segment_id in &pending {
+                for (segment_id, count) in &counts {
                     if let Some(entry) = list.iter_mut().find(|s| &s.segment_id == segment_id) {
                         entry.has_deletions = true;
+                        entry.deleted_count = *count;
                     }
                 }
             })?;
@@ -2696,13 +2682,14 @@ impl InvertedIndexWriter {
         // or the deleted-from-then-published segment would enter the
         // manifest with `has_deletions: false` and resurrect its deleted
         // documents once discovery trusts the manifest (#1021).
-        for segment_id in &pending {
+        for (segment_id, count) in &counts {
             if let Some(entry) = self
                 .pending_publish
                 .iter_mut()
                 .find(|s| &s.segment_id == segment_id)
             {
                 entry.has_deletions = true;
+                entry.deleted_count = *count;
             }
         }
 

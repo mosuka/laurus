@@ -308,10 +308,10 @@ impl LexicalStore {
         // Sync again afterwards so any merge output is durable/visible.
         self.index.maybe_merge()?;
         self.index.storage().sync()?;
-        // For `InvertedIndex` this is a no-op (#1023): the writer applied
-        // its commit deltas straight to the index's shared metadata, so
-        // there is nothing fresher on disk. Kept for other `LexicalIndex`
-        // implementations whose refresh does real work.
+        // For `InvertedIndex` this is a no-op (#1023): the writer updated
+        // the index's shared metadata directly, so there is nothing fresher
+        // on disk. Kept for other `LexicalIndex` implementations whose
+        // refresh does real work.
         self.index.refresh()
     }
 
@@ -433,9 +433,10 @@ impl LexicalStore {
 
     /// Get index statistics.
     ///
-    /// Returns aggregated statistics including document count and deleted document
-    /// count from the index metadata. The `doc_count` field also includes any
-    /// documents pending in the writer cache that have not yet been committed.
+    /// Returns aggregated statistics including document count and deleted
+    /// document count, summed from the segment manifest (Issue #1212). The
+    /// `doc_count` field also includes any documents pending in the writer
+    /// cache that have not yet been committed.
     ///
     /// # Current Limitations
     ///
@@ -455,10 +456,14 @@ impl LexicalStore {
     /// Returns [`LaurusError`](crate::error::LaurusError) if the index stats
     /// cannot be retrieved (e.g., the index is closed).
     pub fn stats(&self) -> Result<InvertedIndexStats> {
+        // Take the writer lock first (Issue #1212): read after it, the
+        // committed counts and the writer's pending documents describe the
+        // same moment. Read before it, a commit could land in between — its
+        // documents then counted in neither half. Same order as `commit`.
+        let guard = self.writer_cache.lock();
         let mut stats = self.index.stats()?;
 
         // Add pending docs from writer cache
-        let guard = self.writer_cache.lock();
         if let Some(writer) = guard.as_ref() {
             stats.doc_count += writer.pending_docs();
         }
