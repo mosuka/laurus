@@ -576,3 +576,73 @@ async fn recover_skip_path_must_leave_the_wal_truncatable() -> laurus::Result<()
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #1212 — the index's counts are derived from the segment manifest.
+// ---------------------------------------------------------------------------
+
+/// A crash between a commit's manifest save and its `metadata.json` write
+/// must not skew the document count once the WAL is replayed.
+///
+/// The crashed commit published a new segment and a deletion, but its
+/// metadata checkpoint never landed, so recovery replays both records: the
+/// put re-upserts over the published copy and the delete re-marks an
+/// already-set bit. Running deltas then counted the replay as one more
+/// document and two more deletions — 2 live instead of 3. Counts summed
+/// from the manifest describe what is actually stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn counts_stay_exact_across_a_crash_before_the_metadata_persist() -> laurus::Result<()> {
+    let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let failing = Arc::new(FailingStorage::new(inner.clone()));
+    let storage: Arc<dyn Storage> = failing.clone();
+
+    let engine = Engine::new(storage, mixed_schema()).await?;
+    for i in 1..=3u64 {
+        engine.put_document(&format!("id{i}"), mixed_doc(i)).await?;
+    }
+    engine.commit().await?;
+    engine.put_document("id4", mixed_doc(4)).await?;
+    engine.delete_documents("id2").await?;
+    failing.fail_next_create_of("lexical/metadata.json.tmp");
+    assert!(
+        engine.commit().await.is_err(),
+        "the injected metadata persist failure must surface"
+    );
+    // The process dies here: nothing else runs, not even the writer's
+    // Drop-time commit retry.
+    std::mem::forget(engine);
+
+    let reopened = Engine::new(inner.clone(), mixed_schema()).await?;
+    assert_eq!(reopened.stats()?.document_count, 3, "id1, id3 and id4");
+    Ok(())
+}
+
+/// A crash between a commit's `.delmap` write and its manifest save leaves
+/// a persisted bit the manifest does not know about. Replaying the delete
+/// re-marks that already-set bit; the writer must still queue the segment,
+/// or its `has_deletions` flag and deletion count are never recorded — and
+/// the deleted document would be served again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deletion_persisted_only_in_its_bitmap_is_recorded_on_replay() -> laurus::Result<()> {
+    let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let failing = Arc::new(FailingStorage::new(inner.clone()));
+    let storage: Arc<dyn Storage> = failing.clone();
+
+    let engine = Engine::new(storage, mixed_schema()).await?;
+    for i in 1..=3u64 {
+        engine.put_document(&format!("id{i}"), mixed_doc(i)).await?;
+    }
+    engine.commit().await?;
+    engine.delete_documents("id2").await?;
+    failing.fail_next_create_of("lexical/segments.json.tmp");
+    assert!(
+        engine.commit().await.is_err(),
+        "the injected manifest save failure must surface"
+    );
+    std::mem::forget(engine);
+
+    let reopened = Engine::new(inner.clone(), mixed_schema()).await?;
+    assert_eq!(reopened.stats()?.document_count, 2);
+    assert!(reopened.get_documents("id2").await?.is_empty());
+    Ok(())
+}

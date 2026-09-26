@@ -168,6 +168,30 @@ where
     Ok(())
 }
 
+/// The index's document and deletion counts, summed over the committed
+/// segments' manifest entries (Issue #1212).
+///
+/// `doc_count` is every document the committed segments hold, deleted ones
+/// included; `deleted_count` is how many of those are deleted, so their
+/// difference is the live count. Both come from persisted state — the
+/// manifest records each segment's count whenever its deletions are
+/// persisted — instead of deltas accumulated per commit, which drifted on
+/// re-upserts, crash-recovery replays and merges. An entry whose count is
+/// still unknown (unreadable at open) contributes no deletions, as its
+/// readers also treat an unreadable bitmap. No I/O.
+pub(crate) fn index_counts(shared: &RwLock<ManifestState>) -> (u64, u64) {
+    let guard = shared.read();
+    guard
+        .segments
+        .iter()
+        .fold((0, 0), |(docs, deleted), segment| {
+            (
+                docs + segment.doc_count,
+                deleted + segment.deleted_count.unwrap_or(0),
+            )
+        })
+}
+
 /// Hand out the next segment generation ordinal (#1024).
 ///
 /// Taken under the manifest write lock so a flushing writer and a
