@@ -41,7 +41,7 @@
 use crate::error::{LaurusError, Result};
 use crate::lexical::index::structures::dictionary::TermInfo;
 
-use super::block_max_data::BlockMaxData;
+use super::block_max_data::{BLOCK_MAX_BYTES, BlockMaxData};
 use super::front_coding::FrontCodingDecoder;
 use super::term_info_block::FixedTermInfoBlock;
 
@@ -147,6 +147,23 @@ impl<'a> BlockReader<'a> {
         if c + bm_data_len > bytes.len() {
             return Err(LaurusError::index(
                 "BlockReader: BlockMaxData data overruns BlockSection",
+            ));
+        }
+        // The writer's offsets start at 0, never decrease, span whole
+        // entries and end at the data's length (Issue #1220).
+        // `BlockMaxData::get` sizes a buffer and indexes the data by them, so
+        // a corrupt offset would otherwise drive a huge allocation or read
+        // out of bounds.
+        let spans_are_whole_entries = offsets.windows(2).all(|pair| {
+            pair[0] <= pair[1] && ((pair[1] - pair[0]) as usize).is_multiple_of(BLOCK_MAX_BYTES)
+        });
+        if offsets.first() != Some(&0)
+            || !spans_are_whole_entries
+            || offsets.last().map(|&last| last as usize) != Some(bm_data_len)
+        {
+            return Err(LaurusError::index(
+                "BlockReader: BlockMaxData offsets are not ascending spans of whole entries \
+                 ending at the data length — segment is corrupted",
             ));
         }
         let bm_data = bytes[c..c + bm_data_len].to_vec();
@@ -559,6 +576,44 @@ mod tests {
             ));
         }
         (section, expected)
+    }
+
+    /// A block's BlockMaxData offsets must be ascending spans of whole
+    /// entries from 0 to the data's length: `BlockMaxData::get` sizes a
+    /// buffer and indexes the data by them (Issue #1220).
+    #[test]
+    fn parse_rejects_block_max_offsets_that_do_not_describe_the_data() {
+        let terms: Vec<&[u8]> = vec![b"apple", b"banana", b"cherry"];
+        let infos = vec![
+            (fti(0, 50, 1, 10, 1.0), Vec::new()),
+            (fti(50, 60, 2, 20, 1.0), vec![sample_block_max(5, 0.5)]),
+            (fti(110, 70, 3, 30, 1.0), Vec::new()),
+        ];
+        let mut section = Vec::new();
+        encode_block_into(&mut section, &terms, &infos);
+        assert!(BlockReader::parse(&section, 0).is_ok());
+
+        // Offsets [0, 0, 12, 12], then the data's length (12) and its bytes.
+        let offsets_at = section.len() - 12 - 4 - 4 * (terms.len() + 1);
+        let with_offset = |index: usize, value: u32| {
+            let mut patched = section.clone();
+            let at = offsets_at + 4 * index;
+            patched[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            patched
+        };
+        for (index, value, why) in [
+            (0, 12, "does not start at 0"),
+            (2, 24, "decreases"),
+            (1, 6, "splits an entry"),
+            (3, 0, "does not end at the data length"),
+        ] {
+            let patched = with_offset(index, value);
+            match BlockReader::parse(&patched, 0) {
+                Err(LaurusError::Index(msg)) => assert!(msg.contains("corrupted"), "{why}: {msg}"),
+                Err(other) => panic!("{why}: expected Index error, got {other:?}"),
+                Ok(_) => panic!("offsets that {why} must be rejected"),
+            }
+        }
     }
 
     #[test]

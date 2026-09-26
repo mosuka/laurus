@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::storage::{FileMetadata, LoadingMode, Storage, StorageInput, StorageOutput};
+use crate::util::alloc_bounds::{checked_capacity_u64, checked_len_u64};
 use crate::util::varint::{read_varint, write_varint};
 use crate::{LaurusError, Result};
 
@@ -734,9 +735,24 @@ impl StorageInput for PartInput {
 fn parse_table(table: &[u8], table_offset: u64, container: &str) -> Result<Vec<PartEntry>> {
     let mut cursor = 0usize;
     let count = read_varint(table, &mut cursor, container)?;
-    let mut parts = Vec::with_capacity(count as usize);
+    // Each entry is at least a one-byte suffix length, an offset and a
+    // length (Issue #1220).
+    let count = checked_capacity_u64(
+        count,
+        1 + 8 + 8,
+        table.len().saturating_sub(cursor) as u64,
+        "compound part table entry count",
+    )?;
+    let mut parts = Vec::with_capacity(count);
     for _ in 0..count {
-        let suffix_len = read_varint(table, &mut cursor, container)? as usize;
+        let suffix_len = read_varint(table, &mut cursor, container)?;
+        // Compared before it is narrowed, which would truncate it on a
+        // 32-bit target.
+        let suffix_len = checked_len_u64(
+            suffix_len,
+            table.len().saturating_sub(cursor) as u64,
+            "compound part suffix length",
+        )?;
         let suffix_end = cursor
             .checked_add(suffix_len)
             .filter(|&end| end <= table.len())
@@ -1083,5 +1099,30 @@ mod tests {
         let mut fields = facade.bkd_field_names();
         fields.sort();
         assert_eq!(fields, vec!["geo.field".to_string(), "rank".to_string()]);
+    }
+
+    /// The part table's entry count and each suffix length are bounded by
+    /// the table's bytes before they size anything (Issue #1220).
+    #[test]
+    fn parse_table_rejects_counts_the_table_cannot_hold() {
+        let mut table = Vec::new();
+        write_varint(&mut table, u64::MAX);
+        match parse_table(&table, 0, "c") {
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("compound part table entry count"), "{msg}");
+            }
+            other => panic!("expected an Index error, got {other:?}"),
+        }
+
+        let mut table = Vec::new();
+        write_varint(&mut table, 1);
+        write_varint(&mut table, u64::MAX); // suffix length
+        table.extend_from_slice(&[0u8; 16]);
+        match parse_table(&table, 0, "c") {
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("compound part suffix length"), "{msg}");
+            }
+            other => panic!("expected an Index error, got {other:?}"),
+        }
     }
 }

@@ -417,7 +417,7 @@ impl<R: StorageInput> StructReader<R> {
     /// the stream (Issue #1218). The trailer is not subtracted: not every
     /// input ends in one, and none of the bytes a prefix describes can lie
     /// past the end of the input anyway.
-    fn remaining(&self) -> u64 {
+    pub(crate) fn remaining(&self) -> u64 {
         self.file_size.saturating_sub(self.position)
     }
 
