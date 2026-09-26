@@ -531,72 +531,9 @@ impl DeletionLog {
     }
 }
 
-/// Statistics about deletion operations.
-#[derive(Debug, Clone, Default)]
-pub struct DeletionStats {
-    /// Total number of segments tracked.
-    pub segments_tracked: usize,
-
-    /// Total documents across all segments.
-    pub total_docs: u64,
-
-    /// Total deleted documents.
-    pub total_deleted: u64,
-
-    /// Overall deletion ratio.
-    pub overall_deletion_ratio: f64,
-
-    /// Number of segments needing compaction.
-    pub segments_needing_compaction: usize,
-
-    /// Total memory used by bitmaps (bytes).
-    pub bitmap_memory_usage: usize,
-}
-
-/// Global deletion state across all segments.
-#[derive(Debug, Clone)]
-pub struct GlobalDeletionState {
-    /// Total documents across all segments.
-    pub total_documents: u64,
-
-    /// Total deleted documents across all segments.
-    pub total_deleted: u64,
-
-    /// Global deletion ratio.
-    pub global_deletion_ratio: f64,
-
-    /// Segments that need compaction.
-    pub compaction_candidates: Vec<String>,
-
-    /// Total space that can be reclaimed (bytes).
-    pub reclaimable_space: u64,
-}
-
-impl Default for GlobalDeletionState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GlobalDeletionState {
-    /// Create a new global deletion state.
-    pub fn new() -> Self {
-        GlobalDeletionState {
-            total_documents: 0,
-            total_deleted: 0,
-            global_deletion_ratio: 0.0,
-            compaction_candidates: Vec::new(),
-            reclaimable_space: 0,
-        }
-    }
-}
-
 /// Core deletion manager.
 #[derive(Debug)]
 pub struct DeletionManager {
-    /// Configuration.
-    config: DeletionConfig,
-
     /// Storage backend.
     storage: Arc<dyn Storage>,
 
@@ -606,18 +543,11 @@ pub struct DeletionManager {
     /// Deletion log for recovery.
     deletion_log: Option<DeletionLog>,
 
-    /// Statistics.
-    stats: RwLock<DeletionStats>,
-
-    /// Global deletion state.
-    global_state: RwLock<GlobalDeletionState>,
-
     /// Segments whose in-memory bitmap has changed since the last
     /// [`flush`](Self::flush) (Issue #875).
     ///
-    /// Mutations ([`delete_document`](Self::delete_document) /
-    /// [`delete_documents`](Self::delete_documents) /
-    /// [`resize_segment`](Self::resize_segment)) only update the in-memory
+    /// Mutations ([`delete_document`](Self::delete_document) and
+    /// [`initialize_segment`](Self::initialize_segment)) only update the in-memory
     /// bitmap and record the segment here; the `.delmap` files are written
     /// once per group by [`flush`](Self::flush) instead of once per delete.
     /// This removes the per-delete full-bitmap rewrite (+ fsync) from the
@@ -639,20 +569,14 @@ impl DeletionManager {
         };
 
         let manager = DeletionManager {
-            config,
             storage,
             bitmaps: RwLock::new(AHashMap::new()),
             deletion_log,
-            stats: RwLock::new(DeletionStats::default()),
-            global_state: RwLock::new(GlobalDeletionState::new()),
             dirty_segments: RwLock::new(ahash::AHashSet::new()),
         };
 
         // Load existing bitmaps
         manager.load_bitmaps()?;
-
-        // Initialize global state
-        manager.update_global_state()?;
 
         Ok(manager)
     }
@@ -687,8 +611,6 @@ impl DeletionManager {
         // The empty bitmap is persisted by the next `flush` together with the
         // deletions that prompted the initialization (Issue #875).
         self.mark_dirty(segment_id);
-        self.update_stats();
-        let _ = self.update_global_state();
 
         Ok(())
     }
@@ -722,8 +644,6 @@ impl DeletionManager {
         // Defer bitmap persistence to the next `flush` (Issue #875)
         if was_deleted {
             self.mark_dirty(segment_id);
-            self.update_stats();
-            let _ = self.update_global_state();
         }
 
         Ok(was_deleted)
@@ -738,12 +658,8 @@ impl DeletionManager {
     /// left for the caller, which deletes the segment's files itself.
     /// Forgetting an unknown segment is a no-op.
     pub fn forget_segment(&self, segment_id: &str) {
-        let removed = self.bitmaps.write().unwrap().remove(segment_id).is_some();
+        self.bitmaps.write().unwrap().remove(segment_id);
         self.dirty_segments.write().unwrap().remove(segment_id);
-        if removed {
-            self.update_stats();
-            let _ = self.update_global_state();
-        }
     }
 
     /// Whether `doc_id` is marked deleted in `segment_id`'s bitmap.
@@ -840,81 +756,6 @@ impl DeletionManager {
                 }
             }
         }
-
-        self.update_stats();
-        let _ = self.update_global_state();
-        Ok(())
-    }
-
-    /// Update internal statistics.
-    fn update_stats(&self) {
-        let bitmaps = self.bitmaps.read().unwrap();
-        let mut stats = self.stats.write().unwrap();
-
-        stats.segments_tracked = bitmaps.len();
-        stats.total_docs = bitmaps
-            .values()
-            .map(|b| b.total_docs.load(Ordering::SeqCst))
-            .sum();
-        stats.total_deleted = bitmaps
-            .values()
-            .map(|b| b.deleted_count.load(Ordering::SeqCst))
-            .sum();
-
-        if stats.total_docs > 0 {
-            stats.overall_deletion_ratio = stats.total_deleted as f64 / stats.total_docs as f64;
-        }
-
-        stats.segments_needing_compaction = bitmaps
-            .values()
-            .filter(|b| b.needs_compaction(self.config.compaction_threshold))
-            .count();
-
-        stats.bitmap_memory_usage = bitmaps.values().map(|b| b.memory_usage()).sum();
-    }
-
-    /// Update global deletion state based on current segment states.
-    pub fn update_global_state(&self) -> Result<()> {
-        let bitmaps = self.bitmaps.read().unwrap();
-        let mut global_state = self.global_state.write().unwrap();
-
-        // Calculate totals
-        global_state.total_documents = bitmaps
-            .values()
-            .map(|b| b.total_docs.load(Ordering::SeqCst))
-            .sum();
-        global_state.total_deleted = bitmaps
-            .values()
-            .map(|b| b.deleted_count.load(Ordering::SeqCst))
-            .sum();
-
-        // Calculate global deletion ratio
-        if global_state.total_documents > 0 {
-            global_state.global_deletion_ratio =
-                global_state.total_deleted as f64 / global_state.total_documents as f64;
-        } else {
-            global_state.global_deletion_ratio = 0.0;
-        }
-
-        // Find compaction candidates
-        global_state.compaction_candidates = bitmaps
-            .values()
-            .filter(|b| b.needs_compaction(self.config.compaction_threshold))
-            .map(|b| b.segment_id.clone())
-            .collect();
-
-        // Estimate reclaimable space (approximate)
-        global_state.reclaimable_space = bitmaps
-            .values()
-            .map(|b| {
-                if b.needs_compaction(self.config.compaction_threshold) {
-                    // Rough estimate: deleted_ratio * segment_size
-                    (b.deletion_ratio() * b.total_docs.load(Ordering::SeqCst) as f64 * 100.0) as u64 // 100 bytes per doc estimate
-                } else {
-                    0
-                }
-            })
-            .sum();
 
         Ok(())
     }

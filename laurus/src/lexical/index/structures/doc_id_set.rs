@@ -82,6 +82,27 @@ pub(crate) fn read_doc_id_set(
     decode(input, segment_id).map(Some)
 }
 
+/// A segment's doc-id set: its `.ids` part, or — for a segment written
+/// before that part existed — the `.norms` slot map, which records the same
+/// ids (Issue #1210).
+///
+/// # Returns
+///
+/// `Ok(None)` when the segment has neither part (a pre-#555 segment).
+///
+/// # Errors
+///
+/// Returns an error when the part that exists is unreadable or corrupt.
+pub(crate) fn load_segment_doc_ids(
+    storage: &dyn Storage,
+    segment_id: &str,
+) -> Result<Option<RoaringTreemap>> {
+    if let Some(ids) = read_doc_id_set(storage, segment_id)? {
+        return Ok(Some(ids));
+    }
+    super::norms::read_doc_ids(storage, segment_id)
+}
+
 fn decode<R: StorageInput>(input: R, segment_id: &str) -> Result<RoaringTreemap> {
     let mut reader = StructReader::new(input)?;
     let magic = reader.read_u32()?;

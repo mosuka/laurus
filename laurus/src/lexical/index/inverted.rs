@@ -1513,4 +1513,219 @@ mod tests {
         );
         assert!(!has_flushed_segment(&storage));
     }
+
+    // ---- Deletions check segment membership, Issue #1210 ------------------
+
+    /// Whether `segment_id`'s persisted deletion bitmap marks `doc_id`.
+    fn marks_deleted(storage: &Arc<MemoryStorage>, segment_id: &str, doc_id: u64) -> bool {
+        let name = format!("{segment_id}.delmap");
+        if !storage.file_exists(&name) {
+            return false;
+        }
+        let mut reader =
+            crate::storage::structured::StructReader::new(storage.open_input(&name).unwrap())
+                .unwrap();
+        crate::maintenance::deletion::DeletionBitmap::read_from_storage(&mut reader)
+            .unwrap()
+            .is_deleted(doc_id)
+    }
+
+    /// The committed segments, in manifest order.
+    fn committed_segments(index: &InvertedIndex) -> Vec<SegmentInfo> {
+        index.segment_manifest.read().segments.clone()
+    }
+
+    /// The committed segment holding exactly `ids`.
+    fn segment_holding(index: &InvertedIndex, ids: &[u64]) -> SegmentInfo {
+        committed_segments(index)
+            .into_iter()
+            .find(|s| {
+                s.doc_count == ids.len() as u64
+                    && s.min_doc_id == ids[0]
+                    && s.max_doc_id == *ids.last().unwrap()
+            })
+            .unwrap_or_else(|| panic!("no committed segment holds {ids:?}"))
+    }
+
+    fn doc_with_body(body: &str) -> Document {
+        create_test_document("t", body)
+    }
+
+    /// A merge of non-adjacent segments spans the one it left out, and a
+    /// deletion of a document in that one must not also mark the merged
+    /// segment: the merged range covers the id, but the segment does not
+    /// hold it. Before the membership check the delete set a bit in both
+    /// and counted twice.
+    #[test]
+    fn deleting_across_a_non_adjacent_merge_marks_only_the_holder() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            max_segments: 2,
+            merge_factor: 2,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+        // A {0,1,2} and C {6,7,8} are small; B {3,4,5} is large, so the
+        // smallest-first auto-merge picks A and C around it.
+        for (body, count) in [("a", 3), (&"large body ".repeat(400)[..], 3), ("c", 3)] {
+            for _ in 0..count {
+                writer.add_document(doc_with_body(body)).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        drop(writer);
+        index.maybe_merge().unwrap();
+        let merged = segment_holding(&index, &[0, 1, 2, 6, 7, 8]);
+        assert_eq!((merged.min_doc_id, merged.max_doc_id), (0, 8), "spans B");
+        let b = segment_holding(&index, &[3, 4, 5]);
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(4).unwrap();
+        writer.commit().unwrap();
+
+        assert!(marks_deleted(&storage, &b.segment_id, 4));
+        assert!(!marks_deleted(&storage, &merged.segment_id, 4));
+        assert_eq!(index.stats().unwrap().deleted_count, 1);
+    }
+
+    /// A caller-chosen id inside another segment's range is not that
+    /// segment's document: upserting it deletes nothing there.
+    #[test]
+    fn upserting_an_id_inside_another_segments_range_marks_nothing() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(1, doc_with_body("one")).unwrap();
+        writer.upsert_document(10, doc_with_body("ten")).unwrap();
+        writer.commit().unwrap();
+        let s = segment_holding(&index, &[1, 10]);
+
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(5, doc_with_body("five")).unwrap();
+        writer.commit().unwrap();
+
+        assert!(!marks_deleted(&storage, &s.segment_id, 5));
+        assert_eq!(index.stats().unwrap().deleted_count, 0);
+    }
+
+    /// Ids can reach the writer out of order (concurrent puts): a flushed
+    /// segment {9, 11} covers 10 without holding it, so buffering 10 and
+    /// later deleting it must mark only the segment that holds 10.
+    #[test]
+    fn out_of_order_ids_across_a_flush_mark_only_the_holder() {
+        let (storage, index) = index_flushing_every_two_docs();
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(9, doc_with_body("nine")).unwrap();
+        writer.upsert_document(11, doc_with_body("eleven")).unwrap(); // flushes {9, 11}
+        writer.upsert_document(10, doc_with_body("ten")).unwrap();
+        writer.commit().unwrap();
+        let s = segment_holding(&index, &[9, 11]);
+        assert_eq!(
+            index.stats().unwrap().deleted_count,
+            0,
+            "10 superseded nothing"
+        );
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(10).unwrap();
+        writer.commit().unwrap();
+
+        assert!(!marks_deleted(&storage, &s.segment_id, 10));
+        assert_eq!(index.stats().unwrap().deleted_count, 1);
+    }
+
+    /// A merge whose every source document was deleted publishes an empty
+    /// segment with range (0, 0); it holds no document 0 to delete.
+    #[test]
+    fn an_empty_merged_segment_holds_nothing() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for _ in 0..2 {
+            for _ in 0..2 {
+                writer.add_document(doc_with_body("x")).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        for id in 0..4 {
+            writer.delete_document(id).unwrap();
+        }
+        writer.commit().unwrap();
+        drop(writer);
+        index.optimize().unwrap();
+        let empty = committed_segments(&index)
+            .into_iter()
+            .find(|s| s.doc_count == 0)
+            .expect("the fully deleted merge publishes an empty segment");
+        let deleted_before = index.stats().unwrap().deleted_count;
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(0).unwrap();
+        writer.commit().unwrap();
+
+        assert!(!marks_deleted(&storage, &empty.segment_id, 0));
+        assert_eq!(index.stats().unwrap().deleted_count, deleted_before);
+    }
+
+    /// A committed segment written before `.ids` existed still answers from
+    /// its `.norms` slot map.
+    #[test]
+    fn a_segment_without_ids_falls_back_to_its_norms() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            use_compound: false,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(1, doc_with_body("one")).unwrap();
+        writer.upsert_document(10, doc_with_body("ten")).unwrap();
+        writer.commit().unwrap();
+        let s = segment_holding(&index, &[1, 10]);
+        storage
+            .delete_file(&format!("{}.ids", s.segment_id))
+            .unwrap();
+
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(5, doc_with_body("five")).unwrap();
+        writer.commit().unwrap();
+
+        assert!(!marks_deleted(&storage, &s.segment_id, 5));
+    }
+
+    /// A doc-id set that disagrees with the segment's recorded count is not
+    /// trusted: deletions fall back to the id range, so a real copy is still
+    /// deleted instead of being skipped (and left as a duplicate).
+    #[test]
+    fn an_inconsistent_doc_id_set_falls_back_to_the_range() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            use_compound: false,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer.upsert_document(1, doc_with_body("one")).unwrap();
+        writer.upsert_document(10, doc_with_body("ten")).unwrap();
+        writer.commit().unwrap();
+        let s = segment_holding(&index, &[1, 10]);
+        // A valid part that lists only one of the two documents.
+        crate::lexical::index::structures::doc_id_set::write_doc_id_set(
+            storage
+                .create_output(&format!("{}.ids", s.segment_id))
+                .unwrap(),
+            &[1],
+        )
+        .unwrap();
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(10).unwrap();
+        writer.commit().unwrap();
+
+        assert!(
+            marks_deleted(&storage, &s.segment_id, 10),
+            "the untrusted set must not make the deletion skip doc 10"
+        );
+    }
 }

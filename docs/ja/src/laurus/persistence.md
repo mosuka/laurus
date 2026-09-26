@@ -247,7 +247,8 @@ pending 状態がリトライ用に残る）、reader の構築は純粋なメ�
 
 セグメントデータ本体はセグメントごとに 1 つの**コンパウンドコンテナ**
 （`segment_<N>.cfs` — posting・term dictionary・stored documents・field
-lengths/statistics・doc values・フィールドごとの BKD tree を連結し、末尾に
+lengths/statistics・セグメントの doc id の集合・doc values・フィールドごとの
+BKD tree を連結し、末尾に
 パートテーブルを持つ）として書かれます: flush ごとの create と fsync が
 パートごと 1 回ではなく合計 1 回になります。削除ビットマップ（`.delmap`）は
 封印後も書き換えられる唯一のデータとして別ファイルのままです。reader は
