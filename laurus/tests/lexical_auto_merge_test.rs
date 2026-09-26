@@ -210,3 +210,31 @@ fn stats_count_documents_flushed_before_commit() {
     store.commit().unwrap();
     assert_eq!(store.stats().unwrap().doc_count, TITLES.len() as u64);
 }
+
+/// An auto-merge of segments whose documents record no field lengths must
+/// not fail the commit that triggers it (Issue #1213). The merge reads every
+/// source segment's `.norms`, which the reader used to reject as corrupted
+/// past 21 documents — failing `commit()` although its data was persisted.
+#[test]
+fn auto_merge_of_field_less_segments_does_not_fail_the_commit() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder()
+        .max_segments(1)
+        .merge_factor(2)
+        .build();
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+
+    for batch in [1..=30u64, 31..=60] {
+        for id in batch {
+            // `Bytes` fields are never indexed, so no field length is recorded.
+            let document = Document::builder()
+                .add_bytes("blob", id.to_le_bytes().to_vec())
+                .build();
+            store.upsert_document(id, document).unwrap();
+        }
+        store.commit().unwrap();
+    }
+
+    assert_eq!(segment_count(&storage), 1, "the second commit merged");
+    assert_eq!(store.stats().unwrap().doc_count, 60);
+}
