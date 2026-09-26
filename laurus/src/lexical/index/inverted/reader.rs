@@ -24,7 +24,7 @@ use crate::lexical::index::inverted::core::terms::{
 };
 use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
-use crate::lexical::index::inverted::segment::SegmentInfo;
+use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
 use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree};
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
 use crate::lexical::index::structures::dictionary::TermInfo;
@@ -487,47 +487,6 @@ impl SegmentNorms {
     }
 }
 
-/// What a segment is known to hold (Issue #1211).
-///
-/// Deletions and counts address global doc ids, and a segment's
-/// `[min_doc_id, max_doc_id]` range can contain ids it does not hold — a
-/// merge drops deleted documents and can span segments it left out — so the
-/// range alone does not say which ids are the segment's.
-#[derive(Debug, Clone)]
-pub(crate) enum Membership {
-    /// No documents: a merge whose every source document was deleted.
-    Empty,
-    /// Every id of the range: the range has no gaps.
-    Range,
-    /// Exactly these ids, from the `.ids` part (or `.norms` for a segment
-    /// written before it existed).
-    Set(Arc<RoaringTreemap>),
-    /// Not recorded (a pre-#555 segment), or a recorded set that disagrees
-    /// with the segment and so is not trusted.
-    Unknown,
-}
-
-impl Membership {
-    /// Whether the segment holds `doc_id` (which must be inside its range);
-    /// `None` when that is unknown.
-    pub(crate) fn holds(&self, doc_id: u64) -> Option<bool> {
-        match self {
-            Membership::Empty => Some(false),
-            Membership::Range => Some(true),
-            Membership::Set(ids) => Some(ids.contains(doc_id)),
-            Membership::Unknown => None,
-        }
-    }
-}
-
-/// Width of a segment's id range, `max − min + 1`; `None` on overflow or an
-/// inverted range.
-fn range_width(info: &SegmentInfo) -> Option<u64> {
-    info.max_doc_id
-        .checked_sub(info.min_doc_id)
-        .and_then(|w| w.checked_add(1))
-}
-
 /// Reader for a single segment (schema-less mode).
 #[derive(Debug)]
 pub struct SegmentReader {
@@ -901,47 +860,19 @@ impl SegmentReader {
     pub(crate) fn membership(&self) -> &Membership {
         self.membership.get_or_init(|| {
             let info = &self.info;
-            if info.doc_count == 0 {
-                return Membership::Empty;
-            }
-            if range_width(info) == Some(info.doc_count) {
-                return Membership::Range;
-            }
-            match crate::lexical::index::structures::doc_id_set::load_doc_ids_from_segment_storage(
-                self.storage.as_ref(),
-                &info.segment_id,
-            ) {
-                Ok(Some(ids))
-                    if ids.len() == info.doc_count
-                        && ids.min() == Some(info.min_doc_id)
-                        && ids.max() == Some(info.max_doc_id) =>
-                {
-                    Membership::Set(Arc::new(ids))
-                }
-                Ok(Some(ids)) => {
-                    log::warn!(
-                        "segment {} records {} doc ids in [{:?}, {:?}] but claims {} in [{}, {}]; \
-                         its live count falls back to an upper bound",
-                        info.segment_id,
-                        ids.len(),
-                        ids.min(),
-                        ids.max(),
-                        info.doc_count,
+            Membership::from_shape(info.min_doc_id, info.max_doc_id, info.doc_count)
+                .unwrap_or_else(|| {
+                    Membership::from_loaded(
+                        &info.segment_id,
                         info.min_doc_id,
-                        info.max_doc_id
-                    );
-                    Membership::Unknown
-                }
-                Ok(None) => Membership::Unknown,
-                Err(e) => {
-                    log::warn!(
-                        "cannot read the doc-id set of segment {}: {e}; its live count falls back \
-                         to an upper bound",
-                        info.segment_id
-                    );
-                    Membership::Unknown
-                }
-            }
+                        info.max_doc_id,
+                        info.doc_count,
+                        crate::lexical::index::structures::doc_id_set::load_doc_ids_from_segment_storage(
+                            self.storage.as_ref(),
+                            &info.segment_id,
+                        ),
+                    )
+                })
         })
     }
 
@@ -957,11 +888,13 @@ impl SegmentReader {
         };
         let info = &self.info;
         match self.membership() {
-            Membership::Empty => false,
-            Membership::Range | Membership::Unknown => {
-                bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id) > 0
+            // The held count is only a lower bound here: any bit in range
+            // might be a real deletion.
+            Membership::Unknown => bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id) > 0,
+            membership => {
+                membership.held_deletions(&bitmap, info.min_doc_id, info.max_doc_id, info.doc_count)
+                    > 0
             }
-            Membership::Set(ids) => bitmap.deleted_count_in(ids) > 0,
         }
     }
 
@@ -1580,20 +1513,13 @@ impl SegmentReader {
             let Some(bitmap) = self.deletions() else {
                 return info.doc_count;
             };
-            match self.membership() {
-                Membership::Empty => 0,
-                Membership::Range => info
-                    .doc_count
-                    .saturating_sub(bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id)),
-                Membership::Set(ids) => info.doc_count.saturating_sub(bitmap.deleted_count_in(ids)),
-                Membership::Unknown => {
-                    let bits = bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id);
-                    let gaps = range_width(info)
-                        .unwrap_or(u64::MAX)
-                        .saturating_sub(info.doc_count);
-                    info.doc_count.saturating_sub(bits.saturating_sub(gaps))
-                }
-            }
+            let deleted = self.membership().held_deletions(
+                &bitmap,
+                info.min_doc_id,
+                info.max_doc_id,
+                info.doc_count,
+            );
+            info.doc_count.saturating_sub(deleted)
         })
     }
 
@@ -2937,6 +2863,7 @@ mod tests {
             max_doc_id: docs.iter().map(|d| d.0).max().unwrap_or(0),
             generation: 0,
             has_deletions,
+            deleted_count: None,
             shard_id: 0,
         };
         (storage, info)
@@ -3839,6 +3766,7 @@ mod tests {
             max_doc_id: 999,
             generation: 1,
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         };
 
@@ -3900,6 +3828,7 @@ mod tests {
             max_doc_id: 1,
             generation: 0,
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         };
         let reader = SegmentReader::open(info, storage).unwrap();
@@ -3964,6 +3893,7 @@ mod tests {
             max_doc_id: 0,
             generation: 0,
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         };
         let reader = SegmentReader::open(info, storage).unwrap();

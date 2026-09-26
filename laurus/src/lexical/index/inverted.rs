@@ -462,6 +462,7 @@ impl InvertedIndex {
                     max_doc_id: record.max_doc_id,
                     generation: record.generation,
                     has_deletions: record.has_deletions,
+                    deleted_count: None,
                     shard_id: record.shard_id,
                 });
             }
@@ -1500,6 +1501,7 @@ mod tests {
             max_doc_id: 1,
             generation: segment_manifest::stem_ordinal(&flushed[0]).unwrap(),
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         }];
         segment_manifest::save(storage.as_ref(), &landed).unwrap();
@@ -1726,6 +1728,80 @@ mod tests {
         assert!(
             marks_deleted(&storage, &s.segment_id, 10),
             "the untrusted set must not make the deletion skip doc 10"
+        );
+    }
+
+    // ---- Per-segment deletion counts in the manifest, Issue #1212 --------
+
+    fn manifest_entry(index: &InvertedIndex, ids: &[u64]) -> SegmentInfo {
+        segment_holding(index, ids)
+    }
+
+    /// `flush_deletions` records each touched segment's deletion count in the
+    /// manifest, counted from its bitmap: a repeated upsert of one id sets
+    /// one bit, so it counts once (the writer's delta counted it twice).
+    #[test]
+    fn flush_deletions_records_each_segments_deletion_count() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..4 {
+            writer
+                .add_document(doc_with_body(&format!("doc {i}")))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        assert_eq!(manifest_entry(&index, &[0, 1, 2, 3]).deleted_count, Some(0));
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(1).unwrap();
+        writer.upsert_document(2, doc_with_body("v2")).unwrap();
+        writer.upsert_document(2, doc_with_body("v3")).unwrap();
+        writer.commit().unwrap();
+
+        let entry = manifest_entry(&index, &[0, 1, 2, 3]);
+        assert!(entry.has_deletions);
+        assert_eq!(entry.deleted_count, Some(2), "docs 1 and 2, each once");
+    }
+
+    /// A segment flushed and deleted from within one commit enters the
+    /// manifest with its deletion count already recorded.
+    #[test]
+    fn a_segment_deleted_from_before_publication_records_its_count() {
+        let (_storage, index) = index_flushing_every_two_docs();
+        let mut writer = index.writer().unwrap();
+        for i in 0..2 {
+            writer
+                .add_document(doc_with_body(&format!("doc {i}")))
+                .unwrap();
+        }
+        writer.upsert_document(0, doc_with_body("v2")).unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(manifest_entry(&index, &[0, 1]).deleted_count, Some(1));
+    }
+
+    /// A merge drops deleted documents, so its output records no deletions.
+    #[test]
+    fn a_merged_segment_records_no_deletions() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for _ in 0..2 {
+            for _ in 0..2 {
+                writer.add_document(doc_with_body("x")).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        writer.delete_document(0).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        index.optimize().unwrap();
+
+        let merged = manifest_entry(&index, &[1, 2, 3]);
+        assert_eq!(
+            (merged.has_deletions, merged.deleted_count),
+            (false, Some(0))
         );
     }
 }

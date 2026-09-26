@@ -235,6 +235,28 @@ pub(crate) fn upsert_entry(list: &mut Vec<SegmentInfo>, info: SegmentInfo) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `SegmentInfo::deleted_count` (Issue #1212) reads as `None` from an
+    /// entry written by an older build, and `None` is not written back.
+    #[test]
+    fn deleted_count_is_optional_in_the_manifest() {
+        let old = r#"{"segment_id":"s","doc_count":3,"min_doc_id":0,"max_doc_id":2,"generation":0,"has_deletions":true,"shard_id":0}"#;
+        let info: SegmentInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(info.deleted_count, None);
+        assert!(
+            !serde_json::to_string(&info)
+                .unwrap()
+                .contains("deleted_count")
+        );
+
+        let recorded = SegmentInfo {
+            deleted_count: Some(1),
+            ..info
+        };
+        let json = serde_json::to_string(&recorded).unwrap();
+        let back: SegmentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.deleted_count, Some(1));
+    }
     use super::*;
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 
@@ -246,6 +268,7 @@ mod tests {
             max_doc_id: 0,
             generation,
             has_deletions: false,
+            deleted_count: None,
             shard_id: 0,
         }
     }
