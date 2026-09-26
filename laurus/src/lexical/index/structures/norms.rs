@@ -35,6 +35,10 @@
 //! field lengths ends right after `num_fields`, whatever `N` is (Issue
 //! #1213). See `NormsHeader` for how a reader checks each layout.
 //!
+//! The only defined values are `codec_id` 0, flag bit 0, and field
+//! encodings 0 and 1; a reader rejects any other value as corruption rather
+//! than reading the file as something it is not (Issue #1218).
+//!
 //! `sum_length`/`present_count`/`min_length`/`max_length` are the *exact*,
 //! pre-quantisation aggregates -- this is what lets `avg_length` (fed into
 //! BM25's global length normalisation) stay bit-identical to what `.fstats`
@@ -396,8 +400,9 @@ impl NormsHeader {
     ///
     /// # Errors
     ///
-    /// Returns an error when the part has a foreign magic or version, or its
-    /// header is inconsistent with itself or with the file's size.
+    /// Returns an error when the part has a foreign magic or version, an
+    /// unknown codec or flag bit, or a header inconsistent with itself or
+    /// with the file's size.
     fn read<R: StorageInput>(reader: &mut StructReader<R>) -> Result<Self> {
         let file_size = reader.size();
 
@@ -412,8 +417,18 @@ impl NormsHeader {
                 version[0], version[1]
             )));
         }
-        let _codec_id = reader.read_u8()?;
+        let codec_id = reader.read_u8()?;
+        if codec_id != CODEC_TANTIVY_TABLE_V1 {
+            return Err(LaurusError::index(format!(
+                "Unknown .norms codec {codec_id} — segment is corrupted"
+            )));
+        }
         let flags = reader.read_u8()?;
+        if flags & !FLAG_SLOT_MAP_CONTIGUOUS != 0 {
+            return Err(LaurusError::index(format!(
+                "Unknown .norms flags {flags:#010b} — segment is corrupted"
+            )));
+        }
         let contiguous = flags & FLAG_SLOT_MAP_CONTIGUOUS != 0;
 
         // The slot map's count type; checked before anything else is read.
@@ -515,7 +530,8 @@ fn read_sparse_ids<R: StorageInput>(
 /// # Errors
 ///
 /// Returns an error when the part is unreadable, has a foreign magic or
-/// version, or its slot map is inconsistent with its header.
+/// version, an unknown codec or flag bit, or a slot map inconsistent with
+/// its header.
 pub(crate) fn read_doc_ids(
     storage: &dyn Storage,
     segment_id: &str,
@@ -535,8 +551,8 @@ pub(crate) fn read_doc_ids(
 ///
 /// # Errors
 ///
-/// Returns an error when the part has a foreign magic or version, or its
-/// slot map is inconsistent with its header.
+/// Returns an error when the part has a foreign magic or version, an
+/// unknown codec or flag bit, or a slot map inconsistent with its header.
 pub(crate) fn read_doc_ids_from<R: StorageInput>(input: R) -> Result<roaring::RoaringTreemap> {
     let mut reader = StructReader::new(input)?;
     let header = NormsHeader::read(&mut reader)?;
@@ -566,9 +582,10 @@ impl NormsReader {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file has a foreign magic or version, or its
-    /// header, slot map or field directory is inconsistent with itself or
-    /// with the file's size — see [`NormsHeader`].
+    /// Returns an error when the file has a foreign magic or version, an
+    /// unknown codec, flag bit or field encoding, or a header, slot map or
+    /// field directory inconsistent with itself or with the file's size —
+    /// see [`NormsHeader`].
     pub(crate) fn load(storage: &dyn Storage, segment_id: &str) -> Result<Option<Self>> {
         let file_name = format!("{segment_id}{NORMS_EXTENSION}");
         let input = match storage.open_input(&file_name) {
@@ -602,13 +619,19 @@ impl NormsReader {
             let max_length = reader.read_varint()? as u32;
             let encoding = reader.read_u8()?;
 
-            let presence = if encoding == ENCODING_PRESENCE_BITMAP {
-                let nbytes = (doc_count as usize).div_ceil(8);
-                let available = file_size.saturating_sub(reader.position());
-                let nbytes = checked_len(nbytes, available, "presence bitmap")?;
-                Some(reader.read_raw(nbytes)?.into_boxed_slice())
-            } else {
-                None
+            let presence = match encoding {
+                ENCODING_ALL_PRESENT => None,
+                ENCODING_PRESENCE_BITMAP => {
+                    let nbytes = (doc_count as usize).div_ceil(8);
+                    let available = file_size.saturating_sub(reader.position());
+                    let nbytes = checked_len(nbytes, available, "presence bitmap")?;
+                    Some(reader.read_raw(nbytes)?.into_boxed_slice())
+                }
+                other => {
+                    return Err(LaurusError::index(format!(
+                        "Unknown .norms encoding {other} for field {name} — segment is corrupted"
+                    )));
+                }
             };
 
             let available = file_size.saturating_sub(reader.position());
@@ -787,6 +810,7 @@ mod format_tests {
     fn write_header(
         storage: &MemoryStorage,
         segment_id: &str,
+        codec_id: u8,
         flags: u8,
         doc_count: u64,
         (min_doc_id, max_doc_id): (u64, u64),
@@ -798,7 +822,7 @@ mod format_tests {
         let mut writer = StructWriter::new(output);
         writer.write_raw(MAGIC).unwrap();
         writer.write_raw(&VERSION).unwrap();
-        writer.write_u8(CODEC_TANTIVY_TABLE_V1).unwrap();
+        writer.write_u8(codec_id).unwrap();
         writer.write_u8(flags).unwrap();
         writer.write_varint(doc_count).unwrap();
         writer.write_u64(min_doc_id).unwrap();
@@ -883,7 +907,15 @@ mod format_tests {
     #[test]
     fn rejects_a_sparse_slot_map_the_file_cannot_back() {
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
-        write_header(&storage, "seg_short", 0, 1000, (0, 1998), &[]);
+        write_header(
+            &storage,
+            "seg_short",
+            CODEC_TANTIVY_TABLE_V1,
+            0,
+            1000,
+            (0, 1998),
+            &[],
+        );
         assert_both_readers_reject(&storage, "seg_short");
     }
 
@@ -895,6 +927,7 @@ mod format_tests {
         write_header(
             &storage,
             "seg_range",
+            CODEC_TANTIVY_TABLE_V1,
             FLAG_SLOT_MAP_CONTIGUOUS,
             5,
             (0, 10),
@@ -908,8 +941,105 @@ mod format_tests {
     fn rejects_a_slot_map_that_does_not_end_at_max_doc_id() {
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
         // Ids 0 and 2 (one delta of 1), but the header claims a max of 9.
-        write_header(&storage, "seg_end", 0, 2, (0, 9), &[1]);
+        write_header(
+            &storage,
+            "seg_end",
+            CODEC_TANTIVY_TABLE_V1,
+            0,
+            2,
+            (0, 9),
+            &[1],
+        );
         assert_both_readers_reject(&storage, "seg_end");
+    }
+
+    /// A codec other than the only one ever written is rejected by both
+    /// readers rather than decoded as if it were that one (Issue #1218).
+    #[test]
+    fn rejects_an_unknown_codec() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        write_header(
+            &storage,
+            "seg_codec",
+            CODEC_TANTIVY_TABLE_V1 + 1,
+            FLAG_SLOT_MAP_CONTIGUOUS,
+            1,
+            (0, 0),
+            &[],
+        );
+        assert_both_readers_reject(&storage, "seg_codec");
+    }
+
+    /// A flag bit other than the contiguous one is rejected, even next to
+    /// a valid contiguous bit (Issue #1218).
+    #[test]
+    fn rejects_unknown_flag_bits() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        write_header(
+            &storage,
+            "seg_flags",
+            CODEC_TANTIVY_TABLE_V1,
+            0x80 | FLAG_SLOT_MAP_CONTIGUOUS,
+            1,
+            (0, 0),
+            &[],
+        );
+        assert_both_readers_reject(&storage, "seg_flags");
+    }
+
+    /// A field encoding other than "all present" or "presence bitmap" is
+    /// rejected; it used to be read as "all present" (Issue #1218).
+    #[test]
+    fn rejects_an_unknown_field_encoding() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let output = storage.create_output("seg_encoding.norms").unwrap();
+        let mut writer = StructWriter::new(output);
+        writer.write_raw(MAGIC).unwrap();
+        writer.write_raw(&VERSION).unwrap();
+        writer.write_u8(CODEC_TANTIVY_TABLE_V1).unwrap();
+        writer.write_u8(FLAG_SLOT_MAP_CONTIGUOUS).unwrap();
+        writer.write_varint(1).unwrap(); // doc_count
+        writer.write_u64(0).unwrap(); // min_doc_id
+        writer.write_u64(0).unwrap(); // max_doc_id
+        writer.write_varint(1).unwrap(); // num_fields
+        writer.write_string("body").unwrap();
+        for stat in [1, 3, 3, 3] {
+            // present_count, sum_length, min_length, max_length
+            writer.write_varint(stat).unwrap();
+        }
+        writer.write_u8(7).unwrap(); // unknown encoding
+        writer.write_u8(3).unwrap(); // the norm column
+        writer.close().unwrap();
+
+        match NormsReader::load(&storage, "seg_encoding").unwrap_err() {
+            LaurusError::Index(msg) => assert!(msg.contains("corrupted"), "{msg}"),
+            other => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// A field name whose length prefix exceeds the file is rejected before
+    /// its buffer is allocated; it used to request the full declared length
+    /// (Issue #1218).
+    #[test]
+    fn rejects_a_field_name_the_file_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let output = storage.create_output("seg_name.norms").unwrap();
+        let mut writer = StructWriter::new(output);
+        writer.write_raw(MAGIC).unwrap();
+        writer.write_raw(&VERSION).unwrap();
+        writer.write_u8(CODEC_TANTIVY_TABLE_V1).unwrap();
+        writer.write_u8(FLAG_SLOT_MAP_CONTIGUOUS).unwrap();
+        writer.write_varint(0).unwrap(); // doc_count
+        writer.write_u64(0).unwrap(); // min_doc_id
+        writer.write_u64(0).unwrap(); // max_doc_id
+        writer.write_varint(1).unwrap(); // num_fields
+        writer.write_varint(u64::MAX).unwrap(); // impossible name length
+        writer.close().unwrap();
+
+        match NormsReader::load(&storage, "seg_name").unwrap_err() {
+            LaurusError::Index(msg) => assert!(msg.contains("corrupted"), "{msg}"),
+            other => panic!("expected Index error, got {other:?}"),
+        }
     }
 
     /// A buffer holding one id twice records it once (Issue #1210): the

@@ -19,6 +19,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{LaurusError, Result};
 use crate::storage::{StorageInput, StorageOutput};
+use crate::util::alloc_bounds::{checked_capacity_u64, checked_len, checked_len_u64};
 use crate::util::varint::{decode_u64, encode_u64};
 
 /// Structured binary writer with typed fields and CRC-32 checksumming.
@@ -371,6 +372,11 @@ impl<W: StorageOutput> StructWriter<W> {
 /// checksum written by [`StructWriter::close`] can be verified via
 /// [`verify_checksum`](Self::verify_checksum).
 ///
+/// Every read that allocates from a length or count taken from the stream
+/// first bounds it by the bytes left in the input (Issue #1218), so a
+/// corrupt prefix is reported as corruption instead of driving an
+/// allocation large enough to abort the process.
+///
 /// All multi-byte numeric values are expected in **little-endian** byte order.
 pub struct StructReader<R: StorageInput> {
     /// The underlying storage input handle.
@@ -405,6 +411,14 @@ impl<R: StorageInput> StructReader<R> {
             position: 0,
             file_size,
         })
+    }
+
+    /// Bytes left in the input — the bound for a length or count read from
+    /// the stream (Issue #1218). The trailer is not subtracted: not every
+    /// input ends in one, and none of the bytes a prefix describes can lie
+    /// past the end of the input anyway.
+    fn remaining(&self) -> u64 {
+        self.file_size.saturating_sub(self.position)
     }
 
     /// Seek to a position in the input stream.
@@ -580,10 +594,12 @@ impl<R: StorageInput> StructReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying I/O fails or the bytes are not
-    /// valid UTF-8.
+    /// Returns an error if the underlying I/O fails, the bytes are not valid
+    /// UTF-8, or the length prefix exceeds the bytes left in the input (the
+    /// file is corrupted).
     pub fn read_string(&mut self) -> Result<String> {
-        let length = self.read_varint()? as usize;
+        let length = self.read_varint()?;
+        let length = checked_len_u64(length, self.remaining(), "StructReader::read_string length")?;
         let mut bytes = vec![0u8; length];
         self.reader.read_exact(&mut bytes)?;
         self.update_checksum(&bytes);
@@ -600,9 +616,11 @@ impl<R: StorageInput> StructReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying I/O operation fails.
+    /// Returns an error if the underlying I/O operation fails, or the length
+    /// prefix exceeds the bytes left in the input (the file is corrupted).
     pub fn read_bytes(&mut self) -> Result<Vec<u8>> {
-        let length = self.read_varint()? as usize;
+        let length = self.read_varint()?;
+        let length = checked_len_u64(length, self.remaining(), "StructReader::read_bytes length")?;
         let mut bytes = vec![0u8; length];
         self.reader.read_exact(&mut bytes)?;
         self.update_checksum(&bytes);
@@ -622,9 +640,12 @@ impl<R: StorageInput> StructReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying I/O operation fails or the stream
-    /// does not contain enough bytes.
+    /// Returns an error if the underlying I/O operation fails, or `length`
+    /// exceeds the bytes left in the input — checked before the buffer is
+    /// allocated, since a caller's `length` often comes from the file itself
+    /// (Issue #1218).
     pub fn read_raw(&mut self, length: usize) -> Result<Vec<u8>> {
+        let length = checked_len(length, self.remaining(), "StructReader::read_raw length")?;
         let mut bytes = vec![0u8; length];
         self.reader.read_exact(&mut bytes)?;
         self.update_checksum(&bytes);
@@ -653,9 +674,9 @@ impl<R: StorageInput> StructReader<R> {
     ///
     /// * Underlying I/O failure (mmap seek or `read_exact` short
     ///   read).
-    /// * `length` larger than the remaining bytes available in the
-    ///   slice path (caller is expected to bound the request by the
-    ///   posting block size).
+    /// * `length` larger than the bytes left in the input: the slice
+    ///   path is taken only when the input can lend that many bytes, and
+    ///   the fallback is bounded by [`Self::read_raw`] (Issue #1218).
     pub fn read_raw_with<F, T>(&mut self, length: usize, f: F) -> Result<T>
     where
         F: FnOnce(&[u8]) -> T,
@@ -695,9 +716,18 @@ impl<R: StorageInput> StructReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying I/O operation fails.
+    /// Returns an error if the underlying I/O operation fails, or the
+    /// element count exceeds what the bytes left in the input can hold (the
+    /// file is corrupted).
     pub fn read_delta_compressed_u32s(&mut self) -> Result<Vec<u32>> {
-        let length = self.read_varint()? as usize;
+        let length = self.read_varint()?;
+        // Each element is a varint of at least one byte.
+        let length = checked_capacity_u64(
+            length,
+            1,
+            self.remaining(),
+            "StructReader::read_delta_compressed_u32s count",
+        )?;
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -724,9 +754,18 @@ impl<R: StorageInput> StructReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying I/O operation fails.
+    /// Returns an error if the underlying I/O operation fails, or the entry
+    /// count exceeds what the bytes left in the input can hold (the file is
+    /// corrupted).
     pub fn read_string_u64_map(&mut self) -> Result<HashMap<String, u64>> {
-        let length = self.read_varint()? as usize;
+        let length = self.read_varint()?;
+        // Each entry is at least an empty key's 1-byte length and a u64.
+        let length = checked_capacity_u64(
+            length,
+            1 + 8,
+            self.remaining(),
+            "StructReader::read_string_u64_map count",
+        )?;
         let mut map = HashMap::with_capacity(length);
 
         for _ in 0..length {
@@ -981,8 +1020,9 @@ impl<R: StorageInput> BlockReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if reading fails or the block sequence number
-    /// does not match the expected value.
+    /// Returns an error if reading fails, the block sequence number
+    /// does not match the expected value, or the block size exceeds the
+    /// bytes left in the input (see [`StructReader::read_raw`]).
     pub fn read_block(&mut self) -> Result<Option<&[u8]>> {
         if self.reader.is_eof() {
             return Ok(None);
@@ -1203,5 +1243,79 @@ mod tests {
             assert_eq!(decoded, values);
             reader.close().unwrap();
         }
+    }
+
+    /// Writes a lone varint `prefix` — nothing follows it but the trailer —
+    /// and opens a reader over it.
+    fn reader_over_a_lone_prefix(
+        storage: &MemoryStorage,
+        name: &str,
+        prefix: u64,
+    ) -> StructReader<Box<dyn StorageInput>> {
+        let output = storage.create_output(name).unwrap();
+        let mut writer = StructWriter::new(output);
+        writer.write_varint(prefix).unwrap();
+        writer.close().unwrap();
+        StructReader::new(storage.open_input(name).unwrap()).unwrap()
+    }
+
+    fn assert_corrupted<T: std::fmt::Debug>(result: Result<T>) {
+        match result.unwrap_err() {
+            LaurusError::Index(msg) => assert!(msg.contains("corrupted"), "{msg}"),
+            other => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    // A length or count prefix larger than the bytes left in the input is
+    // rejected as corruption before anything is allocated for it (Issue
+    // #1218). Each of these reads used to size an allocation straight from
+    // the prefix; with `u64::MAX`, that panics with a capacity overflow (a
+    // smaller impossible value would abort the process instead).
+
+    #[test]
+    fn read_string_rejects_a_length_the_input_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        assert_corrupted(reader_over_a_lone_prefix(&storage, "s", u64::MAX).read_string());
+    }
+
+    #[test]
+    fn read_bytes_rejects_a_length_the_input_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        assert_corrupted(reader_over_a_lone_prefix(&storage, "b", u64::MAX).read_bytes());
+    }
+
+    #[test]
+    fn read_raw_rejects_a_length_the_input_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        assert_corrupted(reader_over_a_lone_prefix(&storage, "r", 0).read_raw(usize::MAX));
+    }
+
+    #[test]
+    fn read_delta_compressed_u32s_rejects_a_count_the_input_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        assert_corrupted(
+            reader_over_a_lone_prefix(&storage, "d", u64::MAX).read_delta_compressed_u32s(),
+        );
+    }
+
+    #[test]
+    fn read_string_u64_map_rejects_a_count_the_input_cannot_back() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        assert_corrupted(reader_over_a_lone_prefix(&storage, "m", u64::MAX).read_string_u64_map());
+    }
+
+    /// The bound is the bytes left in the input, trailer or not: a length
+    /// that ends exactly at the end of a trailer-less input is read.
+    #[test]
+    fn a_length_prefix_that_ends_exactly_at_the_end_of_the_input_is_read() {
+        use std::io::Write;
+
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut output = storage.create_output("exact").unwrap();
+        output.write_all(&[3, b'a', b'b', b'c']).unwrap();
+        output.close().unwrap();
+
+        let mut reader = StructReader::new(storage.open_input("exact").unwrap()).unwrap();
+        assert_eq!(reader.read_string().unwrap(), "abc");
     }
 }
