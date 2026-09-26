@@ -541,6 +541,12 @@ impl DeletionLog {
                         // EOF or error after string
                         break;
                     }
+                    // Each append uses a fresh StructWriter, whose close() adds
+                    // a CRC trailer after this entry's newline.
+                    if reader.read_u32().is_err() {
+                        // EOF or a truncated checksum trailer
+                        break;
+                    }
                 } else {
                     // Failed to read string (EOF or corruption)
                     break;
@@ -843,6 +849,27 @@ mod tests {
         assert!(result.is_err());
 
         assert!(!bitmap.is_deleted(150));
+    }
+
+    #[test]
+    fn test_deletion_log_resumes_sequence_after_restart() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let log_path = "deletion.log";
+        let log = DeletionLog::new(storage.clone(), log_path.to_string()).unwrap();
+
+        for doc_id in 0..3 {
+            log.log_deletion("segment", doc_id, "test").unwrap();
+        }
+
+        let reopened = DeletionLog::new(storage.clone(), log_path.to_string()).unwrap();
+        assert_eq!(reopened.sequence.load(Ordering::SeqCst), 3);
+
+        reopened
+            .log_deletion("segment", 3, "after restart")
+            .unwrap();
+        let reopened_again = DeletionLog::new(storage, log_path.to_string()).unwrap();
+        assert_eq!(reopened_again.sequence.load(Ordering::SeqCst), 4);
     }
 
     /// v4 (Roaring) `.delmap` round-trips: write then read yields the same
