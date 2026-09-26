@@ -1427,6 +1427,128 @@ mod tests {
         assert_eq!(term_count(&store, "title", "world"), 1);
     }
 
+    fn must_not_alpha() -> Box<dyn Query> {
+        Box::new(
+            crate::lexical::query::BooleanQueryBuilder::new()
+                .must_not(Box::new(TermQuery::new("title", "alpha")))
+                .build(),
+        )
+    }
+
+    /// Issue #1211: re-adding an id leaves the old copy's deletion bit in its
+    /// segment, and that bit must not hide the live copy in the new segment.
+    /// The MustNot-only universe and the numeric-range BKD filter both OR'd
+    /// every segment's bits, so both counts came back 0.
+    #[test]
+    fn a_re_added_id_is_not_hidden_by_its_old_copy() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let doc = |title: &str| {
+            Document::builder()
+                .add_text("title", title)
+                .add_integer("n", 5)
+                .build()
+        };
+        store.upsert_document(1, doc("bravo")).unwrap();
+        store.commit().unwrap();
+        store.upsert_document(1, doc("bravo2")).unwrap();
+        store.commit().unwrap();
+
+        assert_eq!(
+            store
+                .count(LexicalSearchRequest::new(must_not_alpha()))
+                .unwrap(),
+            1
+        );
+        let range = Box::new(crate::lexical::query::NumericRangeQuery::i64_range(
+            "n",
+            Some(0),
+            Some(10),
+        )) as Box<dyn Query>;
+        assert_eq!(store.count(LexicalSearchRequest::new(range)).unwrap(), 1);
+        assert!(!store.reader_for_tests().unwrap().is_deleted(1));
+    }
+
+    /// Issue #1211: under the per-segment fanout, an empty segment (a merge
+    /// whose every source document was deleted) lists no ids, and the
+    /// MustNot-only universe fell back to `0..global_max_doc`, returning ids
+    /// no segment holds.
+    #[test]
+    fn a_must_not_only_search_returns_no_phantom_ids() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for batch in [[1u64, 2], [3, 4]] {
+            for id in batch {
+                store
+                    .upsert_document(id, create_test_document("bravo", "body"))
+                    .unwrap();
+            }
+            store.commit().unwrap();
+        }
+        for id in 1..=4 {
+            store.delete_document_by_internal_id(id).unwrap();
+        }
+        store.commit().unwrap();
+        store.optimize().unwrap();
+        for id in [5u64, 6] {
+            store
+                .upsert_document(id, create_test_document("bravo", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+
+        let mut ids: Vec<u64> = store
+            .search(LexicalSearchRequest::new(must_not_alpha()).limit(100))
+            .unwrap()
+            .hits
+            .iter()
+            .map(|hit| hit.doc_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![5, 6]);
+    }
+
+    /// Issue #1211: a doc-id set that disagrees with its segment is not
+    /// trusted — the universe then comes from the stored documents rather
+    /// than from a set that lists an id the segment never held.
+    #[test]
+    fn an_untrusted_doc_id_set_adds_no_phantom_ids() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config =
+            LexicalIndexConfig::Inverted(crate::lexical::index::config::InvertedIndexConfig {
+                use_compound: false,
+                ..Default::default()
+            });
+        let store = LexicalStore::new(storage.clone(), config).unwrap();
+        for id in [1u64, 10] {
+            store
+                .upsert_document(id, create_test_document("bravo", "body"))
+                .unwrap();
+        }
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(10).unwrap();
+        store.commit().unwrap();
+        let ids_part = storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.ends_with(".ids"))
+            .unwrap();
+        crate::lexical::index::structures::doc_id_set::write_doc_id_set(
+            storage.create_output(&ids_part).unwrap(),
+            &[1, 5],
+        )
+        .unwrap();
+        store.refresh().unwrap();
+
+        assert_eq!(
+            store
+                .count(LexicalSearchRequest::new(must_not_alpha()))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn test_engine_refresh() {
         let temp_dir = TempDir::new().unwrap();

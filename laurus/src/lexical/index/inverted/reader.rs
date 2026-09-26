@@ -507,6 +507,19 @@ pub(crate) enum Membership {
     Unknown,
 }
 
+impl Membership {
+    /// Whether the segment holds `doc_id` (which must be inside its range);
+    /// `None` when that is unknown.
+    pub(crate) fn holds(&self, doc_id: u64) -> Option<bool> {
+        match self {
+            Membership::Empty => Some(false),
+            Membership::Range => Some(true),
+            Membership::Set(ids) => Some(ids.contains(doc_id)),
+            Membership::Unknown => None,
+        }
+    }
+}
+
 /// Width of a segment's id range, `max − min + 1`; `None` on overflow or an
 /// inverted range.
 fn range_width(info: &SegmentInfo) -> Option<u64> {
@@ -950,6 +963,32 @@ impl SegmentReader {
             }
             Membership::Set(ids) => bitmap.deleted_count_in(ids) > 0,
         }
+    }
+
+    /// The ids of the live documents this segment holds, ascending (Issue
+    /// #1211): the ids it holds minus its own deletions. A segment of
+    /// unknown membership lists its stored documents instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment of unknown membership cannot read its
+    /// stored documents.
+    pub(crate) fn live_doc_ids(&self) -> Result<RoaringTreemap> {
+        let info = &self.info;
+        let held: RoaringTreemap = match self.membership() {
+            Membership::Empty => return Ok(RoaringTreemap::new()),
+            Membership::Range => {
+                let mut range = RoaringTreemap::new();
+                range.insert_range(info.min_doc_id..=info.max_doc_id);
+                range
+            }
+            Membership::Set(ids) => (**ids).clone(),
+            Membership::Unknown => self.doc_ids()?.into_iter().collect(),
+        };
+        Ok(match self.deletions() {
+            Some(bitmap) => &held - &*bitmap.deleted_docs.read().unwrap(),
+            None => held,
+        })
     }
 
     /// Check whether a global doc_id is marked as deleted in this segment.
@@ -2132,16 +2171,47 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
     }
 
     fn is_deleted(&self, doc_id: u64) -> bool {
-        // Find the segment containing this document
-        for segment_reader in &self.segment_readers {
-            let reader = segment_reader.read().unwrap();
-            // In Stable ID mode, we ask the reader directly.
-            // A reader returns false if it doesn't own the document.
-            if let Ok(true) = reader.is_deleted(doc_id) {
-                return true;
+        // Decided by the segments that hold the document (Issue #1211): the
+        // same id can be deleted in one segment and live in another (a
+        // re-added id), and a segment can carry a stray bit for an id it
+        // does not hold. A bit counts only where the segment may hold the
+        // id; a segment known to hold it without a bit keeps it live, and
+        // one whose membership is unknown and has no bit does not vote.
+        let covering: Vec<_> = self
+            .segment_readers
+            .iter()
+            .filter(|sr| {
+                let info = &sr.read().unwrap().info;
+                doc_id >= info.min_doc_id && doc_id <= info.max_doc_id
+            })
+            .collect();
+        let marked: Vec<bool> = covering
+            .iter()
+            .map(|sr| matches!(sr.read().unwrap().is_deleted(doc_id), Ok(true)))
+            .collect();
+        if !marked.iter().any(|&bit| bit) {
+            // No covering segment marks it: no membership needs loading.
+            return false;
+        }
+        let mut deleted = false;
+        for (sr, bit) in covering.iter().zip(marked) {
+            let reader = sr.read().unwrap();
+            match (bit, reader.membership().holds(doc_id)) {
+                (false, Some(true)) => return false,
+                (true, Some(true) | None) => deleted = true,
+                _ => {}
             }
         }
-        false
+        deleted
+    }
+
+    fn live_doc_ids(&self) -> Result<Vec<u64>> {
+        self.check_closed()?;
+        let mut live = RoaringTreemap::new();
+        for segment_reader in &self.segment_readers {
+            live |= segment_reader.read().unwrap().live_doc_ids()?;
+        }
+        Ok(live.iter().collect())
     }
 
     fn document(&self, doc_id: u64) -> Result<Option<Document>> {
@@ -2486,10 +2556,17 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
     fn get_bkd_tree(&self, field: &str) -> Result<Option<Arc<dyn BKDTree>>> {
         self.check_closed()?;
 
+        // Each segment's tree is filtered by that segment's own deletion
+        // bitmap (Issue #1211). A tree emits only the ids its segment holds,
+        // so its own bits decide exactly; one snapshot ORing every segment's
+        // bits instead let another segment's bit for the same id — the old
+        // copy of a re-added id, or a stray bit — hide a live hit. Segments
+        // without deletions forward their raw tree, so an index with none
+        // still pays nothing per hit.
         let mut trees = Vec::new();
         for segment_reader in &self.segment_readers {
             let reader = segment_reader.read().unwrap();
-            if let Some(tree) = reader.get_bkd_tree(field)? {
+            if let Some(tree) = reader.get_filtered_bkd_tree(field)? {
                 trees.push(tree);
             }
         }
@@ -2497,33 +2574,7 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         if trees.is_empty() {
             return Ok(None);
         }
-
-        let multi: Arc<dyn BKDTree> = Arc::new(MultiSegmentBKDTree { trees });
-
-        // Capture a lock-free snapshot of every segment's deletion
-        // bitmap *once* here, so per-hit checks during the search
-        // never reach for a `RwLock`. Segments without any deletion
-        // are skipped, and if no segment has any deletion at all the
-        // wrapper's `intersect` short-circuits and forwards verbatim
-        // to the inner BKD tree (zero overhead in the common case).
-        let mut bitmaps = Vec::new();
-        for sr in &self.segment_readers {
-            let reader = sr.read().unwrap();
-            if !reader.info.has_deletions {
-                continue;
-            }
-            // Make sure the bitmap is loaded; the load is idempotent.
-            reader.load_deletion_bitmap()?;
-            if let Some(bitmap) = reader.deletion_bitmap.read().unwrap().clone() {
-                bitmaps.push((reader.info.min_doc_id, reader.info.max_doc_id, bitmap));
-            }
-        }
-        let snapshot = Arc::new(DeletionSnapshot { bitmaps });
-
-        Ok(Some(Arc::new(DeletionFilteringBKDTree {
-            inner: multi,
-            snapshot,
-        })))
+        Ok(Some(Arc::new(MultiSegmentBKDTree { trees })))
     }
 }
 

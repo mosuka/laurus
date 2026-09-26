@@ -13,7 +13,7 @@ use crate::lexical::query::matcher::{
 };
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
 use crate::lexical::query::{HighlightTerm, Query};
-use crate::lexical::reader::{LexicalIndexReader, scan_doc_ids};
+use crate::lexical::reader::LexicalIndexReader;
 
 /// Occurrence requirements for boolean clauses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,11 +262,11 @@ impl Query for BooleanQuery {
                 // actually present in the reader (segment-bounded under the
                 // fanout, correct for sparse id spaces) minus soft-deleted
                 // docs — not the dense `0..max_doc()` range, which yielded
-                // cross-segment, phantom, and deleted ids (#997).
-                let universe: Vec<u64> = scan_doc_ids(reader)?
-                    .filter(|&doc_id| !reader.is_deleted(doc_id))
-                    .collect();
-                Box::new(PreComputedMatcher::new(universe))
+                // cross-segment, phantom, and deleted ids (#997). Each id is
+                // checked against the deletions of the segment that holds
+                // it, so another segment's bit for the same id cannot hide it
+                // (Issue #1211).
+                Box::new(PreComputedMatcher::new(reader.live_doc_ids()?))
             };
 
             // If minimum_should_match is set and we have SHOULD clauses, combine them with MUST
