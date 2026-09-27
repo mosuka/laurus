@@ -682,9 +682,10 @@ pub(crate) fn analyze_field_value(
             // its own and its tokens are appended to ONE ascending position
             // sequence, `position_increment_gap` positions past the previous
             // element's last token. The continuity matters beyond the gap
-            // itself: positions are delta-encoded on write
-            // (`posting.rs`'s `pos.saturating_sub(prev_pos)`), so restarting
-            // each element at 0 would silently corrupt the posting list.
+            // itself: restarting each element at 0 would number the
+            // elements' tokens alike (the encoder sorts a posting's
+            // positions, Issue #1235), so a phrase could match across two
+            // elements.
             // A gap of 0 therefore means "numbered as if concatenated", not
             // "restart". The gap is charged per element, including one that
             // analyzes to no tokens, matching Lucene's per-value

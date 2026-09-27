@@ -3,6 +3,8 @@
 //! This module provides the core inverted index data structures for efficient
 //! term-to-document mapping with frequency and position information.
 
+use std::borrow::Cow;
+
 use ahash::AHashMap;
 use bitpacking::{BitPacker, BitPacker4x};
 
@@ -665,6 +667,8 @@ impl PostingList {
     ///
     /// - `doc_id` must fit in `u32` (i.e. < 2^32). Per-segment doc-id space is
     ///   bounded by Lucene/Tantivy convention; this is enforced at encode time.
+    /// - Each posting's positions are stored as unsigned deltas, so they are
+    ///   written in ascending order — sorted first when they are not.
     ///
     /// # Arguments
     ///
@@ -900,12 +904,30 @@ impl PostingList {
         if any_positions {
             for posting in &self.postings {
                 if let Some(positions) = &posting.positions {
+                    // Positions are written in ascending order, sorting a
+                    // copy when they are not (Issue #1235). Each is stored as
+                    // an unsigned delta from the previous one, so a position
+                    // below its predecessor cannot be written: the saturating
+                    // delta used before flattened it to a repeat, and
+                    // `[5, 3]` read back as `[5, 5]`. Sorting keeps every
+                    // position: `Posting` holds nothing parallel to them, and
+                    // phrase matching looks positions up with `contains`.
+                    // Repeats stay — positions saturated at `u32::MAX` repeat
+                    // in a valid list. Only a hand-built `AnalyzedDocument`,
+                    // or `add_posting` appending a second upsert of the same
+                    // document, produces them out of order.
+                    let positions: Cow<'_, [u32]> = if positions.is_sorted() {
+                        Cow::Borrowed(positions)
+                    } else {
+                        let mut sorted = positions.clone();
+                        sorted.sort_unstable();
+                        Cow::Owned(sorted)
+                    };
                     writer.write_u8(1)?;
                     writer.write_varint(positions.len() as u64)?;
                     let mut prev_pos = 0u32;
-                    for &pos in positions {
-                        let delta = pos.saturating_sub(prev_pos);
-                        writer.write_varint(delta as u64)?;
+                    for &pos in positions.iter() {
+                        writer.write_varint(u64::from(pos - prev_pos))?;
                         prev_pos = pos;
                     }
                 } else {
@@ -1058,6 +1080,51 @@ impl PostingList {
         Ok(num_bits)
     }
 
+    /// A presence flag byte — `any_positions`, `any_weights` or a posting's
+    /// `has_positions` — rejected unless it is 0 or 1 (Issue #1235). Every
+    /// writer stores a `bool`, so another value means the bytes are not
+    /// the list the header describes.
+    fn read_flag<R: StorageInput>(reader: &mut StructReader<R>, what: &str) -> Result<bool> {
+        match reader.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            byte => Err(LaurusError::index(format!(
+                "posting list: the {what} flag is {byte}, not 0 or 1 — segment is corrupted"
+            ))),
+        }
+    }
+
+    /// Decoded doc ids, rejected unless strictly ascending (Issue #1235).
+    ///
+    /// `add_posting` keeps a list sorted and free of repeats, and the
+    /// readers depend on it: `skip_to` searches the doc ids with
+    /// `partition_point`, and a repeated id would be yielded twice. The
+    /// encoding does not guarantee it: a full block is unpacked with
+    /// wrapping deltas, so a corrupt one can descend, and a tail delta of 0
+    /// repeats an id.
+    ///
+    /// The scan folds without an early exit so it vectorises; the offending
+    /// pair is located only once it has failed.
+    fn check_ascending_doc_ids(doc_ids: &[u32]) -> Result<()> {
+        let out_of_order = doc_ids
+            .windows(2)
+            .fold(false, |bad, pair| bad | (pair[0] >= pair[1]));
+        if !out_of_order {
+            return Ok(());
+        }
+        let i = doc_ids
+            .windows(2)
+            .position(|pair| pair[0] >= pair[1])
+            .unwrap_or_default();
+        Err(LaurusError::index(format!(
+            "posting list: doc ids are not strictly ascending, {} at posting {} follows {} — \
+             segment is corrupted",
+            doc_ids[i + 1],
+            i + 1,
+            doc_ids[i]
+        )))
+    }
+
     /// A skip table read from disk, rejected unless it is the one the
     /// writer builds from `doc_ids` (Issue #1224). Formats without an
     /// on-disk table have nothing to check.
@@ -1102,12 +1169,12 @@ impl PostingList {
         let total_frequency = reader.read_varint()?;
         let doc_frequency = reader.read_varint()?;
         let n = reader.read_varint()?;
-        let any_positions = reader.read_u8()? != 0;
+        let any_positions = Self::read_flag(reader, "any_positions")?;
 
         // v3 onward: does Section 3 exist at all? Older versions always
         // wrote it, so they read as if the flag were set (#553).
         let any_weights = if format.has_weight_flag() {
-            reader.read_u8()? != 0
+            Self::read_flag(reader, "any_weights")?
         } else {
             true
         };
@@ -1196,6 +1263,7 @@ impl PostingList {
             doc_ids.push(did);
             prev_did = did;
         }
+        Self::check_ascending_doc_ids(&doc_ids)?;
         Self::check_skip_levels(format, &disk_skip_levels, &doc_ids)?;
 
         // Section 2: frequencies (same zero-copy block path).
@@ -1233,8 +1301,8 @@ impl PostingList {
         // for the common BM25 / boolean case).
         let positions = if any_positions {
             let mut out: Vec<Option<Vec<u32>>> = Vec::with_capacity(n);
-            for _ in 0..n {
-                let has = reader.read_u8()? != 0;
+            for (&doc_id, &frequency) in doc_ids.iter().zip(&frequencies) {
+                let has = Self::read_flag(reader, "has_positions")?;
                 if has {
                     let count = reader.read_varint()?;
                     // Each position is a varint of at least one byte (Issue
@@ -1245,13 +1313,23 @@ impl PostingList {
                         reader.remaining(),
                         "posting position count",
                     )?;
+                    // A posting's frequency is the number of its positions:
+                    // `Posting::with_positions` sets it so, and
+                    // `add_posting` adds both when it merges (Issue #1235).
+                    if count as u64 != u64::from(frequency) {
+                        return Err(LaurusError::index(format!(
+                            "posting list: doc {doc_id} has {count} positions but a frequency \
+                             of {frequency} — segment is corrupted"
+                        )));
+                    }
                     let mut p = Vec::with_capacity(count);
                     let mut prev_pos = 0u32;
                     for _ in 0..count {
                         let delta = reader.read_varint()?;
-                        // The writer stores `pos - prev_pos` (saturating), so
-                        // every real position stays within u32 — including a
-                        // saturated, repeated `u32::MAX` (Issue #1224).
+                        // The writer stores `pos - prev_pos` over sorted
+                        // positions, so every real position stays within u32 —
+                        // including a saturated, repeated `u32::MAX` (Issue
+                        // #1224).
                         let pos = u32::try_from(delta)
                             .ok()
                             .and_then(|delta| prev_pos.checked_add(delta))
@@ -2806,12 +2884,23 @@ mod tests {
         any_positions: bool,
         any_weights: bool,
     ) {
+        write_v3_header_flags(writer, n, u8::from(any_positions), u8::from(any_weights));
+    }
+
+    /// [`write_v3_header`] with its flag bytes as given, so a test can
+    /// store a value no writer produces.
+    fn write_v3_header_flags(
+        writer: &mut StructWriter<Box<dyn StorageOutput>>,
+        n: u64,
+        any_positions: u8,
+        any_weights: u8,
+    ) {
         writer.write_string("t").unwrap();
         writer.write_varint(1).unwrap(); // total_frequency
         writer.write_varint(1).unwrap(); // doc_frequency
         writer.write_varint(n).unwrap();
-        writer.write_u8(u8::from(any_positions)).unwrap();
-        writer.write_u8(u8::from(any_weights)).unwrap();
+        writer.write_u8(any_positions).unwrap();
+        writer.write_u8(any_weights).unwrap();
     }
 
     fn assert_corrupted<T>(result: Result<T>, label: &str) {
@@ -3116,11 +3205,21 @@ mod tests {
         storage: &MemoryStorage,
         deltas: &[u64],
     ) -> StructReader<Box<dyn StorageInput>> {
+        position_list_with_frequency(storage, deltas.len() as u64, deltas)
+    }
+
+    /// [`position_list`] with its frequency as given rather than the number
+    /// of positions.
+    fn position_list_with_frequency(
+        storage: &MemoryStorage,
+        frequency: u64,
+        deltas: &[u64],
+    ) -> StructReader<Box<dyn StorageInput>> {
         reader_over(storage, "positions", |w| {
             write_v3_header(w, 1, true, false);
             w.write_u8(0).unwrap(); // num_levels
             w.write_varint(1).unwrap(); // doc-id delta
-            w.write_varint(deltas.len() as u64).unwrap(); // frequency
+            w.write_varint(frequency).unwrap();
             w.write_u8(1).unwrap(); // has positions
             w.write_varint(deltas.len() as u64).unwrap(); // position count
             for &delta in deltas {
@@ -3165,6 +3264,182 @@ mod tests {
             Some(vec![
                 Some(vec![u32::MAX, u32::MAX]),
                 Some(vec![1, u32::MAX]),
+            ])
+        );
+    }
+
+    // Issue #1235: contradictions the decoder used to read silently — a flag
+    // byte other than 0 or 1, doc ids out of order, a frequency that is not
+    // the posting's position count — are rejected, and the encoder no longer
+    // loses positions that are out of order.
+
+    /// One posting at doc id 1 with frequency 1, under the flag bytes
+    /// given: its weight follows when `any_weights` is not 0, and its
+    /// `has_positions` byte when `any_positions` is not 0, then the single
+    /// position 3 when `has` is not 0.
+    fn flag_list(
+        storage: &MemoryStorage,
+        any_positions: u8,
+        any_weights: u8,
+        has: u8,
+    ) -> StructReader<Box<dyn StorageInput>> {
+        reader_over(storage, "flags", |w| {
+            write_v3_header_flags(w, 1, any_positions, any_weights);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // doc-id delta
+            w.write_varint(1).unwrap(); // frequency
+            if any_weights != 0 {
+                w.write_f32(1.0).unwrap();
+            }
+            if any_positions != 0 {
+                w.write_u8(has).unwrap();
+                if has != 0 {
+                    w.write_varint(1).unwrap(); // position count
+                    w.write_varint(3).unwrap(); // position delta
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_flag_other_than_0_or_1_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let decoded = PostingList::decode_soa_v3(&mut flag_list(&storage, 1, 1, 1)).unwrap();
+        assert_eq!(decoded.weights, vec![1.0]);
+        assert_eq!(decoded.positions, Some(vec![Some(vec![3])]));
+        let decoded = PostingList::decode_soa_v3(&mut flag_list(&storage, 1, 0, 0)).unwrap();
+        assert_eq!(decoded.positions, Some(vec![None]));
+
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut flag_list(&storage, 2, 0, 0)),
+            "any_positions flag is 2",
+        );
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut flag_list(&storage, 0, 2, 0)),
+            "any_weights flag is 2",
+        );
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut flag_list(&storage, 1, 0, 2)),
+            "has_positions flag is 2",
+        );
+    }
+
+    /// A tail doc-id delta of 0 repeats the previous id. The first posting's
+    /// delta is from 0, so a first doc id of 0 is not a repeat.
+    #[test]
+    fn a_repeated_doc_id_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let tail_list = |deltas: [u64; 2]| {
+            reader_over(&storage, "repeat", |w| {
+                write_v3_header(w, 2, false, false);
+                w.write_u8(0).unwrap(); // num_levels
+                for delta in deltas {
+                    w.write_varint(delta).unwrap(); // doc-id delta
+                }
+                for _ in deltas {
+                    w.write_varint(1).unwrap(); // frequency
+                }
+            })
+        };
+        let decoded = PostingList::decode_soa_v3(&mut tail_list([0, 1])).unwrap();
+        assert_eq!(decoded.doc_ids, vec![0, 1]);
+
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut tail_list([5, 0])),
+            "not strictly ascending, 5 at posting 1 follows 5",
+        );
+    }
+
+    /// One full block of 128 postings with frequency 1 whose doc ids are
+    /// `ids`, bit-packed as the writer packs them and after the skip table
+    /// the writer builds from them.
+    fn block_list(
+        storage: &MemoryStorage,
+        ids: &[u32; POSTING_BLOCK_LEN],
+    ) -> StructReader<Box<dyn StorageInput>> {
+        reader_over(storage, "block", |w| {
+            write_v3_header(w, POSTING_BLOCK_LEN as u64, false, false);
+            let levels = build_skip_levels(ids);
+            w.write_u8(levels.len() as u8).unwrap(); // num_levels
+            for level in &levels {
+                w.write_varint(level.len() as u64).unwrap();
+                for &doc_id in level {
+                    w.write_u32(doc_id).unwrap();
+                }
+            }
+            let bitpacker = BitPacker4x::new();
+            let mut packed = [0u8; 4 * POSTING_BLOCK_LEN];
+            let num_bits = bitpacker.num_bits_sorted(0, ids);
+            let bytes = bitpacker.compress_sorted(0, ids, &mut packed, num_bits);
+            w.write_u8(num_bits).unwrap();
+            w.write_raw(&packed[..bytes]).unwrap();
+            let frequencies = [1u32; POSTING_BLOCK_LEN];
+            let num_bits = bitpacker.num_bits(&frequencies);
+            let bytes = bitpacker.compress(&frequencies, &mut packed, num_bits);
+            w.write_u8(num_bits).unwrap();
+            w.write_raw(&packed[..bytes]).unwrap();
+        })
+    }
+
+    /// A bit-packed block is unpacked with wrapping deltas, so a corrupt one
+    /// descends rather than failing. The skip table matches the ids, so only
+    /// their order is wrong.
+    #[test]
+    fn a_block_whose_doc_ids_descend_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut ids: [u32; POSTING_BLOCK_LEN] = std::array::from_fn(|i| i as u32 * 2 + 1);
+        let decoded = PostingList::decode_soa_v3(&mut block_list(&storage, &ids)).unwrap();
+        assert_eq!(decoded.doc_ids, ids);
+
+        ids[64] = 10; // after 127
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut block_list(&storage, &ids)),
+            "not strictly ascending, 10 at posting 64 follows 127",
+        );
+    }
+
+    /// A posting's frequency is its position count whenever it carries
+    /// positions; one without positions keeps any frequency (see
+    /// `test_round_trip_mixed_positions`).
+    #[test]
+    fn a_frequency_other_than_the_position_count_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let decoded =
+            PostingList::decode_soa_v3(&mut position_list_with_frequency(&storage, 2, &[1, 1]))
+                .unwrap();
+        assert_eq!(decoded.frequencies, vec![2]);
+        assert_eq!(decoded.positions, Some(vec![Some(vec![1, 2])]));
+
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut position_list_with_frequency(&storage, 3, &[1, 1])),
+            "doc 1 has 2 positions but a frequency of 3",
+        );
+    }
+
+    /// Positions out of order are written sorted rather than flattened to a
+    /// repeat (`[5, 3]` used to read back as `[5, 5]`), repeats kept and
+    /// sorted ones unchanged — including those `add_posting` appends when
+    /// the same document is added twice.
+    #[test]
+    fn positions_out_of_order_are_written_sorted() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut list = PostingList::new("unsorted".to_string());
+        list.add_posting(Posting::with_positions(1, vec![5, 3]));
+        list.add_posting(Posting::with_positions(2, vec![5, 5, 3]));
+        list.add_posting(Posting::with_positions(3, vec![1, 4, 4, 9]));
+        list.add_posting(Posting::with_positions(4, vec![7, 8]));
+        list.add_posting(Posting::with_positions(4, vec![2]));
+        let mut reader = reader_over(&storage, "unsorted", |w| list.encode_v3(w).unwrap());
+
+        let decoded = PostingList::decode_soa_v3(&mut reader).unwrap();
+        assert_eq!(decoded.frequencies, vec![2, 3, 4, 3]);
+        assert_eq!(
+            decoded.positions,
+            Some(vec![
+                Some(vec![3, 5]),
+                Some(vec![3, 5, 5]),
+                Some(vec![1, 4, 4, 9]),
+                Some(vec![2, 7, 8]),
             ])
         );
     }
