@@ -2255,8 +2255,8 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         // `block_max_score_at`). Tightening this (storing enough
         // per-block raw data to re-anchor the factor at query time) is
         // a format change tracked separately.
-        let mut total_doc_freq = 0;
-        let mut total_term_freq = 0;
+        let mut total_doc_freq = 0u64;
+        let mut total_term_freq = 0u64;
         let mut max_score_factor: f32 = 0.0;
         let mut matched_count = 0_usize;
         let mut combined_block_max: Vec<crate::lexical::index::structures::dictionary::BlockMax> =
@@ -2270,8 +2270,10 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         for segment_reader in &self.segment_readers {
             let reader = segment_reader.read().unwrap();
             if let Some(term_info) = reader.term_info(field, term)? {
-                total_doc_freq += term_info.doc_frequency;
-                total_term_freq += term_info.total_frequency;
+                // Saturating: on-disk statistics a corrupt segment can push
+                // past u64 (Issue #1224).
+                total_doc_freq = total_doc_freq.saturating_add(term_info.doc_frequency);
+                total_term_freq = total_term_freq.saturating_add(term_info.total_frequency);
                 max_score_factor = max_score_factor.max(term_info.max_score_factor);
                 matched_count += 1;
                 combined_block_max.extend(term_info.block_max.iter().copied());
@@ -3425,6 +3427,49 @@ mod tests {
             Err(other) => panic!("expected Index error, got {other:?}"),
             Ok(_) => panic!("a list longer than its segment must be rejected"),
         }
+    }
+
+    /// A term's statistics summed across segments saturate rather than
+    /// overflow on the huge per-segment values a corrupt dictionary can
+    /// carry (Issue #1224).
+    #[test]
+    fn cross_segment_term_statistics_saturate_at_u64_max() {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermInfo};
+        use crate::lexical::reader::LexicalIndexReader;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for _ in 0..2 {
+            writer
+                .add_document(crate::Document::builder().add_text("body", "alpha").build())
+                .unwrap();
+            writer.commit().unwrap();
+        }
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert_eq!(inverted.segment_readers().len(), 2);
+
+        // Both segments' dictionaries claim 2^63 documents and occurrences.
+        let mut builder = TermDictionaryBuilder::new();
+        builder.add_term(
+            "body:alpha".to_string(),
+            TermInfo::new(0, 0, 1 << 63, 1 << 63),
+        );
+        let dict = Arc::new(builder.build().unwrap());
+        for segment in inverted.segment_readers() {
+            *segment.read().unwrap().term_dictionary.write().unwrap() = Some(dict.clone());
+        }
+
+        let info = inverted.term_info("body", "alpha").unwrap().unwrap();
+        assert_eq!((info.doc_freq, info.total_freq), (u64::MAX, u64::MAX));
     }
 
     #[test]

@@ -28,6 +28,8 @@
 // integration is complete.
 #![allow(dead_code)]
 
+use crate::error::{LaurusError, Result};
+
 /// Maximum number of terms in a single dictionary block. Matches the
 /// posting list block size (#403 PR-C) so that block boundaries align
 /// across the dictionary and posting layers.
@@ -61,13 +63,11 @@ pub(super) struct FixedTermInfo {
 /// [block_min_doc_frequency:     u64]
 /// [block_min_total_frequency:   u64]
 /// [ref_max_score_factor:        f32]   (used when max_score_factor_size == 0)
-/// [_padding:                    u32]
 /// [posting_offset_nbits:        u8]
 /// [posting_length_nbits:        u8]
 /// [doc_frequency_nbits:         u8]
 /// [total_frequency_nbits:       u8]
 /// [max_score_factor_size:       u8]    (0 or 32)
-/// [_padding:                    3 bytes]
 /// [payload_len:                 u32]
 /// [payload:                     u8 × payload_len]
 /// ```
@@ -159,13 +159,8 @@ impl FixedTermInfoBlock {
             + posting_length_nbits as usize
             + doc_frequency_nbits as usize
             + total_frequency_nbits as usize;
-        let total_bits = bits_per_entry * term_count;
-        let bytes_4fields = total_bits.div_ceil(8);
-        let bytes_f32 = if max_score_factor_size == 0 {
-            0
-        } else {
-            4 * term_count
-        };
+        let bytes_4fields = packed_len(bits_per_entry, term_count);
+        let bytes_f32 = factor_len(max_score_factor_size, term_count);
 
         let mut payload = vec![0u8; bytes_4fields + bytes_f32];
 
@@ -229,12 +224,68 @@ impl FixedTermInfoBlock {
         }
     }
 
+    /// Check the header against the payload before any entry is decoded.
+    ///
+    /// The writer derives every bit width from a `u64` delta, writes a
+    /// `max_score_factor_size` of 0 or 32, and sizes the payload from
+    /// both. A block that breaks any of these would make
+    /// [`Self::decode_at`] shift past 63 bits or read beyond the payload,
+    /// so it is rejected here, once per block (Issue #1224).
+    ///
+    /// # Errors
+    ///
+    /// [`LaurusError::Index`] when a bit width exceeds 64, the factor size
+    /// is neither 0 nor 32, or the payload length differs from what the
+    /// header describes.
+    pub(super) fn validate(&self) -> Result<()> {
+        for (field, nbits) in [
+            ("posting_offset", self.posting_offset_nbits),
+            ("posting_length", self.posting_length_nbits),
+            ("doc_frequency", self.doc_frequency_nbits),
+            ("total_frequency", self.total_frequency_nbits),
+        ] {
+            if nbits > 64 {
+                return Err(LaurusError::index(format!(
+                    "BlockReader: FixedTermInfoBlock packs {field} in {nbits} bits, more than 64 \
+                     — segment is corrupted"
+                )));
+            }
+        }
+        if !matches!(self.max_score_factor_size, 0 | 32) {
+            return Err(LaurusError::index(format!(
+                "BlockReader: FixedTermInfoBlock max_score_factor size {} is neither 0 nor 32 \
+                 — segment is corrupted",
+                self.max_score_factor_size
+            )));
+        }
+        let term_count = self.term_count as usize;
+        let expected = packed_len(self.bits_per_entry(), term_count)
+            + factor_len(self.max_score_factor_size, term_count);
+        if self.payload.len() != expected {
+            return Err(LaurusError::index(format!(
+                "BlockReader: FixedTermInfoBlock payload is {} bytes but its header describes \
+                 {expected} — segment is corrupted",
+                self.payload.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Decode the entry at `inner_offset` (`0..term_count`).
+    ///
+    /// The block must have passed [`Self::validate`], which keeps every
+    /// read within the payload.
+    ///
+    /// # Errors
+    ///
+    /// [`LaurusError::Index`] when a field's block minimum plus its delta
+    /// overflows `u64` (Issue #1224). The header cannot rule this out: a
+    /// valid block may pack a 64-bit delta over a non-zero minimum.
     ///
     /// # Panics
     ///
     /// Panics if `inner_offset >= self.term_count`.
-    pub(super) fn decode_at(&self, inner_offset: usize) -> FixedTermInfo {
+    pub(super) fn decode_at(&self, inner_offset: usize) -> Result<FixedTermInfo> {
         assert!(
             inner_offset < self.term_count as usize,
             "decode_at: inner_offset {} >= term_count {}",
@@ -242,12 +293,8 @@ impl FixedTermInfoBlock {
             self.term_count
         );
 
-        let bits_per_entry = self.posting_offset_nbits as usize
-            + self.posting_length_nbits as usize
-            + self.doc_frequency_nbits as usize
-            + self.total_frequency_nbits as usize;
-        let total_bits = bits_per_entry * self.term_count as usize;
-        let bytes_4fields = total_bits.div_ceil(8);
+        let bits_per_entry = self.bits_per_entry();
+        let bytes_4fields = packed_len(bits_per_entry, self.term_count as usize);
 
         let mut bit_offset = bits_per_entry * inner_offset;
 
@@ -288,13 +335,61 @@ impl FixedTermInfoBlock {
             f32::from_le_bytes(bytes)
         };
 
-        FixedTermInfo {
-            posting_offset: self.block_min_posting_offset + posting_offset_delta,
-            posting_length: self.block_min_posting_length + posting_length_delta,
-            doc_frequency: self.block_min_doc_frequency + doc_frequency_delta,
-            total_frequency: self.block_min_total_frequency + total_frequency_delta,
+        let add = |field: &str, min: u64, delta: u64| {
+            min.checked_add(delta).ok_or_else(|| {
+                LaurusError::index(format!(
+                    "term dictionary: {field} {min} + {delta} overflows u64 — segment is corrupted"
+                ))
+            })
+        };
+        Ok(FixedTermInfo {
+            posting_offset: add(
+                "posting_offset",
+                self.block_min_posting_offset,
+                posting_offset_delta,
+            )?,
+            posting_length: add(
+                "posting_length",
+                self.block_min_posting_length,
+                posting_length_delta,
+            )?,
+            doc_frequency: add(
+                "doc_frequency",
+                self.block_min_doc_frequency,
+                doc_frequency_delta,
+            )?,
+            total_frequency: add(
+                "total_frequency",
+                self.block_min_total_frequency,
+                total_frequency_delta,
+            )?,
             max_score_factor,
-        }
+        })
+    }
+
+    /// Bits each entry occupies in the bit-packed section.
+    fn bits_per_entry(&self) -> usize {
+        self.posting_offset_nbits as usize
+            + self.posting_length_nbits as usize
+            + self.doc_frequency_nbits as usize
+            + self.total_frequency_nbits as usize
+    }
+}
+
+/// Byte length of the bit-packed delta section: `term_count` entries of
+/// `bits_per_entry` bits each, rounded up to whole bytes. Shared by the
+/// encoder and [`FixedTermInfoBlock::validate`] so the two cannot drift.
+fn packed_len(bits_per_entry: usize, term_count: usize) -> usize {
+    (bits_per_entry * term_count).div_ceil(8)
+}
+
+/// Byte length of the optional `f32` `max_score_factor` section that
+/// follows the bit-packed deltas.
+fn factor_len(max_score_factor_size: u8, term_count: usize) -> usize {
+    if max_score_factor_size == 0 {
+        0
+    } else {
+        4 * term_count
     }
 }
 
@@ -447,7 +542,7 @@ mod tests {
         assert_eq!(block.total_frequency_nbits, 0);
         assert_eq!(block.max_score_factor_size, 0);
 
-        let decoded = block.decode_at(0);
+        let decoded = block.decode_at(0).unwrap();
         assert_eq!(decoded, entries[0]);
     }
 
@@ -458,7 +553,7 @@ mod tests {
         assert_eq!(block.posting_offset_nbits, 0);
         assert_eq!(block.payload.len(), 0); // no payload needed
         for (i, e) in entries.iter().enumerate() {
-            assert_eq!(block.decode_at(i), *e);
+            assert_eq!(block.decode_at(i).unwrap(), *e);
         }
     }
 
@@ -475,7 +570,7 @@ mod tests {
         assert_eq!(block.posting_offset_nbits, 3);
         assert_eq!(block.posting_length_nbits, 0);
         for (i, e) in entries.iter().enumerate() {
-            assert_eq!(block.decode_at(i), *e);
+            assert_eq!(block.decode_at(i).unwrap(), *e);
         }
     }
 
@@ -489,7 +584,7 @@ mod tests {
         // 16 entries × 4 bytes f32 + bit-packed 4-field section
         assert!(block.payload.len() >= 16 * 4);
         for (i, _) in entries.iter().enumerate() {
-            let decoded = block.decode_at(i);
+            let decoded = block.decode_at(i).unwrap();
             assert_eq!(decoded.posting_offset, 1000 + i as u64);
             assert!((decoded.max_score_factor - (1.0 + i as f32 * 0.1)).abs() < 1e-6);
         }
@@ -518,7 +613,7 @@ mod tests {
             .collect();
         let block = FixedTermInfoBlock::encode(&entries);
         for (i, e) in entries.iter().enumerate() {
-            let d = block.decode_at(i);
+            let d = block.decode_at(i).unwrap();
             assert_eq!(d.posting_offset, e.posting_offset);
             assert_eq!(d.posting_length, e.posting_length);
             assert_eq!(d.doc_frequency, e.doc_frequency);
@@ -544,7 +639,7 @@ mod tests {
         let block = FixedTermInfoBlock::encode(&entries);
         assert_eq!(block.posting_length_nbits, 32);
         for (i, e) in entries.iter().enumerate() {
-            assert_eq!(block.decode_at(i), *e);
+            assert_eq!(block.decode_at(i).unwrap(), *e);
         }
     }
 
@@ -569,5 +664,84 @@ mod tests {
         let entries = [fti(0, 0, 0, 0, 0.0); 4];
         let block = FixedTermInfoBlock::encode(&entries);
         let _ = block.decode_at(4);
+    }
+
+    // Issue #1224: a header that disagrees with its payload is rejected
+    // before `decode_at` can shift past 63 bits or read beyond the payload.
+
+    fn assert_corrupted<T: std::fmt::Debug>(result: Result<T>, label: &str) {
+        match result {
+            Ok(value) => panic!("expected a corruption error mentioning {label:?}, got {value:?}"),
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("corrupted") && msg.contains(label), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// A four-entry block whose deltas need a few bits per field and whose
+    /// factors differ, so every section of the payload is present.
+    fn sample_block() -> FixedTermInfoBlock {
+        let entries = [
+            fti(100, 10, 1, 1, 1.0),
+            fti(200, 20, 2, 4, 2.0),
+            fti(300, 30, 3, 9, 3.0),
+            fti(400, 40, 4, 16, 4.0),
+        ];
+        FixedTermInfoBlock::encode(&entries)
+    }
+
+    /// Every block the encoder writes passes validation.
+    #[test]
+    fn encoded_blocks_validate() {
+        sample_block().validate().unwrap();
+        FixedTermInfoBlock::encode(&[fti(0, 0, 0, 0, 0.0)])
+            .validate()
+            .unwrap();
+        FixedTermInfoBlock::encode(&[fti(1, 0, 0, 0, 0.0), fti(u64::MAX, 0, 0, 0, 0.0)])
+            .validate()
+            .unwrap();
+    }
+
+    /// A bit width above 64 is rejected (Issue #1224).
+    #[test]
+    fn a_bit_width_above_64_is_rejected() {
+        let mut block = sample_block();
+        block.doc_frequency_nbits = 65;
+        assert_corrupted(block.validate(), "more than 64");
+    }
+
+    /// A factor size other than 0 or 32 is rejected; `decode_at` would
+    /// otherwise read an `f32` past the payload (Issue #1224).
+    #[test]
+    fn a_factor_size_other_than_0_or_32_is_rejected() {
+        let mut block = sample_block();
+        block.max_score_factor_size = 7;
+        assert_corrupted(block.validate(), "neither 0 nor 32");
+    }
+
+    /// A payload shorter or longer than the header describes is rejected
+    /// (Issue #1224).
+    #[test]
+    fn a_payload_of_the_wrong_length_is_rejected() {
+        let mut short = sample_block();
+        short.payload.pop();
+        assert_corrupted(short.validate(), "payload is");
+
+        let mut long = sample_block();
+        long.payload.push(0);
+        assert_corrupted(long.validate(), "payload is");
+    }
+
+    /// A block minimum plus its delta that overflows `u64` is rejected
+    /// (Issue #1224). Valid data can pack a 64-bit delta over a non-zero
+    /// minimum, so only the addition itself can catch this.
+    #[test]
+    fn a_minimum_plus_delta_overflowing_u64_is_rejected() {
+        let mut block = FixedTermInfoBlock::encode(&[fti(0, 0, 0, 0, 0.0), fti(0, 0, 1, 0, 0.0)]);
+        block.validate().unwrap();
+        block.block_min_doc_frequency = u64::MAX;
+        block.decode_at(0).unwrap();
+        assert_corrupted(block.decode_at(1), "doc_frequency");
     }
 }

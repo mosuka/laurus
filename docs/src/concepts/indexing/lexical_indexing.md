@@ -136,6 +136,12 @@ determined by the sibling `.dict` file's version — the only
 segment-level file carrying a magic and a version number — so the
 posting payload itself never has to be probed.
 
+A table read from disk must be exactly the one the writer builds from
+the decoded `doc_ids`. The decoder compares the two in place and
+rejects any other table as a corrupt segment: `skip_to` relies on that
+shape to keep its strides in range, and a wrong entry would skip
+matching documents.
+
 ### Term Dictionary Storage Layers
 
 The dictionary uses a **two-layer** representation that decouples

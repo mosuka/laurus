@@ -405,8 +405,6 @@ impl BlockTermDictionary {
 
         let fst_bytes_len = reader.read_u32()? as usize;
         let fst_bytes = reader.read_raw(fst_bytes_len)?;
-        let fst = FstMap::new(fst_bytes)
-            .map_err(|e| LaurusError::index(format!("FST parse error: {e}")))?;
 
         let block_section_len = reader.read_u32()? as usize;
         let block_section_vec = reader.read_raw(block_section_len)?;
@@ -414,6 +412,13 @@ impl BlockTermDictionary {
         let total_term_count = reader.read_u64()?;
         let block_count = reader.read_u32()?;
         let _reserved = reader.read_u32()?;
+
+        // Built only once `block_count` is known, which its header is
+        // checked against first (Issue #1224).
+        check_fst_header(&fst_bytes, block_count)?;
+        let fst = FstMap::new(fst_bytes).map_err(|e| {
+            LaurusError::index(format!("FST parse error: {e} — segment is corrupted"))
+        })?;
 
         let block_section: Arc<[u8]> = Arc::from(block_section_vec.into_boxed_slice());
         // Every term costs at least its 4-byte block-max offset, so the
@@ -501,8 +506,10 @@ impl BlockTermDictionary {
 
         for (term, info) in self.iter() {
             total_term_length += term.len();
-            total_doc_frequency += info.doc_frequency;
-            total_term_frequency += info.total_frequency;
+            // Saturating: on-disk statistics a corrupt segment can push
+            // past u64 (Issue #1224).
+            total_doc_frequency = total_doc_frequency.saturating_add(info.doc_frequency);
+            total_term_frequency = total_term_frequency.saturating_add(info.total_frequency);
         }
 
         let avg_term_length = if term_count > 0 {
@@ -668,6 +675,56 @@ impl Default for TermDictionaryBuilder {
     }
 }
 
+/// Check the two header fields `fst::Map::new` trusts, before it sees the
+/// bytes (Issue #1224).
+///
+/// fst 0.4 reads a root address and a key count from the FST's trailer and
+/// narrows both to `usize`, panicking on a 32-bit target when either
+/// exceeds `usize::MAX`; on any target it accepts a non-zero root address
+/// without a range check. This reads the trailer the same way
+/// (`fst::raw::Fst::new`): the root address and the key count are the last
+/// two `u64`s, before a CRC32 from version 3 on.
+///
+/// - The root node is written last, so its address lies inside the bytes.
+/// - The dictionary adds one key per block — the block's last term — so the
+///   key count equals `block_count` exactly.
+///
+/// Input that fst rejects by itself — shorter than its 36-byte minimum, or
+/// of an unknown version — is left to fst's own error.
+///
+/// # Errors
+///
+/// [`LaurusError::Index`] when the root address lies outside the FST or
+/// the key count differs from `block_count`.
+fn check_fst_header(bytes: &[u8], block_count: u32) -> Result<()> {
+    const FST_MIN_LEN: usize = 36;
+    if bytes.len() < FST_MIN_LEN {
+        return Ok(());
+    }
+    let read_u64 = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let end = match read_u64(0) {
+        1 | 2 => bytes.len(),
+        3 => bytes.len() - 4,
+        _ => return Ok(()),
+    };
+    let root_addr = read_u64(end - 8);
+    if root_addr >= bytes.len() as u64 {
+        return Err(LaurusError::index(format!(
+            "term dictionary: FST root address {root_addr} lies outside its {} bytes — segment \
+             is corrupted",
+            bytes.len()
+        )));
+    }
+    let key_count = read_u64(end - 16);
+    if key_count != u64::from(block_count) {
+        return Err(LaurusError::index(format!(
+            "term dictionary: FST holds {key_count} keys but the header declares {block_count} \
+             blocks — segment is corrupted"
+        )));
+    }
+    Ok(())
+}
+
 /// A loaded dictionary's in-memory query layer: the term → ordinal map,
 /// the terms in sorted order, and their [`TermInfo`]s by ordinal.
 type InMemoryLayer = (AHashMap<String, u32>, Vec<String>, Arc<[TermInfo]>);
@@ -682,8 +739,9 @@ type InMemoryLayer = (AHashMap<String, u32>, Vec<String>, Arc<[TermInfo]>);
 ///
 /// # Errors
 ///
-/// Returns an error when the BlockSection yields a different number of
-/// terms than `total_term_count`, the header's count.
+/// Returns an error when a block fails to parse or decode, or when the
+/// BlockSection yields a different number of terms than
+/// `total_term_count`, the header's count.
 fn populate_in_memory_layer(
     block_section: &[u8],
     block_count: u32,
@@ -694,16 +752,19 @@ fn populate_in_memory_layer(
     let mut term_infos: Vec<TermInfo> = Vec::with_capacity(total_term_count);
 
     let iter = block_reader::BlockSectionIter::new(block_section, block_count);
-    for (ordinal, (term, info)) in iter.enumerate() {
+    for (ordinal, entry) in iter.enumerate() {
+        // A block that fails to parse is reported with its own cause
+        // (Issue #1224).
+        let (term, info) = entry?;
         map.insert(term.clone(), ordinal as u32);
         sorted_terms.push(term);
         term_infos.push(info);
     }
 
-    // `BlockSectionIter` ends silently at a block it cannot parse, and the
-    // writer records exactly the terms it encodes. A dictionary cut short
-    // would otherwise load without its later terms — and a merge walking
-    // it would drop them for good (Issue #1220).
+    // The writer records exactly the terms it encodes, so a count that
+    // disagrees with the terms read means the header or the section is
+    // corrupt. A dictionary loaded short would lack its later terms — and a
+    // merge walking it would drop them for good (Issue #1220).
     if sorted_terms.len() != total_term_count {
         return Err(LaurusError::index(format!(
             "term dictionary: read {} terms but the header declares {total_term_count} — \
@@ -1188,21 +1249,37 @@ mod tests {
         bytes
     }
 
-    /// Stores `total_term_count` into a dictionary file's trailer — the u64
-    /// before `block_count`, `reserved` and the CRC — and loads it back.
-    fn load_with_term_count(total_term_count: u64) -> Result<BlockTermDictionary> {
+    /// Writes the 200-term dictionary, lets `patch` edit its bytes, and
+    /// loads the result back.
+    fn load_patched(patch: impl FnOnce(&mut Vec<u8>)) -> Result<BlockTermDictionary> {
         use std::io::Write;
 
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
         let mut bytes = written_dictionary_bytes(&storage, "dict.bin");
-        let at = bytes.len() - 20;
-        bytes[at..at + 8].copy_from_slice(&total_term_count.to_le_bytes());
+        patch(&mut bytes);
         let mut output = storage.create_output("patched.bin").unwrap();
         output.write_all(&bytes).unwrap();
         output.close().unwrap();
 
         let input = storage.open_input("patched.bin").unwrap();
         BlockTermDictionary::read_from_storage(&mut StructReader::new(input).unwrap())
+    }
+
+    /// Stores `total_term_count` into a dictionary file's trailer — the u64
+    /// before `block_count`, `reserved` and the CRC — and loads it back.
+    fn load_with_term_count(total_term_count: u64) -> Result<BlockTermDictionary> {
+        load_patched(|bytes| {
+            let at = bytes.len() - 20;
+            bytes[at..at + 8].copy_from_slice(&total_term_count.to_le_bytes());
+        })
+    }
+
+    /// Where a written dictionary's BlockSection starts: after the magic,
+    /// the version, the FST (a u32 length and its bytes) and the section's
+    /// own u32 length.
+    fn block_section_start(bytes: &[u8]) -> usize {
+        let fst_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        12 + fst_len + 4
     }
 
     fn assert_corrupted<T>(result: Result<T>, label: &str) {
@@ -1226,13 +1303,80 @@ mod tests {
         assert_corrupted(load_with_term_count(u64::MAX), "term dictionary term count");
     }
 
-    /// A dictionary must yield every term its header declares. The block
-    /// walk stops silently at a block it cannot parse, so a dictionary cut
-    /// short would load without its later terms — and a merge walking it
-    /// would drop them for good (Issue #1220).
+    /// A dictionary must yield every term its header declares. One loaded
+    /// short would lack its later terms — and a merge walking it would drop
+    /// them for good (Issue #1220).
     #[test]
     fn a_dictionary_yielding_fewer_terms_than_declared_is_rejected() {
         assert_corrupted(load_with_term_count(201), "read 200 terms");
+    }
+
+    /// A block that fails to parse fails the load with its own cause, not
+    /// with the term-count mismatch its missing terms would cause (Issue
+    /// #1224).
+    #[test]
+    fn a_corrupt_block_fails_the_load_with_its_own_cause() {
+        assert!(load_patched(|_| {}).is_ok(), "the file as written loads");
+        let result = load_patched(|bytes| {
+            let section_at = block_section_start(bytes);
+            let (_, second_block_at) =
+                block_reader::BlockReader::parse(&bytes[section_at..], 0).unwrap();
+            // The second block's term count.
+            bytes[section_at + second_block_at] = 0;
+        });
+        assert_corrupted(result, "declares 0 terms");
+    }
+
+    /// An FST root address outside the FST is rejected before the fst
+    /// crate, which panics on it on a 32-bit target and does not
+    /// range-check it on others (Issue #1224).
+    #[test]
+    fn an_fst_root_address_outside_the_fst_is_rejected() {
+        let result = load_patched(|bytes| {
+            let fst_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            // Version 3: the root address is the u64 before the CRC32.
+            let root_at = 12 + fst_len - 4 - 8;
+            bytes[root_at..root_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert_corrupted(result, "FST root address");
+    }
+
+    /// The FST holds one key per block, so a header declaring another block
+    /// count is rejected (Issue #1224).
+    #[test]
+    fn a_block_count_other_than_the_fsts_key_count_is_rejected() {
+        let result = load_patched(|bytes| {
+            // block_count: the u32 before `reserved` and the CRC.
+            let at = bytes.len() - 12;
+            bytes[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
+        });
+        assert_corrupted(result, "FST holds 2 keys but the header declares 3 blocks");
+    }
+
+    /// Input fst rejects by itself is left to fst, and never read past its
+    /// end by the header check (Issue #1224).
+    #[test]
+    fn the_fst_header_check_leaves_malformed_input_to_fst() {
+        for len in [0, 20, 35] {
+            assert!(check_fst_header(&vec![0; len], 0).is_ok(), "{len} bytes");
+        }
+        let mut unknown_version = vec![0; 36];
+        unknown_version[0] = 9;
+        assert!(check_fst_header(&unknown_version, 0).is_ok());
+        assert!(FstMap::new(unknown_version).is_err());
+    }
+
+    /// The statistic totals saturate rather than overflow on the huge
+    /// per-term values a corrupt segment can carry (Issue #1224).
+    #[test]
+    fn stats_totals_saturate_at_u64_max() {
+        let mut builder = TermDictionaryBuilder::new();
+        for term in ["a", "b"] {
+            builder.add_term(term.to_string(), TermInfo::new(0, 0, 1 << 63, 1 << 63));
+        }
+        let stats = builder.build().unwrap().stats();
+        assert_eq!(stats.total_doc_frequency, u64::MAX);
+        assert_eq!(stats.total_term_frequency, u64::MAX);
     }
 
     #[test]

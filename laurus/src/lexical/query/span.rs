@@ -124,8 +124,13 @@ impl SpanQuery for SpanTermQuery {
                 // Determine positions if available
                 let positions = iter.positions()?;
                 for pos in positions {
-                    // Span for a single term has length 1
-                    spans.push(Span::new(pos as u32, pos as u32 + 1, self.term.clone()));
+                    // Span for a single term has length 1. A valid index can
+                    // hold position u32::MAX — the writer saturates positions
+                    // past a large `position_increment_gap` — so the end
+                    // saturates the same way instead of overflowing (Issue
+                    // #1224).
+                    let start = u32::try_from(pos).unwrap_or(u32::MAX);
+                    spans.push(Span::new(start, start.saturating_add(1), self.term.clone()));
                 }
             }
         }
@@ -332,10 +337,12 @@ impl SpanNearQuery {
             "combined".to_string(),
         );
 
-        let term_length: u32 = sorted_spans.iter().map(|s| s.length()).sum();
-        let gaps = total_span.length().saturating_sub(term_length);
+        // Summed in u64: spans near the top of the u32 position range can
+        // together be longer than u32 holds (Issue #1224).
+        let term_length: u64 = sorted_spans.iter().map(|s| u64::from(s.length())).sum();
+        let gaps = u64::from(total_span.length()).saturating_sub(term_length);
 
-        gaps <= self.slop
+        gaps <= u64::from(self.slop)
     }
 
     /// Combine multiple spans into a single span covering all of them.
@@ -943,5 +950,88 @@ mod tests {
             Span::new(6, 7, "world".to_string()),
         ];
         assert!(!query.spans_satisfy_proximity(&spans));
+    }
+
+    /// A reader holding one posting, at doc 0, with the given positions.
+    #[derive(Debug)]
+    struct PositionsReader(Vec<u32>);
+
+    impl LexicalIndexReader for PositionsReader {
+        fn doc_count(&self) -> u64 {
+            1
+        }
+        fn max_doc(&self) -> u64 {
+            1
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(
+            &self,
+            _doc_id: u64,
+        ) -> Result<Option<crate::lexical::core::document::Document>> {
+            Ok(None)
+        }
+        fn term_info(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(None)
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>> {
+            use crate::lexical::index::inverted::core::posting::Posting;
+            use crate::lexical::index::inverted::reader::InvertedIndexPostingIterator;
+
+            Ok(Some(Box::new(InvertedIndexPostingIterator::new(vec![
+                Posting::with_positions(0, self.0.clone()),
+            ]))))
+        }
+        fn field_stats(&self, _field: &str) -> Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A valid index can hold position `u32::MAX` — the writer saturates
+    /// positions past a large `position_increment_gap` — so its span
+    /// saturates the same way instead of overflowing (Issue #1224).
+    #[test]
+    fn a_term_at_position_u32_max_yields_a_saturated_span() {
+        let query = SpanTermQuery::new("body", "t");
+        let spans = query
+            .get_spans(0, &PositionsReader(vec![7, u32::MAX]))
+            .unwrap();
+        assert_eq!(
+            spans,
+            vec![
+                Span::new(7, 8, "t".to_string()),
+                Span::new(u32::MAX, u32::MAX, "t".to_string()),
+            ]
+        );
+    }
+
+    /// Span lengths are summed without overflowing u32 (Issue #1224).
+    #[test]
+    fn proximity_holds_for_spans_longer_together_than_u32() {
+        let query = SpanNearQuery::new("content", vec![], 0, false);
+        // Overlapping spans, u32::MAX and u32::MAX - 1 long: no gap between them.
+        let spans = vec![
+            Span::new(0, u32::MAX, "hello".to_string()),
+            Span::new(1, u32::MAX, "world".to_string()),
+        ];
+        assert!(query.spans_satisfy_proximity(&spans));
     }
 }
