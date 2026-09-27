@@ -36,7 +36,7 @@ laurus = { version = "0.13.2", path = "laurus", default-features = false }
 laurus-mcp = { version = "0.13.2", path = "laurus-mcp" }
 laurus-server = { version = "0.13.2", path = "laurus-server" }
 prost = "0.14.4"
-rmcp = { version = "3.1.2", features = ["server", "transport-io"] }
+rmcp = { version = "3.4.1", features = ["server", "transport-io"] }
 rustyline = "18.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
