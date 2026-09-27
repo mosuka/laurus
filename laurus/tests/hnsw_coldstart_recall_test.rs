@@ -19,8 +19,14 @@
 //! The gate is **self-recall@10**: query each node with its own vector and check
 //! it appears in its own top-10. A well-built graph is ~1.0; a fragmented one is
 //! much lower. Each test compares the appended nodes' self-recall against a fresh
-//! full build of the same corpus — deterministic and independent of any fixed
-//! absolute threshold (both builds see the identical vectors and query set).
+//! full build of the same corpus, so it needs no fixed absolute threshold (both
+//! builds see the identical vectors and query set).
+//!
+//! A `parallel_build` graph depends on thread interleaving, so each build's
+//! self-recall is a random draw. The rebuild-regime test therefore runs both
+//! builds on a single thread, which makes them deterministic (Issue #1233); the
+//! incremental-regime test keeps real parallelism and takes the best of 3
+//! trials (Issue #886).
 
 use std::sync::Arc;
 
@@ -57,6 +63,19 @@ fn writer_config() -> VectorIndexWriterConfig {
         parallel_build: true,
         ..Default::default()
     }
+}
+
+/// Run `f` on a dedicated single-thread rayon pool, so every `par_iter` inside
+/// the writer runs serially and the build is deterministic (Issue #1233).
+///
+/// The writer still takes its `parallel_build` code path; only the pool it
+/// runs on changes. A panic inside `f` propagates to the caller.
+fn on_single_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("failed to build a single-thread rayon pool")
+        .install(f)
 }
 
 /// Fraction of ids in `[lo, hi)` that appear in their own vector's top-10.
@@ -126,13 +145,16 @@ fn seed_then_append(path: &std::path::Path, name: &str, base: u64, n: u64) {
 /// occasionally produces a graph whose appended-node self-recall dips into a
 /// tail below the tolerance even though the #872 fix is working — a single
 /// build's result is not a reliable pass/fail signal on its own. `cold_trials
-/// == 1` (the seed-1 rebuild regime, which is not flaky — see the module doc)
-/// keeps the original single-build behavior at no extra cost. A genuine
-/// regression (the #872 defect is a structural, deterministic funneling
-/// through `old_ep`, not a scheduling fluke) reproduces on **every** trial, so
-/// taking the max cannot mask it: manually disabling the #872 `promoted_ep`
-/// fix under `RAYON_NUM_THREADS=2` reproduced an identical failing
-/// self-recall@10 (~0.83, tolerance exceeded) on all 3 trials.
+/// == 1` is for callers running on [`on_single_thread`], where every build is
+/// identical and one trial is exact. A genuine regression (the #872 defect is
+/// a structural, deterministic funneling through `old_ep`, not a scheduling
+/// fluke) reproduces on **every** trial, so taking the max cannot mask it:
+/// manually disabling the #872 `promoted_ep` fix under `RAYON_NUM_THREADS=2`
+/// reproduced an identical failing self-recall@10 (~0.83, tolerance exceeded)
+/// on all 3 trials. Not every regression behaves that way, though: disabling
+/// the rebuild regime instead scatters parallel builds across the tolerance
+/// (Issue #1233), so the rebuild-regime test runs single-threaded rather than
+/// taking a best-of-N.
 fn assert_append_matches_fresh(base: u64, n: u64, cold_trials: u32) {
     let fresh_dir = tempdir().unwrap();
     fresh_build(fresh_dir.path(), "fresh", n);
@@ -164,13 +186,21 @@ fn assert_append_matches_fresh(base: u64, n: u64, cold_trials: u32) {
 /// #872, base `< ef_construction`: a seed-1-then-bulk-append build is rebuilt
 /// fresh, so it must reach the same self-recall as a fresh full build.
 ///
-/// Single-trial: the rebuild regime's cold and fresh sides run the identical
-/// full-parallel-build code path (Issue #872's discard-and-rebuild branch), so
-/// their variance is highly correlated and mostly cancels in the diff — this
-/// regime has not been observed to be flaky (Issue #886).
+/// Runs both builds on a single thread (Issue #1233). The cold and fresh sides
+/// take the identical full-build code path (#872's discard-and-rebuild
+/// branch), but under real parallelism each build is an independent draw from
+/// the thread-interleaving distribution, so their variance does not cancel: a
+/// single parallel trial failed ~2.6% of CI jobs once #1150's level draw
+/// widened that distribution. Best-of-N (the #886 fix) would hide the very
+/// regression this test guards: with the rebuild regime disabled, parallel
+/// cold builds scatter across the tolerance (~0.85-0.97), so their max usually
+/// passes. On a single thread the build is deterministic, the two sides agree
+/// (both 0.998 locally), and that regression fails by a wide margin (~0.83).
+/// Parallel builds stay covered by `hnsw_reachability_test` and
+/// [`incremental_append_recall_matches_fresh_build`].
 #[test]
 fn seed_then_bulk_load_recall_matches_fresh_build() {
-    assert_append_matches_fresh(1, 5000, 1);
+    on_single_thread(|| assert_append_matches_fresh(1, 5000, 1));
 }
 
 /// #872, base `>= ef_construction`: appending onto a real (non-trivial) base
