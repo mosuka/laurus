@@ -67,6 +67,69 @@ fn level_rng_seed_for(doc_id: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Number of consecutive new nodes a parallel-build worker claims, and
+/// inserts sequentially, at a time (Issue #1238).
+///
+/// Small on purpose. Larger batches behave more and more like the
+/// contiguous per-thread ranges this scheme replaces (self-recall@10 on the
+/// `hnsw_coldstart_recall_test` corpus, 4 threads: 0.9987 at 16, 0.9954 at
+/// 64, 0.9851 at 256). Claiming one node at a time is worse too (0.9958):
+/// the nodes then inserted together are adjacent in input order, and the
+/// visibility gate (Issue #868) hides each one from the others, so
+/// neighbors on a sorted corpus never link to each other.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_INSERT_BATCH: usize = 16;
+
+/// Run `f` on every id in `ids` on the current rayon pool, with each worker
+/// claiming the next `batch` ids **in input order** from a shared counter
+/// (Issue #1238), the scheme hnswlib's `ParallelFor` and Lucene's
+/// `HnswConcurrentMergeBuilder` use.
+///
+/// `ids.par_iter()` would instead hand each thread a contiguous range, so
+/// each thread grows its own insertion front. When input order follows
+/// position in vector space (e.g. doc ids assigned in ingest order), a
+/// front's region stays linked to the rest of the graph only through the
+/// long edges of its first nodes, which pruning removes as neighborhoods
+/// fill in. The layer-0 graph then splits into large components at the
+/// fronts' boundaries, which ones depending on thread interleaving: on the
+/// `hnsw_coldstart_recall_test` corpus, self-recall@10 fell from 0.998
+/// (serial) to a mean of 0.978 and a minimum of 0.899. Claiming in input
+/// order keeps a single front, as in a serial build.
+///
+/// On a single-thread pool this runs `f` over `ids` serially, in order, so
+/// such builds stay deterministic.
+///
+/// # Errors
+///
+/// Returns the first error `f` returns. Once a worker fails, the counter is
+/// moved past the end so no worker claims another batch; batches already
+/// claimed run to completion.
+#[cfg(not(target_arch = "wasm32"))]
+fn par_for_each_in_order<F>(ids: &[u64], batch: usize, f: F) -> Result<()>
+where
+    F: Fn(u64) -> Result<()> + Sync,
+{
+    let batch = batch.max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    (0..rayon::current_num_threads())
+        .into_par_iter()
+        .try_for_each(|_| {
+            loop {
+                let start = next.fetch_add(batch, std::sync::atomic::Ordering::Relaxed);
+                if start >= ids.len() {
+                    return Ok(());
+                }
+                let end = (start + batch).min(ids.len());
+                for &id in &ids[start..end] {
+                    if let Err(e) = f(id) {
+                        next.store(ids.len(), std::sync::atomic::Ordering::Relaxed);
+                        return Err(e);
+                    }
+                }
+            }
+        })
+}
+
 /// Minimum vector count for training a PQ codebook (Issue #880).
 ///
 /// PQ k-means fits 256 centroids per sub-quantizer; training on fewer
@@ -1205,9 +1268,11 @@ impl HnswIndexWriter {
         // scale disconnected ~96% of the index. The visibility gate makes each
         // concurrent insert see only fully-linked nodes, matching serial HNSW
         // quality; a serial bootstrap warms a connected core so the first
-        // parallel inserts do not all pile onto the lone seed; and a
-        // connectivity-repair pass (below) is the hard backstop that
-        // guarantees full reachability regardless of interleaving.
+        // parallel inserts do not all pile onto the lone seed; workers claim
+        // the remaining nodes in input order (`par_for_each_in_order`, Issue
+        // #1238), so the build grows from a single front as a serial build
+        // does; and a connectivity-repair pass (below) is the hard backstop
+        // that guarantees full reachability regardless of interleaving.
         let writer_ref = &*self;
 
         // The initial search-start node must be visible before any worker runs
@@ -1356,10 +1421,12 @@ impl HnswIndexWriter {
                 insert_one(doc_id, effective_start)?;
             }
 
+            // Claim the rest in input order (Issue #1238): a contiguous range
+            // per thread splits the layer-0 graph at the ranges' boundaries.
             #[cfg(not(target_arch = "wasm32"))]
-            parallel_ids
-                .into_par_iter()
-                .try_for_each(|doc_id| insert_one(doc_id, effective_start))?;
+            par_for_each_in_order(&parallel_ids, PARALLEL_INSERT_BATCH, |doc_id| {
+                insert_one(doc_id, effective_start)
+            })?;
             #[cfg(target_arch = "wasm32")]
             for doc_id in parallel_ids {
                 insert_one(doc_id, effective_start)?;
@@ -2585,5 +2652,123 @@ mod search_layer_arena_tests {
             vec![99],
             "buffer must be cleared, not appended to, between calls"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod par_for_each_in_order_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("failed to build a rayon pool")
+    }
+
+    /// Run `par_for_each_in_order` on `pool` and return `(thread, id)` for
+    /// every call, in call order.
+    fn record_calls(pool: &rayon::ThreadPool, ids: &[u64], batch: usize) -> Vec<(usize, u64)> {
+        let calls = Mutex::new(Vec::new());
+        pool.install(|| {
+            par_for_each_in_order(ids, batch, |id| {
+                let thread = rayon::current_thread_index().expect("must run on the pool");
+                calls.lock().unwrap().push((thread, id));
+                Ok(())
+            })
+        })
+        .expect("no call fails");
+        calls.into_inner().unwrap()
+    }
+
+    #[test]
+    fn processes_every_id_exactly_once() {
+        let pool = pool(4);
+        for n in [0u64, 1, 15, 16, 17, 1000] {
+            let ids: Vec<u64> = (0..n).collect();
+            let mut seen: Vec<u64> = record_calls(&pool, &ids, 16)
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, ids, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn single_thread_pool_runs_in_input_order() {
+        // Deliberately not sorted: the order must be the input order.
+        let ids: Vec<u64> = (0..100).rev().chain(200..250).collect();
+        let seen: Vec<u64> = record_calls(&pool(1), &ids, 16)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(seen, ids);
+    }
+
+    #[test]
+    fn each_batch_runs_on_one_thread_in_input_order() {
+        let batch = 16;
+        let ids: Vec<u64> = (0..1000).collect();
+        let calls = record_calls(&pool(4), &ids, batch);
+        for chunk in ids.chunks(batch) {
+            let in_chunk: Vec<(usize, u64)> = calls
+                .iter()
+                .copied()
+                .filter(|(_, id)| chunk.contains(id))
+                .collect();
+            let thread = in_chunk[0].0;
+            assert!(
+                in_chunk.iter().all(|&(t, _)| t == thread),
+                "batch starting at {} must run on one thread: {in_chunk:?}",
+                chunk[0],
+            );
+            let order: Vec<u64> = in_chunk.iter().map(|&(_, id)| id).collect();
+            assert_eq!(
+                order, chunk,
+                "batch starting at {} must run in order",
+                chunk[0]
+            );
+        }
+    }
+
+    #[test]
+    fn error_stops_the_iteration() {
+        let ids: Vec<u64> = (0..10_000).collect();
+        let fail_at = 20;
+        let calls = AtomicUsize::new(0);
+        let result = pool(1).install(|| {
+            par_for_each_in_order(&ids, 16, |id| {
+                calls.fetch_add(1, AtomicOrdering::Relaxed);
+                if id == fail_at {
+                    Err(LaurusError::internal("injected failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        assert!(result.is_err(), "the error must propagate");
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            fail_at as usize + 1,
+            "no id after the failing one may be processed"
+        );
+    }
+
+    #[test]
+    fn error_propagates_from_a_multi_thread_pool() {
+        let ids: Vec<u64> = (0..10_000).collect();
+        let result = pool(4).install(|| {
+            par_for_each_in_order(&ids, 16, |id| {
+                if id == 5_000 {
+                    Err(LaurusError::internal("injected failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        assert!(result.is_err(), "the error must propagate");
     }
 }
