@@ -45,9 +45,10 @@ fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// # Errors
 ///
-/// [`LaurusError::Index`] when `bytes` ends mid-varint, or when the varint
+/// [`LaurusError::Index`] when `bytes` ends mid-varint, when the varint
 /// runs past the tenth byte, where the shift would pass 63 bits (Issue
-/// #1224).
+/// #1224), or when the tenth byte sets bits above bit 63, which the shift
+/// would drop (Issue #1235).
 pub(super) fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
@@ -58,6 +59,13 @@ pub(super) fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
             ));
         };
         *cursor += 1;
+        // The tenth byte carries bit 63 alone; the writer's minimal
+        // encoding never sets more (Issue #1235).
+        if shift == 63 && byte & 0x7F > 1 {
+            return Err(LaurusError::index(
+                "term dictionary: varint overflows u64 — segment is corrupted",
+            ));
+        }
         result |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             return Ok(result);
@@ -443,6 +451,20 @@ mod tests {
         let mut bytes = vec![0x80; 11];
         bytes.push(0x00);
         assert_corrupted(first_term(&bytes), "longer than 10 bytes");
+    }
+
+    /// A tenth byte with data bits above bit 63 would have them shifted out
+    /// (Issue #1235); `u64::MAX`, whose tenth byte is `0x01`, still decodes.
+    #[test]
+    fn a_tenth_varint_byte_above_bit_63_is_rejected() {
+        let mut bytes = vec![0x80; 9];
+        bytes.push(0x02);
+        assert_corrupted(first_term(&bytes), "overflows u64");
+
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, u64::MAX);
+        assert_eq!(bytes.len(), 10);
+        assert_eq!(read_varint(&bytes, &mut 0).unwrap(), u64::MAX);
     }
 
     /// A first-term length beyond the block is rejected before

@@ -26,6 +26,7 @@ use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
 use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
 use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree};
+use crate::lexical::index::structures::dictionary::BLOCK_SIZE;
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
 use crate::lexical::index::structures::dictionary::TermInfo;
 use crate::lexical::index::structures::doc_values::DocValuesReader;
@@ -666,6 +667,14 @@ impl SegmentReader {
         self.warned_missing_postings.load(Ordering::Relaxed)
     }
 
+    /// Replace this reader's term dictionary (test hook for dictionaries the
+    /// segment load would refuse, Issue #1235). A later load from storage
+    /// overwrites it, so the segment should have no `.dict` part.
+    #[cfg(test)]
+    pub(crate) fn set_term_dictionary(&self, dictionary: Arc<BlockTermDictionary>) {
+        *self.term_dictionary.write().unwrap() = Some(dictionary);
+    }
+
     /// Snapshot of this segment's posting-cache hit / miss counters (Issue #612).
     pub fn posting_cache_stats(
         &self,
@@ -727,7 +736,14 @@ impl SegmentReader {
 
         if let Ok(input) = self.storage.open_input(&dict_file) {
             let mut reader = StructReader::new(input)?;
-            let dictionary = BlockTermDictionary::read_from_storage(&mut reader).map_err(|e| {
+            // Bounded by the documents the segment holds, deleted ones
+            // included, as the posting decode is (Issue #1235). Not
+            // `self.doc_count()`, which is the live count.
+            let dictionary = BlockTermDictionary::read_from_storage_for_segment(
+                &mut reader,
+                self.info.doc_count,
+            )
+            .map_err(|e| {
                 LaurusError::index(format!(
                     "Failed to read term dictionary from {dict_file}: {e}"
                 ))
@@ -1380,6 +1396,12 @@ impl SegmentReader {
                 posting_format,
                 self.info.doc_count,
             )
+            // A list that decodes must still be the one the dictionary
+            // entry describes, inside this segment (Issue #1235).
+            .and_then(|decoded| {
+                self.check_posting_list(&decoded, field, term, &term_info, reader.position())?;
+                Ok(decoded)
+            })
             // Name the segment and term a corruption was found in; other
             // errors (I/O) keep their variant.
             .map_err(|e| match e {
@@ -1415,6 +1437,116 @@ impl SegmentReader {
         } else {
             Ok(None)
         }
+    }
+
+    /// Check a posting list decoded for `field:term` against the dictionary
+    /// entry that located it and against this segment (Issue #1235).
+    ///
+    /// The decoder can only check what a list says about itself. A list
+    /// that decodes cleanly can still be another term's, shorter or longer
+    /// than the one written, or hold ids outside the segment, and would then
+    /// be served as this term's postings. Every check holds for a list the
+    /// writer produced: it records the term's own list, its byte span and
+    /// its posting count, derives the block-max entries from the same
+    /// postings, and the segment's id range from the documents it writes.
+    ///
+    /// `end` is the reader's position after the decode. Positions are
+    /// relative to the `.post` part in both layouts: a compound container
+    /// serves the part through a window that seeks and reports positions
+    /// relative to the part's start, as the writer's were.
+    fn check_posting_list(
+        &self,
+        decoded: &DecodedPostingList,
+        field: &str,
+        term: &str,
+        term_info: &TermInfo,
+        end: u64,
+    ) -> Result<()> {
+        // A dictionary offset that points at another term's list decodes
+        // cleanly, so the list's own key is compared.
+        if decoded
+            .term
+            .strip_prefix(field)
+            .and_then(|rest| rest.strip_prefix(':'))
+            != Some(term)
+        {
+            return Err(LaurusError::index(format!(
+                "posting list: the dictionary entry leads to the list of {:?} — segment is \
+                 corrupted",
+                decoded.term
+            )));
+        }
+        let n = decoded.doc_ids.len();
+        if n as u64 != term_info.doc_frequency {
+            return Err(LaurusError::index(format!(
+                "posting list: holds {n} postings but the dictionary declares {} documents — \
+                 segment is corrupted",
+                term_info.doc_frequency
+            )));
+        }
+        // A corrupt byte can change how much the decoder reads — a varint
+        // continuation bit, a block's bit width — and leave a list that
+        // still parses, with its values shifted. Only its end tells.
+        if end.checked_sub(term_info.posting_offset) != Some(term_info.posting_length) {
+            return Err(LaurusError::index(format!(
+                "posting list: the decode ended at byte {end}, but the dictionary places the list \
+                 at byte {} with {} bytes — segment is corrupted",
+                term_info.posting_offset, term_info.posting_length
+            )));
+        }
+        // The doc ids are strictly ascending (the decoder checks it), so the
+        // ends bound the rest. An id outside the range is not this segment's
+        // document.
+        if let (Some(&first), Some(&last)) = (decoded.doc_ids.first(), decoded.doc_ids.last()) {
+            if u64::from(first) < self.info.min_doc_id {
+                return Err(LaurusError::index(format!(
+                    "posting list: doc id {first} is below the segment's min_doc_id {} — \
+                     segment is corrupted",
+                    self.info.min_doc_id
+                )));
+            }
+            if u64::from(last) > self.info.max_doc_id {
+                return Err(LaurusError::index(format!(
+                    "posting list: doc id {last} is above the segment's max_doc_id {} — \
+                     segment is corrupted",
+                    self.info.max_doc_id
+                )));
+            }
+        }
+        // The scorer finds a document's block as the first entry whose
+        // `last_doc_id` is not below it, and treats a document past the last
+        // entry as unable to score (`current_block_max_score`,
+        // `next_block_boundary`, `block_max_score_at` in the BM25 scorer).
+        // A last entry that ends too early, or an array cut short, would make
+        // it skip the term's remaining documents; a boundary off the list's
+        // own would apply one block's bound to another's documents. The
+        // entries' ascending order and factors are checked when the
+        // dictionary loads. Empty stays allowed: the scorer then uses the
+        // term-level bound, and it is what the writer stores for an empty
+        // list.
+        let block_max = &term_info.block_max;
+        if !block_max.is_empty() {
+            let blocks = n.div_ceil(BLOCK_SIZE);
+            if block_max.len() != blocks {
+                return Err(LaurusError::index(format!(
+                    "posting list: the dictionary has {} block-max entries for {n} postings, \
+                     not {blocks} — segment is corrupted",
+                    block_max.len()
+                )));
+            }
+            for (i, entry) in block_max.iter().enumerate() {
+                // `i < blocks` and `n > 0` here, so the index is in range.
+                let block_last = decoded.doc_ids[((i + 1) * BLOCK_SIZE).min(n) - 1];
+                if entry.last_doc_id != u64::from(block_last) {
+                    return Err(LaurusError::index(format!(
+                        "posting list: block-max entry {i} ends at doc id {}, but block {i} of \
+                         the list ends at {block_last} — segment is corrupted",
+                        entry.last_doc_id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Answer a term query from the stored documents when this segment has
@@ -3382,6 +3514,48 @@ mod tests {
     /// refused as corruption before its buffers are sized (Issue #1220).
     #[test]
     fn postings_are_capped_by_the_segments_document_count() {
+        let (storage, info) = segment_with_three_alphas();
+        let segment = SegmentReader::open(info.clone(), storage.clone()).unwrap();
+        assert!(
+            segment.postings("body", "alpha").unwrap().is_some(),
+            "the segment as written decodes"
+        );
+        // Loaded against the understated count, the dictionary would be
+        // refused first (Issue #1235). The one loaded against the true count
+        // lets the decode reach the posting-list bound.
+        let dictionary = segment
+            .term_dictionary()
+            .unwrap()
+            .expect("the segment has a term dictionary");
+
+        let understated = SegmentInfo {
+            doc_count: 1,
+            ..info
+        };
+        let segment = SegmentReader::open(understated, storage).unwrap();
+        *segment.term_dictionary.write().unwrap() = Some(dictionary);
+        match segment.postings("body", "alpha") {
+            Err(LaurusError::Index(msg)) => {
+                assert!(
+                    msg.contains(
+                        "posting list: header declares 3 postings but the segment holds only 1 \
+                         documents"
+                    ),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("body:alpha"),
+                    "the error names the term: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+            Ok(_) => panic!("a list longer than its segment must be rejected"),
+        }
+    }
+
+    /// Writes one segment of three documents, each holding `body:alpha`,
+    /// and returns its storage and metadata.
+    fn segment_with_three_alphas() -> (Arc<dyn crate::storage::Storage>, SegmentInfo) {
         use crate::lexical::index::LexicalIndex;
         use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
@@ -3402,30 +3576,32 @@ mod tests {
             .downcast_ref::<InvertedIndexReader>()
             .unwrap();
         let info = inverted.segment_readers()[0].read().unwrap().info.clone();
-        assert!(
-            SegmentReader::open(info.clone(), storage.clone())
-                .unwrap()
-                .postings("body", "alpha")
-                .unwrap()
-                .is_some(),
-            "the segment as written decodes"
-        );
+        (storage, info)
+    }
 
+    /// A term cannot occur in more documents than its segment holds, so a
+    /// dictionary claiming so is refused when the segment loads it, naming
+    /// the term (Issue #1235).
+    #[test]
+    fn a_dictionary_term_in_more_documents_than_its_segment_holds_is_rejected() {
+        let (storage, info) = segment_with_three_alphas();
         let understated = SegmentInfo {
             doc_count: 1,
             ..info
         };
         let segment = SegmentReader::open(understated, storage).unwrap();
-        match segment.postings("body", "alpha") {
+        match segment.term_info("body", "alpha") {
             Err(LaurusError::Index(msg)) => {
-                assert!(msg.contains("segment holds only 1 documents"), "{msg}");
                 assert!(
-                    msg.contains("body:alpha"),
-                    "the error names the term: {msg}"
+                    msg.contains(
+                        "term dictionary: term \"body:alpha\" declares 3 documents but the \
+                         segment holds only 1 documents — segment is corrupted"
+                    ),
+                    "{msg}"
                 );
             }
             Err(other) => panic!("expected Index error, got {other:?}"),
-            Ok(_) => panic!("a list longer than its segment must be rejected"),
+            Ok(_) => panic!("a term in more documents than its segment must be rejected"),
         }
     }
 
@@ -3470,6 +3646,299 @@ mod tests {
 
         let info = inverted.term_info("body", "alpha").unwrap().unwrap();
         assert_eq!((info.doc_freq, info.total_freq), (u64::MAX, u64::MAX));
+    }
+
+    // ---- A decoded posting list checked against its dictionary entry and
+    // ---- its segment, Issue #1235 ---------------------------------------
+
+    /// Writes one segment of 200 documents, all holding `body:alpha` and
+    /// every second one `body:beta`, in the given layout. `alpha` spans two
+    /// posting blocks (128 + 72), so its block-max array has two entries.
+    /// Returns the storage, the segment's metadata and its term dictionary as
+    /// the segment loads it.
+    fn segment_with_alphas_and_betas(
+        use_compound: bool,
+    ) -> (
+        Arc<dyn crate::storage::Storage>,
+        SegmentInfo,
+        Arc<BlockTermDictionary>,
+    ) {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            use_compound,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage.clone(), config).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in 0..200 {
+            let body = if i % 2 == 0 { "alpha beta" } else { "alpha" };
+            writer
+                .add_document(crate::Document::builder().add_text("body", body).build())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = writer.build_reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let info = inverted.segment_readers()[0].read().unwrap().info.clone();
+        assert_eq!(
+            (info.doc_count, info.max_doc_id - info.min_doc_id),
+            (200, 199),
+            "the fixture's ids must be one contiguous range"
+        );
+        let dictionary = SegmentReader::open(info.clone(), storage.clone())
+            .unwrap()
+            .term_dictionary()
+            .unwrap()
+            .expect("the segment has a term dictionary");
+        assert_eq!(
+            dictionary.get("body:alpha").unwrap().block_max.len(),
+            2,
+            "the writer records one block-max entry per posting block"
+        );
+        (storage, info, dictionary)
+    }
+
+    /// `dictionary` rebuilt with `body:alpha`'s entry passed through `edit`.
+    fn with_alpha_entry(
+        dictionary: &BlockTermDictionary,
+        edit: impl FnOnce(&mut TermInfo),
+    ) -> Arc<BlockTermDictionary> {
+        use crate::lexical::index::structures::dictionary::TermDictionaryBuilder;
+
+        let mut edit = Some(edit);
+        let mut builder = TermDictionaryBuilder::new();
+        for (key, info) in dictionary.iter() {
+            let mut info = info.clone();
+            if key == "body:alpha" {
+                (edit.take().expect("one entry per key"))(&mut info);
+            }
+            builder.add_term(key.to_string(), info);
+        }
+        assert!(edit.is_none(), "the dictionary holds body:alpha");
+        Arc::new(builder.build().unwrap())
+    }
+
+    /// Opens the segment described by `info`, with `dictionary` in place of
+    /// the one it would load — which also skips the load's own checks.
+    fn open_with_dictionary(
+        storage: &Arc<dyn crate::storage::Storage>,
+        info: SegmentInfo,
+        dictionary: Arc<BlockTermDictionary>,
+    ) -> SegmentReader {
+        let segment = SegmentReader::open(info, storage.clone()).unwrap();
+        *segment.term_dictionary.write().unwrap() = Some(dictionary);
+        segment
+    }
+
+    /// `(doc_id, term_freq)` for every posting `postings(field, term)` yields.
+    fn posting_entries(segment: &SegmentReader, field: &str, term: &str) -> Vec<(u64, u64)> {
+        let mut iter = segment
+            .postings(field, term)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{field}:{term} must have postings"));
+        let mut entries = Vec::new();
+        while iter.next().unwrap() {
+            entries.push((iter.doc_id(), iter.term_freq()));
+        }
+        entries
+    }
+
+    /// Asserts that `body:alpha`'s postings are refused as corruption with a
+    /// message naming the segment, the term and `what`.
+    fn assert_alpha_rejected(segment: &SegmentReader, what: &str) {
+        match segment.postings("body", "alpha") {
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains(what), "{msg}");
+                assert!(msg.contains("segment is corrupted"), "{msg}");
+                assert!(
+                    msg.contains(&format!("segment {}: body:alpha:", segment.info.segment_id)),
+                    "the error names the segment and the term: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+            Ok(_) => panic!("postings refused for `{what}` were accepted"),
+        }
+    }
+
+    /// A segment the writer produced passes every check against its
+    /// dictionary entry and yields the postings it was written with, in both
+    /// layouts: a compound container's part reports positions relative to
+    /// the part, as the loose file does (Issue #1235). A dictionary rebuilt
+    /// from the loaded one passes too, so the tests below that doctor one
+    /// entry of it are refused for that entry alone.
+    #[test]
+    fn postings_matching_their_dictionary_entry_and_segment_decode_unchanged() {
+        for use_compound in [false, true] {
+            let (storage, info, dictionary) = segment_with_alphas_and_betas(use_compound);
+            let all: Vec<(u64, u64)> = (info.min_doc_id..=info.max_doc_id)
+                .map(|id| (id, 1))
+                .collect();
+            let every_second: Vec<(u64, u64)> = all.iter().copied().step_by(2).collect();
+
+            let loaded = SegmentReader::open(info.clone(), storage.clone()).unwrap();
+            assert_eq!(posting_entries(&loaded, "body", "alpha"), all);
+            assert_eq!(posting_entries(&loaded, "body", "beta"), every_second);
+
+            let rebuilt =
+                open_with_dictionary(&storage, info, with_alpha_entry(&dictionary, |_| {}));
+            assert_eq!(posting_entries(&rebuilt, "body", "alpha"), all);
+            assert_eq!(posting_entries(&rebuilt, "body", "beta"), every_second);
+        }
+    }
+
+    /// A dictionary offset pointing at another term's list decodes cleanly;
+    /// the list's own key gives it away (Issue #1235).
+    #[test]
+    fn a_dictionary_entry_leading_to_another_terms_list_is_rejected() {
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+        let beta = dictionary.get("body:beta").unwrap().clone();
+        let doctored = with_alpha_entry(&dictionary, |alpha| {
+            alpha.posting_offset = beta.posting_offset;
+            alpha.posting_length = beta.posting_length;
+        });
+        let segment = open_with_dictionary(&storage, info, doctored);
+        assert_alpha_rejected(
+            &segment,
+            "the dictionary entry leads to the list of \"body:beta\"",
+        );
+    }
+
+    /// A list must hold as many postings as its dictionary entry counts
+    /// documents (Issue #1235). The doctored count stays within the segment's
+    /// document count, which the dictionary load bounds.
+    #[test]
+    fn a_posting_count_differing_from_the_document_frequency_is_rejected() {
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+        let doctored = with_alpha_entry(&dictionary, |alpha| alpha.doc_frequency -= 1);
+        let segment = open_with_dictionary(&storage, info, doctored);
+        assert_alpha_rejected(
+            &segment,
+            "holds 200 postings but the dictionary declares 199 documents",
+        );
+    }
+
+    /// The decode must end exactly where the dictionary entry says the list
+    /// does, one byte short or long included (Issue #1235).
+    #[test]
+    fn a_posting_list_ending_off_its_recorded_length_is_rejected() {
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+        let alpha = dictionary.get("body:alpha").unwrap();
+        let (offset, length) = (alpha.posting_offset, alpha.posting_length);
+        for doctored_length in [length - 1, length + 1] {
+            let doctored =
+                with_alpha_entry(&dictionary, |alpha| alpha.posting_length = doctored_length);
+            let segment = open_with_dictionary(&storage, info.clone(), doctored);
+            assert_alpha_rejected(
+                &segment,
+                &format!(
+                    "the decode ended at byte {}, but the dictionary places the list at byte \
+                     {offset} with {doctored_length} bytes",
+                    offset + length
+                ),
+            );
+        }
+    }
+
+    /// A doc id outside the segment's `[min_doc_id, max_doc_id]` is not the
+    /// segment's document (Issue #1235). The dictionary is the one loaded
+    /// against the true metadata, so only the range can refuse the list.
+    #[test]
+    fn a_posting_outside_the_segments_doc_id_range_is_rejected() {
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+        let (min, max) = (info.min_doc_id, info.max_doc_id);
+
+        let raised_min = SegmentInfo {
+            min_doc_id: min + 1,
+            ..info.clone()
+        };
+        let segment = open_with_dictionary(&storage, raised_min, dictionary.clone());
+        assert_alpha_rejected(
+            &segment,
+            &format!("doc id {min} is below the segment's min_doc_id {}", min + 1),
+        );
+
+        let lowered_max = SegmentInfo {
+            max_doc_id: max - 1,
+            ..info
+        };
+        let segment = open_with_dictionary(&storage, lowered_max, dictionary);
+        assert_alpha_rejected(
+            &segment,
+            &format!("doc id {max} is above the segment's max_doc_id {}", max - 1),
+        );
+    }
+
+    /// Each block-max entry must end where its posting block does (Issue
+    /// #1235). A last entry ending one id early would make the scorer treat
+    /// the term's last document as past its final block, unable to score.
+    #[test]
+    fn a_block_max_entry_off_its_blocks_last_doc_id_is_rejected() {
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+        let max = info.max_doc_id;
+        let doctored = with_alpha_entry(&dictionary, |alpha| {
+            alpha.block_max.last_mut().unwrap().last_doc_id -= 1;
+        });
+        let segment = open_with_dictionary(&storage, info, doctored);
+        assert_alpha_rejected(
+            &segment,
+            &format!(
+                "block-max entry 1 ends at doc id {}, but block 1 of the list ends at {max}",
+                max - 1
+            ),
+        );
+    }
+
+    /// A block-max array must have one entry per posting block (Issue
+    /// #1235): one cut short leaves the last block's documents past the
+    /// array, where the scorer skips them.
+    #[test]
+    fn a_block_max_array_of_the_wrong_length_is_rejected() {
+        use crate::lexical::index::structures::dictionary::BlockMax;
+
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+
+        let truncated = with_alpha_entry(&dictionary, |alpha| {
+            alpha.block_max.pop();
+        });
+        let segment = open_with_dictionary(&storage, info.clone(), truncated);
+        assert_alpha_rejected(
+            &segment,
+            "the dictionary has 1 block-max entries for 200 postings, not 2",
+        );
+
+        let extended = with_alpha_entry(&dictionary, |alpha| {
+            alpha.block_max.push(BlockMax {
+                last_doc_id: info.max_doc_id + 1,
+                max_factor: 1.0,
+            });
+        });
+        let segment = open_with_dictionary(&storage, info, extended);
+        assert_alpha_rejected(
+            &segment,
+            "the dictionary has 3 block-max entries for 200 postings, not 2",
+        );
+    }
+
+    /// An empty block-max array means "no per-block bounds" — the scorer
+    /// falls back to the term-level one — so it is accepted for a non-empty
+    /// list (Issue #1235).
+    #[test]
+    fn an_empty_block_max_array_is_accepted() {
+        let (storage, info, dictionary) = segment_with_alphas_and_betas(true);
+        let all: Vec<(u64, u64)> = (info.min_doc_id..=info.max_doc_id)
+            .map(|id| (id, 1))
+            .collect();
+        let doctored = with_alpha_entry(&dictionary, |alpha| alpha.block_max.clear());
+        let segment = open_with_dictionary(&storage, info, doctored);
+        assert_eq!(posting_entries(&segment, "body", "alpha"), all);
     }
 
     #[test]

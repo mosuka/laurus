@@ -59,7 +59,9 @@ pub fn encode_u64(value: u64) -> Vec<u8> {
 /// # Errors
 ///
 /// Returns an error if the encoding is incomplete (all bytes have the
-/// continuation bit set) or if the value would overflow a u64.
+/// continuation bit set) or if the value would overflow a u64 — including a
+/// tenth byte with data bits above bit 63, which the shift would drop
+/// (Issue #1235).
 pub fn decode_u64(bytes: &[u8]) -> Result<(u64, usize)> {
     let mut result = 0u64;
     let mut shift = 0;
@@ -68,7 +70,9 @@ pub fn decode_u64(bytes: &[u8]) -> Result<(u64, usize)> {
     for &byte in bytes {
         bytes_read += 1;
 
-        if shift >= 64 {
+        // The tenth byte carries bit 63 alone; the encoders here write the
+        // minimal encoding and never set more.
+        if shift >= 64 || (shift == 63 && byte & 0x7F > 1) {
             return Err(LaurusError::other("VarInt overflow"));
         }
 
@@ -114,6 +118,12 @@ pub(crate) fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// * `container` - Names the enclosing structure in error messages
 ///   (truncation / overflow), e.g. `"stored-fields chunk"`.
+///
+/// # Errors
+///
+/// A storage error when `bytes` ends mid-varint, or when the value would
+/// overflow a u64 — including a tenth byte with data bits above bit 63,
+/// which the shift would drop (Issue #1235).
 pub(crate) fn read_varint(bytes: &[u8], cursor: &mut usize, container: &str) -> Result<u64> {
     let mut value = 0u64;
     let mut shift = 0;
@@ -122,6 +132,11 @@ pub(crate) fn read_varint(bytes: &[u8], cursor: &mut usize, container: &str) -> 
             .get(*cursor)
             .ok_or_else(|| LaurusError::storage(format!("{container}: truncated varint")))?;
         *cursor += 1;
+        if shift == 63 && byte & 0x7F > 1 {
+            return Err(LaurusError::storage(format!(
+                "{container}: varint overflow"
+            )));
+        }
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
@@ -171,5 +186,23 @@ mod tests {
         let overflow_data = vec![0xFF; 20]; // Too many bytes for u64
         let result = decode_u64(&overflow_data);
         assert!(result.is_err());
+    }
+
+    /// A tenth byte with data bits above bit 63 is rejected by both
+    /// decoders rather than having them shifted out (Issue #1235), while
+    /// `u64::MAX`, whose tenth byte is `0x01`, still decodes.
+    #[test]
+    fn a_tenth_byte_above_bit_63_is_rejected() {
+        let mut overflowing = vec![0x80; 9];
+        overflowing.push(0x02);
+        let err = decode_u64(&overflowing).unwrap_err();
+        assert!(err.to_string().contains("VarInt overflow"), "{err}");
+        let err = read_varint(&overflowing, &mut 0, "test").unwrap_err();
+        assert!(err.to_string().contains("test: varint overflow"), "{err}");
+
+        let max = encode_u64(u64::MAX);
+        assert_eq!(max.len(), 10);
+        assert_eq!(decode_u64(&max).unwrap(), (u64::MAX, 10));
+        assert_eq!(read_varint(&max, &mut 0, "test").unwrap(), u64::MAX);
     }
 }

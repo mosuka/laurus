@@ -250,7 +250,7 @@ fn term_info_at(
         doc_frequency: fti.doc_frequency,
         total_frequency: fti.total_frequency,
         max_score_factor: fti.max_score_factor,
-        block_max: block_max_data.get(inner_offset),
+        block_max: block_max_data.get(inner_offset)?,
     })
 }
 
@@ -381,7 +381,19 @@ impl<'a> BlockSectionIter<'a> {
                     cb.inner, cb.block_term_count
                 )));
             };
-            let term_string = String::from_utf8_lossy(term_bytes).into_owned();
+            // The writer's keys are `String`s, so invalid bytes mean
+            // corruption. Replacing them would load the key under a name
+            // the writer never gave it — possibly another key's (Issue
+            // #1235).
+            let term_string = std::str::from_utf8(term_bytes)
+                .map_err(|e| {
+                    LaurusError::index(format!(
+                        "term dictionary: term {:?} is not valid UTF-8 ({e}) — segment is \
+                         corrupted",
+                        String::from_utf8_lossy(term_bytes)
+                    ))
+                })?
+                .to_owned();
             let info = term_info_at(&cb.term_info_block, &cb.block_max_data, cb.inner)?;
             cb.inner += 1;
             return Ok(Some((term_string, info)));
@@ -860,6 +872,25 @@ mod tests {
             iter.next().unwrap().unwrap();
         }
         assert_corrupted(iter.next().unwrap(), "yielded 2 of its 3 terms");
+        assert!(iter.next().is_none(), "the walk stops after the error");
+    }
+
+    /// A term that is not valid UTF-8 is rejected rather than loaded with
+    /// its bytes replaced (Issue #1235).
+    #[test]
+    fn block_section_iter_rejects_a_term_that_is_not_utf8() {
+        let terms: Vec<&[u8]> = vec![b"apple", b"ban\xFFna", b"cherry"];
+        let infos = vec![
+            (fti(0, 50, 1, 10, 1.0), Vec::new()),
+            (fti(50, 60, 2, 20, 2.0), Vec::new()),
+            (fti(110, 70, 3, 30, 3.0), Vec::new()),
+        ];
+        let mut section = Vec::new();
+        encode_block_into(&mut section, &terms, &infos);
+
+        let mut iter = BlockSectionIter::new(&section, 1);
+        assert_eq!(iter.next().unwrap().unwrap().0, "apple");
+        assert_corrupted(iter.next().unwrap(), "not valid UTF-8");
         assert!(iter.next().is_none(), "the walk stops after the error");
     }
 }

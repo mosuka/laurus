@@ -381,6 +381,42 @@ impl BlockTermDictionary {
     /// Rejects legacy `STDC` (sorted) / `HTDC` (hash) magic numbers
     /// with an explicit error — pre-release semantics apply.
     pub fn read_from_storage<R: StorageInput>(reader: &mut StructReader<R>) -> Result<Self> {
+        Self::read_from_storage_inner(reader, None)
+    }
+
+    /// Read the dictionary of a segment that holds `max_docs` documents
+    /// (Issue #1235).
+    ///
+    /// On top of [`Self::read_from_storage`]'s checks, a term is rejected
+    /// as corruption when:
+    ///
+    /// - its `doc_frequency` exceeds `max_docs`. The frequency is the
+    ///   term's posting count, and a posting list cannot hold more postings
+    ///   than its segment has documents (see
+    ///   `PostingList::decode_soa_for_segment`) — `max_docs` counts deleted
+    ///   documents too, which stay in the postings until the reader filters
+    ///   them out;
+    /// - its key lacks the `:` between field and term. Every segment writer
+    ///   keys the dictionary by `"<field>:<term>"`.
+    ///
+    /// Both hold only for a segment's dictionary. A dictionary read on its
+    /// own knows no document count, and its keys are free-form — the tests
+    /// here use plain words such as `"apple"` — so
+    /// [`Self::read_from_storage`] applies neither.
+    pub(crate) fn read_from_storage_for_segment<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        max_docs: u64,
+    ) -> Result<Self> {
+        Self::read_from_storage_inner(reader, Some(max_docs))
+    }
+
+    /// The body of [`Self::read_from_storage`] and
+    /// [`Self::read_from_storage_for_segment`]; `max_docs` is the
+    /// segment's document count when the dictionary belongs to one.
+    fn read_from_storage_inner<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        max_docs: Option<u64>,
+    ) -> Result<Self> {
         let magic = reader.read_u32()?;
         match magic {
             MAGIC_LTDD => {} // proceed
@@ -435,7 +471,7 @@ impl BlockTermDictionary {
         // through the in-memory structures; the FST + block_section
         // remain only for `write_to_storage`.
         let (map, sorted_terms, term_infos) =
-            populate_in_memory_layer(&block_section, block_count, expected_terms)?;
+            populate_in_memory_layer(&block_section, block_count, expected_terms, max_docs)?;
 
         Ok(BlockTermDictionary {
             fst: Arc::new(fst),
@@ -737,15 +773,21 @@ type InMemoryLayer = (AHashMap<String, u32>, Vec<String>, Arc<[TermInfo]>);
 /// population happens inline in [`TermDictionaryBuilder::build`] to
 /// avoid a redundant BlockSection walk.
 ///
+/// `max_docs` is the document count of the segment the dictionary belongs
+/// to, if any; see [`BlockTermDictionary::read_from_storage_for_segment`]
+/// for the checks it enables.
+///
 /// # Errors
 ///
-/// Returns an error when a block fails to parse or decode, or when the
-/// BlockSection yields a different number of terms than
+/// Returns an error when a block fails to parse or decode, when the terms
+/// are not strictly ascending, when a term fails a `max_docs` check, or
+/// when the BlockSection yields a different number of terms than
 /// `total_term_count`, the header's count.
 fn populate_in_memory_layer(
     block_section: &[u8],
     block_count: u32,
     total_term_count: usize,
+    max_docs: Option<u64>,
 ) -> Result<InMemoryLayer> {
     let mut map = AHashMap::with_capacity(total_term_count);
     let mut sorted_terms: Vec<String> = Vec::with_capacity(total_term_count);
@@ -756,6 +798,32 @@ fn populate_in_memory_layer(
         // A block that fails to parse is reported with its own cause
         // (Issue #1224).
         let (term, info) = entry?;
+        // The writer emits each key once, in ascending order, within and
+        // across blocks. `seek_index`, `find_prefix` and `find_range`
+        // binary-search `sorted_terms`, and a repeated key would shadow its
+        // first entry in `map` while `iter` still yielded both (Issue #1235).
+        if let Some(prev) = sorted_terms.last()
+            && *prev >= term
+        {
+            return Err(LaurusError::index(format!(
+                "term dictionary: terms {prev:?} then {term:?} are not in ascending order — \
+                 segment is corrupted"
+            )));
+        }
+        if let Some(max_docs) = max_docs {
+            if info.doc_frequency > max_docs {
+                return Err(LaurusError::index(format!(
+                    "term dictionary: term {term:?} declares {} documents but the segment \
+                     holds only {max_docs} documents — segment is corrupted",
+                    info.doc_frequency
+                )));
+            }
+            if !term.contains(':') {
+                return Err(LaurusError::index(format!(
+                    "term dictionary: key {term:?} has no field separator — segment is corrupted"
+                )));
+            }
+        }
         map.insert(term.clone(), ordinal as u32);
         sorted_terms.push(term);
         term_infos.push(info);
@@ -1228,11 +1296,21 @@ mod tests {
 
     /// Writes a 200-term dictionary to `name` and returns its bytes.
     fn written_dictionary_bytes(storage: &Arc<MemoryStorage>, name: &str) -> Vec<u8> {
+        let terms = (0..200u64).map(|i| (format!("term{i:04}"), create_test_term_info(i * 16)));
+        dictionary_bytes(storage, name, terms)
+    }
+
+    /// Writes a dictionary holding `terms` to `name` and returns its bytes.
+    fn dictionary_bytes(
+        storage: &Arc<MemoryStorage>,
+        name: &str,
+        terms: impl IntoIterator<Item = (String, TermInfo)>,
+    ) -> Vec<u8> {
         use std::io::Read;
 
         let mut builder = TermDictionaryBuilder::new();
-        for i in 0..200u64 {
-            builder.add_term(format!("term{i:04}"), create_test_term_info(i * 16));
+        for (term, info) in terms {
+            builder.add_term(term, info);
         }
         let dict = builder.build().unwrap();
         let output = storage.create_output(name).unwrap();
@@ -1364,6 +1442,124 @@ mod tests {
         unknown_version[0] = 9;
         assert!(check_fst_header(&unknown_version, 0).is_ok());
         assert!(FstMap::new(unknown_version).is_err());
+    }
+
+    /// Encodes each of `blocks` — its terms in the order given, as the
+    /// builder's block encoder does not sort them — into a BlockSection, and
+    /// loads it as a dictionary read on its own.
+    fn populate_from_blocks(blocks: &[&[&str]]) -> Result<InMemoryLayer> {
+        let mut section = Vec::new();
+        let mut term_count = 0;
+        for terms in blocks {
+            let term_bytes: Vec<&[u8]> = terms.iter().map(|term| term.as_bytes()).collect();
+            let infos: Vec<term_info_block::FixedTermInfo> = (0..terms.len() as u64)
+                .map(|i| term_info_block::FixedTermInfo {
+                    posting_offset: (term_count + i) * 16,
+                    posting_length: 16,
+                    doc_frequency: 1,
+                    total_frequency: 1,
+                    max_score_factor: 1.0,
+                })
+                .collect();
+            builder::encode_block_into(
+                &mut section,
+                &term_bytes,
+                &infos,
+                &vec![Vec::new(); terms.len()],
+            );
+            term_count += terms.len() as u64;
+        }
+        populate_in_memory_layer(&section, blocks.len() as u32, term_count as usize, None)
+    }
+
+    /// Terms load only in the strictly ascending order the writer emits
+    /// them, within a block and across blocks: the in-memory layer
+    /// binary-searches them, and a repeated key would shadow its first entry
+    /// (Issue #1235).
+    #[test]
+    fn terms_out_of_ascending_order_are_rejected() {
+        let (map, sorted_terms, _) =
+            populate_from_blocks(&[&["apple", "banana"], &["cherry"]]).unwrap();
+        assert_eq!(sorted_terms, ["apple", "banana", "cherry"]);
+        assert_eq!(map.get("cherry"), Some(&2));
+
+        assert_corrupted(
+            populate_from_blocks(&[&["banana", "apple"]]),
+            r#""banana" then "apple" are not in ascending order"#,
+        );
+        assert_corrupted(
+            populate_from_blocks(&[&["apple", "apple"]]),
+            r#""apple" then "apple" are not in ascending order"#,
+        );
+        assert_corrupted(
+            populate_from_blocks(&[&["apple", "cherry"], &["banana"]]),
+            r#""cherry" then "banana" are not in ascending order"#,
+        );
+    }
+
+    /// 200 segment keys, `body:term0000` to `body:term0199`, the i-th in
+    /// `i + 1` documents: two blocks, the largest document frequency (200)
+    /// the last term's.
+    fn segment_terms() -> Vec<(String, TermInfo)> {
+        (0..200u64)
+            .map(|i| {
+                let info = TermInfo::new(i * 16, 16, i + 1, i + 1);
+                (format!("body:term{i:04}"), info)
+            })
+            .collect()
+    }
+
+    /// Writes a dictionary holding `terms` and loads it back — as the
+    /// dictionary of a segment holding `max_docs` documents when given, as
+    /// one read on its own otherwise.
+    fn reload(
+        terms: Vec<(String, TermInfo)>,
+        max_docs: Option<u64>,
+    ) -> Result<BlockTermDictionary> {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        dictionary_bytes(&storage, "dict.bin", terms);
+        let input = storage.open_input("dict.bin").unwrap();
+        let mut reader = StructReader::new(input).unwrap();
+        match max_docs {
+            Some(max_docs) => {
+                BlockTermDictionary::read_from_storage_for_segment(&mut reader, max_docs)
+            }
+            None => BlockTermDictionary::read_from_storage(&mut reader),
+        }
+    }
+
+    /// A segment's term occurs in no more documents than the segment
+    /// holds, so a larger document frequency is rejected (Issue #1235).
+    #[test]
+    fn a_segment_term_in_more_documents_than_the_segment_holds_is_rejected() {
+        let loaded = reload(segment_terms(), Some(200)).unwrap();
+        assert_eq!(
+            loaded.len(),
+            200,
+            "the largest frequency may equal the count"
+        );
+
+        assert_corrupted(
+            reload(segment_terms(), Some(199)),
+            r#""body:term0199" declares 200 documents but the segment holds only 199 documents"#,
+        );
+    }
+
+    /// Every segment key names its field before a `:`, so a key without one
+    /// is rejected — but only for a segment: a dictionary read on its own
+    /// keys its terms freely (Issue #1235).
+    #[test]
+    fn a_segment_key_without_a_field_separator_is_rejected() {
+        let mut terms = segment_terms();
+        terms[199].0 = "bodyterm0199".to_string();
+        assert_corrupted(
+            reload(terms.clone(), Some(200)),
+            r#"key "bodyterm0199" has no field separator"#,
+        );
+        assert!(
+            reload(terms, None).is_ok(),
+            "a dictionary read on its own keeps the key"
+        );
     }
 
     /// The statistic totals saturate rather than overflow on the huge
