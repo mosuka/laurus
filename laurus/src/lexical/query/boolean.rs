@@ -472,10 +472,12 @@ impl Query for BooleanQuery {
     }
 
     fn cost(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
-        let mut total_cost = 0;
+        let mut total_cost = 0u64;
 
         for clause in &self.clauses {
-            total_cost += clause.query.cost(reader)?;
+            // Saturating: a clause's cost can come from on-disk statistics
+            // a corrupt segment pushes to u64::MAX (Issue #1224).
+            total_cost = total_cost.saturating_add(clause.query.cost(reader)?);
         }
 
         Ok(total_cost)

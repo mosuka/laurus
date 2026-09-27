@@ -506,8 +506,10 @@ impl BlockTermDictionary {
 
         for (term, info) in self.iter() {
             total_term_length += term.len();
-            total_doc_frequency += info.doc_frequency;
-            total_term_frequency += info.total_frequency;
+            // Saturating: on-disk statistics a corrupt segment can push
+            // past u64 (Issue #1224).
+            total_doc_frequency = total_doc_frequency.saturating_add(info.doc_frequency);
+            total_term_frequency = total_term_frequency.saturating_add(info.total_frequency);
         }
 
         let avg_term_length = if term_count > 0 {
@@ -1362,6 +1364,19 @@ mod tests {
         unknown_version[0] = 9;
         assert!(check_fst_header(&unknown_version, 0).is_ok());
         assert!(FstMap::new(unknown_version).is_err());
+    }
+
+    /// The statistic totals saturate rather than overflow on the huge
+    /// per-term values a corrupt segment can carry (Issue #1224).
+    #[test]
+    fn stats_totals_saturate_at_u64_max() {
+        let mut builder = TermDictionaryBuilder::new();
+        for term in ["a", "b"] {
+            builder.add_term(term.to_string(), TermInfo::new(0, 0, 1 << 63, 1 << 63));
+        }
+        let stats = builder.build().unwrap().stats();
+        assert_eq!(stats.total_doc_frequency, u64::MAX);
+        assert_eq!(stats.total_term_frequency, u64::MAX);
     }
 
     #[test]

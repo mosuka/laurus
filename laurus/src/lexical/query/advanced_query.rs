@@ -277,14 +277,15 @@ impl Query for AdvancedQuery {
 
     fn cost(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
         let base_cost = self.core_query.cost(reader)?;
+        // Saturating, as in `BooleanQuery::cost` (Issue #1224).
         let filter_cost = self
             .filters
             .iter()
             .map(|f| f.cost(reader))
             .collect::<Result<Vec<_>>>()?
-            .iter()
-            .sum::<u64>();
-        Ok(base_cost + filter_cost)
+            .into_iter()
+            .fold(0u64, u64::saturating_add);
+        Ok(base_cost.saturating_add(filter_cost))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -854,5 +855,86 @@ mod tests {
         let mut ids: Vec<u64> = results.iter().map(|r| r.doc_id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![7, 9], "the first hit must not be dropped");
+    }
+
+    /// A reader whose every term claims `u64::MAX` documents, as a corrupt
+    /// dictionary can, so a `TermQuery` costs `u64::MAX`.
+    #[derive(Debug)]
+    struct SaturatedStatsReader;
+
+    impl LexicalIndexReader for SaturatedStatsReader {
+        fn doc_count(&self) -> u64 {
+            0
+        }
+        fn max_doc(&self) -> u64 {
+            0
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(
+            &self,
+            _doc_id: u64,
+        ) -> crate::error::Result<Option<crate::lexical::core::document::Document>> {
+            Ok(None)
+        }
+        fn term_info(
+            &self,
+            field: &str,
+            term: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(Some(crate::lexical::reader::ReaderTermInfo {
+                field: field.to_string(),
+                term: term.to_string(),
+                doc_freq: u64::MAX,
+                total_freq: u64::MAX,
+                posting_offset: 0,
+                posting_size: 0,
+                max_score_factor: 0.0,
+                block_max: Vec::new(),
+            }))
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>>
+        {
+            Ok(None)
+        }
+        fn field_stats(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Query costs summed from `u64::MAX` term costs saturate rather than
+    /// overflow (Issue #1224): across a boolean query's clauses, across
+    /// the filters, and filters plus the core query.
+    #[test]
+    fn cost_sums_saturate_at_u64_max() {
+        use crate::lexical::query::boolean::BooleanQuery;
+
+        let reader = SaturatedStatsReader;
+        let mut core = BooleanQuery::new();
+        core.add_should(Box::new(TermQuery::new("body", "a")));
+        core.add_should(Box::new(TermQuery::new("body", "b")));
+        assert_eq!(core.cost(&reader).unwrap(), u64::MAX);
+
+        let query = AdvancedQuery::new(Box::new(core))
+            .with_filter(Box::new(TermQuery::new("body", "c")))
+            .with_filter(Box::new(TermQuery::new("body", "d")));
+        assert_eq!(query.cost(&reader).unwrap(), u64::MAX);
     }
 }

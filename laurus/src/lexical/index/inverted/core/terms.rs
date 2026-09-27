@@ -333,8 +333,10 @@ impl InvertedIndexTerms {
                 break;
             }
             size += 1;
-            sum_doc_freq += info.doc_frequency;
-            sum_total_term_freq += info.total_frequency;
+            // Saturating: on-disk statistics a corrupt segment can push
+            // past u64 (Issue #1224).
+            sum_doc_freq = sum_doc_freq.saturating_add(info.doc_frequency);
+            sum_total_term_freq = sum_total_term_freq.saturating_add(info.total_frequency);
             idx += 1;
         }
 
@@ -405,8 +407,9 @@ impl MergedInvertedIndexTerms {
         // across segments, which per-segment stats cannot provide.
         while let Ok(Some(stats)) = stats_cursor.next() {
             size += 1;
-            sum_doc_freq += stats.doc_freq;
-            sum_total_term_freq += stats.total_term_freq;
+            // Saturating, as in `InvertedIndexTerms::new` (Issue #1224).
+            sum_doc_freq = sum_doc_freq.saturating_add(stats.doc_freq);
+            sum_total_term_freq = sum_total_term_freq.saturating_add(stats.total_term_freq);
         }
 
         MergedInvertedIndexTerms {
@@ -489,8 +492,10 @@ impl MergedTermsEnum {
         };
         for stats in self.heads.iter().flatten() {
             if stats.term == merged.term {
-                merged.doc_freq += stats.doc_freq;
-                merged.total_term_freq += stats.total_term_freq;
+                // Saturating, as in `InvertedIndexTerms::new` (Issue #1224).
+                merged.doc_freq = merged.doc_freq.saturating_add(stats.doc_freq);
+                merged.total_term_freq =
+                    merged.total_term_freq.saturating_add(stats.total_term_freq);
             }
         }
         Some(merged)
@@ -677,5 +682,38 @@ mod tests {
         assert_eq!(iter.next().unwrap().unwrap().term, "cherry");
         assert!(!iter.seek("aaa").unwrap(), "miss -> positioned at apple");
         assert_eq!(iter.current().unwrap().term, "apple");
+    }
+
+    /// A dictionary whose `keys` each claim 2^63 documents and occurrences,
+    /// as a corrupt segment can.
+    fn huge_stats_dict(keys: &[&str]) -> Arc<BlockTermDictionary> {
+        let mut builder = TermDictionaryBuilder::new();
+        for key in keys {
+            builder.add_term(key.to_string(), TermInfo::new(0, 0, 1 << 63, 1 << 63));
+        }
+        Arc::new(builder.build().unwrap())
+    }
+
+    /// Statistic sums saturate rather than overflow on huge per-term values
+    /// (Issue #1224): over a field's terms, and — for the merged view —
+    /// over one term's segments too.
+    #[test]
+    fn statistic_sums_saturate_at_u64_max() {
+        let a = huge_stats_dict(&["body:a", "body:b"]);
+        let terms = InvertedIndexTerms::new("body", a.clone());
+        assert_eq!(terms.sum_doc_freq(), Some(u64::MAX));
+        assert_eq!(terms.sum_total_term_freq(), Some(u64::MAX));
+
+        // "a" is in both dictionaries, so its merged statistics are summed
+        // across them before the field's two terms are summed again.
+        let b = huge_stats_dict(&["body:a"]);
+        let merged = MergedInvertedIndexTerms::new("body", &[a, b]);
+        assert_eq!(merged.sum_doc_freq(), Some(u64::MAX));
+        assert_eq!(merged.sum_total_term_freq(), Some(u64::MAX));
+        let first = merged.iterator().unwrap().next().unwrap().unwrap();
+        assert_eq!(
+            (first.doc_freq, first.total_term_freq),
+            (u64::MAX, u64::MAX)
+        );
     }
 }
