@@ -25,6 +25,9 @@
 // integration is complete.
 #![allow(dead_code)]
 
+use crate::error::{LaurusError, Result};
+use crate::util::alloc_bounds::checked_len_u64;
+
 /// Append the unsigned LEB128 (uleb128) encoding of `value` to `buf`.
 fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -36,19 +39,36 @@ fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 
 /// Read the unsigned LEB128 (uleb128) encoding starting at `*cursor`,
 /// advancing `*cursor` past the consumed bytes.
-fn read_varint(bytes: &[u8], cursor: &mut usize) -> u64 {
+///
+/// Shared by every varint in a dictionary block — the front-coded lengths
+/// here and the block header in [`super::block_reader`].
+///
+/// # Errors
+///
+/// [`LaurusError::Index`] when `bytes` ends mid-varint, or when the varint
+/// runs past the tenth byte, where the shift would pass 63 bits (Issue
+/// #1224).
+pub(super) fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     loop {
-        let byte = bytes[*cursor];
+        let Some(&byte) = bytes.get(*cursor) else {
+            return Err(LaurusError::index(
+                "term dictionary: truncated varint — segment is corrupted",
+            ));
+        };
         *cursor += 1;
         result |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
-            break;
+            return Ok(result);
         }
         shift += 7;
+        if shift >= 64 {
+            return Err(LaurusError::index(
+                "term dictionary: varint longer than 10 bytes — segment is corrupted",
+            ));
+        }
     }
-    result
 }
 
 /// Compute the number of leading bytes shared by `a` and `b`.
@@ -142,35 +162,63 @@ impl<'a> FrontCodingDecoder<'a> {
     }
 
     /// Advance to the next term and return a reference to the current
-    /// term's bytes. Returns `None` once the block is exhausted.
+    /// term's bytes. Returns `Ok(None)` once the block is exhausted.
     ///
     /// The returned slice is valid until the next call to `next`.
+    ///
+    /// # Errors
+    ///
+    /// [`LaurusError::Index`] when the encoded bytes are corrupt: a
+    /// truncated or overlong varint, a length running past the end of the
+    /// block, or a shared prefix longer than the previous term (Issue
+    /// #1224).
     #[allow(clippy::should_implement_trait)]
-    pub(super) fn next(&mut self) -> Option<&[u8]> {
+    pub(super) fn next(&mut self) -> Result<Option<&[u8]>> {
         if self.remaining == 0 {
-            return None;
+            return Ok(None);
         }
 
         if self.is_first {
             // First term: full bytes.
-            let len = read_varint(self.bytes, &mut self.cursor) as usize;
+            let len = read_varint(self.bytes, &mut self.cursor)?;
+            let term = self.take(len, "front-coded first term")?;
             self.current.clear();
-            self.current
-                .extend_from_slice(&self.bytes[self.cursor..self.cursor + len]);
-            self.cursor += len;
+            self.current.extend_from_slice(term);
             self.is_first = false;
         } else {
             // Subsequent term: (shared_prefix_len, suffix_len, suffix_bytes).
-            let shared = read_varint(self.bytes, &mut self.cursor) as usize;
-            let suffix_len = read_varint(self.bytes, &mut self.cursor) as usize;
-            self.current.truncate(shared);
-            self.current
-                .extend_from_slice(&self.bytes[self.cursor..self.cursor + suffix_len]);
-            self.cursor += suffix_len;
+            let shared = read_varint(self.bytes, &mut self.cursor)?;
+            // The writer shares at most the whole previous term. Compared
+            // as `u64`, since narrowing first would truncate it on a 32-bit
+            // target; a larger value would otherwise make `truncate` a
+            // silent no-op and yield a wrong term.
+            if shared > self.current.len() as u64 {
+                return Err(LaurusError::index(format!(
+                    "term dictionary: front-coded term shares {shared} bytes with a previous \
+                     term of {} bytes — segment is corrupted",
+                    self.current.len()
+                )));
+            }
+            let suffix_len = read_varint(self.bytes, &mut self.cursor)?;
+            let suffix = self.take(suffix_len, "front-coded term suffix")?;
+            self.current.truncate(shared as usize);
+            self.current.extend_from_slice(suffix);
         }
 
         self.remaining -= 1;
-        Some(&self.current)
+        Ok(Some(&self.current))
+    }
+
+    /// Take the next `len` bytes of the block, advancing the cursor.
+    ///
+    /// `len` comes straight from the block, so it is compared against the
+    /// bytes left before it is narrowed or added to the cursor.
+    fn take(&mut self, len: u64, what: &str) -> Result<&'a [u8]> {
+        let available = self.bytes.len() - self.cursor;
+        let len = checked_len_u64(len, available as u64, what)?;
+        let bytes = &self.bytes[self.cursor..self.cursor + len];
+        self.cursor += len;
+        Ok(bytes)
     }
 
     /// Number of terms still to be yielded by [`Self::next`].
@@ -191,7 +239,7 @@ mod tests {
         let mut decoder = FrontCodingDecoder::new(&encoded, terms.len() as u32);
 
         let mut out = Vec::with_capacity(terms.len());
-        while let Some(term) = decoder.next() {
+        while let Some(term) = decoder.next().unwrap() {
             out.push(term.to_vec());
         }
         out
@@ -203,7 +251,7 @@ mod tests {
             let mut buf = Vec::new();
             write_varint(&mut buf, v);
             let mut cursor = 0;
-            assert_eq!(read_varint(&buf, &mut cursor), v);
+            assert_eq!(read_varint(&buf, &mut cursor).unwrap(), v);
             assert_eq!(cursor, buf.len());
         }
     }
@@ -226,7 +274,7 @@ mod tests {
 
         let mut decoder = FrontCodingDecoder::new(&encoded, 0);
         assert_eq!(decoder.remaining(), 0);
-        assert!(decoder.next().is_none());
+        assert!(decoder.next().unwrap().is_none());
     }
 
     #[test]
@@ -341,11 +389,11 @@ mod tests {
         let term_bytes: Vec<&[u8]> = vec![b"alpha", b"beta"];
         let encoded = encode_block_terms(&term_bytes);
         let mut decoder = FrontCodingDecoder::new(&encoded, 2);
-        assert_eq!(decoder.next().unwrap(), b"alpha");
-        assert_eq!(decoder.next().unwrap(), b"beta");
-        assert!(decoder.next().is_none());
+        assert_eq!(decoder.next().unwrap().unwrap(), b"alpha");
+        assert_eq!(decoder.next().unwrap().unwrap(), b"beta");
+        assert!(decoder.next().unwrap().is_none());
         // Calling next again must remain None and not panic.
-        assert!(decoder.next().is_none());
+        assert!(decoder.next().unwrap().is_none());
         assert_eq!(decoder.remaining(), 0);
     }
 
@@ -357,8 +405,75 @@ mod tests {
         let term_bytes: Vec<&[u8]> = vec![b"", b"abc"];
         let encoded = encode_block_terms(&term_bytes);
         let mut decoder = FrontCodingDecoder::new(&encoded, 2);
-        assert_eq!(decoder.next().unwrap(), b"");
-        assert_eq!(decoder.next().unwrap(), b"abc");
-        assert!(decoder.next().is_none());
+        assert_eq!(decoder.next().unwrap().unwrap(), b"");
+        assert_eq!(decoder.next().unwrap().unwrap(), b"abc");
+        assert!(decoder.next().unwrap().is_none());
+    }
+
+    // Issue #1224: corrupt front-coded bytes are reported, not decoded
+    // past the end of the block.
+
+    fn assert_corrupted<T: std::fmt::Debug>(result: Result<T>, label: &str) {
+        match result {
+            Ok(value) => panic!("expected a corruption error mentioning {label:?}, got {value:?}"),
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("corrupted") && msg.contains(label), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// Decodes the first term of `bytes`, declared as a one-term block.
+    fn first_term(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut decoder = FrontCodingDecoder::new(bytes, 1);
+        decoder.next().map(|term| term.map(<[u8]>::to_vec))
+    }
+
+    /// A varint whose continuation bit runs off the end of the block is
+    /// rejected (Issue #1224).
+    #[test]
+    fn a_truncated_varint_is_rejected() {
+        assert_corrupted(first_term(&[0x80]), "truncated varint");
+    }
+
+    /// A varint longer than ten bytes would shift past 63 bits (Issue
+    /// #1224).
+    #[test]
+    fn a_varint_longer_than_ten_bytes_is_rejected() {
+        let mut bytes = vec![0x80; 11];
+        bytes.push(0x00);
+        assert_corrupted(first_term(&bytes), "longer than 10 bytes");
+    }
+
+    /// A first-term length beyond the block is rejected before
+    /// `cursor + len` can overflow (Issue #1224).
+    #[test]
+    fn a_first_term_longer_than_the_block_is_rejected() {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, u64::MAX);
+        bytes.extend_from_slice(b"abc");
+        assert_corrupted(first_term(&bytes), "front-coded first term");
+    }
+
+    /// A suffix length beyond the block is rejected (Issue #1224).
+    #[test]
+    fn a_suffix_longer_than_the_block_is_rejected() {
+        // "ab", then (shared 2, suffix_len 10, "c"): 9 suffix bytes missing.
+        let bytes = [2, b'a', b'b', 2, 10, b'c'];
+        let mut decoder = FrontCodingDecoder::new(&bytes, 2);
+        assert_eq!(decoder.next().unwrap().unwrap(), b"ab");
+        assert_corrupted(decoder.next(), "front-coded term suffix");
+    }
+
+    /// A shared prefix longer than the previous term is rejected, where
+    /// `truncate` would otherwise ignore it and yield a wrong term (Issue
+    /// #1224).
+    #[test]
+    fn a_shared_prefix_longer_than_the_previous_term_is_rejected() {
+        // "ab", then (shared 3, suffix_len 1, "c").
+        let bytes = [2, b'a', b'b', 3, 1, b'c'];
+        let mut decoder = FrontCodingDecoder::new(&bytes, 2);
+        assert_eq!(decoder.next().unwrap().unwrap(), b"ab");
+        assert_corrupted(decoder.next(), "shares 3 bytes");
     }
 }

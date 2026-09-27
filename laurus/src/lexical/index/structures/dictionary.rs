@@ -682,8 +682,9 @@ type InMemoryLayer = (AHashMap<String, u32>, Vec<String>, Arc<[TermInfo]>);
 ///
 /// # Errors
 ///
-/// Returns an error when the BlockSection yields a different number of
-/// terms than `total_term_count`, the header's count.
+/// Returns an error when a block fails to parse or decode, or when the
+/// BlockSection yields a different number of terms than
+/// `total_term_count`, the header's count.
 fn populate_in_memory_layer(
     block_section: &[u8],
     block_count: u32,
@@ -694,16 +695,19 @@ fn populate_in_memory_layer(
     let mut term_infos: Vec<TermInfo> = Vec::with_capacity(total_term_count);
 
     let iter = block_reader::BlockSectionIter::new(block_section, block_count);
-    for (ordinal, (term, info)) in iter.enumerate() {
+    for (ordinal, entry) in iter.enumerate() {
+        // A block that fails to parse is reported with its own cause
+        // (Issue #1224).
+        let (term, info) = entry?;
         map.insert(term.clone(), ordinal as u32);
         sorted_terms.push(term);
         term_infos.push(info);
     }
 
-    // `BlockSectionIter` ends silently at a block it cannot parse, and the
-    // writer records exactly the terms it encodes. A dictionary cut short
-    // would otherwise load without its later terms — and a merge walking
-    // it would drop them for good (Issue #1220).
+    // The writer records exactly the terms it encodes, so a count that
+    // disagrees with the terms read means the header or the section is
+    // corrupt. A dictionary loaded short would lack its later terms — and a
+    // merge walking it would drop them for good (Issue #1220).
     if sorted_terms.len() != total_term_count {
         return Err(LaurusError::index(format!(
             "term dictionary: read {} terms but the header declares {total_term_count} — \
@@ -1188,21 +1192,37 @@ mod tests {
         bytes
     }
 
-    /// Stores `total_term_count` into a dictionary file's trailer — the u64
-    /// before `block_count`, `reserved` and the CRC — and loads it back.
-    fn load_with_term_count(total_term_count: u64) -> Result<BlockTermDictionary> {
+    /// Writes the 200-term dictionary, lets `patch` edit its bytes, and
+    /// loads the result back.
+    fn load_patched(patch: impl FnOnce(&mut Vec<u8>)) -> Result<BlockTermDictionary> {
         use std::io::Write;
 
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
         let mut bytes = written_dictionary_bytes(&storage, "dict.bin");
-        let at = bytes.len() - 20;
-        bytes[at..at + 8].copy_from_slice(&total_term_count.to_le_bytes());
+        patch(&mut bytes);
         let mut output = storage.create_output("patched.bin").unwrap();
         output.write_all(&bytes).unwrap();
         output.close().unwrap();
 
         let input = storage.open_input("patched.bin").unwrap();
         BlockTermDictionary::read_from_storage(&mut StructReader::new(input).unwrap())
+    }
+
+    /// Stores `total_term_count` into a dictionary file's trailer — the u64
+    /// before `block_count`, `reserved` and the CRC — and loads it back.
+    fn load_with_term_count(total_term_count: u64) -> Result<BlockTermDictionary> {
+        load_patched(|bytes| {
+            let at = bytes.len() - 20;
+            bytes[at..at + 8].copy_from_slice(&total_term_count.to_le_bytes());
+        })
+    }
+
+    /// Where a written dictionary's BlockSection starts: after the magic,
+    /// the version, the FST (a u32 length and its bytes) and the section's
+    /// own u32 length.
+    fn block_section_start(bytes: &[u8]) -> usize {
+        let fst_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        12 + fst_len + 4
     }
 
     fn assert_corrupted<T>(result: Result<T>, label: &str) {
@@ -1226,13 +1246,28 @@ mod tests {
         assert_corrupted(load_with_term_count(u64::MAX), "term dictionary term count");
     }
 
-    /// A dictionary must yield every term its header declares. The block
-    /// walk stops silently at a block it cannot parse, so a dictionary cut
-    /// short would load without its later terms — and a merge walking it
-    /// would drop them for good (Issue #1220).
+    /// A dictionary must yield every term its header declares. One loaded
+    /// short would lack its later terms — and a merge walking it would drop
+    /// them for good (Issue #1220).
     #[test]
     fn a_dictionary_yielding_fewer_terms_than_declared_is_rejected() {
         assert_corrupted(load_with_term_count(201), "read 200 terms");
+    }
+
+    /// A block that fails to parse fails the load with its own cause, not
+    /// with the term-count mismatch its missing terms would cause (Issue
+    /// #1224).
+    #[test]
+    fn a_corrupt_block_fails_the_load_with_its_own_cause() {
+        assert!(load_patched(|_| {}).is_ok(), "the file as written loads");
+        let result = load_patched(|bytes| {
+            let section_at = block_section_start(bytes);
+            let (_, second_block_at) =
+                block_reader::BlockReader::parse(&bytes[section_at..], 0).unwrap();
+            // The second block's term count.
+            bytes[section_at + second_block_at] = 0;
+        });
+        assert_corrupted(result, "declares 0 terms");
     }
 
     #[test]

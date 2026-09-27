@@ -42,8 +42,8 @@ use crate::error::{LaurusError, Result};
 use crate::lexical::index::structures::dictionary::TermInfo;
 
 use super::block_max_data::{BLOCK_MAX_BYTES, BlockMaxData};
-use super::front_coding::FrontCodingDecoder;
-use super::term_info_block::FixedTermInfoBlock;
+use super::front_coding::{FrontCodingDecoder, read_varint};
+use super::term_info_block::{BLOCK_TERM_COUNT, FixedTermInfoBlock};
 
 /// Reader for a single block parsed out of the BlockSection.
 pub(super) struct BlockReader<'a> {
@@ -68,15 +68,17 @@ impl<'a> BlockReader<'a> {
     pub(super) fn parse(bytes: &'a [u8], cursor: usize) -> Result<(Self, usize)> {
         let mut c = cursor;
 
+        // The writer puts 1..=BLOCK_TERM_COUNT terms in every block. Checked
+        // before anything is sized from it — the BlockMaxData offsets below
+        // come one per term (Issue #1224).
         let term_count_u64 = read_varint(bytes, &mut c)?;
-        let term_count = u16::try_from(term_count_u64).map_err(|_| {
-            LaurusError::index(format!(
-                "BlockReader: term_count {term_count_u64} exceeds u16::MAX"
-            ))
-        })?;
-        if term_count == 0 {
-            return Err(LaurusError::index("BlockReader: empty block"));
+        if term_count_u64 == 0 || term_count_u64 > BLOCK_TERM_COUNT as u64 {
+            return Err(LaurusError::index(format!(
+                "BlockReader: block declares {term_count_u64} terms, outside \
+                 1..={BLOCK_TERM_COUNT} — segment is corrupted"
+            )));
         }
+        let term_count = term_count_u64 as u16;
 
         let fc_len = read_varint(bytes, &mut c)?;
         // Compared before it is narrowed, which would truncate it on a
@@ -84,7 +86,7 @@ impl<'a> BlockReader<'a> {
         // (Issue #1220).
         if fc_len > bytes.len().saturating_sub(c) as u64 {
             return Err(LaurusError::index(
-                "BlockReader: front-coded section overruns BlockSection",
+                "BlockReader: front-coded section overruns BlockSection — segment is corrupted",
             ));
         }
         let fc_len = fc_len as usize;
@@ -96,7 +98,7 @@ impl<'a> BlockReader<'a> {
         const FTIB_FIXED_HEADER_BYTES: usize = 8 + 8 + 8 + 8 + 4 + 5 + 4;
         if c + FTIB_FIXED_HEADER_BYTES > bytes.len() {
             return Err(LaurusError::index(
-                "BlockReader: FixedTermInfoBlock header overruns BlockSection",
+                "BlockReader: FixedTermInfoBlock header overruns BlockSection — segment is corrupted",
             ));
         }
 
@@ -112,9 +114,12 @@ impl<'a> BlockReader<'a> {
         let max_score_factor_size = read_u8(bytes, &mut c);
         let payload_len = read_u32_le(bytes, &mut c) as usize;
 
-        if c + payload_len > bytes.len() {
+        // Not `c + payload_len`, which can overflow on a 32-bit target
+        // (Issue #1224).
+        if payload_len > bytes.len().saturating_sub(c) {
             return Err(LaurusError::index(
-                "BlockReader: FixedTermInfoBlock payload overruns BlockSection",
+                "BlockReader: FixedTermInfoBlock payload overruns BlockSection — segment is \
+                 corrupted",
             ));
         }
         let payload = bytes[c..c + payload_len].to_vec();
@@ -134,13 +139,14 @@ impl<'a> BlockReader<'a> {
             max_score_factor_size,
             payload,
         };
+        term_info_block.validate()?;
 
         // BlockMaxData: (term_count + 1) u32 offsets, then bm_data_len + bytes.
         let offsets_count = term_count as usize + 1;
         let offsets_bytes = offsets_count * 4;
         if c + offsets_bytes + 4 > bytes.len() {
             return Err(LaurusError::index(
-                "BlockReader: BlockMaxData header overruns BlockSection",
+                "BlockReader: BlockMaxData header overruns BlockSection — segment is corrupted",
             ));
         }
         let mut offsets = Vec::with_capacity(offsets_count);
@@ -148,9 +154,10 @@ impl<'a> BlockReader<'a> {
             offsets.push(read_u32_le(bytes, &mut c));
         }
         let bm_data_len = read_u32_le(bytes, &mut c) as usize;
-        if c + bm_data_len > bytes.len() {
+        // Not `c + bm_data_len`, as for the payload above (Issue #1224).
+        if bm_data_len > bytes.len().saturating_sub(c) {
             return Err(LaurusError::index(
-                "BlockReader: BlockMaxData data overruns BlockSection",
+                "BlockReader: BlockMaxData data overruns BlockSection — segment is corrupted",
             ));
         }
         // The writer's offsets start at 0, never decrease, span whole
@@ -195,21 +202,27 @@ impl<'a> BlockReader<'a> {
     /// Performs a linear scan over front-coded term bytes, comparing
     /// each decoded term to `target`. Stops early if a decoded term
     /// is greater than `target` (terms are sorted within a block).
-    pub(super) fn lookup(&self, target: &[u8]) -> Option<TermInfo> {
+    ///
+    /// # Errors
+    ///
+    /// [`LaurusError::Index`] when the block's term bytes or term info
+    /// are corrupt (Issue #1224).
+    pub(super) fn lookup(&self, target: &[u8]) -> Result<Option<TermInfo>> {
         let mut decoder = FrontCodingDecoder::new(self.term_bytes, self.block_term_count as u32);
         let mut inner: usize = 0;
-        while let Some(term) = decoder.next() {
+        while let Some(term) = decoder.next()? {
             match term.cmp(target) {
                 std::cmp::Ordering::Equal => {
-                    return Some(self.materialise_term_info(inner));
+                    return term_info_at(&self.term_info_block, &self.block_max_data, inner)
+                        .map(Some);
                 }
-                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Greater => return Ok(None),
                 std::cmp::Ordering::Less => {
                     inner += 1;
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Iterate `(term_bytes_owned, TermInfo)` pairs in sorted order.
@@ -221,27 +234,32 @@ impl<'a> BlockReader<'a> {
             inner: 0,
         }
     }
+}
 
-    /// Build a [`TermInfo`] for the entry at `inner_offset` by
-    /// combining the bit-packed fixed fields with the variable-length
-    /// `block_max` array.
-    fn materialise_term_info(&self, inner_offset: usize) -> TermInfo {
-        let fti = self.term_info_block.decode_at(inner_offset);
-        let block_max = self.block_max_data.get(inner_offset);
-        TermInfo {
-            posting_offset: fti.posting_offset,
-            posting_length: fti.posting_length,
-            doc_frequency: fti.doc_frequency,
-            total_frequency: fti.total_frequency,
-            max_score_factor: fti.max_score_factor,
-            block_max,
-        }
-    }
+/// Build a [`TermInfo`] for the entry at `inner_offset` by combining the
+/// bit-packed fixed fields with the variable-length `block_max` array.
+fn term_info_at(
+    term_info_block: &FixedTermInfoBlock,
+    block_max_data: &BlockMaxData,
+    inner_offset: usize,
+) -> Result<TermInfo> {
+    let fti = term_info_block.decode_at(inner_offset)?;
+    Ok(TermInfo {
+        posting_offset: fti.posting_offset,
+        posting_length: fti.posting_length,
+        doc_frequency: fti.doc_frequency,
+        total_frequency: fti.total_frequency,
+        max_score_factor: fti.max_score_factor,
+        block_max: block_max_data.get(inner_offset),
+    })
 }
 
 /// Iterator yielded by [`BlockReader::iter`]. Yields fresh `Vec<u8>`
 /// term bytes (copy of the decoder's reusable buffer) so the caller
 /// can move the term independently of the iterator.
+///
+/// A corrupt entry yields one `Err` (Issue #1224); iteration should stop
+/// there, since the decoder can no longer find the next term.
 pub(super) struct BlockReaderIter<'r, 'a: 'r> {
     decoder: FrontCodingDecoder<'a>,
     term_info_block: &'r FixedTermInfoBlock,
@@ -250,23 +268,19 @@ pub(super) struct BlockReaderIter<'r, 'a: 'r> {
 }
 
 impl<'r, 'a: 'r> Iterator for BlockReaderIter<'r, 'a> {
-    type Item = (Vec<u8>, TermInfo);
+    type Item = Result<(Vec<u8>, TermInfo)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let term = self.decoder.next()?;
-        let term_owned = term.to_vec();
-        let fti = self.term_info_block.decode_at(self.inner);
-        let block_max = self.block_max_data.get(self.inner);
-        let info = TermInfo {
-            posting_offset: fti.posting_offset,
-            posting_length: fti.posting_length,
-            doc_frequency: fti.doc_frequency,
-            total_frequency: fti.total_frequency,
-            max_score_factor: fti.max_score_factor,
-            block_max,
+        let term_owned = match self.decoder.next() {
+            Ok(term) => term?.to_vec(),
+            Err(e) => return Some(Err(e)),
+        };
+        let info = match term_info_at(self.term_info_block, self.block_max_data, self.inner) {
+            Ok(info) => info,
+            Err(e) => return Some(Err(e)),
         };
         self.inner += 1;
-        Some((term_owned, info))
+        Some(Ok((term_owned, info)))
     }
 }
 
@@ -276,6 +290,10 @@ impl<'r, 'a: 'r> Iterator for BlockReaderIter<'r, 'a> {
 /// Internally walks block-by-block using [`BlockReader`], decoding
 /// front-coded term bytes lazily so memory usage stays at one block
 /// + one decode buffer regardless of dictionary size.
+///
+/// A block that fails to parse or decode yields one `Err` and ends the
+/// iteration, so a caller never mistakes a corrupt section for a shorter
+/// one (Issue #1224).
 pub(super) struct BlockSectionIter<'a> {
     /// BlockSection bytes (full).
     bytes: &'a [u8],
@@ -339,19 +357,13 @@ impl<'a> BlockSectionIter<'a> {
         });
         Ok(true)
     }
-}
 
-impl<'a> Iterator for BlockSectionIter<'a> {
-    type Item = (String, TermInfo);
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Decode the next entry, parsing the next block when the current one
+    /// is used up. Returns `Ok(None)` after the last block.
+    fn next_entry(&mut self) -> Result<Option<(String, TermInfo)>> {
         loop {
-            if self.current.is_none() {
-                match self.advance_block() {
-                    Ok(true) => {}
-                    Ok(false) => return None,
-                    Err(_) => return None, // corruption: end iteration silently
-                }
+            if self.current.is_none() && !self.advance_block()? {
+                return Ok(None);
             }
             // SAFETY of unwrap: just set in advance_block.
             let cb = self.current.as_mut().unwrap();
@@ -363,54 +375,38 @@ impl<'a> Iterator for BlockSectionIter<'a> {
             // Single decoder advance per call. Buffer is reused across
             // calls, so per-step cost is the front-coding decode
             // (≈ 5–10 ns) rather than a `O(N²)` full-block re-walk.
-            let term_bytes = match cb.decoder.next() {
-                Some(b) => b,
-                None => {
-                    // Decoder exhausted unexpectedly — treat as
-                    // corruption and end iteration silently.
-                    self.current = None;
-                    return None;
-                }
+            let Some(term_bytes) = cb.decoder.next()? else {
+                return Err(LaurusError::index(format!(
+                    "term dictionary: block yielded {} of its {} terms — segment is corrupted",
+                    cb.inner, cb.block_term_count
+                )));
             };
             let term_string = String::from_utf8_lossy(term_bytes).into_owned();
-            let fti = cb.term_info_block.decode_at(cb.inner);
-            let block_max = cb.block_max_data.get(cb.inner);
-            let info = TermInfo {
-                posting_offset: fti.posting_offset,
-                posting_length: fti.posting_length,
-                doc_frequency: fti.doc_frequency,
-                total_frequency: fti.total_frequency,
-                max_score_factor: fti.max_score_factor,
-                block_max,
-            };
+            let info = term_info_at(&cb.term_info_block, &cb.block_max_data, cb.inner)?;
             cb.inner += 1;
-            return Some((term_string, info));
+            return Ok(Some((term_string, info)));
+        }
+    }
+}
+
+impl<'a> Iterator for BlockSectionIter<'a> {
+    type Item = Result<(String, TermInfo)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_entry() {
+            Ok(entry) => entry.map(Ok),
+            Err(e) => {
+                // Yield the error once, then stop: past a corrupt block the
+                // cursor no longer points at a block boundary (Issue #1224).
+                self.blocks_remaining = 0;
+                self.current = None;
+                Some(Err(e))
+            }
         }
     }
 }
 
 // ---------- byte-level helpers ----------
-
-/// Read an unsigned LEB128 varint at `*cursor`, advancing the cursor.
-fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
-    let mut result: u64 = 0;
-    let mut shift: u32 = 0;
-    loop {
-        if *cursor >= bytes.len() {
-            return Err(LaurusError::index("BlockReader: truncated varint"));
-        }
-        let byte = bytes[*cursor];
-        *cursor += 1;
-        result |= u64::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(LaurusError::index("BlockReader: varint overflow"));
-        }
-    }
-}
 
 fn read_u64_le(bytes: &[u8], cursor: &mut usize) -> u64 {
     let v = u64::from_le_bytes(
@@ -636,17 +632,17 @@ mod tests {
         assert_eq!(next_cursor, section.len());
 
         // Lookup hits.
-        let info = reader.lookup(b"banana").unwrap();
+        let info = reader.lookup(b"banana").unwrap().unwrap();
         assert_eq!(info.posting_offset, 50);
         assert_eq!(info.block_max.len(), 1);
         assert_eq!(info.block_max[0].last_doc_id, 5);
 
         // Lookup miss (not in block, alphabetically before).
-        assert!(reader.lookup(b"aardvark").is_none());
+        assert!(reader.lookup(b"aardvark").unwrap().is_none());
         // Lookup miss (alphabetically between).
-        assert!(reader.lookup(b"blueberry").is_none());
+        assert!(reader.lookup(b"blueberry").unwrap().is_none());
         // Lookup miss (alphabetically after).
-        assert!(reader.lookup(b"date").is_none());
+        assert!(reader.lookup(b"date").unwrap().is_none());
     }
 
     #[test]
@@ -661,7 +657,7 @@ mod tests {
         encode_block_into(&mut section, &terms, &infos);
 
         let (reader, _) = BlockReader::parse(&section, 0).unwrap();
-        let collected: Vec<(Vec<u8>, TermInfo)> = reader.iter().collect();
+        let collected: Vec<(Vec<u8>, TermInfo)> = reader.iter().collect::<Result<_>>().unwrap();
         assert_eq!(collected.len(), 3);
         assert_eq!(collected[0].0, b"alpha");
         assert_eq!(collected[1].0, b"beta");
@@ -672,7 +668,7 @@ mod tests {
     fn block_section_iter_walks_two_blocks() {
         let (section, expected) = build_two_block_section();
         let iter = BlockSectionIter::new(&section, 2);
-        let collected: Vec<(String, TermInfo)> = iter.collect();
+        let collected: Vec<(String, TermInfo)> = iter.collect::<Result<_>>().unwrap();
         assert_eq!(collected.len(), expected.len());
         for ((got_term, got_info), (exp_term, exp_info)) in collected.iter().zip(expected.iter()) {
             assert_eq!(got_term.as_bytes(), exp_term.as_slice());
@@ -704,7 +700,7 @@ mod tests {
     #[test]
     fn empty_section_iter() {
         let iter = BlockSectionIter::new(&[], 0);
-        let collected: Vec<(String, TermInfo)> = iter.collect();
+        let collected: Vec<(String, TermInfo)> = iter.collect::<Result<_>>().unwrap();
         assert!(collected.is_empty());
     }
 
@@ -723,9 +719,9 @@ mod tests {
         let mut section = Vec::new();
         encode_block_into(&mut section, &terms, &infos);
         let (reader, _) = BlockReader::parse(&section, 0).unwrap();
-        assert!(reader.lookup(&long_term).is_some());
-        assert!(reader.lookup(b"short").is_some());
-        assert!(reader.lookup(b"medium").is_none());
+        assert!(reader.lookup(&long_term).unwrap().is_some());
+        assert!(reader.lookup(b"short").unwrap().is_some());
+        assert!(reader.lookup(b"medium").unwrap().is_none());
     }
 
     #[test]
@@ -740,6 +736,130 @@ mod tests {
         let mut section = Vec::new();
         encode_block_into(&mut section, &terms, &infos);
         let (reader, _) = BlockReader::parse(&section, 0).unwrap();
-        assert!(reader.lookup(b"zulu").is_none());
+        assert!(reader.lookup(b"zulu").unwrap().is_none());
+    }
+
+    // Issue #1224: a corrupt block is rejected by `parse`, and
+    // `BlockSectionIter` reports it instead of ending early.
+
+    fn assert_corrupted<T>(result: Result<T>, label: &str) {
+        match result {
+            Ok(_) => panic!("expected a corruption error mentioning {label:?}"),
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("corrupted") && msg.contains(label), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// The three-term block used by the parse tests, and the offset of its
+    /// FixedTermInfoBlock header: after the one-byte term count, the
+    /// one-byte front-coded length and the front-coded bytes.
+    fn three_term_block() -> (Vec<u8>, usize) {
+        let terms: Vec<&[u8]> = vec![b"apple", b"banana", b"cherry"];
+        let infos = vec![
+            (fti(0, 50, 1, 10, 1.0), Vec::new()),
+            (fti(50, 60, 2, 20, 2.0), vec![sample_block_max(5, 0.5)]),
+            (fti(110, 70, 3, 30, 3.0), Vec::new()),
+        ];
+        let mut section = Vec::new();
+        encode_block_into(&mut section, &terms, &infos);
+        let ftib_at = 2 + encode_block_terms(&terms).len();
+        assert!(
+            BlockReader::parse(&section, 0).is_ok(),
+            "the block as written parses"
+        );
+        (section, ftib_at)
+    }
+
+    /// A block holds 1..=128 terms. The count is checked before the
+    /// BlockMaxData offsets, one per term, are read (Issue #1224).
+    #[test]
+    fn parse_rejects_a_term_count_outside_the_writers_range() {
+        let (mut empty, _) = three_term_block();
+        empty[0] = 0;
+        assert_corrupted(BlockReader::parse(&empty, 0), "declares 0 terms");
+
+        let names: Vec<String> = (0..BLOCK_TERM_COUNT).map(|i| format!("t{i:03}")).collect();
+        let terms: Vec<&[u8]> = names.iter().map(|t| t.as_bytes()).collect();
+        let infos: Vec<(FixedTermInfo, Vec<BlockMax>)> = (0..BLOCK_TERM_COUNT as u64)
+            .map(|i| (fti(i * 10, 10, 1, 1, 1.0), Vec::new()))
+            .collect();
+        let mut full = Vec::new();
+        encode_block_into(&mut full, &terms, &infos);
+        assert!(BlockReader::parse(&full, 0).is_ok(), "a full block parses");
+        // 128 is the two-byte varint 0x80 0x01; 0x81 0x01 is 129.
+        assert_eq!(full[..2], [0x80, 0x01]);
+        full[0] = 0x81;
+        assert_corrupted(BlockReader::parse(&full, 0), "declares 129 terms");
+    }
+
+    /// `parse` validates the FixedTermInfoBlock header against its payload
+    /// (Issue #1224).
+    #[test]
+    fn parse_rejects_a_term_info_header_that_disagrees_with_its_payload() {
+        let (mut section, ftib_at) = three_term_block();
+        // max_score_factor_size sits after four u64 minimums, the f32
+        // reference and four nbits bytes.
+        let size_at = ftib_at + 8 * 4 + 4 + 4;
+        assert_eq!(section[size_at], 32);
+        section[size_at] = 7;
+        assert_corrupted(BlockReader::parse(&section, 0), "neither 0 nor 32");
+    }
+
+    /// Lengths running past the section are compared against the bytes
+    /// left, not added to the cursor, which can overflow on a 32-bit target
+    /// (Issue #1224).
+    #[test]
+    fn parse_rejects_lengths_past_the_section() {
+        let (section, ftib_at) = three_term_block();
+        let payload_len_at = ftib_at + 8 * 4 + 4 + 5;
+        let mut payload = section.clone();
+        payload[payload_len_at..payload_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_corrupted(BlockReader::parse(&payload, 0), "payload overruns");
+
+        // bm_data_len is the u32 before the block-max data (12 bytes).
+        let bm_len_at = section.len() - 12 - 4;
+        let mut bm = section.clone();
+        bm[bm_len_at..bm_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_corrupted(BlockReader::parse(&bm, 0), "data overruns");
+    }
+
+    /// A block that fails to parse yields an error, then ends the walk —
+    /// never a silently shortened term list (Issue #1224).
+    #[test]
+    fn block_section_iter_reports_a_corrupt_block() {
+        let (mut section, _) = build_two_block_section();
+        let (_, second_block_at) = BlockReader::parse(&section, 0).unwrap();
+        section[second_block_at] = 0;
+
+        let mut iter = BlockSectionIter::new(&section, 2);
+        for _ in 0..3 {
+            iter.next().unwrap().unwrap();
+        }
+        assert_corrupted(iter.next().unwrap(), "declares 0 terms");
+        assert!(iter.next().is_none(), "the walk stops after the error");
+    }
+
+    /// A block whose decoder runs out before the block's term count yields
+    /// an error instead of ending the walk (Issue #1224).
+    #[test]
+    fn block_section_iter_reports_a_block_that_ends_early() {
+        let (section, _) = three_term_block();
+        let (reader, _) = BlockReader::parse(&section, 0).unwrap();
+        let mut iter = BlockSectionIter::new(&section, 0);
+        iter.current = Some(CurrentBlock {
+            block_term_count: reader.block_term_count,
+            // Two terms decodable where the block declares three.
+            decoder: FrontCodingDecoder::new(reader.term_bytes, 2),
+            term_info_block: reader.term_info_block,
+            block_max_data: reader.block_max_data,
+            inner: 0,
+        });
+        for _ in 0..2 {
+            iter.next().unwrap().unwrap();
+        }
+        assert_corrupted(iter.next().unwrap(), "yielded 2 of its 3 terms");
+        assert!(iter.next().is_none(), "the walk stops after the error");
     }
 }

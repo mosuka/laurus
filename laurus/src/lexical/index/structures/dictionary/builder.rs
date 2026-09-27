@@ -16,7 +16,7 @@ use crate::lexical::index::structures::dictionary::BlockMax;
 
 use super::block_max_data::BlockMaxData;
 use super::front_coding::encode_block_terms;
-use super::term_info_block::{FixedTermInfo, FixedTermInfoBlock};
+use super::term_info_block::{BLOCK_TERM_COUNT, FixedTermInfo, FixedTermInfoBlock};
 
 /// Append the encoded bytes of a single block (BlockHeader + TermBytes
 /// + FixedTermInfoBlock + BlockMaxData) to `out`.
@@ -56,8 +56,8 @@ pub(super) fn encode_block_into(
         "terms and block_max_per_term must have equal length"
     );
     assert!(
-        !terms.is_empty() && terms.len() <= 128,
-        "terms.len() must be in 1..=128"
+        !terms.is_empty() && terms.len() <= BLOCK_TERM_COUNT,
+        "terms.len() must be in 1..={BLOCK_TERM_COUNT}"
     );
 
     let term_count = terms.len();
@@ -97,7 +97,7 @@ pub(super) fn encode_block_into(
 /// Append the unsigned LEB128 (uleb128) encoding of `value` to `buf`.
 ///
 /// Mirrors the reader-side decoder in
-/// [`super::block_reader::read_varint`]. Kept private to the builder
+/// [`super::front_coding::read_varint`]. Kept private to the builder
 /// module so the writer/reader pair stays in lockstep.
 fn write_varint_into(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
