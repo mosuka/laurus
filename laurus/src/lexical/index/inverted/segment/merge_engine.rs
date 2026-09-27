@@ -725,9 +725,7 @@ impl MergeEngine {
         let mut field_terms: AHashMap<u64, AHashMap<String, Vec<AnalyzedTerm>>> = AHashMap::new();
         if let Some(dict) = reader.term_dictionary()? {
             for (term_key, _info) in dict.iter() {
-                let Some((field, term)) = term_key.split_once(':') else {
-                    continue;
-                };
+                let (field, term) = split_term_key(&reader.segment_info().segment_id, term_key)?;
                 if let Some(mut iter) = reader.postings(field, term)? {
                     while iter.next()? {
                         // No deletion check here: `SegmentReader::postings`
@@ -932,9 +930,7 @@ impl MergeEngine {
         let mut field_terms: AHashMap<u64, AHashMap<String, Vec<AnalyzedTerm>>> = AHashMap::new();
         if let Some(dict) = reader.term_dictionary()? {
             for (term_key, _info) in dict.iter() {
-                let Some((field, term)) = term_key.split_once(':') else {
-                    continue;
-                };
+                let (field, term) = split_term_key(&reader.segment_info().segment_id, term_key)?;
                 if field == target_field {
                     continue;
                 }
@@ -1216,6 +1212,21 @@ impl MergeEngine {
             None => reader,
         })
     }
+}
+
+/// Split a source segment's dictionary key into its field and term, refusing
+/// a key without the `:` separator (Issue #1235).
+///
+/// The segment's dictionary load already refuses such a key, so this is
+/// defence in depth. The merge used to skip it, which dropped the term's
+/// postings from every rebuilt document for good.
+fn split_term_key<'a>(segment_id: &str, term_key: &'a str) -> Result<(&'a str, &'a str)> {
+    term_key.split_once(':').ok_or_else(|| {
+        LaurusError::index(format!(
+            "merge: segment {segment_id}: dictionary key {term_key:?} has no field separator — \
+             segment is corrupted"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -2343,6 +2354,95 @@ mod tests {
         assert!(
             format!("{err:?}").contains("emitted twice"),
             "a doc_id emitted by two (mis-)owned segments must be a hard error: {err:?}"
+        );
+    }
+
+    /// A source dictionary key without the `:` separator fails the replay
+    /// and the field-override reconstruction instead of being skipped, which
+    /// dropped the term's postings from every rebuilt document (Issue #1235).
+    ///
+    /// The segment's dictionary load refuses such a key first, so the
+    /// doctored dictionary is put in place of the loaded one — on a loose
+    /// segment whose `.dict` part is removed, as a reload would otherwise
+    /// overwrite it.
+    #[test]
+    fn a_source_dictionary_key_without_a_field_separator_fails_the_merge() {
+        use crate::lexical::index::structures::dictionary::TermDictionaryBuilder;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer = InvertedIndexWriter::new(
+            storage.clone(),
+            InvertedIndexWriterConfig {
+                use_compound: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let doc_id = writer.add_document(text_int_doc("alpha", 10)).unwrap();
+        writer.flush_buffered_to_segment("seg").unwrap();
+        let reader =
+            SegmentReader::open(segment_info("seg", 1, doc_id, doc_id, 0), storage.clone())
+                .unwrap();
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let replay = |reader: &SegmentReader| {
+            let mut out_writer =
+                InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                    .unwrap();
+            engine.replay_segment_into_writer(
+                reader,
+                &RoaringTreemap::new(),
+                None,
+                &mut RoaringTreemap::new(),
+                &mut out_writer,
+            )
+        };
+        replay(&reader).expect("the segment as written replays");
+
+        // `title:alpha` with its separator lost.
+        let loaded = reader
+            .term_dictionary()
+            .unwrap()
+            .expect("the segment has a term dictionary");
+        assert!(loaded.get("title:alpha").is_some());
+        let mut builder = TermDictionaryBuilder::new();
+        for (key, info) in loaded.iter() {
+            let key = if key == "title:alpha" {
+                "titlealpha"
+            } else {
+                key
+            };
+            builder.add_term(key.to_string(), info.clone());
+        }
+        storage.delete_file("seg.dict").unwrap();
+        reader.set_term_dictionary(Arc::new(builder.build().unwrap()));
+
+        let assert_rejected = |result: Result<()>| match result {
+            Err(LaurusError::Index(msg)) => {
+                assert!(
+                    msg.contains(
+                        "merge: segment seg: dictionary key \"titlealpha\" has no field separator"
+                    ),
+                    "{msg}"
+                );
+                assert!(msg.contains("segment is corrupted"), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+            Ok(()) => panic!("a dictionary key without a field separator must fail the merge"),
+        };
+        assert_rejected(replay(&reader));
+        assert_rejected(
+            engine
+                .reconstruct_segment_with_field_override(
+                    &reader,
+                    &RoaringTreemap::new(),
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                    "num",
+                    None,
+                    0,
+                )
+                .map(|_| ()),
         );
     }
 
