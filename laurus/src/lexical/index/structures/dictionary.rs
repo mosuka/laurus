@@ -405,8 +405,6 @@ impl BlockTermDictionary {
 
         let fst_bytes_len = reader.read_u32()? as usize;
         let fst_bytes = reader.read_raw(fst_bytes_len)?;
-        let fst = FstMap::new(fst_bytes)
-            .map_err(|e| LaurusError::index(format!("FST parse error: {e}")))?;
 
         let block_section_len = reader.read_u32()? as usize;
         let block_section_vec = reader.read_raw(block_section_len)?;
@@ -414,6 +412,13 @@ impl BlockTermDictionary {
         let total_term_count = reader.read_u64()?;
         let block_count = reader.read_u32()?;
         let _reserved = reader.read_u32()?;
+
+        // Built only once `block_count` is known, which its header is
+        // checked against first (Issue #1224).
+        check_fst_header(&fst_bytes, block_count)?;
+        let fst = FstMap::new(fst_bytes).map_err(|e| {
+            LaurusError::index(format!("FST parse error: {e} — segment is corrupted"))
+        })?;
 
         let block_section: Arc<[u8]> = Arc::from(block_section_vec.into_boxed_slice());
         // Every term costs at least its 4-byte block-max offset, so the
@@ -666,6 +671,56 @@ impl Default for TermDictionaryBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check the two header fields `fst::Map::new` trusts, before it sees the
+/// bytes (Issue #1224).
+///
+/// fst 0.4 reads a root address and a key count from the FST's trailer and
+/// narrows both to `usize`, panicking on a 32-bit target when either
+/// exceeds `usize::MAX`; on any target it accepts a non-zero root address
+/// without a range check. This reads the trailer the same way
+/// (`fst::raw::Fst::new`): the root address and the key count are the last
+/// two `u64`s, before a CRC32 from version 3 on.
+///
+/// - The root node is written last, so its address lies inside the bytes.
+/// - The dictionary adds one key per block — the block's last term — so the
+///   key count equals `block_count` exactly.
+///
+/// Input that fst rejects by itself — shorter than its 36-byte minimum, or
+/// of an unknown version — is left to fst's own error.
+///
+/// # Errors
+///
+/// [`LaurusError::Index`] when the root address lies outside the FST or
+/// the key count differs from `block_count`.
+fn check_fst_header(bytes: &[u8], block_count: u32) -> Result<()> {
+    const FST_MIN_LEN: usize = 36;
+    if bytes.len() < FST_MIN_LEN {
+        return Ok(());
+    }
+    let read_u64 = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let end = match read_u64(0) {
+        1 | 2 => bytes.len(),
+        3 => bytes.len() - 4,
+        _ => return Ok(()),
+    };
+    let root_addr = read_u64(end - 8);
+    if root_addr >= bytes.len() as u64 {
+        return Err(LaurusError::index(format!(
+            "term dictionary: FST root address {root_addr} lies outside its {} bytes — segment \
+             is corrupted",
+            bytes.len()
+        )));
+    }
+    let key_count = read_u64(end - 16);
+    if key_count != u64::from(block_count) {
+        return Err(LaurusError::index(format!(
+            "term dictionary: FST holds {key_count} keys but the header declares {block_count} \
+             blocks — segment is corrupted"
+        )));
+    }
+    Ok(())
 }
 
 /// A loaded dictionary's in-memory query layer: the term → ordinal map,
@@ -1268,6 +1323,45 @@ mod tests {
             bytes[section_at + second_block_at] = 0;
         });
         assert_corrupted(result, "declares 0 terms");
+    }
+
+    /// An FST root address outside the FST is rejected before the fst
+    /// crate, which panics on it on a 32-bit target and does not
+    /// range-check it on others (Issue #1224).
+    #[test]
+    fn an_fst_root_address_outside_the_fst_is_rejected() {
+        let result = load_patched(|bytes| {
+            let fst_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            // Version 3: the root address is the u64 before the CRC32.
+            let root_at = 12 + fst_len - 4 - 8;
+            bytes[root_at..root_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert_corrupted(result, "FST root address");
+    }
+
+    /// The FST holds one key per block, so a header declaring another block
+    /// count is rejected (Issue #1224).
+    #[test]
+    fn a_block_count_other_than_the_fsts_key_count_is_rejected() {
+        let result = load_patched(|bytes| {
+            // block_count: the u32 before `reserved` and the CRC.
+            let at = bytes.len() - 12;
+            bytes[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
+        });
+        assert_corrupted(result, "FST holds 2 keys but the header declares 3 blocks");
+    }
+
+    /// Input fst rejects by itself is left to fst, and never read past its
+    /// end by the header check (Issue #1224).
+    #[test]
+    fn the_fst_header_check_leaves_malformed_input_to_fst() {
+        for len in [0, 20, 35] {
+            assert!(check_fst_header(&vec![0; len], 0).is_ok(), "{len} bytes");
+        }
+        let mut unknown_version = vec![0; 36];
+        unknown_version[0] = 9;
+        assert!(check_fst_header(&unknown_version, 0).is_ok());
+        assert!(FstMap::new(unknown_version).is_err());
     }
 
     #[test]
