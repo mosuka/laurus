@@ -48,37 +48,60 @@ pub const SKIP_INTERVAL: usize = 8;
 /// `Vec<Vec<u32>>` where index `0` is level 0 (step = `SKIP_INTERVAL`)
 /// and the last index is the top level (≤ `SKIP_INTERVAL` entries).
 pub fn build_skip_levels(doc_ids: &[u32]) -> Vec<Vec<u32>> {
-    let n = doc_ids.len();
-    if n < SKIP_INTERVAL {
-        return Vec::new();
-    }
-
-    let mut levels: Vec<Vec<u32>> = Vec::new();
-    let mut step = SKIP_INTERVAL;
-    // Level 0: stride directly over `doc_ids`.
-    loop {
-        let len = n / step;
-        if len == 0 {
-            break;
-        }
-        let mut level = Vec::with_capacity(len);
-        for i in 0..len {
+    skip_level_shape(doc_ids.len())
+        .map(|(step, len)| {
             // Last doc id of the i-th window of `step` postings.
-            level.push(doc_ids[(i + 1) * step - 1]);
+            (0..len).map(|i| doc_ids[(i + 1) * step - 1]).collect()
+        })
+        .collect()
+}
+
+/// The shape of the table [`build_skip_levels`] builds over `n` doc ids:
+/// each level's stride and entry count, bottom level first.
+///
+/// The one definition of that shape, shared with [`skip_levels_match`] so
+/// the decoder checks a table against exactly what the writer builds.
+fn skip_level_shape(n: usize) -> impl Iterator<Item = (usize, usize)> {
+    // Level 0: stride directly over `doc_ids`. None once the table is done.
+    let mut step = (n >= SKIP_INTERVAL).then_some(SKIP_INTERVAL);
+    std::iter::from_fn(move || {
+        let current = step?;
+        let len = n / current;
+        if len == 0 {
+            step = None;
+            return None;
         }
-        levels.push(level);
-        // Stop once the top level has collapsed to a single window —
-        // a further level would have zero entries.
-        if len <= 1 {
-            break;
-        }
-        // Saturate to avoid overflow on absurdly large lists.
-        step = match step.checked_mul(SKIP_INTERVAL) {
-            Some(s) => s,
-            None => break,
+        step = if len <= 1 {
+            // Stop once the top level has collapsed to a single window —
+            // a further level would have zero entries.
+            None
+        } else {
+            // Stop rather than overflow on absurdly large lists.
+            current.checked_mul(SKIP_INTERVAL)
         };
-    }
-    levels
+        Some((current, len))
+    })
+}
+
+/// Whether `levels` is exactly the table [`build_skip_levels`] builds from
+/// `doc_ids`, compared in place without building it.
+///
+/// A decoded table must pass this before a reader skips with it (Issue
+/// #1224): `skip_via_levels` derives its strides from the table's level
+/// count and indexes `doc_ids` by its entries, which only a table of this
+/// shape keeps in range, and a wrong entry would skip matching documents.
+fn skip_levels_match(levels: &[Vec<u32>], doc_ids: &[u32]) -> bool {
+    let mut levels = levels.iter();
+    let shape_matches = skip_level_shape(doc_ids.len()).all(|(step, len)| {
+        levels.next().is_some_and(|level| {
+            level.len() == len
+                && level
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &doc_id)| doc_id == doc_ids[(i + 1) * step - 1])
+        })
+    });
+    shape_matches && levels.next().is_none()
 }
 
 /// A single posting in a posting list.
@@ -343,6 +366,10 @@ pub struct DecodedPostingList {
     /// decoder loaded a legacy v1 segment that did not carry skip
     /// metadata — in the latter case the reader path rebuilds the
     /// table on load via [`build_skip_levels`].
+    ///
+    /// Must equal `build_skip_levels(&doc_ids)`: the reader's skip walk
+    /// relies on that shape to keep its strides and indices in range. The
+    /// decoder rejects any other table (Issue #1224).
     pub skip_levels: Vec<Vec<u32>>,
     /// Total term frequency across all documents.
     pub total_frequency: u64,
@@ -1031,6 +1058,25 @@ impl PostingList {
         Ok(num_bits)
     }
 
+    /// A skip table read from disk, rejected unless it is the one the
+    /// writer builds from `doc_ids` (Issue #1224). Formats without an
+    /// on-disk table have nothing to check.
+    fn check_skip_levels(
+        format: PostingFormat,
+        levels: &[Vec<u32>],
+        doc_ids: &[u32],
+    ) -> Result<()> {
+        if format.has_skip_levels() && !skip_levels_match(levels, doc_ids) {
+            return Err(LaurusError::index(format!(
+                "posting list: the skip table does not match the one built from its {} doc ids \
+                 (level count {}) — segment is corrupted",
+                doc_ids.len(),
+                levels.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Shared decoder for every on-disk version.
     ///
     /// The versions differ on two independent axes, both carried by
@@ -1092,6 +1138,7 @@ impl PostingList {
 
         let n = Self::bounded_posting_count(reader, n, any_weights, any_positions, max_postings)?;
         if n == 0 {
+            Self::check_skip_levels(format, &disk_skip_levels, &[])?;
             return Ok(DecodedPostingList {
                 term,
                 doc_ids: Vec::new(),
@@ -1132,17 +1179,24 @@ impl PostingList {
             doc_ids.extend_from_slice(&buf);
             initial = buf[POSTING_BLOCK_LEN - 1];
         }
-        let mut prev_did: u64 = initial as u64;
+        let mut prev_did = initial;
         for _ in 0..tail {
             let delta = reader.read_varint()?;
-            let did = prev_did + delta;
-            doc_ids.push(u32::try_from(did).map_err(|_| {
-                LaurusError::index(format!(
-                    "decoded doc_id {did} exceeds u32::MAX; corrupted posting list"
-                ))
-            })?);
+            // Added in u64 and checked, so a corrupt delta can neither
+            // overflow the add nor be truncated (Issue #1224).
+            let did = u64::from(prev_did)
+                .checked_add(delta)
+                .and_then(|did| u32::try_from(did).ok())
+                .ok_or_else(|| {
+                    LaurusError::index(format!(
+                        "posting list: doc id delta {delta} after {prev_did} exceeds u32::MAX — \
+                         segment is corrupted"
+                    ))
+                })?;
+            doc_ids.push(did);
             prev_did = did;
         }
+        Self::check_skip_levels(format, &disk_skip_levels, &doc_ids)?;
 
         // Section 2: frequencies (same zero-copy block path).
         let mut frequencies: Vec<u32> = Vec::with_capacity(n);
@@ -1155,7 +1209,12 @@ impl PostingList {
             frequencies.extend_from_slice(&buf);
         }
         for _ in 0..tail {
-            frequencies.push(reader.read_varint()? as u32);
+            let frequency = reader.read_varint()?;
+            frequencies.push(u32::try_from(frequency).map_err(|_| {
+                LaurusError::index(format!(
+                    "posting list: frequency {frequency} exceeds u32::MAX — segment is corrupted"
+                ))
+            })?);
         }
 
         // Section 3: weights — absent in v3 when every weight is the
@@ -1189,8 +1248,19 @@ impl PostingList {
                     let mut p = Vec::with_capacity(count);
                     let mut prev_pos = 0u32;
                     for _ in 0..count {
-                        let delta = reader.read_varint()? as u32;
-                        let pos = prev_pos + delta;
+                        let delta = reader.read_varint()?;
+                        // The writer stores `pos - prev_pos` (saturating), so
+                        // every real position stays within u32 — including a
+                        // saturated, repeated `u32::MAX` (Issue #1224).
+                        let pos = u32::try_from(delta)
+                            .ok()
+                            .and_then(|delta| prev_pos.checked_add(delta))
+                            .ok_or_else(|| {
+                                LaurusError::index(format!(
+                                    "posting list: position delta {delta} after {prev_pos} \
+                                     exceeds u32::MAX — segment is corrupted"
+                                ))
+                            })?;
                         p.push(pos);
                         prev_pos = pos;
                     }
@@ -1204,10 +1274,10 @@ impl PostingList {
             None
         };
 
-        // Issue #503: v2 segments carry skip levels on disk; v1 segments
-        // do not, so build the table from the decoded `doc_ids` at load
-        // time. The build cost is paid once per segment open, not per
-        // query, so the fallback path stays cheap.
+        // Issue #503: v2 segments carry skip levels on disk, checked against
+        // the doc ids above; v1 segments do not, so build the table from the
+        // decoded `doc_ids`. Either runs on every decode — each posting-cache
+        // miss — for about n/7 u32s, well under the doc ids' own decode.
         let skip_levels = if format.has_skip_levels() {
             disk_skip_levels
         } else {
@@ -2876,6 +2946,226 @@ mod tests {
         assert_corrupted(
             TermPostingIndex::read_from_storage(&mut reader),
             "posting list count",
+        );
+    }
+
+    // Issue #1224: a skip table other than the one the writer builds from
+    // the doc ids is rejected — `skip_via_levels` divides by and multiplies
+    // with strides only that shape keeps in range — and delta arithmetic is
+    // checked.
+
+    /// `build_skip_levels` as it was before its loop moved into
+    /// `skip_level_shape`, kept as the reference the shape must reproduce.
+    fn reference_build_skip_levels(doc_ids: &[u32]) -> Vec<Vec<u32>> {
+        let n = doc_ids.len();
+        if n < SKIP_INTERVAL {
+            return Vec::new();
+        }
+        let mut levels: Vec<Vec<u32>> = Vec::new();
+        let mut step = SKIP_INTERVAL;
+        loop {
+            let len = n / step;
+            if len == 0 {
+                break;
+            }
+            levels.push((0..len).map(|i| doc_ids[(i + 1) * step - 1]).collect());
+            if len <= 1 {
+                break;
+            }
+            step = match step.checked_mul(SKIP_INTERVAL) {
+                Some(s) => s,
+                None => break,
+            };
+        }
+        levels
+    }
+
+    /// Every table the writer builds matches its doc ids, and the shape
+    /// is unchanged by the refactor — through four levels (8^4 = 4096), and
+    /// both loop exits: a top level of one entry, and a next level of none
+    /// (Issue #1224).
+    #[test]
+    fn every_written_skip_table_matches_its_doc_ids() {
+        for n in 0..=4200u32 {
+            let ids: Vec<u32> = (0..n).map(|i| i * 3 + 1).collect();
+            let levels = build_skip_levels(&ids);
+            assert_eq!(levels, reference_build_skip_levels(&ids), "n = {n}");
+            assert!(skip_levels_match(&levels, &ids), "n = {n}");
+        }
+    }
+
+    /// A v3 list of `n` postings with doc ids `1..=n` and frequency 1,
+    /// after the skip table `write_levels` writes.
+    fn skip_table_list(
+        storage: &MemoryStorage,
+        n: u64,
+        write_levels: impl FnOnce(&mut StructWriter<Box<dyn StorageOutput>>),
+    ) -> StructReader<Box<dyn StorageInput>> {
+        reader_over(storage, "skip", |w| {
+            write_v3_header(w, n, false, false);
+            write_levels(w);
+            for _ in 0..n {
+                w.write_varint(1).unwrap(); // doc-id delta
+            }
+            for _ in 0..n {
+                w.write_varint(1).unwrap(); // frequency
+            }
+        })
+    }
+
+    /// Twenty-three levels saturate the reader's top stride and divide it
+    /// down to zero — a division by zero in release builds too (Issue
+    /// #1224).
+    #[test]
+    fn a_skip_table_with_too_many_levels_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut valid = skip_table_list(&storage, 8, |w| {
+            w.write_u8(1).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // level_len
+            w.write_u32(8).unwrap(); // last doc id of the window
+        });
+        assert!(
+            PostingList::decode_soa_v3(&mut valid).is_ok(),
+            "the table the writer builds decodes"
+        );
+
+        let mut reader = skip_table_list(&storage, 8, |w| {
+            w.write_u8(23).unwrap(); // num_levels
+            for _ in 0..22 {
+                w.write_varint(0).unwrap(); // empty level
+            }
+            w.write_varint(1).unwrap(); // top level_len
+            w.write_u32(8).unwrap();
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "its 8 doc ids (level count 23)",
+        );
+    }
+
+    /// A table of the right shape whose entry is not the window's last doc
+    /// id would make `skip_to` jump past matching documents (Issue #1224).
+    #[test]
+    fn a_skip_table_with_a_wrong_entry_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = skip_table_list(&storage, 8, |w| {
+            w.write_u8(1).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // level_len
+            w.write_u32(7).unwrap(); // not the last doc id, 8
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "its 8 doc ids (level count 1)",
+        );
+    }
+
+    /// An empty list carries no skip table (Issue #1224).
+    #[test]
+    fn an_empty_list_with_a_skip_table_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = skip_table_list(&storage, 0, |w| {
+            w.write_u8(1).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // level_len
+            w.write_u32(5).unwrap();
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "its 0 doc ids (level count 1)",
+        );
+    }
+
+    /// A doc-id delta that overflows the add is rejected (Issue #1224).
+    /// The first delta is 1, since after doc id 0 the u32 narrowing alone
+    /// would catch it.
+    #[test]
+    fn a_doc_id_delta_overflowing_the_add_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "delta", |w| {
+            write_v3_header(w, 2, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // doc-id delta
+            w.write_varint(u64::MAX).unwrap(); // doc-id delta
+            w.write_varint(1).unwrap(); // frequency
+            w.write_varint(1).unwrap(); // frequency
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "doc id delta 18446744073709551615 after 1",
+        );
+    }
+
+    /// A frequency beyond u32 is rejected rather than truncated (Issue
+    /// #1224).
+    #[test]
+    fn a_frequency_beyond_u32_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "freq", |w| {
+            write_v3_header(w, 1, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // doc-id delta
+            w.write_varint(1 << 32).unwrap(); // frequency
+        });
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut reader),
+            "frequency 4294967296",
+        );
+    }
+
+    /// One posting at doc id 1 whose positions are the `deltas`.
+    fn position_list(
+        storage: &MemoryStorage,
+        deltas: &[u64],
+    ) -> StructReader<Box<dyn StorageInput>> {
+        reader_over(storage, "positions", |w| {
+            write_v3_header(w, 1, true, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // doc-id delta
+            w.write_varint(deltas.len() as u64).unwrap(); // frequency
+            w.write_u8(1).unwrap(); // has positions
+            w.write_varint(deltas.len() as u64).unwrap(); // position count
+            for &delta in deltas {
+                w.write_varint(delta).unwrap();
+            }
+        })
+    }
+
+    /// A position delta beyond u32, or one that carries the position past
+    /// it, is rejected rather than truncated or overflowed (Issue #1224).
+    #[test]
+    fn a_position_delta_leaving_u32_is_rejected() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut position_list(&storage, &[1 << 32])),
+            "position delta 4294967296 after 0",
+        );
+        assert_corrupted(
+            PostingList::decode_soa_v3(&mut position_list(&storage, &[1, u64::from(u32::MAX)])),
+            "position delta 4294967295 after 1",
+        );
+    }
+
+    /// Positions the writer saturates at `u32::MAX` (a large
+    /// `position_increment_gap`) still decode, repeated or not (Issue
+    /// #1224).
+    #[test]
+    fn positions_saturated_at_u32_max_round_trip() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut list = PostingList::new("saturated".to_string());
+        list.add_posting(Posting::with_positions(1, vec![u32::MAX, u32::MAX]));
+        list.add_posting(Posting::with_positions(2, vec![1, u32::MAX]));
+        let output = storage.create_output("saturated.bin").unwrap();
+        let mut writer = StructWriter::new(output);
+        list.encode_v3(&mut writer).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = StructReader::new(storage.open_input("saturated.bin").unwrap()).unwrap();
+        let decoded = PostingList::decode_soa_v3(&mut reader).unwrap();
+        assert_eq!(
+            decoded.positions,
+            Some(vec![
+                Some(vec![u32::MAX, u32::MAX]),
+                Some(vec![1, u32::MAX]),
+            ])
         );
     }
 }
