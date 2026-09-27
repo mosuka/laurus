@@ -20,6 +20,7 @@
 // integration is complete.
 #![allow(dead_code)]
 
+use crate::error::{LaurusError, Result};
 use crate::lexical::index::structures::dictionary::BlockMax;
 
 /// Bytes per [`BlockMax`] entry on the wire (`u64 last_doc_id` +
@@ -79,10 +80,21 @@ impl BlockMaxData {
     /// Decode the `BlockMax` array for the i-th term in the block.
     /// Returns an empty `Vec` if the term has no block_max.
     ///
+    /// # Errors
+    ///
+    /// [`LaurusError::Index`] when the entries' `last_doc_id`s are not
+    /// strictly ascending, or a `max_factor` is NaN or negative (Issue
+    /// #1235). The writer emits one entry per 128-posting block in doc-id
+    /// order, its factor the largest of the block's BM25 components and at
+    /// least `0.0`. Block-Max-WAND binary-searches the doc ids and takes the
+    /// factors as score upper bounds, so either would let it skip matching
+    /// documents silently. No upper cap is imposed: a factor that is too
+    /// large only loosens the bound.
+    ///
     /// # Panics
     ///
     /// Panics if `inner_offset >= self.term_count()`.
-    pub(super) fn get(&self, inner_offset: usize) -> Vec<BlockMax> {
+    pub(super) fn get(&self, inner_offset: usize) -> Result<Vec<BlockMax>> {
         assert!(
             inner_offset < self.term_count(),
             "BlockMaxData::get: inner_offset {} >= term_count {}",
@@ -98,7 +110,7 @@ impl BlockMaxData {
         );
 
         let count = (end - start) / BLOCK_MAX_BYTES;
-        let mut result = Vec::with_capacity(count);
+        let mut result: Vec<BlockMax> = Vec::with_capacity(count);
         for i in 0..count {
             let off = start + i * BLOCK_MAX_BYTES;
             let last_doc_id = u64::from_le_bytes(
@@ -111,12 +123,27 @@ impl BlockMaxData {
                     .try_into()
                     .expect("4-byte slice for f32"),
             );
+            if let Some(prev) = result.last()
+                && prev.last_doc_id >= last_doc_id
+            {
+                return Err(LaurusError::index(format!(
+                    "BlockMaxData: last doc ids {} then {last_doc_id} are not strictly \
+                     ascending — segment is corrupted",
+                    prev.last_doc_id
+                )));
+            }
+            if max_factor.is_nan() || max_factor < 0.0 {
+                return Err(LaurusError::index(format!(
+                    "BlockMaxData: block {i} has max_factor {max_factor}, which is NaN or \
+                     negative — segment is corrupted"
+                )));
+            }
             result.push(BlockMax {
                 last_doc_id,
                 max_factor,
             });
         }
-        result
+        Ok(result)
     }
 
     /// Number of terms covered by this block_max data (= `offsets.len() - 1`).
@@ -160,7 +187,7 @@ mod tests {
             assert_eq!(off, 0);
         }
         for i in 0..5 {
-            assert!(data.get(i).is_empty());
+            assert!(data.get(i).unwrap().is_empty());
         }
     }
 
@@ -172,7 +199,7 @@ mod tests {
         assert_eq!(data.data_len(), 3 * BLOCK_MAX_BYTES);
         assert_eq!(data.offsets, vec![0, 36]);
 
-        let got = data.get(0);
+        let got = data.get(0).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].last_doc_id, 10);
         assert!((got[0].max_factor - 1.5).abs() < 1e-6);
@@ -191,16 +218,16 @@ mod tests {
         assert_eq!(data.term_count(), 4);
 
         // term 0: empty
-        assert!(data.get(0).is_empty());
+        assert!(data.get(0).unwrap().is_empty());
 
         // term 1: 1 entry
-        let t1 = data.get(1);
+        let t1 = data.get(1).unwrap();
         assert_eq!(t1.len(), 1);
         assert_eq!(t1[0].last_doc_id, 100);
         assert!((t1[0].max_factor - 0.5).abs() < 1e-6);
 
         // term 2: 10 entries
-        let t2 = data.get(2);
+        let t2 = data.get(2).unwrap();
         assert_eq!(t2.len(), 10);
         for (i, b) in t2.iter().enumerate() {
             assert_eq!(b.last_doc_id, i as u64);
@@ -208,7 +235,7 @@ mod tests {
         }
 
         // term 3: 2 entries
-        let t3 = data.get(3);
+        let t3 = data.get(3).unwrap();
         assert_eq!(t3.len(), 2);
         assert_eq!(t3[0].last_doc_id, 1);
         assert_eq!(t3[1].last_doc_id, 2);
@@ -227,14 +254,20 @@ mod tests {
         let per_term: Vec<Vec<BlockMax>> = (0..128)
             .map(|i| {
                 let count = (i as u64 % 6) as usize; // 0..5 entries per term
+                // Random gaps between doc ids, which `get` requires to be
+                // strictly ascending, as the writer emits them.
+                let mut last_doc_id = 0;
                 (0..count)
-                    .map(|j| bm(next_u64() % 1_000_000, j as f32 * 1.5))
+                    .map(|j| {
+                        last_doc_id += 1 + next_u64() % 1_000_000;
+                        bm(last_doc_id, j as f32 * 1.5)
+                    })
                     .collect()
             })
             .collect();
         let data = BlockMaxData::encode(&per_term);
         for (i, expected) in per_term.iter().enumerate() {
-            let got = data.get(i);
+            let got = data.get(i).unwrap();
             assert_eq!(got.len(), expected.len(), "length mismatch at i={i}");
             for (g, e) in got.iter().zip(expected.iter()) {
                 assert_eq!(g.last_doc_id, e.last_doc_id);
@@ -248,5 +281,44 @@ mod tests {
     fn get_panics_on_out_of_range() {
         let data = BlockMaxData::encode(&[Vec::new(), Vec::new(), Vec::new()]);
         let _ = data.get(5);
+    }
+
+    // Issue #1235: `get` rejects entries Block-Max-WAND would misuse.
+
+    fn assert_corrupted<T>(result: Result<T>, label: &str) {
+        match result {
+            Ok(_) => panic!("expected a corruption error mentioning {label:?}"),
+            Err(LaurusError::Index(msg)) => {
+                assert!(msg.contains("corrupted") && msg.contains(label), "{msg}");
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// Block-Max-WAND binary-searches a term's last doc ids, so they must
+    /// be strictly ascending (Issue #1235).
+    #[test]
+    fn last_doc_ids_that_do_not_ascend_are_rejected() {
+        let descending = BlockMaxData::encode(&[vec![bm(10, 1.0), bm(30, 1.0), bm(20, 1.0)]]);
+        assert_corrupted(descending.get(0), "30 then 20 are not strictly ascending");
+
+        let repeated = BlockMaxData::encode(&[vec![bm(10, 1.0), bm(20, 1.0), bm(20, 1.0)]]);
+        assert_corrupted(repeated.get(0), "20 then 20 are not strictly ascending");
+    }
+
+    /// A block's factor is a score upper bound, so NaN and negative ones
+    /// are rejected. Zero and large ones are sound, and are accepted
+    /// (Issue #1235).
+    #[test]
+    fn nan_and_negative_max_factors_are_rejected() {
+        let with_factor =
+            |factor: f32| BlockMaxData::encode(&[vec![bm(10, 1.0), bm(20, factor), bm(30, 1.0)]]);
+        for factor in [f32::NAN, -0.5] {
+            assert_corrupted(with_factor(factor).get(0), "NaN or negative");
+        }
+        for factor in [0.0, 9.9] {
+            let got = with_factor(factor).get(0).unwrap();
+            assert_eq!(got[1].max_factor.to_bits(), factor.to_bits());
+        }
     }
 }

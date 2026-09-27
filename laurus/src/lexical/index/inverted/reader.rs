@@ -727,7 +727,14 @@ impl SegmentReader {
 
         if let Ok(input) = self.storage.open_input(&dict_file) {
             let mut reader = StructReader::new(input)?;
-            let dictionary = BlockTermDictionary::read_from_storage(&mut reader).map_err(|e| {
+            // Bounded by the documents the segment holds, deleted ones
+            // included, as the posting decode is (Issue #1235). Not
+            // `self.doc_count()`, which is the live count.
+            let dictionary = BlockTermDictionary::read_from_storage_for_segment(
+                &mut reader,
+                self.info.doc_count,
+            )
+            .map_err(|e| {
                 LaurusError::index(format!(
                     "Failed to read term dictionary from {dict_file}: {e}"
                 ))
@@ -3382,6 +3389,48 @@ mod tests {
     /// refused as corruption before its buffers are sized (Issue #1220).
     #[test]
     fn postings_are_capped_by_the_segments_document_count() {
+        let (storage, info) = segment_with_three_alphas();
+        let segment = SegmentReader::open(info.clone(), storage.clone()).unwrap();
+        assert!(
+            segment.postings("body", "alpha").unwrap().is_some(),
+            "the segment as written decodes"
+        );
+        // Loaded against the understated count, the dictionary would be
+        // refused first (Issue #1235). The one loaded against the true count
+        // lets the decode reach the posting-list bound.
+        let dictionary = segment
+            .term_dictionary()
+            .unwrap()
+            .expect("the segment has a term dictionary");
+
+        let understated = SegmentInfo {
+            doc_count: 1,
+            ..info
+        };
+        let segment = SegmentReader::open(understated, storage).unwrap();
+        *segment.term_dictionary.write().unwrap() = Some(dictionary);
+        match segment.postings("body", "alpha") {
+            Err(LaurusError::Index(msg)) => {
+                assert!(
+                    msg.contains(
+                        "posting list: header declares 3 postings but the segment holds only 1 \
+                         documents"
+                    ),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("body:alpha"),
+                    "the error names the term: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Index error, got {other:?}"),
+            Ok(_) => panic!("a list longer than its segment must be rejected"),
+        }
+    }
+
+    /// Writes one segment of three documents, each holding `body:alpha`,
+    /// and returns its storage and metadata.
+    fn segment_with_three_alphas() -> (Arc<dyn crate::storage::Storage>, SegmentInfo) {
         use crate::lexical::index::LexicalIndex;
         use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
@@ -3402,30 +3451,32 @@ mod tests {
             .downcast_ref::<InvertedIndexReader>()
             .unwrap();
         let info = inverted.segment_readers()[0].read().unwrap().info.clone();
-        assert!(
-            SegmentReader::open(info.clone(), storage.clone())
-                .unwrap()
-                .postings("body", "alpha")
-                .unwrap()
-                .is_some(),
-            "the segment as written decodes"
-        );
+        (storage, info)
+    }
 
+    /// A term cannot occur in more documents than its segment holds, so a
+    /// dictionary claiming so is refused when the segment loads it, naming
+    /// the term (Issue #1235).
+    #[test]
+    fn a_dictionary_term_in_more_documents_than_its_segment_holds_is_rejected() {
+        let (storage, info) = segment_with_three_alphas();
         let understated = SegmentInfo {
             doc_count: 1,
             ..info
         };
         let segment = SegmentReader::open(understated, storage).unwrap();
-        match segment.postings("body", "alpha") {
+        match segment.term_info("body", "alpha") {
             Err(LaurusError::Index(msg)) => {
-                assert!(msg.contains("segment holds only 1 documents"), "{msg}");
                 assert!(
-                    msg.contains("body:alpha"),
-                    "the error names the term: {msg}"
+                    msg.contains(
+                        "term dictionary: term \"body:alpha\" declares 3 documents but the \
+                         segment holds only 1 documents — segment is corrupted"
+                    ),
+                    "{msg}"
                 );
             }
             Err(other) => panic!("expected Index error, got {other:?}"),
-            Ok(_) => panic!("a list longer than its segment must be rejected"),
+            Ok(_) => panic!("a term in more documents than its segment must be rejected"),
         }
     }
 
