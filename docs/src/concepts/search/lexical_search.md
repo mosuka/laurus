@@ -339,10 +339,10 @@ true number of matches rather than a scan-truncated count.
 
 When `timeout_ms` is set, the time budget is enforced **cooperatively during**
 the search: the scan loops (including each segment of a multi-segment fanout)
-check the deadline periodically and abort as soon as it is exceeded, returning a
-timeout error rather than running the query to completion first. The check is
-batched (every few thousand scanned documents), so an unset `timeout_ms` and the
-common in-budget case pay no measurable overhead.
+check the deadline periodically and abort as soon as the budget is used up,
+returning a timeout error rather than running the query to completion first. The
+check is batched (every few thousand scanned documents), so an unset
+`timeout_ms` and the common in-budget case pay no measurable overhead.
 
 ### Builder Methods
 

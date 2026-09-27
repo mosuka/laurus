@@ -286,7 +286,7 @@ fn count_matches_only(query: &dyn Query, reader: &dyn LexicalIndexReader) -> Res
 /// Threaded through every scan loop (the default matcher loop, the Block-Max
 /// WAND executor, and the per-segment fanout) so a timed search aborts
 /// mid-flight instead of only being detected after it has already run to
-/// completion. On `wasm32` `Timer` reports zero elapsed, so a deadline never
+/// completion. On `wasm32` `Timer` reports zero elapsed, so only a zero budget
 /// fires there.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
@@ -304,11 +304,30 @@ impl Deadline {
     /// loop iteration: the clock is only read every [`DEADLINE_CHECK_INTERVAL`]
     /// scanned documents, so `scanned` is the caller's running document count.
     pub(crate) fn check(&self, scanned: u64) -> Result<()> {
-        if scanned.is_multiple_of(DEADLINE_CHECK_INTERVAL) && self.start.elapsed() > self.timeout {
+        if scanned.is_multiple_of(DEADLINE_CHECK_INTERVAL) {
+            self.check_now()?;
+        }
+        Ok(())
+    }
+
+    /// Return `Err` if the time budget is exhausted, reading the clock
+    /// unconditionally. For checks outside a scan loop, where there is no
+    /// per-document cost to throttle.
+    pub(crate) fn check_now(&self) -> Result<()> {
+        if budget_spent(self.start.elapsed(), self.timeout) {
             return Err(LaurusError::index("Search timeout exceeded"));
         }
         Ok(())
     }
+}
+
+/// Whether `elapsed` has used up a `timeout` budget.
+///
+/// Inclusive (#1227): with a strict `>`, a zero budget would fire only if the
+/// clock had advanced since the deadline started, which Windows' coarse clock
+/// and wasm32's frozen `Timer` do not guarantee.
+fn budget_spent(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed >= timeout
 }
 
 /// A searcher that executes queries against an index reader.
@@ -1182,12 +1201,11 @@ impl InvertedIndexSearcher {
         params: &LexicalSearchParams,
         timeout: Duration,
     ) -> Result<LexicalSearchResults> {
-        let start_time = Timer::now();
         // Cooperative deadline (Issue #600). Threading it through the scan
         // loops lets the search abort mid-flight once the budget is spent,
         // instead of only being detected after the query has already run to
         // completion as the old post-hoc `elapsed()` check did.
-        let deadline = Some(Deadline::new(start_time, timeout));
+        let deadline = Deadline::new(Timer::now(), timeout);
 
         // Create collector based on sort type
         let (mut hits, total_hits) = match &params.sort_by {
@@ -1207,7 +1225,7 @@ impl InvertedIndexSearcher {
                         ascending,
                         params.limit,
                         params.min_score,
-                        deadline,
+                        Some(deadline),
                     )?
                 } else {
                     // Use TopFieldCollector for field-based sorting
@@ -1223,7 +1241,7 @@ impl InvertedIndexSearcher {
                         query.clone_box(),
                         collector,
                         params.parallel,
-                        deadline,
+                        Some(deadline),
                     )?;
 
                     (result_collector.results(), result_collector.total_hits())
@@ -1237,7 +1255,7 @@ impl InvertedIndexSearcher {
                     query,
                     collector,
                     params.parallel,
-                    deadline,
+                    Some(deadline),
                 )?;
 
                 (result_collector.results(), result_collector.total_hits())
@@ -1247,9 +1265,7 @@ impl InvertedIndexSearcher {
         // Final safety net: the scan loops abort mid-flight on the deadline,
         // but a search that finished just over budget (or spent the time
         // outside a scan loop) is still reported as timed out.
-        if start_time.elapsed() > timeout {
-            return Err(LaurusError::index("Search timeout exceeded"));
-        }
+        deadline.check_now()?;
 
         // Load documents if requested
         if params.load_documents {
@@ -1637,7 +1653,8 @@ mod tests {
         // indices, and only when the budget is actually exhausted.
         let now = Timer::now();
         // Index 0 is a multiple of the interval, so an exhausted (zero) budget
-        // is detected immediately — a search fails fast.
+        // is detected immediately — a search fails fast. A zero budget is
+        // spent even if the clock has not advanced since `now` (#1227).
         assert!(Deadline::new(now, Duration::ZERO).check(0).is_err());
         // Between check intervals the clock is never read, so even a zero
         // budget does not fire — this is what keeps the per-document cost out.
@@ -1659,6 +1676,18 @@ mod tests {
                 .check(0)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn budget_is_spent_once_elapsed_reaches_it() {
+        // #1227: the boundary is inclusive. `(ZERO, ZERO)` is the case that
+        // made a zero budget fail to fire when the clock had not advanced
+        // (a coarse Windows clock tick, or `Timer` on wasm32).
+        assert!(budget_spent(Duration::ZERO, Duration::ZERO));
+        let budget = Duration::from_millis(10);
+        assert!(budget_spent(budget, budget));
+        assert!(budget_spent(budget + Duration::from_nanos(1), budget));
+        assert!(!budget_spent(budget - Duration::from_nanos(1), budget));
     }
 
     /// Build a searcher over a populated index. `segments` commits the docs in
@@ -1701,7 +1730,8 @@ mod tests {
         // With real matches the scan loop is entered, so the first deadline
         // check (scanned == 0) fires on an already-spent zero budget — proving
         // the timeout interrupts the search rather than only being reported
-        // after it completes (Issue #600).
+        // after it completes (Issue #600). A zero budget is spent from the
+        // start, even if the clock has not advanced (#1227).
         let searcher = populated_searcher(1);
         let query = Box::new(TermQuery::new("content", "hello")) as Box<dyn Query>;
         let request = LexicalSearchRequest::new(query).timeout_ms(0);
@@ -1716,9 +1746,34 @@ mod tests {
     #[test]
     fn search_with_zero_timeout_interrupts_multi_segment_fanout() {
         // The per-segment fanout must honour the deadline too (a single slow
-        // segment would otherwise leave the parallel fanout unbounded).
+        // segment would otherwise leave the parallel fanout unbounded). Each
+        // segment's first check fires on the zero budget, even if the clock
+        // has not advanced (#1227).
         let searcher = populated_searcher(3);
         let query = Box::new(TermQuery::new("content", "hello")) as Box<dyn Query>;
+        let request = LexicalSearchRequest::new(query).timeout_ms(0);
+
+        let err = searcher.search(request).unwrap_err();
+        assert!(
+            err.to_string().contains("timeout"),
+            "expected a timeout error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn search_with_zero_timeout_and_no_matches_times_out() {
+        // `hello` keeps the query from being short-circuited as empty before
+        // the timeout path, but `absent` has no postings, so the conjunction
+        // is an empty matcher and no scan loop is entered. Only the final
+        // safety net sees the deadline, and it must treat a zero budget as
+        // spent too, even if the clock has not advanced (#1227).
+        let searcher = populated_searcher(1);
+        let query = Box::new(
+            BooleanQueryBuilder::new()
+                .must(Box::new(TermQuery::new("content", "hello")))
+                .must(Box::new(TermQuery::new("content", "absent")))
+                .build(),
+        ) as Box<dyn Query>;
         let request = LexicalSearchRequest::new(query).timeout_ms(0);
 
         let err = searcher.search(request).unwrap_err();
