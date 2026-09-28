@@ -4,6 +4,7 @@
 
 use laurus::lexical::Query;
 use laurus::lexical::TermQuery;
+use laurus::lexical::query::PhraseQuery;
 use laurus::storage::memory::MemoryStorageConfig;
 use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::vector::{FlatOption, Vector};
@@ -495,5 +496,56 @@ async fn multi_valued_text_field_is_highlighted_per_element() -> Result<()> {
         .build();
     let results = engine.search(capped).await?;
     assert_eq!(only(&results, "doc1").highlights["notes"].len(), 1);
+    Ok(())
+}
+
+/// #1246: every document a `PhraseQuery` matches has the phrase highlighted
+/// at the same slop, including a phrase across a dropped stop word or
+/// punctuation.
+#[tokio::test(flavor = "multi_thread")]
+async fn phrase_hits_are_highlighted_at_the_same_slop() -> Result<()> {
+    let schema = Schema::builder()
+        .add_field("body", FieldOption::Text(TextOption::default()))
+        .build();
+    let engine = engine_with(schema).await?;
+    let docs = [
+        ("adjacent", "hello world"),
+        ("stop", "hello the world"),
+        ("punct", "hello, world"),
+        ("gap", "hello big world"),
+        ("reversed", "world hello"),
+    ];
+    for (id, body) in docs {
+        engine
+            .put_document(id, Document::builder().add_field("body", body).build())
+            .await?;
+    }
+    engine.commit().await?;
+
+    for (slop, expected) in [
+        (0, vec!["adjacent", "punct", "stop"]),
+        (1, vec!["adjacent", "gap", "punct", "stop"]),
+    ] {
+        let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]).with_slop(slop);
+        let request = SearchRequestBuilder::new()
+            .lexical_query(LexicalSearchQuery::Obj(Box::new(query) as Box<dyn Query>))
+            .highlight(vec!["body".to_string()])
+            .build();
+        let results = engine.search(request).await?;
+
+        let mut hits: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        hits.sort_unstable();
+        assert_eq!(hits, expected, "phrase hits at slop {slop}");
+        // Each body is exactly the phrase occurrence, so one mark covers it.
+        for hit in &results {
+            let body = docs.iter().find(|(id, _)| *id == hit.id).unwrap().1;
+            assert_eq!(
+                hit.highlights.get("body"),
+                Some(&vec![format!("<mark>{body}</mark>")]),
+                "{} matched at slop {slop}",
+                hit.id
+            );
+        }
+    }
     Ok(())
 }

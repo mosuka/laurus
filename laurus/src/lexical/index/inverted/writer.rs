@@ -737,6 +737,10 @@ pub(crate) fn position_increment_gap_for(option: Option<&FieldOption>) -> u32 {
 }
 
 /// Convert tokens to analyzed terms.
+///
+/// Positions are dense: the i-th token gets position i, whatever
+/// `Token::position` says. The highlighter's `phrase_spans` numbers phrase
+/// tokens the same way, so change the two together.
 pub(crate) fn tokens_to_analyzed_terms(tokens: Vec<Token>) -> Vec<AnalyzedTerm> {
     let mut term_frequencies = AHashMap::new();
     let mut analyzed_terms = Vec::new();

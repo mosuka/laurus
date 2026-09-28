@@ -829,9 +829,11 @@ fn ceil_boundary(text: &str, pos: usize) -> usize {
 /// Mirrors the index-side phrase matcher: the first term anchors, each
 /// following term must appear at the first position in
 /// `expected..=expected + slop`, and the match then continues from that
-/// position. Positions come from the analyzer, so a stop word removed
-/// without renumbering leaves the same gap here as in the index. A span
-/// runs from the first token's start to the last token's end.
+/// position. A token's position is its index in `tokens`, which is how
+/// `tokens_to_analyzed_terms` numbers what the index stores. The analyzer's
+/// `Token::position` is ignored, so a dropped stop word leaves no gap here,
+/// just as in the index. A span runs from the first token's start to the
+/// last token's end.
 fn phrase_spans(tokens: &[Token], phrase: &[String], slop: u32) -> Vec<HighlightSpan> {
     let token_is = |token: &Token, term: &str| {
         token.text == term || (has_uppercase(&token.text) && token.text.to_lowercase() == term)
@@ -842,43 +844,28 @@ fn phrase_spans(tokens: &[Token], phrase: &[String], slop: u32) -> Vec<Highlight
     let Some((first, rest)) = phrase.split_first() else {
         return spans;
     };
+    // Saturating: `u32::MAX + 1` overflows a 32-bit `usize` (wasm32).
+    let window = (slop as usize).saturating_add(1);
 
     for (anchor_idx, anchor) in tokens.iter().enumerate() {
         if !token_is(anchor, first) {
             continue;
         }
 
-        let mut expected = anchor.position + 1;
-        let mut end = token_end(anchor);
-        let mut cursor = anchor_idx + 1;
-        let mut complete = true;
-        for term in rest {
-            while cursor < tokens.len() && tokens[cursor].position < expected {
-                cursor += 1;
-            }
-            let mut probe = cursor;
-            let mut found = None;
-            while probe < tokens.len() && tokens[probe].position <= expected + slop as usize {
-                if token_is(&tokens[probe], term) {
-                    found = Some(probe);
-                    break;
-                }
-                probe += 1;
-            }
-            match found {
-                Some(idx) => {
-                    expected = tokens[idx].position + 1;
-                    end = token_end(&tokens[idx]);
-                    cursor = idx + 1;
-                }
-                None => {
-                    complete = false;
-                    break;
-                }
-            }
-        }
+        let matched = rest.iter().try_fold(
+            (anchor_idx + 1, token_end(anchor)),
+            |(expected, _), term| {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .skip(expected)
+                    .take(window)
+                    .find(|(_, token)| token_is(token, term))
+                    .map(|(idx, token)| (idx + 1, token_end(token)))
+            },
+        );
 
-        if complete {
+        if let Some((_, end)) = matched {
             // Phrases outrank single terms, as before.
             spans.push(HighlightSpan::new(anchor.start_offset..end, true, 2.0));
         }
@@ -1507,11 +1494,7 @@ mod tests {
     fn phrase_query_highlights_only_adjacent_occurrences() {
         let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]);
         assert_eq!(
-            highlight_marks(
-                &query,
-                "body",
-                "hello world. world hello. hello there world"
-            ),
+            highlight_marks(&query, "body", "hello world. world hello. hello big world"),
             ["hello world"]
         );
     }
@@ -1526,14 +1509,48 @@ mod tests {
             ["hello big world"]
         );
         assert!(highlight_marks(&phrase(0), "body", "hello big world").is_empty());
-        // The stop filter drops `the` but keeps its position, so the
-        // remaining tokens sit one apart: a gap at slop 0, fine at slop 1 —
-        // exactly what the index-side phrase matcher sees.
-        assert!(highlight_marks(&phrase(0), "body", "hello the world").is_empty());
+    }
+
+    /// The index numbers the tokens that survive analysis densely, so a
+    /// dropped stop word leaves no gap: the index matches `"hello world"`
+    /// against "hello the world" at slop 0, and the highlighter must too.
+    #[test]
+    fn phrase_across_a_dropped_stop_word_highlights_at_slop_0() {
+        let phrase = |slop: u32| {
+            PhraseQuery::new("body", vec!["hello".into(), "world".into()]).with_slop(slop)
+        };
         assert_eq!(
-            highlight_marks(&phrase(1), "body", "hello the world"),
+            highlight_marks(&phrase(0), "body", "hello the world"),
             ["hello the world"]
         );
+        // `big` survives analysis, so it is a real gap.
+        assert!(highlight_marks(&phrase(0), "body", "hello the big world").is_empty());
+        assert_eq!(
+            highlight_marks(&phrase(1), "body", "hello the big world"),
+            ["hello the big world"]
+        );
+    }
+
+    /// `UnicodeWordTokenizer` numbers whitespace and punctuation before
+    /// dropping them, so `hello` and `world` come out at positions 0 and 3.
+    /// The index ignores those positions, and so must the highlighter.
+    #[test]
+    fn unicode_word_tokenizer_phrase_highlights_at_slop_0() {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::tokenizer::Tokenizer;
+        use crate::analysis::tokenizer::unicode_word::UnicodeWordTokenizer;
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(UnicodeWordTokenizer::new());
+        let highlighter = Highlighter::with_analyzer(
+            HighlightConfig::default(),
+            Box::new(PipelineAnalyzer::new(tokenizer)),
+        );
+        let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]);
+        let fragments = highlighter
+            .highlight(&query, "body", "hello, world")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["hello, world"]);
     }
 
     #[test]
