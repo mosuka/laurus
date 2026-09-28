@@ -1615,6 +1615,97 @@ mod tests {
         run("a_novec", "b_vec");
     }
 
+    /// #1234: a merge must not reset a term's frequency to 1 in a field
+    /// that does not store positions (`term_vectors: false`).
+    ///
+    /// `replay_segment_into_writer` collapses a frequency-only posting's
+    /// occurrences into a single `AnalyzedTerm` carrying the source
+    /// segment's original frequency; before the fix,
+    /// `add_analyzed_document_to_index` ignored that frequency and
+    /// rebuilt the posting from the replayed term count, which is always
+    /// 1 for a collapsed posting. "cat" occurs 3 times in `d0`, alone in
+    /// its own segment, so the merge exercises the replay path and the
+    /// frequency it carries.
+    #[test]
+    fn merge_preserves_term_frequency_in_a_field_without_positions() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "body".to_string(),
+            FieldOption::Text(TextOption {
+                term_vectors: false,
+                ..Default::default()
+            }),
+        );
+        let config = InvertedIndexWriterConfig {
+            fields,
+            ..Default::default()
+        };
+
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+        let d0 = writer
+            .add_document(
+                Document::builder()
+                    .add_field("body", DataValue::Text("cat cat cat".to_string()))
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap(); // segment_000000
+        let d1 = writer
+            .add_document(
+                Document::builder()
+                    .add_field("body", DataValue::Text("dog".to_string()))
+                    .build(),
+            )
+            .unwrap();
+        writer.commit().unwrap(); // segment_000001
+        drop(writer);
+
+        let si0 = segment_info("segment_000000", 1, d0, d0, 0);
+        let si1 = segment_info("segment_000001", 1, d1, d1, 1);
+        let candidate = MergeCandidate {
+            segments: vec![si0.segment_id.clone(), si1.segment_id.clone()],
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine
+            .merge_segments(
+                &candidate,
+                &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
+                1,
+            )
+            .unwrap();
+
+        let reader = InvertedIndexReader::new(
+            vec![result.new_segment.segment_info.clone()],
+            storage.clone(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let mut it = reader
+            .postings("body", "cat")
+            .unwrap()
+            .expect("\"cat\" must survive the merge");
+        assert!(it.next().unwrap(), "posting for \"cat\" must have a match");
+        assert_eq!(it.doc_id(), d0);
+        assert_eq!(
+            it.term_freq(),
+            3,
+            "merge must not reset \"cat\"'s frequency to 1"
+        );
+        assert!(
+            !it.next().unwrap(),
+            "\"cat\" must appear in exactly one document"
+        );
+    }
+
     /// #1047: mirrors [`merge_preserves_per_field_term_vectors_independently`]
     /// for DocValues -- after merging two segments, each field must keep its
     /// OWN `doc_values` state independently, detected per field from what
