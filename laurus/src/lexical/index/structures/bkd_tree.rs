@@ -540,9 +540,10 @@ impl<W: StorageOutput> BKDWriter<W> {
         let point_count = checked_point_count_u32(doc_ids.len())?;
 
         if doc_ids.is_empty() {
-            // Write basic header for empty tree
-            self.write_header(0, 0, 0)?;
-            return Ok(());
+            // An empty tree is its header alone.
+            self.writer
+                .reserve_header(Self::header_size(self.num_dims))?;
+            return self.write_header(0, 0, 0);
         }
 
         // Reject any NaN coordinate up-front. NaN's `partial_cmp` is `None`,
@@ -573,13 +574,10 @@ impl<W: StorageOutput> BKDWriter<W> {
 
         let total_count = doc_ids.len() as u64;
 
-        // Reserve space for header:
-        // Magic(4) + Version(4) + num_dims(4) + bytes_per_dim(4) + total_count(8) + num_blocks(8)
-        // + block_size(4) + min_values(num_dims * 8) + max_values(num_dims * 8) + index_start(8) + root_offset(8)
-        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 4 + (self.num_dims as u64 * 8 * 2) + 8 + 8;
-
-        self.writer.write_u32(0)?; // Placeholder
-        self.writer.seek(SeekFrom::Start(header_size))?;
+        // The header records where the leaves and the index ended up, so it
+        // is reserved now and written once they are.
+        let header_size = Self::header_size(self.num_dims);
+        self.writer.reserve_header(header_size)?;
 
         // Sort an index permutation instead of the data: this keeps the
         // point/doc_id buffers immutable and avoids per-point allocations.
@@ -592,7 +590,7 @@ impl<W: StorageOutput> BKDWriter<W> {
         let root_info = self.build_subtree(&ctx, &mut indices)?;
 
         // Write index section after all leaves
-        let index_start_offset = self.writer.stream_position()?;
+        let index_start_offset = self.writer.position();
         self.write_index()?;
 
         let node_size = Self::node_size(self.num_dims);
@@ -604,38 +602,43 @@ impl<W: StorageOutput> BKDWriter<W> {
             header_size
         };
 
-        // Go back and write real header
-        self.writer.seek(SeekFrom::Start(0))?;
-        self.write_header(total_count, index_start_offset, root_node_offset)?;
-
-        // Go back to end
-        self.writer.seek(SeekFrom::End(0))?;
-
-        Ok(())
+        self.write_header(total_count, index_start_offset, root_node_offset)
     }
 
+    /// Fill the header reserved at the start of the file.
     fn write_header(&mut self, total_count: u64, index_start: u64, root_offset: u64) -> Result<()> {
-        self.writer.write_u32(BKD_MAGIC)?;
-        self.writer.write_u32(BKD_VERSION)?;
-        self.writer.write_u32(self.num_dims)?;
-        self.writer.write_u32(8)?; // Bytes per dim (f64)
-        self.writer.write_u64(total_count)?;
-        self.writer.write_u64(self.num_blocks)?;
-        // Issue #1142: bounds a leaf's `count` on read against the writer's
-        // actual per-leaf cap, tightening the pre-existing (and, since this
-        // revision shrinks `doc_id_bits`, more reachable) gap where a leaf
-        // with zero point bits and zero doc_id bits left `count` completely
-        // unchecked.
-        self.writer.write_u32(self.block_size as u32)?;
-        for &v in &self.min_values {
-            self.writer.write_f64(v)?;
-        }
-        for &v in &self.max_values {
-            self.writer.write_f64(v)?;
-        }
-        self.writer.write_u64(index_start)?;
-        self.writer.write_u64(root_offset)?;
-        Ok(())
+        let (num_dims, num_blocks, block_size) = (self.num_dims, self.num_blocks, self.block_size);
+        let (min_values, max_values) = (&self.min_values, &self.max_values);
+        self.writer.fill_header(|w| {
+            w.write_u32(BKD_MAGIC)?;
+            w.write_u32(BKD_VERSION)?;
+            w.write_u32(num_dims)?;
+            w.write_u32(8)?; // Bytes per dim (f64)
+            w.write_u64(total_count)?;
+            w.write_u64(num_blocks)?;
+            // Issue #1142: bounds a leaf's `count` on read against the
+            // writer's actual per-leaf cap, tightening the pre-existing (and,
+            // since this revision shrinks `doc_id_bits`, more reachable) gap
+            // where a leaf with zero point bits and zero doc_id bits left
+            // `count` completely unchecked.
+            w.write_u32(block_size as u32)?;
+            for &v in min_values {
+                w.write_f64(v)?;
+            }
+            for &v in max_values {
+                w.write_f64(v)?;
+            }
+            w.write_u64(index_start)?;
+            w.write_u64(root_offset)
+        })
+    }
+
+    /// Returns the on-disk byte size of the header: magic, version,
+    /// num_dims, bytes_per_dim, total_count, num_blocks, block_size, the
+    /// per-dimension min and max values, index_start and root_offset.
+    #[inline]
+    fn header_size(num_dims: u32) -> u64 {
+        4 + 4 + 4 + 4 + 8 + 8 + 4 + (num_dims as u64 * 8 * 2) + 8 + 8
     }
 
     /// Returns the on-disk byte size of one internal index node.
@@ -731,11 +734,11 @@ impl<W: StorageOutput> BKDWriter<W> {
             right_child_idx: None,
         });
 
-        let left_file_pos_before = self.writer.stream_position()?;
+        let left_file_pos_before = self.writer.position();
         let left_info = self.build_subtree(ctx, left_indices)?;
         let left_is_leaf = left_info.node_idx.is_none();
 
-        let right_file_pos_before = self.writer.stream_position()?;
+        let right_file_pos_before = self.writer.position();
         let right_info = self.build_subtree(ctx, right_indices)?;
         let right_is_leaf = right_info.node_idx.is_none();
 
@@ -860,7 +863,7 @@ impl<W: StorageOutput> BKDWriter<W> {
     }
 
     fn write_index(&mut self) -> Result<()> {
-        let start_pos = self.writer.stream_position()?;
+        let start_pos = self.writer.position();
         let node_size = Self::node_size(self.num_dims);
 
         for i in 0..self.index_nodes.len() {
@@ -1487,6 +1490,50 @@ mod tests {
             .unwrap();
         let expected: Vec<u64> = (100u64..=200u64).collect();
         assert_eq!(results, expected);
+    }
+
+    /// The header is written last but sits first, and the footer still
+    /// covers the file in byte order: a whole-file check verifies it, and
+    /// catches a flipped leaf byte (Issue #1214). An empty tree, header
+    /// alone, verifies too.
+    #[test]
+    fn the_footer_covers_the_backfilled_header_and_every_leaf() {
+        use crate::storage::structured::{ChecksumStatus, verify_file_checksum};
+        use std::io::{Read, Write};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let points: Vec<f64> = (0..500).map(f64::from).collect();
+        let doc_ids: Vec<u64> = (0..500).collect();
+        for (name, points, doc_ids) in [
+            ("full.bkd", &points[..], &doc_ids[..]),
+            ("empty.bkd", &[][..], &[][..]),
+        ] {
+            let mut writer = BKDWriter::new(storage.create_output(name).unwrap(), 1);
+            writer.write(points, doc_ids).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(
+                verify_file_checksum(storage.open_input(name).unwrap()).unwrap(),
+                ChecksumStatus::Verified,
+                "{name}"
+            );
+            BKDReader::open(storage.clone(), name).unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        storage
+            .open_input("full.bkd")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let header_size = BKDWriter::<Box<dyn StorageOutput>>::header_size(1) as usize;
+        bytes[header_size + 20] ^= 0x01;
+        let mut output = storage.create_output("full.bkd").unwrap();
+        output.write_all(&bytes).unwrap();
+        output.close().unwrap();
+        assert_eq!(
+            verify_file_checksum(storage.open_input("full.bkd").unwrap()).unwrap(),
+            ChecksumStatus::Mismatch
+        );
     }
 
     #[test]

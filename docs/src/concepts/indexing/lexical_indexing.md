@@ -174,6 +174,7 @@ dictionary on segment merge without re-encoding from scratch.
                           variable-length per-term Block-Max-WAND
                           metadata array
 [Footer                ]  total term count + block count
+[Checksum footer       ]  CRC-32 of all of the above + magic "LCRC"
 ```
 
 Lookup walks the FST once (`O(|term|)`) to identify the block whose

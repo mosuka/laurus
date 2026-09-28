@@ -883,21 +883,32 @@ mod tests {
             let mut input = storage.open_input("segments.json").unwrap();
             input.read_to_end(&mut content).unwrap();
         }
-        // Flip a bit in the 4-byte CRC trailer only — the JSON payload stays
-        // intact, so only the checksum comparison can catch this.
-        let last = content.len() - 1;
-        content[last] ^= 0x01;
-        {
+        let rewrite = |bytes: &[u8]| {
             let mut out = storage.create_output("segments.json").unwrap();
-            std::io::Write::write_all(&mut out, &content).unwrap();
+            std::io::Write::write_all(&mut out, bytes).unwrap();
             out.close().unwrap();
-        }
+        };
 
-        let err = SegmentManager::new(config, storage, TEST_LAYOUT).unwrap_err();
+        // Flip a bit in the footer's CRC only (the u32 before the 4-byte
+        // magic) — the JSON payload stays intact, so only the checksum
+        // comparison can catch this.
+        let mut crc_flipped = content.clone();
+        let crc_at = crc_flipped.len() - 8;
+        crc_flipped[crc_at] ^= 0x01;
+        rewrite(&crc_flipped);
+        let err = SegmentManager::new(config.clone(), storage.clone(), TEST_LAYOUT).unwrap_err();
         assert!(
             err.to_string().contains("checksum mismatch"),
             "the CRC verify must reject a trailer-only corruption, got: {err}"
         );
+
+        // A damaged magic hides the framing, so the file no longer reads as
+        // framed at all — but it is still refused, never loaded.
+        let mut magic_flipped = content;
+        let last = magic_flipped.len() - 1;
+        magic_flipped[last] ^= 0x01;
+        rewrite(&magic_flipped);
+        assert!(SegmentManager::new(config, storage.clone(), TEST_LAYOUT).is_err());
     }
 
     /// #879: a torn manifest write (garbage left in the staging file) must

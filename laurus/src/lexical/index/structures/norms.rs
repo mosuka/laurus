@@ -26,7 +26,7 @@
 //! { name(string) | present_count(varint) | sum_length(varint) | min_length(varint)
 //!   | max_length(varint) | encoding(1B: 0=all present, 1=presence bitmap follows)
 //!   | [presence bitmap: ceil(N/8) bytes, LSB-first] | norms: N bytes }
-//! -- trailer: u32 CRC-32 checksum (StructWriter::close) --
+//! -- footer: CRC-32 of everything above + magic (StructWriter::close) --
 //! ```
 //!
 //! A contiguous file satisfies `max_doc_id == min_doc_id + N - 1`, and a
@@ -650,6 +650,7 @@ impl NormsReader {
                 },
             );
         }
+        reader.expect_checksum("norms")?;
 
         Ok(Some(NormsReader { slot_map, fields }))
     }
@@ -751,6 +752,57 @@ mod format_tests {
         assert_eq!(reader.field_length(2, "body"), Some(200));
         assert_eq!(reader.field_length(3, "title"), None); // doc doesn't exist
         assert_eq!(reader.field_length(0, "unknown"), None); // field doesn't exist
+    }
+
+    /// Writes a small `.norms` part for `seg`, lets `edit` change its bytes,
+    /// and loads the result.
+    fn load_edited(edit: impl FnOnce(&mut Vec<u8>)) -> Result<Option<NormsReader>> {
+        use std::io::{Read, Write};
+
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs = vec![(0u64, doc(&[("body", 12)])), (1u64, doc(&[("body", 40)]))];
+        round_trip(&storage, "seg", &NormsBuilder::from_buffered(&docs));
+        let name = format!("seg{NORMS_EXTENSION}");
+        let mut bytes = Vec::new();
+        storage
+            .open_input(&name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        edit(&mut bytes);
+        let mut output = storage.create_output(&name).unwrap();
+        output.write_all(&bytes).unwrap();
+        output.close().unwrap();
+        NormsReader::load(&storage, "seg")
+    }
+
+    /// A flipped norm byte decodes into a wrong length without tripping any
+    /// structural check; only the footer catches it (Issue #1214).
+    #[test]
+    fn a_flipped_norm_byte_fails_the_checksum() {
+        let result = load_edited(|bytes| {
+            // The last norm column byte, just before the 8-byte footer.
+            let at = bytes.len() - 9;
+            bytes[at] ^= 0x01;
+        });
+        match result {
+            Err(LaurusError::Index(msg)) => assert!(msg.contains("checksum mismatch"), "{msg}"),
+            Err(other) => panic!("expected a checksum mismatch, got {other:?}"),
+            Ok(_) => panic!("a corrupted part must not load"),
+        }
+    }
+
+    /// A part written before the footer, ending in a 4-byte trailer, still
+    /// loads.
+    #[test]
+    fn a_part_with_a_legacy_trailer_still_loads() {
+        let reader = load_edited(|bytes| {
+            bytes.truncate(bytes.len() - 8);
+            bytes.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reader.field_length(1, "body"), Some(40));
     }
 
     /// `read_doc_ids` recovers exactly the ids the slot map records, for a
