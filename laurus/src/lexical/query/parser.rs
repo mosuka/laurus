@@ -5,7 +5,9 @@
 //! - Boolean operators: `AND`, `OR`
 //! - Required/prohibited: `+required`, `-forbidden`
 //! - Phrases: `"hello world"` (quoted → `PhraseQuery`; a quoted value that
-//!   analyzes to one token → `TermQuery`)
+//!   analyzes to one token → `TermQuery`). Tokens the analyzer stacks at one
+//!   position (synonyms) are alternatives there, and a multi-word synonym
+//!   gives one query per path, OR'd.
 //! - Bare terms that the analyzer splits into several tokens are OR'd
 //!   (`BooleanQuery` with `Should` clauses), matching Lucene's `match`
 //!   query. Use quotes for phrase semantics.
@@ -18,6 +20,7 @@
 //! - Boosting: `jakarta^4`
 //! - Grouping: `(title:hello OR body:world)`
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use pest::Parser;
@@ -26,6 +29,7 @@ use pest_derive::Parser;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
+use crate::analysis::token::{Token, token_positions};
 use crate::data::GeoEcefPoint;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::datetime::parse_datetime_literal;
@@ -724,6 +728,15 @@ impl LexicalQueryParser {
     /// as a path or URL on a keyword field, and a `TermQuery` matches it
     /// without the positions a `term_vectors: false` field does not store
     /// (#1247).
+    ///
+    /// The analyzer's output is read as a token graph (#1252; see
+    /// [`phrase_paths`]). Tokens stacked at one position (synonyms) are
+    /// alternatives: one position becomes a `Should` of `TermQuery`, like
+    /// Lucene's `SynonymQuery`, and a longer phrase a `PhraseQuery` with
+    /// the alternatives at that position. A multi-word synonym makes
+    /// several paths, and the query is a `Should` of one query per path.
+    /// The boost goes on each clause, since the Block-Max-WAND fast path
+    /// ignores a `BooleanQuery`'s own boost.
     fn parse_phrase_query(
         &self,
         pair: pest::iterators::Pair<Rule>,
@@ -753,23 +766,37 @@ impl LexicalQueryParser {
         }
 
         self.create_query_over_fields(field, |field_name| {
-            let mut terms = self.analyze_term(Some(field_name), &phrase_content)?;
-            if terms.len() == 1 {
-                let term_query = TermQuery::new(field_name, terms.remove(0)).with_boost(boost);
-                return Ok(Box::new(term_query));
+            let tokens = self.analyze_tokens(Some(field_name), &phrase_content)?;
+            if tokens.is_empty() {
+                // An empty phrase matches nothing and retains the field
+                // reference for schema validation.
+                return Ok(Box::new(
+                    PhraseQuery::new(field_name, Vec::new()).with_boost(boost),
+                ));
             }
 
-            let mut phrase_query = PhraseQuery::new(field_name, terms);
-
-            if let Some(slop_value) = slop {
-                phrase_query = phrase_query.with_slop(slop_value);
+            let mut clauses: Vec<Box<dyn Query>> = Vec::new();
+            for path in phrase_paths(&tokens)? {
+                if let [alternatives] = path.as_slice() {
+                    for term in alternatives {
+                        clauses.push(Box::new(TermQuery::new(field_name, term).with_boost(boost)));
+                    }
+                } else {
+                    let phrase_query = PhraseQuery::from_positions(field_name, path)
+                        .with_slop(slop.unwrap_or(0))
+                        .with_boost(boost);
+                    clauses.push(Box::new(phrase_query));
+                }
             }
 
-            if boost != 1.0 {
-                phrase_query = phrase_query.with_boost(boost);
+            if clauses.len() == 1 {
+                return Ok(clauses.remove(0));
             }
-
-            Ok(Box::new(phrase_query))
+            let mut bool_query = BooleanQuery::new();
+            for clause in clauses {
+                bool_query.add_should(clause);
+            }
+            Ok(Box::new(bool_query))
         })
     }
 
@@ -915,6 +942,14 @@ impl LexicalQueryParser {
     }
 
     fn analyze_term(&self, field: Option<&str>, term: &str) -> Result<Vec<String>> {
+        Ok(self
+            .analyze_tokens(field, term)?
+            .into_iter()
+            .map(|t| t.text)
+            .collect())
+    }
+
+    fn analyze_tokens(&self, field: Option<&str>, term: &str) -> Result<Vec<Token>> {
         let token_stream = if let Some(field_name) = field {
             // Use field-specific analyzer if available (PerFieldAnalyzer)
             if let Some(per_field) = self.analyzer.as_any().downcast_ref::<PerFieldAnalyzer>() {
@@ -925,10 +960,103 @@ impl LexicalQueryParser {
         } else {
             self.analyzer.analyze(term)?
         };
-
-        let tokens: Vec<String> = token_stream.into_iter().map(|t| t.text).collect();
-        Ok(tokens)
+        Ok(token_stream.collect())
     }
+}
+
+/// The most paths [`phrase_paths`] expands a quoted value into. Each path
+/// is a phrase whose postings are scanned for matching and again for
+/// scoring, so this is far below Lucene's 1024-clause limit.
+const MAX_PHRASE_PATHS: usize = 64;
+
+/// The phrases a quoted value's tokens stand for, each as its positions
+/// with their alternative terms.
+///
+/// The tokens form a graph: a token is an arc from its position (as the
+/// index numbers it, [`token_positions`]) to its position +
+/// `position_length`. Arcs with the same start and end are one position
+/// of alternatives, such as a word and its one-word synonyms. Every path
+/// from the first node to the last is one phrase; a multi-word synonym
+/// adds one (`"ml"` → `[[ml]]` and `[[machine], [learning]]`). Without
+/// multi-word synonyms there is a single path.
+///
+/// A graph with no complete path (a filter removed a token the graph
+/// needed) falls back to the positions alone, which is what the index
+/// stores.
+///
+/// # Errors
+///
+/// Returns a query error when there are more than [`MAX_PHRASE_PATHS`]
+/// paths.
+fn phrase_paths(tokens: &[Token]) -> Result<Vec<Vec<Vec<String>>>> {
+    let positions = token_positions(tokens);
+
+    // (from, to) → alternatives, and the arcs leaving each node.
+    let mut arcs: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+    for (token, &from) in tokens.iter().zip(&positions) {
+        let length = u32::try_from(token.position_length.max(1)).unwrap_or(u32::MAX);
+        let alternatives = arcs.entry((from, from.saturating_add(length))).or_default();
+        if !alternatives.contains(&token.text) {
+            alternatives.push(token.text.clone());
+        }
+    }
+    let first = positions[0];
+    let last = arcs.keys().map(|&(_, to)| to).max().unwrap_or(first);
+    let mut leaving: BTreeMap<u32, Vec<(u32, &Vec<String>)>> = BTreeMap::new();
+    for ((from, to), alternatives) in &arcs {
+        leaving.entry(*from).or_default().push((*to, alternatives));
+    }
+
+    // Paths from each node to `last`, counted before any is built.
+    let mut path_counts: BTreeMap<u32, usize> = BTreeMap::new();
+    path_counts.insert(last, 1);
+    for (&node, out) in leaving.iter().rev() {
+        let count = out.iter().fold(0usize, |count, (to, _)| {
+            count.saturating_add(path_counts.get(to).copied().unwrap_or(0))
+        });
+        path_counts.insert(node, count);
+    }
+    let path_count = path_counts.get(&first).copied().unwrap_or(0);
+    if path_count > MAX_PHRASE_PATHS {
+        return Err(LaurusError::query(format!(
+            "a quoted value expands into {path_count} phrases through its synonyms, \
+             more than the {MAX_PHRASE_PATHS} allowed; quote fewer words at once"
+        )));
+    }
+    if path_count == 0 {
+        let mut by_position: Vec<Vec<String>> = Vec::new();
+        for (token, (i, &position)) in tokens.iter().zip(positions.iter().enumerate()) {
+            if i == 0 || positions[i - 1] != position {
+                by_position.push(Vec::new());
+            }
+            let alternatives = by_position.last_mut().expect("pushed above");
+            if !alternatives.contains(&token.text) {
+                alternatives.push(token.text.clone());
+            }
+        }
+        return Ok(vec![by_position]);
+    }
+
+    fn walk(
+        node: u32,
+        last: u32,
+        leaving: &BTreeMap<u32, Vec<(u32, &Vec<String>)>>,
+        path: &mut Vec<Vec<String>>,
+        paths: &mut Vec<Vec<Vec<String>>>,
+    ) {
+        if node == last {
+            paths.push(path.clone());
+            return;
+        }
+        for (to, alternatives) in leaving.get(&node).into_iter().flatten() {
+            path.push((*alternatives).clone());
+            walk(*to, last, leaving, path, paths);
+            path.pop();
+        }
+    }
+    let mut paths = Vec::with_capacity(path_count);
+    walk(first, last, &leaving, &mut Vec::new(), &mut paths);
+    Ok(paths)
 }
 
 /// Walk a `geo3d_*` pair and collect every nested `signed_float` token
@@ -1720,6 +1848,178 @@ mod tests {
         assert!(
             msg.contains("2D geo queries require an explicit field prefix"),
             "got: {msg}"
+        );
+    }
+
+    // ---- Quoted values through stacked tokens (#1252) ----
+
+    /// Whitespace + lowercase + synonyms {big, large} and {ml, machine
+    /// learning}, keeping the originals.
+    fn synonym_parser() -> LexicalQueryParser {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::lowercase::LowercaseFilter;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+        dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
+        let analyzer = PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+            .add_filter(Arc::new(LowercaseFilter::new()))
+            .add_filter(Arc::new(SynonymGraphFilter::with_tokenizer(
+                dict,
+                Box::new(WhitespaceTokenizer::new()),
+                true,
+            )));
+        LexicalQueryParser::new(Arc::new(analyzer)).with_default_field("body")
+    }
+
+    /// The Should clauses of `query`, each as `(description, boost)`,
+    /// sorted; a query that is not a Should-only BooleanQuery is one clause.
+    fn should_clauses(query: &dyn Query) -> Vec<(String, f32)> {
+        let mut clauses: Vec<(String, f32)> = match query.as_any().downcast_ref::<BooleanQuery>() {
+            Some(boolean) => {
+                assert_eq!(boolean.boost(), 1.0, "the boost goes on each clause");
+                boolean
+                    .clauses()
+                    .iter()
+                    .map(|c| {
+                        assert_eq!(c.occur, Occur::Should, "{query:?}");
+                        (c.query.description(), c.query.boost())
+                    })
+                    .collect()
+            }
+            None => vec![(query.description(), query.boost())],
+        };
+        clauses.sort_by(|a, b| a.0.cmp(&b.0));
+        clauses
+    }
+
+    fn term(term: &str, boost: f32) -> (String, f32) {
+        (
+            TermQuery::new("body", term).with_boost(boost).description(),
+            boost,
+        )
+    }
+
+    fn phrase(positions: &[&[&str]], slop: u32, boost: f32) -> (String, f32) {
+        let positions = positions
+            .iter()
+            .map(|alternatives| alternatives.iter().map(|t| t.to_string()).collect())
+            .collect();
+        (
+            PhraseQuery::from_positions("body", positions)
+                .with_slop(slop)
+                .description(),
+            boost,
+        )
+    }
+
+    fn sorted(mut clauses: Vec<(String, f32)>) -> Vec<(String, f32)> {
+        clauses.sort_by(|a, b| a.0.cmp(&b.0));
+        clauses
+    }
+
+    /// One position with stacked tokens matches any of them, like Lucene's
+    /// `SynonymQuery`, and needs no positions.
+    #[test]
+    fn quoted_word_with_stacked_synonyms_ors_them() {
+        let query = synonym_parser().parse("\"big\"").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            sorted(vec![term("big", 1.0), term("large", 1.0)])
+        );
+    }
+
+    /// The BMW fast path ignores a BooleanQuery's own boost, so the boost
+    /// must sit on each clause; slop has nothing to apply to.
+    #[test]
+    fn stacked_alternatives_carry_the_boost_on_each_clause() {
+        let query = synonym_parser().parse("\"big\"~3^2").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            sorted(vec![term("big", 2.0), term("large", 2.0)])
+        );
+    }
+
+    #[test]
+    fn phrase_through_a_stacked_position_has_alternatives_there() {
+        let query = synonym_parser().parse("\"a Big dog\"~2^3").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            vec![phrase(&[&["a"], &["big", "large"], &["dog"]], 2, 3.0)]
+        );
+    }
+
+    /// A multi-word synonym is a graph: one query per path through it.
+    #[test]
+    fn multi_word_synonym_ors_one_query_per_path() {
+        let expected = sorted(vec![
+            term("ml", 1.0),
+            phrase(&[&["machine"], &["learning"]], 0, 1.0),
+        ]);
+        for dsl in ["\"ml\"", "\"machine learning\""] {
+            let query = synonym_parser().parse(dsl).unwrap();
+            assert_eq!(should_clauses(query.as_ref()), expected, "{dsl}");
+        }
+
+        let query = synonym_parser().parse("\"ml is\"").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            sorted(vec![
+                phrase(&[&["ml"], &["is"]], 0, 1.0),
+                phrase(&[&["machine"], &["learning"], &["is"]], 0, 1.0),
+            ])
+        );
+    }
+
+    /// Paths multiply: six multi-word synonyms give 64 paths, seven give
+    /// 128, past the cap.
+    #[test]
+    fn too_many_graph_paths_is_a_query_error() {
+        let parser = synonym_parser();
+        let within = parser.parse("\"ml ml ml ml ml ml\"").unwrap();
+        assert_eq!(should_clauses(within.as_ref()).len(), 64);
+
+        match parser.parse("\"ml ml ml ml ml ml ml\"") {
+            Err(LaurusError::Query(message)) => {
+                assert!(message.contains("128"), "{message}")
+            }
+            other => panic!("expected a query error, got {other:?}"),
+        }
+    }
+
+    /// A graph with no complete path (here "b" starts at a node nothing
+    /// reaches) falls back to the positions the index stores, ignoring
+    /// `position_length`.
+    #[test]
+    fn a_graph_without_a_complete_path_falls_back_to_positions() {
+        use crate::analysis::token::{Token, TokenStream};
+
+        #[derive(Debug)]
+        struct Fixed;
+        impl Analyzer for Fixed {
+            fn analyze(&self, _text: &str) -> Result<TokenStream> {
+                let tokens = vec![
+                    Token::new("a", 0).with_position_length(2),
+                    Token::new("b", 1).with_position_length(3),
+                ];
+                Ok(Box::new(tokens.into_iter()))
+            }
+            fn name(&self) -> &'static str {
+                "fixed"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let parser = LexicalQueryParser::new(Arc::new(Fixed)).with_default_field("body");
+        let query = parser.parse("\"anything\"").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            vec![phrase(&[&["a"], &["b"]], 0, 1.0)]
         );
     }
 }
