@@ -13,6 +13,11 @@
 //! 3. Calculating term frequencies and positions
 //! 4. Preserving both indexed and stored field values
 //!
+//! Every field is analyzed by the same function the writer uses for
+//! [`InvertedIndexWriter::add_document`](crate::lexical::index::inverted::writer::InvertedIndexWriter::add_document),
+//! so each occurrence of a term becomes its own entry, positions are
+//! numbered densely, and the field length counts every token (Issue #1243).
+//!
 //! # Architecture
 //!
 //! ```text
@@ -28,7 +33,7 @@
 //! - **Text fields**: Analyzed with tokenizers and filters
 //! - **Integer/Float**: Converted to string representation for indexing
 //! - **Boolean**: Converted to "true"/"false" strings
-//! - **DateTime**: Converted to RFC3339 format
+//! - **DateTime**: Converted to its whole-second Unix timestamp, plus a BKD point
 //! - **Geo**: Converted to "lat,lon" format
 //! - **Binary**: Stored only, not indexed
 //! - **Null**: Stored only, not indexed
@@ -133,12 +138,11 @@ use std::sync::Arc;
 use ahash::AHashMap;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
-use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
-use crate::analysis::token::Token;
 use crate::error::Result;
-use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm};
+use crate::lexical::core::analyzed::AnalyzedDocument;
 use crate::lexical::core::document::Document;
 use crate::lexical::core::field::{FieldOption, FieldValue};
+use crate::lexical::index::inverted::writer::analyze_field_value;
 
 /// A document parser that converts Documents into AnalyzedDocuments.
 ///
@@ -280,285 +284,33 @@ impl DocumentParser {
         let mut stored_fields = AHashMap::new();
         let mut point_values = AHashMap::new();
 
-        // Process each field in the document
         for (field_name, field) in &doc.fields {
             // Issue #1114: resolve the schema's (indexed, stored) gate
-            // before doing any type-specific analysis below, mirroring
+            // before any analysis, mirroring
             // `InvertedIndexWriter::analyze_document` exactly.
             let Some((should_index, should_store)) = self.field_flags(field_name) else {
                 continue;
             };
 
-            if should_index {
-                match field {
-                    FieldValue::Text(text) => {
-                        // Analyze text field with per-field analyzer
-                        let tokens = if let Some(per_field) =
-                            self.analyzer.as_any().downcast_ref::<PerFieldAnalyzer>()
-                        {
-                            per_field.analyze_field(field_name.as_str(), text.as_str())?
-                        } else {
-                            self.analyzer.analyze(text.as_str())?
-                        };
-
-                        let token_vec: Vec<Token> = tokens.collect();
-                        let analyzed_terms = self.tokens_to_analyzed_terms(token_vec);
-
-                        field_terms.insert(field_name.clone(), analyzed_terms);
-                    }
-                    FieldValue::Int64(num) => {
-                        // Convert integer to text for indexing
-                        let text = num.to_string();
-
-                        let analyzed_term = AnalyzedTerm {
-                            term: text.clone(),
-                            position: 0,
-                            frequency: 1,
-                            offset: (0, text.len()),
-                        };
-
-                        field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                        point_values.insert(field_name.clone(), vec![vec![*num as f64]]);
-                    }
-                    FieldValue::Float64(num) => {
-                        // Convert float to text for indexing
-                        let text = num.to_string();
-
-                        let analyzed_term = AnalyzedTerm {
-                            term: text.clone(),
-                            position: 0,
-                            frequency: 1,
-                            offset: (0, text.len()),
-                        };
-
-                        field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                        point_values.insert(field_name.clone(), vec![vec![*num]]);
-                    }
-                    FieldValue::Bool(b) => {
-                        // Convert boolean to text
-                        let text = b.to_string();
-
-                        let analyzed_term = AnalyzedTerm {
-                            term: text.clone(),
-                            position: 0,
-                            frequency: 1,
-                            offset: (0, text.len()),
-                        };
-
-                        field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                    }
-                    FieldValue::DateTime(dt) => {
-                        // Convert datetime to RFC3339 string
-                        let text = dt.to_rfc3339();
-
-                        let analyzed_term = AnalyzedTerm {
-                            term: text.clone(),
-                            position: 0,
-                            frequency: 1,
-                            offset: (0, text.len()),
-                        };
-
-                        field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                        // Same BKD encoding as the inverted-index writer (#1179).
-                        let ts = crate::lexical::core::datetime::datetime_to_point(dt);
-                        point_values.insert(field_name.clone(), vec![vec![ts]]);
-                    }
-                    FieldValue::Geo(point) => {
-                        // Convert geo point to string representation
-                        let text = format!("{},{}", point.lat, point.lon);
-
-                        let analyzed_term = AnalyzedTerm {
-                            term: text.clone(),
-                            position: 0,
-                            frequency: 1,
-                            offset: (0, text.len()),
-                        };
-
-                        field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                        // Geo is a single 2D point.
-                        point_values.insert(field_name.clone(), vec![vec![point.lat, point.lon]]);
-                    }
-                    FieldValue::GeoEcef(point) => {
-                        // 3D ECEF point: index the (x, y, z) tuple as a single
-                        // BKD entry. Mirrors the 2D Geo flow (text term + point
-                        // values); `FieldOption::Geo3d` (#298) drives the
-                        // schema-side decisions and `BKDWriter` infers the
-                        // dimensionality from the point length, so emitting a
-                        // 3-element point here is enough to land on a 3D BKD.
-                        let text = format!("{},{},{}", point.x, point.y, point.z);
-
-                        let analyzed_term = AnalyzedTerm {
-                            term: text.clone(),
-                            position: 0,
-                            frequency: 1,
-                            offset: (0, text.len()),
-                        };
-
-                        field_terms.insert(field_name.clone(), vec![analyzed_term]);
-                        point_values
-                            .insert(field_name.clone(), vec![vec![point.x, point.y, point.z]]);
-                    }
-                    FieldValue::Int64Array(arr) => {
-                        // Multi-valued integer: each element becomes its own
-                        // analyzed term and a separate 1D BKD point so range
-                        // queries match when any value satisfies the predicate.
-                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
-                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
-                        let mut offset = 0usize;
-                        for (idx, num) in arr.iter().enumerate() {
-                            let text = num.to_string();
-                            let len = text.len();
-                            terms.push(AnalyzedTerm {
-                                term: text,
-                                position: idx as u32,
-                                frequency: 1,
-                                offset: (offset, offset + len),
-                            });
-                            offset += len + 1;
-                            points.push(vec![*num as f64]);
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                        point_values.insert(field_name.clone(), points);
-                    }
-                    FieldValue::Float64Array(arr) => {
-                        // Multi-valued float: same shape as Int64Array.
-                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
-                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
-                        let mut offset = 0usize;
-                        for (idx, num) in arr.iter().enumerate() {
-                            let text = num.to_string();
-                            let len = text.len();
-                            terms.push(AnalyzedTerm {
-                                term: text,
-                                position: idx as u32,
-                                frequency: 1,
-                                offset: (offset, offset + len),
-                            });
-                            offset += len + 1;
-                            points.push(vec![*num]);
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                        point_values.insert(field_name.clone(), points);
-                    }
-                    FieldValue::GeoArray(arr) => {
-                        // Multi-valued geo (#1174): one 2-D BKD point per
-                        // element, same shape as Int64Array.
-                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
-                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
-                        let mut offset = 0usize;
-                        for (idx, p) in arr.iter().enumerate() {
-                            let text = format!("{},{}", p.lat, p.lon);
-                            let len = text.len();
-                            terms.push(AnalyzedTerm {
-                                term: text,
-                                position: idx as u32,
-                                frequency: 1,
-                                offset: (offset, offset + len),
-                            });
-                            offset += len + 1;
-                            points.push(vec![p.lat, p.lon]);
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                        point_values.insert(field_name.clone(), points);
-                    }
-                    FieldValue::GeoEcefArray(arr) => {
-                        // Multi-valued ECEF (#1174): one 3-D BKD point per
-                        // element.
-                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
-                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
-                        let mut offset = 0usize;
-                        for (idx, p) in arr.iter().enumerate() {
-                            let text = format!("{},{},{}", p.x, p.y, p.z);
-                            let len = text.len();
-                            terms.push(AnalyzedTerm {
-                                term: text,
-                                position: idx as u32,
-                                frequency: 1,
-                                offset: (offset, offset + len),
-                            });
-                            offset += len + 1;
-                            points.push(vec![p.x, p.y, p.z]);
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                        point_values.insert(field_name.clone(), points);
-                    }
-                    FieldValue::DateTimeArray(arr) => {
-                        // Multi-valued datetime (#1184): one 1-D BKD point
-                        // per element, same shape as Int64Array.
-                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
-                        let mut points: Vec<Vec<f64>> = Vec::with_capacity(arr.len());
-                        let mut offset = 0usize;
-                        for (idx, dt) in arr.iter().enumerate() {
-                            let text = dt.to_rfc3339();
-                            let len = text.len();
-                            terms.push(AnalyzedTerm {
-                                term: text,
-                                position: idx as u32,
-                                frequency: 1,
-                                offset: (offset, offset + len),
-                            });
-                            offset += len + 1;
-                            points
-                                .push(vec![crate::lexical::core::datetime::datetime_to_point(dt)]);
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                        point_values.insert(field_name.clone(), points);
-                    }
-                    FieldValue::BoolArray(arr) => {
-                        // Multi-valued boolean (#1180): one "true"/"false"
-                        // term per element and, like the scalar `Bool` arm,
-                        // no BKD point.
-                        let mut terms: Vec<AnalyzedTerm> = Vec::with_capacity(arr.len());
-                        let mut offset = 0usize;
-                        for (idx, b) in arr.iter().enumerate() {
-                            let text = b.to_string();
-                            let len = text.len();
-                            terms.push(AnalyzedTerm {
-                                term: text,
-                                position: idx as u32,
-                                frequency: 1,
-                                offset: (offset, offset + len),
-                            });
-                            offset += len + 1;
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                    }
-                    FieldValue::TextArray(arr) => {
-                        // Multi-valued text (#1175): each element analyzed
-                        // separately onto one ascending position sequence,
-                        // separated by the field's position-increment gap.
-                        // Mirrors `analyze_field_value`'s arm; see it for
-                        // why the sequence must stay contiguous.
-                        let gap = self.position_increment_gap(field_name);
-                        let mut terms: Vec<AnalyzedTerm> = Vec::new();
-                        let mut base = 0u32;
-                        for (idx, text) in arr.iter().enumerate() {
-                            if idx > 0 {
-                                base = base.saturating_add(gap);
-                            }
-                            let tokens = if let Some(per_field) =
-                                self.analyzer.as_any().downcast_ref::<PerFieldAnalyzer>()
-                            {
-                                per_field.analyze_field(field_name.as_str(), text.as_str())?
-                            } else {
-                                self.analyzer.analyze(text.as_str())?
-                            };
-                            let token_vec: Vec<Token> = tokens.collect();
-                            let token_count = token_vec.len() as u32;
-                            for mut term in self.tokens_to_analyzed_terms(token_vec) {
-                                term.position = term.position.saturating_add(base);
-                                terms.push(term);
-                            }
-                            base = base.saturating_add(token_count);
-                        }
-                        field_terms.insert(field_name.clone(), terms);
-                    }
-                    // Not lexically indexable: no term representation
-                    // exists for these, regardless of `should_index`.
-                    // Spelled out rather than a wildcard `_ =>` so a new
-                    // `FieldValue` variant still fails exhaustiveness
-                    // checking here.
-                    FieldValue::Bytes(_, _) | FieldValue::Vector(_) | FieldValue::Null => {}
+            // Bytes, Vector and Null have no term representation.
+            let indexable = !matches!(
+                field,
+                FieldValue::Bytes(_, _) | FieldValue::Vector(_) | FieldValue::Null
+            );
+            if should_index && indexable {
+                // The writer's own analysis (Issue #1243), so a parsed
+                // document is indexed exactly like one passed to
+                // `add_document`. Unlike the writer, a field that analyzes
+                // to no terms is still recorded, with length 0.
+                let (terms, points) = analyze_field_value(
+                    field_name,
+                    field,
+                    &self.analyzer,
+                    self.position_increment_gap(field_name),
+                )?;
+                field_terms.insert(field_name.clone(), terms);
+                if !points.is_empty() {
+                    point_values.insert(field_name.clone(), points);
                 }
             }
 
@@ -580,44 +332,13 @@ impl DocumentParser {
             point_values,
         })
     }
-
-    /// Convert tokens to analyzed terms with position and frequency information.
-    fn tokens_to_analyzed_terms(&self, tokens: Vec<Token>) -> Vec<AnalyzedTerm> {
-        // Type alias for clarity: maps term text to list of (position, (start_offset, end_offset))
-        type TermPositionMap = AHashMap<String, Vec<(u32, (usize, usize))>>;
-        let mut term_positions: TermPositionMap = AHashMap::new();
-
-        // Group positions by term
-        for token in tokens {
-            term_positions.entry(token.text.clone()).or_default().push((
-                token.position as u32,
-                (token.start_offset, token.end_offset),
-            ));
-        }
-
-        // Create analyzed terms
-        term_positions
-            .into_iter()
-            .map(|(term, positions)| {
-                let frequency = positions.len() as u32;
-                let position = positions[0].0; // Use first position
-                let offset = positions[0].1; // Use first offset
-
-                AnalyzedTerm {
-                    term,
-                    position,
-                    frequency,
-                    offset,
-                }
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::analyzer::keyword::KeywordAnalyzer;
+    use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
     use crate::analysis::analyzer::standard::StandardAnalyzer;
 
     #[test]
@@ -906,5 +627,61 @@ mod tests {
              even though it isn't declared in the schema"
         );
         assert!(analyzed.stored_fields.contains_key("_id"));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1243: the parser must analyze a field exactly like the writer.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_text_emits_one_term_per_token_with_dense_positions() {
+        let parser = DocumentParser::new(Arc::new(StandardAnalyzer::new().unwrap()));
+
+        let doc = Document::builder()
+            .add_text("repeated", "cat cat cat")
+            .add_text("stopped", "rust the search")
+            .build();
+
+        let analyzed = parser.parse(doc).unwrap();
+        let terms_of = |field: &str| -> Vec<(String, u32)> {
+            analyzed.field_terms[field]
+                .iter()
+                .map(|t| (t.term.clone(), t.position))
+                .collect()
+        };
+
+        assert_eq!(
+            terms_of("repeated"),
+            vec![
+                ("cat".to_string(), 0),
+                ("cat".to_string(), 1),
+                ("cat".to_string(), 2)
+            ],
+            "every occurrence must be its own term"
+        );
+        assert_eq!(analyzed.field_lengths["repeated"], 3);
+
+        // "the" is a stop word; the survivors are numbered densely.
+        assert_eq!(
+            terms_of("stopped"),
+            vec![("rust".to_string(), 0), ("search".to_string(), 1)]
+        );
+        assert_eq!(analyzed.field_lengths["stopped"], 2);
+    }
+
+    #[test]
+    fn test_datetime_term_is_epoch_seconds() {
+        let parser = DocumentParser::new(Arc::new(StandardAnalyzer::new().unwrap()));
+        let dt = chrono::DateTime::parse_from_rfc3339("2024-05-06T07:08:09Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let doc = Document::builder().add_datetime("when", dt).build();
+        let analyzed = parser.parse(doc).unwrap();
+
+        let terms = &analyzed.field_terms["when"];
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].term, dt.timestamp().to_string());
+        assert_eq!(analyzed.point_values["when"].len(), 1);
     }
 }

@@ -465,12 +465,14 @@ impl std::fmt::Debug for InvertedIndexWriter {
 /// field-specific analyzer by name; any other [`Analyzer`] is applied
 /// uniformly).
 ///
-/// Shared by [`InvertedIndexWriter::analyze_document`] (fresh ingestion)
-/// and
+/// Shared by [`InvertedIndexWriter::analyze_document`] (fresh ingestion),
 /// [`MergeEngine`](crate::lexical::index::inverted::segment::merge_engine::MergeEngine)'s
-/// field-override rebuild (Issue #1081), so a field rebuilt under a new
-/// analyzer/option is indistinguishable from one indexed fresh under it —
-/// both paths derive a field's analyzed form through this one function.
+/// field-override rebuild (Issue #1081) and
+/// [`DocumentParser::parse`](crate::lexical::core::parser::DocumentParser::parse)
+/// (Issue #1243), so a field rebuilt under a new analyzer/option, or parsed
+/// ahead of `add_analyzed_document`, is indistinguishable from one indexed
+/// fresh — every path derives a field's analyzed form through this one
+/// function.
 ///
 /// Returns `(terms, points)`; either may be empty (e.g. a `Bool` or
 /// `BoolArray` value produces terms but no points; an unindexable value
