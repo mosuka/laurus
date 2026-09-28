@@ -237,6 +237,15 @@ class LaurusTest extends TestCase
         $this->assertCount(0, $results);
     }
 
+    public function testSearchUnknownFieldThrowsValueError(): void
+    {
+        // Issue #1253: a typo'd field name is the caller's mistake.
+        $idx = $this->createIndex();
+        $this->expectException(\ValueError::class);
+        $this->expectExceptionMessageMatches('/unknown field/');
+        $idx->search("nope:rust");
+    }
+
     // ── Query types ─────────────────────────────────────────────────────
 
     public function testPhraseQuery(): void

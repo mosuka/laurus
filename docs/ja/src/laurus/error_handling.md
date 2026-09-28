@@ -17,6 +17,7 @@ Laurusのすべての操作は `Result<T>` を返します。これは `std::res
 | `Query` | クエリの解析/実行エラー | 不正なQuery DSL、クエリ内の不明なフィールド |
 | `Storage` | ストレージバックエンドエラー | ストレージのオープン失敗、書き込み失敗 |
 | `Field` | フィールド定義エラー | 無効なフィールドオプション、重複するフィールド名 |
+| `InvalidArgument` | 呼び出し側が渡した引数が不正 | DSL クエリ内の不明なフィールド、ドキュメントの値の型の誤り、範囲外の値 |
 | `BenchmarkFailed` | ベンチマークエラー | ベンチマーク実行失敗 |
 | `ThreadJoinError` | スレッド join エラー | ワーカースレッドでのパニック |
 | `Json` | JSONシリアライズエラー | 不正なドキュメントJSON |
@@ -26,7 +27,7 @@ Laurusのすべての操作は `Result<T>` を返します。これは `std::res
 | `SerializationError` | バイナリシリアライズエラー | ディスク上のデータ破損 |
 | `OperationCancelled` | 操作がキャンセルされた | タイムアウト、ユーザーによるキャンセル |
 | `NotImplemented` | 機能が利用不可 | 未実装の操作 |
-| `Other` | 汎用エラー | タイムアウト、無効な設定、無効な引数 |
+| `Other` | 汎用エラー | タイムアウト、無効な設定、見つからない |
 
 ## 基本的なエラーハンドリング
 
@@ -155,7 +156,7 @@ match StorageFactory::open(StorageConfig::File {
 | `LaurusError::field(msg)` | `Field` バリアント |
 | `LaurusError::other(msg)` | `Other` バリアント |
 | `LaurusError::cancelled(msg)` | `OperationCancelled` バリアント |
-| `LaurusError::invalid_argument(msg)` | "Invalid argument" プレフィックス付き `Other` |
+| `LaurusError::invalid_argument(msg)` | `InvalidArgument` バリアント |
 | `LaurusError::invalid_config(msg)` | "Invalid configuration" プレフィックス付き `Other` |
 | `LaurusError::not_found(msg)` | "Not found" プレフィックス付き `Other` |
 | `LaurusError::timeout(msg)` | "Timeout" プレフィックス付き `Other` |

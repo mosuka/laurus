@@ -559,7 +559,7 @@ gRPC errors are returned as standard `Status` codes:
 
 | Laurus Error | gRPC Status | When |
 | :--- | :--- | :--- |
-| Schema / Query / Field / JSON | `INVALID_ARGUMENT` | Malformed request or schema |
+| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query |
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
 | Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |

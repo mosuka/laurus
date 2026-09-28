@@ -656,7 +656,7 @@ async fn reserved_prefix_rejected() -> Result<()> {
         let doc = Document::builder().add_field("_secret", "nope").build();
         let err = engine.put_document("doc1", doc).await.unwrap_err();
         assert!(
-            matches!(err, LaurusError::Other(_)) || err.to_string().contains("reserved"),
+            matches!(err, LaurusError::InvalidArgument(_)) && err.to_string().contains("reserved"),
             "policy {:?}: unexpected error {err}",
             policy
         );

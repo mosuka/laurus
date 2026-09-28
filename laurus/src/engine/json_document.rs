@@ -89,15 +89,13 @@ pub fn json_to_document(json: &JsonValue) -> Result<Document> {
 /// Prefix a per-field inference error with the field name.
 ///
 /// `infer_from_json`'s errors are all built via `LaurusError::invalid_argument`,
-/// which renders as `"Error: Invalid argument: <msg>"`. Re-wrapping that
-/// rendered string with `invalid_argument` again (i.e. `format!("field
-/// \"{name}\": {e}")`) would double the `"Error: Invalid argument: "`
-/// prefix, so the inner message is unwrapped from `LaurusError::Other`
-/// first — the field-name prefix then gets the single, correctly-formatted
-/// `"Error: Invalid argument: "` prefix instead of two nested copies.
+/// which renders as `"Invalid argument: <msg>"`. Re-wrapping that rendered
+/// string with `invalid_argument` again (i.e. `format!("field \"{name}\":
+/// {e}")`) would double the `"Invalid argument: "` prefix, so the inner
+/// message is unwrapped from `LaurusError::InvalidArgument` first.
 fn field_error(name: &str, e: LaurusError) -> LaurusError {
     let inner = match e {
-        LaurusError::Other(msg) => msg,
+        LaurusError::InvalidArgument(msg) => msg,
         other => other.to_string(),
     };
     LaurusError::invalid_argument(format!("field \"{name}\": {inner}"))
@@ -189,19 +187,21 @@ mod tests {
 
     #[test]
     fn field_error_does_not_double_wrap_the_error_prefix() {
-        // `infer_from_json`'s own errors already render as `"Error: Invalid
+        // `infer_from_json`'s own errors already render as `"Invalid
         // argument: <msg>"`; naively re-wrapping that whole rendered string
-        // a second time (`format!("field \"{name}\": {e}")` fed straight
-        // into another `invalid_argument`) would duplicate the "Error: "
-        // prefix. The inner message ("Invalid argument: <msg>", without the
-        // "Error: " prefix Display adds) is expected to survive once.
+        // (`format!("field \"{name}\": {e}")` fed straight into another
+        // `invalid_argument`) would duplicate the prefix.
         let err =
             json_to_document(&json!({"fields": {"loc": {"lat": 999.0, "lon": 0.0}}})).unwrap_err();
+        assert!(
+            matches!(err, LaurusError::InvalidArgument(_)),
+            "a bad field value is a caller error: {err:?}"
+        );
         let msg = err.to_string();
         assert_eq!(
-            msg.matches("Error:").count(),
+            msg.matches("Invalid argument:").count(),
             1,
-            "message must not double-wrap the \"Error: \" prefix: {msg}"
+            "message must not double-wrap the \"Invalid argument: \" prefix: {msg}"
         );
     }
 

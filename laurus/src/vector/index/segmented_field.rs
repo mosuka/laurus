@@ -598,7 +598,7 @@ impl SegmentedVectorField {
 impl VectorFieldReader for SegmentedVectorField {
     fn search(&self, request: FieldSearchInput) -> Result<FieldSearchResults> {
         if request.field != self.name {
-            return Err(LaurusError::invalid_argument(format!(
+            return Err(LaurusError::internal(format!(
                 "field mismatch: expected '{}', got '{}'",
                 self.name, request.field
             )));

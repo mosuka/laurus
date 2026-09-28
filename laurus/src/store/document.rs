@@ -110,9 +110,7 @@ impl DocumentSegmentWriter {
         docs: &HashMap<u64, Document>,
     ) -> Result<DocumentSegment> {
         if docs.is_empty() {
-            return Err(LaurusError::invalid_argument(
-                "cannot write empty document segment",
-            ));
+            return Err(LaurusError::internal("cannot write empty document segment"));
         }
 
         let mut sorted_ids: Vec<_> = docs.keys().cloned().collect();

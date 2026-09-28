@@ -46,7 +46,7 @@ pub async fn create_embedder_from_definition(
             Ok(Arc::new(embedder))
         }
         #[cfg(not(feature = "embeddings-candle"))]
-        EmbedderDefinition::CandleBert { .. } => Err(LaurusError::invalid_argument(
+        EmbedderDefinition::CandleBert { .. } => Err(LaurusError::not_implemented(
             "candle_bert embedder requires the 'embeddings-candle' feature to be enabled",
         )),
 
@@ -57,7 +57,7 @@ pub async fn create_embedder_from_definition(
             Ok(Arc::new(embedder))
         }
         #[cfg(not(feature = "embeddings-multimodal"))]
-        EmbedderDefinition::CandleClip { .. } => Err(LaurusError::invalid_argument(
+        EmbedderDefinition::CandleClip { .. } => Err(LaurusError::not_implemented(
             "candle_clip embedder requires the 'embeddings-multimodal' feature to be enabled",
         )),
 
@@ -65,7 +65,7 @@ pub async fn create_embedder_from_definition(
         EmbedderDefinition::Openai { model } => {
             use crate::embedding::openai_embedder::OpenAIEmbedder;
             let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-                LaurusError::invalid_argument(
+                LaurusError::invalid_config(
                     "OpenAI embedder requires the OPENAI_API_KEY environment variable to be set",
                 )
             })?;
@@ -73,7 +73,7 @@ pub async fn create_embedder_from_definition(
             Ok(Arc::new(embedder))
         }
         #[cfg(not(feature = "embeddings-openai"))]
-        EmbedderDefinition::Openai { .. } => Err(LaurusError::invalid_argument(
+        EmbedderDefinition::Openai { .. } => Err(LaurusError::not_implemented(
             "openai embedder requires the 'embeddings-openai' feature to be enabled",
         )),
     }

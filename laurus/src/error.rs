@@ -59,6 +59,12 @@ pub enum LaurusError {
     #[error("Field error: {0}")]
     Field(String),
 
+    /// The caller passed an invalid argument (unknown field, wrong value
+    /// type, out-of-range value, malformed input, ...). Bindings and
+    /// laurus-server report it as a caller error, not an internal failure.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     /// Benchmark-related errors
     #[error("Benchmark error: {0}")]
     BenchmarkFailed(String),
@@ -231,13 +237,18 @@ impl LaurusError {
         LaurusError::Other(format!("Invalid configuration: {}", msg.into()))
     }
 
-    /// Creates an [`Other`](Self::Other) variant with an `"Invalid argument: "` prefixed message.
+    /// Creates an [`InvalidArgument`](Self::InvalidArgument) variant with the given message.
+    ///
+    /// Use this only for mistakes the caller can fix by changing its input.
+    /// Failures of the server's environment or of internal invariants
+    /// belong in [`invalid_config`](Self::invalid_config) or
+    /// [`internal`](Self::internal) instead.
     ///
     /// # Parameters
     ///
     /// - `msg` - A descriptive message about the invalid argument.
     pub fn invalid_argument<S: Into<String>>(msg: S) -> Self {
-        LaurusError::Other(format!("Invalid argument: {}", msg.into()))
+        LaurusError::InvalidArgument(msg.into())
     }
 
     /// Creates an [`Other`](Self::Other) variant with an `"Internal error: "` prefixed message.
@@ -291,6 +302,16 @@ mod tests {
 
         let error = LaurusError::analysis("Test analysis error");
         assert_eq!(error.to_string(), "Analysis error: Test analysis error");
+    }
+
+    #[test]
+    fn invalid_argument_builds_its_own_variant() {
+        let error = LaurusError::invalid_argument("dimension must be > 0");
+        assert!(
+            matches!(&error, LaurusError::InvalidArgument(m) if m == "dimension must be > 0"),
+            "unexpected variant: {error:?}"
+        );
+        assert_eq!(error.to_string(), "Invalid argument: dimension must be > 0");
     }
 
     #[test]

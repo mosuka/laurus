@@ -674,7 +674,7 @@ impl VectorStore {
         let query_vectors = match &request.query {
             VectorSearchQuery::Vectors(vecs) => vecs,
             VectorSearchQuery::Payloads(_) => {
-                return Err(crate::error::LaurusError::invalid_argument(
+                return Err(crate::error::LaurusError::internal(
                     "VectorStore::search requires pre-embedded vectors; \
                      Payloads must be embedded before calling this method",
                 ));

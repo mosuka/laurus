@@ -17,6 +17,7 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `Query` | Query parsing/execution errors | Malformed Query DSL, unknown field in query |
 | `Storage` | Storage backend errors | Failed to open storage, write failure |
 | `Field` | Field definition errors | Invalid field options, duplicate field name |
+| `InvalidArgument` | The caller passed an invalid argument | Unknown field in a DSL query, wrong value type in a document, out-of-range value |
 | `BenchmarkFailed` | Benchmark errors | Benchmark execution failure |
 | `ThreadJoinError` | Thread join errors | Panic in a worker thread |
 | `Json` | JSON serialization errors | Malformed document JSON |
@@ -26,7 +27,7 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `SerializationError` | Binary serialization errors | Corrupt data on disk |
 | `OperationCancelled` | Operation was cancelled | Timeout, user cancellation |
 | `NotImplemented` | Feature not available | Unimplemented operation |
-| `Other` | Generic errors | Timeout, invalid config, invalid argument |
+| `Other` | Generic errors | Timeout, invalid config, not found |
 
 ## Basic Error Handling
 
@@ -155,7 +156,7 @@ match StorageFactory::open(StorageConfig::File {
 | `LaurusError::field(msg)` | `Field` variant |
 | `LaurusError::other(msg)` | `Other` variant |
 | `LaurusError::cancelled(msg)` | `OperationCancelled` variant |
-| `LaurusError::invalid_argument(msg)` | `Other` with "Invalid argument" prefix |
+| `LaurusError::invalid_argument(msg)` | `InvalidArgument` variant |
 | `LaurusError::invalid_config(msg)` | `Other` with "Invalid configuration" prefix |
 | `LaurusError::not_found(msg)` | `Other` with "Not found" prefix |
 | `LaurusError::timeout(msg)` | `Other` with "Timeout" prefix |

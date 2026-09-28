@@ -202,6 +202,15 @@ class TestIndex < Minitest::Test
     assert_equal [], results
   end
 
+  # Issue #1253: a typo'd field name is the caller's mistake.
+  def test_search_unknown_field_raises_argument_error
+    idx = create_index
+    err = assert_raises(ArgumentError) do
+      idx.search("nope:rust", limit: 5)
+    end
+    assert_match(/unknown field/, err.message)
+  end
+
   # ---------------------------------------------------------------------------
   # Vector search
   # ---------------------------------------------------------------------------

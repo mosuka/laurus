@@ -18,6 +18,9 @@ pub fn laurus_err(err: LaurusError) -> napi::Error {
         }
         LaurusError::Query(m) => napi::Error::new(Status::InvalidArg, format!("Query error: {m}")),
         LaurusError::Field(m) => napi::Error::new(Status::InvalidArg, format!("Field error: {m}")),
+        LaurusError::InvalidArgument(m) => {
+            napi::Error::new(Status::InvalidArg, format!("Invalid argument: {m}"))
+        }
         other => napi::Error::new(Status::GenericFailure, other.to_string()),
     }
 }
@@ -26,7 +29,7 @@ pub fn laurus_err(err: LaurusError) -> napi::Error {
 ///
 /// `SchemaConflict`/`LegacyFlatLayout`/`NotAnIndexDirectory` are
 /// caller-fixable misuse, so they map to `InvalidArg` (matching how
-/// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`). `Io` matches
+/// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`). `Io` matches
 /// the `LaurusError::Io` treatment above (`GenericFailure`, `"IO error: "`
 /// prefix) for consistency.
 pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> napi::Error {

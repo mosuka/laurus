@@ -620,6 +620,28 @@ pub struct Engine {
 
 use crate::engine::search::{FusionAlgorithm, SearchResult};
 
+/// Prefix an analyzer-resolution failure with the field it was resolved for.
+///
+/// The variant is kept, so an unknown analyzer name stays
+/// [`InvalidArgument`](crate::error::LaurusError::InvalidArgument) (a caller
+/// error) while a dictionary that fails to load stays
+/// [`Analysis`](crate::error::LaurusError::Analysis) (a server-side failure).
+fn analyzer_resolution_error(
+    field: &str,
+    err: crate::error::LaurusError,
+) -> crate::error::LaurusError {
+    use crate::error::LaurusError;
+
+    let context = format!("Failed to resolve analyzer for field '{field}'");
+    match err {
+        LaurusError::InvalidArgument(msg) => {
+            LaurusError::InvalidArgument(format!("{context}: {msg}"))
+        }
+        LaurusError::Analysis(msg) => LaurusError::Analysis(format!("{context}: {msg}")),
+        other => other,
+    }
+}
+
 impl Engine {
     /// Create a new Unified Engine with default analyzer and no embedder.
     ///
@@ -1596,11 +1618,7 @@ impl Engine {
                     &schema.analyzers,
                     &self.runtime_analyzers,
                 )
-                .map_err(|e| {
-                    crate::error::LaurusError::invalid_argument(format!(
-                        "Failed to resolve analyzer for field '{name}': {e}"
-                    ))
-                })?;
+                .map_err(|e| analyzer_resolution_error(name, e))?;
                 Some(analyzer)
             } else {
                 None
@@ -1917,11 +1935,7 @@ impl Engine {
                                 &schema.analyzers,
                                 &self.runtime_analyzers,
                             )
-                            .map_err(|e| {
-                                crate::error::LaurusError::invalid_argument(format!(
-                                    "Failed to resolve analyzer for field '{name}': {e}"
-                                ))
-                            })?,
+                            .map_err(|e| analyzer_resolution_error(name, e))?,
                         )
                     } else {
                         // A Text field with no explicit override (uses
@@ -2347,11 +2361,7 @@ impl Engine {
                         &schema.analyzers,
                         runtime_analyzers,
                     )
-                    .map_err(|e| {
-                        crate::error::LaurusError::invalid_argument(format!(
-                            "Failed to resolve analyzer for field '{name}': {e}"
-                        ))
-                    })?;
+                    .map_err(|e| analyzer_resolution_error(name, e))?;
                 per_field_analyzer.add_analyzer(name, field_analyzer);
             }
         }
@@ -3558,6 +3568,54 @@ mod tests {
         assert!(
             second.is_err(),
             "a second Engine over the same storage must be rejected while the first is alive"
+        );
+    }
+
+    /// Issue #1253: adding the field name must not turn a server-side
+    /// analyzer failure into a caller error, or the reverse.
+    #[test]
+    fn analyzer_resolution_error_keeps_the_variant() {
+        use crate::error::LaurusError;
+
+        let caller = LaurusError::invalid_argument("Unknown analyzer 'nope'");
+        match analyzer_resolution_error("body", caller) {
+            LaurusError::InvalidArgument(msg) => assert_eq!(
+                msg,
+                "Failed to resolve analyzer for field 'body': Unknown analyzer 'nope'"
+            ),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        let server = LaurusError::analysis("failed to load dictionary");
+        match analyzer_resolution_error("body", server) {
+            LaurusError::Analysis(msg) => assert_eq!(
+                msg,
+                "Failed to resolve analyzer for field 'body': failed to load dictionary"
+            ),
+            other => panic!("expected Analysis, got {other:?}"),
+        }
+    }
+
+    /// Issue #1253: an unknown analyzer name is the caller's mistake.
+    #[tokio::test]
+    async fn add_field_with_an_unknown_analyzer_is_a_caller_error() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let engine = Engine::builder(storage, Schema::new())
+            .build()
+            .await
+            .unwrap();
+
+        let option = schema::FieldOption::Text(
+            crate::lexical::core::field::TextOption::default().analyzer("no_such_analyzer"),
+        );
+        let err = engine.add_field("body", option).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::error::LaurusError::InvalidArgument(m)
+                    if m.contains("'body'") && m.contains("no_such_analyzer")
+            ),
+            "unexpected error: {err:?}"
         );
     }
 
