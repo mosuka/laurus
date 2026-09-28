@@ -259,6 +259,27 @@ pub trait Query: Send + Sync + Debug {
         }
     }
 
+    /// Collect every field this query and its sub-queries read term
+    /// positions from.
+    ///
+    /// Only a phrase of two or more terms and a span query compare
+    /// positions; everything else, including a one-term phrase, matches
+    /// from the posting list alone. A field indexed with
+    /// `term_vectors: false` stores no positions, so those queries can
+    /// never match it, and [`Engine::search`](crate::engine::Engine::search)
+    /// rejects them instead of returning an empty result (#1247).
+    ///
+    /// The default reports nothing. Composite queries override this to
+    /// recurse into every child, including `MustNot` clauses and filters.
+    ///
+    /// # Arguments
+    ///
+    /// * `out` - The set to populate with field names. Existing entries are
+    ///   preserved; new names are inserted.
+    fn collect_positional_field_refs(&self, out: &mut HashSet<String>) {
+        let _ = out;
+    }
+
     /// Collect what this query would highlight, expressed over analyzed
     /// tokens (#594).
     ///
@@ -584,5 +605,74 @@ mod leaf_field_tests {
                 "{name}: a boost for another field must not apply"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod positional_field_ref_tests {
+    use super::*;
+    use crate::lexical::query::range::RangeQuery;
+    use crate::lexical::query::span::{SpanQueryWrapper, SpanTermQuery};
+
+    fn refs(query: &dyn Query) -> Vec<String> {
+        let mut out = HashSet::new();
+        query.collect_positional_field_refs(&mut out);
+        let mut refs: Vec<String> = out.into_iter().collect();
+        refs.sort();
+        refs
+    }
+
+    fn phrase(field: &str, terms: &[&str]) -> Box<dyn Query> {
+        let terms = terms.iter().map(|t| t.to_string()).collect();
+        Box::new(PhraseQuery::new(field, terms))
+    }
+
+    /// A one-term phrase matches straight from the posting list, and an
+    /// empty one matches nothing, so neither reads positions (#1247).
+    #[test]
+    fn phrase_query_needs_positions_only_with_two_or_more_terms() {
+        assert_eq!(refs(phrase("body", &["rust", "search"]).as_ref()), ["body"]);
+        assert!(refs(phrase("body", &["rust"]).as_ref()).is_empty());
+        assert!(refs(phrase("body", &[]).as_ref()).is_empty());
+    }
+
+    #[test]
+    fn span_query_always_needs_positions() {
+        let query = SpanQueryWrapper::new(Box::new(SpanTermQuery::new("body", "rust")));
+        assert_eq!(refs(&query), ["body"]);
+    }
+
+    #[test]
+    fn position_free_leaves_report_nothing() {
+        assert!(refs(&TermQuery::new("body", "rust")).is_empty());
+        assert!(refs(&PrefixQuery::new("body", "ru")).is_empty());
+        let range = RangeQuery::new("body", Some("a".to_string()), Some("z".to_string()));
+        assert!(refs(&range).is_empty());
+    }
+
+    /// A phrase under `MustNot` or `Filter` still runs against the index,
+    /// and without positions it would silently exclude or keep nothing.
+    #[test]
+    fn boolean_query_recurses_into_every_clause() {
+        let mut nested = BooleanQuery::new();
+        nested.add_should(phrase("summary", &["a", "b"]));
+
+        let mut query = BooleanQuery::new();
+        query.add_must(phrase("title", &["a", "b"]));
+        query.add_must_not(phrase("body", &["a", "b"]));
+        query.add_filter(phrase("tags", &["a", "b"]));
+        query.add_should(Box::new(nested));
+        query.add_should(phrase("path", &["one"]));
+
+        assert_eq!(refs(&query), ["body", "summary", "tags", "title"]);
+    }
+
+    #[test]
+    fn advanced_query_recurses_into_core_and_every_filter() {
+        let query = AdvancedQuery::new(phrase("title", &["a", "b"]))
+            .with_filter(phrase("body", &["a", "b"]))
+            .with_negative_filter(phrase("tags", &["a", "b"]))
+            .with_post_filter(phrase("summary", &["a", "b"]));
+        assert_eq!(refs(&query), ["body", "summary", "tags", "title"]);
     }
 }

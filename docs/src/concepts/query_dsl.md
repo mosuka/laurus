@@ -75,6 +75,15 @@ Match an exact phrase using double quotes. Optional proximity (`~N`) allows N wo
 
 On a multi-valued text field the phrase (or its `~N` proximity window) never crosses from one element into the next unless `N` reaches the field's `position_increment_gap` (default 100).
 
+A quoted value that the field's analyzer turns into a single token is an exact term match, the same as a [Term Query](#term-query) (any `~N` is ignored). This is how to search a `keyword` field for a value the unquoted form does not accept, such as a path, a URL, or an ID containing `.`, `/`, or `:`:
+
+```text
+path:"file:///notes/a.md"
+links:"https://example.com/a"
+```
+
+A phrase of two or more tokens compares term positions, which a field stores only with `term_vectors: true` (the default). On a field with `term_vectors: false` the search is rejected with a query error instead of returning no hits. This includes an unfielded phrase that expands over the default fields when one of them has `term_vectors: false`.
+
 ### Fuzzy Query
 
 Approximate matching with edit distance. Append `~` and optionally the maximum edit distance:

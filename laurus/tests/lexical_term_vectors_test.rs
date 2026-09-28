@@ -1,9 +1,10 @@
 //! Integration tests for #1083: per-field `TextOption::term_vectors` wiring.
 //!
 //! `term_vectors` controls whether a `Text` field's postings carry
-//! positions. Positions are read only by `PhraseQuery` and span queries
-//! (`SpanTermQuery` and friends) — everything else (term matching, BM25
-//! scoring, stored-field retrieval) is unaffected either way.
+//! positions. Positions are read only by `PhraseQuery` of two or more terms
+//! and span queries (`SpanTermQuery` and friends) — everything else (term
+//! matching, one-term phrases, BM25 scoring, stored-field retrieval) is
+//! unaffected either way.
 
 use std::sync::Arc;
 
@@ -95,6 +96,33 @@ fn phrase_query_only_matches_the_field_with_term_vectors_enabled()
     assert!(
         matcher.is_exhausted(),
         "novec_field has no positions, the phrase must not match"
+    );
+
+    Ok(())
+}
+
+/// #1247: a one-term phrase has no adjacency to check, so it must match
+/// from the posting list whether or not the field stores positions, and
+/// score the same in both fields.
+#[test]
+fn one_term_phrase_query_matches_with_or_without_term_vectors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let reader = create_test_index()?;
+
+    let mut scores = Vec::new();
+    for field in ["vec_field", "novec_field"] {
+        let query = PhraseQuery::new(field, vec!["cat".to_string()]);
+        let mut matcher = query.matcher(reader.as_ref())?;
+        assert!(!matcher.is_exhausted(), "doc 1 must match 'cat' in {field}");
+        assert_eq!(matcher.doc_id(), 1);
+        assert!(!matcher.next()?, "only doc 1 contains 'cat' in {field}");
+
+        scores.push(query.scorer(reader.as_ref())?.score(1, 3.0, None));
+    }
+    assert!(scores[0] > 0.0, "the match must score, got {scores:?}");
+    assert_eq!(
+        scores[0], scores[1],
+        "the phrase frequency must come from the term frequency in both fields"
     );
 
     Ok(())

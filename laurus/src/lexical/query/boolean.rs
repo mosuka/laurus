@@ -526,6 +526,12 @@ impl Query for BooleanQuery {
         }
     }
 
+    fn collect_positional_field_refs(&self, out: &mut std::collections::HashSet<String>) {
+        for clause in &self.clauses {
+            clause.query.collect_positional_field_refs(out);
+        }
+    }
+
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
         // A MustNot clause describes what a hit does not contain.
         for clause in &self.clauses {
