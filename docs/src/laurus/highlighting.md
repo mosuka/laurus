@@ -82,7 +82,7 @@ Highlight terms come from the query tree (`Query::collect_highlight_terms`), not
 | Query | What is highlighted |
 | :--- | :--- |
 | `TermQuery` | Tokens equal to the term |
-| `PhraseQuery` | Consecutive tokens forming the phrase, with the same in-order, per-gap `slop` rule as search; each occurrence is one highlight |
+| `PhraseQuery` | Consecutive tokens forming the phrase, with the same in-order, per-gap `slop` rule as search; each occurrence is one highlight. As in the index, positions count the tokens the analyzer emits, so a stop word it drops leaves no gap |
 | `PrefixQuery`, `WildcardQuery`, `RegexpQuery`, `FuzzyQuery` | Every token the pattern (or edit distance) matches |
 | `BooleanQuery` | Terms of `Must`, `Should` and `Filter` clauses; `MustNot` clauses are skipped |
 | `AdvancedQuery` | Terms of the core query, filters and post filters; negative filters are skipped |

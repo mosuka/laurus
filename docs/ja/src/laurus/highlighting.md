@@ -82,7 +82,7 @@ let config = HighlightConfig::default()
 | クエリ | ハイライトされるもの |
 | :--- | :--- |
 | `TermQuery` | 語と一致するトークン |
-| `PhraseQuery` | フレーズを構成する連続トークン。検索と同じ「順序どおり・語間の隙間が `slop` 以内」の規則で、出現 1 回が 1 つのハイライト |
+| `PhraseQuery` | フレーズを構成する連続トークン。検索と同じ「順序どおり・語間の隙間が `slop` 以内」の規則で、出現 1 回が 1 つのハイライト。位置はインデックスと同じくアナライザが出力したトークンの順番で数えるため、除去されたストップワードは隙間にならない |
 | `PrefixQuery`、`WildcardQuery`、`RegexpQuery`、`FuzzyQuery` | パターン（または編集距離）に一致するすべてのトークン |
 | `BooleanQuery` | `Must`・`Should`・`Filter` 節の語。`MustNot` 節は除外 |
 | `AdvancedQuery` | コアクエリ・フィルタ・ポストフィルタの語。ネガティブフィルタは除外 |
