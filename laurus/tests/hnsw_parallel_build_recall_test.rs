@@ -9,7 +9,10 @@
 //! on thread interleaving. On this test's corpus, 4-thread builds scored a
 //! mean self-recall@10 of 0.978 (minimum 0.899) against a serial 0.998, and
 //! 39 of 40 builds scored below 0.99. Workers now claim the new nodes in input
-//! order, 16 at a time, and 4-thread builds score 0.997 or more.
+//! order, 16 at a time, and 4-thread builds score 0.997 or more. Issue #1241's
+//! diversity heuristic for `select_neighbors`/`prune_neighbors` (replacing
+//! plain nearest-first selection) kept this corpus at the same level: 20
+//! local 4-thread builds ranged 0.9980-0.9988 (serial 0.9988).
 //!
 //! The gate is **self-recall@10**: query each node with its own vector and
 //! check it appears in its own top-10.
@@ -35,9 +38,11 @@ const THREADS: usize = 4;
 /// Independent parallel builds; every one must pass.
 const TRIALS: usize = 3;
 
-/// Lowest acceptable self-recall@10 for a single parallel build. The fixed
-/// build's minimum over 20 local 4-thread builds was 0.9974; the old
-/// contiguous-range split scored below this in 39 of 40 builds.
+/// Lowest acceptable self-recall@10 for a single parallel build. The
+/// batch-order fix's (#1238) minimum over 20 local 4-thread builds was
+/// 0.9974; with the #1241 diversity heuristic on top, 20 local 4-thread
+/// builds ranged 0.9980-0.9988. The old contiguous-range split scored below
+/// this threshold in 39 of 40 builds.
 const MIN_SELF_RECALL: f32 = 0.99;
 
 /// A smooth curve parameterized by doc id, so doc id order follows position
