@@ -275,10 +275,18 @@ impl ConcurrentHnswGraph {
             // overwrite — losing the only in-edge of some node made it
             // unreachable from the entry point (silent recall loss). Pruning
             // needs only the immutable `self.vectors` / `self.doc_id_map`
-            // (via `prune_neighbors`) and touches no node lock, so holding
-            // the write lock across it is deadlock-free; the extra work is an
-            // O(max_conn) distance pass that runs only when a node exceeds
-            // its degree bound.
+            // (via `prune_neighbors`), and touches no other node's lock, so
+            // holding the write lock across it is deadlock-free. Since the
+            // diversity heuristic (#1241), the extra work is a bounded pass of
+            // at most `(max_conn + 1) * max_conn` distance computations, with
+            // an early break on the first occlusion, that runs only when a
+            // node exceeds its degree bound — and overflow now recurs less
+            // often, because the heuristic returns fewer than `max_conn`
+            // neighbors, leaving more headroom before the next push
+            // overflows again. Computing the diverse subset on a snapshot
+            // outside the lock and writing it back would reopen the exact
+            // #868 race this lock closes: a concurrent back-edge push in that
+            // window would be clobbered by the stale overwrite.
             let mut neighbors = lock.write();
             if !neighbors.contains(&neighbor_id) {
                 neighbors.push(neighbor_id);
@@ -1353,7 +1361,7 @@ impl HnswIndexWriter {
                     curr_obj = min_cand.id;
                 }
 
-                let neighbors = writer_ref.select_neighbors(&candidates, m, lc, m_max, m_max_0);
+                let neighbors = writer_ref.select_neighbors(&candidates, m)?;
 
                 graph.set_neighbors(doc_id, lc, neighbors.clone());
 
@@ -1610,19 +1618,75 @@ impl HnswIndexWriter {
         })
     }
 
-    fn select_neighbors(
-        &self,
-        candidates: &[Candidate],
-        m: usize,
-        _level: usize,
-        _m_max: usize,
-        _m_max_0: usize,
-    ) -> Vec<u64> {
-        // Simple heuristic: take M nearest.
-        let mut sorted: Vec<_> = candidates.to_vec();
-        sorted.sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance));
-        sorted.truncate(m);
-        sorted.into_iter().map(|c| c.id).collect()
+    /// Select up to `cap` neighbors out of `candidates`, using Malkov &
+    /// Yashunin's Algorithm 4 (the simplified form hnswlib's
+    /// `getNeighborsByHeuristic2` uses: no candidate extension, no kept
+    /// pruned connections) instead of plain nearest-first truncation (Issue
+    /// #1241).
+    ///
+    /// Nearest-first selection lets every edge in a filled neighborhood point
+    /// to nearby nodes only, so once a region of the graph saturates, no long
+    /// edge survives to connect it onward — graph quality then depends
+    /// strongly on insertion order (e.g. cluster-ordered inserts: self-recall
+    /// @10 as low as 0.92, vs 0.996 with this heuristic). A diverse
+    /// candidate — one not "occluded" by an already-picked, closer neighbor —
+    /// is kept even if farther from the reference point than a nearer,
+    /// occluded one, because it reaches nodes the nearer ones already cover.
+    ///
+    /// `candidates[i].distance` MUST already be the distance to the same
+    /// reference point (both call sites compute it that way: from the query
+    /// vector during insertion, or from `doc_id`'s own vector during
+    /// back-edge pruning) — the reference point's own vector is otherwise
+    /// unneeded, since diversity only compares candidates against each other
+    /// and against their own precomputed distance.
+    ///
+    /// Ties in distance are broken by doc id so the result is deterministic
+    /// regardless of the candidates' input order (a plain nearest-first sort
+    /// left exact ties to resolve arbitrarily, which was harmless when only
+    /// the sort order mattered — under this heuristic, selection order
+    /// decides which edges exist).
+    ///
+    /// May return fewer than `cap` ids: that is the point. When `candidates`
+    /// holds `cap` or fewer, every one of them is kept unfiltered (hnswlib's
+    /// early return) — during the serial bootstrap the graph is smaller than
+    /// `m`, and applying diversity there would starve the core the rest of
+    /// the build routes through.
+    fn select_neighbors(&self, candidates: &[Candidate], cap: usize) -> Result<Vec<u64>> {
+        let mut ordered: Vec<&Candidate> = candidates.iter().collect();
+        ordered.sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
+
+        if ordered.len() <= cap {
+            return Ok(ordered.into_iter().map(|c| c.id).collect());
+        }
+
+        let mut kept: Vec<u64> = Vec::with_capacity(cap);
+        // Dense indices of `kept`, parallel to it, so each diversity check
+        // reuses `calc_dist_by_idx` without re-resolving `doc_id_map`.
+        let mut kept_idx: Vec<usize> = Vec::with_capacity(cap);
+        for cand in ordered {
+            if kept.len() >= cap {
+                break;
+            }
+            let cand_idx = *self.doc_id_map.get(&cand.id).ok_or_else(|| {
+                LaurusError::internal(format!("Doc ID {} not found in doc_id_map", cand.id))
+            })?;
+            let cand_vec = &self.vectors[cand_idx].2;
+            let mut diverse = true;
+            for &sel in &kept_idx {
+                // Strict `<`: an exact tie between "distance to base" and
+                // "distance to an already-kept neighbor" keeps the
+                // candidate, matching hnswlib.
+                if self.calc_dist_by_idx(cand_vec, sel)? < cand.distance {
+                    diverse = false;
+                    break;
+                }
+            }
+            if diverse {
+                kept.push(cand.id);
+                kept_idx.push(cand_idx);
+            }
+        }
+        Ok(kept)
     }
 
     fn prune_neighbors(
@@ -1635,7 +1699,9 @@ impl HnswIndexWriter {
             return Ok(neighbors);
         }
 
-        // Sort by distance from doc_id
+        // Distance from doc_id, the node whose back-edge list overflowed —
+        // select_neighbors judges diversity relative to whatever reference
+        // point these distances were computed against.
         let idx = *self.doc_id_map.get(&doc_id).ok_or_else(|| {
             LaurusError::internal(format!(
                 "Doc ID {} not found in doc_id_map during pruning",
@@ -1654,11 +1720,7 @@ impl HnswIndexWriter {
             });
         }
 
-        // We want to keep nearest. Move to min-heap or just sort.
-        candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
-        candidates.truncate(max_conn);
-
-        Ok(candidates.into_iter().map(|c| c.id).collect())
+        self.select_neighbors(&candidates, max_conn)
     }
 
     /// Guarantee that every node is reachable from `entry` over the layer-0
@@ -2652,6 +2714,190 @@ mod search_layer_arena_tests {
             vec![99],
             "buffer must be cleared, not appended to, between calls"
         );
+    }
+}
+
+/// Unit tests for `select_neighbors`'s diversity heuristic (Issue #1241):
+/// which candidates the occlusion check drops, the below-cap early return,
+/// tie handling, `prune_neighbors` delegation, and error propagation.
+/// `Candidate`/`select_neighbors`/`prune_neighbors` are private to this
+/// module, so these tests live here (see `search_layer_arena_tests` above for
+/// the same reasoning). Broader recall behaviour is covered by
+/// `hnsw_cluster_order_recall_test`, `hnsw_coldstart_recall_test`, and the
+/// other integration suites under `laurus/tests/`.
+#[cfg(test)]
+mod neighbor_selection_tests {
+    use super::*;
+    use crate::vector::core::distance::DistanceMetric;
+    use crate::vector::index::HnswIndexConfig;
+
+    /// A minimal, storage-less writer with `vectors`/`doc_id_map` populated
+    /// directly, mirroring `search_layer_arena_tests::make_writer`.
+    fn make_writer(vectors: Vec<(u64, String, Vector)>) -> HnswIndexWriter {
+        let config = HnswIndexConfig {
+            dimension: vectors.first().map(|(_, _, v)| v.data.len()).unwrap_or(2),
+            m: 4,
+            ef_construction: 8,
+            distance_metric: DistanceMetric::Euclidean,
+            ..Default::default()
+        };
+        let mut writer = HnswIndexWriter::new(config, VectorIndexWriterConfig::default(), "test")
+            .expect("writer construction must succeed");
+        writer.vectors = vectors;
+        writer.rebuild_doc_id_map();
+        writer
+    }
+
+    fn candidate(id: u64, distance: f32) -> Candidate {
+        Candidate {
+            id,
+            distance,
+            similarity: 0.0,
+        }
+    }
+
+    /// Build a `Candidate` for `id` with its distance to `base` computed via
+    /// `calc_dist`, so the test's expectations use the exact same arithmetic
+    /// as the code under test rather than a hand-typed value that could
+    /// drift from it (relevant for the exact-tie test below).
+    fn candidate_from(writer: &HnswIndexWriter, base: &Vector, id: u64) -> Result<Candidate> {
+        Ok(candidate(id, writer.calc_dist(base, id)?))
+    }
+
+    #[test]
+    fn drops_candidates_occluded_by_a_nearer_one() -> Result<()> {
+        // Base (doc 0) at the origin; 2 and 3 sit on the same ray as 1 and
+        // are occluded by it (closer to 1 than to the base); 4 is off-axis
+        // and not occluded by 1, so it survives despite being farthest.
+        let vectors = vec![
+            (0, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (1, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+            (2, "t".to_string(), Vector::new(vec![1.2, 0.0])),
+            (3, "t".to_string(), Vector::new(vec![1.4, 0.0])),
+            (4, "t".to_string(), Vector::new(vec![0.0, 1.5])),
+        ];
+        let writer = make_writer(vectors);
+        let base = Vector::new(vec![0.0, 0.0]);
+        let candidates = [1, 2, 3, 4]
+            .into_iter()
+            .map(|id| candidate_from(&writer, &base, id))
+            .collect::<Result<Vec<_>>>()?;
+        let kept = writer.select_neighbors(&candidates, 3)?;
+        assert_eq!(
+            kept,
+            vec![1, 4],
+            "2 and 3 must be dropped as occluded by 1, even though the cap is 3"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_everything_below_the_cap() -> Result<()> {
+        let vectors = vec![
+            (0, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (1, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+            (2, "t".to_string(), Vector::new(vec![1.2, 0.0])),
+        ];
+        let writer = make_writer(vectors);
+        let base = Vector::new(vec![0.0, 0.0]);
+        let candidates = [1, 2]
+            .into_iter()
+            .map(|id| candidate_from(&writer, &base, id))
+            .collect::<Result<Vec<_>>>()?;
+        let kept = writer.select_neighbors(&candidates, 4)?;
+        assert_eq!(
+            kept,
+            vec![1, 2],
+            "below-cap candidates must all be kept unfiltered (hnswlib's early return)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_tie_keeps_the_candidate() -> Result<()> {
+        // By construction d(1,2) == d(base,2) bit-for-bit: both reduce to
+        // sqrt(0.25^2 + 1.0^2), computed from exactly-representable f32
+        // inputs (0.5, 0.25, 1.0), so the two calc_dist calls take the same
+        // path to the same result. This pins strict `<` (occlude only if
+        // strictly closer) against `<=` (which would drop 2).
+        let vectors = vec![
+            (0, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (1, "t".to_string(), Vector::new(vec![0.5, 0.0])),
+            (2, "t".to_string(), Vector::new(vec![0.25, 1.0])),
+            (3, "t".to_string(), Vector::new(vec![0.6, 0.0])),
+        ];
+        let writer = make_writer(vectors);
+        let base = Vector::new(vec![0.0, 0.0]);
+        let candidates = [1, 2, 3]
+            .into_iter()
+            .map(|id| candidate_from(&writer, &base, id))
+            .collect::<Result<Vec<_>>>()?;
+        let kept = writer.select_neighbors(&candidates, 2)?;
+        assert_eq!(
+            kept,
+            vec![1, 2],
+            "an exact tie must keep the candidate, not occlude it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_distances_break_by_doc_id() -> Result<()> {
+        let vectors = vec![
+            (0, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (7, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+            (3, "t".to_string(), Vector::new(vec![0.0, 1.0])),
+            (9, "t".to_string(), Vector::new(vec![2.0, 2.0])),
+        ];
+        let writer = make_writer(vectors);
+        let base = Vector::new(vec![0.0, 0.0]);
+        let candidates = [7, 3, 9]
+            .into_iter()
+            .map(|id| candidate_from(&writer, &base, id))
+            .collect::<Result<Vec<_>>>()?;
+        let kept = writer.select_neighbors(&candidates, 2)?;
+        assert_eq!(
+            kept,
+            vec![3, 7],
+            "a distance tie must break by ascending doc id, not input order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prune_neighbors_uses_the_heuristic() -> Result<()> {
+        // Same geometry as `drops_candidates_occluded_by_a_nearer_one`,
+        // reached through `prune_neighbors`'s own distance computation
+        // instead of pre-built `Candidate`s.
+        let vectors = vec![
+            (0, "t".to_string(), Vector::new(vec![0.0, 0.0])),
+            (1, "t".to_string(), Vector::new(vec![1.0, 0.0])),
+            (2, "t".to_string(), Vector::new(vec![1.2, 0.0])),
+            (3, "t".to_string(), Vector::new(vec![1.4, 0.0])),
+            (4, "t".to_string(), Vector::new(vec![0.0, 1.5])),
+        ];
+        let writer = make_writer(vectors);
+        let kept = writer.prune_neighbors(0, vec![1, 2, 3, 4], 3)?;
+        assert_eq!(
+            kept,
+            vec![1, 4],
+            "pruning an overflowing back-edge list must diversify, same as select_neighbors"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn errors_when_a_candidate_is_missing_from_doc_id_map() {
+        let vectors = vec![(2, "t".to_string(), Vector::new(vec![1.0, 0.0]))];
+        let writer = make_writer(vectors);
+        // id 999 sorts first (nearest), so the missing-id error surfaces on
+        // the very first doc_id_map lookup rather than being short-circuited
+        // by the cap.
+        let candidates = vec![candidate(999, 0.1), candidate(2, 5.0)];
+        let err = writer
+            .select_neighbors(&candidates, 1)
+            .expect_err("a candidate missing from doc_id_map must error");
+        assert!(err.to_string().contains("999"), "{err}");
     }
 }
 
