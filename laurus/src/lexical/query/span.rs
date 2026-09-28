@@ -771,6 +771,10 @@ impl Query for SpanQueryWrapper {
         out.insert(self.span_query.field_name().to_string());
     }
 
+    fn collect_positional_field_refs(&self, out: &mut std::collections::HashSet<String>) {
+        out.insert(self.span_query.field_name().to_string());
+    }
+
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
         if field.is_none_or(|f| f == self.span_query.field_name()) {
             self.span_query.collect_highlight_terms(out);

@@ -513,8 +513,9 @@ fn classify_doc_values(
 /// `true -> false` is `MetadataOnly`: unlike `multi_valued` (where a stale
 /// on-disk shape can be misread under the new setting), a reader tells
 /// positions apart per-posting via the segment's own `any_positions`
-/// header, so leftover positions on disk are simply never read once the
-/// field's setting is `false` — no correctness risk either way (#1083).
+/// header, so leftover positions on disk are harmless (#1083). Nothing
+/// queries them either: once the field's setting is `false`,
+/// `Engine::search` rejects the phrase and span queries that would (#1247).
 fn classify_text(old: &TextOption, new: &TextOption) -> FieldChangeKind {
     // Text indexes terms only (no BKD points), so its `multi_valued` rule is
     // the term-only one: a rebuild can only source the field's original

@@ -235,12 +235,15 @@ pub struct TextOption {
 
     /// Whether to store term positions for this field ("term vectors").
     ///
-    /// Positions are what phrase (`PhraseQuery`) and span (`SpanNearQuery`
-    /// and friends) queries read; without them those queries never match
-    /// this field, with no fallback. Nothing else uses them — BM25 scores
-    /// from the posting list's own frequency section, and highlighting
-    /// always re-tokenizes the stored text. Costs a small per-posting
-    /// section on disk.
+    /// Positions are what phrase (`PhraseQuery` of two or more terms) and
+    /// span (`SpanNearQuery` and friends) queries read; without them those
+    /// queries cannot match this field, and
+    /// [`Engine::search`](crate::engine::Engine::search) rejects them with
+    /// a query error. Nothing else uses them — a one-term phrase (including
+    /// a quoted DSL value that analyzes to one token) matches from the
+    /// posting list, BM25 scores from the posting list's own frequency
+    /// section, and highlighting always re-tokenizes the stored text. Costs
+    /// a small per-posting section on disk.
     #[serde(default = "default_true")]
     pub term_vectors: bool,
 

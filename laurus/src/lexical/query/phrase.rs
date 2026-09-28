@@ -61,8 +61,10 @@ impl PhraseMatcher {
         terms: &[String],
         slop: u32,
     ) -> Result<Vec<PhraseMatch>> {
-        if terms.is_empty() {
-            return Ok(Vec::new());
+        match terms {
+            [] => return Ok(Vec::new()),
+            [term] => return Self::find_single_term_matches(reader, field, term),
+            _ => {}
         }
 
         // Get posting iterators for all terms
@@ -119,6 +121,38 @@ impl PhraseMatcher {
         // Sort matches by document ID
         phrase_matches.sort_by_key(|m| m.doc_id);
         Ok(phrase_matches)
+    }
+
+    /// Match a one-term phrase straight from the term's posting list.
+    ///
+    /// A single term has no adjacency to check, so every document holding
+    /// it matches, `term_freq` times. Requiring positions instead would
+    /// find nothing in a field indexed with `term_vectors: false` (#1247),
+    /// whose `positions` stay empty. Where positions are stored, their
+    /// count is the term frequency, so the phrase frequency, and therefore
+    /// the score, is the same either way.
+    fn find_single_term_matches(
+        reader: &dyn LexicalIndexReader,
+        field: &str,
+        term: &str,
+    ) -> Result<Vec<PhraseMatch>> {
+        let Some(mut iter) = reader.postings(field, term)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut matches = Vec::new();
+        while iter.next()? {
+            let doc_id = iter.doc_id();
+            if doc_id == u64::MAX {
+                break;
+            }
+            matches.push(PhraseMatch {
+                doc_id,
+                phrase_freq: u32::try_from(iter.term_freq()).unwrap_or(u32::MAX),
+                positions: iter.positions()?,
+            });
+        }
+        Ok(matches)
     }
 
     /// Find valid phrase positions within a document.
@@ -520,6 +554,12 @@ impl Query for PhraseQuery {
 
     fn field(&self) -> Option<&str> {
         Some(&self.field)
+    }
+
+    fn collect_positional_field_refs(&self, out: &mut std::collections::HashSet<String>) {
+        if self.terms.len() >= 2 {
+            out.insert(self.field.clone());
+        }
     }
 
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {

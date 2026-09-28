@@ -150,14 +150,14 @@ async fn update_field_enables_term_vectors_and_phrase_query_starts_matching() ->
         .await?;
     engine.commit().await?;
 
-    // Before: `term_vectors: false` means no positions on disk, so a
-    // phrase query must not match.
+    // Before: `term_vectors: false` means no positions on disk, so the
+    // phrase query is rejected rather than silently matching nothing (#1247).
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("body:\"quick brown\"").await?;
-    let before = engine.search(request).await?;
+    let before = engine.search(request).await;
     assert!(
-        before.is_empty(),
-        "term_vectors: false must have no positions to phrase-match against, got {before:?}"
+        matches!(before, Err(LaurusError::Query(_))),
+        "a phrase on a term_vectors: false field must be rejected, got {before:?}"
     );
 
     let new_option = SchemaFieldOption::Text(TextOption::default().term_vectors(true));

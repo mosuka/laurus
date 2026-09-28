@@ -1993,6 +1993,56 @@ impl Engine {
         }
     }
 
+    /// Reject phrase and span queries on fields that store no positions.
+    ///
+    /// A `Text` field indexed with `term_vectors: false` has no positions,
+    /// so a phrase of two or more terms or a span query over it can never
+    /// match (#1247). Returning an empty result would look like a real
+    /// "no hits", so the search fails instead, like Lucene's "field was
+    /// indexed without position data". The check reads the schema, not the
+    /// segments: after a `true -> false` change, positions written earlier
+    /// stay on disk but are not queried.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - A lexical query about to be executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::Query`](crate::error::LaurusError::Query)
+    /// naming the offending fields, in sorted order.
+    fn validate_positional_field_refs(
+        &self,
+        query: &dyn crate::lexical::query::Query,
+    ) -> Result<()> {
+        let mut refs = HashSet::new();
+        query.collect_positional_field_refs(&mut refs);
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.schema.read();
+        let mut positionless: Vec<String> = refs
+            .into_iter()
+            .filter(|field| {
+                matches!(
+                    schema.fields.get(field),
+                    Some(schema::FieldOption::Text(opt)) if opt.indexed && !opt.term_vectors
+                )
+            })
+            .collect();
+        if positionless.is_empty() {
+            return Ok(());
+        }
+
+        positionless.sort();
+        Err(crate::error::LaurusError::query(format!(
+            "phrase and span queries need term positions, but field(s) {positionless:?} \
+             are indexed with term_vectors = false; use a term query, \
+             or set term_vectors = true and reindex"
+        )))
+    }
+
     /// Resolve a [`SearchQuery`](self::search::SearchQuery) into internal
     /// search request types for the lexical and vector stores.
     ///
@@ -2601,6 +2651,11 @@ impl Engine {
     /// Returns an error if the unified query parsing, filter query
     /// execution, lexical search, vector search, embedding, or document
     /// retrieval fails.
+    ///
+    /// Returns [`LaurusError::Query`](crate::error::LaurusError::Query) if
+    /// the lexical query or `filter_query` runs a phrase of two or more
+    /// terms or a span query on a `Text` field indexed with
+    /// `term_vectors: false`, which stores no positions to match against.
     pub async fn search(
         &self,
         request: self::search::SearchRequest,
@@ -2665,6 +2720,13 @@ impl Engine {
             (Some(options), Some(query)) if !options.fields.is_empty() => Some(query.clone_box()),
             _ => None,
         };
+
+        if let Some(query) = &user_lexical_query {
+            self.validate_positional_field_refs(query.as_ref())?;
+        }
+        if let Some(filter_query) = &request_filter {
+            self.validate_positional_field_refs(filter_query.as_ref())?;
+        }
 
         // 0c. Pre-process Filter
         let (allowed_filter, lexical_query_override) = if let Some(filter_query) = &request_filter {

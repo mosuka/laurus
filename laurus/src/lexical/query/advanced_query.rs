@@ -305,6 +305,18 @@ impl Query for AdvancedQuery {
         }
     }
 
+    fn collect_positional_field_refs(&self, out: &mut std::collections::HashSet<String>) {
+        self.core_query.collect_positional_field_refs(out);
+        for filter in self
+            .filters
+            .iter()
+            .chain(&self.negative_filters)
+            .chain(&self.post_filters)
+        {
+            filter.collect_positional_field_refs(out);
+        }
+    }
+
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
         // Negative filters describe what a hit does not contain.
         self.core_query.collect_highlight_terms(field, out);

@@ -4,7 +4,8 @@
 //! - Field-specific queries: `title:hello`
 //! - Boolean operators: `AND`, `OR`
 //! - Required/prohibited: `+required`, `-forbidden`
-//! - Phrases: `"hello world"` (quoted → `PhraseQuery`)
+//! - Phrases: `"hello world"` (quoted → `PhraseQuery`; a quoted value that
+//!   analyzes to one token → `TermQuery`)
 //! - Bare terms that the analyzer splits into several tokens are OR'd
 //!   (`BooleanQuery` with `Should` clauses), matching Lucene's `match`
 //!   query. Use quotes for phrase semantics.
@@ -713,9 +714,16 @@ impl LexicalQueryParser {
     /// Parse a quoted phrase (`"..."`, optionally `~slop`).
     ///
     /// Unlike a bare (unquoted) term whose analyzed tokens are OR'd (see
-    /// `parse_simple_term`), a quoted phrase always builds a `PhraseQuery`
-    /// requiring the tokens to appear in sequence (within `slop`). Quoting
-    /// is how a caller opts into strict adjacency.
+    /// `parse_simple_term`), a quoted phrase of two or more tokens builds a
+    /// `PhraseQuery` requiring them to appear in sequence (within `slop`).
+    /// Quoting is how a caller opts into strict adjacency.
+    ///
+    /// A quoted value that analyzes to one token has no adjacency to check,
+    /// so it builds a `TermQuery`, as Lucene's `QueryBuilder` does. Quoting
+    /// is also the only DSL form for a value containing `.`, `/` or `:`, such
+    /// as a path or URL on a keyword field, and a `TermQuery` matches it
+    /// without the positions a `term_vectors: false` field does not store
+    /// (#1247).
     fn parse_phrase_query(
         &self,
         pair: pest::iterators::Pair<Rule>,
@@ -745,7 +753,12 @@ impl LexicalQueryParser {
         }
 
         self.create_query_over_fields(field, |field_name| {
-            let terms = self.analyze_term(Some(field_name), &phrase_content)?;
+            let mut terms = self.analyze_term(Some(field_name), &phrase_content)?;
+            if terms.len() == 1 {
+                let term_query = TermQuery::new(field_name, terms.remove(0)).with_boost(boost);
+                return Ok(Box::new(term_query));
+            }
+
             let mut phrase_query = PhraseQuery::new(field_name, terms);
 
             if let Some(slop_value) = slop {
@@ -1416,6 +1429,61 @@ mod tests {
             .downcast_ref::<PhraseQuery>()
             .unwrap_or_else(|| panic!("expected PhraseQuery, got {query:?}"));
         assert_eq!(phrase_q.slop(), 5);
+    }
+
+    fn expect_term_query(query: &dyn Query) -> &TermQuery {
+        query
+            .as_any()
+            .downcast_ref::<TermQuery>()
+            .unwrap_or_else(|| panic!("expected TermQuery, got {query:?}"))
+    }
+
+    /// #1247: a quoted value that analyzes to one token is a term match. A
+    /// one-term `PhraseQuery` needs positions, which a field with
+    /// `term_vectors: false` does not store.
+    #[test]
+    fn quoted_single_token_builds_a_term_query() {
+        let parser = create_test_parser().with_default_field("content");
+
+        let query = parser.parse("title:\"Hello\"").unwrap();
+        let term_q = expect_term_query(query.as_ref());
+        assert_eq!(term_q.field(), "title");
+        assert_eq!(term_q.term(), "hello");
+
+        // The default-field form goes through the same path.
+        let query = parser.parse("\"hello\"").unwrap();
+        assert_eq!(expect_term_query(query.as_ref()).field(), "content");
+    }
+
+    /// #1247: quoting is the only DSL form for a value containing `.`, `/`
+    /// or `:`, so a keyword field must get the whole value as one term.
+    #[test]
+    fn quoted_keyword_value_builds_a_term_query_for_the_whole_value() {
+        use crate::analysis::analyzer::keyword::KeywordAnalyzer;
+
+        let per_field = PerFieldAnalyzer::new(Arc::new(StandardAnalyzer::new().unwrap()));
+        per_field.add_analyzer("path", Arc::new(KeywordAnalyzer::new()));
+        let parser = LexicalQueryParser::new(Arc::new(per_field));
+
+        let query = parser.parse("path:\"file:///m/a.md\"").unwrap();
+        let term_q = expect_term_query(query.as_ref());
+        assert_eq!(term_q.field(), "path");
+        assert_eq!(term_q.term(), "file:///m/a.md");
+    }
+
+    #[test]
+    fn quoted_single_token_keeps_its_boost() {
+        let parser = create_test_parser().with_default_field("content");
+        let query = parser.parse("title:\"hello\"^2").unwrap();
+        assert_eq!(expect_term_query(query.as_ref()).boost(), 2.0);
+    }
+
+    /// Slop is a distance between terms, so it has nothing to apply to.
+    #[test]
+    fn quoted_single_token_ignores_its_slop() {
+        let parser = create_test_parser().with_default_field("content");
+        let query = parser.parse("title:\"hello\"~3").unwrap();
+        assert_eq!(expect_term_query(query.as_ref()).term(), "hello");
     }
 
     /// A Japanese sentence tokenized by Lindera into several morphemes

@@ -88,7 +88,7 @@ let opt = TextOption::default()
 | `stored` | `true` | Whether the original value is stored for retrieval |
 | `multi_valued` | `false` | Whether the field accepts arrays of strings (Issue #1175); a term query matches if **any** element contains the term. See [Multi-valued fields](#multi-valued-fields) |
 | `position_increment_gap` | `100` | Positions skipped between the elements of a multi-valued field (Lucene `positionIncrementGap`), so that a phrase query never spans two elements unless its slop reaches the gap; `0` numbers the elements as if concatenated. Ignored unless `multi_valued` is `true` |
-| `term_vectors` | `true` | Whether term positions are stored (needed for phrase and span queries; highlighting always re-tokenizes the stored text and does not use them) |
+| `term_vectors` | `true` | Whether term positions are stored. Phrase queries of two or more terms and span queries need them; with `false`, a search that runs them on this field is rejected with a query error. Term queries, including a quoted value that analyzes to one token, do not need them, and highlighting always re-tokenizes the stored text |
 | `doc_values` | `true` | Whether the value is also copied into DocValues, the column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation read from |
 
 `doc_values` is not unique to `TextOption` — every lexical field option except
@@ -433,10 +433,12 @@ that numbering:
   BM25 score) but not the hit count, like the other multi-valued types.
   The field length is the total token count, so the gap itself does not
   inflate BM25 length normalization.
-- Positions must be stored for phrase queries to work at all
-  (`term_vectors: true`, the default); without them a phrase query
-  silently matches nothing, for multi-valued and single-valued fields
-  alike.
+- Positions must be stored for phrase queries of two or more terms to
+  work at all (`term_vectors: true`, the default); without them the search
+  is rejected with a query error, for multi-valued and single-valued
+  fields alike. A quoted value that analyzes to one token, such as
+  `tags:"lang/rust"` on a `keyword` field, is a term match and does not
+  need positions.
 
 A multi-valued text field is highlighted element by element — only the
 elements that match contribute fragments, and a fragment never straddles

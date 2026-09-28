@@ -87,12 +87,12 @@ pub struct InvertedIndexConfig {
 
     /// Index-wide default for whether term positions are stored.
     ///
-    /// Positions are what phrase (`PhraseQuery`) and span (`SpanNearQuery`
-    /// and friends) queries read — they are not a separate structure but
-    /// section 4 of each posting list, gated per list by an
-    /// `any_positions` byte. Nothing else consults them: BM25 reads the
-    /// posting list's own frequency section, and highlighting always
-    /// re-tokenizes the stored text.
+    /// Positions are what phrase (`PhraseQuery` of two or more terms) and
+    /// span (`SpanNearQuery` and friends) queries read — they are not a
+    /// separate structure but section 4 of each posting list, gated per
+    /// list by an `any_positions` byte. Nothing else consults them: BM25
+    /// reads the posting list's own frequency section, and highlighting
+    /// always re-tokenizes the stored text.
     ///
     /// This is only the **default**. A `Text` field with an explicit
     /// [`TextOption::term_vectors`](crate::lexical::core::field::TextOption)
