@@ -11,7 +11,7 @@ use roaring::RoaringTreemap;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::Token;
+use crate::analysis::token::{Token, TokenPositions};
 use crate::data::DataValue;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm};
@@ -683,7 +683,7 @@ pub(crate) fn analyze_field_value(
             // Multi-valued text field (#1175): every element is analyzed on
             // its own and its tokens are appended to ONE ascending position
             // sequence, `position_increment_gap` positions past the previous
-            // element's last token. The continuity matters beyond the gap
+            // element's last position. The continuity matters beyond the gap
             // itself: restarting each element at 0 would number the
             // elements' tokens alike (the encoder sorts a posting's
             // positions, Issue #1235), so a phrase could match across two
@@ -703,13 +703,16 @@ pub(crate) fn analyze_field_value(
                     } else {
                         analyzer.analyze(text)?
                     };
-                let token_vec: Vec<Token> = tokens.collect();
-                let token_count = token_vec.len() as u32;
-                for mut term in tokens_to_analyzed_terms(token_vec) {
+                let element_terms = tokens_to_analyzed_terms(tokens.collect());
+                // Positions, not tokens: stacked synonyms share one.
+                let element_span = element_terms
+                    .last()
+                    .map_or(0, |last| last.position.saturating_add(1));
+                for mut term in element_terms {
                     term.position = term.position.saturating_add(base);
                     terms.push(term);
                 }
-                base = base.saturating_add(token_count);
+                base = base.saturating_add(element_span);
             }
         }
         // Not lexically indexable: no term representation exists for these.
@@ -738,21 +741,42 @@ pub(crate) fn position_increment_gap_for(option: Option<&FieldOption>) -> u32 {
 
 /// Convert tokens to analyzed terms.
 ///
-/// Positions are dense: the i-th token gets position i, whatever
-/// `Token::position` says. The highlighter's `phrase_spans` numbers phrase
-/// tokens the same way, so change the two together.
+/// Positions come from [`TokenPositions`], whatever `Token::position` says:
+/// a token stacked with increment 0 (a synonym) shares the previous token's
+/// position, and every other token takes the next one. The highlighter's
+/// `phrase_spans` and the query parser number tokens the same way, so a
+/// phrase compares the positions stored here.
+///
+/// The same term stacked twice at one position is kept once, so it does not
+/// inflate the term frequency.
 pub(crate) fn tokens_to_analyzed_terms(tokens: Vec<Token>) -> Vec<AnalyzedTerm> {
     let mut term_frequencies = AHashMap::new();
-    let mut analyzed_terms = Vec::new();
+    let mut analyzed_terms: Vec<AnalyzedTerm> = Vec::with_capacity(tokens.len());
+    let mut positions = TokenPositions::default();
+    // Stacked tokens are contiguous, so duplicates are looked for only among
+    // the terms at the current position, from this index on.
+    let mut current_position_start = 0;
 
-    for (position, token) in tokens.into_iter().enumerate() {
-        let term = token.text;
-        let frequency = term_frequencies.entry(term.clone()).or_insert(0);
+    for token in tokens {
+        let position = positions.assign(&token);
+        if analyzed_terms
+            .last()
+            .is_some_and(|last| last.position != position)
+        {
+            current_position_start = analyzed_terms.len();
+        }
+        if analyzed_terms[current_position_start..]
+            .iter()
+            .any(|t| t.term == token.text)
+        {
+            continue;
+        }
+
+        let frequency = term_frequencies.entry(token.text.clone()).or_insert(0);
         *frequency += 1;
-
         analyzed_terms.push(AnalyzedTerm {
-            term: term.clone(),
-            position: position as u32,
+            term: token.text,
+            position,
             frequency: *frequency,
             offset: (token.start_offset, token.end_offset),
         });
@@ -3548,5 +3572,91 @@ mod tests {
 
         assert_eq!(run(true), 3, "positions-enabled path");
         assert_eq!(run(false), 3, "positions-disabled path");
+    }
+
+    fn stacked(text: &str, increment: usize) -> Token {
+        Token::new(text, 0).with_position_increment(increment)
+    }
+
+    fn term_positions(terms: &[AnalyzedTerm]) -> Vec<(&str, u32)> {
+        terms
+            .iter()
+            .map(|t| (t.term.as_str(), t.position))
+            .collect()
+    }
+
+    /// #1252: a synonym stacked with increment 0 shares its word's position,
+    /// so a phrase through it compares the same positions as without it.
+    #[test]
+    fn stacked_tokens_are_indexed_at_one_position() {
+        let terms = tokens_to_analyzed_terms(vec![
+            stacked("a", 1),
+            stacked("big", 1),
+            stacked("large", 0),
+            stacked("dog", 1),
+        ]);
+        assert_eq!(
+            term_positions(&terms),
+            vec![("a", 0), ("big", 1), ("large", 1), ("dog", 2)]
+        );
+    }
+
+    /// Several synonyms of one group can stack the same word twice at one
+    /// node ("united" for "united states" and "united states of america");
+    /// it must count once, or its term frequency would be inflated.
+    #[test]
+    fn the_same_term_twice_at_one_position_is_indexed_once() {
+        let terms = tokens_to_analyzed_terms(vec![
+            stacked("usa", 1),
+            stacked("united", 0),
+            stacked("united", 0),
+            stacked("states", 1),
+            stacked("states", 0),
+            stacked("of", 1),
+            stacked("america", 1),
+            stacked("united", 1),
+        ]);
+        assert_eq!(
+            term_positions(&terms),
+            vec![
+                ("usa", 0),
+                ("united", 0),
+                ("states", 1),
+                ("of", 2),
+                ("america", 3),
+                ("united", 4)
+            ]
+        );
+        let united: Vec<u32> = terms
+            .iter()
+            .filter(|t| t.term == "united")
+            .map(|t| t.frequency)
+            .collect();
+        assert_eq!(united, vec![1, 2], "a skipped duplicate is not counted");
+    }
+
+    /// The next element of a multi-valued field starts `gap` positions
+    /// after the previous element's last position, not after its token
+    /// count, so a stacked synonym does not push it further out.
+    #[test]
+    fn text_array_gap_follows_positions_not_token_count() {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+        let analyzer: Arc<dyn Analyzer> = Arc::new(
+            PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+                .add_filter(Arc::new(SynonymGraphFilter::new(dict, true))),
+        );
+        let value = DataValue::TextArray(vec!["big".to_string(), "dog".to_string()]);
+
+        let (terms, _) = analyze_field_value("tags", &value, &analyzer, 100).unwrap();
+        assert_eq!(
+            term_positions(&terms),
+            vec![("big", 0), ("large", 0), ("dog", 101)]
+        );
     }
 }

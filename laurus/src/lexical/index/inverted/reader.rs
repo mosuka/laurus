@@ -1561,8 +1561,8 @@ impl SegmentReader {
     /// `analyze_field_value` (Issue #1194), so each `DataValue` variant —
     /// `Text`, a multi-valued `TextArray` with its position-increment gap,
     /// `Bool` / `BoolArray` as `"true"` / `"false"`, numeric and datetime
-    /// terms — yields exactly the terms and dense positions its postings
-    /// would have carried. The analyzer is the one chained through
+    /// terms — yields exactly the terms and positions its postings would
+    /// have carried. The analyzer is the one chained through
     /// [`Self::with_analyzer`] — the index analyzer, so a `PerFieldAnalyzer`
     /// resolves per field and `_id` is analyzed as a keyword (Issue #1196) —
     /// or `StandardAnalyzer` for a reader opened without one.
