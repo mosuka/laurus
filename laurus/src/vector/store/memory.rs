@@ -340,7 +340,7 @@ impl InMemoryFieldReader {
 impl VectorFieldReader for InMemoryFieldReader {
     fn search(&self, request: FieldSearchInput) -> Result<FieldSearchResults> {
         if request.field != self.field_name {
-            return Err(LaurusError::invalid_argument(format!(
+            return Err(LaurusError::internal(format!(
                 "field mismatch: expected '{}', got '{}'",
                 self.field_name, request.field
             )));

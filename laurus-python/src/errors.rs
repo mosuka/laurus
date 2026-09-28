@@ -28,6 +28,7 @@ pub fn laurus_err(err: LaurusError) -> PyErr {
         LaurusError::Schema(m) => PyValueError::new_err(format!("Schema error: {m}")),
         LaurusError::Query(m) => PyValueError::new_err(format!("Query error: {m}")),
         LaurusError::Field(m) => PyValueError::new_err(format!("Field error: {m}")),
+        LaurusError::InvalidArgument(m) => PyValueError::new_err(format!("Invalid argument: {m}")),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -47,7 +48,7 @@ pub fn io_err_with_path(path: &Path, e: io::Error) -> PyErr {
 ///
 /// `SchemaConflict`/`LegacyFlatLayout` are both caller-fixable misuse, so
 /// they become `ValueError` (matching how [`laurus_err`] treats
-/// `LaurusError::Schema`). `Io` goes through [`io_err_with_path`] rather
+/// `LaurusError::Schema`/`InvalidArgument`). `Io` goes through [`io_err_with_path`] rather
 /// than `laurus_err` for the same reason `laurus_err` isn't used for plain
 /// I/O elsewhere in this crate: it preserves `FileNotFoundError` etc.
 /// instead of flattening to a generic `OSError`.

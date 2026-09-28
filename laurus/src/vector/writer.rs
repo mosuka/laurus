@@ -177,7 +177,7 @@ pub trait VectorIndexWriter: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError) if
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument) if
     /// the value is not a `Vector` variant and auto-embedding is not supported.
     async fn add_value(
         &mut self,

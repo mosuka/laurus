@@ -228,6 +228,12 @@ def test_search_no_results(index):
     assert results == []
 
 
+def test_search_unknown_field_raises_value_error(index):
+    # Issue #1253: a typo'd field name is the caller's mistake.
+    with pytest.raises(ValueError, match="unknown field"):
+        index.search("nope:rust", limit=5)
+
+
 # ---------------------------------------------------------------------------
 # Vector search
 # ---------------------------------------------------------------------------

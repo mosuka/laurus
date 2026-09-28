@@ -147,3 +147,43 @@ impl SearchServiceTrait for SearchService {
         Ok(Response::new(SearchBatchResponse { results }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laurus::storage::memory::MemoryStorage;
+    use laurus::{Schema, Storage, TextOption};
+
+    async fn service_with_title_field() -> SearchService {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_text_field("title", TextOption::default())
+            .build();
+        let engine = Engine::builder(storage, schema).build().await.unwrap();
+        SearchService {
+            engine: Arc::new(RwLock::new(Some(engine))),
+        }
+    }
+
+    /// Issue #1253: a DSL query that names an undeclared field is the
+    /// caller's mistake, not a server failure.
+    #[tokio::test]
+    async fn unknown_field_query_is_invalid_argument() {
+        let service = service_with_title_field().await;
+
+        let status = service
+            .search(Request::new(SearchRequest {
+                query: "nope:rust".to_string(),
+                limit: 10,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("unknown field"),
+            "unexpected message: {}",
+            status.message()
+        );
+    }
+}

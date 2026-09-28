@@ -14,13 +14,14 @@ pub fn closed_err() -> Error {
 ///
 /// # Mapping
 ///
-/// | Laurus variant            | Ruby exception    |
-/// |---------------------------|-------------------|
-/// | `LaurusError::Io`         | `IOError`         |
-/// | `LaurusError::Schema`     | `ArgumentError`   |
-/// | `LaurusError::Query`      | `ArgumentError`   |
-/// | `LaurusError::Field`      | `ArgumentError`   |
-/// | other                     | `RuntimeError`    |
+/// | Laurus variant                 | Ruby exception    |
+/// |--------------------------------|-------------------|
+/// | `LaurusError::Io`              | `IOError`         |
+/// | `LaurusError::Schema`          | `ArgumentError`   |
+/// | `LaurusError::Query`           | `ArgumentError`   |
+/// | `LaurusError::Field`           | `ArgumentError`   |
+/// | `LaurusError::InvalidArgument` | `ArgumentError`   |
+/// | other                          | `RuntimeError`    |
 pub fn laurus_err(err: LaurusError) -> Error {
     let ruby = Ruby::get().expect("called from Ruby thread");
     match err {
@@ -33,6 +34,9 @@ pub fn laurus_err(err: LaurusError) -> Error {
         }
         LaurusError::Field(m) => {
             Error::new(ruby.exception_arg_error(), format!("Field error: {m}"))
+        }
+        LaurusError::InvalidArgument(m) => {
+            Error::new(ruby.exception_arg_error(), format!("Invalid argument: {m}"))
         }
         other => Error::new(ruby.exception_runtime_error(), other.to_string()),
     }
@@ -64,7 +68,7 @@ pub fn io_err_with_path(path: &str, e: std::io::Error) -> Error {
 /// `SchemaConflict`/`LegacyFlatLayout`/`NotAnIndexDirectory` are all
 /// caller-fixable misuse, so they map to `ArgumentError` — the same class
 /// [`laurus_err`] uses for
-/// `LaurusError::Schema`/`Query`/`Field`. `Io` maps to `IOError` like
+/// `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`. `Io` maps to `IOError` like
 /// `LaurusError::Io` above; unlike the Python binding, there is no
 /// path-preserving exception hierarchy to lose here, and
 /// `IndexDirError::Io`'s `Display` already includes the offending path, so

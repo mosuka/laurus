@@ -130,8 +130,8 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
         _name: &str,
         _option: crate::lexical::core::field::FieldOption,
     ) -> Result<()> {
-        Err(crate::error::LaurusError::invalid_argument(
-            "This index implementation does not support dynamic field addition",
+        Err(crate::error::LaurusError::InvalidOperation(
+            "This index implementation does not support dynamic field addition".to_string(),
         ))
     }
 
@@ -151,8 +151,8 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// Returns an error if the index implementation does not support dynamic field
     /// deletion.
     fn delete_field(&self, _name: &str) -> Result<()> {
-        Err(crate::error::LaurusError::invalid_argument(
-            "This index implementation does not support dynamic field deletion",
+        Err(crate::error::LaurusError::InvalidOperation(
+            "This index implementation does not support dynamic field deletion".to_string(),
         ))
     }
 
@@ -196,8 +196,8 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
         _option: crate::lexical::core::field::FieldOption,
         _analyzer: Option<Arc<dyn Analyzer>>,
     ) -> Result<()> {
-        Err(crate::error::LaurusError::invalid_argument(
-            "This index implementation does not support rebuilding fields dynamically",
+        Err(crate::error::LaurusError::InvalidOperation(
+            "This index implementation does not support rebuilding fields dynamically".to_string(),
         ))
     }
 }

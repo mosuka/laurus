@@ -283,6 +283,15 @@ describe("Lexical search", () => {
     const results = await index.search("title:nonexistent_xyz", 5);
     expect(results).toEqual([]);
   });
+
+  it("rejects an unknown field as an invalid argument", async () => {
+    // Issue #1253: a typo'd field name is the caller's mistake.
+    const index = await createTextIndex();
+    await expect(index.search("nope:rust", 5)).rejects.toMatchObject({
+      code: "InvalidArg",
+      message: expect.stringMatching(/unknown field/),
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

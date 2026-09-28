@@ -14,13 +14,14 @@ pub fn closed_err() -> PhpException {
 ///
 /// # Mapping
 ///
-/// | Laurus variant            | PHP exception    |
-/// |---------------------------|------------------|
-/// | `LaurusError::Io`         | `Exception`      |
-/// | `LaurusError::Schema`     | `ValueError`     |
-/// | `LaurusError::Query`      | `ValueError`     |
-/// | `LaurusError::Field`      | `ValueError`     |
-/// | other                     | `Exception`      |
+/// | Laurus variant                 | PHP exception    |
+/// |--------------------------------|------------------|
+/// | `LaurusError::Io`              | `Exception`      |
+/// | `LaurusError::Schema`          | `ValueError`     |
+/// | `LaurusError::Query`           | `ValueError`     |
+/// | `LaurusError::Field`           | `ValueError`     |
+/// | `LaurusError::InvalidArgument` | `ValueError`     |
+/// | other                          | `Exception`      |
 pub fn laurus_err(err: LaurusError) -> PhpException {
     match err {
         LaurusError::Io(e) => PhpException::new(e.to_string(), 0, ce::exception()),
@@ -33,6 +34,9 @@ pub fn laurus_err(err: LaurusError) -> PhpException {
         LaurusError::Field(m) => {
             PhpException::new(format!("Field error: {m}"), 0, ce::value_error())
         }
+        LaurusError::InvalidArgument(m) => {
+            PhpException::new(format!("Invalid argument: {m}"), 0, ce::value_error())
+        }
         other => PhpException::new(other.to_string(), 0, ce::exception()),
     }
 }
@@ -41,7 +45,7 @@ pub fn laurus_err(err: LaurusError) -> PhpException {
 ///
 /// `SchemaConflict`/`LegacyFlatLayout`/`NotAnIndexDirectory` are all
 /// caller-fixable misuse, so they map to `ValueError` (matching how
-/// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`). `Io` maps to
+/// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`). `Io` maps to
 /// `Exception`, same as `LaurusError::Io` in [`laurus_err`]; there is no
 /// PHP-specific path-preserving I/O exception in this crate, so
 /// `err.to_string()` (which already formats as `"{path}: {source}"`) carries

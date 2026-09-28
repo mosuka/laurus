@@ -552,7 +552,7 @@ gRPC エラーは標準の `Status` コードとして返されます。
 
 | Laurus エラー | gRPC ステータス | 発生条件 |
 | :--- | :--- | :--- |
-| Schema / Query / Field / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ |
+| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ、クエリ内の不明なフィールド |
 | インデックス未オープン | `FAILED_PRECONDITION` | `CreateIndex` の前に RPC が呼び出された場合 |
 | インデックスが既に存在 | `ALREADY_EXISTS` | `CreateIndex` が 2 回呼び出された場合 |
 | 未実装 | `UNIMPLEMENTED` | まだサポートされていない機能 |

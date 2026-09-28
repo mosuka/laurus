@@ -140,11 +140,11 @@ impl UnifiedQueryParser {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::Other`] (invalid argument) if the query string
-    /// is empty or consists only of whitespace.
+    /// Returns [`LaurusError::InvalidArgument`] if the query string is empty
+    /// or consists only of whitespace.
     ///
-    /// Returns [`LaurusError::Other`] (invalid argument) if, after splitting,
-    /// no valid lexical or vector clause could be parsed from the input.
+    /// Returns [`LaurusError::InvalidArgument`] if, after splitting, no valid
+    /// lexical or vector clause could be parsed from the input.
     pub async fn parse(&self, query_str: &str) -> Result<SearchRequest> {
         let query_str = query_str.trim();
         if query_str.is_empty() {

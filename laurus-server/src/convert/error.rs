@@ -24,6 +24,7 @@ fn code_for(err: &LaurusError) -> tonic::Code {
         LaurusError::Schema(_)
         | LaurusError::Query(_)
         | LaurusError::Field(_)
+        | LaurusError::InvalidArgument(_)
         | LaurusError::SerializationError(_)
         | LaurusError::Json(_) => tonic::Code::InvalidArgument,
         LaurusError::NotImplemented(_) => tonic::Code::Unimplemented,
@@ -66,5 +67,22 @@ mod tests {
             source: Box::new(LaurusError::storage("disk on fire")),
         };
         assert_eq!(to_status(server_fault).code(), tonic::Code::Internal);
+    }
+
+    /// Issue #1253: `invalid_argument` reports a caller mistake, directly
+    /// and as the source of a failed batch.
+    #[test]
+    fn invalid_argument_is_a_caller_error() {
+        let status = to_status(LaurusError::invalid_argument("unknown field 'nope'"));
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "Invalid argument: unknown field 'nope'");
+
+        let batch = LaurusError::BatchIngest {
+            failed_index: 0,
+            failed_id: "x".into(),
+            applied: 0,
+            source: Box::new(LaurusError::invalid_argument("bad value")),
+        };
+        assert_eq!(to_status(batch).code(), tonic::Code::InvalidArgument);
     }
 }
