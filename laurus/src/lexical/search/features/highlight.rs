@@ -325,7 +325,7 @@ impl Highlighter {
         let mut exact: HashSet<String> = HashSet::new();
         let mut min_term_len = usize::MAX;
         let mut max_term_len = 0usize;
-        let mut phrases: Vec<(Vec<String>, u32)> = Vec::new();
+        let mut phrases: Vec<(Vec<Vec<String>>, u32)> = Vec::new();
         let mut prefixes: Vec<&str> = Vec::new();
         let mut regexes: Vec<&Regex> = Vec::new();
         let mut fuzzy: Vec<&LevenshteinAutomaton> = Vec::new();
@@ -337,8 +337,12 @@ impl Highlighter {
                     max_term_len = max_term_len.max(term.len());
                     exact.insert(term);
                 }
-                HighlightTerm::Phrase { terms, slop } => {
-                    phrases.push((terms.iter().map(|t| t.to_lowercase()).collect(), *slop));
+                HighlightTerm::Phrase { positions, slop } => {
+                    let positions = positions
+                        .iter()
+                        .map(|alternatives| alternatives.iter().map(|t| t.to_lowercase()).collect())
+                        .collect();
+                    phrases.push((positions, *slop));
                 }
                 HighlightTerm::Prefix(prefix) => prefixes.push(prefix),
                 HighlightTerm::Regex(regex) => regexes.push(regex),
@@ -833,10 +837,15 @@ fn ceil_boundary(text: &str, pos: usize) -> usize {
 /// `tokens_to_analyzed_terms` numbers what the index stores: a stacked
 /// synonym shares its word's position, and the analyzer's `Token::position`
 /// is ignored, so a dropped stop word leaves no gap here, just as in the
-/// index. A span runs from the first token's start to the last token's end.
-fn phrase_spans(tokens: &[Token], phrase: &[String], slop: u32) -> Vec<HighlightSpan> {
-    let token_is = |token: &Token, term: &str| {
-        token.text == term || (has_uppercase(&token.text) && token.text.to_lowercase() == term)
+/// index. Each phrase position lists alternative terms, any of which
+/// matches there. A span runs from the first token's start to the last
+/// token's end.
+fn phrase_spans(tokens: &[Token], phrase: &[Vec<String>], slop: u32) -> Vec<HighlightSpan> {
+    let token_is = |token: &Token, alternatives: &[String]| {
+        alternatives.iter().any(|term| {
+            token.text == *term
+                || (has_uppercase(&token.text) && token.text.to_lowercase() == *term)
+        })
     };
     let token_end = |token: &Token| token.start_offset + token.text.len();
 
@@ -1589,6 +1598,39 @@ mod tests {
             .unwrap()
             .fragments;
         assert_eq!(marked(&fragments), ["a big dog"]);
+    }
+
+    /// Any alternative matches at its position, as in the phrase matcher,
+    /// and tokens stacked at one position anchor one span, not two.
+    #[test]
+    fn phrase_alternatives_highlight_whichever_occurs() {
+        let alternatives = || {
+            PhraseQuery::from_positions(
+                "body",
+                vec![
+                    vec!["red".into()],
+                    vec!["big".into(), "large".into()],
+                    vec!["dog".into()],
+                ],
+            )
+        };
+        assert_eq!(
+            highlight_marks(
+                &alternatives(),
+                "body",
+                "red large dog. red big dog. red cat"
+            ),
+            ["red large dog", "red big dog"]
+        );
+
+        let stacked_first = PhraseQuery::from_positions(
+            "body",
+            vec![vec!["big".into(), "large".into()], vec!["dog".into()]],
+        );
+        let highlighter = synonym_highlighter();
+        let text = "a big dog";
+        let tokens: Vec<Token> = highlighter.analyzer.analyze(text).unwrap().collect();
+        assert_eq!(phrase_spans(&tokens, stacked_first.positions(), 0).len(), 1);
     }
 
     /// A stacked token takes no position of its own, so it does not widen

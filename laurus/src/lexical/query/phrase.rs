@@ -33,13 +33,16 @@ pub struct PhraseMatch {
 
 impl PhraseMatcher {
     /// Create a new phrase matcher.
+    ///
+    /// `positions` lists the phrase's positions in order, each with the
+    /// terms any of which may appear there (see [`PhraseQuery::positions`]).
     pub fn new(
         reader: &dyn LexicalIndexReader,
         field: &str,
-        terms: &[String],
+        positions: &[Vec<String>],
         slop: u32,
     ) -> Result<Self> {
-        let matches = Self::find_phrase_matches(reader, field, terms, slop)?;
+        let matches = Self::find_phrase_matches(reader, field, positions, slop)?;
 
         let current_doc_id = if matches.is_empty() {
             u64::MAX // Invalid state when no matches
@@ -55,59 +58,65 @@ impl PhraseMatcher {
     }
 
     /// Find all documents containing the phrase.
+    ///
+    /// A term missing from the index only drops that alternative; the
+    /// phrase can match nothing only when every alternative at some
+    /// position is missing.
     pub fn find_phrase_matches(
         reader: &dyn LexicalIndexReader,
         field: &str,
-        terms: &[String],
+        positions: &[Vec<String>],
         slop: u32,
     ) -> Result<Vec<PhraseMatch>> {
-        match terms {
+        match positions {
             [] => return Ok(Vec::new()),
-            [term] => return Self::find_single_term_matches(reader, field, term),
+            [alternatives] if alternatives.len() == 1 => {
+                return Self::find_single_term_matches(reader, field, &alternatives[0]);
+            }
             _ => {}
         }
 
-        // Get posting iterators for all terms
-        let mut iterators = Vec::new();
-        for term in terms {
-            match reader.postings(field, term)? {
-                Some(iter) => iterators.push(iter),
-                None => return Ok(Vec::new()), // If any term is missing, no phrase matches
+        // Per candidate document, the positions of each phrase position's
+        // alternatives, merged.
+        let mut doc_candidates: HashMap<u64, Vec<Vec<u64>>> = HashMap::new();
+        for (slot, alternatives) in positions.iter().enumerate() {
+            let mut any_indexed = false;
+            for term in alternatives {
+                let Some(mut iter) = reader.postings(field, term)? else {
+                    continue;
+                };
+                any_indexed = true;
+                while iter.next()? {
+                    let doc_id = iter.doc_id();
+                    if doc_id == u64::MAX {
+                        break;
+                    }
+                    doc_candidates
+                        .entry(doc_id)
+                        .or_insert_with(|| vec![Vec::new(); positions.len()])[slot]
+                        .extend(iter.positions()?);
+                }
+            }
+            if !any_indexed {
+                return Ok(Vec::new());
             }
         }
 
         let mut phrase_matches = Vec::new();
-        let mut doc_candidates = std::collections::HashMap::new();
-
-        // Find documents that contain all terms
-        for (term_idx, iter) in iterators.iter_mut().enumerate() {
-            while iter.next()? {
-                let doc_id = iter.doc_id();
-                if doc_id == u64::MAX {
-                    break;
-                }
-
-                let positions = iter.positions()?;
-                doc_candidates
-                    .entry(doc_id)
-                    .or_insert_with(Vec::new)
-                    .push((term_idx, positions));
-            }
-        }
-
-        // Check each candidate document for valid phrase matches
-        for (doc_id, term_positions) in doc_candidates {
-            // Sort by term index to ensure correct order
-            let mut term_positions = term_positions;
-            term_positions.sort_by_key(|(term_idx, _)| *term_idx);
-
-            // Skip if we don't have all terms
-            if term_positions.len() != terms.len() {
+        for (doc_id, mut slots) in doc_candidates {
+            // Also skips a document indexed without positions, whose
+            // postings carry none.
+            if slots.iter().any(Vec::is_empty) {
                 continue;
+            }
+            // Stacked alternatives (synonyms) share positions.
+            for slot in &mut slots {
+                slot.sort_unstable();
+                slot.dedup();
             }
 
             // Find valid phrase occurrences in this document
-            let phrase_positions = Self::find_phrase_positions(&term_positions, slop);
+            let phrase_positions = Self::find_phrase_positions(&slots, slop);
 
             if !phrase_positions.is_empty() {
                 phrase_matches.push(PhraseMatch {
@@ -156,54 +165,40 @@ impl PhraseMatcher {
     }
 
     /// Find valid phrase positions within a document.
-    /// Returns the starting positions of valid phrases.
-    fn find_phrase_positions(term_positions: &[(usize, Vec<u64>)], slop: u32) -> Vec<u64> {
-        if term_positions.is_empty() {
+    ///
+    /// `slots` holds, per phrase position, the sorted positions of its
+    /// alternatives in this document. Returns the starting positions of
+    /// valid phrases.
+    fn find_phrase_positions(slots: &[Vec<u64>], slop: u32) -> Vec<u64> {
+        let Some((first, rest)) = slots.split_first() else {
             return Vec::new();
-        }
-
-        let mut valid_positions = Vec::new();
-
-        // Get positions for the first term as starting points
-        for &start_pos in &term_positions[0].1 {
-            if Self::is_valid_phrase_at_position(term_positions, start_pos, slop) {
-                valid_positions.push(start_pos);
-            }
-        }
-
-        valid_positions
+        };
+        first
+            .iter()
+            .copied()
+            .filter(|&start_pos| Self::is_valid_phrase_at_position(rest, start_pos, slop))
+            .collect()
     }
 
-    /// Check if there's a valid phrase starting at the given position.
-    fn is_valid_phrase_at_position(
-        term_positions: &[(usize, Vec<u64>)],
-        start_pos: u64,
-        slop: u32,
-    ) -> bool {
+    /// Check if the phrase positions after the first (`rest`) follow a
+    /// phrase starting at `start_pos`: each must occur at the first
+    /// position within `slop` after the previous one's.
+    fn is_valid_phrase_at_position(rest: &[Vec<u64>], start_pos: u64, slop: u32) -> bool {
         let mut expected_pos = start_pos;
 
-        for (term_idx, positions) in term_positions {
-            if *term_idx == 0 {
-                // First term - must be at start_pos
-                if !positions.contains(&start_pos) {
-                    return false;
-                }
-            } else {
-                // Subsequent terms - must be within slop distance
-                expected_pos += 1; // Next expected position
+        for positions in rest {
+            expected_pos += 1;
 
-                // Use binary search since positions are sorted.
-                let idx = positions.partition_point(|&pos| pos < expected_pos);
-                let found_pos = positions
-                    .get(idx)
-                    .copied()
-                    .filter(|&pos| pos <= expected_pos + slop as u64);
+            // Use binary search since positions are sorted.
+            let idx = positions.partition_point(|&pos| pos < expected_pos);
+            let found_pos = positions
+                .get(idx)
+                .copied()
+                .filter(|&pos| pos <= expected_pos + slop as u64);
 
-                if let Some(actual_pos) = found_pos {
-                    expected_pos = actual_pos;
-                } else {
-                    return false;
-                }
+            match found_pos {
+                Some(actual_pos) => expected_pos = actual_pos,
+                None => return false,
             }
         }
 
@@ -418,12 +413,16 @@ impl Scorer for PhraseScorer {
 ///
 /// A phrase query finds documents where the specified terms appear
 /// in the exact order with no other terms between them.
+///
+/// Each phrase position may also hold several alternative terms, any of
+/// which matches there (Lucene's `MultiPhraseQuery`). The query parser
+/// builds such a phrase when the analyzer stacks synonyms on a word.
 #[derive(Debug, Clone)]
 pub struct PhraseQuery {
     /// The field to search in.
     field: String,
-    /// The terms that make up the phrase, in order.
-    terms: Vec<String>,
+    /// The phrase's positions, in order, each with its alternative terms.
+    positions: Vec<Vec<String>>,
     /// The boost factor for this query.
     boost: f32,
     /// Optional slop - maximum allowed distance between terms (0 = exact phrase).
@@ -431,11 +430,17 @@ pub struct PhraseQuery {
 }
 
 impl PhraseQuery {
-    /// Create a new phrase query.
+    /// Create a new phrase query with one term per position.
     pub fn new<S: Into<String>>(field: S, terms: Vec<String>) -> Self {
+        Self::from_positions(field, terms.into_iter().map(|term| vec![term]).collect())
+    }
+
+    /// Create a phrase query whose positions each hold the given
+    /// alternative terms.
+    pub(crate) fn from_positions<S: Into<String>>(field: S, positions: Vec<Vec<String>>) -> Self {
         PhraseQuery {
             field: field.into(),
-            terms,
+            positions,
             boost: 1.0,
             slop: 0,
         }
@@ -467,9 +472,10 @@ impl PhraseQuery {
         &self.field
     }
 
-    /// Get the phrase terms.
-    pub fn terms(&self) -> &[String] {
-        &self.terms
+    /// Get the phrase's positions, in order, each with its alternative
+    /// terms. A phrase built by [`Self::new`] has one term per position.
+    pub fn positions(&self) -> &[Vec<String>] {
+        &self.positions
     }
 
     /// Get the slop value.
@@ -480,17 +486,17 @@ impl PhraseQuery {
 
 impl Query for PhraseQuery {
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        if self.terms.is_empty() {
+        if self.positions.is_empty() {
             return Ok(Box::new(EmptyMatcher::new()));
         }
 
         // Create a proper phrase matcher that checks position adjacency
-        let phrase_matcher = PhraseMatcher::new(reader, &self.field, &self.terms, self.slop)?;
+        let phrase_matcher = PhraseMatcher::new(reader, &self.field, &self.positions, self.slop)?;
         Ok(Box::new(phrase_matcher))
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        if self.terms.is_empty() {
+        if self.positions.is_empty() {
             return Ok(Box::new(BM25Scorer::new(0, 0, 0, 1.0, 1, self.boost)));
         }
 
@@ -501,7 +507,7 @@ impl Query for PhraseQuery {
 
         // Get actual phrase matches to create accurate scorer
         let phrase_matches =
-            PhraseMatcher::find_phrase_matches(reader, &self.field, &self.terms, self.slop)?;
+            PhraseMatcher::find_phrase_matches(reader, &self.field, &self.positions, self.slop)?;
 
         // Get field statistics
         let avg_field_length = match reader.field_statistics(&self.field) {
@@ -510,7 +516,7 @@ impl Query for PhraseQuery {
         };
 
         // Apply boost multiplier for phrase queries (phrases are generally more valuable)
-        let phrase_boost = self.boost * (1.0 + 0.2 * (self.terms.len() as f32 - 1.0));
+        let phrase_boost = self.boost * (1.0 + 0.2 * (self.positions.len() as f32 - 1.0));
 
         // Create specialized phrase scorer
         Ok(Box::new(PhraseScorer::new(
@@ -531,8 +537,8 @@ impl Query for PhraseQuery {
 
     fn description(&self) -> String {
         format!(
-            "PhraseQuery(field:{}, terms:{:?}, slop:{})",
-            self.field, self.terms, self.slop
+            "PhraseQuery(field:{}, positions:{:?}, slop:{})",
+            self.field, self.positions, self.slop
         )
     }
 
@@ -541,11 +547,12 @@ impl Query for PhraseQuery {
     }
 
     fn is_empty(&self, _reader: &dyn LexicalIndexReader) -> Result<bool> {
-        Ok(self.terms.is_empty())
+        Ok(self.positions.is_empty())
     }
 
     fn cost(&self, _reader: &dyn LexicalIndexReader) -> Result<u64> {
-        Ok(self.terms.len() as u64 * 100) // Rough estimate
+        let terms: usize = self.positions.iter().map(Vec::len).sum();
+        Ok(terms as u64 * 100) // Rough estimate
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -557,40 +564,190 @@ impl Query for PhraseQuery {
     }
 
     fn collect_positional_field_refs(&self, out: &mut std::collections::HashSet<String>) {
-        if self.terms.len() >= 2 {
+        if self.positions.len() >= 2 {
             out.insert(self.field.clone());
         }
     }
 
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
-        if !self.terms.is_empty() && field.is_none_or(|f| f == self.field) {
+        if !self.positions.is_empty() && field.is_none_or(|f| f == self.field) {
             out.push(HighlightTerm::Phrase {
-                terms: self.terms.clone(),
+                positions: self.positions.clone(),
                 slop: self.slop,
             });
         }
     }
 
     fn cache_key(&self) -> Option<String> {
-        // Field + ordered terms + slop determine the matched set; boost is
-        // score-only and excluded. `{:?}` on the term vector is unambiguous.
+        // Field + ordered positions + slop determine the matched set; boost
+        // is score-only and excluded. `{:?}` on the nested vectors is
+        // unambiguous.
         Some(format!(
             "phrase|{:?}|{:?}|{}",
-            self.field, self.terms, self.slop
+            self.field, self.positions, self.slop
         ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::analysis::analyzer::analyzer::Analyzer;
+    use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+    use crate::analysis::synonym::dictionary::SynonymDictionary;
+    use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+    use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+    use crate::data::Document;
+    use crate::lexical::index::LexicalIndex;
+    use crate::lexical::index::config::InvertedIndexConfig;
+    use crate::lexical::index::inverted::InvertedIndex;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+    fn whitespace_analyzer() -> PipelineAnalyzer {
+        PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+    }
+
+    /// Index each text as one document of field `body`; doc ids follow the
+    /// order of `texts`.
+    fn index(analyzer: Arc<dyn Analyzer>, texts: &[&str]) -> Arc<dyn LexicalIndexReader> {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            analyzer,
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage, config).unwrap();
+        let mut writer = index.writer().unwrap();
+        for text in texts {
+            writer
+                .add_document(Document::builder().add_text("body", *text).build())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.build_reader().unwrap()
+    }
+
+    fn slots(positions: &[&[&str]]) -> Vec<Vec<String>> {
+        positions
+            .iter()
+            .map(|alternatives| alternatives.iter().map(|t| t.to_string()).collect())
+            .collect()
+    }
+
+    fn matches(
+        reader: &dyn LexicalIndexReader,
+        positions: &[&[&str]],
+        slop: u32,
+    ) -> Vec<(u64, u32)> {
+        PhraseMatcher::find_phrase_matches(reader, "body", &slots(positions), slop)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.doc_id, m.phrase_freq))
+            .collect()
+    }
+
+    const DOGS: &[&str] = &[
+        "a big dog",
+        "a large dog",
+        "a huge cat",
+        "a big cat",
+        "a very large dog",
+    ];
+
+    /// #1252: a position may hold alternatives (stacked synonyms), any of
+    /// which matches there.
+    #[test]
+    fn any_alternative_matches_at_its_position() {
+        let reader = index(Arc::new(whitespace_analyzer()), DOGS);
+        assert_eq!(
+            matches(reader.as_ref(), &[&["a"], &["big", "large"], &["dog"]], 0),
+            vec![(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            matches(reader.as_ref(), &[&["a"], &["big", "large"], &["dog"]], 1),
+            vec![(0, 1), (1, 1), (4, 1)]
+        );
+    }
+
+    /// An alternative missing from the index does not rule the phrase out;
+    /// only a position whose alternatives are all missing does.
+    #[test]
+    fn a_position_matches_nothing_only_when_every_alternative_is_missing() {
+        let reader = index(Arc::new(whitespace_analyzer()), DOGS);
+        assert_eq!(
+            matches(
+                reader.as_ref(),
+                &[&["a"], &["big", "enormous"], &["dog"]],
+                0
+            ),
+            vec![(0, 1)]
+        );
+        assert!(
+            matches(
+                reader.as_ref(),
+                &[&["a"], &["enormous", "tiny"], &["dog"]],
+                0
+            )
+            .is_empty()
+        );
+    }
+
+    /// With synonyms stacked at index time, "big" and "large" share one
+    /// position; the phrase occurs once there, not once per alternative.
+    #[test]
+    fn stacked_alternatives_count_one_occurrence() {
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+        let analyzer =
+            whitespace_analyzer().add_filter(Arc::new(SynonymGraphFilter::new(dict, true)));
+        let reader = index(Arc::new(analyzer), &["a big dog", "a large dog"]);
+
+        let found = PhraseMatcher::find_phrase_matches(
+            reader.as_ref(),
+            "body",
+            &slots(&[&["a"], &["big", "large"], &["dog"]]),
+            0,
+        )
+        .unwrap();
+        let found: Vec<(u64, u32, Vec<u64>)> = found
+            .into_iter()
+            .map(|m| (m.doc_id, m.phrase_freq, m.positions))
+            .collect();
+        assert_eq!(found, vec![(0, 1, vec![0]), (1, 1, vec![0])]);
+    }
+
+    /// A position count, not a term count, decides whether positions are
+    /// needed and how the phrase is described.
+    #[test]
+    fn alternatives_are_one_position() {
+        let query = PhraseQuery::from_positions("body", slots(&[&["big", "large"], &["dog"]]));
+        let mut fields = std::collections::HashSet::new();
+        query.collect_positional_field_refs(&mut fields);
+        assert!(fields.contains("body"));
+
+        let single = PhraseQuery::from_positions("body", slots(&[&["big", "large"]]));
+        let mut fields = std::collections::HashSet::new();
+        single.collect_positional_field_refs(&mut fields);
+        assert!(fields.is_empty(), "one position needs no positions");
+
+        assert_ne!(query.cache_key(), single.cache_key());
+        let mut highlight = Vec::new();
+        query.collect_highlight_terms(None, &mut highlight);
+        match highlight.as_slice() {
+            [HighlightTerm::Phrase { positions, slop: 0 }] => {
+                assert_eq!(positions, &slots(&[&["big", "large"], &["dog"]]))
+            }
+            other => panic!("expected one Phrase, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_phrase_query_creation() {
         let query = PhraseQuery::new("content", vec!["hello".to_string(), "world".to_string()]);
 
         assert_eq!(query.field(), "content");
-        assert_eq!(query.terms(), &["hello", "world"]);
+        assert_eq!(query.positions(), slots(&[&["hello"], &["world"]]));
         assert_eq!(query.slop(), 0);
         assert_eq!(query.boost(), 1.0);
     }
@@ -600,7 +757,10 @@ mod tests {
         let query = PhraseQuery::from_phrase("content", "hello world test");
 
         assert_eq!(query.field(), "content");
-        assert_eq!(query.terms(), &["hello", "world", "test"]);
+        assert_eq!(
+            query.positions(),
+            slots(&[&["hello"], &["world"], &["test"]])
+        );
     }
 
     #[test]

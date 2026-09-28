@@ -1550,9 +1550,9 @@ mod tests {
             .downcast_ref::<PhraseQuery>()
             .unwrap_or_else(|| panic!("expected PhraseQuery, got {query:?}"));
         assert!(
-            phrase_q.terms().len() >= 2,
+            phrase_q.positions().len() >= 2,
             "expected multiple morphemes, got {:?}",
-            phrase_q.terms()
+            phrase_q.positions()
         );
     }
 
