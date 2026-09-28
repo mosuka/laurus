@@ -367,9 +367,80 @@ impl IntoTokenStream for Vec<Token> {
     }
 }
 
+/// Numbers a token stream the way the index stores it.
+///
+/// A token with `position_increment == 0` shares the previous token's
+/// position; any other token takes the next position, and the first token
+/// is at 0 whatever its increment. An increment above 1 is not a gap: no
+/// filter leaves one (a removed stop word does not), so a stream without
+/// stacked tokens is numbered 0, 1, 2, … The indexer, the highlighter and
+/// the query parser all number tokens through this type, so a phrase
+/// compares the same positions on both sides.
+#[derive(Debug, Default)]
+pub(crate) struct TokenPositions {
+    current: Option<u32>,
+}
+
+impl TokenPositions {
+    /// Return the position of `token`, the next token of the stream.
+    pub(crate) fn assign(&mut self, token: &Token) -> u32 {
+        let position = match self.current {
+            None => 0,
+            Some(current) if token.position_increment == 0 => current,
+            Some(current) => current.saturating_add(1),
+        };
+        self.current = Some(position);
+        position
+    }
+}
+
+/// The positions [`TokenPositions`] assigns to `tokens`, in order.
+pub(crate) fn token_positions(tokens: &[Token]) -> Vec<u32> {
+    let mut positions = TokenPositions::default();
+    tokens.iter().map(|token| positions.assign(token)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token(text: &str, increment: usize) -> Token {
+        Token::new(text, 0).with_position_increment(increment)
+    }
+
+    #[test]
+    fn stacked_tokens_share_a_position() {
+        let tokens = [
+            token("a", 1),
+            token("big", 1),
+            token("large", 0),
+            token("dog", 1),
+        ];
+        assert_eq!(token_positions(&tokens), vec![0, 1, 1, 2]);
+    }
+
+    /// `FlattenGraphFilter` can give the first token increment 0.
+    #[test]
+    fn first_token_is_at_zero_whatever_its_increment() {
+        assert_eq!(
+            token_positions(&[token("a", 0), token("b", 0), token("c", 1)]),
+            vec![0, 0, 1]
+        );
+        assert_eq!(token_positions(&[token("a", 5), token("b", 1)]), vec![0, 1]);
+    }
+
+    #[test]
+    fn an_increment_above_one_is_not_a_gap() {
+        assert_eq!(
+            token_positions(&[token("a", 1), token("b", 3), token("c", 2)]),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn no_tokens_no_positions() {
+        assert!(token_positions(&[]).is_empty());
+    }
 
     #[test]
     fn test_token_creation() {

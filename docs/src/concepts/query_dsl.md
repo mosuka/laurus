@@ -82,7 +82,9 @@ path:"file:///notes/a.md"
 links:"https://example.com/a"
 ```
 
-A phrase of two or more tokens compares term positions, which a field stores only with `term_vectors: true` (the default). On a field with `term_vectors: false` the search is rejected with a query error instead of returning no hits. This includes an unfielded phrase that expands over the default fields when one of them has `term_vectors: false`.
+When the field's analyzer stacks several tokens at one position, as `SynonymGraphFilter` does, they are alternatives at that position. With `big` and `large` as synonyms, `"big"` matches documents that contain either word, and `"a big dog"` also matches "a large dog". A multi-word synonym makes one phrase per alternative, and the value matches when any of them does: with `ml` and `machine learning` as synonyms, `"ml"` matches `ml` or the phrase `machine learning`. A value that expands into more than 64 phrases this way is rejected with a query error. See [Synonym Expansion](analysis.md#synonym-expansion).
+
+A phrase of two or more positions compares term positions, which a field stores only with `term_vectors: true` (the default). On a field with `term_vectors: false` the search is rejected with a query error instead of returning no hits. This includes an unfielded phrase that expands over the default fields when one of them has `term_vectors: false`, and a quoted word whose multi-word synonym makes it a phrase, such as `"ml"` above.
 
 ### Fuzzy Query
 

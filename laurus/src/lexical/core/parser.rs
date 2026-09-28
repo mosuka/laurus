@@ -16,7 +16,8 @@
 //! Every field is analyzed by the same function the writer uses for
 //! [`InvertedIndexWriter::add_document`](crate::lexical::index::inverted::writer::InvertedIndexWriter::add_document),
 //! so each occurrence of a term becomes its own entry, positions are
-//! numbered densely, and the field length counts every token (Issue #1243).
+//! numbered as the index stores them (stacked synonyms share one), and the
+//! field length counts every token (Issue #1243).
 //!
 //! # Architecture
 //!

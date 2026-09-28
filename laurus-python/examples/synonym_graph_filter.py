@@ -106,7 +106,7 @@ def main() -> None:
     print()
     print("  Explanation:")
     print("    - 'package installer' spans positions 0 and 1")
-    print("    - position_length > 1 on 'package' indicates a multi-word synonym")
+    print("    - position_length 2 on 'pip' makes it span both words of the synonym")
     print("    - Downstream phrase indexing uses this graph to support phrase queries\n")
 
     print("Use cases for boost:")

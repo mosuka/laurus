@@ -202,6 +202,52 @@ mod tests {
         assert_eq!(result[3].text, "cat");
     }
 
+    /// Around a multi-word synonym, the token after the match lands on the
+    /// match's end node, both when the synonym is longer than the match and
+    /// when it is shorter.
+    #[test]
+    fn the_token_after_a_match_follows_the_longest_path() {
+        use crate::analysis::token::token_positions;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
+        let filter = SynonymGraphFilter::with_tokenizer(dict, Box::new(WhitespaceTokenizer), true);
+
+        for (input, expected) in [
+            (
+                vec!["ml", "is", "fun"],
+                vec![
+                    ("ml", 0),
+                    ("machine", 0),
+                    ("learning", 1),
+                    ("is", 2),
+                    ("fun", 3),
+                ],
+            ),
+            (
+                vec!["machine", "learning", "is"],
+                vec![("machine", 0), ("ml", 0), ("learning", 1), ("is", 2)],
+            ),
+        ] {
+            let tokens: Vec<Token> = input
+                .iter()
+                .enumerate()
+                .map(|(i, text)| Token::new(*text, i))
+                .collect();
+            let result: Vec<Token> = filter
+                .filter(Box::new(tokens.into_iter()))
+                .unwrap()
+                .collect();
+            let actual: Vec<(&str, u32)> = result
+                .iter()
+                .map(|t| t.text.as_str())
+                .zip(token_positions(&result))
+                .collect();
+            assert_eq!(actual, expected, "{input:?}");
+        }
+    }
+
     #[test]
     fn test_synonym_graph_filter_multi_word() {
         let mut dict = SynonymDictionary::new(None).unwrap();
@@ -739,9 +785,11 @@ mod tests {
         let machine = machine_token.unwrap();
         assert_eq!(machine.position, 0);
         assert_eq!(machine.position_increment, 0);
+        assert_eq!(machine.position_length, 1);
+        let ml = result.iter().find(|t| t.text == "ml").unwrap();
         assert_eq!(
-            machine.position_length, 2,
-            "First token of multi-word synonym should have pos_len=2"
+            ml.position_length, 2,
+            "the original spans both words of its multi-word synonym"
         );
 
         // Verify "learning" token (second token of multi-word synonym)
@@ -758,10 +806,9 @@ mod tests {
         let artificial = artificial_token.unwrap();
         assert_eq!(artificial.position, 2);
         assert_eq!(artificial.position_increment, 0);
-        assert_eq!(
-            artificial.position_length, 2,
-            "First token of multi-word synonym should have pos_len=2"
-        );
+        assert_eq!(artificial.position_length, 1);
+        let ai = result.iter().find(|t| t.text == "ai").unwrap();
+        assert_eq!(ai.position_length, 2);
 
         // Verify "intelligence" token (second token of multi-word synonym)
         let intelligence_token = result.iter().find(|t| t.text == "intelligence");
@@ -850,10 +897,7 @@ mod tests {
         let kikai = kikai_token.unwrap();
         assert_eq!(kikai.position, 0);
         assert_eq!(kikai.position_increment, 0);
-        assert_eq!(
-            kikai.position_length, 2,
-            "First token of Japanese multi-word synonym should have pos_len=2"
-        );
+        assert_eq!(kikai.position_length, 1);
 
         // Verify "学習" token (second token of Japanese multi-word synonym)
         let gakushu_token = result.iter().find(|t| t.text == "学習");
@@ -869,10 +913,7 @@ mod tests {
         let jinko = jinko_token.unwrap();
         assert_eq!(jinko.position, 2);
         assert_eq!(jinko.position_increment, 0);
-        assert_eq!(
-            jinko.position_length, 2,
-            "First token of Japanese multi-word synonym should have pos_len=2"
-        );
+        assert_eq!(jinko.position_length, 1);
 
         // Verify "知能" token (second token of Japanese multi-word synonym)
         let chino_token = result.iter().find(|t| t.text == "知能");

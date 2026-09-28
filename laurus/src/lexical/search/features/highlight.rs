@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::Token;
+use crate::analysis::token::{Token, token_positions};
 use crate::error::Result;
 use crate::lexical::index::inverted::core::automaton::{Automaton, LevenshteinAutomaton};
 use crate::lexical::query::{HighlightTerm, Query};
@@ -325,7 +325,7 @@ impl Highlighter {
         let mut exact: HashSet<String> = HashSet::new();
         let mut min_term_len = usize::MAX;
         let mut max_term_len = 0usize;
-        let mut phrases: Vec<(Vec<String>, u32)> = Vec::new();
+        let mut phrases: Vec<(Vec<Vec<String>>, u32)> = Vec::new();
         let mut prefixes: Vec<&str> = Vec::new();
         let mut regexes: Vec<&Regex> = Vec::new();
         let mut fuzzy: Vec<&LevenshteinAutomaton> = Vec::new();
@@ -337,8 +337,12 @@ impl Highlighter {
                     max_term_len = max_term_len.max(term.len());
                     exact.insert(term);
                 }
-                HighlightTerm::Phrase { terms, slop } => {
-                    phrases.push((terms.iter().map(|t| t.to_lowercase()).collect(), *slop));
+                HighlightTerm::Phrase { positions, slop } => {
+                    let positions = positions
+                        .iter()
+                        .map(|alternatives| alternatives.iter().map(|t| t.to_lowercase()).collect())
+                        .collect();
+                    phrases.push((positions, *slop));
                 }
                 HighlightTerm::Prefix(prefix) => prefixes.push(prefix),
                 HighlightTerm::Regex(regex) => regexes.push(regex),
@@ -829,14 +833,19 @@ fn ceil_boundary(text: &str, pos: usize) -> usize {
 /// Mirrors the index-side phrase matcher: the first term anchors, each
 /// following term must appear at the first position in
 /// `expected..=expected + slop`, and the match then continues from that
-/// position. A token's position is its index in `tokens`, which is how
-/// `tokens_to_analyzed_terms` numbers what the index stores. The analyzer's
-/// `Token::position` is ignored, so a dropped stop word leaves no gap here,
-/// just as in the index. A span runs from the first token's start to the
-/// last token's end.
-fn phrase_spans(tokens: &[Token], phrase: &[String], slop: u32) -> Vec<HighlightSpan> {
-    let token_is = |token: &Token, term: &str| {
-        token.text == term || (has_uppercase(&token.text) && token.text.to_lowercase() == term)
+/// position. Positions come from [`token_positions`], which is how
+/// `tokens_to_analyzed_terms` numbers what the index stores: a stacked
+/// synonym shares its word's position, and the analyzer's `Token::position`
+/// is ignored, so a dropped stop word leaves no gap here, just as in the
+/// index. Each phrase position lists alternative terms, any of which
+/// matches there. A span runs from the first token's start to the last
+/// token's end.
+fn phrase_spans(tokens: &[Token], phrase: &[Vec<String>], slop: u32) -> Vec<HighlightSpan> {
+    let token_is = |token: &Token, alternatives: &[String]| {
+        alternatives.iter().any(|term| {
+            token.text == *term
+                || (has_uppercase(&token.text) && token.text.to_lowercase() == *term)
+        })
     };
     let token_end = |token: &Token| token.start_offset + token.text.len();
 
@@ -844,24 +853,29 @@ fn phrase_spans(tokens: &[Token], phrase: &[String], slop: u32) -> Vec<Highlight
     let Some((first, rest)) = phrase.split_first() else {
         return spans;
     };
-    // Saturating: `u32::MAX + 1` overflows a 32-bit `usize` (wasm32).
-    let window = (slop as usize).saturating_add(1);
+    let positions = token_positions(tokens);
+    // Tokens stacked at one position would repeat the same match.
+    let mut last_anchor_position = None;
 
-    for (anchor_idx, anchor) in tokens.iter().enumerate() {
-        if !token_is(anchor, first) {
+    for (anchor, &anchor_position) in tokens.iter().zip(&positions) {
+        if last_anchor_position == Some(anchor_position) || !token_is(anchor, first) {
             continue;
         }
+        last_anchor_position = Some(anchor_position);
 
         let matched = rest.iter().try_fold(
-            (anchor_idx + 1, token_end(anchor)),
+            (anchor_position.saturating_add(1), token_end(anchor)),
             |(expected, _), term| {
-                tokens
+                // Positions never decrease, so the first match from here is
+                // the one at the smallest position.
+                let from = positions.partition_point(|&p| p < expected);
+                let last = expected.saturating_add(slop);
+                tokens[from..]
                     .iter()
-                    .enumerate()
-                    .skip(expected)
-                    .take(window)
-                    .find(|(_, token)| token_is(token, term))
-                    .map(|(idx, token)| (idx + 1, token_end(token)))
+                    .zip(&positions[from..])
+                    .take_while(|&(_, &p)| p <= last)
+                    .find(|&(token, _)| token_is(token, term))
+                    .map(|(token, &p)| (p.saturating_add(1), token_end(token)))
             },
         );
 
@@ -1511,8 +1525,8 @@ mod tests {
         assert!(highlight_marks(&phrase(0), "body", "hello big world").is_empty());
     }
 
-    /// The index numbers the tokens that survive analysis densely, so a
-    /// dropped stop word leaves no gap: the index matches `"hello world"`
+    /// A dropped stop word leaves no gap in the positions the index stores:
+    /// the index matches `"hello world"`
     /// against "hello the world" at slop 0, and the highlighter must too.
     #[test]
     fn phrase_across_a_dropped_stop_word_highlights_at_slop_0() {
@@ -1532,8 +1546,9 @@ mod tests {
     }
 
     /// `UnicodeWordTokenizer` numbers whitespace and punctuation before
-    /// dropping them, so `hello` and `world` come out at positions 0 and 3.
-    /// The index ignores those positions, and so must the highlighter.
+    /// dropping them, so `hello` and `world` come out at `Token::position`
+    /// 0 and 3. The index ignores `Token::position`, and so must the
+    /// highlighter.
     #[test]
     fn unicode_word_tokenizer_phrase_highlights_at_slop_0() {
         use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
@@ -1551,6 +1566,88 @@ mod tests {
             .unwrap()
             .fragments;
         assert_eq!(marked(&fragments), ["hello, world"]);
+    }
+
+    /// A highlighter whose analyzer stacks `large` on `big` (and the
+    /// reverse), as `SynonymGraphFilter` does.
+    fn synonym_highlighter() -> Highlighter {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+        Highlighter::with_analyzer(
+            HighlightConfig::default(),
+            Box::new(
+                PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+                    .add_filter(Arc::new(SynonymGraphFilter::new(dict, true))),
+            ),
+        )
+    }
+
+    /// #1252: the index puts a stacked synonym at its word's position, so
+    /// `"a large dog"` matches "a big dog" at slop 0 there, and the
+    /// highlighter must count positions the same way.
+    #[test]
+    fn phrase_through_a_stacked_synonym_highlights_at_slop_0() {
+        let query = PhraseQuery::new("body", vec!["a".into(), "large".into(), "dog".into()]);
+        let fragments = synonym_highlighter()
+            .highlight(&query, "body", "a big dog barks")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["a big dog"]);
+    }
+
+    /// Any alternative matches at its position, as in the phrase matcher,
+    /// and tokens stacked at one position anchor one span, not two.
+    #[test]
+    fn phrase_alternatives_highlight_whichever_occurs() {
+        let alternatives = || {
+            PhraseQuery::from_positions(
+                "body",
+                vec![
+                    vec!["red".into()],
+                    vec!["big".into(), "large".into()],
+                    vec!["dog".into()],
+                ],
+            )
+        };
+        assert_eq!(
+            highlight_marks(
+                &alternatives(),
+                "body",
+                "red large dog. red big dog. red cat"
+            ),
+            ["red large dog", "red big dog"]
+        );
+
+        let stacked_first = PhraseQuery::from_positions(
+            "body",
+            vec![vec!["big".into(), "large".into()], vec!["dog".into()]],
+        );
+        let highlighter = synonym_highlighter();
+        let text = "a big dog";
+        let tokens: Vec<Token> = highlighter.analyzer.analyze(text).unwrap().collect();
+        assert_eq!(phrase_spans(&tokens, stacked_first.positions(), 0).len(), 1);
+    }
+
+    /// A stacked token takes no position of its own, so it does not widen
+    /// the slop window: "big dog" is two positions, not three.
+    #[test]
+    fn a_stacked_synonym_does_not_count_against_the_slop() {
+        let query = PhraseQuery::new("body", vec!["a".into(), "dog".into()]);
+        let fragments = synonym_highlighter()
+            .highlight(&query, "body", "a big dog")
+            .unwrap()
+            .fragments;
+        assert!(marked(&fragments).is_empty());
+        let fragments = synonym_highlighter()
+            .highlight(&query.with_slop(1), "body", "a big dog")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["a big dog"]);
     }
 
     #[test]

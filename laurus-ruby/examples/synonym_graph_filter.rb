@@ -92,7 +92,7 @@ def main
   puts
   puts "  Explanation:"
   puts "    - 'interactive ruby' spans positions 0 and 1"
-  puts "    - position_length > 1 on 'interactive' indicates a multi-word synonym"
+  puts "    - position_length 2 on 'irb' makes it span both words of the synonym"
   puts "    - Downstream phrase indexing uses this graph to support phrase queries\n\n"
 
   puts "Use cases for boost:"

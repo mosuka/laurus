@@ -114,7 +114,7 @@ foreach ($resultTokens2 as $i => $tok) {
 echo PHP_EOL;
 echo "  Explanation:" . PHP_EOL;
 echo "    - 'dependency injection' spans positions 0 and 1" . PHP_EOL;
-echo "    - position_length > 1 on 'dependency' indicates a multi-word synonym" . PHP_EOL;
+echo "    - position_length 2 on 'di' makes it span both words of the synonym" . PHP_EOL;
 echo "    - Downstream phrase indexing uses this graph to support phrase queries" . PHP_EOL . PHP_EOL;
 
 echo "Use cases for boost:" . PHP_EOL;

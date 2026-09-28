@@ -386,3 +386,31 @@ let filter = SynonymGraphFilter::new(dict, true)
 ```
 
 The `boost` parameter controls how much weight synonyms receive relative to original tokens. A value of `0.8` means synonym matches contribute 80% as much to the score as exact matches.
+
+#### The token graph
+
+The filter stacks each synonym on the word it expands (`position_increment = 0`), so the output is a graph: a token is an arc from its position to its position + `position_length`. The matched words and every synonym run from the same start node to the same end node. The last token of a shorter alternative spans the remaining positions, and the token after the match starts at the end node. For `ml tutorial` with `ml` and `machine learning` as synonyms:
+
+| Token | Position | `position_increment` | `position_length` |
+| :--- | :--- | :--- | :--- |
+| `ml` | 0 | 1 | 2 |
+| `machine` | 0 | 0 | 1 |
+| `learning` | 1 | 1 | 1 |
+| `tutorial` | 2 | 1 | 1 |
+
+The index stores a stacked token at its word's position, and stores no `position_length`. Positions otherwise stay dense: a stop word removed by `StopFilter` leaves no gap.
+
+#### Searching with synonyms
+
+An engine uses a field's analyzer both to index and to parse queries, so synonyms are expanded on both sides. An unquoted word matches any of its synonyms. A quoted value is matched through the graph (see [Phrase Query](query_dsl.md#phrase-query)): `"big"` with `big` and `large` as synonyms matches either word, and `"a big dog"` also matches "a large dog".
+
+Because the index keeps positions but not `position_length`, index-time expansion of multi-word synonyms behaves as in Lucene:
+
+- A phrase may start or end inside a synonym. `"learning is"` matches "ml is fun", which reads "machine learning is fun" with the synonym.
+- When a group has several multi-word members, their words share the inner positions, so a phrase can match a mix of two members' words.
+
+Other points to keep in mind:
+
+- `keep_original = false` replaces the matched word with the other members of its group, so the word itself is neither indexed nor searched. Use `keep_original = true` for search.
+- Put filters that remove tokens, such as `StopFilter` and `LimitFilter`, before `SynonymGraphFilter`. After it, they drop tokens the graph needs.
+- Documents indexed before Issue #1252 numbered stacked tokens one after another. Put them again after upgrading if their fields use `SynonymGraphFilter`: merging segments copies the stored positions unchanged.

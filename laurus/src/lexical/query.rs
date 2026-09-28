@@ -121,8 +121,9 @@ pub enum HighlightTerm {
     /// Ordered terms matched on token positions with the same in-order,
     /// per-gap `slop` rule as the phrase matcher.
     Phrase {
-        /// The phrase's terms, in order.
-        terms: Vec<String>,
+        /// The phrase's positions, in order, each with the alternative
+        /// terms any of which matches there.
+        positions: Vec<Vec<String>>,
         /// Maximum position gap allowed between consecutive terms.
         slop: u32,
     },
@@ -376,8 +377,8 @@ mod highlight_term_tests {
     fn phrase_query_keeps_terms_and_slop() {
         let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]).with_slop(2);
         match collect(&query, Some("body")).as_slice() {
-            [HighlightTerm::Phrase { terms, slop }] => {
-                assert_eq!(terms, &["hello", "world"]);
+            [HighlightTerm::Phrase { positions, slop }] => {
+                assert_eq!(positions, &[vec!["hello"], vec!["world"]]);
                 assert_eq!(*slop, 2);
             }
             other => panic!("expected one Phrase, got {other:?}"),
