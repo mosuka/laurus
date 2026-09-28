@@ -386,4 +386,50 @@ mod tests {
             "Expected original tokens to be preserved"
         );
     }
+
+    /// `SynonymGraphFilter` emits an already flat graph (no side nodes), so
+    /// flattening it must not move any token, including when paths of 1, 2
+    /// and 3 words share the inner nodes.
+    #[test]
+    fn synonym_graph_output_is_already_flat() {
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec![
+            "ml".to_string(),
+            "machine learning".to_string(),
+            "statistical machine learning".to_string(),
+        ]);
+        let synonym_filter =
+            SynonymGraphFilter::with_tokenizer(dict, Box::new(WhitespaceTokenizer), true);
+
+        for input in [
+            vec!["ml", "is", "fun"],
+            vec!["machine", "learning", "is"],
+            vec!["we", "like", "statistical", "machine", "learning"],
+        ] {
+            let tokens: Vec<Token> = input
+                .iter()
+                .enumerate()
+                .map(|(i, text)| Token::new(*text, i))
+                .collect();
+            let graph: Vec<Token> = synonym_filter
+                .filter(Box::new(tokens.into_iter()))
+                .unwrap()
+                .collect();
+            let flat: Vec<Token> = FlattenGraphFilter::new()
+                .filter(Box::new(graph.clone().into_iter()))
+                .unwrap()
+                .collect();
+            let shape = |tokens: &[Token]| -> Vec<(String, usize, usize)> {
+                tokens
+                    .iter()
+                    .map(|t| (t.text.clone(), t.position_increment, t.position_length))
+                    .collect()
+            };
+            assert_eq!(shape(&flat), shape(&graph), "{input:?}");
+        }
+    }
 }

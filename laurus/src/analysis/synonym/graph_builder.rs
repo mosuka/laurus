@@ -75,8 +75,18 @@ impl SynonymGraphBuilder {
 
     /// Build graph tokens from matched synonyms.
     ///
-    /// This creates tokens with proper position_increment and position_length attributes
-    /// to represent the synonym graph structure.
+    /// The matched words (with `keep_original`) and each synonym form one
+    /// path each, all from the match's start node to one shared end node,
+    /// `L` nodes later, where `L` is the longest path in tokens. A token is
+    /// an arc from its position to its position + `position_length`: the
+    /// last token of a `k`-token path spans `L - (k - 1)` positions, every
+    /// other token one. Tokens come out in node order; at each node the
+    /// first token has increment 1 (the matched word's own increment at the
+    /// start node) and the rest are stacked on it with increment 0, so the
+    /// token after the match lands on the end node.
+    ///
+    /// The graph has no side nodes: paths of several words share the inner
+    /// nodes, as Lucene's `FlattenGraphFilter` output does.
     pub fn build_graph_tokens(
         &self,
         original_tokens: &[Token],
@@ -84,85 +94,86 @@ impl SynonymGraphBuilder {
         match_length: usize,
         synonyms: &[String],
     ) -> Vec<Token> {
-        let mut result = Vec::new();
-        let match_start_offset = original_tokens[match_start].start_offset;
-        let match_end_offset = original_tokens[match_start + match_length - 1].end_offset;
+        let matched = &original_tokens[match_start..match_start + match_length];
+        let first = &matched[0];
+        let match_start_offset = first.start_offset;
+        let match_end_offset = matched[match_length - 1].end_offset;
 
-        // Add original tokens if keep_original is true
-        if self.keep_original {
-            for (i, original) in original_tokens[match_start..match_start + match_length]
-                .iter()
-                .enumerate()
-            {
-                let mut token = original.clone();
-                token.position_increment = if i == 0 { 1 } else { 0 };
-                token.position_length = 1;
-                result.push(token);
-            }
+        let synonym_paths: Vec<Vec<Token>> = synonyms
+            .iter()
+            .map(|synonym| self.split_synonym(synonym))
+            .filter(|words| !words.is_empty())
+            .map(|words| {
+                let single_word = words.len() == 1;
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(i, word)| {
+                        let mut token = Token::new(word, first.position + i)
+                            .with_token_type(TokenType::Synonym);
+                        token.start_offset = match_start_offset;
+                        token.end_offset = match_end_offset;
+                        if let Some(boost) = self.synonym_boost {
+                            // A single word standing for several gets a little more
+                            // weight, as does the first word of a multi-word synonym.
+                            let base_boost = match (single_word, i) {
+                                (true, _) if match_length > 1 => 0.9,
+                                (true, _) => 0.8,
+                                (false, 0) => 0.9,
+                                (false, _) => 0.8,
+                            };
+                            token = token.with_boost(base_boost * boost);
+                        }
+                        token
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // A group with no other member leaves nothing to replace the match
+        // with, so the matched words stay even without `keep_original`.
+        let mut paths = Vec::with_capacity(synonym_paths.len() + 1);
+        if self.keep_original || synonym_paths.is_empty() {
+            paths.push(matched.to_vec());
         }
+        paths.extend(synonym_paths);
 
-        // Add synonym tokens
-        for synonym in synonyms {
-            // Tokenize the synonym using the tokenizer if available
-            let syn_tokens = if let Some(tokenizer) = &self.tokenizer {
-                // Use tokenizer to split synonym
-                match tokenizer.tokenize(synonym) {
-                    Ok(tokens) => tokens.map(|t| t.text).collect::<Vec<_>>(),
-                    Err(_) => {
-                        // Fallback to whitespace splitting on error
-                        synonym.split_whitespace().map(|s| s.to_string()).collect()
-                    }
-                }
-            } else {
-                // Default: split by whitespace
-                synonym.split_whitespace().map(|s| s.to_string()).collect()
-            };
-
-            if syn_tokens.len() == 1 {
-                // Single-word synonym
-                let mut token = Token::new(&syn_tokens[0], original_tokens[match_start].position);
-                token.position_increment = if self.keep_original { 0 } else { 1 };
-                token.position_length = match_length; // Spans the original phrase length
-                token.start_offset = match_start_offset;
-                token.end_offset = match_end_offset;
-                token = token.with_token_type(TokenType::Synonym);
-
-                // Apply boost if configured
-                if let Some(boost) = self.synonym_boost {
-                    // Single-word synonyms spanning multiple positions get slightly higher boost
-                    let base_boost = if match_length > 1 { 0.9 } else { 0.8 };
-                    token = token.with_boost(base_boost * boost);
-                }
-
+        let longest = paths.iter().map(Vec::len).max().unwrap_or(0);
+        let mut result = Vec::with_capacity(paths.iter().map(Vec::len).sum());
+        for node in 0..longest {
+            let mut first_at_node = true;
+            for path in &paths {
+                let Some(token) = path.get(node) else {
+                    continue;
+                };
+                let mut token = token.clone();
+                token.position_length = if node + 1 == path.len() {
+                    longest - node
+                } else {
+                    1
+                };
+                token.position_increment = match (first_at_node, node) {
+                    (false, _) => 0,
+                    (true, 0) => first.position_increment,
+                    (true, _) => 1,
+                };
+                first_at_node = false;
                 result.push(token);
-            } else {
-                // Multi-word synonym
-                for (i, syn_word) in syn_tokens.iter().enumerate() {
-                    let mut token = Token::new(syn_word, original_tokens[match_start].position + i);
-                    token.position_increment = if i == 0 {
-                        if self.keep_original { 0 } else { 1 }
-                    } else {
-                        1
-                    };
-                    // First token spans the entire synonym phrase length
-                    token.position_length = if i == 0 { syn_tokens.len() } else { 1 };
-                    token.start_offset = match_start_offset;
-                    token.end_offset = match_end_offset;
-                    token = token.with_token_type(TokenType::Synonym);
-
-                    // Apply boost if configured
-                    if let Some(boost) = self.synonym_boost {
-                        // Multi-word synonyms: first token gets slightly higher boost
-                        let base_boost = if i == 0 { 0.9 } else { 0.8 };
-                        token = token.with_boost(base_boost * boost);
-                    }
-
-                    result.push(token);
-                }
             }
         }
 
         result
+    }
+
+    /// Split a synonym into words with the configured tokenizer, or on
+    /// whitespace when there is none or it fails.
+    fn split_synonym(&self, synonym: &str) -> Vec<String> {
+        if let Some(tokenizer) = &self.tokenizer
+            && let Ok(tokens) = tokenizer.tokenize(synonym)
+        {
+            return tokens.map(|t| t.text).collect();
+        }
+        synonym.split_whitespace().map(|s| s.to_string()).collect()
     }
 
     /// Try to match a synonym starting at the given position in the token buffer.
@@ -238,6 +249,172 @@ impl SynonymGraphBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::token::token_positions;
+    use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+    /// Each token as an arc `(text, from, to)` of the token graph, plus the
+    /// increments, which must be 1 for the first token at each node.
+    fn arcs(tokens: &[Token]) -> (Vec<(String, u32, u32)>, Vec<usize>) {
+        let arcs = tokens
+            .iter()
+            .zip(token_positions(tokens))
+            .map(|(t, from)| (t.text.clone(), from, from + t.position_length as u32))
+            .collect();
+        let increments = tokens.iter().map(|t| t.position_increment).collect();
+        (arcs, increments)
+    }
+
+    fn arc(text: &str, from: u32, to: u32) -> (String, u32, u32) {
+        (text.to_string(), from, to)
+    }
+
+    fn words(texts: &[&str]) -> Vec<Token> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Token::new(*text, i))
+            .collect()
+    }
+
+    fn synonyms(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn builder(keep_original: bool) -> SynonymGraphBuilder {
+        let dict = SynonymDictionary::new(None).unwrap();
+        SynonymGraphBuilder::with_tokenizer(dict, Box::new(WhitespaceTokenizer), keep_original)
+    }
+
+    /// The original spans the whole match when a synonym is longer, and
+    /// every path ends at node 2.
+    #[test]
+    fn one_word_to_two_words_is_a_graph_with_one_end() {
+        let result = builder(true).build_graph_tokens(
+            &words(&["ml"]),
+            0,
+            1,
+            &synonyms(&["machine learning"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![arc("ml", 0, 2), arc("machine", 0, 1), arc("learning", 1, 2)],
+                vec![1, 0, 1]
+            )
+        );
+    }
+
+    /// The second original word takes the next position instead of being
+    /// stacked on the first.
+    #[test]
+    fn two_words_to_one_word_keeps_the_originals_in_sequence() {
+        let result = builder(true).build_graph_tokens(
+            &words(&["machine", "learning"]),
+            0,
+            2,
+            &synonyms(&["ml"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![arc("machine", 0, 1), arc("ml", 0, 2), arc("learning", 1, 2)],
+                vec![1, 0, 1]
+            )
+        );
+    }
+
+    #[test]
+    fn two_words_to_two_words_stacks_each_node() {
+        let result = builder(true).build_graph_tokens(
+            &words(&["machine", "learning"]),
+            0,
+            2,
+            &synonyms(&["deep learning"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![
+                    arc("machine", 0, 1),
+                    arc("deep", 0, 1),
+                    arc("learning", 1, 2),
+                    arc("learning", 1, 2)
+                ],
+                vec![1, 0, 1, 0]
+            )
+        );
+    }
+
+    /// Paths of 1, 2 and 3 words all end at node 3: the last token of each
+    /// shorter path spans the rest.
+    #[test]
+    fn paths_of_different_lengths_end_at_the_same_node() {
+        let result = builder(true).build_graph_tokens(
+            &words(&["ml"]),
+            0,
+            1,
+            &synonyms(&["machine learning", "statistical machine learning"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![
+                    arc("ml", 0, 3),
+                    arc("machine", 0, 1),
+                    arc("statistical", 0, 1),
+                    arc("learning", 1, 3),
+                    arc("machine", 1, 2),
+                    arc("learning", 2, 3)
+                ],
+                vec![1, 0, 0, 1, 0, 1]
+            )
+        );
+    }
+
+    /// Without the original, the alternatives are still stacked.
+    #[test]
+    fn without_the_original_the_synonyms_are_stacked() {
+        let result = builder(false).build_graph_tokens(
+            &words(&["big"]),
+            0,
+            1,
+            &synonyms(&["large", "huge"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (vec![arc("large", 0, 1), arc("huge", 0, 1)], vec![1, 0])
+        );
+    }
+
+    /// A group with one member has no synonyms; the matched word must
+    /// survive even without `keep_original`.
+    #[test]
+    fn a_match_without_synonyms_keeps_the_original() {
+        let result = builder(false).build_graph_tokens(&words(&["big"]), 0, 1, &[]);
+        assert_eq!(arcs(&result), (vec![arc("big", 0, 1)], vec![1]));
+    }
+
+    #[test]
+    fn a_synonym_with_no_words_is_skipped() {
+        let result =
+            builder(true).build_graph_tokens(&words(&["big"]), 0, 1, &synonyms(&[" ", "large"]));
+        assert_eq!(
+            arcs(&result),
+            (vec![arc("big", 0, 1), arc("large", 0, 1)], vec![1, 0])
+        );
+    }
+
+    /// A match after the first token keeps that token's increment and
+    /// the synonyms' `position` values.
+    #[test]
+    fn a_match_keeps_the_first_word_increment_and_positions() {
+        let tokens = words(&["the", "ml"]);
+        let result =
+            builder(true).build_graph_tokens(&tokens, 1, 1, &synonyms(&["machine learning"]));
+        let positions: Vec<usize> = result.iter().map(|t| t.position).collect();
+        assert_eq!(positions, vec![1, 1, 2]);
+        assert_eq!(result[0].position_increment, 1);
+    }
 
     #[test]
     fn test_build_graph_tokens_single_word_synonym() {
@@ -282,7 +459,11 @@ mod tests {
         assert!(machine_token.is_some());
         let machine = machine_token.unwrap();
         assert_eq!(machine.position_increment, 0);
-        assert_eq!(machine.position_length, 2); // Spans 2 positions
+        assert_eq!(machine.position_length, 1);
+
+        // The original "ml" spans both positions of "machine learning".
+        let ml = result.iter().find(|t| t.text == "ml").unwrap();
+        assert_eq!(ml.position_length, 2);
 
         // Find "learning" token (second of multi-word synonym)
         let learning_token = result.iter().find(|t| t.text == "learning");
