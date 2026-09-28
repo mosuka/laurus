@@ -1253,21 +1253,39 @@ impl InvertedIndexWriter {
             // occurrences', turning 3 occurrences into a triangular-number
             // frequency of 6 instead of 3. Aggregate occurrences per term
             // first so exactly one posting is added per (doc, term) pair.
-            let mut per_term: AHashMap<&str, Vec<u32>> = AHashMap::new();
+            let mut per_term: AHashMap<&str, Vec<&AnalyzedTerm>> = AHashMap::new();
             for analyzed_term in terms {
                 per_term
                     .entry(analyzed_term.term.as_str())
                     .or_default()
-                    .push(analyzed_term.position);
+                    .push(analyzed_term);
             }
 
-            for (term, positions) in per_term {
+            for (term, occurrences) in per_term {
                 let full_term = format!("{field_name}:{term}");
 
                 let posting = if store_positions {
+                    let positions = occurrences.iter().map(|t| t.position).collect();
                     Posting::with_positions(doc_id, positions)
                 } else {
-                    Posting::with_frequency(doc_id, positions.len() as u32)
+                    // With more than one occurrence, `frequency` is a
+                    // running per-occurrence count (or, for non-text
+                    // fields, always 1), so only `occurrences.len()` is
+                    // meaningful — same as before. A single occurrence is
+                    // ambiguous: it is either a genuine one-time term
+                    // (`frequency: 1`) or a segment merge's replay of an
+                    // entire frequency-only posting, collapsed into one
+                    // `AnalyzedTerm` that carries the source segment's
+                    // already-aggregated frequency
+                    // (`merge_engine::replay_segment_into_writer`).
+                    // Trusting that occurrence's `frequency` resolves both
+                    // cases correctly and lets the replayed frequency
+                    // survive the rebuild (#1234).
+                    let frequency = match occurrences.as_slice() {
+                        [only] => only.frequency,
+                        _ => occurrences.len() as u32,
+                    };
+                    Posting::with_frequency(doc_id, frequency)
                 };
 
                 self.inverted_index.add_posting(full_term, posting);
