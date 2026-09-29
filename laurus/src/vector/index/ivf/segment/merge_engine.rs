@@ -1,9 +1,9 @@
 //! Merge engine for IVF vector index segments.
 //!
-//! This module handles the actual merging of segments. [`MergeConfig`],
-//! [`MergeStats`], and [`MergeResult`] are the shared, index-type-agnostic
-//! data shapes defined in [`crate::vector::index::segment::merge`]; this
-//! engine's own logic (below) is IVF-typed.
+//! This module handles the actual merging of segments. [`MergeStats`] and
+//! [`MergeResult`] are the shared, index-type-agnostic data shapes defined
+//! in [`crate::vector::index::segment::merge`]; this engine's own logic
+//! (below) is IVF-typed.
 //!
 //! Unlike Flat/HNSW, an IVF segment's inverted-list structure is meaningless
 //! across a merge — cluster ids are assigned independently per segment (each
@@ -30,7 +30,7 @@ use crate::storage::Storage;
 use crate::vector::core::vector::Vector;
 
 use crate::vector::index::segment::manager::ManagedSegmentInfo;
-use crate::vector::index::segment::merge::{MergeConfig, MergeResult, MergeStats};
+use crate::vector::index::segment::merge::{MergeResult, MergeStats};
 
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::vector::index::config::IvfIndexConfig;
@@ -41,7 +41,6 @@ use crate::vector::writer::{VectorIndexWriter, VectorIndexWriterConfig};
 
 /// Engine for merging IVF vector index segments.
 pub struct MergeEngine {
-    config: MergeConfig,
     storage: Arc<dyn Storage>,
     index_config: IvfIndexConfig,
     writer_config: VectorIndexWriterConfig,
@@ -51,13 +50,11 @@ pub struct MergeEngine {
 impl MergeEngine {
     /// Create a new merge engine.
     pub fn new(
-        config: MergeConfig,
         storage: Arc<dyn Storage>,
         index_config: IvfIndexConfig,
         writer_config: VectorIndexWriterConfig,
     ) -> Self {
         Self {
-            config,
             storage,
             index_config,
             writer_config,
@@ -182,29 +179,5 @@ impl MergeEngine {
     /// Get storage reference.
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
-    }
-
-    /// Get configuration.
-    pub fn config(&self) -> &MergeConfig {
-        &self.config
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_merge_engine_basic() {
-        let config = MergeConfig::default();
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let index_config = IvfIndexConfig::default();
-        let writer_config = VectorIndexWriterConfig::default();
-
-        let engine = MergeEngine::new(config, storage, index_config, writer_config);
-
-        assert_eq!(engine.config.max_merge_segments, 10);
     }
 }
