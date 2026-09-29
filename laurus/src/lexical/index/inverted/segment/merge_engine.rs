@@ -649,29 +649,39 @@ impl MergeEngine {
     }
 
     /// Load the set of deleted doc_ids for a segment from its `.delmap`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bitmap exists but cannot be read or is
+    /// corrupted. Taking it as empty would republish the segment's deleted
+    /// documents and then remove the segment — the only record that they
+    /// were deleted. A missing bitmap still means no deletions, as it does
+    /// for [`SegmentReader`].
     fn load_deleted_docs(&self, segment_info: &SegmentInfo) -> Result<RoaringTreemap> {
+        use crate::maintenance::deletion::DeletionBitmap;
+        use crate::storage::structured::StructReader;
+
         if !segment_info.has_deletions {
             return Ok(RoaringTreemap::new());
         }
         let bitmap_file = format!("{}.delmap", segment_info.segment_id);
-        if let Ok(input) = self.storage.open_input(&bitmap_file) {
-            use crate::maintenance::deletion::DeletionBitmap;
-            use crate::storage::structured::StructReader;
-
-            if let Ok(mut reader) = StructReader::new(input)
-                && let Ok(bitmap) = DeletionBitmap::read_from_storage(&mut reader)
-            {
-                // The `.delmap` payload already *is* a Roaring bitmap, and
-                // the merge only ever asks it for a count and membership —
-                // both of which it answers directly. Expanding it into a
-                // `Vec` and then a hash set turned ~125 KB into tens of
-                // megabytes of transient allocation for a segment with a
-                // million deletions, and replaced a bit test with a hashed
-                // probe on the merge's innermost loops (#541).
-                return Ok(bitmap.into_deleted_docs());
-            }
+        if !self.storage.file_exists(&bitmap_file) {
+            return Ok(RoaringTreemap::new());
         }
-        Ok(RoaringTreemap::new())
+        let mut reader = StructReader::new(self.storage.open_input(&bitmap_file)?)?;
+        let bitmap = DeletionBitmap::read_from_storage(&mut reader).map_err(|e| {
+            LaurusError::index(format!(
+                "merge: segment {}: failed to load its deletion bitmap: {e}",
+                segment_info.segment_id
+            ))
+        })?;
+        // The `.delmap` payload already *is* a Roaring bitmap, and the merge
+        // only ever asks it for a count and membership — both of which it
+        // answers directly. Expanding it into a `Vec` and then a hash set
+        // turned ~125 KB into tens of megabytes of transient allocation for
+        // a segment with a million deletions, and replaced a bit test with a
+        // hashed probe on the merge's innermost loops (#541).
+        Ok(bitmap.into_deleted_docs())
     }
 
     /// Reconstruct every live document's [`AnalyzedDocument`] from one source
@@ -1104,6 +1114,9 @@ impl MergeEngine {
         // here as a mismatch rather than as silently lost documents.
         let info = &segment.segment_info;
         let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
+        // Every part was just written with a footer, so every part must
+        // carry one that matches (Issue #1214).
+        reader.check_integrity(true)?;
         match reader.stored_doc_count()? {
             Some(written) if written != info.doc_count => {
                 return Err(LaurusError::index(format!(
@@ -1159,7 +1172,6 @@ impl MergeEngine {
         Ok(())
 
         // TODO: Add more verification checks
-        // - Term dictionary integrity
         // - Posting list consistency
         // - Document field validation
     }
@@ -1202,11 +1214,16 @@ impl MergeEngine {
     /// Open a source segment for replay or reconstruction, carrying the index
     /// analyzer into the reader so a `.post`-less segment's terms are derived
     /// like the writer derived them (Issue #1196).
+    ///
+    /// The parts it will read by random access are verified first (Issue
+    /// #1214): a merge rewrites what it reads under a new, valid checksum,
+    /// so corruption let through here could no longer be detected.
     fn open_source_segment(
         &self,
         info: &crate::lexical::index::inverted::segment::SegmentInfo,
     ) -> Result<SegmentReader> {
         let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
+        reader.check_integrity(false)?;
         Ok(match &self.config.index_analyzer {
             Some(analyzer) => reader.with_analyzer(Arc::clone(analyzer)),
             None => reader,

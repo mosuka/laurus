@@ -448,6 +448,9 @@ impl BlockTermDictionary {
         let total_term_count = reader.read_u64()?;
         let block_count = reader.read_u32()?;
         let _reserved = reader.read_u32()?;
+        // Checked before anything is decoded, so corrupted bytes never reach
+        // the FST or the BlockSection decoder (Issue #1214).
+        reader.expect_checksum("term dictionary")?;
 
         // Built only once `block_count` is known, which its header is
         // checked against first (Issue #1224).
@@ -894,9 +897,7 @@ mod tests {
     /// written by the current code with an older stamp is byte-identical
     /// to what that older release produced — which is what makes this a
     /// genuine backward-compatibility fixture rather than a re-encoding.
-    /// The trailing CRC is not recomputed because `read_from_storage`
-    /// does not verify it (checksum validation is opt-in via
-    /// `StructReader::verify_checksum`).
+    /// The footer is recomputed, since `read_from_storage` verifies it.
     ///
     /// # Arguments
     ///
@@ -914,6 +915,7 @@ mod tests {
         }
         // [magic: u32][version: u32], little-endian per `StructWriter`.
         bytes[4..8].copy_from_slice(&version.to_le_bytes());
+        crate::storage::structured::restamp_footer(&mut bytes);
         {
             let mut output = storage.create_output(dst).unwrap();
             output.write_all(&bytes).unwrap();
@@ -1328,13 +1330,15 @@ mod tests {
     }
 
     /// Writes the 200-term dictionary, lets `patch` edit its bytes, and
-    /// loads the result back.
+    /// loads the result back. The footer is recomputed after the patch, so
+    /// the load reaches the check under test rather than the checksum.
     fn load_patched(patch: impl FnOnce(&mut Vec<u8>)) -> Result<BlockTermDictionary> {
         use std::io::Write;
 
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
         let mut bytes = written_dictionary_bytes(&storage, "dict.bin");
         patch(&mut bytes);
+        crate::storage::structured::restamp_footer(&mut bytes);
         let mut output = storage.create_output("patched.bin").unwrap();
         output.write_all(&bytes).unwrap();
         output.close().unwrap();
@@ -1343,11 +1347,51 @@ mod tests {
         BlockTermDictionary::read_from_storage(&mut StructReader::new(input).unwrap())
     }
 
+    /// Loads dictionary `bytes` as they are, footer untouched.
+    fn load_bytes(bytes: &[u8]) -> Result<BlockTermDictionary> {
+        use std::io::Write;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut output = storage.create_output("raw.bin").unwrap();
+        output.write_all(bytes).unwrap();
+        output.close().unwrap();
+        BlockTermDictionary::read_from_storage(&mut StructReader::new(
+            storage.open_input("raw.bin").unwrap(),
+        )?)
+    }
+
+    /// A flipped byte inside the BlockSection fails the checksum before the
+    /// block is decoded (Issue #1214) — the old trailer covered only the
+    /// final `reserved` u32.
+    #[test]
+    fn a_flipped_byte_fails_the_checksum() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut bytes = written_dictionary_bytes(&storage, "dict.bin");
+        let at = block_section_start(&bytes) + 3;
+        bytes[at] ^= 0x01;
+        assert_corrupted(load_bytes(&bytes), "term dictionary: checksum mismatch");
+    }
+
+    /// A dictionary written before the footer ends in a 4-byte trailer
+    /// holding the CRC of its last write (the `reserved` u32); it still
+    /// loads.
+    #[test]
+    fn a_dictionary_with_a_legacy_trailer_still_loads() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let bytes = written_dictionary_bytes(&storage, "dict.bin");
+        let mut legacy = bytes[..bytes.len() - 8].to_vec();
+        legacy.extend_from_slice(&crc32fast::hash(&0u32.to_le_bytes()).to_le_bytes());
+
+        let loaded = load_bytes(&legacy).unwrap();
+        assert_eq!(loaded.len(), 200);
+    }
+
     /// Stores `total_term_count` into a dictionary file's trailer — the u64
-    /// before `block_count`, `reserved` and the CRC — and loads it back.
+    /// before `block_count`, `reserved` and the 8-byte footer — and loads it
+    /// back.
     fn load_with_term_count(total_term_count: u64) -> Result<BlockTermDictionary> {
         load_patched(|bytes| {
-            let at = bytes.len() - 20;
+            let at = bytes.len() - 24;
             bytes[at..at + 8].copy_from_slice(&total_term_count.to_le_bytes());
         })
     }
@@ -1424,8 +1468,8 @@ mod tests {
     #[test]
     fn a_block_count_other_than_the_fsts_key_count_is_rejected() {
         let result = load_patched(|bytes| {
-            // block_count: the u32 before `reserved` and the CRC.
-            let at = bytes.len() - 12;
+            // block_count: the u32 before `reserved` and the 8-byte footer.
+            let at = bytes.len() - 16;
             bytes[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
         });
         assert_corrupted(result, "FST holds 2 keys but the header declares 3 blocks");

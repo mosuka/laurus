@@ -35,7 +35,9 @@ use crate::lexical::reader::FieldStats;
 use crate::lexical::reader::PostingIterator;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
-use crate::storage::structured::StructReader;
+use crate::storage::structured::{
+    ChecksumStatus, StructReader, ends_in_footer, verify_file_checksum,
+};
 
 /// Default [`InvertedIndexReaderConfig::max_cache_memory`] (128 MiB), shared
 /// with `InvertedIndexConfig` so the index-level default cannot drift from
@@ -636,6 +638,71 @@ impl SegmentReader {
                     .map(str::to_string)
             })
             .collect())
+    }
+
+    /// Verify this segment's parts against their checksum footers, one
+    /// sequential pass per part (Issue #1214).
+    ///
+    /// `.post` and every `.bkd` are read by random access, so the checks
+    /// made while loading the other parts never reach them. A merge calls
+    /// this on each source before copying it, so that corruption is not
+    /// carried into the merged segment under a fresh, valid checksum.
+    ///
+    /// `strict` is for a segment this binary just wrote: it also covers
+    /// `.dict`, `.docs`, `.norms` and `.ids`, and refuses any part without a
+    /// footer. Otherwise a part with a legacy trailer passes only while the
+    /// rest of its segment has legacy trailers too — one binary writes all of
+    /// a segment's parts, so a footed part beside an unfooted one means that
+    /// part's footer was damaged.
+    ///
+    /// # Arguments
+    ///
+    /// * `strict` - Whether the segment was written with footers throughout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::Index`] naming the first part that fails, and
+    /// any error from reading the parts.
+    pub fn check_integrity(&self, strict: bool) -> Result<()> {
+        let segment_id = &self.info.segment_id;
+        let mut parts = vec![format!("{segment_id}.post")];
+        parts.extend(
+            self.bkd_field_names()?
+                .into_iter()
+                .map(|field| format!("{segment_id}.{field}.bkd")),
+        );
+        if strict {
+            parts.extend(["dict", "docs", "norms", "ids"].map(|s| format!("{segment_id}.{s}")));
+        }
+
+        let dict = format!("{segment_id}.dict");
+        let mut footed = strict
+            || (self.storage.file_exists(&dict)
+                && ends_in_footer(self.storage.open_input(&dict)?)?);
+        let mut legacy_part = None;
+        for part in parts {
+            if !self.storage.file_exists(&part) {
+                continue;
+            }
+            match verify_file_checksum(self.storage.open_input(&part)?)? {
+                ChecksumStatus::Verified => footed = true,
+                ChecksumStatus::Legacy(_) => {
+                    legacy_part.get_or_insert(part);
+                }
+                ChecksumStatus::Mismatch => {
+                    return Err(LaurusError::index(format!(
+                        "{part}: checksum mismatch — the file is corrupted"
+                    )));
+                }
+            }
+        }
+        match legacy_part {
+            Some(part) if footed => Err(LaurusError::index(format!(
+                "{part}: has no checksum footer, though its segment was written with them — the \
+                 file is corrupted"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Enable (or resize) this segment's decoded posting-list cache with a byte

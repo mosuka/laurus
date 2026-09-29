@@ -21,7 +21,8 @@ reader, and on-disk layout are reused unchanged.
 
 ## File Format (Version 4)
 
-A `.bkd` segment file is a self-contained binary blob made of three regions:
+A `.bkd` segment file is a self-contained binary blob made of three regions,
+followed by a checksum footer:
 
 ```text
 +----------------------------------------+
@@ -37,7 +38,15 @@ A `.bkd` segment file is a self-contained binary blob made of three regions:
 |   ...                                  |
 |   node 0  (root, written last)         |
 +----------------------------------------+
+| Footer                                 |   CRC-32 of all of the above
+|                                        |   + magic "LCRC" (8 bytes)
++----------------------------------------+
 ```
+
+The header records where the leaves and the index ended up, so the writer
+reserves it, writes everything after it, and fills it in last. The footer's
+CRC still covers the bytes in file order (Issue #1214). A file written
+before the footer existed ends in a 4-byte trailer instead.
 
 The header (`BKDFileHeader`) records `magic`, `version` (currently `4`),
 `num_dims`, `bytes_per_dim`, the total point count, the number of leaf

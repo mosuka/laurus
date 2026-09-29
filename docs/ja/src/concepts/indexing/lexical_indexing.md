@@ -167,6 +167,7 @@ writer が作るものと完全に一致しなければなりません。デコ�
                           固定長 TermInfo ブロック、可変長の per-term
                           Block-Max-WAND メタデータ配列を含む
 [Footer                ]  全タームカウント + ブロックカウント
+[Checksum footer       ]  上記すべての CRC-32 + マジック "LCRC"
 ```
 
 - 検索: FST を 1 回辿って (`O(|term|)`) target を含むブロックを特定
