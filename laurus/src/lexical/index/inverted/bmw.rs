@@ -21,6 +21,7 @@ use crate::lexical::index::inverted::searcher::Deadline;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanQuery, Occur};
 use crate::lexical::query::collector::Collector;
+use crate::lexical::query::synonym::SynonymQuery;
 use crate::lexical::query::term::TermQuery;
 use crate::lexical::reader::LexicalIndexReader;
 
@@ -42,10 +43,10 @@ struct BmwClause {
     /// the other clauses' matchers.
     matcher: crate::lexical::query::matcher::LeafMatcher,
     /// Field name extracted from the clause's underlying
-    /// [`TermQuery`], used to look up per-doc field length at
-    /// scoring time. `None` when the clause is not a [`TermQuery`]
-    /// (in that case the executor falls back to the scorer's avg
-    /// field length).
+    /// [`TermQuery`] or [`SynonymQuery`], used to look up per-doc
+    /// field length at scoring time. `None` when the clause is
+    /// neither (in that case the executor falls back to the
+    /// scorer's avg field length).
     field_name: Option<String>,
 }
 
@@ -83,7 +84,7 @@ impl<'r> BlockMaxOrExecutor<'r> {
                 scorer.set_boost(scorer.boost() * outer_boost);
             }
             let matcher = clause.query.matcher(reader)?;
-            let field_name = field_name_of(clause.query.as_ref());
+            let field_name = field_name_of(clause.query.as_ref()).map(str::to_string);
             clauses.push(BmwClause {
                 scorer: crate::lexical::query::scorer::LeafScorer::from_box(scorer),
                 matcher: crate::lexical::query::matcher::LeafMatcher::from_box(matcher),
@@ -264,15 +265,18 @@ impl<'r> BlockMaxOrExecutor<'r> {
     }
 }
 
-/// Inspect a clause's underlying [`Query`] for a [`TermQuery`] so
-/// the executor can look up the field's per-doc length at scoring
-/// time. Non-`TermQuery` clauses are not yet wired in (a
-/// `BlockMaxConjunction` follow-up could extend this).
-fn field_name_of(query: &dyn Query) -> Option<String> {
+/// Inspect a clause's underlying [`Query`] for a [`TermQuery`] or
+/// [`SynonymQuery`] so the executor can look up the field's per-doc
+/// length at scoring time. Any other clause type is not yet wired in
+/// (a `BlockMaxConjunction` follow-up could extend this).
+fn field_name_of(query: &dyn Query) -> Option<&str> {
+    if let Some(t) = query.as_any().downcast_ref::<TermQuery>() {
+        return Some(t.field());
+    }
     query
         .as_any()
-        .downcast_ref::<TermQuery>()
-        .map(|t| t.field().to_string())
+        .downcast_ref::<SynonymQuery>()
+        .map(|s| s.field())
 }
 
 /// Cheap eligibility check at the searcher entrypoint: BMW fast
@@ -294,12 +298,23 @@ pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     {
         return None;
     }
-    // All clauses must be TermQuery for this PR; future work
-    // (PhraseQuery / NumericRange) would extend `field_name_of`.
+    // Every clause must be a shape `field_name_of` knows, so one list of
+    // clause types serves both this gate and the per-doc field-length
+    // lookup; future work (PhraseQuery / NumericRange) extends that one
+    // function. A `SynonymQuery` clause (Issue #1257) carries no block-max
+    // table by design — its combined term frequency can exceed any one
+    // alternative's per-block bound — so `BlockMaxOrExecutor::new`'s
+    // runtime `next_block_boundary` check declines it, and with it the
+    // whole `BooleanQuery`: a query mixing a `SynonymQuery` clause with
+    // `TermQuery` siblings loses the fast path entirely, not just for that
+    // clause. That is correctness-safe (the standard path scores the same)
+    // but means a field with a synonym dictionary gives up BMW for its
+    // multi-position bare-term queries until a clause can opt into a
+    // metadata-free bound.
     if bq
         .clauses()
         .iter()
-        .any(|c| c.query.as_any().downcast_ref::<TermQuery>().is_none())
+        .any(|c| field_name_of(c.query.as_ref()).is_none())
     {
         return None;
     }
@@ -342,5 +357,38 @@ mod tests {
             .should(Box::new(TermQuery::new("text", "y")))
             .build();
         assert!(is_bmw_eligible(&ok).is_some());
+    }
+
+    /// Issue #1257: a `SynonymQuery` clause is a structurally eligible
+    /// shape (it carries a field, like `TermQuery`), but it has no
+    /// block-max table by design, so the executor's runtime check must
+    /// still decline it — falling back to the standard search path rather
+    /// than using an unsound bound.
+    #[test]
+    fn synonym_clause_is_structurally_eligible_but_declines_at_runtime() {
+        use crate::lexical::query::synonym::SynonymQuery;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use std::sync::Arc;
+
+        let query = BooleanQueryBuilder::new()
+            .should(Box::new(TermQuery::new("text", "x")))
+            .should(Box::new(SynonymQuery::new(
+                "text",
+                vec!["y".to_string(), "z".to_string()],
+            )))
+            .build();
+        assert!(is_bmw_eligible(&query).is_some());
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let reader = InvertedIndexReader::new(
+            vec![],
+            storage,
+            crate::lexical::index::inverted::reader::InvertedIndexReaderConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            BlockMaxOrExecutor::new(&query, &reader).is_err(),
+            "no per-block metadata for the synonym clause: must not build the executor"
+        );
     }
 }

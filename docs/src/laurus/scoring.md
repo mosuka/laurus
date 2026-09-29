@@ -18,9 +18,11 @@ Where:
 - **IDF** — inverse document frequency (rarity of the term across all documents).
 - **k1** — term-frequency saturation parameter. Laurus uses **1.2**.
 - **b** — document-length normalization factor. Laurus uses **0.75**.
-- **doc_len / avg_doc_len** — ratio of document length to average document length.
+- **doc_len / avg_doc_len** — ratio of document length to average document length. `doc_len` counts field **positions**, not tokens: a synonym the analyzer stacks on another token (`position_increment = 0`) shares its position and does not add to the length, matching Lucene's `discountOverlaps`.
 
 The `(k1, b)` parameters are fixed at the implementation defaults today. The values match Lucene / Elasticsearch defaults, so BM25 scores from Laurus are directly comparable to those engines for tuning intuition.
+
+A quoted or bare value whose analyzer stacks several alternatives at one position (synonyms) is scored as one blended term rather than as a sum of independent term scores, so a document is not rewarded for holding every alternative — see [Searching with synonyms](../concepts/analysis.md#searching-with-synonyms).
 
 ### Field Boosts
 

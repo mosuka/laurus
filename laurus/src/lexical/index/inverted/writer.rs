@@ -14,7 +14,7 @@ use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::analysis::token::{Token, TokenPositions, flatten_token_graph};
 use crate::data::DataValue;
 use crate::error::{LaurusError, Result};
-use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm};
+use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm, field_length_from_terms};
 use crate::lexical::core::document::Document;
 
 use crate::lexical::core::field::FieldOption;
@@ -1256,10 +1256,12 @@ impl InvertedIndexWriter {
             }
         }
 
-        // Calculate field lengths (number of tokens per field)
+        // Calculate field lengths (number of positions per field; a
+        // stacked synonym shares its anchor's position and does not add to
+        // the length, Issue #1257).
         let mut field_lengths = AHashMap::new();
         for (field_name, terms) in &field_terms {
-            field_lengths.insert(field_name.clone(), terms.len() as u32);
+            field_lengths.insert(field_name.clone(), field_length_from_terms(terms));
         }
 
         Ok(AnalyzedDocument {

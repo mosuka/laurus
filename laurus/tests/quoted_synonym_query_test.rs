@@ -242,6 +242,145 @@ async fn phrase_through_a_synonym_is_highlighted() -> Result<()> {
     Ok(())
 }
 
+/// A single-position `SynonymQuery` (Issue #1257) highlights whichever
+/// alternative the matched document actually holds — the highlighter reads
+/// `Query::collect_highlight_terms`, which is exercised here on a leaf
+/// `SynonymQuery` rather than the `PhraseQuery`/`GraphPhraseQuery` shapes
+/// the other highlight tests cover.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_position_synonym_query_is_highlighted() -> Result<()> {
+    let engine = engine().await?;
+    let request = SearchRequestBuilder::new()
+        .query_dsl("syn:\"big\"")
+        .highlight(vec!["syn".to_string()])
+        .limit(10)
+        .build();
+    let results = engine.search(request).await?;
+
+    let hit = |id: &str| {
+        results
+            .iter()
+            .find(|hit| hit.id == id)
+            .unwrap_or_else(|| panic!("{id} must match"))
+    };
+    assert_eq!(
+        hit("big_dog").highlights["syn"],
+        vec!["a <mark>big</mark> dog barks"]
+    );
+    assert_eq!(
+        hit("large_dog").highlights["syn"],
+        vec!["a <mark>large</mark> dog barks"]
+    );
+    Ok(())
+}
+
+// ---- BM25 scoring of stacked synonyms (#1257) ----
+
+/// A single-alternative term match scores the same next to a stacked
+/// synonym as it does next to an ordinary word: the stacked token must
+/// not inflate the field length norm.
+#[tokio::test(flavor = "multi_thread")]
+async fn stacked_synonyms_do_not_change_the_score_of_an_unrelated_term() -> Result<()> {
+    let schema = Schema::from_toml(SCHEMA_TOML)?;
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let engine = Engine::builder(storage, schema)
+        .register_runtime_analyzer("syn", syn_analyzer())
+        .register_runtime_analyzer("plain", Arc::new(plain_analyzer()))
+        .build()
+        .await?;
+    // "big" stacks "large" here; "cat" has no synonym in this dictionary,
+    // so its document is the same length (3) without any stacked token.
+    engine
+        .put_document(
+            "with_synonym",
+            Document::builder().add_text("syn", "a big dog").build(),
+        )
+        .await?;
+    engine
+        .put_document(
+            "without_synonym",
+            Document::builder().add_text("syn", "a cat dog").build(),
+        )
+        .await?;
+    engine.commit().await?;
+
+    let request = SearchRequestBuilder::new()
+        .query_dsl("syn:dog")
+        .limit(10)
+        .build();
+    let hits = engine.search(request).await?;
+    let score_of = |id: &str| {
+        hits.iter()
+            .find(|h| h.id == id)
+            .unwrap_or_else(|| panic!("missing hit {id}"))
+            .score
+    };
+    assert!(
+        (score_of("with_synonym") - score_of("without_synonym")).abs() < 1e-5,
+        "a stacked synonym must not change the field length norm: {hits:?}"
+    );
+    Ok(())
+}
+
+/// Index-time synonyms mean a document holding every alternative at query
+/// time must not score higher than an equal-length document that repeats
+/// the matched word instead — `SynonymQuery` blends the alternatives into
+/// one term's score rather than summing each alternative's independent
+/// score.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stacked_synonym_or_scores_like_the_repeated_word() -> Result<()> {
+    let schema = Schema::from_toml(SCHEMA_TOML)?;
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let engine = Engine::builder(storage, schema)
+        .register_runtime_analyzer("syn", syn_analyzer())
+        .register_runtime_analyzer("plain", Arc::new(plain_analyzer()))
+        .build()
+        .await?;
+    // All on `plain` (no index-time synonyms), all length 3: "big" occurs
+    // twice in one, "big" and "large" once each in another — the same
+    // combined occurrence count — and once in the third.
+    for (id, text) in [
+        ("repeated", "big big dog"),
+        ("alternated", "big large dog"),
+        ("single", "big red dog"),
+    ] {
+        engine
+            .put_document(id, Document::builder().add_text("plain", text).build())
+            .await?;
+    }
+    engine.commit().await?;
+
+    // Query-time-only synonyms, like `search_query_time`: "big" also
+    // matches "large" through `SynonymQuery`.
+    let query = LexicalQueryParser::new(syn_analyzer()).parse("plain:\"big\"")?;
+    let request = SearchRequestBuilder::new()
+        .lexical_query(LexicalSearchQuery::Obj(query))
+        .limit(10)
+        .build();
+    let hits = engine.search(request).await?;
+    let score_of = |id: &str| {
+        hits.iter()
+            .find(|h| h.id == id)
+            .unwrap_or_else(|| panic!("missing hit {id}"))
+            .score
+    };
+
+    assert!(
+        (score_of("repeated") - score_of("alternated")).abs() < 1e-5,
+        "combined term frequency 2, whether from repetition or a stacked \
+         synonym, must score the same: {hits:?}"
+    );
+    assert!(
+        score_of("single") < score_of("alternated"),
+        "one alternative must score less than two: {hits:?}"
+    );
+    assert!(
+        score_of("alternated") < 2.0 * score_of("single"),
+        "combined term frequency must saturate (BM25 tf), not double: {hits:?}"
+    );
+    Ok(())
+}
+
 // ---- Groups with several multi-word members (#1262) ----
 
 const MEMBERS_SCHEMA_TOML: &str = r#"

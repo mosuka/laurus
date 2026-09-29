@@ -431,8 +431,10 @@ that numbering:
   "restart at 0".
 - Repeated terms across elements raise the term frequency (and hence the
   BM25 score) but not the hit count, like the other multi-valued types.
-  The field length is the total token count, so the gap itself does not
-  inflate BM25 length normalization.
+  The field length is the number of positions, not the number of tokens —
+  a synonym stacked on another token (`position_increment = 0`) shares its
+  position and is not counted again — so the gap itself does not inflate
+  BM25 length normalization.
 - Positions must be stored for phrase queries of two or more terms to
   work at all (`term_vectors: true`, the default); without them the search
   is rejected with a query error, for multi-valued and single-valued

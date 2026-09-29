@@ -382,10 +382,11 @@ dict.add_synonym_group(vec!["ai".into(), "artificial intelligence".into()]);
 
 // keep_original=true means original token is preserved alongside synonyms
 let filter = SynonymGraphFilter::new(dict, true)
-    .with_boost(0.8);  // synonyms get 80% weight
+    .with_boost(0.8);  // stored on each synonym token, but not yet read by
+                        // scoring (see below)
 ```
 
-The `boost` parameter controls how much weight synonyms receive relative to original tokens. A value of `0.8` means synonym matches contribute 80% as much to the score as exact matches.
+The `boost` parameter is stored on each synonym `Token`, but neither the indexer nor the query parser reads it today, so it has no effect on scoring or matching — a synonym match currently scores exactly like an exact match (see [Searching with synonyms](#searching-with-synonyms) below). Set it if you plan to consume it from a custom pipeline stage; do not rely on it to weight synonym matches lower.
 
 #### Matching entries of several words
 
@@ -419,6 +420,8 @@ The index stores no `position_length`, so it lays the graph out on its longest p
 
 An engine uses a field's analyzer both to index and to parse queries, so synonyms are expanded on both sides. An unquoted word matches any of its synonyms. A quoted value is matched through the graph (see [Phrase Query](query_dsl.md#phrase-query)): `"big"` with `big` and `large` as synonyms matches either word, and `"a big dog"` also matches "a large dog". Each member of a group is its own phrase, so with the members above `"ml"` matches `ml`, `machine learning` or `statistical machine learning`, and not "statistical learning". Members of the same length are separate phrases too. The phrases of a quoted value are matched together through the graph, so their number, which multiplies with each synonym in the value, sets no limit.
 
+A position with several stacked alternatives is scored as one blended term (a `SynonymQuery`), not as a sum of each alternative's independent score: a document holding both `big` and `large` scores the same for `"big"` as one that repeats `big` twice, not twice as much. Field length also counts positions, not tokens, so a stacked synonym does not lengthen a document either. See [BM25](../laurus/scoring.md#bm25-default).
+
 Because the index keeps positions but not `position_length`, index-time expansion of multi-word synonyms behaves as in Lucene:
 
 - A phrase may start or end inside a synonym. `"learning is"` matches "ml is fun", which reads "machine learning is fun" with the synonym.
@@ -429,4 +432,4 @@ Other points to keep in mind:
 - `keep_original = false` replaces the matched word with the other members of its group, so the word itself is neither indexed nor searched. Use `keep_original = true` for search.
 - Filters that remove tokens, such as `StopFilter`, `RemoveEmptyFilter` and `LimitFilter`, can follow `SynonymGraphFilter`. A removed word leaves no position inside the graph either: with `statue of liberty` and `lady liberty` as synonyms and `of` as a stop word, `"statue of liberty"` matches both "statue of liberty" and "lady liberty". A `StopFilter` before `SynonymGraphFilter` removes `of` before the synonym filter sees it, so that member never matches.
 - A removed word with an alternative at its position, such as a stacked one-word synonym, leaves its position to it: with `the` and `a` as synonyms, removing `the` leaves `a` there, and no path skips the word. `LimitFilter` cuts every path at the same token.
-- Documents indexed before Issue #1252 numbered stacked tokens one after another. Put them again after upgrading if their fields use `SynonymGraphFilter`: merging segments copies the stored positions unchanged.
+- Documents indexed before Issue #1252 numbered stacked tokens one after another, and documents indexed before Issue #1257 counted every stacked token toward the field length (inflating it). Put them again after upgrading if their fields use `SynonymGraphFilter`: merging segments copies both the stored positions and the field length unchanged.

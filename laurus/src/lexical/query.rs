@@ -16,6 +16,7 @@ pub mod range;
 pub mod regexp;
 pub mod scorer;
 pub mod span;
+pub mod synonym;
 pub mod term;
 pub mod wildcard;
 
@@ -36,6 +37,7 @@ pub use prefix::PrefixQuery;
 pub use range::{DateTimeRangeQuery, NumericRangeQuery};
 pub use regexp::RegexpQuery;
 pub use span::{SpanNearQuery, SpanQuery, SpanTermQuery};
+pub use synonym::SynonymQuery;
 pub use term::TermQuery;
 pub use wildcard::WildcardQuery;
 
@@ -384,6 +386,14 @@ mod highlight_term_tests {
     }
 
     #[test]
+    fn synonym_query_is_gated_by_field_and_covers_every_alternative() {
+        let query = SynonymQuery::new("body", vec!["big", "large"]);
+        assert_eq!(exact(&collect(&query, Some("body"))), ["big", "large"]);
+        assert_eq!(exact(&collect(&query, None)), ["big", "large"]);
+        assert!(collect(&query, Some("title")).is_empty());
+    }
+
+    #[test]
     fn phrase_query_keeps_terms_and_slop() {
         let query = PhraseQuery::new("body", vec!["hello".into(), "world".into()]).with_slop(2);
         match collect(&query, Some("body")).as_slice() {
@@ -586,6 +596,10 @@ mod leaf_field_tests {
                         PhraseArc::new(2, 3, vec!["city".to_string()]),
                     ],
                 )),
+            ),
+            (
+                "SynonymQuery",
+                Box::new(SynonymQuery::new(field, vec!["big", "large"])),
             ),
         ]
     }
