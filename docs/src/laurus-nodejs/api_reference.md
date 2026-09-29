@@ -690,8 +690,15 @@ interface Token {
   stopped: boolean;
   positionIncrement: number;
   positionLength: number;
+  tokenType?: string;
 }
 ```
+
+`startOffset` and `endOffset` are UTF-8 byte offsets into the original text. For non-ASCII text they are not JavaScript string (UTF-16) indices; slice the encoded text instead: `new TextDecoder().decode(new TextEncoder().encode(text).slice(tok.startOffset, tok.endOffset))`.
+
+`tokenType` is one of `"alphanum"`, `"num"`, `"cjk"`, `"katakana"`, `"hiragana"`, `"hangul"`, `"punctuation"`, `"whitespace"`, `"synonym"`, `"email"`, `"url"` and `"other"`. `SynonymGraphFilter.apply` keeps each token's offsets and type, and gives each synonym it inserts the type `"synonym"` and the offsets of the words it replaces. It throws on any other `tokenType`.
+
+A token built by hand may leave `tokenType` out. A multi-word synonym then matches only if the words' offsets touch, so set `tokenType: "alphanum"` on words separated by spaces.
 
 ---
 

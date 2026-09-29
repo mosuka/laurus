@@ -387,6 +387,10 @@ let filter = SynonymGraphFilter::new(dict, true)
 
 The `boost` parameter controls how much weight synonyms receive relative to original tokens. A value of `0.8` means synonym matches contribute 80% as much to the score as exact matches.
 
+#### Matching entries of several words
+
+An entry of several words matches consecutive tokens when all of them are alphanumeric (token type `Alphanum` or `Num`), so English words separated by spaces match, or when their offsets touch (each token's `end_offset` is the next one's `start_offset`), as the CJK words a morphological tokenizer splits do. The type comes from `Token::metadata`, so a token without one needs touching offsets. With `東京大学` in the dictionary, the text `東京大学` split into `東京` and `大学` matches it, but `東京 大学` does not: a space separates the two tokens.
+
 #### The token graph
 
 The filter stacks each synonym on the word it expands (`position_increment = 0`), so the output is a graph: a token is an arc from its position to its position + `position_length`. The matched words and every synonym run from the same start node to the same end node. The last token of a shorter alternative spans the remaining positions, and the token after the match starts at the end node. For `ml tutorial` with `ml` and `machine learning` as synonyms:

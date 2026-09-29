@@ -516,13 +516,18 @@ Token filter that expands tokens with their synonyms from a `SynonymDictionary`.
 ```php
 $token->getText()               // string  -- The token text
 $token->getPosition()           // int     -- Position in the token stream
-$token->getStartOffset()        // int     -- Character start offset in the original text
-$token->getEndOffset()          // int     -- Character end offset in the original text
+$token->getStartOffset()        // int     -- UTF-8 byte start offset in the original text
+$token->getEndOffset()          // int     -- UTF-8 byte end offset in the original text
 $token->getBoost()              // float   -- Score boost factor (1.0 = no adjustment)
 $token->isStopped()             // bool    -- Whether removed by a stop filter
 $token->getPositionIncrement()  // int     -- Difference from the previous token's position
 $token->getPositionLength()     // int     -- Number of positions spanned
+$token->getTokenType()          // ?string -- Token type, e.g. "alphanum"
 ```
+
+The offsets count bytes, as PHP strings do, so `substr($text, $start, $end - $start)` gives the token's text.
+
+`getTokenType()` returns one of `"alphanum"`, `"num"`, `"cjk"`, `"katakana"`, `"hiragana"`, `"hangul"`, `"punctuation"`, `"whitespace"`, `"synonym"`, `"email"`, `"url"` and `"other"`, or `null`. `SynonymGraphFilter::apply()` keeps each token's offsets and type, and gives each synonym it inserts the type `"synonym"` and the offsets of the words it replaces.
 
 ---
 

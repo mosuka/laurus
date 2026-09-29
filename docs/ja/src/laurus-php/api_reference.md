@@ -512,13 +512,18 @@ $expanded = $filter->apply($tokens);
 ```php
 $token->getText()               // string  -- トークンテキスト
 $token->getPosition()           // int     -- トークンストリーム内の位置
-$token->getStartOffset()        // int     -- 元テキスト内の文字開始オフセット
-$token->getEndOffset()          // int     -- 元テキスト内の文字終了オフセット
+$token->getStartOffset()        // int     -- 元テキスト内の UTF-8 バイト開始オフセット
+$token->getEndOffset()          // int     -- 元テキスト内の UTF-8 バイト終了オフセット
 $token->getBoost()              // float   -- スコアブースト係数（1.0 = 調整なし）
 $token->isStopped()             // bool    -- ストップフィルターによって除去されたかどうか
 $token->getPositionIncrement()  // int     -- 前のトークンの位置との差分
 $token->getPositionLength()     // int     -- このトークンがカバーする位置数
+$token->getTokenType()          // ?string -- トークン種別（例: "alphanum"）
 ```
+
+オフセットは PHP の文字列と同じくバイト数なので、`substr($text, $start, $end - $start)` でトークンのテキストを取り出せます。
+
+`getTokenType()` は `"alphanum"`、`"num"`、`"cjk"`、`"katakana"`、`"hiragana"`、`"hangul"`、`"punctuation"`、`"whitespace"`、`"synonym"`、`"email"`、`"url"`、`"other"` のいずれか、または `null` を返します。`SynonymGraphFilter::apply()` は各トークンのオフセットと種別を保ち、挿入する同義語には種別 `"synonym"` と、置き換える語のオフセットを付けます。
 
 ---
 

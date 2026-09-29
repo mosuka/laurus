@@ -789,7 +789,13 @@ the zip on the same origin as your app (the Laurus demo bundles
 const tokenizer = new WhitespaceTokenizer();
 const tokens = tokenizer.tokenize("hello world");
 // [{ text: "hello", position: 0, ... }, { text: "world", position: 1, ... }]
+// Each token: { text, position, startOffset, endOffset, boost, stopped,
+//               positionIncrement, positionLength, tokenType }
 ```
+
+`startOffset` and `endOffset` are UTF-8 byte offsets into the original text. For non-ASCII text they are not JavaScript string (UTF-16) indices; slice the encoded text instead: `new TextDecoder().decode(new TextEncoder().encode(text).slice(tok.startOffset, tok.endOffset))`.
+
+`tokenType` is one of `"alphanum"`, `"num"`, `"cjk"`, `"katakana"`, `"hiragana"`, `"hangul"`, `"punctuation"`, `"whitespace"`, `"synonym"`, `"email"`, `"url"` and `"other"`.
 
 ### SynonymDictionary
 
@@ -814,3 +820,5 @@ new SynonymGraphFilter(dictionary, keepOriginal = true, boost = 1.0)
 const filter = new SynonymGraphFilter(dict, true, 0.8);
 const expanded = filter.apply(tokens);
 ```
+
+`apply` keeps each token's offsets and type, and gives each synonym it inserts the type `"synonym"` and the offsets of the words it replaces. It throws on an unknown `tokenType`. A token built by hand may leave `tokenType` out; a multi-word synonym then matches only if the words' offsets touch, so set `tokenType: "alphanum"` on words separated by spaces.
