@@ -74,7 +74,8 @@ use crate::lexical::core::field::FieldValue;
 ///
 /// - `field_terms` - Map of field names to their analyzed terms
 /// - `stored_fields` - Original field values to be stored (for retrieval)
-/// - `field_lengths` - Number of terms per field (used for BM25 scoring)
+/// - `field_lengths` - Number of *positions* per field (used for BM25 scoring;
+///   see [`field_length_from_terms`])
 /// - `point_values` - Numeric point values per field (for BKD tree range queries)
 ///
 /// # Usage
@@ -88,7 +89,10 @@ pub struct AnalyzedDocument {
     pub field_terms: AHashMap<String, Vec<AnalyzedTerm>>,
     /// Stored field values with original types preserved.
     pub stored_fields: AHashMap<String, FieldValue>,
-    /// Field name to field length (number of tokens) mapping.
+    /// Field name to field length mapping. The length is the number of
+    /// distinct positions, not of terms: a synonym stacked on another token
+    /// shares its position and is not counted again (Issue #1257). Compute
+    /// it with [`field_length_from_terms`] rather than `terms.len()`.
     pub field_lengths: AHashMap<String, u32>,
     /// Field name to numeric point values for the BKD tree.
     ///
@@ -137,7 +141,8 @@ impl AnalyzedDocument {
         self.field_terms.values().map(|terms| terms.len()).sum()
     }
 
-    /// Get the length (number of terms) for a specific field.
+    /// Get the length (number of positions, see [`Self::field_lengths`]) for
+    /// a specific field.
     pub fn field_length(&self, field: &str) -> Option<u32> {
         self.field_lengths.get(field).copied()
     }
@@ -159,6 +164,34 @@ impl AnalyzedTerm {
             offset,
         }
     }
+}
+
+/// The field length Lucene's `discountOverlaps` would report: the number of
+/// distinct positions, not the number of terms. A synonym stacked on
+/// another token (`position_increment = 0`) shares its anchor's position
+/// and is not counted again (Issue #1257).
+///
+/// `terms` must be in non-decreasing position order — every
+/// [`analyze_field_value`](crate::lexical::index::inverted::writer::analyze_field_value)
+/// arm produces terms in that order, including the `TextArray` gap
+/// numbering, so a single linear pass suffices. Terms rebuilt from a term
+/// dictionary are in alphabetical order instead and must not be passed
+/// here; the `debug_assert!` below turns any such call into a test-time
+/// panic rather than a silently wrong length norm.
+pub(crate) fn field_length_from_terms(terms: &[AnalyzedTerm]) -> u32 {
+    debug_assert!(
+        terms.windows(2).all(|w| w[0].position <= w[1].position),
+        "field_length_from_terms requires non-decreasing positions"
+    );
+    let mut length = 0u32;
+    let mut last_position: Option<u32> = None;
+    for t in terms {
+        if last_position != Some(t.position) {
+            length += 1;
+            last_position = Some(t.position);
+        }
+    }
+    length
 }
 
 #[cfg(test)]
@@ -204,5 +237,34 @@ mod tests {
         assert_eq!(term.position, 5);
         assert_eq!(term.frequency, 2);
         assert_eq!(term.offset, (10, 16));
+    }
+
+    #[test]
+    fn field_length_from_terms_counts_positions_not_terms() {
+        // "a big dog" with "large" stacked on "big": 4 terms, 3 positions.
+        let terms = vec![
+            AnalyzedTerm::new("a".to_string(), 0, 1, (0, 1)),
+            AnalyzedTerm::new("big".to_string(), 1, 1, (2, 5)),
+            AnalyzedTerm::new("large".to_string(), 1, 1, (2, 5)),
+            AnalyzedTerm::new("dog".to_string(), 2, 1, (6, 9)),
+        ];
+        assert_eq!(field_length_from_terms(&terms), 3);
+    }
+
+    #[test]
+    fn field_length_from_terms_counts_the_gap_between_text_array_elements() {
+        // Two one-token elements at a position_increment_gap of 100: the
+        // gap positions (1..=100) hold no term and are not counted, but
+        // the two elements' own positions (0 and 101) are.
+        let terms = vec![
+            AnalyzedTerm::new("big".to_string(), 0, 1, (0, 3)),
+            AnalyzedTerm::new("dog".to_string(), 101, 1, (0, 3)),
+        ];
+        assert_eq!(field_length_from_terms(&terms), 2);
+    }
+
+    #[test]
+    fn field_length_from_terms_of_empty_slice_is_zero() {
+        assert_eq!(field_length_from_terms(&[]), 0);
     }
 }

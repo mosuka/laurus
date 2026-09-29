@@ -11,7 +11,7 @@ use roaring::RoaringTreemap;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::error::{LaurusError, Result};
-use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm};
+use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm, field_length_from_terms};
 use crate::lexical::index::inverted::reader::SegmentReader;
 use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::inverted::segment::{ManagedSegmentInfo, MergeCandidate, MergeStrategy};
@@ -1088,7 +1088,7 @@ impl MergeEngine {
                         let len = analyzed
                             .field_terms
                             .get(target_field)
-                            .map_or(0, |t| t.len() as u32);
+                            .map_or(0, |t| field_length_from_terms(t));
                         analyzed.field_lengths.insert(field_name, len);
                     }
                 } else if let Some(len) = reader.field_length(doc_id, &field_name)? {

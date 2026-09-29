@@ -17,7 +17,8 @@
 //! [`InvertedIndexWriter::add_document`](crate::lexical::index::inverted::writer::InvertedIndexWriter::add_document),
 //! so each occurrence of a term becomes its own entry, positions are
 //! numbered as the index stores them (stacked synonyms share one), and the
-//! field length counts every token (Issue #1243).
+//! field length counts positions, not tokens, so a stacked synonym does not
+//! add to it (Issue #1243, Issue #1257).
 //!
 //! # Architecture
 //!
@@ -140,7 +141,7 @@ use ahash::AHashMap;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::error::Result;
-use crate::lexical::core::analyzed::AnalyzedDocument;
+use crate::lexical::core::analyzed::{AnalyzedDocument, field_length_from_terms};
 use crate::lexical::core::document::Document;
 use crate::lexical::core::field::{FieldOption, FieldValue};
 use crate::lexical::index::inverted::writer::analyze_field_value;
@@ -320,10 +321,12 @@ impl DocumentParser {
             }
         }
 
-        // Calculate field lengths (number of tokens per field)
+        // Calculate field lengths (number of positions per field; a
+        // stacked synonym shares its anchor's position and does not add to
+        // the length, Issue #1257).
         let mut field_lengths = AHashMap::new();
         for (field_name, terms) in &field_terms {
-            field_lengths.insert(field_name.clone(), terms.len() as u32);
+            field_lengths.insert(field_name.clone(), field_length_from_terms(terms));
         }
 
         Ok(AnalyzedDocument {
@@ -340,7 +343,11 @@ mod tests {
     use super::*;
     use crate::analysis::analyzer::keyword::KeywordAnalyzer;
     use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+    use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
     use crate::analysis::analyzer::standard::StandardAnalyzer;
+    use crate::analysis::synonym::dictionary::SynonymDictionary;
+    use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+    use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
 
     #[test]
     fn test_basic_parsing() {
@@ -668,6 +675,24 @@ mod tests {
             vec![("rust".to_string(), 0), ("search".to_string(), 1)]
         );
         assert_eq!(analyzed.field_lengths["stopped"], 2);
+    }
+
+    /// Issue #1257: a synonym stacked at one position must not lengthen the
+    /// field. "a big dog" with "large" stacked on "big" is 4 terms but 3
+    /// positions.
+    #[test]
+    fn test_stacked_synonyms_do_not_lengthen_the_field() {
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+        let analyzer = PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+            .add_filter(Arc::new(SynonymGraphFilter::new(dict, true)));
+        let parser = DocumentParser::new(Arc::new(analyzer));
+
+        let doc = Document::builder().add_text("syn", "a big dog").build();
+        let analyzed = parser.parse(doc).unwrap();
+
+        assert_eq!(analyzed.field_terms["syn"].len(), 4, "a/big/large/dog");
+        assert_eq!(analyzed.field_lengths["syn"], 3);
     }
 
     #[test]
