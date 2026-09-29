@@ -1867,7 +1867,9 @@ mod tests {
     }
 
     /// Whitespace + lowercase + the synonym `groups`, keeping the originals.
-    fn synonym_parser_with(groups: &[&[&str]]) -> LexicalQueryParser {
+    fn synonym_analyzer(
+        groups: &[&[&str]],
+    ) -> crate::analysis::analyzer::pipeline::PipelineAnalyzer {
         use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
         use crate::analysis::synonym::dictionary::SynonymDictionary;
         use crate::analysis::token_filter::lowercase::LowercaseFilter;
@@ -1878,14 +1880,18 @@ mod tests {
         for group in groups {
             dict.add_synonym_group(group.iter().map(|s| s.to_string()).collect());
         }
-        let analyzer = PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+        PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
             .add_filter(Arc::new(LowercaseFilter::new()))
             .add_filter(Arc::new(SynonymGraphFilter::with_tokenizer(
                 dict,
                 Box::new(WhitespaceTokenizer::new()),
                 true,
-            )));
-        LexicalQueryParser::new(Arc::new(analyzer)).with_default_field("body")
+            )))
+    }
+
+    /// A parser analyzing with [`synonym_analyzer`].
+    fn synonym_parser_with(groups: &[&[&str]]) -> LexicalQueryParser {
+        LexicalQueryParser::new(Arc::new(synonym_analyzer(groups))).with_default_field("body")
     }
 
     /// The Should clauses of `query`, each as `(description, boost)`,
@@ -2119,6 +2125,39 @@ mod tests {
         assert_eq!(graph.arcs().len(), 21);
         assert_eq!(graph.arcs().iter().map(|arc| arc.to).max(), Some(14));
         assert_eq!(phrases(query.as_ref()).len(), 128);
+    }
+
+    /// #1259: a stop word removed after the synonym filter leaves each
+    /// member as a path without it, and no path of a member alone.
+    #[test]
+    fn a_stop_word_after_the_synonyms_leaves_each_member_a_path() {
+        use crate::analysis::token_filter::stop::StopFilter;
+
+        let parser = |groups: &[&[&str]]| {
+            let analyzer = synonym_analyzer(groups)
+                .add_filter(Arc::new(StopFilter::from_words(vec!["of", "the"])));
+            LexicalQueryParser::new(Arc::new(analyzer)).with_default_field("body")
+        };
+
+        let query = parser(&[&["statue of liberty", "lady liberty"]])
+            .parse("\"statue of liberty\"")
+            .unwrap();
+        assert_eq!(
+            phrases(query.as_ref()),
+            sorted_phrases(&[&[&["lady"], &["liberty"]], &[&["statue"], &["liberty"]]])
+        );
+
+        let query = parser(&[&["usa", "united states of america", "united states"]])
+            .parse("\"usa rocks\"")
+            .unwrap();
+        assert_eq!(
+            phrases(query.as_ref()),
+            sorted_phrases(&[
+                &[&["usa"], &["rocks"]],
+                &[&["united"], &["states"], &["america"], &["rocks"]],
+                &[&["united"], &["states"], &["rocks"]],
+            ])
+        );
     }
 
     #[test]

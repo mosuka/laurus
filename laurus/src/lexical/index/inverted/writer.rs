@@ -3666,7 +3666,10 @@ mod tests {
         );
     }
 
-    fn synonym_analyzer(groups: &[&[&str]], keep_original: bool) -> Arc<dyn Analyzer> {
+    fn synonym_pipeline(
+        groups: &[&[&str]],
+        keep_original: bool,
+    ) -> crate::analysis::analyzer::pipeline::PipelineAnalyzer {
         use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
         use crate::analysis::synonym::dictionary::SynonymDictionary;
         use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
@@ -3676,10 +3679,12 @@ mod tests {
         for group in groups {
             dict.add_synonym_group(group.iter().map(|s| s.to_string()).collect());
         }
-        Arc::new(
-            PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
-                .add_filter(Arc::new(SynonymGraphFilter::new(dict, keep_original))),
-        )
+        PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+            .add_filter(Arc::new(SynonymGraphFilter::new(dict, keep_original)))
+    }
+
+    fn synonym_analyzer(groups: &[&[&str]], keep_original: bool) -> Arc<dyn Analyzer> {
+        Arc::new(synonym_pipeline(groups, keep_original))
     }
 
     fn term_occurrences(terms: &[AnalyzedTerm]) -> Vec<(&str, u32, u32)> {
@@ -3918,6 +3923,65 @@ mod tests {
                 ("learning", 2),
                 ("fun", 103)
             ]
+        );
+    }
+
+    /// #1259: stop words removed after the synonym filter leave no
+    /// position, inside a member as elsewhere, and do not move the other
+    /// members' words. Without synonyms the positions are those stored
+    /// before.
+    #[test]
+    fn stop_words_removed_after_the_synonym_filter_leave_no_position() {
+        use crate::analysis::token_filter::stop::StopFilter;
+
+        let analyzer = |groups: &[&[&str]]| -> Arc<dyn Analyzer> {
+            Arc::new(
+                synonym_pipeline(groups, true)
+                    .add_filter(Arc::new(StopFilter::from_words(vec!["of", "the"]))),
+            )
+        };
+        let positions = |groups: &[&[&str]], text: &str| {
+            let value = DataValue::Text(text.to_string());
+            let (terms, _) = analyze_field_value("body", &value, &analyzer(groups), 100).unwrap();
+            terms
+                .into_iter()
+                .map(|t| (t.term, t.position))
+                .collect::<Vec<_>>()
+        };
+        let expected = |pairs: &[(&str, u32)]| {
+            pairs
+                .iter()
+                .map(|&(term, position)| (term.to_string(), position))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            positions(&[], "the statue of liberty"),
+            expected(&[("statue", 0), ("liberty", 1)])
+        );
+        assert_eq!(
+            positions(
+                &[&["statue of liberty", "lady liberty"]],
+                "the statue of liberty"
+            ),
+            expected(&[("statue", 0), ("lady", 0), ("liberty", 1)])
+        );
+        assert_eq!(
+            positions(
+                &[&["usa", "united states of america", "united states"]],
+                "usa rocks"
+            ),
+            expected(&[
+                ("usa", 0),
+                ("united", 0),
+                ("states", 1),
+                ("america", 2),
+                ("rocks", 3)
+            ])
+        );
+        assert_eq!(
+            positions(&[&["the", "a"]], "big the dog"),
+            expected(&[("big", 0), ("a", 1), ("dog", 2)])
         );
     }
 }

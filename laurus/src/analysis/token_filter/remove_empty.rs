@@ -113,4 +113,29 @@ mod tests {
     fn test_filter_name() {
         assert_eq!(RemoveEmptyFilter::new().name(), "remove_empty");
     }
+
+    /// #1259: "a", stacked on the stopped "the", and "b", stacked on an
+    /// empty token, take the removed tokens' positions instead of moving
+    /// back onto the word before them.
+    #[test]
+    fn a_token_stacked_on_a_removed_token_keeps_its_position() {
+        let tokens = vec![
+            Token::new("big", 0),
+            Token::new("the", 1).stop(),
+            Token::new("a", 1).with_position_increment(0),
+            Token::new("", 2),
+            Token::new("b", 2).with_position_increment(0),
+            Token::new("dog", 3),
+        ];
+        let result: Vec<Token> = RemoveEmptyFilter::new()
+            .filter(Box::new(tokens.into_iter()))
+            .unwrap()
+            .collect();
+        let texts: Vec<&str> = result.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, ["big", "a", "b", "dog"]);
+        assert_eq!(
+            crate::analysis::token::token_positions(&result),
+            vec![0, 1, 2, 3]
+        );
+    }
 }
