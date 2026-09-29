@@ -78,9 +78,6 @@ pub struct InvertedIndexWriterConfig {
     /// DocValues (Issue #1047). See [`Self::stores_doc_values`].
     pub store_doc_values: bool,
 
-    /// Whether to optimize segments after writing.
-    pub optimize_segments: bool,
-
     /// Analyzer for text fields (can be PerFieldAnalyzer for field-specific analysis).
     pub analyzer: Arc<dyn Analyzer>,
 
@@ -119,7 +116,6 @@ impl std::fmt::Debug for InvertedIndexWriterConfig {
             .field("segment_prefix", &self.segment_prefix)
             .field("store_term_positions", &self.store_term_positions)
             .field("store_doc_values", &self.store_doc_values)
-            .field("optimize_segments", &self.optimize_segments)
             .field("analyzer", &self.analyzer.name())
             .finish()
     }
@@ -134,7 +130,6 @@ impl Default for InvertedIndexWriterConfig {
             segment_prefix: "segment".to_string(),
             store_term_positions: true,
             store_doc_values: true,
-            optimize_segments: false,
             analyzer: Arc::new(StandardAnalyzer::new().unwrap()),
             shard_id: 0,
             fields: HashMap::new(),
