@@ -1987,7 +1987,8 @@ mod tests {
     /// their lengths, and never into a mix of their words.
     #[test]
     fn each_multi_word_member_is_its_own_path() {
-        let parser = synonym_parser_with(&[&["ml", "machine learning", "statistical machine learning"]]);
+        let parser =
+            synonym_parser_with(&[&["ml", "machine learning", "statistical machine learning"]]);
         let expected = sorted(vec![
             term("ml", 1.0),
             phrase(&[&["machine"], &["learning"]], 0, 1.0),

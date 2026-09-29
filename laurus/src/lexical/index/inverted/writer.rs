@@ -3691,13 +3691,22 @@ mod tests {
 
     const ML_GROUP: &[&str] = &["ml", "machine learning", "statistical machine learning"];
 
+    /// Synonym groups, `keep_original`, the text, and its `(term, position,
+    /// frequency)` in order.
+    type IndexedCase<'a> = (
+        &'a [&'a [&'a str]],
+        bool,
+        &'a str,
+        &'a [(&'a str, u32, u32)],
+    );
+
     /// #1262: the synonym filter gives each multi-word member its own inner
     /// nodes, and indexing flattens that graph so the members' words share
     /// positions again. These are the positions the index has stored since
     /// #1252, and they must not change.
     #[test]
     fn multi_word_synonyms_are_indexed_at_flat_positions() {
-        let cases: &[(&[&[&str]], bool, &str, &[(&str, u32, u32)])] = &[
+        let cases: &[IndexedCase] = &[
             (
                 &[ML_GROUP],
                 true,
