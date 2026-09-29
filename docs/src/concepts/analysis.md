@@ -427,5 +427,6 @@ Because the index keeps positions but not `position_length`, index-time expansio
 Other points to keep in mind:
 
 - `keep_original = false` replaces the matched word with the other members of its group, so the word itself is neither indexed nor searched. Use `keep_original = true` for search.
-- Put filters that remove tokens, such as `StopFilter` and `LimitFilter`, before `SynonymGraphFilter`. After it, they drop tokens the graph needs.
+- Filters that remove tokens, such as `StopFilter`, `RemoveEmptyFilter` and `LimitFilter`, can follow `SynonymGraphFilter`. A removed word leaves no position inside the graph either: with `statue of liberty` and `lady liberty` as synonyms and `of` as a stop word, `"statue of liberty"` matches both "statue of liberty" and "lady liberty". A `StopFilter` before `SynonymGraphFilter` removes `of` before the synonym filter sees it, so that member never matches.
+- A removed word with an alternative at its position, such as a stacked one-word synonym, leaves its position to it: with `the` and `a` as synonyms, removing `the` leaves `a` there, and no path skips the word. `LimitFilter` cuts every path at the same token.
 - Documents indexed before Issue #1252 numbered stacked tokens one after another. Put them again after upgrading if their fields use `SynonymGraphFilter`: merging segments copies the stored positions unchanged.
