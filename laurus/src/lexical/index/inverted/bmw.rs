@@ -61,9 +61,16 @@ impl<'r> BlockMaxOrExecutor<'r> {
     /// metadata — the caller should fall back to the standard search
     /// path in that case.
     pub fn new(boolean_query: &BooleanQuery, reader: &'r dyn LexicalIndexReader) -> Result<Self> {
+        // The regular path sums the clause scores and then multiplies
+        // by the outer BooleanQuery's boost (`BooleanScorer::score`).
+        // Since the pivot loop sums per-clause scores/bounds directly
+        // (see `run` and `advance_clause_past_block`), folding the
+        // outer boost into each clause's own scorer boost here gives
+        // the same result: `outer * sum(c_i) == sum(outer * c_i)`.
+        let outer_boost = boolean_query.boost();
         let mut clauses = Vec::with_capacity(boolean_query.clauses().len());
         for clause in boolean_query.clauses() {
-            let scorer = clause.query.scorer(reader)?;
+            let mut scorer = clause.query.scorer(reader)?;
             // Runtime eligibility: every clause must expose per-block
             // metadata. `next_block_boundary(0).is_none()` is the
             // documented contract for "no per-block info".
@@ -71,6 +78,9 @@ impl<'r> BlockMaxOrExecutor<'r> {
                 return Err(LaurusError::InvalidOperation(
                     "BMW fast path requires per-block scorer for every clause".into(),
                 ));
+            }
+            if outer_boost != 1.0 {
+                scorer.set_boost(scorer.boost() * outer_boost);
             }
             let matcher = clause.query.matcher(reader)?;
             let field_name = field_name_of(clause.query.as_ref());
