@@ -382,7 +382,7 @@ impl Highlighter {
             if matched {
                 let score = self.calculate_term_score(&token.text, terms.len());
                 spans.push(HighlightSpan::new(
-                    token.start_offset..token.start_offset + token.text.len(),
+                    token.start_offset..token.end_offset,
                     true,
                     score,
                 ));
@@ -482,11 +482,11 @@ impl Highlighter {
                 })
                 .collect();
 
-            // Defensive snap: span ends are derived from *filtered* token
-            // text lengths (`start_offset + token.text.len()`), which can
-            // diverge from the source span when a filter rewrites a token
-            // (NFKC, stemming, ...). Snapping keeps the slice total even
-            // when an upstream offset is off.
+            // Defensive snap: span ends come from each token's `end_offset`
+            // (#1258), which every tokenizer sets correctly. This guards
+            // only against a filter that rewrites a token's text without
+            // updating `end_offset` to match; snapping keeps the slice
+            // total even then.
             let start = floor_boundary(text, window.start);
             let end = ceil_boundary(text, window.end).max(start);
             let fragment_text = self.apply_highlighting(&text[start..end], &group_spans, start)?;
@@ -605,7 +605,8 @@ impl Highlighter {
                 // Defensive snap: `span.range` came through `create_fragments`
                 // relative to a fragment window whose own bounds were
                 // already snapped, but token-derived offsets can still
-                // misalign after a char-changing filter. Snapping here
+                // misalign if a filter rewrites a token's text without
+                // updating `end_offset` to match (#1258). Snapping here
                 // keeps every slice below total.
                 let start = floor_boundary(text, span.range.start).max(last_pos);
                 let end = ceil_boundary(text, span.range.end).max(start);
@@ -865,12 +866,12 @@ fn phrase_spans(tokens: &[Token], phrase: &[Vec<String>], slop: u32) -> Vec<High
     phrase_anchors(tokens, &positions, first)
         .filter_map(|(anchor, anchor_position)| {
             let mut previous = anchor_position;
-            let mut end = token_end(anchor);
+            let mut end = anchor.end_offset;
             for alternatives in rest {
                 let (token, position) =
                     next_phrase_token(tokens, &positions, previous, slop, alternatives)?;
                 previous = position;
-                end = token_end(token);
+                end = token.end_offset;
             }
             // Phrases outrank single terms, as before.
             Some(HighlightSpan::new(anchor.start_offset..end, true, 2.0))
@@ -900,7 +901,7 @@ fn graph_phrase_spans(tokens: &[Token], arcs: &[PhraseArc], slop: u32) -> Vec<Hi
         if arc.from == 0 {
             reached.extend(
                 phrase_anchors(tokens, &positions, &arc.terms)
-                    .map(|(anchor, position)| (anchor.start_offset, position, token_end(anchor))),
+                    .map(|(anchor, position)| (anchor.start_offset, position, anchor.end_offset)),
             );
             continue;
         }
@@ -917,7 +918,7 @@ fn graph_phrase_spans(tokens: &[Token], arcs: &[PhraseArc], slop: u32) -> Vec<Hi
             if let Some((token, position)) =
                 next_phrase_token(tokens, &positions, previous, slop, &arc.terms)
             {
-                reached.push((start, position, token_end(token)));
+                reached.push((start, position, token.end_offset));
             }
         }
     }
@@ -940,11 +941,6 @@ fn token_is(token: &Token, alternatives: &[String]) -> bool {
     alternatives.iter().any(|term| {
         token.text == *term || (has_uppercase(&token.text) && token.text.to_lowercase() == *term)
     })
-}
-
-/// The byte offset where `token`'s text ends.
-fn token_end(token: &Token) -> usize {
-    token.start_offset + token.text.len()
 }
 
 /// The tokens a phrase starting with `alternatives` anchors on, with their
@@ -1752,6 +1748,30 @@ mod tests {
             .unwrap()
             .fragments;
         assert_eq!(marked(&fragments), ["a big dog"]);
+    }
+
+    /// #1258: a synonym token carries its matched word's `start_offset` and
+    /// `end_offset`, but not its own `text.len()` — "large" (5 bytes) stands
+    /// in for "big" (3 bytes). A span computed from `text.len()` overruns
+    /// into the following word; `end_offset` gives the real extent.
+    #[test]
+    fn a_term_matching_through_a_synonym_highlights_only_the_original_word() {
+        let fragments = synonym_highlighter()
+            .highlight(&TermQuery::new("body", "large"), "body", "a big dog barks")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["big"]);
+    }
+
+    /// #1258: same overrun, at a phrase's end.
+    #[test]
+    fn a_phrase_ending_on_a_synonym_ends_at_the_original_words_end() {
+        let query = PhraseQuery::new("body", vec!["a".into(), "large".into()]);
+        let fragments = synonym_highlighter()
+            .highlight(&query, "body", "a big dog")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["a big"]);
     }
 
     // ---- Graph phrases (#1271) ----
