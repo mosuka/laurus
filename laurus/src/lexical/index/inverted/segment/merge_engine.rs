@@ -180,15 +180,13 @@ impl MergeEngine {
         // Create new segment ID
         let new_segment_id = format!("merged_{next_generation}");
 
-        // Initialize merge statistics
-        let mut stats = MergeStats {
-            segments_merged: segments_to_merge.len(),
-            size_before: segments_to_merge.iter().map(|s| s.size_bytes).sum(),
-            ..Default::default()
-        };
-
-        // Perform merge based on strategy
-        let merge_result = match candidate.strategy {
+        // Perform merge based on strategy. `perform_merge` already fills in
+        // `segments_merged`, `docs_processed`, `deleted_docs_removed`,
+        // `postings_merged`, `terms_merged`, and `shard_id` on its result's
+        // `stats` -- only the fields below are this function's to compute,
+        // so they're added onto that result instead of overwriting it
+        // wholesale (that used to discard every field `perform_merge` set).
+        let mut final_result = match candidate.strategy {
             MergeStrategy::SizeBased => self.merge_by_size(&segments_to_merge, &new_segment_id)?,
             MergeStrategy::DeletionBased => {
                 self.merge_by_deletion(&segments_to_merge, &new_segment_id)?
@@ -197,20 +195,17 @@ impl MergeEngine {
             MergeStrategy::Balanced => self.merge_balanced(&segments_to_merge, &new_segment_id)?,
         };
 
-        // Calculate final statistics
         let end_millis = crate::util::time::now_millis();
-        stats.merge_time_ms = end_millis.saturating_sub(start_millis);
-
-        stats.size_after = merge_result.new_segment.size_bytes;
-        stats.compression_ratio = if stats.size_before > 0 {
-            stats.size_after as f64 / stats.size_before as f64
+        let size_before: u64 = segments_to_merge.iter().map(|s| s.size_bytes).sum();
+        let size_after = final_result.new_segment.size_bytes;
+        final_result.stats.merge_time_ms = end_millis.saturating_sub(start_millis);
+        final_result.stats.size_before = size_before;
+        final_result.stats.size_after = size_after;
+        final_result.stats.compression_ratio = if size_before > 0 {
+            size_after as f64 / size_before as f64
         } else {
             1.0
         };
-
-        // Update merge result stats
-        let mut final_result = merge_result;
-        final_result.stats = stats;
 
         // Verify merge if configured
         if self.config.verify_after_merge {
@@ -387,6 +382,7 @@ impl MergeEngine {
         let max_doc_id = emitted.max().unwrap_or(0);
         stats.docs_processed = doc_count;
         stats.postings_merged = doc_count;
+        stats.terms_merged = writer.stats().unique_terms;
 
         // Create new segment info
         let segment_info = SegmentInfo {
@@ -2888,6 +2884,69 @@ mod tests {
         assert!(!storage.file_exists(&format!("{id}.docs")));
         assert!(!storage.file_exists(&format!("{id}.cfs")));
         engine.verify_merged_segment(&result.new_segment).unwrap();
+
+        // Issue #1202: `merge_segments` used to overwrite `perform_merge`'s
+        // computed stats wholesale, so `deleted_docs_removed` came back 0
+        // even though both source documents were dropped.
+        assert_eq!(result.stats.segments_merged, 2);
+        assert_eq!(result.stats.deleted_docs_removed, 2);
+        assert_eq!(result.stats.docs_processed, 0);
+        assert_eq!(result.stats.postings_merged, 0);
+        assert_eq!(result.stats.terms_merged, 0);
+    }
+
+    /// Issue #1202: the stats a merge reports for the documents it actually
+    /// kept, alongside the ones only `merge_segments` itself can compute
+    /// (`size_before`/`size_after`/`compression_ratio`/`merge_time_ms`).
+    /// Complements `merge_of_fully_deleted_segments_verifies_as_empty`
+    /// above, which pins the all-deleted case.
+    #[test]
+    fn merge_segments_reports_the_strategys_computed_stats() {
+        // `merged_two_segments` discards the `MergeResult`, so this test
+        // rebuilds the same two-segment, three-document setup directly to
+        // inspect `stats`.
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let d0 = writer
+            .add_document(text_int_doc("alpha bravo", 10))
+            .unwrap();
+        let d1 = writer
+            .add_document(text_int_doc("bravo charlie", 20))
+            .unwrap();
+        writer.commit().unwrap();
+        let d2 = writer
+            .add_document(text_int_doc("charlie delta", 30))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        // `size_bytes` isn't set by `segment_info`/`ManagedSegmentInfo::new`
+        // (both default it to 0), so it's set explicitly here to pin
+        // `size_before`, which `merge_segments` sums straight from it.
+        let mut seg0 = ManagedSegmentInfo::new(segment_info("segment_000000", 2, d0, d1, 0));
+        seg0.size_bytes = 100;
+        let mut seg1 = ManagedSegmentInfo::new(segment_info("segment_000001", 1, d2, d2, 1));
+        seg1.size_bytes = 50;
+
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let result = engine
+            .merge_segments(&two_segment_candidate(), &[seg0, seg1], 1)
+            .unwrap();
+
+        assert_eq!(result.stats.segments_merged, 2);
+        assert_eq!(result.stats.deleted_docs_removed, 0);
+        assert_eq!(result.stats.docs_processed, 3);
+        assert_eq!(result.stats.postings_merged, 3);
+        // Distinct terms across all three documents: "title" contributes
+        // alpha, bravo, charlie, delta (4), and "num" is indexed as terms
+        // too, contributing its three distinct values 10, 20, 30 (3).
+        assert_eq!(result.stats.terms_merged, 7);
+        assert_eq!(result.stats.size_before, 150);
+        assert!(result.stats.size_after > 0);
+        assert!(result.stats.compression_ratio > 0.0);
     }
 
     // ---- An unreadable `.delmap` is corruption, not "no deletions",
