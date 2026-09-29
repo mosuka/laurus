@@ -242,7 +242,9 @@ pub enum TokenFilterConfig {
     /// Removes empty tokens from the stream.
     RemoveEmpty,
 
-    /// Flattens a synonym graph into a linear token stream.
+    /// Flattens a synonym graph into a linear token stream. Indexing already
+    /// does this, and since the analyzer also parses queries, the filter makes
+    /// quoted multi-word synonyms inexact there.
     FlattenGraph,
 }
 

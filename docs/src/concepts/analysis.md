@@ -365,7 +365,7 @@ let analyzer = PipelineAnalyzer::new(Arc::new(RegexTokenizer::new()?))
 | `BoostFilter` | Adjusts token boost values |
 | `LimitFilter` | Limits the number of tokens |
 | `StripFilter` | Strips leading/trailing whitespace from tokens |
-| `FlattenGraphFilter` | Flattens token graphs (for synonym expansion) |
+| `FlattenGraphFilter` | Flattens token graphs. Indexing already does this, so leave it out of an analyzer that also parses queries (see [The token graph](#the-token-graph)) |
 | `RemoveEmptyFilter` | Removes empty tokens |
 
 ### Synonym Expansion
@@ -398,16 +398,27 @@ The filter stacks each synonym on the word it expands (`position_increment = 0`)
 | `learning` | 1 | 1 | 1 |
 | `tutorial` | 2 | 1 | 1 |
 
-The index stores a stacked token at its word's position, and stores no `position_length`. Positions otherwise stay dense: a stop word removed by `StopFilter` leaves no gap.
+A member of several words has inner nodes of its own, so no arc holds words of two members. For `ml` with `machine learning` and `statistical machine learning` as synonyms:
+
+| Token | Arc |
+| :--- | :--- |
+| `ml` | 0 → 4 |
+| `machine` | 0 → 1 |
+| `statistical` | 0 → 2 |
+| `learning` | 1 → 4 |
+| `machine` | 2 → 3 |
+| `learning` | 3 → 4 |
+
+The index stores no `position_length`, so it lays the graph out on its longest path: the members' words share positions there. Above, `ml`, `machine` and `statistical` are stored at 0, `learning` and `machine` at 1, and `learning` at 2. A stacked token is stored at its word's position. Positions otherwise stay dense: a stop word removed by `StopFilter` leaves no gap. The index does this itself, so an analyzer needs no `FlattenGraphFilter`. Adding one would also flatten the graph that quoted values are matched through, because the engine parses queries with the same analyzer.
 
 #### Searching with synonyms
 
-An engine uses a field's analyzer both to index and to parse queries, so synonyms are expanded on both sides. An unquoted word matches any of its synonyms. A quoted value is matched through the graph (see [Phrase Query](query_dsl.md#phrase-query)): `"big"` with `big` and `large` as synonyms matches either word, and `"a big dog"` also matches "a large dog".
+An engine uses a field's analyzer both to index and to parse queries, so synonyms are expanded on both sides. An unquoted word matches any of its synonyms. A quoted value is matched through the graph (see [Phrase Query](query_dsl.md#phrase-query)): `"big"` with `big` and `large` as synonyms matches either word, and `"a big dog"` also matches "a large dog". Each member of a group is its own phrase, so with the members above `"ml"` matches `ml`, `machine learning` or `statistical machine learning`, and not "statistical learning". Members of the same length are separate phrases too, and each counts toward the limit of 64 phrases per quoted value.
 
 Because the index keeps positions but not `position_length`, index-time expansion of multi-word synonyms behaves as in Lucene:
 
 - A phrase may start or end inside a synonym. `"learning is"` matches "ml is fun", which reads "machine learning is fun" with the synonym.
-- When a group has several multi-word members, their words share the inner positions, so a phrase can match a mix of two members' words.
+- When a group has several multi-word members, their words share positions in the index, so a document with one member matches a phrase that mixes two members' words: "ml is fun" matches `"statistical learning"`.
 
 Other points to keep in mind:
 
