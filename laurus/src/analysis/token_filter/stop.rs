@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-use crate::analysis::token::{Token, TokenStream};
+use crate::analysis::token::{Token, TokenStream, remove_tokens};
 use crate::analysis::token_filter::Filter;
 use crate::error::Result;
 
@@ -303,6 +303,13 @@ pub static DEFAULT_JAPANESE_STOP_WORDS_SET: LazyLock<HashSet<String>> = LazyLock
 /// to search relevance. This filter can either remove stop words entirely
 /// or mark them as stopped while keeping them in the stream.
 ///
+/// A removed stop word leaves no position. After [`SynonymGraphFilter`],
+/// removing one keeps the token graph well formed: a member of a synonym
+/// group loses the word and stays a path of its own, and a synonym stacked
+/// on the word keeps its position.
+///
+/// [`SynonymGraphFilter`]: crate::analysis::token_filter::synonym_graph::SynonymGraphFilter
+///
 /// # Default Stop Word Lists
 ///
 /// - English: 33 common words (articles, prepositions, conjunctions)
@@ -484,21 +491,21 @@ impl Default for StopFilter {
 
 impl Filter for StopFilter {
     fn filter(&self, tokens: TokenStream) -> Result<TokenStream> {
-        let filtered_tokens: Vec<Token> = tokens
-            .filter_map(|token| {
-                if token.is_stopped() {
-                    Some(token)
-                } else if self.is_stop_word(&token.text) {
-                    if self.remove_stopped {
-                        None // Remove the token entirely
+        let is_new_stop_word =
+            |token: &Token| !token.is_stopped() && self.is_stop_word(&token.text);
+        let filtered_tokens: Vec<Token> = if self.remove_stopped {
+            remove_tokens(tokens.collect(), |token| !is_new_stop_word(token))
+        } else {
+            tokens
+                .map(|token| {
+                    if is_new_stop_word(&token) {
+                        token.stop()
                     } else {
-                        Some(token.stop()) // Mark as stopped but keep it
+                        token
                     }
-                } else {
-                    Some(token)
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
 
         Ok(Box::new(filtered_tokens.into_iter()))
     }
@@ -557,5 +564,115 @@ mod tests {
     #[test]
     fn test_filter_name() {
         assert_eq!(StopFilter::new().name(), "stop");
+    }
+
+    fn arc(text: &str, increment: usize, length: usize) -> Token {
+        Token::new(text, 0)
+            .with_position_increment(increment)
+            .with_position_length(length)
+    }
+
+    /// Each token as an arc `(text, from, to)` of the token graph.
+    fn arcs(tokens: &[Token]) -> Vec<(&str, u32, u32)> {
+        tokens
+            .iter()
+            .zip(crate::analysis::token::token_positions(tokens))
+            .map(|(t, from)| (t.text.as_str(), from, from + t.position_length as u32))
+            .collect()
+    }
+
+    fn stop(words: &[&str], tokens: Vec<Token>) -> Vec<Token> {
+        StopFilter::from_words(words.to_vec())
+            .filter(Box::new(tokens.into_iter()))
+            .unwrap()
+            .collect()
+    }
+
+    /// #1259: "a", stacked on the stop word "the", takes the stop word's
+    /// node instead of moving back onto the word before it.
+    #[test]
+    fn a_synonym_stacked_on_a_stop_word_keeps_its_node() {
+        let tokens = vec![
+            arc("big", 1, 1),
+            arc("the", 1, 1),
+            arc("a", 0, 1),
+            arc("dog", 1, 1),
+        ];
+        assert_eq!(
+            arcs(&stop(&["the"], tokens)),
+            vec![("big", 0, 1), ("a", 1, 2), ("dog", 2, 3)]
+        );
+    }
+
+    /// #1259: "statue of liberty" with "lady liberty". "of", the only word
+    /// on its node, is contracted: its node merges with the next, and
+    /// "lady liberty" keeps an inner node of its own.
+    #[test]
+    fn a_stop_word_inside_a_member_is_contracted() {
+        let graph = vec![
+            arc("statue", 1, 1),
+            arc("lady", 0, 3),
+            arc("of", 1, 1),
+            arc("liberty", 1, 2),
+            arc("liberty", 1, 1),
+        ];
+        assert_eq!(
+            arcs(&stop(&["of"], graph)),
+            vec![
+                ("statue", 0, 1),
+                ("lady", 0, 2),
+                ("liberty", 1, 3),
+                ("liberty", 2, 3)
+            ]
+        );
+    }
+
+    /// "america" with "the usa": without "the", "usa" leaves the start
+    /// node and ends where "america" does.
+    #[test]
+    fn a_stop_word_starting_a_member_is_contracted() {
+        let graph = vec![
+            arc("america", 1, 2),
+            arc("the", 0, 1),
+            arc("usa", 1, 1),
+            arc("rocks", 1, 1),
+        ];
+        assert_eq!(
+            arcs(&stop(&["the"], graph)),
+            vec![("america", 0, 1), ("usa", 0, 1), ("rocks", 1, 2)]
+        );
+    }
+
+    /// "liberty" with "statue of": without "of", "statue" ends where
+    /// "liberty" does.
+    #[test]
+    fn a_stop_word_ending_a_member_is_contracted() {
+        let graph = vec![
+            arc("liberty", 1, 2),
+            arc("statue", 0, 1),
+            arc("of", 1, 1),
+            arc("rocks", 1, 1),
+        ];
+        assert_eq!(
+            arcs(&stop(&["of"], graph)),
+            vec![("liberty", 0, 1), ("statue", 0, 1), ("rocks", 1, 2)]
+        );
+    }
+
+    /// "a ml" with "machine learning": "ml" spans the same nodes as the
+    /// other member, so only its arc goes, and "machine learning" stays
+    /// after "a".
+    #[test]
+    fn a_stop_word_member_beside_another_member_is_dropped() {
+        let graph = vec![
+            arc("a", 1, 1),
+            arc("ml", 1, 2),
+            arc("machine", 0, 1),
+            arc("learning", 1, 1),
+        ];
+        assert_eq!(
+            arcs(&stop(&["ml"], graph)),
+            vec![("a", 0, 1), ("machine", 1, 2), ("learning", 2, 3)]
+        );
     }
 }

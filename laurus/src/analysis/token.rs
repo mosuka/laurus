@@ -468,6 +468,20 @@ pub(crate) fn token_positions(tokens: &[Token]) -> Vec<u32> {
     tokens.iter().map(|token| positions.assign(token)).collect()
 }
 
+/// The arc of each token in the token graph, in order: from its node
+/// ([`token_positions`]) to that node + `position_length`, a length below 1
+/// counting as 1.
+pub(crate) fn token_arcs(tokens: &[Token]) -> Vec<(u32, u32)> {
+    tokens
+        .iter()
+        .zip(token_positions(tokens))
+        .map(|(token, from)| {
+            let length = u32::try_from(token.position_length.max(1)).unwrap_or(u32::MAX);
+            (from, from.saturating_add(length))
+        })
+        .collect()
+}
+
 /// Lay a token graph out on the positions the index stores.
 ///
 /// A token is an arc from its node ([`token_positions`]) to its node +
@@ -487,13 +501,12 @@ pub(crate) fn flatten_token_graph(tokens: Vec<Token>) -> Vec<Token> {
         return tokens;
     }
 
-    let nodes = token_positions(&tokens);
     // The new position of each node an arc reaches, so far. Arcs only go
     // forward, so a node's entry is final once the stream gets to it.
     let mut reached: HashMap<u32, u32> = HashMap::new();
     let mut previous: Option<(u32, u32)> = None;
     let mut arcs = Vec::with_capacity(tokens.len());
-    for (token, &node) in tokens.iter().zip(&nodes) {
+    for (node, to) in token_arcs(&tokens) {
         let from = match previous {
             Some((previous_node, position)) if previous_node == node => position,
             Some((_, position)) => reached
@@ -503,8 +516,6 @@ pub(crate) fn flatten_token_graph(tokens: Vec<Token>) -> Vec<Token> {
             None => 0,
         };
         previous = Some((node, from));
-        let length = u32::try_from(token.position_length.max(1)).unwrap_or(u32::MAX);
-        let to = node.saturating_add(length);
         let position = reached.entry(to).or_insert(0);
         *position = (*position).max(from.saturating_add(1));
         arcs.push((from, to));
@@ -531,8 +542,166 @@ pub(crate) fn flatten_token_graph(tokens: Vec<Token>) -> Vec<Token> {
         .collect()
 }
 
+/// Remove the tokens `keep` rejects, keeping the token graph well formed.
+///
+/// A removed word leaves no position, so the arc of a removed token is
+/// contracted: its two nodes become one, and every path through it goes on
+/// without the word. That joins no separate paths as long as no other arc
+/// leaves its start node or none reaches its end node. When both nodes have
+/// other arcs, another alternative spans the same words, as a stacked
+/// synonym does, and only the arc goes. Arcs go one by one, in stream order.
+///
+/// The kept tokens are then numbered again: ordered by node, keeping their
+/// order within one, with increment 0 when stacked and 1 otherwise (the
+/// first token keeps its own), and the `position_length` between their new
+/// nodes. Text, offsets and `position` are kept.
+///
+/// In a stream whose arcs all span one position, only a kept token stacked
+/// on a removed one that started a node changes: it starts the node
+/// instead, as the removed increment carried over would in Lucene's
+/// `FilteringTokenFilter`. The others keep their increments, so a stream
+/// without stacked tokens keeps the positions of its kept tokens.
+pub(crate) fn remove_tokens(
+    tokens: Vec<Token>,
+    mut keep: impl FnMut(&Token) -> bool,
+) -> Vec<Token> {
+    let kept: Vec<bool> = tokens.iter().map(&mut keep).collect();
+    if kept.iter().all(|&kept| kept) {
+        tokens
+    } else if tokens.iter().all(|token| token.position_length <= 1) {
+        remove_from_sequence(tokens, &kept)
+    } else {
+        remove_from_graph(tokens, &kept)
+    }
+}
+
+/// [`remove_tokens`] for a stream whose arcs all span one position.
+fn remove_from_sequence(tokens: Vec<Token>, kept: &[bool]) -> Vec<Token> {
+    let mut result = Vec::with_capacity(kept.iter().filter(|&&kept| kept).count());
+    // Whether the current node was started by a removed token.
+    let mut node_removed = false;
+    for (index, (mut token, &kept)) in tokens.into_iter().zip(kept).enumerate() {
+        let starts_node = index == 0 || token.position_increment > 0;
+        if !kept {
+            node_removed |= starts_node;
+            continue;
+        }
+        if node_removed && !starts_node {
+            token.position_increment = 1;
+        }
+        node_removed = false;
+        result.push(token);
+    }
+    result
+}
+
+/// [`remove_tokens`] for a token graph.
+fn remove_from_graph(tokens: Vec<Token>, kept: &[bool]) -> Vec<Token> {
+    let arcs = token_arcs(&tokens);
+    // Nodes 0..started start a token; the ends past them are packed after.
+    let started = arcs.last().map_or(0, |&(from, _)| from as usize + 1);
+    let mut ends: Vec<u32> = arcs
+        .iter()
+        .map(|&(_, to)| to)
+        .filter(|&to| to as usize >= started)
+        .collect();
+    ends.sort_unstable();
+    ends.dedup();
+    let node = |id: u32| {
+        if (id as usize) < started {
+            id as usize
+        } else {
+            started + ends.partition_point(|&end| end < id)
+        }
+    };
+    let arcs: Vec<(usize, usize)> = arcs
+        .into_iter()
+        .map(|(from, to)| (node(from), node(to)))
+        .collect();
+
+    // Merged nodes form a class, named by its root node. Every arc still
+    // goes from a lower root to a higher one, so the roots order the
+    // classes.
+    let node_count = started + ends.len();
+    let mut roots: Vec<usize> = (0..node_count).collect();
+    let mut outs = vec![0usize; node_count];
+    let mut ins = vec![0usize; node_count];
+    for &(from, to) in &arcs {
+        outs[from] += 1;
+        ins[to] += 1;
+    }
+    for (&(from, to), _) in arcs.iter().zip(kept).filter(|&(_, &kept)| !kept) {
+        let start = find_root(&mut roots, from);
+        let end = find_root(&mut roots, to);
+        debug_assert_ne!(start, end, "a removed arc joins two classes");
+        if outs[start] > 1 && ins[end] > 1 {
+            outs[start] -= 1;
+            ins[end] -= 1;
+        } else if outs[start] == 1 {
+            // Every path through the start goes on along this arc.
+            roots[start] = end;
+            ins[end] = ins[end] + ins[start] - 1;
+        } else {
+            // Every path through the end comes along this arc.
+            roots[end] = start;
+            outs[start] = outs[start] + outs[end] - 1;
+        }
+    }
+
+    let mut laid_out: Vec<(Token, usize, usize)> = tokens
+        .into_iter()
+        .zip(arcs)
+        .zip(kept)
+        .filter(|&(_, &kept)| kept)
+        .map(|((token, (from, to)), _)| {
+            let from = find_root(&mut roots, from);
+            let to = find_root(&mut roots, to);
+            (token, from, to)
+        })
+        .collect();
+    laid_out.sort_by_key(|&(_, from, _)| from);
+
+    // A class no kept token starts is past every class one starts, so the
+    // ranks of the classes are the new nodes.
+    let mut classes: Vec<usize> = laid_out
+        .iter()
+        .flat_map(|&(_, from, to)| [from, to])
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    let rank = |class: usize| classes.partition_point(|&other| other < class);
+
+    let mut previous = None;
+    laid_out
+        .into_iter()
+        .map(|(mut token, from, to)| {
+            if let Some(previous) = previous {
+                token.position_increment = usize::from(previous != from);
+            }
+            previous = Some(from);
+            token.position_length = rank(to) - rank(from);
+            token
+        })
+        .collect()
+}
+
+/// The root of `node`'s class, shortening the path to it.
+fn find_root(roots: &mut [usize], node: usize) -> usize {
+    let mut root = node;
+    while roots[root] != root {
+        root = roots[root];
+    }
+    let mut node = node;
+    while roots[node] != root {
+        node = std::mem::replace(&mut roots[node], root);
+    }
+    root
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     fn token(text: &str, increment: usize) -> Token {
@@ -675,6 +844,280 @@ mod tests {
             arc("b", 1, 1, (2, 3)),
         ]);
         assert_eq!(token_positions(&flat), vec![0, 1]);
+    }
+
+    /// Each token as `(text, from, to)`, an arc of the token graph.
+    fn text_arcs(tokens: &[Token]) -> Vec<(&str, u32, u32)> {
+        tokens
+            .iter()
+            .zip(token_arcs(tokens))
+            .map(|(t, (from, to))| (t.text.as_str(), from, to))
+            .collect()
+    }
+
+    /// Remove the tokens at the `removed` indexes.
+    fn remove_at(tokens: Vec<Token>, removed: impl Fn(usize) -> bool) -> Vec<Token> {
+        let mut index = 0;
+        remove_tokens(tokens, |_| {
+            index += 1;
+            !removed(index - 1)
+        })
+    }
+
+    #[test]
+    fn keeping_every_token_changes_nothing() {
+        let tokens = vec![arc("a", 3, 2, (0, 1)), arc("b", 0, 1, (0, 1))];
+        assert_eq!(remove_at(tokens.clone(), |_| false), tokens);
+    }
+
+    #[test]
+    fn removing_every_token_leaves_none() {
+        let sequence = vec![token("a", 1), token("b", 0), token("c", 1)];
+        assert!(remove_at(sequence, |_| true).is_empty());
+        let graph = vec![arc("ml", 1, 2, (0, 2)), arc("machine", 0, 1, (0, 2))];
+        assert!(remove_at(graph, |_| true).is_empty());
+    }
+
+    /// Stop words leave no position, and the kept tokens keep their
+    /// increments, as they did before any graph handling.
+    #[test]
+    fn a_sequence_keeps_the_positions_of_its_kept_tokens() {
+        let tokens = vec![
+            token("the", 1),
+            token("statue", 1),
+            token("of", 2),
+            token("liberty", 1),
+        ];
+        let result = remove_at(tokens, |i| i == 0 || i == 2);
+        assert_eq!(
+            result
+                .iter()
+                .map(|t| (t.text.as_str(), t.position_increment))
+                .collect::<Vec<_>>(),
+            vec![("statue", 1), ("liberty", 1)]
+        );
+        assert_eq!(token_positions(&result), vec![0, 1]);
+    }
+
+    /// The first kept token of a graph keeps its own increment, the others
+    /// get 0 or 1.
+    #[test]
+    fn a_graph_keeps_the_first_increment() {
+        let graph = vec![
+            arc("ml", 3, 2, (0, 2)),
+            arc("machine", 0, 1, (0, 2)),
+            arc("learning", 4, 1, (0, 2)),
+            arc("is", 2, 1, (3, 5)),
+        ];
+        let result = remove_at(graph, |i| i == 2);
+        assert_eq!(
+            result
+                .iter()
+                .map(|t| (t.text.as_str(), t.position_increment, t.position_length))
+                .collect::<Vec<_>>(),
+            vec![("ml", 3, 1), ("machine", 0, 1), ("is", 1, 1)]
+        );
+    }
+
+    /// "a" ends at node `u32::MAX`, far past the last started node; the
+    /// ends past it are packed, not allocated.
+    #[test]
+    fn removing_from_a_graph_with_a_huge_position_length_does_not_overflow() {
+        let graph = vec![
+            arc("a", 1, usize::MAX, (0, 1)),
+            arc("b", 0, 2, (0, 1)),
+            arc("c", 1, 1, (2, 3)),
+            arc("d", 1, 1, (4, 5)),
+        ];
+        let result = remove_at(graph, |i| i == 2);
+        assert_eq!(
+            text_arcs(&result),
+            vec![("a", 0, 3), ("b", 0, 1), ("d", 1, 2)]
+        );
+    }
+
+    /// The tokens `SynonymGraphFilter` emits for `text`, split on
+    /// whitespace.
+    fn synonym_graph(groups: &[&[&str]], keep_original: bool, text: &str) -> Vec<Token> {
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::Filter;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::Tokenizer;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        for group in groups {
+            dict.add_synonym_group(group.iter().map(|s| s.to_string()).collect());
+        }
+        let tokens = WhitespaceTokenizer::new().tokenize(text).unwrap();
+        SynonymGraphFilter::new(dict, keep_original)
+            .filter(tokens)
+            .unwrap()
+            .collect()
+    }
+
+    const ML: &[&str] = &["ml", "machine learning", "statistical machine learning"];
+
+    /// Synonym groups, `keep_original` and the text of each graph.
+    const GRAPHS: &[(&[&[&str]], bool, &str)] = &[
+        (&[ML], true, "a ml b"),
+        (&[ML], false, "a ml b"),
+        (&[ML], true, "statistical machine learning"),
+        (&[ML], true, "ml ml"),
+        (&[&["ml", "machine learning"]], true, "ml machine learning"),
+        (
+            &[&["statue of liberty", "lady liberty"]],
+            true,
+            "the statue of liberty rocks",
+        ),
+        (
+            &[&["usa", "united states of america", "united states"]],
+            true,
+            "usa rocks",
+        ),
+        (&[&["big", "large"]], true, "a big dog"),
+    ];
+
+    /// Every path from node 0 to the last node, as the indexes of its
+    /// tokens, and whether every arc lies on one of them.
+    fn paths(tokens: &[Token]) -> (Vec<Vec<usize>>, bool) {
+        let arcs = token_arcs(tokens);
+        let Some(last) = arcs.iter().map(|&(_, to)| to).max() else {
+            return (Vec::new(), true);
+        };
+        let mut complete = Vec::new();
+        let mut partial = vec![(0, Vec::new())];
+        while let Some((node, path)) = partial.pop() {
+            if node == last {
+                complete.push(path);
+                continue;
+            }
+            for (i, _) in arcs.iter().enumerate().filter(|(_, arc)| arc.0 == node) {
+                let mut longer = path.clone();
+                longer.push(i);
+                partial.push((arcs[i].1, longer));
+            }
+        }
+        let used: BTreeSet<usize> = complete.iter().flatten().copied().collect();
+        let every_arc_used = used.len() == tokens.len();
+        (complete, every_arc_used)
+    }
+
+    fn words(tokens: &[Token], path: &[usize]) -> Vec<String> {
+        path.iter().map(|&i| tokens[i].text.clone()).collect()
+    }
+
+    /// Whatever tokens are removed from a synonym graph, its arcs go
+    /// forward, each lies on a path through it, each path is a path of the
+    /// graph without the removed words, and a path with no removed word is
+    /// still there.
+    #[test]
+    fn removing_any_tokens_leaves_a_well_formed_graph() {
+        for &(groups, keep_original, text) in GRAPHS {
+            let graph = synonym_graph(groups, keep_original, text);
+            let (graph_paths, _) = paths(&graph);
+            for removed in 0u32..1 << graph.len() {
+                let is_removed = |i: usize| removed & (1 << i) != 0;
+                let case =
+                    format!("{text:?}, keep_original = {keep_original}, removed {removed:b}");
+                let result = remove_at(graph.clone(), is_removed);
+
+                assert!(
+                    result.iter().all(|t| t.position_length >= 1),
+                    "{case}: backward arc"
+                );
+                assert!(
+                    result.iter().skip(1).all(|t| t.position_increment <= 1),
+                    "{case}: increment"
+                );
+                let (result_paths, every_arc_used) = paths(&result);
+                assert!(
+                    every_arc_used,
+                    "{case}: dead end in {:?}",
+                    text_arcs(&result)
+                );
+
+                let result_paths: BTreeSet<Vec<String>> =
+                    result_paths.iter().map(|p| words(&result, p)).collect();
+                let without_removed: BTreeSet<Vec<String>> = graph_paths
+                    .iter()
+                    .map(|p| {
+                        let kept: Vec<usize> =
+                            p.iter().copied().filter(|&i| !is_removed(i)).collect();
+                        words(&graph, &kept)
+                    })
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                assert!(
+                    result_paths.is_subset(&without_removed),
+                    "{case}: {result_paths:?} not in {without_removed:?}"
+                );
+                for path in graph_paths
+                    .iter()
+                    .filter(|p| !p.iter().any(|&i| is_removed(i)))
+                {
+                    assert!(
+                        result_paths.contains(&words(&graph, path)),
+                        "{case}: lost {:?}",
+                        words(&graph, path)
+                    );
+                }
+            }
+        }
+    }
+
+    /// In a stream whose arcs all span one position, carrying a removed
+    /// node over to the next kept token gives the positions contracting
+    /// the graph does.
+    #[test]
+    fn a_sequence_is_removed_as_a_graph_would_be() {
+        for length in 1..=6usize {
+            for increments in 0u32..1 << length {
+                let tokens: Vec<Token> = (0..length)
+                    .map(|i| token(&format!("t{i}"), ((increments >> i) & 1) as usize))
+                    .collect();
+                for removed in 0u32..1 << length {
+                    let kept: Vec<bool> = (0..length).map(|i| removed & (1 << i) == 0).collect();
+                    let sequence = remove_from_sequence(tokens.clone(), &kept);
+                    let graph = remove_from_graph(tokens.clone(), &kept);
+                    let case = format!("increments {increments:b}, removed {removed:b}");
+                    assert_eq!(
+                        sequence.iter().map(|t| &t.text).collect::<Vec<_>>(),
+                        graph.iter().map(|t| &t.text).collect::<Vec<_>>(),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        token_positions(&sequence),
+                        token_positions(&graph),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `LimitFilter`'s cut ends the arcs it goes through where removing
+    /// the rest of the stream would.
+    #[test]
+    fn a_limit_cuts_a_graph_as_removing_its_tail_does() {
+        use crate::analysis::token_filter::Filter;
+        use crate::analysis::token_filter::limit::LimitFilter;
+
+        for &(groups, keep_original, text) in GRAPHS {
+            let graph = synonym_graph(groups, keep_original, text);
+            for limit in 0..=graph.len() {
+                let limited: Vec<Token> = LimitFilter::new(limit)
+                    .filter(Box::new(graph.clone().into_iter()))
+                    .unwrap()
+                    .collect();
+                let removed = remove_at(graph.clone(), |i| i >= limit);
+                assert_eq!(
+                    text_arcs(&limited),
+                    text_arcs(&removed),
+                    "{text:?}, keep_original = {keep_original}, limit {limit}"
+                );
+            }
+        }
     }
 
     #[test]

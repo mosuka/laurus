@@ -28,7 +28,7 @@
 //! assert_eq!(result.len(), 3);
 //! ```
 
-use crate::analysis::token::{Token, TokenStream};
+use crate::analysis::token::{Token, TokenStream, token_arcs};
 use crate::analysis::token_filter::Filter;
 use crate::error::Result;
 
@@ -41,6 +41,10 @@ use crate::error::Result;
 /// - Implementing "index first N tokens only" strategies
 /// - Testing and development with truncated input
 /// - Implementing document preview features
+///
+/// A cut inside a token graph, such as a multi-word synonym, cuts every
+/// path there: the kept paths end together, one position after the last
+/// kept token's.
 ///
 /// # Examples
 ///
@@ -95,8 +99,21 @@ impl LimitFilter {
 }
 
 impl Filter for LimitFilter {
-    fn filter(&self, tokens: TokenStream) -> Result<TokenStream> {
-        let limited_tokens: Vec<Token> = tokens.take(self.limit).collect();
+    fn filter(&self, mut tokens: TokenStream) -> Result<TokenStream> {
+        let mut limited_tokens: Vec<Token> = tokens.by_ref().take(self.limit).collect();
+        if tokens.next().is_some() {
+            // Arcs past the last kept node lead only to cut tokens, so they
+            // end at the node after it.
+            let arcs = token_arcs(&limited_tokens);
+            if let Some(&(last, _)) = arcs.last() {
+                let end = last + 1;
+                for (token, (from, to)) in limited_tokens.iter_mut().zip(arcs) {
+                    if to > end {
+                        token.position_length = (end - from) as usize;
+                    }
+                }
+            }
+        }
         Ok(Box::new(limited_tokens.into_iter()))
     }
 
@@ -131,5 +148,56 @@ mod tests {
     #[test]
     fn test_filter_name() {
         assert_eq!(LimitFilter::new(10).name(), "limit");
+    }
+
+    fn arc(text: &str, increment: usize, length: usize) -> Token {
+        Token::new(text, 0)
+            .with_position_increment(increment)
+            .with_position_length(length)
+    }
+
+    /// Each token as an arc `(text, from, to)` of the token graph.
+    fn arcs(tokens: &[Token]) -> Vec<(&str, u32, u32)> {
+        tokens
+            .iter()
+            .zip(crate::analysis::token::token_positions(tokens))
+            .map(|(t, from)| (t.text.as_str(), from, from + t.position_length as u32))
+            .collect()
+    }
+
+    /// "ml is" with "machine learning".
+    fn ml_is() -> Vec<Token> {
+        vec![
+            arc("ml", 1, 2),
+            arc("machine", 0, 1),
+            arc("learning", 1, 1),
+            arc("is", 1, 1),
+        ]
+    }
+
+    fn limit(limit: usize, tokens: Vec<Token>) -> Vec<Token> {
+        LimitFilter::new(limit)
+            .filter(Box::new(tokens.into_iter()))
+            .unwrap()
+            .collect()
+    }
+
+    /// #1259: cut inside a graph, every kept path ends at the node after
+    /// the last kept one, so "machine" is still a path next to "ml".
+    #[test]
+    fn a_cut_inside_a_graph_ends_every_kept_path_at_one_node() {
+        assert_eq!(
+            arcs(&limit(2, ml_is())),
+            vec![("ml", 0, 1), ("machine", 0, 1)]
+        );
+    }
+
+    /// A cut after a whole graph, or no cut at all, leaves it as it is.
+    #[test]
+    fn a_cut_outside_a_graph_leaves_it_unchanged() {
+        let whole = ml_is();
+        assert_eq!(limit(3, ml_is()), whole[..3]);
+        assert_eq!(limit(4, ml_is()), whole);
+        assert_eq!(limit(10, ml_is()), whole);
     }
 }

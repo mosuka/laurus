@@ -26,7 +26,7 @@
 //! assert_eq!(result[1].text, "world");
 //! ```
 
-use crate::analysis::token::{Token, TokenStream};
+use crate::analysis::token::{TokenStream, remove_tokens};
 use crate::analysis::token_filter::Filter;
 use crate::error::Result;
 
@@ -38,6 +38,9 @@ use crate::error::Result;
 ///
 /// This is typically used near the end of an analysis pipeline to clean up
 /// tokens that have been emptied or stopped by previous filters.
+///
+/// A removed token leaves no position, and the token graph stays well
+/// formed, as with [`StopFilter`](crate::analysis::token_filter::stop::StopFilter).
 ///
 /// # Examples
 ///
@@ -74,9 +77,9 @@ impl RemoveEmptyFilter {
 
 impl Filter for RemoveEmptyFilter {
     fn filter(&self, tokens: TokenStream) -> Result<TokenStream> {
-        let filtered_tokens: Vec<Token> = tokens
-            .filter(|token| !token.is_stopped() && !token.text.is_empty())
-            .collect();
+        let filtered_tokens = remove_tokens(tokens.collect(), |token| {
+            !token.is_stopped() && !token.text.is_empty()
+        });
 
         Ok(Box::new(filtered_tokens.into_iter()))
     }
@@ -112,5 +115,30 @@ mod tests {
     #[test]
     fn test_filter_name() {
         assert_eq!(RemoveEmptyFilter::new().name(), "remove_empty");
+    }
+
+    /// #1259: "a", stacked on the stopped "the", and "b", stacked on an
+    /// empty token, take the removed tokens' positions instead of moving
+    /// back onto the word before them.
+    #[test]
+    fn a_token_stacked_on_a_removed_token_keeps_its_position() {
+        let tokens = vec![
+            Token::new("big", 0),
+            Token::new("the", 1).stop(),
+            Token::new("a", 1).with_position_increment(0),
+            Token::new("", 2),
+            Token::new("b", 2).with_position_increment(0),
+            Token::new("dog", 3),
+        ];
+        let result: Vec<Token> = RemoveEmptyFilter::new()
+            .filter(Box::new(tokens.into_iter()))
+            .unwrap()
+            .collect();
+        let texts: Vec<&str> = result.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, ["big", "a", "b", "dog"]);
+        assert_eq!(
+            crate::analysis::token::token_positions(&result),
+            vec![0, 1, 2, 3]
+        );
     }
 }

@@ -42,9 +42,8 @@ impl PhraseArc {
 /// with the nodes renumbered from 0 in order and the arcs sorted by
 /// `(from, to)`. Each `(from, to)` must appear once.
 ///
-/// An arc no path uses, such as one a filter cut off by removing the token
-/// after it, is dropped. The result is empty when no path goes from `first`
-/// to `last`.
+/// An arc no path uses, such as a dead end of a hand-built token stream, is
+/// dropped. The result is empty when no path goes from `first` to `last`.
 pub(crate) fn complete_paths(mut arcs: Vec<PhraseArc>, first: u32, last: u32) -> Vec<PhraseArc> {
     arcs.sort_by_key(|arc| (arc.from, arc.to));
 

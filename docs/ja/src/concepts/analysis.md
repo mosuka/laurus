@@ -415,5 +415,6 @@ let filter = SynonymGraphFilter::new(dict, true)
 そのほかの注意点は次のとおりです。
 
 - `keep_original = false` は、一致した語をグループのほかのメンバーで置き換えます。そのため、その語自体はインデックスも検索もされません。検索には `keep_original = true` を使ってください。
-- `StopFilter` や `LimitFilter` のようにトークンを取り除くフィルターは、`SynonymGraphFilter` より前に置いてください。後ろに置くと、グラフに必要なトークンを取り除いてしまいます。
+- `StopFilter`・`RemoveEmptyFilter`・`LimitFilter` のようにトークンを取り除くフィルターは、`SynonymGraphFilter` の後ろに置けます。グラフの中でも、取り除いた語の位置は空きません。`statue of liberty` と `lady liberty` を同義語とし、`of` をストップワードとすると、`"statue of liberty"` は「statue of liberty」と「lady liberty」の両方にマッチします。`StopFilter` を `SynonymGraphFilter` より前に置くと、同義語フィルターが見る前に `of` が取り除かれるため、このメンバーはマッチしなくなります。
+- 取り除いた語と同じ位置にほかの選択肢（積まれた 1 語の同義語など）があれば、その位置は選択肢に引き継がれます。`the` と `a` を同義語とすると、`the` を取り除いても `a` がその位置に残り、その語を飛ばす経路はできません。`LimitFilter` は、すべての経路を同じトークンで切ります。
 - Issue #1252 より前にインデックスした文書は、積まれたトークンに連続した位置を振っています。フィールドが `SynonymGraphFilter` を使う場合は、アップグレード後に文書を投入し直してください。セグメントのマージは保存済みの位置をそのままコピーするため、マージでは直りません。
