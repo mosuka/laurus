@@ -419,3 +419,42 @@ def test_token_fields():
     assert isinstance(tok.position_increment, int)
     assert isinstance(tok.position_length, int)
     assert isinstance(tok.boost, float)
+    assert (tok.start_offset, tok.end_offset) == (0, 5)
+    assert tok.token_type == "alphanum"
+
+
+def test_synonym_graph_filter_keeps_offsets_and_token_types():
+    syn = laurus.SynonymDictionary()
+    syn.add_synonym_group(["ml", "machine learning"])
+    filt = laurus.SynonymGraphFilter(syn)
+
+    tokens = laurus.WhitespaceTokenizer().tokenize("ml tutorial")
+    by_text = {t.text: t for t in filt.apply(tokens)}
+
+    # Each synonym token carries the offsets of the word it replaces.
+    for text in ("ml", "machine", "learning"):
+        assert (by_text[text].start_offset, by_text[text].end_offset) == (0, 2)
+    assert (by_text["tutorial"].start_offset, by_text["tutorial"].end_offset) == (3, 11)
+    assert by_text["ml"].token_type == "alphanum"
+    assert by_text["tutorial"].token_type == "alphanum"
+    assert by_text["machine"].token_type == "synonym"
+    assert by_text["learning"].token_type == "synonym"
+
+
+def test_synonym_graph_filter_does_not_match_across_a_gap():
+    syn = laurus.SynonymDictionary()
+    syn.add_synonym_group(["東京大学", "東大"])
+    filt = laurus.SynonymGraphFilter(syn)
+
+    # CJK words must touch to form one word, and a space separates these.
+    tokens = laurus.WhitespaceTokenizer().tokenize("東京 大学")
+    assert [t.text for t in filt.apply(tokens)] == ["東京", "大学"]
+
+
+def test_synonym_graph_filter_matches_alphanumeric_words_across_a_space():
+    syn = laurus.SynonymDictionary()
+    syn.add_synonym_group(["ml", "machine learning"])
+    filt = laurus.SynonymGraphFilter(syn)
+
+    tokens = laurus.WhitespaceTokenizer().tokenize("machine learning")
+    assert "ml" in [t.text for t in filt.apply(tokens)]

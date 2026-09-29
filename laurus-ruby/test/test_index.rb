@@ -389,5 +389,45 @@ class TestIndex < Minitest::Test
     assert_kind_of Integer, tok.position_increment
     assert_kind_of Integer, tok.position_length
     assert_kind_of Float, tok.boost
+    assert_equal [0, 5], [tok.start_offset, tok.end_offset]
+    assert_equal "alphanum", tok.token_type
+  end
+
+  def test_synonym_graph_filter_keeps_offsets_and_token_types
+    syn = Laurus::SynonymDictionary.new
+    syn.add_synonym_group(["ml", "machine learning"])
+    filt = Laurus::SynonymGraphFilter.new(syn)
+
+    tokens = Laurus::WhitespaceTokenizer.new.tokenize("ml tutorial")
+    by_text = filt.apply(tokens).to_h { |t| [t.text, t] }
+
+    # Each synonym token carries the offsets of the word it replaces.
+    %w[ml machine learning].each do |text|
+      assert_equal [0, 2], [by_text[text].start_offset, by_text[text].end_offset]
+    end
+    assert_equal [3, 11], [by_text["tutorial"].start_offset, by_text["tutorial"].end_offset]
+    assert_equal "alphanum", by_text["ml"].token_type
+    assert_equal "alphanum", by_text["tutorial"].token_type
+    assert_equal "synonym", by_text["machine"].token_type
+    assert_equal "synonym", by_text["learning"].token_type
+  end
+
+  def test_synonym_graph_filter_does_not_match_across_a_gap
+    syn = Laurus::SynonymDictionary.new
+    syn.add_synonym_group(["東京大学", "東大"])
+    filt = Laurus::SynonymGraphFilter.new(syn)
+
+    # CJK words must touch to form one word, and a space separates these.
+    tokens = Laurus::WhitespaceTokenizer.new.tokenize("東京 大学")
+    assert_equal ["東京", "大学"], filt.apply(tokens).map(&:text)
+  end
+
+  def test_synonym_graph_filter_matches_alphanumeric_words_across_a_space
+    syn = Laurus::SynonymDictionary.new
+    syn.add_synonym_group(["ml", "machine learning"])
+    filt = Laurus::SynonymGraphFilter.new(syn)
+
+    tokens = Laurus::WhitespaceTokenizer.new.tokenize("machine learning")
+    assert_includes filt.apply(tokens).map(&:text), "ml"
   end
 end

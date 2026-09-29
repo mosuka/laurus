@@ -6,6 +6,7 @@ use crate::errors::laurus_err;
 use laurus::Analyzer;
 use laurus::analysis::analyzer::language::japanese::JapaneseAnalyzer;
 use laurus::analysis::synonym::dictionary::SynonymDictionary;
+use laurus::analysis::token::{Token, TokenType};
 use laurus::analysis::token_filter::Filter;
 use laurus::analysis::token_filter::synonym_graph::SynonymGraphFilter;
 use laurus::analysis::tokenizer::Tokenizer;
@@ -24,10 +25,10 @@ pub struct WasmToken {
     pub text: String,
     /// Position in the token stream.
     pub position: u32,
-    /// Character start offset in the original text.
+    /// UTF-8 byte start offset in the original text.
     #[serde(rename = "startOffset")]
     pub start_offset: u32,
-    /// Character end offset in the original text.
+    /// UTF-8 byte end offset in the original text.
     #[serde(rename = "endOffset")]
     pub end_offset: u32,
     /// Score boost factor (1.0 = no adjustment).
@@ -40,10 +41,14 @@ pub struct WasmToken {
     /// Number of positions spanned by this token.
     #[serde(rename = "positionLength")]
     pub position_length: u32,
+    /// Token type, such as `"alphanum"` or `"synonym"`. A token built by
+    /// hand may leave it out.
+    #[serde(rename = "tokenType", default, skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
 }
 
-impl From<laurus::analysis::token::Token> for WasmToken {
-    fn from(t: laurus::analysis::token::Token) -> Self {
+impl From<Token> for WasmToken {
+    fn from(t: Token) -> Self {
         Self {
             text: t.text,
             position: t.position as u32,
@@ -53,7 +58,36 @@ impl From<laurus::analysis::token::Token> for WasmToken {
             stopped: t.stopped,
             position_increment: t.position_increment as u32,
             position_length: t.position_length as u32,
+            token_type: t
+                .metadata
+                .and_then(|m| m.token_type)
+                .map(|token_type| token_type.as_str().to_string()),
         }
+    }
+}
+
+/// Rebuild the core token from everything a `WasmToken` carries.
+///
+/// Token metadata other than the type (original text, language,
+/// attributes) is not carried.
+impl TryFrom<WasmToken> for Token {
+    type Error = JsValue;
+
+    fn try_from(t: WasmToken) -> Result<Self, JsValue> {
+        let mut token = Token::with_offsets(
+            t.text,
+            t.position as usize,
+            t.start_offset as usize,
+            t.end_offset as usize,
+        )
+        .with_boost(t.boost as f32)
+        .with_position_increment(t.position_increment as usize)
+        .with_position_length(t.position_length as usize);
+        token.stopped = t.stopped;
+        if let Some(name) = t.token_type {
+            token = token.with_token_type(name.parse::<TokenType>().map_err(laurus_err)?);
+        }
+        Ok(token)
     }
 }
 
@@ -161,18 +195,12 @@ impl WasmSynonymGraphFilter {
         let wasm_tokens: Vec<WasmToken> = serde_wasm_bindgen::from_value(tokens)
             .map_err(|e| JsValue::from_str(&format!("Invalid token array: {e}")))?;
 
-        let rust_tokens: Vec<laurus::analysis::token::Token> = wasm_tokens
-            .iter()
-            .map(|pt| {
-                laurus::analysis::token::Token::new(pt.text.clone(), pt.position as usize)
-                    .with_boost(pt.boost as f32)
-                    .with_position_increment(pt.position_increment as usize)
-                    .with_position_length(pt.position_length as usize)
-            })
-            .collect();
+        let rust_tokens = wasm_tokens
+            .into_iter()
+            .map(Token::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let stream: Box<dyn Iterator<Item = laurus::analysis::token::Token> + Send> =
-            Box::new(rust_tokens.into_iter());
+        let stream: Box<dyn Iterator<Item = Token> + Send> = Box::new(rust_tokens.into_iter());
 
         let result: Vec<WasmToken> = self
             .inner
@@ -346,5 +374,125 @@ mod tests {
             Some("not-a-mode".into()),
         );
         assert!(result.is_err());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    mod synonym_graph_filter {
+        use wasm_bindgen::JsValue;
+        use wasm_bindgen_test::wasm_bindgen_test;
+
+        use super::super::{
+            WasmSynonymDictionary, WasmSynonymGraphFilter, WasmWhitespaceTokenizer,
+        };
+
+        fn filter(group: &[&str]) -> WasmSynonymGraphFilter {
+            let mut dict = WasmSynonymDictionary::new().unwrap();
+            dict.add_synonym_group(group.iter().map(|s| s.to_string()).collect());
+            WasmSynonymGraphFilter::new(&dict, None, None)
+        }
+
+        fn tokenize(text: &str) -> JsValue {
+            WasmWhitespaceTokenizer::new()
+                .tokenize(text.to_string())
+                .unwrap()
+        }
+
+        fn to_vec(tokens: JsValue) -> Vec<JsValue> {
+            js_sys::Array::from(&tokens).iter().collect()
+        }
+
+        fn get(token: &JsValue, key: &str) -> JsValue {
+            js_sys::Reflect::get(token, &JsValue::from_str(key)).unwrap()
+        }
+
+        fn text(token: &JsValue) -> String {
+            get(token, "text").as_string().unwrap()
+        }
+
+        fn offsets(token: &JsValue) -> (f64, f64) {
+            (
+                get(token, "startOffset").as_f64().unwrap(),
+                get(token, "endOffset").as_f64().unwrap(),
+            )
+        }
+
+        fn find(tokens: &[JsValue], wanted: &str) -> JsValue {
+            tokens.iter().find(|t| text(t) == wanted).unwrap().clone()
+        }
+
+        /// A token of `ml` built by hand, with `extra` spliced into the object.
+        fn hand_built_ml(extra: &str) -> JsValue {
+            js_sys::JSON::parse(&format!(
+                r#"[{{"text":"ml","position":0,"startOffset":0,"endOffset":2,"boost":1.0,"stopped":false,"positionIncrement":1,"positionLength":1{extra}}}]"#
+            ))
+            .unwrap()
+        }
+
+        #[wasm_bindgen_test]
+        fn tokenizer_sets_offsets_and_token_type() {
+            let tokens = to_vec(tokenize("hello"));
+            assert_eq!(offsets(&tokens[0]), (0.0, 5.0));
+            assert_eq!(
+                get(&tokens[0], "tokenType").as_string().as_deref(),
+                Some("alphanum")
+            );
+        }
+
+        #[wasm_bindgen_test]
+        fn apply_keeps_offsets_and_token_types() {
+            let filter = filter(&["ml", "machine learning"]);
+            let tokens = to_vec(filter.apply(tokenize("ml tutorial")).unwrap());
+
+            // Each synonym token carries the offsets of the word it replaces.
+            for wanted in ["ml", "machine", "learning"] {
+                assert_eq!(offsets(&find(&tokens, wanted)), (0.0, 2.0), "{wanted}");
+            }
+            assert_eq!(offsets(&find(&tokens, "tutorial")), (3.0, 11.0));
+            for (wanted, token_type) in [
+                ("ml", "alphanum"),
+                ("tutorial", "alphanum"),
+                ("machine", "synonym"),
+                ("learning", "synonym"),
+            ] {
+                let actual = get(&find(&tokens, wanted), "tokenType").as_string();
+                assert_eq!(actual.as_deref(), Some(token_type), "{wanted}");
+            }
+        }
+
+        #[wasm_bindgen_test]
+        fn apply_does_not_match_across_a_gap() {
+            let filter = filter(&["東京大学", "東大"]);
+            // CJK words must touch to form one word, and a space separates these.
+            let tokens = to_vec(filter.apply(tokenize("東京 大学")).unwrap());
+            let texts: Vec<String> = tokens.iter().map(text).collect();
+            assert_eq!(texts, ["東京", "大学"]);
+        }
+
+        #[wasm_bindgen_test]
+        fn apply_matches_alphanumeric_words_across_a_space() {
+            let filter = filter(&["ml", "machine learning"]);
+            let tokens = to_vec(filter.apply(tokenize("machine learning")).unwrap());
+            assert!(tokens.iter().any(|t| text(t) == "ml"));
+        }
+
+        #[wasm_bindgen_test]
+        fn apply_accepts_a_token_built_by_hand_without_a_type() {
+            let filter = filter(&["ml", "machine learning"]);
+            let tokens = to_vec(filter.apply(hand_built_ml("")).unwrap());
+            assert!(tokens.iter().any(|t| text(t) == "machine"));
+            assert!(get(&find(&tokens, "ml"), "tokenType").is_undefined());
+        }
+
+        #[wasm_bindgen_test]
+        fn apply_rejects_an_unknown_token_type() {
+            let filter = filter(&["ml", "machine learning"]);
+            let err = filter
+                .apply(hand_built_ml(r#","tokenType":"bogus""#))
+                .err()
+                .unwrap()
+                .as_string()
+                .unwrap_or_default();
+            assert!(err.contains("unknown token type 'bogus'"), "{err}");
+        }
     }
 }

@@ -4,6 +4,7 @@ use std::cell::RefCell;
 
 use ext_php_rs::prelude::*;
 use laurus::analysis::synonym::dictionary::SynonymDictionary;
+use laurus::analysis::token::{Token, TokenType};
 use laurus::analysis::token_filter::Filter;
 use laurus::analysis::token_filter::synonym_graph::SynonymGraphFilter;
 use laurus::analysis::tokenizer::Tokenizer;
@@ -20,12 +21,13 @@ use crate::errors::laurus_err;
 /// Properties:
 ///   - `text` (string): The token text.
 ///   - `position` (int): Position in the token stream.
-///   - `startOffset` (int): Character start offset in the original text.
-///   - `endOffset` (int): Character end offset in the original text.
+///   - `startOffset` (int): UTF-8 byte start offset in the original text.
+///   - `endOffset` (int): UTF-8 byte end offset in the original text.
 ///   - `boost` (float): Score boost factor (1.0 = no adjustment).
 ///   - `stopped` (bool): Whether this token has been removed by a stop filter.
 ///   - `positionIncrement` (int): Difference from the previous token's position.
 ///   - `positionLength` (int): Number of positions spanned by this token.
+///   - `tokenType` (?string): Token type, such as `"alphanum"` or `"synonym"`.
 #[php_class]
 #[php(name = "Laurus\\Token")]
 pub struct PhpToken {
@@ -37,6 +39,7 @@ pub struct PhpToken {
     stopped: bool,
     position_increment: usize,
     position_length: usize,
+    token_type: Option<TokenType>,
 }
 
 #[php_impl]
@@ -81,6 +84,12 @@ impl PhpToken {
         self.position_length as i64
     }
 
+    /// Return the token type, such as `"alphanum"` or `"synonym"`, or null.
+    pub fn get_token_type(&self) -> Option<String> {
+        self.token_type
+            .map(|token_type| token_type.as_str().to_string())
+    }
+
     /// Return a string representation.
     pub fn __to_string(&self) -> String {
         format!(
@@ -90,8 +99,8 @@ impl PhpToken {
     }
 }
 
-impl From<laurus::analysis::token::Token> for PhpToken {
-    fn from(t: laurus::analysis::token::Token) -> Self {
+impl From<Token> for PhpToken {
+    fn from(t: Token) -> Self {
         Self {
             text: t.text,
             position: t.position,
@@ -101,7 +110,27 @@ impl From<laurus::analysis::token::Token> for PhpToken {
             stopped: t.stopped,
             position_increment: t.position_increment,
             position_length: t.position_length,
+            token_type: t.metadata.and_then(|m| m.token_type),
         }
+    }
+}
+
+/// Rebuild the core token from everything a `PhpToken` carries.
+///
+/// Token metadata other than the type (original text, language,
+/// attributes) is not carried.
+impl From<&PhpToken> for Token {
+    fn from(t: &PhpToken) -> Self {
+        let mut token =
+            Token::with_offsets(t.text.clone(), t.position, t.start_offset, t.end_offset)
+                .with_boost(t.boost)
+                .with_position_increment(t.position_increment)
+                .with_position_length(t.position_length);
+        token.stopped = t.stopped;
+        if let Some(token_type) = t.token_type {
+            token = token.with_token_type(token_type);
+        }
+        token
     }
 }
 
@@ -233,18 +262,9 @@ impl PhpSynonymGraphFilter {
     ///
     /// Array of expanded `Token` objects.
     pub fn apply(&self, tokens: Vec<&PhpToken>) -> PhpResult<Vec<PhpToken>> {
-        let rust_tokens: Vec<laurus::analysis::token::Token> = tokens
-            .iter()
-            .map(|pt| {
-                laurus::analysis::token::Token::new(pt.text.clone(), pt.position)
-                    .with_boost(pt.boost)
-                    .with_position_increment(pt.position_increment)
-                    .with_position_length(pt.position_length)
-            })
-            .collect();
+        let rust_tokens: Vec<Token> = tokens.into_iter().map(Token::from).collect();
 
-        let stream: Box<dyn Iterator<Item = laurus::analysis::token::Token> + Send> =
-            Box::new(rust_tokens.into_iter());
+        let stream: Box<dyn Iterator<Item = Token> + Send> = Box::new(rust_tokens.into_iter());
 
         let result: Vec<PhpToken> = self
             .inner
