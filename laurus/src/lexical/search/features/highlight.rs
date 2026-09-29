@@ -12,7 +12,7 @@ use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::analysis::token::{Token, flatten_token_graph, token_positions};
 use crate::error::Result;
 use crate::lexical::index::inverted::core::automaton::{Automaton, LevenshteinAutomaton};
-use crate::lexical::query::{HighlightTerm, Query};
+use crate::lexical::query::{HighlightTerm, PhraseArc, Query};
 
 /// Configuration for text highlighting.
 #[derive(Debug, Clone)]
@@ -326,6 +326,7 @@ impl Highlighter {
         let mut min_term_len = usize::MAX;
         let mut max_term_len = 0usize;
         let mut phrases: Vec<(Vec<Vec<String>>, u32)> = Vec::new();
+        let mut graph_phrases: Vec<(Vec<PhraseArc>, u32)> = Vec::new();
         let mut prefixes: Vec<&str> = Vec::new();
         let mut regexes: Vec<&Regex> = Vec::new();
         let mut fuzzy: Vec<&LevenshteinAutomaton> = Vec::new();
@@ -343,6 +344,16 @@ impl Highlighter {
                         .map(|alternatives| alternatives.iter().map(|t| t.to_lowercase()).collect())
                         .collect();
                     phrases.push((positions, *slop));
+                }
+                HighlightTerm::GraphPhrase { arcs, slop } => {
+                    let arcs = arcs
+                        .iter()
+                        .map(|arc| {
+                            let terms = arc.terms.iter().map(|t| t.to_lowercase()).collect();
+                            PhraseArc::new(arc.from, arc.to, terms)
+                        })
+                        .collect();
+                    graph_phrases.push((arcs, *slop));
                 }
                 HighlightTerm::Prefix(prefix) => prefixes.push(prefix),
                 HighlightTerm::Regex(regex) => regexes.push(regex),
@@ -376,7 +387,7 @@ impl Highlighter {
                     score,
                 ));
             }
-            if !phrases.is_empty() {
+            if !phrases.is_empty() || !graph_phrases.is_empty() {
                 buffered.push(token);
             }
         }
@@ -385,6 +396,9 @@ impl Highlighter {
         let buffered = flatten_token_graph(buffered);
         for (phrase, slop) in &phrases {
             spans.extend(phrase_spans(&buffered, phrase, *slop));
+        }
+        for (arcs, slop) in &graph_phrases {
+            spans.extend(graph_phrase_spans(&buffered, arcs, *slop));
         }
 
         // Sort spans by position
@@ -861,6 +875,63 @@ fn phrase_spans(tokens: &[Token], phrase: &[Vec<String>], slop: u32) -> Vec<High
             // Phrases outrank single terms, as before.
             Some(HighlightSpan::new(anchor.start_offset..end, true, 2.0))
         })
+        .collect()
+}
+
+/// Spans of a graph phrase within `tokens`: those [`phrase_spans`] finds
+/// for each path through `arcs`, without listing the paths.
+///
+/// Each arc leaving node 0 anchors on its own tokens ([`phrase_anchors`]),
+/// as that path's first position would. A state (anchor start, previous
+/// position, end) moves along each arc with [`next_phrase_token`], whose
+/// step depends only on the previous position, so the states some path
+/// brings to a node are enough to go on from it. A state that reaches the
+/// last node is a span from its anchor's start to its end.
+fn graph_phrase_spans(tokens: &[Token], arcs: &[PhraseArc], slop: u32) -> Vec<HighlightSpan> {
+    let Some(last) = arcs.iter().map(|arc| arc.to).max() else {
+        return Vec::new();
+    };
+    let positions = token_positions(tokens);
+    let mut states: Vec<Vec<(usize, u32, usize)>> = vec![Vec::new(); last as usize + 1];
+    let mut settled = 0;
+    for arc in arcs {
+        let (before, after) = states.split_at_mut(arc.to as usize);
+        let reached = &mut after[0];
+        if arc.from == 0 {
+            reached.extend(
+                phrase_anchors(tokens, &positions, &arc.terms)
+                    .map(|(anchor, position)| (anchor.start_offset, position, token_end(anchor))),
+            );
+            continue;
+        }
+
+        // Every arc into `from` came earlier, so its states are final. The
+        // end offset only matters at the last node.
+        let states_at = &mut before[arc.from as usize];
+        if arc.from != settled {
+            settled = arc.from;
+            states_at.sort_unstable();
+            states_at.dedup_by_key(|&mut (start, previous, _)| (start, previous));
+        }
+        for &(start, previous, _) in states_at.iter() {
+            if let Some((token, position)) =
+                next_phrase_token(tokens, &positions, previous, slop, &arc.terms)
+            {
+                reached.push((start, position, token_end(token)));
+            }
+        }
+    }
+
+    let mut ranges: Vec<(usize, usize)> = states[last as usize]
+        .iter()
+        .map(|&(start, _, end)| (start, end))
+        .collect();
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+        .into_iter()
+        // Phrases outrank single terms, as before.
+        .map(|(start, end)| HighlightSpan::new(start..end, true, 2.0))
         .collect()
 }
 
@@ -1681,6 +1752,131 @@ mod tests {
             .unwrap()
             .fragments;
         assert_eq!(marked(&fragments), ["a big dog"]);
+    }
+
+    // ---- Graph phrases (#1271) ----
+
+    fn whitespace_analyzer() -> Box<dyn Analyzer> {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        Box::new(PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new())))
+    }
+
+    /// Stacks {a, b c} and {d, c} as `SynonymGraphFilter` does, so tokens
+    /// share positions and synonyms span their words' offsets.
+    fn stacking_analyzer() -> Box<dyn Analyzer> {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["a".to_string(), "b c".to_string()]);
+        dict.add_synonym_group(vec!["d".to_string(), "c".to_string()]);
+        Box::new(
+            PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+                .add_filter(Arc::new(SynonymGraphFilter::new(dict, true))),
+        )
+    }
+
+    /// The tokens of `text` laid out as phrases are matched on them.
+    fn phrase_tokens(analyzer: &dyn Analyzer, text: &str) -> Vec<Token> {
+        flatten_token_graph(analyzer.analyze(text).unwrap().collect())
+    }
+
+    /// The distinct ranges of `spans`, sorted: what they mark once merged.
+    fn ranges(spans: Vec<HighlightSpan>) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = spans
+            .into_iter()
+            .map(|span| (span.range.start, span.range.end))
+            .collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        ranges
+    }
+
+    /// The walk marks exactly what one phrase per path marks, anchored on
+    /// the same tokens, over plain and stacked tokens at every slop.
+    #[test]
+    fn graph_phrase_spans_equal_the_union_of_path_spans() {
+        use crate::lexical::query::graph_phrase::test_support::{
+            Lcg as GraphLcg, paths, random_graph, random_texts,
+        };
+
+        let mut rng = GraphLcg(1271);
+        let analyzers = [whitespace_analyzer(), stacking_analyzer()];
+        let mut compared = 0;
+        let mut marked = 0;
+        for text in random_texts(&mut rng, 500) {
+            for analyzer in &analyzers {
+                let tokens = phrase_tokens(analyzer.as_ref(), &text);
+                let Some(arcs) = random_graph(&mut rng) else {
+                    continue;
+                };
+                for slop in 0..3 {
+                    let expected = ranges(
+                        paths(&arcs)
+                            .iter()
+                            .flat_map(|path| phrase_spans(&tokens, path, slop))
+                            .collect(),
+                    );
+                    assert_eq!(
+                        ranges(graph_phrase_spans(&tokens, &arcs, slop)),
+                        expected,
+                        "slop {slop}, arcs {arcs:?}, text {text:?}"
+                    );
+                    compared += 1;
+                    marked += usize::from(!expected.is_empty());
+                }
+            }
+        }
+        assert!(compared > 1000, "only {compared} comparisons");
+        assert!(marked > compared / 4, "only {marked} of {compared} marked");
+    }
+
+    #[test]
+    fn graph_phrase_on_a_chain_equals_phrase_spans() {
+        use crate::lexical::query::graph_phrase::test_support::{arc, paths};
+
+        let arcs = [
+            arc(0, 1, &["a"]),
+            arc(1, 2, &["big", "large"]),
+            arc(2, 3, &["dog"]),
+        ];
+        let tokens = phrase_tokens(
+            whitespace_analyzer().as_ref(),
+            "a big dog or a very large dog",
+        );
+        for slop in 0..2 {
+            let expected = ranges(phrase_spans(&tokens, &paths(&arcs)[0], slop));
+            assert!(!expected.is_empty());
+            assert_eq!(ranges(graph_phrase_spans(&tokens, &arcs, slop)), expected);
+        }
+    }
+
+    /// Each path that occurs is marked from its first word to its last.
+    #[test]
+    fn graph_phrase_query_highlights_each_path_that_occurs() {
+        use crate::lexical::query::GraphPhraseQuery;
+        use crate::lexical::query::graph_phrase::test_support::arc;
+
+        let query = GraphPhraseQuery::from_arcs(
+            "body",
+            vec![
+                arc(0, 1, &["machine"]),
+                arc(0, 2, &["ml"]),
+                arc(1, 2, &["learning"]),
+                arc(2, 3, &["is"]),
+            ],
+        );
+        let highlighter =
+            Highlighter::with_analyzer(HighlightConfig::default(), whitespace_analyzer());
+        let fragments = highlighter
+            .highlight(&query, "body", "ml is fun, machine learning is fun")
+            .unwrap()
+            .fragments;
+        assert_eq!(marked(&fragments), ["ml is", "machine learning is"]);
     }
 
     #[test]
