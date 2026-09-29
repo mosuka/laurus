@@ -136,7 +136,13 @@ cargo build -p laurus-wasm --target wasm32-unknown-unknown
 cargo clippy -p laurus-wasm --target wasm32-unknown-unknown -- -D warnings
 ```
 
-ブラウザテストは `wasm-pack test` で実行できます:
+`#[wasm_bindgen_test]` によるユニットテストは Node 上で実行します（CI でもこのコマンドを実行しています）:
+
+```bash
+wasm-pack test --node laurus-wasm
+```
+
+ブラウザが必要なテストがある場合は、ヘッドレス Chrome で実行できます:
 
 ```bash
 wasm-pack test --headless --chrome

@@ -136,7 +136,13 @@ cargo build -p laurus-wasm --target wasm32-unknown-unknown
 cargo clippy -p laurus-wasm --target wasm32-unknown-unknown -- -D warnings
 ```
 
-Browser tests can be run with `wasm-pack test`:
+The `#[wasm_bindgen_test]` unit tests run in Node (this is also what CI runs):
+
+```bash
+wasm-pack test --node laurus-wasm
+```
+
+If a test needs a browser instead, run it headless in Chrome:
 
 ```bash
 wasm-pack test --headless --chrome
