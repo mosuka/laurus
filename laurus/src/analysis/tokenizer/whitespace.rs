@@ -206,12 +206,17 @@ impl WhitespaceTokenizer {
     ///
     /// * `text` - The input text
     fn tokenize_fallback(&self, text: &str) -> Result<TokenStream> {
+        // `split_whitespace` yields substrings that are slices of `text`, so
+        // the pointer difference gives each word's real byte offset. This
+        // works for repeated words and words that occur inside an earlier
+        // word, unlike a `text.find(word)` lookup which always returns the
+        // first occurrence.
+        let text_start = text.as_ptr() as usize;
         let tokens: Vec<Token> = text
             .split_whitespace()
             .enumerate()
             .map(|(position, word)| {
-                // Find the actual position in the original text
-                let start_offset = text.find(word).unwrap_or(0);
+                let start_offset = word.as_ptr() as usize - text_start;
                 let end_offset = start_offset + word.len();
                 let token_type = Self::detect_token_type(word);
                 Token::with_offsets(word, position, start_offset, end_offset)
@@ -241,5 +246,52 @@ mod tests {
     #[test]
     fn test_tokenizer_name() {
         assert_eq!(WhitespaceTokenizer::new().name(), "whitespace");
+    }
+
+    /// Every token's offsets must slice back to its own text, not to some
+    /// other occurrence of the same text elsewhere in the input.
+    fn assert_offsets_match(text: &str, tokens: &[Token]) {
+        for token in tokens {
+            assert_eq!(
+                &text[token.start_offset..token.end_offset],
+                token.text,
+                "offset mismatch for token {:?} in {:?}",
+                token.text,
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_fallback_repeated_word_offsets() {
+        let tokenizer = WhitespaceTokenizer::new();
+        let text = "a b a";
+        let tokens: Vec<Token> = tokenizer.tokenize(text).unwrap().collect();
+
+        assert_eq!(tokens.len(), 3);
+        assert_offsets_match(text, &tokens);
+        assert_eq!((tokens[2].start_offset, tokens[2].end_offset), (4, 5));
+    }
+
+    #[test]
+    fn test_fallback_word_inside_earlier_word_offsets() {
+        let tokenizer = WhitespaceTokenizer::new();
+        let text = "ab b";
+        let tokens: Vec<Token> = tokenizer.tokenize(text).unwrap().collect();
+
+        assert_eq!(tokens.len(), 2);
+        assert_offsets_match(text, &tokens);
+        assert_eq!((tokens[1].start_offset, tokens[1].end_offset), (3, 4));
+    }
+
+    #[test]
+    fn test_fallback_non_ascii_repeated_word_offsets() {
+        let tokenizer = WhitespaceTokenizer::new();
+        let text = "猫 犬 猫";
+        let tokens: Vec<Token> = tokenizer.tokenize(text).unwrap().collect();
+
+        assert_eq!(tokens.len(), 3);
+        assert_offsets_match(text, &tokens);
+        assert_ne!(tokens[0].start_offset, tokens[2].start_offset);
     }
 }
