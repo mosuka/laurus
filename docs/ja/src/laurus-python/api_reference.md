@@ -567,7 +567,12 @@ class Token:
     stopped: bool
     position_increment: int
     position_length: int
+    token_type: str | None
 ```
+
+`start_offset` と `end_offset` は、元テキストの UTF-8 バイトオフセットです。非 ASCII のテキストでは `str` の添字と一致しないため、エンコードしたバイト列を切り出します: `text.encode()[tok.start_offset:tok.end_offset].decode()`。
+
+`token_type` は `"alphanum"`、`"num"`、`"cjk"`、`"katakana"`、`"hiragana"`、`"hangul"`、`"punctuation"`、`"whitespace"`、`"synonym"`、`"email"`、`"url"`、`"other"` のいずれか、または `None` です。`SynonymGraphFilter.apply` は各トークンのオフセットと種別を保ち、挿入する同義語には種別 `"synonym"` と、置き換える語のオフセットを付けます。
 
 ---
 

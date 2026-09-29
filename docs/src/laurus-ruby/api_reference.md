@@ -545,13 +545,18 @@ Token filter that expands tokens with their synonyms from a `SynonymDictionary`.
 ```ruby
 token.text                # => String  -- The token text
 token.position            # => Integer -- Position in the token stream
-token.start_offset        # => Integer -- Character start offset in the original text
-token.end_offset          # => Integer -- Character end offset in the original text
+token.start_offset        # => Integer -- UTF-8 byte start offset in the original text
+token.end_offset          # => Integer -- UTF-8 byte end offset in the original text
 token.boost               # => Float   -- Score boost factor (1.0 = no adjustment)
 token.stopped             # => Boolean -- Whether removed by a stop filter
 token.position_increment  # => Integer -- Difference from the previous token's position
 token.position_length     # => Integer -- Number of positions spanned
+token.token_type          # => String or nil -- Token type, e.g. "alphanum"
 ```
+
+The offsets count bytes, not characters; for non-ASCII text slice the bytes: `text.byteslice(token.start_offset...token.end_offset)`.
+
+`token_type` is one of `"alphanum"`, `"num"`, `"cjk"`, `"katakana"`, `"hiragana"`, `"hangul"`, `"punctuation"`, `"whitespace"`, `"synonym"`, `"email"`, `"url"` and `"other"`, or `nil`. `SynonymGraphFilter#apply` keeps each token's offsets and type, and gives each synonym it inserts the type `"synonym"` and the offsets of the words it replaces.
 
 ---
 

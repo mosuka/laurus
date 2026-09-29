@@ -20,6 +20,7 @@
 
 use crate::errors::laurus_err;
 use laurus::analysis::synonym::dictionary::SynonymDictionary;
+use laurus::analysis::token::{Token, TokenType};
 use laurus::analysis::token_filter::Filter;
 use laurus::analysis::token_filter::synonym_graph::SynonymGraphFilter;
 use laurus::analysis::tokenizer::Tokenizer;
@@ -36,21 +37,22 @@ use napi_derive::napi;
 /// Properties:
 ///   - `text` (string): The token text.
 ///   - `position` (number): Position in the token stream.
-///   - `startOffset` (number): Character start offset in the original text.
-///   - `endOffset` (number): Character end offset in the original text.
+///   - `startOffset` (number): UTF-8 byte start offset in the original text.
+///   - `endOffset` (number): UTF-8 byte end offset in the original text.
 ///   - `boost` (number): Score boost factor (1.0 = no adjustment).
 ///   - `stopped` (boolean): Whether this token has been removed by a stop filter.
 ///   - `positionIncrement` (number): Difference from the previous token's position.
 ///   - `positionLength` (number): Number of positions spanned by this token.
+///   - `tokenType` (string, optional): Token type, such as `"alphanum"` or `"synonym"`.
 #[napi(object)]
 pub struct JsToken {
     /// The token text.
     pub text: String,
     /// Position in the token stream.
     pub position: u32,
-    /// Character start offset in the original text.
+    /// UTF-8 byte start offset in the original text.
     pub start_offset: u32,
-    /// Character end offset in the original text.
+    /// UTF-8 byte end offset in the original text.
     pub end_offset: u32,
     /// Score boost factor (1.0 = no adjustment).
     pub boost: f64,
@@ -60,10 +62,13 @@ pub struct JsToken {
     pub position_increment: u32,
     /// Number of positions spanned by this token.
     pub position_length: u32,
+    /// Token type, such as `"alphanum"` or `"synonym"`. A token built by
+    /// hand may leave it out.
+    pub token_type: Option<String>,
 }
 
-impl From<laurus::analysis::token::Token> for JsToken {
-    fn from(t: laurus::analysis::token::Token) -> Self {
+impl From<Token> for JsToken {
+    fn from(t: Token) -> Self {
         Self {
             text: t.text,
             position: t.position as u32,
@@ -73,7 +78,36 @@ impl From<laurus::analysis::token::Token> for JsToken {
             stopped: t.stopped,
             position_increment: t.position_increment as u32,
             position_length: t.position_length as u32,
+            token_type: t
+                .metadata
+                .and_then(|m| m.token_type)
+                .map(|token_type| token_type.as_str().to_string()),
         }
+    }
+}
+
+/// Rebuild the core token from everything a `JsToken` carries.
+///
+/// Token metadata other than the type (original text, language,
+/// attributes) is not carried.
+impl TryFrom<JsToken> for Token {
+    type Error = napi::Error;
+
+    fn try_from(t: JsToken) -> Result<Self> {
+        let mut token = Token::with_offsets(
+            t.text,
+            t.position as usize,
+            t.start_offset as usize,
+            t.end_offset as usize,
+        )
+        .with_boost(t.boost as f32)
+        .with_position_increment(t.position_increment as usize)
+        .with_position_length(t.position_length as usize);
+        token.stopped = t.stopped;
+        if let Some(name) = t.token_type {
+            token = token.with_token_type(name.parse::<TokenType>().map_err(laurus_err)?);
+        }
+        Ok(token)
     }
 }
 
@@ -228,18 +262,12 @@ impl JsSynonymGraphFilter {
     /// A list of expanded Token objects.
     #[napi]
     pub fn apply(&self, tokens: Vec<JsToken>) -> Result<Vec<JsToken>> {
-        let rust_tokens: Vec<laurus::analysis::token::Token> = tokens
-            .iter()
-            .map(|pt| {
-                laurus::analysis::token::Token::new(pt.text.clone(), pt.position as usize)
-                    .with_boost(pt.boost as f32)
-                    .with_position_increment(pt.position_increment as usize)
-                    .with_position_length(pt.position_length as usize)
-            })
-            .collect();
+        let rust_tokens = tokens
+            .into_iter()
+            .map(Token::try_from)
+            .collect::<Result<Vec<_>>>()?;
 
-        let stream: Box<dyn Iterator<Item = laurus::analysis::token::Token> + Send> =
-            Box::new(rust_tokens.into_iter());
+        let stream: Box<dyn Iterator<Item = Token> + Send> = Box::new(rust_tokens.into_iter());
 
         self.inner
             .filter(stream)

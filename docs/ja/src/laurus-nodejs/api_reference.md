@@ -683,8 +683,15 @@ interface Token {
   stopped: boolean;
   positionIncrement: number;
   positionLength: number;
+  tokenType?: string;
 }
 ```
+
+`startOffset` と `endOffset` は、元テキストの UTF-8 バイトオフセットです。非 ASCII のテキストでは JavaScript の文字列（UTF-16）の添字と一致しないため、エンコードしたバイト列を切り出します: `new TextDecoder().decode(new TextEncoder().encode(text).slice(tok.startOffset, tok.endOffset))`。
+
+`tokenType` は `"alphanum"`、`"num"`、`"cjk"`、`"katakana"`、`"hiragana"`、`"hangul"`、`"punctuation"`、`"whitespace"`、`"synonym"`、`"email"`、`"url"`、`"other"` のいずれかです。`SynonymGraphFilter.apply` は各トークンのオフセットと種別を保ち、挿入する同義語には種別 `"synonym"` と、置き換える語のオフセットを付けます。これ以外の `tokenType` を渡すと例外を投げます。
+
+手で組み立てたトークンでは `tokenType` を省略できます。その場合、複数語の同義語は語のオフセットが連続しているときだけ一致するため、空白で区切られた語には `tokenType: "alphanum"` を付けてください。
 
 ---
 

@@ -179,6 +179,71 @@ pub enum TokenType {
     Other,
 }
 
+impl TokenType {
+    const ALL: [TokenType; 12] = [
+        TokenType::Alphanum,
+        TokenType::Num,
+        TokenType::Cjk,
+        TokenType::Katakana,
+        TokenType::Hiragana,
+        TokenType::Hangul,
+        TokenType::Punctuation,
+        TokenType::Whitespace,
+        TokenType::Synonym,
+        TokenType::Email,
+        TokenType::Url,
+        TokenType::Other,
+    ];
+
+    /// Return the lowercase name of this token type, such as `"alphanum"` or
+    /// `"synonym"`. [`FromStr`](std::str::FromStr) parses it back.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenType::Alphanum => "alphanum",
+            TokenType::Num => "num",
+            TokenType::Cjk => "cjk",
+            TokenType::Katakana => "katakana",
+            TokenType::Hiragana => "hiragana",
+            TokenType::Hangul => "hangul",
+            TokenType::Punctuation => "punctuation",
+            TokenType::Whitespace => "whitespace",
+            TokenType::Synonym => "synonym",
+            TokenType::Email => "email",
+            TokenType::Url => "url",
+            TokenType::Other => "other",
+        }
+    }
+}
+
+impl std::str::FromStr for TokenType {
+    type Err = crate::error::LaurusError;
+
+    /// Parse a token type name (case-insensitive), as returned by
+    /// [`TokenType::as_str`].
+    ///
+    /// This is the canonical parser used by all language bindings so the
+    /// accepted spelling is identical across Python, Node.js, WASM, Ruby,
+    /// and PHP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::LaurusError::invalid_argument`] for any
+    /// unrecognised value.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let name = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|token_type| token_type.as_str() == name)
+            .ok_or_else(|| {
+                let expected: Vec<&str> = Self::ALL.iter().map(TokenType::as_str).collect();
+                crate::error::LaurusError::invalid_argument(format!(
+                    "unknown token type '{s}' (expected one of: {})",
+                    expected.join(", ")
+                ))
+            })
+    }
+}
+
 /// Additional metadata that can be attached to tokens
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenMetadata {
@@ -211,7 +276,7 @@ impl Token {
         }
     }
 
-    /// Create a new token with text, position, and character offsets.
+    /// Create a new token with text, position, and byte offsets.
     pub fn with_offsets<S: Into<String>>(
         text: S,
         position: usize,
@@ -675,5 +740,36 @@ mod tests {
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].text, "hello");
         assert_eq!(collected[1].text, "world");
+    }
+
+    #[test]
+    fn token_type_names_parse_back() {
+        for token_type in TokenType::ALL {
+            assert_eq!(
+                token_type.as_str().parse::<TokenType>().unwrap(),
+                token_type
+            );
+        }
+    }
+
+    #[test]
+    fn token_type_parse_ignores_case_and_surrounding_space() {
+        assert_eq!(
+            " AlphaNum ".parse::<TokenType>().unwrap(),
+            TokenType::Alphanum
+        );
+    }
+
+    #[test]
+    fn unknown_token_type_is_an_invalid_argument() {
+        let err = "bogus".parse::<TokenType>().unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::error::LaurusError::InvalidArgument(m)
+                    if m.starts_with("unknown token type 'bogus' (expected one of: alphanum, num,")
+            ),
+            "{err}"
+        );
     }
 }

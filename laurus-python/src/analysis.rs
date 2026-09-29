@@ -16,6 +16,7 @@
 
 use crate::errors::laurus_err;
 use laurus::analysis::synonym::dictionary::SynonymDictionary;
+use laurus::analysis::token::{Token, TokenType};
 use laurus::analysis::token_filter::Filter;
 use laurus::analysis::token_filter::synonym_graph::SynonymGraphFilter;
 use laurus::analysis::tokenizer::Tokenizer;
@@ -31,12 +32,13 @@ use pyo3::prelude::*;
 /// Attributes:
 ///     text (str): The token text.
 ///     position (int): Position in the token stream.
-///     start_offset (int): Character start offset in the original text.
-///     end_offset (int): Character end offset in the original text.
+///     start_offset (int): UTF-8 byte start offset in the original text.
+///     end_offset (int): UTF-8 byte end offset in the original text.
 ///     boost (float): Score boost factor (1.0 = no adjustment).
 ///     stopped (bool): Whether this token has been removed by a stop filter.
 ///     position_increment (int): Difference from the previous token's position.
 ///     position_length (int): Number of positions spanned by this token.
+///     token_type (str | None): Token type, such as "alphanum" or "synonym".
 #[pyclass(name = "Token")]
 pub struct PyToken {
     #[pyo3(get)]
@@ -55,10 +57,17 @@ pub struct PyToken {
     pub position_increment: usize,
     #[pyo3(get)]
     pub position_length: usize,
+    pub token_type: Option<TokenType>,
 }
 
 #[pymethods]
 impl PyToken {
+    /// Token type, such as `"alphanum"` or `"synonym"`, or `None`.
+    #[getter]
+    fn token_type(&self) -> Option<&'static str> {
+        self.token_type.map(|token_type| token_type.as_str())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Token(text='{}', position={}, boost={:.2}, pos_inc={}, pos_len={})",
@@ -67,8 +76,8 @@ impl PyToken {
     }
 }
 
-impl From<laurus::analysis::token::Token> for PyToken {
-    fn from(t: laurus::analysis::token::Token) -> Self {
+impl From<Token> for PyToken {
+    fn from(t: Token) -> Self {
         Self {
             text: t.text,
             position: t.position,
@@ -78,7 +87,27 @@ impl From<laurus::analysis::token::Token> for PyToken {
             stopped: t.stopped,
             position_increment: t.position_increment,
             position_length: t.position_length,
+            token_type: t.metadata.and_then(|m| m.token_type),
         }
+    }
+}
+
+/// Rebuild the core token from everything a `PyToken` carries.
+///
+/// Token metadata other than the type (original text, language,
+/// attributes) is not carried.
+impl From<&PyToken> for Token {
+    fn from(t: &PyToken) -> Self {
+        let mut token =
+            Token::with_offsets(t.text.clone(), t.position, t.start_offset, t.end_offset)
+                .with_boost(t.boost)
+                .with_position_increment(t.position_increment)
+                .with_position_length(t.position_length);
+        token.stopped = t.stopped;
+        if let Some(token_type) = t.token_type {
+            token = token.with_token_type(token_type);
+        }
+        token
     }
 }
 
@@ -222,19 +251,9 @@ impl PySynonymGraphFilter {
     /// Returns:
     ///     A list of expanded [`Token`] objects.
     pub fn apply(&self, tokens: Vec<PyRef<PyToken>>) -> PyResult<Vec<PyToken>> {
-        // Reconstruct Rust Tokens from PyToken references
-        let rust_tokens: Vec<laurus::analysis::token::Token> = tokens
-            .iter()
-            .map(|pt| {
-                laurus::analysis::token::Token::new(pt.text.clone(), pt.position)
-                    .with_boost(pt.boost)
-                    .with_position_increment(pt.position_increment)
-                    .with_position_length(pt.position_length)
-            })
-            .collect();
+        let rust_tokens: Vec<Token> = tokens.iter().map(|t| Token::from(&**t)).collect();
 
-        let stream: Box<dyn Iterator<Item = laurus::analysis::token::Token> + Send> =
-            Box::new(rust_tokens.into_iter());
+        let stream: Box<dyn Iterator<Item = Token> + Send> = Box::new(rust_tokens.into_iter());
 
         self.inner
             .filter(stream)

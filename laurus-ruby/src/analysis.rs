@@ -4,6 +4,7 @@ use std::cell::RefCell;
 
 use crate::errors::laurus_err;
 use laurus::analysis::synonym::dictionary::SynonymDictionary;
+use laurus::analysis::token::{Token, TokenType};
 use laurus::analysis::token_filter::Filter;
 use laurus::analysis::token_filter::synonym_graph::SynonymGraphFilter;
 use laurus::analysis::tokenizer::Tokenizer;
@@ -21,12 +22,13 @@ use magnus::{Error, RArray, RHash, RModule, Ruby, Value};
 /// Attributes:
 ///   - `text` (String): The token text.
 ///   - `position` (Integer): Position in the token stream.
-///   - `start_offset` (Integer): Character start offset in the original text.
-///   - `end_offset` (Integer): Character end offset in the original text.
+///   - `start_offset` (Integer): UTF-8 byte start offset in the original text.
+///   - `end_offset` (Integer): UTF-8 byte end offset in the original text.
 ///   - `boost` (Float): Score boost factor (1.0 = no adjustment).
 ///   - `stopped` (bool): Whether this token has been removed by a stop filter.
 ///   - `position_increment` (Integer): Difference from the previous token's position.
 ///   - `position_length` (Integer): Number of positions spanned by this token.
+///   - `token_type` (String or nil): Token type, such as `"alphanum"` or `"synonym"`.
 #[magnus::wrap(class = "Laurus::Token")]
 pub struct RbToken {
     pub text: String,
@@ -37,6 +39,7 @@ pub struct RbToken {
     pub stopped: bool,
     pub position_increment: usize,
     pub position_length: usize,
+    pub token_type: Option<TokenType>,
 }
 
 impl RbToken {
@@ -72,6 +75,10 @@ impl RbToken {
     fn position_length(&self) -> usize {
         self.position_length
     }
+    /// Return the token type, such as `"alphanum"` or `"synonym"`, or nil.
+    fn token_type(&self) -> Option<&'static str> {
+        self.token_type.map(|token_type| token_type.as_str())
+    }
     fn inspect(&self) -> String {
         format!(
             "Token(text='{}', position={}, boost={:.2}, pos_inc={}, pos_len={})",
@@ -80,8 +87,8 @@ impl RbToken {
     }
 }
 
-impl From<laurus::analysis::token::Token> for RbToken {
-    fn from(t: laurus::analysis::token::Token) -> Self {
+impl From<Token> for RbToken {
+    fn from(t: Token) -> Self {
         Self {
             text: t.text,
             position: t.position,
@@ -91,7 +98,27 @@ impl From<laurus::analysis::token::Token> for RbToken {
             stopped: t.stopped,
             position_increment: t.position_increment,
             position_length: t.position_length,
+            token_type: t.metadata.and_then(|m| m.token_type),
         }
+    }
+}
+
+/// Rebuild the core token from everything an `RbToken` carries.
+///
+/// Token metadata other than the type (original text, language,
+/// attributes) is not carried.
+impl From<&RbToken> for Token {
+    fn from(t: &RbToken) -> Self {
+        let mut token =
+            Token::with_offsets(t.text.clone(), t.position, t.start_offset, t.end_offset)
+                .with_boost(t.boost)
+                .with_position_increment(t.position_increment)
+                .with_position_length(t.position_length);
+        token.stopped = t.stopped;
+        if let Some(token_type) = t.token_type {
+            token = token.with_token_type(token_type);
+        }
+        token
     }
 }
 
@@ -244,16 +271,10 @@ impl RbSynonymGraphFilter {
         for i in 0..len {
             let val: Value = tokens.entry(i as isize)?;
             let pt: &RbToken = <&RbToken>::try_convert(val)?;
-            rust_tokens.push(
-                laurus::analysis::token::Token::new(pt.text.clone(), pt.position)
-                    .with_boost(pt.boost)
-                    .with_position_increment(pt.position_increment)
-                    .with_position_length(pt.position_length),
-            );
+            rust_tokens.push(Token::from(pt));
         }
 
-        let stream: Box<dyn Iterator<Item = laurus::analysis::token::Token> + Send> =
-            Box::new(rust_tokens.into_iter());
+        let stream: Box<dyn Iterator<Item = Token> + Send> = Box::new(rust_tokens.into_iter());
 
         let result: Vec<RbToken> = self
             .inner
@@ -295,6 +316,7 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
         "position_length",
         magnus::method!(RbToken::position_length, 0),
     )?;
+    token.define_method("token_type", magnus::method!(RbToken::token_type, 0))?;
     token.define_method("inspect", magnus::method!(RbToken::inspect, 0))?;
     token.define_method("to_s", magnus::method!(RbToken::inspect, 0))?;
 

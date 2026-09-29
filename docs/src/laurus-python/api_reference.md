@@ -628,7 +628,12 @@ class Token:
     stopped: bool
     position_increment: int
     position_length: int
+    token_type: str | None
 ```
+
+`start_offset` and `end_offset` are UTF-8 byte offsets into the original text. For non-ASCII text they are not `str` indices; slice the encoded text instead: `text.encode()[tok.start_offset:tok.end_offset].decode()`.
+
+`token_type` is one of `"alphanum"`, `"num"`, `"cjk"`, `"katakana"`, `"hiragana"`, `"hangul"`, `"punctuation"`, `"whitespace"`, `"synonym"`, `"email"`, `"url"` and `"other"`, or `None`. `SynonymGraphFilter.apply` keeps each token's offsets and type, and gives each synonym it inserts the type `"synonym"` and the offsets of the words it replaces.
 
 ---
 

@@ -503,5 +503,90 @@ describe("Text analysis", () => {
     expect(typeof tok.positionIncrement).toBe("number");
     expect(typeof tok.positionLength).toBe("number");
     expect(typeof tok.boost).toBe("number");
+    expect([tok.startOffset, tok.endOffset]).toEqual([0, 5]);
+    expect(tok.tokenType).toBe("alphanum");
+  });
+
+  it("synonym graph filter keeps offsets and token types", () => {
+    const syn = new SynonymDictionary();
+    syn.addSynonymGroup(["ml", "machine learning"]);
+    const filter = new SynonymGraphFilter(syn);
+
+    const tokens = new WhitespaceTokenizer().tokenize("ml tutorial");
+    const byText = Object.fromEntries(
+      filter.apply(tokens).map((t) => [t.text, t]),
+    );
+
+    // Each synonym token carries the offsets of the word it replaces.
+    for (const text of ["ml", "machine", "learning"]) {
+      expect([byText[text].startOffset, byText[text].endOffset]).toEqual([
+        0, 2,
+      ]);
+    }
+    expect([byText.tutorial.startOffset, byText.tutorial.endOffset]).toEqual([
+      3, 11,
+    ]);
+    expect(byText.ml.tokenType).toBe("alphanum");
+    expect(byText.tutorial.tokenType).toBe("alphanum");
+    expect(byText.machine.tokenType).toBe("synonym");
+    expect(byText.learning.tokenType).toBe("synonym");
+  });
+
+  it("synonym graph filter does not match across a gap", () => {
+    const syn = new SynonymDictionary();
+    syn.addSynonymGroup(["東京大学", "東大"]);
+    const filter = new SynonymGraphFilter(syn);
+
+    // CJK words must touch to form one word, and a space separates these.
+    const tokens = new WhitespaceTokenizer().tokenize("東京 大学");
+    expect(filter.apply(tokens).map((t) => t.text)).toEqual(["東京", "大学"]);
+  });
+
+  it("synonym graph filter matches alphanumeric words across a space", () => {
+    const syn = new SynonymDictionary();
+    syn.addSynonymGroup(["ml", "machine learning"]);
+    const filter = new SynonymGraphFilter(syn);
+
+    const tokens = new WhitespaceTokenizer().tokenize("machine learning");
+    expect(filter.apply(tokens).map((t) => t.text)).toContain("ml");
+  });
+
+  it("synonym graph filter accepts a token built by hand without a type", () => {
+    const syn = new SynonymDictionary();
+    syn.addSynonymGroup(["ml", "machine learning"]);
+    const filter = new SynonymGraphFilter(syn);
+
+    const token = {
+      text: "ml",
+      position: 0,
+      startOffset: 0,
+      endOffset: 2,
+      boost: 1.0,
+      stopped: false,
+      positionIncrement: 1,
+      positionLength: 1,
+    };
+    const result = filter.apply([token]);
+    expect(result.map((t) => t.text)).toContain("machine");
+    expect(result.find((t) => t.text === "ml").tokenType).toBeUndefined();
+  });
+
+  it("synonym graph filter rejects an unknown token type", () => {
+    const syn = new SynonymDictionary();
+    syn.addSynonymGroup(["ml", "machine learning"]);
+    const filter = new SynonymGraphFilter(syn);
+
+    const token = {
+      text: "ml",
+      position: 0,
+      startOffset: 0,
+      endOffset: 2,
+      boost: 1.0,
+      stopped: false,
+      positionIncrement: 1,
+      positionLength: 1,
+      tokenType: "bogus",
+    };
+    expect(() => filter.apply([token])).toThrow(/unknown token type 'bogus'/);
   });
 });

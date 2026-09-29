@@ -541,13 +541,18 @@ expanded = filter.apply(tokens)
 ```ruby
 token.text                # => String  -- トークンテキスト
 token.position            # => Integer -- トークンストリーム内の位置
-token.start_offset        # => Integer -- 元テキスト内の文字開始オフセット
-token.end_offset          # => Integer -- 元テキスト内の文字終了オフセット
+token.start_offset        # => Integer -- 元テキスト内の UTF-8 バイト開始オフセット
+token.end_offset          # => Integer -- 元テキスト内の UTF-8 バイト終了オフセット
 token.boost               # => Float   -- スコアブースト係数（1.0 = 調整なし）
 token.stopped             # => Boolean -- ストップフィルターによって除去されたかどうか
 token.position_increment  # => Integer -- 前のトークンの位置との差分
 token.position_length     # => Integer -- このトークンがカバーする位置数
+token.token_type          # => String または nil -- トークン種別（例: "alphanum"）
 ```
+
+オフセットは文字数ではなくバイト数です。非 ASCII のテキストではバイト単位で切り出します: `text.byteslice(token.start_offset...token.end_offset)`。
+
+`token_type` は `"alphanum"`、`"num"`、`"cjk"`、`"katakana"`、`"hiragana"`、`"hangul"`、`"punctuation"`、`"whitespace"`、`"synonym"`、`"email"`、`"url"`、`"other"` のいずれか、または `nil` です。`SynonymGraphFilter#apply` は各トークンのオフセットと種別を保ち、挿入する同義語には種別 `"synonym"` と、置き換える語のオフセットを付けます。
 
 ---
 

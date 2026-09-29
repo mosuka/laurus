@@ -875,6 +875,59 @@ class LaurusTest extends TestCase
         $this->assertContains("joyful", $texts);
     }
 
+    public function testTokenOffsetsAndType(): void
+    {
+        $tokens = (new Laurus\WhitespaceTokenizer())->tokenize("hello");
+        $this->assertSame([0, 5], [$tokens[0]->getStartOffset(), $tokens[0]->getEndOffset()]);
+        $this->assertSame("alphanum", $tokens[0]->getTokenType());
+    }
+
+    public function testSynonymGraphFilterKeepsOffsetsAndTokenTypes(): void
+    {
+        $dict = new Laurus\SynonymDictionary();
+        $dict->addSynonymGroup(["ml", "machine learning"]);
+        $filter = new Laurus\SynonymGraphFilter($dict);
+
+        $tokens = (new Laurus\WhitespaceTokenizer())->tokenize("ml tutorial");
+        $byText = [];
+        foreach ($filter->apply($tokens) as $t) {
+            $byText[$t->getText()] = $t;
+        }
+
+        // Each synonym token carries the offsets of the word it replaces.
+        foreach (["ml", "machine", "learning"] as $text) {
+            $this->assertSame([0, 2], [$byText[$text]->getStartOffset(), $byText[$text]->getEndOffset()]);
+        }
+        $this->assertSame([3, 11], [$byText["tutorial"]->getStartOffset(), $byText["tutorial"]->getEndOffset()]);
+        $this->assertSame("alphanum", $byText["ml"]->getTokenType());
+        $this->assertSame("alphanum", $byText["tutorial"]->getTokenType());
+        $this->assertSame("synonym", $byText["machine"]->getTokenType());
+        $this->assertSame("synonym", $byText["learning"]->getTokenType());
+    }
+
+    public function testSynonymGraphFilterDoesNotMatchAcrossAGap(): void
+    {
+        $dict = new Laurus\SynonymDictionary();
+        $dict->addSynonymGroup(["東京大学", "東大"]);
+        $filter = new Laurus\SynonymGraphFilter($dict);
+
+        // CJK words must touch to form one word, and a space separates these.
+        $tokens = (new Laurus\WhitespaceTokenizer())->tokenize("東京 大学");
+        $texts = array_map(fn($t) => $t->getText(), $filter->apply($tokens));
+        $this->assertSame(["東京", "大学"], $texts);
+    }
+
+    public function testSynonymGraphFilterMatchesAlphanumericWordsAcrossASpace(): void
+    {
+        $dict = new Laurus\SynonymDictionary();
+        $dict->addSynonymGroup(["ml", "machine learning"]);
+        $filter = new Laurus\SynonymGraphFilter($dict);
+
+        $tokens = (new Laurus\WhitespaceTokenizer())->tokenize("machine learning");
+        $texts = array_map(fn($t) => $t->getText(), $filter->apply($tokens));
+        $this->assertContains("ml", $texts);
+    }
+
     // ── SearchResult ────────────────────────────────────────────────────
 
     public function testSearchResultDocument(): void
