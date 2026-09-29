@@ -248,6 +248,55 @@ mod tests {
         }
     }
 
+    /// A second match starts on the end node of the first, past the inner
+    /// nodes of all its multi-word members.
+    #[test]
+    fn consecutive_matches_start_on_each_others_end_node() {
+        use crate::analysis::token::token_positions;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec![
+            "ml".to_string(),
+            "machine learning".to_string(),
+            "statistical machine learning".to_string(),
+        ]);
+        let filter = SynonymGraphFilter::with_tokenizer(dict, Box::new(WhitespaceTokenizer), true);
+
+        let tokens: Vec<Token> = ["ml", "ml", "is"]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Token::new(*text, i))
+            .collect();
+        let result: Vec<Token> = filter
+            .filter(Box::new(tokens.into_iter()))
+            .unwrap()
+            .collect();
+        let arcs: Vec<(&str, u32, u32)> = result
+            .iter()
+            .zip(token_positions(&result))
+            .map(|(t, from)| (t.text.as_str(), from, from + t.position_length as u32))
+            .collect();
+        assert_eq!(
+            arcs,
+            vec![
+                ("ml", 0, 4),
+                ("machine", 0, 1),
+                ("statistical", 0, 2),
+                ("learning", 1, 4),
+                ("machine", 2, 3),
+                ("learning", 3, 4),
+                ("ml", 4, 8),
+                ("machine", 4, 5),
+                ("statistical", 4, 6),
+                ("learning", 5, 8),
+                ("machine", 6, 7),
+                ("learning", 7, 8),
+                ("is", 8, 9),
+            ]
+        );
+    }
+
     #[test]
     fn test_synonym_graph_filter_multi_word() {
         let mut dict = SynonymDictionary::new(None).unwrap();

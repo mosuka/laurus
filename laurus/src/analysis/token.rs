@@ -65,6 +65,7 @@
 //! );
 //! ```
 
+use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -375,7 +376,9 @@ impl IntoTokenStream for Vec<Token> {
 /// filter leaves one (a removed stop word does not), so a stream without
 /// stacked tokens is numbered 0, 1, 2, … The indexer, the highlighter and
 /// the query parser all number tokens through this type, so a phrase
-/// compares the same positions on both sides.
+/// compares the same positions on both sides. The indexer and the
+/// highlighter number a stream after [`flatten_token_graph`], since the
+/// index stores no `position_length`.
 #[derive(Debug, Default)]
 pub(crate) struct TokenPositions {
     current: Option<u32>,
@@ -398,6 +401,69 @@ impl TokenPositions {
 pub(crate) fn token_positions(tokens: &[Token]) -> Vec<u32> {
     let mut positions = TokenPositions::default();
     tokens.iter().map(|token| positions.assign(token)).collect()
+}
+
+/// Lay a token graph out on the positions the index stores.
+///
+/// A token is an arc from its node ([`token_positions`]) to its node +
+/// `position_length`. When alternatives have inner nodes of their own,
+/// such as the members of a multi-word synonym group, every node moves to
+/// the most arcs on a path to it, so the alternatives' words share
+/// positions, as Lucene's `FlattenGraphFilter` lays them out. A node no
+/// arc reaches follows the node before it. Tokens are then ordered by
+/// position, keeping their order within one, and get increment 0 when
+/// stacked and 1 otherwise (the first token keeps its own), and the
+/// `position_length` between their new positions. Offsets are kept.
+///
+/// A stream whose tokens all span one position is already flat and comes
+/// back unchanged.
+pub(crate) fn flatten_token_graph(tokens: Vec<Token>) -> Vec<Token> {
+    if tokens.iter().all(|token| token.position_length <= 1) {
+        return tokens;
+    }
+
+    let nodes = token_positions(&tokens);
+    // The new position of each node an arc reaches, so far. Arcs only go
+    // forward, so a node's entry is final once the stream gets to it.
+    let mut reached: HashMap<u32, u32> = HashMap::new();
+    let mut previous: Option<(u32, u32)> = None;
+    let mut arcs = Vec::with_capacity(tokens.len());
+    for (token, &node) in tokens.iter().zip(&nodes) {
+        let from = match previous {
+            Some((previous_node, position)) if previous_node == node => position,
+            Some((_, position)) => reached
+                .get(&node)
+                .copied()
+                .unwrap_or(position.saturating_add(1)),
+            None => 0,
+        };
+        previous = Some((node, from));
+        let length = u32::try_from(token.position_length.max(1)).unwrap_or(u32::MAX);
+        let to = node.saturating_add(length);
+        let position = reached.entry(to).or_insert(0);
+        *position = (*position).max(from.saturating_add(1));
+        arcs.push((from, to));
+    }
+
+    let mut laid_out: Vec<(Token, u32, u32)> = tokens
+        .into_iter()
+        .zip(arcs)
+        .map(|(token, (from, to))| (token, from, reached[&to]))
+        .collect();
+    laid_out.sort_by_key(|&(_, from, _)| from);
+
+    let mut previous_position = None;
+    laid_out
+        .into_iter()
+        .map(|(mut token, from, to)| {
+            if let Some(previous_position) = previous_position {
+                token.position_increment = usize::from(previous_position != from);
+            }
+            previous_position = Some(from);
+            token.position_length = (to - from) as usize;
+            token
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -440,6 +506,110 @@ mod tests {
     #[test]
     fn no_tokens_no_positions() {
         assert!(token_positions(&[]).is_empty());
+    }
+
+    fn arc(text: &str, increment: usize, length: usize, offsets: (usize, usize)) -> Token {
+        Token::with_offsets(text, 0, offsets.0, offsets.1)
+            .with_position_increment(increment)
+            .with_position_length(length)
+    }
+
+    /// Text, increment, length and offsets of each token, in order.
+    fn shape(tokens: &[Token]) -> Vec<(&str, usize, usize, (usize, usize))> {
+        tokens
+            .iter()
+            .map(|t| {
+                (
+                    t.text.as_str(),
+                    t.position_increment,
+                    t.position_length,
+                    (t.start_offset, t.end_offset),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stream_of_one_position_arcs_is_already_flat() {
+        let tokens = vec![
+            arc("a", 1, 1, (0, 1)),
+            arc("big", 1, 1, (2, 5)),
+            arc("large", 0, 1, (2, 5)),
+            arc("dog", 1, 1, (6, 9)),
+        ];
+        assert_eq!(flatten_token_graph(tokens.clone()), tokens);
+        assert!(flatten_token_graph(Vec::new()).is_empty());
+    }
+
+    /// Alternatives whose words share the inner nodes are already laid out
+    /// on the longest path.
+    #[test]
+    fn a_graph_without_side_nodes_is_unchanged() {
+        let tokens = vec![
+            arc("ml", 1, 3, (0, 2)),
+            arc("machine", 0, 1, (0, 2)),
+            arc("statistical", 0, 1, (0, 2)),
+            arc("learning", 1, 2, (0, 2)),
+            arc("machine", 0, 1, (0, 2)),
+            arc("learning", 1, 1, (0, 2)),
+            arc("is", 1, 1, (3, 5)),
+        ];
+        assert_eq!(flatten_token_graph(tokens.clone()), tokens);
+    }
+
+    /// "statistical machine learning is" with "ml" and "machine learning":
+    /// the kept words have inner nodes 1 and 2, the two-word synonym node 3.
+    /// Node 3 moves back to position 1, so its token moves before the one
+    /// at node 2, and every token keeps its offsets.
+    #[test]
+    fn side_nodes_move_onto_the_longest_path() {
+        let graph = vec![
+            arc("statistical", 1, 1, (0, 11)),
+            arc("ml", 0, 4, (0, 28)),
+            arc("machine", 0, 3, (0, 28)),
+            arc("machine", 1, 1, (12, 19)),
+            arc("learning", 1, 2, (20, 28)),
+            arc("learning", 1, 1, (0, 28)),
+            arc("is", 1, 1, (29, 31)),
+        ];
+        let flat = flatten_token_graph(graph);
+        assert_eq!(
+            shape(&flat),
+            vec![
+                ("statistical", 1, 1, (0, 11)),
+                ("ml", 0, 3, (0, 28)),
+                ("machine", 0, 1, (0, 28)),
+                ("machine", 1, 1, (12, 19)),
+                ("learning", 0, 2, (0, 28)),
+                ("learning", 1, 1, (20, 28)),
+                ("is", 1, 1, (29, 31)),
+            ]
+        );
+        assert_eq!(token_positions(&flat), vec![0, 0, 0, 1, 1, 2, 3]);
+    }
+
+    /// A filter removed "machine" from "ml" → "machine learning", so no
+    /// arc reaches the node of "learning"; it follows the node before it,
+    /// as [`token_positions`] numbers it.
+    #[test]
+    fn a_node_no_arc_reaches_follows_the_one_before() {
+        let tokens = vec![
+            arc("ml", 1, 2, (0, 2)),
+            arc("learning", 1, 1, (0, 2)),
+            arc("is", 1, 1, (3, 5)),
+        ];
+        let flat = flatten_token_graph(tokens.clone());
+        assert_eq!(flat, tokens);
+        assert_eq!(token_positions(&flat), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_huge_position_length_does_not_overflow() {
+        let flat = flatten_token_graph(vec![
+            arc("a", 1, usize::MAX, (0, 1)),
+            arc("b", 1, 1, (2, 3)),
+        ]);
+        assert_eq!(token_positions(&flat), vec![0, 1]);
     }
 
     #[test]

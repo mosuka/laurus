@@ -241,3 +241,116 @@ async fn phrase_through_a_synonym_is_highlighted() -> Result<()> {
     );
     Ok(())
 }
+
+// ---- Groups with several multi-word members (#1262) ----
+
+const MEMBERS_SCHEMA_TOML: &str = r#"
+default_fields = ["body"]
+
+[fields.body.Text]
+indexed = true
+stored = true
+analyzer = "members"
+"#;
+
+const MEMBER_DOCS: [(&str, &str); 7] = [
+    ("ml", "ml is fun"),
+    ("machine_learning", "machine learning is fun"),
+    (
+        "statistical_machine_learning",
+        "statistical machine learning is fun",
+    ),
+    ("statistical_learning", "statistical learning is fun"),
+    ("new_york", "new york is big"),
+    ("big_apple", "the big apple is big"),
+    ("new_apple", "a new apple is big"),
+];
+
+const MLS3: &[&str] = &["ml", "machine_learning", "statistical_machine_learning"];
+const NYS: &[&str] = &["new_york", "big_apple"];
+
+/// {ml, machine learning, statistical machine learning} has members of
+/// different lengths, {new york, big apple} of the same length.
+fn members_analyzer() -> Arc<dyn Analyzer> {
+    let mut dict = SynonymDictionary::new(None).unwrap();
+    dict.add_synonym_group(vec![
+        "ml".to_string(),
+        "machine learning".to_string(),
+        "statistical machine learning".to_string(),
+    ]);
+    dict.add_synonym_group(vec!["new york".to_string(), "big apple".to_string()]);
+    Arc::new(plain_analyzer().add_filter(Arc::new(SynonymGraphFilter::new(dict, true))))
+}
+
+async fn members_engine() -> Result<Engine> {
+    let schema = Schema::from_toml(MEMBERS_SCHEMA_TOML)?;
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let engine = Engine::builder(storage, schema)
+        .register_runtime_analyzer("members", members_analyzer())
+        .build()
+        .await?;
+    for (id, text) in MEMBER_DOCS {
+        engine
+            .put_document(id, Document::builder().add_text("body", text).build())
+            .await?;
+    }
+    engine.commit().await?;
+    Ok(engine)
+}
+
+/// A quoted member expands into each member of its group, not into a mix
+/// of their words such as "statistical learning" or "new apple".
+#[tokio::test(flavor = "multi_thread")]
+async fn quoted_member_matches_each_member_and_no_mix_of_them() -> Result<()> {
+    let engine = members_engine().await?;
+    let cases: &[(&str, &[&str])] = &[
+        ("body:\"ml\"", MLS3),
+        ("body:\"machine learning\"", MLS3),
+        ("body:\"statistical machine learning\"", MLS3),
+        ("body:\"ml is fun\"", MLS3),
+        ("body:\"new york\"", NYS),
+        ("body:\"big apple\"", NYS),
+    ];
+    for (dsl, expected) in cases {
+        assert_eq!(search_dsl(&engine, dsl).await?, sorted(expected), "{dsl}");
+    }
+    Ok(())
+}
+
+/// The index stores no `position_length`, so the members' words still
+/// share positions there, as in Lucene: a document with one member
+/// matches a phrase mixing two of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_still_share_positions_in_the_index() -> Result<()> {
+    let engine = members_engine().await?;
+    let mut expected = MLS3.to_vec();
+    expected.push("statistical_learning");
+    assert_eq!(
+        search_dsl(&engine, "body:\"statistical learning\"").await?,
+        sorted(&expected)
+    );
+    Ok(())
+}
+
+/// The highlighter numbers the text as the index does, so the phrase it
+/// marks is the one the index matched: the kept "learning" before "is",
+/// not the synonym's "learning" that spans the whole match.
+#[tokio::test(flavor = "multi_thread")]
+async fn phrase_is_highlighted_where_the_index_matches_it() -> Result<()> {
+    let engine = members_engine().await?;
+    let request = SearchRequestBuilder::new()
+        .query_dsl("body:\"learning is\"")
+        .highlight(vec!["body".to_string()])
+        .limit(10)
+        .build();
+    let results = engine.search(request).await?;
+    let hit = results
+        .iter()
+        .find(|hit| hit.id == "statistical_machine_learning")
+        .expect("statistical_machine_learning must match");
+    assert_eq!(
+        hit.highlights["body"],
+        vec!["statistical machine <mark>learning is</mark> fun"]
+    );
+    Ok(())
+}

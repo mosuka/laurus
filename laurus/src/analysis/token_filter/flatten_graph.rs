@@ -2,11 +2,12 @@
 //!
 //! This filter converts an incoming graph token stream (such as one from SynonymGraphFilter)
 //! into a flat form so that all nodes form a single linear chain with no side paths.
-//! This is necessary when indexing a graph token stream, because the index does not save
-//! position_length and so it cannot preserve the graph structure.
 //!
-//! Note: At search time, query parsers can correctly handle the graph and this filter
-//! should NOT be used.
+//! Laurus's index already lays a token graph out this way when it stores the
+//! positions, because it does not save position_length. An engine parses
+//! queries with the same analyzer, so adding this filter to it flattens query-time
+//! graphs too, and a quoted value then also matches mixes of the words of a group's
+//! multi-word members.
 
 use std::collections::VecDeque;
 
@@ -64,14 +65,11 @@ impl OutputNode {
 
 /// Flatten graph filter that converts graph token streams to linear form.
 ///
-/// This filter is necessary when indexing tokens that have graph structure
-/// (e.g., from SynonymGraphFilter) because the index cannot preserve the
-/// position_length attribute.
-///
-/// # Usage
-///
-/// For indexing: Tokenizer -> ... -> SynonymGraphFilter -> FlattenGraphFilter
-/// For querying: Tokenizer -> ... -> SynonymGraphFilter (no flatten needed)
+/// The index cannot preserve the position_length attribute, so it flattens
+/// graph token streams (e.g., from SynonymGraphFilter) itself; an analyzer
+/// does not need this filter for indexing. Since the same analyzer parses
+/// queries, adding it there loses the graph a quoted value is matched
+/// through.
 pub struct FlattenGraphFilter;
 
 impl FlattenGraphFilter {
@@ -387,12 +385,13 @@ mod tests {
         );
     }
 
-    /// `SynonymGraphFilter` emits an already flat graph (no side nodes), so
-    /// flattening it must not move any token, including when paths of 1, 2
-    /// and 3 words share the inner nodes.
+    /// `SynonymGraphFilter` gives each multi-word member inner nodes of its
+    /// own. This filter lays that graph out on the same positions as the
+    /// indexer's `flatten_token_graph`, for paths of 1, 2 and 3 words.
     #[test]
-    fn synonym_graph_output_is_already_flat() {
+    fn synonym_graph_output_flattens_to_the_indexed_positions() {
         use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token::{flatten_token_graph, token_positions};
         use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
         use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
 
@@ -423,13 +422,19 @@ mod tests {
                 .filter(Box::new(graph.clone().into_iter()))
                 .unwrap()
                 .collect();
-            let shape = |tokens: &[Token]| -> Vec<(String, usize, usize)> {
-                tokens
-                    .iter()
-                    .map(|t| (t.text.clone(), t.position_increment, t.position_length))
-                    .collect()
+            let positions = |tokens: &[Token]| -> Vec<(u32, String)> {
+                let mut positions: Vec<(u32, String)> = token_positions(tokens)
+                    .into_iter()
+                    .zip(tokens.iter().map(|t| t.text.clone()))
+                    .collect();
+                positions.sort();
+                positions
             };
-            assert_eq!(shape(&flat), shape(&graph), "{input:?}");
+            assert_eq!(
+                positions(&flat),
+                positions(&flatten_token_graph(graph)),
+                "{input:?}"
+            );
         }
     }
 }

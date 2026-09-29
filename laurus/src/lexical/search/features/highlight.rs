@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::{Token, token_positions};
+use crate::analysis::token::{Token, flatten_token_graph, token_positions};
 use crate::error::Result;
 use crate::lexical::index::inverted::core::automaton::{Automaton, LevenshteinAutomaton};
 use crate::lexical::query::{HighlightTerm, Query};
@@ -381,6 +381,8 @@ impl Highlighter {
             }
         }
 
+        // Phrases compare positions as the index stores them.
+        let buffered = flatten_token_graph(buffered);
         for (phrase, slop) in &phrases {
             spans.extend(phrase_spans(&buffered, phrase, *slop));
         }
@@ -828,7 +830,8 @@ fn ceil_boundary(text: &str, pos: usize) -> usize {
     pos
 }
 
-/// Spans of `phrase` within `tokens` (analyzer output in text order).
+/// Spans of `phrase` within `tokens` (analyzer output in text order, laid
+/// out by [`flatten_token_graph`]).
 ///
 /// Mirrors the index-side phrase matcher: the first term anchors, each
 /// following term must appear at the first position in
