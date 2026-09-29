@@ -42,6 +42,7 @@ use crate::lexical::query::geo3d::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Ge
 use crate::lexical::query::graph_phrase::{GraphPhraseQuery, PhraseArc, complete_paths};
 use crate::lexical::query::phrase::PhraseQuery;
 use crate::lexical::query::range::{Bound, DateTimeRangeQuery, NumericRangeQuery, RangeQuery};
+use crate::lexical::query::synonym::SynonymQuery;
 use crate::lexical::query::term::TermQuery;
 use crate::lexical::query::wildcard::WildcardQuery;
 
@@ -732,14 +733,18 @@ impl LexicalQueryParser {
     ///
     /// The analyzer's output is read as a token graph (#1252; see
     /// [`phrase_graph`]). Tokens stacked at one position (synonyms) are
-    /// alternatives: one position becomes a `Should` of `TermQuery`, like
-    /// Lucene's `SynonymQuery`, and a longer phrase a `PhraseQuery` with
-    /// the alternatives at that position. A multi-word synonym makes
-    /// several paths. The one-position paths are terms, and the others are
-    /// one `PhraseQuery` when there is one of them and a `GraphPhraseQuery`
-    /// otherwise, which matches them all without listing them (#1271); the
-    /// query is a `Should` of these. The boost goes on each clause, since
-    /// the Block-Max-WAND fast path ignores a `BooleanQuery`'s own boost.
+    /// alternatives: one position becomes a single alternative's
+    /// `TermQuery`, or several alternatives' [`SynonymQuery`], which scores
+    /// them as one blended term instead of summing each alternative's
+    /// independent score (Issue #1257) — the same relationship Lucene's
+    /// `SynonymQuery` has to `TermQuery`. A longer phrase becomes a
+    /// `PhraseQuery` with the alternatives at that position. A multi-word
+    /// synonym makes several paths; the one-position paths are terms or
+    /// synonyms as above, and the others are one `PhraseQuery` when there
+    /// is one of them and a `GraphPhraseQuery` otherwise, which matches
+    /// them all without listing them (#1271); the query is a `Should` of
+    /// these. The boost goes on each clause, since the Block-Max-WAND fast
+    /// path ignores a `BooleanQuery`'s own boost.
     fn parse_phrase_query(
         &self,
         pair: pest::iterators::Pair<Rule>,
@@ -779,9 +784,10 @@ impl LexicalQueryParser {
             }
 
             let slop = slop.unwrap_or(0);
-            let term = |term: String| -> Box<dyn Query> {
-                Box::new(TermQuery::new(field_name, term).with_boost(boost))
-            };
+            // The boost goes on each clause here, since the Block-Max-WAND
+            // fast path ignores a `BooleanQuery`'s own boost.
+            let one_position =
+                |alternatives: Vec<String>| one_position_query(field_name, alternatives, boost);
             let phrase = |positions: Vec<Vec<String>>| -> Box<dyn Query> {
                 Box::new(
                     PhraseQuery::from_positions(field_name, positions)
@@ -791,11 +797,21 @@ impl LexicalQueryParser {
             };
             let mut clauses: Vec<Box<dyn Query>> = match phrase_graph(&tokens) {
                 PhraseGraph::Flat(mut positions) if positions.len() == 1 => {
-                    positions.remove(0).into_iter().map(term).collect()
+                    vec![one_position(positions.remove(0))]
                 }
                 PhraseGraph::Flat(positions) => vec![phrase(positions)],
                 PhraseGraph::Graph { direct, arcs } => {
-                    let mut clauses: Vec<Box<dyn Query>> = direct.into_iter().map(term).collect();
+                    // `direct` and any phrase/graph-path clause below stay
+                    // sibling `Should` clauses: a document matching both
+                    // "nyc" and "new york city" genuinely contains two
+                    // different phrase paths and both contribute, unlike
+                    // the stacked-alternative case `one_position` folds
+                    // into a single term.
+                    let mut clauses: Vec<Box<dyn Query>> = if direct.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![one_position(direct)]
+                    };
                     if arcs.windows(2).all(|pair| pair[0].to == pair[1].from) {
                         // At most one path of two or more positions, as
                         // without multi-word synonyms.
@@ -905,49 +921,55 @@ impl LexicalQueryParser {
         }
 
         self.create_query_over_fields(field, |field_name| {
-            let terms = self.analyze_term(Some(field_name), &term)?;
+            let tokens = self.analyze_tokens(Some(field_name), &term)?;
 
-            if terms.is_empty() {
+            if tokens.is_empty() {
                 // An empty phrase already matches nothing and retains the field
                 // reference for schema validation, unlike an empty BooleanQuery.
                 return Ok(Box::new(
-                    PhraseQuery::new(field_name, terms).with_boost(boost),
+                    PhraseQuery::new(field_name, Vec::new()).with_boost(boost),
                 ));
             }
 
-            if terms.len() == 1 {
-                let query = TermQuery::new(field_name, &terms[0]);
-                if boost != 1.0 {
-                    Ok(Box::new(query.with_boost(boost)))
-                } else {
-                    Ok(Box::new(query))
-                }
+            // Grouped by position rather than flattened to text: a
+            // position with several stacked alternatives (synonyms) must
+            // be scored as one blended term instead of letting each
+            // alternative add its own score (Issue #1257).
+            let mut positions = group_tokens_by_position(tokens);
+
+            if positions.len() == 1 {
+                Ok(one_position_query(field_name, positions.remove(0), boost))
             } else {
-                // The analyzer split one *bare* (unquoted) term into several
-                // tokens. This happens for a Japanese sentence under a
-                // morphological tokenizer, and for inputs like `rust-lang`
-                // under a `\w+` tokenizer.
+                // The analyzer split one *bare* (unquoted) term into
+                // tokens at several positions. This happens for a
+                // Japanese sentence under a morphological tokenizer, and
+                // for inputs like `rust-lang` under a `\w+` tokenizer.
                 //
-                // Those tokens are OR'd, matching Lucene's `match` query and
-                // Elasticsearch's default. The previous slop-0 `PhraseQuery`
-                // required the document to repeat the exact morpheme
-                // sequence, which made unquoted Japanese queries return
-                // almost nothing.
+                // Each position — a single token, or several stacked
+                // alternatives scored as one term above — is OR'd with
+                // the others, matching Lucene's `match` query and
+                // Elasticsearch's default. The previous slop-0
+                // `PhraseQuery` required the document to repeat the exact
+                // morpheme sequence, which made unquoted Japanese queries
+                // return almost nothing.
                 //
                 // Explicit phrase semantics are still available — a quoted
                 // `"..."` goes through `parse_phrase_query`, which keeps
                 // `PhraseQuery` (and its `~slop` modifier).
                 let mut bool_query = BooleanQuery::new();
-                for token in &terms {
+                for alternatives in positions {
+                    // The boost goes on the `BooleanQuery` below, as it did
+                    // before this path grouped by position, so each clause
+                    // is built unboosted.
                     bool_query.add_clause(BooleanClause::new(
-                        Box::new(TermQuery::new(field_name, token)),
+                        one_position_query(field_name, alternatives, 1.0),
                         Occur::Should,
                     ));
                 }
 
                 // `minimum_should_match` stays at its default of 0, so the
                 // matcher builds a plain disjunction and BM25 scores add up
-                // across the matching clauses.
+                // across the matching positions.
                 if boost != 1.0 {
                     bool_query = bool_query.with_boost(boost);
                 }
@@ -1038,19 +1060,7 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
     let mut arcs = complete_paths(arcs, first, last);
 
     if arcs.is_empty() {
-        let flat = flatten_token_graph(tokens.to_vec());
-        let positions = token_positions(&flat);
-        let mut by_position: Vec<Vec<String>> = Vec::new();
-        for (token, (i, &position)) in flat.iter().zip(positions.iter().enumerate()) {
-            if i == 0 || positions[i - 1] != position {
-                by_position.push(Vec::new());
-            }
-            let alternatives = by_position.last_mut().expect("pushed above");
-            if !alternatives.contains(&token.text) {
-                alternatives.push(token.text.clone());
-            }
-        }
-        return PhraseGraph::Flat(by_position);
+        return PhraseGraph::Flat(group_tokens_by_position(tokens.to_vec()));
     }
 
     let last = arcs.iter().map(|arc| arc.to).max().unwrap_or(0);
@@ -1063,6 +1073,49 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
         !is_direct
     });
     PhraseGraph::Graph { direct, arcs }
+}
+
+/// The query for one field position's `alternatives`.
+///
+/// Several alternatives (synonyms the analyzer stacked there) become one
+/// [`SynonymQuery`], which scores them as one blended term (Issue #1257)
+/// rather than as an OR of independent `TermQuery`s: with index-time
+/// synonyms a matching document holds every alternative, so summing their
+/// scores would double-count it. A single alternative stays a plain
+/// `TermQuery`. Shared by the quoted ([`LexicalQueryParser::parse_phrase_query`])
+/// and bare ([`LexicalQueryParser::parse_simple_term`]) paths; each passes
+/// the `boost` its own shape puts on a clause.
+fn one_position_query(
+    field_name: &str,
+    mut alternatives: Vec<String>,
+    boost: f32,
+) -> Box<dyn Query> {
+    if alternatives.len() == 1 {
+        Box::new(TermQuery::new(field_name, alternatives.remove(0)).with_boost(boost))
+    } else {
+        Box::new(SynonymQuery::new(field_name, alternatives).with_boost(boost))
+    }
+}
+
+/// Group `tokens` by field position, each position paired with its
+/// alternative terms — several when the analyzer stacks synonyms there
+/// (`position_increment = 0`). Shared by [`phrase_graph`]'s flat fallback
+/// and [`LexicalQueryParser::parse_simple_term`], the two places that need
+/// a bare term's tokens grouped this way without a full phrase graph.
+fn group_tokens_by_position(tokens: Vec<Token>) -> Vec<Vec<String>> {
+    let flat = flatten_token_graph(tokens);
+    let positions = token_positions(&flat);
+    let mut by_position: Vec<Vec<String>> = Vec::new();
+    for (token, (i, &position)) in flat.iter().zip(positions.iter().enumerate()) {
+        if i == 0 || positions[i - 1] != position {
+            by_position.push(Vec::new());
+        }
+        let alternatives = by_position.last_mut().expect("pushed above");
+        if !alternatives.contains(&token.text) {
+            alternatives.push(token.text.clone());
+        }
+    }
+    by_position
 }
 
 /// Walk a `geo3d_*` pair and collect every nested `signed_float` token
@@ -1921,6 +1974,16 @@ mod tests {
         )
     }
 
+    fn synonym(terms: &[&str], boost: f32) -> (String, f32) {
+        let terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+        (
+            SynonymQuery::new("body", terms)
+                .with_boost(boost)
+                .description(),
+            boost,
+        )
+    }
+
     fn phrase(positions: &[&[&str]], slop: u32, boost: f32) -> (String, f32) {
         let positions = positions
             .iter()
@@ -1939,25 +2002,36 @@ mod tests {
         clauses
     }
 
-    /// One position with stacked tokens matches any of them, like Lucene's
-    /// `SynonymQuery`, and needs no positions.
+    /// One position with stacked tokens is one blended `SynonymQuery`
+    /// (Issue #1257), matching Lucene's `SynonymQuery`, and needs no
+    /// positions — not an OR of independent `TermQuery`s, which would
+    /// double-count a document holding every alternative.
     #[test]
-    fn quoted_word_with_stacked_synonyms_ors_them() {
+    fn quoted_word_with_stacked_synonyms_becomes_a_synonym_query() {
         let query = synonym_parser().parse("\"big\"").unwrap();
         assert_eq!(
             should_clauses(query.as_ref()),
-            sorted(vec![term("big", 1.0), term("large", 1.0)])
+            vec![synonym(&["big", "large"], 1.0)]
         );
     }
 
+    /// A quoted word absent from the synonym dictionary has only one
+    /// alternative at its position, so it stays a plain `TermQuery`
+    /// rather than a one-term `SynonymQuery`.
+    #[test]
+    fn quoted_word_without_a_synonym_stays_a_term_query() {
+        let query = synonym_parser().parse("\"dog\"").unwrap();
+        assert_eq!(should_clauses(query.as_ref()), vec![term("dog", 1.0)]);
+    }
+
     /// The BMW fast path ignores a BooleanQuery's own boost, so the boost
-    /// must sit on each clause; slop has nothing to apply to.
+    /// must sit on the clause itself; slop has nothing to apply to.
     #[test]
     fn stacked_alternatives_carry_the_boost_on_each_clause() {
         let query = synonym_parser().parse("\"big\"~3^2").unwrap();
         assert_eq!(
             should_clauses(query.as_ref()),
-            sorted(vec![term("big", 2.0), term("large", 2.0)])
+            vec![synonym(&["big", "large"], 2.0)]
         );
     }
 
@@ -2001,6 +2075,8 @@ mod tests {
                 let any = clause.as_any();
                 if any.is::<TermQuery>() {
                     "term"
+                } else if any.is::<SynonymQuery>() {
+                    "synonym"
                 } else if any.is::<PhraseQuery>() {
                     "phrase"
                 } else if any.is::<GraphPhraseQuery>() {
@@ -2015,8 +2091,9 @@ mod tests {
     }
 
     /// The phrases `query` matches, sorted, each as its positions with
-    /// their alternatives: a term is one position, and a graph phrase
-    /// stands for every path through it.
+    /// their alternatives: a term is one position, a synonym query is one
+    /// position with its (sorted, for a deterministic comparison)
+    /// alternatives, and a graph phrase stands for every path through it.
     fn phrases(query: &dyn Query) -> Vec<Vec<Vec<String>>> {
         use crate::lexical::query::graph_phrase::test_support::paths;
 
@@ -2025,6 +2102,10 @@ mod tests {
             let any = clause.as_any();
             if let Some(term) = any.downcast_ref::<TermQuery>() {
                 phrases.push(vec![vec![term.term().to_string()]]);
+            } else if let Some(synonym) = any.downcast_ref::<SynonymQuery>() {
+                let mut terms = synonym.terms().to_vec();
+                terms.sort();
+                phrases.push(vec![terms]);
             } else if let Some(phrase) = any.downcast_ref::<PhraseQuery>() {
                 phrases.push(phrase.positions().to_vec());
             } else if let Some(graph) = any.downcast_ref::<GraphPhraseQuery>() {
@@ -2111,6 +2192,22 @@ mod tests {
         }
     }
 
+    /// #1257: several single-word members of the same group span the
+    /// whole quoted value (`direct`, no intermediate node), so they are
+    /// one blended `SynonymQuery`, sibling to a longer member's own
+    /// phrase clause — not one `TermQuery` per member, which would
+    /// double-count a document holding every one of them.
+    #[test]
+    fn a_direct_synonym_group_becomes_one_synonym_query() {
+        let parser = synonym_parser_with(&[&["ml", "ai", "machine learning"]]);
+        let expected = sorted_phrases(&[&[&["ai", "ml"]], &[&["machine"], &["learning"]]]);
+        for dsl in ["\"ml\"", "\"ai\"", "\"machine learning\""] {
+            let query = parser.parse(dsl).unwrap();
+            assert_eq!(phrases(query.as_ref()), expected, "{dsl}");
+            assert_eq!(clause_kinds(query.as_ref()), ["phrase", "synonym"], "{dsl}");
+        }
+    }
+
     /// Paths multiply, so seven multi-word synonyms make 128 of them,
     /// which was past the old cap of 64. The graph phrase grows with the
     /// arcs instead, three per synonym (#1271).
@@ -2163,6 +2260,34 @@ mod tests {
     fn graph_phrase_carries_slop_and_boost() {
         let query = synonym_parser().parse("\"ml is\"~2^3").unwrap();
         assert_eq!(should_clauses(query.as_ref()), vec![graph(ML_IS, 2, 3.0)]);
+    }
+
+    // ---- Bare (unquoted) values through stacked tokens (#1257) ----
+
+    /// The same double-counting bug exists for a bare word — the most
+    /// common way to hit it, since most searches are unquoted — so a
+    /// stacked position becomes one blended `SynonymQuery` here too, not
+    /// an OR of `TermQuery`s.
+    #[test]
+    fn unquoted_word_with_stacked_synonyms_becomes_a_synonym_query() {
+        let query = synonym_parser().parse("big").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            vec![synonym(&["big", "large"], 1.0)]
+        );
+    }
+
+    /// A bare multi-word input still OR's its positions (`parse_simple_term`'s
+    /// pre-existing behavior for Japanese sentences and hyphenated words),
+    /// but a stacked position among them is one `SynonymQuery` clause
+    /// rather than one `TermQuery` per alternative.
+    #[test]
+    fn unquoted_multi_position_term_mixes_term_and_synonym_clauses() {
+        let query = synonym_parser().parse("big dog").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            sorted(vec![synonym(&["big", "large"], 1.0), term("dog", 1.0)])
+        );
     }
 
     /// An analyzer that always emits the same tokens.
