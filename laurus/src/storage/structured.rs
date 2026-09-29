@@ -7,13 +7,31 @@
 //!
 //! - **Structured I/O** ([`StructWriter`] / [`StructReader`]) -- typed field-level
 //!   reading and writing of primitives, variable-length integers, strings, byte
-//!   arrays, and compound structures, with a CRC-32 checksum trailer for
-//!   integrity verification.
+//!   arrays, and compound structures, with a CRC-32 footer for integrity
+//!   verification.
 //! - **Block I/O** ([`BlockWriter`] / [`BlockReader`]) -- higher-level block-based
 //!   batching built on top of structured I/O, designed for posting lists and
 //!   other data that benefits from fixed-size block buffering.
+//!
+//! # Footer
+//!
+//! [`StructWriter::close`] ends every file with an 8-byte footer (Issue
+//! #1214):
+//!
+//! ```text
+//! payload | crc32(payload): u32 LE | FOOTER_MAGIC ("LCRC"): u32 LE
+//! ```
+//!
+//! Files written before Issue #1214 end in a 4-byte trailer instead, holding
+//! the CRC-32 of the file's *last write* only — it covers nothing else, so a
+//! reader accepts it as [`ChecksumStatus::Legacy`] rather than as verified.
+//! The magic is what tells the two apart: a reader that parsed the payload
+//! knows exactly how many bytes follow it, and a reader that did not (a part
+//! read by random access, see [`verify_file_checksum`]) checks for the magic
+//! at the end of the file.
 
 use std::collections::HashMap;
+use std::io::{Read, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -22,22 +40,82 @@ use crate::storage::{StorageInput, StorageOutput};
 use crate::util::alloc_bounds::{checked_capacity_u64, checked_len, checked_len_u64};
 use crate::util::varint::{decode_u64, encode_u64};
 
+/// Marker that ends a [`StructWriter`] footer: `LCRC` in little-endian byte
+/// order (Issue #1214).
+///
+/// It follows the CRC rather than preceding it, so a legacy file is misread
+/// as footed only when its trailer CRC happens to equal the magic (a 1 in
+/// 2^32 chance), never because of what its payload contains. Its bytes also
+/// cannot start a legacy `deletions.log` record (a varint length followed by
+/// `{`), which keeps a log that mixes both forms unambiguous.
+pub const FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"LCRC");
+
+/// Length of a [`StructWriter`] footer: the CRC-32, then [`FOOTER_MAGIC`].
+pub const FOOTER_LEN: u64 = 8;
+
+/// Length of the trailer files carried before Issue #1214: a CRC-32 of the
+/// file's last write.
+const LEGACY_TRAILER_LEN: u64 = 4;
+
+/// Chunk size for hashing a file that cannot lend a slice.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
+/// What the end of a [`StructWriter`] file says about the bytes before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumStatus {
+    /// The footer's CRC-32 matches every byte before it.
+    Verified,
+    /// A 4-byte trailer from before Issue #1214. It holds the CRC-32 of the
+    /// file's last write only, so on its own it verifies nothing; the stored
+    /// value is returned for callers that know what that last write was.
+    Legacy(u32),
+    /// The footer does not match the bytes: the file is corrupted.
+    Mismatch,
+}
+
+impl ChecksumStatus {
+    /// Whether this status vouches for the file, for a caller that knows
+    /// the file's last write was `last_write`: a footer must have verified,
+    /// and a legacy trailer must be the CRC-32 of `last_write` — which is
+    /// all a legacy trailer ever covered.
+    ///
+    /// # Arguments
+    ///
+    /// * `last_write` - The bytes of the file's last write.
+    pub fn vouches_for(self, last_write: &[u8]) -> bool {
+        match self {
+            ChecksumStatus::Verified => true,
+            ChecksumStatus::Legacy(stored) => stored == crc32fast::hash(last_write),
+            ChecksumStatus::Mismatch => false,
+        }
+    }
+}
+
 /// Structured binary writer with typed fields and CRC-32 checksumming.
 ///
 /// `StructWriter` wraps a [`StorageOutput`] and provides typed write methods
 /// for primitive values, variable-length integers, strings, byte arrays, and
 /// compound structures such as delta-compressed integer lists and string-to-u64
-/// maps. A running CRC-32 checksum is maintained and written as a trailer when
-/// the writer is closed, enabling integrity verification on read.
+/// maps. A running CRC-32 of every byte written is kept and emitted in the
+/// footer when the writer is closed (see the [module docs](self)), enabling
+/// integrity verification on read.
+///
+/// The output is written front to back: there is no general `seek`, so the
+/// footer always covers the bytes in the order they sit in the file. A format
+/// whose header depends on what follows it reserves the header with
+/// [`reserve_header`](Self::reserve_header) and writes it last with
+/// [`fill_header`](Self::fill_header).
 ///
 /// All multi-byte numeric values are encoded in **little-endian** byte order.
 pub struct StructWriter<W: StorageOutput> {
     /// The underlying storage output handle.
     writer: W,
-    /// Running CRC-32 checksum of written data.
-    checksum: u32,
+    /// Running CRC-32 of every byte written.
+    hasher: crc32fast::Hasher,
     /// Current byte position in the output stream.
     position: u64,
+    /// Length of a header reserved by `reserve_header` and not yet filled.
+    reserved_header: Option<u64>,
 }
 
 impl<W: StorageOutput> StructWriter<W> {
@@ -49,12 +127,13 @@ impl<W: StorageOutput> StructWriter<W> {
     ///
     /// # Returns
     ///
-    /// A new `StructWriter` positioned at byte 0 with a zeroed checksum.
+    /// A new `StructWriter` positioned at byte 0 with an empty checksum.
     pub fn new(writer: W) -> Self {
         StructWriter {
             writer,
-            checksum: 0,
+            hasher: crc32fast::Hasher::new(),
             position: 0,
+            reserved_header: None,
         }
     }
 
@@ -293,74 +372,113 @@ impl<W: StorageOutput> StructWriter<W> {
         self.position
     }
 
-    /// Get the current CRC-32 checksum of written data.
+    /// Get the CRC-32 of the bytes written so far.
+    ///
+    /// While a reserved header is unfilled, this covers only the bytes
+    /// written after it.
     ///
     /// # Returns
     ///
     /// The running checksum value.
     pub fn checksum(&self) -> u32 {
-        self.checksum
+        self.hasher.clone().finalize()
     }
 
-    /// Replace the CRC-32 checksum with the hash of the given data.
-    ///
-    /// Note: this does **not** accumulate a running checksum. Each call
-    /// overwrites the previous value with `crc32fast::hash(data)`, so the
-    /// stored checksum only reflects the last chunk passed to this method.
+    /// Fold `data` into the running checksum.
     fn update_checksum(&mut self, data: &[u8]) {
-        self.checksum = crc32fast::hash(data);
+        self.hasher.update(data);
     }
 
-    /// Write the trailing CRC-32 checksum, flush, and close the writer.
+    /// Reserve the first `len` bytes of the output for a header that is
+    /// written last, with [`fill_header`](Self::fill_header).
     ///
-    /// The checksum written is the value computed by the most recent
-    /// `update_checksum` call, which only covers the
-    /// last chunk of data passed to that method (not all data written).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing or closing the underlying output fails.
-    pub fn close(mut self) -> Result<()> {
-        // Write final checksum
-        self.writer.write_u32::<LittleEndian>(self.checksum)?;
-        self.writer.flush_and_sync()?;
-        self.writer.close()?;
-        Ok(())
-    }
-
-    /// Seek to a position in the output stream.
+    /// For formats whose header records where the rest of the file ended up.
+    /// The reserved bytes are written as zeros and left out of the checksum;
+    /// `fill_header` hashes the real header and combines it with the rest.
     ///
     /// # Arguments
     ///
-    /// * `pos` - The seek target (start, end, or current-relative).
-    ///
-    /// # Returns
-    ///
-    /// The new absolute byte position after seeking.
+    /// * `len` - The exact length the header will have.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying seek fails.
-    pub fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
-        let new_pos = self.writer.seek(pos)?;
-        self.position = new_pos;
-        Ok(new_pos)
+    /// Returns an error if anything has been written yet (the header must be
+    /// the start of the file), if a header is already reserved, or if the
+    /// write fails.
+    pub fn reserve_header(&mut self, len: u64) -> Result<()> {
+        if self.position != 0 || self.reserved_header.is_some() {
+            return Err(LaurusError::internal(
+                "StructWriter: a header can only be reserved at the start of the output",
+            ));
+        }
+        std::io::copy(&mut std::io::repeat(0).take(len), &mut self.writer)?;
+        self.position = len;
+        self.reserved_header = Some(len);
+        Ok(())
     }
 
-    /// Get the current stream position from the underlying writer.
+    /// Write the header reserved by [`reserve_header`](Self::reserve_header)
+    /// through `write`, then return to the end of the output.
     ///
-    /// This is useful when mixing raw writes with structured writes to
-    /// ensure the tracked position stays in sync.
+    /// The checksum becomes that of the header followed by everything written
+    /// after it, i.e. of the bytes as they sit in the file.
     ///
-    /// # Returns
+    /// # Arguments
     ///
-    /// The absolute byte position reported by the underlying writer.
+    /// * `write` - Writes the header through the writer it is given; it must
+    ///   write exactly the reserved length.
     ///
     /// # Errors
     ///
-    /// Returns an error if querying the position fails.
-    pub fn stream_position(&mut self) -> Result<u64> {
-        self.writer.stream_position().map_err(LaurusError::from)
+    /// Returns an error if no header is reserved, if `write` fails or writes
+    /// a different length than was reserved, or if seeking fails.
+    pub fn fill_header<F>(&mut self, write: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        let Some(len) = self.reserved_header.take() else {
+            return Err(LaurusError::internal(
+                "StructWriter: fill_header called without a reserved header",
+            ));
+        };
+        let end = self.position;
+        let body = std::mem::take(&mut self.hasher);
+
+        self.writer.seek(SeekFrom::Start(0))?;
+        self.position = 0;
+        write(self)?;
+        if self.position != len {
+            return Err(LaurusError::internal(format!(
+                "StructWriter: wrote a {}-byte header into {len} reserved bytes",
+                self.position
+            )));
+        }
+
+        self.writer.seek(SeekFrom::Start(end))?;
+        self.position = end;
+        self.hasher.combine(&body);
+        Ok(())
+    }
+
+    /// Write the footer (the CRC-32 of every byte written, then
+    /// [`FOOTER_MAGIC`]), flush, and close the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a reserved header was never filled, or if writing,
+    /// flushing, or closing the underlying output fails.
+    pub fn close(mut self) -> Result<()> {
+        if let Some(len) = self.reserved_header {
+            return Err(LaurusError::internal(format!(
+                "StructWriter: closed with a {len}-byte header reserved but never filled"
+            )));
+        }
+        let checksum = self.hasher.clone().finalize();
+        self.writer.write_u32::<LittleEndian>(checksum)?;
+        self.writer.write_u32::<LittleEndian>(FOOTER_MAGIC)?;
+        self.writer.flush_and_sync()?;
+        self.writer.close()?;
+        Ok(())
     }
 }
 
@@ -368,9 +486,12 @@ impl<W: StorageOutput> StructWriter<W> {
 ///
 /// `StructReader` is the read counterpart of [`StructWriter`]. It wraps a
 /// [`StorageInput`] and provides typed read methods that mirror the writer's
-/// format. A running CRC-32 checksum is maintained so that the trailing
-/// checksum written by [`StructWriter::close`] can be verified via
-/// [`verify_checksum`](Self::verify_checksum).
+/// format. A reader that parses a file front to back keeps a running CRC-32
+/// of what it read, so the footer written by [`StructWriter::close`] can be
+/// verified via [`verify_checksum`](Self::verify_checksum) with no second
+/// pass. The first [`seek`](Self::seek) ends that: a random-access reader
+/// hashes nothing, and verifies a whole file with [`verify_file_checksum`]
+/// instead.
 ///
 /// Every read that allocates from a length or count taken from the stream
 /// first bounds it by the bytes left in the input (Issue #1218), so a
@@ -381,12 +502,19 @@ impl<W: StorageOutput> StructWriter<W> {
 pub struct StructReader<R: StorageInput> {
     /// The underlying storage input handle.
     reader: R,
-    /// Running CRC-32 checksum of data read so far.
-    checksum: u32,
+    /// Running CRC-32 of the bytes read so far, while `sequential`.
+    hasher: crc32fast::Hasher,
+    /// Whether every read so far has been one contiguous run from offset 0.
+    /// Cleared by the first seek that moves the cursor; from then on reads
+    /// are not hashed and the checksum cannot be verified.
+    sequential: bool,
     /// Current byte position in the input stream.
     position: u64,
     /// Total size of the underlying file in bytes.
     file_size: u64,
+    /// Length of the file's trailer (a footer or a legacy trailer), learned
+    /// on first use by `is_eof`.
+    trailer_len: Option<u64>,
 }
 
 impl<R: StorageInput> StructReader<R> {
@@ -407,9 +535,11 @@ impl<R: StorageInput> StructReader<R> {
         let file_size = reader.size()?;
         Ok(StructReader {
             reader,
-            checksum: 0,
+            hasher: crc32fast::Hasher::new(),
+            sequential: true,
             position: 0,
             file_size,
+            trailer_len: None,
         })
     }
 
@@ -423,6 +553,10 @@ impl<R: StorageInput> StructReader<R> {
 
     /// Seek to a position in the input stream.
     ///
+    /// A seek that moves the cursor ends checksum tracking: later reads are
+    /// not hashed, and [`verify_checksum`](Self::verify_checksum) refuses to
+    /// run.
+    ///
     /// # Arguments
     ///
     /// * `pos` - The seek target (start, end, or current-relative).
@@ -434,8 +568,11 @@ impl<R: StorageInput> StructReader<R> {
     /// # Errors
     ///
     /// Returns an error if the underlying seek fails.
-    pub fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
+    pub fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let new_pos = self.reader.seek(pos)?;
+        if new_pos != self.position {
+            self.sequential = false;
+        }
         self.position = new_pos;
         Ok(new_pos)
     }
@@ -666,9 +803,9 @@ impl<R: StorageInput> StructReader<R> {
     /// allocation + `copy_from_slice` that `read_raw` would otherwise
     /// perform.
     ///
-    /// The CRC checksum and stream position are updated identically
-    /// to [`Self::read_raw`]; callers see the same state-machine
-    /// progression regardless of which path was taken.
+    /// The running checksum and stream position are updated
+    /// identically to [`Self::read_raw`]; callers see the same
+    /// state-machine progression regardless of which path was taken.
     ///
     /// # Errors
     ///
@@ -687,14 +824,16 @@ impl<R: StorageInput> StructReader<R> {
             && slice.len() >= length
         {
             let chunk = &slice[..length];
-            // Compute the CRC and run the callback while the
-            // immutable borrow on `self.reader` is still live.
-            let new_checksum = crc32fast::hash(chunk);
+            // Hash and run the callback while the immutable borrow on
+            // `self.reader` is still live — through the field, since a
+            // `&mut self` helper would conflict with that borrow.
+            if self.sequential {
+                self.hasher.update(chunk);
+            }
             let result = f(chunk);
             // NLL: `chunk` is no longer used after the callback,
             // so the immutable borrow ends here and we can mutate
             // `self`.
-            self.checksum = new_checksum;
             self.position += length as u64;
             self.reader
                 .seek(std::io::SeekFrom::Current(length as i64))?;
@@ -795,56 +934,148 @@ impl<R: StorageInput> StructReader<R> {
         self.file_size
     }
 
-    /// Check whether the reader has reached the end of file.
+    /// Check whether the reader has reached the end of the payload.
     ///
-    /// The last 4 bytes of the file are reserved for the CRC-32 checksum
-    /// trailer, so this returns `true` once the position is within that
-    /// trailing region.
+    /// The file ends in a footer (8 bytes) or a legacy trailer (4 bytes),
+    /// so this returns `true` once the position is within that region. The
+    /// first call peeks at the file's last 4 bytes to learn which one it is.
     ///
     /// # Returns
     ///
     /// `true` if no more data blocks remain to be read.
-    pub fn is_eof(&self) -> bool {
-        self.position >= self.file_size.saturating_sub(4) // Account for checksum
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if peeking at the end of the file fails.
+    pub fn is_eof(&mut self) -> Result<bool> {
+        let trailer_len = self.trailer_len()?;
+        Ok(self.position >= self.file_size.saturating_sub(trailer_len))
     }
 
-    /// Get the current CRC-32 checksum of data read so far.
+    /// The next 4 bytes as a little-endian `u32`, without consuming them.
+    ///
+    /// # Returns
+    ///
+    /// `None` when fewer than 4 bytes remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or restoring the cursor fails.
+    pub(crate) fn peek_u32(&mut self) -> Result<Option<u32>> {
+        if self.remaining() < 4 {
+            return Ok(None);
+        }
+        let value = self.reader.read_u32::<LittleEndian>()?;
+        self.reader.seek(SeekFrom::Start(self.position))?;
+        Ok(Some(value))
+    }
+
+    /// The length of the file's trailer, detected once from its last 4
+    /// bytes. The peek restores the cursor directly, so it does not count
+    /// as a seek that ends checksum tracking.
+    fn trailer_len(&mut self) -> Result<u64> {
+        if let Some(len) = self.trailer_len {
+            return Ok(len);
+        }
+        let mut len = LEGACY_TRAILER_LEN;
+        if self.file_size >= FOOTER_LEN {
+            self.reader
+                .seek(SeekFrom::Start(self.file_size - LEGACY_TRAILER_LEN))?;
+            let last = self.reader.read_u32::<LittleEndian>()?;
+            self.reader.seek(SeekFrom::Start(self.position))?;
+            if last == FOOTER_MAGIC {
+                len = FOOTER_LEN;
+            }
+        }
+        self.trailer_len = Some(len);
+        Ok(len)
+    }
+
+    /// Get the CRC-32 of the bytes read so far.
+    ///
+    /// Meaningful only while the reader has not seeked; see
+    /// [`seek`](Self::seek).
     ///
     /// # Returns
     ///
     /// The running checksum value.
     pub fn checksum(&self) -> u32 {
-        self.checksum
+        self.hasher.clone().finalize()
     }
 
-    /// Replace the CRC-32 checksum with the hash of the given data.
-    ///
-    /// Note: this does **not** accumulate a running checksum. Each call
-    /// overwrites the previous value with `crc32fast::hash(data)`, so the
-    /// stored checksum only reflects the last chunk passed to this method.
+    /// Fold `data` into the running checksum, unless a seek ended tracking.
     fn update_checksum(&mut self, data: &[u8]) {
-        self.checksum = crc32fast::hash(data);
+        if self.sequential {
+            self.hasher.update(data);
+        }
     }
 
-    /// Verify file integrity by comparing the running checksum against the
-    /// CRC-32 trailer stored at the end of the file.
+    /// Read the file's trailer and check it against the bytes parsed so
+    /// far — call this once the whole payload has been read.
     ///
-    /// # Returns
+    /// Having parsed the payload, the reader knows exactly how many bytes
+    /// follow it, which is what tells the two trailer forms apart:
     ///
-    /// `true` if the stored checksum matches the computed one.
+    /// * 8 bytes: a footer. [`Verified`](ChecksumStatus::Verified) when it
+    ///   ends in [`FOOTER_MAGIC`] and its CRC matches, otherwise
+    ///   [`Mismatch`](ChecksumStatus::Mismatch).
+    /// * 4 bytes: a legacy trailer, returned as
+    ///   [`Legacy`](ChecksumStatus::Legacy) — unless it *is* the magic, which
+    ///   means a footed file was read 4 bytes too far.
+    /// * Anything else: the parse did not end where the payload does, so
+    ///   [`Mismatch`](ChecksumStatus::Mismatch).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file is too short to contain a checksum or
-    /// if reading the trailer fails.
-    pub fn verify_checksum(&mut self) -> Result<bool> {
-        if self.position + 4 > self.file_size {
-            return Err(LaurusError::storage("File too short for checksum"));
+    /// Returns an error if the reader has seeked (its checksum no longer
+    /// covers the payload — a caller bug), or if reading the trailer fails.
+    pub fn verify_checksum(&mut self) -> Result<ChecksumStatus> {
+        if !self.sequential {
+            return Err(LaurusError::internal(
+                "StructReader: a checksum cannot be verified after a seek",
+            ));
         }
+        let computed = self.hasher.clone().finalize();
+        let status = match self.remaining() {
+            FOOTER_LEN => {
+                let stored = self.reader.read_u32::<LittleEndian>()?;
+                let magic = self.reader.read_u32::<LittleEndian>()?;
+                self.position += FOOTER_LEN;
+                if magic == FOOTER_MAGIC && stored == computed {
+                    ChecksumStatus::Verified
+                } else {
+                    ChecksumStatus::Mismatch
+                }
+            }
+            LEGACY_TRAILER_LEN => {
+                let stored = self.reader.read_u32::<LittleEndian>()?;
+                self.position += LEGACY_TRAILER_LEN;
+                if stored == FOOTER_MAGIC {
+                    ChecksumStatus::Mismatch
+                } else {
+                    ChecksumStatus::Legacy(stored)
+                }
+            }
+            _ => ChecksumStatus::Mismatch,
+        };
+        Ok(status)
+    }
 
-        // Read the stored checksum from the end of file
-        let stored_checksum = self.reader.read_u32::<LittleEndian>()?;
-        Ok(stored_checksum == self.checksum)
+    /// [`verify_checksum`](Self::verify_checksum), with a mismatch reported
+    /// as corruption of `what`. A legacy trailer passes: it never covered
+    /// the payload, so there is nothing to check it against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::Index`] on a mismatch, and whatever
+    /// `verify_checksum` returns.
+    pub(crate) fn expect_checksum(&mut self, what: &str) -> Result<()> {
+        match self.verify_checksum()? {
+            ChecksumStatus::Verified | ChecksumStatus::Legacy(_) => Ok(()),
+            ChecksumStatus::Mismatch => Err(LaurusError::index(format!(
+                "{what}: checksum mismatch — the file is corrupted"
+            ))),
+        }
     }
 
     /// Close the reader and release the underlying input handle.
@@ -855,6 +1086,99 @@ impl<R: StorageInput> StructReader<R> {
     pub fn close(mut self) -> Result<()> {
         self.reader.close()
     }
+}
+
+/// Verify a whole [`StructWriter`] file against its footer in one pass,
+/// without parsing it — for parts that are read by random access, whose
+/// reads never form the contiguous run [`StructReader::verify_checksum`]
+/// needs (Issue #1214).
+///
+/// Not knowing where the payload ends, this goes by the file's last 4
+/// bytes: [`FOOTER_MAGIC`] means a footer, whose CRC is compared against
+/// every byte before it; anything else is a legacy trailer, returned as
+/// [`ChecksumStatus::Legacy`]. A legacy file whose trailer happens to equal
+/// the magic (a 1 in 2^32 chance) therefore reads as a mismatch.
+///
+/// # Arguments
+///
+/// * `input` - The file, from any cursor position.
+///
+/// # Returns
+///
+/// The file's [`ChecksumStatus`]. A file too short for even a legacy
+/// trailer is a [`Mismatch`](ChecksumStatus::Mismatch).
+///
+/// # Errors
+///
+/// Returns an error if reading the file fails.
+pub fn verify_file_checksum<R: StorageInput>(mut input: R) -> Result<ChecksumStatus> {
+    let size = input.size()?;
+    if size < LEGACY_TRAILER_LEN {
+        return Ok(ChecksumStatus::Mismatch);
+    }
+    input.seek(SeekFrom::Start(size - LEGACY_TRAILER_LEN))?;
+    let last = input.read_u32::<LittleEndian>()?;
+    if size < FOOTER_LEN || last != FOOTER_MAGIC {
+        return Ok(ChecksumStatus::Legacy(last));
+    }
+
+    let payload_len = size - FOOTER_LEN;
+    input.seek(SeekFrom::Start(payload_len))?;
+    let stored = input.read_u32::<LittleEndian>()?;
+
+    input.seek(SeekFrom::Start(0))?;
+    let mut hasher = crc32fast::Hasher::new();
+    match input.as_slice() {
+        // No longer than the slice, so `payload_len` fits in `usize`.
+        Some(slice) if slice.len() as u64 >= payload_len => {
+            hasher.update(&slice[..payload_len as usize]);
+        }
+        _ => {
+            let mut buf = vec![0u8; VERIFY_CHUNK];
+            let mut left = payload_len;
+            while left > 0 {
+                let n = left.min(VERIFY_CHUNK as u64) as usize;
+                input.read_exact(&mut buf[..n])?;
+                hasher.update(&buf[..n]);
+                left -= n as u64;
+            }
+        }
+    }
+
+    Ok(if hasher.finalize() == stored {
+        ChecksumStatus::Verified
+    } else {
+        ChecksumStatus::Mismatch
+    })
+}
+
+/// Whether a file ends in a [`StructWriter`] footer, read from its last 4
+/// bytes alone.
+///
+/// # Errors
+///
+/// Returns an error if reading the file fails.
+pub fn ends_in_footer<R: StorageInput>(mut input: R) -> Result<bool> {
+    let size = input.size()?;
+    if size < FOOTER_LEN {
+        return Ok(false);
+    }
+    input.seek(SeekFrom::Start(size - LEGACY_TRAILER_LEN))?;
+    Ok(input.read_u32::<LittleEndian>()? == FOOTER_MAGIC)
+}
+
+/// Recompute the footer of a [`StructWriter`] file's bytes after a test
+/// patched them, so the file reads as intact rather than corrupted.
+#[cfg(test)]
+pub(crate) fn restamp_footer(bytes: &mut [u8]) {
+    let payload_len = bytes.len() - FOOTER_LEN as usize;
+    assert_eq!(
+        bytes[bytes.len() - 4..],
+        FOOTER_MAGIC.to_le_bytes(),
+        "restamp_footer expects a footed file"
+    );
+    let checksum = crc32fast::hash(&bytes[..payload_len]);
+    bytes[payload_len..payload_len + 4].copy_from_slice(&checksum.to_le_bytes());
 }
 
 /// Block-based writer for efficient batched I/O.
@@ -1024,7 +1348,7 @@ impl<R: StorageInput> BlockReader<R> {
     /// does not match the expected value, or the block size exceeds the
     /// bytes left in the input (see [`StructReader::read_raw`]).
     pub fn read_block(&mut self) -> Result<Option<&[u8]>> {
-        if self.reader.is_eof() {
+        if self.reader.is_eof()? {
             return Ok(None);
         }
 
@@ -1149,7 +1473,7 @@ mod tests {
             assert_eq!(decoded_values, vec![1, 5, 10, 15, 25]);
 
             // Verify checksum
-            assert!(reader.verify_checksum().unwrap());
+            assert_eq!(reader.verify_checksum().unwrap(), ChecksumStatus::Verified);
         }
     }
 
@@ -1317,5 +1641,354 @@ mod tests {
 
         let mut reader = StructReader::new(storage.open_input("exact").unwrap()).unwrap();
         assert_eq!(reader.read_string().unwrap(), "abc");
+    }
+
+    // The footer (Issue #1214).
+
+    /// An input that cannot lend a slice, forcing the buffered fallbacks.
+    #[derive(Debug)]
+    struct NoSlice(Box<dyn StorageInput>);
+
+    impl Read for NoSlice {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl std::io::Seek for NoSlice {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    impl StorageInput for NoSlice {
+        fn size(&self) -> Result<u64> {
+            self.0.size()
+        }
+        fn clone_input(&self) -> Result<Box<dyn StorageInput>> {
+            self.0.clone_input()
+        }
+        fn close(&mut self) -> Result<()> {
+            self.0.close()
+        }
+    }
+
+    fn put(storage: &MemoryStorage, name: &str, bytes: &[u8]) {
+        use std::io::Write;
+
+        let mut output = storage.create_output(name).unwrap();
+        output.write_all(bytes).unwrap();
+        output.close().unwrap();
+    }
+
+    fn get(storage: &MemoryStorage, name: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        storage
+            .open_input(name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// The last write of [`write_fixed`], which a legacy trailer covered.
+    const LAST_WRITE: &[u8] = b"tail!";
+
+    /// Writes fixed-width fields only, so any flipped byte still parses and
+    /// has to be caught by the checksum.
+    fn write_fixed(storage: &MemoryStorage, name: &str) -> Vec<u8> {
+        let mut writer = StructWriter::new(storage.create_output(name).unwrap());
+        writer.write_u8(7).unwrap();
+        writer.write_u16(0xBEEF).unwrap();
+        writer.write_u32(123_456).unwrap();
+        writer.write_u64(u64::MAX - 1).unwrap();
+        writer.write_f64(std::f64::consts::PI).unwrap();
+        writer.write_raw(LAST_WRITE).unwrap();
+        writer.close().unwrap();
+        get(storage, name)
+    }
+
+    fn read_fixed<R: StorageInput>(reader: &mut StructReader<R>) -> Result<ChecksumStatus> {
+        reader.read_u8()?;
+        reader.read_u16()?;
+        reader.read_u32()?;
+        reader.read_u64()?;
+        reader.read_f64()?;
+        reader.read_raw(LAST_WRITE.len())?;
+        reader.verify_checksum()
+    }
+
+    fn status_of(storage: &MemoryStorage, name: &str, bytes: &[u8]) -> ChecksumStatus {
+        put(storage, name, bytes);
+        read_fixed(&mut StructReader::new(storage.open_input(name).unwrap()).unwrap()).unwrap()
+    }
+
+    /// The pre-#1214 form of a file: its payload, then the CRC of its last
+    /// write in place of the footer.
+    fn to_legacy(bytes: &[u8], last_write: &[u8]) -> Vec<u8> {
+        let mut legacy = bytes[..bytes.len() - FOOTER_LEN as usize].to_vec();
+        legacy.extend_from_slice(&crc32fast::hash(last_write).to_le_bytes());
+        legacy
+    }
+
+    #[test]
+    fn the_footer_is_the_crc_of_every_byte_then_the_magic() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let bytes = write_fixed(&storage, "f");
+        let payload_len = bytes.len() - FOOTER_LEN as usize;
+
+        assert_eq!(
+            bytes[payload_len..payload_len + 4],
+            crc32fast::hash(&bytes[..payload_len]).to_le_bytes()
+        );
+        assert_eq!(bytes[payload_len + 4..], FOOTER_MAGIC.to_le_bytes());
+        assert_eq!(status_of(&storage, "g", &bytes), ChecksumStatus::Verified);
+    }
+
+    /// Before Issue #1214 the trailer was the CRC of the last write, so a
+    /// flipped byte anywhere before it went unnoticed.
+    #[test]
+    fn a_flipped_byte_anywhere_is_a_mismatch() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let bytes = write_fixed(&storage, "f");
+
+        for at in 0..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 0x01;
+            assert_eq!(
+                status_of(&storage, "g", &flipped),
+                ChecksumStatus::Mismatch,
+                "byte {at} of {}",
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_trailer_reads_as_legacy_and_vouches_only_for_the_last_write() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let legacy = to_legacy(&write_fixed(&storage, "f"), LAST_WRITE);
+
+        let status = status_of(&storage, "g", &legacy);
+        assert_eq!(status, ChecksumStatus::Legacy(crc32fast::hash(LAST_WRITE)));
+        assert!(status.vouches_for(LAST_WRITE));
+        assert!(!status.vouches_for(b"other"));
+        assert!(ChecksumStatus::Verified.vouches_for(b"anything"));
+        assert!(!ChecksumStatus::Mismatch.vouches_for(LAST_WRITE));
+    }
+
+    /// Four bytes left that spell the magic are a footed file read four
+    /// bytes too far, not a legacy trailer.
+    #[test]
+    fn a_legacy_trailer_equal_to_the_magic_is_a_mismatch() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let bytes = write_fixed(&storage, "f");
+        let mut truncated = bytes[..bytes.len() - FOOTER_LEN as usize].to_vec();
+        truncated.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
+
+        assert_eq!(
+            status_of(&storage, "g", &truncated),
+            ChecksumStatus::Mismatch
+        );
+    }
+
+    #[test]
+    fn a_parse_that_stops_short_of_the_footer_is_a_mismatch() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        write_fixed(&storage, "f");
+
+        let mut reader = StructReader::new(storage.open_input("f").unwrap()).unwrap();
+        reader.read_u8().unwrap();
+        assert_eq!(reader.verify_checksum().unwrap(), ChecksumStatus::Mismatch);
+    }
+
+    #[test]
+    fn a_checksum_cannot_be_verified_after_a_seek() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        write_fixed(&storage, "f");
+
+        let mut reader = StructReader::new(storage.open_input("f").unwrap()).unwrap();
+        reader.read_u8().unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_u8().unwrap();
+        assert!(read_fixed_rest(&mut reader).is_err());
+
+        // A seek that does not move the cursor keeps tracking intact.
+        let mut reader = StructReader::new(storage.open_input("f").unwrap()).unwrap();
+        reader.read_u8().unwrap();
+        reader.seek(SeekFrom::Current(0)).unwrap();
+        assert_eq!(
+            read_fixed_rest(&mut reader).unwrap(),
+            ChecksumStatus::Verified
+        );
+    }
+
+    /// [`read_fixed`] after its first field.
+    fn read_fixed_rest<R: StorageInput>(reader: &mut StructReader<R>) -> Result<ChecksumStatus> {
+        reader.read_u16()?;
+        reader.read_u32()?;
+        reader.read_u64()?;
+        reader.read_f64()?;
+        reader.read_raw(LAST_WRITE.len())?;
+        reader.verify_checksum()
+    }
+
+    /// The zero-copy path and the buffered one hash the same bytes.
+    #[test]
+    fn read_raw_with_hashes_the_same_on_both_paths() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let data: Vec<u8> = (0..=255u8).collect();
+        let mut writer = StructWriter::new(storage.create_output("r").unwrap());
+        writer.write_raw(&data).unwrap();
+        writer.close().unwrap();
+
+        let mut sliced = StructReader::new(storage.open_input("r").unwrap()).unwrap();
+        let mut buffered = StructReader::new(NoSlice(storage.open_input("r").unwrap())).unwrap();
+        for read in [
+            sliced.read_raw_with(data.len(), |b| b.to_vec()).unwrap(),
+            buffered.read_raw_with(data.len(), |b| b.to_vec()).unwrap(),
+        ] {
+            assert_eq!(read, data);
+        }
+        assert_eq!(sliced.checksum(), crc32fast::hash(&data));
+        assert_eq!(buffered.checksum(), crc32fast::hash(&data));
+        assert_eq!(sliced.verify_checksum().unwrap(), ChecksumStatus::Verified);
+        assert_eq!(
+            buffered.verify_checksum().unwrap(),
+            ChecksumStatus::Verified
+        );
+    }
+
+    #[test]
+    fn is_eof_stops_before_either_trailer_form() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut writer = StructWriter::new(storage.create_output("f").unwrap());
+        for v in 0..3u32 {
+            writer.write_u32(v).unwrap();
+        }
+        writer.close().unwrap();
+        let footed = get(&storage, "f");
+        put(&storage, "l", &to_legacy(&footed, &2u32.to_le_bytes()));
+
+        for name in ["f", "l"] {
+            let mut reader = StructReader::new(storage.open_input(name).unwrap()).unwrap();
+            let mut values = Vec::new();
+            while !reader.is_eof().unwrap() {
+                values.push(reader.read_u32().unwrap());
+            }
+            assert_eq!(values, [0, 1, 2], "{name}");
+            // Peeking at the trailer does not end checksum tracking.
+            assert_ne!(
+                reader.verify_checksum().unwrap(),
+                ChecksumStatus::Mismatch,
+                "{name}"
+            );
+        }
+    }
+
+    /// A header reserved up front and filled last is hashed where it sits:
+    /// at the start of the file, ahead of the body written before it.
+    #[test]
+    fn a_filled_header_is_covered_in_file_order() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut writer = StructWriter::new(storage.create_output("h").unwrap());
+        writer.reserve_header(12).unwrap();
+        writer.write_raw(b"body bytes").unwrap();
+        let body_end = writer.position();
+        writer
+            .fill_header(|w| {
+                w.write_u32(0xABCD)?;
+                w.write_u64(body_end)
+            })
+            .unwrap();
+        assert_eq!(writer.position(), body_end, "back at the end of the body");
+        writer.write_u8(b'!').unwrap();
+        writer.close().unwrap();
+
+        let bytes = get(&storage, "h");
+        let payload_len = bytes.len() - FOOTER_LEN as usize;
+        assert_eq!(bytes[..4], 0xABCDu32.to_le_bytes());
+        assert_eq!(bytes[4..12], body_end.to_le_bytes());
+        assert_eq!(&bytes[12..payload_len], b"body bytes!");
+        assert_eq!(
+            bytes[payload_len..payload_len + 4],
+            crc32fast::hash(&bytes[..payload_len]).to_le_bytes()
+        );
+        assert_eq!(
+            verify_file_checksum(storage.open_input("h").unwrap()).unwrap(),
+            ChecksumStatus::Verified
+        );
+    }
+
+    #[test]
+    fn a_header_is_reserved_once_at_the_start_and_filled_to_its_length() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+
+        let mut writer = StructWriter::new(storage.create_output("a").unwrap());
+        writer.write_u8(1).unwrap();
+        assert!(writer.reserve_header(4).is_err(), "not at the start");
+
+        let mut writer = StructWriter::new(storage.create_output("b").unwrap());
+        assert!(writer.fill_header(|_| Ok(())).is_err(), "nothing reserved");
+
+        let mut writer = StructWriter::new(storage.create_output("c").unwrap());
+        writer.reserve_header(4).unwrap();
+        assert!(writer.reserve_header(4).is_err(), "already reserved");
+        assert!(
+            writer.fill_header(|w| w.write_u16(1)).is_err(),
+            "shorter than reserved"
+        );
+
+        let mut writer = StructWriter::new(storage.create_output("d").unwrap());
+        writer.reserve_header(4).unwrap();
+        assert!(writer.close().is_err(), "closed unfilled");
+    }
+
+    #[test]
+    fn verify_file_checksum_tells_footed_legacy_and_corrupt_files_apart() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let bytes = write_fixed(&storage, "f");
+        let verify = |name: &str| verify_file_checksum(storage.open_input(name).unwrap()).unwrap();
+
+        assert_eq!(verify("f"), ChecksumStatus::Verified);
+        let mut flipped = bytes.clone();
+        flipped[3] ^= 0x80;
+        put(&storage, "x", &flipped);
+        assert_eq!(verify("x"), ChecksumStatus::Mismatch);
+        put(&storage, "l", &to_legacy(&bytes, LAST_WRITE));
+        assert_eq!(
+            verify("l"),
+            ChecksumStatus::Legacy(crc32fast::hash(LAST_WRITE))
+        );
+        put(&storage, "e", &[1, 2]);
+        assert_eq!(verify("e"), ChecksumStatus::Mismatch);
+    }
+
+    /// A file larger than one hashing chunk, read without a slice.
+    #[test]
+    fn verify_file_checksum_streams_an_input_without_a_slice() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let data: Vec<u8> = (0..VERIFY_CHUNK * 2 + 17).map(|i| i as u8).collect();
+        let mut writer = StructWriter::new(storage.create_output("big").unwrap());
+        writer.write_raw(&data).unwrap();
+        writer.close().unwrap();
+
+        let verify = || verify_file_checksum(NoSlice(storage.open_input("big").unwrap())).unwrap();
+        assert_eq!(verify(), ChecksumStatus::Verified);
+
+        let mut flipped = get(&storage, "big");
+        flipped[VERIFY_CHUNK + 5] ^= 0x01;
+        put(&storage, "big", &flipped);
+        assert_eq!(verify(), ChecksumStatus::Mismatch);
+    }
+
+    #[test]
+    fn ends_in_footer_reads_the_last_four_bytes() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let bytes = write_fixed(&storage, "f");
+        put(&storage, "l", &to_legacy(&bytes, LAST_WRITE));
+
+        assert!(ends_in_footer(storage.open_input("f").unwrap()).unwrap());
+        assert!(!ends_in_footer(storage.open_input("l").unwrap()).unwrap());
     }
 }

@@ -17,7 +17,7 @@
 //!   -- payload decompresses (codec=1) or is (codec=0) chunk_doc_count documents:
 //!   { doc_id(u64) | field_count(varint)
 //!     | { name(string) | type_tag(1B) | tag-specific payload } * field_count } * chunk_doc_count
-//! -- trailer: u32 CRC-32 checksum (StructWriter::close) --
+//! -- footer: CRC-32 of everything above + magic (StructWriter::close) --
 //! ```
 //!
 //! Design notes:
@@ -730,6 +730,9 @@ impl StoredFieldsReader {
                  {decoded_count} — segment is corrupted"
             )));
         }
+        // Each chunk's payload was checked by its own CRC as it was read;
+        // this covers the rest — the header and every chunk's framing.
+        reader.expect_checksum("stored fields")?;
 
         Ok(documents)
     }
@@ -1426,5 +1429,57 @@ mod tests {
             documents[&30].fields.get("n"),
             Some(&DataValue::Text("thirty".to_string()))
         );
+    }
+
+    /// Writes one small `.docs` part and returns its bytes.
+    fn written_docs_bytes(storage: &MemoryStorage) -> Vec<u8> {
+        use std::io::Read;
+
+        let docs = vec![(1u64, doc(&[("n", DataValue::Int64(7))]))];
+        round_trip(storage, "seg", &docs);
+        let mut bytes = Vec::new();
+        storage
+            .open_input("seg.docs")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn put_docs(storage: &MemoryStorage, bytes: &[u8]) {
+        use std::io::Write;
+
+        let mut output = storage.create_output("seg.docs").unwrap();
+        output.write_all(bytes).unwrap();
+        output.close().unwrap();
+    }
+
+    /// The part's footer covers what the chunk CRCs do not — here the
+    /// header's minor version, which the reader does not otherwise check
+    /// (Issue #1214).
+    #[test]
+    fn a_flipped_header_byte_fails_the_checksum() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut bytes = written_docs_bytes(&storage);
+        bytes[5] ^= 0x01;
+        put_docs(&storage, &bytes);
+
+        match load_docs_file(&storage, "seg").unwrap_err() {
+            LaurusError::Index(msg) => assert!(msg.contains("checksum mismatch"), "{msg}"),
+            other => panic!("expected Index error, got {other:?}"),
+        }
+    }
+
+    /// A part written before the footer, ending in a 4-byte trailer, still
+    /// loads.
+    #[test]
+    fn a_part_with_a_legacy_trailer_still_loads() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let bytes = written_docs_bytes(&storage);
+        let mut legacy = bytes[..bytes.len() - 8].to_vec();
+        legacy.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        put_docs(&storage, &legacy);
+
+        assert_eq!(load_docs_file(&storage, "seg").unwrap().len(), 1);
     }
 }

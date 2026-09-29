@@ -10,13 +10,13 @@
 //!
 //! ```text
 //! magic "SIDS"(u32 LE) | version(u16 LE) | payload: varint(len) + RoaringTreemap bytes
-//! -- trailer: u32 CRC-32 (StructWriter::close) --
+//! -- footer: CRC-32 of everything above + magic (StructWriter::close) --
 //! ```
 //!
-//! The payload is the file's last write, so `StructWriter`'s trailer — which
-//! covers only the most recent write — covers exactly the payload, and
-//! [`StructReader::verify_checksum`] checks it on read. This is the framing
-//! the checksummed segment manifest uses.
+//! [`StructReader::verify_checksum`] checks the footer on read. A part
+//! written before Issue #1214 ends in a legacy trailer instead, which holds
+//! the CRC of the file's last write only; the payload is that last write, so
+//! the legacy trailer is still checked against it.
 
 use roaring::RoaringTreemap;
 
@@ -56,7 +56,6 @@ pub(crate) fn write_doc_id_set<W: StorageOutput>(output: W, doc_ids: &[u64]) -> 
     let mut writer = StructWriter::new(output);
     writer.write_u32(MAGIC)?;
     writer.write_u16(VERSION)?;
-    // Last write: the trailer checksum covers exactly this payload.
     writer.write_bytes(&payload)?;
     writer.close()
 }
@@ -153,7 +152,9 @@ fn decode<R: StorageInput>(input: R, segment_id: &str) -> Result<RoaringTreemap>
     let available = reader.size().saturating_sub(reader.position());
     let len = checked_len_u64(len, available, "segment doc-id set")?;
     let payload = reader.read_raw(len)?;
-    if !reader.verify_checksum()? {
+    // The payload is the part's last write, so a legacy trailer — its CRC —
+    // is still checked in full.
+    if !reader.verify_checksum()?.vouches_for(&payload) {
         return Err(LaurusError::index(format!(
             "{segment_id}.{DOC_ID_SET_SUFFIX}: checksum mismatch — the part is corrupted"
         )));
@@ -217,6 +218,36 @@ mod tests {
         std::io::Write::write_all(&mut output, &bytes).unwrap();
         output.close().unwrap();
 
+        let err = read_doc_id_set(storage.as_ref(), "seg").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    /// A part written before the footer ends in a 4-byte trailer holding the
+    /// CRC of its payload — its last write — so it still loads, and is still
+    /// checked (Issue #1214).
+    #[test]
+    fn a_legacy_trailer_is_still_checked_against_the_payload() {
+        let storage = storage();
+        write_doc_id_set(storage.create_output("seg.ids").unwrap(), &[1, 2, 3]).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut storage.open_input("seg.ids").unwrap(), &mut bytes)
+            .unwrap();
+        let put = |bytes: &[u8]| {
+            let mut output = storage.create_output("seg.ids").unwrap();
+            std::io::Write::write_all(&mut output, bytes).unwrap();
+            output.close().unwrap();
+        };
+        // Past magic (4) + version (2) + length varint (1), up to the footer.
+        let payload_end = bytes.len() - 8;
+        let mut legacy = bytes[..payload_end].to_vec();
+        legacy.extend_from_slice(&crc32fast::hash(&bytes[7..payload_end]).to_le_bytes());
+
+        put(&legacy);
+        let set = read_doc_id_set(storage.as_ref(), "seg").unwrap().unwrap();
+        assert_eq!(set.iter().collect::<Vec<_>>(), [1, 2, 3]);
+
+        legacy[8] ^= 0xFF;
+        put(&legacy);
         let err = read_doc_id_set(storage.as_ref(), "seg").unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
     }

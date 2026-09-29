@@ -35,7 +35,9 @@ use crate::lexical::reader::FieldStats;
 use crate::lexical::reader::PostingIterator;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
-use crate::storage::structured::StructReader;
+use crate::storage::structured::{
+    ChecksumStatus, StructReader, ends_in_footer, verify_file_checksum,
+};
 
 /// Default [`InvertedIndexReaderConfig::max_cache_memory`] (128 MiB), shared
 /// with `InvertedIndexConfig` so the index-level default cannot drift from
@@ -644,6 +646,71 @@ impl SegmentReader {
             .collect())
     }
 
+    /// Verify this segment's parts against their checksum footers, one
+    /// sequential pass per part (Issue #1214).
+    ///
+    /// `.post` and every `.bkd` are read by random access, so the checks
+    /// made while loading the other parts never reach them. A merge calls
+    /// this on each source before copying it, so that corruption is not
+    /// carried into the merged segment under a fresh, valid checksum.
+    ///
+    /// `strict` is for a segment this binary just wrote: it also covers
+    /// `.dict`, `.docs`, `.norms` and `.ids`, and refuses any part without a
+    /// footer. Otherwise a part with a legacy trailer passes only while the
+    /// rest of its segment has legacy trailers too — one binary writes all of
+    /// a segment's parts, so a footed part beside an unfooted one means that
+    /// part's footer was damaged.
+    ///
+    /// # Arguments
+    ///
+    /// * `strict` - Whether the segment was written with footers throughout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::Index`] naming the first part that fails, and
+    /// any error from reading the parts.
+    pub fn check_integrity(&self, strict: bool) -> Result<()> {
+        let segment_id = &self.info.segment_id;
+        let mut parts = vec![format!("{segment_id}.post")];
+        parts.extend(
+            self.bkd_field_names()?
+                .into_iter()
+                .map(|field| format!("{segment_id}.{field}.bkd")),
+        );
+        if strict {
+            parts.extend(["dict", "docs", "norms", "ids"].map(|s| format!("{segment_id}.{s}")));
+        }
+
+        let dict = format!("{segment_id}.dict");
+        let mut footed = strict
+            || (self.storage.file_exists(&dict)
+                && ends_in_footer(self.storage.open_input(&dict)?)?);
+        let mut legacy_part = None;
+        for part in parts {
+            if !self.storage.file_exists(&part) {
+                continue;
+            }
+            match verify_file_checksum(self.storage.open_input(&part)?)? {
+                ChecksumStatus::Verified => footed = true,
+                ChecksumStatus::Legacy(_) => {
+                    legacy_part.get_or_insert(part);
+                }
+                ChecksumStatus::Mismatch => {
+                    return Err(LaurusError::index(format!(
+                        "{part}: checksum mismatch — the file is corrupted"
+                    )));
+                }
+            }
+        }
+        match legacy_part {
+            Some(part) if footed => Err(LaurusError::index(format!(
+                "{part}: has no checksum footer, though its segment was written with them — the \
+                 file is corrupted"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Enable (or resize) this segment's decoded posting-list cache with a byte
     /// budget (Issue #612). `0` keeps it disabled. Returns `self` for chaining
     /// after [`Self::open`].
@@ -836,7 +903,9 @@ impl SegmentReader {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `.delmap` exists but cannot be read.
+    /// Returns [`LaurusError::Index`] naming the segment if the `.delmap`
+    /// exists but cannot be read or is corrupted, as the merge's
+    /// `load_deleted_docs` does.
     fn load_deletion_bitmap(
         info: &SegmentInfo,
         storage: &dyn Storage,
@@ -848,9 +917,13 @@ impl SegmentReader {
         if !storage.file_exists(&bitmap_file) {
             return Ok(None);
         }
-        let input = storage.open_input(&bitmap_file)?;
-        let mut reader = StructReader::new(input)?;
-        let bitmap = DeletionBitmap::read_segment_bitmap(&mut reader, &info.segment_id)?;
+        let mut reader = StructReader::new(storage.open_input(&bitmap_file)?)?;
+        let bitmap = DeletionBitmap::read_from_storage(&mut reader).map_err(|e| {
+            LaurusError::index(format!(
+                "segment {}: failed to load its deletion bitmap: {e}",
+                info.segment_id
+            ))
+        })?;
         Ok(Some(Arc::new(bitmap)))
     }
 
@@ -3161,59 +3234,25 @@ mod tests {
     // ---- An unreadable `.delmap` is corruption, not "no deletions",
     // ---- Issue #1265 ---------------------------------------------------
 
-    /// A `.delmap` that exists but does not parse fails the open. Treating it
-    /// as "no deletions" would bring every deleted document of the segment
-    /// back into search results and counts.
-    #[test]
-    fn a_segment_whose_deletion_bitmap_cannot_be_parsed_refuses_to_open() {
-        use crate::storage::structured::StructWriter;
-
-        let (storage, info) = docs_only_segment(
-            "delmap_bad_magic",
+    /// A two-document segment with `has_deletions` set and no `.delmap` yet.
+    fn segment_marked_deleted(segment_id: &str) -> (Arc<dyn crate::storage::Storage>, SegmentInfo) {
+        docs_only_segment(
+            segment_id,
             &[
                 (0, vec![("body", text("alpha"))]),
                 (1, vec![("body", text("alpha"))]),
             ],
             true,
-        );
-        {
-            let output = storage
-                .create_output(&format!("{}.delmap", info.segment_id))
-                .unwrap();
-            let mut w = StructWriter::new(output);
-            w.write_u32(0xDEAD_BEEF).unwrap(); // not the "DELB" magic
-            w.close().unwrap();
-        }
-
-        match SegmentReader::open(info, storage) {
-            Err(LaurusError::Index(msg)) => {
-                assert!(
-                    msg.contains("segment delmap_bad_magic: deletion bitmap:"),
-                    "the error names the segment: {msg}"
-                );
-                assert!(msg.contains("segment is corrupted"), "{msg}");
-            }
-            Err(other) => panic!("expected an index corruption error, got {other:?}"),
-            Ok(_) => panic!("an unreadable deletion bitmap must not open as \"no deletions\""),
-        }
+        )
     }
 
-    /// A real `.delmap` cut short — what a torn write leaves — fails the open
-    /// too, rather than parsing as far as it can or being skipped.
-    #[test]
-    fn a_segment_whose_deletion_bitmap_is_truncated_refuses_to_open() {
-        use std::io::{Read, Write};
+    /// Flushes a real `.delmap` for `info`'s segment with doc 1 deleted, and
+    /// returns its bytes.
+    fn flush_delmap(storage: &Arc<dyn crate::storage::Storage>, info: &SegmentInfo) -> Vec<u8> {
+        use std::io::Read;
 
         use crate::maintenance::deletion::{DeletionConfig, DeletionManager};
 
-        let (storage, info) = docs_only_segment(
-            "delmap_truncated",
-            &[
-                (0, vec![("body", text("alpha"))]),
-                (1, vec![("body", text("alpha"))]),
-            ],
-            true,
-        );
         let manager = DeletionManager::new(
             DeletionConfig {
                 enable_deletion_log: false,
@@ -3230,36 +3269,99 @@ mod tests {
             .unwrap();
         manager.flush().unwrap();
 
-        let bitmap_file = format!("{}.delmap", info.segment_id);
         let mut bytes = Vec::new();
         storage
-            .open_input(&bitmap_file)
+            .open_input(&format!("{}.delmap", info.segment_id))
             .unwrap()
             .read_to_end(&mut bytes)
             .unwrap();
-        assert!(bytes.len() > 8, "the fixture must write a real bitmap");
-        let mut output = storage.create_output(&bitmap_file).unwrap();
-        output.write_all(&bytes[..bytes.len() / 2]).unwrap();
-        output.close().unwrap();
+        bytes
+    }
 
-        assert!(
-            SegmentReader::open(info, storage).is_err(),
-            "a truncated deletion bitmap must not open as \"no deletions\""
+    fn write_delmap(storage: &Arc<dyn crate::storage::Storage>, info: &SegmentInfo, bytes: &[u8]) {
+        use std::io::Write;
+
+        let mut output = storage
+            .create_output(&format!("{}.delmap", info.segment_id))
+            .unwrap();
+        output.write_all(bytes).unwrap();
+        output.close().unwrap();
+    }
+
+    /// Asserts that `info`'s segment refuses to open with a corruption error
+    /// naming the segment and containing `what`. Opening it as "no
+    /// deletions" would bring its deleted documents back into search results
+    /// and counts.
+    fn assert_open_refused(
+        storage: Arc<dyn crate::storage::Storage>,
+        info: SegmentInfo,
+        what: &str,
+    ) {
+        let expected = format!(
+            "segment {}: failed to load its deletion bitmap",
+            info.segment_id
         );
+        match SegmentReader::open(info, storage) {
+            Err(LaurusError::Index(msg)) => {
+                assert!(
+                    msg.contains(&expected),
+                    "the error names the segment: {msg}"
+                );
+                assert!(msg.contains(what), "{msg}");
+            }
+            Err(other) => panic!("expected an index corruption error, got {other:?}"),
+            Ok(_) => panic!("an unreadable deletion bitmap must not open as \"no deletions\""),
+        }
+    }
+
+    #[test]
+    fn a_segment_whose_deletion_bitmap_cannot_be_parsed_refuses_to_open() {
+        use crate::storage::structured::StructWriter;
+
+        let (storage, info) = segment_marked_deleted("delmap_bad_magic");
+        let output = storage
+            .create_output(&format!("{}.delmap", info.segment_id))
+            .unwrap();
+        let mut w = StructWriter::new(output);
+        w.write_u32(0xDEAD_BEEF).unwrap(); // not the "DELB" magic
+        w.close().unwrap();
+
+        assert_open_refused(storage, info, "Invalid deletion bitmap format");
+    }
+
+    /// The case #1214 made common: one flipped bit in a field nothing else
+    /// checks still parses, and only the checksum catches it.
+    #[test]
+    fn a_segment_whose_deletion_bitmap_fails_its_checksum_refuses_to_open() {
+        let (storage, info) = segment_marked_deleted("delmap_flipped");
+        let mut bytes = flush_delmap(&storage, &info);
+        let reader = SegmentReader::open(info.clone(), storage.clone()).unwrap();
+        assert_eq!(reader.doc_count(), 1, "the intact bitmap hides doc 1");
+
+        // magic (4) + version (4) + segment id (1 + len) + total_docs (8) +
+        // deleted_count (8), then last_modified.
+        let last_modified = 4 + 4 + 1 + info.segment_id.len() + 8 + 8;
+        bytes[last_modified] ^= 0x01;
+        write_delmap(&storage, &info, &bytes);
+
+        assert_open_refused(storage, info, "checksum mismatch");
+    }
+
+    /// A real `.delmap` cut short — what a torn write leaves.
+    #[test]
+    fn a_segment_whose_deletion_bitmap_is_truncated_refuses_to_open() {
+        let (storage, info) = segment_marked_deleted("delmap_truncated");
+        let bytes = flush_delmap(&storage, &info);
+        write_delmap(&storage, &info, &bytes[..bytes.len() / 2]);
+
+        assert_open_refused(storage, info, "");
     }
 
     /// `has_deletions` without a `.delmap` file still opens as a segment with
     /// no deletions: a missing bitmap is not a corrupted one.
     #[test]
     fn a_segment_with_no_deletion_bitmap_file_still_opens_as_undeleted() {
-        let (storage, info) = docs_only_segment(
-            "delmap_absent",
-            &[
-                (0, vec![("body", text("alpha"))]),
-                (1, vec![("body", text("alpha"))]),
-            ],
-            true,
-        );
+        let (storage, info) = segment_marked_deleted("delmap_absent");
         assert!(!storage.file_exists("delmap_absent.delmap"));
 
         let reader = SegmentReader::open(info, storage).unwrap();

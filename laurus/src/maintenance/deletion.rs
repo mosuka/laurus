@@ -11,7 +11,7 @@ use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LaurusError, Result};
-use crate::storage::structured::{StructReader, StructWriter};
+use crate::storage::structured::{FOOTER_MAGIC, StructReader, StructWriter};
 use crate::storage::{Storage, StorageInput, StorageOutput};
 
 /// Configuration for deletion management.
@@ -299,8 +299,20 @@ impl DeletionBitmap {
         Ok(())
     }
 
-    /// Read bitmap from storage.
+    /// Read bitmap from storage, and check the file's checksum (Issue #1214).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is not a deletion bitmap, has an
+    /// unsupported version, does not decode, or fails its checksum.
     pub fn read_from_storage<R: StorageInput>(reader: &mut StructReader<R>) -> Result<Self> {
+        let bitmap = Self::read_fields(reader)?;
+        reader.expect_checksum("deletion bitmap")?;
+        Ok(bitmap)
+    }
+
+    /// Parse every version's fields; each one reads to the end of the payload.
+    fn read_fields<R: StorageInput>(reader: &mut StructReader<R>) -> Result<Self> {
         // Read header
         let magic = reader.read_u32()?;
         if magic != 0x44454C42 {
@@ -450,30 +462,6 @@ impl DeletionBitmap {
             )))
         }
     }
-
-    /// Read the `.delmap` of `segment_id`, reporting one that does not parse
-    /// as corruption of that segment (Issue #1265).
-    ///
-    /// Every reader of a `.delmap` goes through this: a file that exists but
-    /// cannot be read must never be taken for "no deletions", which would
-    /// bring the segment's deleted documents back. An I/O error keeps its own
-    /// variant.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying error, naming the segment when the payload is
-    /// malformed.
-    pub(crate) fn read_segment_bitmap<R: StorageInput>(
-        reader: &mut StructReader<R>,
-        segment_id: &str,
-    ) -> Result<Self> {
-        Self::read_from_storage(reader).map_err(|e| match e {
-            LaurusError::Index(msg) => LaurusError::Index(format!(
-                "segment {segment_id}: deletion bitmap: {msg} — segment is corrupted"
-            )),
-            other => other,
-        })
-    }
 }
 
 /// Entry in the deletion log for recovery.
@@ -555,7 +543,7 @@ impl DeletionLog {
             let mut max_sequence = 0;
 
             // Read all entries to find max sequence
-            while !reader.is_eof() {
+            while reader.remaining() > 0 {
                 if let Ok(json) = reader.read_string() {
                     if let Ok(entry) = serde_json::from_str::<DeletionLogEntry>(&json) {
                         max_sequence = max_sequence.max(entry.sequence);
@@ -565,11 +553,15 @@ impl DeletionLog {
                         // EOF or error after string
                         break;
                     }
-                    // Each append uses a fresh StructWriter, whose close() adds
-                    // a CRC trailer after this entry's newline.
+                    // Each append uses a fresh StructWriter, whose close() ends
+                    // this entry with a CRC — followed by the footer magic
+                    // since Issue #1214, and by the next entry before it.
                     if reader.read_u32().is_err() {
                         // EOF or a truncated checksum trailer
                         break;
+                    }
+                    if reader.peek_u32()? == Some(FOOTER_MAGIC) {
+                        reader.read_u32()?;
                     }
                 } else {
                     // Failed to read string (EOF or corruption)
@@ -803,17 +795,22 @@ impl DeletionManager {
     }
 
     /// Load existing bitmaps from storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a `.delmap` cannot be read or is corrupted.
+    /// Skipping it instead would let the next deletion in that segment start
+    /// a fresh bitmap and overwrite the file, losing every earlier deletion.
     fn load_bitmaps(&self) -> Result<()> {
         let files = self.storage.list_files()?;
 
         for file in files {
-            if let Some(segment_id) = file.strip_suffix(".delmap") {
+            if file.ends_with(".delmap") {
                 let input = self.storage.open_input(&file)?;
                 let mut reader = StructReader::new(input)?;
-                // Skipping an unreadable one would drop that segment's
-                // deletions, and the next flush would overwrite the file
-                // with only the new ones (Issue #1265).
-                let bitmap = DeletionBitmap::read_segment_bitmap(&mut reader, segment_id)?;
+                let bitmap = DeletionBitmap::read_from_storage(&mut reader).map_err(|e| {
+                    LaurusError::index(format!("Failed to load deletion bitmap {file}: {e}"))
+                })?;
                 let mut bitmaps = self.bitmaps.write().unwrap();
                 bitmaps.insert(bitmap.segment_id.clone(), Arc::new(bitmap));
             }
@@ -1051,46 +1048,111 @@ mod tests {
         assert!(!manager.is_deleted("untracked", 5));
     }
 
-    /// A new manager loads the bitmaps an earlier one flushed.
-    #[test]
-    fn new_loads_the_bitmaps_flushed_before() {
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    fn read_file(storage: &dyn Storage, name: &str) -> Vec<u8> {
+        use std::io::Read;
+
+        let mut bytes = Vec::new();
+        storage
+            .open_input(name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn write_file(storage: &dyn Storage, name: &str, bytes: &[u8]) {
+        use std::io::Write;
+
+        let mut output = storage.create_output(name).unwrap();
+        output.write_all(bytes).unwrap();
+        output.close().unwrap();
+    }
+
+    /// Flushes a bitmap for `seg001` with doc 5 deleted and returns its
+    /// bytes.
+    fn flushed_bitmap(storage: &Arc<dyn Storage>) -> Vec<u8> {
         let manager = DeletionManager::new(DeletionConfig::default(), storage.clone()).unwrap();
         manager.initialize_segment("seg001", 0, 999).unwrap();
         manager.delete_document("seg001", 5, "test").unwrap();
         manager.flush().unwrap();
-        drop(manager);
-
-        let reopened = DeletionManager::new(DeletionConfig::default(), storage).unwrap();
-        assert!(reopened.is_deleted("seg001", 5));
-        assert!(!reopened.is_deleted("seg001", 6));
+        read_file(storage.as_ref(), "seg001.delmap")
     }
 
-    /// A `.delmap` that exists but does not parse fails the manager (Issue
-    /// #1265): skipping it would drop that segment's deletions, and the next
-    /// flush would never restore them.
-    #[test]
-    fn new_rejects_an_unreadable_bitmap_on_disk() {
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-        {
-            let output = storage.create_output("seg001.delmap").unwrap();
-            let mut w = StructWriter::new(output);
-            w.write_u32(0xDEAD_BEEF).unwrap(); // not the "DELB" magic
-            w.close().unwrap();
-        }
+    fn load_bitmap(storage: &dyn Storage) -> Result<DeletionBitmap> {
+        let mut reader = StructReader::new(storage.open_input("seg001.delmap").unwrap())?;
+        DeletionBitmap::read_from_storage(&mut reader)
+    }
 
-        let err = DeletionManager::new(DeletionConfig::default(), storage).unwrap_err();
-        match err {
-            LaurusError::Index(msg) => {
-                assert!(
-                    msg.contains("segment seg001: deletion bitmap:"),
-                    "the error names the segment: {msg}"
-                );
-                assert!(msg.contains("segment is corrupted"), "{msg}");
-            }
-            other => panic!("expected an index corruption error, got {other:?}"),
-        }
+    /// A flipped byte in a field nothing else checks — `last_modified` —
+    /// fails the checksum (Issue #1214), and the manager refuses to load the
+    /// bitmap rather than skipping it: a skipped bitmap would be restarted
+    /// empty by the next deletion and overwrite the file, losing doc 5's.
+    #[test]
+    fn a_corrupted_bitmap_is_refused_rather_than_skipped() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut bytes = flushed_bitmap(&storage);
+        // magic (4) + version (4) + "seg001" (1 + 6) + total_docs (8) +
+        // deleted_count (8), then last_modified.
+        bytes[31] ^= 0x01;
+        write_file(storage.as_ref(), "seg001.delmap", &bytes);
+
+        let err = load_bitmap(storage.as_ref()).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let err = DeletionManager::new(DeletionConfig::default(), storage.clone()).unwrap_err();
+        assert!(err.to_string().contains("seg001.delmap"), "{err}");
+        assert_eq!(read_file(storage.as_ref(), "seg001.delmap"), bytes);
+    }
+
+    /// A bitmap written before the footer, ending in a 4-byte trailer, still
+    /// loads.
+    #[test]
+    fn a_bitmap_with_a_legacy_trailer_still_loads() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let bytes = flushed_bitmap(&storage);
+        let mut legacy = bytes[..bytes.len() - 8].to_vec();
+        legacy.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        write_file(storage.as_ref(), "seg001.delmap", &legacy);
+
+        assert!(load_bitmap(storage.as_ref()).unwrap().is_deleted(5));
+        let manager = DeletionManager::new(DeletionConfig::default(), storage).unwrap();
+        assert!(manager.is_deleted("seg001", 5));
+    }
+
+    /// A log holding entries from before the footer (CRC only) and after it
+    /// (CRC + magic) resumes after its highest sequence.
+    #[test]
+    fn a_log_mixing_legacy_and_footed_entries_resumes_its_sequence() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let log_path = "deletion.log";
+        let legacy_entry = |sequence: u64| {
+            let json = serde_json::to_string(&DeletionLogEntry {
+                timestamp: 0,
+                segment_id: "segment".to_string(),
+                doc_id: sequence,
+                reason: "legacy".to_string(),
+                sequence,
+            })
+            .unwrap();
+            let mut bytes = crate::util::varint::encode_u64(json.len() as u64);
+            bytes.extend_from_slice(json.as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&crc32fast::hash(b"\n").to_le_bytes());
+            bytes
+        };
+
+        write_file(storage.as_ref(), log_path, &legacy_entry(0));
+        DeletionLog::new(storage.clone(), log_path.to_string())
+            .unwrap()
+            .log_deletion("segment", 1, "footed")
+            .unwrap();
+        let mut bytes = read_file(storage.as_ref(), log_path);
+        bytes.extend_from_slice(&legacy_entry(7));
+        write_file(storage.as_ref(), log_path, &bytes);
+
+        let reopened = DeletionLog::new(storage, log_path.to_string()).unwrap();
+        assert_eq!(reopened.sequence.load(Ordering::SeqCst), 8);
     }
 }

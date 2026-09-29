@@ -649,6 +649,14 @@ impl MergeEngine {
     }
 
     /// Load the set of deleted doc_ids for a segment from its `.delmap`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bitmap exists but cannot be read or is
+    /// corrupted. Taking it as empty would republish the segment's deleted
+    /// documents and then remove the segment — the only record that they
+    /// were deleted. A missing bitmap still means no deletions, as it does
+    /// for [`SegmentReader`].
     fn load_deleted_docs(&self, segment_info: &SegmentInfo) -> Result<RoaringTreemap> {
         use crate::maintenance::deletion::DeletionBitmap;
         use crate::storage::structured::StructReader;
@@ -658,15 +666,15 @@ impl MergeEngine {
         }
         let bitmap_file = format!("{}.delmap", segment_info.segment_id);
         if !self.storage.file_exists(&bitmap_file) {
-            // Metadata says there are deletions but the bitmap is missing;
-            // `SegmentReader::load_deletion_bitmap` treats this the same way.
             return Ok(RoaringTreemap::new());
         }
-        let input = self.storage.open_input(&bitmap_file)?;
-        let mut reader = StructReader::new(input)?;
-        // Merging over an unreadable one would carry its deleted documents
-        // into the merged segment (Issue #1265).
-        let bitmap = DeletionBitmap::read_segment_bitmap(&mut reader, &segment_info.segment_id)?;
+        let mut reader = StructReader::new(self.storage.open_input(&bitmap_file)?)?;
+        let bitmap = DeletionBitmap::read_from_storage(&mut reader).map_err(|e| {
+            LaurusError::index(format!(
+                "merge: segment {}: failed to load its deletion bitmap: {e}",
+                segment_info.segment_id
+            ))
+        })?;
         // The `.delmap` payload already *is* a Roaring bitmap, and the merge
         // only ever asks it for a count and membership — both of which it
         // answers directly. Expanding it into a `Vec` and then a hash set
@@ -1106,6 +1114,9 @@ impl MergeEngine {
         // here as a mismatch rather than as silently lost documents.
         let info = &segment.segment_info;
         let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
+        // Every part was just written with a footer, so every part must
+        // carry one that matches (Issue #1214).
+        reader.check_integrity(true)?;
         match reader.stored_doc_count()? {
             Some(written) if written != info.doc_count => {
                 return Err(LaurusError::index(format!(
@@ -1161,7 +1172,6 @@ impl MergeEngine {
         Ok(())
 
         // TODO: Add more verification checks
-        // - Term dictionary integrity
         // - Posting list consistency
         // - Document field validation
     }
@@ -1204,11 +1214,16 @@ impl MergeEngine {
     /// Open a source segment for replay or reconstruction, carrying the index
     /// analyzer into the reader so a `.post`-less segment's terms are derived
     /// like the writer derived them (Issue #1196).
+    ///
+    /// The parts it will read by random access are verified first (Issue
+    /// #1214): a merge rewrites what it reads under a new, valid checksum,
+    /// so corruption let through here could no longer be detected.
     fn open_source_segment(
         &self,
         info: &crate::lexical::index::inverted::segment::SegmentInfo,
     ) -> Result<SegmentReader> {
         let reader = SegmentReader::open(info.clone(), self.storage.clone())?;
+        reader.check_integrity(false)?;
         Ok(match &self.config.index_analyzer {
             Some(analyzer) => reader.with_analyzer(Arc::clone(analyzer)),
             None => reader,
@@ -2937,7 +2952,11 @@ mod tests {
         let err = engine
             .merge_segments(&two_segment_candidate(), &sources, 1)
             .expect_err("a merge must not read an unreadable deletion bitmap as empty");
-        assert!(err.to_string().contains("segment is corrupted"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("segment segment_000000: failed to load its deletion bitmap"),
+            "{err}"
+        );
     }
 
     /// `load_deleted_docs` itself refuses an unreadable `.delmap` — the merge
@@ -2955,12 +2974,11 @@ mod tests {
             ..segment_info("segment_bad", 1, 0, 0, 0)
         };
         let err = engine.load_deleted_docs(&info).unwrap_err();
-        let msg = err.to_string();
         assert!(
-            msg.contains("segment segment_bad: deletion bitmap:"),
-            "the error names the segment: {msg}"
+            err.to_string()
+                .contains("merge: segment segment_bad: failed to load its deletion bitmap"),
+            "the error names the segment: {err}"
         );
-        assert!(msg.contains("segment is corrupted"), "{msg}");
     }
 
     /// A missing `.delmap` is still "no deletions", as in

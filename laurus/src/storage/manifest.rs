@@ -14,7 +14,7 @@
 //!
 //! 1. serialize to JSON
 //! 2. write it to `<name>.tmp` through [`StructWriter`], which accumulates a
-//!    CRC-32 and emits it as a trailer on `close`
+//!    CRC-32 of every byte and emits it in a footer on `close`
 //! 3. `close`, which fsyncs the payload
 //! 4. rename `<name>.tmp` over `<name>` — the atomic step
 //! 5. `sync()` the storage, so the *directory entry* is durable too
@@ -27,13 +27,18 @@
 //! Call sites that predate the framing wrote bare JSON in place. The loader
 //! detects that by its leading byte and hands it back unverified, so existing
 //! indexes keep opening; the next save rewrites them in the framed form.
+//!
+//! Framed files written before Issue #1214 end in a 4-byte trailer holding
+//! the CRC-32 of the payload alone, rather than the footer that now covers
+//! the whole file. The payload was the file's last write, so that trailer is
+//! still checked against it.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
-use crate::storage::structured::{StructReader, StructWriter};
+use crate::storage::structured::{FOOTER_LEN, FOOTER_MAGIC, StructReader, StructWriter};
 use crate::util::varint::decode_u64;
 
 /// Suffix used for the staging file a save writes before renaming.
@@ -42,7 +47,8 @@ const TMP_SUFFIX: &str = ".tmp";
 /// What [`load_checksummed_json`] found on storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestFormat {
-    /// The framed form: length-prefixed JSON with a verified CRC-32 trailer.
+    /// The framed form: length-prefixed JSON with a verified CRC-32 footer
+    /// (or, written before Issue #1214, a verified trailer over the payload).
     Checksummed,
     /// Bare JSON written before framing existed. Read as-is; nothing verifies
     /// it, and the next save upgrades it.
@@ -103,8 +109,8 @@ pub fn save_checksummed(
 ) -> Result<()> {
     let tmp_name = format!("{name}{TMP_SUFFIX}");
 
-    // `write_bytes` accumulates the payload's CRC-32; `close` writes it as the
-    // file trailer and fsyncs.
+    // The writer accumulates the CRC-32 of every byte; `close` writes it in
+    // the file's footer and fsyncs.
     let output = storage.create_output(&tmp_name)?;
     let mut writer = StructWriter::new(output);
     if let Some(magic) = magic {
@@ -202,7 +208,9 @@ pub fn load_checksummed(
         }
     }
     let payload = reader.read_bytes()?;
-    if !reader.verify_checksum()? {
+    // The payload is the file's last write, so a legacy trailer — its CRC —
+    // is still checked in full.
+    if !reader.verify_checksum()?.vouches_for(&payload) {
         return Err(LaurusError::index(format!(
             "{name} checksum mismatch — the file is corrupted"
         )));
@@ -219,7 +227,7 @@ pub fn load_checksummed(
 /// the mismatch instead of a confusing deserialize error.
 ///
 /// Without a marker the test is structural: a framed file is exactly
-/// `varint(len) || payload || u32 crc`, so its length is determined by its
+/// `varint(len) || payload || trailer`, so its length is determined by its
 /// own header. Checking that is far sturdier than looking at the first byte,
 /// which collides whenever a payload happens to be 91 or 123 bytes long — the
 /// varint for those encodes as `[` and `{`.
@@ -248,23 +256,37 @@ fn is_legacy_json(content: &[u8], magic: Option<u32>) -> bool {
 
 /// Whether `content`'s length matches what its own varint header claims.
 ///
+/// The trailer is a footer (8 bytes, ending in [`FOOTER_MAGIC`]) or, for a
+/// file written before Issue #1214, a 4-byte CRC. A footer is accepted only
+/// with its magic in place: JSON never ends in the magic's last byte (`C`),
+/// so a bare JSON file whose leading byte happens to read as a varint that
+/// leaves exactly 8 bytes over is still recognised as legacy.
+///
 /// # Arguments
 ///
 /// * `content` - The file's bytes.
 ///
 /// # Returns
 ///
-/// `true` when the bytes are shaped like `varint(len) || payload || u32 crc`.
+/// `true` when the bytes are shaped like `varint(len) || payload || trailer`.
 fn framing_is_consistent(content: &[u8]) -> bool {
     let Ok((payload_len, header_len)) = decode_u64(content) else {
         return false;
     };
-    let Ok(payload_len) = usize::try_from(payload_len) else {
+    let Some(framed_len) = usize::try_from(payload_len)
+        .ok()
+        .and_then(|n| n.checked_add(header_len))
+    else {
         return false;
     };
-    header_len
-        .checked_add(payload_len)
-        .and_then(|n| n.checked_add(4))
+    let ends_in_footer = content.ends_with(&FOOTER_MAGIC.to_le_bytes());
+    let trailer_len = if ends_in_footer {
+        FOOTER_LEN as usize
+    } else {
+        4
+    };
+    framed_len
+        .checked_add(trailer_len)
         .is_some_and(|total| total == content.len())
 }
 
@@ -463,6 +485,67 @@ mod tests {
                 "a {payload_len}-byte payload must still read as framed"
             );
             assert_eq!(loaded, payload);
+        }
+    }
+
+    fn put(storage: &MemoryStorage, name: &str, bytes: &[u8]) {
+        use std::io::Write;
+
+        let mut output = storage.create_output(name).unwrap();
+        output.write_all(bytes).unwrap();
+        output.close().unwrap();
+    }
+
+    /// A framed file written before Issue #1214 ends in the CRC of its
+    /// payload alone. It still loads as checksummed, because that trailer is
+    /// still checked against the payload — and a corrupted payload is still
+    /// refused.
+    #[test]
+    fn a_legacy_trailer_is_still_checked_against_the_payload() {
+        let storage = storage();
+        let json = serde_json::to_vec(&sample()).unwrap();
+        for magic in [None, Some(0xABCD_1234u32)] {
+            let mut framed = Vec::new();
+            if let Some(magic) = magic {
+                framed.extend_from_slice(&magic.to_le_bytes());
+            }
+            framed.extend(crate::util::varint::encode_u64(json.len() as u64));
+            framed.extend_from_slice(&json);
+            framed.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+
+            put(&storage, "m.json", &framed);
+            let (loaded, format): (Sample, _) =
+                load_checksummed_json(storage.as_ref(), "m.json", magic)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(loaded, sample());
+            assert_eq!(format, ManifestFormat::Checksummed);
+
+            let mid = framed.len() / 2;
+            framed[mid] ^= 0x01;
+            put(&storage, "m.json", &framed);
+            let err =
+                load_checksummed_json::<Sample>(storage.as_ref(), "m.json", magic).unwrap_err();
+            assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        }
+    }
+
+    /// Bare JSON whose leading `[` or `{`, read as a varint, would leave
+    /// exactly a footer's 8 bytes over is still legacy: a footer needs its
+    /// magic, and JSON never ends in it.
+    #[test]
+    fn bare_json_of_a_footed_frames_length_is_still_legacy() {
+        let storage = storage();
+        // `[` is 91 and `{` is 123: header byte + payload + 8.
+        for (json, len) in [("[1]", 1 + 91 + 8), ("{\"a\":1}", 1 + 123 + 8)] {
+            let bare = format!("{json:<len$}");
+            put(&storage, "m.json", bare.as_bytes());
+
+            let (loaded, format) = load_checksummed(storage.as_ref(), "m.json", None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(format, ManifestFormat::Legacy, "{len}-byte {json}");
+            assert_eq!(loaded, bare.as_bytes());
         }
     }
 

@@ -198,12 +198,11 @@ impl CompoundSegmentWriter {
 /// A [`StorageOutput`] view over the shared container output, offset by
 /// the current part's base.
 ///
-/// Seeks are translated in BOTH directions — arguments AND return values.
-/// The return-value half is load-bearing: `StructWriter::seek` adopts the
-/// returned position as its internal counter, and `BKDWriter` persists
-/// stream positions into the part (header backfill via `Start(0)`,
-/// `index_start_offset` from `stream_position()`), which its reader then
-/// interprets as part-relative offsets.
+/// Seeks are translated in BOTH directions — arguments AND return values —
+/// so a part writer sees offsets relative to the part. That is what
+/// `StructWriter::fill_header` relies on when it seeks to `Start(0)` to
+/// backfill `BKDWriter`'s header, and what makes the offsets `BKDWriter`
+/// records from its writer's position part-relative, as its reader expects.
 ///
 /// `close()` and `flush_and_sync()` are deliberate no-ops: part writers
 /// end in `StructWriter::close`, which would otherwise fsync per part and
