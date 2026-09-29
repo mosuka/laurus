@@ -2889,4 +2889,110 @@ mod tests {
         assert!(!storage.file_exists(&format!("{id}.cfs")));
         engine.verify_merged_segment(&result.new_segment).unwrap();
     }
+
+    // ---- An unreadable `.delmap` is corruption, not "no deletions",
+    // ---- Issue #1265 ---------------------------------------------------
+
+    /// Overwrites `{segment_id}.delmap` with a file whose magic is not
+    /// "DELB", so it exists but does not parse.
+    fn plant_unreadable_delmap(storage: &Arc<dyn Storage>, segment_id: &str) {
+        use crate::storage::structured::StructWriter;
+
+        let output = storage
+            .create_output(&format!("{segment_id}.delmap"))
+            .unwrap();
+        let mut w = StructWriter::new(output);
+        w.write_u32(0xDEAD_BEEF).unwrap();
+        w.close().unwrap();
+    }
+
+    /// Merging over an unreadable `.delmap` must fail: going on with an empty
+    /// bitmap would write the segment's deleted documents into the merged
+    /// segment and delete the sources, making the loss permanent.
+    #[test]
+    fn merge_over_an_unreadable_deletion_bitmap_fails_instead_of_resurrecting_documents() {
+        use crate::maintenance::deletion::{DeletionConfig, DeletionManager};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let d0 = writer.add_document(text_int_doc("alpha", 1)).unwrap();
+        writer.commit().unwrap();
+        let d1 = writer.add_document(text_int_doc("bravo", 2)).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let manager = DeletionManager::new(
+            DeletionConfig {
+                enable_deletion_log: false,
+                ..Default::default()
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        manager
+            .initialize_segment("segment_000000", d0, d0)
+            .unwrap();
+        manager
+            .delete_document("segment_000000", d0, "test")
+            .unwrap();
+        manager.flush().unwrap();
+        plant_unreadable_delmap(&storage, "segment_000000");
+
+        let sources = [
+            ManagedSegmentInfo::new(SegmentInfo {
+                has_deletions: true,
+                ..segment_info("segment_000000", 1, d0, d0, 0)
+            }),
+            ManagedSegmentInfo::new(segment_info("segment_000001", 1, d1, d1, 1)),
+        ];
+        let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
+        let err = engine
+            .merge_segments(&two_segment_candidate(), &sources, 1)
+            .expect_err("a merge must not read an unreadable deletion bitmap as empty");
+        assert!(
+            err.to_string()
+                .contains("segment segment_000000: failed to load its deletion bitmap"),
+            "{err}"
+        );
+    }
+
+    /// `load_deleted_docs` itself refuses an unreadable `.delmap` — the merge
+    /// paths open the source segment first, which already fails, so this is
+    /// checked directly.
+    #[test]
+    fn load_deleted_docs_rejects_an_unreadable_deletion_bitmap() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        plant_unreadable_delmap(&storage, "segment_bad");
+        let engine = MergeEngine::new(MergeConfig::default(), storage);
+
+        let info = SegmentInfo {
+            has_deletions: true,
+            ..segment_info("segment_bad", 1, 0, 0, 0)
+        };
+        let err = engine.load_deleted_docs(&info).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("merge: segment segment_bad: failed to load its deletion bitmap"),
+            "the error names the segment: {err}"
+        );
+    }
+
+    /// A missing `.delmap` is still "no deletions", as in
+    /// `SegmentReader::load_deletion_bitmap`.
+    #[test]
+    fn load_deleted_docs_treats_a_missing_deletion_bitmap_as_no_deletions() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let engine = MergeEngine::new(MergeConfig::default(), storage);
+
+        let info = SegmentInfo {
+            has_deletions: true,
+            ..segment_info("segment_absent", 1, 0, 0, 0)
+        };
+        assert!(engine.load_deleted_docs(&info).unwrap().is_empty());
+    }
 }

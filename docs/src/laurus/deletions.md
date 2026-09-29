@@ -126,6 +126,13 @@ The bitmap is persisted alongside the index segments (the `.delmap` file) and is
 the WAL during recovery. The on-disk format is versioned: the current writer emits v4 (Roaring),
 and the reader still loads the older v1–v3 (raw ID list) layouts for backward compatibility.
 
+A segment's `.delmap` is read when the segment is opened. One that exists but cannot be read
+is reported as a corruption error, whether the segment is being opened for search, merged, or
+loaded by the writer's deletion tracking. It is never read as "no deletions", which would bring
+the segment's deleted documents back into results and counts, or carry them into a merged
+segment. A segment whose metadata records deletions but has no `.delmap` file still opens as a
+segment with none.
+
 ### Group-Committed Persistence
 
 Deletion state is persisted **once per commit**, not once per delete. Each delete (including
