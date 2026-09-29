@@ -257,7 +257,9 @@ lengths and statistics, the segment's doc-id set, doc values and per-field
 BKD trees, concatenated
 with a trailing part table): one file create and one fsync per flush instead
 of one per part. The deletion bitmap (`.delmap`) stays a separate file, as
-the only per-segment data rewritten after sealing. Readers detect the layout
+the only per-segment data rewritten after sealing — written the same
+temp-file-then-rename way as the container itself (item 6 above), so a crash
+mid-rewrite leaves the previously committed bitmap intact. Readers detect the layout
 per segment, so indexes with older loose-file segments keep working
 unchanged, and merges rewrite them into containers over time.
 `LAURUS_NO_COMPOUND=1` restores the loose layout as a transitional escape

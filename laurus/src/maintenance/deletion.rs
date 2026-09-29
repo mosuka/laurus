@@ -781,14 +781,30 @@ impl DeletionManager {
 
     /// Save bitmap to storage.
     fn save_bitmap(&self, segment_id: &str) -> Result<()> {
-        let bitmaps = self.bitmaps.read().unwrap();
+        // Clone out and drop the read lock before doing I/O: `write_to_storage`
+        // only needs `&DeletionBitmap`, and holding the lock across a syscall
+        // (now two: the tmp write and the rename below) would needlessly stall
+        // concurrent readers/writers of other segments.
+        let bitmap = {
+            let bitmaps = self.bitmaps.read().unwrap();
+            bitmaps.get(segment_id).cloned()
+        };
 
-        if let Some(bitmap) = bitmaps.get(segment_id) {
+        if let Some(bitmap) = bitmap {
             let bitmap_file = format!("{segment_id}.delmap");
-            let output = self.storage.create_output(&bitmap_file)?;
+            // Temp-then-rename for crash safety (#1267), matching the vector
+            // index's own `.delmap` writer (`SegmentedHnswIndex::persist_deletions`).
+            // No extra `storage.sync()` after the rename: this only runs when
+            // `flush_deletions` also queued this commit's manifest publish
+            // (`update_segment_meta_deletions`, called on every delete
+            // regardless of whether the bit was already set), which already
+            // ends in a directory `storage.sync()`.
+            let tmp_file = format!("{bitmap_file}.tmp");
+            let output = self.storage.create_output(&tmp_file)?;
             let mut writer = StructWriter::new(output);
             bitmap.write_to_storage(&mut writer)?;
             writer.close()?;
+            self.storage.rename_file(&tmp_file, &bitmap_file)?;
         }
 
         Ok(())
@@ -1154,5 +1170,169 @@ mod tests {
 
         let reopened = DeletionLog::new(storage, log_path.to_string()).unwrap();
         assert_eq!(reopened.sequence.load(Ordering::SeqCst), 8);
+    }
+
+    /// A `Storage` decorator whose `create_output` returns an output whose
+    /// `close()` fails, exactly once, for one armed file name — simulating a
+    /// crash after bytes reached the temp file but before it (and the
+    /// rename that follows) durably landed. Every other call passes straight
+    /// through to `inner`.
+    #[derive(Debug)]
+    struct FailCloseOnce {
+        inner: Arc<dyn Storage>,
+        armed_for: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FailCloseOnce {
+        fn new(inner: Arc<dyn Storage>) -> Self {
+            Self {
+                inner,
+                armed_for: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn arm(&self, name: &str) {
+            *self.armed_for.lock().unwrap() = Some(name.to_string());
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingOutput {
+        inner: Box<dyn StorageOutput>,
+    }
+
+    impl std::io::Write for FailingOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl std::io::Seek for FailingOutput {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl StorageOutput for FailingOutput {
+        fn flush_and_sync(&mut self) -> Result<()> {
+            self.inner.flush_and_sync()
+        }
+
+        fn position(&self) -> Result<u64> {
+            self.inner.position()
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Err(LaurusError::internal("injected close failure"))
+        }
+    }
+
+    impl Storage for FailCloseOnce {
+        fn loading_mode(&self) -> crate::storage::LoadingMode {
+            self.inner.loading_mode()
+        }
+
+        fn open_input(&self, name: &str) -> Result<Box<dyn StorageInput>> {
+            self.inner.open_input(name)
+        }
+
+        fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+            let output = self.inner.create_output(name)?;
+            let mut armed = self.armed_for.lock().unwrap();
+            if armed.as_deref() == Some(name) {
+                *armed = None;
+                return Ok(Box::new(FailingOutput { inner: output }));
+            }
+            Ok(output)
+        }
+
+        fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+
+        fn delete_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_file(name)
+        }
+
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_file(old_name, new_name)
+        }
+
+        fn create_temp_output(&self, prefix: &str) -> Result<(String, Box<dyn StorageOutput>)> {
+            self.inner.create_temp_output(prefix)
+        }
+
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A crash between the tmp write and the rename (Issue #1267) must leave
+    /// the previously committed `.delmap` intact and readable, not a torn
+    /// file — `flush()`'s existing dirty-segment retry (#875) must still
+    /// pick the segment back up afterward.
+    #[test]
+    fn an_interrupted_write_leaves_the_previous_bitmap_intact() {
+        let real_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let failing = Arc::new(FailCloseOnce::new(real_storage.clone()));
+        let manager = DeletionManager::new(
+            DeletionConfig::default(),
+            failing.clone() as Arc<dyn Storage>,
+        )
+        .unwrap();
+        manager.initialize_segment("seg001", 0, 999).unwrap();
+        manager.delete_document("seg001", 5, "test").unwrap();
+        manager.flush().unwrap();
+
+        let before = read_file(real_storage.as_ref(), "seg001.delmap");
+
+        failing.arm("seg001.delmap.tmp");
+        manager.delete_document("seg001", 6, "test").unwrap();
+        let err = manager.flush().unwrap_err();
+        assert!(err.to_string().contains("injected close failure"), "{err}");
+
+        // The real file was never touched: `close()` failed before the
+        // rename that would have replaced it, so the tmp file (whatever
+        // state it is in) never got promoted to the final name.
+        assert_eq!(read_file(real_storage.as_ref(), "seg001.delmap"), before);
+
+        // Reopening (simulating a restart after the crash) sees only the
+        // previously committed deletion.
+        let reopened =
+            DeletionManager::new(DeletionConfig::default(), real_storage.clone()).unwrap();
+        assert!(reopened.is_deleted("seg001", 5));
+        assert!(!reopened.is_deleted("seg001", 6));
+
+        // The failed segment stayed dirty (#875), so an unarmed retry
+        // persists the deletion the crash had interrupted.
+        manager.flush().unwrap();
+        let retried = DeletionManager::new(DeletionConfig::default(), real_storage).unwrap();
+        assert!(retried.is_deleted("seg001", 5));
+        assert!(retried.is_deleted("seg001", 6));
     }
 }

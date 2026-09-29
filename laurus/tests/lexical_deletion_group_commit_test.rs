@@ -206,11 +206,13 @@ fn commit_writes_delmap_before_metadata_checkpoint() {
     store.commit().unwrap();
 
     let created = recording.created.lock().unwrap().clone();
-    let delmap_pos = created.iter().position(|f| f.ends_with(".delmap"));
-    // `metadata.json` is published atomically since #1023, so what the
-    // recorder sees created is the staging file. The ordering invariant this
-    // test exists for is unchanged — only the name of the file that carries
-    // the checkpoint into place.
+    // `.delmap` (since #1267) and `metadata.json` (since #1023) are both
+    // published atomically, so what the recorder sees created is each one's
+    // staging file. The ordering invariant this test exists for is unchanged
+    // — only the names of the files that carry them into place.
+    let delmap_pos = created
+        .iter()
+        .position(|f| f.ends_with(".delmap") || f.ends_with(".delmap.tmp"));
     let checkpoint_pos = created
         .iter()
         .position(|f| f == "metadata.json" || f == "metadata.json.tmp");
