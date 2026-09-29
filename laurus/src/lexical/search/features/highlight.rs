@@ -844,51 +844,81 @@ fn ceil_boundary(text: &str, pos: usize) -> usize {
 /// matches there. A span runs from the first token's start to the last
 /// token's end.
 fn phrase_spans(tokens: &[Token], phrase: &[Vec<String>], slop: u32) -> Vec<HighlightSpan> {
-    let token_is = |token: &Token, alternatives: &[String]| {
-        alternatives.iter().any(|term| {
-            token.text == *term
-                || (has_uppercase(&token.text) && token.text.to_lowercase() == *term)
-        })
-    };
-    let token_end = |token: &Token| token.start_offset + token.text.len();
-
-    let mut spans = Vec::new();
     let Some((first, rest)) = phrase.split_first() else {
-        return spans;
+        return Vec::new();
     };
     let positions = token_positions(tokens);
-    // Tokens stacked at one position would repeat the same match.
-    let mut last_anchor_position = None;
-
-    for (anchor, &anchor_position) in tokens.iter().zip(&positions) {
-        if last_anchor_position == Some(anchor_position) || !token_is(anchor, first) {
-            continue;
-        }
-        last_anchor_position = Some(anchor_position);
-
-        let matched = rest.iter().try_fold(
-            (anchor_position.saturating_add(1), token_end(anchor)),
-            |(expected, _), term| {
-                // Positions never decrease, so the first match from here is
-                // the one at the smallest position.
-                let from = positions.partition_point(|&p| p < expected);
-                let last = expected.saturating_add(slop);
-                tokens[from..]
-                    .iter()
-                    .zip(&positions[from..])
-                    .take_while(|&(_, &p)| p <= last)
-                    .find(|&(token, _)| token_is(token, term))
-                    .map(|(token, &p)| (p.saturating_add(1), token_end(token)))
-            },
-        );
-
-        if let Some((_, end)) = matched {
+    phrase_anchors(tokens, &positions, first)
+        .filter_map(|(anchor, anchor_position)| {
+            let mut previous = anchor_position;
+            let mut end = token_end(anchor);
+            for alternatives in rest {
+                let (token, position) =
+                    next_phrase_token(tokens, &positions, previous, slop, alternatives)?;
+                previous = position;
+                end = token_end(token);
+            }
             // Phrases outrank single terms, as before.
-            spans.push(HighlightSpan::new(anchor.start_offset..end, true, 2.0));
-        }
-    }
+            Some(HighlightSpan::new(anchor.start_offset..end, true, 2.0))
+        })
+        .collect()
+}
 
-    spans
+/// Whether `token` is one of the lowercased `alternatives`.
+fn token_is(token: &Token, alternatives: &[String]) -> bool {
+    alternatives.iter().any(|term| {
+        token.text == *term || (has_uppercase(&token.text) && token.text.to_lowercase() == *term)
+    })
+}
+
+/// The byte offset where `token`'s text ends.
+fn token_end(token: &Token) -> usize {
+    token.start_offset + token.text.len()
+}
+
+/// The tokens a phrase starting with `alternatives` anchors on, with their
+/// positions: at each position, the first token that is one of them.
+/// Tokens stacked at one position would repeat the same match.
+fn phrase_anchors<'a>(
+    tokens: &'a [Token],
+    positions: &'a [u32],
+    alternatives: &'a [String],
+) -> impl Iterator<Item = (&'a Token, u32)> + 'a {
+    let mut last_anchor_position = None;
+    tokens
+        .iter()
+        .zip(positions)
+        .filter_map(move |(token, &position)| {
+            if last_anchor_position == Some(position) || !token_is(token, alternatives) {
+                return None;
+            }
+            last_anchor_position = Some(position);
+            Some((token, position))
+        })
+}
+
+/// The token a phrase continues with after one at position `previous`:
+/// the first that is one of `alternatives` at a position in `previous + 1
+/// ..= previous + 1 + slop`, with its position, as `next_in_window` picks
+/// it on the index side.
+fn next_phrase_token<'a>(
+    tokens: &'a [Token],
+    positions: &[u32],
+    previous: u32,
+    slop: u32,
+    alternatives: &[String],
+) -> Option<(&'a Token, u32)> {
+    let expected = previous.saturating_add(1);
+    // Positions never decrease, so the first match from here is the one at
+    // the smallest position.
+    let from = positions.partition_point(|&p| p < expected);
+    let last = expected.saturating_add(slop);
+    tokens[from..]
+        .iter()
+        .zip(&positions[from..])
+        .take_while(|&(_, &p)| p <= last)
+        .find(|&(token, _)| token_is(token, alternatives))
+        .map(|(token, &p)| (token, p))
 }
 
 /// Return `true` if `s` contains any upper-case character.
