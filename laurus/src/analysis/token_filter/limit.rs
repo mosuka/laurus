@@ -28,7 +28,7 @@
 //! assert_eq!(result.len(), 3);
 //! ```
 
-use crate::analysis::token::{Token, TokenStream};
+use crate::analysis::token::{Token, TokenStream, token_arcs};
 use crate::analysis::token_filter::Filter;
 use crate::error::Result;
 
@@ -41,6 +41,10 @@ use crate::error::Result;
 /// - Implementing "index first N tokens only" strategies
 /// - Testing and development with truncated input
 /// - Implementing document preview features
+///
+/// A cut inside a token graph, such as a multi-word synonym, cuts every
+/// path there: the kept paths end together, one position after the last
+/// kept token's.
 ///
 /// # Examples
 ///
@@ -95,8 +99,21 @@ impl LimitFilter {
 }
 
 impl Filter for LimitFilter {
-    fn filter(&self, tokens: TokenStream) -> Result<TokenStream> {
-        let limited_tokens: Vec<Token> = tokens.take(self.limit).collect();
+    fn filter(&self, mut tokens: TokenStream) -> Result<TokenStream> {
+        let mut limited_tokens: Vec<Token> = tokens.by_ref().take(self.limit).collect();
+        if tokens.next().is_some() {
+            // Arcs past the last kept node lead only to cut tokens, so they
+            // end at the node after it.
+            let arcs = token_arcs(&limited_tokens);
+            if let Some(&(last, _)) = arcs.last() {
+                let end = last + 1;
+                for (token, (from, to)) in limited_tokens.iter_mut().zip(arcs) {
+                    if to > end {
+                        token.position_length = (end - from) as usize;
+                    }
+                }
+            }
+        }
         Ok(Box::new(limited_tokens.into_iter()))
     }
 

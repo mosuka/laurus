@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-use crate::analysis::token::{Token, TokenStream};
+use crate::analysis::token::{Token, TokenStream, remove_tokens};
 use crate::analysis::token_filter::Filter;
 use crate::error::Result;
 
@@ -303,6 +303,13 @@ pub static DEFAULT_JAPANESE_STOP_WORDS_SET: LazyLock<HashSet<String>> = LazyLock
 /// to search relevance. This filter can either remove stop words entirely
 /// or mark them as stopped while keeping them in the stream.
 ///
+/// A removed stop word leaves no position. After [`SynonymGraphFilter`],
+/// removing one keeps the token graph well formed: a member of a synonym
+/// group loses the word and stays a path of its own, and a synonym stacked
+/// on the word keeps its position.
+///
+/// [`SynonymGraphFilter`]: crate::analysis::token_filter::synonym_graph::SynonymGraphFilter
+///
 /// # Default Stop Word Lists
 ///
 /// - English: 33 common words (articles, prepositions, conjunctions)
@@ -484,21 +491,21 @@ impl Default for StopFilter {
 
 impl Filter for StopFilter {
     fn filter(&self, tokens: TokenStream) -> Result<TokenStream> {
-        let filtered_tokens: Vec<Token> = tokens
-            .filter_map(|token| {
-                if token.is_stopped() {
-                    Some(token)
-                } else if self.is_stop_word(&token.text) {
-                    if self.remove_stopped {
-                        None // Remove the token entirely
+        let is_new_stop_word =
+            |token: &Token| !token.is_stopped() && self.is_stop_word(&token.text);
+        let filtered_tokens: Vec<Token> = if self.remove_stopped {
+            remove_tokens(tokens.collect(), |token| !is_new_stop_word(token))
+        } else {
+            tokens
+                .map(|token| {
+                    if is_new_stop_word(&token) {
+                        token.stop()
                     } else {
-                        Some(token.stop()) // Mark as stopped but keep it
+                        token
                     }
-                } else {
-                    Some(token)
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
 
         Ok(Box::new(filtered_tokens.into_iter()))
     }

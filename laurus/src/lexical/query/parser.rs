@@ -29,7 +29,7 @@ use pest_derive::Parser;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::{Token, flatten_token_graph, token_positions};
+use crate::analysis::token::{Token, flatten_token_graph, token_arcs, token_positions};
 use crate::data::GeoEcefPoint;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::datetime::parse_datetime_literal;
@@ -1007,30 +1007,29 @@ enum PhraseGraph {
 
 /// The graph a quoted value's tokens form.
 ///
-/// A token is an arc from its position (as the index numbers it,
-/// [`token_positions`]) to its position + `position_length`. Arcs with the
+/// A token is an arc from its position (as the index numbers it) to its
+/// position + `position_length` ([`token_arcs`]). Arcs with the
 /// same start and end are one position of alternatives, such as a word and
 /// its one-word synonyms. Every path from the first node to the last is
 /// one phrase; a multi-word synonym adds one (`"ml"` → `[[ml]]` and
 /// `[[machine], [learning]]`). Without multi-word synonyms there is a
 /// single path. Arcs on no complete path are dropped.
 ///
-/// A graph with no complete path (a filter removed a token the graph
-/// needed) falls back to its flat positions ([`flatten_token_graph`]),
-/// which is what the index stores.
+/// A graph with no complete path (a malformed one, such as a hand-built
+/// token stream can make) falls back to its flat positions
+/// ([`flatten_token_graph`]), which is what the index stores.
 fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
-    let positions = token_positions(tokens);
+    let token_arcs = token_arcs(tokens);
 
     // (from, to) → alternatives.
     let mut arcs: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
-    for (token, &from) in tokens.iter().zip(&positions) {
-        let length = u32::try_from(token.position_length.max(1)).unwrap_or(u32::MAX);
-        let alternatives = arcs.entry((from, from.saturating_add(length))).or_default();
+    for (token, &arc) in tokens.iter().zip(&token_arcs) {
+        let alternatives = arcs.entry(arc).or_default();
         if !alternatives.contains(&token.text) {
             alternatives.push(token.text.clone());
         }
     }
-    let first = positions[0];
+    let first = token_arcs[0].0;
     let last = arcs.keys().map(|&(_, to)| to).max().unwrap_or(first);
     let arcs = arcs
         .into_iter()
