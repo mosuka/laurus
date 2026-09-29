@@ -8,7 +8,6 @@
 //!
 //! - [`dictionary`] - Synonym dictionary management and parsing
 //! - [`graph_builder`] - Token graph construction with synonym paths
-//! - [`graph_traverser`] - Graph traversal to extract all possible paths
 //!
 //! # Token Graph Concept
 //!
@@ -40,4 +39,3 @@
 
 pub mod dictionary;
 pub mod graph_builder;
-pub mod graph_traverser;
