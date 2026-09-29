@@ -286,12 +286,6 @@ pub struct FlatIndexConfig {
     /// Larger values reduce merge overhead but increase memory usage.
     pub max_vectors_per_segment: u64,
 
-    /// Buffer size for writing operations (in bytes).
-    ///
-    /// Controls how much data is buffered in memory before being flushed to disk.
-    /// Larger buffers improve write performance but use more memory.
-    pub write_buffer_size: usize,
-
     /// Quantization method.
     pub quantization_method: quantization::QuantizationMethod,
 
@@ -397,7 +391,6 @@ impl Default for FlatIndexConfig {
 
             normalize_vectors: true,
             max_vectors_per_segment: 1000000,
-            write_buffer_size: 1024 * 1024, // 1MB
             quantization_method: quantization::QuantizationMethod::Scalar8Bit,
             rerank_storage: None,
             merge_factor: 10,
@@ -418,7 +411,6 @@ impl std::fmt::Debug for FlatIndexConfig {
             .field("distance_metric", &self.distance_metric)
             .field("normalize_vectors", &self.normalize_vectors)
             .field("max_vectors_per_segment", &self.max_vectors_per_segment)
-            .field("write_buffer_size", &self.write_buffer_size)
             .field("quantization_method", &self.quantization_method)
             .field("rerank_storage", &self.rerank_storage)
             .field("merge_factor", &self.merge_factor)
@@ -493,9 +485,6 @@ pub struct HnswIndexConfig {
 
     /// Maximum number of vectors per segment.
     pub max_vectors_per_segment: u64,
-
-    /// Buffer size for writing operations (in bytes).
-    pub write_buffer_size: usize,
 
     /// Quantization method.
     pub quantization_method: quantization::QuantizationMethod,
@@ -591,7 +580,6 @@ impl Default for HnswIndexConfig {
             default_ef_search: None,
             segmented: true,
             max_vectors_per_segment: 1000000,
-            write_buffer_size: 1024 * 1024, // 1MB
             quantization_method: quantization::QuantizationMethod::Scalar8Bit,
             rerank_storage: None,
             merge_factor: 10,
@@ -616,7 +604,6 @@ impl std::fmt::Debug for HnswIndexConfig {
             .field("ef_construction", &self.ef_construction)
             .field("default_ef_search", &self.default_ef_search)
             .field("max_vectors_per_segment", &self.max_vectors_per_segment)
-            .field("write_buffer_size", &self.write_buffer_size)
             .field("quantization_method", &self.quantization_method)
             .field("rerank_storage", &self.rerank_storage)
             .field("merge_factor", &self.merge_factor)
@@ -770,9 +757,6 @@ pub struct IvfIndexConfig {
     /// Maximum number of vectors per segment.
     pub max_vectors_per_segment: u64,
 
-    /// Buffer size for writing operations (in bytes).
-    pub write_buffer_size: usize,
-
     /// Quantization method.
     pub quantization_method: quantization::QuantizationMethod,
 
@@ -835,7 +819,6 @@ impl Default for IvfIndexConfig {
             n_clusters: 100,
             n_probe: 1,
             max_vectors_per_segment: 1000000,
-            write_buffer_size: 1024 * 1024, // 1MB
             quantization_method: quantization::QuantizationMethod::Scalar8Bit,
             rerank_storage: None,
             merge_factor: 10,
@@ -858,7 +841,6 @@ impl std::fmt::Debug for IvfIndexConfig {
             .field("n_clusters", &self.n_clusters)
             .field("n_probe", &self.n_probe)
             .field("max_vectors_per_segment", &self.max_vectors_per_segment)
-            .field("write_buffer_size", &self.write_buffer_size)
             .field("quantization_method", &self.quantization_method)
             .field("rerank_storage", &self.rerank_storage)
             .field("merge_factor", &self.merge_factor)
