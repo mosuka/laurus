@@ -387,12 +387,13 @@ mod tests {
         );
     }
 
-    /// `SynonymGraphFilter` emits an already flat graph (no side nodes), so
-    /// flattening it must not move any token, including when paths of 1, 2
-    /// and 3 words share the inner nodes.
+    /// `SynonymGraphFilter` gives each multi-word member inner nodes of its
+    /// own. This filter lays that graph out on the same positions as the
+    /// indexer's `flatten_token_graph`, for paths of 1, 2 and 3 words.
     #[test]
-    fn synonym_graph_output_is_already_flat() {
+    fn synonym_graph_output_flattens_to_the_indexed_positions() {
         use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token::{flatten_token_graph, token_positions};
         use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
         use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
 
@@ -423,13 +424,19 @@ mod tests {
                 .filter(Box::new(graph.clone().into_iter()))
                 .unwrap()
                 .collect();
-            let shape = |tokens: &[Token]| -> Vec<(String, usize, usize)> {
-                tokens
-                    .iter()
-                    .map(|t| (t.text.clone(), t.position_increment, t.position_length))
-                    .collect()
+            let positions = |tokens: &[Token]| -> Vec<(u32, String)> {
+                let mut positions: Vec<(u32, String)> = token_positions(tokens)
+                    .into_iter()
+                    .zip(tokens.iter().map(|t| t.text.clone()))
+                    .collect();
+                positions.sort();
+                positions
             };
-            assert_eq!(shape(&flat), shape(&graph), "{input:?}");
+            assert_eq!(
+                positions(&flat),
+                positions(&flatten_token_graph(graph)),
+                "{input:?}"
+            );
         }
     }
 }

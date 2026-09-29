@@ -76,17 +76,27 @@ impl SynonymGraphBuilder {
     /// Build graph tokens from matched synonyms.
     ///
     /// The matched words (with `keep_original`) and each synonym form one
-    /// path each, all from the match's start node to one shared end node,
-    /// `L` nodes later, where `L` is the longest path in tokens. A token is
-    /// an arc from its position to its position + `position_length`: the
-    /// last token of a `k`-token path spans `L - (k - 1)` positions, every
-    /// other token one. Tokens come out in node order; at each node the
-    /// first token has increment 1 (the matched word's own increment at the
-    /// start node) and the rest are stacked on it with increment 0, so the
-    /// token after the match lands on the end node.
+    /// path each, from the match's start node to one shared end node; paths
+    /// with the same words are one path. A token is an arc from its node to
+    /// its node + `position_length`. A path of `k` words has `k - 1` inner
+    /// nodes of its own, allocated after the start node path by path, so no
+    /// two paths share an arc and a quoted value follows each path exactly,
+    /// as with Lucene's `SynonymGraphFilter`. The end node follows the last
+    /// inner node.
     ///
-    /// The graph has no side nodes: paths of several words share the inner
-    /// nodes, as Lucene's `FlattenGraphFilter` output does.
+    /// Tokens come out in node order: every path's first word at the start
+    /// node, then each path's other words. The first token at the start
+    /// node keeps the matched word's increment, the others there are
+    /// stacked on it with increment 0, and each inner node's token has
+    /// increment 1, so the token after the match lands on the end node. A
+    /// token after the match that is itself stacked (increment 0, as an
+    /// earlier synonym filter can leave it) lands on the last inner node.
+    ///
+    /// The index stores no `position_length`, so indexing lays the graph
+    /// out on its longest path ([`flatten_token_graph`]), where the paths'
+    /// words share positions again.
+    ///
+    /// [`flatten_token_graph`]: crate::analysis::token::flatten_token_graph
     pub fn build_graph_tokens(
         &self,
         original_tokens: &[Token],
@@ -132,32 +142,52 @@ impl SynonymGraphBuilder {
 
         // A group with no other member leaves nothing to replace the match
         // with, so the matched words stay even without `keep_original`.
-        let mut paths = Vec::with_capacity(synonym_paths.len() + 1);
+        let mut paths: Vec<Vec<Token>> = Vec::with_capacity(synonym_paths.len() + 1);
         if self.keep_original || synonym_paths.is_empty() {
             paths.push(matched.to_vec());
         }
-        paths.extend(synonym_paths);
+        for path in synonym_paths {
+            let same_words = |kept: &Vec<Token>| {
+                kept.len() == path.len() && kept.iter().zip(&path).all(|(a, b)| a.text == b.text)
+            };
+            if !paths.iter().any(same_words) {
+                paths.push(path);
+            }
+        }
 
-        let longest = paths.iter().map(Vec::len).max().unwrap_or(0);
+        // The first inner node of each path; one past the last is the end.
+        let mut next_node = 1;
+        let first_inner_nodes: Vec<usize> = paths
+            .iter()
+            .map(|path| {
+                let first_inner = next_node;
+                next_node += path.len() - 1;
+                first_inner
+            })
+            .collect();
+        let end_node = next_node;
+
         let mut result = Vec::with_capacity(paths.iter().map(Vec::len).sum());
-        for node in 0..longest {
-            let mut first_at_node = true;
-            for path in &paths {
-                let Some(token) = path.get(node) else {
-                    continue;
-                };
-                let mut token = token.clone();
-                token.position_length = if node + 1 == path.len() {
-                    longest - node
+        for (i, (path, &first_inner)) in paths.iter().zip(&first_inner_nodes).enumerate() {
+            let mut token = path[0].clone();
+            token.position_increment = if i == 0 { first.position_increment } else { 0 };
+            token.position_length = if path.len() == 1 {
+                end_node
+            } else {
+                first_inner
+            };
+            result.push(token);
+        }
+        for (path, &first_inner) in paths.iter().zip(&first_inner_nodes) {
+            for (k, word) in path.iter().enumerate().skip(1) {
+                let node = first_inner + k - 1;
+                let mut token = word.clone();
+                token.position_increment = 1;
+                token.position_length = if k + 1 == path.len() {
+                    end_node - node
                 } else {
                     1
                 };
-                token.position_increment = match (first_at_node, node) {
-                    (false, _) => 0,
-                    (true, 0) => first.position_increment,
-                    (true, _) => 1,
-                };
-                first_at_node = false;
                 result.push(token);
             }
         }
@@ -249,7 +279,7 @@ impl SynonymGraphBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::token::token_positions;
+    use crate::analysis::token::{flatten_token_graph, token_positions};
     use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
 
     /// Each token as an arc `(text, from, to)` of the token graph, plus the
@@ -323,8 +353,10 @@ mod tests {
         );
     }
 
+    /// Two paths of two words each get an inner node of their own, even
+    /// when their second words are the same.
     #[test]
-    fn two_words_to_two_words_stacks_each_node() {
+    fn two_words_to_two_words_gives_each_its_own_inner_node() {
         let result = builder(true).build_graph_tokens(
             &words(&["machine", "learning"]),
             0,
@@ -336,17 +368,18 @@ mod tests {
             (
                 vec![
                     arc("machine", 0, 1),
-                    arc("deep", 0, 1),
-                    arc("learning", 1, 2),
-                    arc("learning", 1, 2)
+                    arc("deep", 0, 2),
+                    arc("learning", 1, 3),
+                    arc("learning", 2, 3)
                 ],
-                vec![1, 0, 1, 0]
+                vec![1, 0, 1, 1]
             )
         );
     }
 
-    /// Paths of 1, 2 and 3 words all end at node 3: the last token of each
-    /// shorter path spans the rest.
+    /// Paths of 1, 2 and 3 words all end at node 4, after the inner nodes
+    /// of "machine learning" (1) and "statistical machine learning" (2, 3),
+    /// so no arc holds words of two members.
     #[test]
     fn paths_of_different_lengths_end_at_the_same_node() {
         let result = builder(true).build_graph_tokens(
@@ -359,16 +392,154 @@ mod tests {
             arcs(&result),
             (
                 vec![
-                    arc("ml", 0, 3),
+                    arc("ml", 0, 4),
                     arc("machine", 0, 1),
-                    arc("statistical", 0, 1),
-                    arc("learning", 1, 3),
-                    arc("machine", 1, 2),
-                    arc("learning", 2, 3)
+                    arc("statistical", 0, 2),
+                    arc("learning", 1, 4),
+                    arc("machine", 2, 3),
+                    arc("learning", 3, 4)
                 ],
-                vec![1, 0, 0, 1, 0, 1]
+                vec![1, 0, 0, 1, 1, 1]
             )
         );
+    }
+
+    #[test]
+    fn without_the_original_each_multi_word_synonym_has_its_own_nodes() {
+        let result = builder(false).build_graph_tokens(
+            &words(&["ml"]),
+            0,
+            1,
+            &synonyms(&["machine learning", "statistical machine learning"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![
+                    arc("machine", 0, 1),
+                    arc("statistical", 0, 2),
+                    arc("learning", 1, 4),
+                    arc("machine", 2, 3),
+                    arc("learning", 3, 4)
+                ],
+                vec![1, 0, 1, 1, 1]
+            )
+        );
+    }
+
+    /// The matched words are a path like any other: a three-word match
+    /// takes inner nodes 1 and 2, and "machine learning" takes node 3.
+    #[test]
+    fn a_three_word_match_keeps_its_words_on_their_own_nodes() {
+        let result = builder(true).build_graph_tokens(
+            &words(&["statistical", "machine", "learning"]),
+            0,
+            3,
+            &synonyms(&["ml", "machine learning"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![
+                    arc("statistical", 0, 1),
+                    arc("ml", 0, 4),
+                    arc("machine", 0, 3),
+                    arc("machine", 1, 2),
+                    arc("learning", 2, 4),
+                    arc("learning", 3, 4)
+                ],
+                vec![1, 0, 0, 1, 1, 1]
+            )
+        );
+    }
+
+    /// A synonym that splits into the same words as another path would
+    /// repeat that path's phrase.
+    #[test]
+    fn a_synonym_with_the_words_of_another_path_is_one_path() {
+        let result = builder(true).build_graph_tokens(
+            &words(&["machine", "learning"]),
+            0,
+            2,
+            &synonyms(&["machine  learning", "ml", "ml"]),
+        );
+        assert_eq!(
+            arcs(&result),
+            (
+                vec![arc("machine", 0, 1), arc("ml", 0, 2), arc("learning", 1, 2)],
+                vec![1, 0, 1]
+            )
+        );
+    }
+
+    /// The flat layout the builder emitted before #1262: the `k`-th word of
+    /// every path on node `k`.
+    fn shared_inner_nodes(paths: &[Vec<&str>]) -> Vec<(String, usize, usize)> {
+        let longest = paths.iter().map(Vec::len).max().unwrap_or(0);
+        let mut layout = Vec::new();
+        for node in 0..longest {
+            let mut first_at_node = true;
+            for path in paths {
+                let Some(word) = path.get(node) else {
+                    continue;
+                };
+                let length = if node + 1 == path.len() {
+                    longest - node
+                } else {
+                    1
+                };
+                layout.push((word.to_string(), usize::from(first_at_node), length));
+                first_at_node = false;
+            }
+        }
+        layout
+    }
+
+    /// Laid out for the index, the graph is exactly the flat layout the
+    /// builder emitted before #1262, so the stored positions do not change.
+    #[test]
+    fn flattened_the_graph_shares_the_inner_nodes_again() {
+        let members = [
+            "ml",
+            "machine learning",
+            "statistical machine learning",
+            "deep vision",
+            "a b c d",
+        ];
+        for matched in ["ml", "machine learning", "statistical machine learning"] {
+            let synonyms: Vec<String> = members
+                .iter()
+                .filter(|member| **member != matched)
+                .map(|member| member.to_string())
+                .collect();
+            let matched_words: Vec<&str> = matched.split(' ').collect();
+            for keep_original in [true, false] {
+                for count in 0..=synonyms.len() {
+                    let synonyms = &synonyms[..count];
+                    let result = builder(keep_original).build_graph_tokens(
+                        &words(&matched_words),
+                        0,
+                        matched_words.len(),
+                        synonyms,
+                    );
+
+                    let mut paths = Vec::new();
+                    if keep_original || synonyms.is_empty() {
+                        paths.push(matched_words.clone());
+                    }
+                    paths.extend(synonyms.iter().map(|s| s.split(' ').collect::<Vec<_>>()));
+                    let flat: Vec<(String, usize, usize)> = flatten_token_graph(result)
+                        .into_iter()
+                        .map(|t| (t.text, t.position_increment, t.position_length))
+                        .collect();
+                    assert_eq!(
+                        flat,
+                        shared_inner_nodes(&paths),
+                        "{matched:?} → {synonyms:?}, keep_original = {keep_original}"
+                    );
+                }
+            }
+        }
     }
 
     /// Without the original, the alternatives are still stacked.

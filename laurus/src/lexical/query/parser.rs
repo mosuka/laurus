@@ -1858,6 +1858,11 @@ mod tests {
     /// Whitespace + lowercase + synonyms {big, large} and {ml, machine
     /// learning}, keeping the originals.
     fn synonym_parser() -> LexicalQueryParser {
+        synonym_parser_with(&[&["big", "large"], &["ml", "machine learning"]])
+    }
+
+    /// Whitespace + lowercase + the synonym `groups`, keeping the originals.
+    fn synonym_parser_with(groups: &[&[&str]]) -> LexicalQueryParser {
         use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
         use crate::analysis::synonym::dictionary::SynonymDictionary;
         use crate::analysis::token_filter::lowercase::LowercaseFilter;
@@ -1865,8 +1870,9 @@ mod tests {
         use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
 
         let mut dict = SynonymDictionary::new(None).unwrap();
-        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
-        dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
+        for group in groups {
+            dict.add_synonym_group(group.iter().map(|s| s.to_string()).collect());
+        }
         let analyzer = PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
             .add_filter(Arc::new(LowercaseFilter::new()))
             .add_filter(Arc::new(SynonymGraphFilter::with_tokenizer(
@@ -1974,6 +1980,37 @@ mod tests {
                 phrase(&[&["machine"], &["learning"], &["is"]], 0, 1.0),
             ])
         );
+    }
+
+    /// #1262: each multi-word member has inner nodes of its own, so a
+    /// quoted member expands into exactly its group's members, whatever
+    /// their lengths, and never into a mix of their words.
+    #[test]
+    fn each_multi_word_member_is_its_own_path() {
+        let parser = synonym_parser_with(&[&["ml", "machine learning", "statistical machine learning"]]);
+        let expected = sorted(vec![
+            term("ml", 1.0),
+            phrase(&[&["machine"], &["learning"]], 0, 1.0),
+            phrase(&[&["statistical"], &["machine"], &["learning"]], 0, 1.0),
+        ]);
+        for dsl in [
+            "\"ml\"",
+            "\"machine learning\"",
+            "\"statistical machine learning\"",
+        ] {
+            let query = parser.parse(dsl).unwrap();
+            assert_eq!(should_clauses(query.as_ref()), expected, "{dsl}");
+        }
+
+        let parser = synonym_parser_with(&[&["new york", "big apple"]]);
+        let expected = sorted(vec![
+            phrase(&[&["new"], &["york"]], 0, 1.0),
+            phrase(&[&["big"], &["apple"]], 0, 1.0),
+        ]);
+        for dsl in ["\"new york\"", "\"big apple\""] {
+            let query = parser.parse(dsl).unwrap();
+            assert_eq!(should_clauses(query.as_ref()), expected, "{dsl}");
+        }
     }
 
     /// Paths multiply: six multi-word synonyms give 64 paths, seven give
