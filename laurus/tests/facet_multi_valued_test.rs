@@ -122,7 +122,7 @@ fn two_segment_tags_index(delete_first_dv: bool) -> (Arc<dyn LexicalIndexReader>
         storage.delete_file(&dv_files[0]).unwrap();
     }
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
     assert!(
         reader.has_doc_values("tags"),
         "a multi-valued text field is written to DocValues like any other stored value"
@@ -171,7 +171,7 @@ fn scalar_datetime_yields_one_label_on_both_paths() {
     assert_eq!(dv_files.len(), 2, "found {dv_files:?}");
     storage.delete_file(&dv_files[0]).unwrap();
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
     assert!(reader.has_doc_values("ts"));
     assert_eq!(
         facet(reader.as_ref(), &[first, second], "ts"),
@@ -205,7 +205,7 @@ fn datetime_array_elements_are_counted_as_rfc3339_labels() {
     ];
     writer.commit().unwrap();
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
     assert_eq!(
         facet(reader.as_ref(), &doc_ids, "seen_at"),
         vec![

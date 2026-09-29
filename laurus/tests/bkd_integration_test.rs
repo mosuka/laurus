@@ -2,20 +2,24 @@ use chrono::{TimeZone, Utc};
 use laurus::lexical::NumericRangeQuery;
 use laurus::lexical::NumericType;
 use laurus::lexical::Query;
+use laurus::lexical::index::LexicalIndex;
+use laurus::lexical::index::inverted::InvertedIndex;
+use laurus::lexical::writer::LexicalIndexWriter;
 use laurus::lexical::{GeoDistanceQuery, GeoPoint};
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use laurus::{DataValue, Document};
 use std::sync::Arc;
 
-/// A writer registered with a real index (#1024): a standalone
-/// `InvertedIndexWriter` is ephemeral — its segments enter no manifest and
-/// `build_reader` sees nothing — so durable fixtures go through
-/// `InvertedIndex::create` + `writer()`.
-fn index_writer(
+/// An index and a writer registered with it (#1024): a standalone
+/// `InvertedIndexWriter` is ephemeral — its segments enter no manifest, so
+/// no reader sees them — so durable fixtures go through
+/// `InvertedIndex::create` + `writer()` and read back through
+/// `index.reader()`.
+fn index_and_writer(
     storage: Arc<dyn laurus::storage::Storage>,
-) -> Box<dyn laurus::lexical::writer::LexicalIndexWriter> {
-    let index = laurus::lexical::index::inverted::InvertedIndex::create(
+) -> (InvertedIndex, Box<dyn LexicalIndexWriter>) {
+    let index = InvertedIndex::create(
         storage,
         // Loose layout, explicitly: this suite pins per-field `.bkd` FILE
         // creation on disk, which only exists as loose files. Compound-layout
@@ -26,14 +30,14 @@ fn index_writer(
         },
     )
     .unwrap();
-    use laurus::lexical::index::LexicalIndex;
-    index.writer().unwrap()
+    let writer = index.writer().unwrap();
+    (index, writer)
 }
 
 #[test]
 fn test_bkd_file_creation_and_query() {
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     // Doc 1: age=30, score=95.5
     let doc1 = Document::builder()
@@ -82,7 +86,7 @@ fn test_bkd_file_creation_and_query() {
     );
 
     // Open Reader
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     // Query 1: Age [25, 35] -> Should match Doc 1 (age 30) -> ID 0
     let query_age = NumericRangeQuery::new(
@@ -122,7 +126,7 @@ fn test_bkd_file_creation_and_query() {
 #[test]
 fn test_geo_bkd_query() {
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     // Tokyo: 35.6812, 139.7671
     let tokyo = GeoPoint::new(35.6812, 139.7671);
@@ -163,7 +167,7 @@ fn test_geo_bkd_query() {
     // Verify BKD file existed
     assert!(storage.file_exists("segment_000000.location.bkd"));
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     // Distance query: Near Tokyo (within 50 km) -> Should match Tokyo (0 km) and Yokohama (~30 km)
     let query = GeoDistanceQuery::new("location", tokyo, 50_000.0);
@@ -202,7 +206,7 @@ fn collect_matcher_results(mut m: Box<dyn laurus::lexical::query::matcher::Match
 #[test]
 fn empty_array_point_field_produces_no_bkd_part() {
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     writer
         .add_document(
@@ -239,7 +243,7 @@ fn empty_array_point_field_produces_no_bkd_part() {
         "a field with no real points in any document must not get a .bkd part"
     );
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
     let query = NumericRangeQuery::new(
         "scores",
         NumericType::Integer,
@@ -264,7 +268,7 @@ fn empty_array_point_field_produces_no_bkd_part() {
 #[test]
 fn multiple_point_bearing_fields_do_not_cross_contaminate() {
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     let tokyo = GeoPoint::new(35.6812, 139.7671);
     let osaka = GeoPoint::new(34.6937, 135.5023);
@@ -290,7 +294,7 @@ fn multiple_point_bearing_fields_do_not_cross_contaminate() {
     assert!(storage.file_exists("segment_000000.price.bkd"));
     assert!(storage.file_exists("segment_000000.location.bkd"));
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     let price_query =
         NumericRangeQuery::new("price", NumericType::Integer, Some(150.0), None, true, true);

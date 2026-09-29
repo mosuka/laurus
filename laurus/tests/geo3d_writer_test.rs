@@ -14,21 +14,25 @@
 //! range on each axis so a narrow query box exercises the BKD's pruning
 //! paths and confirms that all three dimensions are honoured.
 
+use laurus::lexical::index::LexicalIndex;
+use laurus::lexical::index::inverted::InvertedIndex;
 use laurus::lexical::query::Query;
 use laurus::lexical::query::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery};
+use laurus::lexical::writer::LexicalIndexWriter;
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use laurus::{DataValue, Document, GeoEcefPoint};
 use std::sync::Arc;
 
-/// A writer registered with a real index (#1024): a standalone
-/// `InvertedIndexWriter` is ephemeral — its segments enter no manifest and
-/// `build_reader` sees nothing — so durable fixtures go through
-/// `InvertedIndex::create` + `writer()`.
-fn index_writer(
+/// An index and a writer registered with it (#1024): a standalone
+/// `InvertedIndexWriter` is ephemeral — its segments enter no manifest, so
+/// no reader sees them — so durable fixtures go through
+/// `InvertedIndex::create` + `writer()` and read back through
+/// `index.reader()`.
+fn index_and_writer(
     storage: Arc<dyn laurus::storage::Storage>,
-) -> Box<dyn laurus::lexical::writer::LexicalIndexWriter> {
-    let index = laurus::lexical::index::inverted::InvertedIndex::create(
+) -> (InvertedIndex, Box<dyn LexicalIndexWriter>) {
+    let index = InvertedIndex::create(
         storage,
         // Loose layout, explicitly: this suite pins the on-disk BKD
         // FILE format (header bytes, per-field `.bkd` names), which
@@ -40,14 +44,14 @@ fn index_writer(
         },
     )
     .unwrap();
-    use laurus::lexical::index::LexicalIndex;
-    index.writer().unwrap()
+    let writer = index.writer().unwrap();
+    (index, writer)
 }
 
 #[test]
 fn geo3d_round_trip_through_writer_and_reader() {
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     // Three ECEF points, picked so that the per-axis ranges differ by an
     // order of magnitude (this is what makes widest-axis splitting
@@ -91,7 +95,7 @@ fn geo3d_round_trip_through_writer_and_reader() {
         "expected the writer to materialize a 3D BKD for the position field"
     );
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     // Stored-field round-trip: docs come back with their GeoEcef intact.
     // This exercises the new tag-12 path on the reader side.
@@ -146,7 +150,7 @@ fn geo3d_dimension_observable_through_bkd_header() {
     use laurus::lexical::index::structures::bkd_tree::BKDReader;
 
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (_index, mut writer) = index_and_writer(storage.clone());
 
     writer
         .add_document(
@@ -179,7 +183,7 @@ fn geo3d_distance_query_finds_docs_within_radius() {
     // Index three ECEF points and run a sphere query that should match
     // exactly two of them. The third sits well outside the radius.
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     let center = GeoEcefPoint::new(1_000_000.0, 2_000_000.0, 3_000_000.0);
     // Inside (offset 100m on x)
@@ -213,7 +217,7 @@ fn geo3d_distance_query_finds_docs_within_radius() {
         .unwrap();
     writer.commit().unwrap();
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     // 1km sphere query catches the two close docs but not the 5km-away
     // one. Matches arrive distance-ascending — doc 1 (~87m) is closer
@@ -259,7 +263,7 @@ fn geo3d_bbox_query_finds_docs_inside_box() {
     // Index three ECEF points in distinct octants and verify various
     // bounding-box queries pick the right ones.
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     let p_a = GeoEcefPoint::new(100.0, 100.0, 100.0); // doc 0 — interior
     let p_b = GeoEcefPoint::new(200.0, 200.0, 200.0); // doc 1 — interior
@@ -288,7 +292,7 @@ fn geo3d_bbox_query_finds_docs_inside_box() {
         .unwrap();
     writer.commit().unwrap();
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     // Basic case: a box that contains exactly doc 0 and doc 1.
     let q = Geo3dBoundingBoxQuery::new(
@@ -378,7 +382,7 @@ fn geo3d_nearest_query_finds_top_k_in_distance_order() {
     // the origin, then exercise the k-NN query at various k values and
     // initial-radius settings.
     let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-    let mut writer = index_writer(storage.clone());
+    let (index, mut writer) = index_and_writer(storage.clone());
 
     let center = GeoEcefPoint::new(0.0, 0.0, 0.0);
     // Doc i sits at (10^i, 0, 0): 1, 10, 100, 1000, 10000.
@@ -397,7 +401,7 @@ fn geo3d_nearest_query_finds_top_k_in_distance_order() {
     }
     writer.commit().unwrap();
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
 
     // k=1: closest doc is doc 0 (distance 1).
     let q1 = Geo3dNearestQuery::new("position", center, 1);

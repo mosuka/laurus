@@ -553,7 +553,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        writer.build_reader().unwrap()
+        index.reader().unwrap()
     }
 
     /// What a quoted value matched before #1271: each path as a phrase of

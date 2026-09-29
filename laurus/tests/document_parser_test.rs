@@ -80,7 +80,7 @@ fn build_index(ingest: Ingest, docs: Vec<Document>) -> TestResult<Arc<dyn Lexica
         }
     }
     writer.commit()?;
-    Ok(writer.build_reader()?)
+    Ok(index.reader()?)
 }
 
 /// Every `(doc_id, term_freq, positions)` posting of `term` in `field`.

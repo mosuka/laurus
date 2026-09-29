@@ -3464,7 +3464,7 @@ mod tests {
             .add_document(crate::Document::builder().add_text("body", "alpha").build())
             .unwrap();
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3549,7 +3549,7 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3603,7 +3603,7 @@ mod tests {
         }
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3738,7 +3738,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3794,7 +3794,7 @@ mod tests {
                 .unwrap();
             writer.commit().unwrap();
         }
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3850,7 +3850,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -4134,7 +4134,7 @@ mod tests {
         }
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -4693,7 +4693,7 @@ mod tests {
         }
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()

@@ -51,7 +51,7 @@ fn create_test_index() -> Result<TestIndex, Box<dyn std::error::Error>> {
     )?;
 
     writer.commit()?;
-    let reader = writer.build_reader()?;
+    let reader = index.reader()?;
 
     Ok((storage, reader))
 }

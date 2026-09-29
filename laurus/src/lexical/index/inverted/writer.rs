@@ -2841,41 +2841,6 @@ impl LexicalIndexWriter for InvertedIndexWriter {
         InvertedIndexWriter::is_updated_deleted(self, doc_id)
     }
 
-    /// Builds an InvertedIndexReader from the current state of the writer's storage.
-    /// This method is intended to be called by the LexicalIndexWriter trait implementation.
-    fn build_reader(
-        &self,
-    ) -> Result<std::sync::Arc<dyn crate::lexical::reader::LexicalIndexReader>> {
-        use crate::lexical::index::inverted::reader::{
-            InvertedIndexReader, InvertedIndexReaderConfig,
-        };
-
-        // The committed segment set comes from the manifest (#1024): the
-        // shared in-memory copy when this writer holds the handle, a
-        // one-shot load otherwise. The old implementation probed
-        // `segment_000000.meta, _000001, …` until the first miss — it never
-        // saw `merged_*` segments and stopped at the first numbering gap
-        // any merge leaves, so this is also a correctness upgrade.
-        let mut segments = if let Some(manifest) = &self.segment_manifest {
-            manifest.read().segments.clone()
-        } else {
-            super::segment_manifest::load(self.storage.as_ref())?
-                .map(|(_, segments)| segments)
-                .unwrap_or_default()
-        };
-        segments.sort_by_key(|s| s.generation);
-
-        let config = InvertedIndexReaderConfig {
-            analyzer: self.config.analyzer.clone(),
-            ..Default::default()
-        };
-
-        // Note: InvertedIndexReader::new expects Vec<SegmentInfo> and Arc<dyn Storage>
-        // We use the same storage as the writer
-        let reader = InvertedIndexReader::new(segments, self.storage.clone(), config)?;
-        Ok(Arc::new(reader))
-    }
-
     fn next_doc_id(&self) -> u64 {
         self.next_doc_id
     }
