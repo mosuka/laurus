@@ -3661,4 +3661,250 @@ mod tests {
             vec![("big", 0), ("large", 0), ("dog", 101)]
         );
     }
+
+    fn synonym_analyzer(groups: &[&[&str]], keep_original: bool) -> Arc<dyn Analyzer> {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        for group in groups {
+            dict.add_synonym_group(group.iter().map(|s| s.to_string()).collect());
+        }
+        Arc::new(
+            PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+                .add_filter(Arc::new(SynonymGraphFilter::new(dict, keep_original))),
+        )
+    }
+
+    fn term_occurrences(terms: &[AnalyzedTerm]) -> Vec<(&str, u32, u32)> {
+        terms
+            .iter()
+            .map(|t| (t.term.as_str(), t.position, t.frequency))
+            .collect()
+    }
+
+    const ML_GROUP: &[&str] = &["ml", "machine learning", "statistical machine learning"];
+
+    /// #1262: the synonym filter gives each multi-word member its own inner
+    /// nodes, and indexing flattens that graph so the members' words share
+    /// positions again. These are the positions the index has stored since
+    /// #1252, and they must not change.
+    #[test]
+    fn multi_word_synonyms_are_indexed_at_flat_positions() {
+        let cases: &[(&[&[&str]], bool, &str, &[(&str, u32, u32)])] = &[
+            (
+                &[ML_GROUP],
+                true,
+                "ml is fun",
+                &[
+                    ("ml", 0, 1),
+                    ("machine", 0, 1),
+                    ("statistical", 0, 1),
+                    ("learning", 1, 1),
+                    ("machine", 1, 2),
+                    ("learning", 2, 2),
+                    ("is", 3, 1),
+                    ("fun", 4, 1),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                true,
+                "machine learning is fun",
+                &[
+                    ("machine", 0, 1),
+                    ("ml", 0, 1),
+                    ("statistical", 0, 1),
+                    ("learning", 1, 1),
+                    ("machine", 1, 2),
+                    ("learning", 2, 2),
+                    ("is", 3, 1),
+                    ("fun", 4, 1),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                true,
+                "statistical machine learning is fun",
+                &[
+                    ("statistical", 0, 1),
+                    ("ml", 0, 1),
+                    ("machine", 0, 1),
+                    ("machine", 1, 2),
+                    ("learning", 1, 1),
+                    ("learning", 2, 2),
+                    ("is", 3, 1),
+                    ("fun", 4, 1),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                true,
+                "ml ml",
+                &[
+                    ("ml", 0, 1),
+                    ("machine", 0, 1),
+                    ("statistical", 0, 1),
+                    ("learning", 1, 1),
+                    ("machine", 1, 2),
+                    ("learning", 2, 2),
+                    ("ml", 3, 2),
+                    ("machine", 3, 3),
+                    ("statistical", 3, 2),
+                    ("learning", 4, 3),
+                    ("machine", 4, 4),
+                    ("learning", 5, 4),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                true,
+                "fun ml",
+                &[
+                    ("fun", 0, 1),
+                    ("ml", 1, 1),
+                    ("machine", 1, 1),
+                    ("statistical", 1, 1),
+                    ("learning", 2, 1),
+                    ("machine", 2, 2),
+                    ("learning", 3, 2),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                false,
+                "ml is fun",
+                &[
+                    ("machine", 0, 1),
+                    ("statistical", 0, 1),
+                    ("learning", 1, 1),
+                    ("machine", 1, 2),
+                    ("learning", 2, 2),
+                    ("is", 3, 1),
+                    ("fun", 4, 1),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                false,
+                "machine learning is fun",
+                &[
+                    ("ml", 0, 1),
+                    ("statistical", 0, 1),
+                    ("machine", 1, 1),
+                    ("learning", 2, 1),
+                    ("is", 3, 1),
+                    ("fun", 4, 1),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                false,
+                "statistical machine learning is fun",
+                &[
+                    ("ml", 0, 1),
+                    ("machine", 0, 1),
+                    ("learning", 1, 1),
+                    ("is", 2, 1),
+                    ("fun", 3, 1),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                false,
+                "ml ml",
+                &[
+                    ("machine", 0, 1),
+                    ("statistical", 0, 1),
+                    ("learning", 1, 1),
+                    ("machine", 1, 2),
+                    ("learning", 2, 2),
+                    ("machine", 3, 3),
+                    ("statistical", 3, 2),
+                    ("learning", 4, 3),
+                    ("machine", 4, 4),
+                    ("learning", 5, 4),
+                ],
+            ),
+            (
+                &[ML_GROUP],
+                false,
+                "fun ml",
+                &[
+                    ("fun", 0, 1),
+                    ("machine", 1, 1),
+                    ("statistical", 1, 1),
+                    ("learning", 2, 1),
+                    ("machine", 2, 2),
+                    ("learning", 3, 2),
+                ],
+            ),
+            (
+                &[&["machine learning", "deep vision"]],
+                true,
+                "machine learning",
+                &[
+                    ("machine", 0, 1),
+                    ("deep", 0, 1),
+                    ("learning", 1, 1),
+                    ("vision", 1, 1),
+                ],
+            ),
+            (
+                &[&["machine learning", "deep vision"]],
+                true,
+                "deep vision",
+                &[
+                    ("deep", 0, 1),
+                    ("machine", 0, 1),
+                    ("vision", 1, 1),
+                    ("learning", 1, 1),
+                ],
+            ),
+            // Both members end in "learning": it is indexed once.
+            (
+                &[&["machine learning", "deep learning"]],
+                true,
+                "machine learning",
+                &[("machine", 0, 1), ("deep", 0, 1), ("learning", 1, 1)],
+            ),
+        ];
+        for (groups, keep_original, text, expected) in cases {
+            let analyzer = synonym_analyzer(groups, *keep_original);
+            let value = DataValue::Text(text.to_string());
+            let (terms, _) = analyze_field_value("body", &value, &analyzer, 100).unwrap();
+            assert_eq!(
+                term_occurrences(&terms),
+                expected.to_vec(),
+                "{text:?}, keep_original = {keep_original}"
+            );
+        }
+    }
+
+    /// The next element starts after the flat positions of the previous
+    /// one, however many nodes its graph had.
+    #[test]
+    fn text_array_gap_follows_flat_positions_of_multi_word_synonyms() {
+        let analyzer = synonym_analyzer(&[ML_GROUP], true);
+        let value = DataValue::TextArray(vec![
+            "statistical machine learning".to_string(),
+            "fun".to_string(),
+        ]);
+
+        let (terms, _) = analyze_field_value("tags", &value, &analyzer, 100).unwrap();
+        assert_eq!(
+            term_positions(&terms),
+            vec![
+                ("statistical", 0),
+                ("ml", 0),
+                ("machine", 0),
+                ("machine", 1),
+                ("learning", 1),
+                ("learning", 2),
+                ("fun", 103)
+            ]
+        );
+    }
 }
