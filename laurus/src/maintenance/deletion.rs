@@ -450,6 +450,30 @@ impl DeletionBitmap {
             )))
         }
     }
+
+    /// Read the `.delmap` of `segment_id`, reporting one that does not parse
+    /// as corruption of that segment (Issue #1265).
+    ///
+    /// Every reader of a `.delmap` goes through this: a file that exists but
+    /// cannot be read must never be taken for "no deletions", which would
+    /// bring the segment's deleted documents back. An I/O error keeps its own
+    /// variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error, naming the segment when the payload is
+    /// malformed.
+    pub(crate) fn read_segment_bitmap<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        segment_id: &str,
+    ) -> Result<Self> {
+        Self::read_from_storage(reader).map_err(|e| match e {
+            LaurusError::Index(msg) => LaurusError::Index(format!(
+                "segment {segment_id}: deletion bitmap: {msg} — segment is corrupted"
+            )),
+            other => other,
+        })
+    }
 }
 
 /// Entry in the deletion log for recovery.
@@ -783,14 +807,15 @@ impl DeletionManager {
         let files = self.storage.list_files()?;
 
         for file in files {
-            if file.ends_with(".delmap") {
+            if let Some(segment_id) = file.strip_suffix(".delmap") {
                 let input = self.storage.open_input(&file)?;
                 let mut reader = StructReader::new(input)?;
-
-                if let Ok(bitmap) = DeletionBitmap::read_from_storage(&mut reader) {
-                    let mut bitmaps = self.bitmaps.write().unwrap();
-                    bitmaps.insert(bitmap.segment_id.clone(), Arc::new(bitmap));
-                }
+                // Skipping an unreadable one would drop that segment's
+                // deletions, and the next flush would overwrite the file
+                // with only the new ones (Issue #1265).
+                let bitmap = DeletionBitmap::read_segment_bitmap(&mut reader, segment_id)?;
+                let mut bitmaps = self.bitmaps.write().unwrap();
+                bitmaps.insert(bitmap.segment_id.clone(), Arc::new(bitmap));
             }
         }
 
@@ -1024,5 +1049,48 @@ mod tests {
         assert!(!manager.is_deleted("seg001", 6));
         assert!(!manager.is_deleted("seg002", 5));
         assert!(!manager.is_deleted("untracked", 5));
+    }
+
+    /// A new manager loads the bitmaps an earlier one flushed.
+    #[test]
+    fn new_loads_the_bitmaps_flushed_before() {
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let manager = DeletionManager::new(DeletionConfig::default(), storage.clone()).unwrap();
+        manager.initialize_segment("seg001", 0, 999).unwrap();
+        manager.delete_document("seg001", 5, "test").unwrap();
+        manager.flush().unwrap();
+        drop(manager);
+
+        let reopened = DeletionManager::new(DeletionConfig::default(), storage).unwrap();
+        assert!(reopened.is_deleted("seg001", 5));
+        assert!(!reopened.is_deleted("seg001", 6));
+    }
+
+    /// A `.delmap` that exists but does not parse fails the manager (Issue
+    /// #1265): skipping it would drop that segment's deletions, and the next
+    /// flush would never restore them.
+    #[test]
+    fn new_rejects_an_unreadable_bitmap_on_disk() {
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("seg001.delmap").unwrap();
+            let mut w = StructWriter::new(output);
+            w.write_u32(0xDEAD_BEEF).unwrap(); // not the "DELB" magic
+            w.close().unwrap();
+        }
+
+        let err = DeletionManager::new(DeletionConfig::default(), storage).unwrap_err();
+        match err {
+            LaurusError::Index(msg) => {
+                assert!(
+                    msg.contains("segment seg001: deletion bitmap:"),
+                    "the error names the segment: {msg}"
+                );
+                assert!(msg.contains("segment is corrupted"), "{msg}");
+            }
+            other => panic!("expected an index corruption error, got {other:?}"),
+        }
     }
 }

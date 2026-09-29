@@ -517,8 +517,9 @@ pub struct SegmentReader {
     /// DocValues reader for this segment.
     doc_values: RwLock<Option<Arc<DocValuesReader>>>,
 
-    /// Optional deletion bitmap for this segment.
-    deletion_bitmap: RwLock<Option<Arc<DeletionBitmap>>>,
+    /// The segment's deletion bitmap, read by [`Self::open`] and fixed for
+    /// the reader's life; `None` when the segment has no deletions.
+    deletion_bitmap: Option<Arc<DeletionBitmap>>,
 
     /// Cached BKD trees: field -> tree
     bkd_trees: RwLock<AHashMap<String, Arc<dyn BKDTree>>>,
@@ -583,7 +584,14 @@ impl SegmentReader {
             Some(facade) => Arc::clone(facade) as Arc<dyn Storage>,
             None => storage,
         };
-        let reader = SegmentReader {
+        // Unlike the other parts, `.delmap` is read here rather than on first
+        // use (Issue #1265). The deletion checks behind `doc_count` and
+        // `has_effective_deletions` cannot return an error, so a lazy load
+        // could only hide an unreadable bitmap as "no deletions"; reading it
+        // now fails the open instead. It also fixes the deletions for the
+        // reader's life, as a snapshot.
+        let deletion_bitmap = Self::load_deletion_bitmap(&info, storage.as_ref())?;
+        Ok(SegmentReader {
             info,
             storage,
             compound,
@@ -591,7 +599,7 @@ impl SegmentReader {
             stored_documents: RwLock::new(None),
             norms: RwLock::new(None),
             doc_values: RwLock::new(None),
-            deletion_bitmap: RwLock::new(None),
+            deletion_bitmap,
             bkd_trees: RwLock::new(AHashMap::new()),
             // Disabled by default; query readers enable it (Issue #612).
             posting_cache: PostingCache::new(0),
@@ -600,9 +608,7 @@ impl SegmentReader {
             loaded: AtomicBool::new(false),
             membership: OnceLock::new(),
             live_doc_count: OnceLock::new(),
-        };
-
-        Ok(reader)
+        })
     }
 
     /// The numeric/geo field names this segment carries BKD trees for
@@ -723,8 +729,7 @@ impl SegmentReader {
         // Load DocValues
         self.load_doc_values()?;
 
-        // Load deletion bitmap if present
-        self.load_deletion_bitmap()?;
+        // The deletion bitmap is already loaded by `open`.
 
         self.loaded.store(true, Ordering::Release);
         Ok(())
@@ -821,48 +826,37 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Load deletion bitmap if present for this segment.
-    fn load_deletion_bitmap(&self) -> Result<()> {
-        if !self.info.has_deletions {
-            return Ok(());
+    /// Read the segment's deletion bitmap, for [`Self::open`].
+    ///
+    /// # Returns
+    ///
+    /// `None` when the segment has no deletions, or when its metadata
+    /// records deletions but no `.delmap` file exists — a missing bitmap is
+    /// not a corrupted one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `.delmap` exists but cannot be read.
+    fn load_deletion_bitmap(
+        info: &SegmentInfo,
+        storage: &dyn Storage,
+    ) -> Result<Option<Arc<DeletionBitmap>>> {
+        if !info.has_deletions {
+            return Ok(None);
         }
-
-        // Already loaded
-        if self.deletion_bitmap.read().unwrap().is_some() {
-            return Ok(());
+        let bitmap_file = format!("{}.delmap", info.segment_id);
+        if !storage.file_exists(&bitmap_file) {
+            return Ok(None);
         }
-
-        let bitmap_file = format!("{}.delmap", self.info.segment_id);
-        if !self.storage.file_exists(&bitmap_file) {
-            // Metadata says we have deletions but bitmap is missing; treat as no deletions.
-            return Ok(());
-        }
-
-        let input = self.storage.open_input(&bitmap_file)?;
+        let input = storage.open_input(&bitmap_file)?;
         let mut reader = StructReader::new(input)?;
-        let bitmap = DeletionBitmap::read_from_storage(&mut reader)?;
-        // Re-check under the write lock: two first loads racing here must
-        // install one bitmap, or the cached live count and `is_deleted`
-        // could each answer from a different one (Issue #1211).
-        let mut slot = self.deletion_bitmap.write().unwrap();
-        if slot.is_none() {
-            *slot = Some(Arc::new(bitmap));
-        }
-        Ok(())
+        let bitmap = DeletionBitmap::read_segment_bitmap(&mut reader, &info.segment_id)?;
+        Ok(Some(Arc::new(bitmap)))
     }
 
-    /// The segment's deletion bitmap, loaded on first use; `None` when it
-    /// has no deletions (or its bitmap is missing or unreadable, which the
-    /// deletion checks also treat as none).
+    /// The segment's deletion bitmap; `None` when it has no deletions.
     fn deletions(&self) -> Option<Arc<DeletionBitmap>> {
-        if !self.info.has_deletions {
-            return None;
-        }
-        if let Some(bitmap) = self.deletion_bitmap.read().unwrap().clone() {
-            return Some(bitmap);
-        }
-        self.load_deletion_bitmap().ok()?;
-        self.deletion_bitmap.read().unwrap().clone()
+        self.deletion_bitmap.clone()
     }
 
     /// What this segment holds (Issue #1211), resolved once per reader.
@@ -942,26 +936,14 @@ impl SegmentReader {
 
     /// Check whether a global doc_id is marked as deleted in this segment.
     pub fn is_deleted(&self, doc_id: u64) -> Result<bool> {
-        // Lock-free fast path: a segment with no deletions can never mark a doc
-        // deleted, so skip the `deletion_bitmap` RwLock acquire entirely. This
-        // is hot on the scoring path, which probes deletion status per scored
+        // Hot on the scoring path, which probes deletion status per scored
         // doc (often redundantly, since the posting iterator is already
-        // deletion-filtered at decode time via `filter_deleted_soa`).
-        if !self.info.has_deletions {
-            return Ok(false);
-        }
-
-        // Find deletion bitmap (load on demand the first time).
-        if self.deletion_bitmap.read().unwrap().is_none() {
-            self.load_deletion_bitmap()?;
-        }
-
-        let bitmap_lock = self.deletion_bitmap.read().unwrap();
-        if let Some(ref bitmap) = *bitmap_lock {
-            Ok(bitmap.is_deleted(doc_id))
-        } else {
-            Ok(false)
-        }
+        // deletion-filtered at decode time via `filter_deleted_soa`). The
+        // bitmap was read by `open`, so this is a bit test with no I/O.
+        Ok(self
+            .deletion_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.is_deleted(doc_id)))
     }
 
     /// Drop deleted entries from a SoA-decoded posting list in lockstep
@@ -970,18 +952,8 @@ impl SegmentReader {
     /// deletions, avoiding any allocation in the common case.
     fn filter_deleted_soa(&self, decoded: DecodedPostingList) -> Result<DecodedPostingList> {
         // Fast path: nothing to filter.
-        if !self.info.has_deletions {
+        let Some(bitmap) = self.deletion_bitmap.as_ref() else {
             return Ok(decoded);
-        }
-        // Materialise the bitmap once (load on demand) so the inner loop is a
-        // pure index lookup.
-        if self.deletion_bitmap.read().unwrap().is_none() {
-            self.load_deletion_bitmap()?;
-        }
-        let bitmap_lock = self.deletion_bitmap.read().unwrap();
-        let bitmap = match bitmap_lock.as_ref() {
-            Some(b) => b,
-            None => return Ok(decoded),
         };
 
         let n = decoded.doc_ids.len();
@@ -1723,15 +1695,9 @@ impl SegmentReader {
         let Some(tree) = self.get_bkd_tree(field)? else {
             return Ok(None);
         };
-        if !self.info.has_deletions {
-            return Ok(Some(tree));
-        }
-        // Ensure the bitmap is loaded; the load is idempotent and
-        // tolerates the "metadata says deletions but file is missing"
-        // case by leaving the bitmap unset, in which case we forward
-        // the raw tree.
-        self.load_deletion_bitmap()?;
-        let Some(bitmap) = self.deletion_bitmap.read().unwrap().clone() else {
+        // No bitmap — no deletions, or a `.delmap` that `open` found missing
+        // — forwards the raw tree.
+        let Some(bitmap) = self.deletion_bitmap.clone() else {
             return Ok(Some(tree));
         };
         let snapshot = Arc::new(DeletionSnapshot {
@@ -3189,6 +3155,119 @@ mod tests {
         assert_eq!(
             scan_hits(&reader, "body", "alpha"),
             vec![(0, 1, vec![0]), (2, 1, vec![0])]
+        );
+    }
+
+    // ---- An unreadable `.delmap` is corruption, not "no deletions",
+    // ---- Issue #1265 ---------------------------------------------------
+
+    /// A `.delmap` that exists but does not parse fails the open. Treating it
+    /// as "no deletions" would bring every deleted document of the segment
+    /// back into search results and counts.
+    #[test]
+    fn a_segment_whose_deletion_bitmap_cannot_be_parsed_refuses_to_open() {
+        use crate::storage::structured::StructWriter;
+
+        let (storage, info) = docs_only_segment(
+            "delmap_bad_magic",
+            &[
+                (0, vec![("body", text("alpha"))]),
+                (1, vec![("body", text("alpha"))]),
+            ],
+            true,
+        );
+        {
+            let output = storage
+                .create_output(&format!("{}.delmap", info.segment_id))
+                .unwrap();
+            let mut w = StructWriter::new(output);
+            w.write_u32(0xDEAD_BEEF).unwrap(); // not the "DELB" magic
+            w.close().unwrap();
+        }
+
+        match SegmentReader::open(info, storage) {
+            Err(LaurusError::Index(msg)) => {
+                assert!(
+                    msg.contains("segment delmap_bad_magic: deletion bitmap:"),
+                    "the error names the segment: {msg}"
+                );
+                assert!(msg.contains("segment is corrupted"), "{msg}");
+            }
+            Err(other) => panic!("expected an index corruption error, got {other:?}"),
+            Ok(_) => panic!("an unreadable deletion bitmap must not open as \"no deletions\""),
+        }
+    }
+
+    /// A real `.delmap` cut short — what a torn write leaves — fails the open
+    /// too, rather than parsing as far as it can or being skipped.
+    #[test]
+    fn a_segment_whose_deletion_bitmap_is_truncated_refuses_to_open() {
+        use std::io::{Read, Write};
+
+        use crate::maintenance::deletion::{DeletionConfig, DeletionManager};
+
+        let (storage, info) = docs_only_segment(
+            "delmap_truncated",
+            &[
+                (0, vec![("body", text("alpha"))]),
+                (1, vec![("body", text("alpha"))]),
+            ],
+            true,
+        );
+        let manager = DeletionManager::new(
+            DeletionConfig {
+                enable_deletion_log: false,
+                ..Default::default()
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        manager
+            .initialize_segment(&info.segment_id, info.min_doc_id, info.max_doc_id)
+            .unwrap();
+        manager
+            .delete_document(&info.segment_id, 1, "test")
+            .unwrap();
+        manager.flush().unwrap();
+
+        let bitmap_file = format!("{}.delmap", info.segment_id);
+        let mut bytes = Vec::new();
+        storage
+            .open_input(&bitmap_file)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() > 8, "the fixture must write a real bitmap");
+        let mut output = storage.create_output(&bitmap_file).unwrap();
+        output.write_all(&bytes[..bytes.len() / 2]).unwrap();
+        output.close().unwrap();
+
+        assert!(
+            SegmentReader::open(info, storage).is_err(),
+            "a truncated deletion bitmap must not open as \"no deletions\""
+        );
+    }
+
+    /// `has_deletions` without a `.delmap` file still opens as a segment with
+    /// no deletions: a missing bitmap is not a corrupted one.
+    #[test]
+    fn a_segment_with_no_deletion_bitmap_file_still_opens_as_undeleted() {
+        let (storage, info) = docs_only_segment(
+            "delmap_absent",
+            &[
+                (0, vec![("body", text("alpha"))]),
+                (1, vec![("body", text("alpha"))]),
+            ],
+            true,
+        );
+        assert!(!storage.file_exists("delmap_absent.delmap"));
+
+        let reader = SegmentReader::open(info, storage).unwrap();
+        assert_eq!(reader.doc_count(), 2);
+        assert!(!reader.has_effective_deletions());
+        assert_eq!(
+            scan_hits(&reader, "body", "alpha"),
+            vec![(0, 1, vec![0]), (1, 1, vec![0])]
         );
     }
 

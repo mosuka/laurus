@@ -367,8 +367,10 @@ pub struct InvertedIndexWriter {
     /// That is what makes probing them affordable on a path that runs
     /// once per written document.
     ///
-    /// [`SegmentReader::open`] is fully lazy, so registering one costs no
-    /// I/O; the files are opened only if a lookup actually reaches them.
+    /// [`SegmentReader::open`] reads a segment's parts lazily, except
+    /// `.delmap` for a segment with `has_deletions` — which these never
+    /// have. So registering one opens at most the compound container; each
+    /// part is read only if a lookup actually reaches it.
     flushed_segments: Vec<SegmentReader>,
 
     /// Segments flushed but not yet published to readers (#1017).
