@@ -287,10 +287,15 @@ async fn members_engine() -> Result<Engine> {
 }
 
 async fn members_engine_with(docs: &[(&str, &str)]) -> Result<Engine> {
+    body_engine(members_analyzer(), docs).await
+}
+
+/// An engine whose `body` field is indexed with `analyzer`.
+async fn body_engine(analyzer: Arc<dyn Analyzer>, docs: &[(&str, &str)]) -> Result<Engine> {
     let schema = Schema::from_toml(MEMBERS_SCHEMA_TOML)?;
     let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
     let engine = Engine::builder(storage, schema)
-        .register_runtime_analyzer("members", members_analyzer())
+        .register_runtime_analyzer("members", analyzer)
         .build()
         .await?;
     for (id, text) in docs {
@@ -302,13 +307,26 @@ async fn members_engine_with(docs: &[(&str, &str)]) -> Result<Engine> {
     Ok(engine)
 }
 
+/// `dsl` parsed with the members' synonyms, which then apply at query time
+/// only when the index has none.
+fn members_query(dsl: &str) -> Result<SearchRequestBuilder> {
+    let query = LexicalQueryParser::new(members_analyzer())
+        .with_default_field("body")
+        .parse(dsl)?;
+    Ok(SearchRequestBuilder::new().lexical_query(LexicalSearchQuery::Obj(query)))
+}
+
 /// The highlights of every hit of `dsl` in `field`, by id.
 async fn highlights(engine: &Engine, dsl: &str, field: &str) -> Result<Vec<(String, Vec<String>)>> {
-    let request = SearchRequestBuilder::new()
-        .query_dsl(dsl)
-        .highlight(vec![field.to_string()])
-        .limit(20)
-        .build();
+    request_highlights(engine, SearchRequestBuilder::new().query_dsl(dsl), field).await
+}
+
+async fn request_highlights(
+    engine: &Engine,
+    request: SearchRequestBuilder,
+    field: &str,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let request = request.highlight(vec![field.to_string()]).limit(20).build();
     let mut hits: Vec<(String, Vec<String>)> = engine
         .search(request)
         .await?
@@ -442,6 +460,55 @@ async fn multi_path_values_match_the_same_documents() -> Result<()> {
             assert_eq!(search_dsl(&engine, &dsl).await?, sorted(expected), "{dsl}");
         }
     }
+    Ok(())
+}
+
+/// `"ml ml ml ml"` has 3^4 = 81 paths, which was past the old cap of 64
+/// and rejected. It now matches every document where one of its paths
+/// occurs, and marks the whole phrase there. The synonyms apply at query
+/// time only, so the index keeps each word at its own position.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_past_the_old_path_cap_matches() -> Result<()> {
+    let engine = body_engine(
+        Arc::new(plain_analyzer()),
+        &[
+            ("four_mls", "ml ml ml ml"),
+            (
+                "mixed_members",
+                "machine learning ml statistical machine learning ml",
+            ),
+            ("three_mls", "ml ml ml is fun"),
+            ("gap", "ml ml fun ml ml"),
+        ],
+    )
+    .await?;
+    let search = |dsl: &'static str| {
+        let engine = &engine;
+        async move { ids(engine, members_query(dsl)?.limit(10).build()).await }
+    };
+    assert_eq!(
+        search("body:\"ml ml ml ml\"").await?,
+        sorted(&["four_mls", "mixed_members"])
+    );
+    assert_eq!(
+        search("body:\"ml ml ml ml\"~1").await?,
+        sorted(&["four_mls", "gap", "mixed_members"])
+    );
+    assert_eq!(
+        request_highlights(&engine, members_query("body:\"ml ml ml ml\"")?, "body").await?,
+        vec![
+            (
+                "four_mls".to_string(),
+                vec!["<mark>ml ml ml ml</mark>".to_string()]
+            ),
+            (
+                "mixed_members".to_string(),
+                vec![
+                    "<mark>machine learning ml statistical machine learning ml</mark>".to_string()
+                ]
+            ),
+        ]
+    );
     Ok(())
 }
 
