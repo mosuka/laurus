@@ -6,6 +6,7 @@ pub mod collector;
 pub mod fuzzy;
 pub mod geo;
 pub mod geo3d;
+pub mod graph_phrase;
 pub mod matcher;
 pub mod multi_term;
 pub mod parser;
@@ -27,6 +28,7 @@ pub use geo3d::{
     Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dMatch, Geo3dMatcher, Geo3dNearestQuery,
     Geo3dScorer,
 };
+pub use graph_phrase::{GraphPhraseQuery, PhraseArc};
 pub use multi_term::MultiTermQuery;
 pub use parser::LexicalQueryParser;
 pub use phrase::PhraseQuery;
@@ -124,6 +126,14 @@ pub enum HighlightTerm {
         /// The phrase's positions, in order, each with the alternative
         /// terms any of which matches there.
         positions: Vec<Vec<String>>,
+        /// Maximum position gap allowed between consecutive terms.
+        slop: u32,
+    },
+    /// A phrase over a graph of positions: it matches where any path
+    /// through `arcs` matches as a [`HighlightTerm::Phrase`] would.
+    GraphPhrase {
+        /// The arcs, sorted by `(from, to)`, from node 0 to the last node.
+        arcs: Vec<PhraseArc>,
         /// Maximum position gap allowed between consecutive terms.
         slop: u32,
     },
@@ -493,8 +503,8 @@ mod leaf_field_tests {
     use crate::lexical::core::field::NumericType;
     use crate::lexical::query::range::{DateTimeRangeQuery, RangeQuery};
 
-    /// Every single-field leaf query type that is neither a term, phrase,
-    /// prefix nor fuzzy query, built on `field` (#1131).
+    /// Every single-field leaf query type that is neither a term,
+    /// `PhraseQuery`, prefix nor fuzzy query, built on `field` (#1131).
     fn leaf_queries(field: &str) -> Vec<(&'static str, Box<dyn Query>)> {
         let point = || GeoPoint {
             lat: 35.0,
@@ -564,6 +574,18 @@ mod leaf_field_tests {
             (
                 "Geo3dNearestQuery",
                 Box::new(Geo3dNearestQuery::new(field, ecef(1.0), 10)),
+            ),
+            (
+                "GraphPhraseQuery",
+                Box::new(GraphPhraseQuery::from_arcs(
+                    field,
+                    vec![
+                        PhraseArc::new(0, 1, vec!["new".to_string()]),
+                        PhraseArc::new(0, 2, vec!["nyc".to_string()]),
+                        PhraseArc::new(1, 2, vec!["york".to_string()]),
+                        PhraseArc::new(2, 3, vec!["city".to_string()]),
+                    ],
+                )),
             ),
         ]
     }

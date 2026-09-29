@@ -417,7 +417,7 @@ The index stores no `position_length`, so it lays the graph out on its longest p
 
 #### Searching with synonyms
 
-An engine uses a field's analyzer both to index and to parse queries, so synonyms are expanded on both sides. An unquoted word matches any of its synonyms. A quoted value is matched through the graph (see [Phrase Query](query_dsl.md#phrase-query)): `"big"` with `big` and `large` as synonyms matches either word, and `"a big dog"` also matches "a large dog". Each member of a group is its own phrase, so with the members above `"ml"` matches `ml`, `machine learning` or `statistical machine learning`, and not "statistical learning". Members of the same length are separate phrases too, and each counts toward the limit of 64 phrases per quoted value.
+An engine uses a field's analyzer both to index and to parse queries, so synonyms are expanded on both sides. An unquoted word matches any of its synonyms. A quoted value is matched through the graph (see [Phrase Query](query_dsl.md#phrase-query)): `"big"` with `big` and `large` as synonyms matches either word, and `"a big dog"` also matches "a large dog". Each member of a group is its own phrase, so with the members above `"ml"` matches `ml`, `machine learning` or `statistical machine learning`, and not "statistical learning". Members of the same length are separate phrases too. The phrases of a quoted value are matched together through the graph, so their number, which multiplies with each synonym in the value, sets no limit.
 
 Because the index keeps positions but not `position_length`, index-time expansion of multi-word synonyms behaves as in Lucene:
 

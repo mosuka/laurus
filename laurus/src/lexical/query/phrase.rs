@@ -43,18 +43,22 @@ impl PhraseMatcher {
         slop: u32,
     ) -> Result<Self> {
         let matches = Self::find_phrase_matches(reader, field, positions, slop)?;
+        Ok(Self::from_matches(matches))
+    }
 
+    /// Create a matcher over matches already found, sorted by document ID.
+    pub(crate) fn from_matches(matches: Vec<PhraseMatch>) -> Self {
         let current_doc_id = if matches.is_empty() {
             u64::MAX // Invalid state when no matches
         } else {
             matches[0].doc_id
         };
 
-        Ok(PhraseMatcher {
+        PhraseMatcher {
             matches,
             current_index: 0,
             current_doc_id,
-        })
+        }
     }
 
     /// Find all documents containing the phrase.
@@ -184,26 +188,27 @@ impl PhraseMatcher {
     /// phrase starting at `start_pos`: each must occur at the first
     /// position within `slop` after the previous one's.
     fn is_valid_phrase_at_position(rest: &[Vec<u64>], start_pos: u64, slop: u32) -> bool {
-        let mut expected_pos = start_pos;
-
+        let mut previous = start_pos;
         for positions in rest {
-            expected_pos += 1;
-
-            // Use binary search since positions are sorted.
-            let idx = positions.partition_point(|&pos| pos < expected_pos);
-            let found_pos = positions
-                .get(idx)
-                .copied()
-                .filter(|&pos| pos <= expected_pos + slop as u64);
-
-            match found_pos {
-                Some(actual_pos) => expected_pos = actual_pos,
+            match next_in_window(positions, previous, slop) {
+                Some(position) => previous = position,
                 None => return false,
             }
         }
-
         true
     }
+}
+
+/// The next phrase position's occurrence after one at `previous`: the
+/// first of the sorted `occurrences` in `previous + 1 ..= previous + 1 +
+/// slop`. A phrase always continues from the earliest one.
+pub(crate) fn next_in_window(occurrences: &[u64], previous: u64, slop: u32) -> Option<u64> {
+    let expected = previous + 1;
+    let index = occurrences.partition_point(|&position| position < expected);
+    occurrences
+        .get(index)
+        .copied()
+        .filter(|&position| position <= expected + u64::from(slop))
 }
 
 impl Matcher for PhraseMatcher {

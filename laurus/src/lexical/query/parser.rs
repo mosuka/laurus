@@ -39,6 +39,7 @@ use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::fuzzy::FuzzyQuery;
 use crate::lexical::query::geo::{GeoBoundingBoxQuery, GeoDistanceQuery};
 use crate::lexical::query::geo3d::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery};
+use crate::lexical::query::graph_phrase::{GraphPhraseQuery, PhraseArc, complete_paths};
 use crate::lexical::query::phrase::PhraseQuery;
 use crate::lexical::query::range::{Bound, DateTimeRangeQuery, NumericRangeQuery, RangeQuery};
 use crate::lexical::query::term::TermQuery;
@@ -730,13 +731,15 @@ impl LexicalQueryParser {
     /// (#1247).
     ///
     /// The analyzer's output is read as a token graph (#1252; see
-    /// [`phrase_paths`]). Tokens stacked at one position (synonyms) are
+    /// [`phrase_graph`]). Tokens stacked at one position (synonyms) are
     /// alternatives: one position becomes a `Should` of `TermQuery`, like
     /// Lucene's `SynonymQuery`, and a longer phrase a `PhraseQuery` with
     /// the alternatives at that position. A multi-word synonym makes
-    /// several paths, and the query is a `Should` of one query per path.
-    /// The boost goes on each clause, since the Block-Max-WAND fast path
-    /// ignores a `BooleanQuery`'s own boost.
+    /// several paths. The one-position paths are terms, and the others are
+    /// one `PhraseQuery` when there is one of them and a `GraphPhraseQuery`
+    /// otherwise, which matches them all without listing them (#1271); the
+    /// query is a `Should` of these. The boost goes on each clause, since
+    /// the Block-Max-WAND fast path ignores a `BooleanQuery`'s own boost.
     fn parse_phrase_query(
         &self,
         pair: pest::iterators::Pair<Rule>,
@@ -775,19 +778,40 @@ impl LexicalQueryParser {
                 ));
             }
 
-            let mut clauses: Vec<Box<dyn Query>> = Vec::new();
-            for path in phrase_paths(&tokens)? {
-                if let [alternatives] = path.as_slice() {
-                    for term in alternatives {
-                        clauses.push(Box::new(TermQuery::new(field_name, term).with_boost(boost)));
-                    }
-                } else {
-                    let phrase_query = PhraseQuery::from_positions(field_name, path)
-                        .with_slop(slop.unwrap_or(0))
-                        .with_boost(boost);
-                    clauses.push(Box::new(phrase_query));
+            let slop = slop.unwrap_or(0);
+            let term = |term: String| -> Box<dyn Query> {
+                Box::new(TermQuery::new(field_name, term).with_boost(boost))
+            };
+            let phrase = |positions: Vec<Vec<String>>| -> Box<dyn Query> {
+                Box::new(
+                    PhraseQuery::from_positions(field_name, positions)
+                        .with_slop(slop)
+                        .with_boost(boost),
+                )
+            };
+            let mut clauses: Vec<Box<dyn Query>> = match phrase_graph(&tokens) {
+                PhraseGraph::Flat(mut positions) if positions.len() == 1 => {
+                    positions.remove(0).into_iter().map(term).collect()
                 }
-            }
+                PhraseGraph::Flat(positions) => vec![phrase(positions)],
+                PhraseGraph::Graph { direct, arcs } => {
+                    let mut clauses: Vec<Box<dyn Query>> = direct.into_iter().map(term).collect();
+                    if arcs.windows(2).all(|pair| pair[0].to == pair[1].from) {
+                        // At most one path of two or more positions, as
+                        // without multi-word synonyms.
+                        if !arcs.is_empty() {
+                            clauses.push(phrase(arcs.into_iter().map(|arc| arc.terms).collect()));
+                        }
+                    } else {
+                        clauses.push(Box::new(
+                            GraphPhraseQuery::from_arcs(field_name, arcs)
+                                .with_slop(slop)
+                                .with_boost(boost),
+                        ));
+                    }
+                    clauses
+                }
+            };
 
             if clauses.len() == 1 {
                 return Ok(clauses.remove(0));
@@ -964,34 +988,40 @@ impl LexicalQueryParser {
     }
 }
 
-/// The most paths [`phrase_paths`] expands a quoted value into. Each path
-/// is a phrase whose postings are scanned for matching and again for
-/// scoring, so this is far below Lucene's 1024-clause limit.
-const MAX_PHRASE_PATHS: usize = 64;
+/// The graph a quoted value's tokens form ([`phrase_graph`]).
+#[derive(Debug, PartialEq)]
+enum PhraseGraph {
+    /// A graph with no complete path, as the flat positions the index
+    /// stores, each with its alternative terms.
+    Flat(Vec<Vec<String>>),
+    /// A graph with a complete path.
+    Graph {
+        /// The terms of the arcs from the first node straight to the last,
+        /// the paths of one position.
+        direct: Vec<String>,
+        /// The other arcs on a complete path, as [`complete_paths`] numbers
+        /// them.
+        arcs: Vec<PhraseArc>,
+    },
+}
 
-/// The phrases a quoted value's tokens stand for, each as its positions
-/// with their alternative terms.
+/// The graph a quoted value's tokens form.
 ///
-/// The tokens form a graph: a token is an arc from its position (as the
-/// index numbers it, [`token_positions`]) to its position +
-/// `position_length`. Arcs with the same start and end are one position
-/// of alternatives, such as a word and its one-word synonyms. Every path
-/// from the first node to the last is one phrase; a multi-word synonym
-/// adds one (`"ml"` → `[[ml]]` and `[[machine], [learning]]`). Without
-/// multi-word synonyms there is a single path.
+/// A token is an arc from its position (as the index numbers it,
+/// [`token_positions`]) to its position + `position_length`. Arcs with the
+/// same start and end are one position of alternatives, such as a word and
+/// its one-word synonyms. Every path from the first node to the last is
+/// one phrase; a multi-word synonym adds one (`"ml"` → `[[ml]]` and
+/// `[[machine], [learning]]`). Without multi-word synonyms there is a
+/// single path. Arcs on no complete path are dropped.
 ///
 /// A graph with no complete path (a filter removed a token the graph
 /// needed) falls back to its flat positions ([`flatten_token_graph`]),
 /// which is what the index stores.
-///
-/// # Errors
-///
-/// Returns a query error when there are more than [`MAX_PHRASE_PATHS`]
-/// paths.
-fn phrase_paths(tokens: &[Token]) -> Result<Vec<Vec<Vec<String>>>> {
+fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
     let positions = token_positions(tokens);
 
-    // (from, to) → alternatives, and the arcs leaving each node.
+    // (from, to) → alternatives.
     let mut arcs: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
     for (token, &from) in tokens.iter().zip(&positions) {
         let length = u32::try_from(token.position_length.max(1)).unwrap_or(u32::MAX);
@@ -1002,28 +1032,13 @@ fn phrase_paths(tokens: &[Token]) -> Result<Vec<Vec<Vec<String>>>> {
     }
     let first = positions[0];
     let last = arcs.keys().map(|&(_, to)| to).max().unwrap_or(first);
-    let mut leaving: BTreeMap<u32, Vec<(u32, &Vec<String>)>> = BTreeMap::new();
-    for ((from, to), alternatives) in &arcs {
-        leaving.entry(*from).or_default().push((*to, alternatives));
-    }
+    let arcs = arcs
+        .into_iter()
+        .map(|((from, to), terms)| PhraseArc::new(from, to, terms))
+        .collect();
+    let mut arcs = complete_paths(arcs, first, last);
 
-    // Paths from each node to `last`, counted before any is built.
-    let mut path_counts: BTreeMap<u32, usize> = BTreeMap::new();
-    path_counts.insert(last, 1);
-    for (&node, out) in leaving.iter().rev() {
-        let count = out.iter().fold(0usize, |count, (to, _)| {
-            count.saturating_add(path_counts.get(to).copied().unwrap_or(0))
-        });
-        path_counts.insert(node, count);
-    }
-    let path_count = path_counts.get(&first).copied().unwrap_or(0);
-    if path_count > MAX_PHRASE_PATHS {
-        return Err(LaurusError::query(format!(
-            "a quoted value expands into {path_count} phrases through its synonyms, \
-             more than the {MAX_PHRASE_PATHS} allowed; quote fewer words at once"
-        )));
-    }
-    if path_count == 0 {
+    if arcs.is_empty() {
         let flat = flatten_token_graph(tokens.to_vec());
         let positions = token_positions(&flat);
         let mut by_position: Vec<Vec<String>> = Vec::new();
@@ -1036,29 +1051,19 @@ fn phrase_paths(tokens: &[Token]) -> Result<Vec<Vec<Vec<String>>>> {
                 alternatives.push(token.text.clone());
             }
         }
-        return Ok(vec![by_position]);
+        return PhraseGraph::Flat(by_position);
     }
 
-    fn walk(
-        node: u32,
-        last: u32,
-        leaving: &BTreeMap<u32, Vec<(u32, &Vec<String>)>>,
-        path: &mut Vec<Vec<String>>,
-        paths: &mut Vec<Vec<Vec<String>>>,
-    ) {
-        if node == last {
-            paths.push(path.clone());
-            return;
+    let last = arcs.iter().map(|arc| arc.to).max().unwrap_or(0);
+    let mut direct = Vec::new();
+    arcs.retain(|arc| {
+        let is_direct = arc.from == 0 && arc.to == last;
+        if is_direct {
+            direct.extend(arc.terms.iter().cloned());
         }
-        for (to, alternatives) in leaving.get(&node).into_iter().flatten() {
-            path.push((*alternatives).clone());
-            walk(*to, last, leaving, path, paths);
-            path.pop();
-        }
-    }
-    let mut paths = Vec::with_capacity(path_count);
-    walk(first, last, &leaving, &mut Vec::new(), &mut paths);
-    Ok(paths)
+        !is_direct
+    });
+    PhraseGraph::Graph { direct, arcs }
 }
 
 /// Walk a `geo3d_*` pair and collect every nested `signed_float` token
@@ -1960,9 +1965,99 @@ mod tests {
         );
     }
 
-    /// A multi-word synonym is a graph: one query per path through it.
+    fn graph(arcs: &[(u32, u32, &[&str])], slop: u32, boost: f32) -> (String, f32) {
+        let arcs = arcs
+            .iter()
+            .map(|&(from, to, terms)| {
+                PhraseArc::new(from, to, terms.iter().map(|t| t.to_string()).collect())
+            })
+            .collect();
+        (
+            GraphPhraseQuery::from_arcs("body", arcs)
+                .with_slop(slop)
+                .description(),
+            boost,
+        )
+    }
+
+    /// The Should clauses of `query`, or `query` itself.
+    fn clauses(query: &dyn Query) -> Vec<&dyn Query> {
+        match query.as_any().downcast_ref::<BooleanQuery>() {
+            Some(boolean) => boolean.clauses().iter().map(|c| c.query.as_ref()).collect(),
+            None => vec![query],
+        }
+    }
+
+    /// The kind of each clause of `query`, sorted.
+    fn clause_kinds(query: &dyn Query) -> Vec<&'static str> {
+        let mut kinds: Vec<&str> = clauses(query)
+            .into_iter()
+            .map(|clause| {
+                let any = clause.as_any();
+                if any.is::<TermQuery>() {
+                    "term"
+                } else if any.is::<PhraseQuery>() {
+                    "phrase"
+                } else if any.is::<GraphPhraseQuery>() {
+                    "graph"
+                } else {
+                    panic!("unexpected clause {clause:?}")
+                }
+            })
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// The phrases `query` matches, sorted, each as its positions with
+    /// their alternatives: a term is one position, and a graph phrase
+    /// stands for every path through it.
+    fn phrases(query: &dyn Query) -> Vec<Vec<Vec<String>>> {
+        use crate::lexical::query::graph_phrase::test_support::paths;
+
+        let mut phrases = Vec::new();
+        for clause in clauses(query) {
+            let any = clause.as_any();
+            if let Some(term) = any.downcast_ref::<TermQuery>() {
+                phrases.push(vec![vec![term.term().to_string()]]);
+            } else if let Some(phrase) = any.downcast_ref::<PhraseQuery>() {
+                phrases.push(phrase.positions().to_vec());
+            } else if let Some(graph) = any.downcast_ref::<GraphPhraseQuery>() {
+                phrases.extend(paths(graph.arcs()));
+            } else {
+                panic!("unexpected clause {clause:?}");
+            }
+        }
+        phrases.sort();
+        phrases
+    }
+
+    fn sorted_phrases(phrases: &[&[&[&str]]]) -> Vec<Vec<Vec<String>>> {
+        let mut phrases: Vec<Vec<Vec<String>>> = phrases
+            .iter()
+            .map(|positions| {
+                positions
+                    .iter()
+                    .map(|alternatives| alternatives.iter().map(|t| t.to_string()).collect())
+                    .collect()
+            })
+            .collect();
+        phrases.sort();
+        phrases
+    }
+
+    const ML_IS: &[(u32, u32, &[&str])] = &[
+        (0, 1, &["machine"]),
+        (0, 2, &["ml"]),
+        (1, 2, &["learning"]),
+        (2, 3, &["is"]),
+    ];
+
+    /// A multi-word synonym makes several paths. A one-position path is a
+    /// term and a lone longer path a phrase, as without synonyms; two or
+    /// more longer paths are one graph phrase (#1271).
     #[test]
-    fn multi_word_synonym_ors_one_query_per_path() {
+    fn a_multi_word_synonym_makes_several_paths() {
         let expected = sorted(vec![
             term("ml", 1.0),
             phrase(&[&["machine"], &["learning"]], 0, 1.0),
@@ -1973,12 +2068,10 @@ mod tests {
         }
 
         let query = synonym_parser().parse("\"ml is\"").unwrap();
+        assert_eq!(should_clauses(query.as_ref()), vec![graph(ML_IS, 0, 1.0)]);
         assert_eq!(
-            should_clauses(query.as_ref()),
-            sorted(vec![
-                phrase(&[&["ml"], &["is"]], 0, 1.0),
-                phrase(&[&["machine"], &["learning"], &["is"]], 0, 1.0),
-            ])
+            phrases(query.as_ref()),
+            sorted_phrases(&[&[&["ml"], &["is"]], &[&["machine"], &["learning"], &["is"]]])
         );
     }
 
@@ -1989,10 +2082,10 @@ mod tests {
     fn each_multi_word_member_is_its_own_path() {
         let parser =
             synonym_parser_with(&[&["ml", "machine learning", "statistical machine learning"]]);
-        let expected = sorted(vec![
-            term("ml", 1.0),
-            phrase(&[&["machine"], &["learning"]], 0, 1.0),
-            phrase(&[&["statistical"], &["machine"], &["learning"]], 0, 1.0),
+        let expected = sorted_phrases(&[
+            &[&["ml"]],
+            &[&["machine"], &["learning"]],
+            &[&["statistical"], &["machine"], &["learning"]],
         ]);
         for dsl in [
             "\"ml\"",
@@ -2000,34 +2093,68 @@ mod tests {
             "\"statistical machine learning\"",
         ] {
             let query = parser.parse(dsl).unwrap();
-            assert_eq!(should_clauses(query.as_ref()), expected, "{dsl}");
+            assert_eq!(phrases(query.as_ref()), expected, "{dsl}");
+            assert_eq!(clause_kinds(query.as_ref()), ["graph", "term"], "{dsl}");
         }
 
         let parser = synonym_parser_with(&[&["new york", "big apple"]]);
-        let expected = sorted(vec![
-            phrase(&[&["new"], &["york"]], 0, 1.0),
-            phrase(&[&["big"], &["apple"]], 0, 1.0),
-        ]);
+        let expected = sorted_phrases(&[&[&["new"], &["york"]], &[&["big"], &["apple"]]]);
         for dsl in ["\"new york\"", "\"big apple\""] {
             let query = parser.parse(dsl).unwrap();
-            assert_eq!(should_clauses(query.as_ref()), expected, "{dsl}");
+            assert_eq!(phrases(query.as_ref()), expected, "{dsl}");
+            assert_eq!(clause_kinds(query.as_ref()), ["graph"], "{dsl}");
         }
     }
 
-    /// Paths multiply: six multi-word synonyms give 64 paths, seven give
-    /// 128, past the cap.
+    /// Paths multiply, so seven multi-word synonyms make 128 of them,
+    /// which was past the old cap of 64. The graph phrase grows with the
+    /// arcs instead, three per synonym (#1271).
     #[test]
-    fn too_many_graph_paths_is_a_query_error() {
-        let parser = synonym_parser();
-        let within = parser.parse("\"ml ml ml ml ml ml\"").unwrap();
-        assert_eq!(should_clauses(within.as_ref()).len(), 64);
+    fn seven_multi_word_synonyms_build_one_graph_phrase() {
+        let query = synonym_parser().parse("\"ml ml ml ml ml ml ml\"").unwrap();
+        let graph = query
+            .as_any()
+            .downcast_ref::<GraphPhraseQuery>()
+            .expect("one graph phrase");
+        assert_eq!(graph.arcs().len(), 21);
+        assert_eq!(graph.arcs().iter().map(|arc| arc.to).max(), Some(14));
+        assert_eq!(phrases(query.as_ref()).len(), 128);
+    }
 
-        match parser.parse("\"ml ml ml ml ml ml ml\"") {
-            Err(LaurusError::Query(message)) => {
-                assert!(message.contains("128"), "{message}")
-            }
-            other => panic!("expected a query error, got {other:?}"),
+    #[test]
+    fn graph_phrase_carries_slop_and_boost() {
+        let query = synonym_parser().parse("\"ml is\"~2^3").unwrap();
+        assert_eq!(should_clauses(query.as_ref()), vec![graph(ML_IS, 2, 3.0)]);
+    }
+
+    /// An analyzer that always emits the same tokens.
+    #[derive(Debug)]
+    struct Fixed(Vec<Token>);
+
+    impl Analyzer for Fixed {
+        fn analyze(&self, _text: &str) -> Result<crate::analysis::token::TokenStream> {
+            Ok(Box::new(self.0.clone().into_iter()))
         }
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An arc on no complete path is dropped: here "a b" stops at node 2,
+    /// short of the last node, so only "c" is left.
+    #[test]
+    fn arcs_off_every_complete_path_are_dropped() {
+        let tokens = vec![
+            Token::new("c", 0).with_position_length(3),
+            Token::new("a", 0).with_position_increment(0),
+            Token::new("b", 1),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+        let query = parser.parse("\"anything\"").unwrap();
+        assert_eq!(should_clauses(query.as_ref()), vec![term("c", 1.0)]);
     }
 
     /// A graph with no complete path (here "b" starts at a node nothing
@@ -2035,27 +2162,11 @@ mod tests {
     /// `position_length`.
     #[test]
     fn a_graph_without_a_complete_path_falls_back_to_positions() {
-        use crate::analysis::token::{Token, TokenStream};
-
-        #[derive(Debug)]
-        struct Fixed;
-        impl Analyzer for Fixed {
-            fn analyze(&self, _text: &str) -> Result<TokenStream> {
-                let tokens = vec![
-                    Token::new("a", 0).with_position_length(2),
-                    Token::new("b", 1).with_position_length(3),
-                ];
-                Ok(Box::new(tokens.into_iter()))
-            }
-            fn name(&self) -> &'static str {
-                "fixed"
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let parser = LexicalQueryParser::new(Arc::new(Fixed)).with_default_field("body");
+        let tokens = vec![
+            Token::new("a", 0).with_position_length(2),
+            Token::new("b", 1).with_position_length(3),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
         let query = parser.parse("\"anything\"").unwrap();
         assert_eq!(
             should_clauses(query.as_ref()),

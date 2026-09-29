@@ -211,7 +211,7 @@ async fn multi_valued_field_keeps_its_gap_after_a_stacked_token() -> Result<()> 
 async fn positionless_field_accepts_one_position_and_rejects_phrases() -> Result<()> {
     let engine = engine().await?;
     assert_eq!(search_dsl(&engine, "nopos:\"big\"").await?, sorted(DOGS));
-    for dsl in ["nopos:\"big dog\"", "nopos:\"ml\""] {
+    for dsl in ["nopos:\"big dog\"", "nopos:\"ml\"", "nopos:\"ml is\""] {
         match search_dsl(&engine, dsl).await {
             Err(LaurusError::Query(message)) => {
                 assert!(message.contains("nopos"), "{dsl}: {message}")
@@ -283,19 +283,61 @@ fn members_analyzer() -> Arc<dyn Analyzer> {
 }
 
 async fn members_engine() -> Result<Engine> {
+    members_engine_with(&MEMBER_DOCS).await
+}
+
+async fn members_engine_with(docs: &[(&str, &str)]) -> Result<Engine> {
+    body_engine(members_analyzer(), docs).await
+}
+
+/// An engine whose `body` field is indexed with `analyzer`.
+async fn body_engine(analyzer: Arc<dyn Analyzer>, docs: &[(&str, &str)]) -> Result<Engine> {
     let schema = Schema::from_toml(MEMBERS_SCHEMA_TOML)?;
     let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
     let engine = Engine::builder(storage, schema)
-        .register_runtime_analyzer("members", members_analyzer())
+        .register_runtime_analyzer("members", analyzer)
         .build()
         .await?;
-    for (id, text) in MEMBER_DOCS {
+    for (id, text) in docs {
         engine
-            .put_document(id, Document::builder().add_text("body", text).build())
+            .put_document(id, Document::builder().add_text("body", *text).build())
             .await?;
     }
     engine.commit().await?;
     Ok(engine)
+}
+
+/// `dsl` parsed with the members' synonyms, which then apply at query time
+/// only when the index has none.
+fn members_query(dsl: &str) -> Result<SearchRequestBuilder> {
+    let query = LexicalQueryParser::new(members_analyzer())
+        .with_default_field("body")
+        .parse(dsl)?;
+    Ok(SearchRequestBuilder::new().lexical_query(LexicalSearchQuery::Obj(query)))
+}
+
+/// The highlights of every hit of `dsl` in `field`, by id.
+async fn highlights(engine: &Engine, dsl: &str, field: &str) -> Result<Vec<(String, Vec<String>)>> {
+    request_highlights(engine, SearchRequestBuilder::new().query_dsl(dsl), field).await
+}
+
+async fn request_highlights(
+    engine: &Engine,
+    request: SearchRequestBuilder,
+    field: &str,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let request = request.highlight(vec![field.to_string()]).limit(20).build();
+    let mut hits: Vec<(String, Vec<String>)> = engine
+        .search(request)
+        .await?
+        .into_iter()
+        .map(|hit| {
+            let marked = hit.highlights.get(field).cloned().unwrap_or_default();
+            (hit.id, marked)
+        })
+        .collect();
+    hits.sort();
+    Ok(hits)
 }
 
 /// A quoted member expands into each member of its group, not into a mix
@@ -351,6 +393,156 @@ async fn phrase_is_highlighted_where_the_index_matches_it() -> Result<()> {
     assert_eq!(
         hit.highlights["body"],
         vec!["statistical machine <mark>learning is</mark> fun"]
+    );
+    Ok(())
+}
+
+// ---- Values with several paths (#1271) ----
+
+/// Members followed by other words at gaps of zero to two positions.
+const GAP_DOCS: [(&str, &str); 9] = [
+    ("ml", "ml is fun"),
+    ("ml_gap1", "ml really is fun"),
+    ("ml_gap2", "ml really truly is fun"),
+    ("machine_learning_gap1", "machine learning really is fun"),
+    (
+        "statistical_machine_learning",
+        "statistical machine learning is fun",
+    ),
+    ("statistical_learning", "statistical learning is fun"),
+    ("new_york_city", "new york city is big"),
+    ("big_apple_gap1", "the big apple really is big"),
+    ("apple_big", "apple big is new york"),
+];
+
+/// The documents each value with several paths matches at slop 0 to 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_path_values_match_the_same_documents() -> Result<()> {
+    let engine = members_engine_with(&GAP_DOCS).await?;
+    const ML_IS: [&[&str]; 3] = [
+        &["ml", "statistical_machine_learning"],
+        &[
+            "machine_learning_gap1",
+            "ml",
+            "ml_gap1",
+            "statistical_machine_learning",
+        ],
+        &[
+            "machine_learning_gap1",
+            "ml",
+            "ml_gap1",
+            "ml_gap2",
+            "statistical_machine_learning",
+        ],
+    ];
+    const NEW_YORK: [&[&str]; 3] = [
+        &[],
+        &["big_apple_gap1", "new_york_city"],
+        &["big_apple_gap1", "new_york_city"],
+    ];
+    let cases: &[(&str, [&[&str]; 3])] = &[
+        ("ml is", ML_IS),
+        ("ml is fun", ML_IS),
+        (
+            "ml really is",
+            [
+                &["machine_learning_gap1", "ml_gap1"],
+                &["machine_learning_gap1", "ml_gap1", "ml_gap2"],
+                &["machine_learning_gap1", "ml_gap1", "ml_gap2"],
+            ],
+        ),
+        ("new york is", NEW_YORK),
+        ("big apple is big", NEW_YORK),
+    ];
+    for (value, by_slop) in cases {
+        for (slop, expected) in by_slop.iter().enumerate() {
+            let dsl = format!("body:\"{value}\"~{slop}");
+            assert_eq!(search_dsl(&engine, &dsl).await?, sorted(expected), "{dsl}");
+        }
+    }
+    Ok(())
+}
+
+/// `"ml ml ml ml"` has 3^4 = 81 paths, which was past the old cap of 64
+/// and rejected. It now matches every document where one of its paths
+/// occurs, and marks the whole phrase there. The synonyms apply at query
+/// time only, so the index keeps each word at its own position.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_past_the_old_path_cap_matches() -> Result<()> {
+    let engine = body_engine(
+        Arc::new(plain_analyzer()),
+        &[
+            ("four_mls", "ml ml ml ml"),
+            (
+                "mixed_members",
+                "machine learning ml statistical machine learning ml",
+            ),
+            ("three_mls", "ml ml ml is fun"),
+            ("gap", "ml ml fun ml ml"),
+        ],
+    )
+    .await?;
+    let search = |dsl: &'static str| {
+        let engine = &engine;
+        async move { ids(engine, members_query(dsl)?.limit(10).build()).await }
+    };
+    assert_eq!(
+        search("body:\"ml ml ml ml\"").await?,
+        sorted(&["four_mls", "mixed_members"])
+    );
+    assert_eq!(
+        search("body:\"ml ml ml ml\"~1").await?,
+        sorted(&["four_mls", "gap", "mixed_members"])
+    );
+    assert_eq!(
+        request_highlights(&engine, members_query("body:\"ml ml ml ml\"")?, "body").await?,
+        vec![
+            (
+                "four_mls".to_string(),
+                vec!["<mark>ml ml ml ml</mark>".to_string()]
+            ),
+            (
+                "mixed_members".to_string(),
+                vec![
+                    "<mark>machine learning ml statistical machine learning ml</mark>".to_string()
+                ]
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// Every path of the value that occurs in a document is marked, from its
+/// first word to its last.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_member_path_is_highlighted() -> Result<()> {
+    let engine = members_engine_with(&GAP_DOCS).await?;
+    let marked = |hits: &[(&str, &str)]| -> Vec<(String, Vec<String>)> {
+        hits.iter()
+            .map(|(id, text)| (id.to_string(), vec![text.to_string()]))
+            .collect()
+    };
+    assert_eq!(
+        highlights(&engine, "body:\"ml is\"~1", "body").await?,
+        marked(&[
+            (
+                "machine_learning_gap1",
+                "<mark>machine learning really is</mark> fun"
+            ),
+            ("ml", "<mark>ml is</mark> fun"),
+            ("ml_gap1", "<mark>ml really is</mark> fun"),
+            (
+                "statistical_machine_learning",
+                "<mark>statistical machine learning is</mark> fun"
+            ),
+        ])
+    );
+    assert_eq!(
+        highlights(&engine, "body:\"new york is\"~1", "body").await?,
+        marked(&[
+            ("big_apple_gap1", "the <mark>big apple really is</mark> big"),
+            ("new_york_city", "<mark>new york city is</mark> big"),
+        ])
     );
     Ok(())
 }
