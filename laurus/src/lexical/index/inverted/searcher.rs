@@ -2114,6 +2114,71 @@ mod tests {
         }
     }
 
+    /// Issue #1257: a `SynonymQuery`'s blended `doc_freq` must come from
+    /// the whole index, not from whichever alternatives a segment happens
+    /// to hold — otherwise identical content scores differently depending
+    /// on which segment it landed in. Segment 1 holds "large" nowhere at
+    /// all; segment 2 has "large" far more often than "big". A per-segment
+    /// local blend of `max(df(big), df(large))` would therefore be small
+    /// in segment 1 (only "big" is visible there) and large in segment 2
+    /// (dominated by "large"), giving the two identical documents
+    /// different idf — exactly what freezing the blend in `rewrite`
+    /// (against the top-level reader, before the fanout) prevents.
+    #[test]
+    fn synonym_query_scores_identical_docs_the_same_across_segments() {
+        use crate::Document;
+        use crate::lexical::query::synonym::SynonymQuery;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+
+        // Segment 1: one doc with "big" (doc 0, the comparison target),
+        // nine with neither alternative. "large" never appears here.
+        let doc = |text: &str| Document::builder().add_text("body", text).build();
+        store.upsert_document(0, doc("big filler")).unwrap();
+        for id in 1..10u64 {
+            store.upsert_document(id, doc("filler filler")).unwrap();
+        }
+        store.commit().unwrap();
+
+        // Segment 2: one doc with "big" (doc 10, identical content to doc
+        // 0), nine with "large" -- df(large) = 9 far exceeds df(big) = 1
+        // in this segment alone.
+        store.upsert_document(10, doc("big filler")).unwrap();
+        for id in 11..20u64 {
+            store.upsert_document(id, doc("large filler")).unwrap();
+        }
+        store.commit().unwrap();
+
+        let query: Box<dyn Query> = Box::new(SynonymQuery::new(
+            "body",
+            vec!["big".to_string(), "large".to_string()],
+        ));
+        // `TopDocsCollector` is bmw_capable and segment_count == 2, so
+        // this dispatches through `search_per_segment_fanout`, which
+        // re-enters `rewrite` per segment (searcher.rs:751) after the
+        // top-level call already froze the blended stats.
+        let hits = store
+            .search(LexicalSearchRequest::new(query).limit(20))
+            .unwrap()
+            .hits;
+
+        let score_of = |doc_id: u64| {
+            hits.iter()
+                .find(|h| h.doc_id == doc_id)
+                .unwrap_or_else(|| panic!("doc {doc_id} must match"))
+                .score
+        };
+        let (score0, score10) = (score_of(0), score_of(10));
+        assert!(
+            (score0 - score10).abs() < 1e-4,
+            "identical content in different segments must score the same: \
+             doc 0 = {score0}, doc 10 = {score10}"
+        );
+    }
+
     /// #1120 fixture: two segments with deliberately divergent local
     /// `avg_field_length` (2.0 vs 100.0), so the cross-segment weighted
     /// average (~83.67) exceeds segment A's own local average. Targets
