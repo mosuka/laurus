@@ -11,7 +11,7 @@ use roaring::RoaringTreemap;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::{Token, TokenPositions};
+use crate::analysis::token::{Token, TokenPositions, flatten_token_graph};
 use crate::data::DataValue;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm};
@@ -743,15 +743,19 @@ pub(crate) fn position_increment_gap_for(option: Option<&FieldOption>) -> u32 {
 
 /// Convert tokens to analyzed terms.
 ///
-/// Positions come from [`TokenPositions`], whatever `Token::position` says:
-/// a token stacked with increment 0 (a synonym) shares the previous token's
-/// position, and every other token takes the next one. The highlighter's
-/// `phrase_spans` and the query parser number tokens the same way, so a
-/// phrase compares the positions stored here.
+/// The index stores no `position_length`, so the token graph is first laid
+/// out on flat positions ([`flatten_token_graph`]): the words of a
+/// multi-word synonym's members share positions. Positions then come from
+/// [`TokenPositions`], whatever `Token::position` says: a token stacked
+/// with increment 0 (a synonym) shares the previous token's position, and
+/// every other token takes the next one. The highlighter's `phrase_spans`
+/// numbers tokens the same way, so a phrase compares the positions stored
+/// here.
 ///
 /// The same term stacked twice at one position is kept once, so it does not
 /// inflate the term frequency.
 pub(crate) fn tokens_to_analyzed_terms(tokens: Vec<Token>) -> Vec<AnalyzedTerm> {
+    let tokens = flatten_token_graph(tokens);
     let mut term_frequencies = AHashMap::new();
     let mut analyzed_terms: Vec<AnalyzedTerm> = Vec::with_capacity(tokens.len());
     let mut positions = TokenPositions::default();

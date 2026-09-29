@@ -29,7 +29,7 @@ use pest_derive::Parser;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::analysis::token::{Token, token_positions};
+use crate::analysis::token::{Token, flatten_token_graph, token_positions};
 use crate::data::GeoEcefPoint;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::datetime::parse_datetime_literal;
@@ -981,8 +981,8 @@ const MAX_PHRASE_PATHS: usize = 64;
 /// multi-word synonyms there is a single path.
 ///
 /// A graph with no complete path (a filter removed a token the graph
-/// needed) falls back to the positions alone, which is what the index
-/// stores.
+/// needed) falls back to its flat positions ([`flatten_token_graph`]),
+/// which is what the index stores.
 ///
 /// # Errors
 ///
@@ -1024,8 +1024,10 @@ fn phrase_paths(tokens: &[Token]) -> Result<Vec<Vec<Vec<String>>>> {
         )));
     }
     if path_count == 0 {
+        let flat = flatten_token_graph(tokens.to_vec());
+        let positions = token_positions(&flat);
         let mut by_position: Vec<Vec<String>> = Vec::new();
-        for (token, (i, &position)) in tokens.iter().zip(positions.iter().enumerate()) {
+        for (token, (i, &position)) in flat.iter().zip(positions.iter().enumerate()) {
             if i == 0 || positions[i - 1] != position {
                 by_position.push(Vec::new());
             }
