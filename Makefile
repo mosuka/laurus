@@ -140,8 +140,9 @@ else
 endif
 	cd laurus-php && composer install --quiet && php -d extension=$(LAURUS_PHP_EXT) vendor/bin/phpunit tests/LaurusTest.php
 
-test-laurus-wasm: ## Build-test laurus-wasm (wasm32 target)
+test-laurus-wasm: ## Test laurus-wasm (wasm32 build check + wasm-pack tests)
 	cargo build -p laurus-wasm --target wasm32-unknown-unknown
+	wasm-pack test --node laurus-wasm
 
 # ── Build ──────────────────────────────────────────────────────────────────
 

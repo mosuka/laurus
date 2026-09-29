@@ -53,12 +53,14 @@ cargo test --all-features     # Run tests with all features enabled
 ```
 
 For language bindings, use the dedicated targets, which set up the language
-toolchain (venv, npm, bundler, composer) before running tests:
+toolchain (venv, npm, bundler, composer) before running tests. `laurus-wasm`
+additionally requires [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/)
+to be installed:
 
 ```bash
 make test-laurus-python   # Rust unit tests + Python pytest (via Maturin)
 make test-laurus-nodejs   # Build + npm test
-make test-laurus-wasm     # wasm32-unknown-unknown build check
+make test-laurus-wasm     # wasm32-unknown-unknown build check + wasm-pack tests
 make test-laurus-ruby     # Rust unit tests + Ruby minitest
 make test-laurus-php      # Build + PHPUnit
 ```

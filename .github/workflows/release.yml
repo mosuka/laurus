@@ -500,6 +500,12 @@ jobs:
       - name: Run clippy
         run: cargo clippy -p laurus-wasm --target wasm32-unknown-unknown --tests -- -D warnings
 
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Run tests
+        run: wasm-pack test --node laurus-wasm
+
   # ============================================================
   # Gate: ensure all tests pass before proceeding to build
   # ============================================================
