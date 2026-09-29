@@ -1980,6 +1980,107 @@ mod tests {
         let _suppress_dead_code = NonBmwTopDocs(TopDocsCollector::new(0));
     }
 
+    /// #1256: the outer `BooleanQuery`'s own boost must reach the BMW
+    /// fast path, not just the legacy matcher-driven path (`BooleanScorer`
+    /// applies it via `set_boost` in `BooleanQuery::scorer`, but
+    /// `BlockMaxOrExecutor::new` used to build its per-clause scorers
+    /// straight from each clause's query, never reading
+    /// `boolean_query.boost()`).
+    #[test]
+    fn bmw_applies_should_only_boolean_query_boost() {
+        use crate::Document;
+        use crate::lexical::query::boolean::BooleanQueryBuilder;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+
+        // Every document's "body" gets the same total token count (padded
+        // with "filler"), so every doc's field length is `BODY_LEN` and
+        // the reference score below can pass that constant directly
+        // instead of resolving it per document.
+        const BODY_LEN: usize = 8;
+        for id in 0..64u64 {
+            let alpha_count = if id % 2 == 0 { 2 } else { 0 };
+            let beta_count = if id % 3 == 0 { 1 } else { 0 };
+            let filler_count = BODY_LEN - alpha_count - beta_count;
+            let mut words = Vec::with_capacity(BODY_LEN);
+            words.extend(std::iter::repeat_n("alpha", alpha_count));
+            words.extend(std::iter::repeat_n("beta", beta_count));
+            words.extend(std::iter::repeat_n("filler", filler_count));
+            let doc = Document::builder()
+                .add_text("title", format!("doc-{id}"))
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+
+        let make_query = |boost: f32| -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .should(Box::new(TermQuery::new("body", "alpha")))
+                    .should(Box::new(TermQuery::new("body", "beta")))
+                    .boost(boost)
+                    .build(),
+            )
+        };
+
+        let reader = store.reader_for_tests().unwrap();
+        let searcher = InvertedIndexSearcher::from_arc(reader);
+
+        // BMW path: `TopDocsCollector::bmw_capable()` is true, so the
+        // searcher entrypoint dispatches to `BlockMaxOrExecutor`.
+        let bmw_unboosted = searcher
+            .search_with_collector(make_query(1.0), TopDocsCollector::new(64))
+            .unwrap();
+        let bmw_boosted = searcher
+            .search_with_collector(make_query(2.0), TopDocsCollector::new(64))
+            .unwrap();
+
+        let sort_hits = |hits: Vec<SearchHit>| -> Vec<(u64, f32)> {
+            let mut v: Vec<_> = hits.into_iter().map(|h| (h.doc_id, h.score)).collect();
+            v.sort_by_key(|h| h.0);
+            v
+        };
+        let bmw_unboosted_hits = sort_hits(bmw_unboosted.results());
+        let bmw_boosted_hits = sort_hits(bmw_boosted.results());
+
+        assert!(!bmw_unboosted_hits.is_empty(), "expected matches");
+        assert_eq!(bmw_unboosted_hits.len(), bmw_boosted_hits.len());
+
+        // Acceptance criterion: a boosted Should-only BooleanQuery of
+        // TermQuery scores twice as high with boost=2 as with boost=1.
+        for ((doc, unboosted), (doc2, boosted)) in
+            bmw_unboosted_hits.iter().zip(bmw_boosted_hits.iter())
+        {
+            assert_eq!(
+                doc, doc2,
+                "doc_id mismatch between boost=1 and boost=2 runs"
+            );
+            assert!(
+                (boosted - unboosted * 2.0).abs() < 1e-4,
+                "doc {doc}: boosted score {boosted} is not double the unboosted score {unboosted}"
+            );
+        }
+
+        // Acceptance criterion: the BMW path scores a boosted query the
+        // same as the "regular path" the issue names — `BooleanQuery::
+        // scorer`'s `BooleanScorer`, which sums each clause's score and
+        // then multiplies by `self.boost` (`boolean_scorer.set_boost`).
+        // Every doc's "body" is `BODY_LEN` tokens, so that constant is
+        // this reference scorer's field length too.
+        let reference_scorer = make_query(2.0).scorer(searcher.reader().as_ref()).unwrap();
+        for (doc, bmw_score) in bmw_boosted_hits.iter() {
+            let reference_score = reference_scorer.score(*doc, 0.0, Some(BODY_LEN as f32));
+            assert!(
+                (bmw_score - reference_score).abs() < 1e-4,
+                "doc {doc}: BMW score {bmw_score} != BooleanQuery::scorer score {reference_score}"
+            );
+        }
+    }
+
     /// Helper for #476 Phase 1 tests: build a `LexicalStore` with
     /// the same skewed-TF corpus as the equivalence test, but split
     /// the writes across `segment_count` commits so the underlying
