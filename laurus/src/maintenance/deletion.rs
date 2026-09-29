@@ -23,15 +23,6 @@ pub struct DeletionConfig {
     /// Enable automatic compaction.
     pub auto_compaction: bool,
 
-    /// Compaction check interval in seconds.
-    pub compaction_interval_secs: u64,
-
-    /// Maximum memory for deletion bitmaps (in MB).
-    pub max_bitmap_memory_mb: u64,
-
-    /// Batch size for deletion operations.
-    pub deletion_batch_size: usize,
-
     /// Enable deletion log for recovery.
     pub enable_deletion_log: bool,
 }
@@ -41,9 +32,6 @@ impl Default for DeletionConfig {
         DeletionConfig {
             compaction_threshold: 0.3,
             auto_compaction: true,
-            compaction_interval_secs: 300, // 5 minutes
-            max_bitmap_memory_mb: 64,
-            deletion_batch_size: 1000,
             enable_deletion_log: true,
         }
     }
