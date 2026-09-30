@@ -928,6 +928,124 @@ class LaurusTest extends TestCase
         $this->assertContains("ml", $texts);
     }
 
+    // ── Custom analyzers (Schema::addAnalyzer, Issue #1190) ───────────────
+    //
+    // Adapted from laurus-nodejs's schema_analyzer.spec.mjs. These
+    // deliberately avoid the Lindera tokenizer: this repository ships no
+    // Lindera dictionary. `whitespace`/`ngram`/`regex` tokenizers exercise
+    // the same conversion code path without that dependency. Each
+    // behavioural test proves the analyzer actually reached the query
+    // engine (a deterministic search-result difference), not just that
+    // addAnalyzer() didn't throw.
+
+    public function testAddAnalyzerNgramEnablesSubstringMatch(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("ngram3", ["type" => "ngram", "min_gram" => 3, "max_gram" => 3]);
+        $schema->addTextField("title", analyzer: "ngram3");
+        $schema->addTextField("plain"); // default "standard" analyzer: whole-word tokens
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("doc1", ["title" => "hello", "plain" => "hello"]);
+        $idx->commit();
+
+        // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
+        $this->assertCount(1, $idx->search("title:ell", 5));
+        $this->assertCount(0, $idx->search("plain:ell", 5));
+    }
+
+    public function testAddAnalyzerTokenFiltersApplyLowercase(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("ws", ["type" => "whitespace"]);
+        $schema->addAnalyzer("wsLower", ["type" => "whitespace"], null, [["type" => "lowercase"]]);
+        $schema->addTextField("raw", analyzer: "ws");
+        $schema->addTextField("lower", analyzer: "wsLower");
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("doc1", ["raw" => "HELLO World", "lower" => "HELLO World"]);
+        $idx->commit();
+
+        $this->assertCount(0, $idx->search("raw:hello", 5));
+        $this->assertCount(1, $idx->search("lower:hello", 5));
+    }
+
+    public function testAddAnalyzerCharFiltersApplyPatternReplace(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("dash", ["type" => "whitespace"]);
+        $schema->addAnalyzer(
+            "dashSplit",
+            ["type" => "whitespace"],
+            [["type" => "pattern_replace", "pattern" => "-", "replacement" => " "]],
+        );
+        $schema->addTextField("raw", analyzer: "dash");
+        $schema->addTextField("split", analyzer: "dashSplit");
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("doc1", ["raw" => "state-of-the-art", "split" => "state-of-the-art"]);
+        $idx->commit();
+
+        $this->assertCount(0, $idx->search("raw:art", 5));
+        $this->assertCount(1, $idx->search("split:art", 5));
+    }
+
+    public function testAnalyzerNamesReturnsRegisteredNames(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("ws", ["type" => "whitespace"]);
+        $this->assertEquals(["ws"], $schema->analyzerNames());
+    }
+
+    public function testAddAnalyzerRejectsUnknownTokenizerType(): void
+    {
+        $schema = new Laurus\Schema();
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/tokenizer/');
+        $schema->addAnalyzer("bad", ["type" => "kuromoji"]);
+    }
+
+    public function testAddAnalyzerRejectsTokenizerMissingRequiredField(): void
+    {
+        $schema = new Laurus\Schema();
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/tokenizer/');
+        $schema->addAnalyzer("bad", ["type" => "ngram", "min_gram" => 2]); // missing max_gram
+    }
+
+    public function testAddAnalyzerRejectsUnknownCharFilterTypeWithIndexedMessage(): void
+    {
+        $schema = new Laurus\Schema();
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/charFilters\[0\]/');
+        $schema->addAnalyzer("bad", ["type" => "whitespace"], [["type" => "unknown_filter"]]);
+    }
+
+    public function testAddAnalyzerRejectsInvalidTokenFilterWithIndexedMessage(): void
+    {
+        $schema = new Laurus\Schema();
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/tokenFilters\[0\]/');
+        $schema->addAnalyzer("bad", ["type" => "whitespace"], null, [["type" => "limit", "limit" => -1]]);
+    }
+
+    public function testAddAnalyzerAcceptsBooleanGapsOnRegexTokenizer(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("r", ["type" => "regex", "pattern" => "\\w+", "gaps" => true]);
+        $this->assertEquals(["r"], $schema->analyzerNames());
+    }
+
+    public function testAddTextFieldWithUnregisteredAnalyzerNameFailsAtIndexBuild(): void
+    {
+        // addAnalyzer only validates the definition it is given; a text
+        // field referencing a name that was never registered (or a typo)
+        // is only caught when the schema is resolved into an Index, same
+        // as every other binding.
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title", analyzer: "does_not_exist");
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/Unknown analyzer/');
+        new Laurus\Index(null, $schema);
+    }
+
     // ── SearchResult ────────────────────────────────────────────────────
 
     public function testSearchResultDocument(): void

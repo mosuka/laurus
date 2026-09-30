@@ -175,7 +175,7 @@ new \Laurus\Schema()
 
 | Method | Description |
 | :--- | :--- |
-| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | Full-text field (inverted index, BM25). `$docValues` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `$stored` is also `true`. Pass `$multiValued = true` to accept a sequential array of strings (Issue #1175): a term query matches if any element contains the term, a phrase query never spans two elements unless its slop reaches `$positionIncrementGap` (default 100; `0` numbers the elements as if concatenated), and values are read back as an array of strings. `$analyzer` is the name of a parameter-less built-in (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`). The PHP binding has no analyzer registration API yet, so parameterized presets such as the Japanese analyzer (which needs a Lindera dictionary path) are not available from PHP (Issue #1190). |
+| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | Full-text field (inverted index, BM25). `$docValues` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `$stored` is also `true`. Pass `$multiValued = true` to accept a sequential array of strings (Issue #1175): a term query matches if any element contains the term, a phrase query never spans two elements unless its slop reaches `$positionIncrementGap` (default 100; `0` numbers the elements as if concatenated), and values are read back as an array of strings. `$analyzer` accepts a parameter-less built-in name (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or any custom name registered via `addAnalyzer` (e.g. a Japanese/Lindera analyzer). |
 | `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64-bit integer field. Pass `$multiValued = true` to accept arrays of integers (range queries match if any value satisfies the predicate). See `$docValues` above. |
 | `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64-bit float field. Pass `$multiValued = true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `$docValues` above. |
 | `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | Boolean field. Pass `$multiValued = true` to accept a sequential array of `bool` (a term query such as `flags:true` matches if any element equals the value; values are read back as an array of `bool`). See `$docValues` above. |
@@ -198,6 +198,8 @@ new \Laurus\Schema()
 | Method | Description |
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | Register a named embedder definition. `$config` is an associative array with a `"type"` key (see below). |
+| `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | Register a custom analyzer definition. `$tokenizer` is required; `$charFilters`/`$tokenFilters` are optional arrays of associative arrays. Each uses the same `{"type": "...", ...}` shape as the schema TOML/JSON format (see below). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
+| `analyzerNames(): array` | Return the names of custom analyzers registered via `addAnalyzer`. |
 | `setDefaultFields(array $fields): void` | Set the default fields used when no field is specified in a query. `$fields` is an array of strings. |
 | `setDynamicFieldPolicy(string $policy): void` | Set how undeclared fields are handled. `$policy` is `"strict"`, `"dynamic"` (default), or `"ignore"`. See notes below. |
 | `dynamicFieldPolicy(): string` | Return the current policy as a lowercase string. |
@@ -226,6 +228,60 @@ the full behaviour matrix.
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+
+### Analyzer components
+
+Used by `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null)`
+and by the `[analyzers.<name>]` TOML section. `$tokenizer` is a single
+associative array; `$charFilters`/`$tokenFilters` are arrays of associative
+arrays, applied in array order.
+
+**Tokenizers** (`$tokenizer`, exactly one):
+
+| `"type"` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `"pattern"` (default `\w+`), `"gaps"` (default `false`) |
+| `"ngram"` | `"min_gram"`, `"max_gram"` | -- |
+| `"lindera"` | `"mode"`, `"dict"` | `"user_dict"` |
+| `"whole"` | -- | -- |
+
+**Char filters** (`$charFilters`, applied to raw text before tokenization):
+
+| `"type"` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `"form"` (`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`) | -- |
+| `"pattern_replace"` | `"pattern"`, `"replacement"` | -- |
+| `"mapping"` | `"mapping"` (associative array of string replacements) | -- |
+| `"japanese_iteration_mark"` | -- | `"kanji"` (default `true`), `"kana"` (default `true`) |
+
+**Token filters** (`$tokenFilters`, applied to the token stream after tokenization):
+
+| `"type"` | Required keys | Optional keys |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `"words"` (default: English stop words) |
+| `"stem"` | -- | `"stem_type"` (`"porter"`/`"simple"`/`"identity"`) |
+| `"boost"` | `"boost"` | -- |
+| `"limit"` | `"limit"` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```php
+$schema = new Laurus\Schema();
+$schema->addAnalyzer(
+    "ja_ipadic",
+    ["type" => "lindera", "mode" => "normal", "dict" => "/var/lib/lindera/ipadic"],
+    [
+        ["type" => "unicode_normalization", "form" => "nfkc"],
+        ["type" => "japanese_iteration_mark"],
+    ],
+    [["type" => "lowercase"]],
+);
+$schema->addTextField("title", analyzer: "ja_ipadic");
+```
 
 ### Distance metrics
 

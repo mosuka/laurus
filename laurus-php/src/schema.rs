@@ -7,10 +7,13 @@ use ext_php_rs::convert::FromZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::ZendHashTable;
 use laurus::{
-    BooleanOption, BytesOption, DateTimeOption, DistanceMetric, DynamicFieldPolicy,
-    EmbedderDefinition, FieldOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
+    DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
+    GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema,
+    TextOption, TokenFilterConfig, TokenizerConfig,
 };
+
+use crate::convert::hashtable_to_json_value;
 
 /// Parse a distance metric string into [`DistanceMetric`].
 ///
@@ -91,6 +94,47 @@ fn ht_get_string(ht: &ZendHashTable, key: &str) -> PhpResult<String> {
     String::from_zval(zv).ok_or_else(|| format!("'{key}' must be a string").into())
 }
 
+/// Convert a PHP array into a [`TokenizerConfig`], using the same
+/// `{"type": "..."}`-tagged shape as the schema TOML/JSON format.
+fn tokenizer_from_ht(ht: &ZendHashTable) -> PhpResult<TokenizerConfig> {
+    let value = hashtable_to_json_value(ht)?;
+    serde_json::from_value(value).map_err(|e| format!("invalid tokenizer: {e}").into())
+}
+
+/// Convert a PHP array into a [`CharFilterConfig`].
+fn char_filter_from_ht(ht: &ZendHashTable, index: usize) -> PhpResult<CharFilterConfig> {
+    let value = hashtable_to_json_value(ht)?;
+    serde_json::from_value(value).map_err(|e| format!("invalid charFilters[{index}]: {e}").into())
+}
+
+/// Convert a PHP array into a [`TokenFilterConfig`].
+fn token_filter_from_ht(ht: &ZendHashTable, index: usize) -> PhpResult<TokenFilterConfig> {
+    let value = hashtable_to_json_value(ht)?;
+    serde_json::from_value(value).map_err(|e| format!("invalid tokenFilters[{index}]: {e}").into())
+}
+
+/// Convert an optional PHP array of arrays into a `Vec<T>`, defaulting to an
+/// empty vector when `None` (mirroring the core's `#[serde(default)]` on
+/// `AnalyzerDefinition::char_filters`/`token_filters`).
+fn filter_list_from_ht<T>(
+    list: Option<&ZendHashTable>,
+    label: &str,
+    convert: impl Fn(&ZendHashTable, usize) -> PhpResult<T>,
+) -> PhpResult<Vec<T>> {
+    let Some(list) = list else {
+        return Ok(Vec::new());
+    };
+    list.values()
+        .enumerate()
+        .map(|(i, v)| {
+            let item = v
+                .array()
+                .ok_or_else(|| format!("{label}[{i}] must be an array"))?;
+            convert(item, i)
+        })
+        .collect()
+}
+
 /// PHP-facing schema builder (`Laurus\Schema`).
 ///
 /// Uses `RefCell` for interior mutability since ext-php-rs methods receive `&self`.
@@ -123,10 +167,10 @@ impl PhpSchema {
     ///   (default: true). Takes effect only when `stored` is also true.
     /// * `analyzer` - Optional analyzer name. For parameter-less built-in
     ///   analyzers (`"standard"`, `"english"`, `"keyword"`, `"simple"`,
-    ///   `"noop"`) pass the name directly. Parameterized presets such as
-    ///   the Japanese analyzer (which needs a Lindera dictionary path) are
-    ///   not available from PHP yet: the binding has no analyzer
-    ///   registration API (Issue #1190).
+    ///   `"noop"`) pass the name directly. For parameterized presets such
+    ///   as the Japanese analyzer (which needs a Lindera dictionary path),
+    ///   register a custom analyzer via `addAnalyzer` and reference it by
+    ///   name.
     /// * `multi_valued` - When true, the field accepts a sequential array of
     ///   strings; a term query matches if any element contains the term,
     ///   and a phrase query never spans two elements (Lucene-style).
@@ -578,6 +622,52 @@ impl PhpSchema {
 
         self.inner.borrow_mut().embedders.insert(name, definition);
         Ok(())
+    }
+
+    /// Register a named custom analyzer definition in the schema.
+    ///
+    /// `tokenizer` is required; `charFilters`/`tokenFilters` are optional
+    /// lists of components, applied in list order. Each is an associative
+    /// array with a `"type"` key, using the same shape as the schema
+    /// TOML/JSON format shared with `laurus-cli` and the other language
+    /// bindings (see the "Analyzer components" tables in the API
+    /// reference). Semantic validity of the registered name (e.g.
+    /// referencing an analyzer from `addTextField` that was never
+    /// registered) is checked when the schema is used to build an
+    /// `Index`, not here.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Unique analyzer name, referenced from `addTextField`'s
+    ///   `analyzer` parameter.
+    /// * `tokenizer` - Associative array describing the tokenizer.
+    /// * `char_filters` - Optional sequential array of char-filter
+    ///   definitions, applied to raw text before tokenization.
+    /// * `token_filters` - Optional sequential array of token-filter
+    ///   definitions, applied to the token stream after tokenization.
+    pub fn add_analyzer(
+        &self,
+        name: String,
+        tokenizer: &ZendHashTable,
+        char_filters: Option<&ZendHashTable>,
+        token_filters: Option<&ZendHashTable>,
+    ) -> PhpResult<()> {
+        let definition = AnalyzerDefinition {
+            tokenizer: tokenizer_from_ht(tokenizer)?,
+            char_filters: filter_list_from_ht(char_filters, "charFilters", char_filter_from_ht)?,
+            token_filters: filter_list_from_ht(
+                token_filters,
+                "tokenFilters",
+                token_filter_from_ht,
+            )?,
+        };
+        self.inner.borrow_mut().analyzers.insert(name, definition);
+        Ok(())
+    }
+
+    /// Return the names of custom analyzers registered via `addAnalyzer`.
+    pub fn analyzer_names(&self) -> Vec<String> {
+        self.inner.borrow().analyzers.keys().cloned().collect()
     }
 
     /// Set the default fields used when no field is specified in a query.
