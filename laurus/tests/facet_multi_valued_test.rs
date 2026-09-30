@@ -15,7 +15,9 @@ use laurus::lexical::index::LexicalIndex;
 use laurus::lexical::index::config::InvertedIndexConfig;
 use laurus::lexical::index::inverted::InvertedIndex;
 use laurus::lexical::reader::LexicalIndexReader;
-use laurus::lexical::search::features::facet::{FacetCollector, FacetConfig, FacetResults};
+use laurus::lexical::search::features::facet::{
+    FacetCollector, FacetConfig, FacetCount, FacetResults,
+};
 use laurus::lexical::writer::LexicalIndexWriter;
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
@@ -53,25 +55,33 @@ fn tags_doc(tags: &[&str]) -> Document {
         .build()
 }
 
-/// Sorted `(path, count)` pairs for `field`, so two collection runs can be
-/// compared for exact equivalence.
+/// Sorted `(path, count)` pairs for every node of `field`'s facet tree, so
+/// two collection runs can be compared for exact equivalence.
 fn flatten(results: &FacetResults, field: &str) -> Vec<(Vec<String>, u64)> {
-    let mut out: Vec<(Vec<String>, u64)> = results
-        .get_field_facets(field)
-        .into_iter()
-        .flatten()
-        .map(|c| (c.path.path.clone(), c.count))
-        .collect();
+    fn walk(facets: &[FacetCount], out: &mut Vec<(Vec<String>, u64)>) {
+        for c in facets {
+            out.push((c.path.path.clone(), c.count));
+            walk(&c.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(facets) = results.get_field_facets(field) {
+        walk(facets, &mut out);
+    }
     out.sort();
     out
 }
 
-fn facet(reader: &dyn LexicalIndexReader, doc_ids: &[u64], field: &str) -> Vec<(Vec<String>, u64)> {
+fn collect_facets(reader: &dyn LexicalIndexReader, doc_ids: &[u64], field: &str) -> FacetResults {
     let mut collector = FacetCollector::new(FacetConfig::default(), vec![field.to_string()]);
     for doc_id in doc_ids {
         collector.collect_doc(*doc_id, reader).unwrap();
     }
-    flatten(&collector.finalize().unwrap(), field)
+    collector.finalize().unwrap()
+}
+
+fn facet(reader: &dyn LexicalIndexReader, doc_ids: &[u64], field: &str) -> Vec<(Vec<String>, u64)> {
+    flatten(&collect_facets(reader, doc_ids, field), field)
 }
 
 /// Segment 0 of every `tags` corpus below: a plain array, a duplicate
@@ -137,6 +147,33 @@ fn text_array_elements_are_counted_once_per_document_via_docvalues() {
         facet(reader.as_ref(), &doc_ids, "tags"),
         expected_two_segment_tag_facets()
     );
+}
+
+#[test]
+fn hierarchical_array_elements_nest_under_one_root_node() {
+    // Issue #1192: `a` is one top-level facet whose children are `b` and
+    // `c`, not a flat sibling of `["a", "b"]` and `["a", "c"]`.
+    let (reader, doc_ids) = two_segment_tags_index(false);
+    let results = collect_facets(reader.as_ref(), &doc_ids, "tags");
+    let top = results.get_field_facets("tags").unwrap();
+    let top_level: Vec<(&str, u64)> = top
+        .iter()
+        .map(|c| (c.path.path[0].as_str(), c.count))
+        .collect();
+    // Count descending, ties by label.
+    assert_eq!(top_level, vec![("rust", 3), ("a", 2), ("search", 1)]);
+
+    let a = &top[1];
+    let children: Vec<(Vec<String>, u64)> = a
+        .children
+        .iter()
+        .map(|c| (c.path.path.clone(), c.count))
+        .collect();
+    assert_eq!(
+        children,
+        vec![(path(&["a", "b"]), 2), (path(&["a", "c"]), 1)]
+    );
+    assert!(a.children.iter().all(|c| c.children.is_empty()));
 }
 
 #[test]

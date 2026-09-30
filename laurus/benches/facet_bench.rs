@@ -38,10 +38,11 @@
 //! # Sanity check
 //!
 //! For each scenario, before timing, the bench runs the collector once
-//! over `0..n` and asserts that `total_facet_count >= n`. Every document
-//! contributes at least one leaf increment, so the lower bound holds for
-//! all three scenarios; for the hierarchical case the count is closer to
-//! `5n` because each doc also bumps four ancestor paths.
+//! over `0..n` and asserts that the counts of each field's top-level
+//! facets add up to at least `n`. Every document gives each facet field at
+//! least one path, whose root is a top-level facet, so the lower bound
+//! holds for every scenario. Ancestors below the root are nested in
+//! `children` (Issue #1192) and are not part of the sum.
 //!
 //! # Run
 //!
@@ -266,14 +267,14 @@ fn make_reader(documents: Vec<Document>) -> Arc<MockFacetReader> {
 /// one-time sanity probe before each bench group.
 ///
 /// `FacetResults::total_facet_count` only returns the number of distinct
-/// `FacetPath` keys across all fields, not the sum of their doc counts.
-/// We instead sum every `FacetCount::count` per field and assert
-/// `>= n * fields.len()`. Hierarchical paths additionally contribute to
-/// each ancestor and multi-valued arrays to each element, so the actual
-/// sum is larger, but the lower bound is sufficient for catching
-/// empty-result regressions. (It holds because every bench corpus gives
-/// each document a facetable, non-empty value; a geo value or an empty
-/// array would contribute nothing — Issue #1187.)
+/// facet values across all fields, not the sum of their doc counts. We
+/// instead sum the `FacetCount::count` of each field's top-level facets
+/// (the path roots; deeper levels sit in `children`, Issue #1192) and
+/// assert `>= n * fields.len()`. Multi-valued arrays contribute to each
+/// element, so that sum can be larger, but the lower bound is sufficient
+/// for catching empty-result regressions. (It holds because every bench
+/// corpus gives each document a facetable, non-empty value; a geo value or
+/// an empty array would contribute nothing — Issue #1187.)
 fn assert_collector_probe(fields: &[String], reader: &MockFacetReader, n: usize, label: &str) {
     let mut probe = FacetCollector::new(FacetConfig::default(), fields.to_vec());
     for doc_id in 0..n as u64 {

@@ -32,8 +32,18 @@ impl FacetPath {
     }
 
     /// Create a facet path from a delimited string.
+    ///
+    /// Empty components are dropped, exactly as [`FacetCollector`] does for
+    /// `/`-delimited values, so `"/a//b"` gives `["a", "b"]` and the path
+    /// matches the one the collector counts. A string with no non-empty
+    /// component gives the empty path: the root of `field`, which
+    /// [`is_parent_of`](Self::is_parent_of) every other path of that field.
     pub fn from_delimited(field: String, path_str: &str, delimiter: &str) -> Self {
-        let path = path_str.split(delimiter).map(|s| s.to_string()).collect();
+        let path = path_str
+            .split(delimiter)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
         FacetPath { field, path }
     }
 
@@ -86,11 +96,14 @@ impl FacetPath {
 pub struct FacetCount {
     /// The facet path.
     pub path: FacetPath,
-    /// Number of documents matching this facet. A document is counted once
-    /// per path even when a multi-valued field repeats the element or
-    /// several elements share a hierarchical ancestor (Issue #1187).
+    /// Number of documents whose value is this path or lies under it. A
+    /// document is counted once per path even when a multi-valued field
+    /// repeats the element or several elements share a hierarchical
+    /// ancestor (Issue #1187), so no child outnumbers its parent.
     pub count: u64,
-    /// Child facets (for hierarchical display).
+    /// Facets one level deeper for hierarchical drill-down (`["a", "b"]`
+    /// under `["a"]`), filtered, sorted and truncated like the top level
+    /// (Issue #1192).
     pub children: Vec<FacetCount>,
 }
 
@@ -109,10 +122,15 @@ impl FacetCount {
         self.children.push(child);
     }
 
-    /// Sort children by count (descending) or name (ascending).
+    /// Sort children by count (descending, ties by name) or name
+    /// (ascending), the order [`FacetCollector::finalize`] produces.
     pub fn sort_children(&mut self, by_count: bool) {
         if by_count {
-            self.children.sort_by_key(|c| std::cmp::Reverse(c.count));
+            self.children.sort_by(|a, b| {
+                b.count
+                    .cmp(&a.count)
+                    .then_with(|| a.path.path.last().cmp(&b.path.path.last()))
+            });
         } else {
             self.children
                 .sort_by(|a, b| a.path.path.last().cmp(&b.path.path.last()));
@@ -128,15 +146,22 @@ impl FacetCount {
 /// Configuration for facet collection.
 #[derive(Debug, Clone)]
 pub struct FacetConfig {
-    /// Maximum number of facet values to return per field.
+    /// Maximum number of facet values kept per level: at the top level of
+    /// each field and, separately, among the children of each node. It is
+    /// applied after sorting, so a level keeps its best entries.
     pub max_facets_per_field: usize,
-    /// Maximum depth for hierarchical facets.
+    /// Maximum depth of a hierarchical facet. Each path is cut to its first
+    /// `max_depth` components while collecting, so deeper levels are never
+    /// counted: with `2`, `a/b/c` counts `a` and `a/b`. `0` counts nothing
+    /// and `usize::MAX` keeps every level.
     pub max_depth: usize,
-    /// Minimum count threshold for including a facet.
+    /// Minimum document count for a facet value to be returned. A value
+    /// below it is dropped together with its children, which never count
+    /// more. Values no collected document has are never returned, so `0`
+    /// behaves like `1`.
     pub min_count: u64,
-    /// Whether to include zero counts for missing facets.
-    pub include_zero_counts: bool,
-    /// Sort facets by count (true) or alphabetically (false).
+    /// Sort each level by count, descending, with ties broken by label
+    /// (`true`), or by label alone (`false`). Labels compare as strings.
     pub sort_by_count: bool,
 }
 
@@ -146,7 +171,6 @@ impl Default for FacetConfig {
             max_facets_per_field: 100,
             max_depth: 10,
             min_count: 1,
-            include_zero_counts: false,
             sort_by_count: true,
         }
     }
@@ -161,13 +185,18 @@ impl Default for FacetConfig {
 /// Two specialised counter maps keep keys cheap to hash and parent walks
 /// allocation-free:
 ///
-/// - `flat_counts: HashMap<u64, Slot>` — depth-1 paths. The 64-bit key
-///   packs `(field_id << 32) | value_id`, so each increment hashes a
+/// - `flat_counts: HashMap<u64, Slot>` — the root (first component) of
+///   every path, whether the path is a flat value `a` or a hierarchical
+///   `a/b`, so both share one counter for `a` (Issue #1192). The 64-bit
+///   key packs `(field_id << 32) | value_id`, so each increment hashes a
 ///   single `u64` instead of a `String + Vec<String>` pair.
-/// - `hier_counts: HashMap<Box<[u32]>, Slot>` — depth-N paths. The boxed
-///   slice stores `[field_id, level0_id, level1_id, …]`; the parent walk
-///   shrinks a local `Vec<u32>` by `pop()` at each level and only pays a
-///   single `Box<[u32]>` allocation when the entry doesn't yet exist.
+/// - `hier_counts: HashMap<Box<[u32]>, Slot>` — the depth ≥ 2 prefixes of
+///   hierarchical paths. The boxed slice stores `[field_id, level0_id,
+///   level1_id, …]`; the parent walk shrinks a local `Vec<u32>` by `pop()`
+///   at each level and only pays a `Box<[u32]>` allocation when the entry
+///   doesn't yet exist.
+///
+/// [`finalize`](Self::finalize) nests both tiers into one tree per field.
 ///
 /// A multi-valued field value expands to one path per element (Issue
 /// #1187), so a single document can reach the same key more than once —
@@ -202,10 +231,10 @@ pub struct FacetCollector {
     value_interner: HashMap<String, u32>,
     /// Reverse map for `value_interner`. Indexed by id.
     value_names: Vec<String>,
-    /// Counter map for depth-1 paths. Key encodes
-    /// `(field_id << 32) | value_id`.
+    /// Counter map for the root of every path. Key is
+    /// [`flat_key`]`(field_id, value_id)`.
     flat_counts: HashMap<u64, Slot>,
-    /// Counter map for depth ≥ 2 paths. Key is `[field_id, level0_id,
+    /// Counter map for depth ≥ 2 prefixes. Key is `[field_id, level0_id,
     /// level1_id, …]`.
     hier_counts: HashMap<Box<[u32]>, Slot>,
     /// Per-field DocValues availability, parallel to `facet_fields`
@@ -288,12 +317,19 @@ impl FacetPaths {
 
 /// Push the facet path of one text value: a `/`-delimited string becomes a
 /// hierarchical path, anything else a single component. Empty components
-/// (`""`, `"a/"`) are kept as they always were (tracked in Issue #1192).
+/// are dropped (Issue #1192) — Lucene rejects them outright — so `"/a/b"`
+/// and `"a//b"` both give `a/b`, `"a/"` gives `a`, and `""` or `"/"` give
+/// no path at all.
 fn push_text_path(text: &str, out: &mut FacetPaths) {
     out.push_path(|components| {
         if text.contains('/') {
-            components.extend(text.split('/').map(str::to_string));
-        } else {
+            components.extend(
+                text.split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+            );
+        } else if !text.is_empty() {
+            // The common flat value: one push, no split iterator.
             components.push(text.to_string());
         }
     });
@@ -506,124 +542,164 @@ impl FacetCollector {
             }
 
             // Phase 2: intern path components and bump counters, once per
-            // key per document (Issue #1187).
+            // key per document (Issue #1187). A path is cut to its first
+            // `max_depth` components, and its root always lands in
+            // `flat_counts` — the counter a flat value with the same label
+            // uses — so a label reached at depth 1 has a single counter per
+            // field however many paths reach it (Issue #1192).
             for path in paths.paths() {
-                if path.len() == 1 {
-                    // Depth-1 fast path. Single hash on a `u64` key, no
-                    // boxed-slice allocation.
-                    let value_id = self.intern_value(&path[0]);
-                    let key = ((field_id as u64) << 32) | (value_id as u64);
-                    self.flat_counts.entry(key).or_default().bump(generation);
-                } else {
-                    // Depth-N path. Build `[field_id, level0_id, …]` once
-                    // into the scratch `Vec<u32>`, then `pop()` the last id
-                    // at each step of the parent walk.
+                let depth = path.len().min(self.config.max_depth);
+                if depth == 0 {
+                    continue;
+                }
+                let root_id = self.intern_value(&path[0]);
+                if depth > 1 {
+                    // Build `[field_id, root_id, level1_id, …]` once into
+                    // the scratch `Vec<u32>` for the parent walk.
                     path_ids.clear();
                     path_ids.push(field_id);
-                    for component in path {
+                    path_ids.push(root_id);
+                    for component in &path[1..depth] {
                         let id = self.intern_value(component);
                         path_ids.push(id);
                     }
-                    while path_ids.len() > 1 {
-                        // Allocates a fresh `Box<[u32]>` per `entry()` —
-                        // unavoidable with the std `HashMap::entry` API, but
-                        // the box is `4 + 4*depth` bytes and hashes an
-                        // integer slice rather than a string, so the
-                        // per-step cost is ~30-40 ns vs the ~160-200 ns of
-                        // cloning + hashing a `FacetPath`.
-                        let key: Box<[u32]> = path_ids.as_slice().into();
-                        if !self.hier_counts.entry(key).or_default().bump(generation) {
-                            // Already counted for this document by an earlier
-                            // element of the same value — and so is every
-                            // ancestor, because each walk stamps leaf-to-root
-                            // in one go before stopping.
-                            break;
-                        }
-                        path_ids.pop();
+                    if !self.bump_hier_prefixes(&mut path_ids, generation) {
+                        continue;
                     }
                 }
+                self.flat_counts
+                    .entry(flat_key(field_id, root_id))
+                    .or_default()
+                    .bump(generation);
             }
         }
 
         Ok(())
     }
 
-    /// Finalize and return the collected facet counts.
+    /// Bump the depth ≥ 2 prefixes of `path_ids` (`[field_id, root_id, …]`)
+    /// in `hier_counts`, leaf to root, popping one id per step. Returns
+    /// `false` when a prefix was already counted for this document: the
+    /// earlier walk that counted it also counted every shorter prefix, root
+    /// included, so the caller must not bump the root either.
+    fn bump_hier_prefixes(&mut self, path_ids: &mut Vec<u32>, generation: u64) -> bool {
+        while path_ids.len() > 2 {
+            // Probe with the borrowed slice first so a hit allocates
+            // nothing; only a key seen for the first time pays for its
+            // `Box<[u32]>`.
+            let fresh = match self.hier_counts.get_mut(path_ids.as_slice()) {
+                Some(slot) => slot.bump(generation),
+                None => self
+                    .hier_counts
+                    .entry(path_ids.as_slice().into())
+                    .or_default()
+                    .bump(generation),
+            };
+            if !fresh {
+                return false;
+            }
+            path_ids.pop();
+        }
+        true
+    }
+
+    /// Finalize and return the collected facet counts, one tree per field.
+    ///
+    /// Every level — the top level and the children of each node — is
+    /// filtered by `min_count`, sorted and cut to `max_facets_per_field` on
+    /// its own, so ancestors never use up their descendants' budget (Issue
+    /// #1192). A field with nothing left is absent from the results.
     pub fn finalize(self) -> Result<FacetResults> {
-        let mut field_facets: HashMap<String, Vec<FacetCount>> = HashMap::new();
-
-        // Decode the depth-1 (`flat_counts`) tier. The 64-bit key splits
-        // into `(field_id << 32) | value_id`; both ids index into the
-        // collector's reverse-name maps so we can reconstruct the
-        // original `FacetPath`.
-        for (key, slot) in &self.flat_counts {
-            if slot.count < self.config.min_count {
-                continue;
-            }
-            let field_id = (key >> 32) as u32;
-            let value_id = (*key & 0xFFFF_FFFF) as u32;
-            let field_name = &self.field_names[field_id as usize];
-            let value = &self.value_names[value_id as usize];
-            let facet_path = FacetPath::from_value(field_name.clone(), value.clone());
-            field_facets
-                .entry(field_name.clone())
-                .or_default()
-                .push(FacetCount::new(facet_path, slot.count));
+        // Assemble one trie per field from both tiers. The counters are
+        // prefix-closed — whenever a path is counted for a document, so is
+        // each of its ancestors — so every node receives a count of its own
+        // below and no child outnumbers its parent.
+        let mut roots: Vec<HashMap<u32, TrieNode>> = (0..self.field_names.len())
+            .map(|_| HashMap::new())
+            .collect();
+        for (&key, slot) in &self.flat_counts {
+            // Unpack `flat_key`: `(field_id << 32) | root_id`.
+            let (field_id, root_id) = ((key >> 32) as usize, key as u32);
+            roots[field_id].entry(root_id).or_default().count = slot.count;
         }
-
-        // Decode the depth ≥ 2 (`hier_counts`) tier. Slot 0 is the
-        // `field_id`; slots 1.. are interned path components in order.
         for (key, slot) in &self.hier_counts {
-            if slot.count < self.config.min_count {
-                continue;
+            // `[field_id, root_id, level1_id, …]`.
+            let mut node = roots[key[0] as usize].entry(key[1]).or_default();
+            for &id in &key[2..] {
+                node = node.children.entry(id).or_default();
             }
-            let field_id = key[0];
-            let field_name = &self.field_names[field_id as usize];
-            let path_components: Vec<String> = key[1..]
-                .iter()
-                .map(|&id| self.value_names[id as usize].clone())
-                .collect();
-            let facet_path = FacetPath::new(field_name.clone(), path_components);
-            field_facets
-                .entry(field_name.clone())
-                .or_default()
-                .push(FacetCount::new(facet_path, slot.count));
+            node.count = slot.count;
         }
 
-        // Build hierarchical structure and sort
-        for facet_counts in field_facets.values_mut() {
-            FacetCollector::build_hierarchy_static(facet_counts);
-
-            // Sort top-level facets
-            if self.config.sort_by_count {
-                facet_counts.sort_by_key(|c| std::cmp::Reverse(c.count));
-            } else {
-                facet_counts.sort_by(|a, b| a.path.path.first().cmp(&b.path.path.first()));
-            }
-
-            // Limit number of facets
-            facet_counts.truncate(self.config.max_facets_per_field);
-
-            // Sort children recursively
-            for facet_count in facet_counts {
-                facet_count.sort_children(self.config.sort_by_count);
+        let mut field_facets = HashMap::new();
+        for (field_id, level) in roots.into_iter().enumerate() {
+            let field = &self.field_names[field_id];
+            let facets = self.build_level(level, field, &[]);
+            if !facets.is_empty() {
+                field_facets.insert(field.clone(), facets);
             }
         }
-
         Ok(FacetResults { field_facets })
     }
 
-    /// Build hierarchical structure from flat facet counts.
-    fn build_hierarchy_static(facet_counts: &mut [FacetCount]) {
-        // This is a simplified implementation
-        // In a real implementation, we would:
-        // 1. Identify parent-child relationships
-        // 2. Move child facets under their parents
-        // 3. Build the hierarchical tree structure
+    /// Turn one trie level into `FacetCount`s: drop the nodes under
+    /// `min_count` (with their subtrees, which count no more), sort, keep
+    /// the first `max_facets_per_field`, and recurse into the kept nodes'
+    /// children. `parent` holds the labels leading to this level.
+    fn build_level(
+        &self,
+        level: HashMap<u32, TrieNode>,
+        field: &str,
+        parent: &[String],
+    ) -> Vec<FacetCount> {
+        let mut nodes: Vec<(&str, TrieNode)> = level
+            .into_iter()
+            .filter(|(_, node)| node.count >= self.config.min_count)
+            .map(|(id, node)| (self.value_names[id as usize].as_str(), node))
+            .collect();
+        // Sibling labels are distinct, so either order is total and the
+        // truncation below is deterministic. Count ties go to the smaller
+        // label, as in Lucene (whose ordinals follow label order) and
+        // Tantivy; interned ids would follow first-seen order instead.
+        if self.config.sort_by_count {
+            nodes.sort_unstable_by(|(a_label, a), (b_label, b)| {
+                b.count.cmp(&a.count).then_with(|| a_label.cmp(b_label))
+            });
+        } else {
+            nodes.sort_unstable_by_key(|&(label, _)| label);
+        }
+        nodes.truncate(self.config.max_facets_per_field);
 
-        // For now, just sort by depth
-        facet_counts.sort_by_key(|c| c.path.depth());
+        nodes
+            .into_iter()
+            .map(|(label, node)| {
+                debug_assert!(node.count > 0, "facet trie node `{label}` has no count");
+                let mut path = parent.to_vec();
+                path.push(label.to_string());
+                let children = self.build_level(node.children, field, &path);
+                FacetCount {
+                    path: FacetPath::new(field.to_string(), path),
+                    count: node.count,
+                    children,
+                }
+            })
+            .collect()
     }
+}
+
+/// `flat_counts` key of a root label: `(field_id << 32) | value_id`, a
+/// single `u64` to hash instead of a `String + Vec<String>` pair.
+#[inline]
+fn flat_key(field_id: u32, value_id: u32) -> u64 {
+    (u64::from(field_id) << 32) | u64::from(value_id)
+}
+
+/// Node of the per-field trie [`FacetCollector::finalize`] assembles from
+/// the counters, keyed by interned label id.
+#[derive(Debug, Default)]
+struct TrieNode {
+    count: u64,
+    children: HashMap<u32, TrieNode>,
 }
 
 /// Results of facet collection.
@@ -646,17 +722,13 @@ impl FacetResults {
         self.field_facets.get(field_name)
     }
 
-    /// Get the total number of unique facet values across all fields.
+    /// Get the total number of unique facet values across all fields,
+    /// nested hierarchical values included.
     pub fn total_facet_count(&self) -> usize {
-        self.field_facets.values().map(|facets| facets.len()).sum()
-    }
-
-    /// Merge with another facet results.
-    pub fn merge(&mut self, other: FacetResults) {
-        for (field, other_facets) in other.field_facets {
-            let field_facets = self.field_facets.entry(field).or_default();
-            field_facets.extend(other_facets);
+        fn count(facets: &[FacetCount]) -> usize {
+            facets.iter().map(|f| 1 + count(&f.children)).sum()
         }
+        self.field_facets.values().map(|facets| count(facets)).sum()
     }
 }
 
@@ -1017,6 +1089,31 @@ mod tests {
         out
     }
 
+    /// Render a field's facet tree in result order as `label:count`,
+    /// siblings space-separated and children in brackets, e.g.
+    /// `"a:2[b:1 c:1] d:1"`. Unlike `flatten`, it pins the nesting and the
+    /// order of every level.
+    fn tree(results: &FacetResults, field: &str) -> String {
+        fn render(facets: &[FacetCount]) -> String {
+            facets
+                .iter()
+                .map(|c| {
+                    let label = c.path.path.last().map(String::as_str).unwrap_or("");
+                    if c.children.is_empty() {
+                        format!("{label}:{}", c.count)
+                    } else {
+                        format!("{label}:{}[{}]", c.count, render(&c.children))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        results
+            .get_field_facets(field)
+            .map(|facets| render(facets))
+            .unwrap_or_default()
+    }
+
     /// Run a full facet collection over `docs` with `config` and return
     /// the results.
     fn collect_with(
@@ -1167,42 +1264,227 @@ mod tests {
         );
     }
 
+    // ---- Hierarchical facet tree, Issue #1192 ---------------------------
+
     #[test]
-    fn facet_flat_and_hierarchical_tiers_emit_separate_entries() {
-        // Characterization of a pre-existing quirk (Issue #1192): the
-        // depth-1 tier and the hierarchical tier are decoded independently,
-        // so `a` from the flat element and `a` as the ancestor of `a/b`
-        // come back as two `FacetCount` entries with the same path. The
-        // generation stamp keeps each of them at 1 — no double counting.
-        let docs = vec![doc(&[("cat", texts(&["a", "a/b"]))])];
-        let results = collect(docs, &["cat"], &["cat"], true);
-        assert_eq!(
-            flatten(&results, "cat"),
-            vec![(p(&["a"]), 1), (p(&["a"]), 1), (p(&["a", "b"]), 1)]
+    fn facet_hierarchical_path_builds_nested_children() {
+        let results = collect(
+            vec![text_doc(&[("cat", "a/b/c")])],
+            &["cat"],
+            &["cat"],
+            true,
         );
+        assert_eq!(tree(&results, "cat"), "a:1[b:1[c:1]]");
+        // Every node carries its full path, not just its label.
+        let a = &results.get_field_facets("cat").unwrap()[0];
+        assert_eq!(a.children[0].children[0].path.path, p(&["a", "b", "c"]));
     }
 
     #[test]
-    fn facet_empty_components_keep_scalar_parity() {
-        // `""` is one empty component and `"a/"` is `["a", ""]`, exactly as
-        // for scalar `Text` (Issue #1192 tracks whether to reject them).
+    fn facet_flat_value_and_hierarchical_ancestor_share_one_node() {
+        // Within one document: the flat `a` and the root of `a/b` are the
+        // same facet, counted once, in either element order.
+        for elements in [["a", "a/b"], ["a/b", "a"]] {
+            let results = collect(
+                vec![doc(&[("cat", texts(&elements))])],
+                &["cat"],
+                &["cat"],
+                true,
+            );
+            assert_eq!(tree(&results, "cat"), "a:1[b:1]", "{elements:?}");
+        }
+        // Across documents the two contributions add up on one node.
+        let results = collect(
+            vec![text_doc(&[("cat", "a")]), text_doc(&[("cat", "a/b")])],
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        assert_eq!(tree(&results, "cat"), "a:2[b:1]");
+    }
+
+    #[test]
+    fn facet_max_facets_per_field_applies_per_level() {
+        // a: 3 docs (children x: 2, y: 1), b: 1 doc (child z). With one
+        // facet per level, ancestors no longer eat the budget: `a` keeps
+        // its best child instead of being the only entry returned.
+        let docs = vec![
+            text_doc(&[("cat", "a/x")]),
+            text_doc(&[("cat", "a/x")]),
+            text_doc(&[("cat", "a/y")]),
+            text_doc(&[("cat", "b/z")]),
+        ];
+        let config = || FacetConfig {
+            max_facets_per_field: 1,
+            ..Default::default()
+        };
+        let results = collect_with(config(), docs.clone(), &["cat"], &["cat"], true);
+        assert_eq!(tree(&results, "cat"), "a:3[x:2]");
+
+        let results = collect_with(
+            FacetConfig {
+                max_facets_per_field: 2,
+                ..config()
+            },
+            docs,
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        assert_eq!(tree(&results, "cat"), "a:3[x:2 y:1] b:1[z:1]");
+    }
+
+    #[test]
+    fn facet_min_count_prunes_whole_subtree() {
+        let docs = vec![
+            text_doc(&[("cat", "a/x")]),
+            text_doc(&[("cat", "a/x")]),
+            text_doc(&[("cat", "a/y")]),
+            text_doc(&[("cat", "b/z/w")]),
+        ];
+        let results = collect_with(
+            FacetConfig {
+                min_count: 2,
+                ..Default::default()
+            },
+            docs,
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        // `y` (1) goes; `b` (1) goes with its whole subtree.
+        assert_eq!(tree(&results, "cat"), "a:3[x:2]");
+    }
+
+    #[test]
+    fn facet_max_depth_truncates_paths() {
+        let docs = || {
+            vec![
+                // Two elements that collapse to the same `a/b` prefix under
+                // `max_depth: 2` — still one document for `a/b`.
+                doc(&[("cat", texts(&["a/b/c", "a/b/d"]))]),
+                text_doc(&[("cat", "a/e/f/g")]),
+            ]
+        };
+        let with_depth = |max_depth| {
+            let config = FacetConfig {
+                max_depth,
+                ..Default::default()
+            };
+            tree(
+                &collect_with(config, docs(), &["cat"], &["cat"], true),
+                "cat",
+            )
+        };
+        assert_eq!(with_depth(2), "a:2[b:1 e:1]");
+        assert_eq!(with_depth(1), "a:2");
+        assert_eq!(with_depth(usize::MAX), "a:2[b:1[c:1 d:1] e:1[f:1[g:1]]]");
+        let nothing = collect_with(
+            FacetConfig {
+                max_depth: 0,
+                ..Default::default()
+            },
+            docs(),
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        assert!(nothing.get_field_facets("cat").is_none());
+    }
+
+    #[test]
+    fn facet_count_ties_sort_by_label() {
+        // 20 values with the same count, inserted in reverse label order:
+        // the kept three must be the smallest labels, in order, not
+        // whichever the hash map happened to yield first.
+        let labels: Vec<String> = (0..20).rev().map(|i| format!("v{i:02}")).collect();
+        let docs: Vec<Document> = labels
+            .iter()
+            .map(|label| text_doc(&[("cat", &format!("root/{label}")), ("flat", label)]))
+            .collect();
+        let results = collect_with(
+            FacetConfig {
+                max_facets_per_field: 3,
+                ..Default::default()
+            },
+            docs,
+            &["cat", "flat"],
+            &["cat", "flat"],
+            true,
+        );
+        assert_eq!(tree(&results, "flat"), "v00:1 v01:1 v02:1");
+        assert_eq!(tree(&results, "cat"), "root:20[v00:1 v01:1 v02:1]");
+    }
+
+    #[test]
+    fn facet_sort_by_name_orders_every_level() {
+        let docs = vec![
+            text_doc(&[("cat", "b/z")]),
+            text_doc(&[("cat", "b/y")]),
+            text_doc(&[("cat", "b/y")]),
+            text_doc(&[("cat", "a/x")]),
+        ];
+        let results = collect_with(
+            FacetConfig {
+                sort_by_count: false,
+                ..Default::default()
+            },
+            docs,
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        assert_eq!(tree(&results, "cat"), "a:1[x:1] b:3[y:2 z:1]");
+    }
+
+    #[test]
+    fn facet_empty_components_are_dropped() {
+        // Scalars and array elements follow the same rule.
+        let values = ["/a/b", "a//b", "a/", "", "/"];
         let array = collect(
-            vec![doc(&[("cat", texts(&["", "a/"]))])],
+            vec![doc(&[("cat", texts(&values))])],
             &["cat"],
             &["cat"],
             true,
         );
         let scalars = collect(
-            vec![text_doc(&[("cat", "")]), text_doc(&[("cat", "a/")])],
+            values.iter().map(|v| text_doc(&[("cat", v)])).collect(),
             &["cat"],
             &["cat"],
             true,
         );
-        assert_eq!(flatten(&array, "cat"), flatten(&scalars, "cat"));
-        assert_eq!(
-            flatten(&array, "cat"),
-            vec![(p(&[""]), 1), (p(&["a"]), 1), (p(&["a", ""]), 1)]
+        assert_eq!(tree(&array, "cat"), "a:1[b:1]");
+        // Three documents reach `a`, two of them `a/b`; `""` and `"/"`
+        // count nothing.
+        assert_eq!(tree(&scalars, "cat"), "a:3[b:2]");
+        let nothing = collect(
+            vec![text_doc(&[("cat", "")]), text_doc(&[("cat", "//")])],
+            &["cat"],
+            &["cat"],
+            true,
         );
+        assert!(nothing.get_field_facets("cat").is_none());
+    }
+
+    #[test]
+    fn facet_path_from_delimited_drops_empty_components() {
+        let path = FacetPath::from_delimited("cat".to_string(), "/a//b/", "/");
+        assert_eq!(path.path, p(&["a", "b"]));
+        // No non-empty component: the field root, parent of every path.
+        let root = FacetPath::from_delimited("cat".to_string(), "//", "/");
+        assert_eq!(root.depth(), 0);
+        assert!(root.is_parent_of(&path));
+    }
+
+    #[test]
+    fn facet_total_facet_count_includes_nested_values() {
+        let results = collect(
+            vec![text_doc(&[("cat", "a/b/c")]), text_doc(&[("cat", "d")])],
+            &["cat"],
+            &["cat"],
+            true,
+        );
+        assert_eq!(results.total_facet_count(), 4);
     }
 
     #[test]
@@ -1553,7 +1835,6 @@ mod tests {
         assert_eq!(config.max_facets_per_field, 100);
         assert_eq!(config.max_depth, 10);
         assert_eq!(config.min_count, 1);
-        assert!(!config.include_zero_counts);
         assert!(config.sort_by_count);
     }
 
