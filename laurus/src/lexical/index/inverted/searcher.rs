@@ -1019,14 +1019,17 @@ impl InvertedIndexSearcher {
             );
         }
 
-        // Single clause: no need for parallel execution
+        // Single clause: no need for parallel execution. The clause runs
+        // standalone, bypassing `BooleanQuery::scorer` (which applies
+        // `boolean_query.boost()` via `set_boost`), so the outer boost
+        // must be folded into the clause's own boost here (#1290).
+        let outer_boost = boolean_query.boost();
         if clauses.len() == 1 {
-            return self.search_with_collector_deadline(
-                clauses[0].query.clone_box(),
-                collector,
-                false,
-                deadline,
-            );
+            let mut clause_query = clauses[0].query.clone_box();
+            if outer_boost != 1.0 {
+                clause_query.set_boost(clause_query.boost() * outer_boost);
+            }
+            return self.search_with_collector_deadline(clause_query, collector, false, deadline);
         }
 
         // Execute all clauses in parallel, collecting (doc_id, score) per clause
@@ -1150,8 +1153,11 @@ impl InvertedIndexSearcher {
             }
         }
 
+        // Distributes the same way the serial path's `BooleanScorer`
+        // applies it: `outer_boost * sum(clause_i) == sum(outer_boost * clause_i)`
+        // (#1290).
         for doc_id in survivor.iter() {
-            let score = score_acc.get(&doc_id).copied().unwrap_or(0.0);
+            let score = score_acc.get(&doc_id).copied().unwrap_or(0.0) * outer_boost;
             collector.collect(doc_id, score)?;
             if !collector.needs_more() {
                 break;
@@ -3897,6 +3903,127 @@ mod tests {
             "doc 3 (alpha+gamma) must outscore doc 0 (alpha only): s3={s3} s0={s0}"
         );
         assert_eq!(hits[0].doc_id, 3, "the should-boosted doc must rank first");
+    }
+
+    /// #1290: the multi-clause main path must fold in the outer
+    /// `BooleanQuery`'s own boost, not just each clause's raw score.
+    #[test]
+    fn parallel_boolean_query_boost_matches_serial() {
+        use crate::lexical::query::boolean::BooleanQueryBuilder;
+        let store = build_boolean_corpus();
+        let make = |boost: f32| -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .must(Box::new(TermQuery::new("body", "alpha")))
+                    .should(Box::new(TermQuery::new("body", "gamma")))
+                    .boost(boost)
+                    .build(),
+            )
+        };
+        let reader = store.reader_for_tests().unwrap();
+        let searcher = InvertedIndexSearcher::from_arc(reader);
+
+        let sort_hits = |hits: Vec<SearchHit>| -> Vec<(u64, f32)> {
+            let mut v: Vec<_> = hits.into_iter().map(|h| (h.doc_id, h.score)).collect();
+            v.sort_unstable_by_key(|h| h.0);
+            v
+        };
+
+        // Boost=2 must double boost=1 under the parallel path.
+        let parallel_unboosted = sort_hits(
+            searcher
+                .search_with_collector_parallel(make(1.0), TopDocsCollector::new(100), true)
+                .unwrap()
+                .results(),
+        );
+        let parallel_boosted = sort_hits(
+            searcher
+                .search_with_collector_parallel(make(2.0), TopDocsCollector::new(100), true)
+                .unwrap()
+                .results(),
+        );
+        assert!(!parallel_unboosted.is_empty(), "expected matches");
+        assert_eq!(parallel_unboosted.len(), parallel_boosted.len());
+        for ((doc, unboosted), (doc2, boosted)) in
+            parallel_unboosted.iter().zip(parallel_boosted.iter())
+        {
+            assert_eq!(
+                doc, doc2,
+                "doc_id mismatch between boost=1 and boost=2 runs"
+            );
+            assert!(
+                (boosted - unboosted * 2.0).abs() < 1e-4,
+                "doc {doc}: boosted score {boosted} is not double the unboosted score {unboosted}"
+            );
+        }
+
+        // Parallel and serial paths must agree on the boosted score exactly.
+        let serial_boosted = sort_hits(
+            searcher
+                .search_with_collector_parallel(make(2.0), TopDocsCollector::new(100), false)
+                .unwrap()
+                .results(),
+        );
+        assert_eq!(parallel_boosted, serial_boosted);
+    }
+
+    /// #1290: the single-clause shortcut must also fold in the outer
+    /// `BooleanQuery`'s own boost.
+    #[test]
+    fn parallel_single_clause_boolean_query_boost() {
+        use crate::lexical::query::boolean::BooleanQueryBuilder;
+        let store = build_boolean_corpus();
+        let make = |boost: f32| -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .should(Box::new(TermQuery::new("body", "alpha")))
+                    .boost(boost)
+                    .build(),
+            )
+        };
+        let reader = store.reader_for_tests().unwrap();
+        let searcher = InvertedIndexSearcher::from_arc(reader);
+
+        let sort_hits = |hits: Vec<SearchHit>| -> Vec<(u64, f32)> {
+            let mut v: Vec<_> = hits.into_iter().map(|h| (h.doc_id, h.score)).collect();
+            v.sort_unstable_by_key(|h| h.0);
+            v
+        };
+
+        let parallel_unboosted = sort_hits(
+            searcher
+                .search_with_collector_parallel(make(1.0), TopDocsCollector::new(100), true)
+                .unwrap()
+                .results(),
+        );
+        let parallel_boosted = sort_hits(
+            searcher
+                .search_with_collector_parallel(make(2.0), TopDocsCollector::new(100), true)
+                .unwrap()
+                .results(),
+        );
+        assert!(!parallel_unboosted.is_empty(), "expected matches");
+        assert_eq!(parallel_unboosted.len(), parallel_boosted.len());
+        for ((doc, unboosted), (doc2, boosted)) in
+            parallel_unboosted.iter().zip(parallel_boosted.iter())
+        {
+            assert_eq!(
+                doc, doc2,
+                "doc_id mismatch between boost=1 and boost=2 runs"
+            );
+            assert!(
+                (boosted - unboosted * 2.0).abs() < 1e-4,
+                "doc {doc}: boosted score {boosted} is not double the unboosted score {unboosted}"
+            );
+        }
+
+        let serial_boosted = sort_hits(
+            searcher
+                .search_with_collector_parallel(make(2.0), TopDocsCollector::new(100), false)
+                .unwrap()
+                .results(),
+        );
+        assert_eq!(parallel_boosted, serial_boosted);
     }
 
     /// Parallel and serial paths must agree on membership for a Must-present
