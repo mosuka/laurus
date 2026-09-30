@@ -193,6 +193,112 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
     .into())
 }
 
+/// Maximum nesting depth accepted by [`zval_to_json_value`].
+///
+/// Guards against a self-referential array (PHP arrays can reference
+/// themselves) blowing the Rust call stack, which would abort the process
+/// rather than raise a PHP exception. Mirrors `laurus-python`'s
+/// `py_to_json_value` / `laurus-ruby`'s `rb_to_json_value`.
+const MAX_JSON_VALUE_DEPTH: usize = 32;
+
+/// Convert an arbitrary PHP [`Zval`] into a [`serde_json::Value`].
+///
+/// Used to bridge PHP array literals (e.g. the `tokenizer` / `charFilters` /
+/// `tokenFilters` arguments of `Schema::addAnalyzer`) into serde-deserializable
+/// JSON so they can be decoded with exactly the same semantics (field
+/// defaults, `snake_case` variant names, etc.) as the TOML schema format.
+///
+/// Type mapping:
+/// - `null`                        → `Value::Null`
+/// - `bool`                        → `Value::Bool`
+/// - `int`                         → `Value::Number`
+/// - `float`                       → `Value::Number` (rejected if NaN or infinite)
+/// - `string`                      → `Value::String`
+/// - sequential array (list)       → `Value::Array`
+/// - associative array             → `Value::Object`
+///
+/// Any other type, or nesting deeper than [`MAX_JSON_VALUE_DEPTH`], is
+/// rejected with an error.
+pub fn zval_to_json_value(zv: &Zval) -> PhpResult<serde_json::Value> {
+    zval_to_json_value_inner(zv, 0)
+}
+
+fn zval_to_json_value_inner(zv: &Zval, depth: usize) -> PhpResult<serde_json::Value> {
+    if depth > MAX_JSON_VALUE_DEPTH {
+        return Err(
+            format!("value is nested too deeply (max depth: {MAX_JSON_VALUE_DEPTH})").into(),
+        );
+    }
+    if zv.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    if zv.is_bool() {
+        let b = bool::from_zval(zv).ok_or("failed to convert bool")?;
+        return Ok(serde_json::Value::Bool(b));
+    }
+    if zv.is_long() {
+        let i = i64::from_zval(zv).ok_or("failed to convert int")?;
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    if zv.is_double() {
+        let f = f64::from_zval(zv).ok_or("failed to convert float")?;
+        let n =
+            serde_json::Number::from_f64(f).ok_or("float value must be finite (not NaN or inf)")?;
+        return Ok(serde_json::Value::Number(n));
+    }
+    if zv.is_string() {
+        let s = String::from_zval(zv).ok_or("failed to convert string")?;
+        return Ok(serde_json::Value::String(s));
+    }
+    if zv.is_array() {
+        let ht = zv.array().ok_or("failed to get array")?;
+        return hashtable_to_json_value_inner(ht, depth);
+    }
+    Err(format!(
+        "cannot convert PHP value of type {:?} to a schema value",
+        zv.get_type()
+    )
+    .into())
+}
+
+/// Convert a PHP array (already unwrapped as a [`ZendHashTable`]) into a
+/// [`serde_json::Value`]. A sequential array (list) becomes a JSON array;
+/// an associative array becomes a JSON object.
+///
+/// See [`zval_to_json_value`] for the element type mapping.
+pub fn hashtable_to_json_value(ht: &ZendHashTable) -> PhpResult<serde_json::Value> {
+    hashtable_to_json_value_inner(ht, 0)
+}
+
+fn hashtable_to_json_value_inner(ht: &ZendHashTable, depth: usize) -> PhpResult<serde_json::Value> {
+    if depth > MAX_JSON_VALUE_DEPTH {
+        return Err(
+            format!("value is nested too deeply (max depth: {MAX_JSON_VALUE_DEPTH})").into(),
+        );
+    }
+    if ht.has_sequential_keys() {
+        let items = ht
+            .values()
+            .map(|v| zval_to_json_value_inner(v, depth + 1))
+            .collect::<PhpResult<Vec<_>>>()?;
+        return Ok(serde_json::Value::Array(items));
+    }
+    let mut map = serde_json::Map::with_capacity(ht.len());
+    for (key, val) in ht.iter() {
+        let key = match key {
+            ArrayKey::String(s) => s,
+            ArrayKey::Str(s) => s.to_string(),
+            ArrayKey::ZendString(s) => s
+                .as_str()
+                .map_err(|_| "array key must be valid UTF-8")?
+                .to_string(),
+            ArrayKey::Long(i) => i.to_string(),
+        };
+        map.insert(key, zval_to_json_value_inner(val, depth + 1)?);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
 /// Convert a non-empty array whose elements are all arrays into a
 /// [`DataValue::GeoArray`] (all `lat`/`lon`) or [`DataValue::GeoEcefArray`]
 /// (all `x`/`y`/`z`), rejecting a mix or an element of any other shape.

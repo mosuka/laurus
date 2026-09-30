@@ -177,7 +177,7 @@ new \Laurus\Schema()
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | 全文フィールド（転置インデックス、BM25）。`$docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$multiValued = true` で文字列のシーケンシャル配列を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `$positionIncrementGap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`）を指定します。PHP バインディングには analyzer 登録 API がまだ無いため、Lindera 辞書パスが必要な Japanese プリセットなどのパラメータ付き analyzer は PHP からは利用できません（Issue #1190）。 |
+| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | 全文フィールド（転置インデックス、BM25）。`$docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$multiValued = true` で文字列のシーケンシャル配列を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `$positionIncrementGap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`）、または `addAnalyzer` で登録済みの任意のカスタム名（Japanese/Lindera アナライザーなど）を指定できます。 |
 | `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット整数フィールド。`$multiValued = true` で整数配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット浮動小数点フィールド。`$multiValued = true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | ブールフィールド。`$multiValued = true` で `bool` のシーケンシャル配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `bool` の配列として読み戻されます）。`$docValues` は上記を参照。 |
@@ -200,6 +200,8 @@ new \Laurus\Schema()
 | メソッド | 説明 |
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | 名前付きエンベダー定義を登録します。`$config` は `"type"` キーを持つ連想配列です（下記参照）。 |
+| `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$charFilters`/`$tokenFilters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
+| `analyzerNames(): array` | `addAnalyzer` で登録済みのカスタムアナライザー名の一覧を返します。 |
 | `setDefaultFields(array $fieldNames): void` | クエリでフィールドが指定されていない場合に使用するデフォルトフィールドを設定します。`$fieldNames` は文字列の配列です。 |
 | `setDynamicFieldPolicy(string $policy): void` | 未宣言フィールドの扱いを設定します。`$policy` は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"`。詳細は下記を参照。 |
 | `dynamicFieldPolicy(): string` | 現在のポリシーを小文字の文字列で返します。 |
@@ -223,6 +225,60 @@ new \Laurus\Schema()
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+
+### アナライザーコンポーネント
+
+`addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null)`
+および `[analyzers.<name>]` TOML セクションで使用します。`$tokenizer` は単一の
+連想配列、`$charFilters`/`$tokenFilters` は連想配列の配列で、配列の順序で
+適用されます。
+
+**トークナイザー**（`$tokenizer`、必ず1つ）:
+
+| `"type"` | 必須キー | 任意キー |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `"pattern"`（デフォルト `\w+`）、`"gaps"`（デフォルト `false`） |
+| `"ngram"` | `"min_gram"`, `"max_gram"` | -- |
+| `"lindera"` | `"mode"`, `"dict"` | `"user_dict"` |
+| `"whole"` | -- | -- |
+
+**Char filter**（`$charFilters`、トークン化前の生テキストに適用）:
+
+| `"type"` | 必須キー | 任意キー |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `"form"`（`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`） | -- |
+| `"pattern_replace"` | `"pattern"`, `"replacement"` | -- |
+| `"mapping"` | `"mapping"`（文字列置換の連想配列） | -- |
+| `"japanese_iteration_mark"` | -- | `"kanji"`（デフォルト `true`）、`"kana"`（デフォルト `true`） |
+
+**Token filter**（`$tokenFilters`、トークン化後のトークン列に適用）:
+
+| `"type"` | 必須キー | 任意キー |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `"words"`（デフォルト: 英語のストップワード） |
+| `"stem"` | -- | `"stem_type"`（`"porter"`/`"simple"`/`"identity"`） |
+| `"boost"` | `"boost"` | -- |
+| `"limit"` | `"limit"` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```php
+$schema = new Laurus\Schema();
+$schema->addAnalyzer(
+    "ja_ipadic",
+    ["type" => "lindera", "mode" => "normal", "dict" => "/var/lib/lindera/ipadic"],
+    [
+        ["type" => "unicode_normalization", "form" => "nfkc"],
+        ["type" => "japanese_iteration_mark"],
+    ],
+    [["type" => "lowercase"]],
+);
+$schema->addTextField("title", analyzer: "ja_ipadic");
+```
 
 ### 距離メトリクス
 

@@ -2915,6 +2915,7 @@ dependencies = [
  "chrono",
  "ext-php-rs",
  "laurus",
+ "serde_json",
  "tokio",
 ]
 

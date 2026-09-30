@@ -152,6 +152,7 @@ if (Laurus\peek_commit_generation($path) !== $before) {
 | `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat（総当たり）ベクトルインデックスフィールド |
 | `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF ベクトルインデックスフィールド |
 | `addEmbedder(name, config)` | 名前付きエンベダーの登録 |
+| `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | 名前付きカスタムアナライザーの登録 |
 | `setDefaultFields(fieldNames)` | デフォルト検索フィールドの設定 |
 
 `name`（ベクトルフィールドでは `dimension` も）以降の引数にはすべてデフォルト値があるため、末尾の引数は省略できます。引数は位置引数なので、後ろの引数を渡すときは上記の順序を守ってください。型とデフォルト値は [API リファレンス](../docs/ja/src/laurus-php/api_reference.md) を参照してください。

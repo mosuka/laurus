@@ -153,6 +153,7 @@ The `Schema` class defines the structure of your index. Use the following method
 | `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat (brute-force) vector index field |
 | `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF vector index field |
 | `addEmbedder(name, config)` | Register a named embedder |
+| `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | Register a named custom analyzer |
 | `setDefaultFields(fieldNames)` | Set default search fields |
 
 Every parameter after `name` (and `dimension` for vector fields) has a default, so trailing arguments can be omitted; the arguments are positional, so keep the order above when passing a later one. Types and defaults are listed in the [API reference](../docs/src/laurus-php/api_reference.md).
