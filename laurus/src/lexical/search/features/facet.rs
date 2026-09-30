@@ -414,6 +414,13 @@ impl FacetCollector {
     /// Add a document to the facet counts. Every facet key is incremented at
     /// most once per call, however many paths the document's values expand
     /// to (Issue #1187).
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader's error when a facet field has to be read from
+    /// the stored document and that read fails. Fields collected earlier in
+    /// the same call are already counted by then, so the collector holds
+    /// partial counts afterwards and should be discarded.
     pub fn collect_doc(&mut self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<()> {
         // One generation per document: `Slot::bump` refuses a second
         // increment of the same key in the same generation.
@@ -444,9 +451,7 @@ impl FacetCollector {
         // DocValues never pay for this. Uses `document_fields` (only the
         // facet fields), not `document`, to avoid cloning every field of
         // a wide-schema document.
-        let mut doc_fields: Option<
-            Result<Option<std::collections::HashMap<String, crate::data::DataValue>>>,
-        > = None;
+        let mut doc_fields: Option<Option<HashMap<String, crate::data::DataValue>>> = None;
 
         // Reusable scratch buffers — allocated once per call, cleared at
         // each field iteration. Avoids per-field `Vec` reallocations that
@@ -479,29 +484,19 @@ impl FacetCollector {
                     push_facet_paths(&value, &mut paths);
                 } else {
                     // No DocValues column, or a miss despite `has_dv`
-                    // (#1047) -- fall back to the stored document.
-                    let result = doc_fields.get_or_insert_with(|| {
+                    // (#1047) -- fall back to the stored document. A read
+                    // error is returned rather than counted: this document's
+                    // facet values are unknown.
+                    if doc_fields.is_none() {
                         let field_refs: Vec<&str> =
                             self.facet_fields.iter().map(String::as_str).collect();
-                        reader.document_fields(doc_id, &field_refs)
-                    });
-                    match result {
-                        Ok(Some(fields)) => {
-                            if let Some(val) = fields.get(field_name) {
-                                push_facet_paths(val, &mut paths);
-                            }
-                        }
-                        Ok(None) => {
-                            // Document not found — no facet contribution.
-                        }
-                        Err(_) => {
-                            // Synthetic fallback preserved from the pre-#409
-                            // implementation: 5 distinct values stratified
-                            // by `doc_id`.
-                            paths.push_path(|components| {
-                                components.push(format!("value_{}", doc_id % 5))
-                            });
-                        }
+                        doc_fields = Some(reader.document_fields(doc_id, &field_refs)?);
+                    }
+                    // `None` = document not found: no facet contribution.
+                    if let Some(Some(fields)) = &doc_fields
+                        && let Some(val) = fields.get(field_name)
+                    {
+                        push_facet_paths(val, &mut paths);
                     }
                 }
             }
@@ -883,6 +878,9 @@ mod tests {
         /// has the DocValues column but lacks this particular document's
         /// value (Issue #1047 mixed-segment case).
         dv_miss_doc_ids: HashSet<u64>,
+        /// `document()` returns an error, simulating a failed stored-field
+        /// read.
+        fail_document: bool,
     }
 
     impl DvMockReader {
@@ -892,6 +890,7 @@ mod tests {
                 dv_fields: dv_fields.iter().map(|s| (*s).to_string()).collect(),
                 panic_on_document,
                 dv_miss_doc_ids: HashSet::new(),
+                fail_document: false,
             }
         }
 
@@ -899,10 +898,16 @@ mod tests {
         /// `miss_doc_ids` while `has_doc_values` still reports `true`.
         fn with_dv_miss(docs: Vec<Document>, dv_fields: &[&str], miss_doc_ids: &[u64]) -> Self {
             Self {
-                docs,
-                dv_fields: dv_fields.iter().map(|s| (*s).to_string()).collect(),
-                panic_on_document: false,
                 dv_miss_doc_ids: miss_doc_ids.iter().copied().collect(),
+                ..Self::new(docs, dv_fields, false)
+            }
+        }
+
+        /// Like `new` with no DocValues, but every stored-document read fails.
+        fn with_failing_document(docs: Vec<Document>) -> Self {
+            Self {
+                fail_document: true,
+                ..Self::new(docs, &[], false)
             }
         }
     }
@@ -922,6 +927,11 @@ mod tests {
                 !self.panic_on_document,
                 "document() must not be called when all facet fields have DocValues"
             );
+            if self.fail_document {
+                return Err(crate::error::LaurusError::storage(
+                    "simulated stored-field read failure",
+                ));
+            }
             Ok(self.docs.get(doc_id as usize).cloned())
         }
         fn term_info(&self, _field: &str, _term: &str) -> Result<Option<ReaderTermInfo>> {
@@ -1423,6 +1433,28 @@ mod tests {
             flatten(&results, "cat"),
             vec![(vec!["a".to_string()], 1), (vec!["b".to_string()], 1)],
             "a DocValues miss with has_dv=true must still fall back to the stored document"
+        );
+    }
+
+    #[test]
+    fn facet_collect_doc_propagates_stored_document_error() {
+        // A failed stored-document read is an error, not a facet value: the
+        // collector used to count a made-up `value_{doc_id % 5}` instead.
+        let reader = DvMockReader::with_failing_document(vec![text_doc(&[("cat", "a")])]);
+        let mut collector = FacetCollector::new(FacetConfig::default(), vec!["cat".to_string()]);
+        let err = collector
+            .collect_doc(0, &reader)
+            .expect_err("a stored-document read error must be returned");
+        assert!(
+            err.to_string()
+                .contains("simulated stored-field read failure"),
+            "unexpected error: {err}"
+        );
+        let results = collector.finalize().expect("finalize must not error");
+        assert!(
+            results.get_field_facets("cat").is_none(),
+            "nothing may be counted for a document that could not be read, got {:?}",
+            flatten(&results, "cat")
         );
     }
 
