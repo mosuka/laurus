@@ -2341,6 +2341,136 @@ mod tests {
         }
     }
 
+    /// #1286: the pivot loop picked the pivot from each clause's current-block
+    /// bound, then skipped the lagging clauses to the pivot -- straight over a
+    /// later block with a higher bound. Here `bravo`'s second block (docs
+    /// 128..=255, tf 30) was skipped once doc 0 set the threshold, and K = 1
+    /// returned doc 0 (1.79) instead of doc 128 (2.93).
+    #[test]
+    fn bmw_does_not_skip_a_later_higher_block() {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        const LEN: usize = 40;
+        for id in 0..2000u64 {
+            let bravo = match id {
+                128..=255 => 30,
+                0..=399 => 1,
+                _ => 0,
+            };
+            let charlie = match id {
+                0 | 1001..=1799 => 1,
+                1000 => 3,
+                _ => 0,
+            };
+            let mut words = Vec::with_capacity(LEN);
+            words.extend(std::iter::repeat_n("bravo", bravo));
+            words.extend(std::iter::repeat_n("charlie", charlie));
+            words.extend(std::iter::repeat_n("filler", LEN - bravo - charlie));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let query = should_terms(&["bravo", "charlie"]);
+        let top = searcher
+            .search_with_collector(query.clone_box(), TopDocsCollector::new(1))
+            .unwrap()
+            .results();
+        assert_eq!(top[0].doc_id, 128, "top hit {top:?}");
+        assert_bmw_top_k_is_exact(&searcher, query.as_ref(), 1, "repro");
+    }
+
+    /// A deterministic single-segment corpus over `red`, `green` and `blue`.
+    /// Each term's presence and term frequency change from one stretch of doc
+    /// ids to the next, in an order `seed` decides:
+    ///
+    /// - a term's posting blocks carry low and high bounds in turn, and
+    /// - a term common across the index can be absent from whole stretches,
+    ///   which puts it -- as a low-idf pivot -- far ahead of the other terms.
+    fn build_varied_block_store(seed: u64) -> crate::lexical::store::LexicalStore {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+
+        const TERMS: [&str; 3] = ["red", "green", "blue"];
+        const DOCS: u64 = 3000;
+        const STRETCH: u64 = 100;
+        // Per term and stretch: the percent of documents holding the term,
+        // and how high its tf can go.
+        let stretches = DOCS.div_ceil(STRETCH) as usize;
+        let shape: Vec<Vec<(u32, u32)>> = TERMS
+            .iter()
+            .map(|_| {
+                (0..stretches)
+                    .map(|_| {
+                        let presence = [0, 0, 0, 3, 40, 90][(next() % 6) as usize];
+                        let max_tf = [1, 1, 2, 4, 12, 30][(next() % 6) as usize];
+                        (presence, max_tf)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for id in 0..DOCS {
+            let stretch = (id / STRETCH) as usize;
+            let mut words = Vec::new();
+            for (t, term) in TERMS.iter().enumerate() {
+                let (presence, max_tf) = shape[t][stretch];
+                if next() % 100 < presence {
+                    let tf = 1 + next() % max_tf;
+                    words.extend(std::iter::repeat_n(*term, tf as usize));
+                }
+            }
+            words.extend(std::iter::repeat_n("filler", (1 + next() % 40) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+        store
+    }
+
+    /// #1286: across varied corpora and K, BMW returns exactly the top-K that
+    /// exhaustive scoring does. The miss is rare in these corpora (2 of 2400
+    /// seed/query/K combinations over seeds 0..400 before the fix); seeds 127
+    /// and 321 are the two that hit it.
+    #[test]
+    fn bmw_top_k_is_exact_on_varied_blocks() {
+        for seed in [0u64, 1, 2, 3, 127, 321] {
+            let store = build_varied_block_store(seed);
+            let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+            for terms in [
+                &["red", "green", "blue"][..],
+                &["red", "green"][..],
+                &["red", "blue"][..],
+                &["green", "blue"][..],
+            ] {
+                for k in [1usize, 3, 10] {
+                    let label = format!("seed {seed}, {terms:?}, k {k}");
+                    assert_bmw_top_k_is_exact(&searcher, should_terms(terms).as_ref(), k, &label);
+                }
+            }
+        }
+    }
+
     /// Helper for #476 Phase 1 tests: build a `LexicalStore` with
     /// the same skewed-TF corpus as the equivalence test, but split
     /// the writes across `segment_count` commits so the underlying

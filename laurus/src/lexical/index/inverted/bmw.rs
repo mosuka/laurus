@@ -3,11 +3,12 @@
 //! [`BlockMaxOrExecutor`] implements the per-clause Block-Max-WAND
 //! pivot loop on top of the per-block bound metadata that landed in
 //! [`crate::lexical::query::scorer`] (PR-C / PR-E). The executor
-//! drives each clause's matcher independently, picks a *pivot* clause
-//! whose prefix-sum of per-block bounds exceeds the collector's
-//! current K-th score, and either scores the pivot doc (if all
-//! prefix clauses align there) or skips clauses that lag behind
-//! the pivot — bypassing every doc in non-competitive blocks.
+//! drives each clause's matcher independently and picks a *pivot*
+//! clause whose prefix-sum of suffix bounds exceeds the collector's
+//! current K-th score. It then checks the bounds of the blocks that
+//! hold the pivot doc: it scores the pivot doc (if all prefix clauses
+//! align there), skips lagging clauses to it, or, when those blocks
+//! cannot compete, skips past the first of them to end (#1286).
 //!
 //! The standard whole-query searcher in
 //! [`super::searcher::InvertedIndexSearcher::search_with_collector_parallel`]
@@ -88,6 +89,19 @@ impl BlockMaxOrExecutor {
     /// `collector`. Returns the same collector once exhausted or
     /// short-circuited via `needs_more()`.
     ///
+    /// Every skip stays within the documents its bounds cover (#1286):
+    ///
+    /// 1. The pivot is the first clause, in document order, at which the
+    ///    clauses' suffix bounds (`block_max_score_at`, valid for every
+    ///    document from a clause's current one on) sum past the threshold.
+    ///    A document before the pivot's can only match the clauses in front
+    ///    of it, whose suffix bounds do not pass the threshold, so every
+    ///    clause may skip to the pivot document.
+    /// 2. The bounds of the blocks holding the pivot document
+    ///    (`current_block_max_score`) refine that. When they do not pass the
+    ///    threshold either, no document can until the first of those blocks
+    ///    ends or the next clause starts, so the clauses skip there.
+    ///
     /// `deadline` (Issue #600) is consulted once per
     /// [`crate::lexical::index::inverted::searcher::DEADLINE_CHECK_INTERVAL`]
     /// pivot iterations so a timed search aborts this loop mid-flight rather
@@ -118,88 +132,78 @@ impl BlockMaxOrExecutor {
 
             let min_comp = collector.min_competitive();
 
-            // Find pivot k: smallest j such that the prefix sum of
-            // current per-block bounds for active[0..=j] strictly
-            // exceeds min_comp. If no such j exists the entire current
-            // frontier is non-competitive in itself.
+            // 1. The pivot: the first clause at which the suffix bounds sum
+            //    past the threshold. Without one, no document from here on
+            //    can make the top-K.
             let mut sum = 0.0_f32;
-            let mut pivot_k: Option<usize> = None;
+            let mut pivot: Option<usize> = None;
             for (j, &i) in active.iter().enumerate() {
                 let doc_id = self.clauses[i].matcher.doc_id();
-                sum += self.clauses[i].scorer.current_block_max_score(doc_id);
+                sum += self.clauses[i].scorer.block_max_score_at(doc_id);
                 if sum > min_comp {
-                    pivot_k = Some(j);
+                    pivot = Some(j);
                     break;
                 }
             }
+            let Some(mut last) = pivot else {
+                break;
+            };
+            // The pivot side takes every clause sitting on the pivot document.
+            let pivot_doc = self.clauses[active[last]].matcher.doc_id();
+            while last + 1 < active.len()
+                && self.clauses[active[last + 1]].matcher.doc_id() == pivot_doc
+            {
+                last += 1;
+            }
+            let pivot_side = &active[..=last];
 
-            match pivot_k {
-                None => {
-                    // No pivot found at the current frontier. Use the
-                    // *cumulative* (right_max) bound to decide whether
-                    // any later block could still produce a top-K
-                    // candidate; if not, we are globally done.
-                    let mut cum_sum = 0.0_f32;
-                    for &i in &active {
-                        let d = self.clauses[i].matcher.doc_id();
-                        cum_sum += self.clauses[i].scorer.block_max_score_at(d);
+            // 2. Refine with the blocks holding the pivot document.
+            let block_sum: f32 = pivot_side
+                .iter()
+                .map(|&i| self.clauses[i].scorer.current_block_max_score(pivot_doc))
+                .sum();
+            if block_sum > min_comp {
+                if self.clauses[active[0]].matcher.doc_id() == pivot_doc {
+                    // Every pivot-side clause sits on the pivot document.
+                    let mut total_score = 0.0_f32;
+                    for &i in pivot_side {
+                        let tf = self.clauses[i].matcher.term_freq() as f32;
+                        // Each leaf looks up its own document's field
+                        // length (#1287).
+                        total_score += self.clauses[i].scorer.score(pivot_doc, tf, None);
                     }
-                    if cum_sum <= min_comp {
+                    collector.collect(pivot_doc, total_score)?;
+                    if !collector.needs_more() {
                         break;
                     }
-                    // Otherwise advance the lead clause past its
-                    // current block — that's the smallest doc_id in
-                    // the frontier, so doing so is guaranteed to make
-                    // progress.
-                    let lead = active[0];
-                    let lead_doc = self.clauses[lead].matcher.doc_id();
-                    self.advance_clause_past_block(lead, lead_doc)?;
-                }
-                Some(k) => {
-                    let pivot_doc = self.clauses[active[k]].matcher.doc_id();
-                    let head_doc = self.clauses[active[0]].matcher.doc_id();
-
-                    if head_doc == pivot_doc {
-                        // All clauses in active[0..=k] are aligned at
-                        // pivot_doc. Score the union of every clause
-                        // (active OR not in the prefix) currently
-                        // sitting at pivot_doc.
-                        let mut total_score = 0.0_f32;
-                        for &i in &active {
-                            if self.clauses[i].matcher.doc_id() == pivot_doc {
-                                let tf = self.clauses[i].matcher.term_freq() as f32;
-                                // Each leaf looks up its own document's
-                                // field length (#1287).
-                                total_score += self.clauses[i].scorer.score(pivot_doc, tf, None);
-                            } else {
-                                // active is sorted by doc_id; once we
-                                // pass pivot_doc no later clause can
-                                // share it.
-                                break;
-                            }
-                        }
-                        collector.collect(pivot_doc, total_score)?;
-                        if !collector.needs_more() {
-                            break;
-                        }
-
-                        // Advance every clause that contributed.
-                        for &i in active.iter() {
-                            if self.clauses[i].matcher.doc_id() == pivot_doc {
-                                self.clauses[i].matcher.next()?;
-                            } else {
-                                break;
-                            }
-                        }
-                    } else {
-                        // Some clauses in [0..k] lag behind pivot_doc.
-                        // Skip each one forward to pivot_doc — they
-                        // either land on it (and contribute next
-                        // iteration) or land past it.
-                        for &i in &active[..k] {
+                    for &i in pivot_side {
+                        self.clauses[i].matcher.next()?;
+                    }
+                } else {
+                    // Bring the clauses lagging behind to the pivot document;
+                    // they land on it or past it.
+                    for &i in pivot_side {
+                        if self.clauses[i].matcher.doc_id() < pivot_doc {
                             self.clauses[i].matcher.skip_to(pivot_doc)?;
                         }
                     }
+                }
+            } else {
+                // No document can pass the threshold before the first of the
+                // pivot-side blocks ends, or before the next clause starts. A
+                // clause without per-block bounds (`None`) bounds every
+                // document alike, so it does not end the range.
+                let mut next = active
+                    .get(last + 1)
+                    .map_or(u64::MAX, |&i| self.clauses[i].matcher.doc_id());
+                for &i in pivot_side {
+                    if let Some(boundary) = self.clauses[i].scorer.next_block_boundary(pivot_doc) {
+                        next = next.min(boundary);
+                    }
+                }
+                debug_assert!(next > pivot_doc, "a skip must move past the pivot");
+                for &i in pivot_side {
+                    self.clauses[i].matcher.skip_to(next)?;
                 }
             }
 
@@ -211,30 +215,6 @@ impl BlockMaxOrExecutor {
         }
 
         Ok(collector)
-    }
-
-    /// Skip a single clause past the block containing `at_doc`.
-    /// `at_doc` is the matcher's current position; the scorer
-    /// resolves the block boundary and `matcher.skip_to` jumps
-    /// forward. If the clause has no further blocks it is left
-    /// in an exhausted state for the active-list filter to drop.
-    fn advance_clause_past_block(&mut self, clause_idx: usize, at_doc: u64) -> Result<()> {
-        let target = self.clauses[clause_idx].scorer.next_block_boundary(at_doc);
-        match target {
-            Some(t) if t == u64::MAX => {
-                // Past last block. Force exhaustion.
-                self.clauses[clause_idx].matcher.skip_to(u64::MAX)?;
-            }
-            Some(t) => {
-                self.clauses[clause_idx].matcher.skip_to(t)?;
-            }
-            None => {
-                // Construction enforces Some, but be defensive: fall
-                // back to a single doc step rather than looping.
-                self.clauses[clause_idx].matcher.next()?;
-            }
-        }
-        Ok(())
     }
 }
 
