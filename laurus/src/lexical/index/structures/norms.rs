@@ -330,6 +330,7 @@ enum SlotMap {
 }
 
 impl SlotMap {
+    #[inline]
     fn slot_of(&self, doc_id: u64) -> Option<usize> {
         match self {
             SlotMap::Contiguous { min_doc_id, count } => {
@@ -685,6 +686,7 @@ impl NormsReader {
 
     /// [`Self::field_length`] for a field already resolved by
     /// [`Self::column`].
+    #[inline]
     pub(crate) fn column_length(&self, column: NormsColumn, doc_id: u64) -> Option<u32> {
         let f = self.columns.get(column.0)?;
         let slot = self.slot_map.slot_of(doc_id)?;

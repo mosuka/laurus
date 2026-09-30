@@ -2311,8 +2311,16 @@ impl SegmentLengths {
         }
         match (self.norms.as_ref(), self.column) {
             (SegmentNorms::V1(reader), Some(column)) => reader.column_length(column, doc_id),
-            (norms, _) => norms.field_length(doc_id, field),
+            _ => self.length_by_name(doc_id, field),
         }
+    }
+
+    /// A pre-#555 segment's length, looked up by field name. Kept out of
+    /// line: inlined, its hashing bloats `get` and slows the `.norms` path.
+    #[cold]
+    #[inline(never)]
+    fn length_by_name(&self, doc_id: u64, field: &str) -> Option<u32> {
+        self.norms.field_length(doc_id, field)
     }
 }
 
