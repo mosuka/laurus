@@ -1098,14 +1098,13 @@ impl SegmentReader {
     /// `.norms` if present, otherwise the pre-#555 `.lens`/`.fstats` pair
     /// via the legacy path (empty maps if neither exists -- a segment with
     /// no indexed fields, or one predating field-length tracking
-    /// altogether).
-    fn load_norms(&self) -> Result<()> {
+    /// altogether). Returns the source it stored.
+    fn load_norms(&self) -> Result<Arc<SegmentNorms>> {
         if let Some(reader) = crate::lexical::index::structures::norms::NormsReader::load(
             self.storage.as_ref(),
             &self.info.segment_id,
         )? {
-            *self.norms.write().unwrap() = Some(Arc::new(SegmentNorms::V1(reader)));
-            return Ok(());
+            return Ok(self.store_norms(SegmentNorms::V1(reader)));
         }
 
         let lens_file = format!("{}.lens", self.info.segment_id);
@@ -1164,8 +1163,21 @@ impl SegmentReader {
             AHashMap::new()
         };
 
-        *self.norms.write().unwrap() = Some(Arc::new(SegmentNorms::Legacy { lengths, stats }));
-        Ok(())
+        Ok(self.store_norms(SegmentNorms::Legacy { lengths, stats }))
+    }
+
+    fn store_norms(&self, norms: SegmentNorms) -> Arc<SegmentNorms> {
+        let norms = Arc::new(norms);
+        *self.norms.write().unwrap() = Some(Arc::clone(&norms));
+        norms
+    }
+
+    /// This segment's field-length source, loaded on first use.
+    fn norms(&self) -> Result<Arc<SegmentNorms>> {
+        if let Some(norms) = self.norms.read().unwrap().as_ref() {
+            return Ok(Arc::clone(norms));
+        }
+        self.load_norms()
     }
 
     /// Get field statistics for a specific field.
@@ -2256,18 +2268,67 @@ fn segment_field_length<'a>(
 }
 
 /// The per-document lengths of one field across a set of segments (#1287).
-/// It owns its segments, so a `'static` scorer can keep it for a whole query.
+///
+/// Each segment's length source is resolved when this is built, once per
+/// scorer (#1298), so a lookup takes neither the segment's lock nor its norms
+/// lock. It owns what it resolved, so a `'static` scorer can keep it for a
+/// whole query.
 #[derive(Debug)]
 pub(crate) struct SegmentFieldLengths {
     field: String,
-    /// Each segment with the `[min_doc_id, max_doc_id]` range it can hold.
-    segments: Vec<(u64, u64, Arc<RwLock<SegmentReader>>)>,
+    segments: Vec<SegmentLengths>,
+}
+
+/// One segment's part of a [`SegmentFieldLengths`].
+#[derive(Debug)]
+struct SegmentLengths {
+    /// The `[min_doc_id, max_doc_id]` range the segment can hold.
+    min_doc_id: u64,
+    max_doc_id: u64,
+    /// `None` when the segment has no deletions.
+    deletions: Option<Arc<DeletionBitmap>>,
+    norms: Arc<SegmentNorms>,
+}
+
+impl SegmentLengths {
+    /// `doc_id`'s length of `field`; `None` when the segment cannot hold
+    /// `doc_id`, holds only a deleted copy of it (the old copy of a re-added
+    /// id, whose live copy is in another segment), or records no length.
+    fn get(&self, doc_id: u64, field: &str) -> Option<u32> {
+        if doc_id < self.min_doc_id || doc_id > self.max_doc_id {
+            return None;
+        }
+        if self
+            .deletions
+            .as_ref()
+            .is_some_and(|deletions| deletions.is_deleted(doc_id))
+        {
+            return None;
+        }
+        self.norms.field_length(doc_id, field)
+    }
 }
 
 impl SegmentFieldLengths {
     /// Lengths of `field` across `segments`, each given with the doc id range
-    /// it can hold.
-    pub(crate) fn new(field: &str, segments: Vec<(u64, u64, Arc<RwLock<SegmentReader>>)>) -> Self {
+    /// it can hold. A segment whose length source fails to load is left out:
+    /// no lookup could find a length in it.
+    pub(crate) fn new<'a>(
+        field: &str,
+        segments: impl IntoIterator<Item = (u64, u64, &'a Arc<RwLock<SegmentReader>>)>,
+    ) -> Self {
+        let segments = segments
+            .into_iter()
+            .filter_map(|(min_doc_id, max_doc_id, segment)| {
+                let segment = segment.read().unwrap();
+                Some(SegmentLengths {
+                    min_doc_id,
+                    max_doc_id,
+                    deletions: segment.deletions(),
+                    norms: segment.norms().ok()?,
+                })
+            })
+            .collect();
         SegmentFieldLengths {
             field: field.to_string(),
             segments,
@@ -2277,13 +2338,9 @@ impl SegmentFieldLengths {
 
 impl crate::lexical::reader::FieldLengths for SegmentFieldLengths {
     fn get(&self, doc_id: u64) -> Option<u32> {
-        segment_field_length(
-            self.segments
-                .iter()
-                .map(|(min_doc_id, max_doc_id, segment)| (*min_doc_id, *max_doc_id, segment)),
-            doc_id,
-            &self.field,
-        )
+        self.segments
+            .iter()
+            .find_map(|segment| segment.get(doc_id, &self.field))
     }
 }
 
@@ -2702,11 +2759,10 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
 
     fn field_lengths(&self, field: &str) -> Option<Arc<dyn crate::lexical::reader::FieldLengths>> {
         self.check_closed().ok()?;
-        let segments = self
-            .segment_ranges()
-            .map(|(min_doc_id, max_doc_id, segment)| (min_doc_id, max_doc_id, Arc::clone(segment)))
-            .collect();
-        Some(Arc::new(SegmentFieldLengths::new(field, segments)))
+        Some(Arc::new(SegmentFieldLengths::new(
+            field,
+            self.segment_ranges(),
+        )))
     }
 
     fn get_bkd_tree(&self, field: &str) -> Result<Option<Arc<dyn BKDTree>>> {
@@ -4647,6 +4703,94 @@ mod tests {
         assert_eq!(stats.min_length, 7);
         assert_eq!(stats.max_length, 20);
         assert!((stats.avg_length - 13.5).abs() < 1e-9);
+
+        // A scorer's per-document lengths read the same exact values.
+        use crate::lexical::reader::FieldLengths;
+        let segment = Arc::new(RwLock::new(reader));
+        let body = SegmentFieldLengths::new("body", [(0, 1, &segment)]);
+        assert_eq!(body.get(0), Some(7));
+        assert_eq!(body.get(1), Some(20));
+        assert_eq!(body.get(2), None);
+        assert_eq!(
+            SegmentFieldLengths::new("missing", [(0, 1, &segment)]).get(0),
+            None
+        );
+    }
+
+    /// #1298: `SegmentFieldLengths` resolves each segment once, then answers
+    /// every lookup as the per-document path does -- across segments, for a
+    /// re-added id whose deleted old copy sits in an earlier segment, and for
+    /// a field only some documents have.
+    #[test]
+    fn field_lengths_match_each_segments_own_lengths() {
+        use crate::Document;
+        use crate::lexical::reader::{FieldLengths, LexicalIndexReader};
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let words = |n: u64| vec!["word"; n as usize].join(" ");
+        // Lengths stay below 40, which `.norms` stores exactly.
+        for id in 0..30u64 {
+            let mut doc = Document::builder().add_text("body", words(1 + id % 25));
+            if id % 3 == 0 {
+                doc = doc.add_text("title", words(2 + id % 5));
+            }
+            store.upsert_document(id, doc.build()).unwrap();
+            if id % 10 == 9 {
+                store.commit().unwrap();
+            }
+        }
+        store
+            .upsert_document(5, Document::builder().add_text("body", words(33)).build())
+            .unwrap();
+        store.commit().unwrap();
+
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let segments = inverted.segment_readers();
+        assert!(segments.len() >= 2);
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.read().unwrap().is_deleted(5).unwrap()),
+            "the fixture must keep a deleted copy of id 5"
+        );
+
+        for field in ["body", "title", "missing"] {
+            let lengths = inverted.field_lengths(field).unwrap();
+            for id in 0..32u64 {
+                assert_eq!(
+                    lengths.get(id),
+                    inverted.field_length(id, field).unwrap(),
+                    "{field}: doc {id}"
+                );
+            }
+            // One segment on its own, as `PerSegmentReaderView` builds it.
+            for segment in segments {
+                let lengths = SegmentFieldLengths::new(field, [(0, u64::MAX, segment)]);
+                let segment = segment.read().unwrap();
+                for id in 0..32u64 {
+                    assert_eq!(
+                        lengths.get(id),
+                        segment.field_length(id, field).unwrap(),
+                        "{field}: doc {id} in one segment"
+                    );
+                }
+            }
+        }
+
+        let body = inverted.field_lengths("body").unwrap();
+        assert_eq!(body.get(5), Some(33), "the live copy of a re-added id");
+        assert_eq!(body.get(6), Some(7));
+        let title = inverted.field_lengths("title").unwrap();
+        assert_eq!(title.get(3), Some(5));
+        assert_eq!(title.get(4), None);
     }
 
     /// `.norms` must win even when stale `.lens`/`.fstats` are also

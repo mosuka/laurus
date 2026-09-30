@@ -288,7 +288,7 @@ impl LexicalIndexReader for PerSegmentReaderView {
     fn field_lengths(&self, field: &str) -> Option<Arc<dyn FieldLengths>> {
         Some(Arc::new(SegmentFieldLengths::new(
             field,
-            vec![(0, u64::MAX, Arc::clone(&self.segment))],
+            [(0, u64::MAX, &self.segment)],
         )))
     }
 
