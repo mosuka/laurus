@@ -180,11 +180,13 @@ Raw binary data field. Not indexed — stored only.
 ```toml
 [fields.thumbnail.Bytes]
 stored = true
+multi_valued = false
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `stored` | `bool` | `true` | Stores the binary data |
+| `multi_valued` | `bool` | `false` | Accept arrays of byte strings; a `Bytes` field is never indexed, so unlike every other `multi_valued` option this has no "any match" query semantics — it only governs the stored shape and ingestion arity |
 
 `BytesOption` has no `doc_values` setting: a `Bytes` value is never written to
 DocValues regardless, since neither sorting nor faceting can do anything with

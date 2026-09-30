@@ -323,3 +323,41 @@ def test_position_increment_gap_keeps_phrases_inside_one_element():
     contiguous.put_document("doc1", {"title": "t", "notes": ["hello world", "foo bar"]})
     contiguous.commit()
     assert [h.id for h in contiguous.search('notes:"world foo"', limit=5)] == ["doc1"]
+
+
+# ---- Multi-valued bytes (Issue #1176) ----
+
+
+def test_bytes_list_round_trips_through_multi_valued_bytes_field():
+    """A list of `bytes` is a multi-valued bytes field; it reads back as a
+    list of `bytes`. MIME metadata is not carried through the Python
+    bindings, same as the scalar `Bytes` field."""
+    idx = _index_with(laurus.Schema.add_bytes_field, "blobs", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "blobs": [b"hello", b"world"]})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["blobs"] == [b"hello", b"world"]
+
+
+def test_single_bytes_is_wrapped_on_multi_valued_bytes_field():
+    idx = _index_with(laurus.Schema.add_bytes_field, "blobs", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "blobs": b"hello"})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["blobs"] == [b"hello"]
+
+
+def test_empty_list_is_accepted_by_multi_valued_bytes_field():
+    idx = _index_with(laurus.Schema.add_bytes_field, "blobs", multi_valued=True)
+    idx.put_document("doc1", {"title": "t", "blobs": []})
+    idx.commit()
+
+    assert idx.get_documents("doc1")[0]["blobs"] == []
+
+
+def test_bytes_list_into_single_valued_bytes_field_is_rejected():
+    import pytest
+
+    idx = _index_with(laurus.Schema.add_bytes_field, "blob")
+    with pytest.raises(Exception, match="multi_valued"):
+        idx.put_document("doc1", {"title": "t", "blob": [b"hello"]})

@@ -126,6 +126,11 @@ const TAG_BOOL_ARRAY: u8 = 16;
 // varint-length-prefixed UTF-8 body the scalar tag 0 uses. Same
 // no-version-bump policy as tags 10–16 (recorded on Issue #1040).
 const TAG_TEXT_ARRAY: u8 = 17;
+// Multi-valued bytes (#1176): varint element count + per element the same
+// (mime, then data) length-prefixed layout the scalar tag 4 uses — an
+// empty mime string means `None`, exactly like the scalar case. Same
+// no-version-bump policy as tags 10–17 (recorded on Issue #1040).
+const TAG_BYTES_ARRAY: u8 = 18;
 
 // ---------------------------------------------------------------------------
 // Encoding (document -> plain bytes, before compression)
@@ -250,6 +255,17 @@ fn encode_document(buf: &mut Vec<u8>, doc_id: u64, fields: &AHashMap<String, Dat
                 for text in arr {
                     write_varint(buf, text.len() as u64);
                     buf.extend_from_slice(text.as_bytes());
+                }
+            }
+            DataValue::BytesArray(arr) => {
+                buf.push(TAG_BYTES_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for (data, mime) in arr {
+                    let mime_str = mime.as_deref().unwrap_or("");
+                    write_varint(buf, mime_str.len() as u64);
+                    buf.extend_from_slice(mime_str.as_bytes());
+                    write_varint(buf, data.len() as u64);
+                    buf.extend_from_slice(data);
                 }
             }
         }
@@ -493,6 +509,27 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                     )?);
                 }
                 DataValue::TextArray(arr)
+            }
+            TAG_BYTES_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored BytesArray field length")?;
+                // Elements are variable-width (a mime string plus a data
+                // blob), so the only honest bound is the 2-byte minimum an
+                // empty-mime, empty-data element occupies.
+                let len = checked_capacity_u64(
+                    len,
+                    2,
+                    (bytes.len() - *cursor) as u64,
+                    "stored BytesArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let mime =
+                        read_len_prefixed_str(bytes, cursor, "stored BytesArray field mime")?;
+                    let data =
+                        read_len_prefixed_bytes(bytes, cursor, "stored BytesArray field data")?;
+                    arr.push((data, if mime.is_empty() { None } else { Some(mime) }));
+                }
+                DataValue::BytesArray(arr)
             }
             other => {
                 return Err(LaurusError::index(format!(
@@ -922,6 +959,17 @@ mod tests {
                     ]),
                 ),
                 ("w_text_array_empty", DataValue::TextArray(Vec::new())),
+                // Multi-valued bytes (#1176): a mixed-MIME element, a
+                // no-MIME element, an empty-data element, and the empty list.
+                (
+                    "x_bytes_array",
+                    DataValue::BytesArray(vec![
+                        (vec![1, 2, 3, 4], Some("image/png".to_string())),
+                        (vec![9, 9], None),
+                        (Vec::new(), Some("application/octet-stream".to_string())),
+                    ]),
+                ),
+                ("y_bytes_array_empty", DataValue::BytesArray(Vec::new())),
             ]),
         )];
 
@@ -1023,6 +1071,39 @@ mod tests {
             d.fields.get("w_text_array_empty"),
             Some(&DataValue::TextArray(Vec::new()))
         );
+        assert_eq!(
+            d.fields.get("x_bytes_array"),
+            Some(&DataValue::BytesArray(vec![
+                (vec![1, 2, 3, 4], Some("image/png".to_string())),
+                (vec![9, 9], None),
+                (Vec::new(), Some("application/octet-stream".to_string())),
+            ]))
+        );
+        assert_eq!(
+            d.fields.get("y_bytes_array_empty"),
+            Some(&DataValue::BytesArray(Vec::new()))
+        );
+    }
+
+    /// #1176: unlike a bool array, a bytes-array element has no "impossible"
+    /// byte pattern — the loud-failure pin is a length header that
+    /// overshoots the bytes left, caught by `checked_capacity` up front.
+    #[test]
+    fn rejects_a_truncated_bytes_array() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // doc id
+        write_varint(&mut buf, 1); // field count
+        write_varint(&mut buf, 1); // name length
+        buf.extend_from_slice(b"t");
+        buf.push(TAG_BYTES_ARRAY);
+        write_varint(&mut buf, 64); // declares 64 elements ...
+        write_varint(&mut buf, 0); // ... but only one empty-mime, ...
+        write_varint(&mut buf, 1); // ... one-byte-data element follows
+        buf.push(b'a');
+
+        let mut cursor = 0;
+        let err = decode_document(&buf, &mut cursor).unwrap_err();
+        assert!(err.to_string().contains("header declares"), "{err}");
     }
 
     /// #1175: a length header that overshoots the bytes left must be

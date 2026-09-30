@@ -97,6 +97,12 @@ pub fn data_value_to_proto(val: &DataValue) -> v1::Value {
         DataValue::TextArray(arr) => Some(Kind::TextArrayValue(v1::TextArrayValue {
             values: arr.clone(),
         })),
+        // The per-element MIME type is dropped, matching the scalar
+        // `DataValue::Bytes` arm above -- the wire format has no place to
+        // carry it for either shape (Issue #1176).
+        DataValue::BytesArray(arr) => Some(Kind::BytesArrayValue(v1::BytesArrayValue {
+            values: arr.iter().map(|(b, _mime)| b.clone()).collect(),
+        })),
     };
     v1::Value { kind }
 }
@@ -138,6 +144,10 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
         ),
         Some(Kind::BoolArrayValue(arr)) => DataValue::BoolArray(arr.values.clone()),
         Some(Kind::TextArrayValue(arr)) => DataValue::TextArray(arr.values.clone()),
+        // Mime is always `None`, matching the scalar `BytesValue` arm above.
+        Some(Kind::BytesArrayValue(arr)) => {
+            DataValue::BytesArray(arr.values.iter().map(|b| (b.clone(), None)).collect())
+        }
         None => DataValue::Null,
     }
 }
@@ -302,6 +312,35 @@ mod tests {
         assert_eq!(data_value_from_proto(&proto), value);
 
         let empty = DataValue::TextArray(Vec::new());
+        assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
+    }
+
+    /// #1176: multi-valued bytes use the dedicated `BytesArrayValue` kind
+    /// and round-trip element-wise, including the empty list. The MIME type
+    /// carried per element is dropped over the wire, matching the existing
+    /// (lossy) behavior of the scalar `DataValue::Bytes` <-> `BytesValue`
+    /// conversion just above.
+    #[test]
+    fn data_value_bytes_arrays_round_trip() {
+        let value = DataValue::BytesArray(vec![
+            (b"hello".to_vec(), Some("text/plain".to_string())),
+            (Vec::new(), None),
+        ]);
+        let proto = data_value_to_proto(&value);
+        match &proto.kind {
+            Some(v1::value::Kind::BytesArrayValue(a)) => {
+                assert_eq!(a.values, vec![b"hello".to_vec(), Vec::new()]);
+            }
+            other => panic!("expected BytesArrayValue, got {other:?}"),
+        }
+        let back = data_value_from_proto(&proto);
+        assert_eq!(
+            back,
+            DataValue::BytesArray(vec![(b"hello".to_vec(), None), (Vec::new(), None)]),
+            "mime is not carried over the wire, same as the scalar Bytes arm"
+        );
+
+        let empty = DataValue::BytesArray(Vec::new());
         assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
     }
 

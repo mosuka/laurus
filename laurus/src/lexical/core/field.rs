@@ -425,6 +425,21 @@ pub struct BytesOption {
     /// If true, the value is stored.
     #[serde(default = "default_true")]
     pub stored: bool,
+
+    /// Whether this field accepts multiple values per document
+    /// (Issue #1176).
+    ///
+    /// When `true`, the field accepts [`DataValue::BytesArray`] (a single
+    /// `Bytes` is auto-wrapped into a one-element array), each element
+    /// carrying its own optional MIME type just like the scalar variant.
+    /// `Bytes` fields are never indexed, so unlike the other multi-valued
+    /// types this has no BKD/term-posting "any match" query semantics — it
+    /// only governs the stored shape and ingestion arity.
+    ///
+    /// When `false` (the default), a `BytesArray` value is rejected at
+    /// ingestion instead of being silently truncated.
+    #[serde(default)]
+    pub multi_valued: bool,
 }
 
 impl BytesOption {
@@ -433,11 +448,20 @@ impl BytesOption {
         self.stored = stored;
         self
     }
+
+    /// Set whether this field accepts multiple values per document.
+    pub fn multi_valued(mut self, multi_valued: bool) -> Self {
+        self.multi_valued = multi_valued;
+        self
+    }
 }
 
 impl Default for BytesOption {
     fn default() -> Self {
-        Self { stored: true }
+        Self {
+            stored: true,
+            multi_valued: false,
+        }
     }
 }
 
@@ -948,6 +972,10 @@ impl FieldOption {
                 multi_valued: true,
                 ..Default::default()
             }),
+            FieldValue::BytesArray(_) => FieldOption::Bytes(BytesOption {
+                multi_valued: true,
+                ..Default::default()
+            }),
         }
     }
 
@@ -1103,12 +1131,18 @@ mod tests {
                 false,
             ),
             (
-                FieldOption::Bytes(BytesOption { stored: true }),
+                FieldOption::Bytes(BytesOption {
+                    stored: true,
+                    ..Default::default()
+                }),
                 false, // Bytes has no `indexed` flag: always false.
                 true,
             ),
             (
-                FieldOption::Bytes(BytesOption { stored: false }),
+                FieldOption::Bytes(BytesOption {
+                    stored: false,
+                    ..Default::default()
+                }),
                 false,
                 false,
             ),

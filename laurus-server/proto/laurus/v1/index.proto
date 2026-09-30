@@ -250,6 +250,12 @@ message Geo3dOption {
 
 message BytesOption {
   bool stored = 1;
+  // When true, the field accepts `BytesArrayValue` (arrays of byte
+  // strings); a single value is auto-wrapped into a one-element array.
+  // Bytes fields are never indexed, so unlike the other multi-valued types
+  // this has no "any match" query semantics -- it only governs the stored
+  // shape and ingestion arity. Field number 2; `1` was already taken.
+  bool multi_valued = 2;
 }
 
 // Vector field options.

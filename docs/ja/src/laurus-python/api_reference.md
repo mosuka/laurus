@@ -210,7 +210,7 @@ class Schema:
 | `add_integer_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット整数フィールド。`multi_valued=True` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット浮動小数点フィールド。`multi_valued=True` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_boolean_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | ブールフィールド。`multi_valued=True` で `list[bool]` を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `list[bool]` として読み戻されます）。`doc_values` は上記を参照。 |
-| `add_bytes_field(name, *, stored=True)` | 生バイトフィールド。`doc_values` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
+| `add_bytes_field(name, *, stored=True, multi_valued=False)` | 生バイトフィールド。`doc_values` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`multi_valued=True` で `list[bytes]` を受け付けます（Issue #1176）。`Bytes` はそもそもインデックスされないため、他の `multi_valued` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値は `list[bytes]` として読み戻されます（MIME は保持されません）。 |
 | `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 地理座標フィールド（緯度/経度）。`multi_valued=True` で `(lat, lon)` タプルのリストを受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。`doc_values` は上記を参照。 |
 | `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued=True` で `(x, y, z)` タプルのリストを受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values` は上記を参照。 |
 | `add_datetime_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | UTC 日時フィールド。`multi_valued=True` で `datetime.datetime` / `str` のリストを受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC の RFC 3339 文字列の `list[str]` として読み戻されます）。`doc_values` は上記を参照。 |
@@ -589,6 +589,7 @@ Python の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `str` | `Text` | |
 | `bytes` | `Bytes` | |
 | `list[bool]` | `BoolArray` | 多値ブールフィールド。`bool` は `int` のサブクラスのため `list[int]` の規則より先にチェック。フィールドに `multi_valued=True` が必要 |
+| `list[bytes]` | `BytesArray` | 多値バイトフィールド（Issue #1176）。各要素は単一の `bytes` 値と同じ直接バイト経路をたどるため、MIME は常に `None`。`Bytes` はそもそもインデックスされないため、クエリ一致の意味論はなく保存時の形を変えるだけ。フィールドに `multi_valued=True` が必要 |
 | `list[int]` | `Int64Array` | 多値整数フィールド（`bool` のリストは代わりに `BoolArray` になり、多値の Float / Integer フィールドではコアが 0/1 に拡張する）。ベクトルフィールドではリストを `f32` にキャスト。空リストは空の `Int64Array` |
 | `list[float \| int]` | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドではリストを `f32` にキャスト |
 | `(lat, lon)` タプル | `Geo` | 2 つの `float` 値 |

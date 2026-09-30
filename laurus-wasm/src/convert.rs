@@ -44,7 +44,10 @@ pub fn json_to_document(value: &Value) -> Result<Document, JsValue> {
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
 /// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `array` of booleans     -> `DataValue::BoolArray` (multi-valued boolean, #1180)
-/// - `array` of other strings -> `DataValue::TextArray` (multi-valued text, #1175)
+/// - `array` of other strings -> `DataValue::TextArray` (multi-valued text, #1175); on a
+///   multi-valued `Bytes` field the schema-aware coercion further base64-decodes each
+///   element into a `DataValue::BytesArray` (#1176) — this function still returns
+///   `TextArray`, the same as the scalar `Bytes` case (see `DataValue::Bytes` doc)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -201,6 +204,18 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
         DataValue::TextArray(arr) => {
             Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
         }
+        // Each element rendered the same way the scalar `Bytes` arm above
+        // renders it (mime dropped; #1176). Not expected to round-trip back
+        // into a `BytesArray` through `json_to_data_value` — same
+        // intentional asymmetry as the scalar case, which also renders as a
+        // byte-integer array but only accepts base64 text as input.
+        DataValue::BytesArray(arr) => Value::Array(
+            arr.iter()
+                .map(|(data, _mime)| {
+                    Value::Array(data.iter().map(|b| serde_json::json!(*b)).collect())
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -337,5 +352,20 @@ mod tests {
     #[wasm_bindgen_test]
     fn mixed_bool_and_number_array_is_rejected() {
         assert!(json_to_data_value(&json!([true, 1])).is_err());
+    }
+
+    /// Issue #1176: a `BytesArray` renders as an array of byte-integer
+    /// arrays, each element in the same shape the scalar `Bytes` arm
+    /// renders (mime dropped). This is not expected to round-trip back
+    /// through `json_to_data_value` — the scalar `Bytes` case has the same
+    /// asymmetry, accepting base64 text as input but rendering as an
+    /// integer array on output.
+    #[wasm_bindgen_test]
+    fn bytes_array_renders_as_array_of_byte_arrays() {
+        let dv = DataValue::BytesArray(vec![
+            (vec![1, 2, 3], None),
+            (vec![4, 5], Some("image/png".to_string())),
+        ]);
+        assert_eq!(data_value_to_json(&dv), json!([[1, 2, 3], [4, 5]]));
     }
 }

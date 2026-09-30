@@ -417,8 +417,11 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         // always metadata-only: they only affect documents ingested after
         // the change, never data already on disk. `Bytes` has no
         // `doc_values` flag (Issue #1047: is_doc_values_candidate excludes
-        // it unconditionally), so there is no fold here.
-        (FieldOption::Bytes(_), FieldOption::Bytes(_)) => FieldChangeKind::MetadataOnly,
+        // it unconditionally), so there is no fold here. `multi_valued`
+        // (Issue #1176) is handled by `classify_bytes`.
+        (FieldOption::Bytes(o), FieldOption::Bytes(n)) => {
+            classify_bytes(o.multi_valued, n.multi_valued, o.stored)
+        }
 
         (FieldOption::Hnsw(o), FieldOption::Hnsw(n)) => {
             classify_vector_common(old, new).max(classify_hnsw_specific(o, n))
@@ -614,6 +617,33 @@ fn classify_term_lexical(
         });
     }
     kind
+}
+
+/// Classification for `BytesOption` (Issue #1176). `Bytes` has no `indexed`
+/// flag at all — it is never lexically indexed, unlike every other option —
+/// so only `multi_valued` needs a rule, following the same shape as
+/// [`classify_term_lexical`]'s `multi_valued` half: `false -> true` is
+/// metadata-only (an existing scalar value is a valid one-element read even
+/// without a rebuild); `true -> false` needs a rebuild so a pre-existing
+/// multi-valued stored value is not silently read back as absent by
+/// scalar-only accessors like `DataValue::as_bytes`, which returns `None`
+/// for a `BytesArray`. That rebuild is `Reindex` when `old_stored` (the
+/// rebuild can recover the original values from the segment's stored
+/// fields) and `Destructive` otherwise (nothing to recover from).
+fn classify_bytes(
+    old_multi_valued: bool,
+    new_multi_valued: bool,
+    old_stored: bool,
+) -> FieldChangeKind {
+    if old_multi_valued && !new_multi_valued {
+        if old_stored {
+            FieldChangeKind::Reindex
+        } else {
+            FieldChangeKind::Destructive
+        }
+    } else {
+        FieldChangeKind::MetadataOnly
+    }
 }
 
 /// Classification for the parameters shared by every vector variant
@@ -1367,12 +1397,40 @@ mod tests {
                 geo3d(|o| o.stored(false)),
                 Reindex,
             ),
-            // ---- Bytes (no `indexed`; only `stored`) ----
+            // ---- Bytes (no `indexed`; only `stored` and `multi_valued`) ----
             (
                 "bytes: stored toggle is metadata-only",
                 bytes(|o| o),
                 bytes(|o| o.stored(false)),
                 MetadataOnly,
+            ),
+            (
+                "bytes: multi_valued false->true is metadata-only",
+                bytes(|o| o),
+                bytes(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                MetadataOnly,
+            ),
+            (
+                "bytes: multi_valued true->false requires reindex (stored fields are the only source)",
+                bytes(|mut o| {
+                    o.multi_valued = true;
+                    o
+                }),
+                bytes(|o| o),
+                Reindex,
+            ),
+            (
+                "bytes: multi_valued true->false on a stored:false field is destructive (nothing to rebuild from)",
+                bytes(|mut o| {
+                    o.stored = false;
+                    o.multi_valued = true;
+                    o
+                }),
+                bytes(|o| o.stored(false)),
+                Destructive,
             ),
             // ---- Hnsw ----
             (

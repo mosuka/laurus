@@ -180,11 +180,13 @@ doc_values = true
 ```toml
 [fields.thumbnail.Bytes]
 stored = true
+multi_valued = false
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `stored` | `bool` | `true` | バイナリデータを保存する |
+| `multi_valued` | `bool` | `false` | バイト列の配列を受け付ける。`Bytes` フィールドはそもそもインデックスされないため、他の `multi_valued` オプションと異なり "any match" のクエリ意味論は存在せず、保存時の形と取り込み時の許容個数を変えるだけ |
 
 `BytesOption` に `doc_values` 設定はありません。`Bytes` の値はソートにもファセットにも
 使えないため、設定にかかわらず DocValues には一切書き込まれないからです。

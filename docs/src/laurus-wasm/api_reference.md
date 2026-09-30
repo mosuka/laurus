@@ -463,10 +463,16 @@ trait objects). Instead, use the `Index.searchGeo3dDistance` /
 `Index.searchGeo3dBoundingBox` / `Index.searchGeo3dNearest` methods documented
 above.
 
-#### `addBytesField(name, stored?)`
+#### `addBytesField(name, stored?, multiValued?)`
 
 Add a binary data field. No `docValues` option: a `Bytes` value is never
-written to DocValues regardless.
+written to DocValues regardless. Pass `multiValued: true` to accept an array
+of base64 strings (Issue #1176), decoded element-wise by the schema-aware
+coercion the same way a single base64 string is; `Bytes` is never indexed,
+so unlike every other `multiValued` option this has no query-matching
+semantics — it only governs the stored shape and ingestion arity. Values
+are read back as an array of byte-integer arrays with MIME dropped, the
+same input/output asymmetry the scalar field already has.
 
 #### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)`
 

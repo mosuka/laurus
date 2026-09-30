@@ -494,13 +494,24 @@ fn prompt_indexed_stored_option(type_name: &str) -> Result<FieldOption> {
     })
 }
 
-/// Prompt for BytesOption (stored only).
+/// Prompt for BytesOption (stored + multi-valued).
+///
+/// Bytes fields are never indexed, so unlike `prompt_indexed_stored_option`
+/// there is no "Indexed?"/"Doc values?" question here — multi-valued only
+/// governs ingestion arity and the stored shape (#1176).
 fn prompt_bytes_option() -> Result<FieldOption> {
     let stored = Confirm::new()
         .with_prompt("Stored?")
         .default(true)
         .interact()?;
-    Ok(FieldOption::Bytes(BytesOption { stored }))
+    let multi_valued = Confirm::new()
+        .with_prompt("Multi-valued? (accepts arrays of values)")
+        .default(false)
+        .interact()?;
+    Ok(FieldOption::Bytes(BytesOption {
+        stored,
+        multi_valued,
+    }))
 }
 
 /// Prompt for a distance metric selection.

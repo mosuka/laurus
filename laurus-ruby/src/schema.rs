@@ -585,15 +585,23 @@ impl RbSchema {
     /// * `args` - Positional and keyword arguments:
     ///   - `name` (String): Field name.
     ///   - `stored:` (bool, default true): Whether the value is retrievable.
+    ///   - `multi_valued:` (bool, default false): When true, the field
+    ///     accepts an Array of binary values (each with its own optional
+    ///     MIME type).
     fn add_bytes_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<bool>,), ()>(args.keywords, &[], &["stored"])?;
-        let (stored,) = kwargs.optional;
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<bool>), ()>(
+            args.keywords,
+            &[],
+            &["stored", "multi_valued"],
+        )?;
+        let (stored, multi_valued) = kwargs.optional;
         self.inner.borrow_mut().fields.insert(
             name,
             FieldOption::Bytes(BytesOption {
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
             }),
         );
         Ok(())

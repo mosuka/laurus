@@ -176,5 +176,12 @@ fn format_data_value(value: &DataValue) -> String {
         }
         DataValue::BoolArray(arr) => format!("{arr:?}"),
         DataValue::TextArray(arr) => format!("[{}]", arr.join(", ")),
+        DataValue::BytesArray(arr) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|(b, _)| format!("[{} bytes]", b.len()))
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
     }
 }

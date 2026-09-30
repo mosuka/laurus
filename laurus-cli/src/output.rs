@@ -346,6 +346,14 @@ fn format_data_value(value: &DataValue) -> String {
                 .join(", ")
         ),
         DataValue::TextArray(arr) => format!("[{}]", arr.join(", ")),
+        // Same per-element format the scalar `Bytes` arm produces (#1176).
+        DataValue::BytesArray(arr) => format!(
+            "[{}]",
+            arr.iter()
+                .map(|(b, _)| format!("<{} bytes>", b.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -397,6 +405,21 @@ fn data_value_to_json(value: &DataValue) -> serde_json::Value {
         // multi-valued text field (#1175) — or a datetime array when every
         // element is RFC 3339.
         DataValue::TextArray(arr) => json!(arr),
+        // Same per-value `{"data": "<base64>", "mime": ...}` object shape as
+        // the single-valued `Bytes` arm (#1176). An *undeclared* field can
+        // never infer this shape back (a JSON array of base64 strings is
+        // indistinguishable from a plain text array — see
+        // `type_inference::infer_option_from_data_value`), so this only
+        // round-trips through `put docs` when the target field is already
+        // declared `Bytes` with `multi_valued = true`.
+        DataValue::BytesArray(arr) => json!(
+            arr.iter()
+                .map(|(b, mime)| json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(b),
+                    "mime": mime
+                }))
+                .collect::<Vec<_>>()
+        ),
     }
 }
 

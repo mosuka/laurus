@@ -479,6 +479,20 @@ pub fn data_value_to_zval(value: &DataValue) -> PhpResult<Zval> {
             }
             zv.set_hashtable(arr);
         }
+        // An array of binary values, delegating each element to the scalar
+        // `Bytes` arm above (#1176). MIME metadata is discarded per element,
+        // matching the scalar arm.
+        DataValue::BytesArray(values) => {
+            let mut arr = ZendHashTable::new();
+            for (b, mime) in values {
+                arr.push(data_value_to_zval(&DataValue::Bytes(
+                    b.clone(),
+                    mime.clone(),
+                ))?)
+                .map_err(|_| "failed to push bytes value")?;
+            }
+            zv.set_hashtable(arr);
+        }
     }
     Ok(zv)
 }

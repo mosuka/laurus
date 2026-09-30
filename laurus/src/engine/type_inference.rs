@@ -149,6 +149,14 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
         DataValue::Bytes(_, _) => Err(LaurusError::invalid_argument(
             "bytes values require an explicit bytes field declaration in the schema",
         )),
+        // A JSON array of base64 strings is indistinguishable from
+        // `TextArray`, so `BytesArray` can never be inferred from raw
+        // input — only a field explicitly declared with
+        // `BytesOption::multi_valued = true` can hold it (Issue #1176).
+        DataValue::BytesArray(_) => Err(LaurusError::invalid_argument(
+            "bytes array values require an explicit multi-valued bytes field declaration \
+             in the schema",
+        )),
     }
 }
 

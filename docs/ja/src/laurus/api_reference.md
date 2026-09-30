@@ -60,7 +60,7 @@ cargo doc --open
 | `.add_datetime_field(name, DateTimeOption)` | 日時フィールドを追加（`DateTimeOption::multi_valued = true` で時刻配列対応） |
 | `.add_geo_field(name, GeoOption)` | 2D 地理（緯度/経度）フィールドを追加（`GeoOption::multi_valued = true` でポイント配列対応） |
 | `.add_geo3d_field(name, Geo3dOption)` | 3D ECEF 直交座標系の点フィールド（x, y, z メートル単位）を追加（`Geo3dOption::multi_valued = true` でポイント配列対応） |
-| `.add_bytes_field(name, BytesOption)` | バイナリフィールドを追加 |
+| `.add_bytes_field(name, BytesOption)` | バイナリフィールドを追加（`BytesOption::multi_valued = true` でバイト列配列対応。`Bytes` はそもそもインデックスされないため、これは保存時の形と取り込み時の許容個数を変えるだけ） |
 | `.add_hnsw_field(name, HnswOption)` | HNSWベクトルフィールドを追加 |
 | `.add_flat_field(name, FlatOption)` | Flatベクトルフィールドを追加 |
 | `.add_ivf_field(name, IvfOption)` | IVFベクトルフィールドを追加 |
@@ -102,6 +102,7 @@ cargo doc --open
 | `.add_bool_array(name, values)` | 多値真偽値フィールドを追加（`Vec<bool>`） |
 | `.add_text_array(name, values)` | 多値テキストフィールドを追加（`Vec<String>`） |
 | `.add_bytes(name, data)` | バイナリデータを追加 |
+| `.add_bytes_array(name, values)` | 多値バイナリフィールドを追加（`Vec<(Vec<u8>, Option<String>)>`。各要素が独自の任意 MIME タイプを持つ） |
 | `.build()` | `Document` を構築 |
 
 ## Search
@@ -238,3 +239,4 @@ cargo doc --open
 | `DataValue::DateTimeArray(Vec<DateTime<Utc>>)` | 多値の時刻（`multi_valued` フィールドオプションが必要） |
 | `DataValue::BoolArray(Vec<bool>)` | 多値の真偽値（`multi_valued` フィールドオプションが必要） |
 | `DataValue::TextArray(Vec<String>)` | 多値の文字列（`multi_valued` フィールドオプションが必要） |
+| `DataValue::BytesArray(Vec<(Vec<u8>, Option<String>)>)` | 多値のバイナリデータ。各要素が独自の任意 MIME タイプを持つ（`multi_valued` フィールドオプションが必要。インデックスされない） |

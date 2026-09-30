@@ -321,7 +321,7 @@ impl LaurusMcpServer {
     ///
     /// The schema describes the fields of the documents that will be indexed.
     #[tool(
-        description = "Create a new search index with the provided schema. The schema_json must be a JSON string defining index fields (Text, Integer, Float, Boolean, DateTime, Hnsw, Flat, Ivf, etc.). An optional top-level \"dynamic_field_policy\" key controls how fields not listed in the schema are treated at ingest time: \"Strict\" rejects them, \"Dynamic\" (default) infers a type and adds the field (note: Integer fields silently truncate incoming float values), \"Ignore\" drops them silently. Call this before add_document or search if the index does not exist yet."
+        description = "Create a new search index with the provided schema. The schema_json must be a JSON string defining index fields (Text, Integer, Float, Boolean, DateTime, Bytes, Hnsw, Flat, Ivf, etc.). An optional top-level \"dynamic_field_policy\" key controls how fields not listed in the schema are treated at ingest time: \"Strict\" rejects them, \"Dynamic\" (default) infers a type and adds the field (note: Integer fields silently truncate incoming float values), \"Ignore\" drops them silently. Call this before add_document or search if the index does not exist yet."
     )]
     async fn create_index(
         &self,

@@ -60,6 +60,7 @@ pub fn hash_to_document(ruby: &Ruby, hash: RHash) -> Result<Document, Error> {
 /// | `Array` of `Time` / RFC 3339 Strings | `DateTimeArray` (multi-valued datetime, #1184) |
 /// | `Array` of `true` / `false`   | `BoolArray` (multi-valued boolean, #1180) |
 /// | `Array` of Strings            | `TextArray` (multi-valued text, #1175), or `DateTimeArray` when every element parses as a datetime |
+/// | `Array` of Strings, on a multi-valued `Bytes` field | `BytesArray`, each element base64-decoded (multi-valued bytes, #1176) — this reinterpretation happens in the schema-aware coercion, not here; this function still returns `TextArray` |
 /// | `Hash` with `"lat"`, `"lon"`  | `Geo`                |
 /// | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` (3D ECEF Cartesian, meters) |
 /// | `Time` / ISO 8601 string      | `DateTime`           |
@@ -398,6 +399,18 @@ pub fn data_value_to_rb(ruby: &Ruby, value: &DataValue) -> Result<Value, Error> 
             let out = ruby.ary_new_capa(arr.len());
             for s in arr {
                 out.push(ruby.str_new(s))?;
+            }
+            Ok(out.as_value())
+        }
+        // An Array of the same values the single-valued `Bytes` arm
+        // produces, each element converted independently (#1176).
+        DataValue::BytesArray(arr) => {
+            let out = ruby.ary_new_capa(arr.len());
+            for (data, mime) in arr {
+                out.push(data_value_to_rb(
+                    ruby,
+                    &DataValue::Bytes(data.clone(), mime.clone()),
+                )?)?;
             }
             Ok(out.as_value())
         }

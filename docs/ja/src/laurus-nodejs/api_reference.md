@@ -200,7 +200,7 @@ class Schema {
 | `addIntegerField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット整数フィールド。`multiValued: true` で整数配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
 | `addFloatField(name, stored?, indexed?, multiValued?, docValues?)` | 64 ビット浮動小数点フィールド。`multiValued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`docValues` は上記を参照。 |
 | `addBooleanField(name, stored?, indexed?, multiValued?, docValues?)` | 真偽値フィールド。`multiValued: true` で真偽値の配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は真偽値の配列として読み戻されます）。`docValues` は上記を参照。 |
-| `addBytesField(name, stored?)` | バイナリデータフィールド。`docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
+| `addBytesField(name, stored?, multiValued?)` | バイナリデータフィールド。`docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`multiValued: true` を渡すと base64 文字列の配列を受け付け（Issue #1176）、単一の base64 文字列と同じ方法でスキーマ対応の変換が要素ごとにデコードします。`Bytes` はそもそもインデックスされないため、他の `multiValued` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値は MIME を落としたバイト整数配列の配列として読み戻され、スカラーフィールドと同じ入出力の非対称性を持ちます。 |
 | `addGeoField(name, stored?, indexed?, multiValued?, docValues?)` | 地理座標フィールド。`multiValued: true` で `{ lat, lon }` オブジェクトの配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`docValues` は上記を参照。 |
 | `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multiValued: true` で `{ x, y, z }` オブジェクトの配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
 | `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)` | UTC 日時フィールド。`multiValued: true` で RFC 3339 文字列の配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`docValues` は上記を参照。 |
@@ -713,5 +713,5 @@ JavaScript の値は自動的に Laurus の `DataValue` 型に変換されます
 | `{ lat, lon }[]` | `GeoArray` | `{ lat, lon }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `{ x, y, z }[]` | `GeoEcefArray` | `{ x, y, z }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `string[]`（すべて RFC 3339） | `DateTimeArray` | RFC 3339 日時文字列の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要 |
-| `string[]`（すべてが RFC 3339 ではない） | `TextArray` | 文字列の配列（Issue #1175）。フィールドに `multiValued: true` が必要。`string[]` として読み戻される |
+| `string[]`（すべてが RFC 3339 ではない） | `TextArray` | 文字列の配列（Issue #1175）。フィールドに `multiValued: true` が必要。`string[]` として読み戻される。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列がスキーマ対応の変換によって要素ごとに `BytesArray` にデコードされる（Issue #1176） |
 | `boolean[]` | `BoolArray` | 真偽値の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要。`[true, 1]` のような混在配列は拒否される |

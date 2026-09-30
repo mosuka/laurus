@@ -456,6 +456,7 @@ fn sort_type_rank(v: &crate::lexical::core::field::FieldValue) -> u8 {
         FieldValue::DateTimeArray(_) => 13,
         FieldValue::BoolArray(_) => 14,
         FieldValue::TextArray(_) => 15,
+        FieldValue::BytesArray(_) => 16,
     }
 }
 

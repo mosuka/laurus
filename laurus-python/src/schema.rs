@@ -462,11 +462,21 @@ impl PySchema {
     }
 
     /// Add a binary data field.
-    #[pyo3(signature = (name, *, stored=true))]
-    pub fn add_bytes_field(&mut self, name: &str, stored: bool) {
-        self.inner
-            .fields
-            .insert(name.to_string(), FieldOption::Bytes(BytesOption { stored }));
+    ///
+    /// Args:
+    ///     name: Field name.
+    ///     stored: Whether the value is retrievable (default True).
+    ///     multi_valued: When True, the field accepts a list of binary
+    ///         values (each with its own optional MIME type). Default False.
+    #[pyo3(signature = (name, *, stored=true, multi_valued=false))]
+    pub fn add_bytes_field(&mut self, name: &str, stored: bool, multi_valued: bool) {
+        self.inner.fields.insert(
+            name.to_string(),
+            FieldOption::Bytes(BytesOption {
+                stored,
+                multi_valued,
+            }),
+        );
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.

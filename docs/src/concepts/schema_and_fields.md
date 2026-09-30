@@ -237,6 +237,7 @@ graph LR
 | `add_geo(name, lat, lon)` | `(f64, f64)` | Add a 2D geographic point (WGS84) |
 | `add_geo_ecef(name, x, y, z)` | `(f64, f64, f64)` | Add a 3D ECEF Cartesian point (metres) |
 | `add_bytes(name, data)` | `Vec<u8>` | Add binary data |
+| `add_bytes_array(name, values)` | `Vec<(Vec<u8>, Option<String>)>` | Add a multi-valued binary field, each element carrying its own optional MIME type |
 | `add_field(name, value)` | `DataValue` | Add any value type |
 
 ## DataValue
@@ -262,6 +263,7 @@ pub enum DataValue {
     DateTimeArray(Vec<DateTime<Utc>>), // multi-valued datetime field
     BoolArray(Vec<bool>),            // multi-valued boolean field
     TextArray(Vec<String>),          // multi-valued text field
+    BytesArray(Vec<(Vec<u8>, Option<String>)>), // multi-valued bytes field, per-element MIME
 }
 ```
 
@@ -458,10 +460,32 @@ stores positions (`term_vectors: true`) — `Reindex` when `stored`,
 under the old gap; when `term_vectors` is `false` the gap is unobservable
 and the change is metadata-only.
 
+Bytes fields accept `multi_valued = true` as well (Issue #1176), but the
+mechanism differs from every other multi-valued type, Boolean included:
+`BytesOption` has no `indexed` flag at all — a `Bytes` value is **never
+lexically indexed**, so there are no BKD points and no term postings, and
+`multi_valued` has no "any match" query semantics to speak of. It only
+governs the stored shape and the ingestion arity. `DataValue::BytesArray`
+is `Vec<(Vec<u8>, Option<String>)>`: unlike the bare `Vec<T>` every other
+`*Array` variant uses, each element mirrors the scalar
+`Bytes(Vec<u8>, Option<String>)` shape exactly, carrying its own MIME
+type. A `Bytes` value — scalar or array — can never be inferred for an
+**undeclared** field under the `Dynamic` policy (see
+[Type inference rules](#type-inference-rules-dynamic-policy) above); a
+multi-valued bytes field must always be declared explicitly. Once
+declared, a single `Bytes` value or a base64 `Text` string is auto-wrapped
+into a one-element array (a `Text` element is decoded as base64, the same
+rule the scalar field uses), and an empty numeric array (`[]`) is accepted
+as an empty byte-value list. Turning `multi_valued` on for an existing
+Bytes field is a metadata-only change; turning it off requires a reindex
+when the field is `stored`, and is **Destructive** when the field is
+`stored: false` — like Boolean and Text, there is no point tree or
+postings to rebuild from, only the stored value.
+
 Faceting expands every multi-valued type element by element (Issue #1187):
 each integer, float, boolean, datetime or text element becomes its own facet
 value (a text element containing `/` becomes a hierarchical path), counted
-once per document even when an element repeats; geo arrays are not
+once per document even when an element repeats; geo and bytes arrays are not
 facetable and contribute nothing. See
 [Faceting](../laurus/faceting.md#multi-valued-fields) for the element formats.
 
@@ -470,18 +494,24 @@ one-element array; arrays sent to a single-valued field are rejected
 rather than silently truncating (the error tells you to declare the field
 with `multi_valued = true`). An empty array sent to a multi-valued geo,
 datetime, boolean or text field is accepted and simply has no points,
-instants or terms, so it matches no spatial, range, term or phrase query.
+instants or terms, so it matches no spatial, range, term or phrase query;
+an empty array on a multi-valued bytes field is accepted the same way and
+is simply stored as an empty list — a `Bytes` field is never queried, so
+there is no query for it to not match.
 
-Segments that contain multi-valued geo, datetime, boolean or text values
-use new stored-field type tags and cannot be read by builds that predate
-these features; there is no format version bump, so an older reader fails
-loudly instead of misreading the data. Stored multi-valued datetimes are
-kept at microsecond precision (one `i64` Unix microsecond per instant, so
-sub-microsecond digits are truncated), whereas a single-valued `DateTime`
-keeps its full precision. Stored multi-valued booleans are written one
-byte per element (not bit-packed). Stored multi-valued text values are
-written as an element count followed by each string with its length
-prefix — the same body as a single-valued text value.
+Segments that contain multi-valued geo, datetime, boolean, text or bytes
+values use new stored-field type tags and cannot be read by builds that
+predate these features; there is no format version bump, so an older
+reader fails loudly instead of misreading the data. Stored multi-valued
+datetimes are kept at microsecond precision (one `i64` Unix microsecond
+per instant, so sub-microsecond digits are truncated), whereas a
+single-valued `DateTime` keeps its full precision. Stored multi-valued
+booleans are written one byte per element (not bit-packed). Stored
+multi-valued text values are written as an element count followed by each
+string with its length prefix — the same body as a single-valued text
+value. Stored multi-valued bytes values are written as an element count
+followed by, for each element, the same (MIME, then data) length-prefixed
+layout the scalar `Bytes` value uses (an empty MIME string means `None`).
 
 ### Type conflicts
 
@@ -524,6 +554,12 @@ to coerce the value to the declared type. The coercion rules are:
 | `Text` with `multi_valued = true` | `Null` or empty numeric array (`[]`) | empty string list (matches no term or phrase query) |
 | `Text` with `multi_valued = true` | anything else (geo arrays, vectors, bytes) | error |
 | `Integer` / `Float` / `Boolean` / `DateTime` with `multi_valued = true` | `TextArray` | parsed element-wise under the same rule as a scalar `Text` (`["1", "2"]` → `[1, 2]`; a bad element is an error naming it). A single-valued `Integer` / `Float` / `Boolean` / `DateTime` rejects it, asking for `multi_valued = true` |
+| `Bytes` (single-valued) | `BytesArray` | error (declare `multi_valued = true`) |
+| `Bytes` with `multi_valued = true` | `BytesArray` | stored as-is |
+| `Bytes` with `multi_valued = true` | single `Bytes` or base64 `Text` | wrapped into a one-element array (same scalar rule as above) |
+| `Bytes` with `multi_valued = true` | `TextArray` | each element decoded as base64 (same scalar rule as above, applied element-wise; MIME is always `None`) |
+| `Bytes` with `multi_valued = true` | empty numeric array (`[]`) | empty byte-value list |
+| `Bytes` with `multi_valued = true` | anything else | error |
 | vector (`Hnsw`/`Flat`/`Ivf`) | `Text` or `Bytes` | passed through unchanged for the field's embedder |
 | vector (`Hnsw`/`Flat`/`Ivf`) | numeric array | cast element-wise to `f32` |
 
@@ -638,7 +674,7 @@ The requested change is classified into one of three kinds, reported as
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
   `distance`, a type change on a `stored: false` field, or turning
-  `multi_valued` off on a `stored: false` Boolean or Text field).
+  `multi_valued` off on a `stored: false` Boolean, Text or Bytes field).
 
 `Reindex` and `Destructive` changes are rejected unless you explicitly
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against

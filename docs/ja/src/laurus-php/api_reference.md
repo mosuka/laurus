@@ -181,7 +181,7 @@ new \Laurus\Schema()
 | `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット整数フィールド。`$multiValued = true` で整数配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット浮動小数点フィールド。`$multiValued = true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
 | `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | ブールフィールド。`$multiValued = true` で `bool` のシーケンシャル配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `bool` の配列として読み戻されます）。`$docValues` は上記を参照。 |
-| `addBytesField(string $name, bool $stored = true): void` | 生バイトフィールド。`$docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
+| `addBytesField(string $name, bool $stored = true, bool $multiValued = false): void` | 生バイトフィールド。`$docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`$multiValued = true` を渡すと base64 文字列のシーケンシャル配列を受け付け（Issue #1176）、単一の base64 文字列と同じ方法で要素ごとにデコードされます。`Bytes` はそもそもインデックスされないため、他の `$multiValued` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値はスカラーフィールドと同様、バイナリ文字列の配列として読み戻されます。 |
 | `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 地理座標フィールド（緯度/経度）。`$multiValued = true` で `["lat" => .., "lon" => ..]` 配列の配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`$docValues` は上記を参照。 |
 | `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`$multiValued = true` で `["x" => .., "y" => .., "z" => ..]` 配列の配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`$docValues` は上記を参照。 |
 | `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | UTC 日時フィールド。`$multiValued = true` で RFC 3339 文字列のシーケンシャル配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`$docValues` は上記を参照。 |
@@ -602,5 +602,5 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
 | `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 全要素が ISO 8601 としてパースできる場合のみ選ばれる。フィールドに `$multiValued = true` が必要 |
-| `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multiValued = true` が必要 |
+| `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multiValued = true` が必要。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列が要素ごとにデコードされる（Issue #1176） |
 | `array`（`bool`、シーケンシャル） | `BoolArray` | 全要素が `bool` であること。`[true, 1]` のような混在配列はエラー（"numeric array elements must be numeric"）。フィールドに `$multiValued = true` が必要 |

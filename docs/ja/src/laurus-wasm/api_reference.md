@@ -458,10 +458,16 @@ WASM バインディングは `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` /
 `Index.searchGeo3dDistance` / `Index.searchGeo3dBoundingBox` /
 `Index.searchGeo3dNearest` メソッドを使用してください。
 
-#### `addBytesField(name, stored?)`
+#### `addBytesField(name, stored?, multiValued?)`
 
 バイナリデータフィールドを追加します。`docValues` オプションはありません
 —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。
+`multiValued: true` を指定すると base64 文字列の配列を受け付け（Issue #1176）、
+単一の base64 文字列と同じ方法でスキーマ対応の変換が要素ごとにデコードします。
+`Bytes` はそもそもインデックスされないため、他の `multiValued` オプションと異なり
+クエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。
+値は MIME を落としたバイト整数配列の配列として読み戻され、スカラーフィールドと
+同じ入出力の非対称性を持ちます。
 
 #### `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)`
 

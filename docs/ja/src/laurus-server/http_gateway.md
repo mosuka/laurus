@@ -83,7 +83,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。
+レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
 
 ### フィールドの動的追加
 
