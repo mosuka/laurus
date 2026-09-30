@@ -2583,7 +2583,7 @@ impl InvertedIndexWriter {
         let bitmap = self.deletion_manager.as_ref()?.bitmap(segment_id)?;
         let membership = self.segment_membership(&range);
         Some(membership.held_deletions(
-            &bitmap,
+            &bitmap.deleted_docs.read().unwrap(),
             range.min_doc_id,
             range.max_doc_id,
             range.doc_count,

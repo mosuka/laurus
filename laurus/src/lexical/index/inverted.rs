@@ -37,6 +37,7 @@ use crate::storage::manifest as manifest_io;
 pub(crate) mod bmw;
 pub(crate) mod compound;
 pub mod core;
+pub(crate) mod deleted_docs;
 pub mod parsed_query_cache;
 pub(crate) mod per_segment_view;
 pub mod posting_cache;
@@ -411,7 +412,12 @@ impl InvertedIndex {
                     ),
                 )
             });
-        Some(membership.held_deletions(&bitmap, info.min_doc_id, info.max_doc_id, info.doc_count))
+        Some(membership.held_deletions(
+            &bitmap.into_deleted_docs(),
+            info.min_doc_id,
+            info.max_doc_id,
+            info.doc_count,
+        ))
     }
 
     /// Check if the index is closed.

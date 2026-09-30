@@ -11,7 +11,6 @@ use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::maintenance::deletion::DeletionBitmap;
 
 /// Information about a segment in the inverted index.
 ///
@@ -145,8 +144,13 @@ impl Membership {
         }
     }
 
-    /// How many of the documents the segment holds `bitmap` marks deleted
+    /// How many of the documents the segment holds `deleted` marks deleted
     /// (Issues #1211 / #1212).
+    ///
+    /// Counted from the set itself, not from a `.delmap` header's
+    /// `deleted_count`: a v1/v2 `.delmap` infers its range from its own bits,
+    /// and nothing checks a loaded bitmap against its segment's range, so
+    /// bits outside the range (or a stale counter) are possible.
     ///
     /// Exact unless the membership is unknown, where it is a lower bound:
     /// at most `width − doc_count` bits can sit on ids the segment does not
@@ -155,21 +159,21 @@ impl Membership {
     /// under-counts.
     pub(crate) fn held_deletions(
         &self,
-        bitmap: &DeletionBitmap,
+        deleted: &RoaringTreemap,
         min_doc_id: u64,
         max_doc_id: u64,
         doc_count: u64,
     ) -> u64 {
         match self {
             Membership::Empty => 0,
-            Membership::Range => bitmap.deleted_in_range(min_doc_id, max_doc_id),
-            Membership::Set(ids) => bitmap.deleted_count_in(ids),
+            Membership::Range => deleted.range_cardinality(min_doc_id..=max_doc_id),
+            Membership::Set(ids) => deleted.intersection_len(ids),
             Membership::Unknown => {
                 let gaps = range_width(min_doc_id, max_doc_id)
                     .unwrap_or(u64::MAX)
                     .saturating_sub(doc_count);
-                bitmap
-                    .deleted_in_range(min_doc_id, max_doc_id)
+                deleted
+                    .range_cardinality(min_doc_id..=max_doc_id)
                     .saturating_sub(gaps)
             }
         }
@@ -293,4 +297,28 @@ pub enum MergeStrategy {
 
     /// Balanced approach considering multiple factors.
     Balanced,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `held_deletions` counts the bits on documents the segment holds, not
+    /// every bit (Issue #1211): a v1/v2 `.delmap` infers its range from its
+    /// own bits, so a loaded bitmap can hold ids outside the segment's.
+    #[test]
+    fn held_deletions_counts_only_the_documents_the_segment_holds() {
+        let deleted: RoaringTreemap = [1u64, 2, 3, 50].into_iter().collect();
+
+        assert_eq!(Membership::Range.held_deletions(&deleted, 0, 9, 10), 3);
+        let held: RoaringTreemap = [3u64, 4].into_iter().collect();
+        assert_eq!(
+            Membership::Set(Arc::new(held)).held_deletions(&deleted, 3, 4, 2),
+            1
+        );
+        // Two of the range's ten ids are gaps, so at most two of its three
+        // bits are not real deletions.
+        assert_eq!(Membership::Unknown.held_deletions(&deleted, 0, 9, 8), 1);
+        assert_eq!(Membership::Empty.held_deletions(&deleted, 0, 9, 0), 0);
+    }
 }

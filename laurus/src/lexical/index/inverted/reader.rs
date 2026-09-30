@@ -22,6 +22,7 @@ use crate::lexical::index::inverted::core::posting::{DecodedPostingList, Posting
 use crate::lexical::index::inverted::core::terms::{
     InvertedIndexTerms, MergedInvertedIndexTerms, TermDictionaryAccess, Terms,
 };
+use crate::lexical::index::inverted::deleted_docs::DeletedDocs;
 use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
 use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
@@ -507,9 +508,10 @@ pub struct SegmentReader {
     /// DocValues reader for this segment.
     doc_values: RwLock<Option<Arc<DocValuesReader>>>,
 
-    /// The segment's deletion bitmap, read by [`Self::open`] and fixed for
-    /// the reader's life; `None` when the segment has no deletions.
-    deletion_bitmap: Option<Arc<DeletionBitmap>>,
+    /// The segment's deleted documents, read by [`Self::open`] and fixed for
+    /// the reader's life, so a check takes no lock (Issue #1301); `None` when
+    /// the segment has no deletions.
+    deleted_docs: Option<Arc<DeletedDocs>>,
 
     /// Cached BKD trees: field -> tree
     bkd_trees: RwLock<AHashMap<String, Arc<dyn BKDTree>>>,
@@ -580,7 +582,7 @@ impl SegmentReader {
         // could only hide an unreadable bitmap as "no deletions"; reading it
         // now fails the open instead. It also fixes the deletions for the
         // reader's life, as a snapshot.
-        let deletion_bitmap = Self::load_deletion_bitmap(&info, storage.as_ref())?;
+        let deleted_docs = Self::load_deletion_bitmap(&info, storage.as_ref())?;
         Ok(SegmentReader {
             info,
             storage,
@@ -589,7 +591,7 @@ impl SegmentReader {
             stored_documents: RwLock::new(None),
             norms: RwLock::new(None),
             doc_values: RwLock::new(None),
-            deletion_bitmap,
+            deleted_docs,
             bkd_trees: RwLock::new(AHashMap::new()),
             // Disabled by default; query readers enable it (Issue #612).
             posting_cache: PostingCache::new(0),
@@ -881,7 +883,8 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Read the segment's deletion bitmap, for [`Self::open`].
+    /// Read the segment's deletion bitmap as its deleted documents, for
+    /// [`Self::open`].
     ///
     /// # Returns
     ///
@@ -897,7 +900,7 @@ impl SegmentReader {
     fn load_deletion_bitmap(
         info: &SegmentInfo,
         storage: &dyn Storage,
-    ) -> Result<Option<Arc<DeletionBitmap>>> {
+    ) -> Result<Option<Arc<DeletedDocs>>> {
         if !info.has_deletions {
             return Ok(None);
         }
@@ -912,12 +915,17 @@ impl SegmentReader {
                 info.segment_id
             ))
         })?;
-        Ok(Some(Arc::new(bitmap)))
+        Ok(Some(Arc::new(DeletedDocs::new(
+            bitmap.into_deleted_docs(),
+            info.min_doc_id,
+            info.max_doc_id,
+            info.doc_count,
+        ))))
     }
 
-    /// The segment's deletion bitmap; `None` when it has no deletions.
-    fn deletions(&self) -> Option<Arc<DeletionBitmap>> {
-        self.deletion_bitmap.clone()
+    /// The segment's deleted documents; `None` when it has no deletions.
+    fn deletions(&self) -> Option<Arc<DeletedDocs>> {
+        self.deleted_docs.clone()
     }
 
     /// What this segment holds (Issue #1211), resolved once per reader.
@@ -954,16 +962,17 @@ impl SegmentReader {
     /// bit, so a caller relying on "no deletions" (the count fast path)
     /// never takes a bound for the truth.
     pub(crate) fn has_effective_deletions(&self) -> bool {
-        let Some(bitmap) = self.deletions() else {
+        let Some(deleted) = self.deletions() else {
             return false;
         };
+        let deleted = deleted.ids();
         let info = &self.info;
         match self.membership() {
             // The held count is only a lower bound here: any bit in range
             // might be a real deletion.
-            Membership::Unknown => bitmap.deleted_in_range(info.min_doc_id, info.max_doc_id) > 0,
+            Membership::Unknown => deleted.range_cardinality(info.min_doc_id..=info.max_doc_id) > 0,
             membership => {
-                membership.held_deletions(&bitmap, info.min_doc_id, info.max_doc_id, info.doc_count)
+                membership.held_deletions(deleted, info.min_doc_id, info.max_doc_id, info.doc_count)
                     > 0
             }
         }
@@ -990,7 +999,7 @@ impl SegmentReader {
             Membership::Unknown => self.doc_ids()?.into_iter().collect(),
         };
         Ok(match self.deletions() {
-            Some(bitmap) => &held - &*bitmap.deleted_docs.read().unwrap(),
+            Some(deleted) => &held - deleted.ids(),
             None => held,
         })
     }
@@ -1000,11 +1009,12 @@ impl SegmentReader {
         // Hot on the scoring path, which probes deletion status per scored
         // doc (often redundantly, since the posting iterator is already
         // deletion-filtered at decode time via `filter_deleted_soa`). The
-        // bitmap was read by `open`, so this is a bit test with no I/O.
+        // deletions were read by `open`, so this is a lookup with no I/O and
+        // no lock.
         Ok(self
-            .deletion_bitmap
+            .deleted_docs
             .as_ref()
-            .is_some_and(|bitmap| bitmap.is_deleted(doc_id)))
+            .is_some_and(|deleted| deleted.contains(doc_id)))
     }
 
     /// Drop deleted entries from a SoA-decoded posting list in lockstep
@@ -1013,7 +1023,7 @@ impl SegmentReader {
     /// deletions, avoiding any allocation in the common case.
     fn filter_deleted_soa(&self, decoded: DecodedPostingList) -> Result<DecodedPostingList> {
         // Fast path: nothing to filter.
-        let Some(bitmap) = self.deletion_bitmap.as_ref() else {
+        let Some(deleted) = self.deleted_docs.as_ref() else {
             return Ok(decoded);
         };
 
@@ -1025,7 +1035,7 @@ impl SegmentReader {
 
         for i in 0..n {
             let did = decoded.doc_ids[i] as u64;
-            if bitmap.is_deleted(did) {
+            if deleted.contains(did) {
                 continue;
             }
             doc_ids.push(decoded.doc_ids[i]);
@@ -1701,11 +1711,11 @@ impl SegmentReader {
     pub fn doc_count(&self) -> u64 {
         *self.live_doc_count.get_or_init(|| {
             let info = &self.info;
-            let Some(bitmap) = self.deletions() else {
+            let Some(deleted_docs) = self.deletions() else {
                 return info.doc_count;
             };
             let deleted = self.membership().held_deletions(
-                &bitmap,
+                deleted_docs.ids(),
                 info.min_doc_id,
                 info.max_doc_id,
                 info.doc_count,
@@ -1770,11 +1780,11 @@ impl SegmentReader {
         };
         // No bitmap — no deletions, or a `.delmap` that `open` found missing
         // — forwards the raw tree.
-        let Some(bitmap) = self.deletion_bitmap.clone() else {
+        let Some(deleted) = self.deletions() else {
             return Ok(Some(tree));
         };
         let snapshot = Arc::new(DeletionSnapshot {
-            bitmaps: vec![(self.info.min_doc_id, self.info.max_doc_id, bitmap)],
+            bitmaps: vec![(self.info.min_doc_id, self.info.max_doc_id, deleted)],
         });
         Ok(Some(Arc::new(DeletionFilteringBKDTree {
             inner: tree,
@@ -1811,10 +1821,10 @@ impl BKDTree for MultiSegmentBKDTree {
 /// to a no-op when no segment has deletions at all.
 #[derive(Debug, Clone)]
 struct DeletionSnapshot {
-    /// `(min_doc_id, max_doc_id, bitmap)` for each segment that has
+    /// `(min_doc_id, max_doc_id, deleted)` for each segment that has
     /// any recorded deletion. Segments with no deletions are not
     /// stored — they cannot contribute hits.
-    bitmaps: Vec<(u64, u64, Arc<DeletionBitmap>)>,
+    bitmaps: Vec<(u64, u64, Arc<DeletedDocs>)>,
 }
 
 impl DeletionSnapshot {
@@ -1831,8 +1841,8 @@ impl DeletionSnapshot {
     /// without touching the bitmap.
     #[inline]
     fn is_deleted(&self, doc_id: u64) -> bool {
-        for (min, max, bitmap) in &self.bitmaps {
-            if doc_id >= *min && doc_id <= *max && bitmap.is_deleted(doc_id) {
+        for (min, max, deleted) in &self.bitmaps {
+            if doc_id >= *min && doc_id <= *max && deleted.contains(doc_id) {
                 return true;
             }
         }
@@ -2287,7 +2297,7 @@ struct SegmentLengths {
     min_doc_id: u64,
     max_doc_id: u64,
     /// `None` when the segment has no deletions.
-    deletions: Option<Arc<DeletionBitmap>>,
+    deletions: Option<Arc<DeletedDocs>>,
     norms: Arc<SegmentNorms>,
     /// The field's `.norms` column; `None` for a pre-#555 segment, which is
     /// looked up by field name.
@@ -2305,7 +2315,7 @@ impl SegmentLengths {
         if self
             .deletions
             .as_ref()
-            .is_some_and(|deletions| deletions.is_deleted(doc_id))
+            .is_some_and(|deletions| deletions.contains(doc_id))
         {
             return None;
         }
@@ -4813,6 +4823,71 @@ mod tests {
         let title = inverted.field_lengths("title").unwrap();
         assert_eq!(title.get(3), Some(5));
         assert_eq!(title.get(4), None);
+    }
+
+    /// #1301: a segment whose id range is too wide for a deletion bitset
+    /// answers deletion checks, the live count and field lengths like a
+    /// segment with one.
+    #[test]
+    fn a_segment_without_a_deletion_bitset_answers_like_one_with_it() {
+        use crate::Document;
+        use crate::lexical::reader::LexicalIndexReader;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let words = |n: u64| vec!["word"; n as usize].join(" ");
+        let upsert = |id: u64| {
+            store
+                .upsert_document(
+                    id,
+                    Document::builder()
+                        .add_text("body", words(1 + id % 7))
+                        .build(),
+                )
+                .unwrap()
+        };
+        // A segment without gaps: [200, 209].
+        (200..210).for_each(upsert);
+        store.commit().unwrap();
+        // Two documents in [5, 100]: 96 ids is wider than their 16 bits.
+        [5, 100].into_iter().for_each(upsert);
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(100).unwrap();
+        store.delete_document_by_internal_id(203).unwrap();
+        store.commit().unwrap();
+
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let bitsets: Vec<(u64, bool)> = inverted
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                let segment = segment.read().unwrap();
+                let deleted = segment.deletions().expect("both segments carry a deletion");
+                (segment.segment_info().min_doc_id, deleted.has_bits())
+            })
+            .collect();
+        assert_eq!(bitsets, vec![(200, true), (5, false)]);
+
+        let lengths = inverted.field_lengths("body").unwrap();
+        for id in 0..=210u64 {
+            let held = id == 5 || (200..210).contains(&id);
+            let deleted = id == 100 || id == 203;
+            assert_eq!(
+                LexicalIndexReader::is_deleted(inverted, id),
+                deleted,
+                "doc {id}"
+            );
+            let expected = (held && !deleted).then(|| (1 + id % 7) as u32);
+            assert_eq!(lengths.get(id), expected, "length of doc {id}");
+        }
+        assert_eq!(LexicalIndexReader::doc_count(inverted), 10);
     }
 
     /// `.norms` must win even when stale `.lens`/`.fstats` are also
