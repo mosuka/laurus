@@ -12,18 +12,21 @@
 use laurus::lexical::search::features::facet::FacetPath;
 
 // 単一レベルのファセット
-let facet = FacetPath::from_value("category", "Electronics");
+let facet = FacetPath::from_value("category".into(), "Electronics".into());
 
 // コンポーネントからの階層的ファセット
-let facet = FacetPath::new("category", vec![
+let facet = FacetPath::new("category".into(), vec![
     "Electronics".to_string(),
     "Computers".to_string(),
     "Laptops".to_string(),
 ]);
 
 // 区切り文字付き文字列から
-let facet = FacetPath::from_delimited("category", "Electronics/Computers/Laptops", "/");
+let facet = FacetPath::from_delimited("category".into(), "Electronics/Computers/Laptops", "/");
 ```
+
+`from_delimited` はコレクターと同じく空の成分を捨てます。そのため
+`"/Electronics//Computers"` は `["Electronics", "Computers"]` になります。
 
 #### FacetPathメソッド
 
@@ -52,11 +55,51 @@ pub struct FacetCount {
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `path` | `FacetPath` | ファセット値 |
-| `count` | `u64` | マッチするドキュメント数 |
-| `children` | `Vec<FacetCount>` | 階層的なドリルダウン用の子ファセット |
+| `path` | `FacetPath` | ファセット値。フィールドのトップレベルからの完全なパス |
+| `count` | `u64` | 値がこのパス、またはその下にある、マッチしたドキュメントの数 |
+| `children` | `Vec<FacetCount>` | 1 階層下のファセット。階層的なドリルダウン用 |
 
-## 例: 階層的ファセット
+### FacetConfig
+
+`FacetConfig` は、コレクターが何を数えて何を返すかを指定します。
+
+| フィールド | 既定値 | 説明 |
+| :--- | :--- | :--- |
+| `max_facets_per_field` | `100` | 1 階層あたりに残す値の最大数。各フィールドのトップレベルと、各ノードの子に、それぞれ別々に適用される。並べ替えの後に適用する |
+| `max_depth` | `10` | 集計時にパスを先頭 `max_depth` 個の成分で切り詰める。それより深い階層は数えない。`0` は何も数えず、`usize::MAX` はすべての階層を残す |
+| `min_count` | `1` | 値を返すのに必要な最小ドキュメント数。これに満たない値は、その子と一緒に落とされる |
+| `sort_by_count` | `true` | 各階層を件数の降順に並べ、同数ならラベル順にする。`false` なら各階層をラベル順に並べる |
+
+集計したドキュメントのどれも持たない値は返らないため、`min_count` の `0` は `1` と同じ動作になります。
+
+## ファセットの集計
+
+一致した各ドキュメントを `FacetCollector` に渡し、最後に `finalize` を呼びます。
+
+```rust
+use laurus::lexical::search::features::facet::{FacetCollector, FacetConfig};
+
+let mut collector = FacetCollector::new(FacetConfig::default(), vec!["category".to_string()]);
+for doc_id in matching_doc_ids {
+    collector.collect_doc(doc_id, reader.as_ref())?;
+}
+let results = collector.finalize()?;
+
+for facet in results.get_field_facets("category").into_iter().flatten() {
+    println!("{} ({})", facet.path.to_string_with_delimiter("/"), facet.count);
+}
+```
+
+ファセットのフィールドを stored document から読む必要があり、その読み取りに失敗すると、
+`collect_doc` はエラーを返します。エラーの後はコレクターの件数が不完全なので、そのコレクターは
+破棄してください。
+
+## 階層的ファセット
+
+`/` を含む `Text` 値は階層パスです。`Electronics/Computers/Laptops` は 3 階層です。コレクターは
+パスとその各祖先を、ドキュメントごとに 1 回ずつ数えます。`finalize` はフィールドごとに 1 つの
+ツリーを返します。トップレベルの値は `get_field_facets(field)` に、それより深い階層は親の
+`children` に入ります。
 
 ```text
 Category
@@ -70,7 +113,22 @@ Category
     └── Non-Fiction (15)
 ```
 
-このツリーの各ノードは、ドリルダウンナビゲーション用に `children` が設定された `FacetCount` に対応します。
+ノードの `count` は、値がそのパス、またはその下にあるドキュメントの数です。したがって、子の件数が
+親を上回ることはありません。フラットな値と、階層的な値の根は同じノードです。例えば `cat = "a"` の
+ドキュメントと `cat = "a/b"` のドキュメントからは、子 `b (1)` を 1 つ持つ `a (2)` が 1 つだけ
+できます。
+
+各階層は、それぞれ独立に絞り込み・並べ替え・切り詰めが行われます。
+
+- `min_count` は、値をその部分木全体と一緒に落とします。
+- `max_facets_per_field` は、トップレベルと各ノードの子に別々に適用されます。そのため、祖先が
+  子孫の枠を使い切ることはありません。
+- 件数が同じ値はラベル順に並ぶので、どの値が残るかがハッシュの順序に左右されません。これは
+  Lucene・Tantivy と同じです。
+
+空の成分は捨てられます。`"/a/b"` と `"a//b"` はどちらも `a/b` に、`"a/"` は `a` になり、`""` と
+`"/"` は何も数えません。Lucene は索引時にこのような成分を拒否します。laurus はファセットを検索時に
+通常のテキスト値から作るので、検索を失敗させる代わりに捨てます。
 
 ## ユースケース
 
@@ -105,9 +163,6 @@ Category
 `Null`、地理座標（`Geo`・`GeoEcef` とそれらの配列）、`Vector`、`Bytes` はファセットの対象外で、
 何も寄与しません。DocValues がヒットしてファセット値が 0 個になった場合でも、stored document
 へのフォールバックは行いません。
-
-階層パスは現状、入れ子の `children` ではなくフラットな兄弟（`["a"]`、`["a", "b"]`）として
-返されます。Issue #1192 を参照してください。
 
 ## パフォーマンス
 
