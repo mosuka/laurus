@@ -167,7 +167,10 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
-        FieldOption::Bytes(o) => Some(Opt::Bytes(v1::BytesOption { stored: o.stored })),
+        FieldOption::Bytes(o) => Some(Opt::Bytes(v1::BytesOption {
+            stored: o.stored,
+            multi_valued: o.multi_valued,
+        })),
         FieldOption::Hnsw(o) => Some(Opt::Hnsw(v1::HnswOption {
             dimension: o.dimension as u32,
             distance: distance_to_proto(&o.distance) as i32,
@@ -266,7 +269,10 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             // arm used to hardcode `true` and drop an explicit `false`.
             doc_values: o.doc_values.unwrap_or(true),
         })),
-        Some(Opt::Bytes(o)) => Some(FieldOption::Bytes(BytesOption { stored: o.stored })),
+        Some(Opt::Bytes(o)) => Some(FieldOption::Bytes(BytesOption {
+            stored: o.stored,
+            multi_valued: o.multi_valued,
+        })),
         Some(Opt::Hnsw(o)) => Some(FieldOption::Hnsw(HnswOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
@@ -1251,6 +1257,30 @@ mod tests {
                 assert!(!o.doc_values);
             }
             other => panic!("expected FieldOption::Boolean, got {other:?}"),
+        }
+    }
+
+    /// #1176: `BytesOption.multi_valued` (proto field 2) round-trips. Unlike
+    /// the other multi-valued options, `BytesOption` has no `indexed` /
+    /// `doc_values` flags to check alongside it.
+    #[test]
+    fn schema_field_option_bytes_multi_valued_round_trip() {
+        let schema = Schema::builder()
+            .add_field(
+                "attachments",
+                FieldOption::Bytes(BytesOption {
+                    stored: true,
+                    multi_valued: true,
+                }),
+            )
+            .build();
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("attachments") {
+            Some(FieldOption::Bytes(o)) => {
+                assert!(o.stored);
+                assert!(o.multi_valued);
+            }
+            other => panic!("expected FieldOption::Bytes, got {other:?}"),
         }
     }
 

@@ -21,6 +21,7 @@ message Value {
     DatetimeArrayValue datetime_array_value = 15;
     BoolArrayValue bool_array_value = 16;
     TextArrayValue text_array_value = 17;
+    BytesArrayValue bytes_array_value = 18;
   }
 }
 
@@ -95,6 +96,16 @@ message BoolArrayValue {
 // `TextOption.multi_valued`.
 message TextArrayValue {
   repeated string values = 1;
+}
+
+// A multi-valued bytes field (Lucene-style "any match" semantics do not
+// apply here -- bytes fields are never indexed, so this only governs the
+// stored shape and ingestion arity). Each element is a raw byte string, like
+// `bytes_value`; the per-element MIME type carried by
+// `laurus::DataValue::BytesArray` is not represented on the wire, matching
+// `bytes_value`, which likewise drops it. Requires `BytesOption.multi_valued`.
+message BytesArrayValue {
+  repeated bytes values = 1;
 }
 
 // A document consisting of named fields.

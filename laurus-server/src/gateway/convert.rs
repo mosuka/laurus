@@ -69,6 +69,16 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|s| Value::String(s.clone()))
                 .collect(),
         ),
+        // Same plain base64-string encoding as the scalar `BytesValue` arm
+        // above, one element per array entry. The per-element MIME type is
+        // not carried over the wire (see `data_value_to_proto`), so it has
+        // no JSON representation here either.
+        Some(Kind::BytesArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|b| Value::String(base64_encode(&base64_engine(), b)))
+                .collect(),
+        ),
         None => Value::Null,
     }
 }
@@ -531,6 +541,10 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
     } else if let Some(v) = obj.get("bytes") {
         Opt::Bytes(v1::BytesOption {
             stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            multi_valued: v
+                .get("multi_valued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     } else if let Some(v) = obj.get("hnsw") {
         Opt::Hnsw(json_to_hnsw_option(v)?)
@@ -651,8 +665,11 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             }
             json!({ "geo3d": obj })
         }
+        // `multi_valued` is always surfaced, like on every other option
+        // that carries it (#1176; see the comment on the BKD-backed arms
+        // above). `BytesOption` has no `indexed` / `doc_values` flags.
         Some(Opt::Bytes(v)) => json!({
-            "bytes": { "stored": v.stored }
+            "bytes": { "stored": v.stored, "multi_valued": v.multi_valued }
         }),
         Some(Opt::Hnsw(v)) => json!({ "hnsw": hnsw_option_to_json(v) }),
         Some(Opt::Flat(v)) => json!({ "flat": flat_option_to_json(v) }),
@@ -1641,6 +1658,24 @@ mod tests {
         assert!(err.contains("numeric"), "unexpected error: {err}");
     }
 
+    /// #1176: a `BytesArrayValue` proto value (as produced for a
+    /// multi-valued bytes field) renders as a JSON array of plain base64
+    /// strings -- the same encoding the scalar `BytesValue` arm already
+    /// uses, just one element per array entry. Unlike the geo/datetime/bool
+    /// array tests above, this cannot go through `json_value_to_proto`:
+    /// `infer_from_json` never infers `BytesArray` from raw JSON (Issue
+    /// #1176; a multi-valued bytes field must be declared explicitly), so
+    /// the proto value is built directly here.
+    #[test]
+    fn test_proto_bytes_array_value_renders_as_base64_array() {
+        let proto = v1::Value {
+            kind: Some(v1::value::Kind::BytesArrayValue(v1::BytesArrayValue {
+                values: vec![b"hi".to_vec(), b"there".to_vec(), Vec::new()],
+            })),
+        };
+        assert_eq!(proto_value_to_json(&proto), json!(["aGk=", "dGhlcmU=", ""]));
+    }
+
     /// #1174: `multi_valued` is read from and written to the JSON schema
     /// shape for every option that carries it (the BKD-backed ones and,
     /// since #1180, Boolean). Integer/Float used to accept it on input but
@@ -1668,6 +1703,24 @@ mod tests {
             let back = proto_field_option_to_json(&proto);
             assert_eq!(back[kind]["multi_valued"], json!(false), "{kind}");
         }
+    }
+
+    /// #1176: `BytesOption.multi_valued` round-trips through the JSON schema
+    /// shape too, even though bytes fields have no `indexed` flag, so they
+    /// cannot join the loop above.
+    #[test]
+    fn test_bytes_option_multi_valued_round_trips_through_json() {
+        let json = json!({ "bytes": {"stored": true, "multi_valued": true} });
+        let proto = json_to_proto_field_option(&json).unwrap();
+        let back = proto_field_option_to_json(&proto);
+        assert_eq!(back["bytes"]["multi_valued"], json!(true));
+        assert_eq!(back["bytes"]["stored"], json!(true));
+
+        // Absent on input means single-valued, and is still surfaced.
+        let json = json!({ "bytes": {"stored": true} });
+        let proto = json_to_proto_field_option(&json).unwrap();
+        let back = proto_field_option_to_json(&proto);
+        assert_eq!(back["bytes"]["multi_valued"], json!(false));
     }
 
     #[test]

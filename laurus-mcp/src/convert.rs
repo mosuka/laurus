@@ -96,6 +96,15 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
         ),
         Some(Kind::BoolArrayValue(arr)) => json!(arr.values),
         Some(Kind::TextArrayValue(arr)) => json!(arr.values),
+        // Array of the same plain base64 strings the scalar `BytesValue` arm
+        // produces (#1176); per-element MIME is not on the wire, matching
+        // the scalar arm.
+        Some(Kind::BytesArrayValue(arr)) => Value::Array(
+            arr.values
+                .iter()
+                .map(|b| Value::String(base64::engine::general_purpose::STANDARD.encode(b)))
+                .collect(),
+        ),
     }
 }
 
@@ -693,5 +702,25 @@ mod tests {
         let doc = v1::Document { fields };
         let json = document_to_json(&doc);
         assert_eq!(json["fields"]["thumb"], json!("aGk="));
+    }
+
+    #[test]
+    fn proto_bytes_array_to_json_is_base64_string_array() {
+        // #1176: a `BytesArrayValue` is surfaced to MCP clients as an array
+        // of the same plain base64 strings the scalar `BytesValue` arm
+        // produces, with no per-element MIME wrapper (matching the scalar
+        // arm, which also drops it).
+        let mut fields = HashMap::new();
+        fields.insert(
+            "thumbs".to_string(),
+            v1::Value {
+                kind: Some(v1::value::Kind::BytesArrayValue(v1::BytesArrayValue {
+                    values: vec![b"hi".to_vec(), b"bye".to_vec()],
+                })),
+            },
+        );
+        let doc = v1::Document { fields };
+        let json = document_to_json(&doc);
+        assert_eq!(json["fields"]["thumbs"], json!(["aGk=", "Ynll"]));
     }
 }
