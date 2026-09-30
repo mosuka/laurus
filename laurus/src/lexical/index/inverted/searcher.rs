@@ -2471,6 +2471,69 @@ mod tests {
         }
     }
 
+    /// A Should-only `BooleanQuery` on `body` with one clause per entry: a
+    /// `TermQuery` for a single term, a `SynonymQuery` for several.
+    fn should_clauses(clauses: &[&[&str]]) -> Box<dyn Query> {
+        use crate::lexical::query::synonym::SynonymQuery;
+
+        let mut builder = BooleanQueryBuilder::new();
+        for terms in clauses {
+            let clause: Box<dyn Query> = match terms {
+                [term] => Box::new(TermQuery::new("body", *term)),
+                _ => Box::new(SynonymQuery::new("body", terms.to_vec())),
+            };
+            builder = builder.should(clause);
+        }
+        Box::new(builder.build())
+    }
+
+    /// #1283: a clause without a block-max table -- a `SynonymQuery`, or a
+    /// `TermQuery` whose term the index lacks -- joins the BMW pivot loop with
+    /// its scorer's `max_score()` as a constant bound instead of sending the
+    /// whole query to the regular path, and BMW still returns the exact top-K.
+    #[test]
+    fn bmw_runs_clauses_without_block_max_metadata() {
+        let queries: [&[&[&str]]; 3] = [
+            &[&["red"], &["green", "blue"]],
+            &[&["red", "green"], &["blue"]],
+            &[&["red"], &["green"], &["absent"]],
+        ];
+        for seed in [0u64, 1, 2, 3, 127, 321] {
+            let store = build_varied_block_store(seed);
+            let reader = store.reader_for_tests().unwrap();
+            let searcher = InvertedIndexSearcher::from_arc(reader.clone());
+            for clauses in queries {
+                let query = should_clauses(clauses);
+                let boolean = is_bmw_eligible(query.as_ref()).expect("Should-only leaves");
+                assert!(
+                    BlockMaxOrExecutor::new(boolean, reader.as_ref()).is_ok(),
+                    "{clauses:?}: the query must run on BMW"
+                );
+                for k in [1usize, 3, 10] {
+                    let label = format!("seed {seed}, {clauses:?}, k {k}");
+                    assert_bmw_top_k_is_exact(&searcher, query.as_ref(), k, &label);
+                }
+            }
+        }
+    }
+
+    /// #1283: the same inside the per-segment fanout.
+    #[test]
+    fn fanout_runs_clauses_without_block_max_metadata() {
+        let store = build_interleaved_store(4);
+        let queries: [&[&[&str]]; 2] = [
+            &[&["alpha"], &["beta", "gamma"]],
+            &[&["alpha"], &["beta"], &["absent"]],
+        ];
+        for clauses in queries {
+            let query = should_clauses(clauses);
+            for k in [1usize, 3, 10] {
+                let label = format!("{clauses:?}, k {k}");
+                assert_fanout_top_k_is_exact(&store, query.as_ref(), k, &label);
+            }
+        }
+    }
+
     /// Helper for #476 Phase 1 tests: build a `LexicalStore` with
     /// the same skewed-TF corpus as the equivalence test, but split
     /// the writes across `segment_count` commits so the underlying

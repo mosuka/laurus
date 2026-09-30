@@ -16,7 +16,7 @@
 //! Should-only Boolean queries against a [`TopDocsCollector`]; every
 //! other query / collector keeps the existing matcher-driven path.
 
-use crate::error::{LaurusError, Result};
+use crate::error::Result;
 use crate::lexical::index::inverted::searcher::Deadline;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanQuery, Occur};
@@ -35,8 +35,8 @@ use crate::lexical::reader::LexicalIndexReader;
 /// arms via `match` instead of paying a vtable lookup.
 struct BmwClause {
     /// The per-clause scorer (specialised for BM25 / Constant in the
-    /// production hot path). Must expose a finite-block bound —
-    /// checked at construction time.
+    /// production hot path). One without a block-max table bounds every
+    /// block with its `max_score()` (#1283).
     scorer: crate::lexical::query::scorer::LeafScorer,
     /// The per-clause matcher (specialised for PostingMatcher in the
     /// production hot path). Walks its posting list independently of
@@ -50,29 +50,31 @@ pub(crate) struct BlockMaxOrExecutor {
 }
 
 impl BlockMaxOrExecutor {
-    /// Build an executor from a Should-only [`BooleanQuery`]. Returns
-    /// an error if any clause's scorer does not carry per-block
-    /// metadata — the caller should fall back to the standard search
-    /// path in that case.
+    /// Build an executor from a Should-only [`BooleanQuery`].
+    ///
+    /// A clause whose scorer has no block-max table joins the pivot loop
+    /// anyway, with its `max_score()` as the bound of every block (#1283):
+    /// its `block_max_score_at` and `current_block_max_score` return
+    /// `max_score()`, and its `next_block_boundary` returns `None`, which
+    /// `run` treats as a block without end. That covers a `SynonymQuery`
+    /// (whose combined term frequency no single alternative's table
+    /// bounds), and a `TermQuery` whose table is absent: a term missing
+    /// from the index (`max_score()` 0, and its clause starts exhausted),
+    /// a legacy v1/v2 dictionary, or an aggregated reader whose table the
+    /// #1120 guard dropped. Each such `max_score()` is a sound bound
+    /// (`k1 + 1` for BM25's TF component when no tighter factor applies).
+    /// Such a query used to leave BMW for the regular path entirely.
     pub fn new(boolean_query: &BooleanQuery, reader: &dyn LexicalIndexReader) -> Result<Self> {
         // The regular path sums the clause scores and then multiplies
         // by the outer BooleanQuery's boost (`BooleanScorer::score`).
         // Since the pivot loop sums per-clause scores/bounds directly
-        // (see `run` and `advance_clause_past_block`), folding the
-        // outer boost into each clause's own scorer boost here gives
-        // the same result: `outer * sum(c_i) == sum(outer * c_i)`.
+        // (see `run`), folding the outer boost into each clause's own
+        // scorer boost here gives the same result:
+        // `outer * sum(c_i) == sum(outer * c_i)`.
         let outer_boost = boolean_query.boost();
         let mut clauses = Vec::with_capacity(boolean_query.clauses().len());
         for clause in boolean_query.clauses() {
             let mut scorer = clause.query.scorer(reader)?;
-            // Runtime eligibility: every clause must expose per-block
-            // metadata. `next_block_boundary(0).is_none()` is the
-            // documented contract for "no per-block info".
-            if scorer.next_block_boundary(0).is_none() {
-                return Err(LaurusError::InvalidOperation(
-                    "BMW fast path requires per-block scorer for every clause".into(),
-                ));
-            }
             if outer_boost != 1.0 {
                 scorer.set_boost(scorer.boost() * outer_boost);
             }
@@ -229,8 +231,8 @@ fn is_bmw_leaf(query: &dyn Query) -> bool {
 
 /// Cheap eligibility check at the searcher entrypoint: BMW fast
 /// path requires a Should-only [`BooleanQuery`] with at least two
-/// clauses and `minimum_should_match == 0`. The runtime per-block
-/// check happens in [`BlockMaxOrExecutor::new`].
+/// clauses and `minimum_should_match == 0`, every clause a leaf
+/// [`is_bmw_leaf`] knows.
 pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     let bq = query.as_any().downcast_ref::<BooleanQuery>()?;
     if bq.minimum_should_match() > 0 {
@@ -246,18 +248,10 @@ pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     {
         return None;
     }
-    // Every clause must be a leaf `is_bmw_leaf` knows; future work
-    // (PhraseQuery / NumericRange) extends that one function. A
-    // `SynonymQuery` clause (Issue #1257) carries no block-max
-    // table by design — its combined term frequency can exceed any one
-    // alternative's per-block bound — so `BlockMaxOrExecutor::new`'s
-    // runtime `next_block_boundary` check declines it, and with it the
-    // whole `BooleanQuery`: a query mixing a `SynonymQuery` clause with
-    // `TermQuery` siblings loses the fast path entirely, not just for that
-    // clause. That is correctness-safe (the standard path scores the same)
-    // but means a field with a synonym dictionary gives up BMW for its
-    // multi-position bare-term queries until a clause can opt into a
-    // metadata-free bound.
+    // Future work (PhraseQuery / NumericRange) extends `is_bmw_leaf`. A
+    // leaf without a block-max table, such as a `SynonymQuery` (#1257),
+    // still qualifies: it runs with a constant bound (see
+    // `BlockMaxOrExecutor::new`).
     if !bq.clauses().iter().all(|c| is_bmw_leaf(c.query.as_ref())) {
         return None;
     }
@@ -302,13 +296,13 @@ mod tests {
         assert!(is_bmw_eligible(&ok).is_some());
     }
 
-    /// Issue #1257: a `SynonymQuery` clause is a structurally eligible
-    /// shape (it carries a field, like `TermQuery`), but it has no
-    /// block-max table by design, so the executor's runtime check must
-    /// still decline it — falling back to the standard search path rather
-    /// than using an unsound bound.
+    /// A `SynonymQuery` clause (#1257) is eligible, and although it has no
+    /// block-max table by design, it joins the executor with a constant
+    /// bound (#1283) rather than sending the query to the standard path.
+    /// `searcher::tests::bmw_runs_clauses_without_block_max_metadata`
+    /// checks the results on a real index.
     #[test]
-    fn synonym_clause_is_structurally_eligible_but_declines_at_runtime() {
+    fn synonym_clause_joins_the_executor() {
         use crate::lexical::index::inverted::reader::InvertedIndexReader;
         use crate::lexical::query::synonym::SynonymQuery;
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
@@ -330,9 +324,6 @@ mod tests {
             crate::lexical::index::inverted::reader::InvertedIndexReaderConfig::default(),
         )
         .unwrap();
-        assert!(
-            BlockMaxOrExecutor::new(&query, &reader).is_err(),
-            "no per-block metadata for the synonym clause: must not build the executor"
-        );
+        assert!(BlockMaxOrExecutor::new(&query, &reader).is_ok());
     }
 }
