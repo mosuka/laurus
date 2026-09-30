@@ -47,10 +47,12 @@ use roaring::RoaringTreemap;
 
 use crate::error::Result;
 use crate::lexical::core::document::Document;
-use crate::lexical::index::inverted::reader::SegmentReader;
+use crate::lexical::index::inverted::reader::{SegmentFieldLengths, SegmentReader};
 use crate::lexical::index::structures::bkd_tree::BKDTree;
 use crate::lexical::query::Query;
-use crate::lexical::reader::{FieldStats, LexicalIndexReader, PostingIterator, ReaderTermInfo};
+use crate::lexical::reader::{
+    FieldLengths, FieldStats, LexicalIndexReader, PostingIterator, ReaderTermInfo,
+};
 
 /// Cross-segment term-info lookup function. Returns the **global**
 /// `doc_freq` and `total_freq` for a `(field, term)` pair so per-segment
@@ -281,6 +283,13 @@ impl LexicalIndexReader for PerSegmentReaderView {
         // would otherwise under-bound).
         let seg = self.segment.read().unwrap();
         seg.field_stats(field)
+    }
+
+    fn field_lengths(&self, field: &str) -> Option<Arc<dyn FieldLengths>> {
+        Some(Arc::new(SegmentFieldLengths::new(
+            field,
+            vec![(0, u64::MAX, Arc::clone(&self.segment))],
+        )))
     }
 
     fn get_bkd_tree(&self, field: &str) -> Result<Option<Arc<dyn BKDTree>>> {

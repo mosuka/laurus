@@ -148,7 +148,8 @@ impl Query for SynonymQuery {
                     field_stats.avg_length,
                     reader.doc_count(),
                     self.boost,
-                );
+                )
+                .with_field_lengths(reader.field_lengths(&self.field));
                 Ok(Box::new(scorer))
             }
             _ => {

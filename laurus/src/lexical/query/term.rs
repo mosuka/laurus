@@ -93,7 +93,8 @@ impl Query for TermQuery {
                     self.boost,
                     term_info.max_score_factor,
                     block_max,
-                );
+                )
+                .with_field_lengths(reader.field_lengths(&self.field));
                 Ok(Box::new(scorer))
             }
             _ => {

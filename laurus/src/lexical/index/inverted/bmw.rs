@@ -16,7 +16,6 @@
 //! other query / collector keeps the existing matcher-driven path.
 
 use crate::error::{LaurusError, Result};
-use crate::lexical::index::inverted::reader::InvertedIndexReader;
 use crate::lexical::index::inverted::searcher::Deadline;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanQuery, Occur};
@@ -42,26 +41,19 @@ struct BmwClause {
     /// production hot path). Walks its posting list independently of
     /// the other clauses' matchers.
     matcher: crate::lexical::query::matcher::LeafMatcher,
-    /// Field name extracted from the clause's underlying
-    /// [`TermQuery`] or [`SynonymQuery`], used to look up per-doc
-    /// field length at scoring time. `None` when the clause is
-    /// neither (in that case the executor falls back to the
-    /// scorer's avg field length).
-    field_name: Option<String>,
 }
 
 /// Block-Max-WAND executor for a Should-only `BooleanQuery`.
-pub(crate) struct BlockMaxOrExecutor<'r> {
+pub(crate) struct BlockMaxOrExecutor {
     clauses: Vec<BmwClause>,
-    inverted_reader: Option<&'r InvertedIndexReader>,
 }
 
-impl<'r> BlockMaxOrExecutor<'r> {
+impl BlockMaxOrExecutor {
     /// Build an executor from a Should-only [`BooleanQuery`]. Returns
     /// an error if any clause's scorer does not carry per-block
     /// metadata — the caller should fall back to the standard search
     /// path in that case.
-    pub fn new(boolean_query: &BooleanQuery, reader: &'r dyn LexicalIndexReader) -> Result<Self> {
+    pub fn new(boolean_query: &BooleanQuery, reader: &dyn LexicalIndexReader) -> Result<Self> {
         // The regular path sums the clause scores and then multiplies
         // by the outer BooleanQuery's boost (`BooleanScorer::score`).
         // Since the pivot loop sums per-clause scores/bounds directly
@@ -84,18 +76,12 @@ impl<'r> BlockMaxOrExecutor<'r> {
                 scorer.set_boost(scorer.boost() * outer_boost);
             }
             let matcher = clause.query.matcher(reader)?;
-            let field_name = field_name_of(clause.query.as_ref()).map(str::to_string);
             clauses.push(BmwClause {
                 scorer: crate::lexical::query::scorer::LeafScorer::from_box(scorer),
                 matcher: crate::lexical::query::matcher::LeafMatcher::from_box(matcher),
-                field_name,
             });
         }
-        let inverted_reader = reader.as_any().downcast_ref::<InvertedIndexReader>();
-        Ok(BlockMaxOrExecutor {
-            clauses,
-            inverted_reader,
-        })
+        Ok(BlockMaxOrExecutor { clauses })
     }
 
     /// Drive the pivot loop and feed competitive documents into
@@ -182,8 +168,9 @@ impl<'r> BlockMaxOrExecutor<'r> {
                         for &i in &active {
                             if self.clauses[i].matcher.doc_id() == pivot_doc {
                                 let tf = self.clauses[i].matcher.term_freq() as f32;
-                                let fl = self.field_length_for(i, pivot_doc);
-                                total_score += self.clauses[i].scorer.score(pivot_doc, tf, fl);
+                                // Each leaf looks up its own document's
+                                // field length (#1287).
+                                total_score += self.clauses[i].scorer.score(pivot_doc, tf, None);
                             } else {
                                 // active is sorted by doc_id; once we
                                 // pass pivot_doc no later clause can
@@ -249,34 +236,15 @@ impl<'r> BlockMaxOrExecutor<'r> {
         }
         Ok(())
     }
-
-    /// Per-doc field length for the clause's matcher position.
-    /// Returns `None` to let the scorer fall back to its average
-    /// field length when the underlying reader cannot satisfy the
-    /// query (e.g. non-`InvertedIndexReader` readers, missing field).
-    fn field_length_for(&self, clause_idx: usize, doc_id: u64) -> Option<f32> {
-        let field = self.clauses[clause_idx].field_name.as_deref()?;
-        let reader = self.inverted_reader?;
-        reader
-            .field_length(doc_id, field)
-            .ok()
-            .flatten()
-            .map(|n| n as f32)
-    }
 }
 
-/// Inspect a clause's underlying [`Query`] for a [`TermQuery`] or
-/// [`SynonymQuery`] so the executor can look up the field's per-doc
-/// length at scoring time. Any other clause type is not yet wired in
-/// (a `BlockMaxConjunction` follow-up could extend this).
-fn field_name_of(query: &dyn Query) -> Option<&str> {
-    if let Some(t) = query.as_any().downcast_ref::<TermQuery>() {
-        return Some(t.field());
-    }
-    query
-        .as_any()
-        .downcast_ref::<SynonymQuery>()
-        .map(|s| s.field())
+/// Whether `query` is a leaf the executor supports: a [`TermQuery`] or a
+/// [`SynonymQuery`], whose BM25 scorer bounds its own scores. Any other
+/// clause type is not yet wired in (a `BlockMaxConjunction` follow-up could
+/// extend this).
+fn is_bmw_leaf(query: &dyn Query) -> bool {
+    let any = query.as_any();
+    any.is::<TermQuery>() || any.is::<SynonymQuery>()
 }
 
 /// Cheap eligibility check at the searcher entrypoint: BMW fast
@@ -298,10 +266,9 @@ pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     {
         return None;
     }
-    // Every clause must be a shape `field_name_of` knows, so one list of
-    // clause types serves both this gate and the per-doc field-length
-    // lookup; future work (PhraseQuery / NumericRange) extends that one
-    // function. A `SynonymQuery` clause (Issue #1257) carries no block-max
+    // Every clause must be a leaf `is_bmw_leaf` knows; future work
+    // (PhraseQuery / NumericRange) extends that one function. A
+    // `SynonymQuery` clause (Issue #1257) carries no block-max
     // table by design — its combined term frequency can exceed any one
     // alternative's per-block bound — so `BlockMaxOrExecutor::new`'s
     // runtime `next_block_boundary` check declines it, and with it the
@@ -311,11 +278,7 @@ pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     // but means a field with a synonym dictionary gives up BMW for its
     // multi-position bare-term queries until a clause can opt into a
     // metadata-free bound.
-    if bq
-        .clauses()
-        .iter()
-        .any(|c| field_name_of(c.query.as_ref()).is_none())
-    {
+    if !bq.clauses().iter().all(|c| is_bmw_leaf(c.query.as_ref())) {
         return None;
     }
     Some(bq)
@@ -366,6 +329,7 @@ mod tests {
     /// than using an unsound bound.
     #[test]
     fn synonym_clause_is_structurally_eligible_but_declines_at_runtime() {
+        use crate::lexical::index::inverted::reader::InvertedIndexReader;
         use crate::lexical::query::synonym::SynonymQuery;
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
         use std::sync::Arc;

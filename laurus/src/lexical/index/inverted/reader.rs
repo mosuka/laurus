@@ -2220,23 +2220,70 @@ impl InvertedIndexReader {
     /// `Ok(Some(length))` if found, `Ok(None)` otherwise.
     pub fn field_length(&self, doc_id: u64, field: &str) -> Result<Option<u32>> {
         self.check_closed()?;
+        Ok(segment_field_length(self.segment_ranges(), doc_id, field))
+    }
 
-        // Search across segments, skipping those that cannot contain doc_id.
-        for (i, segment_reader) in self.segment_readers.iter().enumerate() {
-            // Use cached segment info to skip out-of-range segments
-            // without acquiring the reader lock.
-            if let Some(info) = self.segment_infos.get(i)
-                && (doc_id < info.min_doc_id || doc_id > info.max_doc_id)
-            {
-                continue;
+    /// Each segment with the `[min_doc_id, max_doc_id]` range its cached
+    /// info says it can hold (the whole id space when that info is missing).
+    fn segment_ranges(&self) -> impl Iterator<Item = (u64, u64, &Arc<RwLock<SegmentReader>>)> {
+        self.segment_readers.iter().enumerate().map(|(i, segment)| {
+            match self.segment_infos.get(i) {
+                Some(info) => (info.min_doc_id, info.max_doc_id, segment),
+                None => (0, u64::MAX, segment),
             }
-            let reader = segment_reader.read().unwrap();
-            if let Ok(Some(length)) = reader.field_length(doc_id, field) {
-                return Ok(Some(length));
-            }
+        })
+    }
+}
+
+/// `doc_id`'s length of `field`, from the first segment whose range holds
+/// `doc_id` and that has a live value for it. The range check skips a segment
+/// without taking its lock; a deleted copy (the old copy of a re-added id)
+/// yields no value, so the search moves on to the live one.
+fn segment_field_length<'a>(
+    segments: impl Iterator<Item = (u64, u64, &'a Arc<RwLock<SegmentReader>>)>,
+    doc_id: u64,
+    field: &str,
+) -> Option<u32> {
+    for (min_doc_id, max_doc_id, segment) in segments {
+        if doc_id < min_doc_id || doc_id > max_doc_id {
+            continue;
         }
+        if let Ok(Some(length)) = segment.read().unwrap().field_length(doc_id, field) {
+            return Some(length);
+        }
+    }
+    None
+}
 
-        Ok(None)
+/// The per-document lengths of one field across a set of segments (#1287).
+/// It owns its segments, so a `'static` scorer can keep it for a whole query.
+#[derive(Debug)]
+pub(crate) struct SegmentFieldLengths {
+    field: String,
+    /// Each segment with the `[min_doc_id, max_doc_id]` range it can hold.
+    segments: Vec<(u64, u64, Arc<RwLock<SegmentReader>>)>,
+}
+
+impl SegmentFieldLengths {
+    /// Lengths of `field` across `segments`, each given with the doc id range
+    /// it can hold.
+    pub(crate) fn new(field: &str, segments: Vec<(u64, u64, Arc<RwLock<SegmentReader>>)>) -> Self {
+        SegmentFieldLengths {
+            field: field.to_string(),
+            segments,
+        }
+    }
+}
+
+impl crate::lexical::reader::FieldLengths for SegmentFieldLengths {
+    fn get(&self, doc_id: u64) -> Option<u32> {
+        segment_field_length(
+            self.segments
+                .iter()
+                .map(|(min_doc_id, max_doc_id, segment)| (*min_doc_id, *max_doc_id, segment)),
+            doc_id,
+            &self.field,
+        )
     }
 }
 
@@ -2651,6 +2698,15 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
             let seg = seg_lock.read().unwrap();
             seg.has_doc_values(field)
         })
+    }
+
+    fn field_lengths(&self, field: &str) -> Option<Arc<dyn crate::lexical::reader::FieldLengths>> {
+        self.check_closed().ok()?;
+        let segments = self
+            .segment_ranges()
+            .map(|(min_doc_id, max_doc_id, segment)| (min_doc_id, max_doc_id, Arc::clone(segment)))
+            .collect();
+        Some(Arc::new(SegmentFieldLengths::new(field, segments)))
     }
 
     fn get_bkd_tree(&self, field: &str) -> Result<Option<Arc<dyn BKDTree>>> {
