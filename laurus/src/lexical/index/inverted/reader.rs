@@ -915,7 +915,12 @@ impl SegmentReader {
                 info.segment_id
             ))
         })?;
-        Ok(Some(Arc::new(DeletedDocs::new(bitmap.into_deleted_docs()))))
+        Ok(Some(Arc::new(DeletedDocs::new(
+            bitmap.into_deleted_docs(),
+            info.min_doc_id,
+            info.max_doc_id,
+            info.doc_count,
+        ))))
     }
 
     /// The segment's deleted documents; `None` when it has no deletions.
@@ -4818,6 +4823,71 @@ mod tests {
         let title = inverted.field_lengths("title").unwrap();
         assert_eq!(title.get(3), Some(5));
         assert_eq!(title.get(4), None);
+    }
+
+    /// #1301: a segment whose id range is too wide for a deletion bitset
+    /// answers deletion checks, the live count and field lengths like a
+    /// segment with one.
+    #[test]
+    fn a_segment_without_a_deletion_bitset_answers_like_one_with_it() {
+        use crate::Document;
+        use crate::lexical::reader::LexicalIndexReader;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let words = |n: u64| vec!["word"; n as usize].join(" ");
+        let upsert = |id: u64| {
+            store
+                .upsert_document(
+                    id,
+                    Document::builder()
+                        .add_text("body", words(1 + id % 7))
+                        .build(),
+                )
+                .unwrap()
+        };
+        // A segment without gaps: [200, 209].
+        (200..210).for_each(upsert);
+        store.commit().unwrap();
+        // Two documents in [5, 100]: 96 ids is wider than their 16 bits.
+        [5, 100].into_iter().for_each(upsert);
+        store.commit().unwrap();
+        store.delete_document_by_internal_id(100).unwrap();
+        store.delete_document_by_internal_id(203).unwrap();
+        store.commit().unwrap();
+
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let bitsets: Vec<(u64, bool)> = inverted
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                let segment = segment.read().unwrap();
+                let deleted = segment.deletions().expect("both segments carry a deletion");
+                (segment.segment_info().min_doc_id, deleted.has_bits())
+            })
+            .collect();
+        assert_eq!(bitsets, vec![(200, true), (5, false)]);
+
+        let lengths = inverted.field_lengths("body").unwrap();
+        for id in 0..=210u64 {
+            let held = id == 5 || (200..210).contains(&id);
+            let deleted = id == 100 || id == 203;
+            assert_eq!(
+                LexicalIndexReader::is_deleted(inverted, id),
+                deleted,
+                "doc {id}"
+            );
+            let expected = (held && !deleted).then(|| (1 + id % 7) as u32);
+            assert_eq!(lengths.get(id), expected, "length of doc {id}");
+        }
+        assert_eq!(LexicalIndexReader::doc_count(inverted), 10);
     }
 
     /// `.norms` must win even when stale `.lens`/`.fstats` are also

@@ -120,7 +120,12 @@ The deletion bitmap tracks which internal IDs have been deleted:
   plain ID list — e.g. a 10M-doc segment at 10% deletion is ~125 KB on disk instead of ~8 MB.
 - **Lookup**: a branch-light bit test, which stays CPU-cache-resident even for large deletion
   sets — `is_deleted` is on the per-document (lexical) and per-neighbour (vector) search hot
-  paths.
+  paths. A lexical segment reader reads its segment's bitmap once, when it opens, and keeps it
+  fixed, so its checks take no lock. It also copies the deletions into a plain bitset over the
+  segment's ID range (one bit per ID, like Lucene's `FixedBitSet` and Tantivy's `AliveBitSet`),
+  so a check tests a single bit instead of searching the Roaring containers. A segment whose
+  range is more than 8× wider than its document count (the bitset would then take more than
+  one byte per document) keeps only the Roaring bitmap.
 
 The bitmap is persisted alongside the index segments (the `.delmap` file) and is rebuilt from
 the WAL during recovery. The on-disk format is versioned: the current writer emits v4 (Roaring),
