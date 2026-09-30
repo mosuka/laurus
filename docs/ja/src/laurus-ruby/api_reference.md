@@ -173,7 +173,7 @@ Laurus::Schema.new
 | `add_integer_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット整数フィールド。`multi_valued: true` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
 | `add_float_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 64 ビット浮動小数点フィールド。`multi_valued: true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values:` は上記を参照。 |
 | `add_boolean_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | ブールフィールド。`multi_valued: true` で `true` / `false` の Array を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `true` / `false` の Array として読み戻されます）。`doc_values:` は上記を参照。 |
-| `add_bytes_field(name, stored: true)` | 生バイトフィールド。`doc_values:` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。 |
+| `add_bytes_field(name, stored: true, multi_valued: false)` | 生バイトフィールド。`doc_values:` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`multi_valued: true` を渡すと base64 String の Array を受け付け（Issue #1176）、単一の base64 String と同じ方法で要素ごとにデコードされます。`Bytes` はそもそもインデックスされないため、他の `multi_valued:` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値はスカラーフィールドと同様、（バイナリ）String の Array として読み戻されます。 |
 | `add_geo_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 地理座標フィールド（緯度/経度）。`multi_valued: true` で `{ "lat" => .., "lon" => .. }` Hash の Array を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`doc_values:` は上記を参照。 |
 | `add_geo3d_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued: true` で `{ "x" => .., "y" => .., "z" => .. }` Hash の Array を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values:` は上記を参照。 |
 | `add_datetime_field(name, stored: true, indexed: true, multi_valued: false, doc_values: true)` | UTC 日時フィールド。`multi_valued: true` で `Time` / `DateTime` / RFC 3339 `String` の Array を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC の RFC 3339 String の Array として読み戻されます）。`doc_values:` は上記を参照。 |
@@ -575,5 +575,5 @@ Ruby の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `Array`（`"x"`, `"y"`, `"z"` を持つ `Hash` の配列） | `GeoEcefArray` | フィールドに `multi_valued: true` が必要 |
 | `Time` / `String`（`iso8601` に応答） | `DateTime` | `iso8601` 経由で変換 |
 | `Array`（`Time`、または `iso8601` に応答する他のオブジェクトを含む） | `DateTimeArray` | 各要素を RFC 3339 としてパース（`iso8601` に応答するオブジェクトは先に変換）。日時でない要素は `ArgumentError`。フィールドに `multi_valued: true` が必要 |
-| `Array`（`String`） | `DateTimeArray` または `TextArray` | 全要素が RFC 3339 としてパースできれば `DateTimeArray`、そうでなければ `TextArray`（Issue #1175。String の Array として読み戻される）。フィールドに `multi_valued: true` が必要 |
+| `Array`（`String`） | `DateTimeArray` または `TextArray` | 全要素が RFC 3339 としてパースできれば `DateTimeArray`、そうでなければ `TextArray`（Issue #1175。String の Array として読み戻される）。フィールドに `multi_valued: true` が必要。宣言済みの多値 `Bytes` フィールドでは、同じ base64 String の Array が要素ごとにデコードされる（Issue #1176） |
 | `Array`（`true` / `false`） | `BoolArray` | 全要素が `true` または `false` であること。`[true, 1]` のような混在 Array は `TypeError`。フィールドに `multi_valued: true` が必要 |

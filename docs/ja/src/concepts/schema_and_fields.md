@@ -225,6 +225,7 @@ graph LR
 | `add_geo(name, lat, lon)` | `(f64, f64)` | 2D 地理座標フィールドを追加（WGS84） |
 | `add_geo_ecef(name, x, y, z)` | `(f64, f64, f64)` | 3D ECEF 直交座標ポイントを追加（メートル） |
 | `add_bytes(name, data)` | `Vec<u8>` | バイナリデータを追加 |
+| `add_bytes_array(name, values)` | `Vec<(Vec<u8>, Option<String>)>` | 多値バイナリフィールドを追加。各要素が独自の任意 MIME タイプを持つ |
 | `add_field(name, value)` | `DataValue` | 任意の値型を追加 |
 
 ## DataValue
@@ -250,6 +251,7 @@ pub enum DataValue {
     DateTimeArray(Vec<DateTime<Utc>>), // 多値日時フィールド
     BoolArray(Vec<bool>),            // 多値ブールフィールド
     TextArray(Vec<String>),          // 多値テキストフィールド
+    BytesArray(Vec<(Vec<u8>, Option<String>)>), // 多値バイトフィールド（要素ごとに MIME）
 }
 ```
 
@@ -407,25 +409,47 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 必要です（`stored` なら `Reindex`、そうでなければ `Destructive`）。既存の posting は古い gap で付番されているためです。
 `term_vectors` が `false` なら gap は観測できないため、変更は metadata-only です。
 
+`Bytes` フィールドも同様に `multi_valued = true` を指定できます（Issue #1176）。ただし
+仕組みは他のどの多値型とも異なり、`Boolean` よりもさらに徹底しています —— `BytesOption` には
+`indexed` フラグ自体が存在せず、`Bytes` の値は**そもそもレキシカルインデックスされません**。
+そのため BKD ポイントも term posting も存在せず、`multi_valued` には "any match" のクエリ
+意味論が一切ありません。単に保存時の形と取り込み時の許容個数を変えるだけです。
+`DataValue::BytesArray` は `Vec<(Vec<u8>, Option<String>)>` で、他の `*Array` variant が使う
+素の `Vec<T>` とは異なり、各要素がスカラーの `Bytes(Vec<u8>, Option<String>)` と全く同じ形で
+独自の MIME タイプを持ちます。`Bytes` の値はスカラーでも配列でも、`Dynamic` ポリシーの下で
+**未宣言**のフィールドに対して推論されることは決してありません（前述の
+[型推論ルール（Dynamic ポリシー）](#型推論ルールdynamic-ポリシー)を参照）。多値 Bytes
+フィールドは常に明示的な宣言が必要です。宣言済みのフィールドでは、単一の `Bytes` 値や
+base64 の `Text` 文字列は要素 1 個の配列に自動ラップされ（`Text` 要素はスカラーと同じ規則で
+base64 デコードされます）、空の数値配列（`[]`）は空のバイト値リストとして受理されます。
+既存の `Bytes` フィールドで `multi_valued` を有効にする変更は metadata-only です。無効にする
+変更は、フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら
+**`Destructive`** になります —— `Boolean` や `Text` と同じく、再構築の元になるポイントツリーも
+posting もなく、保存された値しかないためです。
+
 ファセット集計はすべての多値型を要素ごとに展開します（Issue #1187）: 整数・浮動小数点・ブール・
 日時・テキストの各要素がそれぞれ独立したファセット値になり（`/` を含むテキスト要素は階層パスになります）、
-要素が重複していてもドキュメントごとに 1 回だけ数えられます。地理座標の配列はファセットの対象外で
-何も寄与しません。要素の文字列形式は [ファセット](../laurus/faceting.md) を参照してください。
+要素が重複していてもドキュメントごとに 1 回だけ数えられます。地理座標とバイト列の配列はファセットの
+対象外で何も寄与しません。要素の文字列形式は [ファセット](../laurus/faceting.md) を参照してください。
 
 多値フィールドに単一値を送った場合は要素 1 個の配列に自動ラップされます。
 逆に単一値フィールドに配列を送ると、暗黙の切り捨てではなくエラーになります
 （エラーメッセージは `multi_valued = true` でフィールドを宣言するよう案内します）。
 多値地理・多値日時・多値ブール・多値テキストフィールドに空配列を送った場合は受理され、
 ポイント・時刻・term を持たないフィールドになります（どの空間クエリ・範囲クエリ・term クエリ・フレーズクエリにもマッチしません）。
+多値バイトフィールドに空配列を送った場合も同様に受理され、単に空リストとして保存されます ——
+`Bytes` フィールドはそもそもクエリの対象にならないため、マッチしないクエリというもの自体が存在しません。
 
-多値地理・多値日時・多値ブール・多値テキストの値を含むセグメントは新しい stored-field 型タグを使用するため、
+多値地理・多値日時・多値ブール・多値テキスト・多値バイトの値を含むセグメントは新しい stored-field 型タグを使用するため、
 これらの機能より前のビルドでは読み込めません。フォーマットのバージョンは上げていないため、
 古いリーダーはデータを誤読するのではなく、明示的なエラーで失敗します。
 保存される多値日時はマイクロ秒精度（時刻ごとに 1 つの `i64` Unix マイクロ秒。マイクロ秒未満の桁は
 切り捨て）で保持され、単一値の `DateTime` は完全な精度を保ちます。
 保存される多値ブールは要素ごとに 1 バイト（ビットパックなし）で書き込まれます。
 保存される多値テキストは、要素数に続けて各文字列を長さプレフィックス付きで書き込みます
-（本体は単一値のテキストと同じ形式です）。
+（本体は単一値のテキストと同じ形式です）。保存される多値バイトは、要素数に続けて各要素を
+スカラーの `Bytes` 値と同じ（MIME、続けてデータ）の長さプレフィックス付き形式で書き込みます
+（空の MIME 文字列は `None` を意味します）。
 
 ### 型衝突
 
@@ -468,6 +492,12 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 | `Text`（`multi_valued = true`） | `Null` または空の数値配列（`[]`） | 空の文字列リスト（どの term クエリ・フレーズクエリにもマッチしない） |
 | `Text`（`multi_valued = true`） | 上記以外（地理配列・ベクトル・バイト列） | エラー |
 | `Integer` / `Float` / `Boolean` / `DateTime`（`multi_valued = true`） | `TextArray` | スカラーの `Text` と同じ規則で要素ごとにパース（`["1", "2"]` → `[1, 2]`。不正な要素はその要素を示すエラー）。単一値の `Integer` / `Float` / `Boolean` / `DateTime` は `multi_valued = true` を案内するエラーで拒否 |
+| `Bytes`（単一値） | `BytesArray` | エラー（`multi_valued = true` を宣言する） |
+| `Bytes`（`multi_valued = true`） | `BytesArray` | そのまま格納 |
+| `Bytes`（`multi_valued = true`） | 単一の `Bytes` または base64 の `Text` | 要素 1 個の配列にラップ（スカラーと同じ規則） |
+| `Bytes`（`multi_valued = true`） | `TextArray` | 各要素を base64 としてデコード（スカラーと同じ規則を要素ごとに適用。MIME は常に `None`） |
+| `Bytes`（`multi_valued = true`） | 空の数値配列（`[]`） | 空のバイト値リスト |
+| `Bytes`（`multi_valued = true`） | 上記以外 | エラー |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | `Text` または `Bytes` | フィールドの embedder にそのまま渡す |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | 数値配列 | 要素ごとに `f32` へキャスト |
 
@@ -556,7 +586,7 @@ let outcome = engine.update_field(
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
 - **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、HNSW の `m`/`ef_construction` 変更）。
-- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` フィールドの `multi_valued` を無効にする変更）。
+- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` / `Bytes` フィールドの `multi_valued` を無効にする変更）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 

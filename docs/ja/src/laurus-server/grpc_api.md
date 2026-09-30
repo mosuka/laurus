@@ -107,13 +107,13 @@ message AnalyzerDefinition {
 | `DateTimeOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `GeoOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `Geo3dOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
-| `BytesOption` (`stored`) | |
+| `BytesOption` (`stored`, `multi_valued`) | |
 
 ベクトルフィールドオプションの `embedder` フィールドには、`Schema.embedders` で定義したエンベッダー名を指定します。設定すると、インデックス時にドキュメントのテキストフィールドからベクトルを自動生成します。事前計算済みのベクトルを直接供給する場合は空のままにします。
 
 **Doc values:** `doc_values`（Issue #1047）は、上記の `BytesOption` を除く全ての lexical オプションで `optional bool` であり、`term_vectors` と同じ tri-state の契約に従います。クライアントが省略するとエンジンのデフォルト（`true`）になり、明示的な `false` とは区別されます。フィールドの値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御し、DocValues 列が書き込まれるのは `stored` と `doc_values` の両方が `true` の場合のみです。`BytesOption` にはこのフィールドがありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。ソートにもファセットにも使わないフィールドで `doc_values` を無効にするとセグメントの使用容量が削減されます。フィールド自体は引き続き完全に検索・取得可能です。
 
-**多値地理・多値日時・多値ブール・多値テキスト（multi-valued geo, datetime, boolean and text）:** `GeoOption` / `Geo3dOption`（Issue #1174）、`DateTimeOption`（Issue #1184）、および `BooleanOption`（Issue #1180）の `multi_valued` は proto のフィールド番号 `4` です（`IntegerOption` / `FloatOption` と異なり、`3` は既に `doc_values` が使用しているため）。`TextOption`（Issue #1175）ではフィールド番号 `6` です（Text は `3`〜`5` を既に `term_vectors`・`analyzer`・`doc_values` に使用しているため）。`true` にすると地理フィールドは `GeoArrayValue` / `Geo3dArrayValue`（後述の `Value` 表を参照）を受け付け、距離 / バウンディングボックスクエリ（および `geo3d_nearest`）は**いずれかのポイント**が条件を満たせばドキュメントにマッチし、最も近いポイントでスコアリングされます。日時フィールドは `DatetimeArrayValue`（`repeated int64`。`datetime_value` と同じ UTC の Unix マイクロ秒）を受け付け、範囲クエリは**いずれかの時刻**が範囲内にあればドキュメントにマッチします（スコアは constant。複数の時刻がマッチしてもドキュメントは 1 回だけ報告されます）。ブールフィールドは `BoolArrayValue`（`repeated bool`）を受け付け、term クエリは**いずれかの要素**がクエリの値と等しければドキュメントにマッチします。各要素はそれぞれ独立した `true` / `false` の term posting としてインデックスされ（ブールに BKD ポイントはありません）、要素の重複はヒット数ではなく term frequency（したがって BM25 スコア）を増やします。テキストフィールドは `TextArrayValue`（`repeated string`）を受け付け、term クエリは**いずれかの要素**がタームを含めばドキュメントにマッチします。`position_increment_gap`（フィールド `7`、`optional uint32`）は連続する要素の間に挿入される位置数で、slop がこの値に達しない限りフレーズクエリが 2 つの要素をまたがないようにします。`term_vectors` / `doc_values` と同じ理由で `optional` になっており、省略時は `0` ではなくエンジンのデフォルト（`100`）を意味します。
+**多値地理・多値日時・多値ブール・多値テキスト・多値バイト（multi-valued geo, datetime, boolean, text and bytes）:** `GeoOption` / `Geo3dOption`（Issue #1174）、`DateTimeOption`（Issue #1184）、および `BooleanOption`（Issue #1180）の `multi_valued` は proto のフィールド番号 `4` です（`IntegerOption` / `FloatOption` と異なり、`3` は既に `doc_values` が使用しているため）。`TextOption`（Issue #1175）ではフィールド番号 `6` です（Text は `3`〜`5` を既に `term_vectors`・`analyzer`・`doc_values` に使用しているため）。`BytesOption`（Issue #1176）ではフィールド番号 `2` です（`1` は既に `stored` が使用しており、`BytesOption` には `indexed` も `doc_values` もありません）。`true` にすると地理フィールドは `GeoArrayValue` / `Geo3dArrayValue`（後述の `Value` 表を参照）を受け付け、距離 / バウンディングボックスクエリ（および `geo3d_nearest`）は**いずれかのポイント**が条件を満たせばドキュメントにマッチし、最も近いポイントでスコアリングされます。日時フィールドは `DatetimeArrayValue`（`repeated int64`。`datetime_value` と同じ UTC の Unix マイクロ秒）を受け付け、範囲クエリは**いずれかの時刻**が範囲内にあればドキュメントにマッチします（スコアは constant。複数の時刻がマッチしてもドキュメントは 1 回だけ報告されます）。ブールフィールドは `BoolArrayValue`（`repeated bool`）を受け付け、term クエリは**いずれかの要素**がクエリの値と等しければドキュメントにマッチします。各要素はそれぞれ独立した `true` / `false` の term posting としてインデックスされ（ブールに BKD ポイントはありません）、要素の重複はヒット数ではなく term frequency（したがって BM25 スコア）を増やします。テキストフィールドは `TextArrayValue`（`repeated string`）を受け付け、term クエリは**いずれかの要素**がタームを含めばドキュメントにマッチします。`position_increment_gap`（フィールド `7`、`optional uint32`）は連続する要素の間に挿入される位置数で、slop がこの値に達しない限りフレーズクエリが 2 つの要素をまたがないようにします。`term_vectors` / `doc_values` と同じ理由で `optional` になっており、省略時は `0` ではなくエンジンのデフォルト（`100`）を意味します。バイトフィールドは `BytesArrayValue`（`repeated bytes`）を受け付けますが、`Bytes` の値はそもそもレキシカルインデックスされないため "any match" のクエリ意味論は一切なく、保存時・ワイヤ上の形と取り込み時の許容個数を変えるだけです。また、スカラーの `bytes_value` と同じく、`DataValue::BytesArray` が持つ要素ごとの MIME タイプはワイヤ上に表現されません。
 
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
@@ -274,6 +274,7 @@ message Document {
 | DateTimeArray | `datetime_array_value` | `DatetimeArrayValue`（`repeated int64` Unix マイクロ秒。多値の時刻。`DateTimeOption.multi_valued = true` を要求） |
 | BoolArray | `bool_array_value` | `BoolArrayValue`（`repeated bool`。多値ブール。`BooleanOption.multi_valued = true` を要求） |
 | TextArray | `text_array_value` | `TextArrayValue`（`repeated string`。多値テキスト。`TextOption.multi_valued = true` を要求） |
+| BytesArray | `bytes_array_value` | `BytesArrayValue`（`repeated bytes`。多値バイト列。MIME はワイヤ上に含まれない。`BytesOption.multi_valued = true` を要求） |
 
 **Geo3dPoint:**
 
