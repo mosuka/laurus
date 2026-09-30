@@ -330,6 +330,7 @@ enum SlotMap {
 }
 
 impl SlotMap {
+    #[inline]
     fn slot_of(&self, doc_id: u64) -> Option<usize> {
         match self {
             SlotMap::Contiguous { min_doc_id, count } => {
@@ -367,8 +368,18 @@ struct NormsField {
 #[derive(Debug)]
 pub(crate) struct NormsReader {
     slot_map: SlotMap,
-    fields: AHashMap<String, NormsField>,
+    /// One column per field, in file order.
+    columns: Vec<NormsField>,
+    /// Field name -> index into `columns`.
+    column_index: AHashMap<String, usize>,
 }
+
+/// A field's column in one [`NormsReader`], from [`NormsReader::column`].
+/// Looking lengths up through it skips the field-name hash, so a scorer
+/// resolves it once instead of once per document (#1298). It means nothing
+/// to any other reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormsColumn(usize);
 
 /// A `.norms` header, read and checked by [`NormsHeader::read`] for both
 /// readers — [`NormsReader::load`] and [`read_doc_ids_from`].
@@ -610,7 +621,8 @@ impl NormsReader {
             SlotMap::Sparse(ids)
         };
 
-        let mut fields = AHashMap::new();
+        let mut columns = Vec::new();
+        let mut column_index = AHashMap::new();
         for _ in 0..header.num_fields {
             let name = reader.read_string()?;
             let present_count = reader.read_varint()?;
@@ -638,21 +650,30 @@ impl NormsReader {
             let norm_len = checked_len(doc_count as usize, available, "norm column")?;
             let norms = reader.read_raw(norm_len)?.into_boxed_slice();
 
-            fields.insert(
-                name,
-                NormsField {
-                    present_count,
-                    sum_length,
-                    min_length,
-                    max_length,
-                    presence,
-                    norms,
-                },
-            );
+            // A name repeated in the directory resolves to its last column.
+            column_index.insert(name, columns.len());
+            columns.push(NormsField {
+                present_count,
+                sum_length,
+                min_length,
+                max_length,
+                presence,
+                norms,
+            });
         }
         reader.expect_checksum("norms")?;
 
-        Ok(Some(NormsReader { slot_map, fields }))
+        Ok(Some(NormsReader {
+            slot_map,
+            columns,
+            column_index,
+        }))
+    }
+
+    /// `field`'s column, or `None` when this segment records no length for
+    /// `field`.
+    pub(crate) fn column(&self, field: &str) -> Option<NormsColumn> {
+        self.column_index.get(field).copied().map(NormsColumn)
     }
 
     /// Quantised-then-decoded length for `(doc_id, field)`. `None` when the
@@ -660,7 +681,14 @@ impl NormsReader {
     /// it, or the presence bitmap marks it absent -- callers must not
     /// conflate this with a recorded length of zero (`Some(0)`).
     pub(crate) fn field_length(&self, doc_id: u64, field: &str) -> Option<u32> {
-        let f = self.fields.get(field)?;
+        self.column_length(self.column(field)?, doc_id)
+    }
+
+    /// [`Self::field_length`] for a field already resolved by
+    /// [`Self::column`].
+    #[inline]
+    pub(crate) fn column_length(&self, column: NormsColumn, doc_id: u64) -> Option<u32> {
+        let f = self.columns.get(column.0)?;
         let slot = self.slot_map.slot_of(doc_id)?;
         let present = match &f.presence {
             None => true,
@@ -679,7 +707,7 @@ impl NormsReader {
     /// pre-quantisation aggregates (not from the quantised column) so
     /// `avg_length` matches what `.fstats` used to report.
     pub(crate) fn field_stats(&self, field: &str) -> Option<FieldStats> {
-        let f = self.fields.get(field)?;
+        let f = self.columns.get(self.column(field)?.0)?;
         let avg_length = if f.present_count > 0 {
             f.sum_length as f64 / f.present_count as f64
         } else {
@@ -703,7 +731,7 @@ impl NormsReader {
     /// analyzed to zero tokens (and so left no term postings for
     /// `field_terms`-based enumeration to find).
     pub(crate) fn field_names(&self) -> Vec<String> {
-        self.fields.keys().cloned().collect()
+        self.column_index.keys().cloned().collect()
     }
 }
 
@@ -1151,6 +1179,46 @@ mod format_tests {
         // A universally-present field must not pay for a bitmap it doesn't need.
         assert_eq!(reader.field_length(0, "title"), Some(3));
         assert_eq!(reader.field_length(1, "title"), Some(5));
+    }
+
+    /// #1298: a column resolved once reads each field's own lengths, for a
+    /// dense and a sparse slot map and through a presence bitmap.
+    #[test]
+    fn a_resolved_column_reads_its_fields_lengths() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let dense = vec![
+            (0u64, doc(&[("title", 3), ("optional", 9)])),
+            (1u64, doc(&[("title", 5)])),
+            (2u64, doc(&[("title", 2), ("optional", 4)])),
+        ];
+        let reader = round_trip(&storage, "seg_dense", &NormsBuilder::from_buffered(&dense));
+        let title = reader.column("title").unwrap();
+        let optional = reader.column("optional").unwrap();
+        assert_ne!(title, optional);
+        assert_eq!(reader.column("missing"), None);
+        let lengths = |column| [0, 1, 2, 3].map(|doc_id| reader.column_length(column, doc_id));
+        assert_eq!(lengths(title), [Some(3), Some(5), Some(2), None]);
+        assert_eq!(lengths(optional), [Some(9), None, Some(4), None]);
+
+        let sparse = vec![
+            (5u64, doc(&[("title", 3)])),
+            (9u64, doc(&[("title", 7), ("optional", 1)])),
+            (1000u64, doc(&[("title", 42)])),
+        ];
+        let reader = round_trip(
+            &storage,
+            "seg_sparse",
+            &NormsBuilder::from_buffered(&sparse),
+        );
+        let title = reader.column("title").unwrap();
+        let optional = reader.column("optional").unwrap();
+        let lengths =
+            |column| [4, 5, 6, 9, 1000, 1001].map(|doc_id| reader.column_length(column, doc_id));
+        assert_eq!(
+            lengths(title),
+            [None, Some(3), None, Some(7), Some(42), None]
+        );
+        assert_eq!(lengths(optional), [None, None, None, Some(1), None, None]);
     }
 
     #[test]

@@ -126,16 +126,6 @@ impl PerSegmentReaderView {
     pub fn matching_doc_ids(&self, query: &dyn Query) -> Result<Arc<RoaringTreemap>> {
         (self.global_matching_doc_ids_fn)(query)
     }
-
-    /// Per-segment field length for `(doc_id, field)`. Mirrors
-    /// `InvertedIndexReader::field_length` so the searcher can pull
-    /// accurate per-doc lengths through the view (otherwise BM25 would
-    /// fall back to the segment's avg field length and lose precision
-    /// on long / short docs).
-    pub fn field_length(&self, doc_id: u64, field: &str) -> Result<Option<u32>> {
-        let seg = self.segment.read().unwrap();
-        seg.field_length(doc_id, field)
-    }
 }
 
 impl std::fmt::Debug for PerSegmentReaderView {
@@ -288,7 +278,7 @@ impl LexicalIndexReader for PerSegmentReaderView {
     fn field_lengths(&self, field: &str) -> Option<Arc<dyn FieldLengths>> {
         Some(Arc::new(SegmentFieldLengths::new(
             field,
-            vec![(0, u64::MAX, Arc::clone(&self.segment))],
+            [(0, u64::MAX, &self.segment)],
         )))
     }
 

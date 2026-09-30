@@ -502,7 +502,11 @@ impl InvertedIndexSearcher {
         let mut score_buf: [f32; BATCH_SIZE] = [0.0; BATCH_SIZE];
         let mut n: usize = 0;
         let avg_fl = scorer.avg_field_length();
-        let query_field = query.field().map(|s| s.to_string());
+        // Resolved once per query, so a document's length costs no lock,
+        // downcast or field-name lookup (#1298).
+        let field_lengths = query
+            .field()
+            .and_then(|field| self.reader.field_lengths(field));
 
         // Running count of scanned documents, used to throttle the deadline
         // clock read (Issue #600). Starts at 0 so the first iteration checks
@@ -570,39 +574,14 @@ impl InvertedIndexSearcher {
                 // break path after scoring this doc.
             }
 
-            // Gather per-doc inputs into the batch buffer. The field
-            // length lookup mirrors the scalar path's reader downcasts
-            // (`InvertedIndexReader` / `PerSegmentReaderView`), but
-            // substitutes the scorer's avg when no per-doc value is
-            // available so the dense SIMD slice stays valid.
+            // Gather per-doc inputs into the batch buffer, substituting the
+            // scorer's avg when no per-doc length is available so the dense
+            // SIMD slice stays valid.
             let term_freq = matcher.term_freq() as f32;
-            let field_length = if let Some(field_name) = query_field.as_deref() {
-                if let Some(inverted_index_reader) =
-                    self.reader.as_any().downcast_ref::<InvertedIndexReader>()
-                {
-                    inverted_index_reader
-                        .field_length(doc_id, field_name)
-                        .ok()
-                        .flatten()
-                        .map(|len| len as f32)
-                        .unwrap_or(avg_fl)
-                } else if let Some(view) =
-                    self.reader.as_any().downcast_ref::<PerSegmentReaderView>()
-                {
-                    // #476 Phase 1: per-segment fanout reads field
-                    // lengths through the view so BM25 normalisation
-                    // matches each segment's local avg.
-                    view.field_length(doc_id, field_name)
-                        .ok()
-                        .flatten()
-                        .map(|len| len as f32)
-                        .unwrap_or(avg_fl)
-                } else {
-                    avg_fl
-                }
-            } else {
-                avg_fl
-            };
+            let field_length = field_lengths
+                .as_ref()
+                .and_then(|lengths| lengths.get(doc_id))
+                .map_or(avg_fl, |len| len as f32);
 
             doc_buf[n] = doc_id;
             tf_buf[n] = term_freq;
@@ -2247,6 +2226,103 @@ mod tests {
                 (got - want).abs() < 1e-5,
                 "doc {doc} scored {got}, but its clauses sum to {want}"
             );
+        }
+    }
+
+    /// #1298: a lone `TermQuery` on the default loop scores each document
+    /// with that document's own length, over a whole index and over one
+    /// segment's view. Checked against `BM25Scorer` fed the length
+    /// `SegmentReader::field_length` reports, since the #1287 tests compare
+    /// paths that now share one length source.
+    #[test]
+    fn term_query_scores_each_document_with_its_own_length() {
+        use crate::Document;
+        use crate::lexical::index::inverted::per_segment_view::PerSegmentReaderView;
+        use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Two segments. A matching document holds `alpha` once, so only its
+        // length tells its score apart; every third one matches nothing.
+        for id in 0..60u64 {
+            let mut words = vec![if id % 3 == 0 { "gamma" } else { "alpha" }];
+            words.extend(std::iter::repeat_n("filler", (id % 13) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+            if id == 29 {
+                store.commit().unwrap();
+            }
+        }
+        store.commit().unwrap();
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert_eq!(inverted.segment_count(), 2);
+
+        // `reader` supplies the statistics, `length` each document's length.
+        let check = |reader: Arc<dyn LexicalIndexReader>, length: &dyn Fn(u64) -> u32| {
+            let term = reader.term_info("body", "alpha").unwrap().unwrap();
+            let stats = reader.field_stats("body").unwrap().unwrap();
+            let bm25 = BM25Scorer::new(
+                term.doc_freq,
+                term.total_freq,
+                stats.doc_count,
+                stats.avg_length,
+                reader.doc_count(),
+                1.0,
+            );
+            let mut hits = InvertedIndexSearcher::from_arc(reader)
+                .search_with_collector(
+                    Box::new(TermQuery::new("body", "alpha")),
+                    NonBmwTopDocs(TopDocsCollector::new(100)),
+                )
+                .unwrap()
+                .0
+                .results();
+            assert!(hits.len() >= 10);
+            for hit in &hits {
+                let want = bm25.score(hit.doc_id, 1.0, Some(length(hit.doc_id) as f32));
+                assert!(
+                    (hit.score - want).abs() <= want * 1e-5,
+                    "doc {} scored {}, but its length gives {want}",
+                    hit.doc_id,
+                    hit.score
+                );
+            }
+            // With equal tf, the shorter document scores higher.
+            hits.sort_by_key(|hit| length(hit.doc_id));
+            for pair in hits.windows(2) {
+                if length(pair[0].doc_id) < length(pair[1].doc_id) {
+                    assert!(pair[0].score > pair[1].score);
+                }
+            }
+        };
+
+        check(Arc::clone(&reader), &|doc_id| {
+            inverted.field_length(doc_id, "body").unwrap().unwrap()
+        });
+        for segment in inverted.segment_readers() {
+            let view = PerSegmentReaderView::new(
+                Arc::clone(segment),
+                inverted.doc_count(),
+                inverted.max_doc(),
+                Arc::new(|_: &str, _: &str| Ok(None)),
+                Arc::new(|_: &dyn Query| Ok(Arc::new(RoaringTreemap::new()))),
+            );
+            check(Arc::new(view), &|doc_id| {
+                segment
+                    .read()
+                    .unwrap()
+                    .field_length(doc_id, "body")
+                    .unwrap()
+                    .unwrap()
+            });
         }
     }
 
