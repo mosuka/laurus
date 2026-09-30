@@ -375,12 +375,20 @@ impl JsSchema {
     ///
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default `true`).
+    /// * `multiValued` - When `true`, the field accepts arrays of binary
+    ///   values (each with its own optional MIME type). Default `false`.
     #[napi]
-    pub fn add_bytes_field(&mut self, name: String, stored: Option<bool>) {
+    pub fn add_bytes_field(
+        &mut self,
+        name: String,
+        stored: Option<bool>,
+        multi_valued: Option<bool>,
+    ) {
         self.inner.fields.insert(
             name,
             FieldOption::Bytes(BytesOption {
                 stored: stored.unwrap_or(true),
+                multi_valued: multi_valued.unwrap_or(false),
             }),
         );
     }

@@ -33,6 +33,7 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 /// - `list[(x, y, z)]`     → `DataValue::GeoEcefArray`
 /// - `list[datetime | str]` → `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `list[bool]`          → `DataValue::BoolArray` (multi-valued boolean, #1180)
+/// - `list[bytes]`         → `DataValue::BytesArray` (multi-valued bytes, #1176)
 /// - `list[str]`           → `DataValue::TextArray` (multi-valued text, #1175) —
 ///   or `DateTimeArray` when every element parses as a datetime
 /// - `(lat, lon)` tuple    → `DataValue::Geo`
@@ -112,6 +113,17 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
                 .map(|item| item.extract::<bool>())
                 .collect::<PyResult<_>>()?;
             return Ok(DataValue::BoolArray(flags));
+        }
+        // A list of `bytes` is a multi-valued bytes field (#1176). Each
+        // element takes the same direct-bytes path as a single value; the
+        // scalar `bytes` conversion carries no MIME metadata either, so
+        // every element's MIME type is `None` here too.
+        if list.iter().all(|item| item.is_instance_of::<PyBytes>()) {
+            let items: Vec<(Vec<u8>, Option<String>)> = list
+                .iter()
+                .map(|item| item.extract::<Vec<u8>>().map(|b| (b, None)))
+                .collect::<PyResult<_>>()?;
+            return Ok(DataValue::BytesArray(items));
         }
         let all_ints = list
             .iter()
@@ -296,6 +308,12 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
         DataValue::BoolArray(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
         // A list of Python strs (#1175).
         DataValue::TextArray(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
+        // A list of Python `bytes`, mirroring the scalar `Bytes` arm (#1176).
+        // MIME metadata is discarded per element just like the scalar arm.
+        DataValue::BytesArray(arr) => {
+            let items: Vec<_> = arr.iter().map(|(b, _mime)| PyBytes::new(py, b)).collect();
+            Ok(PyList::new(py, items)?.unbind().into_any())
+        }
     }
 }
 

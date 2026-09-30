@@ -424,12 +424,17 @@ impl PhpSchema {
     ///
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
-    #[php(defaults(stored = true))]
-    pub fn add_bytes_field(&self, name: String, stored: bool) {
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Bytes(BytesOption { stored }));
+    /// * `multi_valued` - When true, the field accepts an array of binary
+    ///   values (each with its own optional MIME type). Default: false.
+    #[php(defaults(stored = true, multi_valued = false))]
+    pub fn add_bytes_field(&self, name: String, stored: bool, multi_valued: bool) {
+        self.inner.borrow_mut().fields.insert(
+            name,
+            FieldOption::Bytes(BytesOption {
+                stored,
+                multi_valued,
+            }),
+        );
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.

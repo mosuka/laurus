@@ -346,3 +346,63 @@ describe("multi-valued text arrays from JS (#1175)", () => {
     expect((await contiguous.search('notes:"world foo"', 5)).map((h) => h.id)).toEqual(["doc1"]);
   });
 });
+
+async function indexWithBytesField(multiValued) {
+  const schema = new Schema();
+  schema.addTextField("title");
+  // (name, stored, multiValued)
+  schema.addBytesField("blobs", true, multiValued);
+  return Index.create(null, schema);
+}
+
+describe("multi-valued bytes arrays from JS (#1176)", () => {
+  it("round-trips an array of base64 strings through a multiValued bytes field", async () => {
+    const index = await indexWithBytesField(true);
+    const hello = Buffer.from("hello").toString("base64");
+    const world = Buffer.from("world").toString("base64");
+    await index.putDocument("doc1", { title: "t", blobs: [hello, world] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    // The Node.js binding renders Bytes/BytesArray back as byte-integer
+    // arrays (MIME dropped), the same asymmetry as the scalar Bytes field.
+    expect(docs[0].blobs).toEqual([
+      Array.from(Buffer.from("hello")),
+      Array.from(Buffer.from("world")),
+    ]);
+  });
+
+  it("wraps a single base64 string on a multiValued bytes field", async () => {
+    const index = await indexWithBytesField(true);
+    const hello = Buffer.from("hello").toString("base64");
+    await index.putDocument("doc1", { title: "t", blobs: hello });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].blobs).toEqual([Array.from(Buffer.from("hello"))]);
+  });
+
+  it("accepts an empty array on a multiValued bytes field", async () => {
+    const index = await indexWithBytesField(true);
+    await index.putDocument("doc1", { title: "t", blobs: [] });
+    await index.commit();
+
+    const docs = await index.getDocuments("doc1");
+    expect(docs[0].blobs).toEqual([]);
+  });
+
+  it("rejects an array sent to a single-valued bytes field", async () => {
+    const index = await indexWithBytesField(false);
+    const hello = Buffer.from("hello").toString("base64");
+    await expect(
+      index.putDocument("doc1", { title: "t", blobs: [hello] }),
+    ).rejects.toThrow(/multi_valued/);
+  });
+
+  it("rejects a non-base64 element in the array", async () => {
+    const index = await indexWithBytesField(true);
+    await expect(
+      index.putDocument("doc1", { title: "t", blobs: ["not base64!!"] }),
+    ).rejects.toThrow(/base64/);
+  });
+});

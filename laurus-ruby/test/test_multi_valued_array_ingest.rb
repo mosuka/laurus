@@ -329,4 +329,56 @@ class TestMultiValuedArrayIngest < Minitest::Test
       )
     end
   end
+
+  # ---- Multi-valued bytes (Issue #1176) ----
+
+  def index_with_bytes_field(multi_valued:)
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    schema.add_bytes_field("blobs", multi_valued: multi_valued)
+    Laurus::Index.new(schema: schema)
+  end
+
+  # Base64-encodes a raw byte String using `Array#pack`, avoiding a
+  # dependency on the `base64` gem (no longer a default gem since Ruby 3.4).
+  def b64(raw)
+    [raw].pack("m0")
+  end
+
+  # An Array of base64 Strings is a multi-valued bytes field (the same
+  # base64 shape the scalar `Bytes` field accepts, per #1176); each element
+  # is decoded independently and it reads back as raw byte Strings. MIME
+  # metadata is not carried through the Ruby bindings, same as the scalar
+  # `Bytes` field.
+  def test_base64_string_array_round_trips_through_multi_valued_bytes_field
+    idx = index_with_bytes_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "blobs" => [b64("hello"), b64("world")] })
+    idx.commit
+
+    assert_equal ["hello", "world"], idx.get_documents("doc1").first["blobs"]
+  end
+
+  def test_single_base64_string_is_wrapped_on_multi_valued_bytes_field
+    idx = index_with_bytes_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "blobs" => b64("hello") })
+    idx.commit
+
+    assert_equal ["hello"], idx.get_documents("doc1").first["blobs"]
+  end
+
+  def test_empty_array_is_accepted_by_multi_valued_bytes_field
+    idx = index_with_bytes_field(multi_valued: true)
+    idx.put_document("doc1", { "title" => "t", "blobs" => [] })
+    idx.commit
+
+    assert_equal [], idx.get_documents("doc1").first["blobs"]
+  end
+
+  def test_base64_string_array_into_single_valued_bytes_field_is_rejected
+    idx = index_with_bytes_field(multi_valued: false)
+    err = assert_raises(StandardError) do
+      idx.put_document("doc1", { "title" => "t", "blobs" => [b64("hello")] })
+    end
+    assert_match(/multi_valued/, err.message)
+  end
 end

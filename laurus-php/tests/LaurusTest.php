@@ -610,6 +610,55 @@ class LaurusTest extends TestCase
         $this->assertSame(["doc1"], $this->idsOf($contiguous->search('notes:"world foo"')));
     }
 
+    // ── Multi-valued bytes arrays (Issue #1176) ──────────────────────────
+
+    private function indexWithMultiValuedBytesField(bool $multiValued): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        // (name, stored, multi_valued)
+        $schema->addBytesField("blobs", true, $multiValued);
+        return new Laurus\Index(null, $schema);
+    }
+
+    // A declared `Bytes` field treats a plain PHP string as base64, so the
+    // array elements sent in must be base64-encoded; they read back as the
+    // raw decoded bytes, the same asymmetry the scalar `Bytes` field follows.
+    public function testBytesArrayRoundTripsThroughMultiValuedBytesField(): void
+    {
+        $idx = $this->indexWithMultiValuedBytesField(true);
+        $idx->putDocument("doc1", [
+            "title" => "t",
+            "blobs" => [base64_encode("hello"), base64_encode("world")],
+        ]);
+        $idx->commit();
+        $this->assertSame(["hello", "world"], $idx->getDocuments("doc1")[0]["blobs"]);
+    }
+
+    public function testSingleBytesValueIsWrappedOnMultiValuedBytesField(): void
+    {
+        $idx = $this->indexWithMultiValuedBytesField(true);
+        $idx->putDocument("doc1", ["title" => "t", "blobs" => base64_encode("hello")]);
+        $idx->commit();
+        $this->assertSame(["hello"], $idx->getDocuments("doc1")[0]["blobs"]);
+    }
+
+    public function testEmptyArrayIsAcceptedByMultiValuedBytesField(): void
+    {
+        $idx = $this->indexWithMultiValuedBytesField(true);
+        $idx->putDocument("doc1", ["title" => "t", "blobs" => []]);
+        $idx->commit();
+        $this->assertSame([], $idx->getDocuments("doc1")[0]["blobs"]);
+    }
+
+    public function testBytesArrayIntoSingleValuedBytesFieldIsRejected(): void
+    {
+        $idx = $this->indexWithMultiValuedBytesField(false);
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/multi_valued/');
+        $idx->putDocument("doc1", ["title" => "t", "blobs" => [base64_encode("hello")]]);
+    }
+
     public function testMixedGeoDimensionArrayIsRejected(): void
     {
         $idx = $this->indexWithGeoField(true);

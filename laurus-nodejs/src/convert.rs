@@ -46,7 +46,10 @@ pub fn json_to_document(value: &Value) -> napi::Result<Document> {
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
 /// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `array` of booleans     -> `DataValue::BoolArray` (multi-valued boolean, #1180)
-/// - `array` of other strings -> `DataValue::TextArray` (multi-valued text, #1175)
+/// - `array` of other strings -> `DataValue::TextArray` (multi-valued text, #1175); on a
+///   multi-valued `Bytes` field the schema-aware coercion further base64-decodes each
+///   element into a `DataValue::BytesArray` (#1176) — this function still returns
+///   `TextArray`, the same as the scalar `Bytes` case (see `DataValue::Bytes` doc)
 /// - `{ "lat", "lon" }`      -> `DataValue::Geo`
 /// - `{ "x", "y", "z" }`     -> `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
 ///
@@ -205,5 +208,17 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
         DataValue::TextArray(arr) => {
             Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
         }
+        // Each element rendered the same way the scalar `Bytes` arm above
+        // renders it (mime dropped; #1176). Not expected to round-trip back
+        // into a `BytesArray` through `json_to_data_value` — same
+        // intentional asymmetry as the scalar case, which also renders as a
+        // byte-integer array but only accepts base64 text as input.
+        DataValue::BytesArray(arr) => Value::Array(
+            arr.iter()
+                .map(|(data, _mime)| {
+                    Value::Array(data.iter().map(|b| serde_json::json!(*b)).collect())
+                })
+                .collect(),
+        ),
     }
 }
