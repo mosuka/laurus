@@ -243,10 +243,11 @@ pub trait Scorer: Send + Debug {
         }
     }
 
-    /// Average field length the scorer would substitute when the
-    /// caller passes `None` to [`Self::score`] (#506). Used by the
-    /// batched default loop to pre-fill the `field_lengths` slice with
-    /// the scalar fallback value, keeping SIMD and scalar paths
+    /// Average field length the scorer substitutes when it has no length
+    /// for a document: the caller passes `None` to [`Self::score`] and the
+    /// scorer cannot look the document's own length up (#506, #1287). Used
+    /// by the batched default loop to pre-fill the `field_lengths` slice
+    /// with the scalar fallback value, keeping SIMD and scalar paths
     /// numerically identical. The default implementation returns 0.0,
     /// which non-BM25 scorers ignore.
     fn avg_field_length(&self) -> f32 {
