@@ -30,6 +30,7 @@ use crate::lexical::index::structures::dictionary::BLOCK_SIZE;
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
 use crate::lexical::index::structures::dictionary::TermInfo;
 use crate::lexical::index::structures::doc_values::DocValuesReader;
+use crate::lexical::index::structures::norms::NormsColumn;
 use crate::lexical::query::Query;
 use crate::lexical::reader::FieldStats;
 use crate::lexical::reader::PostingIterator;
@@ -2288,6 +2289,9 @@ struct SegmentLengths {
     /// `None` when the segment has no deletions.
     deletions: Option<Arc<DeletionBitmap>>,
     norms: Arc<SegmentNorms>,
+    /// The field's `.norms` column; `None` for a pre-#555 segment, which is
+    /// looked up by field name.
+    column: Option<NormsColumn>,
 }
 
 impl SegmentLengths {
@@ -2305,14 +2309,18 @@ impl SegmentLengths {
         {
             return None;
         }
-        self.norms.field_length(doc_id, field)
+        match (self.norms.as_ref(), self.column) {
+            (SegmentNorms::V1(reader), Some(column)) => reader.column_length(column, doc_id),
+            (norms, _) => norms.field_length(doc_id, field),
+        }
     }
 }
 
 impl SegmentFieldLengths {
     /// Lengths of `field` across `segments`, each given with the doc id range
-    /// it can hold. A segment whose length source fails to load is left out:
-    /// no lookup could find a length in it.
+    /// it can hold. A segment no lookup could find a length in is left out:
+    /// one whose length source fails to load, or a `.norms` segment with no
+    /// column for `field`.
     pub(crate) fn new<'a>(
         field: &str,
         segments: impl IntoIterator<Item = (u64, u64, &'a Arc<RwLock<SegmentReader>>)>,
@@ -2321,11 +2329,17 @@ impl SegmentFieldLengths {
             .into_iter()
             .filter_map(|(min_doc_id, max_doc_id, segment)| {
                 let segment = segment.read().unwrap();
+                let norms = segment.norms().ok()?;
+                let column = match norms.as_ref() {
+                    SegmentNorms::V1(reader) => Some(reader.column(field)?),
+                    SegmentNorms::Legacy { .. } => None,
+                };
                 Some(SegmentLengths {
                     min_doc_id,
                     max_doc_id,
                     deletions: segment.deletions(),
-                    norms: segment.norms().ok()?,
+                    norms,
+                    column,
                 })
             })
             .collect();
