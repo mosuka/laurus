@@ -12,18 +12,21 @@ A `FacetPath` represents a hierarchical facet value. For example, a product cate
 use laurus::lexical::search::features::facet::FacetPath;
 
 // Single-level facet
-let facet = FacetPath::from_value("category", "Electronics");
+let facet = FacetPath::from_value("category".into(), "Electronics".into());
 
 // Hierarchical facet from components
-let facet = FacetPath::new("category", vec![
+let facet = FacetPath::new("category".into(), vec![
     "Electronics".to_string(),
     "Computers".to_string(),
     "Laptops".to_string(),
 ]);
 
 // From a delimited string
-let facet = FacetPath::from_delimited("category", "Electronics/Computers/Laptops", "/");
+let facet = FacetPath::from_delimited("category".into(), "Electronics/Computers/Laptops", "/");
 ```
+
+`from_delimited` drops empty components, as the collector does, so
+`"/Electronics//Computers"` gives `["Electronics", "Computers"]`.
 
 #### FacetPath Methods
 
@@ -52,11 +55,53 @@ pub struct FacetCount {
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `path` | `FacetPath` | The facet value |
-| `count` | `u64` | Number of matching documents |
-| `children` | `Vec<FacetCount>` | Child facets for hierarchical drill-down |
+| `path` | `FacetPath` | The facet value, as the full path from the field's top level |
+| `count` | `u64` | Number of matching documents whose value is this path or lies under it |
+| `children` | `Vec<FacetCount>` | Facets one level deeper, for hierarchical drill-down |
 
-## Example: Hierarchical Facets
+### FacetConfig
+
+`FacetConfig` controls what the collector counts and returns:
+
+| Field | Default | Description |
+| :--- | :--- | :--- |
+| `max_facets_per_field` | `100` | Maximum number of values kept per level: at the top level of each field and, separately, among the children of each node. Applied after sorting |
+| `max_depth` | `10` | Paths are cut to their first `max_depth` components while collecting, so deeper levels are never counted. `0` counts nothing; `usize::MAX` keeps every level |
+| `min_count` | `1` | Minimum document count for a value to be returned. A value below it is dropped together with its children |
+| `sort_by_count` | `true` | Sort each level by count, descending, with ties broken by label. `false` sorts each level by label |
+
+Values that no collected document has are never returned, so a `min_count`
+of `0` behaves like `1`.
+
+## Collecting facets
+
+Feed each matching document to a `FacetCollector`, then call `finalize`:
+
+```rust
+use laurus::lexical::search::features::facet::{FacetCollector, FacetConfig};
+
+let mut collector = FacetCollector::new(FacetConfig::default(), vec!["category".to_string()]);
+for doc_id in matching_doc_ids {
+    collector.collect_doc(doc_id, reader.as_ref())?;
+}
+let results = collector.finalize()?;
+
+for facet in results.get_field_facets("category").into_iter().flatten() {
+    println!("{} ({})", facet.path.to_string_with_delimiter("/"), facet.count);
+}
+```
+
+`collect_doc` returns an error when a facet field has to be read from the
+stored document and that read fails. The collector's counts are incomplete
+after such an error, so discard it.
+
+## Hierarchical facets
+
+A `Text` value containing `/` is a hierarchical path: `Electronics/Computers/Laptops`
+has three levels. The collector counts the path and each of its ancestors,
+once per document, and `finalize` returns one tree per field: the top-level
+values in `get_field_facets(field)`, and each deeper level in the `children`
+of its parent.
 
 ```text
 Category
@@ -70,7 +115,25 @@ Category
     └── Non-Fiction (15)
 ```
 
-Each node in this tree corresponds to a `FacetCount` with its `children` populated for drill-down navigation.
+A node's `count` is the number of documents whose value is that path or lies
+under it, so a child never outnumbers its parent. A flat value and the root
+of a hierarchical one are the same node. For example, one document with
+`cat = "a"` and another with `cat = "a/b"` give a single `a (2)` with one
+child `b (1)`.
+
+Each level is filtered, sorted and truncated on its own:
+
+- `min_count` drops a value together with its whole subtree.
+- `max_facets_per_field` applies to the top level and to the children of
+  each node separately, so an ancestor never uses up its descendants'
+  budget.
+- Values with equal counts are ordered by label, so which values are kept
+  never depends on hash order. This matches Lucene and Tantivy.
+
+Empty components are dropped: `"/a/b"` and `"a//b"` both give `a/b`, `"a/"`
+gives `a`, and `""` or `"/"` count nothing. Lucene rejects such components
+when indexing; here facets are derived at search time from ordinary text
+values, so they are dropped instead of failing the search.
 
 ## Use Cases
 
@@ -107,9 +170,6 @@ Array elements are rendered exactly like the scalar of the same type:
 `Null`, geo points (`Geo`, `GeoEcef` and their arrays), `Vector` and `Bytes`
 are not facetable and contribute nothing. A DocValues hit that yields no facet
 value does not fall back to the stored document.
-
-Hierarchical paths are currently returned as flat siblings (`["a"]`,
-`["a", "b"]`) rather than nested `children`; see Issue #1192.
 
 ## Performance
 
