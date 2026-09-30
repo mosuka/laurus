@@ -23,6 +23,7 @@ use crate::lexical::query::collector::{
     Collector, CountCollector, FieldHit, FieldTopK, TopDocsCollector, TopFieldCollector,
 };
 use crate::lexical::query::parser::LexicalQueryParser;
+use crate::lexical::query::synonym::SynonymQuery;
 use crate::lexical::query::term::TermQuery;
 use crate::lexical::query::{LexicalSearchResults, SearchHit};
 use crate::lexical::reader::LexicalIndexReader;
@@ -1493,6 +1494,16 @@ impl InvertedIndexSearcher {
                 .term_doc_freq(term_query.field(), term_query.term());
         }
 
+        // A `SynonymQuery` counts the union of its alternatives' postings,
+        // which no dictionary statistic gives: the largest `doc_freq` only
+        // bounds it from below (Issue #1283). With no score threshold, walking
+        // that union without scoring counts what the collector below would
+        // (the same matcher, whose postings drop deleted documents as they
+        // decode) without a field-length read and a BM25 evaluation per match.
+        if request.params.min_score <= 0.0 && query.as_any().is::<SynonymQuery>() {
+            return count_matches_only(query.as_ref(), self.reader.as_ref());
+        }
+
         // Use count collector with min_score if specified
         let collector = if request.params.min_score > 0.0 {
             CountCollector::with_min_score(request.params.min_score)
@@ -2532,6 +2543,54 @@ mod tests {
                 assert_fanout_top_k_is_exact(&store, query.as_ref(), k, &label);
             }
         }
+    }
+
+    /// #1283: `count()` on a `SynonymQuery` counts the union of its
+    /// alternatives' postings without scoring them, and agrees with the
+    /// scoring `CountCollector` path, across segments and deletions.
+    #[test]
+    fn count_of_a_synonym_query_is_the_union_of_its_postings() {
+        use crate::Document;
+        use crate::lexical::query::synonym::SynonymQuery;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Two segments, whose documents hold `big`, `large`, both, or neither.
+        let body = |id: u64| match id % 4 {
+            0 => "big filler",
+            1 => "large filler",
+            2 => "big large",
+            _ => "filler",
+        };
+        for id in 0..40u64 {
+            let doc = Document::builder().add_text("body", body(id)).build();
+            store.upsert_document(id, doc).unwrap();
+            if id == 19 {
+                store.commit().unwrap();
+            }
+        }
+        store.commit().unwrap();
+        let deleted = [0u64, 5, 22, 26];
+        for id in deleted {
+            store.delete_document_by_internal_id(id).unwrap();
+        }
+        store.commit().unwrap();
+
+        let union = (0..40u64)
+            .filter(|id| id % 4 != 3 && !deleted.contains(id))
+            .count() as u64;
+        let query =
+            || -> Box<dyn Query> { Box::new(SynonymQuery::new("body", vec!["big", "large"])) };
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let counted = searcher.count(LexicalSearchRequest::new(query())).unwrap();
+        let collected = searcher
+            .search_with_collector(query(), CountCollector::new())
+            .unwrap()
+            .total_hits();
+        assert_eq!(counted, union);
+        assert_eq!(collected, union);
     }
 
     /// Helper for #476 Phase 1 tests: build a `LexicalStore` with
