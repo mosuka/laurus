@@ -88,6 +88,17 @@ pub struct FieldStatistics {
     pub total_terms: u64,
 }
 
+/// Per-document lengths of one field, as BM25 normalizes them (#1287).
+///
+/// A leaf scorer keeps one for its field, so it can score a document with
+/// that document's own length even when its caller -- a composite scorer
+/// spanning several fields -- has no length to hand it.
+pub trait FieldLengths: Send + Sync + std::fmt::Debug {
+    /// The field's length in `doc_id`, or `None` when the document is deleted
+    /// or has no value for the field.
+    fn get(&self, doc_id: u64) -> Option<u32>;
+}
+
 /// Trait for lexical index readers.
 ///
 /// Provides read-only access to a committed lexical index. Implementations
@@ -222,6 +233,13 @@ pub trait LexicalIndexReader: Send + Sync + std::fmt::Debug {
         // Default implementation returns None (no BKD Tree support)
         let _ = field;
         Ok(None)
+    }
+
+    /// Per-document lengths of `field`, for a scorer to keep (#1287). The
+    /// default is `None`, which leaves scorers on the field's average length.
+    fn field_lengths(&self, field: &str) -> Option<Arc<dyn FieldLengths>> {
+        let _ = field;
+        None
     }
 
     /// Get document frequency for a specific term in a field.

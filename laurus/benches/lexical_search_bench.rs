@@ -123,7 +123,7 @@ use laurus::analysis::analyzer::analyzer::Analyzer;
 use laurus::analysis::analyzer::standard::StandardAnalyzer;
 use laurus::lexical::core::field::IntegerOption;
 use laurus::lexical::{
-    BooleanQuery, FuzzyQuery, PhraseQuery, TermQuery, TextOption, WildcardQuery,
+    BooleanQuery, FuzzyQuery, PhraseQuery, SynonymQuery, TermQuery, TextOption, WildcardQuery,
 };
 use laurus::storage::Storage;
 use laurus::storage::file::FileStorageConfig;
@@ -898,6 +898,30 @@ fn bench_topk_or_skewed_tf(c: &mut Criterion) {
                 }
             });
         });
+
+        // The same OR with a `SynonymQuery` in place of `data`: the shape the
+        // query parser builds for a position with stacked synonyms. A
+        // `SynonymQuery` carries no block-max table (#1283).
+        group.bench_with_input(
+            BenchmarkId::new("should_or_synonym_topk10", n),
+            &n,
+            |b, _| {
+                b.to_async(&rt).iter(|| {
+                    let engine = &engine;
+                    async move {
+                        let mut bq = BooleanQuery::new();
+                        bq.add_should(Box::new(TermQuery::new("body", "search")));
+                        bq.add_should(Box::new(TermQuery::new("body", "system")));
+                        bq.add_should(Box::new(SynonymQuery::new("body", vec!["data", "query"])));
+                        let request = SearchRequestBuilder::new()
+                            .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
+                            .limit(10)
+                            .build();
+                        black_box(engine.search(request).await.unwrap())
+                    }
+                });
+            },
+        );
     }
     group.finish();
 }

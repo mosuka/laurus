@@ -23,6 +23,7 @@ use crate::lexical::query::collector::{
     Collector, CountCollector, FieldHit, FieldTopK, TopDocsCollector, TopFieldCollector,
 };
 use crate::lexical::query::parser::LexicalQueryParser;
+use crate::lexical::query::synonym::SynonymQuery;
 use crate::lexical::query::term::TermQuery;
 use crate::lexical::query::{LexicalSearchResults, SearchHit};
 use crate::lexical::reader::LexicalIndexReader;
@@ -1493,6 +1494,16 @@ impl InvertedIndexSearcher {
                 .term_doc_freq(term_query.field(), term_query.term());
         }
 
+        // A `SynonymQuery` counts the union of its alternatives' postings,
+        // which no dictionary statistic gives: the largest `doc_freq` only
+        // bounds it from below (Issue #1283). With no score threshold, walking
+        // that union without scoring counts what the collector below would
+        // (the same matcher, whose postings drop deleted documents as they
+        // decode) without a field-length read and a BM25 evaluation per match.
+        if request.params.min_score <= 0.0 && query.as_any().is::<SynonymQuery>() {
+            return count_matches_only(query.as_ref(), self.reader.as_ref());
+        }
+
         // Use count collector with min_score if specified
         let collector = if request.params.min_score > 0.0 {
             CountCollector::with_min_score(request.params.min_score)
@@ -1974,10 +1985,10 @@ mod tests {
             );
         }
 
-        // Suppress dead-code warning on the wrapper while we're using
-        // the round-trip technique. The wrapper is kept for future
-        // tests that want to invoke the legacy path explicitly.
-        let _suppress_dead_code = NonBmwTopDocs(TopDocsCollector::new(0));
+        // Against the regular path too, now that it scores each clause with
+        // its own document's length as BMW does (#1287).
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        assert_bmw_top_k_is_exact(&searcher, make_query().as_ref(), 10, "skewed TF");
     }
 
     /// #1256: the outer `BooleanQuery`'s own boost must reach the BMW
@@ -2081,6 +2092,507 @@ mod tests {
         }
     }
 
+    /// Each hit's score, keyed by doc id.
+    fn scores_by_doc(hits: Vec<SearchHit>) -> std::collections::HashMap<u64, f32> {
+        hits.into_iter().map(|h| (h.doc_id, h.score)).collect()
+    }
+
+    /// A Should-only `BooleanQuery` of one `TermQuery` per term on `body`.
+    fn should_terms(terms: &[&str]) -> Box<dyn Query> {
+        let mut builder = BooleanQueryBuilder::new();
+        for term in terms {
+            builder = builder.should(Box::new(TermQuery::new("body", *term)));
+        }
+        Box::new(builder.build())
+    }
+
+    /// #1287: a `BooleanQuery` scores each clause with that clause's own
+    /// per-document field length, so a document scores as the sum of its
+    /// clauses' `TermQuery` scores whichever path runs the query. The regular
+    /// path used to hand every clause length 0.
+    #[test]
+    fn boolean_clauses_score_with_each_documents_own_length() {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Docs 0..30 match the query, with lengths growing with the id so
+        // length normalization tells them apart; docs 30..60 match nothing
+        // and keep the idf away from its floor.
+        for id in 0..60u64 {
+            let mut words = if id < 30 {
+                vec!["alpha"]
+            } else {
+                vec!["gamma"]
+            };
+            if id % 2 == 0 && id < 30 {
+                words.push("beta");
+            }
+            words.extend(std::iter::repeat_n("filler", (id % 30) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let search = |query: Box<dyn Query>| {
+            scores_by_doc(
+                searcher
+                    .search_with_collector(query, TopDocsCollector::new(100))
+                    .unwrap()
+                    .results(),
+            )
+        };
+        let alpha = search(Box::new(TermQuery::new("body", "alpha")));
+        let beta = search(Box::new(TermQuery::new("body", "beta")));
+
+        // Single-segment BMW: `TopDocsCollector` is BMW-capable.
+        let bmw = search(should_terms(&["alpha", "beta"]));
+        let regular = scores_by_doc(
+            searcher
+                .search_with_collector(
+                    should_terms(&["alpha", "beta"]),
+                    NonBmwTopDocs(TopDocsCollector::new(100)),
+                )
+                .unwrap()
+                .0
+                .results(),
+        );
+        // A Must clause keeps the query off BMW.
+        let must_should = search(Box::new(
+            BooleanQueryBuilder::new()
+                .must(Box::new(TermQuery::new("body", "alpha")))
+                .should(Box::new(TermQuery::new("body", "beta")))
+                .build(),
+        ));
+
+        for doc in 0..30u64 {
+            let want = alpha[&doc] + beta.get(&doc).copied().unwrap_or(0.0);
+            for (path, scores) in [
+                ("BMW", &bmw),
+                ("regular", &regular),
+                ("must+should", &must_should),
+            ] {
+                let got = scores[&doc];
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "{path}: doc {doc} scored {got}, but its clauses sum to {want}"
+                );
+            }
+        }
+    }
+
+    /// #1287: inside the per-segment fanout, BMW scored every clause at the
+    /// average length, because it could only read field lengths through an
+    /// `InvertedIndexReader`, not a `PerSegmentReaderView`. Every segment
+    /// here holds both terms, so each one runs BMW.
+    #[test]
+    fn fanout_boolean_clauses_score_with_each_documents_own_length() {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Two segments of 40 documents; in each, the first 20 match the query
+        // and the other 20 keep the idf away from its floor.
+        let matches = |id: u64| id % 40 < 20;
+        for id in 0..80u64 {
+            let mut words = if matches(id) {
+                vec!["alpha"]
+            } else {
+                vec!["gamma"]
+            };
+            if matches(id) && id % 2 == 0 {
+                words.push("beta");
+            }
+            words.extend(std::iter::repeat_n("filler", (id % 20) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+            if id == 39 {
+                store.commit().unwrap();
+            }
+        }
+        store.commit().unwrap();
+
+        let search = |query: Box<dyn Query>| {
+            scores_by_doc(
+                store
+                    .search(LexicalSearchRequest::new(query).limit(100))
+                    .unwrap()
+                    .hits,
+            )
+        };
+        let alpha = search(Box::new(TermQuery::new("body", "alpha")));
+        let beta = search(Box::new(TermQuery::new("body", "beta")));
+        let boolean = search(should_terms(&["alpha", "beta"]));
+
+        assert_eq!(boolean.len(), 40);
+        for doc in (0..80u64).filter(|&id| matches(id)) {
+            let want = alpha[&doc] + beta.get(&doc).copied().unwrap_or(0.0);
+            let got = boolean[&doc];
+            assert!(
+                (got - want).abs() < 1e-5,
+                "doc {doc} scored {got}, but its clauses sum to {want}"
+            );
+        }
+    }
+
+    /// #1287: scored with length 0, a `BooleanQuery` on the regular path
+    /// exceeded the per-block bounds its early termination skips by (those
+    /// are computed from each document's real length), so a small top-K
+    /// could skip the true best document.
+    #[test]
+    fn regular_path_early_termination_keeps_the_true_top_hit() {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // `alpha`'s first posting block: short documents, tf 1. Its second
+        // block: long documents, tf 2 -- a lower real score, but a higher
+        // score than the first block when every length reads as 0.
+        for id in 0..256u64 {
+            let body = if id < 128 {
+                "alpha filler".to_string()
+            } else {
+                let mut words = vec!["alpha", "alpha"];
+                words.extend(std::iter::repeat_n("filler", 38));
+                words.join(" ")
+            };
+            let doc = Document::builder().add_text("body", body).build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        // Documents without `alpha` keep its idf away from the floor.
+        for id in 256..556u64 {
+            let doc = Document::builder().add_text("body", "gamma filler").build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        // A lone Must clause keeps the query off BMW, and its block bounds are
+        // the only ones the regular loop's skip consults.
+        let query = || -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .must(Box::new(TermQuery::new("body", "alpha")))
+                    .build(),
+            )
+        };
+        let top = |k: usize| {
+            let mut hits = searcher
+                .search_with_collector(query(), TopDocsCollector::new(k))
+                .unwrap()
+                .results();
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+            (hits[0].doc_id, hits[0].score)
+        };
+        let (pruned, exhaustive) = (top(1), top(1000));
+        assert_eq!(
+            pruned.0, exhaustive.0,
+            "top-1 {pruned:?} vs exhaustive {exhaustive:?}"
+        );
+        assert!((pruned.1 - exhaustive.1).abs() < 1e-5);
+    }
+
+    /// Asserts that BMW's top-`k` for `query` is a correct top-`k`: at every
+    /// rank it holds the score exhaustive regular-path scoring holds there,
+    /// and it scores each document it returns as the regular path does. (Tied
+    /// documents may differ.)
+    fn assert_bmw_top_k_is_exact(
+        searcher: &InvertedIndexSearcher,
+        query: &dyn Query,
+        k: usize,
+        label: &str,
+    ) {
+        let exhaustive = scores_by_doc(
+            searcher
+                .search_with_collector(
+                    query.clone_box(),
+                    NonBmwTopDocs(TopDocsCollector::new(1_000_000)),
+                )
+                .unwrap()
+                .0
+                .results(),
+        );
+        let mut ranked: Vec<f32> = exhaustive.values().copied().collect();
+        ranked.sort_by(|a, b| b.total_cmp(a));
+        ranked.truncate(k);
+
+        let mut bmw = searcher
+            .search_with_collector(query.clone_box(), TopDocsCollector::new(k))
+            .unwrap()
+            .results();
+        bmw.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+
+        assert_eq!(bmw.len(), ranked.len(), "{label}: hit count");
+        for (rank, (hit, want)) in bmw.iter().zip(&ranked).enumerate() {
+            let tol = 1e-5_f32.max(1e-5 * want.abs());
+            assert!(
+                (hit.score - want).abs() < tol,
+                "{label}: rank {rank} holds doc {} at {}, exhaustive scoring has {want}",
+                hit.doc_id,
+                hit.score
+            );
+            let reference = exhaustive[&hit.doc_id];
+            assert!(
+                (hit.score - reference).abs() < tol,
+                "{label}: doc {} scored {} by BMW, {reference} by the regular path",
+                hit.doc_id,
+                hit.score
+            );
+        }
+    }
+
+    /// #1286: the pivot loop picked the pivot from each clause's current-block
+    /// bound, then skipped the lagging clauses to the pivot -- straight over a
+    /// later block with a higher bound. Here `bravo`'s second block (docs
+    /// 128..=255, tf 30) was skipped once doc 0 set the threshold, and K = 1
+    /// returned doc 0 (1.79) instead of doc 128 (2.93).
+    #[test]
+    fn bmw_does_not_skip_a_later_higher_block() {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        const LEN: usize = 40;
+        for id in 0..2000u64 {
+            let bravo = match id {
+                128..=255 => 30,
+                0..=399 => 1,
+                _ => 0,
+            };
+            let charlie = match id {
+                0 | 1001..=1799 => 1,
+                1000 => 3,
+                _ => 0,
+            };
+            let mut words = Vec::with_capacity(LEN);
+            words.extend(std::iter::repeat_n("bravo", bravo));
+            words.extend(std::iter::repeat_n("charlie", charlie));
+            words.extend(std::iter::repeat_n("filler", LEN - bravo - charlie));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let query = should_terms(&["bravo", "charlie"]);
+        let top = searcher
+            .search_with_collector(query.clone_box(), TopDocsCollector::new(1))
+            .unwrap()
+            .results();
+        assert_eq!(top[0].doc_id, 128, "top hit {top:?}");
+        assert_bmw_top_k_is_exact(&searcher, query.as_ref(), 1, "repro");
+    }
+
+    /// A deterministic single-segment corpus over `red`, `green` and `blue`.
+    /// Each term's presence and term frequency change from one stretch of doc
+    /// ids to the next, in an order `seed` decides:
+    ///
+    /// - a term's posting blocks carry low and high bounds in turn, and
+    /// - a term common across the index can be absent from whole stretches,
+    ///   which puts it -- as a low-idf pivot -- far ahead of the other terms.
+    fn build_varied_block_store(seed: u64) -> crate::lexical::store::LexicalStore {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+
+        const TERMS: [&str; 3] = ["red", "green", "blue"];
+        const DOCS: u64 = 3000;
+        const STRETCH: u64 = 100;
+        // Per term and stretch: the percent of documents holding the term,
+        // and how high its tf can go.
+        let stretches = DOCS.div_ceil(STRETCH) as usize;
+        let shape: Vec<Vec<(u32, u32)>> = TERMS
+            .iter()
+            .map(|_| {
+                (0..stretches)
+                    .map(|_| {
+                        let presence = [0, 0, 0, 3, 40, 90][(next() % 6) as usize];
+                        let max_tf = [1, 1, 2, 4, 12, 30][(next() % 6) as usize];
+                        (presence, max_tf)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for id in 0..DOCS {
+            let stretch = (id / STRETCH) as usize;
+            let mut words = Vec::new();
+            for (t, term) in TERMS.iter().enumerate() {
+                let (presence, max_tf) = shape[t][stretch];
+                if next() % 100 < presence {
+                    let tf = 1 + next() % max_tf;
+                    words.extend(std::iter::repeat_n(*term, tf as usize));
+                }
+            }
+            words.extend(std::iter::repeat_n("filler", (1 + next() % 40) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+        store
+    }
+
+    /// #1286: across varied corpora and K, BMW returns exactly the top-K that
+    /// exhaustive scoring does. The miss is rare in these corpora (2 of 2400
+    /// seed/query/K combinations over seeds 0..400 before the fix); seeds 127
+    /// and 321 are the two that hit it.
+    #[test]
+    fn bmw_top_k_is_exact_on_varied_blocks() {
+        for seed in [0u64, 1, 2, 3, 127, 321] {
+            let store = build_varied_block_store(seed);
+            let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+            for terms in [
+                &["red", "green", "blue"][..],
+                &["red", "green"][..],
+                &["red", "blue"][..],
+                &["green", "blue"][..],
+            ] {
+                for k in [1usize, 3, 10] {
+                    let label = format!("seed {seed}, {terms:?}, k {k}");
+                    assert_bmw_top_k_is_exact(&searcher, should_terms(terms).as_ref(), k, &label);
+                }
+            }
+        }
+    }
+
+    /// A Should-only `BooleanQuery` on `body` with one clause per entry: a
+    /// `TermQuery` for a single term, a `SynonymQuery` for several.
+    fn should_clauses(clauses: &[&[&str]]) -> Box<dyn Query> {
+        use crate::lexical::query::synonym::SynonymQuery;
+
+        let mut builder = BooleanQueryBuilder::new();
+        for terms in clauses {
+            let clause: Box<dyn Query> = match terms {
+                [term] => Box::new(TermQuery::new("body", *term)),
+                _ => Box::new(SynonymQuery::new("body", terms.to_vec())),
+            };
+            builder = builder.should(clause);
+        }
+        Box::new(builder.build())
+    }
+
+    /// #1283: a clause without a block-max table -- a `SynonymQuery`, or a
+    /// `TermQuery` whose term the index lacks -- joins the BMW pivot loop with
+    /// its scorer's `max_score()` as a constant bound instead of sending the
+    /// whole query to the regular path, and BMW still returns the exact top-K.
+    #[test]
+    fn bmw_runs_clauses_without_block_max_metadata() {
+        let queries: [&[&[&str]]; 3] = [
+            &[&["red"], &["green", "blue"]],
+            &[&["red", "green"], &["blue"]],
+            &[&["red"], &["green"], &["absent"]],
+        ];
+        for seed in [0u64, 1, 2, 3, 127, 321] {
+            let store = build_varied_block_store(seed);
+            let reader = store.reader_for_tests().unwrap();
+            let searcher = InvertedIndexSearcher::from_arc(reader.clone());
+            for clauses in queries {
+                let query = should_clauses(clauses);
+                let boolean = is_bmw_eligible(query.as_ref()).expect("Should-only leaves");
+                assert!(
+                    BlockMaxOrExecutor::new(boolean, reader.as_ref()).is_ok(),
+                    "{clauses:?}: the query must run on BMW"
+                );
+                for k in [1usize, 3, 10] {
+                    let label = format!("seed {seed}, {clauses:?}, k {k}");
+                    assert_bmw_top_k_is_exact(&searcher, query.as_ref(), k, &label);
+                }
+            }
+        }
+    }
+
+    /// #1283: the same inside the per-segment fanout.
+    #[test]
+    fn fanout_runs_clauses_without_block_max_metadata() {
+        let store = build_interleaved_store(4);
+        let queries: [&[&[&str]]; 2] = [
+            &[&["alpha"], &["beta", "gamma"]],
+            &[&["alpha"], &["beta"], &["absent"]],
+        ];
+        for clauses in queries {
+            let query = should_clauses(clauses);
+            for k in [1usize, 3, 10] {
+                let label = format!("{clauses:?}, k {k}");
+                assert_fanout_top_k_is_exact(&store, query.as_ref(), k, &label);
+            }
+        }
+    }
+
+    /// #1283: `count()` on a `SynonymQuery` counts the union of its
+    /// alternatives' postings without scoring them, and agrees with the
+    /// scoring `CountCollector` path, across segments and deletions.
+    #[test]
+    fn count_of_a_synonym_query_is_the_union_of_its_postings() {
+        use crate::Document;
+        use crate::lexical::query::synonym::SynonymQuery;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Two segments, whose documents hold `big`, `large`, both, or neither.
+        let body = |id: u64| match id % 4 {
+            0 => "big filler",
+            1 => "large filler",
+            2 => "big large",
+            _ => "filler",
+        };
+        for id in 0..40u64 {
+            let doc = Document::builder().add_text("body", body(id)).build();
+            store.upsert_document(id, doc).unwrap();
+            if id == 19 {
+                store.commit().unwrap();
+            }
+        }
+        store.commit().unwrap();
+        let deleted = [0u64, 5, 22, 26];
+        for id in deleted {
+            store.delete_document_by_internal_id(id).unwrap();
+        }
+        store.commit().unwrap();
+
+        let union = (0..40u64)
+            .filter(|id| id % 4 != 3 && !deleted.contains(id))
+            .count() as u64;
+        let query =
+            || -> Box<dyn Query> { Box::new(SynonymQuery::new("body", vec!["big", "large"])) };
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let counted = searcher.count(LexicalSearchRequest::new(query())).unwrap();
+        let collected = searcher
+            .search_with_collector(query(), CountCollector::new())
+            .unwrap()
+            .total_hits();
+        assert_eq!(counted, union);
+        assert_eq!(collected, union);
+    }
+
     /// Helper for #476 Phase 1 tests: build a `LexicalStore` with
     /// the same skewed-TF corpus as the equivalence test, but split
     /// the writes across `segment_count` commits so the underlying
@@ -2127,91 +2639,106 @@ mod tests {
         store
     }
 
-    /// PR-F follow-up #476 Phase 1: the per-segment fanout path
-    /// must return the **same top-K** as the legacy cross-segment
-    /// path on the same multi-segment store. We can't compare to
-    /// a single-segment build because per-segment scoring uses each
-    /// segment's local `avg_field_length` (Lucene-style), which
-    /// produces ranking-equivalent but numerically-different scores
-    /// from global-avg single-segment scoring. Comparing fanout to
-    /// the **legacy path on the same multi-segment store** isolates
-    /// the fanout's correctness from that scoring choice.
-    ///
-    /// This fixture's per-segment averages are close (see
-    /// `build_skewed_store_with_segments`), so the cross-segment bound
-    /// stays valid throughout. A fixture with sharply divergent segment
-    /// averages is covered separately by
-    /// `cross_segment_bm25_bound_holds_with_divergent_segment_avgs` (#1120).
-    #[test]
-    fn per_segment_fanout_topk_matches_legacy_multi_segment_path() {
-        use crate::lexical::query::SearchHit;
-        use crate::lexical::query::boolean::BooleanQueryBuilder;
+    /// A 512-document store split into `segment_count` segments, in which
+    /// every segment holds every one of `alpha`, `beta` and `gamma` (so a
+    /// Should query over them runs BMW in each segment of the fanout), with
+    /// term frequencies and lengths varying from document to document.
+    fn build_interleaved_store(segment_count: u64) -> crate::lexical::store::LexicalStore {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
 
-        let store = build_skewed_store_with_segments(4);
-        let make_query = || -> Box<dyn Query> {
-            Box::new(
-                BooleanQueryBuilder::new()
-                    .should(Box::new(TermQuery::new("body", "alpha")))
-                    .should(Box::new(TermQuery::new("body", "beta")))
-                    .should(Box::new(TermQuery::new("body", "gamma")))
-                    .build(),
-            )
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        const DOCS: u64 = 512;
+        let per_segment = DOCS.div_ceil(segment_count);
+        for id in 0..DOCS {
+            let mut words = Vec::new();
+            if id % 2 == 0 {
+                words.extend(std::iter::repeat_n(
+                    "alpha",
+                    if id % 16 == 0 { 4 } else { 1 },
+                ));
+            }
+            if id % 3 == 0 {
+                words.extend(std::iter::repeat_n(
+                    "beta",
+                    if id % 29 == 0 { 6 } else { 1 },
+                ));
+            }
+            if id % 5 == 0 {
+                words.push("gamma");
+            }
+            words.extend(std::iter::repeat_n("filler", 1 + (id % 11) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+            if (id + 1) % per_segment == 0 && id + 1 < DOCS {
+                store.commit().unwrap();
+            }
+        }
+        store.commit().unwrap();
+        store
+    }
+
+    /// Asserts that the per-segment fanout's top-`k` for `query` is a correct
+    /// top-`k`: rank by rank, it holds the scores an unpruned fanout (a `k`
+    /// no heap fills) holds, and it scores each document it returns as the
+    /// unpruned fanout does. (Tied documents may differ.)
+    fn assert_fanout_top_k_is_exact(
+        store: &crate::lexical::store::LexicalStore,
+        query: &dyn Query,
+        k: usize,
+        label: &str,
+    ) {
+        let search = |limit: usize| {
+            let mut hits = store
+                .search(LexicalSearchRequest::new(query.clone_box()).limit(limit))
+                .unwrap()
+                .hits;
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+            hits
         };
+        let unpruned = search(1_000_000);
+        let unpruned_by_doc: std::collections::HashMap<u64, f32> =
+            unpruned.iter().map(|h| (h.doc_id, h.score)).collect();
+        let pruned = search(k);
 
-        // Fanout path: TopDocsCollector reports `bmw_capable = true`
-        // and segment_count == 4 → dispatches to fanout.
-        let fanout_hits = store
-            .search(LexicalSearchRequest::new(make_query()).limit(10))
-            .unwrap()
-            .hits;
-
-        // Legacy path: drive the searcher directly with our
-        // `NonBmwTopDocs` wrapper so `bmw_capable = false` and
-        // dispatch falls through to the existing matcher-driven
-        // loop on the cross-segment-aggregated reader.
-        let legacy_hits: Vec<SearchHit> = {
-            let reader = store.reader_for_tests().unwrap();
-            let searcher = InvertedIndexSearcher::from_arc(reader);
-            let collector = NonBmwTopDocs(TopDocsCollector::new(10));
-            let collected = searcher
-                .search_with_collector(make_query(), collector)
-                .unwrap();
-            collected.0.results()
-        };
-
-        assert_eq!(
-            fanout_hits.len(),
-            legacy_hits.len(),
-            "fanout vs legacy hit count differs"
-        );
-
-        let fanout_ids: std::collections::BTreeSet<u64> =
-            fanout_hits.iter().map(|h| h.doc_id).collect();
-        let legacy_ids: std::collections::BTreeSet<u64> =
-            legacy_hits.iter().map(|h| h.doc_id).collect();
-        assert_eq!(
-            fanout_ids, legacy_ids,
-            "fanout vs legacy top-K doc id sets differ"
-        );
-
-        // Both paths run on the same multi-segment store with the
-        // same per-segment avg semantics, so scores must agree
-        // within float tolerance.
-        for hit in &fanout_hits {
-            let legacy_score = legacy_hits
-                .iter()
-                .find(|h| h.doc_id == hit.doc_id)
-                .expect("doc must be in legacy top-K too")
-                .score;
-            let tol = 1e-4_f32.max(0.01_f32 * legacy_score.abs());
+        assert_eq!(pruned.len(), k.min(unpruned.len()), "{label}: hit count");
+        for (rank, (hit, want)) in pruned.iter().zip(&unpruned).enumerate() {
+            let tol = 1e-5_f32.max(1e-5 * want.score.abs());
             assert!(
-                (hit.score - legacy_score).abs() < tol,
-                "doc {}: fanout={} legacy={} (tol {})",
+                (hit.score - want.score).abs() < tol,
+                "{label}: rank {rank} holds doc {} at {}, the unpruned fanout has {}",
                 hit.doc_id,
                 hit.score,
-                legacy_score,
-                tol,
+                want.score
             );
+            let reference = unpruned_by_doc[&hit.doc_id];
+            assert!(
+                (hit.score - reference).abs() < tol,
+                "{label}: doc {} scored {} pruned, {reference} unpruned",
+                hit.doc_id,
+                hit.score
+            );
+        }
+    }
+
+    /// PR-F follow-up #476 Phase 1: the per-segment fanout, with BMW running
+    /// in every segment, returns the top-K an unpruned fanout does.
+    ///
+    /// The reference is the unpruned fanout rather than the regular
+    /// cross-segment path: the fanout normalizes lengths with each segment's
+    /// own `avg_field_length`, the regular path with the index-wide one, so
+    /// their scores differ by design. They used to agree only because both
+    /// scored every `BooleanQuery` clause with length 0 (#1287).
+    #[test]
+    fn per_segment_fanout_topk_matches_unpruned_fanout() {
+        let store = build_interleaved_store(4);
+        let query = should_terms(&["alpha", "beta", "gamma"]);
+        for k in [1usize, 3, 10] {
+            assert_fanout_top_k_is_exact(&store, query.as_ref(), k, &format!("k {k}"));
         }
     }
 

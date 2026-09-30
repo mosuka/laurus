@@ -3,11 +3,12 @@
 //! [`BlockMaxOrExecutor`] implements the per-clause Block-Max-WAND
 //! pivot loop on top of the per-block bound metadata that landed in
 //! [`crate::lexical::query::scorer`] (PR-C / PR-E). The executor
-//! drives each clause's matcher independently, picks a *pivot* clause
-//! whose prefix-sum of per-block bounds exceeds the collector's
-//! current K-th score, and either scores the pivot doc (if all
-//! prefix clauses align there) or skips clauses that lag behind
-//! the pivot — bypassing every doc in non-competitive blocks.
+//! drives each clause's matcher independently and picks a *pivot*
+//! clause whose prefix-sum of suffix bounds exceeds the collector's
+//! current K-th score. It then checks the bounds of the blocks that
+//! hold the pivot doc: it scores the pivot doc (if all prefix clauses
+//! align there), skips lagging clauses to it, or, when those blocks
+//! cannot compete, skips past the first of them to end (#1286).
 //!
 //! The standard whole-query searcher in
 //! [`super::searcher::InvertedIndexSearcher::search_with_collector_parallel`]
@@ -15,8 +16,7 @@
 //! Should-only Boolean queries against a [`TopDocsCollector`]; every
 //! other query / collector keeps the existing matcher-driven path.
 
-use crate::error::{LaurusError, Result};
-use crate::lexical::index::inverted::reader::InvertedIndexReader;
+use crate::error::Result;
 use crate::lexical::index::inverted::searcher::Deadline;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanQuery, Occur};
@@ -35,72 +35,74 @@ use crate::lexical::reader::LexicalIndexReader;
 /// arms via `match` instead of paying a vtable lookup.
 struct BmwClause {
     /// The per-clause scorer (specialised for BM25 / Constant in the
-    /// production hot path). Must expose a finite-block bound —
-    /// checked at construction time.
+    /// production hot path). One without a block-max table bounds every
+    /// block with its `max_score()` (#1283).
     scorer: crate::lexical::query::scorer::LeafScorer,
     /// The per-clause matcher (specialised for PostingMatcher in the
     /// production hot path). Walks its posting list independently of
     /// the other clauses' matchers.
     matcher: crate::lexical::query::matcher::LeafMatcher,
-    /// Field name extracted from the clause's underlying
-    /// [`TermQuery`] or [`SynonymQuery`], used to look up per-doc
-    /// field length at scoring time. `None` when the clause is
-    /// neither (in that case the executor falls back to the
-    /// scorer's avg field length).
-    field_name: Option<String>,
 }
 
 /// Block-Max-WAND executor for a Should-only `BooleanQuery`.
-pub(crate) struct BlockMaxOrExecutor<'r> {
+pub(crate) struct BlockMaxOrExecutor {
     clauses: Vec<BmwClause>,
-    inverted_reader: Option<&'r InvertedIndexReader>,
 }
 
-impl<'r> BlockMaxOrExecutor<'r> {
-    /// Build an executor from a Should-only [`BooleanQuery`]. Returns
-    /// an error if any clause's scorer does not carry per-block
-    /// metadata — the caller should fall back to the standard search
-    /// path in that case.
-    pub fn new(boolean_query: &BooleanQuery, reader: &'r dyn LexicalIndexReader) -> Result<Self> {
+impl BlockMaxOrExecutor {
+    /// Build an executor from a Should-only [`BooleanQuery`].
+    ///
+    /// A clause whose scorer has no block-max table joins the pivot loop
+    /// anyway, with its `max_score()` as the bound of every block (#1283):
+    /// its `block_max_score_at` and `current_block_max_score` return
+    /// `max_score()`, and its `next_block_boundary` returns `None`, which
+    /// `run` treats as a block without end. That covers a `SynonymQuery`
+    /// (whose combined term frequency no single alternative's table
+    /// bounds), and a `TermQuery` whose table is absent: a term missing
+    /// from the index (`max_score()` 0, and its clause starts exhausted),
+    /// a legacy v1/v2 dictionary, or an aggregated reader whose table the
+    /// #1120 guard dropped. Each such `max_score()` is a sound bound
+    /// (`k1 + 1` for BM25's TF component when no tighter factor applies).
+    /// Such a query used to leave BMW for the regular path entirely.
+    pub fn new(boolean_query: &BooleanQuery, reader: &dyn LexicalIndexReader) -> Result<Self> {
         // The regular path sums the clause scores and then multiplies
         // by the outer BooleanQuery's boost (`BooleanScorer::score`).
         // Since the pivot loop sums per-clause scores/bounds directly
-        // (see `run` and `advance_clause_past_block`), folding the
-        // outer boost into each clause's own scorer boost here gives
-        // the same result: `outer * sum(c_i) == sum(outer * c_i)`.
+        // (see `run`), folding the outer boost into each clause's own
+        // scorer boost here gives the same result:
+        // `outer * sum(c_i) == sum(outer * c_i)`.
         let outer_boost = boolean_query.boost();
         let mut clauses = Vec::with_capacity(boolean_query.clauses().len());
         for clause in boolean_query.clauses() {
             let mut scorer = clause.query.scorer(reader)?;
-            // Runtime eligibility: every clause must expose per-block
-            // metadata. `next_block_boundary(0).is_none()` is the
-            // documented contract for "no per-block info".
-            if scorer.next_block_boundary(0).is_none() {
-                return Err(LaurusError::InvalidOperation(
-                    "BMW fast path requires per-block scorer for every clause".into(),
-                ));
-            }
             if outer_boost != 1.0 {
                 scorer.set_boost(scorer.boost() * outer_boost);
             }
             let matcher = clause.query.matcher(reader)?;
-            let field_name = field_name_of(clause.query.as_ref()).map(str::to_string);
             clauses.push(BmwClause {
                 scorer: crate::lexical::query::scorer::LeafScorer::from_box(scorer),
                 matcher: crate::lexical::query::matcher::LeafMatcher::from_box(matcher),
-                field_name,
             });
         }
-        let inverted_reader = reader.as_any().downcast_ref::<InvertedIndexReader>();
-        Ok(BlockMaxOrExecutor {
-            clauses,
-            inverted_reader,
-        })
+        Ok(BlockMaxOrExecutor { clauses })
     }
 
     /// Drive the pivot loop and feed competitive documents into
     /// `collector`. Returns the same collector once exhausted or
     /// short-circuited via `needs_more()`.
+    ///
+    /// Every skip stays within the documents its bounds cover (#1286):
+    ///
+    /// 1. The pivot is the first clause, in document order, at which the
+    ///    clauses' suffix bounds (`block_max_score_at`, valid for every
+    ///    document from a clause's current one on) sum past the threshold.
+    ///    A document before the pivot's can only match the clauses in front
+    ///    of it, whose suffix bounds do not pass the threshold, so every
+    ///    clause may skip to the pivot document.
+    /// 2. The bounds of the blocks holding the pivot document
+    ///    (`current_block_max_score`) refine that. When they do not pass the
+    ///    threshold either, no document can until the first of those blocks
+    ///    ends or the next clause starts, so the clauses skip there.
     ///
     /// `deadline` (Issue #600) is consulted once per
     /// [`crate::lexical::index::inverted::searcher::DEADLINE_CHECK_INTERVAL`]
@@ -132,87 +134,78 @@ impl<'r> BlockMaxOrExecutor<'r> {
 
             let min_comp = collector.min_competitive();
 
-            // Find pivot k: smallest j such that the prefix sum of
-            // current per-block bounds for active[0..=j] strictly
-            // exceeds min_comp. If no such j exists the entire current
-            // frontier is non-competitive in itself.
+            // 1. The pivot: the first clause at which the suffix bounds sum
+            //    past the threshold. Without one, no document from here on
+            //    can make the top-K.
             let mut sum = 0.0_f32;
-            let mut pivot_k: Option<usize> = None;
+            let mut pivot: Option<usize> = None;
             for (j, &i) in active.iter().enumerate() {
                 let doc_id = self.clauses[i].matcher.doc_id();
-                sum += self.clauses[i].scorer.current_block_max_score(doc_id);
+                sum += self.clauses[i].scorer.block_max_score_at(doc_id);
                 if sum > min_comp {
-                    pivot_k = Some(j);
+                    pivot = Some(j);
                     break;
                 }
             }
+            let Some(mut last) = pivot else {
+                break;
+            };
+            // The pivot side takes every clause sitting on the pivot document.
+            let pivot_doc = self.clauses[active[last]].matcher.doc_id();
+            while last + 1 < active.len()
+                && self.clauses[active[last + 1]].matcher.doc_id() == pivot_doc
+            {
+                last += 1;
+            }
+            let pivot_side = &active[..=last];
 
-            match pivot_k {
-                None => {
-                    // No pivot found at the current frontier. Use the
-                    // *cumulative* (right_max) bound to decide whether
-                    // any later block could still produce a top-K
-                    // candidate; if not, we are globally done.
-                    let mut cum_sum = 0.0_f32;
-                    for &i in &active {
-                        let d = self.clauses[i].matcher.doc_id();
-                        cum_sum += self.clauses[i].scorer.block_max_score_at(d);
+            // 2. Refine with the blocks holding the pivot document.
+            let block_sum: f32 = pivot_side
+                .iter()
+                .map(|&i| self.clauses[i].scorer.current_block_max_score(pivot_doc))
+                .sum();
+            if block_sum > min_comp {
+                if self.clauses[active[0]].matcher.doc_id() == pivot_doc {
+                    // Every pivot-side clause sits on the pivot document.
+                    let mut total_score = 0.0_f32;
+                    for &i in pivot_side {
+                        let tf = self.clauses[i].matcher.term_freq() as f32;
+                        // Each leaf looks up its own document's field
+                        // length (#1287).
+                        total_score += self.clauses[i].scorer.score(pivot_doc, tf, None);
                     }
-                    if cum_sum <= min_comp {
+                    collector.collect(pivot_doc, total_score)?;
+                    if !collector.needs_more() {
                         break;
                     }
-                    // Otherwise advance the lead clause past its
-                    // current block — that's the smallest doc_id in
-                    // the frontier, so doing so is guaranteed to make
-                    // progress.
-                    let lead = active[0];
-                    let lead_doc = self.clauses[lead].matcher.doc_id();
-                    self.advance_clause_past_block(lead, lead_doc)?;
-                }
-                Some(k) => {
-                    let pivot_doc = self.clauses[active[k]].matcher.doc_id();
-                    let head_doc = self.clauses[active[0]].matcher.doc_id();
-
-                    if head_doc == pivot_doc {
-                        // All clauses in active[0..=k] are aligned at
-                        // pivot_doc. Score the union of every clause
-                        // (active OR not in the prefix) currently
-                        // sitting at pivot_doc.
-                        let mut total_score = 0.0_f32;
-                        for &i in &active {
-                            if self.clauses[i].matcher.doc_id() == pivot_doc {
-                                let tf = self.clauses[i].matcher.term_freq() as f32;
-                                let fl = self.field_length_for(i, pivot_doc);
-                                total_score += self.clauses[i].scorer.score(pivot_doc, tf, fl);
-                            } else {
-                                // active is sorted by doc_id; once we
-                                // pass pivot_doc no later clause can
-                                // share it.
-                                break;
-                            }
-                        }
-                        collector.collect(pivot_doc, total_score)?;
-                        if !collector.needs_more() {
-                            break;
-                        }
-
-                        // Advance every clause that contributed.
-                        for &i in active.iter() {
-                            if self.clauses[i].matcher.doc_id() == pivot_doc {
-                                self.clauses[i].matcher.next()?;
-                            } else {
-                                break;
-                            }
-                        }
-                    } else {
-                        // Some clauses in [0..k] lag behind pivot_doc.
-                        // Skip each one forward to pivot_doc — they
-                        // either land on it (and contribute next
-                        // iteration) or land past it.
-                        for &i in &active[..k] {
+                    for &i in pivot_side {
+                        self.clauses[i].matcher.next()?;
+                    }
+                } else {
+                    // Bring the clauses lagging behind to the pivot document;
+                    // they land on it or past it.
+                    for &i in pivot_side {
+                        if self.clauses[i].matcher.doc_id() < pivot_doc {
                             self.clauses[i].matcher.skip_to(pivot_doc)?;
                         }
                     }
+                }
+            } else {
+                // No document can pass the threshold before the first of the
+                // pivot-side blocks ends, or before the next clause starts. A
+                // clause without per-block bounds (`None`) bounds every
+                // document alike, so it does not end the range.
+                let mut next = active
+                    .get(last + 1)
+                    .map_or(u64::MAX, |&i| self.clauses[i].matcher.doc_id());
+                for &i in pivot_side {
+                    if let Some(boundary) = self.clauses[i].scorer.next_block_boundary(pivot_doc) {
+                        next = next.min(boundary);
+                    }
+                }
+                debug_assert!(next > pivot_doc, "a skip must move past the pivot");
+                for &i in pivot_side {
+                    self.clauses[i].matcher.skip_to(next)?;
                 }
             }
 
@@ -225,64 +218,21 @@ impl<'r> BlockMaxOrExecutor<'r> {
 
         Ok(collector)
     }
-
-    /// Skip a single clause past the block containing `at_doc`.
-    /// `at_doc` is the matcher's current position; the scorer
-    /// resolves the block boundary and `matcher.skip_to` jumps
-    /// forward. If the clause has no further blocks it is left
-    /// in an exhausted state for the active-list filter to drop.
-    fn advance_clause_past_block(&mut self, clause_idx: usize, at_doc: u64) -> Result<()> {
-        let target = self.clauses[clause_idx].scorer.next_block_boundary(at_doc);
-        match target {
-            Some(t) if t == u64::MAX => {
-                // Past last block. Force exhaustion.
-                self.clauses[clause_idx].matcher.skip_to(u64::MAX)?;
-            }
-            Some(t) => {
-                self.clauses[clause_idx].matcher.skip_to(t)?;
-            }
-            None => {
-                // Construction enforces Some, but be defensive: fall
-                // back to a single doc step rather than looping.
-                self.clauses[clause_idx].matcher.next()?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Per-doc field length for the clause's matcher position.
-    /// Returns `None` to let the scorer fall back to its average
-    /// field length when the underlying reader cannot satisfy the
-    /// query (e.g. non-`InvertedIndexReader` readers, missing field).
-    fn field_length_for(&self, clause_idx: usize, doc_id: u64) -> Option<f32> {
-        let field = self.clauses[clause_idx].field_name.as_deref()?;
-        let reader = self.inverted_reader?;
-        reader
-            .field_length(doc_id, field)
-            .ok()
-            .flatten()
-            .map(|n| n as f32)
-    }
 }
 
-/// Inspect a clause's underlying [`Query`] for a [`TermQuery`] or
-/// [`SynonymQuery`] so the executor can look up the field's per-doc
-/// length at scoring time. Any other clause type is not yet wired in
-/// (a `BlockMaxConjunction` follow-up could extend this).
-fn field_name_of(query: &dyn Query) -> Option<&str> {
-    if let Some(t) = query.as_any().downcast_ref::<TermQuery>() {
-        return Some(t.field());
-    }
-    query
-        .as_any()
-        .downcast_ref::<SynonymQuery>()
-        .map(|s| s.field())
+/// Whether `query` is a leaf the executor supports: a [`TermQuery`] or a
+/// [`SynonymQuery`], whose BM25 scorer bounds its own scores. Any other
+/// clause type is not yet wired in (a `BlockMaxConjunction` follow-up could
+/// extend this).
+fn is_bmw_leaf(query: &dyn Query) -> bool {
+    let any = query.as_any();
+    any.is::<TermQuery>() || any.is::<SynonymQuery>()
 }
 
 /// Cheap eligibility check at the searcher entrypoint: BMW fast
 /// path requires a Should-only [`BooleanQuery`] with at least two
-/// clauses and `minimum_should_match == 0`. The runtime per-block
-/// check happens in [`BlockMaxOrExecutor::new`].
+/// clauses and `minimum_should_match == 0`, every clause a leaf
+/// [`is_bmw_leaf`] knows.
 pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     let bq = query.as_any().downcast_ref::<BooleanQuery>()?;
     if bq.minimum_should_match() > 0 {
@@ -298,24 +248,11 @@ pub(crate) fn is_bmw_eligible(query: &dyn Query) -> Option<&BooleanQuery> {
     {
         return None;
     }
-    // Every clause must be a shape `field_name_of` knows, so one list of
-    // clause types serves both this gate and the per-doc field-length
-    // lookup; future work (PhraseQuery / NumericRange) extends that one
-    // function. A `SynonymQuery` clause (Issue #1257) carries no block-max
-    // table by design — its combined term frequency can exceed any one
-    // alternative's per-block bound — so `BlockMaxOrExecutor::new`'s
-    // runtime `next_block_boundary` check declines it, and with it the
-    // whole `BooleanQuery`: a query mixing a `SynonymQuery` clause with
-    // `TermQuery` siblings loses the fast path entirely, not just for that
-    // clause. That is correctness-safe (the standard path scores the same)
-    // but means a field with a synonym dictionary gives up BMW for its
-    // multi-position bare-term queries until a clause can opt into a
-    // metadata-free bound.
-    if bq
-        .clauses()
-        .iter()
-        .any(|c| field_name_of(c.query.as_ref()).is_none())
-    {
+    // Future work (PhraseQuery / NumericRange) extends `is_bmw_leaf`. A
+    // leaf without a block-max table, such as a `SynonymQuery` (#1257),
+    // still qualifies: it runs with a constant bound (see
+    // `BlockMaxOrExecutor::new`).
+    if !bq.clauses().iter().all(|c| is_bmw_leaf(c.query.as_ref())) {
         return None;
     }
     Some(bq)
@@ -359,13 +296,14 @@ mod tests {
         assert!(is_bmw_eligible(&ok).is_some());
     }
 
-    /// Issue #1257: a `SynonymQuery` clause is a structurally eligible
-    /// shape (it carries a field, like `TermQuery`), but it has no
-    /// block-max table by design, so the executor's runtime check must
-    /// still decline it — falling back to the standard search path rather
-    /// than using an unsound bound.
+    /// A `SynonymQuery` clause (#1257) is eligible, and although it has no
+    /// block-max table by design, it joins the executor with a constant
+    /// bound (#1283) rather than sending the query to the standard path.
+    /// `searcher::tests::bmw_runs_clauses_without_block_max_metadata`
+    /// checks the results on a real index.
     #[test]
-    fn synonym_clause_is_structurally_eligible_but_declines_at_runtime() {
+    fn synonym_clause_joins_the_executor() {
+        use crate::lexical::index::inverted::reader::InvertedIndexReader;
         use crate::lexical::query::synonym::SynonymQuery;
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
         use std::sync::Arc;
@@ -386,9 +324,6 @@ mod tests {
             crate::lexical::index::inverted::reader::InvertedIndexReaderConfig::default(),
         )
         .unwrap();
-        assert!(
-            BlockMaxOrExecutor::new(&query, &reader).is_err(),
-            "no per-block metadata for the synonym clause: must not build the executor"
-        );
+        assert!(BlockMaxOrExecutor::new(&query, &reader).is_ok());
     }
 }

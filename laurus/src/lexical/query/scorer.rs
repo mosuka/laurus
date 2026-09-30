@@ -8,6 +8,7 @@ use wide::f32x8;
 use crate::error::Result;
 use crate::lexical::index::structures::dictionary::BlockMax;
 use crate::lexical::query::Query;
+use crate::lexical::reader::FieldLengths;
 
 /// Type alias for boolean scorer clauses.
 type BooleanScorerClauses =
@@ -113,7 +114,9 @@ pub trait Scorer: Send + Debug {
     /// # Arguments
     /// * `doc_id` - Document ID
     /// * `term_freq` - Term frequency in the document
-    /// * `field_length` - Length of the field (number of tokens). If None, uses average field length.
+    /// * `field_length` - Length of the field (number of tokens). If `None`, a
+    ///   scorer that knows its field's per-document lengths looks `doc_id`'s up;
+    ///   otherwise it uses the average field length.
     fn score(&self, doc_id: u64, term_freq: f32, field_length: Option<f32>) -> f32;
 
     /// Get the boost factor for this scorer.
@@ -240,10 +243,11 @@ pub trait Scorer: Send + Debug {
         }
     }
 
-    /// Average field length the scorer would substitute when the
-    /// caller passes `None` to [`Self::score`] (#506). Used by the
-    /// batched default loop to pre-fill the `field_lengths` slice with
-    /// the scalar fallback value, keeping SIMD and scalar paths
+    /// Average field length the scorer substitutes when it has no length
+    /// for a document: the caller passes `None` to [`Self::score`] and the
+    /// scorer cannot look the document's own length up (#506, #1287). Used
+    /// by the batched default loop to pre-fill the `field_lengths` slice
+    /// with the scalar fallback value, keeping SIMD and scalar paths
     /// numerically identical. The default implementation returns 0.0,
     /// which non-BM25 scorers ignore.
     fn avg_field_length(&self) -> f32 {
@@ -299,6 +303,10 @@ pub struct BM25Scorer {
     /// doc id — required for the searcher loop's global early-break to
     /// be correctness-preserving.
     right_max: Arc<[f32]>,
+    /// Per-document lengths of the scored field (#1287), for a caller that
+    /// scores without a length (see [`Scorer::score`]). `None` leaves such a
+    /// call on [`Self::avg_field_length`].
+    lengths: Option<Arc<dyn FieldLengths>>,
 }
 
 impl BM25Scorer {
@@ -345,6 +353,7 @@ impl BM25Scorer {
             max_score_factor: 0.0,
             block_max: Arc::from([] as [BlockMax; 0]),
             right_max: Arc::from([] as [f32; 0]),
+            lengths: None,
         }
     }
 
@@ -377,6 +386,7 @@ impl BM25Scorer {
             max_score_factor,
             block_max: Arc::from([] as [BlockMax; 0]),
             right_max: Arc::from([] as [f32; 0]),
+            lengths: None,
         }
     }
 
@@ -432,6 +442,7 @@ impl BM25Scorer {
             max_score_factor,
             block_max,
             right_max,
+            lengths: None,
         }
     }
 
@@ -464,7 +475,15 @@ impl BM25Scorer {
             max_score_factor: 0.0,
             block_max: Arc::from([] as [BlockMax; 0]),
             right_max: Arc::from([] as [f32; 0]),
+            lengths: None,
         }
+    }
+
+    /// Look each document's length up in `lengths` whenever a caller scores
+    /// without one (#1287), instead of using the average length.
+    pub fn with_field_lengths(mut self, lengths: Option<Arc<dyn FieldLengths>>) -> Self {
+        self.lengths = lengths;
+        self
     }
 
     /// Return the cached IDF (Inverse Document Frequency) value.
@@ -516,7 +535,7 @@ impl BM25Scorer {
 }
 
 impl Scorer for BM25Scorer {
-    fn score(&self, _doc_id: u64, term_freq: f32, field_length: Option<f32>) -> f32 {
+    fn score(&self, doc_id: u64, term_freq: f32, field_length: Option<f32>) -> f32 {
         if self.doc_freq == 0 || self.total_docs == 0 || term_freq == 0.0 {
             return 0.0;
         }
@@ -524,8 +543,17 @@ impl Scorer for BM25Scorer {
         // Standard BM25 formula: score = boost × IDF × TF
         let idf = self.idf();
 
-        // Use provided field length, or fall back to average
-        let field_len = field_length.unwrap_or(self.avg_field_length as f32);
+        // A composite caller (`BooleanScorer`, the BMW executor) passes no
+        // length, as it cannot tell which field each clause scores; look the
+        // document's own length up then, falling back to the average.
+        let field_len = match field_length {
+            Some(len) => len,
+            None => self
+                .lengths
+                .as_ref()
+                .and_then(|lengths| lengths.get(doc_id))
+                .map_or(self.avg_field_length as f32, |len| len as f32),
+        };
         let tf = self.tf(term_freq, field_len);
 
         self.boost * idf * tf
@@ -884,7 +912,10 @@ impl BooleanScorer {
 }
 
 impl Scorer for BooleanScorer {
-    fn score(&self, doc_id: u64, _term_freq: f32, field_length: Option<f32>) -> f32 {
+    /// Sums the clauses that match `doc_id`. `field_length` is ignored: the
+    /// clauses may score different fields, so each looks up its own
+    /// document's length (#1287).
+    fn score(&self, doc_id: u64, _term_freq: f32, _field_length: Option<f32>) -> f32 {
         let mut total_score = 0.0;
         let mut clauses = self.clauses.borrow_mut();
 
@@ -894,7 +925,7 @@ impl Scorer for BooleanScorer {
                 Ok(true) if matcher.doc_id() == doc_id => {
                     // This clause matches the document
                     let tf = matcher.term_freq() as f32;
-                    total_score += scorer.score(doc_id, tf, field_length);
+                    total_score += scorer.score(doc_id, tf, None);
                 }
                 _ => {
                     // This clause doesn't match, contributes zero
