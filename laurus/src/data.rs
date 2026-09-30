@@ -278,6 +278,17 @@ pub enum DataValue {
     /// term while a phrase query cannot span two elements (unless its slop
     /// reaches the gap).
     TextArray(Vec<String>),
+
+    /// Multi-valued binary content (Issue #1176), each element carrying its
+    /// own optional MIME type just like the scalar [`DataValue::Bytes`].
+    ///
+    /// Used by fields declared with
+    /// [`BytesOption::multi_valued`](crate::lexical::core::field::BytesOption::multi_valued)
+    /// set to `true`. `Bytes` fields are never indexed, so there is no
+    /// term/BKD "any match" query semantics here (unlike the other
+    /// multi-valued types) — `multi_valued` only governs the stored shape
+    /// and ingestion arity.
+    BytesArray(Vec<(Vec<u8>, Option<String>)>),
 }
 
 impl DataValue {
@@ -408,6 +419,14 @@ impl DataValue {
             _ => None,
         }
     }
+
+    /// Returns the multi-valued bytes slice if this is a `BytesArray` variant.
+    pub fn as_bytes_array(&self) -> Option<&[(Vec<u8>, Option<String>)]> {
+        match self {
+            DataValue::BytesArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 // --- Conversions ---
@@ -505,6 +524,12 @@ impl From<Vec<bool>> for DataValue {
 impl From<Vec<String>> for DataValue {
     fn from(v: Vec<String>) -> Self {
         DataValue::TextArray(v)
+    }
+}
+
+impl From<Vec<(Vec<u8>, Option<String>)>> for DataValue {
+    fn from(v: Vec<(Vec<u8>, Option<String>)>) -> Self {
+        DataValue::BytesArray(v)
     }
 }
 
@@ -719,6 +744,19 @@ impl DocumentBuilder {
         self.add_field(name.into(), DataValue::Bytes(data, None))
     }
 
+    /// Add a multi-valued binary data field.
+    ///
+    /// The schema field must be declared with
+    /// [`BytesOption::multi_valued`](crate::lexical::core::field::BytesOption::multi_valued)
+    /// set to `true`. Each element carries its own optional MIME type.
+    pub fn add_bytes_array(
+        self,
+        name: impl Into<String>,
+        values: Vec<(Vec<u8>, Option<String>)>,
+    ) -> Self {
+        self.add_field(name.into(), DataValue::BytesArray(values))
+    }
+
     pub fn build(self) -> Document {
         Document {
             fields: self.fields,
@@ -778,13 +816,20 @@ mod tests {
                 "TextArray",
                 archive(&DataValue::TextArray(vec!["a".to_string()])),
             ),
+            (
+                "BytesArray",
+                archive(&DataValue::BytesArray(vec![(vec![7u8], None)])),
+            ),
         ];
         // Little-endian rkyv 0.8 layout: the root enum sits at the end of
         // the buffer, its first byte being the archived discriminant (Geo =
         // 8, Int64Array = 10, Float64Array = 11, GeoArray = 12, GeoEcefArray
-        // = 13, DateTimeArray = 14, BoolArray = 15, TextArray = 16),
-        // followed by the payload — `ArchivedVec` is a relative pointer to
-        // the element data written before the root, plus a length.
+        // = 13, DateTimeArray = 14, BoolArray = 15, TextArray = 16,
+        // BytesArray = 17), followed by the payload — `ArchivedVec` is a
+        // relative pointer to the element data written before the root,
+        // plus a length. `BytesArray`'s element is a tuple, but
+        // `ArchivedVec`'s own header size never depends on what it points
+        // to, so it archives the same size as every other array variant.
         // `DateTimeArray` archives its elements as micro-second `i64`s, so
         // its bytes are `Int64Array`'s with the discriminant changed; a
         // `bool` element is a single byte, so `BoolArray`'s element data is
@@ -848,6 +893,14 @@ mod tests {
                 vec![
                     97, 255, 255, 255, 255, 255, 255, 255, 16, 0, 0, 0, 244, 255, 255, 255, 1, 0,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "BytesArray",
+                vec![
+                    7, 0, 0, 0, 252, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    17, 0, 0, 0, 232, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ],
             ),
         ];
@@ -966,6 +1019,50 @@ mod tests {
         assert_eq!(doc.get_field("flags").and_then(DataValue::as_boolean), None);
         assert_eq!(DataValue::Bool(true).as_bool_array(), None);
         assert_eq!(DataValue::from(flags.clone()), DataValue::BoolArray(flags));
+    }
+
+    /// #1176: each element round-trips its own bytes and optional MIME type,
+    /// including a `None` MIME, an empty byte string, and the empty list.
+    #[test]
+    fn bytes_arrays_round_trip_through_rkyv() {
+        for value in [
+            DataValue::BytesArray(vec![
+                (vec![1, 2, 3], Some("image/png".to_string())),
+                (Vec::new(), None),
+                (vec![0xff; 32], Some("application/octet-stream".to_string())),
+            ]),
+            DataValue::BytesArray(Vec::new()),
+        ] {
+            let bytes = archive(&value);
+            let back = rkyv::from_bytes::<DataValue, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialization");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn bytes_array_accessors_and_builders() {
+        let values = vec![
+            (vec![1u8, 2, 3], Some("image/png".to_string())),
+            (vec![4u8, 5], None),
+        ];
+        let doc = Document::builder()
+            .add_bytes_array("attachments", values.clone())
+            .build();
+        assert_eq!(
+            doc.get_field("attachments")
+                .and_then(DataValue::as_bytes_array),
+            Some(values.as_slice())
+        );
+        assert_eq!(
+            doc.get_field("attachments").and_then(DataValue::as_bytes),
+            None
+        );
+        assert_eq!(DataValue::Bytes(vec![1, 2, 3], None).as_bytes_array(), None);
+        assert_eq!(
+            DataValue::from(values.clone()),
+            DataValue::BytesArray(values)
+        );
     }
 
     #[test]

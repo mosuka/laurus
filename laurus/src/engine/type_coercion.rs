@@ -57,7 +57,7 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
         FieldOption::DateTime(opt) => coerce_to_datetime(field_name, opt, value),
         FieldOption::Geo(opt) => coerce_to_geo(field_name, opt, value),
         FieldOption::Geo3d(opt) => coerce_to_geo3d(field_name, opt, value),
-        FieldOption::Bytes(_) => coerce_to_bytes(field_name, value),
+        FieldOption::Bytes(opt) => coerce_to_bytes(field_name, opt, value),
         FieldOption::Hnsw(_) | FieldOption::Flat(_) | FieldOption::Ivf(_) => {
             coerce_to_vector(field_name, value)
         }
@@ -495,29 +495,74 @@ fn coerce_to_geo3d(
     }
 }
 
-fn coerce_to_bytes(field_name: &str, value: DataValue) -> Result<DataValue> {
-    match value {
-        DataValue::Bytes(data, mime) => Ok(DataValue::Bytes(data, mime)),
-        // A plain string on a declared `Bytes` field is unambiguous — the
-        // schema already says "this is bytes" — so treat it as base64,
-        // matching the `{"data": "<base64>"}` object shape that
-        // `type_inference::infer_from_object` produces for undeclared
-        // fields. Unlike a bytes-typed `Hnsw`/`Flat`/`Ivf` field (see
-        // `coerce_to_vector`), there is no text-vs-bytes ambiguity here to
-        // preserve, since a declared `Bytes` field never accepts a
-        // to-be-embedded string.
-        DataValue::Text(s) => base64::engine::general_purpose::STANDARD
-            .decode(s.trim())
-            .map(|data| DataValue::Bytes(data, None))
-            .map_err(|e| {
-                LaurusError::invalid_argument(format!(
-                    "field '{field_name}': cannot decode '{s}' as base64: {e}"
-                ))
-            }),
-        other => Err(LaurusError::invalid_argument(format!(
-            "field '{field_name}': cannot coerce {} to bytes",
-            describe(&other)
-        ))),
+fn coerce_to_bytes(
+    field_name: &str,
+    option: &crate::lexical::core::field::BytesOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    // A plain string on a declared `Bytes` field is unambiguous — the
+    // schema already says "this is bytes" — so treat it as base64,
+    // matching the `{"data": "<base64>"}` object shape that
+    // `type_inference::infer_from_object` produces for undeclared fields.
+    // Unlike a bytes-typed `Hnsw`/`Flat`/`Ivf` field (see
+    // `coerce_to_vector`), there is no text-vs-bytes ambiguity here to
+    // preserve, since a declared `Bytes` field never accepts a
+    // to-be-embedded string.
+    let scalar = |value: DataValue| -> Result<(Vec<u8>, Option<String>)> {
+        match value {
+            DataValue::Bytes(data, mime) => Ok((data, mime)),
+            DataValue::Text(s) => base64::engine::general_purpose::STANDARD
+                .decode(s.trim())
+                .map(|data| (data, None))
+                .map_err(|e| {
+                    LaurusError::invalid_argument(format!(
+                        "field '{field_name}': cannot decode '{s}' as base64: {e}"
+                    ))
+                }),
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to bytes",
+                describe(&other)
+            ))),
+        }
+    };
+
+    if option.multi_valued {
+        // Multi-valued bytes field (#1176). A single value is auto-wrapped;
+        // an empty numeric array is an empty byte-value list because every
+        // binding turns `[]` into `Int64Array(vec![])` before the field
+        // type is known (#1178); a text array decodes element-wise as
+        // base64 (mime always `None`, matching the scalar rule above).
+        // Bytes has no BKD/term-posting query semantics, so unlike the
+        // other multi-valued types there is no "any match" query language
+        // this array shape needs to satisfy.
+        match value {
+            DataValue::BytesArray(arr) => Ok(DataValue::BytesArray(arr)),
+            DataValue::Int64Array(a) if a.is_empty() => Ok(DataValue::BytesArray(Vec::new())),
+            DataValue::TextArray(arr) => arr
+                .into_iter()
+                .map(|s| scalar(DataValue::Text(s)))
+                .collect::<Result<Vec<_>>>()
+                .map(DataValue::BytesArray),
+            scalar_value @ (DataValue::Bytes(_, _) | DataValue::Text(_)) => {
+                Ok(DataValue::BytesArray(vec![scalar(scalar_value)?]))
+            }
+            other => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': cannot coerce {} to a multi-valued bytes field",
+                describe(&other)
+            ))),
+        }
+    } else {
+        match value {
+            // Multi-valued input to a single-valued field is rejected
+            // rather than silently truncating to one element.
+            DataValue::BytesArray(_) | DataValue::TextArray(_) => {
+                Err(LaurusError::invalid_argument(format!(
+                    "field '{field_name}': received an array but the field is single-valued; \
+                     declare the field with multi_valued = true to accept arrays"
+                )))
+            }
+            other => scalar(other).map(|(data, mime)| DataValue::Bytes(data, mime)),
+        }
     }
 }
 
@@ -569,6 +614,7 @@ fn describe(value: &DataValue) -> &'static str {
         DataValue::DateTimeArray(_) => "datetime array",
         DataValue::BoolArray(_) => "bool array",
         DataValue::TextArray(_) => "text array",
+        DataValue::BytesArray(_) => "bytes array",
     }
 }
 

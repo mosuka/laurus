@@ -716,7 +716,10 @@ pub(crate) fn analyze_field_value(
         // Spelled out rather than a wildcard `_ =>` so a new `DataValue`
         // variant fails exhaustiveness checking here instead of being
         // silently skipped at indexing time.
-        DataValue::Bytes(_, _) | DataValue::Vector(_) | DataValue::Null => {}
+        DataValue::Bytes(_, _)
+        | DataValue::BytesArray(_)
+        | DataValue::Vector(_)
+        | DataValue::Null => {}
     }
     Ok((terms, points))
 }
@@ -1412,6 +1415,12 @@ impl InvertedIndexWriter {
             DataValue::BoolArray(v) => v.len(),
             DataValue::TextArray(v) => {
                 v.iter().map(String::len).sum::<usize>() + v.len() * std::mem::size_of::<String>()
+            }
+            DataValue::BytesArray(v) => {
+                v.iter()
+                    .map(|(data, mime)| data.len() + mime.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+                    + v.len() * std::mem::size_of::<(Vec<u8>, Option<String>)>()
             }
             // The remaining variants are fixed-size and already covered by
             // `size_of::<DataValue>()`.

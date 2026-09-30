@@ -524,11 +524,17 @@ mod tests {
         );
         fields.insert(
             "thumb".to_string(),
-            FieldOption::Bytes(BytesOption { stored: true }),
+            FieldOption::Bytes(BytesOption {
+                stored: true,
+                ..Default::default()
+            }),
         );
         fields.insert(
             "blob".to_string(),
-            FieldOption::Bytes(BytesOption { stored: false }),
+            FieldOption::Bytes(BytesOption {
+                stored: false,
+                ..Default::default()
+            }),
         );
         let parser =
             DocumentParser::new(Arc::new(StandardAnalyzer::new().unwrap())).with_fields(fields);
