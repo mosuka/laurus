@@ -78,9 +78,6 @@ pub struct InvertedIndexWriterConfig {
     /// DocValues (Issue #1047). See [`Self::stores_doc_values`].
     pub store_doc_values: bool,
 
-    /// Whether to optimize segments after writing.
-    pub optimize_segments: bool,
-
     /// Analyzer for text fields (can be PerFieldAnalyzer for field-specific analysis).
     pub analyzer: Arc<dyn Analyzer>,
 
@@ -119,7 +116,6 @@ impl std::fmt::Debug for InvertedIndexWriterConfig {
             .field("segment_prefix", &self.segment_prefix)
             .field("store_term_positions", &self.store_term_positions)
             .field("store_doc_values", &self.store_doc_values)
-            .field("optimize_segments", &self.optimize_segments)
             .field("analyzer", &self.analyzer.name())
             .finish()
     }
@@ -134,7 +130,6 @@ impl Default for InvertedIndexWriterConfig {
             segment_prefix: "segment".to_string(),
             store_term_positions: true,
             store_doc_values: true,
-            optimize_segments: false,
             analyzer: Arc::new(StandardAnalyzer::new().unwrap()),
             shard_id: 0,
             fields: HashMap::new(),
@@ -2844,41 +2839,6 @@ impl LexicalIndexWriter for InvertedIndexWriter {
 
     fn is_updated_deleted(&self, doc_id: u64) -> bool {
         InvertedIndexWriter::is_updated_deleted(self, doc_id)
-    }
-
-    /// Builds an InvertedIndexReader from the current state of the writer's storage.
-    /// This method is intended to be called by the LexicalIndexWriter trait implementation.
-    fn build_reader(
-        &self,
-    ) -> Result<std::sync::Arc<dyn crate::lexical::reader::LexicalIndexReader>> {
-        use crate::lexical::index::inverted::reader::{
-            InvertedIndexReader, InvertedIndexReaderConfig,
-        };
-
-        // The committed segment set comes from the manifest (#1024): the
-        // shared in-memory copy when this writer holds the handle, a
-        // one-shot load otherwise. The old implementation probed
-        // `segment_000000.meta, _000001, …` until the first miss — it never
-        // saw `merged_*` segments and stopped at the first numbering gap
-        // any merge leaves, so this is also a correctness upgrade.
-        let mut segments = if let Some(manifest) = &self.segment_manifest {
-            manifest.read().segments.clone()
-        } else {
-            super::segment_manifest::load(self.storage.as_ref())?
-                .map(|(_, segments)| segments)
-                .unwrap_or_default()
-        };
-        segments.sort_by_key(|s| s.generation);
-
-        let config = InvertedIndexReaderConfig {
-            analyzer: self.config.analyzer.clone(),
-            ..Default::default()
-        };
-
-        // Note: InvertedIndexReader::new expects Vec<SegmentInfo> and Arc<dyn Storage>
-        // We use the same storage as the writer
-        let reader = InvertedIndexReader::new(segments, self.storage.clone(), config)?;
-        Ok(Arc::new(reader))
     }
 
     fn next_doc_id(&self) -> u64 {

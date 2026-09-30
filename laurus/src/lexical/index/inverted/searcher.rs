@@ -1722,7 +1722,7 @@ mod tests {
             }
             writer.commit().unwrap();
         }
-        InvertedIndexSearcher::from_arc(writer.build_reader().unwrap())
+        InvertedIndexSearcher::from_arc(index.reader().unwrap())
     }
 
     #[test]
@@ -2659,7 +2659,7 @@ mod tests {
             }
             writer.commit().unwrap();
         }
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -2732,7 +2732,7 @@ mod tests {
             }
             writer.commit().unwrap();
         }
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -2851,7 +2851,7 @@ mod tests {
             )
             .unwrap();
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()

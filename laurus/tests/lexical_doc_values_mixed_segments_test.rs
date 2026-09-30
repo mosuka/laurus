@@ -231,7 +231,7 @@ fn facet_falls_back_when_a_segments_dv_file_is_missing() {
     // Delete segment 0's DocValues column entirely.
     storage.delete_file(&dv_files[0]).unwrap();
 
-    let reader = writer.build_reader().unwrap();
+    let reader = index.reader().unwrap();
     assert!(
         reader.has_doc_values("brand"),
         "segment 1 still has the brand column, so this stays true index-wide"

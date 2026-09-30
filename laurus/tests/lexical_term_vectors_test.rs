@@ -70,7 +70,7 @@ fn create_test_index() -> Result<TestIndex, Box<dyn std::error::Error>> {
     )?;
 
     writer.commit()?;
-    Ok(writer.build_reader()?)
+    Ok(index.reader()?)
 }
 
 #[test]

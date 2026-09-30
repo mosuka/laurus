@@ -1,41 +1,13 @@
 //! Shared merge-operation data types for vector index segments.
 //!
-//! [`MergeConfig`], [`MergeStats`], and [`MergeResult`] are index-type-
-//! agnostic; each index type's own merge engine (e.g.
-//! `hnsw::segment::merge_engine::MergeEngine`) performs the actual
-//! type-specific segment-reader/segment-writer I/O and returns these shared
-//! shapes.
+//! [`MergeStats`] and [`MergeResult`] are index-type-agnostic; each index
+//! type's own merge engine (e.g. `hnsw::segment::merge_engine::MergeEngine`)
+//! performs the actual type-specific segment-reader/segment-writer I/O and
+//! returns these shared shapes.
 
 use serde::{Deserialize, Serialize};
 
 use crate::vector::index::segment::manager::ManagedSegmentInfo;
-
-/// Configuration for merge operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MergeConfig {
-    /// Maximum number of segments to merge at once.
-    pub max_merge_segments: u32,
-
-    /// Target segment size after merge (in vectors).
-    pub target_segment_size: u64,
-
-    /// Whether to use parallel merging.
-    pub parallel_merge: bool,
-
-    /// Number of threads to use for parallel merging.
-    pub num_threads: usize,
-}
-
-impl Default for MergeConfig {
-    fn default() -> Self {
-        Self {
-            max_merge_segments: 10,
-            target_segment_size: 1000000,
-            parallel_merge: true,
-            num_threads: 4,
-        }
-    }
-}
 
 /// Statistics about a merge operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

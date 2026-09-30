@@ -1,9 +1,9 @@
 //! Merge engine for vector index segments.
 //!
-//! This module handles the actual merging of segments. [`MergeConfig`],
-//! [`MergeStats`], and [`MergeResult`] are the shared, index-type-agnostic
-//! data shapes defined in [`crate::vector::index::segment::merge`]; this
-//! engine's own logic (below) is HNSW-graph-typed.
+//! This module handles the actual merging of segments. [`MergeStats`] and
+//! [`MergeResult`] are the shared, index-type-agnostic data shapes defined
+//! in [`crate::vector::index::segment::merge`]; this engine's own logic
+//! (below) is HNSW-graph-typed.
 
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use crate::storage::Storage;
 use crate::vector::core::vector::Vector;
 
 use crate::vector::index::segment::manager::ManagedSegmentInfo;
-use crate::vector::index::segment::merge::{MergeConfig, MergeResult, MergeStats};
+use crate::vector::index::segment::merge::{MergeResult, MergeStats};
 
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::vector::index::config::HnswIndexConfig;
@@ -23,7 +23,6 @@ use crate::vector::writer::{VectorIndexWriter, VectorIndexWriterConfig};
 
 /// Engine for merging vector index segments.
 pub struct MergeEngine {
-    config: MergeConfig,
     storage: Arc<dyn Storage>,
     index_config: HnswIndexConfig,
     writer_config: VectorIndexWriterConfig,
@@ -33,13 +32,11 @@ pub struct MergeEngine {
 impl MergeEngine {
     /// Create a new merge engine.
     pub fn new(
-        config: MergeConfig,
         storage: Arc<dyn Storage>,
         index_config: HnswIndexConfig,
         writer_config: VectorIndexWriterConfig,
     ) -> Self {
         Self {
-            config,
             storage,
             index_config,
             writer_config,
@@ -183,49 +180,11 @@ impl MergeEngine {
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
     }
-
-    /// Get configuration.
-    pub fn config(&self) -> &MergeConfig {
-        &self.config
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
-
-    #[test]
-    fn test_merge_engine_basic() {
-        let config = MergeConfig::default();
-        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-        let index_config = HnswIndexConfig::default();
-        let writer_config = VectorIndexWriterConfig::default();
-
-        let engine = MergeEngine::new(config, storage, index_config, writer_config);
-
-        // In this unit test, we cannot easily mock HnswIndexReader::load unless we actually write files to MemoryStorage first.
-        // HnswIndexReader::load uses storage.open_input().
-        // So we would need to prepare segments.
-        // Since that is complex setup, we will skip the execution part for now or use a simpler verification.
-        // Or we could mock storage.
-
-        let _segments = [ManagedSegmentInfo {
-            segment_id: "seg1".to_string(),
-            vector_count: 1000,
-            vector_offset: 0,
-            generation: 0,
-            has_deletions: false,
-            size_bytes: 128000,
-        }];
-
-        // We comment out actual execution because it will fail on file not found
-        // let result = engine.merge_segments(segments, "merged_seg".to_string());
-        // assert!(result.is_ok());
-
-        // At least we verify compilation of `new` signature
-        assert_eq!(engine.config.max_merge_segments, 10);
-    }
 
     #[test]
     fn test_merge_stats() {

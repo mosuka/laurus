@@ -630,7 +630,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        writer.build_reader().unwrap()
+        index.reader().unwrap()
     }
 
     fn slots(positions: &[&[&str]]) -> Vec<Vec<String>> {

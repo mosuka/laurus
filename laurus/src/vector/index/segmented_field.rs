@@ -20,7 +20,6 @@ use crate::vector::index::hnsw::searcher::HnswSearcher;
 use crate::vector::index::hnsw::segment::merge_engine::MergeEngine;
 use crate::vector::index::hnsw::writer::HnswIndexWriter;
 use crate::vector::index::segment::manager::{ManagedSegmentInfo, SegmentManager};
-use crate::vector::index::segment::merge::MergeConfig;
 use crate::vector::index::segment::reader_cache::SegmentedReaderCache;
 use crate::vector::search::searcher::{
     VectorIndexQuery, VectorIndexQueryParams, VectorIndexSearcher,
@@ -206,7 +205,6 @@ impl SegmentedVectorField {
             // and without the magnitude-corrupting normalization the
             // merge config used to apply via the always-on default.
             let mut engine = MergeEngine::new(
-                MergeConfig::default(),
                 self.storage.clone(),
                 HnswIndexConfig::from_hnsw_option(opt),
                 VectorIndexWriterConfig {

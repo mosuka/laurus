@@ -52,17 +52,11 @@ pub struct InvertedIndexReaderConfig {
     /// Default: 128 MiB.
     pub max_cache_memory: usize,
 
-    /// Enable term caching.
-    pub enable_term_cache: bool,
-
     /// Enable posting cache.
     pub enable_posting_cache: bool,
 
     /// Preload segments on open.
     pub preload_segments: bool,
-
-    /// Maximum number of cached terms per field.
-    pub max_cached_terms_per_field: usize,
 
     /// Maximum number of entries in the snapshot-scoped query / filter result
     /// cache (Issue #578). `0` disables the cache. See
@@ -77,13 +71,8 @@ impl std::fmt::Debug for InvertedIndexReaderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedIndexReaderConfig")
             .field("max_cache_memory", &self.max_cache_memory)
-            .field("enable_term_cache", &self.enable_term_cache)
             .field("enable_posting_cache", &self.enable_posting_cache)
             .field("preload_segments", &self.preload_segments)
-            .field(
-                "max_cached_terms_per_field",
-                &self.max_cached_terms_per_field,
-            )
             .field(
                 "query_filter_cache_capacity",
                 &self.query_filter_cache_capacity,
@@ -97,10 +86,8 @@ impl Default for InvertedIndexReaderConfig {
     fn default() -> Self {
         InvertedIndexReaderConfig {
             max_cache_memory: DEFAULT_MAX_CACHE_MEMORY,
-            enable_term_cache: true,
             enable_posting_cache: true,
             preload_segments: false,
-            max_cached_terms_per_field: 10000,
             query_filter_cache_capacity: 1024,
             analyzer: Arc::new(
                 StandardAnalyzer::new().expect("StandardAnalyzer should be creatable"),
@@ -3477,7 +3464,7 @@ mod tests {
             .add_document(crate::Document::builder().add_text("body", "alpha").build())
             .unwrap();
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3562,7 +3549,7 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3616,7 +3603,7 @@ mod tests {
         }
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3751,7 +3738,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3807,7 +3794,7 @@ mod tests {
                 .unwrap();
             writer.commit().unwrap();
         }
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -3863,7 +3850,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -4147,7 +4134,7 @@ mod tests {
         }
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()
@@ -4706,7 +4693,7 @@ mod tests {
         }
         writer.commit().unwrap();
 
-        let reader = writer.build_reader().unwrap();
+        let reader = index.reader().unwrap();
         let inverted = reader
             .as_any()
             .downcast_ref::<InvertedIndexReader>()

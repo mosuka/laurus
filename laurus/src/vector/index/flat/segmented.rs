@@ -50,7 +50,6 @@ use crate::vector::index::segment::fanout::{SegmentFanoutSearcher, SegmentedRead
 use crate::vector::index::segment::manager::{
     ManagedSegmentInfo, MergeCandidate, SegmentManager, SegmentManagerConfig,
 };
-use crate::vector::index::segment::merge::MergeConfig;
 use crate::vector::index::segment::reader_cache::SegmentedReaderCache;
 use crate::vector::index::{VectorIndex, VectorIndexStats};
 use crate::vector::reader::VectorIndexReader;
@@ -314,7 +313,6 @@ impl SegmentedFlatIndex {
         };
 
         let mut engine = MergeEngine::new(
-            MergeConfig::default(),
             self.shared.storage.clone(),
             self.config.clone(),
             VectorIndexWriterConfig::default(),
@@ -447,7 +445,6 @@ impl VectorIndex for SegmentedFlatIndex {
         // through the deletion bitmap (physical reclamation) and collapses
         // same-key duplicates newest-generation-first.
         let mut engine = MergeEngine::new(
-            MergeConfig::default(),
             self.shared.storage.clone(),
             self.config.clone(),
             VectorIndexWriterConfig::default(),

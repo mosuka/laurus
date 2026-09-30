@@ -150,22 +150,6 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
     /// Returns `true` if [`close()`](Self::close) has been called.
     fn is_closed(&self) -> bool;
 
-    /// Build a reader from the written index.
-    ///
-    /// This method allows creating a reader directly from the writer,
-    /// enabling the "write-then-read" workflow used in hybrid search.
-    ///
-    /// # Returns
-    ///
-    /// An `Arc`-wrapped reader that can be shared across threads.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the reader cannot be constructed.
-    fn build_reader(
-        &self,
-    ) -> Result<std::sync::Arc<dyn crate::lexical::reader::LexicalIndexReader>>;
-
     /// Get the next available document ID.
     ///
     /// Returns the ID that will be assigned to the next document added
