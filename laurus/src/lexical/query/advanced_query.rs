@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::lexical::query::boolean::{BooleanQuery, Occur};
+use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query, QueryResult};
@@ -498,6 +498,9 @@ pub struct MultiFieldQuery {
 
     /// Cross-field matching strategy.
     tie_breaker: f32,
+
+    /// Query-level boost, applied to the `BooleanQuery` this query runs as.
+    boost: f32,
 }
 
 /// Type of multi-field query.
@@ -524,6 +527,7 @@ impl MultiFieldQuery {
             fields: HashMap::new(),
             query_type: MultiFieldQueryType::BestFields,
             tie_breaker: 0.0,
+            boost: 1.0,
         }
     }
 
@@ -544,98 +548,42 @@ impl MultiFieldQuery {
         self.tie_breaker = tie_breaker;
         self
     }
+
+    /// The `BooleanQuery` this query runs as: one `TermQuery` per field,
+    /// `Must` for [`MultiFieldQueryType::MostFields`] and `Should`
+    /// otherwise, carrying this query's boost.
+    fn boolean_query(&self) -> BooleanQuery {
+        let occur = match self.query_type {
+            MultiFieldQueryType::MostFields => Occur::Must,
+            MultiFieldQueryType::BestFields
+            | MultiFieldQueryType::Boolean
+            | MultiFieldQueryType::CrossFields => Occur::Should,
+        };
+        let mut query = BooleanQuery::new().with_boost(self.boost);
+        for field in self.fields.keys() {
+            let term_query =
+                crate::lexical::query::term::TermQuery::new(field.clone(), self.query_text.clone());
+            query.add_clause(BooleanClause::new(Box::new(term_query), occur));
+        }
+        query
+    }
 }
 
 impl Query for MultiFieldQuery {
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        // Create boolean query based on type
-        let mut boolean_builder = BooleanQueryBuilder::new();
-
-        match self.query_type {
-            MultiFieldQueryType::BestFields | MultiFieldQueryType::Boolean => {
-                // Add each field as a should clause
-                for field in self.fields.keys() {
-                    let term_query = crate::lexical::query::term::TermQuery::new(
-                        field.clone(),
-                        self.query_text.clone(),
-                    );
-                    boolean_builder =
-                        boolean_builder.add_clause(Box::new(term_query), Occur::Should);
-                }
-            }
-            MultiFieldQueryType::MostFields => {
-                // All fields should match
-                for field in self.fields.keys() {
-                    let term_query = crate::lexical::query::term::TermQuery::new(
-                        field.clone(),
-                        self.query_text.clone(),
-                    );
-                    boolean_builder = boolean_builder.add_clause(Box::new(term_query), Occur::Must);
-                }
-            }
-            MultiFieldQueryType::CrossFields => {
-                // Create phrase query across fields (simplified)
-                let mut combined_query = BooleanQuery::new();
-                for field in self.fields.keys() {
-                    let term_query = crate::lexical::query::term::TermQuery::new(
-                        field.clone(),
-                        self.query_text.clone(),
-                    );
-                    combined_query.add_should(Box::new(term_query));
-                }
-                return combined_query.matcher(reader);
-            }
-        }
-
-        boolean_builder.build().matcher(reader)
+        self.boolean_query().matcher(reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        // Create boolean query and use its scorer
-        let mut boolean_builder = BooleanQueryBuilder::new();
-
-        match self.query_type {
-            MultiFieldQueryType::BestFields | MultiFieldQueryType::Boolean => {
-                for field in self.fields.keys() {
-                    let term_query = crate::lexical::query::term::TermQuery::new(
-                        field.clone(),
-                        self.query_text.clone(),
-                    );
-                    boolean_builder =
-                        boolean_builder.add_clause(Box::new(term_query), Occur::Should);
-                }
-            }
-            MultiFieldQueryType::MostFields => {
-                for field in self.fields.keys() {
-                    let term_query = crate::lexical::query::term::TermQuery::new(
-                        field.clone(),
-                        self.query_text.clone(),
-                    );
-                    boolean_builder = boolean_builder.add_clause(Box::new(term_query), Occur::Must);
-                }
-            }
-            MultiFieldQueryType::CrossFields => {
-                let mut combined_query = BooleanQuery::new();
-                for field in self.fields.keys() {
-                    let term_query = crate::lexical::query::term::TermQuery::new(
-                        field.clone(),
-                        self.query_text.clone(),
-                    );
-                    combined_query.add_should(Box::new(term_query));
-                }
-                return combined_query.scorer(reader);
-            }
-        }
-
-        boolean_builder.build().scorer(reader)
+        self.boolean_query().scorer(reader)
     }
 
     fn boost(&self) -> f32 {
-        1.0 // Default boost for multi-field queries
+        self.boost
     }
 
-    fn set_boost(&mut self, _boost: f32) {
-        // Multi-field queries manage boosts per field
+    fn set_boost(&mut self, boost: f32) {
+        self.boost = boost;
     }
 
     fn apply_field_boosts(&mut self, boosts: &HashMap<String, f32>) {
