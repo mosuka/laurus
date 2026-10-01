@@ -215,6 +215,8 @@ Laurus::Schema.new
 
 ### エンベダータイプ
 
+各型の説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → エンベダー](../laurus-cli/schema_format.md#エンベダー) を参照してください。
+
 | `"type"` | 必須キー | Feature Flag |
 | :--- | :--- | :--- |
 | `"precomputed"` | -- | （常に利用可能） |
@@ -227,6 +229,8 @@ Laurus::Schema.new
 `add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)` と
 `[analyzers.<name>]` TOML セクションで使用します。`tokenizer` は単一の Hash、
 `char_filters:`/`token_filters:` は Hash の配列で、配列の順序どおりに適用されます。
+
+各コンポーネントの説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください。
 
 **トークナイザ**（`tokenizer`、必ず1つ）:
 

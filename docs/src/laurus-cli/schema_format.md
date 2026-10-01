@@ -4,7 +4,7 @@ The schema file defines the structure of your index — what fields exist, their
 
 ## Overview
 
-A schema consists of three top-level elements:
+A schema consists of five top-level elements:
 
 ```toml
 # Policy for fields not declared below. Optional — defaults to "dynamic".
@@ -13,6 +13,14 @@ dynamic_field_policy = "dynamic"
 # Fields to search by default when a query does not specify a field.
 default_fields = ["title", "body"]
 
+# Custom analyzer definitions, referenced by name from Text fields. Optional.
+[analyzers.<analyzer_name>]
+# ... tokenizer, char_filters, token_filters
+
+# Embedder definitions, referenced by name from vector fields. Optional.
+[embedders.<embedder_name>]
+# ... type and type-specific options
+
 # Field definitions. Each field has a name and a typed configuration.
 [fields.<field_name>.<FieldType>]
 # ... type-specific options
@@ -20,6 +28,8 @@ default_fields = ["title", "body"]
 
 - **`dynamic_field_policy`** — How the engine treats fields present in an ingested document but **absent** from this schema. Accepted values: `"strict"`, `"dynamic"`, `"ignore"`. Defaults to `"dynamic"`. See [Dynamic Schema](../concepts/schema_and_fields.md#dynamic-schema) for the full semantics and the warning about silent truncation under `"dynamic"`.
 - **`default_fields`** — A list of field names used as default search targets by the [Query DSL](../concepts/query_dsl.md). Only lexical fields (Text, Integer, Float, etc.) can be default fields. This key is optional and defaults to an empty list.
+- **`analyzers`** — A map of names to custom text-analysis pipelines. A Text field uses one by naming it in its `analyzer` option. Optional. See [Analyzers](#analyzers).
+- **`embedders`** — A map of names to embedding models. A vector field uses one by naming it in its `embedder` option. Optional. See [Embedders](#embedders).
 - **`fields`** — A map of field names to their typed configuration. Each field must specify exactly one field type.
 
 ## Field Naming
@@ -46,6 +56,7 @@ multi_valued = false         # Whether to accept arrays of strings (Issue #1175)
 position_increment_gap = 100 # Positions skipped between the elements of a multi-valued field
 term_vectors = true          # Whether to store term positions (for phrase and span queries)
 doc_values = true            # Whether to also copy the value into DocValues (for sorting/faceting)
+analyzer = "standard"        # Analyzer for indexing and querying this field
 ```
 
 | Option | Type | Default | Description |
@@ -56,6 +67,7 @@ doc_values = true            # Whether to also copy the value into DocValues (fo
 | `position_increment_gap` | `integer` | `100` | Positions skipped between the elements of a multi-valued field (Lucene `positionIncrementGap`); `0` numbers the elements as if concatenated. Ignored unless `multi_valued = true` |
 | `term_vectors` | `bool` | `true` | Stores term positions, read by phrase and span queries; highlighting always re-tokenizes the stored text and does not use them |
 | `doc_values` | `bool` | `true` | Copies the value into DocValues, the column-oriented store [sorting](../laurus/faceting.md) and faceting/aggregation read from. Takes effect only when `stored` is also `true` — see [Common option: `doc_values`](#common-option-doc_values) below |
+| `analyzer` | `string` or table | *(omit)* | Analyzer used both when indexing and when parsing queries against this field. A string names a built-in analyzer (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or an entry in [`[analyzers.*]`](#analyzers). A table selects a parameterized built-in preset; today only `{ language = "japanese", mode = "normal", dict = "<path>" }` (see [Text Analysis](../concepts/analysis.md#configuring-per-field-analyzers-from-a-schema)). When omitted, `"standard"` is used |
 
 The interactive generator (`laurus create schema`, see [Generating a Schema](#generating-a-schema)) asks whether a Text field is multi-valued and, when it is, for its position increment gap.
 
@@ -232,6 +244,7 @@ base_weight = 1.0
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)). `"F32"` enables a per-field f32 sidecar so search can rescore int8 candidates against the original vectors. Omit to keep Stage 1 int8-only behavior. |
 | `pq_codebook_path` | `string` | *(omit)* | Storage-relative file name of a shared PQ codebook (Issue #631); only meaningful with a `ProductQuantization` quantizer. Train it with `laurus train pq-codebook`; commits then encode against it instead of re-training k-means per segment. When set but not yet trained, commits fail loudly (no silent fallback). Omit to train per segment. |
+| `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders). Text (or image) values given for this field are then embedded with that model, both when indexing and when searching. Omit to supply precomputed vectors only |
 
 **Tuning guidelines:**
 
@@ -257,6 +270,7 @@ base_weight = 1.0
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
+| `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders); see [Hnsw](#hnsw) |
 
 #### Ivf
 
@@ -280,6 +294,7 @@ base_weight = 1.0
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
+| `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders); see [Hnsw](#hnsw) |
 
 > **Note:** Unlike Hnsw and Flat, the `dimension` field in Ivf is **required** and has no default value.
 
@@ -394,6 +409,168 @@ was discarded at index time.
 > for schema symmetry but currently neither emit nor consume the
 > sidecar.
 
+## Analyzers
+
+An `[analyzers.<name>]` table defines a custom text-analysis pipeline. A Text field uses it by naming it in its `analyzer` option. Define one when no built-in analyzer fits — for example, to add stemming, or to analyze Japanese text without the stop filter of the `japanese` preset. See [Text Analysis](../concepts/analysis.md) for how the pipeline works.
+
+```toml
+[analyzers.<name>]
+char_filters = [{ type = "...", ... }, ...]   # optional
+tokenizer = { type = "...", ... }             # required
+token_filters = [{ type = "...", ... }, ...]  # optional
+```
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `tokenizer` | table | *(required)* | Splits the text into tokens. Exactly one |
+| `char_filters` | array of tables | `[]` | Applied to the raw text before tokenization, in array order |
+| `token_filters` | array of tables | `[]` | Applied to the token stream after tokenization, in array order |
+
+Each component is a table whose `type` key selects the component; its other keys configure it. Inline tables (`{ type = "lowercase" }`) are the usual TOML spelling. The same shape is used in JSON schemas (`{"type": "lowercase"}`) and by every binding's `addAnalyzer` / `add_analyzer`.
+
+### Tokenizers
+
+| `type` | Required keys | Optional keys | Description |
+| :--- | :--- | :--- | :--- |
+| `"whitespace"` | -- | -- | Splits on whitespace |
+| `"unicode_word"` | -- | -- | Splits on Unicode word boundaries |
+| `"regex"` | -- | `pattern` (default `\w+`), `gaps` (default `false`) | Emits each match of `pattern` as a token. With `gaps = true`, `pattern` matches the separators between tokens instead |
+| `"ngram"` | `min_gram`, `max_gram` | -- | Emits every n-gram from `min_gram` to `max_gram` characters long |
+| `"lindera"` | `mode`, `dict` | `user_dict` | Morphological analysis with [Lindera](https://github.com/lindera/lindera). `mode` is `"normal"` or `"decompose"`. `dict` is the path to a Lindera dictionary directory and `user_dict` the path to a user dictionary; laurus does not embed a dictionary, so `dict` must exist on disk |
+| `"whole"` | -- | -- | Emits the whole input as a single token |
+
+### Char filters
+
+| `type` | Required keys | Optional keys | Description |
+| :--- | :--- | :--- | :--- |
+| `"unicode_normalization"` | `form` (`"nfc"` / `"nfd"` / `"nfkc"` / `"nfkd"`) | -- | Applies Unicode normalization |
+| `"pattern_replace"` | `pattern`, `replacement` | -- | Replaces each match of the regular expression `pattern` with `replacement` |
+| `"mapping"` | `mapping` (a table of string replacements) | -- | Replaces each key of `mapping` with its value |
+| `"japanese_iteration_mark"` | -- | `kanji` (default `true`), `kana` (default `true`) | Expands Japanese iteration marks (踊り字) |
+
+### Token filters
+
+| `type` | Required keys | Optional keys | Description |
+| :--- | :--- | :--- | :--- |
+| `"lowercase"` | -- | -- | Lowercases each token |
+| `"stop"` | -- | `words` (default: English stop words) | Removes stop words |
+| `"stem"` | -- | `stem_type` (`"porter"` (default) / `"simple"` / `"identity"`) | Reduces each token to its stem |
+| `"boost"` | `boost` | -- | Multiplies each token's boost by `boost` |
+| `"limit"` | `limit` | -- | Keeps at most `limit` tokens |
+| `"strip"` | -- | -- | Trims leading and trailing whitespace from each token |
+| `"remove_empty"` | -- | -- | Removes empty tokens |
+| `"flatten_graph"` | -- | -- | Flattens a token graph into a linear stream. Indexing already does this; because the analyzer also parses queries, adding it makes quoted multi-word synonyms inexact at query time |
+
+### Referencing an analyzer
+
+A Text field names an analyzer in its `analyzer` option:
+
+```toml
+[fields.body.Text]
+analyzer = "english_stemmed"
+```
+
+The name is resolved in this order:
+
+1. An analyzer registered at runtime through a binding (for example the WASM binding's `addAnalyzer`)
+2. A built-in analyzer: `standard`, `keyword`, `english`, `simple`, or `noop`
+3. An entry in `[analyzers.*]`
+
+Because built-ins are checked first, an `[analyzers.*]` entry named after a built-in (such as `[analyzers.standard]`) is never used. Give custom analyzers distinct names.
+
+Errors surface at two points:
+
+- An unknown `type` or a missing required key is rejected when the schema is parsed; `create index` creates nothing.
+- An invalid value (a malformed regular expression, an unknown `form` or `stem_type`, a missing Lindera dictionary) or an `analyzer` name that resolves to nothing is rejected when the index is built, with an error such as `Failed to resolve analyzer for field 'body': ...`.
+
+### Example: English text with stemming
+
+```toml
+default_fields = ["title", "body"]
+
+[analyzers.english_stemmed]
+char_filters = [{ type = "unicode_normalization", form = "nfkc" }]
+tokenizer = { type = "unicode_word" }
+token_filters = [
+    { type = "lowercase" },
+    { type = "stop" },
+    { type = "stem", stem_type = "porter" },
+]
+
+[fields.title.Text]
+analyzer = "english_stemmed"
+
+[fields.body.Text]
+analyzer = "english_stemmed"
+
+[fields.tag.Text]
+analyzer = "keyword"
+```
+
+A document whose `body` is `"Ｄｏｇｓ are RUNNING in the park."` then matches `body:dog` (NFKC normalization, lowercasing, and stemming) and `body:run`, while `body:the` matches nothing (stop words are removed). The `tag` field keeps the built-in `keyword` analyzer, so it matches only its exact value.
+
+### Example: Japanese text with Lindera
+
+This definition, taken from `examples/aozora/schema.toml`, differs from the `{ language = "japanese" }` preset in that it has no stop filter, so particles such as の and は stay in the index:
+
+```toml
+[analyzers.ja_ipadic]
+tokenizer = { type = "lindera", mode = "normal", dict = "/var/lib/lindera/ipadic" }
+char_filters = [
+    { type = "unicode_normalization", form = "nfkc" },
+    { type = "japanese_iteration_mark", kanji = true, kana = true },
+]
+token_filters = [{ type = "lowercase" }]
+
+[fields.title.Text]
+analyzer = "ja_ipadic"
+```
+
+`dict` must point to an unpacked Lindera dictionary (typically IPADIC). If it does not exist, `create index` fails with `Failed to load dictionary: ... Dictionary path does not exist`.
+
+## Embedders
+
+An `[embedders.<name>]` table declares an embedding model. A vector field (Hnsw, Flat, or Ivf) uses it by naming it in its `embedder` option. Text (or, for CLIP, image) values given for that field are then converted to vectors with the model, both when documents are indexed and when a query targets the field. Several fields can share one embedder. See [Embeddings](../concepts/embedding.md) for how each model works and how to choose one.
+
+```toml
+[embedders.<name>]
+type = "..."   # required
+model = "..."  # required for every type except "precomputed"
+```
+
+| `type` | Required keys | Feature flag | Description |
+| :--- | :--- | :--- | :--- |
+| `"precomputed"` | -- | *(always available)* | Performs no embedding; documents supply the vectors directly |
+| `"candle_bert"` | `model` | `embeddings-candle` | Local text embedding with a BERT-family model from Hugging Face Hub, such as `"sentence-transformers/all-MiniLM-L6-v2"` |
+| `"candle_clip"` | `model` | `embeddings-multimodal` | Local text and image embedding with a CLIP model from Hugging Face Hub, such as `"openai/clip-vit-base-patch32"` |
+| `"openai"` | `model` | `embeddings-openai` | Text embedding through the OpenAI API, such as `"text-embedding-3-small"`. The API key is read from the `OPENAI_API_KEY` environment variable when the engine starts and is never stored in the schema |
+
+Hugging Face models are downloaded on first use and cached under `$HF_HOME` (default `~/.cache/huggingface`). The vector field's `dimension` must equal the model's output dimension.
+
+> **Note:** The prebuilt release binaries are built with `--features embeddings-all`. A `laurus` binary installed with `cargo install laurus-cli` or built from source enables none of the embedding features unless you pass them (for example `cargo install laurus-cli --features embeddings-candle`), so only `"precomputed"` works. See [Installation](installation.md) and [Feature Flags](../development/feature_flags.md). A schema that names a type whose feature is missing still parses, but `create index` fails:
+>
+> ```text
+> Error: Not implemented: candle_bert embedder requires the 'embeddings-candle' feature to be enabled
+> ```
+
+### Example: one embedder shared by two fields
+
+```toml
+[embedders.text_embedder]
+type = "candle_bert"
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[fields.title_vec.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "text_embedder"
+
+[fields.body_vec.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "text_embedder"
+```
+
 ## Complete Examples
 
 ### Full-text search only
@@ -502,6 +679,37 @@ stored = true
 [fields.description_vec.Hnsw]
 dimension = 384
 distance = "Cosine"
+```
+
+### Custom analysis and automatic embedding
+
+A hybrid index whose Text fields use a custom analyzer and whose vector field embeds its text with a local model. It needs a `laurus` binary with the `embeddings-candle` feature (see [Embedders](#embedders)):
+
+```toml
+default_fields = ["title", "body"]
+
+[analyzers.english_stemmed]
+tokenizer = { type = "unicode_word" }
+token_filters = [
+    { type = "lowercase" },
+    { type = "stop" },
+    { type = "stem" },
+]
+
+[embedders.text_embedder]
+type = "candle_bert"
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[fields.title.Text]
+analyzer = "english_stemmed"
+
+[fields.body.Text]
+analyzer = "english_stemmed"
+
+[fields.body_vec.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "text_embedder"
 ```
 
 ## Generating a Schema

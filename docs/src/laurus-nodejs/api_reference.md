@@ -245,6 +245,8 @@ Used by `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` and by
 the `[analyzers.<name>]` TOML section. `tokenizer` is a single object;
 `charFilters`/`tokenFilters` are arrays of objects, applied in array order.
 
+See [Schema Format Reference → Analyzers](../laurus-cli/schema_format.md#analyzers) for the canonical description of each component.
+
 **Tokenizers** (`tokenizer`, exactly one):
 
 | `type` | Required keys | Optional keys |

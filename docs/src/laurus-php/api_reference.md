@@ -226,6 +226,8 @@ the full behaviour matrix.
 
 ### Embedder types
 
+See [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embedders) for the canonical description of each type.
+
 | `"type"` | Required keys | Feature flag |
 | :--- | :--- | :--- |
 | `"precomputed"` | -- | (always available) |
@@ -239,6 +241,8 @@ Used by `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null,
 and by the `[analyzers.<name>]` TOML section. `$tokenizer` is a single
 associative array; `$charFilters`/`$tokenFilters` are arrays of associative
 arrays, applied in array order.
+
+See [Schema Format Reference → Analyzers](../laurus-cli/schema_format.md#analyzers) for the canonical description of each component.
 
 **Tokenizers** (`$tokenizer`, exactly one):
 
