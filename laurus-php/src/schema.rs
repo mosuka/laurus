@@ -14,6 +14,7 @@ use laurus::{
 };
 
 use crate::convert::hashtable_to_json_value;
+use crate::errors::{io_err_with_path, laurus_err};
 
 /// Parse a distance metric string into [`DistanceMetric`].
 ///
@@ -670,9 +671,71 @@ impl PhpSchema {
         Ok(())
     }
 
-    /// Return the names of custom analyzers registered via `addAnalyzer`.
+    /// Return the names of custom analyzers registered via `addAnalyzer`
+    /// or loaded from TOML.
     pub fn analyzer_names(&self) -> Vec<String> {
         self.inner.borrow().analyzers.keys().cloned().collect()
+    }
+
+    /// Parse a schema from a TOML string, in the same format
+    /// `laurus-cli create index --schema` accepts.
+    ///
+    /// # Arguments
+    ///
+    /// * `toml_str` - Schema definition in TOML.
+    ///
+    /// # Errors
+    ///
+    /// Throws a PHP `ValueError` if `toml_str` is not a valid schema.
+    pub fn from_toml(toml_str: String) -> PhpResult<Self> {
+        let inner = Schema::from_toml(&toml_str).map_err(laurus_err)?;
+        Ok(Self {
+            inner: RefCell::new(inner),
+        })
+    }
+
+    /// Load a schema from a TOML file (see `fromToml`).
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the TOML file.
+    ///
+    /// # Errors
+    ///
+    /// Throws a PHP `Exception` if the file cannot be read, or a
+    /// `ValueError` if its content is not a valid schema.
+    pub fn from_toml_file(path: String) -> PhpResult<Self> {
+        let content = std::fs::read_to_string(&path).map_err(|e| io_err_with_path(&path, e))?;
+        Self::from_toml(content)
+    }
+
+    /// Serialize this schema to a TOML string in the same format
+    /// `laurus-cli` accepts.
+    ///
+    /// Tables are emitted in sorted key order, not insertion order, so
+    /// compare round-tripped schemas by their parsed content rather than
+    /// by raw text.
+    ///
+    /// # Errors
+    ///
+    /// Throws a PHP `ValueError` if the schema cannot be serialized.
+    pub fn to_toml(&self) -> PhpResult<String> {
+        self.inner.borrow().to_toml().map_err(laurus_err)
+    }
+
+    /// Write this schema to a TOML file (see `toToml`).
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Destination path; an existing file is overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Throws a PHP `Exception` if the file cannot be written, or a
+    /// `ValueError` if the schema cannot be serialized.
+    pub fn to_toml_file(&self, path: String) -> PhpResult<()> {
+        let content = self.to_toml()?;
+        std::fs::write(&path, content).map_err(|e| io_err_with_path(&path, e))
     }
 
     /// Set the default fields used when no field is specified in a query.

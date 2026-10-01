@@ -155,6 +155,10 @@ The `Schema` class defines the structure of your index. Use the following method
 | `addEmbedder(name, config)` | Register a named embedder |
 | `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | Register a named custom analyzer |
 | `setDefaultFields(fieldNames)` | Set default search fields |
+| `Schema::fromToml(tomlStr)` | Parse a schema from a TOML string (the format `laurus-cli create index --schema` accepts) |
+| `Schema::fromTomlFile(path)` | Load a schema from a TOML file |
+| `toToml()` | Serialize the schema to a TOML string |
+| `toTomlFile(path)` | Write the schema to a TOML file |
 
 Every parameter after `name` (and `dimension` for vector fields) has a default, so trailing arguments can be omitted; the arguments are positional, so keep the order above when passing a later one. Types and defaults are listed in the [API reference](../docs/src/laurus-php/api_reference.md).
 

@@ -62,3 +62,12 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PhpException {
         IndexDirError::Core(e) => laurus_err(e),
     }
 }
+
+/// Convert a file I/O error into a PHP `Exception` whose message is
+/// `"{path}: {err}"`.
+///
+/// Maps to `Exception`, same as `LaurusError::Io` in [`laurus_err`]; a bare
+/// [`std::io::Error`] does not name the file, so the path is prefixed here.
+pub fn io_err_with_path(path: &str, err: std::io::Error) -> PhpException {
+    PhpException::new(format!("{path}: {err}"), 0, ce::exception())
+}

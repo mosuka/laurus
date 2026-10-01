@@ -1095,6 +1095,113 @@ class LaurusTest extends TestCase
         new Laurus\Index(null, $schema);
     }
 
+    // ── TOML I/O (Schema::fromToml/toToml, Issue #1294) ──────────────────
+    //
+    // Adapted from laurus-nodejs's schema_analyzer.spec.mjs. toToml emits
+    // tables in sorted key order, so round trips are checked by field and
+    // analyzer names plus a search that only the custom analyzer can
+    // satisfy, not by comparing raw TOML text.
+
+    private const SCHEMA_TOML = <<<'TOML'
+        default_fields = ["title"]
+
+        [analyzers.ngram3]
+        tokenizer = { type = "ngram", min_gram = 3, max_gram = 3 }
+
+        [fields.title.Text]
+        indexed = true
+        stored = true
+        term_vectors = false
+        analyzer = "ngram3"
+        TOML;
+
+    private static function tempSchemaPath(): string
+    {
+        return sys_get_temp_dir() . "/laurus_schema_" . uniqid() . ".toml";
+    }
+
+    public function testSchemaFromTomlLoadsAndSearches(): void
+    {
+        $schema = Laurus\Schema::fromToml(self::SCHEMA_TOML);
+        $this->assertEquals(["title"], $schema->fieldNames());
+        $this->assertEquals(["ngram3"], $schema->analyzerNames());
+
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("doc1", ["title" => "hello"]);
+        $idx->commit();
+        $this->assertCount(1, $idx->search("title:ell", 5));
+    }
+
+    public function testSchemaFromTomlFileLoadsSchema(): void
+    {
+        $path = self::tempSchemaPath();
+        file_put_contents($path, self::SCHEMA_TOML);
+        try {
+            $schema = Laurus\Schema::fromTomlFile($path);
+            $this->assertEquals(["title"], $schema->fieldNames());
+        } finally {
+            unlink($path);
+        }
+    }
+
+    public function testSchemaFromTomlFileRejectsMissingFile(): void
+    {
+        $path = self::tempSchemaPath();
+        // ValueError is not an Exception subclass, so this also proves the
+        // I/O failure is not reported as a malformed schema.
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessageMatches('/' . preg_quote($path, '/') . '/');
+        Laurus\Schema::fromTomlFile($path);
+    }
+
+    public function testSchemaFromTomlRejectsMalformedToml(): void
+    {
+        $this->expectException(\ValueError::class);
+        $this->expectExceptionMessageMatches('/invalid schema TOML/');
+        Laurus\Schema::fromToml("not = [valid");
+    }
+
+    public function testSchemaTomlRoundTripKeepsAnalyzer(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer(
+            "ngram3",
+            ["type" => "ngram", "min_gram" => 3, "max_gram" => 3],
+            [["type" => "unicode_normalization", "form" => "nfkc"]],
+            [["type" => "lowercase"]],
+        );
+        $schema->addTextField("title", analyzer: "ngram3");
+        $schema->setDefaultFields(["title"]);
+
+        $restored = Laurus\Schema::fromToml($schema->toToml());
+        $this->assertEquals($schema->fieldNames(), $restored->fieldNames());
+        $this->assertEquals($schema->analyzerNames(), $restored->analyzerNames());
+
+        $idx = new Laurus\Index(null, $restored);
+        $idx->putDocument("doc1", ["title" => "HELLO"]);
+        $idx->commit();
+        // Reachable only if both the ngram tokenizer and the lowercase
+        // token filter survived the round trip.
+        $this->assertCount(1, $idx->search("title:ell", 5));
+    }
+
+    public function testSchemaTomlFileRoundTrip(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("ws", ["type" => "whitespace"]);
+        $schema->addTextField("title", analyzer: "ws");
+
+        $path = self::tempSchemaPath();
+        try {
+            $schema->toTomlFile($path);
+            $restored = Laurus\Schema::fromTomlFile($path);
+            $this->assertEquals($schema->fieldNames(), $restored->fieldNames());
+            $this->assertEquals($schema->analyzerNames(), $restored->analyzerNames());
+        } finally {
+            unlink($path);
+        }
+    }
+
     // ── SearchResult ────────────────────────────────────────────────────
 
     public function testSearchResultDocument(): void
