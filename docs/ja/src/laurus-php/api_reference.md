@@ -223,6 +223,8 @@ new \Laurus\Schema()
 
 ### エンベダータイプ
 
+各型の説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → エンベダー](../laurus-cli/schema_format.md#エンベダー) を参照してください。
+
 | `"type"` | 必須キー | Feature Flag |
 | :--- | :--- | :--- |
 | `"precomputed"` | -- | （常に利用可能） |
@@ -236,6 +238,8 @@ new \Laurus\Schema()
 および `[analyzers.<name>]` TOML セクションで使用します。`$tokenizer` は単一の
 連想配列、`$charFilters`/`$tokenFilters` は連想配列の配列で、配列の順序で
 適用されます。
+
+各コンポーネントの説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください。
 
 **トークナイザー**（`$tokenizer`、必ず1つ）:
 

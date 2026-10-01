@@ -254,6 +254,8 @@ the full behaviour matrix.
 
 ### Embedder types
 
+See [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embedders) for the canonical description of each type.
+
 | `"type"` | Required keys | Feature flag |
 | :--- | :--- | :--- |
 | `"precomputed"` | -- | (always available) |
@@ -266,6 +268,8 @@ the full behaviour matrix.
 Used by `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)`
 and by the `[analyzers.<name>]` TOML section. `tokenizer` is a single dict;
 `char_filters`/`token_filters` are lists of dicts, applied in list order.
+
+See [Schema Format Reference → Analyzers](../laurus-cli/schema_format.md#analyzers) for the canonical description of each component.
 
 **Tokenizers** (`tokenizer`, exactly one):
 

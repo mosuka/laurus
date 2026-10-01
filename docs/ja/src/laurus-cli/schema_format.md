@@ -4,7 +4,7 @@
 
 ## 概要
 
-スキーマは 3 つのトップレベル要素で構成されます:
+スキーマは 5 つのトップレベル要素で構成されます:
 
 ```toml
 # スキーマに宣言されていないフィールドの扱い。省略時は "dynamic"。
@@ -13,6 +13,14 @@ dynamic_field_policy = "dynamic"
 # クエリでフィールドが指定されていない場合にデフォルトで検索するフィールド。
 default_fields = ["title", "body"]
 
+# カスタムアナライザの定義。Text フィールドから名前で参照する。省略可能。
+[analyzers.<analyzer_name>]
+# ... tokenizer、char_filters、token_filters
+
+# エンベダーの定義。ベクトルフィールドから名前で参照する。省略可能。
+[embedders.<embedder_name>]
+# ... type と型固有のオプション
+
 # フィールド定義。各フィールドには名前と型付き設定があります。
 [fields.<field_name>.<FieldType>]
 # ... 型固有のオプション
@@ -20,6 +28,8 @@ default_fields = ["title", "body"]
 
 - **`dynamic_field_policy`** — スキーマに**宣言されていない**フィールドがドキュメントに含まれる場合の挙動を制御します。値は `"strict"` / `"dynamic"` / `"ignore"`。デフォルトは `"dynamic"`。詳細および「`dynamic` では情報損失が起きうる」という警告は [動的スキーマ](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
 - **`default_fields`** — [Query DSL](../concepts/query_dsl.md) でデフォルトの検索対象として使用されるフィールド名のリストです。Lexical フィールド（Text、Integer、Float など）のみデフォルトフィールドに指定できます。このキーはオプションで、デフォルトは空のリストです。
+- **`analyzers`** — 名前とカスタムのテキスト解析パイプラインのマップです。Text フィールドは `analyzer` オプションに名前を書いて使います。省略可能です。[アナライザ](#アナライザ) を参照してください。
+- **`embedders`** — 名前と埋め込みモデルのマップです。ベクトルフィールドは `embedder` オプションに名前を書いて使います。省略可能です。[エンベダー](#エンベダー) を参照してください。
 - **`fields`** — フィールド名とその型付き設定のマップです。各フィールドにはフィールド型を1つだけ指定する必要があります。
 
 ## フィールド命名規則
@@ -46,6 +56,7 @@ multi_valued = false         # 文字列の配列を受け付けるかどうか�
 position_increment_gap = 100 # 多値フィールドの要素間で読み飛ばす位置数
 term_vectors = true          # タームの位置を保存するかどうか（フレーズクエリ・スパンクエリ用）
 doc_values = true            # 値を DocValues にもコピーするかどうか（ソート・ファセット用）
+analyzer = "standard"        # このフィールドのインデックス時とクエリ解析時に使うアナライザ
 ```
 
 | オプション | 型 | デフォルト | 説明 |
@@ -56,6 +67,7 @@ doc_values = true            # 値を DocValues にもコピーするかどう�
 | `position_increment_gap` | `integer` | `100` | 多値フィールドの要素間で読み飛ばす位置数（Lucene の `positionIncrementGap`）。`0` にすると要素を連結したものとして付番する。`multi_valued = true` でなければ無視される |
 | `term_vectors` | `bool` | `true` | フレーズクエリ・スパンクエリが読み取るタームの位置を保存する。ハイライトは常に保存済みテキストを再トークナイズするため使用しない |
 | `doc_values` | `bool` | `true` | 値を DocValues（[ソート](../laurus/faceting.md)・ファセット・集計が読み取る列指向ストア）にもコピーする。`stored` も `true` の場合のみ有効 —— 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
+| `analyzer` | `string` またはテーブル | *（省略）* | このフィールドのインデックス時とクエリ解析時の両方で使うアナライザ。文字列は組み込みアナライザ（`"standard"`、`"english"`、`"keyword"`、`"simple"`、`"noop"`）か [`[analyzers.*]`](#アナライザ) の名前を指す。テーブルはパラメータ付きの組み込みプリセットを選び、現在は `{ language = "japanese", mode = "normal", dict = "<path>" }` のみ（[テキスト解析](../concepts/analysis.md#schema-からの-per-field-analyzer-設定) を参照）。省略すると `"standard"` を使う |
 
 対話的なスキーマジェネレータ（`laurus create schema`。[スキーマの生成](#スキーマの生成) を参照）は、Text フィールドについて多値にするかどうかを尋ね、多値にする場合は position increment gap も尋ねます。
 
@@ -230,6 +242,7 @@ base_weight = 1.0
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできるようにする。省略すると Stage 1 int8-only の挙動を維持。 |
 | `pq_codebook_path` | `string` | *（省略）* | 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`ProductQuantization` quantizer との組み合わせでのみ意味を持つ。`laurus train pq-codebook` で学習すると、以後の commit は segment ごとの k-means 再学習の代わりにこの codebook で encode する。設定済みで未学習の場合、commit は明示的にエラーになる（無言のフォールバック無し）。省略すると segment ごとに学習。 |
+| `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。指定すると、このフィールドに与えたテキスト（または画像）をそのモデルでベクトルに変換する。インデックス時と検索時の両方で変換する。省略すると計算済みのベクトルだけを受け付ける |
 
 **チューニングガイドライン:**
 
@@ -255,6 +268,7 @@ base_weight = 1.0
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
+| `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。[Hnsw](#hnsw) を参照 |
 
 #### Ivf
 
@@ -278,6 +292,7 @@ base_weight = 1.0
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
+| `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。[Hnsw](#hnsw) を参照 |
 
 > **注意:** Hnsw および Flat とは異なり、Ivf の `dimension` フィールドは**必須**であり、デフォルト値はありません。
 
@@ -392,6 +407,168 @@ rerank_storage = "F32"  # opt-in。省略すると Stage 1 int8-only の挙動�
 > スキーマの対称性のためにフィールドを受け付けますが、現状 sidecar
 > の書き出し・読み込みは行いません。
 
+## アナライザ
+
+`[analyzers.<name>]` テーブルは、カスタムのテキスト解析パイプラインを定義します。Text フィールドは `analyzer` オプションにその名前を書いて使います。組み込みのアナライザでは足りないとき、たとえばステミングを加えたいときや、`japanese` プリセットのストップフィルタを使わずに日本語を解析したいときに定義します。パイプラインの仕組みは [テキスト解析](../concepts/analysis.md) を参照してください。
+
+```toml
+[analyzers.<name>]
+char_filters = [{ type = "...", ... }, ...]   # 省略可能
+tokenizer = { type = "...", ... }             # 必須
+token_filters = [{ type = "...", ... }, ...]  # 省略可能
+```
+
+| キー | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `tokenizer` | テーブル | *（必須）* | テキストをトークンに分割する。必ず 1 つ |
+| `char_filters` | テーブルの配列 | `[]` | トークン化の前に生テキストへ、配列の順に適用する |
+| `token_filters` | テーブルの配列 | `[]` | トークン化の後にトークン列へ、配列の順に適用する |
+
+各コンポーネントは、`type` キーで種類を選び、残りのキーで設定するテーブルです。TOML ではインラインテーブル（`{ type = "lowercase" }`）で書くのが一般的です。JSON 形式のスキーマ（`{"type": "lowercase"}`）や、各バインディングの `addAnalyzer` / `add_analyzer` も同じ形を使います。
+
+### トークナイザ
+
+| `type` | 必須キー | 省略可能キー | 説明 |
+| :--- | :--- | :--- | :--- |
+| `"whitespace"` | -- | -- | 空白で分割する |
+| `"unicode_word"` | -- | -- | Unicode の単語境界で分割する |
+| `"regex"` | -- | `pattern`（デフォルト `\w+`）、`gaps`（デフォルト `false`） | `pattern` に一致した部分をトークンにする。`gaps = true` のときは、`pattern` がトークン間の区切りに一致するものとして扱う |
+| `"ngram"` | `min_gram`、`max_gram` | -- | `min_gram` 文字から `max_gram` 文字までのすべての n-gram を出力する |
+| `"lindera"` | `mode`、`dict` | `user_dict` | [Lindera](https://github.com/lindera/lindera) による形態素解析。`mode` は `"normal"` か `"decompose"`。`dict` は Lindera 辞書のディレクトリ、`user_dict` はユーザー辞書のパス。laurus は辞書を同梱しないため、`dict` は実在するパスでなければならない |
+| `"whole"` | -- | -- | 入力全体を 1 つのトークンにする |
+
+### 文字フィルタ
+
+| `type` | 必須キー | 省略可能キー | 説明 |
+| :--- | :--- | :--- | :--- |
+| `"unicode_normalization"` | `form`（`"nfc"` / `"nfd"` / `"nfkc"` / `"nfkd"`） | -- | Unicode 正規化を適用する |
+| `"pattern_replace"` | `pattern`、`replacement` | -- | 正規表現 `pattern` に一致した部分を `replacement` に置き換える |
+| `"mapping"` | `mapping`（置換用の文字列のテーブル） | -- | `mapping` の各キーを対応する値に置き換える |
+| `"japanese_iteration_mark"` | -- | `kanji`（デフォルト `true`）、`kana`（デフォルト `true`） | 踊り字を展開する |
+
+### トークンフィルタ
+
+| `type` | 必須キー | 省略可能キー | 説明 |
+| :--- | :--- | :--- | :--- |
+| `"lowercase"` | -- | -- | 各トークンを小文字にする |
+| `"stop"` | -- | `words`（デフォルト: 英語のストップワード） | ストップワードを取り除く |
+| `"stem"` | -- | `stem_type`（`"porter"`（デフォルト）/ `"simple"` / `"identity"`） | 各トークンを語幹にする |
+| `"boost"` | `boost` | -- | 各トークンのブーストに `boost` を掛ける |
+| `"limit"` | `limit` | -- | 先頭の `limit` 個のトークンだけを残す |
+| `"strip"` | -- | -- | 各トークンの前後の空白を取り除く |
+| `"remove_empty"` | -- | -- | 空のトークンを取り除く |
+| `"flatten_graph"` | -- | -- | トークングラフを直線的なトークン列に平坦化する。インデックス時は常に平坦化されるうえ、アナライザはクエリの解析にも使われるため、これを加えるとクエリ時に引用符付きの複数語の同義語が厳密に一致しなくなる |
+
+### アナライザの参照
+
+Text フィールドは `analyzer` オプションにアナライザの名前を書きます:
+
+```toml
+[fields.body.Text]
+analyzer = "english_stemmed"
+```
+
+名前は次の順に解決されます:
+
+1. バインディングから実行時に登録したアナライザ（例: WASM バインディングの `addAnalyzer`）
+2. 組み込みのアナライザ: `standard`、`keyword`、`english`、`simple`、`noop`
+3. `[analyzers.*]` のエントリ
+
+組み込みが先に調べられるため、組み込みと同じ名前の `[analyzers.*]` エントリ（`[analyzers.standard]` など）は使われません。カスタムアナライザには別の名前を付けてください。
+
+エラーは次の 2 つの時点で起きます:
+
+- 未知の `type` や必須キーの欠落は、スキーマの解析時にエラーになります。このとき `create index` は何も作りません。
+- 不正な値（誤った正規表現、未知の `form` や `stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。
+
+### 例: ステミング付きの英語テキスト
+
+```toml
+default_fields = ["title", "body"]
+
+[analyzers.english_stemmed]
+char_filters = [{ type = "unicode_normalization", form = "nfkc" }]
+tokenizer = { type = "unicode_word" }
+token_filters = [
+    { type = "lowercase" },
+    { type = "stop" },
+    { type = "stem", stem_type = "porter" },
+]
+
+[fields.title.Text]
+analyzer = "english_stemmed"
+
+[fields.body.Text]
+analyzer = "english_stemmed"
+
+[fields.tag.Text]
+analyzer = "keyword"
+```
+
+`body` が `"Ｄｏｇｓ are RUNNING in the park."` の文書は、`body:dog`（NFKC 正規化・小文字化・ステミングによる）と `body:run` に一致し、`body:the` には一致しません（ストップワードが取り除かれるため）。`tag` フィールドは組み込みの `keyword` アナライザのままなので、値そのものにだけ一致します。
+
+### 例: Lindera による日本語テキスト
+
+次の定義は `examples/aozora/schema.toml` から取ったものです。`{ language = "japanese" }` プリセットと違ってストップフィルタを含まないため、「の」「は」などの助詞もインデックスに残ります:
+
+```toml
+[analyzers.ja_ipadic]
+tokenizer = { type = "lindera", mode = "normal", dict = "/var/lib/lindera/ipadic" }
+char_filters = [
+    { type = "unicode_normalization", form = "nfkc" },
+    { type = "japanese_iteration_mark", kanji = true, kana = true },
+]
+token_filters = [{ type = "lowercase" }]
+
+[fields.title.Text]
+analyzer = "ja_ipadic"
+```
+
+`dict` には展開済みの Lindera 辞書（通常は IPADIC）を指定します。存在しないパスを指定すると、`create index` は `Failed to load dictionary: ... Dictionary path does not exist` で失敗します。
+
+## エンベダー
+
+`[embedders.<name>]` テーブルは、埋め込みモデルを宣言します。ベクトルフィールド（Hnsw、Flat、Ivf）は `embedder` オプションにその名前を書いて使います。するとそのフィールドに与えたテキスト（CLIP の場合は画像も）が、文書のインデックス時と、そのフィールドを対象とするクエリの実行時の両方で、モデルによってベクトルに変換されます。1 つのエンベダーを複数のフィールドで共有できます。各モデルの仕組みと選び方は [Embedding](../concepts/embedding.md) を参照してください。
+
+```toml
+[embedders.<name>]
+type = "..."   # 必須
+model = "..."  # "precomputed" 以外のすべての型で必須
+```
+
+| `type` | 必須キー | Feature Flag | 説明 |
+| :--- | :--- | :--- | :--- |
+| `"precomputed"` | -- | *（常に利用可能）* | 埋め込みを行わない。文書がベクトルを直接与える |
+| `"candle_bert"` | `model` | `embeddings-candle` | Hugging Face Hub の BERT 系モデル（例: `"sentence-transformers/all-MiniLM-L6-v2"`）によるローカルでのテキスト埋め込み |
+| `"candle_clip"` | `model` | `embeddings-multimodal` | Hugging Face Hub の CLIP モデル（例: `"openai/clip-vit-base-patch32"`）によるローカルでのテキストと画像の埋め込み |
+| `"openai"` | `model` | `embeddings-openai` | OpenAI API（例: `"text-embedding-3-small"`）によるテキスト埋め込み。API キーはエンジン起動時に環境変数 `OPENAI_API_KEY` から読み、スキーマには保存しない |
+
+Hugging Face のモデルは初回の使用時にダウンロードされ、`$HF_HOME`（デフォルトは `~/.cache/huggingface`）にキャッシュされます。ベクトルフィールドの `dimension` は、モデルの出力次元と一致させる必要があります。
+
+> **注意:** リリースで配布しているビルド済みバイナリは `--features embeddings-all` 付きでビルドされています。一方、`cargo install laurus-cli` やソースからのビルドでは、feature を指定しない限り（例: `cargo install laurus-cli --features embeddings-candle`）埋め込みの feature がどれも有効にならず、使えるのは `"precomputed"` だけです。[インストール](installation.md) と [Feature Flags](../development/feature_flags.md) を参照してください。feature が無効な型を書いたスキーマも解析は通りますが、`create index` が次のエラーで失敗します:
+>
+> ```text
+> Error: Not implemented: candle_bert embedder requires the 'embeddings-candle' feature to be enabled
+> ```
+
+### 例: 1 つのエンベダーを 2 つのフィールドで共有する
+
+```toml
+[embedders.text_embedder]
+type = "candle_bert"
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[fields.title_vec.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "text_embedder"
+
+[fields.body_vec.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "text_embedder"
+```
+
 ## 完全な例
 
 ### 全文検索のみ
@@ -500,6 +677,37 @@ stored = true
 [fields.description_vec.Hnsw]
 dimension = 384
 distance = "Cosine"
+```
+
+### カスタム解析と自動埋め込み
+
+Text フィールドにカスタムアナライザを使い、ベクトルフィールドではテキストをローカルのモデルで埋め込むハイブリッドインデックスです。`embeddings-candle` feature 付きの `laurus` バイナリが必要です（[エンベダー](#エンベダー) を参照）:
+
+```toml
+default_fields = ["title", "body"]
+
+[analyzers.english_stemmed]
+tokenizer = { type = "unicode_word" }
+token_filters = [
+    { type = "lowercase" },
+    { type = "stop" },
+    { type = "stem" },
+]
+
+[embedders.text_embedder]
+type = "candle_bert"
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[fields.title.Text]
+analyzer = "english_stemmed"
+
+[fields.body.Text]
+analyzer = "english_stemmed"
+
+[fields.body_vec.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "text_embedder"
 ```
 
 ## スキーマの生成

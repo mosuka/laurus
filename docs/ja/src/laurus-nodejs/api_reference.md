@@ -242,6 +242,8 @@ class Schema {
 `[analyzers.<name>]` TOML セクションで使用します。`tokenizer` は単一のオブジェクト、
 `charFilters`/`tokenFilters` はオブジェクトの配列で、配列の順序どおりに適用されます。
 
+各コンポーネントの説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください。
+
 **トークナイザ**（`tokenizer`、必ず1つ）:
 
 | `type` | 必須キー | 省略可能キー |
