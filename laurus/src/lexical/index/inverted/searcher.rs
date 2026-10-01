@@ -4189,6 +4189,82 @@ mod tests {
         assert_eq!(parallel_boosted, serial_boosted);
     }
 
+    /// Run `query` and return its `(doc_id, score)` hits sorted by doc id.
+    fn scored_hits(
+        searcher: &InvertedIndexSearcher,
+        query: Box<dyn Query>,
+        parallel: bool,
+    ) -> Vec<(u64, f32)> {
+        let mut hits: Vec<_> = searcher
+            .search_with_collector_parallel(query, TopDocsCollector::new(100), parallel)
+            .unwrap()
+            .results()
+            .into_iter()
+            .map(|h| (h.doc_id, h.score))
+            .collect();
+        hits.sort_unstable_by_key(|h| h.0);
+        hits
+    }
+
+    /// Assert that `boosted` holds the same docs as `unboosted`, each at
+    /// twice the score.
+    fn assert_doubled(unboosted: &[(u64, f32)], boosted: &[(u64, f32)]) {
+        assert!(!unboosted.is_empty(), "expected matches");
+        assert_eq!(unboosted.len(), boosted.len());
+        for ((doc, unboosted), (doc2, boosted)) in unboosted.iter().zip(boosted) {
+            assert_eq!(doc, doc2, "doc_id mismatch between the two runs");
+            assert!(
+                (boosted - unboosted * 2.0).abs() < 1e-4,
+                "doc {doc}: boosted score {boosted} is not double the unboosted score {unboosted}"
+            );
+        }
+    }
+
+    fn alpha_multi_field_query() -> crate::lexical::query::advanced_query::MultiFieldQuery {
+        crate::lexical::query::advanced_query::MultiFieldQuery::new("alpha".to_string())
+            .add_field("body".to_string(), 1.0)
+    }
+
+    /// #1315: `MultiFieldQuery` keeps the boost `set_boost` gives it and
+    /// scales its scores by it.
+    #[test]
+    fn multi_field_query_boost_scales_scores() {
+        let store = build_boolean_corpus();
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+
+        let mut boosted = alpha_multi_field_query();
+        boosted.set_boost(2.0);
+        assert_eq!(boosted.boost(), 2.0);
+
+        let unboosted = scored_hits(&searcher, Box::new(alpha_multi_field_query()), false);
+        let boosted = scored_hits(&searcher, Box::new(boosted), false);
+        assert_doubled(&unboosted, &boosted);
+    }
+
+    /// #1315: the parallel path runs a single clause on its own and folds
+    /// the outer boost into it through `set_boost`, so a boosted
+    /// single-clause `BooleanQuery` over a `MultiFieldQuery` must score as
+    /// it does on the serial path.
+    #[test]
+    fn parallel_single_clause_boolean_over_multi_field_query_boost() {
+        let store = build_boolean_corpus();
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let boosted = || -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .must(Box::new(alpha_multi_field_query()))
+                    .boost(2.0)
+                    .build(),
+            )
+        };
+
+        let bare = scored_hits(&searcher, Box::new(alpha_multi_field_query()), false);
+        let parallel = scored_hits(&searcher, boosted(), true);
+        let serial = scored_hits(&searcher, boosted(), false);
+        assert_doubled(&bare, &parallel);
+        assert_eq!(parallel, serial);
+    }
+
     /// Parallel and serial paths must agree on membership for a Must-present
     /// shape (both implement the same boolean membership there).
     #[test]
