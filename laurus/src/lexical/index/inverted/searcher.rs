@@ -502,11 +502,11 @@ impl InvertedIndexSearcher {
         let mut score_buf: [f32; BATCH_SIZE] = [0.0; BATCH_SIZE];
         let mut n: usize = 0;
         let avg_fl = scorer.avg_field_length();
-        // Resolved once per query, so a document's length costs no lock,
-        // downcast or field-name lookup (#1298).
-        let field_lengths = query
-            .field()
-            .and_then(|field| self.reader.field_lengths(field));
+        // Taken from the scorer that consumes them, so a query wrapping its
+        // leaf still scores each document at its own length (#1289). The
+        // scorer resolved them once when it was built, so a document's length
+        // costs no lock, downcast or field-name lookup (#1298).
+        let field_lengths = scorer.field_lengths();
 
         // Running count of scanned documents, used to throttle the deadline
         // clock read (Issue #600). Starts at 0 so the first iteration checks
@@ -579,7 +579,6 @@ impl InvertedIndexSearcher {
             // SIMD slice stays valid.
             let term_freq = matcher.term_freq() as f32;
             let field_length = field_lengths
-                .as_ref()
                 .and_then(|lengths| lengths.get(doc_id))
                 .map_or(avg_fl, |len| len as f32);
 
@@ -2323,6 +2322,94 @@ mod tests {
                     .unwrap()
                     .unwrap()
             });
+        }
+    }
+
+    /// #1289: a top-level `AdvancedQuery` scores each document as its bare
+    /// core does. The regular loop took the lengths from `query.field()`,
+    /// which the wrapper does not report, so it scored every document at the
+    /// average length.
+    #[test]
+    fn advanced_query_scores_each_document_as_its_core() {
+        use crate::Document;
+        use crate::lexical::query::AdvancedQuery;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Two segments, both holding `alpha` and `beta`: a wrapped
+        // `SynonymQuery` is not rewritten, so the fanout blends its statistics
+        // in each segment, which matches the global blend only then. Every
+        // third document holds neither term.
+        for id in 0..60u64 {
+            let mut words = vec![["gamma", "alpha", "beta"][(id % 3) as usize]];
+            words.extend(std::iter::repeat_n("filler", (id % 13) as usize));
+            let doc = Document::builder()
+                .add_text("body", words.join(" "))
+                .build();
+            store.upsert_document(id, doc).unwrap();
+            if id == 29 {
+                store.commit().unwrap();
+            }
+        }
+        store.commit().unwrap();
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+
+        // `NonBmwTopDocs` keeps the query on the regular loop over the whole
+        // index; `store.search` fans out to each segment.
+        let regular = |query: Box<dyn Query>| {
+            scores_by_doc(
+                searcher
+                    .search_with_collector(query, NonBmwTopDocs(TopDocsCollector::new(100)))
+                    .unwrap()
+                    .0
+                    .results(),
+            )
+        };
+        let fanout = |query: Box<dyn Query>| {
+            scores_by_doc(
+                store
+                    .search(LexicalSearchRequest::new(query).limit(100))
+                    .unwrap()
+                    .hits,
+            )
+        };
+        type Core = fn() -> Box<dyn Query>;
+        type Search<'a> = &'a dyn Fn(Box<dyn Query>) -> std::collections::HashMap<u64, f32>;
+        let cores: [(&str, Core); 2] = [
+            ("term", || Box::new(TermQuery::new("body", "alpha"))),
+            ("synonym", || {
+                Box::new(SynonymQuery::new("body", vec!["alpha", "beta"]))
+            }),
+        ];
+        let paths: [(&str, Search); 2] = [("regular", &regular), ("fanout", &fanout)];
+
+        for (core_name, core) in cores {
+            for (path, search) in paths {
+                let want = search(core());
+                let got = search(Box::new(AdvancedQuery::new(core())));
+
+                assert!(want.len() >= 10, "{core_name}/{path}: {} hits", want.len());
+                let first = want.values().next().copied().unwrap();
+                assert!(
+                    want.values().any(|&score| (score - first).abs() > 1e-4),
+                    "{core_name}/{path}: lengths must set the scores apart"
+                );
+                let mut want_docs: Vec<u64> = want.keys().copied().collect();
+                let mut got_docs: Vec<u64> = got.keys().copied().collect();
+                want_docs.sort_unstable();
+                got_docs.sort_unstable();
+                assert_eq!(got_docs, want_docs, "{core_name}/{path}");
+                for (doc, &want_score) in &want {
+                    let got_score = got[doc];
+                    assert!(
+                        (got_score - want_score).abs() <= want_score * 1e-5,
+                        "{core_name}/{path}: doc {doc} scored {got_score}, \
+                         but its core scores {want_score}"
+                    );
+                }
+            }
         }
     }
 

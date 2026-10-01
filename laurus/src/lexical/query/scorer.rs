@@ -253,6 +253,17 @@ pub trait Scorer: Send + Debug {
     fn avg_field_length(&self) -> f32 {
         0.0
     }
+
+    /// Per-document lengths of the field this scorer normalizes by, which
+    /// the batched default loop reads to fill the `field_lengths` slice of
+    /// [`Self::batch_score`] (#1289). The loop takes them from the scorer, not
+    /// the query, so a query that wraps another one scores with its leaf's
+    /// lengths. `None`, the default, leaves every document on
+    /// [`Self::avg_field_length`]. A scorer that hands `field_length` on to
+    /// an inner scorer must forward this too.
+    fn field_lengths(&self) -> Option<&dyn FieldLengths> {
+        None
+    }
 }
 
 /// BM25 scorer implementation.
@@ -480,7 +491,10 @@ impl BM25Scorer {
     }
 
     /// Look each document's length up in `lengths` whenever a caller scores
-    /// without one (#1287), instead of using the average length.
+    /// without one (#1287), instead of using the average length. The
+    /// searcher's batched loop reads them through [`Scorer::field_lengths`]
+    /// too (#1289), so a scorer built without them scores every document at
+    /// the average length there.
     pub fn with_field_lengths(mut self, lengths: Option<Arc<dyn FieldLengths>>) -> Self {
         self.lengths = lengths;
         self
@@ -694,13 +708,18 @@ impl Scorer for BM25Scorer {
         field_lengths: &[f32],
         out: &mut [f32],
     ) {
-        // BM25 ignores `doc_id` in scalar `score`, so the SIMD kernel
-        // does too. Forward to the heap-allocation-free implementation.
+        // Scalar `score` reads `doc_id` only to look a missing length up, and
+        // every slot here carries one, so the SIMD kernel needs no doc ids.
+        // Forward to the heap-allocation-free implementation.
         self.batch_score_into(term_freqs, field_lengths, out);
     }
 
     fn avg_field_length(&self) -> f32 {
         self.avg_field_length as f32
+    }
+
+    fn field_lengths(&self) -> Option<&dyn FieldLengths> {
+        self.lengths.as_deref()
     }
 }
 
