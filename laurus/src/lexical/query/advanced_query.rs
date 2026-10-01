@@ -11,10 +11,16 @@ use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query, QueryResult};
 use crate::lexical::reader::LexicalIndexReader;
 
-/// Configuration for advanced query execution.
+/// Configuration for [`AdvancedQuery::execute`].
+///
+/// A search does not read it: it takes its score threshold and time budget
+/// from the request
+/// ([`LexicalSearchRequest::min_score`](crate::lexical::search::searcher::LexicalSearchRequest::min_score),
+/// [`LexicalSearchRequest::timeout_ms`](crate::lexical::search::searcher::LexicalSearchRequest::timeout_ms)).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvancedQueryConfig {
-    /// Enable query optimization.
+    /// Enable [`AdvancedQuery::optimize`]. Neither `execute` nor a search
+    /// depends on it.
     pub enable_optimization: bool,
 
     /// Maximum number of clauses to allow in boolean queries.
@@ -47,6 +53,17 @@ impl Default for AdvancedQueryConfig {
 }
 
 /// Advanced query with complex composition capabilities.
+///
+/// It means the equivalent [`BooleanQuery`]: the core query as a `Must`
+/// clause, the filters and post filters as `Filter` clauses and the negative
+/// filters as `MustNot` clauses, scaled by the boost. With no filters and a
+/// boost of 1.0 it is the core query itself. A search runs that query, and so
+/// does [`AdvancedQuery::execute`].
+///
+/// The minimum score and the [`AdvancedQueryConfig`] apply only in
+/// `execute`. A search takes its score threshold from
+/// [`LexicalSearchRequest::min_score`](crate::lexical::search::searcher::LexicalSearchRequest::min_score)
+/// instead.
 #[derive(Debug)]
 pub struct AdvancedQuery {
     /// The core query.
@@ -102,6 +119,11 @@ impl AdvancedQuery {
     }
 
     /// Set minimum score threshold.
+    ///
+    /// It applies only in [`AdvancedQuery::execute`]: no `BooleanQuery`
+    /// expresses it, so a search filters by
+    /// [`LexicalSearchRequest::min_score`](crate::lexical::search::searcher::LexicalSearchRequest::min_score)
+    /// instead.
     pub fn with_min_score(mut self, min_score: f32) -> Self {
         self.min_score = min_score;
         self
@@ -125,13 +147,17 @@ impl AdvancedQuery {
         self
     }
 
-    /// Set configuration.
+    /// Set configuration. It applies only in [`AdvancedQuery::execute`].
     pub fn with_config(mut self, config: AdvancedQueryConfig) -> Self {
         self.config = config;
         self
     }
 
     /// Optimize the query for better performance.
+    ///
+    /// Folds the filters and negative filters into the core query. Neither
+    /// [`AdvancedQuery::execute`] nor a search needs this: both already run
+    /// the equivalent `BooleanQuery`.
     pub fn optimize(&mut self) -> Result<()> {
         if !self.config.enable_optimization {
             return Ok(());
@@ -164,32 +190,25 @@ impl AdvancedQuery {
         Ok(())
     }
 
-    /// Execute the advanced query with optimization.
-    pub fn execute(&mut self, reader: &dyn LexicalIndexReader) -> Result<Vec<QueryResult>> {
-        // Optimize query first
-        self.optimize()?;
-
+    /// Execute the advanced query.
+    ///
+    /// Runs the same query a search does, then applies what no
+    /// `BooleanQuery` expresses: the minimum score and the
+    /// [`AdvancedQueryConfig`]'s timeout and early termination. Results are
+    /// sorted by descending score.
+    pub fn execute(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<QueryResult>> {
         // Build the matcher and scorer in one pass (#999).
-        let (mut matcher, scorer) = self.core_query.matcher_scorer(reader)?;
-
-        // Build each post filter's matcher once: candidates arrive in
-        // ascending doc-id order, so a single monotonic forward pass per
-        // filter suffices (#1001 — the previous code rebuilt every
-        // filter matcher per candidate document).
-        let mut post_filter_matchers = self
-            .post_filters
-            .iter()
-            .map(|filter| filter.matcher(reader))
-            .collect::<Result<Vec<_>>>()?;
+        let (mut matcher, scorer) = self.lowered().matcher_scorer(reader)?;
+        let min_score = self.min_score.max(self.config.min_score);
 
         let mut results = Vec::new();
         let start_time = crate::util::time::Timer::now();
 
-        // Drain the core matcher. It is positioned on its first match at
+        // Drain the matcher. It is positioned on its first match at
         // construction, so read the current doc before advancing (the
         // previous `while matcher.next()` loop dropped the first hit),
-        // and advance exactly once per iteration so score / filter
-        // rejections never skip the advance.
+        // and advance exactly once per iteration so score rejections
+        // never skip the advance.
         while !matcher.is_exhausted() {
             let doc_id = matcher.doc_id();
             if doc_id == u64::MAX {
@@ -201,14 +220,8 @@ impl AdvancedQuery {
                 break;
             }
 
-            // Calculate score
-            let mut score = scorer.score(doc_id, matcher.term_freq() as f32, None);
-            score *= self.boost;
-
-            // Minimum score threshold, then post filters
-            let admitted = score >= self.min_score.max(self.config.min_score)
-                && Self::post_filters_match(&mut post_filter_matchers, doc_id)?;
-            if admitted {
+            let score = scorer.score(doc_id, matcher.term_freq() as f32, None);
+            if score >= min_score {
                 results.push(QueryResult { doc_id, score });
 
                 // Early termination check
@@ -228,31 +241,55 @@ impl AdvancedQuery {
         Ok(results)
     }
 
-    /// Check `doc_id` against every prebuilt post-filter matcher.
+    /// The query this one means (see [`AdvancedQuery`]).
     ///
-    /// The matchers advance monotonically: candidates arrive in
-    /// ascending doc-id order, so `skip_to` never needs to move
-    /// backwards. A matcher already past `doc_id` reports a mismatch —
-    /// the same verdict a freshly built matcher would reach — and an
-    /// exhausted matcher correctly rejects everything after its last
-    /// match.
-    fn post_filters_match(matchers: &mut [Box<dyn Matcher>], doc_id: u64) -> Result<bool> {
-        for matcher in matchers.iter_mut() {
-            if !matcher.skip_to(doc_id)? || matcher.doc_id() != doc_id {
-                return Ok(false);
-            }
+    /// Post filters become `Filter` clauses: they differ from filters only
+    /// in being checked after scoring, which changes no hit and no score.
+    fn lowered(&self) -> Box<dyn Query> {
+        if self.filters.is_empty()
+            && self.negative_filters.is_empty()
+            && self.post_filters.is_empty()
+            && self.boost == 1.0
+        {
+            return self.core_query.clone_box();
         }
-        Ok(true)
+        let mut query = BooleanQuery::new().with_boost(self.boost);
+        query.add_must(self.core_query.clone_box());
+        for filter in self.filters.iter().chain(&self.post_filters) {
+            query.add_filter(filter.clone_box());
+        }
+        for filter in &self.negative_filters {
+            query.add_must_not(filter.clone_box());
+        }
+        Box::new(query)
     }
 }
 
 impl Query for AdvancedQuery {
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        self.core_query.matcher(reader)
+        self.lowered().matcher(reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        self.core_query.scorer(reader)
+        self.lowered().scorer(reader)
+    }
+
+    fn matcher_scorer(
+        &self,
+        reader: &dyn LexicalIndexReader,
+    ) -> Result<(Box<dyn Matcher>, Box<dyn Scorer>)> {
+        self.lowered().matcher_scorer(reader)
+    }
+
+    fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Option<Box<dyn Query>>> {
+        // Always replaced, so the per-segment fanout's second rewrite sees
+        // the lowered query, never this wrapper again.
+        let lowered = self.lowered();
+        Ok(Some(lowered.rewrite(reader)?.unwrap_or(lowered)))
+    }
+
+    fn cache_key(&self) -> Option<String> {
+        self.lowered().cache_key()
     }
 
     fn boost(&self) -> f32 {
@@ -645,8 +682,20 @@ impl Query for MultiFieldQuery {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
     use super::*;
+    use crate::Document;
+    use crate::lexical::index::inverted::reader::InvertedIndexReader;
     use crate::lexical::query::term::TermQuery;
+    use crate::lexical::query::{
+        FuzzyQuery, PrefixQuery, RegexpQuery, SynonymQuery, WildcardQuery,
+    };
+    use crate::lexical::search::searcher::LexicalSearchRequest;
+    use crate::lexical::store::LexicalStore;
+    use crate::lexical::store::config::LexicalIndexConfig;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 
     #[allow(dead_code)]
     #[test]
@@ -840,7 +889,7 @@ mod tests {
         let filter = FixedDocsQuery::new(vec![2, 4]);
         let filter_builds = filter.matcher_builds.clone();
 
-        let mut query = AdvancedQuery::new(Box::new(FixedDocsQuery::new(vec![1, 2, 3, 4, 5])))
+        let query = AdvancedQuery::new(Box::new(FixedDocsQuery::new(vec![1, 2, 3, 4, 5])))
             .with_post_filter(Box::new(filter));
         let results = query.execute(&reader).unwrap();
 
@@ -860,7 +909,7 @@ mod tests {
     #[test]
     fn execute_keeps_the_first_hit() {
         let reader = TestReader;
-        let mut query = AdvancedQuery::new(Box::new(FixedDocsQuery::new(vec![7, 9])));
+        let query = AdvancedQuery::new(Box::new(FixedDocsQuery::new(vec![7, 9])));
 
         let results = query.execute(&reader).unwrap();
 
@@ -948,5 +997,263 @@ mod tests {
             .with_filter(Box::new(TermQuery::new("body", "c")))
             .with_filter(Box::new(TermQuery::new("body", "d")));
         assert_eq!(query.cost(&reader).unwrap(), u64::MAX);
+    }
+
+    // apple: 0 1 2 5 6 7 8 10 11 / red: 0 2 3 6 8 9 / green: 1 4 7 11
+    // fresh: 0 4 7 10 / ripe: 1 2 3 8 10
+    const FRUIT_A: &[(u64, &str)] = &[
+        (0, "apple red fresh"),
+        (1, "apple green ripe"),
+        (2, "apple apple red ripe filler filler"),
+        (3, "apricot red ripe"),
+        (4, "banana green fresh"),
+        (5, "apple cherry"),
+    ];
+    const FRUIT_B: &[(u64, &str)] = &[
+        (6, "apple red"),
+        (7, "apple green fresh filler"),
+        (8, "apricot apple red ripe"),
+        (9, "cherry red"),
+        (10, "apple fresh fresh ripe"),
+        (11, "banana apple green filler filler filler"),
+    ];
+
+    /// A store holding one committed segment per slice of `(id, body)`.
+    fn store_with_segments(segments: &[&[(u64, &str)]]) -> LexicalStore {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for segment in segments {
+            for &(id, body) in *segment {
+                let doc = Document::builder().add_text("body", body).build();
+                store.upsert_document(id, doc).unwrap();
+            }
+            store.commit().unwrap();
+        }
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert_eq!(inverted.segment_count(), segments.len());
+        store
+    }
+
+    fn term(text: &str) -> Box<dyn Query> {
+        Box::new(TermQuery::new("body", text))
+    }
+
+    /// The hits of `query` on `store`, as doc id → score.
+    fn search_scores(
+        store: &LexicalStore,
+        query: Box<dyn Query>,
+        parallel: bool,
+    ) -> BTreeMap<u64, f32> {
+        store
+            .search(
+                LexicalSearchRequest::new(query)
+                    .limit(100)
+                    .parallel(parallel),
+            )
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| (hit.doc_id, hit.score))
+            .collect()
+    }
+
+    fn assert_scores_eq(label: &str, actual: &BTreeMap<u64, f32>, expected: &BTreeMap<u64, f32>) {
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "{label}: hits"
+        );
+        for (doc_id, want) in expected {
+            let got = actual[doc_id];
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "{label}: doc {doc_id} scores {got}, expected {want}"
+            );
+        }
+    }
+
+    /// #1305: on every search path — one segment (the matcher loop), two
+    /// segments (the per-segment fanout), each also with `parallel` — an
+    /// `AdvancedQuery` returns the hits `execute()` returns, each scored as
+    /// the bare core scores it on that path, times the boost.
+    #[test]
+    fn search_matches_execute_on_every_path() {
+        let one = store_with_segments(&[&[FRUIT_A, FRUIT_B].concat()]);
+        let two = store_with_segments(&[FRUIT_A, FRUIT_B]);
+        let apple = || AdvancedQuery::new(term("apple"));
+        let cases: Vec<(&str, AdvancedQuery, &[u64])> = vec![
+            (
+                "boost",
+                apple().with_boost(2.5),
+                &[0, 1, 2, 5, 6, 7, 8, 10, 11],
+            ),
+            ("filter", apple().with_filter(term("red")), &[0, 2, 6, 8]),
+            (
+                "negative filter",
+                apple().with_negative_filter(term("green")),
+                &[0, 2, 5, 6, 8, 10],
+            ),
+            (
+                "post filter",
+                apple().with_post_filter(term("ripe")),
+                &[1, 2, 8, 10],
+            ),
+            (
+                "all",
+                apple()
+                    .with_boost(0.5)
+                    .with_filter(term("red"))
+                    .with_negative_filter(term("fresh"))
+                    .with_post_filter(term("ripe")),
+                &[2, 8],
+            ),
+        ];
+
+        for (store_label, store) in [("one segment", &one), ("two segments", &two)] {
+            let reader = store.reader_for_tests().unwrap();
+            for parallel in [false, true] {
+                let bare = search_scores(store, term("apple"), parallel);
+                for (case, query, expected_ids) in &cases {
+                    let label = format!("{store_label}, parallel={parallel}, {case}");
+                    let expected_ids: BTreeSet<u64> = expected_ids.iter().copied().collect();
+
+                    let executed: BTreeSet<u64> = query
+                        .execute(reader.as_ref())
+                        .unwrap()
+                        .iter()
+                        .map(|result| result.doc_id)
+                        .collect();
+                    assert_eq!(executed, expected_ids, "{label}: execute()");
+
+                    let expected: BTreeMap<u64, f32> = expected_ids
+                        .iter()
+                        .map(|doc_id| (*doc_id, bare[doc_id] * query.boost()))
+                        .collect();
+                    let hits = search_scores(store, Box::new(query.clone()), parallel);
+                    assert_scores_eq(&label, &hits, &expected);
+                }
+            }
+        }
+    }
+
+    /// #1305: a wrapped multi-term core is lowered at the top-level
+    /// rewrite, so on two segments it returns what the bare query returns.
+    /// Unrewritten, the fanout's per-segment views cannot enumerate its
+    /// terms.
+    #[test]
+    fn wrapped_multi_term_cores_match_the_bare_queries_on_two_segments() {
+        let store = store_with_segments(&[FRUIT_A, FRUIT_B]);
+        let cores: Vec<(&str, Box<dyn Query>)> = vec![
+            ("prefix", Box::new(PrefixQuery::new("body", "ap"))),
+            (
+                "wildcard",
+                Box::new(WildcardQuery::new("body", "ch*y").unwrap()),
+            ),
+            ("fuzzy", Box::new(FuzzyQuery::new("body", "aple"))),
+            (
+                "regexp",
+                Box::new(RegexpQuery::new("body", "ban.*").unwrap()),
+            ),
+        ];
+        for (name, core) in cores {
+            let bare = search_scores(&store, core.clone_box(), false);
+            assert!(!bare.is_empty(), "{name}: the bare query must match");
+            let wrapped = search_scores(
+                &store,
+                Box::new(AdvancedQuery::new(core.clone_box())),
+                false,
+            );
+            assert_scores_eq(name, &wrapped, &bare);
+
+            // With a filter the wrapper lowers to a `BooleanQuery`, whose
+            // own rewrite lowers the core.
+            let mut boolean = BooleanQuery::new();
+            boolean.add_must(core.clone_box());
+            boolean.add_filter(term("red"));
+            let bare = search_scores(&store, Box::new(boolean), false);
+            let wrapped = search_scores(
+                &store,
+                Box::new(AdvancedQuery::new(core.clone_box()).with_filter(term("red"))),
+                false,
+            );
+            assert_scores_eq(&format!("{name} with a filter"), &wrapped, &bare);
+        }
+    }
+
+    /// #1305: a wrapped `SynonymQuery` is frozen with the whole index's
+    /// statistics at the top-level rewrite, so on two segments holding
+    /// different alternatives it scores each document as the bare query
+    /// does (the #1257 fixture: "large" is absent from the first segment).
+    #[test]
+    fn wrapped_synonym_core_scores_as_the_bare_query_on_two_segments() {
+        let first: Vec<(u64, &str)> = std::iter::once((0, "big filler"))
+            .chain((1..10).map(|id| (id, "filler filler")))
+            .collect();
+        let second: Vec<(u64, &str)> = std::iter::once((10, "big filler"))
+            .chain((11..20).map(|id| (id, "large filler")))
+            .collect();
+        let store = store_with_segments(&[&first, &second]);
+        let synonym =
+            || -> Box<dyn Query> { Box::new(SynonymQuery::new("body", vec!["big", "large"])) };
+
+        let bare = search_scores(&store, synonym(), false);
+        assert_eq!(bare.len(), 11, "docs 0, 10 and 11..20 hold an alternative");
+        let wrapped = search_scores(&store, Box::new(AdvancedQuery::new(synonym())), false);
+        assert_scores_eq("synonym", &wrapped, &bare);
+    }
+
+    /// #1305: an `AdvancedQuery` used as a `Filter` clause is served from
+    /// the cross-segment filter cache through its lowered query's
+    /// `cache_key`, so its multi-term core is enumerated against the whole
+    /// index, not a per-segment view.
+    #[test]
+    fn advanced_query_as_a_filter_clause_matches_on_two_segments() {
+        let store = store_with_segments(&[FRUIT_A, FRUIT_B]);
+        let red_filtered_by = |filter: Box<dyn Query>| -> Box<dyn Query> {
+            let mut query = BooleanQuery::new();
+            query.add_must(term("red"));
+            query.add_filter(filter);
+            Box::new(query)
+        };
+        let prefix = || -> Box<dyn Query> { Box::new(PrefixQuery::new("body", "ap")) };
+
+        let bare = search_scores(&store, red_filtered_by(prefix()), false);
+        assert_eq!(
+            bare.keys().copied().collect::<Vec<_>>(),
+            vec![0, 2, 3, 6, 8]
+        );
+        let wrapped = search_scores(
+            &store,
+            red_filtered_by(Box::new(AdvancedQuery::new(prefix()))),
+            false,
+        );
+        assert_scores_eq("filter clause", &wrapped, &bare);
+    }
+
+    /// #1305: `execute()` applies filters and negative filters whether or
+    /// not `enable_optimization` is set; turning it off used to drop them.
+    #[test]
+    fn execute_applies_filters_without_optimization() {
+        let store = store_with_segments(&[FRUIT_A, FRUIT_B]);
+        let reader = store.reader_for_tests().unwrap();
+        let query = AdvancedQuery::new(term("apple"))
+            .with_filter(term("red"))
+            .with_negative_filter(term("fresh"))
+            .with_config(AdvancedQueryConfig {
+                enable_optimization: false,
+                ..Default::default()
+            });
+
+        let ids: BTreeSet<u64> = query
+            .execute(reader.as_ref())
+            .unwrap()
+            .iter()
+            .map(|result| result.doc_id)
+            .collect();
+        assert_eq!(ids, BTreeSet::from([2, 6, 8]));
     }
 }
