@@ -199,7 +199,11 @@ new \Laurus\Schema()
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | Register a named embedder definition. `$config` is an associative array with a `"type"` key (see below). |
 | `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | Register a custom analyzer definition. `$tokenizer` is required; `$charFilters`/`$tokenFilters` are optional arrays of associative arrays. Each uses the same `{"type": "...", ...}` shape as the schema TOML/JSON format (see below). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
-| `analyzerNames(): array` | Return the names of custom analyzers registered via `addAnalyzer`. |
+| `analyzerNames(): array` | Return the names of custom analyzers registered via `addAnalyzer` or loaded from TOML. |
+| `Schema::fromToml(string $tomlStr): Schema` | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. Throws `ValueError` if the TOML is not a valid schema. |
+| `Schema::fromTomlFile(string $path): Schema` | Load a schema from a TOML file. Throws `Exception` (message prefixed with the path) if the file cannot be read, or `ValueError` if its content is not a valid schema. |
+| `toToml(): string` | Serialize this schema to a TOML string in the same format `laurus-cli` accepts. Tables come out in sorted key order, so compare round-tripped schemas by content, not raw text. |
+| `toTomlFile(string $path): void` | Write this schema to a TOML file, overwriting any existing file. Throws `Exception` (message prefixed with the path) if the file cannot be written. |
 | `setDefaultFields(array $fields): void` | Set the default fields used when no field is specified in a query. `$fields` is an array of strings. |
 | `setDynamicFieldPolicy(string $policy): void` | Set how undeclared fields are handled. `$policy` is `"strict"`, `"dynamic"` (default), or `"ignore"`. See notes below. |
 | `dynamicFieldPolicy(): string` | Return the current policy as a lowercase string. |

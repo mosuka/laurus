@@ -201,7 +201,11 @@ new \Laurus\Schema()
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | 名前付きエンベダー定義を登録します。`$config` は `"type"` キーを持つ連想配列です（下記参照）。 |
 | `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$charFilters`/`$tokenFilters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
-| `analyzerNames(): array` | `addAnalyzer` で登録済みのカスタムアナライザー名の一覧を返します。 |
+| `analyzerNames(): array` | `addAnalyzer` で登録済み、または TOML から読み込んだカスタムアナライザー名の一覧を返します。 |
+| `Schema::fromToml(string $tomlStr): Schema` | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。TOML がスキーマとして正しくない場合は `ValueError` を投げます。 |
+| `Schema::fromTomlFile(string $path): Schema` | TOML ファイルからスキーマを読み込みます。ファイルを読めない場合はパスで始まるメッセージの `Exception` を、内容がスキーマとして正しくない場合は `ValueError` を投げます。 |
+| `toToml(): string` | このスキーマを `laurus-cli` と同じ形式の TOML 文字列にシリアライズします。テーブルはキーの昇順で出力されるため、往復させたスキーマはテキストではなく内容で比較してください。 |
+| `toTomlFile(string $path): void` | このスキーマを TOML ファイルに書き込みます。既存のファイルは上書きします。書き込めない場合はパスで始まるメッセージの `Exception` を投げます。 |
 | `setDefaultFields(array $fieldNames): void` | クエリでフィールドが指定されていない場合に使用するデフォルトフィールドを設定します。`$fieldNames` は文字列の配列です。 |
 | `setDynamicFieldPolicy(string $policy): void` | 未宣言フィールドの扱いを設定します。`$policy` は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"`。詳細は下記を参照。 |
 | `dynamicFieldPolicy(): string` | 現在のポリシーを小文字の文字列で返します。 |
