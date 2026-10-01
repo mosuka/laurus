@@ -800,6 +800,23 @@ impl InvertedIndexSearcher {
             .downcast_ref::<InvertedIndexReader>()
             .expect("search_field_sorted_fanout requires InvertedIndexReader");
 
+        // Query rewrite (Issue #1314), as `search_with_collector_deadline`
+        // already does for the score-sorted path (#613, searcher.rs:435).
+        // Each segment below is searched through a `PerSegmentReaderView`,
+        // which can neither enumerate the term dictionary (multi-term
+        // queries would otherwise rewrite to an always-empty
+        // `BooleanQuery`) nor see the other segments' postings (so
+        // `SynonymQuery`/`MultiFieldQuery::CombinedFields` would blend
+        // only their own segment's document frequency). Rewriting once
+        // here, against the top-level reader, fixes both; every
+        // downstream use of `query` in this function (and the pruning
+        // branch's `count_matches_only` call) picks it up via closure
+        // capture, so nothing else in this function needs to change.
+        let query = match query.rewrite(self.reader.as_ref())? {
+            Some(rewritten) => rewritten,
+            None => query,
+        };
+
         let global_doc_count = inverted_reader.doc_count();
         let global_max_doc = inverted_reader.max_doc();
         let global_term_info_fn = {
@@ -2973,6 +2990,208 @@ mod tests {
             (score0 - score10).abs() < 1e-4,
             "identical content in different segments must score the same: \
              doc 0 = {score0}, doc 10 = {score10}"
+        );
+    }
+
+    /// Issue #1314: the same guarantee as the test above, but through
+    /// `search_field_sorted_fanout`, which skipped the top-level rewrite
+    /// entirely (it called `search_with_collector_deadline` per segment
+    /// against a `PerSegmentReaderView`, never against `self.reader`).
+    /// Field sort does not rank by score, so the stats mismatch does not
+    /// reorder hits -- it only shows up through `score`, and in
+    /// production through `min_score` admitting one of two identical
+    /// documents but not the other.
+    #[test]
+    fn synonym_query_scores_identical_docs_the_same_when_field_sorted() {
+        use crate::Document;
+        use crate::lexical::query::synonym::SynonymQuery;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+
+        let doc = |text: &str, popularity: i64| {
+            Document::builder()
+                .add_text("body", text)
+                .add_integer("popularity", popularity)
+                .build()
+        };
+
+        // Same corpus shape as the score-sorted test above, plus a
+        // `popularity` field so field sort has something to order by.
+        store.upsert_document(0, doc("big filler", 100)).unwrap();
+        for id in 1..10u64 {
+            store.upsert_document(id, doc("filler filler", 0)).unwrap();
+        }
+        store.commit().unwrap();
+
+        store.upsert_document(10, doc("big filler", 50)).unwrap();
+        for id in 11..20u64 {
+            store.upsert_document(id, doc("large filler", 0)).unwrap();
+        }
+        store.commit().unwrap();
+
+        let query: Box<dyn Query> = Box::new(SynonymQuery::new(
+            "body",
+            vec!["big".to_string(), "large".to_string()],
+        ));
+        // `segment_count() == 2` and the request sorts by field, so this
+        // routes through `search_field_sorted_fanout`, not
+        // `search_per_segment_fanout`.
+        let hits = store
+            .search(
+                LexicalSearchRequest::new(query.clone_box())
+                    .limit(20)
+                    .sort_by_field_desc("popularity"),
+            )
+            .unwrap()
+            .hits;
+
+        let score_of = |doc_id: u64| {
+            hits.iter()
+                .find(|h| h.doc_id == doc_id)
+                .unwrap_or_else(|| panic!("doc {doc_id} must match"))
+                .score
+        };
+        let (score0, score10) = (score_of(0), score_of(10));
+        assert!(
+            (score0 - score10).abs() < 1e-4,
+            "identical content in different segments must score the same \
+             under field sort too: doc 0 = {score0}, doc 10 = {score10}"
+        );
+
+        // A `min_score` just above that shared score must exclude both
+        // identical documents together. Before the fix, doc 0's
+        // locally-inflated score (segment 1 blends df(big)=1 alone,
+        // since "large" is absent there) cleared this bar while doc
+        // 10's correctly-blended score did not -- admitting one but not
+        // its identical twin.
+        let threshold = score0.max(score10) + 0.5;
+        let admitted: Vec<u64> = store
+            .search(
+                LexicalSearchRequest::new(query)
+                    .limit(20)
+                    .min_score(threshold)
+                    .sort_by_field_desc("popularity"),
+            )
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| h.doc_id)
+            .collect();
+        assert!(
+            !admitted.contains(&0) && !admitted.contains(&10),
+            "doc 0 and doc 10 must be admitted or excluded together, got {admitted:?}"
+        );
+    }
+
+    /// Issue #1314 (comment): `MultiFieldQuery::CombinedFields` freezes
+    /// its blended document frequency in `rewrite` exactly like
+    /// `SynonymQuery` freezes its stats (`advanced_query.rs:719-738`),
+    /// so it is vulnerable to the same field-sorted-fanout bug. Segment
+    /// 1 holds "apple" in `title` only (doc 0); segment 2 holds an
+    /// identical doc 10 plus nine fillers with "apple" in `body` alone,
+    /// so `body`'s locally-visible document frequency there (9) dwarfs
+    /// `title`'s (1) -- the same asymmetry as the `SynonymQuery` test
+    /// above, with `title`/`body` standing in for `big`/`large`. Every
+    /// document holds both fields at the same length (two words each,
+    /// following `combined_fields_scores_identical_documents_alike_across_segments`
+    /// in `advanced_query.rs`), so average field length cannot differ
+    /// per segment and confound the document-frequency effect under test.
+    #[test]
+    fn combined_fields_scores_identical_docs_the_same_when_field_sorted() {
+        use crate::Document;
+        use crate::lexical::query::advanced_query::{MultiFieldQuery, MultiFieldQueryType};
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+
+        let title_apple = |popularity: i64| {
+            Document::builder()
+                .add_text("title", "apple fig")
+                .add_text("body", "kiwi plum")
+                .add_integer("popularity", popularity)
+                .build()
+        };
+        let body_apple = |popularity: i64| {
+            Document::builder()
+                .add_text("title", "pear fig")
+                .add_text("body", "apple plum")
+                .add_integer("popularity", popularity)
+                .build()
+        };
+        let neither = |popularity: i64| {
+            Document::builder()
+                .add_text("title", "pear fig")
+                .add_text("body", "kiwi plum")
+                .add_integer("popularity", popularity)
+                .build()
+        };
+
+        // Segment 1: doc 0 matches via `title` alone; nine fillers match
+        // neither field, so `body`'s document frequency is 0 here.
+        store.upsert_document(0, title_apple(100)).unwrap();
+        for id in 1..10u64 {
+            store.upsert_document(id, neither(0)).unwrap();
+        }
+        store.commit().unwrap();
+
+        // Segment 2: doc 10, identical content to doc 0, plus nine
+        // fillers matching via `body` alone -- `body`'s local document
+        // frequency (9) dwarfs `title`'s (1) here.
+        store.upsert_document(10, title_apple(50)).unwrap();
+        for id in 11..20u64 {
+            store.upsert_document(id, body_apple(0)).unwrap();
+        }
+        store.commit().unwrap();
+
+        let query: Box<dyn Query> = Box::new(
+            MultiFieldQuery::new("apple".to_string())
+                .query_type(MultiFieldQueryType::CombinedFields)
+                .add_field("title".to_string(), 1.0)
+                .add_field("body".to_string(), 1.0),
+        );
+        let hits = store
+            .search(
+                LexicalSearchRequest::new(query.clone_box())
+                    .limit(20)
+                    .sort_by_field_desc("popularity"),
+            )
+            .unwrap()
+            .hits;
+
+        let score_of = |doc_id: u64| {
+            hits.iter()
+                .find(|h| h.doc_id == doc_id)
+                .unwrap_or_else(|| panic!("doc {doc_id} must match"))
+                .score
+        };
+        let (score0, score10) = (score_of(0), score_of(10));
+        assert!(
+            (score0 - score10).abs() < 1e-4,
+            "identical content in different segments must score the same \
+             under field sort too: doc 0 = {score0}, doc 10 = {score10}"
+        );
+
+        let threshold = score0.max(score10) + 0.5;
+        let admitted: Vec<u64> = store
+            .search(
+                LexicalSearchRequest::new(query)
+                    .limit(20)
+                    .min_score(threshold)
+                    .sort_by_field_desc("popularity"),
+            )
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| h.doc_id)
+            .collect();
+        assert!(
+            !admitted.contains(&0) && !admitted.contains(&10),
+            "doc 0 and doc 10 must be admitted or excluded together, got {admitted:?}"
         );
     }
 

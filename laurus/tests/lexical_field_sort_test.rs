@@ -13,6 +13,10 @@ use std::sync::Arc;
 
 use laurus::Document;
 use laurus::lexical::query::Query;
+use laurus::lexical::query::fuzzy::FuzzyQuery;
+use laurus::lexical::query::prefix::PrefixQuery;
+use laurus::lexical::query::regexp::RegexpQuery;
+use laurus::lexical::query::wildcard::WildcardQuery;
 use laurus::lexical::{
     BooleanQueryBuilder, LexicalIndexConfig, LexicalSearchRequest, LexicalStore, TermQuery,
 };
@@ -161,6 +165,139 @@ fn field_sort_multi_segment_with_min_score() {
             .sort_by_field_desc("popularity"),
     );
     assert_eq!(included, vec![9, 8, 7]);
+}
+
+/// Issue #1314 reproduction corpus, verbatim from the issue's table:
+/// docs 0-2 in one commit, docs 3-5 in the next, so a
+/// `max_segments(1000)` store keeps them in separate segments. Half the
+/// docs contain a word starting with "ap" (`apple`); `popularity`
+/// disambiguates the field-sorted order.
+const REPRO_CORPUS: [(u64, &str, i64); 6] = [
+    (0, "apple red fresh", 10),
+    (1, "apple green", 20),
+    (2, "banana fresh", 30),
+    (3, "apple fresh", 40),
+    (4, "apple ripe", 50),
+    (5, "cherry", 60),
+];
+
+/// Build a store holding `REPRO_CORPUS`, split across `n_segments`
+/// commits.
+fn store_with_repro_corpus(n_segments: usize) -> (LexicalStore, Arc<dyn Storage>) {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder().max_segments(1000).build();
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+
+    let chunk = REPRO_CORPUS.len().div_ceil(n_segments);
+    for group in REPRO_CORPUS.chunks(chunk) {
+        for &(id, body, popularity) in group {
+            let d = Document::builder()
+                .add_text("body", body)
+                .add_integer("popularity", popularity)
+                .build();
+            store.upsert_document(id, d).unwrap();
+        }
+        store.commit().unwrap();
+    }
+    (store, storage)
+}
+
+/// Issue #1314: `search_field_sorted_fanout` handed each segment the
+/// un-rewritten query, so multi-term queries -- which need the
+/// top-level rewrite to enumerate terms (`tests/lexical_multi_term_query_test.rs`)
+/// -- silently returned zero hits on a multi-segment index once the
+/// search was sorted by field instead of score.
+#[test]
+fn field_sort_multi_term_queries_match_single_segment() {
+    // popularity desc among docs containing "apple": 50, 40, 20, 10.
+    let expected = vec![4, 3, 1, 0];
+
+    let (single, _s1) = store_with_repro_corpus(1);
+    let (multi, _s2) = store_with_repro_corpus(2);
+
+    let queries: Vec<(&str, Box<dyn Query>)> = vec![
+        ("PrefixQuery", Box::new(PrefixQuery::new("body", "ap"))),
+        (
+            "WildcardQuery",
+            Box::new(WildcardQuery::new("body", "ap*").unwrap()),
+        ),
+        (
+            "FuzzyQuery",
+            Box::new(FuzzyQuery::new("body", "apple").max_edits(1)),
+        ),
+        (
+            "RegexpQuery",
+            Box::new(RegexpQuery::new("body", "ap.*").unwrap()),
+        ),
+    ];
+
+    for (label, query) in queries {
+        let single_ids = field_sorted_ids(
+            &single,
+            LexicalSearchRequest::new(query.clone_box())
+                .limit(10)
+                .sort_by_field_desc("popularity"),
+        );
+        assert_eq!(single_ids, expected, "{label}: single segment");
+
+        let multi_ids = field_sorted_ids(
+            &multi,
+            LexicalSearchRequest::new(query)
+                .limit(10)
+                .sort_by_field_desc("popularity"),
+        );
+        assert_eq!(
+            multi_ids, expected,
+            "{label}: multi-segment must match single-segment, not return zero hits"
+        );
+    }
+}
+
+/// Issue #1314: the pruning branch (a segment whose range cannot beat
+/// the running floor is only counted via `count_matches_only`, never
+/// fully collected) must also search against the rewritten query --
+/// before the fix it counted zero matches for a multi-term query,
+/// undercounting `total_hits`. Same disjoint-range shape as
+/// `field_sort_disjoint_segment_ranges_matches_unpruned` above, with a
+/// `PrefixQuery` standing in for the `TermQuery`.
+#[test]
+fn field_sort_prefix_query_total_hits_with_pruning() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder().max_segments(1000).build();
+    let store = LexicalStore::new(storage, config).unwrap();
+
+    // Six commits, values strictly increasing per commit, so segment
+    // ranges never overlap and only the newest segment is unpruned.
+    for group in 0..6u64 {
+        for offset in 0..4u64 {
+            let id = group * 4 + offset + 1;
+            let d = Document::builder()
+                .add_text("body", "apple")
+                .add_integer("popularity", id as i64)
+                .build();
+            store.upsert_document(id, d).unwrap();
+        }
+        store.commit().unwrap();
+    }
+
+    let query: Box<dyn Query> = Box::new(PrefixQuery::new("body", "ap"));
+    let results = store
+        .search(
+            LexicalSearchRequest::new(query)
+                .limit(3)
+                .sort_by_field_desc("popularity"),
+        )
+        .unwrap();
+    assert_eq!(
+        results.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+        vec![24, 23, 22],
+        "the newest segment holds the whole answer"
+    );
+    assert_eq!(
+        results.total_hits, 24,
+        "pruned segments must still contribute their exact match count \
+         once the fanout rewrites the query before counting"
+    );
 }
 
 #[test]
