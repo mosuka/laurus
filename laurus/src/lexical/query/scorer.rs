@@ -1027,6 +1027,121 @@ impl Scorer for BooleanScorer {
     }
 }
 
+/// A scorer that combines multiple scorers by dis-max: the **best**
+/// matching clause's score, plus `tie_breaker` times the sum of the
+/// others — what Elasticsearch's `multi_match` calls `best_fields`
+/// (Issue #1317). `tie_breaker == 0.0` keeps only the best clause;
+/// `tie_breaker == 1.0` recovers a plain sum, identical to
+/// [`BooleanScorer`].
+#[derive(Debug)]
+pub struct DisjunctionMaxScorer {
+    /// The sub-queries and their scorers/matchers, specialised the same
+    /// way as [`BooleanScorer`] (#466).
+    clauses: BooleanScorerClauses,
+    /// Weight given to every matching clause but the best one.
+    tie_breaker: f32,
+    /// The boost factor for this scorer.
+    boost: f32,
+}
+
+// SAFETY: same as `BooleanScorer` above — only used within single-threaded
+// search execution paths.
+unsafe impl Send for DisjunctionMaxScorer {}
+
+impl DisjunctionMaxScorer {
+    /// Create a new dis-max scorer. Mirrors [`BooleanScorer::new`]: one
+    /// matcher/scorer pass per clause (#996).
+    pub fn new(
+        reader: &dyn crate::lexical::reader::LexicalIndexReader,
+        queries: Vec<Box<dyn Query>>,
+        tie_breaker: f32,
+        boost: f32,
+    ) -> Result<Self> {
+        let mut clauses = Vec::with_capacity(queries.len());
+        for query in queries {
+            let (matcher, scorer) = query.matcher_scorer(reader)?;
+            clauses.push((
+                LeafScorer::from_box(scorer),
+                crate::lexical::query::matcher::LeafMatcher::from_box(matcher),
+            ));
+        }
+        Ok(DisjunctionMaxScorer {
+            clauses: std::cell::RefCell::new(clauses),
+            tie_breaker,
+            boost,
+        })
+    }
+}
+
+impl Scorer for DisjunctionMaxScorer {
+    /// The best matching clause's score plus `tie_breaker` times the sum
+    /// of the others. `field_length` is ignored for the same reason as
+    /// `BooleanScorer::score` (#1287): each clause scores its own field.
+    fn score(&self, doc_id: u64, _term_freq: f32, _field_length: Option<f32>) -> f32 {
+        let mut clauses = self.clauses.borrow_mut();
+        let mut max_score = 0.0_f32;
+        let mut sum_of_others = 0.0_f32;
+        let mut matched = false;
+
+        for (scorer, matcher) in clauses.iter_mut() {
+            if matches!(matcher.skip_to(doc_id), Ok(true)) && matcher.doc_id() == doc_id {
+                matched = true;
+                let tf = matcher.term_freq() as f32;
+                let score = scorer.score(doc_id, tf, None);
+                if score > max_score {
+                    sum_of_others += max_score;
+                    max_score = score;
+                } else {
+                    sum_of_others += score;
+                }
+            }
+        }
+
+        if !matched {
+            return 0.0;
+        }
+        (max_score + self.tie_breaker * sum_of_others) * self.boost
+    }
+
+    fn boost(&self) -> f32 {
+        self.boost
+    }
+
+    fn set_boost(&mut self, boost: f32) {
+        self.boost = boost;
+    }
+
+    /// Upper bound `max(m) + tie_breaker * (sum(m) - max(m))`, valid for
+    /// `tie_breaker` in `[0, 1]` (Elasticsearch's own accepted range for
+    /// it): the per-clause bound is `m_i + tie_breaker * (sum(m) - m_i)
+    /// = m_i * (1 - tie_breaker) + tie_breaker * sum(m)`, which, since
+    /// `1 - tie_breaker >= 0`, is maximised at the largest `m_i` — i.e.
+    /// exactly the expression below. Block-max methods are left at their
+    /// trait defaults (forwarding here), the same "correct but loose"
+    /// bound `SynonymQuery` and others already rely on.
+    fn max_score(&self) -> f32 {
+        let clauses = self.clauses.borrow();
+        let mut max_m = 0.0_f32;
+        let mut sum_m = 0.0_f32;
+        for (scorer, _) in clauses.iter() {
+            let m = scorer.max_score();
+            sum_m += m;
+            if m > max_m {
+                max_m = m;
+            }
+        }
+        (max_m + self.tie_breaker * (sum_m - max_m)) * self.boost
+    }
+
+    fn name(&self) -> &'static str {
+        "DisjunctionMax"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -496,27 +496,29 @@ pub struct MultiFieldQuery {
     /// Query type for each field.
     query_type: MultiFieldQueryType,
 
-    /// Cross-field matching strategy.
+    /// Weight given to every matching field but the best one, when
+    /// `query_type` is [`MultiFieldQueryType::BestFields`]. Expected to be
+    /// in `[0, 1]`; `0.0` (the default) keeps only the best field's score,
+    /// `1.0` sums every matching field's score.
     tie_breaker: f32,
 
-    /// Query-level boost, applied to the `BooleanQuery` this query runs as.
+    /// Query-level boost, applied to whichever scorer this query runs as
+    /// (the `BooleanQuery` for `MostFields`, or the `DisjunctionMaxScorer`
+    /// for `BestFields`).
     boost: f32,
 }
 
 /// Type of multi-field query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MultiFieldQueryType {
-    /// Best matching field.
+    /// Dis-max: the best matching field's score, plus [`MultiFieldQuery::tie_breaker`]
+    /// times the sum of the other matching fields' scores. Matches like an
+    /// OR across fields (Elasticsearch's `multi_match` `best_fields`).
     BestFields,
 
-    /// Most matching fields.
+    /// Every field must match (AND across fields); the score is the sum of
+    /// the matching fields' scores (Elasticsearch's `multi_match` `most_fields`).
     MostFields,
-
-    /// Cross-field matching.
-    CrossFields,
-
-    /// Boolean combination.
-    Boolean,
 }
 
 impl MultiFieldQuery {
@@ -549,34 +551,69 @@ impl MultiFieldQuery {
         self
     }
 
+    /// One `TermQuery` per configured field, carrying that field's boost
+    /// (Issue #1317).
+    fn field_queries(&self) -> Vec<Box<dyn Query>> {
+        self.fields
+            .iter()
+            .map(|(field, &boost)| {
+                Box::new(
+                    crate::lexical::query::term::TermQuery::new(
+                        field.clone(),
+                        self.query_text.clone(),
+                    )
+                    .with_boost(boost),
+                ) as Box<dyn Query>
+            })
+            .collect()
+    }
+
     /// The `BooleanQuery` this query runs as: one `TermQuery` per field,
     /// `Must` for [`MultiFieldQueryType::MostFields`] and `Should`
-    /// otherwise, carrying this query's boost.
+    /// otherwise, carrying this query's boost. Used for matching by both
+    /// query types, and for scoring [`MultiFieldQueryType::MostFields`]
+    /// (summed, like `BooleanScorer`); [`MultiFieldQueryType::BestFields`]
+    /// scores through [`DisjunctionMaxScorer`] instead (see `scorer`).
     fn boolean_query(&self) -> BooleanQuery {
         let occur = match self.query_type {
             MultiFieldQueryType::MostFields => Occur::Must,
-            MultiFieldQueryType::BestFields
-            | MultiFieldQueryType::Boolean
-            | MultiFieldQueryType::CrossFields => Occur::Should,
+            MultiFieldQueryType::BestFields => Occur::Should,
         };
         let mut query = BooleanQuery::new().with_boost(self.boost);
-        for field in self.fields.keys() {
-            let term_query =
-                crate::lexical::query::term::TermQuery::new(field.clone(), self.query_text.clone());
-            query.add_clause(BooleanClause::new(Box::new(term_query), occur));
+        for field_query in self.field_queries() {
+            query.add_clause(BooleanClause::new(field_query, occur));
         }
         query
     }
 }
 
 impl Query for MultiFieldQuery {
+    /// Matching is independent of how `BestFields` vs. `MostFields` score:
+    /// `Should` (union) or `Must` (intersection) over the same per-field
+    /// `TermQuery`s `scorer` scores.
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
         self.boolean_query().matcher(reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        self.boolean_query().scorer(reader)
+        match self.query_type {
+            MultiFieldQueryType::BestFields => Ok(Box::new(
+                crate::lexical::query::scorer::DisjunctionMaxScorer::new(
+                    reader,
+                    self.field_queries(),
+                    self.tie_breaker,
+                    self.boost,
+                )?,
+            )),
+            MultiFieldQueryType::MostFields => self.boolean_query().scorer(reader),
+        }
     }
+
+    // No `rewrite()` override: unlike `AdvancedQuery` (#1316), replacing
+    // this query with its `boolean_query()` would route it into the
+    // parallel path's `downcast::<BooleanQuery>()` or the BMW path, both
+    // of which discard the `BestFields` `DisjunctionMaxScorer` above and
+    // silently fall back to the summed `BooleanScorer` instead.
 
     fn boost(&self) -> f32 {
         self.boost
@@ -1203,5 +1240,204 @@ mod tests {
             .map(|result| result.doc_id)
             .collect();
         assert_eq!(ids, BTreeSet::from([2, 6, 8]));
+    }
+
+    // ----- #1317: MultiFieldQuery per-field boost, tie_breaker, BestFields -----
+
+    // title: "apple" matches 0, 2 / body: "apple" matches 1, 2.
+    // Different per-field term frequencies and lengths give field 0 and
+    // field 1 distinguishable BM25 scores on doc 2, so a dis-max test can
+    // tell "max of the fields" apart from "sum of the fields".
+    const TITLE_BODY: &[(u64, &str, &str)] = &[
+        (0, "apple", "filler"),
+        (
+            1,
+            "filler filler filler filler filler filler filler filler",
+            "apple apple apple",
+        ),
+        (2, "apple", "apple apple apple"),
+    ];
+
+    /// A store holding one committed segment per slice of `(id, title, body)`.
+    fn store_with_two_field_segments(segments: &[&[(u64, &str, &str)]]) -> LexicalStore {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        for segment in segments {
+            for &(id, title, body) in *segment {
+                let doc = Document::builder()
+                    .add_text("title", title)
+                    .add_text("body", body)
+                    .build();
+                store.upsert_document(id, doc).unwrap();
+            }
+            store.commit().unwrap();
+        }
+        store
+    }
+
+    /// #1317: a per-field boost passed to `add_field` scales that field's
+    /// contribution to the score (acceptance criterion 1).
+    #[test]
+    fn per_field_boost_scales_the_fields_contribution() {
+        let store = store_with_segments(&[&[FRUIT_A, FRUIT_B].concat()]);
+        let unboosted = search_scores(
+            &store,
+            Box::new(MultiFieldQuery::new("apple".to_string()).add_field("body".to_string(), 1.0)),
+            false,
+        );
+        let boosted = search_scores(
+            &store,
+            Box::new(MultiFieldQuery::new("apple".to_string()).add_field("body".to_string(), 3.0)),
+            false,
+        );
+        assert!(!unboosted.is_empty(), "expected matches");
+        for (doc_id, score) in &unboosted {
+            assert!(
+                (boosted[doc_id] - score * 3.0).abs() < 1e-4,
+                "doc {doc_id}: boosted score {} is not 3x the unboosted score {score}",
+                boosted[doc_id]
+            );
+        }
+    }
+
+    /// #1317: `BestFields` with the default `tie_breaker` (0.0) scores a
+    /// document as the *best* matching field's score, not the sum of every
+    /// matching field — distinguishing it from the old (and from
+    /// `MostFields`'s still-correct) summing behavior.
+    #[test]
+    fn best_fields_scores_as_the_max_of_matching_fields() {
+        let store = store_with_two_field_segments(&[TITLE_BODY]);
+        let title_scores = search_scores(&store, Box::new(TermQuery::new("title", "apple")), false);
+        let body_scores = search_scores(&store, Box::new(TermQuery::new("body", "apple")), false);
+        let title_score = title_scores[&2];
+        let body_score = body_scores[&2];
+        assert_ne!(
+            title_score, body_score,
+            "the fixture must give the two fields distinguishable scores"
+        );
+
+        let hits = search_scores(
+            &store,
+            Box::new(
+                MultiFieldQuery::new("apple".to_string())
+                    .add_field("title".to_string(), 1.0)
+                    .add_field("body".to_string(), 1.0)
+                    .query_type(MultiFieldQueryType::BestFields),
+            ),
+            false,
+        );
+
+        let max = title_score.max(body_score);
+        assert!((hits[&2] - max).abs() < 1e-5, "doc 2 must score as the max");
+        assert!(
+            (hits[&2] - (title_score + body_score)).abs() > 1e-4,
+            "doc 2 must not score as the sum of both fields"
+        );
+    }
+
+    /// #1317: `tie_breaker` is wired up — 1.0 recovers the old summed
+    /// score, and 0.5 lands exactly between the max-only and summed scores.
+    #[test]
+    fn tie_breaker_blends_in_the_other_matching_fields() {
+        let store = store_with_two_field_segments(&[TITLE_BODY]);
+        let title_score =
+            search_scores(&store, Box::new(TermQuery::new("title", "apple")), false)[&2];
+        let body_score =
+            search_scores(&store, Box::new(TermQuery::new("body", "apple")), false)[&2];
+        let max = title_score.max(body_score);
+        let rest = title_score + body_score - max;
+
+        let query_with = |tie_breaker: f32| -> Box<dyn Query> {
+            Box::new(
+                MultiFieldQuery::new("apple".to_string())
+                    .add_field("title".to_string(), 1.0)
+                    .add_field("body".to_string(), 1.0)
+                    .query_type(MultiFieldQueryType::BestFields)
+                    .tie_breaker(tie_breaker),
+            )
+        };
+
+        let summed = search_scores(&store, query_with(1.0), false);
+        assert!((summed[&2] - (title_score + body_score)).abs() < 1e-5);
+
+        let blended = search_scores(&store, query_with(0.5), false);
+        assert!((blended[&2] - (max + 0.5 * rest)).abs() < 1e-5);
+    }
+
+    /// #1317: `MostFields` keeps requiring every field to match (the
+    /// `Occur::Must` behavior) and keeps summing their scores.
+    #[test]
+    fn most_fields_still_requires_every_field_and_sums_scores() {
+        let store = store_with_two_field_segments(&[TITLE_BODY]);
+        let title_score =
+            search_scores(&store, Box::new(TermQuery::new("title", "apple")), false)[&2];
+        let body_score =
+            search_scores(&store, Box::new(TermQuery::new("body", "apple")), false)[&2];
+
+        let hits = search_scores(
+            &store,
+            Box::new(
+                MultiFieldQuery::new("apple".to_string())
+                    .add_field("title".to_string(), 1.0)
+                    .add_field("body".to_string(), 1.0)
+                    .query_type(MultiFieldQueryType::MostFields),
+            ),
+            false,
+        );
+
+        // Docs 0 and 1 each match only one field, so `Must` on both excludes them.
+        assert_eq!(hits.keys().collect::<Vec<_>>(), vec![&2]);
+        assert!((hits[&2] - (title_score + body_score)).abs() < 1e-5);
+    }
+
+    /// #1317: a boosted `BestFields` query with a non-trivial `tie_breaker`
+    /// scores identically on every search path (one segment, two segments,
+    /// each with and without `parallel`), each computed from that same
+    /// path's own per-field `TermQuery` scores (BM25 stats such as average
+    /// field length are per-segment, so no single absolute value holds
+    /// across every path).
+    #[test]
+    fn best_fields_scores_agree_across_every_search_path() {
+        let one = store_with_two_field_segments(&[TITLE_BODY]);
+        let two = store_with_two_field_segments(&[&TITLE_BODY[..1], &TITLE_BODY[1..]]);
+
+        for (label, store) in [("one segment", &one), ("two segments", &two)] {
+            for parallel in [false, true] {
+                let title_scores = search_scores(
+                    store,
+                    Box::new(TermQuery::new("title", "apple").with_boost(2.0)),
+                    parallel,
+                );
+                let body_scores =
+                    search_scores(store, Box::new(TermQuery::new("body", "apple")), parallel);
+
+                let hits = search_scores(
+                    store,
+                    Box::new(
+                        MultiFieldQuery::new("apple".to_string())
+                            .add_field("title".to_string(), 2.0)
+                            .add_field("body".to_string(), 1.0)
+                            .query_type(MultiFieldQueryType::BestFields)
+                            .tie_breaker(0.3),
+                    ),
+                    parallel,
+                );
+
+                assert!(
+                    !hits.is_empty(),
+                    "{label}, parallel={parallel}: expected matches"
+                );
+                for (doc_id, score) in &hits {
+                    let t = title_scores.get(doc_id).copied().unwrap_or(0.0);
+                    let b = body_scores.get(doc_id).copied().unwrap_or(0.0);
+                    let max = t.max(b);
+                    let expected = max + 0.3 * (t + b - max);
+                    assert!(
+                        (score - expected).abs() < 1e-4,
+                        "{label}, parallel={parallel}, doc {doc_id}: got {score}, expected {expected}"
+                    );
+                }
+            }
+        }
     }
 }
