@@ -39,9 +39,41 @@ let request = SearchRequestBuilder::new()
     .build();
 ```
 
-ブーストはそのフィールドにマッチした BM25 スコア寄与に乗算されます。`1.0` は無効化と同じです。クエリで指定されたフィールド（またはスキーマの既定検索フィールド）にのみ適用されます。
+ブーストはそのフィールドにマッチした BM25 スコア寄与に乗算されます。`1.0` は無効化と同じです。クエリで指定されたフィールド（またはスキーマの既定検索フィールド）にのみ適用されます。例外は `CombinedFields` の[マルチフィールドクエリ](#マルチフィールドクエリ)で、ブーストはスコアの乗数ではなく、BM25F の内側の重みになります。
 
 gRPC / HTTP 経由では同じ設定が `SearchRequest.field_boosts`（`map<string, float>`）として公開されます。[gRPC API → SearchRequest](../laurus-server/grpc_api.md#searchrequest-fields) を参照してください。
+
+### マルチフィールドクエリ
+
+`MultiFieldQuery` は、1 つのターム（`TermQuery` と同じく解析しない）を複数のフィールドから検索します。フィールドごとにブーストを指定できます。フィールドの組み合わせ方は `MultiFieldQueryType` で決まります。
+
+| 種類 | マッチ | スコア |
+| :--- | :--- | :--- |
+| `BestFields`（デフォルト） | いずれかのフィールド | 最良のフィールドの BM25 スコア + `tie_breaker` × 他にマッチしたフィールドのスコア（Elasticsearch の `best_fields`） |
+| `MostFields` | すべてのフィールド | 各フィールドの BM25 スコアの合計（Elasticsearch の `most_fields`） |
+| `CombinedFields` | いずれかのフィールド | BM25F: 複数のフィールドを連結した 1 つのフィールドとしてスコア付けする（Elasticsearch の `combined_fields`、Lucene の `CombinedFieldQuery`） |
+
+`BestFields` と `MostFields` は、各フィールドをそのフィールド自身の統計でスコア付けします。あるフィールドで珍しいタームはそのフィールドで IDF が高くなるため、同じテキストでも、どのフィールドに入ったかでスコアが変わります。`CombinedFields` は統計をブレンドし、各ドキュメントを次の値の BM25 で 1 回だけスコア付けします。
+
+```text
+tf          = Σ w_f · tf_f                     （各フィールドでのドキュメントの単語頻度）
+doc_len     = Σ w_f · len_f                    （タームを含むかどうかに関係なく、すべてのフィールド）
+avg_doc_len = Σ w_f · avg_len_f · doc_count_f / max(doc_count_f)
+df          = max(df_f)                        （IDF 用）
+```
+
+`w_f` はフィールドのブーストです。BM25F の内側の重みとして働き、`2.0` は、フィールドのスコアを 2 倍にするのではなく、そのフィールドのテキストを 2 回索引したものとして数えます。ブーストは有限で `0.0` より大きい値でなければならず、それ以外の値では検索が `InvalidArgument` を返します。Lucene と Elasticsearch は `1.0` 未満のブーストを拒否しますが、Laurus は受け付けます。
+
+`TermQuery` と同じく、文書頻度はインデックス全体の値を使います。一方、複数セグメントのインデックスでは、平均長は各セグメント自身の値を使います。
+
+```rust
+use laurus::lexical::query::advanced_query::{MultiFieldQuery, MultiFieldQueryType};
+
+let query = MultiFieldQuery::new("smith".to_string())
+    .add_field("first_name".to_string(), 1.0)
+    .add_field("last_name".to_string(), 1.0)
+    .query_type(MultiFieldQueryType::CombinedFields);
+```
 
 ## Vector スコアリング
 

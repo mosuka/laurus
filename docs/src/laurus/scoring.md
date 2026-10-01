@@ -39,9 +39,41 @@ let request = SearchRequestBuilder::new()
     .build();
 ```
 
-The boost is multiplied into the BM25 score contribution of matches in that field. A boost of `1.0` is a no-op; boosts apply only to fields named in the query (or in the schema's default-search fields).
+The boost is multiplied into the BM25 score contribution of matches in that field. A boost of `1.0` is a no-op; boosts apply only to fields named in the query (or in the schema's default-search fields). The exception is a `CombinedFields` [multi-field query](#multi-field-queries), where a boost is a BM25F weight inside the score instead.
 
 Over gRPC and HTTP, the same setting is exposed as `SearchRequest.field_boosts` (`map<string, float>`). See [gRPC API → SearchRequest](../laurus-server/grpc_api.md#searchrequest-fields).
+
+### Multi-field Queries
+
+`MultiFieldQuery` searches one term, unanalyzed like a `TermQuery`, across several fields, each with its own boost. Its `MultiFieldQueryType` decides how the fields combine:
+
+| Type | Matches | Score |
+| :--- | :--- | :--- |
+| `BestFields` (default) | Any field | The best field's BM25 score plus `tie_breaker` × the other matching fields' scores (Elasticsearch `best_fields`) |
+| `MostFields` | Every field | The sum of the fields' BM25 scores (Elasticsearch `most_fields`) |
+| `CombinedFields` | Any field | BM25F: the fields are scored as one concatenated field (Elasticsearch `combined_fields`, Lucene `CombinedFieldQuery`) |
+
+`BestFields` and `MostFields` score each field with that field's own statistics. A term that is rare in one field gets a high IDF there, so the same text scores differently depending on which field it lands in. `CombinedFields` blends the statistics and scores each document once, with BM25 over:
+
+```text
+tf          = Σ w_f · tf_f                     (the document's term frequency in each field)
+doc_len     = Σ w_f · len_f                    (every field, whether the term occurs in it or not)
+avg_doc_len = Σ w_f · avg_len_f · doc_count_f / max(doc_count_f)
+df          = max(df_f)                        (for the IDF)
+```
+
+Here `w_f` is the field's boost. It acts as a weight inside BM25F: `2.0` counts the field as if its text were indexed twice, rather than multiplying the field's score. Every boost must be finite and greater than `0.0`; any other value makes the search return `InvalidArgument`. Boosts below `1.0` are accepted, although Lucene and Elasticsearch reject them.
+
+As with `TermQuery`, the document frequency covers the whole index, while on a multi-segment index the average length is each segment's own.
+
+```rust
+use laurus::lexical::query::advanced_query::{MultiFieldQuery, MultiFieldQueryType};
+
+let query = MultiFieldQuery::new("smith".to_string())
+    .add_field("first_name".to_string(), 1.0)
+    .add_field("last_name".to_string(), 1.0)
+    .query_type(MultiFieldQueryType::CombinedFields);
+```
 
 ## Vector Scoring
 

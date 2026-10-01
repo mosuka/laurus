@@ -271,10 +271,13 @@ pub trait Scorer: Send + Debug {
 pub struct BM25Scorer {
     /// Document frequency of the term.
     doc_freq: u64,
-    /// Total term frequency across all documents (reserved for BM25F).
+    /// Total term frequency across all documents. Not read by the formula;
+    /// BM25F ([`CombinedFieldsScorer`]) blends its statistics before
+    /// building this scorer.
     #[allow(dead_code)]
     total_term_freq: u64,
-    /// Number of documents containing the field (reserved for BM25F).
+    /// Number of documents containing the field. Not read by the formula
+    /// (see `total_term_freq`).
     #[allow(dead_code)]
     field_doc_count: u64,
     /// Average field length.
@@ -1135,6 +1138,147 @@ impl Scorer for DisjunctionMaxScorer {
 
     fn name(&self) -> &'static str {
         "DisjunctionMax"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// One field of a [`CombinedFieldsScorer`].
+#[derive(Debug)]
+struct CombinedField {
+    /// BM25F weight: scales the field's term frequency and length alike.
+    weight: f32,
+    /// The term's postings in this field (empty when the field lacks it).
+    matcher: crate::lexical::query::matcher::LeafMatcher,
+    /// Per-document lengths of the field, or `None` when the reader keeps
+    /// none.
+    lengths: Option<Arc<dyn FieldLengths>>,
+    /// The field's average length, standing in for a document's own when
+    /// `lengths` is `None` (as [`BM25Scorer`] does).
+    avg_length: f32,
+}
+
+/// A scorer that scores one term against several fields as if they were
+/// one concatenated field, with BM25F (Issue #1319) — Lucene's
+/// `CombinedFieldQuery`, Elasticsearch's `combined_fields`.
+///
+/// A document's term frequency and length are the weighted sums of its
+/// per-field ones (`Σ w·tf`, `Σ w·len`, the length summed over every field
+/// whether the term occurs there or not), scored once by a [`BM25Scorer`]
+/// whose average length is the weighted sum of the fields' total lengths
+/// over the largest field document count. The caller supplies the blended
+/// document frequency, so it can freeze one for every segment.
+#[derive(Debug)]
+pub struct CombinedFieldsScorer {
+    /// Scores the combined term frequency and length.
+    bm25: BM25Scorer,
+    /// The fields, each with its own matcher, mutated as documents are
+    /// scored in increasing id order.
+    fields: std::cell::RefCell<Vec<CombinedField>>,
+}
+
+// SAFETY: same as `BooleanScorer` — only used within single-threaded search
+// execution paths; the RefCell is never shared across threads.
+unsafe impl Send for CombinedFieldsScorer {}
+
+impl CombinedFieldsScorer {
+    /// Create a scorer for `term` over `fields`, given as `(field, weight)`
+    /// pairs, scoring against the blended `doc_freq`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a field's statistics or postings cannot be read.
+    pub fn new(
+        reader: &dyn crate::lexical::reader::LexicalIndexReader,
+        term: &str,
+        fields: &[(&str, f32)],
+        doc_freq: u64,
+        boost: f32,
+    ) -> Result<Self> {
+        let mut combined = Vec::with_capacity(fields.len());
+        let mut weighted_total_length = 0.0_f64;
+        let mut max_doc_count = 0_u64;
+        for &(field, weight) in fields {
+            let stats = reader.field_stats(field)?;
+            if let Some(stats) = &stats {
+                // `FieldStats::total_terms` is not filled in, so a field's
+                // total length is its average times its document count.
+                weighted_total_length +=
+                    f64::from(weight) * stats.avg_length * stats.doc_count as f64;
+                max_doc_count = max_doc_count.max(stats.doc_count);
+            }
+            let matcher =
+                crate::lexical::query::term::TermQuery::new(field, term).matcher(reader)?;
+            combined.push(CombinedField {
+                weight,
+                matcher: crate::lexical::query::matcher::LeafMatcher::from_box(matcher),
+                lengths: reader.field_lengths(field),
+                avg_length: stats.map_or(0.0, |stats| stats.avg_length as f32),
+            });
+        }
+        let avg_length = if max_doc_count == 0 {
+            0.0
+        } else {
+            weighted_total_length / max_doc_count as f64
+        };
+        Ok(CombinedFieldsScorer {
+            // BM25 reads no total term frequency, so none is blended.
+            bm25: BM25Scorer::new(
+                doc_freq,
+                0,
+                max_doc_count,
+                avg_length,
+                reader.doc_count(),
+                boost,
+            ),
+            fields: std::cell::RefCell::new(combined),
+        })
+    }
+}
+
+impl Scorer for CombinedFieldsScorer {
+    /// Ignores `term_freq` and `field_length`, as `BooleanScorer::score`
+    /// does: the combined values come from every field's own matcher and
+    /// lengths.
+    fn score(&self, doc_id: u64, _term_freq: f32, _field_length: Option<f32>) -> f32 {
+        let mut fields = self.fields.borrow_mut();
+        let mut term_freq = 0.0_f32;
+        let mut length = 0.0_f32;
+        for field in fields.iter_mut() {
+            if matches!(field.matcher.skip_to(doc_id), Ok(true)) && field.matcher.doc_id() == doc_id
+            {
+                term_freq += field.weight * field.matcher.term_freq() as f32;
+            }
+            // A document without the field adds nothing to the length.
+            let field_length = match &field.lengths {
+                Some(lengths) => lengths.get(doc_id).map_or(0.0, |len| len as f32),
+                None => field.avg_length,
+            };
+            length += field.weight * field_length;
+        }
+        self.bm25.score(doc_id, term_freq, Some(length))
+    }
+
+    fn boost(&self) -> f32 {
+        self.bm25.boost()
+    }
+
+    fn set_boost(&mut self, boost: f32) {
+        self.bm25.set_boost(boost);
+    }
+
+    /// `boost · idf · (k1 + 1)`, which bounds the score for any positive
+    /// combined term frequency. No block-max bounds: a combined term
+    /// frequency can exceed any single field's per-block maximum, as with
+    /// `SynonymQuery`.
+    fn max_score(&self) -> f32 {
+        self.bm25.max_score()
+    }
+
+    fn name(&self) -> &'static str {
+        "CombinedFields"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

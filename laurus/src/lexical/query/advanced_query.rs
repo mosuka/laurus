@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{LaurusError, Result};
+use crate::lexical::index::inverted::reader::InvertedIndexReader;
 use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::scorer::Scorer;
@@ -499,13 +500,25 @@ pub struct MultiFieldQuery {
     /// Weight given to every matching field but the best one, when
     /// `query_type` is [`MultiFieldQueryType::BestFields`]. Expected to be
     /// in `[0, 1]`; `0.0` (the default) keeps only the best field's score,
-    /// `1.0` sums every matching field's score.
+    /// `1.0` sums every matching field's score. Other query types ignore it.
     tie_breaker: f32,
 
     /// Query-level boost, applied to whichever scorer this query runs as
-    /// (the `BooleanQuery` for `MostFields`, or the `DisjunctionMaxScorer`
-    /// for `BestFields`).
+    /// (the `BooleanQuery` for `MostFields`, the `DisjunctionMaxScorer` for
+    /// `BestFields`, or the `CombinedFieldsScorer` for `CombinedFields`).
     boost: f32,
+
+    /// The blended document frequency of a
+    /// [`MultiFieldQueryType::CombinedFields`] query, frozen by
+    /// [`rewrite`](Query::rewrite) against the top-level reader so every
+    /// segment of a multi-segment fanout scores against the same value
+    /// instead of blending only the fields its own segment holds the term
+    /// in.
+    ///
+    /// Frozen statistics belong to the reader snapshot they were taken
+    /// from, and `rewrite` never refreshes them, so a rewritten query must
+    /// not be cached and reused across a `commit` (as with `SynonymQuery`).
+    doc_freq: Option<u64>,
 }
 
 /// Type of multi-field query.
@@ -519,6 +532,21 @@ pub enum MultiFieldQueryType {
     /// Every field must match (AND across fields); the score is the sum of
     /// the matching fields' scores (Elasticsearch's `multi_match` `most_fields`).
     MostFields,
+
+    /// BM25F: the fields are scored as one concatenated field, so a document
+    /// scores the same whichever of them its occurrences of the term fall
+    /// in (Issue #1319). Matches like an OR across fields (Elasticsearch's
+    /// `combined_fields`, Lucene's `CombinedFieldQuery`).
+    ///
+    /// A document's term frequency and length are `Σ w·tf` and `Σ w·len`
+    /// over the fields, with `w` the field's boost; the document frequency
+    /// is the largest of the fields', and the average length
+    /// `Σ w·avg_len·doc_count / max(doc_count)`. A boost is therefore a
+    /// BM25F weight — `2.0` counts the field as if it were indexed twice —
+    /// rather than a multiplier on the field's score. Every boost must be
+    /// finite and greater than zero; searching with any other returns
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument).
+    CombinedFields,
 }
 
 impl MultiFieldQuery {
@@ -530,12 +558,16 @@ impl MultiFieldQuery {
             query_type: MultiFieldQueryType::BestFields,
             tie_breaker: 0.0,
             boost: 1.0,
+            doc_freq: None,
         }
     }
 
-    /// Add a field with boost.
+    /// Add a field with boost (a BM25F weight for
+    /// [`MultiFieldQueryType::CombinedFields`]).
     pub fn add_field(mut self, field: String, boost: f32) -> Self {
         self.fields.insert(field, boost);
+        // The blended document frequency depends on the field set.
+        self.doc_freq = None;
         self
     }
 
@@ -549,6 +581,49 @@ impl MultiFieldQuery {
     pub fn tie_breaker(mut self, tie_breaker: f32) -> Self {
         self.tie_breaker = tie_breaker;
         self
+    }
+
+    /// The configured fields and their boosts, ordered by field name so the
+    /// combined sums do not depend on `HashMap` iteration order.
+    fn sorted_fields(&self) -> Vec<(&str, f32)> {
+        let mut fields: Vec<(&str, f32)> = self
+            .fields
+            .iter()
+            .map(|(field, &boost)| (field.as_str(), boost))
+            .collect();
+        fields.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        fields
+    }
+
+    /// Reject a [`MultiFieldQueryType::CombinedFields`] boost that is not a
+    /// finite number greater than zero: a BM25F weight scales lengths, so a
+    /// zero or negative one could make the combined average length zero or
+    /// negative.
+    fn check_weights(&self) -> Result<()> {
+        if let Some((field, boost)) = self
+            .sorted_fields()
+            .into_iter()
+            .find(|&(_, boost)| !(boost.is_finite() && boost > 0.0))
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "MultiFieldQuery CombinedFields boost for field {field:?} must be finite and greater than 0, got {boost}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The document frequency [`MultiFieldQueryType::CombinedFields`]
+    /// scores with: the largest of the fields', as Lucene's
+    /// `CombinedFieldQuery` blends it (at least that many documents hold
+    /// the term).
+    fn combined_doc_freq(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
+        let mut doc_freq = 0;
+        for field in self.fields.keys() {
+            if let Some(info) = reader.term_info(field, &self.query_text)? {
+                doc_freq = doc_freq.max(info.doc_freq);
+            }
+        }
+        Ok(doc_freq)
     }
 
     /// One `TermQuery` per configured field, carrying that field's boost
@@ -570,14 +645,15 @@ impl MultiFieldQuery {
 
     /// The `BooleanQuery` this query runs as: one `TermQuery` per field,
     /// `Must` for [`MultiFieldQueryType::MostFields`] and `Should`
-    /// otherwise, carrying this query's boost. Used for matching by both
-    /// query types, and for scoring [`MultiFieldQueryType::MostFields`]
+    /// otherwise, carrying this query's boost. Used for matching by every
+    /// query type, and for scoring [`MultiFieldQueryType::MostFields`]
     /// (summed, like `BooleanScorer`); [`MultiFieldQueryType::BestFields`]
-    /// scores through [`DisjunctionMaxScorer`] instead (see `scorer`).
+    /// and [`MultiFieldQueryType::CombinedFields`] score through their own
+    /// scorers instead (see `scorer`).
     fn boolean_query(&self) -> BooleanQuery {
         let occur = match self.query_type {
             MultiFieldQueryType::MostFields => Occur::Must,
-            MultiFieldQueryType::BestFields => Occur::Should,
+            MultiFieldQueryType::BestFields | MultiFieldQueryType::CombinedFields => Occur::Should,
         };
         let mut query = BooleanQuery::new().with_boost(self.boost);
         for field_query in self.field_queries() {
@@ -588,10 +664,15 @@ impl MultiFieldQuery {
 }
 
 impl Query for MultiFieldQuery {
-    /// Matching is independent of how `BestFields` vs. `MostFields` score:
-    /// `Should` (union) or `Must` (intersection) over the same per-field
-    /// `TermQuery`s `scorer` scores.
+    /// Matching is independent of how the query types score: `Should`
+    /// (union) or `Must` (intersection) over the same per-field
+    /// `TermQuery`s `scorer` scores. A `CombinedFields` query with an
+    /// invalid boost is rejected here too, so it fails as a filter clause
+    /// as well as a scoring one.
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
+        if matches!(self.query_type, MultiFieldQueryType::CombinedFields) {
+            self.check_weights()?;
+        }
         self.boolean_query().matcher(reader)
     }
 
@@ -606,14 +687,55 @@ impl Query for MultiFieldQuery {
                 )?,
             )),
             MultiFieldQueryType::MostFields => self.boolean_query().scorer(reader),
+            MultiFieldQueryType::CombinedFields => {
+                self.check_weights()?;
+                let doc_freq = match self.doc_freq {
+                    Some(doc_freq) => doc_freq,
+                    None => self.combined_doc_freq(reader)?,
+                };
+                Ok(Box::new(
+                    crate::lexical::query::scorer::CombinedFieldsScorer::new(
+                        reader,
+                        &self.query_text,
+                        &self.sorted_fields(),
+                        doc_freq,
+                        self.boost,
+                    )?,
+                ))
+            }
         }
     }
 
-    // No `rewrite()` override: unlike `AdvancedQuery` (#1316), replacing
-    // this query with its `boolean_query()` would route it into the
-    // parallel path's `downcast::<BooleanQuery>()` or the BMW path, both
-    // of which discard the `BestFields` `DisjunctionMaxScorer` above and
-    // silently fall back to the summed `BooleanScorer` instead.
+    /// Freezes a `CombinedFields` query's blended document frequency against
+    /// the top-level reader (see `doc_freq`); every other query type, and an
+    /// already-frozen one, is left as is.
+    ///
+    /// Only ever rewrites into another `MultiFieldQuery`: unlike
+    /// `AdvancedQuery` (#1316), replacing this query with its
+    /// `boolean_query()` would route it into the parallel path's
+    /// `downcast::<BooleanQuery>()` or the BMW path, both of which discard
+    /// the `DisjunctionMaxScorer` / `CombinedFieldsScorer` and silently fall
+    /// back to the summed `BooleanScorer` instead.
+    fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Option<Box<dyn Query>>> {
+        if !matches!(self.query_type, MultiFieldQueryType::CombinedFields)
+            || self.doc_freq.is_some()
+        {
+            return Ok(None);
+        }
+        // A per-segment fanout view reports no `term_info` for a field its
+        // own segment lacks the term in, so only the top-level reader can
+        // blend the document frequency every segment should share.
+        if reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let mut rewritten = self.clone();
+        rewritten.doc_freq = Some(self.combined_doc_freq(reader)?);
+        Ok(Some(Box::new(rewritten)))
+    }
 
     fn boost(&self) -> f32 {
         self.boost
@@ -633,9 +755,10 @@ impl Query for MultiFieldQuery {
 
     fn description(&self) -> String {
         format!(
-            "MultiFieldQuery(text: {}, fields: {:?})",
+            "MultiFieldQuery(text: {}, type: {:?}, fields: {:?})",
             self.query_text,
-            self.fields.keys().collect::<Vec<_>>()
+            self.query_type,
+            self.sorted_fields()
         )
     }
 
@@ -1438,6 +1561,383 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ----- #1319: MultiFieldQuery CombinedFields (BM25F) -----
+
+    /// A document as `(id, [(field, text)])`, so a fixture can leave a field
+    /// out of a document altogether.
+    type FieldDoc<'a> = (u64, &'a [(&'a str, &'a str)]);
+
+    /// A store holding one committed segment per batch of documents.
+    fn store_with_document_segments(segments: Vec<Vec<(u64, Document)>>) -> LexicalStore {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let segment_count = segments.len();
+        for segment in segments {
+            for (id, doc) in segment {
+                store.upsert_document(id, doc).unwrap();
+            }
+            store.commit().unwrap();
+        }
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert_eq!(inverted.segment_count(), segment_count);
+        store
+    }
+
+    /// A store holding one committed segment per slice of documents.
+    fn store_with_field_docs(segments: &[&[FieldDoc]]) -> LexicalStore {
+        store_with_document_segments(
+            segments
+                .iter()
+                .map(|segment| {
+                    segment
+                        .iter()
+                        .map(|&(id, fields)| {
+                            let doc = fields
+                                .iter()
+                                .fold(Document::builder(), |doc, &(field, text)| {
+                                    doc.add_text(field, text)
+                                })
+                                .build();
+                            (id, doc)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    /// A `CombinedFields` query for "apple" over `(field, weight)` pairs.
+    fn combined(fields: &[(&str, f32)]) -> MultiFieldQuery {
+        fields.iter().fold(
+            MultiFieldQuery::new("apple".to_string())
+                .query_type(MultiFieldQueryType::CombinedFields),
+            |query, &(field, weight)| query.add_field(field.to_string(), weight),
+        )
+    }
+
+    /// The same query as a `BestFields` one, every field weighted 1.
+    fn best_fields(fields: &[&str]) -> Box<dyn Query> {
+        Box::new(fields.iter().fold(
+            MultiFieldQuery::new("apple".to_string()).query_type(MultiFieldQueryType::BestFields),
+            |query, &field| query.add_field(field.to_string(), 1.0),
+        ))
+    }
+
+    /// A `BooleanQuery` holding each `(query, occur)` clause.
+    fn boolean_of(clauses: Vec<(Box<dyn Query>, Occur)>) -> Box<dyn Query> {
+        let mut query = BooleanQuery::new();
+        for (clause, occur) in clauses {
+            query.add_clause(BooleanClause::new(clause, occur));
+        }
+        Box::new(query)
+    }
+
+    /// Documents without "apple", so its IDF is not clamped to the floor.
+    const NO_APPLE: &[(&str, &str)] = &[("title", "fig plum"), ("body", "kiwi pear")];
+
+    /// #1319 (acceptance criterion 2): with weight 1, a term split across
+    /// two short fields scores the same as the same term concentrated in
+    /// one field, given the same combined length — including when the
+    /// document lacks the other field altogether, which adds no length.
+    /// `BestFields` scores each field on its own, so it does not.
+    #[test]
+    fn combined_fields_scores_split_and_concentrated_terms_alike() {
+        let store = store_with_field_docs(&[&[
+            // tf 1 + 1, length 2 + 2.
+            (0, &[("title", "apple fig"), ("body", "apple plum")]),
+            // tf 2 + 0, length 3 + 1.
+            (1, &[("title", "apple apple fig"), ("body", "plum")]),
+            // No title: tf 2, length 4.
+            (2, &[("body", "apple apple fig plum")]),
+            (3, NO_APPLE),
+            (4, NO_APPLE),
+            (5, NO_APPLE),
+            (6, NO_APPLE),
+        ]]);
+
+        let hits = search_scores(
+            &store,
+            Box::new(combined(&[("title", 1.0), ("body", 1.0)])),
+            false,
+        );
+        assert_eq!(hits.keys().collect::<Vec<_>>(), vec![&0, &1, &2]);
+        for doc_id in [1, 2] {
+            assert!(
+                (hits[&doc_id] - hits[&0]).abs() <= 1e-6,
+                "doc {doc_id} scores {}, doc 0 scores {}",
+                hits[&doc_id],
+                hits[&0]
+            );
+        }
+
+        let per_field = search_scores(&store, best_fields(&["title", "body"]), false);
+        assert!(
+            (per_field[&0] - per_field[&1]).abs() > 1e-4,
+            "the fixture must tell independent per-field scoring apart"
+        );
+    }
+
+    /// #1319 (acceptance criterion 1): one blended document frequency
+    /// serves every field. "apple" is rare in title and common in body, so
+    /// `BestFields` scores a title match above an equally long body match;
+    /// `CombinedFields` scores the two alike.
+    #[test]
+    fn combined_fields_blends_the_document_frequency_across_fields() {
+        let body_apple: &[(&str, &str)] = &[("title", "fig plum"), ("body", "apple kiwi")];
+        let store = store_with_field_docs(&[&[
+            (0, &[("title", "apple fig"), ("body", "plum kiwi")]),
+            (1, body_apple),
+            (2, body_apple),
+            (3, body_apple),
+            (4, body_apple),
+            (5, NO_APPLE),
+            (6, NO_APPLE),
+            (7, NO_APPLE),
+            (8, NO_APPLE),
+            (9, NO_APPLE),
+        ]]);
+
+        let hits = search_scores(
+            &store,
+            Box::new(combined(&[("title", 1.0), ("body", 1.0)])),
+            false,
+        );
+        assert!((hits[&0] - hits[&1]).abs() <= 1e-6, "{hits:?}");
+
+        let per_field = search_scores(&store, best_fields(&["title", "body"]), false);
+        assert!(
+            per_field[&0] > per_field[&1] + 1e-4,
+            "the rarer title match must win under per-field IDF: {per_field:?}"
+        );
+    }
+
+    /// Every document holds title, body, and `all` = title + " " + body
+    /// (`all2` = title twice, then body). The documents with "apple" in body
+    /// include every one with it in title, so the blended (largest)
+    /// document frequency equals the concatenated field's.
+    const CONCATENATED: &[(u64, &str, &str)] = &[
+        (0, "apple fig", "apple plum kiwi"),
+        (1, "fig", "apple apple pear"),
+        (2, "plum kiwi fig", "pear"),
+        (3, "apple apple", "apple fig"),
+        (4, "kiwi", "plum pear fig"),
+        (5, "pear plum", "apple"),
+    ];
+
+    /// A store holding `CONCATENATED`, committed as consecutive segments of
+    /// `segment_sizes` documents each.
+    fn concatenated_store(segment_sizes: &[usize]) -> LexicalStore {
+        let mut docs = CONCATENATED.iter().map(|&(id, title, body)| {
+            let doc = Document::builder()
+                .add_text("title", title)
+                .add_text("body", body)
+                .add_text("all", format!("{title} {body}"))
+                .add_text("all2", format!("{title} {title} {body}"))
+                .build();
+            (id, doc)
+        });
+        store_with_document_segments(
+            segment_sizes
+                .iter()
+                .map(|&size| docs.by_ref().take(size).collect())
+                .collect(),
+        )
+    }
+
+    /// A labelled query and the reference query it must score like.
+    type ScoredLike = (&'static str, Box<dyn Query>, Box<dyn Query>);
+
+    /// #1319: `CombinedFields` scores exactly like one field holding the
+    /// fields' concatenation, on every search path: one and two segments,
+    /// at the top level and nested in a `BooleanQuery` (which is what
+    /// `parallel` changes the path for).
+    #[test]
+    fn combined_fields_scores_like_the_concatenated_field_on_every_path() {
+        let stores = [
+            ("one segment", concatenated_store(&[6])),
+            ("two segments", concatenated_store(&[3, 3])),
+        ];
+        let never = || -> Box<dyn Query> { Box::new(TermQuery::new("body", "zzz")) };
+        for (label, store) in &stores {
+            for parallel in [false, true] {
+                let cases: [ScoredLike; 2] = [
+                    (
+                        "top level",
+                        Box::new(combined(&[("title", 1.0), ("body", 1.0)])),
+                        Box::new(TermQuery::new("all", "apple")),
+                    ),
+                    (
+                        "nested",
+                        boolean_of(vec![
+                            (
+                                Box::new(combined(&[("title", 1.0), ("body", 1.0)])),
+                                Occur::Should,
+                            ),
+                            (never(), Occur::Should),
+                        ]),
+                        boolean_of(vec![
+                            (Box::new(TermQuery::new("all", "apple")), Occur::Should),
+                            (never(), Occur::Should),
+                        ]),
+                    ),
+                ];
+                for (shape, query, reference) in cases {
+                    let expected = search_scores(store, reference, parallel);
+                    assert_eq!(expected.len(), 4, "{label}: the fixture's apple docs");
+                    assert_scores_eq(
+                        &format!("{label}, {shape}, parallel={parallel}"),
+                        &search_scores(store, query, parallel),
+                        &expected,
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1319: a BM25F weight scales a field's term frequency and length
+    /// alike, so weight 2 on title scores like a field holding title twice.
+    #[test]
+    fn combined_fields_weight_counts_the_field_that_many_times() {
+        for (label, store) in [
+            ("one segment", concatenated_store(&[6])),
+            ("two segments", concatenated_store(&[3, 3])),
+        ] {
+            assert_scores_eq(
+                label,
+                &search_scores(
+                    &store,
+                    Box::new(combined(&[("title", 2.0), ("body", 1.0)])),
+                    false,
+                ),
+                &search_scores(&store, Box::new(TermQuery::new("all2", "apple")), false),
+            );
+        }
+    }
+
+    /// #1319: the blended document frequency is frozen against the
+    /// top-level reader. Title holds "apple" in three documents and body in
+    /// two, but segment 2 has none in title: blending per segment would give
+    /// segment 2 the body's frequency instead, and so score doc 4 apart from
+    /// doc 0, which has the same content and the same segment statistics.
+    #[test]
+    fn combined_fields_scores_identical_documents_alike_across_segments() {
+        let body_apple: &[(&str, &str)] = &[("title", "pear fig"), ("body", "apple plum")];
+        let title_apple: &[(&str, &str)] = &[("title", "apple fig"), ("body", "kiwi plum")];
+        let neither: &[(&str, &str)] = &[("title", "pear fig"), ("body", "kiwi plum")];
+        let store = store_with_field_docs(&[
+            &[
+                (0, body_apple),
+                (1, title_apple),
+                (2, title_apple),
+                (3, title_apple),
+            ],
+            &[(4, body_apple), (5, neither), (6, neither), (7, neither)],
+        ]);
+
+        let query = || combined(&[("title", 1.0), ("body", 1.0)]);
+        for parallel in [false, true] {
+            let cases: [(&str, Box<dyn Query>); 2] = [
+                ("top level", Box::new(query())),
+                (
+                    "nested",
+                    boolean_of(vec![
+                        (Box::new(query()), Occur::Must),
+                        (Box::new(TermQuery::new("body", "apple")), Occur::Filter),
+                    ]),
+                ),
+            ];
+            for (shape, query) in cases {
+                let hits = search_scores(&store, query, parallel);
+                assert!(
+                    (hits[&0] - hits[&4]).abs() <= 1e-6,
+                    "{shape}, parallel={parallel}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    /// #1319: a boost that is not finite and greater than zero is rejected
+    /// when searching and counting; a fractional one is a valid weight.
+    #[test]
+    fn combined_fields_rejects_non_positive_or_non_finite_weights() {
+        let store = store_with_field_docs(&[&[
+            (0, &[("title", "apple fig"), ("body", "apple plum")]),
+            (1, NO_APPLE),
+        ]]);
+        for weight in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let request = || {
+                LexicalSearchRequest::new(Box::new(combined(&[("title", weight), ("body", 1.0)])))
+            };
+            let error = store.search(request()).unwrap_err();
+            assert!(
+                matches!(error, LaurusError::InvalidArgument(_)),
+                "weight {weight}: search returned {error:?}"
+            );
+            let error = store.count(request()).unwrap_err();
+            assert!(
+                matches!(error, LaurusError::InvalidArgument(_)),
+                "weight {weight}: count returned {error:?}"
+            );
+        }
+
+        let hits = search_scores(
+            &store,
+            Box::new(combined(&[("title", 0.5), ("body", 1.0)])),
+            false,
+        );
+        assert_eq!(hits.keys().collect::<Vec<_>>(), vec![&0]);
+        assert!(hits[&0].is_finite() && hits[&0] > 0.0, "{hits:?}");
+        assert_eq!(
+            store
+                .count(LexicalSearchRequest::new(Box::new(combined(&[
+                    ("title", 0.5),
+                    ("body", 1.0)
+                ]))))
+                .unwrap(),
+            1
+        );
+    }
+
+    /// #1319: `rewrite` freezes a `CombinedFields` query's document
+    /// frequency once against the top-level reader, and leaves the other
+    /// query types alone.
+    #[test]
+    fn combined_fields_rewrite_freezes_the_document_frequency_once() {
+        let store = concatenated_store(&[3, 3]);
+        let reader = store.reader_for_tests().unwrap();
+
+        let rewritten = combined(&[("title", 1.0), ("body", 1.0)])
+            .rewrite(reader.as_ref())
+            .unwrap()
+            .expect("CombinedFields rewrites against the top-level reader");
+        let frozen = rewritten
+            .as_any()
+            .downcast_ref::<MultiFieldQuery>()
+            .unwrap();
+        // The larger of title's (docs 0, 3) and body's (docs 0, 1, 3, 5).
+        assert_eq!(frozen.doc_freq, Some(4));
+        assert!(rewritten.rewrite(reader.as_ref()).unwrap().is_none());
+        assert_eq!(
+            frozen.clone().add_field("all".to_string(), 1.0).doc_freq,
+            None,
+            "adding a field invalidates the frozen value"
+        );
+
+        for query_type in [
+            MultiFieldQueryType::BestFields,
+            MultiFieldQueryType::MostFields,
+        ] {
+            let query = MultiFieldQuery::new("apple".to_string())
+                .add_field("title".to_string(), 1.0)
+                .query_type(query_type);
+            assert!(query.rewrite(reader.as_ref()).unwrap().is_none());
         }
     }
 }
