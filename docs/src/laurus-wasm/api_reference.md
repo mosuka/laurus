@@ -584,6 +584,12 @@ below) — keys inside a component stay snake_case, matching that wire
 format. Only the two outer wrapper keys (`charFilters`/`tokenFilters`)
 follow this binding's own camelCase convention.
 
+A name reserved for a built-in analyzer (`standard`, `keyword`, `english`,
+`simple`, `noop`) throws, and so does `Index.create` or a first
+`Index.open` with a schema that defines one (e.g. loaded with `fromToml`).
+`addAnalyzer` is not affected: a runtime analyzer is resolved before the
+built-ins, so registering one under a built-in name does take effect.
+
 ```javascript
 const schema = new Schema();
 schema.addAnalyzerDefinition("ngram3", {

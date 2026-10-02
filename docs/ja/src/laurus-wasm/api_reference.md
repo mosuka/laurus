@@ -568,6 +568,11 @@ schema.addEmbedder("callback-embedder", {
 キーはこのワイヤ形式に合わせて snake_case のままです。外側のラッパーキー
 （`charFilters`/`tokenFilters`）のみ、このバインディング独自の camelCase 規約に従います。
 
+組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、
+`noop`）は例外になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）で
+`Index.create` や初回の `Index.open` をする場合も同じです。`addAnalyzer` は対象外です。
+ランタイムアナライザは組み込みより先に解決されるため、組み込みと同じ名前で登録しても効きます。
+
 ```javascript
 const schema = new Schema();
 schema.addAnalyzerDefinition("ngram3", {

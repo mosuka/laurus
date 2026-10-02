@@ -229,7 +229,7 @@ class Schema:
 | メソッド | 説明 |
 | :--- | :--- |
 | `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ辞書です（下記参照）。 |
-| `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`char_filters`/`token_filters` は省略可能な辞書のリストです。各辞書はスキーマ TOML/JSON 形式と同じ `{"type": "..."}` 形式です（下記参照）。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
+| `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`char_filters`/`token_filters` は省略可能な辞書のリストです。各辞書はスキーマ TOML/JSON 形式と同じ `{"type": "..."}` 形式です（下記参照）。組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `ValueError` になり、その名前を定義したスキーマ（`from_toml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
 | `analyzer_names()` | `add_analyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
 | `Schema.from_toml(toml_str)` *(静的メソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
 | `Schema.from_toml_file(path)` *(静的メソッド)* | TOML ファイルからスキーマを読み込みます（`path` は `str` または `os.PathLike` を受け付けます）。 |

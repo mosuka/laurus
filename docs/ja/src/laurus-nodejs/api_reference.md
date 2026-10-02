@@ -208,7 +208,7 @@ class Schema {
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |
 | `addEmbedder(name, config)` | 名前付き Embedder を登録。 |
-| `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`charFilters`/`tokenFilters` は省略可能なオブジェクトの配列です。各オブジェクトはスキーマ TOML/JSON 形式と同じ `{ type: "...", ... }` 形式で、キーは snake_case のままです（下記参照）。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
+| `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`charFilters`/`tokenFilters` は省略可能なオブジェクトの配列です。各オブジェクトはスキーマ TOML/JSON 形式と同じ `{ type: "...", ... }` 形式で、キーは snake_case のままです（下記参照）。組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は例外になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）で新しいインデックスを `Index.create` する場合も同じです。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
 | `analyzerNames()` | `addAnalyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
 | `Schema.fromToml(tomlStr)` *(静的メソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
 | `Schema.fromTomlFile(path)` *(静的メソッド)* | TOML ファイルからスキーマを読み込みます。 |

@@ -65,7 +65,7 @@ Defines document structure.
 | `.add_flat_field(name, FlatOption)` | Add a Flat vector field |
 | `.add_ivf_field(name, IvfOption)` | Add an IVF vector field |
 | `.add_default_field(name)` | Set a default search field |
-| `.add_analyzer(name, AnalyzerDefinition)` | Register a custom analyzer pipeline |
+| `.add_analyzer(name, AnalyzerDefinition)` | Register a custom analyzer pipeline. A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) makes `.build()` panic and `.try_build()` return an error; a `Schema` built another way (e.g. `Schema::from_toml`) is checked with `Schema::validate_for_create` |
 | `.add_embedder(name, EmbedderDefinition)` | Register an embedder definition |
 | `.dynamic_field_policy(DynamicFieldPolicy)` | Set the policy for undeclared fields (`Strict` / `Dynamic` / `Ignore`) |
 | `.build()` | Build the `Schema` |
