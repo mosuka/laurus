@@ -553,6 +553,14 @@ Hugging Face models are downloaded on first use and cached under `$HF_HOME` (def
 > Error: Not implemented: candle_bert embedder requires the 'embeddings-candle' feature to be enabled
 > ```
 
+A vector field's `embedder` must name an `[embedders.*]` entry. An undeclared name is rejected by `create index`, `add field`, and `update field`, and an existing index whose `schema.toml` holds one fails to open:
+
+```text
+Error: Invalid argument: Unknown embedder 'missing' for field 'vec': not defined in schema.embedders
+```
+
+To open such an index, edit its `schema.toml`. Declaring the name with `type = "precomputed"` keeps the field working as it did, with documents supplying its vectors. Deleting the field's `embedder` line does the same.
+
 ### Example: one embedder shared by two fields
 
 ```toml

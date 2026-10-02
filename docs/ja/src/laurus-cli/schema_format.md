@@ -551,6 +551,14 @@ Hugging Face のモデルは初回の使用時にダウンロードされ、`$HF
 > Error: Not implemented: candle_bert embedder requires the 'embeddings-candle' feature to be enabled
 > ```
 
+ベクトルフィールドの `embedder` には、`[embedders.*]` のエントリの名前を書く必要があります。宣言していない名前は `create index`、`add field`、`update field` で拒否されます。`schema.toml` にそうした名前を含む既存のインデックスは開けません:
+
+```text
+Error: Invalid argument: Unknown embedder 'missing' for field 'vec': not defined in schema.embedders
+```
+
+このインデックスを開くには、`schema.toml` を編集します。その名前を `type = "precomputed"` で宣言すれば、フィールドはそれまでどおり、文書が与えるベクトルで動きます。フィールドの `embedder` の行を削除しても同じです。
+
 ### 例: 1 つのエンベダーを 2 つのフィールドで共有する
 
 ```toml
