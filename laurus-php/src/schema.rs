@@ -651,6 +651,12 @@ impl PhpSchema {
     ///   definitions, applied to raw text before tokenization.
     /// * `token_filters` - Optional sequential array of token-filter
     ///   definitions, applied to the token stream after tokenization.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` is reserved for a built-in analyzer
+    /// (`standard`, `keyword`, `english`, `simple`, `noop`), or if a
+    /// component does not match a known shape.
     pub fn add_analyzer(
         &self,
         name: String,
@@ -658,6 +664,7 @@ impl PhpSchema {
         char_filters: Option<&ZendHashTable>,
         token_filters: Option<&ZendHashTable>,
     ) -> PhpResult<()> {
+        laurus::analysis::analyzer::registry::validate_analyzer_name(&name).map_err(laurus_err)?;
         let definition = AnalyzerDefinition {
             tokenizer: tokenizer_from_ht(tokenizer)?,
             char_filters: filter_list_from_ht(char_filters, "charFilters", char_filter_from_ht)?,

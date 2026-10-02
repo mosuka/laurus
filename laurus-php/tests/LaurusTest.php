@@ -1861,4 +1861,73 @@ class LaurusTest extends TestCase
 
         $this->assertNotEquals($before, Laurus\peek_commit_generation($dir));
     }
+
+    // ── Names reserved for built-in analyzers (Issue #1310) ───────────────
+
+    // The entry tokenizes on whitespace without lowercasing, so a lowercase
+    // query matches "Hello" only when the built-in `standard` analyzer is used.
+    private const RESERVED_SCHEMA_TOML = <<<'TOML'
+        [analyzers.standard]
+        tokenizer = { type = "whitespace" }
+
+        [fields.body.Text]
+        analyzer = "standard"
+        TOML;
+
+    public function testAddAnalyzerRejectsReservedNames(): void
+    {
+        foreach (["standard", "keyword", "english", "simple", "noop"] as $name) {
+            $schema = new Laurus\Schema();
+            try {
+                $schema->addAnalyzer($name, ["type" => "whitespace"]);
+                $this->fail("addAnalyzer accepted reserved name '$name'");
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString(
+                    "Analyzer name '$name' is reserved for a built-in analyzer",
+                    $e->getMessage()
+                );
+            }
+            $this->assertSame([], $schema->analyzerNames());
+        }
+    }
+
+    public function testAddAnalyzerAcceptsJapaneseName(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addAnalyzer("japanese", ["type" => "whitespace"]);
+        $this->assertSame(["japanese"], $schema->analyzerNames());
+    }
+
+    public function testInMemoryIndexRejectsReservedAnalyzerName(): void
+    {
+        $schema = Laurus\Schema::fromToml(self::RESERVED_SCHEMA_TOML);
+        $this->expectException(\ValueError::class);
+        $this->expectExceptionMessageMatches('/reserved for a built-in analyzer/');
+        new Laurus\Index(null, $schema);
+    }
+
+    public function testPathIndexRejectsReservedAnalyzerNameAndWritesNothing(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_reserved_" . uniqid();
+        $schema = Laurus\Schema::fromToml(self::RESERVED_SCHEMA_TOML);
+        try {
+            new Laurus\Index($dir, $schema);
+            $this->fail("a reserved analyzer name was accepted");
+        } catch (\ValueError $e) {
+            $this->assertStringContainsString("reserved for a built-in analyzer", $e->getMessage());
+        }
+        $this->assertFalse(file_exists($dir), "a rejected create must write nothing");
+    }
+
+    public function testExistingIndexWithReservedAnalyzerNameStillOpens(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_reserved_" . uniqid();
+        mkdir($dir);
+        file_put_contents($dir . "/schema.toml", self::RESERVED_SCHEMA_TOML);
+        $idx = new Laurus\Index($dir);
+        $idx->putDocument("doc1", ["body" => "Hello World"]);
+        $idx->commit();
+        $this->assertCount(1, $idx->search("body:hello", 5));
+        $idx->close();
+    }
 }
