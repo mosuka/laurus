@@ -206,7 +206,7 @@ class Schema:
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, doc_values=True, multi_valued=False, position_increment_gap=100, analyzer=None)` | 全文フィールド（転置インデックス、BM25）。`term_vectors` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored=True` の場合のみ有効です。`multi_valued=True` で `list[str]` を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `position_increment_gap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は `list[str]` として読み戻されます。`analyzer` には組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）か、`{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}` のようなパラメータ付きプリセットの dict を渡せます。文字列単独の `"japanese"` は Lindera 辞書パスが必須なため拒否されます。カスタムアナライザのコンポーネントは [スキーマフォーマットリファレンス → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください。 |
+| `add_text_field(name, *, stored=True, indexed=True, term_vectors=True, doc_values=True, multi_valued=False, position_increment_gap=100, analyzer=None)` | 全文フィールド（転置インデックス、BM25）。`term_vectors` はタームの位置を保存するかどうかを制御し、フレーズクエリ・スパンクエリが読み取ります。`doc_values` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`stored=True` の場合のみ有効です。`multi_valued=True` で `list[str]` を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `position_increment_gap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は `list[str]` として読み戻されます。`analyzer` には組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`、または `add_analyzer` で登録したカスタム名）か、`{"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}` のようなパラメータ付きプリセットの dict を渡せます。文字列単独の `"japanese"` は Lindera 辞書パスが必須なため拒否されます。 |
 | `add_integer_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット整数フィールド。`multi_valued=True` で整数配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット浮動小数点フィールド。`multi_valued=True` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_boolean_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | ブールフィールド。`multi_valued=True` で `list[bool]` を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `list[bool]` として読み戻されます）。`doc_values` は上記を参照。 |
@@ -229,6 +229,12 @@ class Schema:
 | メソッド | 説明 |
 | :--- | :--- |
 | `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ辞書です（下記参照）。 |
+| `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`char_filters`/`token_filters` は省略可能な辞書のリストです。各辞書はスキーマ TOML/JSON 形式と同じ `{"type": "..."}` 形式です（下記参照）。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
+| `analyzer_names()` | `add_analyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
+| `Schema.from_toml(toml_str)` *(静的メソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
+| `Schema.from_toml_file(path)` *(静的メソッド)* | TOML ファイルからスキーマを読み込みます（`path` は `str` または `os.PathLike` を受け付けます）。 |
+| `to_toml()` | このスキーマを `laurus-cli` と同じ形式の TOML 文字列にシリアライズします。 |
+| `to_toml_file(path)` | このスキーマを TOML ファイルに書き込みます。 |
 | `set_default_fields(fields)` | デフォルト検索フィールドを設定（文字列のリスト）。 |
 | `set_dynamic_field_policy(policy)` | 未宣言フィールドの扱いを設定。`policy` は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"`。詳細は下記を参照。 |
 | `dynamic_field_policy()` | 現在のポリシーを小文字の文字列で返す。 |
@@ -254,6 +260,61 @@ class Schema:
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+
+### アナライザコンポーネント
+
+`add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` と
+`[analyzers.<name>]` TOML セクションで使用します。`tokenizer` は単一の辞書、
+`char_filters`/`token_filters` は辞書のリストで、リストの順序どおりに適用されます。
+
+各コンポーネントの説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください。
+
+**トークナイザ**（`tokenizer`、必ず1つ）:
+
+| `"type"` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"whitespace"` | -- | -- |
+| `"unicode_word"` | -- | -- |
+| `"regex"` | -- | `"pattern"`（デフォルト `\w+`）、`"gaps"`（デフォルト `false`） |
+| `"ngram"` | `"min_gram"`、`"max_gram"` | -- |
+| `"lindera"` | `"mode"`、`"dict"` | `"user_dict"` |
+| `"whole"` | -- | -- |
+
+**文字フィルタ**（`char_filters`、トークン化前の生テキストに適用）:
+
+| `"type"` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"unicode_normalization"` | `"form"`（`"nfc"`/`"nfd"`/`"nfkc"`/`"nfkd"`） | -- |
+| `"pattern_replace"` | `"pattern"`、`"replacement"` | -- |
+| `"mapping"` | `"mapping"`（文字列置換の辞書） | -- |
+| `"japanese_iteration_mark"` | -- | `"kanji"`（デフォルト `true`）、`"kana"`（デフォルト `true`） |
+
+**トークンフィルタ**（`token_filters`、トークン化後のトークン列に適用）:
+
+| `"type"` | 必須キー | 省略可能キー |
+| :--- | :--- | :--- |
+| `"lowercase"` | -- | -- |
+| `"stop"` | -- | `"words"`（デフォルト: 英語のストップワード） |
+| `"stem"` | -- | `"stem_type"`（`"porter"`/`"simple"`/`"identity"`） |
+| `"boost"` | `"boost"` | -- |
+| `"limit"` | `"limit"` | -- |
+| `"strip"` | -- | -- |
+| `"remove_empty"` | -- | -- |
+| `"flatten_graph"` | -- | -- |
+
+```python
+schema = laurus.Schema()
+schema.add_analyzer(
+    "ja_ipadic",
+    {"type": "lindera", "mode": "normal", "dict": "/var/lib/lindera/ipadic"},
+    char_filters=[
+        {"type": "unicode_normalization", "form": "nfkc"},
+        {"type": "japanese_iteration_mark"},
+    ],
+    token_filters=[{"type": "lowercase"}],
+)
+schema.add_text_field("title", analyzer="ja_ipadic")
+```
 
 ### 距離メトリクス
 
