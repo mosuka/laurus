@@ -616,14 +616,17 @@ impl WasmSchema {
     ///
     /// # Errors
     ///
-    /// Returns a JS error if `tokenizer` is missing, or if `tokenizer`/
-    /// `charFilters`/`tokenFilters` do not match a known component shape.
+    /// Returns a JS error if `name` is reserved for a built-in analyzer
+    /// (`standard`, `keyword`, `english`, `simple`, `noop`), if `tokenizer`
+    /// is missing, or if `tokenizer`/`charFilters`/`tokenFilters` do not
+    /// match a known component shape.
     #[wasm_bindgen(js_name = "addAnalyzerDefinition")]
     pub fn add_analyzer_definition(
         &mut self,
         name: String,
         definition: js_sys::Object,
     ) -> Result<(), JsValue> {
+        laurus::analysis::analyzer::registry::validate_analyzer_name(&name).map_err(laurus_err)?;
         let tokenizer_val = js_sys::Reflect::get(&definition, &JsValue::from_str("tokenizer"))
             .unwrap_or(JsValue::UNDEFINED);
         if tokenizer_val.is_undefined() {

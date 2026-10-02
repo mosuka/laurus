@@ -15,6 +15,8 @@ use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use wasm_bindgen::prelude::*;
 
+use crate::errors::laurus_err;
+
 /// Name of the persisted-schema file inside an OPFS index directory.
 ///
 /// This file is managed directly through the OPFS bridge functions, NOT
@@ -200,7 +202,8 @@ impl OpfsPersistence {
     ///   reopening with custom embedders/analyzers impossible.
     /// - `SCHEMA_FILE` is absent and the directory has no other files
     ///   either: this is a fresh index. `schema` (or [`Schema::default`]
-    ///   if omitted) is written to `SCHEMA_FILE` and returned.
+    ///   if omitted) is checked with [`Schema::validate_for_create`],
+    ///   written to `SCHEMA_FILE` and returned.
     /// - `SCHEMA_FILE` is absent but other files already exist (an index
     ///   persisted before this method existed): `schema` must be `Some`
     ///   (an `Err` asking the caller to supply it once is returned
@@ -232,18 +235,7 @@ impl OpfsPersistence {
         let file_names: Vec<String> = serde_wasm_bindgen::from_value(file_names_js)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse file list: {e}")))?;
 
-        let schema = match schema {
-            Some(schema) => schema,
-            None if file_names.is_empty() => Schema::default(),
-            None => {
-                return Err(JsValue::from_str(&format!(
-                    "OPFS index '{}' contains data persisted before schema tracking was added, \
-                     but no schema was provided; pass the original schema once to migrate this \
-                     index (it will be persisted for future opens)",
-                    self.name
-                )));
-            }
-        };
+        let schema = schema_for_unpersisted_index(&self.name, schema, file_names.is_empty())?;
 
         let json = serde_json::to_vec(&schema).map_err(|e| {
             JsValue::from_str(&format!(
@@ -253,5 +245,102 @@ impl OpfsPersistence {
         })?;
         opfs_write_file(&self.dir, SCHEMA_FILE, &json).await?;
         Ok(schema)
+    }
+}
+
+/// Choose the schema to persist for an OPFS index that has no
+/// `SCHEMA_FILE` yet (the last two cases of
+/// [`OpfsPersistence::resolve_schema`]).
+///
+/// # Arguments
+///
+/// * `index_name` - The OPFS index name, for error messages.
+/// * `schema` - The schema the caller passed to `Index.open`, if any.
+/// * `dir_is_empty` - Whether the index directory holds no files, i.e.
+///   whether this creates a fresh index rather than backfilling the schema
+///   of data persisted before schema tracking was added.
+///
+/// # Errors
+///
+/// Returns an error if a fresh index's `schema` fails
+/// [`Schema::validate_for_create`], or if the directory holds data but no
+/// `schema` was given.
+fn schema_for_unpersisted_index(
+    index_name: &str,
+    schema: Option<Schema>,
+    dir_is_empty: bool,
+) -> Result<Schema, JsValue> {
+    match schema {
+        Some(schema) if dir_is_empty => {
+            schema.validate_for_create().map_err(laurus_err)?;
+            Ok(schema)
+        }
+        // A backfill describes data that already exists, so it is trusted
+        // as-is, like a persisted schema on reopen.
+        Some(schema) => Ok(schema),
+        None if dir_is_empty => Ok(Schema::default()),
+        None => Err(JsValue::from_str(&format!(
+            "OPFS index '{index_name}' contains data persisted before schema tracking was \
+             added, but no schema was provided; pass the original schema once to migrate this \
+             index (it will be persisted for future opens)"
+        ))),
+    }
+}
+
+// See the note on `wal.rs`'s tests: this crate's tests run on `wasm32` only.
+#[cfg(test)]
+#[cfg(target_arch = "wasm32")]
+mod tests {
+    use super::schema_for_unpersisted_index;
+    use laurus::Schema;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn schema_with_reserved_analyzer_name() -> Schema {
+        Schema::from_toml(
+            r#"
+            [analyzers.standard]
+            tokenizer = { type = "whitespace" }
+
+            [fields.body.Text]
+            analyzer = "standard"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    fn fresh_index_rejects_reserved_analyzer_name() {
+        let err =
+            schema_for_unpersisted_index("idx", Some(schema_with_reserved_analyzer_name()), true)
+                .unwrap_err();
+        let msg = err.as_string().unwrap();
+        assert!(
+            msg.contains("Analyzer name 'standard' is reserved for a built-in analyzer"),
+            "got: {msg}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn backfill_keeps_reserved_analyzer_name() {
+        let schema =
+            schema_for_unpersisted_index("idx", Some(schema_with_reserved_analyzer_name()), false)
+                .unwrap();
+        assert!(schema.analyzers.contains_key("standard"));
+    }
+
+    #[wasm_bindgen_test]
+    fn fresh_index_without_schema_uses_default() {
+        let schema = schema_for_unpersisted_index("idx", None, true).unwrap();
+        assert!(schema.fields.is_empty() && schema.analyzers.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn backfill_without_schema_is_rejected() {
+        let err = schema_for_unpersisted_index("idx", None, false).unwrap_err();
+        assert!(
+            err.as_string()
+                .unwrap()
+                .contains("persisted before schema tracking")
+        );
     }
 }

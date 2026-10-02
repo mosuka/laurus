@@ -233,6 +233,12 @@ impl WasmIndex {
     /// # Returns
     ///
     /// A new `Index` instance backed by in-memory storage.
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `schema` defines a custom analyzer (via
+    /// `addAnalyzerDefinition` or `fromToml`) under a name reserved for a
+    /// built-in analyzer.
     #[wasm_bindgen]
     pub async fn create(
         schema: Option<WasmSchema>,
@@ -248,6 +254,7 @@ impl WasmIndex {
                 laurus::Schema::default(),
             ),
         };
+        schema.validate_for_create().map_err(laurus_err)?;
 
         // Build embedder BEFORE moving schema into EngineBuilder
         let embedder = if js_embedders.is_empty() {
@@ -1107,5 +1114,63 @@ mod tests {
             .expect_err("unknown tokenizer type must be rejected");
         let message = err.as_string().unwrap();
         assert!(message.contains("tokenizer"), "{message}");
+    }
+
+    // ── Names reserved for built-in analyzers (Issue #1310) ─────────────────
+
+    #[wasm_bindgen_test]
+    fn add_analyzer_definition_rejects_reserved_names() {
+        for name in laurus::analysis::analyzer::registry::RESERVED_ANALYZER_NAMES {
+            let mut schema = WasmSchema::new();
+            let definition = highlight_object(serde_json::json!({
+                "tokenizer": { "type": "whitespace" }
+            }));
+            let err = schema
+                .add_analyzer_definition(name.to_string(), definition)
+                .expect_err("a reserved name must be rejected");
+            let message = err.as_string().unwrap();
+            assert!(
+                message.contains(&format!(
+                    "Analyzer name '{name}' is reserved for a built-in analyzer"
+                )),
+                "{message}"
+            );
+            assert!(schema.analyzer_names().is_empty());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn add_analyzer_definition_accepts_japanese_name() {
+        let mut schema = WasmSchema::new();
+        let definition = highlight_object(serde_json::json!({
+            "tokenizer": { "type": "whitespace" }
+        }));
+        schema
+            .add_analyzer_definition("japanese".to_string(), definition)
+            .expect("'japanese' is not reserved");
+        assert_eq!(schema.analyzer_names(), ["japanese".to_string()]);
+    }
+
+    #[wasm_bindgen_test]
+    async fn create_rejects_reserved_analyzer_name() {
+        let schema = WasmSchema::from_toml(
+            r#"
+            [analyzers.standard]
+            tokenizer = { type = "whitespace" }
+
+            [fields.body.Text]
+            analyzer = "standard"
+            "#
+            .to_string(),
+        )
+        .expect("fromToml accepts the entry; Index.create rejects it");
+        let Err(err) = WasmIndex::create(Some(schema), None, None).await else {
+            panic!("a reserved analyzer name must be rejected");
+        };
+        let message = err.as_string().unwrap();
+        assert!(
+            message.contains("reserved for a built-in analyzer"),
+            "{message}"
+        );
     }
 }
