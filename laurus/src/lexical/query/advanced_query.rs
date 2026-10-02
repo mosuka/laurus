@@ -55,11 +55,12 @@ impl Default for AdvancedQueryConfig {
 
 /// Advanced query with complex composition capabilities.
 ///
-/// It means the equivalent [`BooleanQuery`]: the core query as a `Must`
-/// clause, the filters and post filters as `Filter` clauses and the negative
-/// filters as `MustNot` clauses, scaled by the boost. With no filters and a
-/// boost of 1.0 it is the core query itself. A search runs that query, and so
-/// does [`AdvancedQuery::execute`].
+/// It means the equivalent [`BooleanQuery`]: the core query, with the field
+/// boosts applied, as a `Must` clause, the filters and post filters as
+/// `Filter` clauses and the negative filters as `MustNot` clauses, scaled by
+/// the boost. With no filters and a boost of 1.0 it is the field-boosted core
+/// query itself. A search runs that query, and so does
+/// [`AdvancedQuery::execute`].
 ///
 /// The minimum score and the [`AdvancedQueryConfig`] apply only in
 /// `execute`. A search takes its score threshold from
@@ -108,6 +109,12 @@ impl AdvancedQuery {
     }
 
     /// Set field boost for scoring.
+    ///
+    /// The core query's clauses on `field` are boosted by `boost`, as
+    /// [`Query::apply_field_boosts`] boosts them. It applies once, on every
+    /// search path and in [`AdvancedQuery::execute`]; boosts later passed to
+    /// [`Query::apply_field_boosts`], such as a request's field boosts,
+    /// multiply in on top.
     pub fn add_field_boost(mut self, field: String, boost: f32) -> Self {
         self.field_boosts.insert(field, boost);
         self
@@ -247,15 +254,21 @@ impl AdvancedQuery {
     /// Post filters become `Filter` clauses: they differ from filters only
     /// in being checked after scoring, which changes no hit and no score.
     fn lowered(&self) -> Box<dyn Query> {
+        // Boosting a clone keeps `self` unchanged, so the field boosts apply
+        // once however often this runs.
+        let mut core = self.core_query.clone_box();
+        if !self.field_boosts.is_empty() {
+            core.apply_field_boosts(&self.field_boosts);
+        }
         if self.filters.is_empty()
             && self.negative_filters.is_empty()
             && self.post_filters.is_empty()
             && self.boost == 1.0
         {
-            return self.core_query.clone_box();
+            return core;
         }
         let mut query = BooleanQuery::new().with_boost(self.boost);
-        query.add_must(self.core_query.clone_box());
+        query.add_must(core);
         for filter in self.filters.iter().chain(&self.post_filters) {
             query.add_filter(filter.clone_box());
         }
@@ -364,12 +377,7 @@ impl Query for AdvancedQuery {
     }
 
     fn apply_field_boosts(&mut self, boosts: &HashMap<String, f32>) {
-        // Apply field-level boosts from AdvanceQuery's own field_boosts first
-        if !self.field_boosts.is_empty() {
-            self.core_query.apply_field_boosts(&self.field_boosts);
-        }
-
-        // Then apply external boosts
+        // The query's own field boosts are applied by `lowered`.
         self.core_query.apply_field_boosts(boosts);
 
         for filter in &mut self.filters {
@@ -1363,6 +1371,110 @@ mod tests {
             .map(|result| result.doc_id)
             .collect();
         assert_eq!(ids, BTreeSet::from([2, 6, 8]));
+    }
+
+    /// The hits of `query.execute()` on `store`, as doc id → score.
+    fn execute_scores(store: &LexicalStore, query: &AdvancedQuery) -> BTreeMap<u64, f32> {
+        let reader = store.reader_for_tests().unwrap();
+        query
+            .execute(reader.as_ref())
+            .unwrap()
+            .into_iter()
+            .map(|result| (result.doc_id, result.score))
+            .collect()
+    }
+
+    fn scaled(scores: &BTreeMap<u64, f32>, factor: f32) -> BTreeMap<u64, f32> {
+        scores
+            .iter()
+            .map(|(&doc_id, &score)| (doc_id, score * factor))
+            .collect()
+    }
+
+    /// #1312: an `AdvancedQuery`'s own field boosts scale its scores on
+    /// every search path and in `execute()`, with no request field boosts
+    /// and no `apply_field_boosts` call, with or without filters.
+    #[test]
+    fn own_field_boosts_scale_scores_on_every_path() {
+        let one = store_with_segments(&[&[FRUIT_A, FRUIT_B].concat()]);
+        let two = store_with_segments(&[FRUIT_A, FRUIT_B]);
+        let unfiltered = || AdvancedQuery::new(term("apple"));
+        let filtered = || AdvancedQuery::new(term("apple")).with_filter(term("red"));
+        let cases: Vec<(&str, AdvancedQuery, AdvancedQuery, f32)> = vec![
+            (
+                "unfiltered",
+                unfiltered(),
+                unfiltered().add_field_boost("body".to_string(), 3.0),
+                3.0,
+            ),
+            (
+                "filtered",
+                filtered(),
+                filtered().add_field_boost("body".to_string(), 3.0),
+                3.0,
+            ),
+            (
+                "another field",
+                unfiltered(),
+                unfiltered().add_field_boost("title".to_string(), 3.0),
+                1.0,
+            ),
+        ];
+
+        for (store_label, store) in [("one segment", &one), ("two segments", &two)] {
+            for (case, plain, boosted, factor) in &cases {
+                let label = format!("{store_label}, {case}");
+                assert_scores_eq(
+                    &format!("{label}, execute()"),
+                    &execute_scores(store, boosted),
+                    &scaled(&execute_scores(store, plain), *factor),
+                );
+                for parallel in [false, true] {
+                    let plain_hits = search_scores(store, Box::new(plain.clone()), parallel);
+                    assert!(!plain_hits.is_empty(), "{label}: expected matches");
+                    assert_scores_eq(
+                        &format!("{label}, parallel={parallel}"),
+                        &search_scores(store, Box::new(boosted.clone()), parallel),
+                        &scaled(&plain_hits, *factor),
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1312: the own field boosts apply once however many times
+    /// `apply_field_boosts` runs, and the boosts it passes in (the request
+    /// field boosts, as `Engine::search` applies them) apply on top.
+    #[test]
+    fn own_field_boosts_apply_once_alongside_request_boosts() {
+        let store = store_with_segments(&[FRUIT_A, FRUIT_B]);
+        let boosted = || AdvancedQuery::new(term("apple")).add_field_boost("body".to_string(), 3.0);
+        let plain_hits = search_scores(&store, term("apple"), false);
+        let plain_executed = execute_scores(&store, &AdvancedQuery::new(term("apple")));
+
+        let other_field = HashMap::from([("title".to_string(), 2.0)]);
+        let mut twice = boosted();
+        twice.apply_field_boosts(&other_field);
+        twice.apply_field_boosts(&other_field);
+
+        let mut with_request = boosted();
+        with_request.apply_field_boosts(&HashMap::from([("body".to_string(), 2.0)]));
+
+        for (label, query, factor) in [
+            ("applied twice", twice, 3.0),
+            ("with a request boost", with_request, 6.0),
+        ] {
+            assert_scores_eq(
+                label,
+                &search_scores(&store, Box::new(query.clone()), false),
+                &scaled(&plain_hits, factor),
+            );
+            assert_scores_eq(
+                &format!("{label}, execute()"),
+                &execute_scores(&store, &query),
+                &scaled(&plain_executed, factor),
+            );
+        }
     }
 
     // ----- #1317: MultiFieldQuery per-field boost, tie_breaker, BestFields -----
