@@ -149,6 +149,61 @@ def test_tokenizer_must_be_dict_not_string():
 
 
 # ---------------------------------------------------------------------------
+# Names reserved for built-in analyzers (Issue #1310)
+# ---------------------------------------------------------------------------
+
+RESERVED_NAMES = ["standard", "keyword", "english", "simple", "noop"]
+
+# The entry tokenizes on whitespace without lowercasing, so a lowercase query
+# matches "Hello" only when the built-in `standard` analyzer is used.
+RESERVED_SCHEMA_TOML = """
+[analyzers.standard]
+tokenizer = { type = "whitespace" }
+
+[fields.body.Text]
+analyzer = "standard"
+"""
+
+
+@pytest.mark.parametrize("name", RESERVED_NAMES)
+def test_add_analyzer_rejects_reserved_name(name):
+    schema = laurus.Schema()
+    with pytest.raises(
+        ValueError, match=f"Analyzer name '{name}' is reserved for a built-in analyzer"
+    ):
+        schema.add_analyzer(name, {"type": "whitespace"})
+    assert schema.analyzer_names() == []
+
+
+def test_add_analyzer_accepts_japanese_name():
+    schema = laurus.Schema()
+    schema.add_analyzer("japanese", {"type": "whitespace"})
+    assert schema.analyzer_names() == ["japanese"]
+
+
+def test_in_memory_index_rejects_reserved_analyzer_name():
+    schema = laurus.Schema.from_toml(RESERVED_SCHEMA_TOML)
+    with pytest.raises(ValueError, match="reserved for a built-in analyzer"):
+        laurus.Index(schema=schema)
+
+
+def test_path_index_rejects_reserved_analyzer_name_and_writes_nothing(tmp_path):
+    schema = laurus.Schema.from_toml(RESERVED_SCHEMA_TOML)
+    index_dir = tmp_path / "idx"
+    with pytest.raises(ValueError, match="reserved for a built-in analyzer"):
+        laurus.Index(str(index_dir), schema=schema)
+    assert not index_dir.exists()
+
+
+def test_existing_index_with_reserved_analyzer_name_still_opens(tmp_path):
+    (tmp_path / "schema.toml").write_text(RESERVED_SCHEMA_TOML)
+    idx = laurus.Index(str(tmp_path))
+    idx.put_document("doc1", {"body": "Hello World"})
+    idx.commit()
+    assert len(idx.search("body:hello", limit=5)) == 1
+
+
+# ---------------------------------------------------------------------------
 # from_toml / from_toml_file
 # ---------------------------------------------------------------------------
 
