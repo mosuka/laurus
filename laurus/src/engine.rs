@@ -2348,9 +2348,22 @@ impl Engine {
                 pfa
             };
 
+        // New schemas reject these entries (`Schema::validate_for_create`);
+        // a persisted one may still hold them, and must keep opening.
+        for name in schema
+            .analyzers
+            .keys()
+            .filter(|name| crate::analysis::analyzer::registry::is_reserved_analyzer_name(name))
+        {
+            log::warn!(
+                "schema.analyzers entry '{name}' is never used: the name is reserved for a \
+                 built-in analyzer, which a field naming '{name}' gets instead; rename the entry"
+            );
+        }
+
         // Register per-field analyzers declared in the schema.
-        // Resolution order: parameterized built-in → built-in name → custom
-        // definition in schema.analyzers.
+        // Resolution order: parameterized built-in → runtime registration →
+        // built-in name → custom definition in schema.analyzers.
         for (name, field_option) in &schema.fields {
             if let schema::FieldOption::Text(text_opt) = field_option
                 && let Some(spec) = &text_opt.analyzer

@@ -55,12 +55,53 @@ use crate::engine::schema::analyzer::{
 };
 use crate::error::{LaurusError, Result};
 
+/// Names of the built-in analyzers that [`create_analyzer_by_name`]
+/// resolves before `schema.analyzers` is consulted, so a custom definition
+/// under one of them would never be used.
+///
+/// `"japanese"` is not listed: it is a built-in, but
+/// [`create_analyzer_by_name`] rejects it, so `schema.analyzers["japanese"]`
+/// is reachable.
+pub const RESERVED_ANALYZER_NAMES: [&str; 5] = ["standard", "keyword", "english", "simple", "noop"];
+
+/// Returns `true` if `name` is in [`RESERVED_ANALYZER_NAMES`].
+///
+/// # Arguments
+///
+/// * `name` - The analyzer name to check.
+pub fn is_reserved_analyzer_name(name: &str) -> bool {
+    RESERVED_ANALYZER_NAMES.contains(&name)
+}
+
+/// Validates that a custom analyzer definition does not use a name
+/// reserved for a built-in analyzer.
+///
+/// # Arguments
+///
+/// * `name` - The name of the custom analyzer definition.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::invalid_argument`] if `name` is in
+/// [`RESERVED_ANALYZER_NAMES`].
+pub fn validate_analyzer_name(name: &str) -> Result<()> {
+    if is_reserved_analyzer_name(name) {
+        return Err(LaurusError::invalid_argument(format!(
+            "Analyzer name '{name}' is reserved for a built-in analyzer; choose another name"
+        )));
+    }
+    Ok(())
+}
+
 /// Create an analyzer instance by its well-known name.
 ///
 /// Built-in analyzers that take no parameters are resolved by name.
 /// `"japanese"` is **not** included here because it requires a Lindera
 /// dictionary path; use [`create_analyzer_from_spec`] with
 /// [`BuiltinAnalyzerSpec::Japanese`] instead.
+///
+/// The names this function resolves must match
+/// [`RESERVED_ANALYZER_NAMES`].
 ///
 /// # Arguments
 ///
@@ -391,6 +432,38 @@ mod tests {
     fn test_unknown_returns_error() {
         let result = create_analyzer_by_name("nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reserved_analyzer_names_all_resolve_by_name() {
+        for name in RESERVED_ANALYZER_NAMES {
+            assert!(
+                create_analyzer_by_name(name).is_ok(),
+                "'{name}' is reserved but create_analyzer_by_name does not resolve it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_analyzer_name_rejects_reserved_names() {
+        for name in RESERVED_ANALYZER_NAMES {
+            let msg = validate_analyzer_name(name).unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!(
+                    "Analyzer name '{name}' is reserved for a built-in analyzer"
+                )),
+                "got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_analyzer_name_accepts_non_reserved_names() {
+        // `japanese` is a built-in, but create_analyzer_by_name rejects it,
+        // so schema.analyzers["japanese"] is reachable and must stay allowed.
+        for name in ["japanese", "Standard", "my_custom"] {
+            assert!(validate_analyzer_name(name).is_ok(), "'{name}' rejected");
+        }
     }
 
     #[test]

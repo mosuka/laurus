@@ -18,8 +18,8 @@
 //!   flat layout), that's refused as [`IndexDirError::LegacyFlatLayout`]
 //!   rather than silently starting a fresh, empty index alongside
 //!   orphaned data. Otherwise, the given schema (or [`Schema::default`]
-//!   when omitted) is written to `schema.toml` and a fresh `store/`
-//!   directory is created.
+//!   when omitted) is checked with [`Schema::validate_for_create`],
+//!   written to `schema.toml`, and a fresh `store/` directory is created.
 //!
 //! `laurus-cli`/`laurus-server` are not migrated to use this module (see
 //! Issue #1061) — it exists solely for the four bindings, which had no
@@ -127,6 +127,9 @@ pub fn open_or_create(
             });
         }
         let schema = schema.unwrap_or_default();
+        // Before anything is written, so a rejected schema leaves no
+        // schema.toml behind to block the retry.
+        schema.validate_for_create()?;
         std::fs::create_dir_all(index_dir).map_err(|e| IndexDirError::Io {
             path: index_dir.to_path_buf(),
             source: e,
@@ -237,6 +240,38 @@ mod tests {
 
         let err = open_or_create(dir.path(), Some(Schema::new())).unwrap_err();
         assert!(matches!(err, IndexDirError::SchemaConflict { .. }));
+    }
+
+    const RESERVED_ANALYZER_SCHEMA_TOML: &str = r#"
+        [analyzers.standard]
+        tokenizer = { type = "whitespace" }
+
+        [fields.body.Text]
+        analyzer = "standard"
+    "#;
+
+    #[test]
+    fn test_create_rejects_reserved_analyzer_name_before_writing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index_dir = dir.path().join("idx");
+        let schema = Schema::from_toml(RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
+
+        let err = open_or_create(&index_dir, Some(schema)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Analyzer name 'standard' is reserved for a built-in analyzer"),
+            "got: {err}"
+        );
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
+    #[test]
+    fn test_reopen_with_persisted_reserved_analyzer_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
+
+        let (reopened, _storage) = open_or_create(dir.path(), None).unwrap();
+        assert!(reopened.analyzers.contains_key("standard"));
     }
 
     #[test]
