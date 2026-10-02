@@ -47,6 +47,9 @@ impl IndexServiceTrait for IndexService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("schema is required"))?;
         let schema = schema_convert::from_proto(proto_schema).map_err(Status::invalid_argument)?;
+        // Here rather than in `context::create_index`, whose anyhow error
+        // would be reported as Internal instead of InvalidArgument.
+        schema.validate_for_create().map_err(error::to_status)?;
 
         let mut guard = self.engine.write().await;
         if guard.is_some() {
@@ -212,5 +215,53 @@ impl IndexServiceTrait for IndexService {
                 as i32,
             schema: Some(proto_schema),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laurus::Schema;
+
+    /// Issue #1310: CreateIndex rejects an `[analyzers.*]` entry named after
+    /// a built-in analyzer as InvalidArgument, and writes nothing.
+    #[tokio::test]
+    async fn create_index_rejects_reserved_analyzer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: data_dir.clone(),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        };
+        let schema = Schema::from_toml(
+            r#"
+            [analyzers.standard]
+            tokenizer = { type = "whitespace" }
+
+            [fields.body.Text]
+            analyzer = "standard"
+            "#,
+        )
+        .unwrap();
+
+        let status = service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema_convert::to_proto(&schema)),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("Analyzer name 'standard' is reserved for a built-in analyzer"),
+            "got: {}",
+            status.message()
+        );
+        assert!(!data_dir.exists(), "a rejected create must write nothing");
+        assert!(service.engine.read().await.is_none());
     }
 }
