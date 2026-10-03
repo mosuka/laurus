@@ -142,6 +142,11 @@ impl JsSchema {
     ///   value to cross an element boundary (default 100; `0` numbers the
     ///   elements as if concatenated). Ignored unless `multiValued` is
     ///   `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
@@ -154,8 +159,8 @@ impl JsSchema {
         analyzer: Option<String>,
         multi_valued: Option<bool>,
         position_increment_gap: Option<u32>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Text(TextOption {
                 indexed: indexed.unwrap_or(true),
@@ -167,7 +172,7 @@ impl JsSchema {
                 doc_values: doc_values.unwrap_or(true),
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
-        );
+        )
     }
 
     /// Add an integer (i64) field.
@@ -182,6 +187,11 @@ impl JsSchema {
     ///   (Lucene-style "any match"). Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     pub fn add_integer_field(
         &mut self,
@@ -190,8 +200,8 @@ impl JsSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed: indexed.unwrap_or(true),
@@ -199,7 +209,7 @@ impl JsSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a float (f64) field.
@@ -214,6 +224,11 @@ impl JsSchema {
     ///   (Lucene-style "any match"). Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     pub fn add_float_field(
         &mut self,
@@ -222,8 +237,8 @@ impl JsSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Float(FloatOption {
                 indexed: indexed.unwrap_or(true),
@@ -231,7 +246,7 @@ impl JsSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a boolean field.
@@ -246,6 +261,11 @@ impl JsSchema {
     ///   `true` (Lucene-style "any match"). Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     pub fn add_boolean_field(
         &mut self,
@@ -254,8 +274,8 @@ impl JsSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
@@ -263,7 +283,7 @@ impl JsSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a date/time field.
@@ -278,6 +298,11 @@ impl JsSchema {
     ///   predicate (Lucene-style "any match"). Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     pub fn add_datetime_field(
         &mut self,
@@ -286,8 +311,8 @@ impl JsSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
@@ -295,7 +320,7 @@ impl JsSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
@@ -311,6 +336,11 @@ impl JsSchema {
     ///   scoring the document by its closest point. Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     pub fn add_geo_field(
         &mut self,
@@ -319,8 +349,8 @@ impl JsSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
@@ -328,7 +358,7 @@ impl JsSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -349,6 +379,11 @@ impl JsSchema {
     ///   document by its closest point. Default `false`.
     /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi(js_name = "addGeo3dField")]
     pub fn add_geo3d_field(
         &mut self,
@@ -357,8 +392,8 @@ impl JsSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
@@ -366,7 +401,7 @@ impl JsSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a binary data field.
@@ -377,20 +412,25 @@ impl JsSchema {
     /// * `stored` - Whether the value is retrievable (default `true`).
     /// * `multiValued` - When `true`, the field accepts arrays of binary
     ///   values (each with its own optional MIME type). Default `false`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[napi]
     pub fn add_bytes_field(
         &mut self,
         name: String,
         stored: Option<bool>,
         multi_valued: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<()> {
+        self.insert_field(
             name,
             FieldOption::Bytes(BytesOption {
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
             }),
-        );
+        )
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.
@@ -426,6 +466,13 @@ impl JsSchema {
     ///   1.0. Only matters when a query targets two or more specific
     ///   vector fields at once; has no effect on the lexical-vs-vector
     ///   balance of a hybrid search.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields; if `distance`, `quantizer` or
+    /// `rerankStorage` is not a known name; or if `subvectorCount` is
+    /// missing for "product_quantization" or given for another quantizer.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
@@ -455,8 +502,7 @@ impl JsSchema {
             pq_codebook_path,
             base_weight: base_weight.unwrap_or(1.0) as f32,
         };
-        self.inner.fields.insert(name, FieldOption::Hnsw(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Hnsw(opt))
     }
 
     /// Add a flat (brute-force) vector index field.
@@ -470,6 +516,11 @@ impl JsSchema {
     /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `addHnswField` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields, or if `distance` is not a known metric.
     #[napi]
     pub fn add_flat_field(
         &mut self,
@@ -486,8 +537,7 @@ impl JsSchema {
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
         };
-        self.inner.fields.insert(name, FieldOption::Flat(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Flat(opt))
     }
 
     /// Add an IVF (Inverted File Index) approximate nearest-neighbor vector field.
@@ -503,6 +553,11 @@ impl JsSchema {
     /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `addHnswField` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields, or if `distance` is not a known metric.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -524,8 +579,7 @@ impl JsSchema {
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
         };
-        self.inner.fields.insert(name, FieldOption::Ivf(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Ivf(opt))
     }
 
     /// Register a named embedder definition in the schema.
@@ -776,5 +830,14 @@ impl JsSchema {
             "Schema(fields={:?})",
             self.inner.fields.keys().collect::<Vec<_>>()
         )
+    }
+}
+
+impl JsSchema {
+    /// Validate `name` against the reserved-name rule, then add the field.
+    fn insert_field(&mut self, name: String, option: FieldOption) -> Result<()> {
+        laurus::validate_field_name(&name).map_err(laurus_err)?;
+        self.inner.fields.insert(name, option);
+        Ok(())
     }
 }

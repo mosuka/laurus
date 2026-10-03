@@ -203,6 +203,29 @@ stored = true
 `;
 
 describe("field names reserved for the engine", () => {
+  it.each([
+    ["addTextField", (s, n) => s.addTextField(n)],
+    ["addIntegerField", (s, n) => s.addIntegerField(n)],
+    ["addFloatField", (s, n) => s.addFloatField(n)],
+    ["addBooleanField", (s, n) => s.addBooleanField(n)],
+    ["addDatetimeField", (s, n) => s.addDatetimeField(n)],
+    ["addGeoField", (s, n) => s.addGeoField(n)],
+    ["addGeo3dField", (s, n) => s.addGeo3dField(n)],
+    ["addBytesField", (s, n) => s.addBytesField(n)],
+    ["addHnswField", (s, n) => s.addHnswField(n, 4)],
+    ["addFlatField", (s, n) => s.addFlatField(n, 4)],
+    ["addIvfField", (s, n) => s.addIvfField(n, 4)],
+  ])("%s rejects a reserved name and adds nothing", (_method, addField) => {
+    const schema = new Schema();
+    expect(() => addField(schema, "_secret")).toThrow(
+      expect.objectContaining({
+        code: "InvalidArg",
+        message: expect.stringContaining("Field name '_secret' is reserved"),
+      }),
+    );
+    expect(schema.fieldNames()).toEqual([]);
+  });
+
   it("rejects an in-memory index", async () => {
     const schema = Schema.fromToml(RESERVED_FIELD_SCHEMA_TOML);
     await expect(Index.create(null, schema)).rejects.toThrow(
