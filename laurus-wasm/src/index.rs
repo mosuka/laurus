@@ -1173,4 +1173,23 @@ mod tests {
             "{message}"
         );
     }
+
+    #[wasm_bindgen_test]
+    async fn create_rejects_reserved_field_name() {
+        let schema = WasmSchema::from_toml(
+            r#"
+            [fields._secret.Text]
+            "#
+            .to_string(),
+        )
+        .expect("fromToml accepts the field; Index.create rejects it");
+        let Err(err) = WasmIndex::create(Some(schema), None, None).await else {
+            panic!("a reserved field name must be rejected");
+        };
+        let message = err.as_string().unwrap();
+        assert!(
+            message.contains("Field name '_secret' is reserved"),
+            "{message}"
+        );
+    }
 }

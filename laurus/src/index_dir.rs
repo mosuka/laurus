@@ -274,6 +274,33 @@ mod tests {
         assert!(reopened.analyzers.contains_key("standard"));
     }
 
+    const RESERVED_FIELD_SCHEMA_TOML: &str = r#"
+        [fields._secret.Text]
+    "#;
+
+    #[test]
+    fn test_create_rejects_reserved_field_name_before_writing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index_dir = dir.path().join("idx");
+        let schema = Schema::from_toml(RESERVED_FIELD_SCHEMA_TOML).unwrap();
+
+        let err = open_or_create(&index_dir, Some(schema)).unwrap_err();
+        assert!(
+            err.to_string().contains("Field name '_secret' is reserved"),
+            "got: {err}"
+        );
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
+    #[test]
+    fn test_reopen_with_persisted_reserved_field_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_FIELD_SCHEMA_TOML).unwrap();
+
+        let (reopened, _storage) = open_or_create(dir.path(), None).unwrap();
+        assert!(reopened.fields.contains_key("_secret"));
+    }
+
     #[test]
     fn test_legacy_flat_layout_is_rejected() {
         let dir = tempfile::TempDir::new().unwrap();

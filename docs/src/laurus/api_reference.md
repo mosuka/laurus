@@ -70,6 +70,8 @@ Defines document structure.
 | `.dynamic_field_policy(DynamicFieldPolicy)` | Set the policy for undeclared fields (`Strict` / `Dynamic` / `Ignore`) |
 | `.build()` | Build the `Schema` |
 
+A field name starting with `_` (other than `_id`) is accepted by every `add_*_field` method above; it is rejected only when the schema is checked by `Schema::validate_for_create` — `.build()`/`.try_build()` here, or index creation for a schema built another way (e.g. `Schema::from_toml`). See [Field Naming](../laurus-cli/schema_format.md#field-naming).
+
 ## Document
 
 A collection of named field values.

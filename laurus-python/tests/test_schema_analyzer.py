@@ -204,6 +204,45 @@ def test_existing_index_with_reserved_analyzer_name_still_opens(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Field names reserved for the engine (Issue #1329)
+# ---------------------------------------------------------------------------
+
+RESERVED_FIELD_SCHEMA_TOML = """
+default_fields = ["body"]
+
+[fields.body.Text]
+indexed = true
+stored = true
+
+[fields._secret.Text]
+indexed = true
+stored = true
+"""
+
+
+def test_in_memory_index_rejects_reserved_field_name():
+    schema = laurus.Schema.from_toml(RESERVED_FIELD_SCHEMA_TOML)
+    with pytest.raises(ValueError, match="Field name '_secret' is reserved"):
+        laurus.Index(schema=schema)
+
+
+def test_path_index_rejects_reserved_field_name_and_writes_nothing(tmp_path):
+    schema = laurus.Schema.from_toml(RESERVED_FIELD_SCHEMA_TOML)
+    index_dir = tmp_path / "idx"
+    with pytest.raises(ValueError, match="Field name '_secret' is reserved"):
+        laurus.Index(str(index_dir), schema=schema)
+    assert not index_dir.exists()
+
+
+def test_existing_index_with_reserved_field_name_still_opens(tmp_path):
+    (tmp_path / "schema.toml").write_text(RESERVED_FIELD_SCHEMA_TOML)
+    idx = laurus.Index(str(tmp_path))
+    idx.put_document("doc1", {"body": "Hello World"})
+    idx.commit()
+    assert len(idx.search("body:hello", limit=5)) == 1
+
+
+# ---------------------------------------------------------------------------
 # from_toml / from_toml_file
 # ---------------------------------------------------------------------------
 

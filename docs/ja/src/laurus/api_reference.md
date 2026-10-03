@@ -70,6 +70,8 @@ cargo doc --open
 | `.dynamic_field_policy(DynamicFieldPolicy)` | 未宣言フィールドのポリシー（`Strict` / `Dynamic` / `Ignore`）を設定 |
 | `.build()` | `Schema` を構築 |
 
+上記のどの `add_*_field` メソッドも `_`（`_id` を除く）で始まるフィールド名をそのまま受け付けるが、実際に拒否されるのは `Schema::validate_for_create` による検査の時点のみ — ここでは `.build()` / `.try_build()`、`Schema::from_toml` など別経路で作った `Schema` の場合はインデックス作成時。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
+
 ## Document
 
 名前付きフィールド値のコレクションです。

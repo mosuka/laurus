@@ -2369,6 +2369,20 @@ impl Engine {
             );
         }
 
+        // Same tolerance for a persisted reserved field name (`validate_for_create`
+        // rejects it on create, but a schema persisted before that check may hold one).
+        for name in schema
+            .fields
+            .keys()
+            .filter(|name| name.starts_with('_') && !schema::is_allowed_reserved_field(name))
+        {
+            log::warn!(
+                "schema.fields entry '{name}' cannot receive values: names starting with '_' \
+                 are reserved for system fields, so every document setting it is rejected; \
+                 rename the field"
+            );
+        }
+
         // Register per-field analyzers declared in the schema.
         // Resolution order: parameterized built-in → runtime registration →
         // built-in name → custom definition in schema.analyzers.

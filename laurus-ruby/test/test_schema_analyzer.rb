@@ -191,6 +191,48 @@ class TestSchemaAnalyzer < Minitest::Test
   end
 
   # ---------------------------------------------------------------------
+  # Field names reserved for the engine (Issue #1329)
+  # ---------------------------------------------------------------------
+
+  RESERVED_FIELD_SCHEMA_TOML = <<~TOML
+    default_fields = ["body"]
+
+    [fields.body.Text]
+    indexed = true
+    stored = true
+
+    [fields._secret.Text]
+    indexed = true
+    stored = true
+  TOML
+
+  def test_in_memory_index_rejects_reserved_field_name
+    schema = Laurus::Schema.from_toml(RESERVED_FIELD_SCHEMA_TOML)
+    err = assert_raises(ArgumentError) { Laurus::Index.new(schema: schema) }
+    assert_match(/Field name '_secret' is reserved/, err.message)
+  end
+
+  def test_path_index_rejects_reserved_field_name_and_writes_nothing
+    Dir.mktmpdir do |dir|
+      index_dir = File.join(dir, "idx")
+      schema = Laurus::Schema.from_toml(RESERVED_FIELD_SCHEMA_TOML)
+      err = assert_raises(ArgumentError) { Laurus::Index.new(path: index_dir, schema: schema) }
+      assert_match(/Field name '_secret' is reserved/, err.message)
+      refute File.exist?(index_dir), "a rejected create must write nothing"
+    end
+  end
+
+  def test_existing_index_with_reserved_field_name_still_opens
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "schema.toml"), RESERVED_FIELD_SCHEMA_TOML)
+      idx = Laurus::Index.new(path: dir)
+      idx.put_document("doc1", { "body" => "Hello World" })
+      idx.commit
+      assert_equal 1, idx.search("body:hello", limit: 5).length
+    end
+  end
+
+  # ---------------------------------------------------------------------
   # from_toml / from_toml_file
   # ---------------------------------------------------------------------
 

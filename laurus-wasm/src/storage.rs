@@ -328,6 +328,35 @@ mod tests {
         assert!(schema.analyzers.contains_key("standard"));
     }
 
+    fn schema_with_reserved_field_name() -> Schema {
+        Schema::from_toml(
+            r#"
+            [fields._secret.Text]
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    fn fresh_index_rejects_reserved_field_name() {
+        let err =
+            schema_for_unpersisted_index("idx", Some(schema_with_reserved_field_name()), true)
+                .unwrap_err();
+        let msg = err.as_string().unwrap();
+        assert!(
+            msg.contains("Field name '_secret' is reserved"),
+            "got: {msg}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn backfill_keeps_reserved_field_name() {
+        let schema =
+            schema_for_unpersisted_index("idx", Some(schema_with_reserved_field_name()), false)
+                .unwrap();
+        assert!(schema.fields.contains_key("_secret"));
+    }
+
     #[wasm_bindgen_test]
     fn fresh_index_without_schema_uses_default() {
         let schema = schema_for_unpersisted_index("idx", None, true).unwrap();
