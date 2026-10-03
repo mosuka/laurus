@@ -455,4 +455,69 @@ mod tests {
         let engine = open_index(dir.path()).await.unwrap();
         assert!(engine.schema().analyzers.contains_key("standard"));
     }
+
+    /// Issue #1329: a schema with a `_`-prefixed field other than `_id`.
+    const RESERVED_FIELD_SCHEMA_TOML: &str = r#"
+        [fields._secret.Text]
+    "#;
+
+    fn assert_reserved_field_error(err: &anyhow::Error) {
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Field name '_secret' is reserved"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_rejects_reserved_field_name_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("schema_in.toml");
+        std::fs::write(&schema_path, RESERVED_FIELD_SCHEMA_TOML).unwrap();
+        let index_dir = dir.path().join("idx");
+
+        let err = create_index(&index_dir, &schema_path).await.unwrap_err();
+        assert_reserved_field_error(&err);
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
+    #[tokio::test]
+    async fn create_index_from_schema_rejects_reserved_field_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("idx");
+        let schema = Schema::from_toml(RESERVED_FIELD_SCHEMA_TOML).unwrap();
+
+        let err = create_index_from_schema(&index_dir, schema)
+            .await
+            .unwrap_err();
+        assert_reserved_field_error(&err);
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
+    /// The recovery branch reuses a persisted schema.toml, which predates
+    /// the check and must not be rejected.
+    #[tokio::test]
+    async fn create_index_recovery_keeps_persisted_reserved_field_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_FIELD_SCHEMA_TOML).unwrap();
+
+        create_index_from_schema(dir.path(), Schema::new())
+            .await
+            .unwrap();
+        assert!(
+            read_schema(dir.path())
+                .unwrap()
+                .fields
+                .contains_key("_secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_index_with_persisted_reserved_field_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_FIELD_SCHEMA_TOML).unwrap();
+
+        let engine = open_index(dir.path()).await.unwrap();
+        assert!(engine.schema().fields.contains_key("_secret"));
+    }
 }
