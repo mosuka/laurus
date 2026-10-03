@@ -822,7 +822,7 @@ impl PhpSchema {
     /// Throws a PHP `Exception` if `policy` is not one of the accepted names.
     pub fn set_dynamic_field_policy(&self, policy: String) -> PhpResult<()> {
         let parsed = DynamicFieldPolicy::from_str(&policy)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         self.inner.borrow_mut().dynamic_field_policy = parsed;
         Ok(())
     }

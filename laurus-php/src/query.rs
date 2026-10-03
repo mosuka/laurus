@@ -54,7 +54,7 @@ pub fn extract_lexical_query(zv: &Zval) -> PhpResult<Box<dyn laurus::lexical::Qu
     if let Some(obj) = <&ZendClassObject<PhpWildcardQuery>>::from_zval(zv) {
         let q: &PhpWildcardQuery = obj;
         return Ok(Box::new(WildcardQuery::new(&q.field, &q.pattern).map_err(
-            |e| ext_php_rs::exception::PhpException::default(e.to_string()),
+            |e| ext_php_rs::exception::PhpException::from_message(e.to_string()),
         )?));
     }
     if let Some(obj) = <&ZendClassObject<PhpNumericRangeQuery>>::from_zval(zv) {
@@ -65,19 +65,19 @@ pub fn extract_lexical_query(zv: &Zval) -> PhpResult<Box<dyn laurus::lexical::Qu
         let q: &PhpDateTimeRangeQuery = obj;
         return q
             .build()
-            .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()));
+            .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()));
     }
     if let Some(obj) = <&ZendClassObject<PhpGeoDistanceQuery>>::from_zval(zv) {
         let q: &PhpGeoDistanceQuery = obj;
         return q
             .build()
-            .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()));
+            .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()));
     }
     if let Some(obj) = <&ZendClassObject<PhpGeoBoundingBoxQuery>>::from_zval(zv) {
         let q: &PhpGeoBoundingBoxQuery = obj;
         return q
             .build()
-            .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()));
+            .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()));
     }
     if let Some(obj) = <&ZendClassObject<PhpGeo3dDistanceQuery>>::from_zval(zv) {
         let q: &PhpGeo3dDistanceQuery = obj;
@@ -87,7 +87,7 @@ pub fn extract_lexical_query(zv: &Zval) -> PhpResult<Box<dyn laurus::lexical::Qu
         let q: &PhpGeo3dBoundingBoxQuery = obj;
         return q
             .build()
-            .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()));
+            .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()));
     }
     if let Some(obj) = <&ZendClassObject<PhpGeo3dNearestQuery>>::from_zval(zv) {
         let q: &PhpGeo3dNearestQuery = obj;
