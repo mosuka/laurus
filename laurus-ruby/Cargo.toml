@@ -23,7 +23,7 @@ embeddings-all = [
 
 [dependencies]
 laurus = { workspace = true, features = ["native"] }
-magnus = { version = "0.8.2", features = ["rb-sys"] }
+magnus = { version = "0.9.1", features = ["rb-sys"] }
 rb-sys = "0.9"
 tokio = { workspace = true }
 chrono = { workspace = true }
