@@ -214,7 +214,7 @@ let engine = Engine::builder(storage, schema)
 
 文字列単独の `"japanese"` は辞書パスを伴わないためエラーとなります。既存スキーマで `"analyzer": "japanese"` を保存していた場合は、上記の構造化形式に移行してください。
 
-プリセットに収まらないパイプラインを使いたい場合は、`schema.analyzers` に `AnalyzerDefinition` として登録し、フィールドからは名前で参照します。
+プリセットに収まらないパイプラインを使いたい場合は、`schema.analyzers` に `AnalyzerDefinition` として登録し、フィールドからは名前で参照します。パラメータ不要の組込 analyzer の名前は予約されているため、パイプラインには別の名前を付けてください（[アナライザの参照](../laurus-cli/schema_format.md#アナライザの参照) を参照）。
 
 ## Char Filter
 

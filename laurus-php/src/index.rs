@@ -321,8 +321,10 @@ impl PhpIndex {
     /// # Exceptions
     ///
     /// Throws a `ValueError` if `path` points at an existing index and
-    /// `schema` was also given, or if `path` contains an index in the
-    /// pre-existing (pre-Issue-1059) flat layout.
+    /// `schema` was also given, if `path` contains an index in the
+    /// pre-existing (pre-Issue-1059) flat layout, or if a new index's
+    /// `schema` defines a custom analyzer under a name reserved for a
+    /// built-in analyzer (nothing is written then).
     pub fn __construct(
         path: Option<String>,
         schema: Option<&PhpSchema>,
@@ -793,9 +795,11 @@ fn resolve_storage_and_schema(
 ) -> PhpResult<(laurus::Schema, Arc<dyn Storage>)> {
     match path {
         None => {
+            let schema = schema.unwrap_or_default();
+            schema.validate_for_create().map_err(laurus_err)?;
             let storage = StorageFactory::create(StorageConfig::Memory(Default::default()))
                 .map_err(laurus_err)?;
-            Ok((schema.unwrap_or_default(), storage))
+            Ok((schema, storage))
         }
         Some(p) => laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err),
     }

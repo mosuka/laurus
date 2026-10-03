@@ -132,6 +132,65 @@ class TestSchemaAnalyzer < Minitest::Test
   end
 
   # ---------------------------------------------------------------------
+  # Names reserved for built-in analyzers (Issue #1310)
+  # ---------------------------------------------------------------------
+
+  RESERVED_NAMES = %w[standard keyword english simple noop].freeze
+
+  # The entry tokenizes on whitespace without lowercasing, so a lowercase
+  # query matches "Hello" only when the built-in `standard` analyzer is used.
+  RESERVED_SCHEMA_TOML = <<~TOML
+    [analyzers.standard]
+    tokenizer = { type = "whitespace" }
+
+    [fields.body.Text]
+    analyzer = "standard"
+  TOML
+
+  def test_add_analyzer_rejects_reserved_names
+    RESERVED_NAMES.each do |name|
+      schema = Laurus::Schema.new
+      err = assert_raises(ArgumentError) do
+        schema.add_analyzer(name, { type: "whitespace" })
+      end
+      assert_includes err.message, "Analyzer name '#{name}' is reserved for a built-in analyzer"
+      assert_equal [], schema.analyzer_names
+    end
+  end
+
+  def test_add_analyzer_accepts_japanese_name
+    schema = Laurus::Schema.new
+    schema.add_analyzer("japanese", { type: "whitespace" })
+    assert_equal ["japanese"], schema.analyzer_names
+  end
+
+  def test_in_memory_index_rejects_reserved_analyzer_name
+    schema = Laurus::Schema.from_toml(RESERVED_SCHEMA_TOML)
+    err = assert_raises(ArgumentError) { Laurus::Index.new(schema: schema) }
+    assert_match(/reserved for a built-in analyzer/, err.message)
+  end
+
+  def test_path_index_rejects_reserved_analyzer_name_and_writes_nothing
+    Dir.mktmpdir do |dir|
+      index_dir = File.join(dir, "idx")
+      schema = Laurus::Schema.from_toml(RESERVED_SCHEMA_TOML)
+      err = assert_raises(ArgumentError) { Laurus::Index.new(path: index_dir, schema: schema) }
+      assert_match(/reserved for a built-in analyzer/, err.message)
+      refute File.exist?(index_dir), "a rejected create must write nothing"
+    end
+  end
+
+  def test_existing_index_with_reserved_analyzer_name_still_opens
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "schema.toml"), RESERVED_SCHEMA_TOML)
+      idx = Laurus::Index.new(path: dir)
+      idx.put_document("doc1", { "body" => "Hello World" })
+      idx.commit
+      assert_equal 1, idx.search("body:hello", limit: 5).length
+    end
+  end
+
+  # ---------------------------------------------------------------------
   # from_toml / from_toml_file
   # ---------------------------------------------------------------------
 

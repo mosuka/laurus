@@ -189,9 +189,33 @@ impl Default for Schema {
 }
 
 impl Schema {
+    /// Check a schema that is about to create a new index.
+    ///
+    /// Call this before the schema is persisted for a new index. A schema
+    /// persisted earlier is not re-checked when its index is reopened, so
+    /// a rule added here never stops an existing index from opening.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::LaurusError::invalid_argument`] if an entry
+    /// in [`Self::analyzers`] uses a name reserved for a built-in analyzer
+    /// (see [`validate_analyzer_name`]). Such an entry would never be
+    /// used, because the built-in is resolved first.
+    ///
+    /// [`validate_analyzer_name`]: crate::analysis::analyzer::registry::validate_analyzer_name
+    pub fn validate_for_create(&self) -> crate::error::Result<()> {
+        for name in self.analyzers.keys() {
+            crate::analysis::analyzer::registry::validate_analyzer_name(name)?;
+        }
+        Ok(())
+    }
+
     /// Parse a schema from a TOML string, in the same format
     /// `laurus-cli create index --schema` accepts (and what
     /// [`Schema::to_toml`] produces).
+    ///
+    /// This also reads schemas persisted by existing indexes, so it does
+    /// not run [`Self::validate_for_create`].
     ///
     /// # Errors
     ///
@@ -853,35 +877,39 @@ impl SchemaBuilder {
         self
     }
 
-    /// Build the schema, validating reserved field names.
+    /// Build the schema, validating reserved field and analyzer names.
     ///
     /// # Errors
     ///
     /// Returns an error if any field name starts with `_` and is not in the
-    /// reserved allow-list (see [`validate_field_name`]).
+    /// reserved allow-list (see [`validate_field_name`]), or if a custom
+    /// analyzer uses a name reserved for a built-in analyzer (see
+    /// [`Schema::validate_for_create`]).
     pub fn try_build(self) -> crate::error::Result<Schema> {
         for name in self.fields.keys() {
             validate_field_name(name)?;
         }
-        Ok(Schema {
+        let schema = Schema {
             analyzers: self.analyzers,
             embedders: self.embedders,
             fields: self.fields,
             default_fields: self.default_fields,
             dynamic_field_policy: self.dynamic_field_policy,
             pending_reindex: BTreeSet::new(),
-        })
+        };
+        schema.validate_for_create()?;
+        Ok(schema)
     }
 
     /// Build the schema.
     ///
     /// # Panics
     ///
-    /// Panics if any field name collides with a reserved name. Use
-    /// [`try_build`](Self::try_build) for a fallible variant.
+    /// Panics if a field or custom analyzer name collides with a reserved
+    /// name. Use [`try_build`](Self::try_build) for a fallible variant.
     pub fn build(self) -> Schema {
         self.try_build()
-            .expect("SchemaBuilder::build: field name validation failed")
+            .expect("SchemaBuilder::build: schema validation failed")
     }
 }
 
@@ -946,6 +974,69 @@ mod tests {
             .add_field("title", FieldOption::Text(TextOption::default()))
             .try_build();
         assert!(result.is_ok());
+    }
+
+    fn whitespace_analyzer() -> AnalyzerDefinition {
+        AnalyzerDefinition {
+            char_filters: vec![],
+            tokenizer: self::analyzer::TokenizerConfig::Whitespace,
+            token_filters: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_for_create_rejects_reserved_analyzer_name() {
+        let mut schema = Schema::new();
+        schema
+            .analyzers
+            .insert("standard".to_string(), whitespace_analyzer());
+        let msg = schema.validate_for_create().unwrap_err().to_string();
+        assert!(
+            msg.contains("Analyzer name 'standard' is reserved for a built-in analyzer"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_for_create_accepts_japanese_and_custom_names() {
+        let mut schema = Schema::new();
+        schema
+            .analyzers
+            .insert("japanese".to_string(), whitespace_analyzer());
+        schema
+            .analyzers
+            .insert("my_custom".to_string(), whitespace_analyzer());
+        assert!(schema.validate_for_create().is_ok());
+    }
+
+    #[test]
+    fn schema_builder_try_build_rejects_reserved_analyzer_name() {
+        let result = Schema::builder()
+            .add_analyzer("keyword", whitespace_analyzer())
+            .try_build();
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Analyzer name 'keyword' is reserved"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_reserved_analyzer_name() {
+        // Persisted schemas are read with from_toml, so it must keep
+        // accepting an entry that validate_for_create rejects.
+        let schema = Schema::from_toml(
+            r#"
+            [analyzers.standard]
+            tokenizer = { type = "whitespace" }
+
+            [fields.body.Text]
+            analyzer = "standard"
+            "#,
+        )
+        .unwrap();
+        assert!(schema.analyzers.contains_key("standard"));
+        assert!(schema.validate_for_create().is_err());
     }
 
     #[test]

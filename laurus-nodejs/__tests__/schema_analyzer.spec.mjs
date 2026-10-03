@@ -120,6 +120,73 @@ describe("Schema#addAnalyzer errors", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Names reserved for built-in analyzers (Issue #1310)
+// ---------------------------------------------------------------------------
+
+// The entry tokenizes on whitespace without lowercasing, so a lowercase query
+// matches "Hello" only when the built-in `standard` analyzer is used.
+const RESERVED_SCHEMA_TOML = `
+[analyzers.standard]
+tokenizer = { type = "whitespace" }
+
+[fields.body.Text]
+analyzer = "standard"
+`;
+
+describe("names reserved for built-in analyzers", () => {
+  it.each(["standard", "keyword", "english", "simple", "noop"])(
+    "addAnalyzer rejects %s",
+    (name) => {
+      const schema = new Schema();
+      expect(() => schema.addAnalyzer(name, { type: "whitespace" })).toThrow(
+        `Analyzer name '${name}' is reserved for a built-in analyzer`,
+      );
+      expect(schema.analyzerNames()).toEqual([]);
+    },
+  );
+
+  it("addAnalyzer accepts japanese", () => {
+    const schema = new Schema();
+    schema.addAnalyzer("japanese", { type: "whitespace" });
+    expect(schema.analyzerNames()).toEqual(["japanese"]);
+  });
+
+  it("rejects an in-memory index", async () => {
+    const schema = Schema.fromToml(RESERVED_SCHEMA_TOML);
+    await expect(Index.create(null, schema)).rejects.toThrow(
+      /reserved for a built-in analyzer/,
+    );
+  });
+
+  it("rejects a file-backed index and writes nothing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "laurus-reserved-"));
+    try {
+      const indexDir = path.join(dir, "idx");
+      const schema = Schema.fromToml(RESERVED_SCHEMA_TOML);
+      await expect(Index.create(indexDir, schema)).rejects.toThrow(
+        /reserved for a built-in analyzer/,
+      );
+      expect(fs.existsSync(indexDir)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still opens an existing index that holds such an entry", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "laurus-reserved-"));
+    try {
+      fs.writeFileSync(path.join(dir, "schema.toml"), RESERVED_SCHEMA_TOML);
+      const index = await Index.create(dir);
+      await index.putDocument("doc1", { body: "Hello World" });
+      await index.commit();
+      expect((await index.search("body:hello", 5)).length).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // fromToml / fromTomlFile
 // ---------------------------------------------------------------------------
 

@@ -741,7 +741,9 @@ impl PySchema {
     ///         stream after tokenization (default: none).
     ///
     /// Raises:
-    ///     ValueError: if any component has an unknown ``type`` or is
+    ///     ValueError: if ``name`` is reserved for a built-in analyzer
+    ///         (``standard``, ``keyword``, ``english``, ``simple``,
+    ///         ``noop``), or if any component has an unknown ``type`` or is
     ///         missing a required key.
     ///
     /// Note:
@@ -771,6 +773,8 @@ impl PySchema {
         char_filters: Option<&Bound<PyAny>>,
         token_filters: Option<&Bound<PyAny>>,
     ) -> PyResult<()> {
+        laurus::analysis::analyzer::registry::validate_analyzer_name(name)
+            .map_err(crate::errors::laurus_err)?;
         let definition = AnalyzerDefinition {
             char_filters: filter_list_from_py(char_filters, "char_filters", char_filter_from_py)?,
             tokenizer: tokenizer_from_py(tokenizer)?,

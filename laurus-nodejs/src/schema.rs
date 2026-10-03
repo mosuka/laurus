@@ -615,8 +615,9 @@ impl JsSchema {
     ///
     /// # Errors
     ///
-    /// Throws if `tokenizer` or any filter does not match a known
-    /// component shape.
+    /// Throws if `name` is reserved for a built-in analyzer (`standard`,
+    /// `keyword`, `english`, `simple`, `noop`), or if `tokenizer` or any
+    /// filter does not match a known component shape.
     #[napi]
     pub fn add_analyzer(
         &mut self,
@@ -625,6 +626,7 @@ impl JsSchema {
         char_filters: Option<Vec<serde_json::Value>>,
         token_filters: Option<Vec<serde_json::Value>>,
     ) -> Result<()> {
+        laurus::analysis::analyzer::registry::validate_analyzer_name(&name).map_err(laurus_err)?;
         let tokenizer: TokenizerConfig = serde_json::from_value(tokenizer)
             .map_err(|e| napi::Error::from_reason(format!("invalid tokenizer: {e}")))?;
         let char_filters = char_filters

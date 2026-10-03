@@ -51,6 +51,7 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+tempfile = { workspace = true }
 # `net` feature provides `TcpListenerStream`, used by the client-server
 # bench to serve the gRPC service on an ephemeral port (#727).
 tokio-stream = { workspace = true, features = ["net"] }

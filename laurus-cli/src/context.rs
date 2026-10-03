@@ -132,6 +132,9 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
             std::fs::read_to_string(&schema_path).context("Failed to read existing schema file")?;
         Schema::from_toml(&content).context("Failed to parse existing schema TOML")?
     } else {
+        // Before anything is written, so a rejected schema leaves no
+        // schema.toml behind to block the retry.
+        schema.validate_for_create()?;
         // Create the index directory and write the schema.
         std::fs::create_dir_all(index_dir).context("Failed to create index directory")?;
         let schema_toml = schema
@@ -381,5 +384,75 @@ mod tests {
             }
             other => panic!("expected FieldOption::Text, got {other:?}"),
         }
+    }
+
+    /// Issue #1310: a schema with an `[analyzers.*]` entry named after a
+    /// built-in analyzer.
+    const RESERVED_ANALYZER_SCHEMA_TOML: &str = r#"
+        [analyzers.standard]
+        tokenizer = { type = "whitespace" }
+
+        [fields.body.Text]
+        analyzer = "standard"
+    "#;
+
+    fn assert_reserved_analyzer_error(err: &anyhow::Error) {
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Analyzer name 'standard' is reserved for a built-in analyzer"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_rejects_reserved_analyzer_name_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("schema_in.toml");
+        std::fs::write(&schema_path, RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
+        let index_dir = dir.path().join("idx");
+
+        let err = create_index(&index_dir, &schema_path).await.unwrap_err();
+        assert_reserved_analyzer_error(&err);
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
+    #[tokio::test]
+    async fn create_index_from_schema_rejects_reserved_analyzer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("idx");
+        let schema = Schema::from_toml(RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
+
+        let err = create_index_from_schema(&index_dir, schema)
+            .await
+            .unwrap_err();
+        assert_reserved_analyzer_error(&err);
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
+    /// The recovery branch reuses a persisted schema.toml, which predates
+    /// the check and must not be rejected.
+    #[tokio::test]
+    async fn create_index_recovery_keeps_persisted_reserved_analyzer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
+
+        create_index_from_schema(dir.path(), Schema::new())
+            .await
+            .unwrap();
+        assert!(
+            read_schema(dir.path())
+                .unwrap()
+                .analyzers
+                .contains_key("standard")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_index_with_persisted_reserved_analyzer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
+
+        let engine = open_index(dir.path()).await.unwrap();
+        assert!(engine.schema().analyzers.contains_key("standard"));
     }
 }

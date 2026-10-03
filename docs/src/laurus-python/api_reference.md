@@ -226,7 +226,7 @@ class Schema:
 | Method | Description |
 | :--- | :--- |
 | `add_embedder(name, config)` | Register a named embedder definition. `config` is a dict with a `"type"` key (see below). |
-| `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | Register a custom analyzer definition. `tokenizer` is required; `char_filters`/`token_filters` are optional lists of dicts. Each dict uses the same `{"type": "..."}` shape as the schema TOML/JSON format (see below). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
+| `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | Register a custom analyzer definition. `tokenizer` is required; `char_filters`/`token_filters` are optional lists of dicts. Each dict uses the same `{"type": "..."}` shape as the schema TOML/JSON format (see below). A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) raises `ValueError`, and so does creating a new `Index` from a schema that defines one (e.g. loaded with `from_toml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzer_names()` | Return the names of custom analyzers registered via `add_analyzer` or loaded from TOML. |
 | `Schema.from_toml(toml_str)` *(static)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
 | `Schema.from_toml_file(path)` *(static)* | Load a schema from a TOML file (`path` accepts `str` or `os.PathLike`). |

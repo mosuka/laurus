@@ -200,7 +200,7 @@ new \Laurus\Schema()
 | メソッド | 説明 |
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | 名前付きエンベダー定義を登録します。`$config` は `"type"` キーを持つ連想配列です（下記参照）。 |
-| `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$charFilters`/`$tokenFilters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
+| `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$charFilters`/`$tokenFilters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。組み込みアナライザー用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `\ValueError` になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
 | `analyzerNames(): array` | `addAnalyzer` で登録済み、または TOML から読み込んだカスタムアナライザー名の一覧を返します。 |
 | `Schema::fromToml(string $tomlStr): Schema` | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。TOML がスキーマとして正しくない場合は `ValueError` を投げます。 |
 | `Schema::fromTomlFile(string $path): Schema` | TOML ファイルからスキーマを読み込みます。ファイルを読めない場合はパスで始まるメッセージの `Exception` を、内容がスキーマとして正しくない場合は `ValueError` を投げます。 |

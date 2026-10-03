@@ -65,7 +65,7 @@ cargo doc --open
 | `.add_flat_field(name, FlatOption)` | Flatベクトルフィールドを追加 |
 | `.add_ivf_field(name, IvfOption)` | IVFベクトルフィールドを追加 |
 | `.add_default_field(name)` | デフォルト検索フィールドを設定 |
-| `.add_analyzer(name, AnalyzerDefinition)` | カスタム Analyzer パイプラインを登録 |
+| `.add_analyzer(name, AnalyzerDefinition)` | カスタム Analyzer パイプラインを登録。組み込み Analyzer 用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）を使うと `.build()` は panic し、`.try_build()` はエラーを返す。ほかの方法で作った `Schema`（`Schema::from_toml` など）は `Schema::validate_for_create` で検査する |
 | `.add_embedder(name, EmbedderDefinition)` | Embedder 定義を登録 |
 | `.dynamic_field_policy(DynamicFieldPolicy)` | 未宣言フィールドのポリシー（`Strict` / `Dynamic` / `Ignore`）を設定 |
 | `.build()` | `Schema` を構築 |

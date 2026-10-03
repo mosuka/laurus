@@ -206,7 +206,7 @@ class Schema {
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF vector field. |
 | `addEmbedder(name, config)` | Register a named embedder. |
-| `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | Register a custom analyzer definition. `tokenizer` is required; `charFilters`/`tokenFilters` are optional arrays of objects. Each object uses the same `{ type: "...", ... }` shape as the schema TOML/JSON format (see below) — keys stay snake_case, matching that wire format. Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
+| `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | Register a custom analyzer definition. `tokenizer` is required; `charFilters`/`tokenFilters` are optional arrays of objects. Each object uses the same `{ type: "...", ... }` shape as the schema TOML/JSON format (see below) — keys stay snake_case, matching that wire format. A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) throws, and so does `Index.create` with a new index's schema that defines one (e.g. loaded with `fromToml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzerNames()` | Return the names of custom analyzers registered via `addAnalyzer` or loaded from TOML. |
 | `Schema.fromToml(tomlStr)` *(static)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
 | `Schema.fromTomlFile(path)` *(static)* | Load a schema from a TOML file. |

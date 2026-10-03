@@ -227,6 +227,9 @@ constructed without a dictionary. Schemas that previously stored
 
 For full pipelines that do not fit a preset, register the pipeline under
 `schema.analyzers` as an `AnalyzerDefinition` and reference it by name.
+The names of the parameter-less built-ins are reserved, so give the
+pipeline a name of its own (see
+[Referencing an analyzer](../laurus-cli/schema_format.md#referencing-an-analyzer)).
 
 ## Char Filters
 

@@ -904,10 +904,17 @@ impl RbSchema {
     /// )
     /// schema.add_text_field("title", analyzer: "ngram3")
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` is reserved for a built-in analyzer
+    /// (`standard`, `keyword`, `english`, `simple`, `noop`), or if a
+    /// component does not match a known shape.
     fn add_analyzer(&self, args: &[Value]) -> Result<(), Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(String, Value), (), (), (), RHash, ()>(args)?;
         let (name, tokenizer) = args.required;
+        laurus::analysis::analyzer::registry::validate_analyzer_name(&name).map_err(laurus_err)?;
         let kwargs = get_kwargs::<_, (), (Option<Value>, Option<Value>), ()>(
             args.keywords,
             &[],
