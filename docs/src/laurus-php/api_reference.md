@@ -193,7 +193,7 @@ new \Laurus\Schema()
 - `rerankStorage` — set to `"f32"` to write a full-precision `*.hnsw.f32` sidecar enabling exact Stage-2 rerank; omit to keep the int8-only segment.
 - `pqCodebookPath` — storage-relative file name of a shared PQ codebook (Issue #631), trained once via the `laurus train pq-codebook` CLI command. Only meaningful with `$quantizer = "product_quantization"`; commits then encode against the pre-trained codebook instead of re-training k-means per segment. Omit to keep per-segment training.
 
-A field name starting with `_` (other than `_id`) is accepted by every `add*Field` method above; it is rejected only when the schema is used to create an `Index` (an in-memory one, or a new one on disk), with `\ValueError`. See [Field Naming](../laurus-cli/schema_format.md#field-naming).
+Every `add*Field` method above throws `\ValueError` when `name` starts with `_` (other than `_id`), and adds nothing. A schema loaded with `fromToml` / `fromTomlFile` keeps accepting such a field, so a persisted schema still loads; creating a new `Index` from it throws `\ValueError`. See [Field Naming](../laurus-cli/schema_format.md#field-naming).
 
 ### Other methods
 

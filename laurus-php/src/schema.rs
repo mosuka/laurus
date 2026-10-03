@@ -182,6 +182,12 @@ impl PhpSchema {
     ///   value to cross an element boundary (default 100; `0` numbers the
     ///   elements as if concatenated). Ignored unless `multi_valued` is
     ///   true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\Exception` if `position_increment_gap` is outside
+    /// `0..=4294967295`, or `\ValueError` if `name` starts with `_` (other
+    /// than `_id`), which is reserved for system fields.
     #[php(defaults(
         stored = true,
         indexed = true,
@@ -204,7 +210,7 @@ impl PhpSchema {
     ) -> PhpResult<()> {
         let position_increment_gap = u32::try_from(position_increment_gap)
             .map_err(|_| "position_increment_gap must be between 0 and 4294967295")?;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Text(TextOption {
                 indexed,
@@ -215,8 +221,7 @@ impl PhpSchema {
                 doc_values,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add an integer (i64) field.
@@ -231,6 +236,11 @@ impl PhpSchema {
     ///   (Lucene-style "any match"). Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
     pub fn add_integer_field(
         &self,
@@ -239,8 +249,8 @@ impl PhpSchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.borrow_mut().fields.insert(
+    ) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed,
@@ -248,7 +258,7 @@ impl PhpSchema {
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a float (f64) field.
@@ -263,6 +273,11 @@ impl PhpSchema {
     ///   (Lucene-style "any match"). Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
     pub fn add_float_field(
         &self,
@@ -271,8 +286,8 @@ impl PhpSchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.borrow_mut().fields.insert(
+    ) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::Float(FloatOption {
                 indexed,
@@ -280,7 +295,7 @@ impl PhpSchema {
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a boolean field.
@@ -295,6 +310,11 @@ impl PhpSchema {
     ///   (Lucene-style "any match"). Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
     pub fn add_boolean_field(
         &self,
@@ -303,8 +323,8 @@ impl PhpSchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.borrow_mut().fields.insert(
+    ) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed,
@@ -312,7 +332,7 @@ impl PhpSchema {
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a date/time field.
@@ -327,6 +347,11 @@ impl PhpSchema {
     ///   predicate (Lucene-style "any match"). Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
     pub fn add_datetime_field(
         &self,
@@ -335,8 +360,8 @@ impl PhpSchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.borrow_mut().fields.insert(
+    ) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed,
@@ -344,7 +369,7 @@ impl PhpSchema {
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
@@ -361,6 +386,11 @@ impl PhpSchema {
     ///   false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
     pub fn add_geo_field(
         &self,
@@ -369,8 +399,8 @@ impl PhpSchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.borrow_mut().fields.insert(
+    ) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::Geo(GeoOption {
                 indexed,
@@ -378,7 +408,7 @@ impl PhpSchema {
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -399,6 +429,11 @@ impl PhpSchema {
     ///   match"), scoring the document by its closest point. Default: false.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
     pub fn add_geo3d_field(
         &self,
@@ -407,8 +442,8 @@ impl PhpSchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.borrow_mut().fields.insert(
+    ) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed,
@@ -416,7 +451,7 @@ impl PhpSchema {
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a binary data field.
@@ -427,15 +462,20 @@ impl PhpSchema {
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `multi_valued` - When true, the field accepts an array of binary
     ///   values (each with its own optional MIME type). Default: false.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     #[php(defaults(stored = true, multi_valued = false))]
-    pub fn add_bytes_field(&self, name: String, stored: bool, multi_valued: bool) {
-        self.inner.borrow_mut().fields.insert(
+    pub fn add_bytes_field(&self, name: String, stored: bool, multi_valued: bool) -> PhpResult<()> {
+        self.insert_field(
             name,
             FieldOption::Bytes(BytesOption {
                 stored,
                 multi_valued,
             }),
-        );
+        )
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.
@@ -471,6 +511,14 @@ impl PhpSchema {
     ///   1.0. Only matters when a query targets two or more specific
     ///   vector fields at once; has no effect on the lexical-vs-vector
     ///   balance of a hybrid search.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\Exception` if `distance`, `quantizer` or `rerank_storage`
+    /// is not a known name, or if `subvector_count` is missing for, or
+    /// supplied without, `"product_quantization"`. Throws `\ValueError` if
+    /// `name` starts with `_` (other than `_id`), which is reserved for
+    /// system fields.
     #[php(defaults(m = 16, ef_construction = 200, base_weight = 1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
@@ -501,11 +549,7 @@ impl PhpSchema {
             pq_codebook_path,
             base_weight: base_weight as f32,
         };
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Hnsw(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Hnsw(opt))
     }
 
     /// Add a flat (brute-force) vector index field.
@@ -519,6 +563,12 @@ impl PhpSchema {
     /// * `base_weight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `add_hnsw_field` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\Exception` if `distance` is not a known metric, or
+    /// `\ValueError` if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[php(defaults(base_weight = 1.0))]
     pub fn add_flat_field(
         &self,
@@ -536,11 +586,7 @@ impl PhpSchema {
             base_weight: base_weight as f32,
             ..Default::default()
         };
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Flat(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Flat(opt))
     }
 
     /// Add an IVF (Inverted File Index) approximate nearest-neighbor vector field.
@@ -556,6 +602,12 @@ impl PhpSchema {
     /// * `base_weight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `add_hnsw_field` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\Exception` if `distance` is not a known metric, or
+    /// `\ValueError` if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[php(defaults(n_clusters = 100, n_probe = 1, base_weight = 1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -578,11 +630,7 @@ impl PhpSchema {
             base_weight: base_weight as f32,
             ..Default::default()
         };
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Ivf(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Ivf(opt))
     }
 
     /// Register a named embedder definition in the schema.
@@ -800,5 +848,14 @@ impl PhpSchema {
             "Schema(fields={:?})",
             self.inner.borrow().fields.keys().collect::<Vec<_>>()
         )
+    }
+}
+
+impl PhpSchema {
+    /// Insert a field after rejecting a name reserved for system fields.
+    fn insert_field(&self, name: String, option: FieldOption) -> PhpResult<()> {
+        laurus::validate_field_name(&name).map_err(laurus_err)?;
+        self.inner.borrow_mut().fields.insert(name, option);
+        Ok(())
     }
 }
