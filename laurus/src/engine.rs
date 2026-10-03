@@ -642,6 +642,24 @@ fn analyzer_resolution_error(
     }
 }
 
+/// Look up the definition of the embedder that vector field `field` names.
+///
+/// # Errors
+///
+/// Returns [`InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+/// if `schema.embedders` does not declare `embedder`.
+fn embedder_definition<'a>(
+    schema: &'a Schema,
+    field: &str,
+    embedder: &str,
+) -> Result<&'a schema::embedder::EmbedderDefinition> {
+    schema.embedders.get(embedder).ok_or_else(|| {
+        crate::error::LaurusError::invalid_argument(format!(
+            "Unknown embedder '{embedder}' for field '{field}': not defined in schema.embedders"
+        ))
+    })
+}
+
 impl Engine {
     /// Create a new Unified Engine with default analyzer and no embedder.
     ///
@@ -1560,6 +1578,32 @@ impl Engine {
         Ok(())
     }
 
+    /// Build the embedder that a vector field option names, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema does not declare the named embedder,
+    /// or if constructing it fails.
+    async fn field_embedder(
+        &self,
+        field: &str,
+        option: &schema::FieldOption,
+    ) -> Result<Option<Arc<dyn Embedder>>> {
+        let Some(embedder_name) = option.embedder_name() else {
+            return Ok(None);
+        };
+        // Clone the definition out of the `parking_lot` guard, which is not
+        // `Send`, before the `await`.
+        let def = {
+            let schema = self.schema.read();
+            embedder_definition(&schema, field, embedder_name)?.clone()
+        };
+        let embedder =
+            crate::embedding::registry::create_embedder_from_definition(embedder_name, &def)
+                .await?;
+        Ok(Some(embedder))
+    }
+
     /// Dynamically add a new field to the engine at runtime.
     ///
     /// This method registers the field in both the engine schema and the
@@ -1631,29 +1675,7 @@ impl Engine {
         }
 
         if option.is_vector() {
-            // Resolve the per-field embedder if configured.
-            // Clone the embedder definition out of the schema lock before
-            // calling the async factory so that the non-Send parking_lot
-            // guard is not held across an await point.
-            let field_embedder = if let Some(embedder_name) = option.embedder_name() {
-                let embedder_def = {
-                    let schema = self.schema.read();
-                    schema.embedders.get(embedder_name).cloned()
-                };
-                if let Some(def) = embedder_def {
-                    Some(
-                        crate::embedding::registry::create_embedder_from_definition(
-                            embedder_name,
-                            &def,
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let field_embedder = self.field_embedder(name, &option).await?;
 
             let vector_opt = option
                 .to_vector()
@@ -1794,6 +1816,8 @@ impl Engine {
     ///
     /// Returns an error if:
     /// - No field with the given name exists in the schema.
+    /// - `option` names an embedder that the schema does not declare, also
+    ///   when `opts.dry_run` is `true`.
     /// - The change is classified as [`FieldChangeKind::Reindex`](schema::FieldChangeKind::Reindex)
     ///   or [`FieldChangeKind::Destructive`](schema::FieldChangeKind::Destructive)
     ///   and `opts.reindex` is `false`.
@@ -1819,6 +1843,12 @@ impl Engine {
                 ))
             })?
         };
+
+        // Checked before the dry-run return so that a dry run reports what
+        // the real call would do.
+        if let Some(embedder_name) = option.embedder_name() {
+            embedder_definition(&self.schema.read(), name, embedder_name)?;
+        }
 
         let classification = schema::classify_change(&old_option, &option);
 
@@ -1860,29 +1890,7 @@ impl Engine {
                 }
 
                 if option.is_vector() {
-                    // Same embedder-resolution pattern as `add_field`
-                    // above: clone the definition out of the
-                    // `parking_lot` schema guard before the `await`
-                    // (that guard is not `Send`).
-                    let field_embedder = if let Some(embedder_name) = option.embedder_name() {
-                        let embedder_def = {
-                            let schema = self.schema.read();
-                            schema.embedders.get(embedder_name).cloned()
-                        };
-                        if let Some(def) = embedder_def {
-                            Some(
-                                crate::embedding::registry::create_embedder_from_definition(
-                                    embedder_name,
-                                    &def,
-                                )
-                                .await?,
-                            )
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    let field_embedder = self.field_embedder(name, &option).await?;
 
                     let vector_opt = option
                         .to_vector()
@@ -2394,6 +2402,15 @@ impl Engine {
 
         let lexical_config = lexical_builder.build();
 
+        // Every embedder name must be declared even when an explicit embedder
+        // serves the fields: the persisted schema is also opened by front ends
+        // that do not pass that embedder (Issue #1309).
+        for (name, field_option) in &schema.fields {
+            if let Some(embedder_name) = field_option.embedder_name() {
+                embedder_definition(schema, name, embedder_name)?;
+            }
+        }
+
         // Construct Vector Config — resolve embedder from schema if not explicitly provided.
         let embedder = if embedder.is_some() {
             embedder
@@ -2410,12 +2427,7 @@ impl Engine {
                     let emb = if let Some(cached) = embedder_cache.get(embedder_name) {
                         cached.clone()
                     } else {
-                        let def = schema.embedders.get(embedder_name).ok_or_else(|| {
-                            crate::error::LaurusError::invalid_argument(format!(
-                                "Unknown embedder '{embedder_name}' for field '{name}': \
-                                 not defined in schema.embedders"
-                            ))
-                        })?;
+                        let def = embedder_definition(schema, name, embedder_name)?;
                         let emb = crate::embedding::registry::create_embedder_from_definition(
                             embedder_name,
                             def,
@@ -3367,7 +3379,14 @@ impl EngineBuilder {
     /// are supported. When a `PerFieldEmbedder` is passed, each vector field will use
     /// the embedder registered for that field name, falling back to the default.
     ///
-    /// If not set, no embedder is configured.
+    /// The given embedder serves the vector fields in place of the ones
+    /// declared in [`Schema::embedders`], but every vector field's `embedder`
+    /// name must still be declared there: the persisted schema is also opened
+    /// by front ends that do not pass this embedder, so [`Self::build`]
+    /// rejects an undeclared name either way.
+    ///
+    /// If not set, the vector fields use the embedders that the schema
+    /// declares, or none if it declares none.
     pub fn embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
         self
@@ -3437,7 +3456,8 @@ impl EngineBuilder {
     /// # Errors
     ///
     /// Returns an error if storage initialization, index creation, WAL
-    /// opening, or recovery replay fails.
+    /// opening, or recovery replay fails, or if a vector field names an
+    /// embedder that [`Schema::embedders`] does not declare.
     pub async fn build(self) -> Result<Engine> {
         // Acquire an exclusive lock on the root storage before doing
         // anything else (Issue #1086): a second `Engine` built over the
@@ -3630,6 +3650,193 @@ mod tests {
             ),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// A 4-dimensional HNSW field option that names `embedder`.
+    fn hnsw_naming(embedder: &str) -> schema::FieldOption {
+        let mut option = crate::vector::core::field::HnswOption::default().dimension(4);
+        option.embedder = Some(embedder.to_string());
+        schema::FieldOption::Hnsw(option)
+    }
+
+    fn assert_undeclared_embedder(err: &crate::error::LaurusError, field: &str, embedder: &str) {
+        let expected = format!("Unknown embedder '{embedder}' for field '{field}'");
+        assert!(
+            matches!(err, crate::error::LaurusError::InvalidArgument(m) if m.contains(&expected)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Issue #1309: build rejects an undeclared embedder name whether or
+    /// not the schema declares other embedders, and also when an explicit
+    /// embedder is passed.
+    #[tokio::test]
+    async fn build_rejects_an_undeclared_embedder_name() {
+        use crate::engine::schema::embedder::EmbedderDefinition;
+
+        let with_other_embedders = Schema::builder()
+            .add_embedder("pre", EmbedderDefinition::Precomputed)
+            .add_field("vec", hnsw_naming("missing"))
+            .build();
+        let without_embedders = Schema::builder()
+            .add_field("vec", hnsw_naming("missing"))
+            .build();
+        let explicit: Arc<dyn Embedder> = Arc::new(PrecomputedEmbedder::new());
+
+        let cases = [
+            ("other embedders declared", with_other_embedders, None),
+            ("no embedder declared", without_embedders.clone(), None),
+            ("explicit embedder", without_embedders, Some(explicit)),
+        ];
+        for (case, schema, embedder) in cases {
+            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+            let mut builder = Engine::builder(storage, schema);
+            if let Some(embedder) = embedder {
+                builder = builder.embedder(embedder);
+            }
+            let err = builder
+                .build()
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case}: build must fail"));
+            assert_undeclared_embedder(&err, "vec", "missing");
+        }
+    }
+
+    /// Issue #1309: `add_field` rejects an undeclared embedder name before
+    /// touching the vector store or the schema. It used to fall back to no
+    /// embedder and persist the name, and when the schema declared other
+    /// embedders the next build then rejected it, leaving the index
+    /// unopenable.
+    #[tokio::test]
+    async fn add_field_rejects_an_undeclared_embedder_name() {
+        use crate::engine::schema::embedder::EmbedderDefinition;
+
+        let schemas = [
+            ("no embedder declared", Schema::new()),
+            (
+                "other embedders declared",
+                Schema::builder()
+                    .add_embedder("pre", EmbedderDefinition::Precomputed)
+                    .build(),
+            ),
+        ];
+        for (case, schema) in schemas {
+            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+            let persisted = Arc::new(AtomicU64::new(0));
+            let persisted_clone = Arc::clone(&persisted);
+            let engine = Engine::builder(storage.clone(), schema)
+                .persist_schema_with(Arc::new(move |_: &Schema| {
+                    persisted_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }))
+                .build()
+                .await
+                .unwrap();
+
+            let err = engine
+                .add_field("vec", hnsw_naming("missing"))
+                .await
+                .unwrap_err();
+            assert_undeclared_embedder(&err, "vec", "missing");
+            assert!(
+                !engine.schema().fields.contains_key("vec"),
+                "{case}: the schema must not gain the field"
+            );
+            assert_eq!(
+                persisted.load(Ordering::SeqCst),
+                0,
+                "{case}: nothing must be persisted"
+            );
+
+            // The vector store has no half-registered field either.
+            engine
+                .add_field(
+                    "vec",
+                    schema::FieldOption::Hnsw(
+                        crate::vector::core::field::HnswOption::default().dimension(4),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{case}: re-adding the field failed: {e:?}"));
+
+            let schema = engine.schema();
+            drop(engine);
+            Engine::builder(storage, schema)
+                .build()
+                .await
+                .unwrap_or_else(|e| panic!("{case}: reopening failed: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn add_field_accepts_a_declared_embedder_name() {
+        use crate::engine::schema::embedder::EmbedderDefinition;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_embedder("pre", EmbedderDefinition::Precomputed)
+            .build();
+        let engine = Engine::builder(storage.clone(), schema)
+            .build()
+            .await
+            .unwrap();
+
+        let updated = engine.add_field("vec", hnsw_naming("pre")).await.unwrap();
+        assert_eq!(updated.fields["vec"].embedder_name(), Some("pre"));
+
+        drop(engine);
+        Engine::builder(storage, updated)
+            .build()
+            .await
+            .unwrap_or_else(|e| panic!("reopening failed: {e:?}"));
+    }
+
+    /// Issue #1309: `update_field` rejects an undeclared embedder name,
+    /// also in a dry run, and leaves the field as it was. It used to fall
+    /// back to no embedder and persist the name.
+    #[tokio::test]
+    async fn update_field_rejects_an_undeclared_embedder_name() {
+        use crate::engine::schema::embedder::EmbedderDefinition;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_embedder("pre", EmbedderDefinition::Precomputed)
+            .add_field("vec", hnsw_naming("pre"))
+            .build();
+        let persisted = Arc::new(AtomicU64::new(0));
+        let persisted_clone = Arc::clone(&persisted);
+        let engine = Engine::builder(storage, schema)
+            .persist_schema_with(Arc::new(move |_: &Schema| {
+                persisted_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let dry_run = UpdateFieldOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let reindex = UpdateFieldOptions {
+            reindex: true,
+            ..Default::default()
+        };
+        for opts in [dry_run, reindex] {
+            let err = engine
+                .update_field("vec", hnsw_naming("missing"), opts)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{opts:?}: update_field must fail"));
+            assert_undeclared_embedder(&err, "vec", "missing");
+            assert_eq!(
+                engine.schema().fields["vec"].embedder_name(),
+                Some("pre"),
+                "{opts:?}: the field must keep its embedder"
+            );
+        }
+        assert_eq!(persisted.load(Ordering::SeqCst), 0);
     }
 
     /// Companion to the above: once the first `Engine` is dropped, its
