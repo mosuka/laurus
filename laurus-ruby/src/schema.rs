@@ -272,6 +272,13 @@ impl RbSchema {
         }
     }
 
+    /// Insert a field after rejecting a name reserved for system fields.
+    fn insert_field(&self, name: String, option: FieldOption) -> Result<(), Error> {
+        laurus::validate_field_name(&name).map_err(laurus_err)?;
+        self.inner.borrow_mut().fields.insert(name, option);
+        Ok(())
+    }
+
     /// Add a full-text searchable text field.
     ///
     /// # Arguments
@@ -292,6 +299,11 @@ impl RbSchema {
     ///     For parameterized presets such as the Japanese analyzer
     ///     (which needs a Lindera dictionary path), register a custom
     ///     analyzer via `add_analyzer` and reference it by name.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_text_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -336,7 +348,7 @@ impl RbSchema {
         let multi_valued = multi_valued.unwrap_or(false);
         let position_increment_gap =
             gap.unwrap_or(laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP);
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Text(TextOption {
                 indexed,
@@ -347,8 +359,7 @@ impl RbSchema {
                 doc_values,
                 analyzer,
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add an integer (i64) field.
@@ -365,6 +376,11 @@ impl RbSchema {
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_integer_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -375,7 +391,7 @@ impl RbSchema {
                 &["stored", "indexed", "multi_valued", "doc_values"],
             )?;
         let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed: indexed.unwrap_or(true),
@@ -383,8 +399,7 @@ impl RbSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add a float (f64) field.
@@ -401,6 +416,11 @@ impl RbSchema {
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_float_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -411,7 +431,7 @@ impl RbSchema {
                 &["stored", "indexed", "multi_valued", "doc_values"],
             )?;
         let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Float(FloatOption {
                 indexed: indexed.unwrap_or(true),
@@ -419,8 +439,7 @@ impl RbSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add a boolean field.
@@ -438,6 +457,11 @@ impl RbSchema {
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_boolean_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -448,7 +472,7 @@ impl RbSchema {
                 &["stored", "indexed", "multi_valued", "doc_values"],
             )?;
         let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
@@ -456,8 +480,7 @@ impl RbSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add a date/time field.
@@ -475,6 +498,11 @@ impl RbSchema {
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_datetime_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -485,7 +513,7 @@ impl RbSchema {
                 &["stored", "indexed", "multi_valued", "doc_values"],
             )?;
         let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
@@ -493,8 +521,7 @@ impl RbSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
@@ -513,6 +540,11 @@ impl RbSchema {
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_geo_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -523,7 +555,7 @@ impl RbSchema {
                 &["stored", "indexed", "multi_valued", "doc_values"],
             )?;
         let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
@@ -531,8 +563,7 @@ impl RbSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -556,6 +587,11 @@ impl RbSchema {
     ///   - `doc_values:` (bool, default true): Whether the value is also
     ///     copied into DocValues. Takes effect only when `stored:` is
     ///     also true.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_geo3d_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -566,7 +602,7 @@ impl RbSchema {
                 &["stored", "indexed", "multi_valued", "doc_values"],
             )?;
         let (stored, indexed, multi_valued, doc_values) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
@@ -574,8 +610,7 @@ impl RbSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add a binary data field.
@@ -588,6 +623,11 @@ impl RbSchema {
     ///   - `multi_valued:` (bool, default false): When true, the field
     ///     accepts an Array of binary values (each with its own optional
     ///     MIME type).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields.
     fn add_bytes_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (name,) = args.required;
@@ -597,14 +637,13 @@ impl RbSchema {
             &["stored", "multi_valued"],
         )?;
         let (stored, multi_valued) = kwargs.optional;
-        self.inner.borrow_mut().fields.insert(
+        self.insert_field(
             name,
             FieldOption::Bytes(BytesOption {
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.
@@ -641,6 +680,14 @@ impl RbSchema {
     ///     (Issue #1084). Only matters when a query targets two or more
     ///     specific vector fields at once; has no effect on the
     ///     lexical-vs-vector balance of a hybrid search.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields, if `distance:`, `quantizer:` or
+    /// `rerank_storage:` is not a known value, or if `subvector_count:` is
+    /// missing for `quantizer:` "product_quantization" or given with any
+    /// other quantizer.
     fn add_hnsw_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
@@ -698,11 +745,7 @@ impl RbSchema {
             pq_codebook_path,
             base_weight: base_weight_from_splat(kwargs.splat)?,
         };
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Hnsw(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Hnsw(opt))
     }
 
     /// Add a flat (brute-force) vector index field.
@@ -717,6 +760,12 @@ impl RbSchema {
     ///   - `base_weight:` (Float, default 1.0): This field's relative
     ///     scoring priority when searched alongside other vector fields
     ///     (Issue #1084). See `add_hnsw_field` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields, or if `distance:` is not a known
+    /// metric.
     fn add_flat_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
@@ -734,11 +783,7 @@ impl RbSchema {
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
         };
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Flat(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Flat(opt))
     }
 
     /// Add an IVF (Inverted File Index) approximate nearest-neighbor vector field.
@@ -755,6 +800,12 @@ impl RbSchema {
     ///   - `base_weight:` (Float, default 1.0): This field's relative
     ///     scoring priority when searched alongside other vector fields
     ///     (Issue #1084). See `add_hnsw_field` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// which is reserved for system fields, or if `distance:` is not a known
+    /// metric.
     fn add_ivf_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
@@ -791,11 +842,7 @@ impl RbSchema {
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
         };
-        self.inner
-            .borrow_mut()
-            .fields
-            .insert(name, FieldOption::Ivf(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Ivf(opt))
     }
 
     /// Register a named embedder definition in the schema.
