@@ -197,13 +197,20 @@ impl Schema {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::LaurusError::invalid_argument`] if an entry
-    /// in [`Self::analyzers`] uses a name reserved for a built-in analyzer
-    /// (see [`validate_analyzer_name`]). Such an entry would never be
-    /// used, because the built-in is resolved first.
+    /// Returns [`crate::error::LaurusError::invalid_argument`] if:
+    ///
+    /// - An entry in [`Self::fields`] uses a name reserved for the engine
+    ///   (see [`validate_field_name`]). Such a field could never receive a
+    ///   value, because ingestion rejects it.
+    /// - An entry in [`Self::analyzers`] uses a name reserved for a built-in
+    ///   analyzer (see [`validate_analyzer_name`]). Such an entry would
+    ///   never be used, because the built-in is resolved first.
     ///
     /// [`validate_analyzer_name`]: crate::analysis::analyzer::registry::validate_analyzer_name
     pub fn validate_for_create(&self) -> crate::error::Result<()> {
+        for name in self.fields.keys() {
+            validate_field_name(name)?;
+        }
         for name in self.analyzers.keys() {
             crate::analysis::analyzer::registry::validate_analyzer_name(name)?;
         }
@@ -882,13 +889,9 @@ impl SchemaBuilder {
     /// # Errors
     ///
     /// Returns an error if any field name starts with `_` and is not in the
-    /// reserved allow-list (see [`validate_field_name`]), or if a custom
-    /// analyzer uses a name reserved for a built-in analyzer (see
-    /// [`Schema::validate_for_create`]).
+    /// reserved allow-list, or if a custom analyzer uses a name reserved for
+    /// a built-in analyzer (see [`Schema::validate_for_create`]).
     pub fn try_build(self) -> crate::error::Result<Schema> {
-        for name in self.fields.keys() {
-            validate_field_name(name)?;
-        }
         let schema = Schema {
             analyzers: self.analyzers,
             embedders: self.embedders,
@@ -976,6 +979,40 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn validate_for_create_rejects_reserved_field_name() {
+        let mut schema = Schema::new();
+        schema
+            .fields
+            .insert("_score".to_string(), FieldOption::Text(TextOption::default()));
+        let msg = schema.validate_for_create().unwrap_err().to_string();
+        assert!(msg.contains("Field name '_score' is reserved"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_for_create_accepts_id_field() {
+        let mut schema = Schema::new();
+        schema.fields.insert(
+            RESERVED_ID_FIELD.to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
+        assert!(schema.validate_for_create().is_ok());
+    }
+
+    #[test]
+    fn from_toml_accepts_reserved_field_name() {
+        // Persisted schemas are read with from_toml, so it must keep
+        // accepting a field that validate_for_create rejects (Issue #1329).
+        let schema = Schema::from_toml(
+            r#"
+            [fields._secret.Text]
+            "#,
+        )
+        .unwrap();
+        assert!(schema.fields.contains_key("_secret"));
+        assert!(schema.validate_for_create().is_err());
+    }
+
     fn whitespace_analyzer() -> AnalyzerDefinition {
         AnalyzerDefinition {
             char_filters: vec![],
@@ -1007,6 +1044,19 @@ mod tests {
             .analyzers
             .insert("my_custom".to_string(), whitespace_analyzer());
         assert!(schema.validate_for_create().is_ok());
+    }
+
+    #[test]
+    fn validate_for_create_reports_the_field_error_before_the_analyzer_error() {
+        let mut schema = Schema::new();
+        schema
+            .fields
+            .insert("_bad".to_string(), FieldOption::Text(TextOption::default()));
+        schema
+            .analyzers
+            .insert("standard".to_string(), whitespace_analyzer());
+        let msg = schema.validate_for_create().unwrap_err().to_string();
+        assert!(msg.contains("Field name '_bad' is reserved"), "got: {msg}");
     }
 
     #[test]
