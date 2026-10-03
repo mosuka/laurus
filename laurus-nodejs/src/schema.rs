@@ -95,7 +95,7 @@ fn parse_rerank_storage(name: Option<&str>) -> Result<Option<RerankStorageKind>>
 ///
 /// const schema = new Schema();
 /// schema.addTextField("title");
-/// schema.addHnswField("embedding", 384, { distance: "cosine" });
+/// schema.addHnswField("embedding", 384, "cosine");
 /// schema.addIntegerField("year");
 /// schema.setDefaultFields(["title"]);
 /// ```
@@ -584,8 +584,9 @@ impl JsSchema {
 
     /// Register a named embedder definition in the schema.
     ///
-    /// The embedder can then be referenced by name from vector field options
-    /// (e.g. `addHnswField("embedding", 384, { embedder: "my-bert" })`).
+    /// The embedder can then be referenced by name from a vector field's
+    /// `embedder` argument (e.g.
+    /// `addHnswField("embedding", 384, "cosine", undefined, undefined, undefined, "my-bert")`).
     ///
     /// The `config` object must have a `type` key selecting the backend:
     ///
