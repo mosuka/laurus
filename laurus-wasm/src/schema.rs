@@ -155,6 +155,11 @@ impl WasmSchema {
     ///   value to cross an element boundary (default 100; `0` numbers the
     ///   elements as if concatenated). Ignored unless `multi_valued` is
     ///   `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addTextField")]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
@@ -167,8 +172,8 @@ impl WasmSchema {
         analyzer: Option<String>,
         multi_valued: Option<bool>,
         position_increment_gap: Option<u32>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Text(TextOption {
                 indexed: indexed.unwrap_or(true),
@@ -180,13 +185,18 @@ impl WasmSchema {
                 doc_values: doc_values.unwrap_or(true),
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
-        );
+        )
     }
 
     /// Add an integer (i64) field.
     ///
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addIntegerField")]
     pub fn add_integer_field(
         &mut self,
@@ -195,8 +205,8 @@ impl WasmSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed: indexed.unwrap_or(true),
@@ -204,13 +214,18 @@ impl WasmSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a float (f64) field.
     ///
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addFloatField")]
     pub fn add_float_field(
         &mut self,
@@ -219,8 +234,8 @@ impl WasmSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Float(FloatOption {
                 indexed: indexed.unwrap_or(true),
@@ -228,7 +243,7 @@ impl WasmSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a boolean field.
@@ -238,6 +253,11 @@ impl WasmSchema {
     ///   `true` (Lucene-style "any match"). Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addBooleanField")]
     pub fn add_boolean_field(
         &mut self,
@@ -246,8 +266,8 @@ impl WasmSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed: indexed.unwrap_or(true),
@@ -255,7 +275,7 @@ impl WasmSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a date/time field.
@@ -265,6 +285,11 @@ impl WasmSchema {
     ///   predicate (Lucene-style "any match"). Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addDatetimeField")]
     pub fn add_datetime_field(
         &mut self,
@@ -273,8 +298,8 @@ impl WasmSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed: indexed.unwrap_or(true),
@@ -282,7 +307,7 @@ impl WasmSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
@@ -293,6 +318,11 @@ impl WasmSchema {
     ///   scoring the document by its closest point. Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addGeoField")]
     pub fn add_geo_field(
         &mut self,
@@ -301,8 +331,8 @@ impl WasmSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Geo(GeoOption {
                 indexed: indexed.unwrap_or(true),
@@ -310,7 +340,7 @@ impl WasmSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -326,6 +356,11 @@ impl WasmSchema {
     ///   document by its closest point. Default `false`.
     /// * `doc_values` - Whether the value is also copied into DocValues
     ///   (default `true`). Takes effect only when `stored` is also `true`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addGeo3dField")]
     pub fn add_geo3d_field(
         &mut self,
@@ -334,8 +369,8 @@ impl WasmSchema {
         indexed: Option<bool>,
         multi_valued: Option<bool>,
         doc_values: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed: indexed.unwrap_or(true),
@@ -343,27 +378,32 @@ impl WasmSchema {
                 multi_valued: multi_valued.unwrap_or(false),
                 doc_values: doc_values.unwrap_or(true),
             }),
-        );
+        )
     }
 
     /// Add a binary data field.
     ///
     /// * `multi_valued` - When `true`, the field accepts arrays of binary
     ///   values (each with its own optional MIME type). Default `false`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields.
     #[wasm_bindgen(js_name = "addBytesField")]
     pub fn add_bytes_field(
         &mut self,
         name: String,
         stored: Option<bool>,
         multi_valued: Option<bool>,
-    ) {
-        self.inner.fields.insert(
+    ) -> Result<(), JsValue> {
+        self.insert_field(
             name,
             FieldOption::Bytes(BytesOption {
                 stored: stored.unwrap_or(true),
                 multi_valued: multi_valued.unwrap_or(false),
             }),
-        );
+        )
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.
@@ -399,6 +439,14 @@ impl WasmSchema {
     ///   1.0. Only matters when a query targets two or more specific
     ///   vector fields at once; has no effect on the lexical-vs-vector
     ///   balance of a hybrid search.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields; if `distance`, `quantizer` or
+    /// `rerankStorage` is not a known value; or if `subvectorCount` is
+    /// missing for "product_quantization" or supplied for another
+    /// quantizer.
     #[wasm_bindgen(js_name = "addHnswField")]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
@@ -428,8 +476,7 @@ impl WasmSchema {
             pq_codebook_path,
             base_weight: base_weight.unwrap_or(1.0),
         };
-        self.inner.fields.insert(name, FieldOption::Hnsw(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Hnsw(opt))
     }
 
     /// Add a flat (brute-force) vector index field.
@@ -439,6 +486,11 @@ impl WasmSchema {
     /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `addHnswField` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields, or if `distance` is not a known metric.
     #[wasm_bindgen(js_name = "addFlatField")]
     pub fn add_flat_field(
         &mut self,
@@ -455,8 +507,7 @@ impl WasmSchema {
             base_weight: base_weight.unwrap_or(1.0),
             ..Default::default()
         };
-        self.inner.fields.insert(name, FieldOption::Flat(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Flat(opt))
     }
 
     /// Add an IVF approximate nearest-neighbor vector field.
@@ -466,6 +517,11 @@ impl WasmSchema {
     /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `addHnswField` for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), which is
+    /// reserved for system fields, or if `distance` is not a known metric.
     #[wasm_bindgen(js_name = "addIvfField")]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -487,8 +543,7 @@ impl WasmSchema {
             base_weight: base_weight.unwrap_or(1.0),
             ..Default::default()
         };
-        self.inner.fields.insert(name, FieldOption::Ivf(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Ivf(opt))
     }
 
     /// Register a named embedder definition in the schema.
@@ -757,5 +812,14 @@ impl WasmSchema {
             "Schema(fields={:?})",
             self.inner.fields.keys().collect::<Vec<_>>()
         )
+    }
+}
+
+impl WasmSchema {
+    /// Insert a field after rejecting a name reserved for system fields.
+    fn insert_field(&mut self, name: String, option: FieldOption) -> Result<(), JsValue> {
+        laurus::validate_field_name(&name).map_err(laurus_err)?;
+        self.inner.fields.insert(name, option);
+        Ok(())
     }
 }

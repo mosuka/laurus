@@ -884,7 +884,7 @@ mod tests {
 
     // ── Highlighting (Issue #1134) ──────────────────────────────────────────
 
-    use wasm_bindgen::JsCast;
+    use wasm_bindgen::{JsCast, JsValue};
 
     use super::WasmIndex;
     use crate::schema::WasmSchema;
@@ -893,7 +893,9 @@ mod tests {
     /// document, ready to commit and search.
     async fn text_index() -> WasmIndex {
         let mut schema = WasmSchema::new();
-        schema.add_text_field("body".to_string(), None, None, None, None, None, None, None);
+        schema
+            .add_text_field("body".to_string(), None, None, None, None, None, None, None)
+            .expect("addTextField must succeed");
         let index = WasmIndex::create(Some(schema), None, None)
             .await
             .expect("index creation must succeed");
@@ -992,27 +994,31 @@ mod tests {
         schema
             .add_analyzer_definition("ngram3".to_string(), definition)
             .expect("addAnalyzerDefinition must succeed");
-        schema.add_text_field(
-            "title".to_string(),
-            None,
-            None,
-            None,
-            None,
-            Some("ngram3".to_string()),
-            None,
-            None,
-        );
+        schema
+            .add_text_field(
+                "title".to_string(),
+                None,
+                None,
+                None,
+                None,
+                Some("ngram3".to_string()),
+                None,
+                None,
+            )
+            .expect("addTextField must succeed");
         // Default "standard" analyzer: whole-word tokens only.
-        schema.add_text_field(
-            "plain".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        schema
+            .add_text_field(
+                "plain".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("addTextField must succeed");
 
         let index = WasmIndex::create(Some(schema), None, None)
             .await
@@ -1057,16 +1063,18 @@ mod tests {
         schema
             .add_analyzer_definition("ngram3".to_string(), definition)
             .expect("addAnalyzerDefinition must succeed");
-        schema.add_text_field(
-            "title".to_string(),
-            None,
-            None,
-            None,
-            None,
-            Some("ngram3".to_string()),
-            None,
-            None,
-        );
+        schema
+            .add_text_field(
+                "title".to_string(),
+                None,
+                None,
+                None,
+                None,
+                Some("ngram3".to_string()),
+                None,
+                None,
+            )
+            .expect("addTextField must succeed");
 
         let toml_str = schema.to_toml().expect("toToml must succeed");
         let restored = WasmSchema::from_toml(toml_str).expect("fromToml must succeed");
@@ -1191,5 +1199,59 @@ mod tests {
             message.contains("Field name '_secret' is reserved"),
             "{message}"
         );
+    }
+
+    /// Every `add*Field` method rejects a reserved name at call time and
+    /// leaves the schema untouched (Issue #1331).
+    #[wasm_bindgen_test]
+    fn add_field_methods_reject_reserved_field_name() {
+        type AddField = fn(&mut WasmSchema, String) -> Result<(), JsValue>;
+        let methods: [(&str, AddField); 11] = [
+            ("addTextField", |s, n| {
+                s.add_text_field(n, None, None, None, None, None, None, None)
+            }),
+            ("addIntegerField", |s, n| {
+                s.add_integer_field(n, None, None, None, None)
+            }),
+            ("addFloatField", |s, n| {
+                s.add_float_field(n, None, None, None, None)
+            }),
+            ("addBooleanField", |s, n| {
+                s.add_boolean_field(n, None, None, None, None)
+            }),
+            ("addDatetimeField", |s, n| {
+                s.add_datetime_field(n, None, None, None, None)
+            }),
+            ("addGeoField", |s, n| {
+                s.add_geo_field(n, None, None, None, None)
+            }),
+            ("addGeo3dField", |s, n| {
+                s.add_geo3d_field(n, None, None, None, None)
+            }),
+            ("addBytesField", |s, n| s.add_bytes_field(n, None, None)),
+            ("addHnswField", |s, n| {
+                s.add_hnsw_field(
+                    n, 3, None, None, None, None, None, None, None, None, None, None,
+                )
+            }),
+            ("addFlatField", |s, n| {
+                s.add_flat_field(n, 3, None, None, None)
+            }),
+            ("addIvfField", |s, n| {
+                s.add_ivf_field(n, 3, None, None, None, None, None)
+            }),
+        ];
+        for (method, add_field) in methods {
+            let mut schema = WasmSchema::new();
+            let Err(err) = add_field(&mut schema, "_secret".to_string()) else {
+                panic!("{method} must reject a reserved field name");
+            };
+            let message = err.as_string().unwrap();
+            assert!(
+                message.contains("Field name '_secret' is reserved"),
+                "{method}: {message}"
+            );
+            assert!(schema.field_names().is_empty(), "{method}");
+        }
     }
 }
