@@ -293,7 +293,9 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
-            status.message().contains("Field name '_secret' is reserved"),
+            status
+                .message()
+                .contains("Field name '_secret' is reserved"),
             "got: {}",
             status.message()
         );

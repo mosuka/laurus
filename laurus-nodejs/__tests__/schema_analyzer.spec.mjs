@@ -187,6 +187,58 @@ describe("names reserved for built-in analyzers", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Field names reserved for the engine (Issue #1329)
+// ---------------------------------------------------------------------------
+
+const RESERVED_FIELD_SCHEMA_TOML = `
+default_fields = ["body"]
+
+[fields.body.Text]
+indexed = true
+stored = true
+
+[fields._secret.Text]
+indexed = true
+stored = true
+`;
+
+describe("field names reserved for the engine", () => {
+  it("rejects an in-memory index", async () => {
+    const schema = Schema.fromToml(RESERVED_FIELD_SCHEMA_TOML);
+    await expect(Index.create(null, schema)).rejects.toThrow(
+      /Field name '_secret' is reserved/,
+    );
+  });
+
+  it("rejects a file-backed index and writes nothing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "laurus-reserved-field-"));
+    try {
+      const indexDir = path.join(dir, "idx");
+      const schema = Schema.fromToml(RESERVED_FIELD_SCHEMA_TOML);
+      await expect(Index.create(indexDir, schema)).rejects.toThrow(
+        /Field name '_secret' is reserved/,
+      );
+      expect(fs.existsSync(indexDir)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still opens an existing index that holds such a field", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "laurus-reserved-field-"));
+    try {
+      fs.writeFileSync(path.join(dir, "schema.toml"), RESERVED_FIELD_SCHEMA_TOML);
+      const index = await Index.create(dir);
+      await index.putDocument("doc1", { body: "Hello World" });
+      await index.commit();
+      expect((await index.search("body:hello", 5)).length).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // fromToml / fromTomlFile
 // ---------------------------------------------------------------------------
 

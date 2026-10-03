@@ -982,11 +982,15 @@ mod tests {
     #[test]
     fn validate_for_create_rejects_reserved_field_name() {
         let mut schema = Schema::new();
-        schema
-            .fields
-            .insert("_score".to_string(), FieldOption::Text(TextOption::default()));
+        schema.fields.insert(
+            "_score".to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
         let msg = schema.validate_for_create().unwrap_err().to_string();
-        assert!(msg.contains("Field name '_score' is reserved"), "got: {msg}");
+        assert!(
+            msg.contains("Field name '_score' is reserved"),
+            "got: {msg}"
+        );
     }
 
     #[test]

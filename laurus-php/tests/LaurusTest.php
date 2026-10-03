@@ -1930,4 +1930,51 @@ class LaurusTest extends TestCase
         $this->assertCount(1, $idx->search("body:hello", 5));
         $idx->close();
     }
+
+    // ── Field names reserved for the engine (Issue #1329) ─────────────────
+
+    private const RESERVED_FIELD_SCHEMA_TOML = <<<'TOML'
+        default_fields = ["body"]
+
+        [fields.body.Text]
+        indexed = true
+        stored = true
+
+        [fields._secret.Text]
+        indexed = true
+        stored = true
+        TOML;
+
+    public function testInMemoryIndexRejectsReservedFieldName(): void
+    {
+        $schema = Laurus\Schema::fromToml(self::RESERVED_FIELD_SCHEMA_TOML);
+        $this->expectException(\ValueError::class);
+        $this->expectExceptionMessageMatches("/Field name '_secret' is reserved/");
+        new Laurus\Index(null, $schema);
+    }
+
+    public function testPathIndexRejectsReservedFieldNameAndWritesNothing(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_reserved_field_" . uniqid();
+        $schema = Laurus\Schema::fromToml(self::RESERVED_FIELD_SCHEMA_TOML);
+        try {
+            new Laurus\Index($dir, $schema);
+            $this->fail("a reserved field name was accepted");
+        } catch (\ValueError $e) {
+            $this->assertStringContainsString("Field name '_secret' is reserved", $e->getMessage());
+        }
+        $this->assertFalse(file_exists($dir), "a rejected create must write nothing");
+    }
+
+    public function testExistingIndexWithReservedFieldNameStillOpens(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_reserved_field_" . uniqid();
+        mkdir($dir);
+        file_put_contents($dir . "/schema.toml", self::RESERVED_FIELD_SCHEMA_TOML);
+        $idx = new Laurus\Index($dir);
+        $idx->putDocument("doc1", ["body" => "Hello World"]);
+        $idx->commit();
+        $this->assertCount(1, $idx->search("body:hello", 5));
+        $idx->close();
+    }
 }
