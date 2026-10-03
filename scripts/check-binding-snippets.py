@@ -7,8 +7,11 @@ analyzer 名を 5 番目（`docValues`）に渡したまま残っていた（Iss
 `addHnswField` も `defaultEfSearch` が `embedder` の前に挿入された同じ形をしている。
 
 このスクリプトは `git ls-files` が返すスニペットを含みうるファイルを走査し、
-1 行に収まる `addTextField(...)` / `addHnswField(...)` の呼び出しについて
+1 行に収まる呼び出しについて
 
+* `add*Field`（`addTextField` / `addHnswField` など）の引数にオブジェクトリテラル
+  `{ ... }` がある（Node.js / WASM の `add*Field` はすべて位置引数を取る。
+  Issue #978、#1327）
 * `addTextField` の 5 番目の引数が文字列リテラル、または
   `true` / `false` / `null` / `undefined`（および引数名そのものの
   `docValues` / `doc_values`）以外の識別子である
@@ -50,8 +53,9 @@ ALLOWED_DOC_VALUES_IDENTS = {
     "$docValues",
 }
 
+ADD_FIELD_RE = re.compile(r"add[A-Z][A-Za-z0-9]*Field")
 CALL_RE = re.compile(
-    r"\b(addTextField|addHnswField|setVectorQuery|setVectorTextQuery"
+    rf"\b({ADD_FIELD_RE.pattern}|setVectorQuery|setVectorTextQuery"
     r"|setFilterQuery|setLexicalTermQuery|setLexicalPhraseQuery"
     r"|setRrfFusion|setWeightedSumFusion|SearchRequest)\s*\("
 )
@@ -111,6 +115,8 @@ def is_string_literal(arg: str) -> bool:
 
 
 def violation_for(method: str, args: list[str]) -> str | None:
+    if ADD_FIELD_RE.fullmatch(method) and any(arg.startswith("{") for arg in args):
+        return f"options object passed to {method}(); the add*Field methods take positional arguments"
     if method == "addTextField":
         if len(args) < 5:
             return None
