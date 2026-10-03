@@ -35,7 +35,7 @@ default_fields = ["title", "body"]
 ## Field Naming
 
 - Field names are arbitrary strings (e.g., `title`, `body_vec`, `created_at`).
-- **Field names starting with `_` are reserved** for the engine. The only allow-listed name is `_id` (managed automatically). Attempting to declare any other `_`-prefixed field results in an error.
+- **Field names starting with `_` are reserved** for the engine. The only allow-listed name is `_id` (managed automatically). Declaring any other `_`-prefixed field is rejected when the index is created, with `Field name '_score' is reserved: names starting with '_' are reserved for system fields (allowed: '_id')`; `create index` creates nothing. An index created before this check keeps opening, and the field stays unusable — a document that sets it is still rejected at ingestion, exactly as it is today.
 - Field names must be unique within a schema.
 
 ## Field Types

@@ -282,8 +282,11 @@ let v: DataValue = vec![0.1f32, 0.2].into(); // Vector
 ## Reserved Fields
 
 Any field name starting with an underscore (`_`) is **reserved for the
-engine**. User code cannot declare fields with such names, and documents that
-carry user-supplied `_`-prefixed keys are rejected at ingest time.
+engine**. Declaring such a field is rejected when the index is created, and
+documents that carry user-supplied `_`-prefixed keys are rejected at ingest
+time — so the field can never hold a value either way. See [Field
+Naming](../laurus-cli/schema_format.md#field-naming) for the exact error and
+how an index created before this check is handled.
 
 The only `_`-prefixed name that is accepted is the allow-listed `_id`
 system field described below.
