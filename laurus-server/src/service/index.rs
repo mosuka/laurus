@@ -264,4 +264,40 @@ mod tests {
         assert!(!data_dir.exists(), "a rejected create must write nothing");
         assert!(service.engine.read().await.is_none());
     }
+
+    /// Issue #1329: CreateIndex rejects a `_`-prefixed field other than
+    /// `_id` as InvalidArgument, and writes nothing.
+    #[tokio::test]
+    async fn create_index_rejects_reserved_field_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: data_dir.clone(),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        };
+        let schema = Schema::from_toml(
+            r#"
+            [fields._secret.Text]
+            "#,
+        )
+        .unwrap();
+
+        let status = service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema_convert::to_proto(&schema)),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("Field name '_secret' is reserved"),
+            "got: {}",
+            status.message()
+        );
+        assert!(!data_dir.exists(), "a rejected create must write nothing");
+        assert!(service.engine.read().await.is_none());
+    }
 }
