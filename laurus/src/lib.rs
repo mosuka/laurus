@@ -97,7 +97,7 @@ pub use engine::schema::analyzer::{
 };
 pub use engine::schema::embedder::EmbedderDefinition;
 pub use engine::schema::{
-    DynamicFieldPolicy, FieldChangeKind, FieldOption, Schema, classify_change,
+    DynamicFieldPolicy, FieldChangeKind, FieldOption, Schema, classify_change, validate_field_name,
 };
 pub use engine::search::{
     FusionAlgorithm, HighlightOptions, HybridMode, LexicalSearchOptions, SearchQuery,

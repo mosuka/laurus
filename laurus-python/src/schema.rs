@@ -238,6 +238,12 @@ impl PySchema {
     ///         this value to cross an element boundary (default 100; ``0``
     ///         numbers the elements as if concatenated). Ignored unless
     ///         ``multi_valued`` is True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields, or if ``analyzer`` is
+    ///         neither a str nor a dict, or is a dict that names an
+    ///         unsupported ``language`` or lacks a required key.
     #[pyo3(signature = (name, *, stored=true, indexed=true, term_vectors=true, doc_values=true, multi_valued=false, position_increment_gap=laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP, analyzer=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
@@ -255,8 +261,8 @@ impl PySchema {
         let analyzer = analyzer
             .map(|obj| analyzer_spec_from_py(py, obj))
             .transpose()?;
-        self.inner.fields.insert(
-            name.to_string(),
+        self.insert_field(
+            name,
             FieldOption::Text(TextOption {
                 indexed,
                 stored,
@@ -266,8 +272,7 @@ impl PySchema {
                 doc_values,
                 analyzer,
             }),
-        );
-        Ok(())
+        )
     }
 
     /// Add an integer (i64) field.
@@ -283,6 +288,10 @@ impl PySchema {
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_integer_field(
         &mut self,
@@ -291,16 +300,16 @@ impl PySchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.fields.insert(
-            name.to_string(),
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::Integer(IntegerOption {
                 indexed,
                 stored,
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a float (f64) field.
@@ -316,6 +325,10 @@ impl PySchema {
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_float_field(
         &mut self,
@@ -324,16 +337,16 @@ impl PySchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.fields.insert(
-            name.to_string(),
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::Float(FloatOption {
                 indexed,
                 stored,
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a boolean field.
@@ -345,6 +358,10 @@ impl PySchema {
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_boolean_field(
         &mut self,
@@ -353,16 +370,16 @@ impl PySchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.fields.insert(
-            name.to_string(),
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::Boolean(BooleanOption {
                 indexed,
                 stored,
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a date/time field.
@@ -375,6 +392,10 @@ impl PySchema {
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_datetime_field(
         &mut self,
@@ -383,16 +404,16 @@ impl PySchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.fields.insert(
-            name.to_string(),
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::DateTime(DateTimeOption {
                 indexed,
                 stored,
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a geographic coordinate field (latitude, longitude).
@@ -406,6 +427,10 @@ impl PySchema {
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_geo_field(
         &mut self,
@@ -414,16 +439,16 @@ impl PySchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.fields.insert(
-            name.to_string(),
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::Geo(GeoOption {
                 indexed,
                 stored,
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
@@ -441,6 +466,10 @@ impl PySchema {
     ///     doc_values: Whether the value is also copied into DocValues
     ///         (default True). Takes effect only when ``stored`` is also
     ///         True.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, indexed=true, multi_valued=false, doc_values=true))]
     pub fn add_geo3d_field(
         &mut self,
@@ -449,16 +478,16 @@ impl PySchema {
         indexed: bool,
         multi_valued: bool,
         doc_values: bool,
-    ) {
-        self.inner.fields.insert(
-            name.to_string(),
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed,
                 stored,
                 multi_valued,
                 doc_values,
             }),
-        );
+        )
     }
 
     /// Add a binary data field.
@@ -468,15 +497,24 @@ impl PySchema {
     ///     stored: Whether the value is retrievable (default True).
     ///     multi_valued: When True, the field accepts a list of binary
     ///         values (each with its own optional MIME type). Default False.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields.
     #[pyo3(signature = (name, *, stored=true, multi_valued=false))]
-    pub fn add_bytes_field(&mut self, name: &str, stored: bool, multi_valued: bool) {
-        self.inner.fields.insert(
-            name.to_string(),
+    pub fn add_bytes_field(
+        &mut self,
+        name: &str,
+        stored: bool,
+        multi_valued: bool,
+    ) -> PyResult<()> {
+        self.insert_field(
+            name,
             FieldOption::Bytes(BytesOption {
                 stored,
                 multi_valued,
             }),
-        );
+        )
     }
 
     /// Add an HNSW approximate nearest-neighbor vector index field.
@@ -513,6 +551,14 @@ impl PySchema {
     ///         Defaults to 1.0. Only matters when a query targets two or
     ///         more specific vector fields at once; has no effect on the
     ///         lexical-vs-vector balance of a hybrid search.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields, if ``distance``,
+    ///         ``quantizer`` or ``rerank_storage`` is not a recognized name,
+    ///         or if ``subvector_count`` is missing with
+    ///         ``quantizer="product_quantization"`` or given with any other
+    ///         quantizer.
     #[pyo3(signature = (name, dimension, *, distance="cosine", m=16, ef_construction=200, default_ef_search=None, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
@@ -542,10 +588,7 @@ impl PySchema {
             pq_codebook_path,
             base_weight,
         };
-        self.inner
-            .fields
-            .insert(name.to_string(), FieldOption::Hnsw(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Hnsw(opt))
     }
 
     /// Add a flat (brute-force) vector index field.
@@ -559,6 +602,11 @@ impl PySchema {
     ///     base_weight: This field's relative scoring priority when
     ///         searched alongside other vector fields (Issue #1084).
     ///         Defaults to 1.0. See `add_hnsw_field` for the full contract.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields, or if ``distance`` is
+    ///         not a recognized metric.
     #[pyo3(signature = (name, dimension, *, distance="cosine", embedder=None, base_weight=1.0))]
     pub fn add_flat_field(
         &mut self,
@@ -575,10 +623,7 @@ impl PySchema {
             base_weight,
             ..Default::default()
         };
-        self.inner
-            .fields
-            .insert(name.to_string(), FieldOption::Flat(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Flat(opt))
     }
 
     /// Add an IVF (Inverted File Index) approximate nearest-neighbor vector field.
@@ -594,6 +639,11 @@ impl PySchema {
     ///     base_weight: This field's relative scoring priority when
     ///         searched alongside other vector fields (Issue #1084).
     ///         Defaults to 1.0. See `add_hnsw_field` for the full contract.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
+    ///         which is reserved for system fields, or if ``distance`` is
+    ///         not a recognized metric.
     #[pyo3(signature = (name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -615,10 +665,7 @@ impl PySchema {
             base_weight,
             ..Default::default()
         };
-        self.inner
-            .fields
-            .insert(name.to_string(), FieldOption::Ivf(opt));
-        Ok(())
+        self.insert_field(name, FieldOption::Ivf(opt))
     }
 
     /// Register a named embedder definition in the schema.
@@ -891,5 +938,14 @@ impl PySchema {
             "Schema(fields={:?})",
             self.inner.fields.keys().collect::<Vec<_>>()
         )
+    }
+}
+
+impl PySchema {
+    /// Insert a field after rejecting a name reserved for system fields.
+    fn insert_field(&mut self, name: &str, option: FieldOption) -> PyResult<()> {
+        laurus::validate_field_name(name).map_err(crate::errors::laurus_err)?;
+        self.inner.fields.insert(name.to_string(), option);
+        Ok(())
     }
 }

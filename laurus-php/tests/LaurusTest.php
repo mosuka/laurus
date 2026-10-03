@@ -1977,4 +1977,36 @@ class LaurusTest extends TestCase
         $this->assertCount(1, $idx->search("body:hello", 5));
         $idx->close();
     }
+
+    // Issue #1331: every add*Field method rejects a reserved name at call
+    // time and leaves the schema unchanged.
+    public function testAddFieldMethodsRejectReservedName(): void
+    {
+        $adders = [
+            "addTextField" => fn ($s) => $s->addTextField("_secret"),
+            "addIntegerField" => fn ($s) => $s->addIntegerField("_secret"),
+            "addFloatField" => fn ($s) => $s->addFloatField("_secret"),
+            "addBooleanField" => fn ($s) => $s->addBooleanField("_secret"),
+            "addDatetimeField" => fn ($s) => $s->addDatetimeField("_secret"),
+            "addGeoField" => fn ($s) => $s->addGeoField("_secret"),
+            "addGeo3dField" => fn ($s) => $s->addGeo3dField("_secret"),
+            "addBytesField" => fn ($s) => $s->addBytesField("_secret"),
+            "addHnswField" => fn ($s) => $s->addHnswField("_secret", 4),
+            "addFlatField" => fn ($s) => $s->addFlatField("_secret", 4),
+            "addIvfField" => fn ($s) => $s->addIvfField("_secret", 4),
+        ];
+        foreach ($adders as $method => $add) {
+            $schema = new Laurus\Schema();
+            try {
+                $add($schema);
+                $this->fail("$method accepted reserved name '_secret'");
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString(
+                    "Field name '_secret' is reserved",
+                    $e->getMessage()
+                );
+            }
+            $this->assertSame([], $schema->fieldNames(), "$method must add nothing");
+        }
+    }
 }

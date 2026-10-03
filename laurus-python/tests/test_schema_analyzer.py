@@ -219,6 +219,32 @@ indexed = true
 stored = true
 """
 
+# Every field-adding method, with the extra positional arguments it requires
+# (vector fields need a `dimension`).
+ADD_FIELD_CALLS = [
+    ("add_text_field", ()),
+    ("add_integer_field", ()),
+    ("add_float_field", ()),
+    ("add_boolean_field", ()),
+    ("add_datetime_field", ()),
+    ("add_geo_field", ()),
+    ("add_geo3d_field", ()),
+    ("add_bytes_field", ()),
+    ("add_hnsw_field", (4,)),
+    ("add_flat_field", (4,)),
+    ("add_ivf_field", (4,)),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "args"), ADD_FIELD_CALLS, ids=[m for m, _ in ADD_FIELD_CALLS]
+)
+def test_add_field_rejects_reserved_name(method, args):
+    schema = laurus.Schema()
+    with pytest.raises(ValueError, match="Field name '_secret' is reserved"):
+        getattr(schema, method)("_secret", *args)
+    assert schema.field_names() == []
+
 
 def test_in_memory_index_rejects_reserved_field_name():
     schema = laurus.Schema.from_toml(RESERVED_FIELD_SCHEMA_TOML)

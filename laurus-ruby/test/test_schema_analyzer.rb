@@ -206,6 +206,33 @@ class TestSchemaAnalyzer < Minitest::Test
     stored = true
   TOML
 
+  # Every add_*_field method, mapped to the positional arguments it needs
+  # after the field name (vector fields take a dimension).
+  FIELD_ADDERS = {
+    add_text_field: [],
+    add_integer_field: [],
+    add_float_field: [],
+    add_boolean_field: [],
+    add_datetime_field: [],
+    add_geo_field: [],
+    add_geo3d_field: [],
+    add_bytes_field: [],
+    add_hnsw_field: [4],
+    add_flat_field: [4],
+    add_ivf_field: [4]
+  }.freeze
+
+  def test_add_field_methods_reject_reserved_name
+    FIELD_ADDERS.each do |method, extra_args|
+      schema = Laurus::Schema.new
+      err = assert_raises(ArgumentError, "#{method} must reject '_secret'") do
+        schema.public_send(method, "_secret", *extra_args)
+      end
+      assert_includes err.message, "Field name '_secret' is reserved"
+      assert_equal [], schema.field_names, "#{method} must add nothing"
+    end
+  end
+
   def test_in_memory_index_rejects_reserved_field_name
     schema = Laurus::Schema.from_toml(RESERVED_FIELD_SCHEMA_TOML)
     err = assert_raises(ArgumentError) { Laurus::Index.new(schema: schema) }

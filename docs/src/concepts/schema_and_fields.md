@@ -284,7 +284,9 @@ let v: DataValue = vec![0.1f32, 0.2].into(); // Vector
 Any field name starting with an underscore (`_`) is **reserved for the
 engine**. Declaring such a field is rejected when the index is created, and
 documents that carry user-supplied `_`-prefixed keys are rejected at ingest
-time — so the field can never hold a value either way. See [Field
+time — so the field can never hold a value either way. The language
+bindings check even earlier: their field-adding methods (`add_*_field` /
+`add*Field`) reject such a name as soon as it is passed. See [Field
 Naming](../laurus-cli/schema_format.md#field-naming) for the exact error and
 how an index created before this check is handled.
 

@@ -224,7 +224,7 @@ class Schema:
 - `rerank_storage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
 - `pq_codebook_path` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`quantizer="product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
 
-上記のどの `add_*_field` メソッドも `_`（`_id` を除く）で始まるフィールド名をそのまま受け付けるが、実際に拒否されるのはそのスキーマで `Index`（インメモリ・新規のディスク上インデックスいずれも）を作成するときのみで、`ValueError` になる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
+上記のどの `add_*_field` メソッドも、`name` が `_`（`_id` を除く）で始まる場合は `ValueError` を送出し、フィールドを追加しない。`from_toml` / `from_toml_file` で読み込むスキーマは引き続きそのようなフィールドを受け付けるため、永続化済みのスキーマは読み込めるが、そのスキーマから新しい `Index` を作成すると `ValueError` になる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
 
 ### その他のメソッド
 
