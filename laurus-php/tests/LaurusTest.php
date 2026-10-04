@@ -1760,6 +1760,106 @@ class LaurusTest extends TestCase
         $this->assertFileExists($dir . "/schema.toml");
     }
 
+    // ── Build-failure cleanup (Issue #1308) ───────────────────────────────
+    //
+    // `schema.toml` and `store/` are written before the `Engine` is built,
+    // so before this fix a build-time failure (e.g. analyzer resolution
+    // against a malformed regex) left both on disk with nothing to clean
+    // them up -- a retry at the same path then failed with a confusing
+    // "reopen" error instead of the original problem.
+
+    // `addAnalyzer` only validates shape (Issue #1057); a malformed regex
+    // pattern is only caught when the analyzer is compiled, which happens
+    // while building the `Engine` -- i.e. inside `new Laurus\Index(...)`,
+    // not `addAnalyzer` itself. Written as TOML (rather than
+    // `addAnalyzer`/`addTextField`) so the malformed pattern survives
+    // schema persistence unchanged.
+    private const MALFORMED_REGEX_SCHEMA_TOML = <<<'TOML'
+        [analyzers.bad]
+        tokenizer = { type = "regex", pattern = "(" }
+
+        [fields.body.Text]
+        analyzer = "bad"
+        TOML;
+
+    public function testFailedBuildLeavesNoSchemaTomlAndRetrySucceeds(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_rollback_" . uniqid();
+        // No mkdir(): $dir does not exist yet, so a build failure must
+        // remove the whole directory this call created, not just
+        // schema.toml/store/ within it.
+        $badSchema = Laurus\Schema::fromToml(self::MALFORMED_REGEX_SCHEMA_TOML);
+
+        try {
+            new Laurus\Index($dir, $badSchema);
+            $this->fail("a malformed regex analyzer was accepted");
+        } catch (\Exception $e) {
+            $this->assertStringContainsString(
+                "Failed to resolve analyzer for field 'body'",
+                $e->getMessage()
+            );
+        }
+        $this->assertDirectoryDoesNotExist($dir, "a build failure in a directory this call created must leave nothing behind");
+
+        // Retrying at the same path must not be blocked by anything the
+        // failed attempt left behind.
+        new Laurus\Index($dir);
+        $this->assertFileExists($dir . "/schema.toml");
+    }
+
+    public function testRetryAfterFailedBuildSucceedsWithAFixedSchema(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_rollback_" . uniqid();
+        mkdir($dir);
+        $badSchema = Laurus\Schema::fromToml(self::MALFORMED_REGEX_SCHEMA_TOML);
+
+        try {
+            new Laurus\Index($dir, $badSchema);
+            $this->fail("a malformed regex analyzer was accepted");
+        } catch (\Exception $e) {
+            $this->assertStringContainsString(
+                "Failed to resolve analyzer for field 'body'",
+                $e->getMessage()
+            );
+        }
+        $this->assertFileDoesNotExist($dir . "/schema.toml");
+        $this->assertDirectoryDoesNotExist($dir . "/store");
+
+        // A retry at the same path with a fixed schema must fully succeed --
+        // not merely construct without throwing, but actually index and
+        // serve a search.
+        $fixedSchema = new Laurus\Schema();
+        $fixedSchema->addTextField("body");
+        $idx = new Laurus\Index($dir, $fixedSchema);
+        $idx->putDocument("doc1", ["body" => "hello world"]);
+        $idx->commit();
+        $this->assertCount(1, $idx->search("body:hello", 5));
+    }
+
+    public function testFailedBuildInAPreExistingDirectoryKeepsUnrelatedFiles(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_rollback_" . uniqid();
+        mkdir($dir);
+        // An unrelated file already in the directory before the failed
+        // attempt.
+        file_put_contents($dir . "/README.txt", "keep me");
+        $badSchema = Laurus\Schema::fromToml(self::MALFORMED_REGEX_SCHEMA_TOML);
+
+        try {
+            new Laurus\Index($dir, $badSchema);
+            $this->fail("a malformed regex analyzer was accepted");
+        } catch (\Exception $e) {
+            $this->assertStringContainsString(
+                "Failed to resolve analyzer for field 'body'",
+                $e->getMessage()
+            );
+        }
+
+        $this->assertFileExists($dir . "/README.txt", "unrelated pre-existing files must survive");
+        $this->assertFileDoesNotExist($dir . "/schema.toml");
+        $this->assertDirectoryDoesNotExist($dir . "/store");
+    }
+
     // ── close() (Issue #1086/#1097) ────────────────────────────────────────
     //
     // Engine::build() (Issue #1086) takes an exclusive lock on the storage

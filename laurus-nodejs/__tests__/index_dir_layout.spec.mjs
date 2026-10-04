@@ -77,3 +77,49 @@ describe("Index(path) directory layout (#1059)", () => {
     expect(existsSync(join(dir, "schema.toml"))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Build-time failure cleanup (Issue #1308)
+//
+// A malformed regex parses fine as schema TOML/JS (it's just a string) but
+// fails only once the analyzer is resolved during the engine build, after
+// schema.toml and store/ already exist. `Index.create` must roll both back
+// before throwing, so a retry at the same path isn't blocked by the failed
+// attempt's leftovers.
+// ---------------------------------------------------------------------------
+
+describe("Index.create build-time failure cleanup (#1308)", () => {
+  function brokenSchema() {
+    const schema = new Schema();
+    schema.addAnalyzer("bad", { type: "regex", pattern: "(" });
+    schema.addTextField("body", true, true, true, true, "bad");
+    return schema;
+  }
+
+  it("a build failure in a fresh directory leaves nothing behind, and a fixed retry succeeds", async () => {
+    const dir = freshDir();
+
+    await expect(Index.create(dir, brokenSchema())).rejects.toThrow();
+    expect(existsSync(join(dir, "schema.toml"))).toBe(false);
+    expect(existsSync(join(dir, "store"))).toBe(false);
+
+    const fixedSchema = new Schema();
+    fixedSchema.addTextField("body");
+    await expect(Index.create(dir, fixedSchema)).resolves.toBeDefined();
+  });
+
+  it("a build failure in a pre-existing directory only removes schema.toml/store, keeping unrelated files", async () => {
+    const dir = freshDir();
+    writeFileSync(join(dir, "README.txt"), "keep me");
+
+    await expect(Index.create(dir, brokenSchema())).rejects.toThrow();
+
+    expect(existsSync(join(dir, "README.txt"))).toBe(true);
+    expect(existsSync(join(dir, "schema.toml"))).toBe(false);
+    expect(existsSync(join(dir, "store"))).toBe(false);
+
+    const fixedSchema = new Schema();
+    fixedSchema.addTextField("body");
+    await expect(Index.create(dir, fixedSchema)).resolves.toBeDefined();
+  });
+});

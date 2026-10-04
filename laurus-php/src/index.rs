@@ -7,6 +7,7 @@ use std::sync::Arc;
 use ext_php_rs::convert::FromZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
+use laurus::index_dir::CreateRollback;
 use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Engine, EngineStats, Storage,
     StorageConfig, StorageFactory, WalSyncPolicy,
@@ -324,7 +325,12 @@ impl PhpIndex {
     /// `schema` was also given, if `path` contains an index in the
     /// pre-existing (pre-Issue-1059) flat layout, or if a new index's
     /// `schema` defines a custom analyzer under a name reserved for a
-    /// built-in analyzer (nothing is written then).
+    /// built-in analyzer (nothing is written then). If engine construction
+    /// itself then fails (e.g. analyzer resolution against a malformed
+    /// regex, embedder construction), whatever this call wrote is rolled
+    /// back too: `path` ends up exactly as it was before the call, so a
+    /// retry after fixing the schema is not blocked by leftover state
+    /// (Issue #1308).
     pub fn __construct(
         path: Option<String>,
         schema: Option<&PhpSchema>,
@@ -335,7 +341,8 @@ impl PhpIndex {
             .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()))?;
 
         let schema_val = schema.map(|php_schema| php_schema.inner.borrow().clone());
-        let (schema_val, storage) = resolve_storage_and_schema(path.as_deref(), schema_val)?;
+        let (schema_val, storage, rollback) =
+            resolve_storage_and_schema(path.as_deref(), schema_val)?;
 
         let mut builder = Engine::builder(storage, schema_val);
         if let Some(policy) = wal_sync_policy {
@@ -345,12 +352,18 @@ impl PhpIndex {
             builder = builder.commit_policy(policy.inner);
         }
 
-        let engine = rt.block_on(builder.build()).map_err(laurus_err)?;
-
-        Ok(Self {
-            engine: RefCell::new(Some(Arc::new(engine))),
-            rt: Arc::new(rt),
-        })
+        match rt.block_on(builder.build()) {
+            Ok(engine) => Ok(Self {
+                engine: RefCell::new(Some(Arc::new(engine))),
+                rt: Arc::new(rt),
+            }),
+            Err(err) => {
+                if let Some(rollback) = rollback {
+                    rollback.rollback();
+                }
+                Err(laurus_err(err))
+            }
+        }
     }
 
     /// Release this index's handle on the underlying engine, deterministically
@@ -788,19 +801,28 @@ pub fn peek_commit_generation_function_entry() -> ext_php_rs::builders::Function
 ///
 /// # Returns
 ///
-/// The resolved `(Schema, Storage)` pair for the engine builder.
+/// The resolved `(Schema, Storage)` pair for the engine builder, plus a
+/// [`CreateRollback`] snapshot to undo whatever `open_or_create` wrote if
+/// the engine subsequently fails to build (Issue #1308). `None` for the
+/// in-memory path, since nothing is ever written to disk there.
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<laurus::Schema>,
-) -> PhpResult<(laurus::Schema, Arc<dyn Storage>)> {
+) -> PhpResult<(laurus::Schema, Arc<dyn Storage>, Option<CreateRollback>)> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
             schema.validate_for_create().map_err(laurus_err)?;
             let storage = StorageFactory::create(StorageConfig::Memory(Default::default()))
                 .map_err(laurus_err)?;
-            Ok((schema, storage))
+            Ok((schema, storage, None))
         }
-        Some(p) => laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err),
+        Some(p) => {
+            let index_dir = Path::new(p);
+            let rollback = CreateRollback::snapshot(index_dir);
+            let (schema, storage) =
+                laurus::index_dir::open_or_create(index_dir, schema).map_err(index_dir_err)?;
+            Ok((schema, storage, Some(rollback)))
+        }
     }
 }

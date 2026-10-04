@@ -21,9 +21,11 @@
 //!   when omitted) is checked with [`Schema::validate_for_create`],
 //!   written to `schema.toml`, and a fresh `store/` directory is created.
 //!
-//! `laurus-cli`/`laurus-server` are not migrated to use this module (see
-//! Issue #1061) — it exists solely for the four bindings, which had no
-//! shared convention before Issue #1059.
+//! [`open_or_create`] itself is not used by `laurus-cli`/`laurus-server`
+//! (see Issue #1061) — it exists solely for the four bindings, which had no
+//! shared convention before Issue #1059. [`CreateRollback`], however, is
+//! shared by all three entry points, since the write-then-build-engine
+//! shape (and the cleanup a failed build needs) is the same everywhere.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,6 +101,87 @@ pub enum IndexDirError {
     /// Schema (de)serialization or storage creation/opening failed.
     #[error(transparent)]
     Core(#[from] LaurusError),
+}
+
+/// Snapshot of an index directory's on-disk state, taken before a create
+/// attempt writes `schema.toml`/`store/` and builds an [`crate::Engine`],
+/// used to undo exactly what that attempt added if the build fails
+/// afterwards (Issue #1308).
+///
+/// Every entry point that writes the `schema.toml` + `store/` layout before
+/// building an engine (`laurus-cli`, `laurus-server`, and each binding's
+/// `Index` constructor, all built on this module's convention) takes a
+/// snapshot right after checking that a complete index doesn't already
+/// exist, and calls [`Self::rollback`] if the build fails -- otherwise a
+/// retry is blocked by state the failed attempt left behind.
+#[must_use = "take the snapshot before the create attempt and call rollback() if it fails"]
+pub struct CreateRollback {
+    index_dir: PathBuf,
+    dir_existed: bool,
+    schema_existed: bool,
+    store_existed: bool,
+}
+
+impl CreateRollback {
+    /// Record `index_dir`'s state. Call this before writing `schema.toml`
+    /// or creating `store/`.
+    pub fn snapshot(index_dir: &Path) -> Self {
+        Self {
+            index_dir: index_dir.to_path_buf(),
+            dir_existed: index_dir.exists(),
+            schema_existed: index_dir.join(SCHEMA_FILE).exists(),
+            store_existed: index_dir.join(STORE_DIR).exists(),
+        }
+    }
+
+    /// Undo whatever the create attempt added, leaving anything that
+    /// predates the attempt untouched:
+    ///
+    /// - `index_dir` itself didn't exist: remove the whole directory.
+    /// - `schema.toml` didn't exist (this attempt was creating, not
+    ///   reopening): remove `store/` -- even a stale one that predates the
+    ///   attempt, since storage creation already overwrote it and the
+    ///   both-exist case is rejected before any snapshot is taken, so a
+    ///   `store/` reachable here was never part of a complete index -- and
+    ///   the `schema.toml` this attempt wrote.
+    /// - `schema.toml` existed (reopening, or the CLI's recovery path):
+    ///   never touch it, and only remove `store/` if this attempt created
+    ///   it fresh.
+    ///
+    /// Best-effort: a removal failure is logged through the `log` crate and
+    /// otherwise ignored, since the caller is already on its way to
+    /// returning the original build error.
+    pub fn rollback(self) {
+        if !self.dir_existed {
+            Self::remove_best_effort(&self.index_dir, true);
+            return;
+        }
+
+        if self.schema_existed {
+            if !self.store_existed {
+                Self::remove_best_effort(&self.index_dir.join(STORE_DIR), true);
+            }
+        } else {
+            Self::remove_best_effort(&self.index_dir.join(STORE_DIR), true);
+            Self::remove_best_effort(&self.index_dir.join(SCHEMA_FILE), false);
+        }
+    }
+
+    fn remove_best_effort(path: &Path, is_dir: bool) {
+        let result = if is_dir {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        if let Err(err) = result
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "failed to remove {} after a failed create: {err}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Resolve `index_dir` into a `(Schema, Storage)` pair, creating a new
@@ -299,6 +382,99 @@ mod tests {
 
         let (reopened, _storage) = open_or_create(dir.path(), None).unwrap();
         assert!(reopened.fields.contains_key("_secret"));
+    }
+
+    // --- CreateRollback (Issue #1308) ---
+
+    #[test]
+    fn create_rollback_removes_the_whole_directory_when_it_did_not_exist_before() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+
+        let rollback = CreateRollback::snapshot(&index_dir);
+        open_or_create(&index_dir, Some(Schema::new())).unwrap();
+        assert!(index_dir.join(SCHEMA_FILE).is_file());
+        assert!(index_dir.join(STORE_DIR).is_dir());
+
+        rollback.rollback();
+        assert!(!index_dir.exists());
+    }
+
+    #[test]
+    fn create_rollback_removes_only_schema_and_store_when_the_directory_predates_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // An unrelated file already in the directory before the attempt.
+        std::fs::write(dir.path().join("README.txt"), b"keep me").unwrap();
+
+        let rollback = CreateRollback::snapshot(dir.path());
+        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+
+        rollback.rollback();
+        assert!(
+            dir.path().is_dir(),
+            "the pre-existing directory must survive"
+        );
+        assert!(
+            dir.path().join("README.txt").is_file(),
+            "unrelated pre-existing files must survive"
+        );
+        assert!(!dir.path().join(SCHEMA_FILE).exists());
+        assert!(!dir.path().join(STORE_DIR).exists());
+    }
+
+    #[test]
+    fn create_rollback_removes_a_stale_store_with_no_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A leftover store/ with no schema.toml: not a complete index (the
+        // both-exist case is rejected before any snapshot), so rollback may
+        // remove it even though it predates the attempt.
+        std::fs::create_dir_all(dir.path().join(STORE_DIR).join("stale")).unwrap();
+
+        let rollback = CreateRollback::snapshot(dir.path());
+        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+
+        rollback.rollback();
+        assert!(dir.path().is_dir());
+        assert!(!dir.path().join(SCHEMA_FILE).exists());
+        assert!(!dir.path().join(STORE_DIR).exists());
+    }
+
+    #[test]
+    fn create_rollback_on_reopen_never_touches_a_pre_existing_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(SCHEMA_FILE),
+            RESERVED_ANALYZER_SCHEMA_TOML.trim(),
+        )
+        .unwrap();
+
+        let rollback = CreateRollback::snapshot(dir.path());
+        open_or_create(dir.path(), None).unwrap();
+        assert!(dir.path().join(STORE_DIR).is_dir());
+
+        rollback.rollback();
+        assert!(
+            dir.path().join(SCHEMA_FILE).is_file(),
+            "a schema.toml that predates the attempt must never be removed"
+        );
+        assert!(
+            !dir.path().join(STORE_DIR).exists(),
+            "a store/ this attempt created must still be removed"
+        );
+    }
+
+    #[test]
+    fn create_rollback_on_reopen_never_removes_a_pre_existing_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+
+        // Simulate a later call that only reopens (schema.toml and store/
+        // both already exist): a build failure here must not touch either.
+        let rollback = CreateRollback::snapshot(dir.path());
+        rollback.rollback();
+
+        assert!(dir.path().join(SCHEMA_FILE).is_file());
+        assert!(dir.path().join(STORE_DIR).is_dir());
     }
 
     #[test]

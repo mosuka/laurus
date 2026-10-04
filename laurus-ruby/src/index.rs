@@ -10,6 +10,7 @@ use crate::gvl::without_gvl;
 use crate::schema::RbSchema;
 use crate::search::{build_request_from_rb, rb_to_highlight_options, to_rb_search_result};
 use crate::wal::RbWalSyncPolicy;
+use laurus::index_dir::CreateRollback;
 use laurus::{Engine, EngineStats, Schema, Storage, StorageConfig, StorageFactory};
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -100,7 +101,10 @@ impl RbIndex {
     /// and `schema:` was also given, if `path:` contains an index in the
     /// pre-existing (pre-Issue-1059) flat layout, or if a new index's
     /// `schema:` defines a custom analyzer under a name reserved for a
-    /// built-in analyzer (nothing is written then).
+    /// built-in analyzer (nothing is written then). A build-time failure
+    /// (e.g. analyzer resolution against a malformed regex, embedder
+    /// construction) likewise leaves `path:` in the state it was in before
+    /// this call -- nothing is left behind to block a retry (Issue #1308).
     fn new(args: &[Value]) -> Result<Self, Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
@@ -132,7 +136,7 @@ impl RbIndex {
         let schema = schema_ref.map(|s| s.inner.borrow().clone());
         // Returns `magnus::Error` (holds a `Value`, so it's `!Send`); must
         // run with the GVL held, before entering `without_gvl` below.
-        let (schema, storage) = resolve_storage_and_schema(path.as_deref(), schema)?;
+        let (schema, storage, rollback) = resolve_storage_and_schema(path.as_deref(), schema)?;
         let wal_sync_policy = wal_sync_policy.map(|p| p.inner);
         let commit_policy = commit_policy.map(|p| p.inner);
 
@@ -145,7 +149,18 @@ impl RbIndex {
             if let Some(policy) = commit_policy {
                 builder = builder.commit_policy(policy);
             }
-            rt_for_build.block_on(builder.build())
+            // A build failure must not leave schema.toml/store/ behind to
+            // block a retry (Issue #1308), so undo exactly what
+            // `resolve_storage_and_schema` added above.
+            match rt_for_build.block_on(builder.build()) {
+                Ok(engine) => Ok(engine),
+                Err(err) => {
+                    if let Some(rollback) = rollback {
+                        rollback.rollback();
+                    }
+                    Err(err)
+                }
+            }
         })
         .map_err(laurus_err)?;
 
@@ -541,12 +556,16 @@ fn pairs_to_documents(ruby: &Ruby, docs: RArray) -> Result<Vec<(String, laurus::
 // Storage factory helper
 // ---------------------------------------------------------------------------
 
-/// Resolve the `(Schema, Storage)` pair for [`RbIndex::new`].
+/// Resolve the `(Schema, Storage)` pair for [`RbIndex::new`], plus the
+/// [`CreateRollback`] snapshot a build failure must undo (Issue #1308).
 ///
 /// `path: nil` keeps the pre-existing in-memory behavior (schema defaults
-/// to empty, no persistence, no conflict checking). `path: Some(p)` defers
-/// to `laurus::index_dir::open_or_create`, which applies the
-/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`.
+/// to empty, no persistence, no conflict checking) -- nothing is ever
+/// written to disk there, so the rollback is always `None`. `path: Some(p)`
+/// defers to `laurus::index_dir::open_or_create`, which applies the
+/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`; the
+/// snapshot is taken immediately before that call, since it's the point
+/// `schema.toml`/`store/` may first be written.
 ///
 /// # Arguments
 ///
@@ -557,20 +576,28 @@ fn pairs_to_documents(ruby: &Ruby, docs: RArray) -> Result<Vec<(String, laurus::
 ///
 /// # Returns
 ///
-/// The resolved `Schema` and an `Arc<dyn Storage>` for the engine.
+/// The resolved `Schema`, an `Arc<dyn Storage>` for the engine, and the
+/// rollback snapshot to call `rollback()` on if building the engine fails
+/// (`None` for an in-memory index).
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<Schema>,
-) -> Result<(Schema, Arc<dyn Storage>), Error> {
+) -> Result<(Schema, Arc<dyn Storage>, Option<CreateRollback>), Error> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
             schema.validate_for_create().map_err(laurus_err)?;
             let storage = StorageFactory::create(StorageConfig::Memory(Default::default()))
                 .map_err(laurus_err)?;
-            Ok((schema, storage))
+            Ok((schema, storage, None))
         }
-        Some(p) => laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err),
+        Some(p) => {
+            let index_dir = Path::new(p);
+            let rollback = CreateRollback::snapshot(index_dir);
+            let (schema, storage) =
+                laurus::index_dir::open_or_create(index_dir, schema).map_err(index_dir_err)?;
+            Ok((schema, storage, Some(rollback)))
+        }
     }
 }
 

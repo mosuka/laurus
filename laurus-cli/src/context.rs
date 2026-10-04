@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use laurus::index_dir::CreateRollback;
 use laurus::storage::file::FileStorageConfig;
 use laurus::{CommitPolicy, Engine, LaurusError, Schema, StorageConfig, StorageFactory};
 
@@ -102,6 +103,13 @@ pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Resul
 /// ignores the `schema` argument and reads the existing file instead so that
 /// a plain `create index` (without `--schema`) recovers correctly.
 ///
+/// If engine/storage initialisation then fails (analyzer resolution,
+/// embedder construction, ...), whatever this call wrote above is rolled
+/// back: `index_dir` ends up exactly as it was before the call (Issue
+/// #1308). Because of this, the recovery row above only ever matters when a
+/// process crashes between writing `schema.toml` and finishing storage/engine
+/// initialisation -- a build failure no longer leaves that state behind.
+///
 /// # Arguments
 ///
 /// * `index_dir` - Path to the index directory.
@@ -111,7 +119,10 @@ pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Resul
 /// # Errors
 ///
 /// Returns an error if the index already fully exists, the directory cannot
-/// be created, or engine/storage initialisation fails.
+/// be created, or engine/storage initialisation fails. A failure in engine
+/// or storage initialisation (e.g. analyzer resolution, embedder
+/// construction) leaves `index_dir` in the state it was in before this call
+/// -- nothing is left behind to block a retry (Issue #1308).
 async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
     let schema_path = index_dir.join(SCHEMA_FILE);
     let store_path = index_dir.join(STORE_DIR);
@@ -124,6 +135,8 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
             index_dir.display()
         );
     }
+
+    let rollback = CreateRollback::snapshot(index_dir);
 
     // If schema.toml exists but store/ is missing, recover using the existing
     // schema rather than the one passed in (which may come from the wizard).
@@ -144,13 +157,24 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
         schema
     };
 
-    // Create the storage and engine to initialize the index structure.
+    // Create the storage and engine to initialize the index structure. A
+    // failure here must not leave schema.toml/store/ behind to block a
+    // retry (Issue #1308), so undo exactly what this call added above.
     let storage_config = StorageConfig::File(FileStorageConfig::new(&store_path));
-    let storage = StorageFactory::create(storage_config)?;
-    let _engine = Engine::builder(storage, schema)
-        .persist_schema_with(schema_persist_hook(index_dir))
-        .build()
-        .await?;
+    let build_result: Result<()> = async {
+        let storage = StorageFactory::create(storage_config)?;
+        Engine::builder(storage, schema)
+            .persist_schema_with(schema_persist_hook(index_dir))
+            .build()
+            .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = build_result {
+        rollback.rollback();
+        return Err(err);
+    }
 
     Ok(())
 }
@@ -454,6 +478,106 @@ mod tests {
 
         let engine = open_index(dir.path()).await.unwrap();
         assert!(engine.schema().analyzers.contains_key("standard"));
+    }
+
+    // --- Issue #1308: a build-time failure must leave nothing behind ---
+
+    /// A malformed regex pattern parses fine as TOML (it's just a string)
+    /// but fails when the analyzer is resolved during the engine build --
+    /// after `schema.toml` and `store/` already exist, unlike the
+    /// reserved-name checks above which run before anything is written.
+    const MALFORMED_REGEX_SCHEMA_TOML: &str = r#"
+        [analyzers.bad]
+        tokenizer = { type = "regex", pattern = "(" }
+
+        [fields.body.Text]
+        analyzer = "bad"
+    "#;
+
+    const VALID_SCHEMA_TOML: &str = r#"
+        [fields.body.Text]
+    "#;
+
+    fn assert_build_failure(err: &anyhow::Error) {
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to resolve analyzer for field 'body'"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_build_failure_in_a_fresh_directory_leaves_nothing_and_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("idx");
+        let bad_schema_path = dir.path().join("bad.toml");
+        std::fs::write(&bad_schema_path, MALFORMED_REGEX_SCHEMA_TOML).unwrap();
+
+        let err = create_index(&index_dir, &bad_schema_path)
+            .await
+            .unwrap_err();
+        assert_build_failure(&err);
+        assert!(
+            !index_dir.exists(),
+            "a build failure in a directory this call created must leave nothing behind"
+        );
+
+        let good_schema_path = dir.path().join("good.toml");
+        std::fs::write(&good_schema_path, VALID_SCHEMA_TOML).unwrap();
+        create_index(&index_dir, &good_schema_path)
+            .await
+            .expect("retry with a fixed schema must succeed without deleting anything by hand");
+    }
+
+    #[tokio::test]
+    async fn create_index_build_failure_in_a_pre_existing_directory_only_removes_schema_and_store()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("idx");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("README.txt"), b"keep me").unwrap();
+
+        let schema = Schema::from_toml(MALFORMED_REGEX_SCHEMA_TOML).unwrap();
+        let err = create_index_from_schema(&index_dir, schema)
+            .await
+            .unwrap_err();
+        assert_build_failure(&err);
+        assert!(
+            index_dir.join("README.txt").is_file(),
+            "a build failure must not remove files that predate the call"
+        );
+        assert!(!index_dir.join(SCHEMA_FILE).exists());
+        assert!(!index_dir.join(STORE_DIR).exists());
+
+        let good_schema = Schema::from_toml(VALID_SCHEMA_TOML).unwrap();
+        create_index_from_schema(&index_dir, good_schema)
+            .await
+            .expect("retry with a fixed schema must succeed without deleting anything by hand");
+    }
+
+    #[tokio::test]
+    async fn create_index_build_failure_on_recovery_path_keeps_the_persisted_schema_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("idx");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        // schema.toml predates the call (no store/ yet): the recovery path.
+        std::fs::write(index_dir.join(SCHEMA_FILE), MALFORMED_REGEX_SCHEMA_TOML).unwrap();
+
+        let err = create_index_from_schema(&index_dir, Schema::new())
+            .await
+            .unwrap_err();
+        assert_build_failure(&err);
+        assert!(
+            index_dir.join(SCHEMA_FILE).is_file(),
+            "a schema.toml that predates the call must never be removed"
+        );
+        assert!(!index_dir.join(STORE_DIR).exists());
+
+        // Fix schema.toml by hand (as the recovery rule expects) and retry.
+        std::fs::write(index_dir.join(SCHEMA_FILE), VALID_SCHEMA_TOML).unwrap();
+        create_index_from_schema(&index_dir, Schema::new())
+            .await
+            .expect("retry after fixing the persisted schema must succeed");
     }
 
     /// Issue #1329: a schema with a `_`-prefixed field other than `_id`.
