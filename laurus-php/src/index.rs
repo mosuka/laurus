@@ -332,7 +332,7 @@ impl PhpIndex {
         commit_policy: Option<&PhpCommitPolicy>,
     ) -> PhpResult<Self> {
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()))?;
+            .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()))?;
 
         let schema_val = schema.map(|php_schema| php_schema.inner.borrow().clone());
         let (schema_val, storage) = resolve_storage_and_schema(path.as_deref(), schema_val)?;
