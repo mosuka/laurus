@@ -83,6 +83,8 @@ graph TD
 
 Recovery is transparent — you do not need to handle it manually. Note that a post-crash open therefore does commit-scale work (segment flush, index writes), and `Engine::build` returns an error if that commit fails (e.g. the disk is full); reopening after the condition clears is safe, since replay is idempotent and the WAL is only truncated after the commit succeeds.
 
+A `put`/`add` call rejected for a caller-input reason — an unsupported input type for a field's embedder, a vector of the wrong dimension, an unconfigured field — never reaches the WAL (the document's vector fields are embedded and validated before anything is written or deleted), so it leaves no replayable record for a later recovery to retry. An index that an older build already left with such a record still in its WAL replays it once more: recovery logs a warning and discards the record instead of failing to open, since the call that originally wrote it already returned that same error to its caller. A record rejected for any other reason (e.g. a remote embedder temporarily unreachable) still fails recovery and is retried on the next open, as before.
+
 ## The Commit Lifecycle
 
 ```rust

@@ -20,7 +20,7 @@ use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::data::Document;
 use crate::embedding::cache::{EmbeddingCache, embed_batch_with_cache};
 use crate::embedding::embedder::Embedder;
-use crate::error::Result;
+use crate::error::{LaurusError, Result};
 use crate::lexical::store::LexicalStore;
 use crate::lexical::store::config::LexicalIndexConfig;
 use crate::storage::Storage;
@@ -620,6 +620,19 @@ pub struct Engine {
 
 use crate::engine::search::{FusionAlgorithm, SearchResult};
 
+/// Whether a WAL record that fails to re-apply during recovery may be
+/// discarded instead of failing the whole recovery (Issue #1326).
+///
+/// Only [`InvalidArgument`](LaurusError::InvalidArgument) qualifies: by
+/// convention (Issue #1253) it means the input itself was invalid, so
+/// retrying the exact same bytes on a later open can never succeed. Every
+/// other error kind (I/O, an unreachable remote embedder, ...) may be
+/// transient, and `recover`'s caller relies on retrying those on the next
+/// open, so they keep propagating.
+fn is_quarantinable(err: &LaurusError) -> bool {
+    matches!(err, LaurusError::InvalidArgument(_))
+}
+
 /// Prefix an analyzer-resolution failure with the field it was resolved for.
 ///
 /// The variant is kept, so an unknown analyzer name stays
@@ -698,6 +711,18 @@ impl Engine {
     /// the stores at different `last_wal_seq` values) is reconciled here — each
     /// store re-applies only what it is missing. See [`Self::commit`] for the
     /// ordering guarantees that make this safe (Issue #821).
+    ///
+    /// A record whose re-application fails is normally a fatal error for
+    /// recovery (and therefore for [`EngineBuilder::build`]), since retrying
+    /// a deterministic rejection would just fail the same way on every
+    /// future open. As a backstop for an index a build predating Issue
+    /// #1326 already left in that state — new writes can no longer produce
+    /// such a record, see [`Engine::index_internal`] — a record neither
+    /// store has checkpointed yet (so its originating `put`/`add` already
+    /// returned this same error to its caller) is instead logged and
+    /// discarded when the failure is [`quarantinable`](is_quarantinable):
+    /// an [`InvalidArgument`](crate::error::LaurusError::InvalidArgument),
+    /// meaning the input itself, not a transient condition, was the problem.
     async fn recover(&self) -> Result<()> {
         // read_all() internally syncs next_doc_id with doc_store segments.
         let records = self.log.read_all()?;
@@ -761,20 +786,30 @@ impl Engine {
             match record.entry {
                 LogEntry::Upsert {
                     doc_id,
-                    external_id: _,
+                    external_id,
                     document,
                 } => {
                     // Restore document into document store
                     let stored_doc = self.filter_stored_fields(&document);
                     self.log.store_document(doc_id, stored_doc);
 
-                    // Re-index into both stores using the recorded doc_id.
-                    // Update seq only after BOTH stores succeed to maintain atomicity.
-                    if record.seq > lexical_last_seq {
-                        self.lexical.upsert_document(doc_id, document.clone())?;
-                    }
+                    // Re-index into both stores using the recorded doc_id, in
+                    // the same order `index_internal` now uses (Issue #1326):
+                    // embed+validate the vector fields before touching the
+                    // lexical store, so neither store is mutated for a record
+                    // this build would reject. `neither_checkpointed` is true
+                    // only when BOTH stores still need this record applied —
+                    // i.e. the record was never durably committed anywhere,
+                    // so the `put`/`add` that wrote it already returned this
+                    // same error to its caller, and quarantining it here loses
+                    // no acknowledged write. A record only one store still
+                    // needs (a commit that crashed between the two stores)
+                    // is NOT quarantined even on the same error kind: the
+                    // other store already holds it durably.
+                    let neither_checkpointed =
+                        record.seq > lexical_last_seq && record.seq > vector_last_seq;
 
-                    if record.seq > vector_last_seq {
+                    let vectors = if record.seq > vector_last_seq {
                         // Filter for vector fields
                         let mut vector_doc = Document::new();
                         {
@@ -785,9 +820,39 @@ impl Engine {
                                 }
                             }
                         }
-                        self.vector
-                            .upsert_document_by_internal_id(doc_id, vector_doc)
-                            .await?;
+                        match self.vector.embed_document(&vector_doc).await {
+                            Ok(vectors) => Some(vectors),
+                            Err(e) if neither_checkpointed && is_quarantinable(&e) => {
+                                log::warn!(
+                                    "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
+                                    record.seq
+                                );
+                                self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Update seq only after BOTH stores succeed to maintain atomicity.
+                    if record.seq > lexical_last_seq
+                        && let Err(e) = self.lexical.upsert_document(doc_id, document.clone())
+                    {
+                        if neither_checkpointed && is_quarantinable(&e) {
+                            log::warn!(
+                                "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
+                                record.seq
+                            );
+                            self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+
+                    if let Some(vectors) = vectors {
+                        self.vector.write_vectors(doc_id, vectors).await?;
                     }
 
                     // Both stores succeeded — now update seq trackers.
@@ -854,15 +919,20 @@ impl Engine {
 
     /// Put (upsert) a document.
     ///
-    /// If a document with the same external ID exists, all its chunks are
-    /// deleted before the new document is indexed. A `_id` field is
-    /// automatically inserted into the document with the provided `id` value.
-    /// A WAL entry is written before any index mutations to ensure durability.
+    /// The new document's vector fields are embedded and validated first
+    /// (Issue #1326): only once that succeeds are a document with the same
+    /// external ID's chunks deleted and the new document indexed. A
+    /// rejection (e.g. an unsupported input type, the wrong dimension) thus
+    /// leaves the previous version in place and never reaches the WAL. A
+    /// `_id` field is automatically inserted into the document with the
+    /// provided `id` value. A WAL entry is written before any index
+    /// mutation, to ensure durability.
     ///
     /// The document fields are routed to the appropriate underlying stores
-    /// (lexical or vector) based on the schema field configuration. If the
-    /// vector store indexing fails after the lexical store has already been
-    /// updated, the lexical insert is rolled back to maintain cross-store
+    /// (lexical or vector) based on the schema field configuration. If
+    /// writing the already-validated vectors fails after the lexical store
+    /// has already been updated (e.g. an I/O error obtaining the vector
+    /// writer), the lexical insert is rolled back to maintain cross-store
     /// consistency.
     ///
     /// # Parameters
@@ -872,8 +942,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns an error if the WAL write, deletion of existing documents,
-    /// or indexing into either the lexical or vector store fails.
+    /// Returns an error if embedding/validating the document's vector
+    /// fields fails, if the WAL write, deletion of existing documents, or
+    /// indexing into either the lexical or vector store fails.
     pub async fn put_document(&self, id: &str, doc: Document) -> Result<()> {
         let _ = self.index_internal(id, doc, false).await?;
         // Re-assert per-record durability: a concurrent batch may hold a WAL
@@ -894,8 +965,9 @@ impl Engine {
     /// associated with the same logical document.
     ///
     /// A `_id` field is automatically inserted into the document with the
-    /// provided `id` value. A WAL entry is written before any index mutations
-    /// to ensure durability.
+    /// provided `id` value. The chunk's vector fields are embedded and
+    /// validated first (Issue #1326); a WAL entry is written only once that
+    /// succeeds, before any index mutation, to ensure durability.
     ///
     /// # Parameters
     ///
@@ -904,8 +976,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns an error if the WAL write or indexing into either the lexical
-    /// or vector store fails.
+    /// Returns an error if embedding/validating the chunk's vector fields
+    /// fails, or if the WAL write or indexing into either the lexical or
+    /// vector store fails.
     pub async fn add_document(&self, id: &str, doc: Document) -> Result<()> {
         let _ = self.index_internal(id, doc, true).await?;
         // Re-assert per-record durability: a concurrent batch may hold a WAL
@@ -950,8 +1023,11 @@ impl Engine {
     /// searchable immediately, durable at the next commit, and replayed on
     /// crash recovery — so retrying the batch (or its suffix from
     /// `failed_index`) is idempotent. The failing document inherits the
-    /// singular-put semantics: its WAL record (if written) is retried by
-    /// crash recovery and discarded by the next successful commit.
+    /// singular-put semantics: a rejection during embedding/validation
+    /// (Issue #1326) never reaches the WAL, so there is nothing to replay or
+    /// discard for it and its previous version, if any, is untouched; any
+    /// other failure after its WAL record was written is retried by crash
+    /// recovery exactly as for a singular put.
     pub async fn put_documents(&self, docs: Vec<(String, Document)>) -> Result<()> {
         self.index_batch_internal(docs, false).await
     }
@@ -1064,18 +1140,14 @@ impl Engine {
         // mutation, including the internal delete below.
         let _schema_guard = self.schema_change_lock.read().await;
 
-        if !as_chunk {
-            self.delete_documents_internal(id).await?;
-        }
-
-        // 2. Write-Ahead Log: assign doc_id + persist (before any index updates)
-        let (doc_id, seq) = self.log.append(id, doc.clone())?;
-
-        // 3. Store only stored fields for retrieval (WAL has full data for recovery)
-        let stored_doc = self.filter_stored_fields(&doc);
-        self.log.store_document(doc_id, stored_doc);
-
-        // 4. Prepare vector document (extract vector fields only)
+        // 2. Prepare the vector document (extract vector fields only) and embed
+        // it BEFORE anything durable or destructive happens (Issue #1326): a
+        // document whose embedding is rejected (unsupported input type, wrong
+        // dimension, an unconfigured field, NaN/infinity) must leave no WAL
+        // record and must not delete a `put`'s previous version. Embedding was
+        // already performed under both guards above (unchanged), just later in
+        // the sequence; moving it here changes only the ordering, not the lock
+        // scope.
         let mut vector_doc = Document::new();
         {
             let schema = self.schema.read();
@@ -1085,14 +1157,26 @@ impl Engine {
                 }
             }
         }
+        let vectors = self.vector.embed_document(&vector_doc).await?;
 
-        // 5. Index into Lexical and Vector stores
+        if !as_chunk {
+            self.delete_documents_internal(id).await?;
+        }
+
+        // 3. Write-Ahead Log: assign doc_id + persist (before any index updates)
+        let (doc_id, seq) = self.log.append(id, doc.clone())?;
+
+        // 4. Store only stored fields for retrieval (WAL has full data for recovery)
+        let stored_doc = self.filter_stored_fields(&doc);
+        self.log.store_document(doc_id, stored_doc);
+
+        // 5. Index into Lexical and Vector stores. The vector side can no
+        // longer fail here on a rejection it already had the chance to raise
+        // at step 2 (see `VectorStore::write_vectors`'s doc comment); it can
+        // still fail on e.g. a writer-creation I/O error, so the lexical
+        // rollback on failure is kept.
         self.lexical.upsert_document(doc_id, doc)?;
-        if let Err(e) = self
-            .vector
-            .upsert_document_by_internal_id(doc_id, vector_doc)
-            .await
-        {
+        if let Err(e) = self.vector.write_vectors(doc_id, vectors).await {
             // Rollback lexical insert to maintain consistency
             let _ = self.lexical.delete_document_by_internal_id(doc_id);
             return Err(e);
@@ -6495,5 +6579,69 @@ mod tests {
         // not repeat a read-back/rewrite of the same stale tail forever.
         reopened.commit().await.unwrap();
         assert_eq!(wal_bytes(&storage), 0);
+    }
+
+    /// Issue #1326: an index a build predating the fix already left with a
+    /// deterministically-rejected WAL record must still open. `index_internal`
+    /// can no longer produce such a record (it validates before appending),
+    /// so this test bypasses it and appends directly via `log.append` —
+    /// exactly as the old binary's `index_internal` would have, after its
+    /// vector-store rejection left the record behind.
+    #[tokio::test]
+    async fn recover_discards_a_record_an_older_build_already_poisoned() {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+        use crate::vector::core::field::FlatOption;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .add_field("vec", FieldOption::Flat(FlatOption::default().dimension(3)))
+            .build();
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+
+        // "a" is a normal, fully-applied document.
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+
+        // "poison" is appended directly, skipping `index_internal`'s
+        // pre-append validation — the 2-dimensional vector can never apply
+        // against the 3-dimensional field, so this reproduces exactly what
+        // an old build's post-append rejection would have left in the WAL.
+        let poison_doc = Document::builder()
+            .add_text("title", "poison")
+            .add_vector("vec", vec![1.0, 0.0])
+            .build();
+        engine.log.append("poison", poison_doc).unwrap();
+
+        // Crash: drop without a commit, leaving both records WAL-only.
+        drop(engine);
+        assert!(
+            wal_bytes(&storage) > 0,
+            "precondition: WAL has pending records"
+        );
+
+        // Reopen must succeed — recovery discards the poisoned record
+        // instead of failing `Engine::new`/`build` outright.
+        let reopened = Engine::new(storage.clone(), schema)
+            .await
+            .expect("recovery must discard the poisoned record, not fail to open");
+
+        assert_eq!(
+            wal_bytes(&storage),
+            0,
+            "the discarded record must not linger in the WAL after recovery's own commit"
+        );
+        assert_eq!(
+            reopened.stats().unwrap().document_count,
+            1,
+            "only 'a' must exist; the poisoned record must not have been applied"
+        );
+
+        use crate::lexical::search::searcher::LexicalSearchQuery;
+        let alpha = crate::engine::search::SearchRequestBuilder::new()
+            .lexical_query(LexicalSearchQuery::from("title:alpha"))
+            .limit(10)
+            .build();
+        assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
     }
 }
