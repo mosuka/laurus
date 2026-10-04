@@ -556,6 +556,12 @@ fn pairs_to_documents(ruby: &Ruby, docs: RArray) -> Result<Vec<(String, laurus::
 // Storage factory helper
 // ---------------------------------------------------------------------------
 
+/// Return type of [`resolve_storage_and_schema`], named so the explicit
+/// `Result<T, magnus::Error>` spelling (unlike `PyResult`/`napi::Result`,
+/// `magnus` has no single-generic result alias) doesn't trip clippy's
+/// `type_complexity` lint, which this crate denies via `#![deny(clippy::all)]`.
+type ResolvedIndex = (Schema, Arc<dyn Storage>, Option<CreateRollback>);
+
 /// Resolve the `(Schema, Storage)` pair for [`RbIndex::new`], plus the
 /// [`CreateRollback`] snapshot a build failure must undo (Issue #1308).
 ///
@@ -582,7 +588,7 @@ fn pairs_to_documents(ruby: &Ruby, docs: RArray) -> Result<Vec<(String, laurus::
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<Schema>,
-) -> Result<(Schema, Arc<dyn Storage>, Option<CreateRollback>), Error> {
+) -> Result<ResolvedIndex, Error> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
