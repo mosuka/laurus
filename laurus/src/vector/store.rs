@@ -172,6 +172,12 @@ impl VectorStore {
     /// It is primarily used during WAL recovery where the internal ID
     /// is already known.
     ///
+    /// A thin wrapper over [`Self::embed_document`] followed by
+    /// [`Self::write_vectors`] (Issue #1326): callers that must not mutate
+    /// anything else until embedding is known to succeed — `Engine::index_internal`
+    /// before its WAL append, and `Engine::recover` before replaying a
+    /// record's other side effects — call the two phases directly instead.
+    ///
     /// # Arguments
     ///
     /// * `doc_id` - The internal document ID.
@@ -182,11 +188,37 @@ impl VectorStore {
     /// Returns an error if obtaining/creating the writer fails, if deleting the
     /// existing document fails, or if adding any field value fails.
     pub async fn upsert_document_by_internal_id(&self, doc_id: u64, doc: Document) -> Result<()> {
+        let vectors = self.embed_document(&doc).await?;
+        self.write_vectors(doc_id, vectors).await
+    }
+
+    /// Embed every vector-field value in `doc`, with no lock held.
+    ///
+    /// This is Phase 1 of the former single-method `upsert_document_by_internal_id`
+    /// (Issue #1326), split out so a caller can run it *before* taking any
+    /// action that would be hard to undo — a WAL append, a prior version's
+    /// deletion — so that a document this store cannot apply leaves no
+    /// trace anywhere. Also validates the resulting vectors against this
+    /// index's configured field shapes, which used to be checked only deep
+    /// inside the writer, after such side effects had already happened.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc` - The document whose vector-field values will be embedded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if a field's embedder does
+    /// not support the given input type, if a value names a field this
+    /// index has no configuration for, or if a vector's dimension or values
+    /// are invalid for its field. Returns the embedder's own error if the
+    /// embedding call itself fails (e.g. a remote embedder is unreachable).
+    pub async fn embed_document(&self, doc: &Document) -> Result<Vec<(String, Vector)>> {
         // Phase 1: Embed all fields OUTSIDE the lock.
         // This allows multiple concurrent upserts to perform embedding in parallel
         // rather than being serialized by the writer Mutex.
         let embedder = self.index.embedder();
-        let mut embedded_vectors: Vec<(u64, String, Vector)> = Vec::new();
+        let mut embedded_vectors: Vec<(String, Vector)> = Vec::new();
 
         for (field_name, value) in &doc.fields {
             let vector = match value {
@@ -196,9 +228,60 @@ impl VectorStore {
                 }
                 _ => continue,
             };
-            embedded_vectors.push((doc_id, field_name.clone(), vector));
+            embedded_vectors.push((field_name.clone(), vector));
         }
 
+        // Validate every resulting vector against this index's configured
+        // field shapes before returning (Issue #1326): a dimension mismatch,
+        // an unknown field, or NaN/infinity used to be caught only inside
+        // the writer's `validate_vectors`, by which point the WAL append and
+        // any prior-version deletion had already happened. `field_dimensions()`
+        // is empty for stores built via `with_index_type_config` (no field
+        // boundaries to check against, e.g. standalone tests/benches) — the
+        // writer's own validation remains the backstop for those, as today.
+        let dims = self.index.field_dimensions();
+        if !dims.is_empty() {
+            for (field_name, vector) in &embedded_vectors {
+                let Some(&expected_dim) = dims.get(field_name) else {
+                    return Err(LaurusError::invalid_argument(format!(
+                        "unknown vector field '{field_name}': no index configured for it"
+                    )));
+                };
+                if vector.dimension() != expected_dim {
+                    return Err(LaurusError::invalid_argument(format!(
+                        "vector for field '{field_name}' has dimension {}, expected {expected_dim}",
+                        vector.dimension()
+                    )));
+                }
+                if !vector.is_valid() {
+                    return Err(LaurusError::invalid_argument(format!(
+                        "vector for field '{field_name}' contains invalid values (NaN or infinity)"
+                    )));
+                }
+            }
+        }
+
+        Ok(embedded_vectors)
+    }
+
+    /// Write already-embedded vectors for `doc_id` (Phase 2 of the former
+    /// single-method `upsert_document_by_internal_id`, Issue #1326).
+    ///
+    /// Acquires the writer lock, deletes any existing vectors for `doc_id`,
+    /// and adds the given ones. Callers are expected to have produced
+    /// `vectors` via [`Self::embed_document`], which has already validated
+    /// them; this phase performs no further validation of its own.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - The internal document ID.
+    /// * `vectors` - `(field_name, Vector)` pairs, already embedded and validated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if obtaining/creating the writer fails, or if
+    /// deleting the existing document or adding the new vectors fails.
+    pub async fn write_vectors(&self, doc_id: u64, vectors: Vec<(String, Vector)>) -> Result<()> {
         // Phase 2: Acquire lock and write pre-computed vectors (fast, sync-only).
         let mut guard = self.writer_cache.lock().await;
         if guard.is_none() {
@@ -206,7 +289,12 @@ impl VectorStore {
         }
         let writer = guard.as_mut().unwrap();
         writer.delete_document(doc_id)?;
-        writer.add_vectors(embedded_vectors)?;
+        writer.add_vectors(
+            vectors
+                .into_iter()
+                .map(|(field_name, vector)| (doc_id, field_name, vector))
+                .collect(),
+        )?;
 
         Ok(())
     }
