@@ -20,7 +20,7 @@ use laurus::storage::memory::MemoryStorage;
 use laurus::vector::FlatOption;
 use laurus::vector::Vector;
 use laurus::{DataValue, Document};
-use laurus::{EmbedInput, EmbedInputType, Embedder};
+use laurus::{DistanceMetric, EmbedInput, EmbedInputType, Embedder, UpdateFieldOptions};
 use laurus::{FieldOption, Schema};
 
 /// Embedder that maps known texts to vectors and counts `embed` calls.
@@ -254,4 +254,80 @@ async fn test_cache_hit_returns_correct_results() {
     assert_eq!(first[0].id, "doc1");
     assert_eq!(first.len(), second.len());
     assert_eq!(first[0].id, second[0].id);
+}
+
+/// Adding, deleting or rebuilding a vector field may change the embedder
+/// behind a field name, so each of them empties the cache (Issue #1349).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_vector_field_changes_clear_the_cache() {
+    let storage = Arc::new(MemoryStorage::new(Default::default()));
+    let embedder = Arc::new(CountingEmbedder::new());
+    embedder.add("apple", vec![1.0, 0.0, 0.0]);
+
+    let engine = Engine::builder(storage, schema())
+        .embedder(embedder.clone())
+        .embedding_cache_capacity(16)
+        .build()
+        .await
+        .unwrap();
+    index_corpus(&engine).await;
+
+    let search = || async {
+        engine
+            .search(
+                SearchRequestBuilder::new()
+                    .query_dsl("embedding:\"apple\"")
+                    .build(),
+            )
+            .await
+            .unwrap();
+    };
+    let base = embedder.call_count();
+    search().await;
+    search().await;
+    assert_eq!(embedder.call_count() - base, 1);
+
+    engine
+        .add_field(
+            "other",
+            FieldOption::Flat(FlatOption::default().dimension(3)),
+        )
+        .await
+        .unwrap();
+    search().await;
+    assert_eq!(
+        embedder.call_count() - base,
+        2,
+        "add_field clears the cache"
+    );
+
+    engine.delete_field("other").await.unwrap();
+    search().await;
+    assert_eq!(
+        embedder.call_count() - base,
+        3,
+        "delete_field clears the cache"
+    );
+
+    engine
+        .update_field(
+            "embedding",
+            FieldOption::Flat(
+                FlatOption::default()
+                    .dimension(3)
+                    .distance(DistanceMetric::DotProduct),
+            ),
+            UpdateFieldOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    search().await;
+    assert_eq!(
+        embedder.call_count() - base,
+        4,
+        "update_field clears the cache"
+    );
 }

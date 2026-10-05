@@ -23,8 +23,8 @@ use std::sync::Arc;
 use lru::LruCache;
 use parking_lot::Mutex;
 
-use crate::embedding::embedder::{EmbedInput, Embedder};
-use crate::embedding::per_field::PerFieldEmbedder;
+use crate::embedding::embedder::{EmbedInput, EmbedRole, Embedder};
+use crate::embedding::per_field::{PerFieldEmbedder, embed_tokens_with, resolve_field_embedder};
 use crate::error::Result;
 use crate::vector::core::vector::Vector;
 
@@ -65,7 +65,24 @@ fn hash_embed_input(input: &EmbedInput<'_>) -> u64 {
     hasher.finish()
 }
 
+/// Cache key for a query's token vectors (Issue #1349).
+///
+/// `embedder` is the name of the field's own embedder (not of a
+/// [`PerFieldEmbedder`] router, whose name is the same for every field), and
+/// `role` keeps a query and a document embedding of the same text apart.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TokenCacheKey {
+    field: String,
+    embedder: String,
+    role: EmbedRole,
+    payload_hash: u64,
+}
+
 /// A bounded LRU cache of query embeddings.
+///
+/// Single-vector and token-level embeddings live in two LRUs, each holding
+/// up to `capacity` entries, so the much larger token entries (one vector
+/// per query token) never evict single-vector ones.
 ///
 /// A `Mutex` (not `RwLock`) is required because [`LruCache::get`] takes
 /// `&mut self` to update recency. Critical sections are tiny (a hash-map
@@ -73,14 +90,26 @@ fn hash_embed_input(input: &EmbedInput<'_>) -> u64 {
 #[derive(Debug)]
 pub struct EmbeddingCache {
     inner: Mutex<LruCache<EmbeddingCacheKey, Vector>>,
+    tokens: Mutex<LruCache<TokenCacheKey, Arc<[Vector]>>>,
 }
 
 impl EmbeddingCache {
-    /// Create a cache holding up to `capacity` entries.
+    /// Create a cache holding up to `capacity` single-vector entries and
+    /// `capacity` token-level entries.
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             inner: Mutex::new(LruCache::new(capacity)),
+            tokens: Mutex::new(LruCache::new(capacity)),
         }
+    }
+
+    /// Drop every cached embedding.
+    ///
+    /// The engine calls this whenever a vector field is added, deleted or
+    /// rebuilt, because the embedder behind a field name may have changed.
+    pub fn clear(&self) {
+        self.inner.lock().clear();
+        self.tokens.lock().clear();
     }
 
     /// Look up a cached embedding, bumping its recency on a hit.
@@ -251,6 +280,52 @@ pub async fn embed_batch_with_cache(
         .collect()
 }
 
+/// Embed `input` into token vectors with the embedder of `field`,
+/// consulting `cache` first when it is `Some` (Issue #1349).
+///
+/// The token-level counterpart of [`embed_with_cache`], used for a
+/// late-interaction rescore query. Documents never go through the cache.
+///
+/// # Errors
+///
+/// See [`embed_field_tokens`](crate::embedding::per_field::embed_field_tokens).
+pub async fn embed_tokens_with_cache(
+    cache: Option<&Arc<EmbeddingCache>>,
+    embedder: &Arc<dyn Embedder>,
+    field: &str,
+    input: &EmbedInput<'_>,
+    role: EmbedRole,
+) -> Result<Arc<[Vector]>> {
+    let field_embedder = resolve_field_embedder(embedder, field);
+    let key = cache.map(|_| TokenCacheKey {
+        field: field.to_string(),
+        embedder: field_embedder.name().to_string(),
+        role,
+        payload_hash: hash_embed_input(input),
+    });
+
+    if let (Some(cache), Some(key)) = (cache, &key)
+        && let Some(tokens) = cache.tokens.lock().get(key).cloned()
+    {
+        return Ok(tokens);
+    }
+
+    let tokens: Arc<[Vector]> = embed_tokens_with(
+        field_embedder.as_ref(),
+        field,
+        std::slice::from_ref(input),
+        role,
+    )
+    .await?
+    .swap_remove(0)
+    .into();
+
+    if let (Some(cache), Some(key)) = (cache, key) {
+        cache.tokens.lock().put(key, tokens.clone());
+    }
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +493,136 @@ mod tests {
         let got = embed_batch_with_cache(None, &embedder, &[]).await.unwrap();
         assert!(got.is_empty());
         assert_eq!(counter.embed_batch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Token embedder that counts calls and returns two tokens per input,
+    /// the second one tagged with the role.
+    #[derive(Debug)]
+    struct CountingTokenEmbedder {
+        name: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::embedding::embedder::TokenEmbedder for CountingTokenEmbedder {
+        async fn embed_tokens(
+            &self,
+            inputs: &[EmbedInput<'_>],
+            role: EmbedRole,
+        ) -> Result<Vec<Vec<Vector>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let tag = match role {
+                EmbedRole::Query => 1.0,
+                EmbedRole::Document => 2.0,
+            };
+            Ok(inputs
+                .iter()
+                .map(|i| vec![Vector::new(vec![seed(i)]), Vector::new(vec![tag])])
+                .collect())
+        }
+
+        fn token_dimension(&self) -> usize {
+            1
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for CountingTokenEmbedder {
+        async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
+            Err(crate::error::LaurusError::invalid_argument(
+                "token embedder",
+            ))
+        }
+        fn supported_input_types(&self) -> Vec<EmbedInputType> {
+            vec![EmbedInputType::Text]
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn as_token_embedder(&self) -> Option<&dyn crate::embedding::embedder::TokenEmbedder> {
+            Some(self)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn token_embedder(name: &str) -> Arc<CountingTokenEmbedder> {
+        Arc::new(CountingTokenEmbedder {
+            name: name.to_string(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// A repeated token query is served from the cache; a different field,
+    /// role or payload is a miss, and `clear` empties the cache.
+    #[tokio::test]
+    async fn token_cache_keys_by_field_role_and_payload() {
+        let a = token_embedder("a");
+        let b = token_embedder("b");
+        let pf =
+            PerFieldEmbedder::new(Arc::new(CountingEmbedder::new("dense")) as Arc<dyn Embedder>);
+        pf.add_embedder("fa", a.clone() as Arc<dyn Embedder>);
+        pf.add_embedder("fb", b.clone() as Arc<dyn Embedder>);
+        let embedder: Arc<dyn Embedder> = Arc::new(pf);
+        let cache = cache(16);
+        let text = EmbedInput::Text("q");
+        let embed = |field: &'static str, input: EmbedInput<'static>, role| {
+            let (cache, embedder) = (cache.clone(), embedder.clone());
+            async move { embed_tokens_with_cache(Some(&cache), &embedder, field, &input, role).await }
+        };
+
+        let first = embed("fa", text.clone(), EmbedRole::Query).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].data[0], 1.0);
+        embed("fa", text.clone(), EmbedRole::Query).await.unwrap();
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1, "second query is a hit");
+
+        let document = embed("fa", text.clone(), EmbedRole::Document)
+            .await
+            .unwrap();
+        assert_eq!(document[1].data[0], 2.0);
+        assert_eq!(a.calls.load(Ordering::SeqCst), 2, "role is part of the key");
+
+        embed("fb", text.clone(), EmbedRole::Query).await.unwrap();
+        assert_eq!(
+            b.calls.load(Ordering::SeqCst),
+            1,
+            "field is part of the key"
+        );
+
+        embed("fa", EmbedInput::Text("other"), EmbedRole::Query)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.calls.load(Ordering::SeqCst),
+            3,
+            "payload is part of the key"
+        );
+
+        cache.clear();
+        embed("fa", text, EmbedRole::Query).await.unwrap();
+        assert_eq!(
+            a.calls.load(Ordering::SeqCst),
+            4,
+            "clear drops token entries"
+        );
+    }
+
+    /// `clear` also drops single-vector entries.
+    #[tokio::test]
+    async fn clear_drops_single_vector_entries() {
+        let counter = Arc::new(CountingEmbedder::new("m"));
+        let embedder: Arc<dyn Embedder> = counter.clone();
+        let cache = cache(16);
+        let items = [item("f", "a")];
+        embed_batch_with_cache(Some(&cache), &embedder, &items)
+            .await
+            .unwrap();
+        cache.clear();
+        embed_batch_with_cache(Some(&cache), &embedder, &items)
+            .await
+            .unwrap();
+        assert_eq!(counter.embed_batch_calls.load(Ordering::SeqCst), 2);
     }
 }

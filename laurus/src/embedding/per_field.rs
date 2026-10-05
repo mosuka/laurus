@@ -57,8 +57,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
-use crate::error::Result;
+use crate::embedding::embedder::{EmbedInput, EmbedInputType, EmbedRole, Embedder, TokenEmbedder};
+use crate::error::{LaurusError, Result};
 use crate::vector::core::vector::Vector;
 
 /// A per-field embedder that applies different embedders to different fields.
@@ -281,9 +281,81 @@ impl Embedder for PerFieldEmbedder {
         "PerFieldEmbedder"
     }
 
+    /// The default embedder's capability, like [`embed`](Self::embed).
+    /// Use [`embed_field_tokens`] to embed with a field's own embedder.
+    fn as_token_embedder(&self) -> Option<&dyn TokenEmbedder> {
+        self.default_embedder.as_token_embedder()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// The embedder that `embedder` applies to `field`: the field's own
+/// embedder when `embedder` is a [`PerFieldEmbedder`], otherwise `embedder`
+/// itself.
+pub fn resolve_field_embedder(embedder: &Arc<dyn Embedder>, field: &str) -> Arc<dyn Embedder> {
+    match embedder.as_any().downcast_ref::<PerFieldEmbedder>() {
+        Some(per_field) => per_field.get_embedder(field),
+        None => embedder.clone(),
+    }
+}
+
+/// Embed `inputs` into token vectors with the embedder of `field`
+/// (Issue #1349).
+///
+/// This is the single entry point for multi-vector fields, used both when
+/// indexing documents and when embedding a rescore query.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] when the field's embedder has
+/// no token-level capability or does not accept one of the input types,
+/// and whatever the embedder returns when embedding fails.
+pub async fn embed_field_tokens(
+    embedder: &Arc<dyn Embedder>,
+    field: &str,
+    inputs: &[EmbedInput<'_>],
+    role: EmbedRole,
+) -> Result<Vec<Vec<Vector>>> {
+    let field_embedder = resolve_field_embedder(embedder, field);
+    embed_tokens_with(field_embedder.as_ref(), field, inputs, role).await
+}
+
+/// [`embed_field_tokens`] with the field's embedder already resolved.
+pub(crate) async fn embed_tokens_with(
+    field_embedder: &dyn Embedder,
+    field: &str,
+    inputs: &[EmbedInput<'_>],
+    role: EmbedRole,
+) -> Result<Vec<Vec<Vector>>> {
+    let Some(token_embedder) = field_embedder.as_token_embedder() else {
+        return Err(LaurusError::invalid_argument(format!(
+            "field '{field}' needs a token-level embedder to embed text into token vectors, \
+             but its embedder '{}' produces one vector per input",
+            field_embedder.name()
+        )));
+    };
+    for input in inputs {
+        let input_type = input.input_type();
+        if !field_embedder.supports(input_type) {
+            return Err(LaurusError::invalid_argument(format!(
+                "embedder '{}' of field '{field}' does not accept {input_type:?} input",
+                field_embedder.name()
+            )));
+        }
+    }
+    let tokens = token_embedder.embed_tokens(inputs, role).await?;
+    if tokens.len() != inputs.len() {
+        return Err(LaurusError::internal(format!(
+            "embedder '{}' returned token vectors for {} of {} inputs",
+            field_embedder.name(),
+            tokens.len(),
+            inputs.len()
+        )));
+    }
+    Ok(tokens)
 }
 
 #[cfg(test)]
@@ -432,5 +504,141 @@ mod tests {
 
         assert!(per_field.field_supports("any", EmbedInputType::Text));
         assert!(!per_field.field_supports("any", EmbedInputType::Image));
+    }
+
+    /// Token embedder producing one 2-d vector per byte of text, marked
+    /// with the role; `drop` inputs are left out of the output.
+    #[derive(Debug)]
+    struct MockTokenEmbedder {
+        drop: usize,
+    }
+
+    #[async_trait]
+    impl TokenEmbedder for MockTokenEmbedder {
+        async fn embed_tokens(
+            &self,
+            inputs: &[EmbedInput<'_>],
+            role: EmbedRole,
+        ) -> Result<Vec<Vec<Vector>>> {
+            let marker = match role {
+                EmbedRole::Query => 1.0,
+                EmbedRole::Document => 2.0,
+            };
+            Ok(inputs
+                .iter()
+                .skip(self.drop)
+                .map(|input| {
+                    let len = input.as_text().map_or(0, str::len);
+                    vec![Vector::new(vec![marker, 0.0]); len]
+                })
+                .collect())
+        }
+
+        fn token_dimension(&self) -> usize {
+            2
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for MockTokenEmbedder {
+        async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
+            Err(LaurusError::invalid_argument("token embedder"))
+        }
+
+        fn supported_input_types(&self) -> Vec<EmbedInputType> {
+            vec![EmbedInputType::Text]
+        }
+
+        fn name(&self) -> &str {
+            "mock-token"
+        }
+
+        fn as_token_embedder(&self) -> Option<&dyn TokenEmbedder> {
+            Some(self)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn dense(name: &str) -> Arc<dyn Embedder> {
+        Arc::new(MockEmbedder {
+            name: name.into(),
+            dim: 2,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_embed_field_tokens_uses_the_field_embedder() {
+        let per_field = PerFieldEmbedder::new(dense("default"));
+        per_field.add_embedder("tokens", Arc::new(MockTokenEmbedder { drop: 0 }));
+        let embedder: Arc<dyn Embedder> = Arc::new(per_field);
+
+        let inputs = [EmbedInput::Text("ab"), EmbedInput::Text("cde")];
+        let tokens = embed_field_tokens(&embedder, "tokens", &inputs, EmbedRole::Query)
+            .await
+            .unwrap();
+        assert_eq!(tokens.iter().map(Vec::len).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(tokens[0][0].data[0], 1.0);
+
+        let tokens = embed_field_tokens(&embedder, "tokens", &inputs, EmbedRole::Document)
+            .await
+            .unwrap();
+        assert_eq!(tokens[1][0].data[0], 2.0);
+
+        // The router itself has no capability unless its default does.
+        assert!(embedder.as_token_embedder().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_embed_field_tokens_rejects_a_single_vector_embedder() {
+        let embedder: Arc<dyn Embedder> = Arc::new(PerFieldEmbedder::new(dense("dense")));
+        let err = embed_field_tokens(
+            &embedder,
+            "tokens",
+            &[EmbedInput::Text("ab")],
+            EmbedRole::Document,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("token-level embedder"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_embed_field_tokens_checks_input_types_and_output_count() {
+        let embedder: Arc<dyn Embedder> = Arc::new(MockTokenEmbedder { drop: 0 });
+        let err = embed_field_tokens(
+            &embedder,
+            "tokens",
+            &[EmbedInput::Bytes(&[1, 2], Some("image/png"))],
+            EmbedRole::Document,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockTokenEmbedder { drop: 1 });
+        let err = embed_field_tokens(
+            &embedder,
+            "tokens",
+            &[EmbedInput::Text("ab")],
+            EmbedRole::Document,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("for 0 of 1 inputs"), "{err}");
+    }
+
+    #[test]
+    fn test_per_field_forwards_token_capability_of_its_default() {
+        let per_field = PerFieldEmbedder::new(Arc::new(MockTokenEmbedder { drop: 0 }));
+        assert_eq!(
+            per_field
+                .as_token_embedder()
+                .map(TokenEmbedder::token_dimension),
+            Some(2)
+        );
     }
 }

@@ -1758,6 +1758,17 @@ impl Engine {
         Ok(())
     }
 
+    /// Drop every cached query embedding.
+    ///
+    /// Called after a vector field is added, deleted or rebuilt: the
+    /// embedder behind a field name may have changed, and the cache keys
+    /// entries by field name.
+    fn clear_embedding_cache(&self) {
+        if let Some(cache) = &self.embedding_cache {
+            cache.clear();
+        }
+    }
+
     /// Build the embedder that a vector field option names, if any.
     ///
     /// # Errors
@@ -1863,6 +1874,7 @@ impl Engine {
             self.vector
                 .add_field(name, &vector_opt, field_embedder)
                 .await?;
+            self.clear_embedding_cache();
         }
 
         // 3. Update the schema.
@@ -1927,6 +1939,7 @@ impl Engine {
 
         if option.is_vector() {
             self.vector.delete_field(name).await?;
+            self.clear_embedding_cache();
         }
 
         // 3. Update the schema.
@@ -2078,6 +2091,7 @@ impl Engine {
                     self.vector
                         .rebuild_field(name, &vector_opt, field_embedder, purge)
                         .await?;
+                    self.clear_embedding_cache();
                 } else {
                     let lexical_opt = option
                         .to_lexical()
