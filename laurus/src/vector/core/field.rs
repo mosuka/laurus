@@ -1,10 +1,12 @@
 //! Vector field configuration options.
 //!
 //! This module defines options for configuring vector fields, including
-//! index types and parameters for different algorithms (Flat, HNSW, IVF).
+//! index types and parameters for different algorithms (Flat, HNSW, IVF),
+//! and the multi-vector field used for late-interaction rescoring.
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{LaurusError, Result};
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::quantization;
 use crate::vector::core::rerank::RerankStorageKind;
@@ -39,6 +41,8 @@ pub enum FieldOption {
     Hnsw(HnswOption),
     /// IVF index options.
     Ivf(IvfOption),
+    /// Multi-vector (late-interaction) options.
+    MultiVector(MultiVectorOption),
 }
 
 impl Default for FieldOption {
@@ -54,6 +58,7 @@ impl FieldOption {
             FieldOption::Flat(opt) => opt.dimension,
             FieldOption::Hnsw(opt) => opt.dimension,
             FieldOption::Ivf(opt) => opt.dimension,
+            FieldOption::MultiVector(opt) => opt.dimension,
         }
     }
 
@@ -63,6 +68,7 @@ impl FieldOption {
             FieldOption::Flat(opt) => opt.distance,
             FieldOption::Hnsw(opt) => opt.distance,
             FieldOption::Ivf(opt) => opt.distance,
+            FieldOption::MultiVector(opt) => opt.distance,
         }
     }
 
@@ -78,11 +84,15 @@ impl FieldOption {
     /// either side). Should be a positive, finite value — non-positive or
     /// non-finite values are clamped to `1.0` (with a warning) wherever
     /// they are read.
+    ///
+    /// A [`FieldOption::MultiVector`] field is never a vector-search
+    /// target, so it always reports `1.0`.
     pub fn base_weight(&self) -> f32 {
         match self {
             FieldOption::Flat(opt) => opt.base_weight,
             FieldOption::Hnsw(opt) => opt.base_weight,
             FieldOption::Ivf(opt) => opt.base_weight,
+            FieldOption::MultiVector(_) => default_weight(),
         }
     }
 
@@ -92,7 +102,14 @@ impl FieldOption {
             FieldOption::Flat(_) => VectorIndexKind::Flat,
             FieldOption::Hnsw(_) => VectorIndexKind::Hnsw,
             FieldOption::Ivf(_) => VectorIndexKind::Ivf,
+            FieldOption::MultiVector(_) => VectorIndexKind::MultiVector,
         }
+    }
+
+    /// Whether this field stores per-document token vectors for
+    /// late-interaction rescoring instead of one searchable vector.
+    pub fn is_multi_vector(&self) -> bool {
+        matches!(self, FieldOption::MultiVector(_))
     }
 }
 
@@ -320,6 +337,146 @@ impl Default for IvfOption {
     }
 }
 
+/// Options for a multi-vector field (Issue #1177).
+///
+/// The field stores every token vector of a document (e.g. the per-token
+/// embeddings of a ColBERT-style model) with no ANN index. It is not a
+/// vector-search target; it is read by late-interaction rescoring, which
+/// scores a document as `Σ_i max_j sim(q_i, d_j)` over the query's and the
+/// document's token vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiVectorOption {
+    /// Number of dimensions of every token vector. Defaults to `128`.
+    #[serde(default = "default_dimension")]
+    pub dimension: usize,
+    /// Token similarity. Only [`DistanceMetric::Cosine`] (vectors are
+    /// L2-normalized, so the similarity is their dot product) and
+    /// [`DistanceMetric::DotProduct`] are supported. Defaults to
+    /// [`DistanceMetric::Cosine`].
+    #[serde(default = "default_distance_metric")]
+    pub distance: DistanceMetric,
+}
+
+impl Default for MultiVectorOption {
+    fn default() -> Self {
+        Self {
+            dimension: default_dimension(),
+            distance: default_distance_metric(),
+        }
+    }
+}
+
+impl MultiVectorOption {
+    /// Most token vectors one document may hold (the same limit as
+    /// Elasticsearch's `rank_vectors`).
+    pub const MAX_VECTORS_PER_DOCUMENT: usize = 8192;
+
+    /// Create options for token vectors of `dimension` dimensions.
+    pub fn new(dimension: usize) -> Self {
+        Self {
+            dimension,
+            ..Default::default()
+        }
+    }
+
+    /// Set the dimension of every token vector.
+    pub fn dimension(mut self, dimension: usize) -> Self {
+        self.dimension = dimension;
+        self
+    }
+
+    /// Set the token similarity (`Cosine` or `DotProduct`).
+    pub fn distance(mut self, distance: DistanceMetric) -> Self {
+        self.distance = distance;
+        self
+    }
+
+    /// Check that the options describe a usable field.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::invalid_argument`] when the dimension is zero
+    /// or the distance is neither `Cosine` nor `DotProduct` (see
+    /// [`multi_vector_params_error`]).
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        match multi_vector_params_error(self.dimension, self.distance) {
+            Some(reason) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Check one document's token vectors against this field.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    /// * `vectors` - The document's token vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::invalid_argument`] when there are no vectors,
+    /// more than [`Self::MAX_VECTORS_PER_DOCUMENT`], a vector whose length
+    /// is not [`Self::dimension`], or a non-finite value.
+    pub fn validate_vectors(&self, field_name: &str, vectors: &[Vec<f32>]) -> Result<()> {
+        let invalid = |reason: String| {
+            Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': {reason}"
+            )))
+        };
+        if vectors.is_empty() {
+            return invalid("a multi-vector value needs at least one vector".to_string());
+        }
+        if vectors.len() > Self::MAX_VECTORS_PER_DOCUMENT {
+            return invalid(format!(
+                "a multi-vector value holds at most {} vectors, got {}",
+                Self::MAX_VECTORS_PER_DOCUMENT,
+                vectors.len()
+            ));
+        }
+        for (i, vector) in vectors.iter().enumerate() {
+            if vector.len() != self.dimension {
+                return invalid(format!(
+                    "vector {i} has dimension {}, expected {}",
+                    vector.len(),
+                    self.dimension
+                ));
+            }
+            if vector.iter().any(|v| !v.is_finite()) {
+                return invalid(format!("vector {i} contains a non-finite value"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why `dimension` / `distance` cannot describe a multi-vector field, if
+/// they cannot.
+///
+/// Late interaction sums each query vector's best similarity, which is
+/// meaningless for a distance where smaller is better, so only `Cosine` and
+/// `DotProduct` are accepted.
+pub(crate) fn multi_vector_params_error(
+    dimension: usize,
+    distance: DistanceMetric,
+) -> Option<String> {
+    if dimension == 0 {
+        return Some("MultiVector dimension must be greater than 0".to_string());
+    }
+    match distance {
+        DistanceMetric::Cosine | DistanceMetric::DotProduct => None,
+        other => Some(format!(
+            "MultiVector distance must be Cosine or DotProduct, got {}",
+            other.name()
+        )),
+    }
+}
+
 /// The type of vector index to use.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -330,6 +487,9 @@ pub enum VectorIndexKind {
     Hnsw,
     /// IVF (Inverted File Index) - approximate with clustering.
     Ivf,
+    /// Per-document token vectors with no ANN index, read by
+    /// late-interaction rescoring.
+    MultiVector,
 }
 
 // From implementations for VectorOption
@@ -348,6 +508,12 @@ impl From<HnswOption> for FieldOption {
 impl From<IvfOption> for FieldOption {
     fn from(opt: IvfOption) -> Self {
         FieldOption::Ivf(opt)
+    }
+}
+
+impl From<MultiVectorOption> for FieldOption {
+    fn from(opt: MultiVectorOption) -> Self {
+        FieldOption::MultiVector(opt)
     }
 }
 
@@ -540,5 +706,76 @@ mod tests {
         // schemas stay readable by pre-#631 binaries.
         let default_json = serde_json::to_string(&HnswOption::default()).unwrap();
         assert!(!default_json.contains("pq_codebook_path"));
+    }
+
+    #[test]
+    fn multi_vector_option_round_trips_and_defaults() {
+        let opt =
+            FieldOption::from(MultiVectorOption::new(96).distance(DistanceMetric::DotProduct));
+        let json = serde_json::to_string(&opt).unwrap();
+        let back: FieldOption = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dimension(), 96);
+        assert_eq!(back.distance(), DistanceMetric::DotProduct);
+        assert_eq!(back.index_kind(), VectorIndexKind::MultiVector);
+        assert!(back.is_multi_vector());
+        assert_eq!(back.base_weight(), 1.0);
+
+        let defaulted: MultiVectorOption = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.dimension, 128);
+        assert_eq!(defaulted.distance, DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn multi_vector_option_validate_rejects_unusable_settings() {
+        assert!(MultiVectorOption::new(128).validate("t").is_ok());
+        assert!(
+            MultiVectorOption::new(8)
+                .distance(DistanceMetric::DotProduct)
+                .validate("t")
+                .is_ok()
+        );
+        let err = MultiVectorOption::new(0).validate("t").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: field 't': MultiVector dimension must be greater than 0"
+        );
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::Manhattan,
+            DistanceMetric::Angular,
+        ] {
+            let err = MultiVectorOption::new(8)
+                .distance(metric)
+                .validate("t")
+                .unwrap_err();
+            assert!(err.to_string().contains("Cosine or DotProduct"), "{err}");
+        }
+    }
+
+    #[test]
+    fn multi_vector_option_validate_vectors() {
+        let opt = MultiVectorOption::new(2);
+        assert!(
+            opt.validate_vectors("t", &[vec![1.0, 0.0], vec![0.5, 0.5]])
+                .is_ok()
+        );
+
+        let cases: Vec<(Vec<Vec<f32>>, &str)> = vec![
+            (Vec::new(), "at least one vector"),
+            (vec![vec![1.0, 0.0], vec![1.0]], "vector 1 has dimension 1"),
+            (vec![Vec::new()], "vector 0 has dimension 0"),
+            (vec![vec![f32::NAN, 0.0]], "non-finite"),
+            (vec![vec![0.0, f32::INFINITY]], "non-finite"),
+            (
+                vec![vec![0.0, 0.0]; MultiVectorOption::MAX_VECTORS_PER_DOCUMENT + 1],
+                "at most 8192 vectors",
+            ),
+        ];
+        for (vectors, expected) in cases {
+            let err = opt.validate_vectors("t", &vectors).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.starts_with("Invalid argument: field 't': "), "{msg}");
+            assert!(msg.contains(expected), "{msg}");
+        }
     }
 }

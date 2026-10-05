@@ -11,7 +11,7 @@ use crate::lexical::core::field::{
     BooleanOption, BytesOption, DateTimeOption, FloatOption, Geo3dOption, GeoOption, IntegerOption,
     TextOption,
 };
-use crate::vector::core::field::{FlatOption, HnswOption, IvfOption};
+use crate::vector::core::field::{FlatOption, HnswOption, IvfOption, MultiVectorOption};
 
 /// Policy for fields that are not declared in the schema.
 ///
@@ -205,11 +205,17 @@ impl Schema {
     /// - An entry in [`Self::analyzers`] uses a name reserved for a built-in
     ///   analyzer (see [`validate_analyzer_name`]). Such an entry would
     ///   never be used, because the built-in is resolved first.
+    /// - A [`FieldOption::MultiVector`] field has a zero dimension or a
+    ///   distance other than `Cosine` / `DotProduct` (see
+    ///   [`MultiVectorOption::validate`]).
     ///
     /// [`validate_analyzer_name`]: crate::analysis::analyzer::registry::validate_analyzer_name
     pub fn validate_for_create(&self) -> crate::error::Result<()> {
-        for name in self.fields.keys() {
+        for (name, option) in &self.fields {
             validate_field_name(name)?;
+            if let FieldOption::MultiVector(opt) = option {
+                opt.validate(name)?;
+            }
         }
         for name in self.analyzers.keys() {
             crate::analysis::analyzer::registry::validate_analyzer_name(name)?;
@@ -286,12 +292,27 @@ pub enum FieldOption {
     Flat(FlatOption),
     /// IVF vector index options.
     Ivf(IvfOption),
+    /// Multi-vector (late-interaction) options: per-document token vectors
+    /// with no ANN index, read by late-interaction rescoring.
+    MultiVector(MultiVectorOption),
 }
 
 impl FieldOption {
     /// Returns true if this is a vector field.
+    ///
+    /// This includes [`Self::MultiVector`], which lives in the vector store
+    /// but is not a vector-search target (see [`Self::is_multi_vector`]).
     pub fn is_vector(&self) -> bool {
-        matches!(self, Self::Hnsw(_) | Self::Flat(_) | Self::Ivf(_))
+        matches!(
+            self,
+            Self::Hnsw(_) | Self::Flat(_) | Self::Ivf(_) | Self::MultiVector(_)
+        )
+    }
+
+    /// Returns true if this field stores per-document token vectors for
+    /// late-interaction rescoring.
+    pub fn is_multi_vector(&self) -> bool {
+        matches!(self, Self::MultiVector(_))
     }
 
     /// Returns true if this is a lexical field.
@@ -315,6 +336,9 @@ impl FieldOption {
             Self::Hnsw(o) => Some(crate::vector::core::field::FieldOption::Hnsw(o.clone())),
             Self::Flat(o) => Some(crate::vector::core::field::FieldOption::Flat(o.clone())),
             Self::Ivf(o) => Some(crate::vector::core::field::FieldOption::Ivf(o.clone())),
+            Self::MultiVector(o) => Some(crate::vector::core::field::FieldOption::MultiVector(
+                o.clone(),
+            )),
             _ => None,
         }
     }
@@ -387,7 +411,10 @@ pub enum FieldChangeKind {
 /// `Flat`) is likewise a [`FieldChangeKind::Reindex`] in principle (the raw
 /// vectors on disk are the same regardless of index algorithm), escalated
 /// to [`FieldChangeKind::Destructive`] if `dimension`, `distance`, or
-/// `embedder` also changed. Changing between a lexical and a vector variant
+/// `embedder` also changed. Changing between [`FieldOption::MultiVector`]
+/// and any other vector variant is always [`FieldChangeKind::Destructive`]:
+/// per-document token vectors and one searchable vector per document share
+/// no on-disk layout. Changing between a lexical and a vector variant
 /// is always [`FieldChangeKind::Destructive`]: the two subsystems have no
 /// shared "rebuild from existing data" path (vector fields are always
 /// stored as raw vectors; lexical fields honor `stored` independently).
@@ -462,6 +489,16 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         }
         (FieldOption::Ivf(o), FieldOption::Ivf(n)) => {
             classify_vector_common(old, new).max(classify_ivf_specific(o, n))
+        }
+        // A multi-vector field has no other options than dimension and
+        // distance, both covered by the common rule.
+        (FieldOption::MultiVector(_), FieldOption::MultiVector(_)) => {
+            classify_vector_common(old, new)
+        }
+        // Token vectors and a single searchable vector share no on-disk
+        // layout, so there is nothing to rebuild from.
+        (o, n) if o.is_multi_vector() != n.is_multi_vector() && o.is_vector() && n.is_vector() => {
+            FieldChangeKind::Destructive
         }
 
         (o, n) if o.is_lexical() && n.is_lexical() => FieldChangeKind::Reindex,
@@ -843,6 +880,16 @@ impl SchemaBuilder {
         self.add_field(name, FieldOption::Ivf(option.into()))
     }
 
+    /// Add a multi-vector field holding each document's token vectors for
+    /// late-interaction rescoring (Issue #1177).
+    pub fn add_multi_vector_field(
+        self,
+        name: impl Into<String>,
+        option: impl Into<MultiVectorOption>,
+    ) -> Self {
+        self.add_field(name, FieldOption::MultiVector(option.into()))
+    }
+
     pub fn add_default_field(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
         self.default_fields.push(name);
@@ -1158,7 +1205,7 @@ mod tests {
         assert_eq!(back.pending_reindex, schema.pending_reindex);
     }
 
-    /// Issue #1079: table-driven coverage of `classify_change` for all 11
+    /// Issue #1079: table-driven coverage of `classify_change` for all 12
     /// `FieldOption` variants, plus the cross-variant (lexical<->lexical,
     /// vector<->vector, lexical<->vector) rules.
     #[test]
@@ -1188,6 +1235,9 @@ mod tests {
         let hnsw = |f: fn(HnswOption) -> HnswOption| FieldOption::Hnsw(f(HnswOption::default()));
         let flat = |f: fn(FlatOption) -> FlatOption| FieldOption::Flat(f(FlatOption::default()));
         let ivf = |f: fn(IvfOption) -> IvfOption| FieldOption::Ivf(f(IvfOption::default()));
+        let multi_vector = |f: fn(MultiVectorOption) -> MultiVectorOption| {
+            FieldOption::MultiVector(f(MultiVectorOption::default()))
+        };
 
         let cases: Vec<(&str, FieldOption, FieldOption, FieldChangeKind)> = vec![
             // ---- Text ----
@@ -1785,6 +1835,43 @@ mod tests {
                 flat(|o| o),
                 ivf(|o| o),
                 Reindex,
+            ),
+            // ---- MultiVector ----
+            (
+                "multi_vector: unchanged options are metadata-only",
+                multi_vector(|o| o),
+                multi_vector(|o| o),
+                MetadataOnly,
+            ),
+            (
+                "multi_vector: dimension change is destructive",
+                multi_vector(|o| o),
+                multi_vector(|o| o.dimension(96)),
+                Destructive,
+            ),
+            (
+                "multi_vector: distance change is destructive",
+                multi_vector(|o| o),
+                multi_vector(|o| o.distance(DistanceMetric::DotProduct)),
+                Destructive,
+            ),
+            (
+                "hnsw -> multi_vector with identical dimension/distance is destructive (different layout)",
+                hnsw(|o| o),
+                multi_vector(|o| o),
+                Destructive,
+            ),
+            (
+                "multi_vector -> flat with identical dimension/distance is destructive (different layout)",
+                multi_vector(|o| o),
+                flat(|o| o),
+                Destructive,
+            ),
+            (
+                "multi_vector -> text is destructive (different storage subsystem)",
+                multi_vector(|o| o),
+                text(|o| o),
+                Destructive,
             ),
             // ---- Cross-variant: lexical <-> vector ----
             (

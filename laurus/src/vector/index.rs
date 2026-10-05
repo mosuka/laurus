@@ -388,6 +388,9 @@ impl ManagedVectorIndex {
                     storage.clone(),
                 )?)
             }
+            VectorIndexTypeConfig::MultiVector(_) => {
+                return Err(Self::multi_vector_unsupported());
+            }
         };
 
         Ok(Self {
@@ -402,6 +405,14 @@ impl ManagedVectorIndex {
     /// Helper to create a default writer config.
     fn default_writer_config() -> crate::vector::writer::VectorIndexWriterConfig {
         crate::vector::writer::VectorIndexWriterConfig::default()
+    }
+
+    /// A multi-vector index exists only in the segmented layout opened
+    /// through [`factory::VectorIndexFactory`].
+    fn multi_vector_unsupported() -> LaurusError {
+        LaurusError::invalid_config(
+            "ManagedVectorIndex does not support MultiVector; open it through VectorIndexFactory",
+        )
     }
 
     /// Add vectors to the index.
@@ -521,6 +532,9 @@ impl ManagedVectorIndex {
                         VectorIndexTypeConfig::IVF(c) => {
                             IvfIndexReader::load(storage.clone(), path, c.distance_metric)
                                 .map(|r| Arc::new(r) as _)
+                        }
+                        VectorIndexTypeConfig::MultiVector(_) => {
+                            Err(Self::multi_vector_unsupported())
                         }
                     };
                 if let Ok(reader) = storage_result {

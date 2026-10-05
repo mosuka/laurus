@@ -169,18 +169,31 @@ use laurus::lexical::core::field::{
     TextOption,
 };
 use laurus::vector::DistanceMetric;
-use laurus::vector::core::field::{FlatOption, HnswOption, IvfOption};
+use laurus::vector::core::field::{FlatOption, HnswOption, IvfOption, MultiVectorOption};
 use laurus::vector::core::rerank::RerankStorageKind;
 use laurus::{AnalyzerSpec, BuiltinAnalyzerSpec, FieldOption, Schema};
 
 /// Field type names shown in the interactive prompt.
 const FIELD_TYPES: &[&str] = &[
-    "Text", "Integer", "Float", "Boolean", "DateTime", "Geo", "Geo3d", "Bytes", "Hnsw", "Flat",
+    "Text",
+    "Integer",
+    "Float",
+    "Boolean",
+    "DateTime",
+    "Geo",
+    "Geo3d",
+    "Bytes",
+    "Hnsw",
+    "Flat",
     "Ivf",
+    "MultiVector",
 ];
 
 /// Distance metric names shown in the interactive prompt.
 const DISTANCE_METRICS: &[&str] = &["Cosine", "Euclidean", "Manhattan", "DotProduct", "Angular"];
+
+/// The token similarities a MultiVector field accepts.
+const MULTI_VECTOR_DISTANCE_METRICS: &[&str] = &["Cosine", "DotProduct"];
 
 /// Run the interactive schema generation wizard (`create schema`).
 ///
@@ -331,6 +344,7 @@ fn prompt_field_type_and_options() -> Result<FieldOption> {
         "Hnsw" => prompt_hnsw_option(),
         "Flat" => prompt_flat_option(),
         "Ivf" => prompt_ivf_option(),
+        "MultiVector" => prompt_multi_vector_option(),
         _ => unreachable!(),
     }
 }
@@ -683,6 +697,26 @@ fn prompt_flat_option() -> Result<FieldOption> {
     }))
 }
 
+/// Prompt for MultiVectorOption: the token vector dimension and a token
+/// similarity limited to the ones late interaction supports.
+fn prompt_multi_vector_option() -> Result<FieldOption> {
+    let dimension = prompt_usize("Token vector dimension", 128)?;
+    let idx = Select::new()
+        .with_prompt("Token similarity")
+        .items(MULTI_VECTOR_DISTANCE_METRICS)
+        .default(0)
+        .interact()?;
+    let distance = match MULTI_VECTOR_DISTANCE_METRICS[idx] {
+        "Cosine" => DistanceMetric::Cosine,
+        "DotProduct" => DistanceMetric::DotProduct,
+        _ => unreachable!(),
+    };
+
+    Ok(FieldOption::MultiVector(
+        MultiVectorOption::new(dimension).distance(distance),
+    ))
+}
+
 /// Prompt for IvfOption.
 fn prompt_ivf_option() -> Result<FieldOption> {
     let dimension = prompt_usize("Dimension", 128)?;
@@ -749,6 +783,7 @@ fn field_type_label(option: &FieldOption) -> &'static str {
         FieldOption::Hnsw(_) => "Hnsw",
         FieldOption::Flat(_) => "Flat",
         FieldOption::Ivf(_) => "Ivf",
+        FieldOption::MultiVector(_) => "MultiVector",
     }
 }
 
@@ -779,6 +814,37 @@ mod tests {
         });
         assert_eq!(field_type_label(&opt), "Geo3d");
         assert!(is_lexical_field(&opt));
+    }
+
+    /// #1177: the wizard offers `MultiVector`, labels it, and keeps it out
+    /// of the lexical default-field candidates; its TOML form round-trips.
+    #[test]
+    fn multi_vector_field_in_wizard_and_toml() {
+        assert!(FIELD_TYPES.contains(&"MultiVector"));
+        let opt = FieldOption::MultiVector(MultiVectorOption::new(96));
+        assert_eq!(field_type_label(&opt), "MultiVector");
+        assert!(!is_lexical_field(&opt));
+
+        let schema = Schema::from_toml(
+            r#"
+[fields.tokens.MultiVector]
+dimension = 96
+distance = "DotProduct"
+"#,
+        )
+        .unwrap();
+        match schema.fields.get("tokens") {
+            Some(FieldOption::MultiVector(o)) => {
+                assert_eq!(o.dimension, 96);
+                assert_eq!(o.distance, DistanceMetric::DotProduct);
+            }
+            other => panic!("expected MultiVector, got {other:?}"),
+        }
+        let back = Schema::from_toml(&schema.to_toml().unwrap()).unwrap();
+        assert!(matches!(
+            back.fields.get("tokens"),
+            Some(FieldOption::MultiVector(_))
+        ));
     }
 
     /// Stage 2 (Issue #481): the schema TOML accepts `rerank_storage =

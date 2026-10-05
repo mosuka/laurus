@@ -64,6 +64,10 @@ pub struct UnifiedQueryParser {
     /// non-empty, any `field:value` clause referencing a field outside this
     /// set is rejected at parse time with a clear error.
     known_fields: HashSet<String>,
+    /// Multi-vector fields (Issue #1177). They hold token vectors for
+    /// late-interaction rescoring and are not a DSL query target, so a
+    /// clause naming one is rejected instead of silently matching nothing.
+    multi_vector_fields: HashSet<String>,
     default_fusion: FusionAlgorithm,
 }
 
@@ -88,8 +92,23 @@ impl UnifiedQueryParser {
             vector_parser,
             vector_fields,
             known_fields: HashSet::new(),
+            multi_vector_fields: HashSet::new(),
             default_fusion: FusionAlgorithm::RRF { k: 60.0 },
         }
+    }
+
+    /// Provide the multi-vector fields of the schema (Issue #1177).
+    ///
+    /// A query clause naming one of them is rejected at parse time: their
+    /// token vectors are read only by late-interaction rescoring. They must
+    /// not be part of the `vector_fields` passed to [`Self::new`].
+    ///
+    /// # Arguments
+    ///
+    /// * `multi_vector_fields` - Names of the schema's multi-vector fields.
+    pub fn with_multi_vector_fields(mut self, multi_vector_fields: HashSet<String>) -> Self {
+        self.multi_vector_fields = multi_vector_fields;
+        self
     }
 
     /// Provide the set of all field names declared in the schema.
@@ -322,15 +341,31 @@ impl UnifiedQueryParser {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::invalid_argument`] listing the unknown field
-    /// names found, in deterministic (sorted) order.
+    /// Returns [`LaurusError::invalid_argument`] listing the multi-vector
+    /// fields referenced, or else the unknown field names found, in
+    /// deterministic (sorted) order.
     fn validate_field_refs(&self, query: &dyn crate::lexical::query::Query) -> Result<()> {
-        if self.known_fields.is_empty() {
+        if self.known_fields.is_empty() && self.multi_vector_fields.is_empty() {
             return Ok(());
         }
 
         let mut refs: HashSet<String> = HashSet::new();
         query.collect_field_refs(&mut refs);
+
+        let mut multi_vector: Vec<&String> = refs
+            .iter()
+            .filter(|f| self.multi_vector_fields.contains(*f))
+            .collect();
+        if !multi_vector.is_empty() {
+            multi_vector.sort();
+            return Err(LaurusError::invalid_argument(format!(
+                "query references multi-vector field(s) {multi_vector:?}; they hold token \
+                 vectors for late-interaction rescoring and cannot be queried directly"
+            )));
+        }
+        if self.known_fields.is_empty() {
+            return Ok(());
+        }
 
         let mut unknown: Vec<String> = refs
             .into_iter()
@@ -959,6 +994,23 @@ mod tests {
         let parser = make_parser_with_known_fields(&["title", "body"]);
         parser.parse("title:hello").await.unwrap();
         parser.parse("body:world").await.unwrap();
+    }
+
+    /// #1177: a clause naming a multi-vector field is rejected with a clear
+    /// error instead of being parsed as a lexical term that matches nothing.
+    #[tokio::test]
+    async fn validate_rejects_multi_vector_field_reference() {
+        let parser = make_parser_with_known_fields(&["title", "tokens"])
+            .with_multi_vector_fields(["tokens".to_string()].into_iter().collect());
+        parser.parse("title:hello").await.unwrap();
+        for query in ["tokens:hello", "title:hello AND tokens:\"some text\""] {
+            let err = match parser.parse(query).await {
+                Ok(_) => panic!("expected error for {query}"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("multi-vector field(s) [\"tokens\"]"), "{msg}");
+        }
     }
 
     #[tokio::test]

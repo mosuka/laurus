@@ -61,6 +61,7 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
         FieldOption::Hnsw(_) | FieldOption::Flat(_) | FieldOption::Ivf(_) => {
             coerce_to_vector(field_name, value)
         }
+        FieldOption::MultiVector(opt) => coerce_to_vector_array(field_name, opt, value),
     }
 }
 
@@ -595,6 +596,27 @@ fn coerce_to_vector(field_name: &str, value: DataValue) -> Result<DataValue> {
     }
 }
 
+/// A multi-vector field accepts only a `VectorArray` of valid token vectors
+/// (Issue #1177). A single vector is rejected rather than wrapped, since it
+/// most likely means the field was meant to be `Hnsw` / `Flat` / `Ivf`.
+fn coerce_to_vector_array(
+    field_name: &str,
+    opt: &crate::vector::core::field::MultiVectorOption,
+    value: DataValue,
+) -> Result<DataValue> {
+    match value {
+        DataValue::VectorArray(vectors) => {
+            opt.validate_vectors(field_name, &vectors)?;
+            Ok(DataValue::VectorArray(vectors))
+        }
+        other => Err(LaurusError::invalid_argument(format!(
+            "field '{field_name}': MultiVector fields accept an array of token vectors \
+             (an array of numeric arrays); got {}",
+            describe(&other)
+        ))),
+    }
+}
+
 fn describe(value: &DataValue) -> &'static str {
     match value {
         DataValue::Null => "null",
@@ -662,6 +684,59 @@ mod tests {
             multi_valued: true,
             ..Default::default()
         })
+    }
+
+    fn multi_vector(dimension: usize) -> FieldOption {
+        FieldOption::MultiVector(crate::vector::core::field::MultiVectorOption::new(
+            dimension,
+        ))
+    }
+
+    /// #1177: a MultiVector field accepts valid token vectors and nothing
+    /// else — a single vector or a flat numeric array is a different field
+    /// kind, and text needs a multi-vector embedder.
+    #[test]
+    fn test_multi_vector_coercion() {
+        let ok = coerce_value(
+            "tokens",
+            &multi_vector(2),
+            DataValue::VectorArray(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            DataValue::VectorArray(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+        );
+
+        let err = coerce_value(
+            "tokens",
+            &multi_vector(2),
+            DataValue::VectorArray(vec![vec![1.0, 0.0, 0.0]]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("field 'tokens': vector 0 has dimension 3"),
+            "{err}"
+        );
+
+        for value in [
+            DataValue::Vector(vec![1.0, 0.0]),
+            DataValue::Float64Array(vec![1.0, 0.0]),
+            DataValue::Text("hello".to_string()),
+        ] {
+            let err = coerce_value("tokens", &multi_vector(2), value).unwrap_err();
+            assert!(err.to_string().contains("array of token vectors"), "{err}");
+        }
+    }
+
+    /// #1177: a single-vector field does not take token vectors.
+    #[test]
+    fn test_vector_field_rejects_vector_array() {
+        let hnsw = FieldOption::Hnsw(crate::vector::core::field::HnswOption::new(2));
+        let err =
+            coerce_value("vec", &hnsw, DataValue::VectorArray(vec![vec![1.0, 0.0]])).unwrap_err();
+        assert!(err.to_string().contains("vector array"), "{err}");
     }
 
     fn dt_single() -> FieldOption {
