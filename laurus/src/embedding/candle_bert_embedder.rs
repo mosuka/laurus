@@ -414,4 +414,111 @@ mod tests {
         let options = CandleBertOptions::default().revision("abc");
         assert_eq!(options.revision.as_deref(), Some("abc"));
     }
+
+    // Parity with sentence-transformers, the reference implementation. The
+    // fixtures in `tests/fixtures/sentence_transformers/` come from
+    // `scripts/sentence_transformers_reference.py`. These tests download
+    // the models, so they are ignored by default:
+    //
+    //     cargo test -p laurus --features embeddings-candle --lib -- \
+    //         --ignored bert_parity --nocapture
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        model: String,
+        revision: String,
+        max_seq_length: usize,
+        /// Whether sentence-transformers normalizes this model's output;
+        /// CandleBertEmbedder always does.
+        normalize: bool,
+        dim: usize,
+        inputs: Vec<FixtureInput>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixtureInput {
+        text: String,
+        input_ids: Vec<u32>,
+        /// Little-endian f32 values, base64.
+        vector: String,
+    }
+
+    fn decode(encoded: &str) -> Vec<f32> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let (words, rest) = bytes.as_chunks::<4>();
+        assert!(rest.is_empty());
+        words.iter().map(|b| f32::from_le_bytes(*b)).collect()
+    }
+
+    fn l2_normalized(vector: &[f32]) -> Vec<f32> {
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        vector.iter().map(|x| x / norm).collect()
+    }
+
+    async fn check_parity(file: &str) {
+        let path = format!(
+            "{}/tests/fixtures/sentence_transformers/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture: Fixture =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (model, revision) = (fixture.model.clone(), fixture.revision.clone());
+        let embedder = tokio::task::spawn_blocking(move || {
+            CandleBertEmbedder::with_options(
+                &model,
+                CandleBertOptions::default().revision(revision),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            embedder.tokenizer.get_truncation().map(|t| t.max_length),
+            Some(fixture.max_seq_length)
+        );
+
+        let (mut max_abs, mut min_cosine) = (0.0f32, 1.0f32);
+        for input in &fixture.inputs {
+            let encoding = embedder
+                .tokenizer
+                .encode(input.text.as_str(), true)
+                .unwrap();
+            assert_eq!(encoding.get_ids(), input.input_ids, "{}", input.text);
+
+            let ours = embedder
+                .embed(&EmbedInput::Text(&input.text))
+                .await
+                .unwrap();
+            let mut reference = decode(&input.vector);
+            assert_eq!(reference.len(), fixture.dim);
+            if !fixture.normalize {
+                reference = l2_normalized(&reference);
+            }
+            for (a, b) in ours.data.iter().zip(&reference) {
+                max_abs = max_abs.max((a - b).abs());
+            }
+            // Both sides are unit vectors.
+            let cosine: f32 = ours.data.iter().zip(&reference).map(|(a, b)| a * b).sum();
+            min_cosine = min_cosine.min(cosine);
+        }
+
+        println!("{file}: max |Δ| {max_abs:.2e}, min cosine {min_cosine:.8}");
+        assert!(max_abs <= 1e-5, "max |Δ| {max_abs}");
+        assert!(min_cosine >= 0.99999, "min cosine {min_cosine}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads sentence-transformers/all-MiniLM-L6-v2"]
+    async fn bert_parity_all_minilm_l6_v2() {
+        check_parity("all-MiniLM-L6-v2.json").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"]
+    async fn bert_parity_paraphrase_multilingual_minilm_l12_v2() {
+        check_parity("paraphrase-multilingual-MiniLM-L12-v2.json").await;
+    }
 }
