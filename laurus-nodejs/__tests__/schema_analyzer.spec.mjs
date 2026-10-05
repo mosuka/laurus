@@ -215,6 +215,7 @@ describe("field names reserved for the engine", () => {
     ["addHnswField", (s, n) => s.addHnswField(n, 4)],
     ["addFlatField", (s, n) => s.addFlatField(n, 4)],
     ["addIvfField", (s, n) => s.addIvfField(n, 4)],
+    ["addMultiVectorField", (s, n) => s.addMultiVectorField(n, 4)],
   ])("%s rejects a reserved name and adds nothing", (_method, addField) => {
     const schema = new Schema();
     expect(() => addField(schema, "_secret")).toThrow(

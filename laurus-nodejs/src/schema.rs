@@ -5,8 +5,8 @@ use std::str::FromStr;
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
-    Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod,
-    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
+    Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption,
+    QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -582,6 +582,37 @@ impl JsSchema {
         self.insert_field(name, FieldOption::Ivf(opt))
     }
 
+    /// Add a multi-vector field holding a variable number of token vectors
+    /// per document, for the late-interaction rescore (Issue #1351).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Field name.
+    /// * `dimension` - Dimensionality of each token vector.
+    /// * `distance` - "cosine" (default) or "dot_product".
+    /// * `embedder` - Optional token-level embedder registered via
+    ///   `addEmbedder` (a "candle_colbert" one), which embeds text values
+    ///   and rescore query text.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), if `dimension`
+    /// is 0, or if `distance` is neither cosine nor dot_product.
+    #[napi]
+    pub fn add_multi_vector_field(
+        &mut self,
+        name: String,
+        dimension: u32,
+        distance: Option<String>,
+        embedder: Option<String>,
+    ) -> Result<()> {
+        let mut opt = MultiVectorOption::new(dimension as usize)
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+        opt.embedder = embedder;
+        opt.validate(&name).map_err(laurus_err)?;
+        self.insert_field(name, FieldOption::MultiVector(opt))
+    }
+
     /// Register a named embedder definition in the schema.
     ///
     /// The embedder can then be referenced by name from a vector field's
@@ -590,61 +621,38 @@ impl JsSchema {
     ///
     /// The `config` object must have a `type` key selecting the backend:
     ///
-    /// | type            | required keys | feature flag            |
-    /// |-----------------|---------------|-------------------------|
-    /// | "precomputed"   | —             | (always available)      |
-    /// | "candle_bert"   | "model"       | `embeddings-candle`     |
-    /// | "candle_clip"   | "model"       | `embeddings-multimodal` |
-    /// | "openai"        | "model"       | `embeddings-openai`     |
+    /// | type             | required keys | optional keys                            | feature flag            |
+    /// |------------------|---------------|------------------------------------------|-------------------------|
+    /// | "precomputed"    | —             | —                                        | (always available)      |
+    /// | "candle_bert"    | "model"       | —                                        | `embeddings-candle`     |
+    /// | "candle_clip"    | "model"       | —                                        | `embeddings-multimodal` |
+    /// | "openai"         | "model"       | —                                        | `embeddings-openai`     |
+    /// | "candle_colbert" | "model"       | "revision", "query_maxlen", "doc_maxlen" | `embeddings-candle`     |
+    ///
+    /// "candle_colbert" produces token vectors and only serves a
+    /// multi-vector field (`addMultiVectorField`).
     ///
     /// # Arguments
     ///
     /// * `name` - Unique embedder name referenced from vector fields.
     /// * `config` - Object describing the embedder, e.g.
     ///     `{ type: "candle_bert", model: "sentence-transformers/all-MiniLM-L6-v2" }`.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `config` is not an object, has no or an unknown `type`, or
+    /// lacks a required key.
     #[napi]
     pub fn add_embedder(&mut self, name: String, config: serde_json::Value) -> Result<()> {
-        let obj = config
-            .as_object()
-            .ok_or_else(|| napi::Error::from_reason("embedder config must be an object"))?;
-
-        let embedder_type = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "embedder config must have a 'type' key (e.g. \"candle_bert\")",
-                )
-            })?
-            .to_string();
-
-        let get_model = |key: &str| -> Result<String> {
-            obj.get("model")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    napi::Error::from_reason(format!("{key} embedder requires a 'model' key"))
-                })
-        };
-
-        let definition = match embedder_type.as_str() {
-            "precomputed" => EmbedderDefinition::Precomputed,
-            "candle_bert" => EmbedderDefinition::CandleBert {
-                model: get_model("candle_bert")?,
-            },
-            "candle_clip" => EmbedderDefinition::CandleClip {
-                model: get_model("candle_clip")?,
-            },
-            "openai" => EmbedderDefinition::Openai {
-                model: get_model("openai")?,
-            },
-            other => {
-                return Err(napi::Error::from_reason(format!(
-                    "Unknown embedder type: '{other}'. Valid types: precomputed, candle_bert, candle_clip, openai"
-                )));
-            }
-        };
-
+        if !config.is_object() {
+            return Err(napi::Error::from_reason(
+                "embedder config must be an object, e.g. { type: \"candle_bert\", model: \"...\" }",
+            ));
+        }
+        // The core definition's serde decides the accepted types and keys,
+        // so every embedder type the engine knows is available here.
+        let definition: EmbedderDefinition = serde_json::from_value(config)
+            .map_err(|e| napi::Error::from_reason(format!("invalid embedder config: {e}")))?;
         self.inner.embedders.insert(name, definition);
         Ok(())
     }

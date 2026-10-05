@@ -9,8 +9,9 @@ use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::query::{JsQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery};
 use crate::schema::JsSchema;
 use crate::search::{
-    JsHighlightOptions, JsSearchRequest, JsSearchResult, build_dsl_request, build_lexical_request,
-    build_vector_request, js_highlight_options_to_core, to_js_search_result,
+    JsHighlightOptions, JsRescoreOptions, JsSearchRequest, JsSearchResult, build_dsl_request,
+    build_lexical_request, build_vector_request, js_highlight_options_to_core,
+    js_rescore_options_to_core, to_js_search_result,
 };
 use crate::wal::JsWalSyncPolicy;
 use laurus::index_dir::CreateRollback;
@@ -327,6 +328,8 @@ impl JsIndex {
     /// * `highlight` - Request highlighted fragments per field (Issue
     ///   #1134). Highlighting follows this query, and only `stored: true`
     ///   text fields can be highlighted.
+    /// * `rescore` - Reorder the top results by MaxSim against a
+    ///   multi-vector field (Issue #1351).
     ///
     /// # Returns
     ///
@@ -338,6 +341,7 @@ impl JsIndex {
         limit: Option<u32>,
         offset: Option<u32>,
         highlight: Option<JsHighlightOptions>,
+        rescore: Option<JsRescoreOptions>,
     ) -> Result<Vec<JsSearchResult>> {
         let mut request = build_dsl_request(
             query,
@@ -345,6 +349,10 @@ impl JsIndex {
             offset.unwrap_or(0) as usize,
         );
         request.lexical_options.highlight = highlight.as_ref().map(js_highlight_options_to_core);
+        request.rescore = rescore
+            .as_ref()
+            .map(js_rescore_options_to_core)
+            .transpose()?;
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
