@@ -1,4 +1,6 @@
 pub mod json_document;
+#[cfg(test)]
+mod multi_vector_tests;
 pub mod query;
 pub mod schema;
 pub mod search;

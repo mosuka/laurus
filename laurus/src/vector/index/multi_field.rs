@@ -62,7 +62,7 @@
 //! [`HnswIndexConfig::resolve_pq_codebook`] only overwrites an already-resolved
 //! codebook when it finds a *replacement* file, never clears one to `None`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -77,6 +77,7 @@ use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::VectorIndexTypeConfig;
 use crate::vector::index::factory::VectorIndexFactory;
+use crate::vector::index::multivector::MultiVectorSnapshot;
 use crate::vector::index::{VectorIndex, VectorIndexStats};
 use crate::vector::reader::{
     SimpleVectorIterator, ValidationReport, VectorIndexMetadata, VectorIndexReader, VectorIterator,
@@ -148,6 +149,20 @@ struct FieldEntry {
     index: Arc<dyn VectorIndex>,
     dimension: usize,
     distance_metric: DistanceMetric,
+    /// Holds token vectors for late-interaction rescoring (Issue #1177)
+    /// rather than searchable vectors.
+    multi_vector: bool,
+}
+
+impl FieldEntry {
+    fn new(index: Box<dyn VectorIndex>, config: &VectorIndexTypeConfig) -> Self {
+        Self {
+            dimension: config.dimension(),
+            distance_metric: config.distance_metric(),
+            multi_vector: config.is_multi_vector(),
+            index: Arc::from(index),
+        }
+    }
 }
 
 /// A [`VectorIndex`] that routes each vector field to its own independent
@@ -212,14 +227,7 @@ impl MultiFieldVectorIndex {
                 Arc::new(PrefixedStorage::new(name.clone(), storage.clone()));
             let index =
                 VectorIndexFactory::open_or_create(field_storage, SUB_INDEX_NAME, config.clone())?;
-            fields.insert(
-                name.clone(),
-                FieldEntry {
-                    dimension: config.dimension(),
-                    distance_metric: config.distance_metric(),
-                    index: Arc::from(index),
-                },
-            );
+            fields.insert(name.clone(), FieldEntry::new(index, config));
         }
 
         Ok(Self {
@@ -333,6 +341,7 @@ impl VectorIndex for MultiFieldVectorIndex {
                     searcher: entry.index.searcher()?,
                     dimension: entry.dimension,
                     distance_metric: entry.distance_metric,
+                    multi_vector: entry.multi_vector,
                 },
             );
         }
@@ -414,14 +423,7 @@ impl VectorIndex for MultiFieldVectorIndex {
         // applied, on every open, forever.
         let current_min = Self::min_wal_seq(&fields);
         index.set_last_wal_seq(current_min)?;
-        fields.insert(
-            name.to_string(),
-            FieldEntry {
-                dimension: config.dimension(),
-                distance_metric: config.distance_metric(),
-                index: Arc::from(index),
-            },
-        );
+        fields.insert(name.to_string(), FieldEntry::new(index, &config));
         Ok(())
     }
 
@@ -467,14 +469,9 @@ impl VectorIndex for MultiFieldVectorIndex {
         // existing data is left completely untouched.
         index.optimize()?;
 
-        self.fields.write().insert(
-            name.to_string(),
-            FieldEntry {
-                dimension: new_config.dimension(),
-                distance_metric: new_config.distance_metric(),
-                index: Arc::from(index),
-            },
-        );
+        self.fields
+            .write()
+            .insert(name.to_string(), FieldEntry::new(index, &new_config));
         Ok(())
     }
 
@@ -483,6 +480,27 @@ impl VectorIndex for MultiFieldVectorIndex {
             .read()
             .iter()
             .map(|(name, entry)| (name.clone(), entry.dimension))
+            .collect()
+    }
+
+    fn multi_vector_snapshot(&self, field: &str) -> Result<Option<MultiVectorSnapshot>> {
+        let index = match self.fields.read().get(field) {
+            Some(entry) => entry.index.clone(),
+            None => {
+                return Err(LaurusError::invalid_argument(format!(
+                    "unknown vector field '{field}': no index configured for it"
+                )));
+            }
+        };
+        index.multi_vector_snapshot(field)
+    }
+
+    fn late_interaction_fields(&self) -> BTreeSet<String> {
+        self.fields
+            .read()
+            .iter()
+            .filter(|(_, entry)| entry.multi_vector)
+            .map(|(name, _)| name.clone())
             .collect()
     }
 }
@@ -713,6 +731,9 @@ struct SearcherEntry {
     searcher: Box<dyn VectorIndexSearcher>,
     dimension: usize,
     distance_metric: DistanceMetric,
+    /// A multi-vector field: rejected when targeted explicitly, never a
+    /// fan-out candidate.
+    multi_vector: bool,
 }
 
 /// Searcher over a [`MultiFieldVectorIndex`]'s per-field sub-searchers.
@@ -740,12 +761,13 @@ impl MultiFieldFanoutSearcher {
         })
     }
 
-    /// Fields whose configured dimension matches `dim`, in deterministic
-    /// (field-name-sorted) order.
+    /// Searchable fields whose configured dimension matches `dim`, in
+    /// deterministic (field-name-sorted) order. Multi-vector fields are
+    /// never candidates.
     fn candidates_for_dimension(&self, dim: usize) -> Vec<&SearcherEntry> {
         self.fields
             .values()
-            .filter(|e| e.dimension == dim)
+            .filter(|e| e.dimension == dim && !e.multi_vector)
             .collect()
     }
 
