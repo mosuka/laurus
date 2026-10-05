@@ -361,8 +361,12 @@ let rescore = RescoreOptions::late_interaction("body_colbert", query_tokens);
 再採点は、Rust API のほか、[gRPC](../../laurus-server/grpc_api.md#rescoreparams)、
 [HTTP gateway](../../laurus-server/http_gateway.md)、
 [MCP の `search` ツール](../../laurus-mcp/tools.md#再採点の例)、
-[`laurus search`](../../laurus-cli/commands.md#search) でも使えます。各言語
-バインディングからはまだ使えません。
+[`laurus search`](../../laurus-cli/commands.md#search)、
+[Python](../../laurus-python/api_reference.md#lateinteractionrescore)・
+[Ruby](../../laurus-ruby/api_reference.md#lateinteractionrescore)・
+[PHP](../../laurus-php/api_reference.md#lateinteractionrescore)・
+[Node.js](../../laurus-nodejs/api_reference.md#late-interaction-による再採点rescore)・
+[WASM](../../laurus-wasm/api_reference.md#late-interaction-による再採点) の各バインディングでも使えます。
 
 ### オプション
 
