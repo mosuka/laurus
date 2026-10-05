@@ -464,6 +464,7 @@ laurus train pq-codebook --field embedding --from-index --sample-size 5000 --upd
 
 ```bash
 laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
+              [--rescore-field <FIELD> (--rescore-text <TEXT> | --rescore-vectors <JSON>) [--rescore-window <N>]]
 ```
 
 クエリ文字列は、各フィールドに設定されたアナライザー自身で解析されます。例えば `schema.toml` で日本語（Lindera）アナライザーを設定したフィールドは、インデックス時と同じ方法でクエリ時にも解析されます。スキーマに宣言されていないフィールドを参照すると、そのフィールド名を含むエラーで拒否されます（typo の検出に役立ちます）。予約済みの `_id` フィールドはスキーマに現れませんが、常に検索可能です。
@@ -476,6 +477,16 @@ laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
 | `--limit <N>` | いいえ | `10` | 最大結果件数 |
 | `--offset <N>` | いいえ | `0` | スキップする結果件数 |
 | `--highlight <FIELD>` | いいえ | （なし） | ハイライトする保存済みテキストフィールド（Issue #1134）。複数フィールドを指定する場合は繰り返す。既定の `HighlightConfig` を使用 — one-shot 専用で [REPL](repl.md) では使用不可 |
+| `--rescore-field <FIELD>` | いいえ | （なし） | 上位の結果を late interaction で再採点するときに、トークンベクトルを読む `MultiVector` フィールド（Issue #1351）。`--rescore-text` か `--rescore-vectors` が必要 |
+| `--rescore-text <TEXT>` | いいえ | （なし） | 再採点のクエリのテキスト。フィールドのトークン単位のエンベッダー（`candle_colbert`）が埋め込む |
+| `--rescore-vectors <JSON>` | いいえ | （なし） | 再採点のクエリのトークンベクトル（JSON。例: `'[[0.1, 0.2], [0.3, 0.4]]'`） |
+| `--rescore-window <N>` | いいえ | `100` | 再採点する上位の件数（最大 10,000） |
+
+再採点した結果のスコアは late interaction（MaxSim）のスコアです。[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照してください。例えば `body_colbert` に `candle_colbert` のエンベッダーがある場合:
+
+```bash
+laurus search 'body:lifetimes' --rescore-field body_colbert --rescore-text 'how do lifetimes work'
+```
 
 **クエリ構文の例:**
 

@@ -269,6 +269,37 @@ schema, and highlighting always follows the request's lexical query — a
 request produces no `highlights` at all. See [Highlighting](../laurus/highlighting.md)
 for the full semantics.
 
+#### Search with Rescore
+
+`rescore` reorders the top `window_size` results (default 100) with
+late interaction over a `MultiVector` field (Issue #1351). The query is text,
+embedded by the field's token-level embedder (a `candle_colbert` one), or
+the query's token vectors as an array of equal-length numeric arrays:
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "body:lifetimes",
+    "limit": 10,
+    "rescore": {
+      "window_size": 100,
+      "late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}
+    }
+  }'
+```
+
+```json
+"rescore": {"late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
+```
+
+A rescored result's `score` is its late-interaction (MaxSim) score. Unlike
+the other search options, a malformed `rescore` (missing `field`, both or
+neither of `vectors` and `text`, unequal vector lengths) is rejected with
+400 instead of being ignored; so are the values the engine rejects (see
+[gRPC `RescoreParams`](grpc_api.md#rescoreparams) and
+[Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)).
+
 ### Streaming Search (SSE)
 
 The `/v1/search/stream` endpoint returns results as Server-Sent Events (SSE). Each result is sent as a separate event:

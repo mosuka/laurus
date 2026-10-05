@@ -176,6 +176,18 @@ struct SearchParams {
     /// - `["title", "body"]`
     /// - `{"fields": ["body"], "max_fragments": 2, "tag": "em"}`
     highlight: Option<String>,
+
+    /// Rescore the top results with late interaction (ColBERT MaxSim) over a
+    /// MultiVector field, as a JSON string (Issue #1351). The query is
+    /// either text, embedded by the field's token-level embedder (e.g. a
+    /// `candle_colbert` one), or token vectors. `window_size` (default 100,
+    /// at most 10,000) is how many top results are rescored; a rescored
+    /// result's score is its MaxSim.
+    ///
+    /// Examples:
+    /// - `{"late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}}`
+    /// - `{"window_size": 50, "late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}`
+    rescore: Option<String>,
 }
 
 /// Parameters for the `search_batch` tool.
@@ -886,7 +898,7 @@ impl LaurusMcpServer {
 
     /// Search documents using the laurus unified query DSL.
     #[tool(
-        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Returns JSON with total count and array of results (id, score, fields, highlights when requested via the highlight parameter)."
+        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field). Returns JSON with total count and array of results (id, score, fields, highlights when requested via the highlight parameter)."
     )]
     async fn search(
         &self,
@@ -931,6 +943,16 @@ impl LaurusMcpServer {
             None
         };
 
+        // Parse optional rescore (Issue #1351)
+        let rescore = if let Some(ref rescore_json) = params.rescore {
+            match convert::json_to_rescore_params(rescore_json) {
+                Ok(r) => Some(r),
+                Err(e) => return Ok(Self::tool_error(format!("Invalid rescore JSON: {e}"))),
+            }
+        } else {
+            None
+        };
+
         let request = SearchRequest {
             query: params.query,
             limit: params.limit.unwrap_or(10),
@@ -938,6 +960,7 @@ impl LaurusMcpServer {
             fusion,
             field_boosts,
             highlight,
+            rescore,
             ..Default::default()
         };
 

@@ -251,6 +251,29 @@ curl -X POST http://localhost:8080/v1/search \
 
 `highlight` はスキーマ上で `stored: true` のテキストフィールドにのみ作用し、ハイライトは常にリクエストの lexical クエリに従います。`filter_query` はハイライト対象の語を提供せず、Vector-only のリクエストは `highlights` を一切生成しません。詳細な意味論は[ハイライト](../laurus/highlighting.md)を参照してください。
 
+#### 再採点付き検索
+
+`rescore` を指定すると、上位 `window_size` 件（既定 100）を `MultiVector` フィールドに対する late interaction で並べ替えます（Issue #1351）。クエリは、フィールドのトークン単位のエンベッダー（`candle_colbert`）が埋め込むテキストか、クエリのトークンベクトル（同じ長さの数値配列の配列）です。
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "body:lifetimes",
+    "limit": 10,
+    "rescore": {
+      "window_size": 100,
+      "late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}
+    }
+  }'
+```
+
+```json
+"rescore": {"late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
+```
+
+再採点した結果の `score` は late interaction（MaxSim）のスコアです。ほかの検索オプションと違い、不正な `rescore`（`field` がない、`vectors` と `text` の両方またはどちらもない、ベクトルの長さがそろわない）は無視されず 400 で拒否されます。エンジンが拒否する値も同じです（[gRPC の `RescoreParams`](grpc_api.md#rescoreparams) と [late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照）。
+
 ### ストリーミング検索（SSE）
 
 `/v1/search/stream` エンドポイントは Server-Sent Events（SSE）として結果を返します。各結果は個別のイベントとして送信されます。

@@ -337,6 +337,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `fusion` | string | いいえ | ハイブリッド検索用の融合アルゴリズム（JSON） |
 | `field_boosts` | string | いいえ | フィールド毎のブースト係数（JSON） |
 | `highlight` | string | いいえ | フィールドごとのハイライト済みフラグメント（JSON、[ハイライトの例](#ハイライトの例)を参照） |
+| `rescore` | string | いいえ | 上位の結果の late interaction による再採点（JSON、[再採点の例](#再採点の例)を参照） |
 
 ### クエリ DSL の例
 
@@ -409,6 +410,22 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 ```json
 {"fields": ["body"], "max_fragments": 2, "tag": "em"}
 ```
+
+### 再採点の例
+
+`rescore` は、上位 `window_size` 件（既定 100）を `MultiVector` フィールドに対する late interaction で並べ替えます（Issue #1351）。再採点した結果の `score` は late interaction（MaxSim）のスコアです。クエリは、フィールドのトークン単位のエンベッダー（`candle_colbert`）が埋め込むテキスト:
+
+```json
+{"late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}}
+```
+
+か、クエリのトークンベクトルです。
+
+```json
+{"window_size": 50, "late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
+```
+
+不正な `rescore` はツールのエラーになります。`search_batch` には `rescore` パラメーターはありません。[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照してください。
 
 ### 結果
 

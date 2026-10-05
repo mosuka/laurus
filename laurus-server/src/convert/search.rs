@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, LexicalSearchQuery, QueryVector, SearchRequestBuilder,
-    SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
+    FusionAlgorithm, HighlightConfig, LexicalSearchQuery, QueryVector, RescoreOptions,
+    SearchRequestBuilder, SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
 };
 
 use crate::convert::document;
@@ -149,7 +149,152 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
         }
     }
 
+    // Rescoring (Issue #1351). The engine validates the window, the field
+    // and the query; only the message shape is checked here.
+    if let Some(rescore) = &proto.rescore {
+        builder = builder.rescore(rescore_from_proto(rescore)?);
+    }
+
     Ok(builder.build())
+}
+
+/// Build [`RescoreOptions`] from proto `RescoreParams`.
+///
+/// # Errors
+///
+/// Returns `INVALID_ARGUMENT` when no rescorer or no late-interaction query
+/// is set.
+#[allow(clippy::result_large_err)]
+fn rescore_from_proto(params: &v1::RescoreParams) -> Result<RescoreOptions, tonic::Status> {
+    let Some(v1::rescore_params::Rescorer::LateInteraction(late)) = &params.rescorer else {
+        return Err(tonic::Status::invalid_argument(
+            "rescore.late_interaction must be set",
+        ));
+    };
+    let options = match &late.query {
+        Some(v1::late_interaction_rescore::Query::Vectors(vectors)) => {
+            let vectors = document::vector_array_from_proto(vectors)
+                .into_iter()
+                .map(Vector::new)
+                .collect();
+            RescoreOptions::late_interaction(late.field.clone(), vectors)
+        }
+        Some(v1::late_interaction_rescore::Query::Text(text)) => {
+            RescoreOptions::late_interaction_text(late.field.clone(), text.clone())
+        }
+        None => {
+            return Err(tonic::Status::invalid_argument(
+                "rescore.late_interaction needs vectors or text",
+            ));
+        }
+    };
+    Ok(match params.window_size {
+        Some(window_size) => options.window_size(window_size as usize),
+        None => options,
+    })
+}
+
+/// Parse the JSON form of [`v1::RescoreParams`], shared by the HTTP
+/// gateway's `POST /v1/search` and the MCP `search` tool (Issue #1351):
+///
+/// ```json
+/// {"window_size": 100,
+///  "late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
+/// ```
+///
+/// `late_interaction` takes exactly one of `vectors` (equal-length numeric
+/// arrays) and `text`; `window_size` is optional. Unlike the other search
+/// options, a malformed value is an error rather than ignored: the caller
+/// asked for a rescore explicitly, and dropping it would silently return the
+/// first-stage ranking.
+///
+/// # Errors
+///
+/// Returns a message describing the first malformed part.
+pub fn rescore_params_from_json(json: &serde_json::Value) -> Result<v1::RescoreParams, String> {
+    use serde_json::Value;
+
+    let obj = json.as_object().ok_or("rescore must be an object")?;
+    let window_size = match obj.get("window_size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or("rescore.window_size must be a non-negative integer")?,
+        ),
+    };
+    let late = obj
+        .get("late_interaction")
+        .ok_or("rescore.late_interaction is required")?
+        .as_object()
+        .ok_or("rescore.late_interaction must be an object")?;
+    let field = late
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or("rescore.late_interaction.field must be a string")?
+        .to_string();
+    let query = match (late.get("vectors"), late.get("text")) {
+        (Some(vectors), None) => {
+            v1::late_interaction_rescore::Query::Vectors(token_vectors_from_json(vectors)?)
+        }
+        (None, Some(text)) => v1::late_interaction_rescore::Query::Text(
+            text.as_str()
+                .ok_or("rescore.late_interaction.text must be a string")?
+                .to_string(),
+        ),
+        _ => {
+            return Err(
+                "rescore.late_interaction needs exactly one of vectors and text".to_string(),
+            );
+        }
+    };
+    Ok(v1::RescoreParams {
+        window_size,
+        rescorer: Some(v1::rescore_params::Rescorer::LateInteraction(
+            v1::LateInteractionRescore {
+                field,
+                query: Some(query),
+            },
+        )),
+    })
+}
+
+/// Pack a JSON array of equal-length numeric arrays row-major.
+///
+/// An empty array packs to no vectors, which the engine rejects with its
+/// own message.
+fn token_vectors_from_json(json: &serde_json::Value) -> Result<v1::VectorArrayValue, String> {
+    const WHAT: &str = "rescore.late_interaction.vectors";
+    let rows = json
+        .as_array()
+        .ok_or_else(|| format!("{WHAT} must be an array of numeric arrays"))?;
+    let dimension = rows
+        .first()
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let mut values = Vec::with_capacity(rows.len() * dimension);
+    for (i, row) in rows.iter().enumerate() {
+        let row = row
+            .as_array()
+            .ok_or_else(|| format!("{WHAT}: element {i} is not an array"))?;
+        if row.is_empty() || row.len() != dimension {
+            return Err(format!(
+                "{WHAT}: vector {i} has {} values, expected {dimension}",
+                row.len()
+            ));
+        }
+        for value in row {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| format!("{WHAT}: vector {i} holds a non-number"))?;
+            values.push(number as f32);
+        }
+    }
+    Ok(v1::VectorArrayValue {
+        dimension: dimension as u32,
+        values,
+    })
 }
 
 /// Whether `params` sets any field beyond `fields`, i.e. whether a
@@ -253,6 +398,146 @@ mod tests {
     fn from_proto_without_highlight_leaves_it_unset() {
         let request = from_proto(&base_request(None)).unwrap();
         assert!(request.lexical_options.highlight.is_none());
+    }
+
+    fn late_interaction(
+        window_size: Option<u32>,
+        query: Option<v1::late_interaction_rescore::Query>,
+    ) -> v1::SearchRequest {
+        v1::SearchRequest {
+            rescore: Some(v1::RescoreParams {
+                window_size,
+                rescorer: Some(v1::rescore_params::Rescorer::LateInteraction(
+                    v1::LateInteractionRescore {
+                        field: "tokens".to_string(),
+                        query,
+                    },
+                )),
+            }),
+            ..base_request(None)
+        }
+    }
+
+    /// #1351: packed token vectors and query text become the engine's
+    /// rescore options, with the default window when none is given.
+    #[test]
+    fn from_proto_builds_late_interaction_rescore() {
+        let vectors = v1::late_interaction_rescore::Query::Vectors(v1::VectorArrayValue {
+            dimension: 2,
+            values: vec![1.0, 0.0, 0.0, 1.0],
+        });
+        let request = from_proto(&late_interaction(None, Some(vectors))).unwrap();
+        let rescore = request.rescore.expect("rescore is set");
+        assert_eq!(rescore.window_size, RescoreOptions::DEFAULT_WINDOW_SIZE);
+        match rescore.rescorer {
+            laurus::Rescorer::LateInteraction {
+                field,
+                query: laurus::LateInteractionQuery::Vectors(vectors),
+            } => {
+                assert_eq!(field, "tokens");
+                assert_eq!(vectors.len(), 2);
+                assert_eq!(vectors[1].data.as_slice(), [0.0, 1.0]);
+            }
+            other => panic!("unexpected rescorer {other:?}"),
+        }
+
+        let text = v1::late_interaction_rescore::Query::Text("rust".to_string());
+        let rescore = from_proto(&late_interaction(Some(7), Some(text)))
+            .unwrap()
+            .rescore
+            .unwrap();
+        assert_eq!(rescore.window_size, 7);
+        assert!(matches!(
+            rescore.rescorer,
+            laurus::Rescorer::LateInteraction {
+                query: laurus::LateInteractionQuery::Text(ref t),
+                ..
+            } if t == "rust"
+        ));
+    }
+
+    #[test]
+    fn from_proto_rejects_a_rescore_without_rescorer_or_query() {
+        let mut no_rescorer = base_request(None);
+        no_rescorer.rescore = Some(v1::RescoreParams {
+            window_size: None,
+            rescorer: None,
+        });
+        for request in [no_rescorer, late_interaction(None, None)] {
+            let Err(status) = from_proto(&request) else {
+                panic!("expected INVALID_ARGUMENT for {request:?}");
+            };
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn rescore_params_from_json_parses_vectors_and_text() {
+        let params = rescore_params_from_json(&serde_json::json!({
+            "window_size": 50,
+            "late_interaction": {"field": "tokens", "vectors": [[1, 0.5], [0, 1]]}
+        }))
+        .unwrap();
+        assert_eq!(params.window_size, Some(50));
+        let Some(v1::rescore_params::Rescorer::LateInteraction(late)) = params.rescorer else {
+            panic!("late interaction expected");
+        };
+        assert_eq!(late.field, "tokens");
+        assert_eq!(
+            late.query,
+            Some(v1::late_interaction_rescore::Query::Vectors(
+                v1::VectorArrayValue {
+                    dimension: 2,
+                    values: vec![1.0, 0.5, 0.0, 1.0],
+                }
+            ))
+        );
+
+        let params = rescore_params_from_json(&serde_json::json!({
+            "late_interaction": {"field": "tokens", "text": "rust"}
+        }))
+        .unwrap();
+        assert_eq!(params.window_size, None);
+    }
+
+    #[test]
+    fn rescore_params_from_json_rejects_malformed_values() {
+        let cases = [
+            (serde_json::json!([]), "must be an object"),
+            (serde_json::json!({}), "late_interaction is required"),
+            (
+                serde_json::json!({"window_size": -1, "late_interaction": {"field": "t", "text": "q"}}),
+                "window_size",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"text": "q"}}),
+                "field must be a string",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t"}}),
+                "exactly one of vectors and text",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t", "text": "q", "vectors": [[1]]}}),
+                "exactly one of vectors and text",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t", "vectors": [[1, 0], [1]]}}),
+                "vector 1 has 1 values, expected 2",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t", "vectors": [[1, "x"]]}}),
+                "non-number",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t", "vectors": [1, 2]}}),
+                "element 0 is not an array",
+            ),
+        ];
+        for (json, expected) in cases {
+            let err = rescore_params_from_json(&json).unwrap_err();
+            assert!(err.contains(expected), "{json}: {err}");
+        }
     }
 
     #[test]
