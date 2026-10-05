@@ -124,12 +124,12 @@ Each clause produces a vector that is searched against its respective field. Res
 | :--- | :--- |
 | `WeightedSum` (default) | Sum of (similarity * weight) across all clauses |
 | `MaxSim` | Maximum similarity score across clauses |
-| `LateInteraction` | ColBERT-style late interaction scoring |
+| `LateInteraction` | Currently the same as `WeightedSum`, because a vector field holds one vector per document. For token-level (ColBERT-style) late interaction, use a [late-interaction rescore](#late-interaction-rescore) |
 
 ### Parallel Multi-Vector Execution
 
-When a request carries multiple query vectors (e.g., ColBERT-style late
-interaction, multi-vector MaxSim, ensemble rerankers), Laurus dispatches the
+When a request carries multiple query vectors (e.g., several fields, or
+several query embeddings combined by a score mode), Laurus dispatches the
 per-query similarity searches in parallel via [rayon][rayon-crate].
 
 Behaviour:
@@ -341,6 +341,107 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 ```
+
+## Late-Interaction Rescore
+
+A late-interaction rescore (Issue #1345) reorders the top candidates of any
+search — lexical, vector or hybrid — with ColBERT-style late interaction.
+Each document keeps one vector per token in a
+[multi-vector field](../schema_and_fields.md#multi-vector-fields), the query
+is likewise a set of token vectors, and a document scores the sum, over the
+query vectors, of each one's best match among the document's vectors
+(MaxSim):
+
+```text
+score(q, d) = Σ_i max_j (q_i · d_j)
+```
+
+Matching token by token keeps the details that a single document embedding
+averages away, while the first stage keeps the search fast: only the top
+candidates are rescored, so the multi-vector field needs no ANN index.
+
+```text
+query ─→ first stage: lexical / vector / hybrid (as usual)
+              │ top window_size candidates (default 100)
+              ▼
+         rescore: MaxSim against the multi-vector field
+              ▼
+         offset / limit → documents
+```
+
+```rust
+use laurus::{RescoreOptions, SearchRequestBuilder};
+use laurus::vector::Vector;
+
+// Token vectors of the query, from the same model that produced the
+// documents' token vectors (e.g. a ColBERT checkpoint).
+let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
+
+let request = SearchRequestBuilder::new()
+    .query_dsl("body:lifetimes body_vec:\"how do lifetimes work\"")
+    .rescore(
+        RescoreOptions::late_interaction("body_colbert", query_tokens)
+            .window_size(100),
+    )
+    .limit(10)
+    .build();
+let results = engine.search(request).await?;
+```
+
+The rescore stage is part of the Rust API. The server and the language
+bindings do not expose it yet.
+
+### Options
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `window_size` | `usize` | `100` | How many top first-stage candidates to rescore, `1..=10,000` |
+| `rescorer` | `Rescorer` | — | `Rescorer::LateInteraction { field, query }`: the multi-vector field and the query token vectors (`LateInteractionQuery::Vectors`) |
+
+The query must hold between 1 and 1,024 vectors, each of the field's
+dimension and with finite values. The request fails with
+`LaurusError::InvalidArgument` before any search runs when the options are
+invalid, when the field is not a multi-vector field, or when the request
+also sorts by a field (`sort_by` with `SortField::Field`): a field sort
+does not rank by score, so there is nothing to rescore.
+
+### Ordering and Scores
+
+1. The window — the top `window_size` first-stage candidates — is sorted by
+   MaxSim, highest first. Equal scores are ordered by internal document ID,
+   so the order is deterministic.
+2. Window candidates without token vectors in the field follow, in their
+   first-stage order.
+3. Candidates beyond the window follow last, unchanged.
+
+A rescored hit's `score` is its MaxSim; the other hits keep their
+first-stage score. The two kinds of score are not comparable, which is why
+the groups are ordered by position rather than by score.
+
+The first stage fetches `max(window_size, offset + limit)` candidates, so
+every page is cut from the same rescored ranking: pages fetched one by one
+concatenate to the ranking a single large page returns, even when a page
+reaches past the window. A larger window lets the rescore promote documents
+the first stage ranked lower, at a cost linear in the window; it cannot
+recover a document the first stage did not retrieve at all.
+
+### Similarity
+
+The similarity of a query vector and a document vector is their dot
+product. In a field with `DistanceMetric::Cosine` (the default), document
+vectors are L2-normalized when written and query vectors when searched, so
+each pair contributes its cosine similarity and a score is at most the
+number of query vectors. With `DistanceMetric::DotProduct` the vectors are
+used as given.
+
+### Cost
+
+Rescoring takes `window_size × query vectors × document vectors` dot
+products. On native builds the candidates are scored in parallel on
+[rayon][rayon-crate]'s global thread pool; on `wasm32` they are scored one
+by one. As a guide, 100 candidates of 300 vectors with 128 dimensions and a
+32-vector query (about 123 million multiply-adds) took about 2 ms per
+search on an Apple M4, and about 7 ms on one thread.
 
 ## Distance Metrics
 

@@ -328,7 +328,7 @@ There are no `AND`/`OR` operators in the vector DSL. Vector search is inherently
 | :--- | :--- |
 | `WeightedSum` (default) | Sum of (similarity * weight) across all clauses |
 | `MaxSim` | Maximum similarity score across clauses |
-| `LateInteraction` | Late interaction scoring |
+| `LateInteraction` | Currently the same as `WeightedSum`; token-level late interaction is a [rescore](search/vector_search.md#late-interaction-rescore) |
 
 Score mode cannot be set from DSL syntax. Use the Rust API to override:
 

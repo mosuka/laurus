@@ -147,6 +147,7 @@ let fusion = FusionAlgorithm::WeightedSum {
 | `filter_query` | `Option<Box<dyn Query>>` | None | Lexical クエリによるプレフィルター（Lexical と Vector の両方の結果を制限） |
 | `lexical_options` | `LexicalSearchOptions` | デフォルト | Lexical 検索の動作パラメータ |
 | `vector_options` | `VectorSearchOptions` | デフォルト | Vector 検索の動作パラメータ |
+| `rescore` | `Option<RescoreOptions>` | None | フュージョン後の上位候補を late interaction で並べ替える（[フュージョン結果の再採点](#フュージョン結果の再採点rescore)を参照） |
 
 ## SearchResult
 
@@ -155,7 +156,7 @@ let fusion = FusionAlgorithm::WeightedSum {
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `id` | `String` | 外部ドキュメント ID |
-| `score` | `f32` | フュージョン後の関連性スコア |
+| `score` | `f32` | フュージョン後の関連性スコア。再採点した結果では late interaction のスコア |
 | `document` | `Option<Document>` | ドキュメントの全内容（ロードされた場合） |
 | `highlights` | `HashMap<String, Vec<String>>` | `lexical_options.highlight` で要求した場合のハイライト済みフラグメント |
 
@@ -209,6 +210,31 @@ let page2 = SearchRequestBuilder::new()
     .limit(10)
     .build();
 ```
+
+## フュージョン結果の再採点（Rescore）
+
+ハイブリッド検索は、late interaction による再採点の 1 段目に適しています。
+フュージョンがキーワードと意味のどちらかに合う候補を集め、再採点がその上位
+`window_size` 件を MultiVector フィールドに対するトークン単位の MaxSim で
+並べ替えます。
+
+```rust
+use laurus::RescoreOptions;
+
+let request = SearchRequestBuilder::new()
+    .lexical_query(/* ... */)
+    .vector_query(/* ... */)
+    .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
+    .rescore(RescoreOptions::late_interaction("body_colbert", query_tokens))
+    .limit(10)
+    .build();
+```
+
+再採点はフュージョンの後、`offset` / `limit` の前に実行されるため、
+ページネーションは再採点の有無にかかわらず同じように動作します。オプション、
+並び順の規則、コストは
+[late interaction による再採点](vector_search.md#late-interaction-による再採点rescore)
+を参照してください。
 
 ## 完全な例
 

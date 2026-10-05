@@ -37,8 +37,7 @@ pub enum FieldSelector {
 /// Different modes suit different retrieval scenarios. For example,
 /// [`WeightedSum`](Self::WeightedSum) works well when all query vectors contribute
 /// additively, while [`MaxSim`](Self::MaxSim) is better for alternative-interpretation
-/// queries and [`LateInteraction`](Self::LateInteraction) suits ColBERT-style multi-vector
-/// representations.
+/// queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorScoreMode {
@@ -49,9 +48,13 @@ pub enum VectorScoreMode {
     /// Useful when multiple query vectors represent alternative interpretations
     /// and only the best-matching one should determine the score.
     MaxSim,
-    /// For each query vector, find the max similarity across all document vectors,
-    /// then sum. Inspired by ColBERT's late interaction mechanism.
-    /// Best suited for multi-vector document representations.
+    /// For each query vector, the max similarity across a document's vectors,
+    /// summed. A vector field holds one vector per document, so this is
+    /// currently the same as [`WeightedSum`](Self::WeightedSum).
+    ///
+    /// For ColBERT-style late interaction over a document's token vectors,
+    /// use a [`RescoreOptions::late_interaction`](crate::RescoreOptions::late_interaction)
+    /// rescore against a multi-vector field instead.
     LateInteraction,
 }
 

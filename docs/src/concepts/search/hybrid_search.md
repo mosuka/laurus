@@ -161,6 +161,7 @@ let fusion = FusionAlgorithm::WeightedSum {
 | `filter_query` | `Option<Box<dyn Query>>` | None | Pre-filter using a lexical query (restricts both lexical and vector results) |
 | `lexical_options` | `LexicalSearchOptions` | Default | Parameters controlling lexical search behavior (field boosts, min score, timeout, etc.) |
 | `vector_options` | `VectorSearchOptions` | Default | Parameters controlling vector search behavior (score mode, min score) |
+| `rescore` | `Option<RescoreOptions>` | None | Reorder the top fused candidates with late interaction (see [Rescoring the Fused Results](#rescoring-the-fused-results)) |
 
 ## SearchResult
 
@@ -169,7 +170,7 @@ Each result contains:
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `id` | `String` | External document ID |
-| `score` | `f32` | Fused relevance score |
+| `score` | `f32` | Fused relevance score, or the late-interaction score of a rescored hit |
 | `document` | `Option<Document>` | Full document content (if loaded) |
 | `highlights` | `HashMap<String, Vec<String>>` | Highlighted fragments, if requested via `lexical_options.highlight` |
 
@@ -227,6 +228,30 @@ let page2 = SearchRequestBuilder::new()
     .limit(10)
     .build();
 ```
+
+## Rescoring the Fused Results
+
+Hybrid search makes a good first stage for a late-interaction rescore: fusion
+gathers candidates that match either the keywords or the meaning, and the
+rescore then reorders the top `window_size` of them by token-level MaxSim
+against a multi-vector field:
+
+```rust
+use laurus::RescoreOptions;
+
+let request = SearchRequestBuilder::new()
+    .lexical_query(/* ... */)
+    .vector_query(/* ... */)
+    .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
+    .rescore(RescoreOptions::late_interaction("body_colbert", query_tokens))
+    .limit(10)
+    .build();
+```
+
+The rescore runs after fusion and before `offset` / `limit`, so pagination
+works the same with or without it. See
+[Late-Interaction Rescore](vector_search.md#late-interaction-rescore) for the
+options, the ordering rules and the cost.
 
 ## Complete Example
 

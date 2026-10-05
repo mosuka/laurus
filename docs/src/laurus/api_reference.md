@@ -132,6 +132,7 @@ A collection of named field values.
 | `.highlight_config(HighlightConfig)` | Set the tag/fragment/`require_field_match` settings used for highlighting |
 | `.vector_score_mode(VectorScoreMode)` | Set score combination mode for vector search |
 | `.vector_min_score(f32)` | Set minimum score threshold for vector search |
+| `.rescore(RescoreOptions)` | Reorder the top first-stage candidates with late interaction ([Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)) |
 | `.build()` | Build the `SearchRequest` |
 
 ### LexicalSearchQuery
@@ -153,7 +154,7 @@ A collection of named field values.
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `id` | `String` | External document ID |
-| `score` | `f32` | Relevance score |
+| `score` | `f32` | Relevance score (the late-interaction score for a rescored hit) |
 | `document` | `Option<Document>` | Document content (if loaded) |
 | `highlights` | `HashMap<String, Vec<String>>` | Highlighted fragments per field requested via `.highlight()`; empty when not requested or nothing matched ([Highlighting](./highlighting.md)) |
 
@@ -163,6 +164,14 @@ A collection of named field values.
 | :--- | :--- |
 | `RRF { k: f64 }` | Reciprocal Rank Fusion (default k=60.0) |
 | `WeightedSum { lexical_weight, vector_weight }` | Linear combination of scores |
+
+### RescoreOptions
+
+| Item | Description |
+| :--- | :--- |
+| `RescoreOptions::late_interaction(field, query_vectors)` | Rescore by late interaction (MaxSim) against a multi-vector field, with the query's token vectors (`Vec<Vector>`) |
+| `.window_size(n)` | How many top first-stage candidates to rescore (default `100`, at most `RescoreOptions::MAX_WINDOW_SIZE` = `10,000`) |
+| `Rescorer::LateInteraction { field, query }` | The rescorer the constructor builds; `query` is `LateInteractionQuery::Vectors(Vec<Vector>)` |
 
 ## Query Types (Lexical)
 
