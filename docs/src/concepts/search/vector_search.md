@@ -399,7 +399,11 @@ let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
 let rescore = RescoreOptions::late_interaction("body_colbert", query_tokens);
 ```
 
-The rescore stage is part of the Rust API. The server and the language
+Besides the Rust API, the rescore stage is available over
+[gRPC](../../laurus-server/grpc_api.md#rescoreparams) and the
+[HTTP gateway](../../laurus-server/http_gateway.md), in the
+[MCP `search` tool](../../laurus-mcp/tools.md#rescore-example) and in
+[`laurus search`](../../laurus-cli/commands.md#search). The language
 bindings do not expose it yet.
 
 ### Options

@@ -469,6 +469,7 @@ Execute a search query using the [Query DSL](../concepts/query_dsl.md).
 
 ```bash
 laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
+              [--rescore-field <FIELD> (--rescore-text <TEXT> | --rescore-vectors <JSON>) [--rescore-window <N>]]
 ```
 
 The query string is analyzed with each field's own configured analyzer —
@@ -486,6 +487,18 @@ field is always queryable even though it does not appear in the schema.
 | `--limit <N>` | No | `10` | Maximum number of results |
 | `--offset <N>` | No | `0` | Number of results to skip |
 | `--highlight <FIELD>` | No | (none) | Stored text field to highlight (Issue #1134); repeat for multiple fields. Uses the default `HighlightConfig` — one-shot only, not available in the [REPL](repl.md) |
+| `--rescore-field <FIELD>` | No | (none) | `MultiVector` field whose token vectors rescore the top results with late interaction (Issue #1351). Needs `--rescore-text` or `--rescore-vectors` |
+| `--rescore-text <TEXT>` | No | (none) | Rescore query text, embedded by the field's token-level embedder (a `candle_colbert` one) |
+| `--rescore-vectors <JSON>` | No | (none) | Rescore query token vectors as JSON, e.g. `'[[0.1, 0.2], [0.3, 0.4]]'` |
+| `--rescore-window <N>` | No | `100` | How many top results to rescore (at most 10,000) |
+
+A rescored result's score is its late-interaction (MaxSim) score; see
+[Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore).
+For example, with a `candle_colbert` embedder on `body_colbert`:
+
+```bash
+laurus search 'body:lifetimes' --rescore-field body_colbert --rescore-text 'how do lifetimes work'
+```
 
 **Query syntax examples:**
 

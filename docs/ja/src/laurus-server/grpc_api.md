@@ -424,6 +424,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `vector_params` | `VectorParams` | いいえ | ベクトル検索パラメータ |
 | `field_boosts` | `map<string, float>` | いいえ | フィールドごとのスコアブースト |
 | `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
+| `rescore` | `RescoreParams` | いいえ | 1 段目の上位の結果を late interaction で再採点する（Issue #1351） |
 
 `query` または `query_vectors` のいずれか 1 つ以上を指定する必要があります。
 
@@ -500,12 +501,38 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | :--- | :--- | :--- |
 | `fragments` | `repeated string` | 1 フィールド分のハイライト済みフラグメント（最も良いフラグメントが先頭） |
 
+### RescoreParams
+
+1 段目（lexical・vector・ハイブリッド）の上位 `window_size` 件を、`MultiVector`
+フィールドに対する ColBERT 型の late interaction で並べ替えます（Issue #1351）。
+採点と並び順の規則は
+[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)
+を参照してください。
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `window_size` | `optional uint32` | 再採点する 1 段目の上位の件数。1〜10,000。未設定なら 100 |
+| `late_interaction` | `LateInteractionRescore` | 再採点の方法（`oneof`、必須） |
+
+**LateInteractionRescore:**
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `field` | `string` | `MultiVector` フィールド |
+| `vectors` | `VectorArrayValue` | クエリのトークンベクトル。文書の値と同じく行ごとに詰める（フィールドの次元のベクトルを 1〜1,024 本）。`vectors` と `text` のどちらか一方が必須 |
+| `text` | `string` | クエリのテキスト。フィールドのトークン単位のエンベッダー（`candle_colbert`）が埋め込む |
+
+値はエンジンが検査します。範囲外の window、`MultiVector` でないフィールド、
+ベクトルの本数や次元の誤り、トークン単位のエンベッダーがないフィールドへの
+テキスト、`lexical_params.sort_by` との併用は、`INVALID_ARGUMENT` で拒否されます。
+`late_interaction` やクエリのない `RescoreParams` も同じです。
+
 ### SearchResult
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `id` | `string` | 外部ドキュメント ID |
-| `score` | `float` | 関連度スコア |
+| `score` | `float` | 関連度スコア。再採点した結果では late interaction（MaxSim）のスコア |
 | `document` | `Document` | ドキュメントの内容 |
 | `highlights` | `map<string, Highlights>` | `SearchRequest.highlight.fields` で指定したフィールドごとのハイライト済みフラグメント。ハイライトがないフィールドはこのマップに現れない |
 
@@ -545,6 +572,33 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
   "score": 1.2,
   "document": {"fields": {"body": {"text_value": "Rust is great"}}},
   "highlights": {"body": {"fragments": ["<em>Rust</em> is great"]}}
+}
+```
+
+### 例: 再採点
+
+ハイブリッドの 1 段目の上位 100 件を、`body_colbert` の ColBERT エンベッダーで
+再採点します。
+
+```json
+{
+  "query": "body:lifetimes body_vec:\"how do lifetimes work\"",
+  "limit": 10,
+  "rescore": {
+    "window_size": 100,
+    "late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}
+  }
+}
+```
+
+テキストの代わりに、計算済みのクエリのトークンベクトルを渡す場合:
+
+```json
+{
+  "late_interaction": {
+    "field": "body_colbert",
+    "vectors": {"dimension": 2, "values": [1.0, 0.0, 0.0, 1.0]}
+  }
 }
 ```
 

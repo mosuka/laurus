@@ -350,6 +350,7 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `fusion` | string | No | Fusion algorithm as JSON (for hybrid search) |
 | `field_boosts` | string | No | Per-field boost factors as JSON |
 | `highlight` | string | No | Highlighted fragments per field, as JSON (see [Highlight example](#highlight-example)) |
+| `rescore` | string | No | Late-interaction rescore of the top results, as JSON (see [Rescore example](#rescore-example)) |
 
 ### Query DSL examples
 
@@ -427,6 +428,26 @@ The full object form adds `HighlightConfig` knobs — `max_fragments`,
 ```json
 {"fields": ["body"], "max_fragments": 2, "tag": "em"}
 ```
+
+### Rescore example
+
+`rescore` reorders the top `window_size` results (default 100) with
+late interaction over a `MultiVector` field (Issue #1351). A rescored
+result's `score` is its late-interaction (MaxSim) score. The query is text,
+embedded by the field's token-level embedder (a `candle_colbert` one):
+
+```json
+{"late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}}
+```
+
+or the query's token vectors:
+
+```json
+{"window_size": 50, "late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
+```
+
+A malformed `rescore` is a tool error. `search_batch` has no `rescore`
+parameter. See [Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore).
 
 ### Result
 

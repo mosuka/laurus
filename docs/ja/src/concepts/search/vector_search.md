@@ -358,8 +358,11 @@ let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
 let rescore = RescoreOptions::late_interaction("body_colbert", query_tokens);
 ```
 
-再採点は Rust API の機能です。サーバーと各言語バインディングからはまだ
-使えません。
+再採点は、Rust API のほか、[gRPC](../../laurus-server/grpc_api.md#rescoreparams)、
+[HTTP gateway](../../laurus-server/http_gateway.md)、
+[MCP の `search` ツール](../../laurus-mcp/tools.md#再採点の例)、
+[`laurus search`](../../laurus-cli/commands.md#search) でも使えます。各言語
+バインディングからはまだ使えません。
 
 ### オプション
 

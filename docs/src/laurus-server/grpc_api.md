@@ -425,6 +425,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `vector_params` | `VectorParams` | No | Vector search parameters |
 | `field_boosts` | `map<string, float>` | No | Per-field score boosting |
 | `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
+| `rescore` | `RescoreParams` | No | Rescore the top first-stage results with late interaction (Issue #1351) |
 
 At least one of `query` or `query_vectors` must be provided.
 
@@ -507,12 +508,39 @@ semantics.
 | :--- | :--- | :--- |
 | `fragments` | `repeated string` | Highlighted fragments for one field, best fragment first |
 
+### RescoreParams
+
+Reorders the top `window_size` first-stage results (lexical, vector or
+hybrid) with ColBERT-style late interaction over a `MultiVector` field
+(Issue #1351). See
+[Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)
+for the scoring and ordering rules.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `window_size` | `optional uint32` | How many top first-stage results to rescore, 1 to 10,000. Unset means 100 |
+| `late_interaction` | `LateInteractionRescore` | The rescorer (a `oneof`; required) |
+
+**LateInteractionRescore:**
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `field` | `string` | A `MultiVector` field |
+| `vectors` | `VectorArrayValue` | The query's token vectors, packed row-major like a document value (1 to 1,024 vectors of the field's dimension). One of `vectors` and `text` is required |
+| `text` | `string` | Query text, embedded by the field's token-level embedder (a `candle_colbert` one) |
+
+The engine validates the values: an out-of-range window, a field that is not
+a `MultiVector` field, the wrong number or dimension of vectors, text for a
+field without a token-level embedder, or a rescore combined with
+`lexical_params.sort_by` is rejected with `INVALID_ARGUMENT`, as is a
+`RescoreParams` without `late_interaction` or a query.
+
 ### SearchResult
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `id` | `string` | External document ID |
-| `score` | `float` | Relevance score |
+| `score` | `float` | Relevance score; for a rescored result, its late-interaction (MaxSim) score |
 | `document` | `Document` | Document content |
 | `highlights` | `map<string, Highlights>` | Highlighted fragments per field named in `SearchRequest.highlight.fields`. A field with no highlight is absent from this map |
 
@@ -552,6 +580,33 @@ A matching hit's `SearchResult` then carries:
   "score": 1.2,
   "document": {"fields": {"body": {"text_value": "Rust is great"}}},
   "highlights": {"body": {"fragments": ["<em>Rust</em> is great"]}}
+}
+```
+
+### Example: Rescore
+
+A hybrid first stage whose top 100 results are rescored by a ColBERT
+embedder on `body_colbert`:
+
+```json
+{
+  "query": "body:lifetimes body_vec:\"how do lifetimes work\"",
+  "limit": 10,
+  "rescore": {
+    "window_size": 100,
+    "late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}
+  }
+}
+```
+
+With pre-computed query token vectors instead of text:
+
+```json
+{
+  "late_interaction": {
+    "field": "body_colbert",
+    "vectors": {"dimension": 2, "values": [1.0, 0.0, 0.0, 1.0]}
+  }
 }
 ```
 
