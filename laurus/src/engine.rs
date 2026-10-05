@@ -3059,13 +3059,21 @@ impl Engine {
             rescore: request_rescore,
         } = request;
 
-        // Validate the rescore options before any search runs.
-        let rescore = match &request_rescore {
-            Some(options) => Some(self::rescore::PreparedRescore::prepare(
+        // Validate the rescore options, and embed a text query, before any
+        // search runs. Two statements on purpose: the `parking_lot` schema
+        // guard is not `Send`, so it must be dropped before the `await`
+        // (holding it across would make this future `!Send`).
+        let plan = match request_rescore {
+            Some(options) => Some(self::rescore::RescorePlan::new(
                 &self.schema.read(),
+                self.vector.embedder(),
                 options,
                 &lexical_options.sort_by,
             )?),
+            None => None,
+        };
+        let rescore = match plan {
+            Some(plan) => Some(plan.prepare(self.embedding_cache.as_ref()).await?),
             None => None,
         };
 

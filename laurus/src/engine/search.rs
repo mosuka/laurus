@@ -268,6 +268,26 @@ impl RescoreOptions {
         }
     }
 
+    /// Rescore with late interaction over the multi-vector field `field`,
+    /// embedding `text` into query token vectors with the field's
+    /// token-level embedder (Issue #1349).
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - A [`MultiVector`](crate::vector::core::field::FieldOption::MultiVector)
+    ///   field served by a token-level embedder (for example a
+    ///   `candle_colbert` one).
+    /// * `text` - The query text.
+    pub fn late_interaction_text(field: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            window_size: Self::DEFAULT_WINDOW_SIZE,
+            rescorer: Rescorer::LateInteraction {
+                field: field.into(),
+                query: LateInteractionQuery::Text(text.into()),
+            },
+        }
+    }
+
     /// Set how many top first-stage candidates to rescore.
     pub fn window_size(mut self, window_size: usize) -> Self {
         self.window_size = window_size;
@@ -277,6 +297,7 @@ impl RescoreOptions {
 
 /// How a [`RescoreOptions`] window is rescored.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Rescorer {
     /// ColBERT-style late interaction: each candidate is scored as
     /// `Σ_i max_j sim(q_i, d_j)` over the query's token vectors `q_i` and
@@ -293,9 +314,15 @@ pub enum Rescorer {
 
 /// The query side of [`Rescorer::LateInteraction`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum LateInteractionQuery {
     /// Pre-computed query token vectors (`1..=1_024` of them).
     Vectors(Vec<crate::vector::core::vector::Vector>),
+    /// Query text, embedded into token vectors by the field's token-level
+    /// embedder with the query role. The result is cached when
+    /// [`EngineBuilder::embedding_cache_capacity`](crate::engine::EngineBuilder::embedding_cache_capacity)
+    /// is set.
+    Text(String),
 }
 
 // ── SearchRequest ────────────────────────────────────────────────────────────
