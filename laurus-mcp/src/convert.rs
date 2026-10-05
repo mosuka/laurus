@@ -266,6 +266,19 @@ pub fn json_to_highlight_params(json_str: &str) -> anyhow::Result<v1::HighlightP
     })
 }
 
+/// Parse a JSON string into [`v1::RescoreParams`] (Issue #1351), in the
+/// same shape as the HTTP gateway's `rescore`:
+/// `{"window_size": 100, "late_interaction": {"field": "...", "vectors": [[...]] | "text": "..."}}`.
+///
+/// # Errors
+///
+/// Returns an error if the JSON is malformed or does not have that shape;
+/// the server validates the values (window range, field, query).
+pub fn json_to_rescore_params(json_str: &str) -> anyhow::Result<v1::RescoreParams> {
+    let val: Value = serde_json::from_str(json_str)?;
+    laurus_server::convert::search::rescore_params_from_json(&val).map_err(anyhow::Error::msg)
+}
+
 /// Convert a proto [`v1::SearchResult`] to the JSON shape every MCP search
 /// tool returns: `{"id", "score", "fields", "highlights"?}`. `"highlights"`
 /// is present only when at least one field actually highlighted, matching
@@ -388,6 +401,28 @@ mod tests {
     fn test_json_to_field_boosts_invalid() {
         let json = r#"[1, 2, 3]"#;
         assert!(json_to_field_boosts(json).is_err());
+    }
+
+    #[test]
+    fn test_json_to_rescore_params() {
+        let params = json_to_rescore_params(
+            r#"{"window_size": 20, "late_interaction": {"field": "body_colbert", "text": "rust lifetimes"}}"#,
+        )
+        .unwrap();
+        assert_eq!(params.window_size, Some(20));
+        assert!(matches!(
+            params.rescorer,
+            Some(v1::rescore_params::Rescorer::LateInteraction(ref late))
+                if late.field == "body_colbert"
+                    && late.query == Some(v1::late_interaction_rescore::Query::Text("rust lifetimes".into()))
+        ));
+
+        assert!(json_to_rescore_params("not json").is_err());
+        let err = json_to_rescore_params(r#"{"late_interaction": {"field": "t"}}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one of vectors and text"),
+            "{err}"
+        );
     }
 
     #[test]
