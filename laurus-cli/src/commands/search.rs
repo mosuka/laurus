@@ -13,7 +13,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use laurus::{SearchRequestBuilder, SearchResult};
+use laurus::vector::Vector;
+use laurus::{RescoreOptions, SearchRequestBuilder, SearchResult};
 
 use crate::cli::SearchCommand;
 use crate::context;
@@ -44,11 +45,46 @@ pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<Vec
     if !cmd.highlight.is_empty() {
         builder = builder.highlight(cmd.highlight.clone());
     }
+    if let Some(rescore) = rescore_options(cmd)? {
+        builder = builder.rescore(rescore);
+    }
 
     engine
         .search(builder.build())
         .await
         .context("Failed to execute search")
+}
+
+/// The rescore the `--rescore-*` flags ask for, if any (Issue #1351).
+///
+/// clap already enforces that `--rescore-field` comes with exactly one of
+/// `--rescore-text` and `--rescore-vectors`; the engine validates the
+/// values.
+///
+/// # Errors
+///
+/// Returns an error if `--rescore-vectors` is not a JSON array of numeric
+/// arrays.
+fn rescore_options(cmd: &SearchCommand) -> Result<Option<RescoreOptions>> {
+    let Some(field) = &cmd.rescore_field else {
+        return Ok(None);
+    };
+    let options = match (&cmd.rescore_text, &cmd.rescore_vectors) {
+        (Some(text), _) => RescoreOptions::late_interaction_text(field.clone(), text.clone()),
+        (None, Some(json)) => {
+            let vectors: Vec<Vec<f32>> = serde_json::from_str(json)
+                .context("--rescore-vectors must be a JSON array of numeric arrays")?;
+            RescoreOptions::late_interaction(
+                field.clone(),
+                vectors.into_iter().map(Vector::new).collect(),
+            )
+        }
+        (None, None) => anyhow::bail!("--rescore-field needs --rescore-text or --rescore-vectors"),
+    };
+    Ok(Some(match cmd.rescore_window {
+        Some(window_size) => options.window_size(window_size),
+        None => options,
+    }))
 }
 
 /// Execute a search command against the index and print the results.
@@ -103,6 +139,10 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             limit: 10,
             offset: 0,
             highlight: Vec::new(),
+            rescore_field: None,
+            rescore_text: None,
+            rescore_vectors: None,
+            rescore_window: None,
         }
     }
 
@@ -269,10 +309,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
         // token at all (min_gram = 2).
         let limited = execute(
             &SearchCommand {
-                query: "猫で".to_string(),
                 limit: 2,
-                offset: 0,
-                highlight: Vec::new(),
+                ..search_command("猫で")
             },
             dir.path(),
         )
@@ -341,10 +379,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
 
         let results = execute(
             &SearchCommand {
-                query: "吾輩は猫".to_string(),
-                limit: 10,
-                offset: 0,
                 highlight: vec!["body".to_string()],
+                ..search_command("吾輩は猫")
             },
             dir.path(),
         )
@@ -387,5 +423,128 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             .unwrap();
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.highlights.is_empty()));
+    }
+
+    /// The corpus of `laurus/tests/late_interaction_rescore_test.rs`.
+    const RESCORE_SCHEMA: &str = r#"
+[fields.title.Text]
+indexed = true
+stored = true
+
+[fields.vec.Flat]
+dimension = 2
+
+[fields.tokens.MultiVector]
+dimension = 2
+distance = "DotProduct"
+"#;
+
+    /// Issue #1351: `--rescore-*` rescores the top results, giving the
+    /// Rust API's ranking for the shared corpus.
+    #[tokio::test]
+    async fn search_rescores_with_token_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.toml"), RESCORE_SCHEMA).unwrap();
+        let engine = context::open_index(dir.path()).await.unwrap();
+        let corpus = [
+            ("a", "rust", [1.0, 0.0], vec![vec![0.1, 0.0]]),
+            (
+                "b",
+                "rust rust",
+                [0.9, 0.1],
+                vec![vec![0.5, 0.5], vec![0.0, 0.2]],
+            ),
+            ("c", "rust language", [0.5, 0.5], vec![vec![0.9, 0.2]]),
+            (
+                "d",
+                "rust rust rust",
+                [0.2, 0.8],
+                vec![vec![0.3, 0.3], vec![0.6, 0.0]],
+            ),
+            (
+                "e",
+                "learning rust today",
+                [0.0, 1.0],
+                vec![vec![0.02, 0.03]],
+            ),
+        ];
+        for (id, title, vec, tokens) in corpus {
+            let doc = laurus::Document::builder()
+                .add_text("title", title)
+                .add_vector("vec", vec.to_vec())
+                .add_vector_array("tokens", tokens)
+                .build();
+            engine.put_document(id, doc).await.unwrap();
+        }
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let results = execute(
+            &SearchCommand {
+                rescore_field: Some("tokens".to_string()),
+                rescore_vectors: Some("[[1, 0], [0, 1]]".to_string()),
+                ..search_command("title:rust")
+            },
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["c", "b", "d", "a", "e"]);
+
+        // Text needs a token-level embedder, which this field lacks.
+        let err = execute(
+            &SearchCommand {
+                rescore_field: Some("tokens".to_string()),
+                rescore_text: Some("rust".to_string()),
+                ..search_command("title:rust")
+            },
+            dir.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no token-level embedder"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn rescore_flags_must_come_together() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            SearchCommand::try_parse_from(["search", "title:rust"].iter().chain(args))
+        };
+        assert!(parse(&["--rescore-field", "tokens"]).is_err(), "no query");
+        assert!(parse(&["--rescore-text", "q"]).is_err(), "no field");
+        assert!(parse(&["--rescore-window", "5"]).is_err(), "no field");
+        assert!(
+            parse(&[
+                "--rescore-field",
+                "tokens",
+                "--rescore-text",
+                "q",
+                "--rescore-vectors",
+                "[[1]]"
+            ])
+            .is_err(),
+            "two queries"
+        );
+
+        let cmd = parse(&[
+            "--rescore-field",
+            "tokens",
+            "--rescore-vectors",
+            "[[1, 0]]",
+            "--rescore-window",
+            "5",
+        ])
+        .unwrap();
+        let rescore = rescore_options(&cmd).unwrap().unwrap();
+        assert_eq!(rescore.window_size, 5);
+
+        let cmd = parse(&["--rescore-field", "tokens", "--rescore-vectors", "[1, 0]"]).unwrap();
+        assert!(rescore_options(&cmd).is_err(), "not an array of arrays");
     }
 }

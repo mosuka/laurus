@@ -394,6 +394,11 @@ pub struct ServeCommand {
 /// Accepts a query string written in the Laurus query DSL along with
 /// pagination parameters (`limit` and `offset`).
 #[derive(Parser)]
+#[command(group(
+    clap::ArgGroup::new("rescore_query")
+        .args(["rescore_text", "rescore_vectors"])
+        .multiple(false)
+))]
 pub struct SearchCommand {
     /// Search query string (Laurus query DSL).
     pub query: String,
@@ -414,4 +419,23 @@ pub struct SearchCommand {
     /// for the other `HighlightConfig` knobs.
     #[arg(long = "highlight", value_name = "FIELD")]
     pub highlight: Vec<String>,
+
+    /// MultiVector field whose token vectors rescore the top results with
+    /// late interaction (ColBERT MaxSim) (Issue #1351). Takes the query
+    /// from `--rescore-text` or `--rescore-vectors`.
+    #[arg(long, value_name = "FIELD", requires = "rescore_query")]
+    pub rescore_field: Option<String>,
+
+    /// Rescore query text, embedded by the field's token-level embedder
+    /// (e.g. a `candle_colbert` one).
+    #[arg(long, value_name = "TEXT", requires = "rescore_field")]
+    pub rescore_text: Option<String>,
+
+    /// Rescore query token vectors as JSON, e.g. `[[0.1, 0.2], [0.3, 0.4]]`.
+    #[arg(long, value_name = "JSON", requires = "rescore_field")]
+    pub rescore_vectors: Option<String>,
+
+    /// How many top results to rescore (default 100, at most 10,000).
+    #[arg(long, value_name = "N", requires = "rescore_field")]
+    pub rescore_window: Option<usize>,
 }
