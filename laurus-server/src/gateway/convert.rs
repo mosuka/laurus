@@ -999,6 +999,14 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
 
     let highlight = json.get("highlight").and_then(json_to_highlight_params);
 
+    // A malformed `rescore` is rejected (400) rather than dropped: see
+    // `rescore_params_from_json`.
+    let rescore = json
+        .get("rescore")
+        .filter(|v| !v.is_null())
+        .map(crate::convert::search::rescore_params_from_json)
+        .transpose()?;
+
     Ok(v1::SearchRequest {
         query,
         query_vectors,
@@ -1009,6 +1017,7 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         vector_params,
         field_boosts,
         highlight,
+        rescore,
     })
 }
 
@@ -2167,6 +2176,31 @@ mod tests {
             let req = json_to_proto_search_request(&json).unwrap();
             assert!(req.highlight.is_none(), "expected no highlight for {json}");
         }
+    }
+
+    /// #1351: `rescore` reaches the proto request, and a malformed one is
+    /// an error (400) instead of being dropped like the other options.
+    #[test]
+    fn test_json_to_proto_search_request_rescore() {
+        let json = json!({
+            "query": "title:rust",
+            "rescore": {"late_interaction": {"field": "tokens", "text": "rust"}}
+        });
+        let req = json_to_proto_search_request(&json).unwrap();
+        assert!(matches!(
+            req.rescore.and_then(|r| r.rescorer),
+            Some(v1::rescore_params::Rescorer::LateInteraction(ref late)) if late.field == "tokens"
+        ));
+
+        let req = json_to_proto_search_request(&json!({"query": "q", "rescore": null})).unwrap();
+        assert!(req.rescore.is_none());
+
+        let err = json_to_proto_search_request(&json!({
+            "query": "title:rust",
+            "rescore": {"late_interaction": {"field": "tokens"}}
+        }))
+        .unwrap_err();
+        assert!(err.contains("rescore"), "{err}");
     }
 
     /// Every concrete `FieldChangeKind` value maps to its own distinct

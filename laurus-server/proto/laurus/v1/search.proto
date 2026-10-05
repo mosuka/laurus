@@ -62,6 +62,42 @@ message SearchRequest {
   // query above, ignoring `filter_query` and vector queries — a vector-only
   // request produces no highlights.
   optional HighlightParams highlight = 9;
+
+  // Rescore the top first-stage candidates before the page is cut
+  // (Issue #1351). Unset leaves the first-stage ranking as is.
+  optional RescoreParams rescore = 10;
+}
+
+// Reorder the top `window_size` first-stage candidates (lexical, vector or
+// hybrid) with a second, more precise scorer. Values are validated by the
+// engine: an invalid window, field or query is INVALID_ARGUMENT.
+message RescoreParams {
+  // How many top first-stage candidates to rescore, 1 to 10,000. Unset
+  // means 100.
+  optional uint32 window_size = 1;
+
+  oneof rescorer {
+    // ColBERT-style late interaction (MaxSim) over a MultiVector field.
+    LateInteractionRescore late_interaction = 2;
+  }
+}
+
+// Late-interaction rescore: a candidate scores the sum, over the query's
+// token vectors, of each one's best dot product with the candidate's token
+// vectors in `field` (cosine for a COSINE field). A rescored hit's score is
+// that sum.
+message LateInteractionRescore {
+  // A MultiVector field.
+  string field = 1;
+
+  oneof query {
+    // The query's token vectors, packed row-major (1 to 1,024 vectors of
+    // the field's dimension).
+    VectorArrayValue vectors = 2;
+    // Query text, embedded into token vectors by the field's token-level
+    // embedder (e.g. a "candle_colbert" one).
+    string text = 3;
+  }
 }
 
 message QueryVector {
