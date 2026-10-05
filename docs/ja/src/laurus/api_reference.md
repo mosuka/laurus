@@ -132,6 +132,7 @@ cargo doc --open
 | `.highlight_config(HighlightConfig)` | ハイライトに使うタグ・フラグメント・`require_field_match` の設定を指定 |
 | `.vector_score_mode(VectorScoreMode)` | Vector検索のスコア結合モードを設定 |
 | `.vector_min_score(f32)` | Vector検索の最小スコアしきい値 |
+| `.rescore(RescoreOptions)` | 1段目の上位候補を late interaction で並べ替える（[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)） |
 | `.build()` | `SearchRequest` を構築 |
 
 ### VectorSearchRequestBuilder
@@ -153,7 +154,7 @@ cargo doc --open
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `id` | `String` | 外部ドキュメントID |
-| `score` | `f32` | 関連度スコア |
+| `score` | `f32` | 関連度スコア（再採点した結果では late interaction のスコア） |
 | `document` | `Option<Document>` | ドキュメント内容（ロードされた場合） |
 | `highlights` | `HashMap<String, Vec<String>>` | `.highlight()` で要求したフィールドごとのハイライト済みフラグメント。未要求またはマッチなしの場合は空（[ハイライト](./highlighting.md)） |
 
@@ -163,6 +164,14 @@ cargo doc --open
 | :--- | :--- |
 | `RRF { k: f64 }` | Reciprocal Rank Fusion（デフォルト k=60.0） |
 | `WeightedSum { lexical_weight, vector_weight }` | スコアの線形結合 |
+
+### RescoreOptions
+
+| 項目 | 説明 |
+| :--- | :--- |
+| `RescoreOptions::late_interaction(field, query_vectors)` | MultiVector フィールドに対して、クエリのトークンベクトル（`Vec<Vector>`）で late interaction（MaxSim）の再採点を行う |
+| `.window_size(n)` | 再採点する1段目の上位候補の件数（デフォルト `100`、上限は `RescoreOptions::MAX_WINDOW_SIZE` = `10,000`） |
+| `Rescorer::LateInteraction { field, query }` | コンストラクタが作る再採点方法。`query` は `LateInteractionQuery::Vectors(Vec<Vector>)` |
 
 ## クエリタイプ（Lexical）
 

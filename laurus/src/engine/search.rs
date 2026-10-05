@@ -205,6 +205,99 @@ impl Default for VectorSearchOptions {
     }
 }
 
+// ── Rescore ──────────────────────────────────────────────────────────────────
+
+/// A second stage that rescores the top first-stage candidates of a search
+/// (Issue #1345).
+///
+/// The first stage (lexical, vector or hybrid) ranks documents as usual;
+/// the top [`window_size`](Self::window_size) of them are then reordered by
+/// the [`rescorer`](Self::rescorer). Candidates beyond the window keep their
+/// first-stage order after the rescored ones. Set it with
+/// [`SearchRequestBuilder::rescore`].
+///
+/// # Example
+///
+/// ```
+/// use laurus::{RescoreOptions, SearchRequestBuilder};
+/// use laurus::vector::Vector;
+///
+/// let query_tokens = vec![Vector::new(vec![0.1; 128]), Vector::new(vec![0.2; 128])];
+/// let request = SearchRequestBuilder::new()
+///     .query_dsl("body:rust")
+///     .rescore(RescoreOptions::late_interaction("body_colbert", query_tokens).window_size(200))
+///     .limit(10)
+///     .build();
+/// assert!(request.rescore.is_some());
+/// ```
+#[derive(Debug, Clone)]
+pub struct RescoreOptions {
+    /// How many top first-stage candidates to rescore, `1..=10_000`.
+    /// Defaults to [`Self::DEFAULT_WINDOW_SIZE`].
+    pub window_size: usize,
+    /// How the window is rescored.
+    pub rescorer: Rescorer,
+}
+
+impl RescoreOptions {
+    /// Default [`window_size`](Self::window_size).
+    pub const DEFAULT_WINDOW_SIZE: usize = 100;
+
+    /// Largest accepted [`window_size`](Self::window_size).
+    pub const MAX_WINDOW_SIZE: usize = 10_000;
+
+    /// Rescore with late interaction over the multi-vector field `field`,
+    /// using pre-computed query token vectors.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - A [`MultiVector`](crate::vector::core::field::FieldOption::MultiVector)
+    ///   field.
+    /// * `query_vectors` - The query's token vectors, each of the field's
+    ///   dimension.
+    pub fn late_interaction(
+        field: impl Into<String>,
+        query_vectors: Vec<crate::vector::core::vector::Vector>,
+    ) -> Self {
+        Self {
+            window_size: Self::DEFAULT_WINDOW_SIZE,
+            rescorer: Rescorer::LateInteraction {
+                field: field.into(),
+                query: LateInteractionQuery::Vectors(query_vectors),
+            },
+        }
+    }
+
+    /// Set how many top first-stage candidates to rescore.
+    pub fn window_size(mut self, window_size: usize) -> Self {
+        self.window_size = window_size;
+        self
+    }
+}
+
+/// How a [`RescoreOptions`] window is rescored.
+#[derive(Debug, Clone)]
+pub enum Rescorer {
+    /// ColBERT-style late interaction: each candidate is scored as
+    /// `Σ_i max_j sim(q_i, d_j)` over the query's token vectors `q_i` and
+    /// the candidate's token vectors `d_j` in a multi-vector field. `sim` is
+    /// the dot product (cosine for a `Cosine` field, whose vectors are
+    /// L2-normalized).
+    LateInteraction {
+        /// The multi-vector field holding the candidates' token vectors.
+        field: String,
+        /// The query side.
+        query: LateInteractionQuery,
+    },
+}
+
+/// The query side of [`Rescorer::LateInteraction`].
+#[derive(Debug, Clone)]
+pub enum LateInteractionQuery {
+    /// Pre-computed query token vectors (`1..=1_024` of them).
+    Vectors(Vec<crate::vector::core::vector::Vector>),
+}
+
 // ── SearchRequest ────────────────────────────────────────────────────────────
 
 /// Unified search request combining query specification with pagination,
@@ -246,6 +339,11 @@ pub struct SearchRequest {
 
     /// Parameters controlling vector search behavior.
     pub vector_options: VectorSearchOptions,
+
+    /// Optional second stage that reorders the top first-stage candidates
+    /// (see [`RescoreOptions`]). Cannot be combined with a lexical
+    /// [`sort_by`](LexicalSearchOptions::sort_by).
+    pub rescore: Option<RescoreOptions>,
 }
 
 /// Algorithm used to combine lexical and vector scores in hybrid search.
@@ -289,6 +387,7 @@ impl Default for SearchRequest {
             filter_query: None,
             lexical_options: LexicalSearchOptions::default(),
             vector_options: VectorSearchOptions::default(),
+            rescore: None,
         }
     }
 }
@@ -319,6 +418,7 @@ pub struct SearchRequestBuilder {
     filter_query: Option<Box<dyn Query>>,
     lexical_options: LexicalSearchOptions,
     vector_options: VectorSearchOptions,
+    rescore: Option<RescoreOptions>,
 }
 
 impl Default for SearchRequestBuilder {
@@ -340,6 +440,7 @@ impl SearchRequestBuilder {
             filter_query: None,
             lexical_options: LexicalSearchOptions::default(),
             vector_options: VectorSearchOptions::default(),
+            rescore: None,
         }
     }
 
@@ -508,6 +609,14 @@ impl SearchRequestBuilder {
         self
     }
 
+    // ── Rescore ──────────────────────────────────────────────────────────
+
+    /// Rescore the top first-stage candidates (see [`RescoreOptions`]).
+    pub fn rescore(mut self, rescore: RescoreOptions) -> Self {
+        self.rescore = Some(rescore);
+        self
+    }
+
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder and return the constructed [`SearchRequest`].
@@ -535,6 +644,7 @@ impl SearchRequestBuilder {
             filter_query: self.filter_query,
             lexical_options: self.lexical_options,
             vector_options: self.vector_options,
+            rescore: self.rescore,
         }
     }
 }
@@ -550,6 +660,9 @@ pub struct SearchResult {
     /// - Lexical only: BM25 score.
     /// - Vector only: similarity score (e.g. cosine similarity).
     /// - Hybrid: fused score produced by the [`FusionAlgorithm`].
+    /// - Rescored by [`Rescorer::LateInteraction`]: the late-interaction
+    ///   score. A candidate the rescorer did not score (beyond the window,
+    ///   or with no token vectors) keeps its first-stage score.
     pub score: f32,
     /// The stored fields of the document, or `None` if the document could
     /// not be retrieved (e.g. it was deleted between scoring and retrieval).

@@ -100,8 +100,9 @@ pub use engine::schema::{
     DynamicFieldPolicy, FieldChangeKind, FieldOption, Schema, classify_change, validate_field_name,
 };
 pub use engine::search::{
-    FusionAlgorithm, HighlightOptions, HybridMode, LexicalSearchOptions, SearchQuery,
-    SearchRequest, SearchRequestBuilder, SearchResult, VectorSearchOptions, VectorSearchQuery,
+    FusionAlgorithm, HighlightOptions, HybridMode, LateInteractionQuery, LexicalSearchOptions,
+    RescoreOptions, Rescorer, SearchQuery, SearchRequest, SearchRequestBuilder, SearchResult,
+    VectorSearchOptions, VectorSearchQuery,
 };
 pub use engine::type_inference::{InferredValue, infer_from_json, infer_option_from_data_value};
 pub use engine::{UpdateFieldOptions, UpdateFieldOutcome};

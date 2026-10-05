@@ -103,7 +103,7 @@ impl DistanceMetric {
             }
             DistanceMetric::Euclidean => self.simd_euclidean_sq(a, b).sqrt(),
             DistanceMetric::Manhattan => self.simd_manhattan(a, b),
-            DistanceMetric::DotProduct => -self.simd_dot_product(a, b),
+            DistanceMetric::DotProduct => -dot_product(a, b),
             DistanceMetric::Angular => {
                 let (dot_product, norm_a_sq, norm_b_sq) = self.simd_dot_and_norms(a, b);
                 let norm_a = norm_a_sq.sqrt();
@@ -186,25 +186,6 @@ impl DistanceMetric {
         }
 
         (dot_product, norm_b_sq)
-    }
-
-    /// Calculate dot product using SIMD.
-    fn simd_dot_product(&self, a: &[f32], b: &[f32]) -> f32 {
-        use wide::f32x8;
-
-        let mut sum = f32x8::ZERO;
-        let (chunks_a, rem_a) = a.as_chunks::<8>();
-        let (chunks_b, rem_b) = b.as_chunks::<8>();
-
-        for (ca, cb) in chunks_a.iter().zip(chunks_b) {
-            sum += f32x8::from(*ca) * f32x8::from(*cb);
-        }
-
-        let mut dot_product: f32 = sum.reduce_add();
-        for (x, y) in rem_a.iter().zip(rem_b.iter()) {
-            dot_product += x * y;
-        }
-        dot_product
     }
 
     /// Calculate squared Euclidean distance using SIMD.
@@ -460,6 +441,28 @@ impl DistanceMetric {
                 .collect::<Result<Vec<_>>>()
         }
     }
+}
+
+/// Dot product of two equal-length slices, 8 lanes at a time.
+///
+/// Extra elements of the longer slice are ignored; callers pass slices of
+/// the same length.
+pub(crate) fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    use wide::f32x8;
+
+    let mut sum = f32x8::ZERO;
+    let (chunks_a, rem_a) = a.as_chunks::<8>();
+    let (chunks_b, rem_b) = b.as_chunks::<8>();
+
+    for (ca, cb) in chunks_a.iter().zip(chunks_b) {
+        sum += f32x8::from(*ca) * f32x8::from(*cb);
+    }
+
+    let mut dot_product: f32 = sum.reduce_add();
+    for (x, y) in rem_a.iter().zip(rem_b.iter()) {
+        dot_product += x * y;
+    }
+    dot_product
 }
 
 #[cfg(test)]

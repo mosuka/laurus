@@ -316,7 +316,7 @@ Vector DSL には `AND`/`OR` 演算子はありません。Vector 検索は本�
 | :--- | :--- |
 | `WeightedSum`（デフォルト） | すべてのクエリ句にわたる（類似度 * ウェイト）の合計 |
 | `MaxSim` | クエリ句間の最大類似度スコア |
-| `LateInteraction` | Late Interaction スコアリング |
+| `LateInteraction` | 現在は `WeightedSum` と同じ。トークン単位の late interaction は [再採点](search/vector_search.md#late-interaction-による再採点rescore) で行う |
 
 スコアモードは DSL 構文からは設定できません。Rust API を使用してオーバーライドします。
 

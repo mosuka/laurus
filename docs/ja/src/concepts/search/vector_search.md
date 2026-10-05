@@ -92,12 +92,12 @@ let request = VectorSearchRequestBuilder::new()
 | :--- | :--- |
 | `WeightedSum`（デフォルト） | すべてのクエリ句にわたる（類似度 * ウェイト）の合計 |
 | `MaxSim` | クエリ句間の最大類似度スコア |
-| `LateInteraction` | ColBERT スタイルの Late Interaction スコアリング |
+| `LateInteraction` | ベクトルフィールドは 1 文書につき 1 本のベクトルを持つため、現在は `WeightedSum` と同じ。トークン単位（ColBERT 型）の late interaction には [late interaction による再採点](#late-interaction-による再採点rescore)を使う |
 
 ### マルチベクトル検索の並列実行
 
-複数のクエリベクトル（ColBERT スタイルの late interaction、マルチベクトル
-MaxSim、ensemble reranker など）を含むリクエストに対して、Laurus は
+複数のクエリベクトル（複数のフィールドや、スコアモードで結合する複数の
+クエリ埋め込みなど）を含むリクエストに対して、Laurus は
 [rayon][rayon-crate] を使ってクエリごとの類似度検索を並列に実行します。
 
 動作:
@@ -302,6 +302,103 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 ```
+
+## Late Interaction による再採点（Rescore）
+
+late interaction による再採点（Issue #1345）は、lexical・vector・ハイブリッドの
+どの検索でも、上位の候補を ColBERT 型の late interaction で並べ替えます。
+各文書は [MultiVector フィールド](../schema_and_fields.md#multivector-フィールド)
+にトークンごとのベクトルを持ち、クエリも同じくトークンベクトルの集合です。
+文書のスコアは、クエリの各ベクトルについて文書のベクトルの中で最もよく合う
+ものとの類似度を求め、それを合計した値（MaxSim）です。
+
+```text
+score(q, d) = Σ_i max_j (q_i · d_j)
+```
+
+トークン単位で照合するため、文書全体を 1 本の埋め込みにすると平均化されて
+失われる細部を拾えます。一方で 1 段目の検索が速度を保ちます。再採点するのは
+上位の候補だけなので、MultiVector フィールドに ANN 索引は要りません。
+
+```text
+クエリ ─→ 1 段目: lexical / vector / ハイブリッド（通常の検索）
+              │ 上位 window_size 件（既定 100）
+              ▼
+          再採点: MultiVector フィールドに対する MaxSim
+              ▼
+          offset / limit → 文書を取得
+```
+
+```rust
+use laurus::{RescoreOptions, SearchRequestBuilder};
+use laurus::vector::Vector;
+
+// クエリのトークンベクトル。文書のトークンベクトルを作ったのと同じモデル
+// （例: ColBERT のチェックポイント）で生成する。
+let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
+
+let request = SearchRequestBuilder::new()
+    .query_dsl("body:lifetimes body_vec:\"how do lifetimes work\"")
+    .rescore(
+        RescoreOptions::late_interaction("body_colbert", query_tokens)
+            .window_size(100),
+    )
+    .limit(10)
+    .build();
+let results = engine.search(request).await?;
+```
+
+再採点は Rust API の機能です。サーバーと各言語バインディングからはまだ
+使えません。
+
+### オプション
+
+| フィールド | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `window_size` | `usize` | `100` | 再採点する 1 段目の上位候補の件数。`1..=10,000` |
+| `rescorer` | `Rescorer` | — | `Rescorer::LateInteraction { field, query }`: 対象の MultiVector フィールドと、クエリのトークンベクトル（`LateInteractionQuery::Vectors`） |
+
+クエリのベクトルは 1〜1,024 本で、どれもフィールドの次元と一致し、有限値で
+なければなりません。オプションが不正な場合、対象が MultiVector フィールドで
+ない場合、フィールドによるソート（`sort_by` に `SortField::Field`）を同時に
+指定した場合は、検索を始める前に `LaurusError::InvalidArgument` で失敗します。
+フィールドによるソートはスコアで並べないため、再採点する対象がないからです。
+
+### 並び順とスコア
+
+1. window（1 段目の上位 `window_size` 件）を MaxSim の降順に並べます。
+   同点は内部の文書 ID の順にするため、並び順は決定的です。
+2. フィールドにトークンベクトルを持たない window 内の候補を、1 段目の順で
+   続けます。
+3. window の外の候補を、元の順のまま最後に続けます。
+
+再採点した結果の `score` は MaxSim の値になり、それ以外の結果は 1 段目の
+スコアのままです。2 種類のスコアは比較できないため、グループはスコアでは
+なく位置で並べます。
+
+1 段目は `max(window_size, offset + limit)` 件の候補を取得するため、どの
+ページも同じ再採点済みの順位から切り出されます。ページを 1 つずつ取得して
+つなげると、1 回で大きなページを取得したときと同じ順位になります。ページが
+window の外に及ぶ場合も同じです。window を広げると 1 段目で下位だった文書を
+引き上げられますが、コストは window に比例して増えます。1 段目で取得されな
+かった文書は、再採点でも拾えません。
+
+### 類似度
+
+クエリのベクトルと文書のベクトルの類似度は内積です。
+`DistanceMetric::Cosine`（デフォルト）のフィールドでは、文書のベクトルを
+書き込み時に、クエリのベクトルを検索時に L2 正規化するため、各ペアはコサイン
+類似度になり、スコアはクエリのベクトルの本数を超えません。
+`DistanceMetric::DotProduct` ではベクトルをそのまま使います。
+
+### コスト
+
+再採点の計算量は `window_size × クエリのベクトル数 × 文書のベクトル数` 回の
+内積です。ネイティブビルドでは候補を [rayon][rayon-crate] のグローバル
+スレッドプールで並列に採点し、`wasm32` では 1 件ずつ採点します。目安として、
+128 次元のベクトルを 300 本持つ候補 100 件を 32 本のクエリで再採点すると
+（約 1 億 2,300 万回の積和）、Apple M4 で 1 回の検索あたり約 2 ms、1 スレッド
+では約 7 ms でした。
 
 ## 距離メトリクス（Distance Metrics）
 
