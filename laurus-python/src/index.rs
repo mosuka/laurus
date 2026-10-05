@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::convert::{dict_to_document, document_to_dict};
 use crate::errors::{closed_err, index_dir_err, laurus_err, reload_requires_path_err};
 use crate::schema::PySchema;
-use crate::search::{PySearchResult, build_request_from_py, to_py_search_result};
+use crate::search::{
+    PyLateInteractionRescore, PySearchResult, build_request_from_py, to_py_search_result,
+};
 use laurus::index_dir::CreateRollback;
 use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Embedder, Engine,
@@ -722,11 +724,15 @@ impl PyIndex {
     ///         this query, and only `stored: true` text fields can be
     ///         highlighted. `None` (the default) leaves every result's
     ///         `highlights` empty.
+    ///     rescore: A `LateInteractionRescore` that reorders the top
+    ///         results by late interaction over a multi-vector field
+    ///         (Issue #1351). Ignored when `query` is a `SearchRequest`,
+    ///         which carries its own.
     ///
     /// Returns:
     ///     A list of [`SearchResult`] objects with `.id`, `.score`,
     ///     `.document`, `.highlights`.
-    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None))]
+    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None, rescore=None))]
     pub fn search(
         &self,
         py: Python,
@@ -734,8 +740,9 @@ impl PyIndex {
         limit: usize,
         offset: usize,
         highlight: Option<&Bound<PyAny>>,
+        rescore: Option<PyLateInteractionRescore>,
     ) -> PyResult<Vec<PySearchResult>> {
-        let request = build_request_from_py(py, query, limit, offset, highlight)?;
+        let request = build_request_from_py(py, query, limit, offset, highlight, rescore.as_ref())?;
 
         let engine = self.engine()?;
         let results = py
@@ -792,7 +799,9 @@ impl PyIndex {
         let mut requests = Vec::new();
         for item in queries_seq {
             let item = item?;
-            requests.push(build_request_from_py(py, &item, limit, offset, highlight)?);
+            requests.push(build_request_from_py(
+                py, &item, limit, offset, highlight, None,
+            )?);
         }
 
         if requests.is_empty() {

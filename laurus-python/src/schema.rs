@@ -7,8 +7,8 @@ use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
     CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
     FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption, IntegerOption,
-    IvfOption, QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig,
-    TokenizerConfig,
+    IvfOption, MultiVectorOption, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    TokenFilterConfig, TokenizerConfig,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -626,6 +626,40 @@ impl PySchema {
         self.insert_field(name, FieldOption::Flat(opt))
     }
 
+    /// Add a multi-vector field holding each document's token vectors for
+    /// late-interaction rescoring (e.g. ColBERT embeddings).
+    ///
+    /// The field has no ANN index and cannot be queried directly; a search
+    /// rescores its top results against it with `LateInteractionRescore`.
+    /// A document gives it a list of equal-length float lists, or text when
+    /// ``embedder`` names a token-level embedder (`"candle_colbert"`).
+    ///
+    /// Args:
+    ///     name: Field name.
+    ///     dimension: Dimensionality of every token vector.
+    ///     distance: ``"cosine"`` (default; vectors are L2-normalized when
+    ///         written) or ``"dot_product"``.
+    ///     embedder: Optional token-level embedder registered via
+    ///         `add_embedder`.
+    ///
+    /// Raises:
+    ///     ValueError: if ``name`` is reserved, ``dimension`` is zero, or
+    ///         ``distance`` is neither cosine nor dot product.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", embedder=None))]
+    pub fn add_multi_vector_field(
+        &mut self,
+        name: &str,
+        dimension: usize,
+        distance: &str,
+        embedder: Option<String>,
+    ) -> PyResult<()> {
+        let mut opt = MultiVectorOption::new(dimension).distance(parse_distance(distance)?);
+        opt.embedder = embedder;
+        opt.validate(name)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.insert_field(name, FieldOption::MultiVector(opt))
+    }
+
     /// Add an IVF (Inverted File Index) approximate nearest-neighbor vector field.
     ///
     /// Args:
@@ -675,17 +709,25 @@ impl PySchema {
     ///
     /// The `config` dict must have a `"type"` key selecting the backend:
     ///
-    /// | type            | required keys | feature flag          |
-    /// |-----------------|---------------|-----------------------|
-    /// | `"precomputed"` | —             | (always available)    |
-    /// | `"candle_bert"` | `"model"`     | `embeddings-candle`   |
-    /// | `"candle_clip"` | `"model"`     | `embeddings-multimodal` |
-    /// | `"openai"`      | `"model"`     | `embeddings-openai`   |
+    /// | type               | required keys | optional keys                              | feature flag            |
+    /// |--------------------|---------------|--------------------------------------------|-------------------------|
+    /// | `"precomputed"`    | —             | —                                          | (always available)      |
+    /// | `"candle_bert"`    | `"model"`     | —                                          | `embeddings-candle`     |
+    /// | `"candle_clip"`    | `"model"`     | —                                          | `embeddings-multimodal` |
+    /// | `"openai"`         | `"model"`     | —                                          | `embeddings-openai`     |
+    /// | `"candle_colbert"` | `"model"`     | `"revision"`, `"query_maxlen"`, `"doc_maxlen"` | `embeddings-candle`     |
+    ///
+    /// `"candle_colbert"` produces token vectors and only serves a
+    /// multi-vector field (`add_multi_vector_field`).
     ///
     /// Args:
     ///     name: Unique embedder name referenced from vector fields.
     ///     config: Dict describing the embedder, e.g.
     ///         `{"type": "candle_bert", "model": "sentence-transformers/all-MiniLM-L6-v2"}`.
+    ///
+    /// Raises:
+    ///     ValueError: if ``config`` is not a dict, has no or an unknown
+    ///         ``"type"``, or lacks a required key.
     ///
     /// Example:
     ///     ```python
@@ -693,51 +735,15 @@ impl PySchema {
     ///     schema.add_hnsw_field("embedding", dimension=384, embedder="bert")
     ///     ```
     pub fn add_embedder(&mut self, name: &str, config: &Bound<PyAny>) -> PyResult<()> {
-        let dict = config.extract::<Bound<PyDict>>().map_err(|_| {
-            PyValueError::new_err("embedder config must be a dict, e.g. {\"type\": \"candle_bert\", \"model\": \"...\"}")
-        })?;
-        let dict = &dict;
-
-        let embedder_type: String = dict
-            .get_item("type")?
-            .ok_or_else(|| PyValueError::new_err("embedder config must have a 'type' key"))?
-            .extract()?;
-
-        let definition = match embedder_type.as_str() {
-            "precomputed" => EmbedderDefinition::Precomputed,
-            "candle_bert" => {
-                let model: String = dict
-                    .get_item("model")?
-                    .ok_or_else(|| {
-                        PyValueError::new_err("candle_bert embedder requires a 'model' key")
-                    })?
-                    .extract()?;
-                EmbedderDefinition::CandleBert { model }
-            }
-            "candle_clip" => {
-                let model: String = dict
-                    .get_item("model")?
-                    .ok_or_else(|| {
-                        PyValueError::new_err("candle_clip embedder requires a 'model' key")
-                    })?
-                    .extract()?;
-                EmbedderDefinition::CandleClip { model }
-            }
-            "openai" => {
-                let model: String = dict
-                    .get_item("model")?
-                    .ok_or_else(|| PyValueError::new_err("openai embedder requires a 'model' key"))?
-                    .extract()?;
-                EmbedderDefinition::Openai { model }
-            }
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "Unknown embedder type: '{}'. Valid types: precomputed, candle_bert, candle_clip, openai",
-                    other
-                )));
-            }
-        };
-
+        if !config.is_instance_of::<PyDict>() {
+            return Err(PyValueError::new_err(
+                "embedder config must be a dict, e.g. {\"type\": \"candle_bert\", \"model\": \"...\"}",
+            ));
+        }
+        // The core definition's serde decides the accepted types and keys,
+        // so every embedder type the engine knows is available here.
+        let definition: EmbedderDefinition = serde_json::from_value(py_to_json_value(config)?)
+            .map_err(|e| PyValueError::new_err(format!("invalid embedder config: {e}")))?;
         self.inner.embedders.insert(name.to_string(), definition);
         Ok(())
     }

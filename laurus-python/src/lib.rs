@@ -27,7 +27,7 @@ use query::{
     PyWildcardQuery,
 };
 use schema::PySchema;
-use search::{PyRRF, PySearchRequest, PySearchResult, PyWeightedSum};
+use search::{PyLateInteractionRescore, PyRRF, PySearchRequest, PySearchResult, PyWeightedSum};
 
 /// Laurus — unified lexical, vector, and hybrid search for Python.
 ///
@@ -66,6 +66,9 @@ fn laurus(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Fusion algorithms ─────────────────────────────────────────────────
     m.add_class::<PyRRF>()?;
     m.add_class::<PyWeightedSum>()?;
+
+    // ── Rescore (Issue #1351) ─────────────────────────────────────────────
+    m.add_class::<PyLateInteractionRescore>()?;
 
     // ── Lexical query types ───────────────────────────────────────────────
     m.add_class::<PyTermQuery>()?;
