@@ -87,6 +87,8 @@ curl http://localhost:8080/v1/schema
 
 MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` のように宣言します（`distance` は `"cosine"` または `"dot_product"`、省略時は `"cosine"`）。文書での値は、トークンベクトルごとの同じ長さの数値配列の配列です（`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`）。このフィールドは late interaction の再採点のためにトークンベクトルを保持するもので、ベクトル検索の対象にはならず、文書とともに返されることもありません。
 
+MultiVector フィールドには、トークン単位のエンベッダーも指定できます（Issue #1349）。エンベッダーはスキーマの `embedders` で宣言し、数値のオプションは JSON の数値で書きます。例: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` と `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`。こうすると、文書はこのフィールドにテキスト（`"body_colbert": "how lifetimes work in rust"`）を与えられ、テキストはトークンベクトルに埋め込まれます。エンベッダーのパラメータのうち数値と真偽値は文字列として渡され、配列とオブジェクトは拒否されます。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:

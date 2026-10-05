@@ -315,8 +315,9 @@ distance = "Cosine"
 | :--- | :--- | :--- | :--- |
 | `dimension` | `integer` | `128` | 各トークンベクトルの次元数 |
 | `distance` | `string` | `"Cosine"` | トークン間の類似度。`"Cosine"`（書き込み時に L2 正規化する）または `"DotProduct"`。それ以外は拒否されます |
+| `embedder` | `string` | -- | `[embedders]` で宣言したトークン単位のエンベダー（`type = "candle_colbert"`）の名前。指定すると、文書はこのフィールドにテキストを与えられ、テキストはトークンベクトルに埋め込まれます（[エンベダー](#エンベダー)を参照） |
 
-文書の値は、同じ長さの数値配列の配列（1〜8,192 本）です。このフィールドは文書ストアに保存されません。
+文書の値は、同じ長さの数値配列の配列（1〜8,192 本）です。エンベダーを指定したフィールドではテキストも使えます。このフィールドは文書ストアに保存されません。
 
 ## 距離メトリクス
 
@@ -546,7 +547,7 @@ analyzer = "ja_ipadic"
 
 ## エンベダー
 
-`[embedders.<name>]` テーブルは、埋め込みモデルを宣言します。ベクトルフィールド（Hnsw、Flat、Ivf）は `embedder` オプションにその名前を書いて使います。するとそのフィールドに与えたテキスト（CLIP の場合は画像も）が、文書のインデックス時と、そのフィールドを対象とするクエリの実行時の両方で、モデルによってベクトルに変換されます。1 つのエンベダーを複数のフィールドで共有できます。各モデルの仕組みと選び方は [Embedding](../concepts/embedding.md) を参照してください。
+`[embedders.<name>]` テーブルは、埋め込みモデルを宣言します。ベクトルフィールド（Hnsw、Flat、Ivf、MultiVector）は `embedder` オプションにその名前を書いて使います。するとそのフィールドに与えたテキスト（CLIP の場合は画像も）が、文書のインデックス時と、そのフィールドを対象とするクエリの実行時の両方で、モデルによってベクトルに変換されます。1 つのエンベダーを複数のフィールドで共有できます。各モデルの仕組みと選び方は [Embedding](../concepts/embedding.md) を参照してください。
 
 ```toml
 [embedders.<name>]
@@ -560,8 +561,19 @@ model = "..."  # "precomputed" 以外のすべての型で必須
 | `"candle_bert"` | `model` | `embeddings-candle` | Hugging Face Hub の BERT 系モデル（例: `"sentence-transformers/all-MiniLM-L6-v2"`）によるローカルでのテキスト埋め込み |
 | `"candle_clip"` | `model` | `embeddings-multimodal` | Hugging Face Hub の CLIP モデル（例: `"openai/clip-vit-base-patch32"`）によるローカルでのテキストと画像の埋め込み |
 | `"openai"` | `model` | `embeddings-openai` | OpenAI API（例: `"text-embedding-3-small"`）によるテキスト埋め込み。API キーはエンジン起動時に環境変数 `OPENAI_API_KEY` から読み、スキーマには保存しない |
+| `"candle_colbert"` | `model` | `embeddings-candle` | BERT ベースの ColBERT のチェックポイント（例: `"colbert-ir/colbertv2.0"`、`"answerdotai/answerai-colbert-small-v1"`）によるローカルでのトークン単位の埋め込み。MultiVector フィールドでだけ使える |
 
-Hugging Face のモデルは初回の使用時にダウンロードされ、`$HF_HOME`（デフォルトは `~/.cache/huggingface`）にキャッシュされます。ベクトルフィールドの `dimension` は、モデルの出力次元と一致させる必要があります。
+`"candle_colbert"` は、次のキーも任意で受け付けます。
+
+| キー | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `revision` | `string` | デフォルトブランチ | モデルのリポジトリのブランチ、タグ、またはコミット。コミットに固定してください。まだコミットされていない文書は、復旧時に write-ahead log から埋め込み直されるため、モデルが変わると異なるベクトルになります |
+| `query_maxlen` | `integer` | チェックポイントの値（`32`） | すべてのクエリを埋める、または切り詰めるトークン数 |
+| `doc_maxlen` | `integer` | チェックポイントの値（colbertv2.0 は `180`、answerai-colbert-small-v1 は `300`） | 文書の最大トークン数 |
+
+Hugging Face のモデルは初回の使用時にダウンロードされます。`candle_bert` と `candle_clip` は `$HF_HOME`（デフォルトは `~/.cache/huggingface`）にキャッシュします。`candle_colbert` は Hugging Face の標準のキャッシュ `$HF_HOME/hub`（デフォルトは `~/.cache/huggingface/hub`）を使うため、Python のツールとキャッシュを共有できます。ベクトルフィールドの `dimension` は、モデルの出力次元と一致させる必要があります。`candle_colbert` では、エンジンの起動時にこれを検査します。
+
+エンベダーは、それを指定したフィールドに合っている必要があります。MultiVector フィールドに置けるのは `"candle_colbert"` か `"precomputed"` だけで、Hnsw、Flat、Ivf のフィールドには `"candle_colbert"` を置けません。それ以外の組み合わせは、`create index`、`add field`、`update field` で拒否されます。
 
 > **注意:** リリースで配布しているビルド済みバイナリは `--features embeddings-all` 付きでビルドされています。一方、`cargo install laurus-cli` やソースからのビルドでは、feature を指定しない限り（例: `cargo install laurus-cli --features embeddings-candle`）埋め込みの feature がどれも有効にならず、使えるのは `"precomputed"` だけです。[インストール](installation.md) と [Feature Flags](../development/feature_flags.md) を参照してください。feature が無効な型を書いたスキーマも解析は通りますが、`create index` が次のエラーで失敗します:
 >
@@ -594,6 +606,28 @@ dimension = 384
 distance = "Cosine"
 embedder = "text_embedder"
 ```
+
+### 例: late interaction の再採点に使う ColBERT のトークンベクトル
+
+```toml
+[embedders.colbert]
+type = "candle_colbert"
+model = "answerdotai/answerai-colbert-small-v1"
+revision = "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e"
+
+[fields.body.Text]
+indexed = true
+stored = true
+
+[fields.body_colbert.MultiVector]
+dimension = 96
+distance = "Cosine"
+embedder = "colbert"
+```
+
+文書は `body_colbert` に `body` と同じテキストを与えます。
+[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)
+では、クエリをテキストで渡せます。
 
 ## 完全な例
 

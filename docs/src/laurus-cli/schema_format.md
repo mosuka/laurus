@@ -317,8 +317,9 @@ distance = "Cosine"
 | :--- | :--- | :--- | :--- |
 | `dimension` | `integer` | `128` | Dimensionality of every token vector |
 | `distance` | `string` | `"Cosine"` | Token similarity: `"Cosine"` (vectors are L2-normalized when written) or `"DotProduct"`. Other metrics are rejected |
+| `embedder` | `string` | -- | Name of a token-level embedder (`type = "candle_colbert"`) declared under `[embedders]`. When set, documents may give the field text, which is embedded into token vectors (see [Embedders](#embedders)) |
 
-A document's value is an array of equal-length numeric arrays, between 1 and 8,192 of them. The field is not stored in the document store.
+A document's value is an array of equal-length numeric arrays, between 1 and 8,192 of them, or text when the field has an embedder. The field is not stored in the document store.
 
 ## Distance Metrics
 
@@ -548,7 +549,7 @@ analyzer = "ja_ipadic"
 
 ## Embedders
 
-An `[embedders.<name>]` table declares an embedding model. A vector field (Hnsw, Flat, or Ivf) uses it by naming it in its `embedder` option. Text (or, for CLIP, image) values given for that field are then converted to vectors with the model, both when documents are indexed and when a query targets the field. Several fields can share one embedder. See [Embeddings](../concepts/embedding.md) for how each model works and how to choose one.
+An `[embedders.<name>]` table declares an embedding model. A vector field (Hnsw, Flat, Ivf, or MultiVector) uses it by naming it in its `embedder` option. Text (or, for CLIP, image) values given for that field are then converted to vectors with the model, both when documents are indexed and when a query targets the field. Several fields can share one embedder. See [Embeddings](../concepts/embedding.md) for how each model works and how to choose one.
 
 ```toml
 [embedders.<name>]
@@ -562,8 +563,19 @@ model = "..."  # required for every type except "precomputed"
 | `"candle_bert"` | `model` | `embeddings-candle` | Local text embedding with a BERT-family model from Hugging Face Hub, such as `"sentence-transformers/all-MiniLM-L6-v2"` |
 | `"candle_clip"` | `model` | `embeddings-multimodal` | Local text and image embedding with a CLIP model from Hugging Face Hub, such as `"openai/clip-vit-base-patch32"` |
 | `"openai"` | `model` | `embeddings-openai` | Text embedding through the OpenAI API, such as `"text-embedding-3-small"`. The API key is read from the `OPENAI_API_KEY` environment variable when the engine starts and is never stored in the schema |
+| `"candle_colbert"` | `model` | `embeddings-candle` | Local token-level embedding with a BERT-based ColBERT checkpoint, such as `"colbert-ir/colbertv2.0"` or `"answerdotai/answerai-colbert-small-v1"`. Only a MultiVector field can use it |
 
-Hugging Face models are downloaded on first use and cached under `$HF_HOME` (default `~/.cache/huggingface`). The vector field's `dimension` must equal the model's output dimension.
+`"candle_colbert"` also takes these optional keys:
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `revision` | `string` | default branch | Branch, tag or commit of the model repository. Pin a commit: documents not yet committed are embedded again from the write-ahead log on recovery, and a changed model would produce different vectors |
+| `query_maxlen` | `integer` | from the checkpoint (`32`) | Number of tokens every query is padded or truncated to |
+| `doc_maxlen` | `integer` | from the checkpoint (`180` for colbertv2.0, `300` for answerai-colbert-small-v1) | Maximum number of tokens of a document |
+
+Hugging Face models are downloaded on first use. `candle_bert` and `candle_clip` cache them under `$HF_HOME` (default `~/.cache/huggingface`); `candle_colbert` uses the Hugging Face default cache, `$HF_HOME/hub` (default `~/.cache/huggingface/hub`), which Python tools share. The vector field's `dimension` must equal the model's output dimension; for `candle_colbert` this is checked when the engine starts.
+
+An embedder must fit the field that names it: a MultiVector field accepts only `"candle_colbert"` or `"precomputed"`, and an Hnsw, Flat or Ivf field does not accept `"candle_colbert"`. Any other combination is rejected by `create index`, `add field` and `update field`.
 
 > **Note:** The prebuilt release binaries are built with `--features embeddings-all`. A `laurus` binary installed with `cargo install laurus-cli` or built from source enables none of the embedding features unless you pass them (for example `cargo install laurus-cli --features embeddings-candle`), so only `"precomputed"` works. See [Installation](installation.md) and [Feature Flags](../development/feature_flags.md). A schema that names a type whose feature is missing still parses, but `create index` fails:
 >
@@ -596,6 +608,28 @@ dimension = 384
 distance = "Cosine"
 embedder = "text_embedder"
 ```
+
+### Example: ColBERT token vectors for late-interaction rescoring
+
+```toml
+[embedders.colbert]
+type = "candle_colbert"
+model = "answerdotai/answerai-colbert-small-v1"
+revision = "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e"
+
+[fields.body.Text]
+indexed = true
+stored = true
+
+[fields.body_colbert.MultiVector]
+dimension = 96
+distance = "Cosine"
+embedder = "colbert"
+```
+
+Documents then give `body_colbert` the same text as `body`, and a
+[late-interaction rescore](../concepts/search/vector_search.md#late-interaction-rescore)
+can take its query as text.
 
 ## Complete Examples
 

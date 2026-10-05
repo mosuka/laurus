@@ -369,23 +369,34 @@ query ─→ first stage: lexical / vector / hybrid (as usual)
          offset / limit → documents
 ```
 
+When the multi-vector field has a token-level embedder (a
+[`candle_colbert`](../../laurus-cli/schema_format.md#embedders) one, see
+[CandleColbertEmbedder](../embedding.md#candlecolbertembedder)), documents
+can be indexed as text and the query given as text:
+
 ```rust
 use laurus::{RescoreOptions, SearchRequestBuilder};
-use laurus::vector::Vector;
-
-// Token vectors of the query, from the same model that produced the
-// documents' token vectors (e.g. a ColBERT checkpoint).
-let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
 
 let request = SearchRequestBuilder::new()
     .query_dsl("body:lifetimes body_vec:\"how do lifetimes work\"")
     .rescore(
-        RescoreOptions::late_interaction("body_colbert", query_tokens)
+        RescoreOptions::late_interaction_text("body_colbert", "how do lifetimes work")
             .window_size(100),
     )
     .limit(10)
     .build();
 let results = engine.search(request).await?;
+```
+
+Without one, pass the query's token vectors, computed with the same model
+that produced the documents' token vectors:
+
+```rust
+use laurus::RescoreOptions;
+use laurus::vector::Vector;
+
+let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
+let rescore = RescoreOptions::late_interaction("body_colbert", query_tokens);
 ```
 
 The rescore stage is part of the Rust API. The server and the language
@@ -396,14 +407,20 @@ bindings do not expose it yet.
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `window_size` | `usize` | `100` | How many top first-stage candidates to rescore, `1..=10,000` |
-| `rescorer` | `Rescorer` | — | `Rescorer::LateInteraction { field, query }`: the multi-vector field and the query token vectors (`LateInteractionQuery::Vectors`) |
+| `rescorer` | `Rescorer` | — | `Rescorer::LateInteraction { field, query }`: the multi-vector field and the query, either token vectors (`LateInteractionQuery::Vectors`) or text (`LateInteractionQuery::Text`) |
+
+A text query is embedded by the field's token-level embedder, as a query,
+before the first stage runs; with
+[`EngineBuilder::embedding_cache_capacity`](../../laurus/engine.md#query-embedding-cache)
+set, a repeated query (for example the next page) is served from the cache.
 
 The query must hold between 1 and 1,024 vectors, each of the field's
 dimension and with finite values. The request fails with
 `LaurusError::InvalidArgument` before any search runs when the options are
-invalid, when the field is not a multi-vector field, or when the request
-also sorts by a field (`sort_by` with `SortField::Field`): a field sort
-does not rank by score, so there is nothing to rescore.
+invalid, when the field is not a multi-vector field, when a text query is
+blank or the field has no token-level embedder, or when the request also
+sorts by a field (`sort_by` with `SortField::Field`): a field sort does not
+rank by score, so there is nothing to rescore.
 
 ### Ordering and Scores
 

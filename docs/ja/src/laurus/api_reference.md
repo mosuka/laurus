@@ -170,8 +170,9 @@ cargo doc --open
 | 項目 | 説明 |
 | :--- | :--- |
 | `RescoreOptions::late_interaction(field, query_vectors)` | MultiVector フィールドに対して、クエリのトークンベクトル（`Vec<Vector>`）で late interaction（MaxSim）の再採点を行う |
+| `RescoreOptions::late_interaction_text(field, text)` | 同上。クエリをテキストで渡し、フィールドのトークン単位の Embedder が埋め込む |
 | `.window_size(n)` | 再採点する1段目の上位候補の件数（デフォルト `100`、上限は `RescoreOptions::MAX_WINDOW_SIZE` = `10,000`） |
-| `Rescorer::LateInteraction { field, query }` | コンストラクタが作る再採点方法。`query` は `LateInteractionQuery::Vectors(Vec<Vector>)` |
+| `Rescorer::LateInteraction { field, query }` | コンストラクタが作る再採点方法。`query` は `LateInteractionQuery::Vectors(Vec<Vector>)` か `LateInteractionQuery::Text(String)`。どちらの enum も `#[non_exhaustive]` |
 
 ## クエリタイプ（Lexical）
 
@@ -220,8 +221,11 @@ cargo doc --open
 | `CandleBertEmbedder` | `embeddings-candle` | ローカルBERTモデル |
 | `OpenAIEmbedder` | `embeddings-openai` | OpenAI API |
 | `CandleClipEmbedder` | `embeddings-multimodal` | ローカルCLIPモデル |
+| `CandleColbertEmbedder` | `embeddings-candle` | MultiVector フィールド用のトークンベクトルを出すローカル ColBERT モデル（`with_options(model, CandleColbertOptions)` で revision と長さを指定） |
 | `PrecomputedEmbedder` | *(デフォルト)* | 事前計算済みベクトル |
 | `PerFieldEmbedder` | *(デフォルト)* | フィールドごとのEmbedderディスパッチ |
+
+トークン単位の Embedder は `TokenEmbedder`（`embed_tokens(inputs, EmbedRole)`、`token_dimension()`）も実装し、`Embedder::as_token_embedder()` でそれを返します。[トークン単位の Embedder](../concepts/embedding.md#トークン単位の-embedder) を参照してください。
 
 ## Storage
 

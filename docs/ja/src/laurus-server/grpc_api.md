@@ -93,8 +93,8 @@ message AnalyzerDefinition {
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `type` | `string` | エンベッダータイプ名（例: `"precomputed"`, `"candle_bert"`, `"openai"`） |
-| `params` | `map<string, string>` | タイプ固有のパラメータ（例: `"model"` → `"sentence-transformers/all-MiniLM-L6-v2"`） |
+| `type` | `string` | エンベッダータイプ名（例: `"precomputed"`, `"candle_bert"`, `"candle_colbert"`, `"openai"`） |
+| `params` | `map<string, string>` | タイプ固有のパラメータ（例: `"model"` → `"sentence-transformers/all-MiniLM-L6-v2"`）。`"candle_colbert"`（Issue #1349）は、任意で `"revision"`、`"query_maxlen"`、`"doc_maxlen"` も受け付けます。長さは `"32"` のような 10 進の文字列で、それ以外は拒否されます |
 
 各 `FieldOption` は以下のフィールドタイプのいずれかを持つ `oneof` です。
 
@@ -103,7 +103,7 @@ message AnalyzerDefinition {
 | `TextOption` (`indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
 | `IntegerOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
-| `BooleanOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `MultiVectorOption` (`dimension`, `distance`) |
+| `BooleanOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `MultiVectorOption` (`dimension`, `distance`, `embedder`) |
 | `DateTimeOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `GeoOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
 | `Geo3dOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | |
@@ -115,7 +115,7 @@ message AnalyzerDefinition {
 
 **多値地理・多値日時・多値ブール・多値テキスト・多値バイト（multi-valued geo, datetime, boolean, text and bytes）:** `GeoOption` / `Geo3dOption`（Issue #1174）、`DateTimeOption`（Issue #1184）、および `BooleanOption`（Issue #1180）の `multi_valued` は proto のフィールド番号 `4` です（`IntegerOption` / `FloatOption` と異なり、`3` は既に `doc_values` が使用しているため）。`TextOption`（Issue #1175）ではフィールド番号 `6` です（Text は `3`〜`5` を既に `term_vectors`・`analyzer`・`doc_values` に使用しているため）。`BytesOption`（Issue #1176）ではフィールド番号 `2` です（`1` は既に `stored` が使用しており、`BytesOption` には `indexed` も `doc_values` もありません）。`true` にすると地理フィールドは `GeoArrayValue` / `Geo3dArrayValue`（後述の `Value` 表を参照）を受け付け、距離 / バウンディングボックスクエリ（および `geo3d_nearest`）は**いずれかのポイント**が条件を満たせばドキュメントにマッチし、最も近いポイントでスコアリングされます。日時フィールドは `DatetimeArrayValue`（`repeated int64`。`datetime_value` と同じ UTC の Unix マイクロ秒）を受け付け、範囲クエリは**いずれかの時刻**が範囲内にあればドキュメントにマッチします（スコアは constant。複数の時刻がマッチしてもドキュメントは 1 回だけ報告されます）。ブールフィールドは `BoolArrayValue`（`repeated bool`）を受け付け、term クエリは**いずれかの要素**がクエリの値と等しければドキュメントにマッチします。各要素はそれぞれ独立した `true` / `false` の term posting としてインデックスされ（ブールに BKD ポイントはありません）、要素の重複はヒット数ではなく term frequency（したがって BM25 スコア）を増やします。テキストフィールドは `TextArrayValue`（`repeated string`）を受け付け、term クエリは**いずれかの要素**がタームを含めばドキュメントにマッチします。`position_increment_gap`（フィールド `7`、`optional uint32`）は連続する要素の間に挿入される位置数で、slop がこの値に達しない限りフレーズクエリが 2 つの要素をまたがないようにします。`term_vectors` / `doc_values` と同じ理由で `optional` になっており、省略時は `0` ではなくエンジンのデフォルト（`100`）を意味します。バイトフィールドは `BytesArrayValue`（`repeated bytes`）を受け付けますが、`Bytes` の値はそもそもレキシカルインデックスされないため "any match" のクエリ意味論は一切なく、保存時・ワイヤ上の形と取り込み時の許容個数を変えるだけです。また、スカラーの `bytes_value` と同じく、`DataValue::BytesArray` が持つ要素ごとの MIME タイプはワイヤ上に表現されません。
 
-**MultiVector フィールド:** `MultiVectorOption`（`FieldOption` のフィールド番号 `12`、Issue #1177）は、文書ごとのトークンベクトル（ColBERT 型のトークンごとの埋め込みなど）を late interaction の再採点のために保持するフィールドを宣言します。ANN 索引は持たず、ベクトル検索の対象にはなりません。`query_vectors` でこのフィールドを指定すると拒否されます。`distance` は `COSINE`（書き込み時に L2 正規化する）か `DOT_PRODUCT` でなければなりません。値は `VectorArrayValue`（下の `Value` の表を参照）です。このフィールドは保存されないため、サーバーが返す文書には含まれません。
+**MultiVector フィールド:** `MultiVectorOption`（`FieldOption` のフィールド番号 `12`、Issue #1177）は、文書ごとのトークンベクトル（ColBERT 型のトークンごとの埋め込みなど）を late interaction の再採点のために保持するフィールドを宣言します。ANN 索引は持たず、ベクトル検索の対象にはなりません。`query_vectors` でこのフィールドを指定すると拒否されます。`distance` は `COSINE`（書き込み時に L2 正規化する）か `DOT_PRODUCT` でなければなりません。値は `VectorArrayValue`（下の `Value` の表を参照）です。このフィールドは保存されないため、サーバーが返す文書には含まれません。`embedder`（フィールド番号 `3`、Issue #1349）には、`Schema.embedders` で宣言したトークン単位のエンベッダー（`"candle_colbert"`）の名前を指定します。指定すると、文書はこのフィールドに `text_value` を与えられ、テキストはトークンベクトルに埋め込まれます。MultiVector フィールドに置けるのは `"candle_colbert"` か `"precomputed"` のエンベッダーだけで、他のベクトルフィールドには `"candle_colbert"` を置けません。
 
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 

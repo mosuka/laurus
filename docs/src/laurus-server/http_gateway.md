@@ -91,6 +91,8 @@ The response always includes `multi_valued` for `text`, `integer`, `float`, `boo
 
 A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` (`distance` is `"cosine"` or `"dot_product"`, defaulting to `"cosine"`). Its value in a document is an array of equal-length numeric arrays, one per token vector (`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`). The field holds token vectors for late-interaction rescoring: it is not a vector-search target and is not returned with documents.
 
+A multi-vector field may also name a token-level embedder (Issue #1349), declared in the schema's `embedders` with its numeric options as JSON numbers: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` and `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`. A document can then give the field text (`"body_colbert": "how lifetimes work in rust"`), which is embedded into token vectors. Embedder parameters that are numbers or booleans are passed on as strings, and arrays or objects are rejected.
+
 ### Add a Field (Dynamic Schema)
 
 Adds a new field to the running index. The request body uses the same `FieldOption` JSON shape as `POST /v1/index`:

@@ -75,6 +75,13 @@ Within a single query, all of its payloads are embedded in one
 `PerFieldEmbedder`), so a batch-capable embedder pays one round trip for a
 multi-vector query instead of one per payload (Issue #671).
 
+The token vectors of a late-interaction rescore's text query are cached
+too, in a separate LRU of the same capacity, keyed by field, the field's
+own embedder, role and query text, so their larger entries never evict
+single-vector ones (Issue #1349). Adding, deleting or rebuilding a vector
+field empties both, since the embedder behind a field name may have
+changed.
+
 ### Build Lifecycle
 
 When `build()` is called, the following steps occur:
