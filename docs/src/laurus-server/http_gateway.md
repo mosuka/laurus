@@ -89,6 +89,8 @@ curl http://localhost:8080/v1/schema
 
 The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, `geo3d`, and `bytes` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}` or `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response. A `bytes` option has no `indexed` or `doc_values` key: a `Bytes` value is never indexed or written to DocValues regardless of `multi_valued` (Issue #1176).
 
+A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` (`distance` is `"cosine"` or `"dot_product"`, defaulting to `"cosine"`). Its value in a document is an array of equal-length numeric arrays, one per token vector (`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`). The field holds token vectors for late-interaction rescoring: it is not a vector-search target and is not returned with documents.
+
 ### Add a Field (Dynamic Schema)
 
 Adds a new field to the running index. The request body uses the same `FieldOption` JSON shape as `POST /v1/index`:

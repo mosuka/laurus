@@ -152,6 +152,48 @@ latency.
 
 See [Vector Indexing](indexing/vector_indexing.md) for detailed parameter guidance.
 
+### Multi-Vector Fields
+
+A `MultiVector` field holds **all the token vectors of a document**, for
+example the per-token embeddings of a ColBERT-style late-interaction model
+(typically 100–300 vectors of 128 dimensions per passage). It has no ANN
+index: it is never a vector-search target, and its vectors are read only to
+rescore candidates that another query (lexical, vector, or hybrid) already
+found.
+
+| Type | Rust Type | SchemaBuilder Method | Description |
+| :--- | :--- | :--- | :--- |
+| **MultiVector** | `MultiVectorOption` | `add_multi_vector_field()` | Per-document token vectors for late-interaction rescoring; not searchable |
+
+```rust
+use laurus::{MultiVectorOption, Schema};
+use laurus::vector::core::distance::DistanceMetric;
+
+let schema = Schema::builder()
+    .add_multi_vector_field(
+        "body_colbert",
+        MultiVectorOption::new(128).distance(DistanceMetric::Cosine), // Cosine (default) or DotProduct
+    )
+    .build();
+```
+
+- **Options**: `dimension` (every token vector's length) and `distance`.
+  Only `Cosine` (vectors are L2-normalized when written, so the similarity is
+  their dot product; a zero vector is kept as-is) and `DotProduct` are
+  accepted; other metrics are rejected when the index is created.
+- **Values**: a `DataValue::VectorArray(Vec<Vec<f32>>)` holding at least one
+  and at most 8,192 vectors, each of the field's dimension and with finite
+  values. In JSON it is an array of equal-length numeric arrays
+  (`[[0.1, 0.2, ...], [0.3, 0.4, ...]]`).
+- **Not stored**: the token vectors are kept only in the vector index (about
+  150 KB per document for 300 × 128 `f32`), so `get_documents` and search
+  results never include the field.
+- **Not queryable**: a field-less vector query and a prefix field selector
+  skip it, naming it in a vector query is an error, and so is naming it in a
+  DSL query.
+- **Schema changes**: changing its dimension or distance, or changing it to
+  or from another vector field type, is a destructive change.
+
 ## Document
 
 A `Document` is a collection of named field values. Use `DocumentBuilder` to construct documents:
@@ -238,6 +280,7 @@ graph LR
 | `add_geo_ecef(name, x, y, z)` | `(f64, f64, f64)` | Add a 3D ECEF Cartesian point (metres) |
 | `add_bytes(name, data)` | `Vec<u8>` | Add binary data |
 | `add_bytes_array(name, values)` | `Vec<(Vec<u8>, Option<String>)>` | Add a multi-valued binary field, each element carrying its own optional MIME type |
+| `add_vector_array(name, vectors)` | `Vec<Vec<f32>>` | Add the token vectors of a `MultiVector` field |
 | `add_field(name, value)` | `DataValue` | Add any value type |
 
 ## DataValue
@@ -264,6 +307,7 @@ pub enum DataValue {
     BoolArray(Vec<bool>),            // multi-valued boolean field
     TextArray(Vec<String>),          // multi-valued text field
     BytesArray(Vec<(Vec<u8>, Option<String>)>), // multi-valued bytes field, per-element MIME
+    VectorArray(Vec<Vec<f32>>),      // token vectors of a MultiVector field
 }
 ```
 
@@ -339,10 +383,12 @@ let schema = Schema::builder()
 | any other array of strings (e.g. `["rust", "search"]`) | `Text` with `multi_valued = true` |
 | array of booleans (e.g. `[true, false]`) | `Boolean` with `multi_valued = true` |
 | object with a `data` key (base64-encoded string) and an optional `mime` string key | `Bytes` value |
+| array of equal-length, non-empty numeric arrays (e.g. `[[0.1, 0.2], [0.3, 0.4]]`) | `VectorArray` value (token vectors) |
 
-Vector fields (`Hnsw`, `Flat`, `Ivf`) are **never** inferred: they must be
-declared in the schema explicitly, since dimension, distance metric, and
-embedder configuration cannot be recovered from a value alone. `Bytes`
+Vector fields (`Hnsw`, `Flat`, `Ivf`, `MultiVector`) are **never** inferred:
+they must be declared in the schema explicitly, since dimension, distance
+metric, and embedder configuration cannot be recovered from a value alone.
+An undeclared field carrying token vectors is rejected. `Bytes`
 values can be *parsed* from the `{data, mime}` object shape above, but an
 **undeclared** field carrying a `Bytes` value is still rejected rather than
 auto-registered — bytes fields must always be declared explicitly, same as
@@ -567,6 +613,9 @@ to coerce the value to the declared type. The coercion rules are:
 | `Bytes` with `multi_valued = true` | anything else | error |
 | vector (`Hnsw`/`Flat`/`Ivf`) | `Text` or `Bytes` | passed through unchanged for the field's embedder |
 | vector (`Hnsw`/`Flat`/`Ivf`) | numeric array | cast element-wise to `f32` |
+| vector (`Hnsw`/`Flat`/`Ivf`) | `VectorArray` | error (token vectors need a `MultiVector` field) |
+| `MultiVector` | `VectorArray` with 1–8,192 vectors of the field's dimension, all finite | stored as-is |
+| `MultiVector` | anything else (a single vector, a flat numeric array, text) | error |
 
 Coercion errors interact with the policy:
 

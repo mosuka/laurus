@@ -64,6 +64,7 @@ Defines document structure.
 | `.add_hnsw_field(name, HnswOption)` | Add an HNSW vector field |
 | `.add_flat_field(name, FlatOption)` | Add a Flat vector field |
 | `.add_ivf_field(name, IvfOption)` | Add an IVF vector field |
+| `.add_multi_vector_field(name, MultiVectorOption)` | Add a multi-vector field: per-document token vectors for late-interaction rescoring, not searchable |
 | `.add_default_field(name)` | Set a default search field |
 | `.add_analyzer(name, AnalyzerDefinition)` | Register a custom analyzer pipeline. A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) makes `.build()` panic and `.try_build()` return an error; a `Schema` built another way (e.g. `Schema::from_toml`) is checked with `Schema::validate_for_create` |
 | `.add_embedder(name, EmbedderDefinition)` | Register an embedder definition |
@@ -105,6 +106,7 @@ A collection of named field values.
 | `.add_text_array(name, values)` | Add a multi-valued text field (`Vec<String>`) |
 | `.add_bytes(name, data)` | Add binary data |
 | `.add_bytes_array(name, values)` | Add a multi-valued binary field (`Vec<(Vec<u8>, Option<String>)>`; each element carries its own optional MIME type) |
+| `.add_vector_array(name, vectors)` | Add the token vectors of a multi-vector field (`Vec<Vec<f32>>`) |
 | `.build()` | Build the `Document` |
 
 ## Search
@@ -242,3 +244,4 @@ A collection of named field values.
 | `DataValue::BoolArray(Vec<bool>)` | Multi-valued booleans (requires `multi_valued` field option) |
 | `DataValue::TextArray(Vec<String>)` | Multi-valued strings (requires `multi_valued` field option) |
 | `DataValue::BytesArray(Vec<(Vec<u8>, Option<String>)>)` | Multi-valued binary content, each element carrying its own optional MIME type (requires `multi_valued` field option; never indexed) |
+| `DataValue::VectorArray(Vec<Vec<f32>>)` | Token vectors of a multi-vector field (1 to 8,192 vectors of the field's dimension; not stored in the document store) |
