@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use ext_php_rs::convert::FromZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendClassObject, ZendHashTable, Zval};
+use ext_php_rs::zend::ce;
+use laurus::vector::Vector;
 use laurus::{
     Document, FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery,
-    SearchRequestBuilder, SearchResult, VectorSearchQuery,
+    RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
 };
 
-use crate::convert::document_to_hashtable;
+use crate::convert::{document_to_hashtable, is_token_vector_list, php_token_vectors};
 use crate::query::{
     extract_lexical_query, is_vector_query, zval_to_lexical_search_query,
     zval_to_vector_search_query,
@@ -188,6 +190,112 @@ impl PhpWeightedSum {
 }
 
 // ---------------------------------------------------------------------------
+// Rescore (Issue #1351)
+// ---------------------------------------------------------------------------
+
+/// Late-interaction (ColBERT MaxSim) rescore of the top search results
+/// (`Laurus\LateInteractionRescore`).
+///
+/// The top `windowSize` first-stage results are reordered by their MaxSim
+/// against a multi-vector field, and a rescored result's score is that
+/// MaxSim.
+///
+/// ```php
+/// $rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes work");
+/// $index->search("body:lifetimes", 10, 0, null, $rescore);
+///
+/// $rescore = new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], 50);
+/// ```
+#[php_class]
+#[php(name = "Laurus\\LateInteractionRescore")]
+#[derive(Clone)]
+pub struct PhpLateInteractionRescore {
+    field: String,
+    options: RescoreOptions,
+}
+
+#[php_impl]
+impl PhpLateInteractionRescore {
+    /// Create a late-interaction rescore.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - A multi-vector field.
+    /// * `query` - Query text, embedded by the field's token-level embedder
+    ///   (a `"candle_colbert"` one), or the query's token vectors as a list
+    ///   of numeric lists.
+    /// * `window_size` - How many top results to rescore (default 100, at
+    ///   most 10,000).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\TypeError` if `query` is neither a string nor a list of
+    /// numeric lists. The other values are checked when searching.
+    pub fn __construct(field: String, query: &Zval, window_size: Option<i64>) -> PhpResult<Self> {
+        let options = if let Some(text) = query.str() {
+            RescoreOptions::late_interaction_text(field.clone(), text)
+        } else {
+            let rows = query
+                .array()
+                .filter(|ht| is_token_vector_list(ht))
+                .ok_or_else(|| {
+                    PhpException::new(
+                        "query must be a string or a list of numeric lists".to_string(),
+                        0,
+                        ce::type_error(),
+                    )
+                })?;
+            RescoreOptions::late_interaction(
+                field.clone(),
+                php_token_vectors(rows)?
+                    .into_iter()
+                    .map(Vector::new)
+                    .collect(),
+            )
+        };
+        let options = match window_size {
+            // A negative window is rejected by the engine like 0.
+            Some(window_size) => options.window_size(usize::try_from(window_size).unwrap_or(0)),
+            None => options,
+        };
+        Ok(Self { field, options })
+    }
+
+    /// Return how many top results are rescored.
+    pub fn get_window_size(&self) -> i64 {
+        self.options.window_size as i64
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        format!(
+            "LateInteractionRescore(field={:?}, window_size={})",
+            self.field, self.options.window_size
+        )
+    }
+}
+
+/// Convert a PHP `$rescore` argument into [`RescoreOptions`].
+///
+/// # Errors
+///
+/// Throws `\TypeError` if `rescore` is not a `Laurus\LateInteractionRescore`.
+pub fn parse_rescore_option(rescore: Option<&Zval>) -> PhpResult<Option<RescoreOptions>> {
+    let Some(rescore) = rescore.filter(|zv| !zv.is_null()) else {
+        return Ok(None);
+    };
+    <&ZendClassObject<PhpLateInteractionRescore>>::from_zval(rescore)
+        .map(|obj| Some(obj.options.clone()))
+        .ok_or_else(|| {
+            PhpException::new(
+                "rescore must be a Laurus\\LateInteractionRescore".to_string(),
+                0,
+                ce::type_error(),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -304,6 +412,8 @@ pub struct PhpSearchRequest {
     offset: usize,
     /// Highlight request (Issue #1134).
     highlight: Option<HighlightOptions>,
+    /// Late-interaction rescore of the top results (Issue #1351).
+    rescore: Option<RescoreOptions>,
 }
 
 #[php_impl]
@@ -323,6 +433,8 @@ impl PhpSearchRequest {
     /// * `offset` - Pagination offset (default: 0).
     /// * `highlight` - Field list or config array for search-result
     ///   highlighting (Issue #1134).
+    /// * `rescore` - `LateInteractionRescore` reordering the top results
+    ///   (Issue #1351).
     #[php(defaults(limit = 10, offset = 0))]
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
@@ -334,6 +446,7 @@ impl PhpSearchRequest {
         limit: i64,
         offset: i64,
         highlight: Option<&ZendHashTable>,
+        rescore: Option<&Zval>,
     ) -> PhpResult<Self> {
         // Convert fusion
         let fusion_alg = if !fusion.is_null() {
@@ -388,6 +501,7 @@ impl PhpSearchRequest {
         };
 
         let highlight = parse_highlight_option(highlight)?;
+        let rescore = parse_rescore_option(rescore)?;
 
         Ok(Self {
             query: q,
@@ -398,6 +512,7 @@ impl PhpSearchRequest {
             limit: limit as usize,
             offset: offset as usize,
             highlight,
+            rescore,
         })
     }
 
@@ -433,6 +548,9 @@ impl PhpSearchRequest {
             builder = builder
                 .highlight(options.fields.clone())
                 .highlight_config(options.config.clone());
+        }
+        if let Some(rescore) = &self.rescore {
+            builder = builder.rescore(rescore.clone());
         }
 
         // Explicit hybrid: lexical_query + vector_query both set
@@ -480,7 +598,7 @@ impl PhpSearchRequest {
 // ---------------------------------------------------------------------------
 
 /// Build a [`laurus::SearchRequest`] from the arguments passed to
-/// `Index->search($query, $limit, $offset, $highlight)`.
+/// `Index->search($query, $limit, $offset, $highlight, $rescore)`.
 ///
 /// `query` may be:
 /// - A `string` (DSL)
@@ -488,8 +606,8 @@ impl PhpSearchRequest {
 /// - Any lexical query class
 /// - `VectorQuery` or `VectorTextQuery`
 ///
-/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight` are used
-/// as-is from the request without overriding — same precedent as
+/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`
+/// are used as-is from the request without overriding — same precedent as
 /// `limit`/`offset` already had here before highlighting existed.
 ///
 /// # Arguments
@@ -498,6 +616,7 @@ impl PhpSearchRequest {
 /// * `limit` - Maximum results.
 /// * `offset` - Pagination offset.
 /// * `highlight` - Already-parsed highlight options, if `$highlight` was given.
+/// * `rescore` - Already-parsed rescore, if `$rescore` was given.
 ///
 /// # Returns
 ///
@@ -507,6 +626,7 @@ pub fn build_request_from_php(
     limit: usize,
     offset: usize,
     highlight: Option<&HighlightOptions>,
+    rescore: Option<&RescoreOptions>,
 ) -> PhpResult<laurus::SearchRequest> {
     // Full SearchRequest object
     if let Some(req_obj) = <&ZendClassObject<PhpSearchRequest>>::from_zval(query) {
@@ -520,6 +640,9 @@ pub fn build_request_from_php(
         builder = builder
             .highlight(options.fields.clone())
             .highlight_config(options.config.clone());
+    }
+    if let Some(rescore) = rescore {
+        builder = builder.rescore(rescore.clone());
     }
 
     // DSL string

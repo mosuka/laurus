@@ -54,6 +54,7 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 /// | `array` of numerics (sequential)          | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
 /// | `array` of `lat`/`lon` arrays (sequential) | `GeoArray` (multi-valued geo, #1174) |
 /// | `array` of `x`/`y`/`z` arrays (sequential) | `GeoEcefArray`      |
+/// | `array` of numeric lists (sequential)     | `VectorArray` (multi-vector field token vectors, #1351) |
 /// | `array` of RFC 3339 strings (sequential)  | `DateTimeArray` (multi-valued datetime, #1184) |
 /// | `array` of bools (sequential)             | `BoolArray` (multi-valued boolean, #1180) |
 /// | `array` of strings (sequential)           | `TextArray` (multi-valued text, #1175), or `DateTimeArray` when every element parses as ISO 8601 |
@@ -132,6 +133,13 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         if ht.is_empty() {
             return Ok(DataValue::Int64Array(Vec::new()));
         }
+        // A list of lists is the token vectors of a multi-vector field
+        // (#1351). A geo point is keyed (`lat`/`lon`, `x`/`y`/`z`), so it
+        // never takes this path. Their count and dimension are checked
+        // against the field by the core's schema-aware coercion.
+        if is_token_vector_list(ht) {
+            return php_token_vectors(ht).map(DataValue::VectorArray);
+        }
         // A sequential array of arrays is a multi-valued geo field (#1174):
         // the outer array has no `lat`/`x` keys so the marker checks above
         // fall through to here, and each element takes the same
@@ -191,6 +199,43 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         zv.get_type()
     )
     .into())
+}
+
+/// Whether `ht` is a list whose elements are all lists, the shape of token
+/// vectors (#1351).
+pub fn is_token_vector_list(ht: &ZendHashTable) -> bool {
+    ht.has_sequential_keys()
+        && ht
+            .values()
+            .all(|val| val.array().is_some_and(|row| row.has_sequential_keys()))
+}
+
+/// Convert a list of numeric lists into token vectors (#1351), for both a
+/// multi-vector field's value and a rescore query. `int` elements are
+/// widened; any other non-`float` element is an error.
+pub fn php_token_vectors(ht: &ZendHashTable) -> PhpResult<Vec<Vec<f32>>> {
+    ht.values()
+        .enumerate()
+        .map(|(i, row)| {
+            let row = row
+                .array()
+                .ok_or_else(|| format!("token vector {i} must be an array"))?;
+            row.values()
+                .map(|val| {
+                    let value = if val.is_long() {
+                        i64::from_zval(val).map(|n| n as f64)
+                    } else if val.is_double() {
+                        f64::from_zval(val)
+                    } else {
+                        None
+                    };
+                    value
+                        .map(|v| v as f32)
+                        .ok_or_else(|| format!("token vector {i} must hold only numbers").into())
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Maximum nesting depth accepted by [`zval_to_json_value`].

@@ -2110,6 +2110,7 @@ class LaurusTest extends TestCase
             "addHnswField" => fn ($s) => $s->addHnswField("_secret", 4),
             "addFlatField" => fn ($s) => $s->addFlatField("_secret", 4),
             "addIvfField" => fn ($s) => $s->addIvfField("_secret", 4),
+            "addMultiVectorField" => fn ($s) => $s->addMultiVectorField("_secret", 4),
         ];
         foreach ($adders as $method => $add) {
             $schema = new Laurus\Schema();
@@ -2123,6 +2124,250 @@ class LaurusTest extends TestCase
                 );
             }
             $this->assertSame([], $schema->fieldNames(), "$method must add nothing");
+        }
+    }
+
+    // ── Late-interaction rescore (Issue #1351) ────────────────────────────
+    //
+    // Uses the same corpus as the Rust test
+    // (`laurus/tests/late_interaction_rescore_test.rs`): against the query
+    // token vectors [[1, 0], [0, 1]] the MaxSim scores are c 1.1, b 1.0,
+    // d 0.9, a 0.1, e 0.05 — an order that matches neither the BM25 nor the
+    // `vec` ranking — so the binding must rank exactly like the Rust API.
+
+    private const RESCORE_QUERY = [[1.0, 0.0], [0.0, 1.0]];
+    private const RESCORE_EXPECTED = ["c", "b", "d", "a", "e"];
+    private const RESCORE_CORPUS = [
+        "a" => ["rust", [1.0, 0.0], [[0.1, 0.0]]],
+        "b" => ["rust rust", [0.9, 0.1], [[0.5, 0.5], [0.0, 0.2]]],
+        "c" => ["rust language", [0.5, 0.5], [[0.9, 0.2]]],
+        "d" => ["rust rust rust", [0.2, 0.8], [[0.3, 0.3], [0.6, 0.0]]],
+        "e" => ["learning rust today", [0.0, 1.0], [[0.02, 0.03]]],
+    ];
+
+    private function createRescoreIndex(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addFlatField("vec", 2);
+        $schema->addMultiVectorField("tokens", 2, "dot_product");
+        $idx = new Laurus\Index(null, $schema);
+        foreach (self::RESCORE_CORPUS as $id => [$title, $vec, $tokens]) {
+            $idx->putDocument($id, ["title" => $title, "vec" => $vec, "tokens" => $tokens]);
+        }
+        $idx->commit();
+        return $idx;
+    }
+
+    private static function maxSim(array $query, array $tokens): float
+    {
+        $sum = 0.0;
+        foreach ($query as $q) {
+            $sum += max(array_map(
+                fn ($t) => array_sum(array_map(fn ($a, $b) => $a * $b, $q, $t)),
+                $tokens
+            ));
+        }
+        return $sum;
+    }
+
+    private static function rankedIds(array $results): array
+    {
+        return array_map(fn ($r) => $r->getId(), $results);
+    }
+
+    private function rescore(?int $windowSize = null): Laurus\LateInteractionRescore
+    {
+        return new Laurus\LateInteractionRescore("tokens", self::RESCORE_QUERY, $windowSize);
+    }
+
+    public function testDslSearchIsReorderedByLateInteraction(): void
+    {
+        $idx = $this->createRescoreIndex();
+        $this->assertNotSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search("title:rust")));
+
+        $results = $idx->search("title:rust", 10, 0, null, $this->rescore());
+
+        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($results));
+        foreach ($results as $r) {
+            $expected = self::maxSim(self::RESCORE_QUERY, self::RESCORE_CORPUS[$r->getId()][2]);
+            $this->assertEqualsWithDelta($expected, $r->getScore(), 1e-5);
+        }
+    }
+
+    public function testSearchRequestIsReorderedByLateInteraction(): void
+    {
+        $idx = $this->createRescoreIndex();
+        $request = new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $this->rescore());
+        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search($request)));
+
+        $hybrid = new Laurus\SearchRequest(
+            null, // query
+            new Laurus\TermQuery("title", "rust"), // lexical_query
+            new Laurus\VectorQuery("vec", [1.0, 0.0]), // vector_query
+            null, // filter_query
+            new Laurus\RRF(), // fusion
+            10, // limit
+            0, // offset
+            null, // highlight
+            $this->rescore(), // rescore
+        );
+        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search($hybrid)));
+    }
+
+    public function testOnlyTheRescoreWindowIsReordered(): void
+    {
+        $idx = $this->createRescoreIndex();
+        $baseline = $idx->search("title:rust");
+        $window = $this->rescore(1);
+        $this->assertSame(1, $window->getWindowSize());
+
+        $results = $idx->search("title:rust", 10, 0, null, $window);
+
+        $this->assertSame(self::rankedIds($baseline), self::rankedIds($results));
+        $top = self::maxSim(self::RESCORE_QUERY, self::RESCORE_CORPUS[$results[0]->getId()][2]);
+        $this->assertEqualsWithDelta($top, $results[0]->getScore(), 1e-5);
+        for ($i = 1; $i < count($results); $i++) {
+            $this->assertSame($baseline[$i]->getScore(), $results[$i]->getScore());
+        }
+    }
+
+    public function testRescoreDefaultsAndString(): void
+    {
+        $this->assertSame(100, $this->rescore()->getWindowSize());
+        $this->assertSame('LateInteractionRescore(field="tokens", window_size=100)', (string)$this->rescore());
+    }
+
+    public function testTokenVectorsAreNotStored(): void
+    {
+        // Token vectors live only in the vector store, unlike a single vector.
+        $doc = $this->createRescoreIndex()->getDocuments("b")[0];
+        $this->assertArrayNotHasKey("tokens", $doc);
+        $this->assertCount(2, $doc["vec"]);
+    }
+
+    public function testRescoreQueryMustBeTextOrTokenVectors(): void
+    {
+        foreach ([[1.0, 0.0], [[1.0], "x"], 42, null] as $query) {
+            try {
+                new Laurus\LateInteractionRescore("tokens", $query);
+                $this->fail("accepted " . json_encode($query));
+            } catch (\TypeError $e) {
+                $this->assertStringContainsString("query must be a string or a list of numeric lists", $e->getMessage());
+            }
+        }
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage("token vector 0 must hold only numbers");
+        new Laurus\LateInteractionRescore("tokens", [[1.0, "x"]]);
+    }
+
+    public function testRescoreMustBeALateInteractionRescore(): void
+    {
+        $this->expectException(\TypeError::class);
+        $this->expectExceptionMessage("rescore must be a Laurus\\LateInteractionRescore");
+        $this->createRescoreIndex()->search("title:rust", 10, 0, null, new Laurus\RRF());
+    }
+
+    public function testInvalidRescoreIsRejected(): void
+    {
+        $idx = $this->createRescoreIndex();
+        $cases = [
+            "has no token-level embedder" => new Laurus\LateInteractionRescore("tokens", "rust"),
+            "needs a MultiVector field" => new Laurus\LateInteractionRescore("vec", self::RESCORE_QUERY),
+            "between 1 and 1024 query vectors" => new Laurus\LateInteractionRescore("tokens", []),
+            "has dimension 3" => new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0, 0.0]]),
+            "window_size" => $this->rescore(0),
+        ];
+        foreach ($cases as $message => $rescore) {
+            try {
+                $idx->search("title:rust", 10, 0, null, $rescore);
+                $this->fail("accepted a rescore that should fail with '$message'");
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString($message, $e->getMessage());
+            }
+        }
+    }
+
+    public function testInvalidTokenVectorsAreRejected(): void
+    {
+        $idx = $this->createRescoreIndex();
+        try {
+            $idx->putDocument("x", ["title" => "rust", "tokens" => [[1.0, 0.0], [0.0]]]);
+            $this->fail("accepted ragged token vectors");
+        } catch (\ValueError $e) {
+            $this->assertStringContainsString("tokens", $e->getMessage());
+        }
+        foreach ([[[1.0, true]], [[1.0, "x"]]] as $tokens) {
+            try {
+                $idx->putDocument("x", ["title" => "rust", "tokens" => $tokens]);
+                $this->fail("accepted " . json_encode($tokens));
+            } catch (\Exception $e) {
+                $this->assertStringContainsString("token vector 0 must hold only numbers", $e->getMessage());
+            }
+        }
+    }
+
+    public function testIntegerTokenVectorsAreAccepted(): void
+    {
+        $idx = $this->createRescoreIndex();
+        $idx->putDocument("x", ["title" => "rust", "tokens" => [[2, 0]]]);
+        $idx->commit();
+        $results = $idx->search("title:rust", 10, 0, null, $this->rescore());
+        $this->assertSame("x", $results[0]->getId());
+        $this->assertEqualsWithDelta(2.0, $results[0]->getScore(), 1e-5);
+    }
+
+    public function testAddMultiVectorFieldRejectsInvalidOptions(): void
+    {
+        $cases = [
+            [[0], "dimension must be greater than 0"],
+            [[-1], "dimension must be greater than 0"],
+            [[2, "euclidean"], "distance must be Cosine or DotProduct"],
+        ];
+        foreach ($cases as [$args, $message]) {
+            $schema = new Laurus\Schema();
+            try {
+                $schema->addMultiVectorField("tokens", ...$args);
+                $this->fail("accepted invalid options: " . json_encode($args));
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString($message, $e->getMessage());
+            }
+            $this->assertSame([], $schema->fieldNames());
+        }
+    }
+
+    public function testAddEmbedderAcceptsEveryCoreType(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addEmbedder("colbert", [
+            "type" => "candle_colbert",
+            "model" => "colbert-ir/colbertv2.0",
+            "revision" => "main",
+            "query_maxlen" => 16,
+            "doc_maxlen" => 64,
+        ]);
+        $schema->addMultiVectorField("tokens", 128, null, "colbert");
+
+        $toml = Laurus\Schema::fromToml($schema->toToml())->toToml();
+        $this->assertStringContainsString('type = "candle_colbert"', $toml);
+        $this->assertStringContainsString("query_maxlen = 16", $toml);
+        $this->assertStringContainsString('embedder = "colbert"', $toml);
+    }
+
+    public function testAddEmbedderRejectsInvalidConfig(): void
+    {
+        $cases = [
+            "missing field `model`" => ["type" => "candle_bert"],
+            "unknown variant" => ["type" => "nope"],
+            "missing field `type`" => ["model" => "x"],
+        ];
+        foreach ($cases as $message => $config) {
+            try {
+                (new Laurus\Schema())->addEmbedder("e", $config);
+                $this->fail("accepted an invalid embedder config: $message");
+            } catch (\Exception $e) {
+                $this->assertStringContainsString($message, $e->getMessage());
+            }
         }
     }
 }
