@@ -2,6 +2,7 @@ pub mod json_document;
 #[cfg(test)]
 mod multi_vector_tests;
 pub mod query;
+mod rescore;
 pub mod schema;
 pub mod search;
 pub mod type_coercion;
@@ -673,6 +674,86 @@ fn embedder_definition<'a>(
             "Unknown embedder '{embedder}' for field '{field}': not defined in schema.embedders"
         ))
     })
+}
+
+/// Combine lexical and vector hits into one ranking, best first.
+///
+/// Lexical hits are fetched with `load_documents(false)`, so documents are
+/// resolved after ranking (and pagination) instead of carried through here.
+fn fuse_scores(
+    lexical_hits: Vec<crate::lexical::query::SearchHit>,
+    vector_hits: Vec<crate::vector::store::response::VectorHit>,
+    fusion: FusionAlgorithm,
+    mode: self::search::HybridMode,
+) -> Vec<(u64, f32)> {
+    // Collect doc_id sets upfront for intersection filtering.
+    let lexical_ids: HashSet<u64> = lexical_hits.iter().map(|h| h.doc_id).collect();
+    let vector_ids: HashSet<u64> = vector_hits.iter().map(|h| h.doc_id).collect();
+
+    let mut fused_scores: HashMap<u64, f32> = HashMap::new();
+
+    match fusion {
+        FusionAlgorithm::RRF { k } => {
+            for (rank, hit) in lexical_hits.into_iter().enumerate() {
+                let rrf_score = 1.0 / (k + (rank + 1) as f64);
+                *fused_scores.entry(hit.doc_id).or_insert(0.0) += rrf_score as f32;
+            }
+            for (rank, hit) in vector_hits.into_iter().enumerate() {
+                let rrf_score = 1.0 / (k + (rank + 1) as f64);
+                *fused_scores.entry(hit.doc_id).or_insert(0.0) += rrf_score as f32;
+            }
+        }
+        FusionAlgorithm::WeightedSum {
+            lexical_weight,
+            vector_weight,
+        } => {
+            let lexical_min = lexical_hits
+                .iter()
+                .map(|h| h.score)
+                .fold(f32::INFINITY, f32::min);
+            let lexical_max = lexical_hits
+                .iter()
+                .map(|h| h.score)
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            for hit in lexical_hits {
+                let norm_score = if lexical_max > lexical_min {
+                    (hit.score - lexical_min) / (lexical_max - lexical_min)
+                } else {
+                    1.0
+                };
+                *fused_scores.entry(hit.doc_id).or_insert(0.0) += norm_score * lexical_weight;
+            }
+
+            let vector_min = vector_hits
+                .iter()
+                .map(|h| h.score)
+                .fold(f32::INFINITY, f32::min);
+            let vector_max = vector_hits
+                .iter()
+                .map(|h| h.score)
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            for hit in vector_hits {
+                let norm_score = if vector_max > vector_min {
+                    (hit.score - vector_min) / (vector_max - vector_min)
+                } else {
+                    1.0
+                };
+                *fused_scores.entry(hit.doc_id).or_insert(0.0) += norm_score * vector_weight;
+            }
+        }
+    }
+
+    // Intersection mode: keep only documents appearing in BOTH result sets.
+    if mode == self::search::HybridMode::Intersection {
+        fused_scores.retain(|id, _| lexical_ids.contains(id) && vector_ids.contains(id));
+    }
+
+    let mut fused: Vec<(u64, f32)> = fused_scores.into_iter().collect();
+    // Sort by fused score descending
+    fused.sort_by(|a, b| b.1.total_cmp(&a.1));
+    fused
 }
 
 impl Engine {
@@ -2174,8 +2255,8 @@ impl Engine {
     /// # Parameters
     ///
     /// * `query` - The search query to resolve.
-    /// * `offset` - The pagination offset from the search request.
-    /// * `limit` - The result limit from the search request.
+    /// * `fetch_count` - How many first-stage candidates the vector request
+    ///   should return.
     /// * `fusion_algorithm` - The caller-specified fusion algorithm, if any.
     /// * `lexical_options` - Lexical search options.
     /// * `vector_options` - Vector search options.
@@ -2188,8 +2269,7 @@ impl Engine {
     fn resolve_search_query_from_parts(
         &self,
         query: self::search::SearchQuery,
-        offset: usize,
-        limit: usize,
+        fetch_count: usize,
         fusion_algorithm: Option<FusionAlgorithm>,
         lexical_options: &self::search::LexicalSearchOptions,
         vector_options: &self::search::VectorSearchOptions,
@@ -2199,8 +2279,6 @@ impl Engine {
         Option<FusionAlgorithm>,
         self::search::HybridMode,
     )> {
-        let fetch_count = offset.saturating_add(limit);
-
         match query {
             self::search::SearchQuery::Dsl(_) => {
                 // DSL should be parsed by UnifiedQueryParser before calling this
@@ -2820,6 +2898,11 @@ impl Engine {
     /// Results are paginated via `offset` and `limit` on the
     /// [`SearchRequest`](self::search::SearchRequest).
     ///
+    /// When [`rescore`](self::search::SearchRequest::rescore) is set, the
+    /// first stage ranks `max(window_size, offset + limit)` candidates and
+    /// the top `window_size` of them are reordered by the rescorer before
+    /// the page is cut (see [`RescoreOptions`](self::search::RescoreOptions)).
+    ///
     /// When `lexical_options.highlight` is set, each returned hit's
     /// [`highlights`](self::search::SearchResult::highlights) is filled from
     /// its stored document using the request's lexical query (without the
@@ -2833,8 +2916,14 @@ impl Engine {
     /// # Errors
     ///
     /// Returns an error if the unified query parsing, filter query
-    /// execution, lexical search, vector search, embedding, or document
-    /// retrieval fails.
+    /// execution, lexical search, vector search, embedding, rescoring, or
+    /// document retrieval fails.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if the rescore options are invalid: a window outside
+    /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
+    /// multi-vector field, query vectors of the wrong dimension or count, or
+    /// a lexical `sort_by` on a field.
     ///
     /// Returns [`LaurusError::Query`](crate::error::LaurusError::Query) if
     /// the lexical query or `filter_query` runs a phrase of two or more
@@ -2860,7 +2949,25 @@ impl Engine {
             filter_query: request_filter,
             lexical_options,
             vector_options,
+            rescore: request_rescore,
         } = request;
+
+        // Validate the rescore options before any search runs.
+        let rescore = match &request_rescore {
+            Some(options) => Some(self::rescore::PreparedRescore::prepare(
+                &self.schema.read(),
+                options,
+                &lexical_options.sort_by,
+            )?),
+            None => None,
+        };
+
+        // How many first-stage candidates to rank: enough for the requested
+        // page, and for the rescore window when there is one.
+        let page_end = request_offset.saturating_add(request_limit);
+        let fetch_count = rescore
+            .as_ref()
+            .map_or(page_end, |rescore| rescore.depth(page_end));
 
         let (lexical_search_request, vector_search_request, fusion_algorithm, hybrid_mode) =
             match request_query {
@@ -2875,8 +2982,7 @@ impl Engine {
                     // UnifiedQueryParser now returns Lexical/Vector/Hybrid variants
                     self.resolve_search_query_from_parts(
                         parsed.query,
-                        request_offset,
-                        request_limit,
+                        fetch_count,
                         request_fusion,
                         &lexical_options,
                         &vector_options,
@@ -2884,8 +2990,7 @@ impl Engine {
                 }
                 other => self.resolve_search_query_from_parts(
                     other,
-                    request_offset,
-                    request_limit,
+                    fetch_count,
                     request_fusion,
                     &lexical_options,
                     &vector_options,
@@ -2950,8 +3055,6 @@ impl Engine {
         {
             query.apply_field_boosts(&lex_req.field_boosts);
         }
-
-        let fetch_count = request_offset.saturating_add(request_limit);
 
         // Build the lexical request; the search itself runs in parallel below.
         let lex_req = if let Some(query) = &lexical_query_to_use {
@@ -3076,74 +3179,42 @@ impl Engine {
         let lexical_hits = lex_res?.map(|r| r.hits).unwrap_or_default();
         let vector_hits = vec_res?.map(|r| r.hits).unwrap_or_default();
 
-        // 3. Fusion
-        let mut results = if lexical_search_request.is_some() && vector_search_request.is_some() {
-            let algorithm = fusion_algorithm.unwrap_or(FusionAlgorithm::RRF { k: 60.0 });
-            let mut results = self.fuse_results(
-                lexical_hits,
-                vector_hits,
-                algorithm,
-                hybrid_mode,
-                fetch_count,
-            )?;
-            if request_offset > 0 {
-                results = results.into_iter().skip(request_offset).collect();
-            }
-            results.truncate(request_limit);
-            results
-        } else if !vector_hits.is_empty() {
-            // Only vector results — batch-resolve external IDs and documents.
-            let paginated: Vec<_> = vector_hits
-                .into_iter()
-                .skip(request_offset)
-                .take(request_limit)
-                .collect();
-            let ids: Vec<u64> = paginated.iter().map(|h| h.doc_id).collect();
-            let mut resolved = self.resolve_ids_and_documents_batch(&ids)?;
-            let mut results = Vec::with_capacity(paginated.len());
-            for hit in paginated {
-                // `remove` moves the id and document out instead of
-                // cloning them per hit (#1010). Hits carry distinct doc
-                // ids — they come from a collector's top-K — so no entry
-                // is needed twice.
-                if let Some((external_id, document)) = resolved.remove(&hit.doc_id) {
-                    results.push(SearchResult {
-                        id: external_id,
-                        score: hit.score,
-                        document,
-                        highlights: HashMap::new(),
-                    });
-                }
-            }
-            results
-        } else {
-            // Only lexical results (or both empty)
-            let paginated: Vec<_> = lexical_hits
-                .into_iter()
-                .skip(request_offset)
-                .take(request_limit)
-                .collect();
-            let ids: Vec<u64> = paginated.iter().map(|h| h.doc_id).collect();
-            let mut resolved = self.resolve_ids_and_documents_batch(&ids)?;
-            let mut results = Vec::with_capacity(paginated.len());
-            for hit in paginated {
-                // `remove` moves the id and document out instead of
-                // cloning them per hit (#1010). Hits carry distinct doc
-                // ids — they come from a collector's top-K — so no entry
-                // is needed twice.
-                if let Some((external_id, document)) = resolved.remove(&hit.doc_id) {
-                    results.push(SearchResult {
-                        id: external_id,
-                        score: hit.score,
-                        document,
-                        highlights: HashMap::new(),
-                    });
-                }
-            }
-            results
+        // 3. Rank: every mode reduces to one list of (doc id, score), best
+        // first, before any page is cut or any document is read.
+        let ranked: Vec<(u64, f32)> =
+            if lexical_search_request.is_some() && vector_search_request.is_some() {
+                let algorithm = fusion_algorithm.unwrap_or(FusionAlgorithm::RRF { k: 60.0 });
+                let mut fused = fuse_scores(lexical_hits, vector_hits, algorithm, hybrid_mode);
+                fused.truncate(fetch_count);
+                fused
+            } else if !vector_hits.is_empty() {
+                vector_hits
+                    .into_iter()
+                    .map(|h| (h.doc_id, h.score))
+                    .collect()
+            } else {
+                // Only lexical results (or both empty).
+                lexical_hits
+                    .into_iter()
+                    .map(|h| (h.doc_id, h.score))
+                    .collect()
+            };
+
+        // 4. Rescore the top of the ranking.
+        let ranked = match &rescore {
+            Some(rescore) => rescore.apply(&self.vector, ranked)?,
+            None => ranked,
         };
 
-        // 4. Highlighting: after pagination, so the cost is bounded by
+        // 5. Paginate once, then resolve ids and documents for the page only.
+        let page: Vec<(u64, f32)> = ranked
+            .into_iter()
+            .skip(request_offset)
+            .take(request_limit)
+            .collect();
+        let mut results = self.resolve_hits(page)?;
+
+        // 6. Highlighting: after pagination, so the cost is bounded by
         // `limit × fields` analyzer passes.
         if let (Some(options), Some(query)) = (&lexical_options.highlight, &highlight_query) {
             self.apply_highlights(&mut results, query.as_ref(), options)?;
@@ -3242,128 +3313,27 @@ impl Engine {
         Ok(())
     }
 
-    /// Combine results from lexical and vector engines.
-    fn fuse_results(
-        &self,
-        lexical_hits: Vec<crate::lexical::query::SearchHit>,
-        vector_hits: Vec<crate::vector::store::response::VectorHit>,
-        fusion: FusionAlgorithm,
-        mode: self::search::HybridMode,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>> {
-        // Collect doc_id sets upfront for intersection filtering.
-        let lexical_ids: HashSet<u64> = lexical_hits.iter().map(|h| h.doc_id).collect();
-        let vector_ids: HashSet<u64> = vector_hits.iter().map(|h| h.doc_id).collect();
-
-        let mut fused_scores: HashMap<u64, (f32, Option<crate::data::Document>)> = HashMap::new();
-
-        match fusion {
-            FusionAlgorithm::RRF { k } => {
-                for (rank, hit) in lexical_hits.into_iter().enumerate() {
-                    let rrf_score = 1.0 / (k + (rank + 1) as f64);
-                    let entry = fused_scores
-                        .entry(hit.doc_id)
-                        .or_insert((0.0, hit.document));
-                    entry.0 += rrf_score as f32;
-                }
-                for (rank, hit) in vector_hits.into_iter().enumerate() {
-                    let rrf_score = 1.0 / (k + (rank + 1) as f64);
-                    let entry = fused_scores.entry(hit.doc_id).or_insert((0.0, None));
-                    entry.0 += rrf_score as f32;
-                }
-            }
-            FusionAlgorithm::WeightedSum {
-                lexical_weight,
-                vector_weight,
-            } => {
-                let lexical_min = lexical_hits
-                    .iter()
-                    .map(|h| h.score)
-                    .fold(f32::INFINITY, f32::min);
-                let lexical_max = lexical_hits
-                    .iter()
-                    .map(|h| h.score)
-                    .fold(f32::NEG_INFINITY, f32::max);
-
-                for hit in lexical_hits {
-                    let norm_score = if lexical_max > lexical_min {
-                        (hit.score - lexical_min) / (lexical_max - lexical_min)
-                    } else {
-                        1.0
-                    };
-                    let entry = fused_scores
-                        .entry(hit.doc_id)
-                        .or_insert((0.0, hit.document));
-                    entry.0 += norm_score * lexical_weight;
-                }
-
-                let vector_min = vector_hits
-                    .iter()
-                    .map(|h| h.score)
-                    .fold(f32::INFINITY, f32::min);
-                let vector_max = vector_hits
-                    .iter()
-                    .map(|h| h.score)
-                    .fold(f32::NEG_INFINITY, f32::max);
-
-                for hit in vector_hits {
-                    let norm_score = if vector_max > vector_min {
-                        (hit.score - vector_min) / (vector_max - vector_min)
-                    } else {
-                        1.0
-                    };
-                    let entry = fused_scores.entry(hit.doc_id).or_insert((0.0, None));
-                    entry.0 += norm_score * vector_weight;
-                }
-            }
-        }
-
-        // Intersection mode: keep only documents appearing in BOTH result sets.
-        if mode == self::search::HybridMode::Intersection {
-            fused_scores.retain(|id, _| lexical_ids.contains(id) && vector_ids.contains(id));
-        }
-
-        let mut intermediate: Vec<(u64, f32, Option<crate::data::Document>)> = fused_scores
-            .into_iter()
-            .map(|(doc_id, (score, document))| (doc_id, score, document))
-            .collect();
-
-        // Sort by fused score descending
-        intermediate.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        // Limit results
-        if intermediate.len() > limit {
-            intermediate.truncate(limit);
-        }
-
-        // Batch-resolve external IDs and fill missing documents.
-        // Collect IDs that need resolution (either missing external ID or
-        // missing document).
-        let ids_to_resolve: Vec<u64> = intermediate.iter().map(|(doc_id, _, _)| *doc_id).collect();
-        let mut resolved = self.resolve_ids_and_documents_batch(&ids_to_resolve)?;
-
-        let mut results = Vec::with_capacity(intermediate.len());
-        for (doc_id, score, document) in intermediate {
+    /// Resolve external ids and stored documents for ranked hits, keeping
+    /// their order.
+    ///
+    /// One batch lookup for the whole page. A hit whose id appears twice
+    /// keeps only its first position.
+    fn resolve_hits(&self, hits: Vec<(u64, f32)>) -> Result<Vec<SearchResult>> {
+        let ids: Vec<u64> = hits.iter().map(|(doc_id, _)| *doc_id).collect();
+        let mut resolved = self.resolve_ids_and_documents_batch(&ids)?;
+        let mut results = Vec::with_capacity(hits.len());
+        for (doc_id, score) in hits {
             // `remove` moves the id and document out instead of cloning
-            // them per hit (#1010); the fused map is keyed by doc id, so
-            // each entry is wanted exactly once.
-            if let Some((external_id, resolved_doc)) = resolved.remove(&doc_id) {
-                // Prefer the document already fetched by the lexical search;
-                // fall back to the batch-resolved copy.
-                let final_doc = if document.is_some() {
-                    document
-                } else {
-                    resolved_doc
-                };
+            // them per hit (#1010).
+            if let Some((external_id, document)) = resolved.remove(&doc_id) {
                 results.push(SearchResult {
                     id: external_id,
                     score,
-                    document: final_doc,
+                    document,
                     highlights: HashMap::new(),
                 });
             }
         }
-
         Ok(results)
     }
 
