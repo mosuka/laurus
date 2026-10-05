@@ -50,6 +50,18 @@ impl HubModel {
             .map_err(|e| self.download_error(filename, e))
     }
 
+    /// Like [`Self::file`], but `Ok(None)` when the repository has no such
+    /// file. Every other failure is still an error, so a network problem
+    /// never passes for a missing file.
+    #[cfg(feature = "embeddings-candle")]
+    pub(crate) fn optional_file(&self, filename: &str) -> Result<Option<PathBuf>> {
+        match self.fetch(filename) {
+            Ok(path) => Ok(Some(path)),
+            Err(HFError::EntryNotFound { .. }) => Ok(None),
+            Err(e) => Err(self.download_error(filename, e)),
+        }
+    }
+
     fn fetch(&self, filename: &str) -> std::result::Result<PathBuf, HFError> {
         self.repo
             .download_file()

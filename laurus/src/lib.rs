@@ -78,6 +78,8 @@ pub use data::{DataValue, Document, GeoEcefPoint, GeoPoint};
 pub use embedding::candle_bert_embedder::CandleBertEmbedder;
 #[cfg(feature = "embeddings-multimodal")]
 pub use embedding::candle_clip_embedder::CandleClipEmbedder;
+#[cfg(feature = "embeddings-candle")]
+pub use embedding::candle_colbert_embedder::{CandleColbertEmbedder, CandleColbertOptions};
 pub use embedding::embedder::{EmbedInput, EmbedInputType, EmbedRole, Embedder, TokenEmbedder};
 #[cfg(feature = "embeddings-openai")]
 pub use embedding::openai_embedder::OpenAIEmbedder;

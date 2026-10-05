@@ -28,6 +28,10 @@ pub(crate) mod candle_hub;
 #[cfg(feature = "embeddings-candle")]
 pub mod candle_bert_embedder;
 
+// ColBERT token-level embedder on candle (requires feature flag)
+#[cfg(feature = "embeddings-candle")]
+pub mod candle_colbert_embedder;
+
 // OpenAI implementation (requires feature flag)
 #[cfg(feature = "embeddings-openai")]
 pub mod openai_embedder;
