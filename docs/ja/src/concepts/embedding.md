@@ -74,6 +74,30 @@ let embedder = CandleBertEmbedder::new(
 | 実行環境 | ローカル（CPU） |
 | 初回ダウンロード | 約 80 MB |
 
+sentence-transformers と同じ方法で符号化し、`all-MiniLM-L6-v2` と
+`paraphrase-multilingual-MiniLM-L12-v2` では、出力のベクトルが
+sentence-transformers と要素ごとに 1e-6 以内で一致します。
+
+- 入力は、`sentence_bert_config.json` にあるモデルの `max_seq_length`
+  （`all-MiniLM-L6-v2` は 256 トークン、`paraphrase-multilingual-MiniLM-L12-v2` は 128）
+  で切り詰めます。特殊トークンも長さに含みます。このファイルがないリポジトリでは、
+  `tokenizer.json` の切り詰めの長さ、それもなければモデルの `max_position_embeddings`
+  を使います。`tokenizer.json` の padding の設定は使いません。
+- ベクトルは、トークンのベクトルの平均を L2 正規化したものです。sentence-transformers
+  では正規化しないモデル（`paraphrase-multilingual-MiniLM-L12-v2` など）や、別の方法で
+  pooling するモデルでも、同じようにこの処理を行います。
+
+`CandleBertEmbedder::with_options(model, CandleBertOptions::default().revision("<commit>"))`
+で、モデルをコミットに固定できます。
+
+> **マイグレーション注記（Issue #1340）:** 以前の版は attention mask を token type id
+> としてモデルに渡し、すべての入力を `tokenizer.json` の長さまで PAD で埋めていたため、
+> ベクトルがずれていました（`all-MiniLM-L6-v2` では、短い文で sentence-transformers との
+> cosine が 0.61〜0.70 しかありませんでした）。`candle_bert` のベクトルは変わり、長い入力は
+> `all-MiniLM-L6-v2` で 128 ではなく `max_seq_length` トークンまで使うようになりました。
+> `candle_bert` で作った索引は埋め込み直してください。そうしないと、新しいクエリの
+> ベクトルが古い文書のベクトルと比べられます。
+
 ### OpenAIEmbedder
 
 OpenAI Embeddings API を呼び出します。API キーが必要です。

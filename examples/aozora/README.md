@@ -77,10 +77,11 @@ each lacked either `model.safetensors` or `tokenizer.json` on the Hub, which
 laurus's `CandleBertEmbedder` requires — this multilingual model was the one
 confirmed to actually load and work.
 
-The model's `tokenizer.json` embeds a truncation rule (`max_length = 128`
-tokens), applied automatically. A long Aozora Bunko body is therefore safely
-truncated rather than causing an error — `body_vec`'s embedding reflects the
-opening of the work, not the full text.
+`CandleBertEmbedder` truncates input to the model's `max_seq_length` from
+`sentence_bert_config.json` (128 tokens for this model), like
+sentence-transformers. A long Aozora Bunko body is therefore safely truncated
+rather than causing an error — `body_vec`'s embedding reflects the opening of
+the work, not the full text.
 
 `author` is intentionally not vectorized: a person's name is a proper noun,
 and semantic similarity search over names is not meaningful. Use the

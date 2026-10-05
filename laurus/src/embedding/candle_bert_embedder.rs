@@ -9,13 +9,13 @@ use std::any::Any;
 #[cfg(feature = "embeddings-candle")]
 use async_trait::async_trait;
 #[cfg(feature = "embeddings-candle")]
-use candle_core::{DType, Device, Tensor};
+use candle_core::{D, DType, Device, Tensor};
 #[cfg(feature = "embeddings-candle")]
 use candle_nn::VarBuilder;
 #[cfg(feature = "embeddings-candle")]
 use candle_transformers::models::bert::{BertModel, Config};
 #[cfg(feature = "embeddings-candle")]
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
 #[cfg(feature = "embeddings-candle")]
 use crate::embedding::candle_hub::{HubModel, legacy_cache_dir};
@@ -123,12 +123,32 @@ impl CandleBertEmbedder {
     /// # }
     /// ```
     pub fn new(model_name: &str) -> Result<Self> {
+        Self::with_options(model_name, CandleBertOptions::default())
+    }
+
+    /// Create a BERT embedder from a HuggingFace model with options, for
+    /// example a pinned model revision.
+    ///
+    /// Inputs are truncated to the model's `max_seq_length` from
+    /// `sentence_bert_config.json` when the repository has one, as
+    /// sentence-transformers does (Issue #1340); otherwise to the
+    /// truncation length in `tokenizer.json`, otherwise to
+    /// `max_position_embeddings`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::new`].
+    pub fn with_options(model_name: &str, options: CandleBertOptions) -> Result<Self> {
         // Setup device (prefer GPU if available)
         let device = Device::cuda_if_available(0)
             .map_err(|e| LaurusError::InvalidOperation(format!("Device setup failed: {}", e)))?;
 
         // Download model from HuggingFace Hub
-        let repo = HubModel::open(model_name, None, Some(legacy_cache_dir()))?;
+        let repo = HubModel::open(
+            model_name,
+            options.revision.as_deref(),
+            Some(legacy_cache_dir()),
+        )?;
 
         // Load config
         let config_filename = repo.file("config.json")?;
@@ -151,8 +171,43 @@ impl CandleBertEmbedder {
 
         // Load tokenizer
         let tokenizer_filename = repo.file("tokenizer.json")?;
-        let tokenizer = Tokenizer::from_file(tokenizer_filename)
+        let mut tokenizer = Tokenizer::from_file(tokenizer_filename)
             .map_err(|e| LaurusError::InvalidOperation(format!("Tokenizer load failed: {}", e)))?;
+
+        // Truncate and pad like sentence-transformers rather than as
+        // tokenizer.json says: a fixed padding (128 for all-MiniLM-L6-v2)
+        // would feed the model pad tokens it was never meant to see.
+        let sentence_bert_max_length = match repo.optional_file("sentence_bert_config.json")? {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    LaurusError::InvalidOperation(format!(
+                        "sentence_bert_config.json read failed: {e}"
+                    ))
+                })?;
+                serde_json::from_str::<SentenceBertConfig>(&text)
+                    .map_err(|e| {
+                        LaurusError::InvalidOperation(format!(
+                            "sentence_bert_config.json parse failed: {e}"
+                        ))
+                    })?
+                    .max_seq_length
+            }
+            None => None,
+        };
+        let max_length = max_sequence_length(
+            sentence_bert_max_length,
+            tokenizer.get_truncation().map(|t| t.max_length),
+            config.max_position_embeddings,
+        );
+        tokenizer.with_padding(None);
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length,
+                ..Default::default()
+            }))
+            .map_err(|e| {
+                LaurusError::InvalidOperation(format!("Tokenizer truncation setup failed: {e}"))
+            })?;
 
         let dim = config.hidden_size;
 
@@ -177,94 +232,89 @@ impl CandleBertEmbedder {
 
     /// Synchronous embedding implementation.
     fn embed_text_sync(&self, text: &str) -> Result<Vector> {
-        // Tokenize
         let encoding = self
             .tokenizer
             .encode(text, true)
             .map_err(|e| LaurusError::InvalidOperation(format!("Tokenization failed: {}", e)))?;
-
-        let token_ids = encoding.get_ids();
-        let attention_mask = encoding.get_attention_mask();
-
-        // Convert to tensors
-        let token_ids_tensor = Tensor::new(token_ids, &self.device)
-            .map_err(|e| LaurusError::InvalidOperation(format!("Tensor creation failed: {}", e)))?
-            .unsqueeze(0)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        let attention_mask_tensor = Tensor::new(attention_mask, &self.device)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .unsqueeze(0)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        // Forward pass
-        let embeddings = self
-            .model
-            .forward(&token_ids_tensor, &attention_mask_tensor, None)
-            .map_err(|e| LaurusError::InvalidOperation(format!("Model forward failed: {}", e)))?;
-
-        // Mean pooling
-        let pooled = self.mean_pool(&embeddings, &attention_mask_tensor)?;
-
-        // Normalize (L2 normalization)
-        let norm = pooled
-            .sqr()
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .sum_all()
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .sqrt()
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .to_scalar::<f32>()
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        // Divide by norm to normalize
-        let normalized = pooled
-            .affine((1.0 / norm) as f64, 0.0)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        // Convert to Vector
-        let vector_data: Vec<f32> = normalized
-            .squeeze(0)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .to_vec1()
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        Ok(Vector::new(vector_data))
+        let vector = pooled_embedding(
+            &self.model,
+            &self.device,
+            encoding.get_ids(),
+            encoding.get_type_ids(),
+            encoding.get_attention_mask(),
+        )
+        .map_err(|e| LaurusError::InvalidOperation(format!("Model forward failed: {}", e)))?;
+        Ok(Vector::new(vector))
     }
+}
 
-    /// Perform mean pooling over token embeddings.
-    fn mean_pool(&self, embeddings: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        // Expand attention mask to match embedding dimensions
-        let mask_expanded = attention_mask
-            .unsqueeze(2)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .expand(embeddings.shape())
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?
-            .to_dtype(embeddings.dtype())
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
+/// Options for [`CandleBertEmbedder::with_options`].
+#[cfg(feature = "embeddings-candle")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CandleBertOptions {
+    /// Branch, tag or commit of the model repository; `None` is the
+    /// default branch.
+    pub revision: Option<String>,
+}
 
-        // Multiply embeddings by mask
-        let masked_embeddings = embeddings
-            .mul(&mask_expanded)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        // Sum across sequence dimension
-        let sum_embeddings = masked_embeddings
-            .sum(1)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        // Sum mask values
-        let sum_mask = mask_expanded
-            .sum(1)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        // Divide to get mean
-        let mean = sum_embeddings
-            .div(&sum_mask)
-            .map_err(|e| LaurusError::InvalidOperation(e.to_string()))?;
-
-        Ok(mean)
+#[cfg(feature = "embeddings-candle")]
+impl CandleBertOptions {
+    /// Download the model at this branch, tag or commit.
+    pub fn revision(mut self, revision: impl Into<String>) -> Self {
+        self.revision = Some(revision.into());
+        self
     }
+}
+
+/// The part of a sentence-transformers `sentence_bert_config.json` that
+/// affects the encoding.
+#[cfg(feature = "embeddings-candle")]
+#[derive(Debug, serde::Deserialize)]
+struct SentenceBertConfig {
+    max_seq_length: Option<usize>,
+}
+
+/// Longest input in tokens, special tokens included: the
+/// sentence-transformers `max_seq_length`, else the tokenizer's truncation
+/// length, else the model's position limit, and never past that limit.
+#[cfg(feature = "embeddings-candle")]
+fn max_sequence_length(
+    sentence_bert: Option<usize>,
+    tokenizer: Option<usize>,
+    max_position_embeddings: usize,
+) -> usize {
+    sentence_bert
+        .filter(|&n| n > 0)
+        .or(tokenizer.filter(|&n| n > 0))
+        .unwrap_or(max_position_embeddings)
+        .min(max_position_embeddings)
+}
+
+/// Mean-pooled, L2-normalized embedding of one tokenized input.
+///
+/// Like sentence-transformers: the type ids and the attention mask go to
+/// the model in their own slots, the mean is taken over the attended
+/// tokens (divided by at least 1e-9), and the result is divided by
+/// `max(‖x‖, 1e-12)`.
+#[cfg(feature = "embeddings-candle")]
+fn pooled_embedding(
+    model: &BertModel,
+    device: &Device,
+    ids: &[u32],
+    type_ids: &[u32],
+    attention_mask: &[u32],
+) -> candle_core::Result<Vec<f32>> {
+    let row = |values: &[u32]| Tensor::new(values, device)?.unsqueeze(0);
+    let (ids, type_ids, attention_mask) = (row(ids)?, row(type_ids)?, row(attention_mask)?);
+    let hidden = model.forward(&ids, &type_ids, Some(&attention_mask))?;
+
+    let mask = attention_mask.to_dtype(hidden.dtype())?.unsqueeze(2)?;
+    let summed = hidden.broadcast_mul(&mask)?.sum(1)?;
+    let counts = mask.sum(1)?.maximum(1e-9)?;
+    let mean = summed.broadcast_div(&counts)?;
+    let norms = mean.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?.maximum(1e-12)?;
+    mean.broadcast_div(&norms)?.squeeze(0)?.to_vec1()
 }
 
 #[cfg(feature = "embeddings-candle")]
@@ -294,5 +344,181 @@ impl Embedder for CandleBertEmbedder {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(all(test, feature = "embeddings-candle"))]
+mod tests {
+    use candle_nn::VarMap;
+    use candle_transformers::models::bert::HiddenAct;
+
+    use super::*;
+
+    #[test]
+    fn test_max_sequence_length_prefers_sentence_transformers() {
+        // all-MiniLM-L6-v2: max_seq_length 256 over tokenizer.json's 128.
+        assert_eq!(max_sequence_length(Some(256), Some(128), 512), 256);
+        assert_eq!(max_sequence_length(None, Some(128), 512), 128);
+        assert_eq!(max_sequence_length(None, None, 512), 512);
+        // Never past the position limit, and zero means unset.
+        assert_eq!(max_sequence_length(Some(1024), None, 512), 512);
+        assert_eq!(max_sequence_length(Some(0), Some(0), 512), 512);
+    }
+
+    /// A tiny BERT with random weights.
+    fn tiny_bert() -> BertModel {
+        let config = Config {
+            vocab_size: 128,
+            hidden_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            intermediate_size: 32,
+            hidden_act: HiddenAct::Gelu,
+            max_position_embeddings: 64,
+            ..Config::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        BertModel::load(vb, &config).unwrap()
+    }
+
+    /// Issue #1340: masked padding must not change the embedding. It did
+    /// when the mask was passed as `token_type_ids` and no attention mask
+    /// was given, so the real tokens attended to the pads.
+    #[test]
+    fn test_padding_does_not_change_the_embedding() {
+        let model = tiny_bert();
+        let device = Device::Cpu;
+        let alone = pooled_embedding(&model, &device, &[101, 7, 8, 102], &[0; 4], &[1; 4]).unwrap();
+        let padded = pooled_embedding(
+            &model,
+            &device,
+            &[101, 7, 8, 102, 0, 0, 0],
+            &[0; 7],
+            &[1, 1, 1, 1, 0, 0, 0],
+        )
+        .unwrap();
+
+        let diff = alone
+            .iter()
+            .zip(&padded)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-5, "padding changed the embedding by {diff}");
+        let norm = alone.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "{norm}");
+    }
+
+    #[test]
+    fn test_options_builder() {
+        let options = CandleBertOptions::default().revision("abc");
+        assert_eq!(options.revision.as_deref(), Some("abc"));
+    }
+
+    // Parity with sentence-transformers, the reference implementation. The
+    // fixtures in `tests/fixtures/sentence_transformers/` come from
+    // `scripts/sentence_transformers_reference.py`. These tests download
+    // the models, so they are ignored by default:
+    //
+    //     cargo test -p laurus --features embeddings-candle --lib -- \
+    //         --ignored bert_parity --nocapture
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        model: String,
+        revision: String,
+        max_seq_length: usize,
+        /// Whether sentence-transformers normalizes this model's output;
+        /// CandleBertEmbedder always does.
+        normalize: bool,
+        dim: usize,
+        inputs: Vec<FixtureInput>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixtureInput {
+        text: String,
+        input_ids: Vec<u32>,
+        /// Little-endian f32 values, base64.
+        vector: String,
+    }
+
+    fn decode(encoded: &str) -> Vec<f32> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let (words, rest) = bytes.as_chunks::<4>();
+        assert!(rest.is_empty());
+        words.iter().map(|b| f32::from_le_bytes(*b)).collect()
+    }
+
+    fn l2_normalized(vector: &[f32]) -> Vec<f32> {
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        vector.iter().map(|x| x / norm).collect()
+    }
+
+    async fn check_parity(file: &str) {
+        let path = format!(
+            "{}/tests/fixtures/sentence_transformers/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture: Fixture =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (model, revision) = (fixture.model.clone(), fixture.revision.clone());
+        let embedder = tokio::task::spawn_blocking(move || {
+            CandleBertEmbedder::with_options(
+                &model,
+                CandleBertOptions::default().revision(revision),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            embedder.tokenizer.get_truncation().map(|t| t.max_length),
+            Some(fixture.max_seq_length)
+        );
+
+        let (mut max_abs, mut min_cosine) = (0.0f32, 1.0f32);
+        for input in &fixture.inputs {
+            let encoding = embedder
+                .tokenizer
+                .encode(input.text.as_str(), true)
+                .unwrap();
+            assert_eq!(encoding.get_ids(), input.input_ids, "{}", input.text);
+
+            let ours = embedder
+                .embed(&EmbedInput::Text(&input.text))
+                .await
+                .unwrap();
+            let mut reference = decode(&input.vector);
+            assert_eq!(reference.len(), fixture.dim);
+            if !fixture.normalize {
+                reference = l2_normalized(&reference);
+            }
+            for (a, b) in ours.data.iter().zip(&reference) {
+                max_abs = max_abs.max((a - b).abs());
+            }
+            // Both sides are unit vectors.
+            let cosine: f32 = ours.data.iter().zip(&reference).map(|(a, b)| a * b).sum();
+            min_cosine = min_cosine.min(cosine);
+        }
+
+        println!("{file}: max |Δ| {max_abs:.2e}, min cosine {min_cosine:.8}");
+        assert!(max_abs <= 1e-5, "max |Δ| {max_abs}");
+        assert!(min_cosine >= 0.99999, "min cosine {min_cosine}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads sentence-transformers/all-MiniLM-L6-v2"]
+    async fn bert_parity_all_minilm_l6_v2() {
+        check_parity("all-MiniLM-L6-v2.json").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"]
+    async fn bert_parity_paraphrase_multilingual_minilm_l12_v2() {
+        check_parity("paraphrase-multilingual-MiniLM-L12-v2.json").await;
     }
 }
