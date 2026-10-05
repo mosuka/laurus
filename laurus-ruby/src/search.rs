@@ -2,17 +2,18 @@
 
 use std::collections::HashMap;
 
-use crate::convert::document_to_hash;
+use crate::convert::{document_to_hash, rb_token_vectors};
 use crate::query::{
     extract_lexical_query, is_vector_query, rb_to_lexical_search_query, rb_to_vector_search_query,
 };
+use laurus::vector::Vector;
 use laurus::{
     Document, FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery,
-    SearchRequestBuilder, SearchResult, VectorSearchQuery,
+    RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
 };
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
-use magnus::{Error, RArray, RHash, RModule, Ruby, TryConvert, Value};
+use magnus::{Error, RArray, RHash, RModule, RString, Ruby, TryConvert, Value};
 
 // ---------------------------------------------------------------------------
 // Highlighting (Issue #1134)
@@ -163,6 +164,112 @@ impl RbWeightedSum {
 }
 
 // ---------------------------------------------------------------------------
+// Rescore (Issue #1351)
+// ---------------------------------------------------------------------------
+
+/// Late-interaction (ColBERT MaxSim) rescore of the top search results
+/// (`Laurus::LateInteractionRescore`).
+///
+/// The top `window_size` first-stage results are reordered by their MaxSim
+/// against a multi-vector field, and a rescored result's score is that
+/// MaxSim.
+///
+/// ```ruby
+/// rescore = Laurus::LateInteractionRescore.new("body_colbert", "how do lifetimes work")
+/// index.search("body:lifetimes", rescore: rescore)
+///
+/// rescore = Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size: 50)
+/// ```
+#[magnus::wrap(class = "Laurus::LateInteractionRescore")]
+#[derive(Clone)]
+pub struct RbLateInteractionRescore {
+    field: String,
+    options: RescoreOptions,
+}
+
+impl RbLateInteractionRescore {
+    /// Create a late-interaction rescore.
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Positional and keyword arguments:
+    ///   - `field` (String): A multi-vector field.
+    ///   - `query` (String | Array of Arrays): Query text, embedded by the
+    ///     field's token-level embedder (a `"candle_colbert"` one), or the
+    ///     query's token vectors.
+    ///   - `window_size:` (Integer, default 100, at most 10,000): How many
+    ///     top results to rescore.
+    ///
+    /// # Errors
+    ///
+    /// Raises `TypeError` if `query` is neither a String nor an Array of
+    /// numeric Arrays. The other values are checked when searching.
+    fn new(args: &[Value]) -> Result<Self, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let args = scan_args::<(String, Value), (), (), (), RHash, ()>(args)?;
+        let (field, query) = args.required;
+        let kwargs =
+            get_kwargs::<_, (), (Option<usize>,), ()>(args.keywords, &[], &["window_size"])?;
+        let (window_size,) = kwargs.optional;
+
+        let options = if let Some(text) = RString::from_value(query) {
+            RescoreOptions::late_interaction_text(field.clone(), text.to_string()?)
+        } else {
+            let rows: Vec<Value> = RArray::from_value(query)
+                .map(|arr| arr.into_iter().collect())
+                .filter(|rows: &Vec<Value>| rows.iter().all(|v| v.is_kind_of(ruby.class_array())))
+                .ok_or_else(|| {
+                    Error::new(
+                        ruby.exception_type_error(),
+                        "query must be a String or an Array of numeric Arrays",
+                    )
+                })?;
+            RescoreOptions::late_interaction(
+                field.clone(),
+                rb_token_vectors(&ruby, &rows)?
+                    .into_iter()
+                    .map(Vector::new)
+                    .collect(),
+            )
+        };
+        let options = match window_size {
+            Some(window_size) => options.window_size(window_size),
+            None => options,
+        };
+        Ok(Self { field, options })
+    }
+
+    /// Return how many top results are rescored.
+    fn window_size(&self) -> usize {
+        self.options.window_size
+    }
+
+    fn inspect(&self) -> String {
+        format!(
+            "LateInteractionRescore(field={:?}, window_size={})",
+            self.field, self.options.window_size
+        )
+    }
+}
+
+/// Convert a Ruby `rescore:` value into [`RescoreOptions`].
+///
+/// # Errors
+///
+/// Raises `TypeError` if `value` is not a `Laurus::LateInteractionRescore`.
+pub fn rb_to_rescore_options(value: Value) -> Result<RescoreOptions, Error> {
+    <&RbLateInteractionRescore>::try_convert(value)
+        .map(|rescore| rescore.options.clone())
+        .map_err(|_| {
+            let ruby = Ruby::get().expect("called from Ruby thread");
+            Error::new(
+                ruby.exception_type_error(),
+                "rescore must be a Laurus::LateInteractionRescore",
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -272,6 +379,8 @@ pub struct RbSearchRequest {
     offset: usize,
     /// Highlight request (Issue #1134).
     highlight: Option<HighlightOptions>,
+    /// Late-interaction rescore of the top results (Issue #1351).
+    rescore: Option<RescoreOptions>,
 }
 
 impl RbSearchRequest {
@@ -291,9 +400,12 @@ impl RbSearchRequest {
     ///   - `offset:` (usize, default 0): Pagination offset.
     ///   - `highlight:` - Field list (Array) or config Hash for
     ///     search-result highlighting (Issue #1134).
+    ///   - `rescore:` - `LateInteractionRescore` reordering the top results
+    ///     (Issue #1351).
     fn new(args: &[Value]) -> Result<Self, Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
+        // `ScanArgsOpt` stops at 9 elements, which this list now fills.
         let kwargs = get_kwargs::<
             _,
             (),
@@ -305,6 +417,7 @@ impl RbSearchRequest {
                 Option<Value>,
                 Option<usize>,
                 Option<usize>,
+                Option<Value>,
                 Option<Value>,
             ),
             (),
@@ -320,6 +433,7 @@ impl RbSearchRequest {
                 "limit",
                 "offset",
                 "highlight",
+                "rescore",
             ],
         )?;
         let (
@@ -331,11 +445,13 @@ impl RbSearchRequest {
             limit,
             offset,
             highlight_val,
+            rescore_val,
         ) = kwargs.optional;
 
         let highlight = highlight_val
             .map(|v| rb_to_highlight_options(&ruby, v))
             .transpose()?;
+        let rescore = rescore_val.map(rb_to_rescore_options).transpose()?;
 
         // Convert fusion
         let fusion = if let Some(f) = fusion_val {
@@ -388,6 +504,7 @@ impl RbSearchRequest {
             limit: limit.unwrap_or(10),
             offset: offset.unwrap_or(0),
             highlight,
+            rescore,
         })
     }
 
@@ -422,6 +539,9 @@ impl RbSearchRequest {
             builder = builder
                 .highlight(options.fields.clone())
                 .highlight_config(options.config.clone());
+        }
+        if let Some(rescore) = &self.rescore {
+            builder = builder.rescore(rescore.clone());
         }
 
         // Explicit hybrid: lexical_query + vector_query both set
@@ -469,7 +589,7 @@ impl RbSearchRequest {
 // ---------------------------------------------------------------------------
 
 /// Build a [`laurus::SearchRequest`] from the arguments passed to
-/// `Index#search(query, limit:, offset:, highlight:)`.
+/// `Index#search(query, limit:, offset:, highlight:, rescore:)`.
 ///
 /// `query` may be:
 /// - A `String` (DSL)
@@ -477,8 +597,8 @@ impl RbSearchRequest {
 /// - Any lexical query class
 /// - `VectorQuery` or `VectorTextQuery`
 ///
-/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight` are used
-/// as-is from the request without overriding — same precedent as
+/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`
+/// are used as-is from the request without overriding — same precedent as
 /// `limit`/`offset` already had here before highlighting existed.
 ///
 /// # Arguments
@@ -487,6 +607,7 @@ impl RbSearchRequest {
 /// * `limit` - Maximum results.
 /// * `offset` - Pagination offset.
 /// * `highlight` - Already-parsed highlight options, if `highlight:` was given.
+/// * `rescore` - Already-parsed rescore, if `rescore:` was given.
 ///
 /// # Returns
 ///
@@ -496,6 +617,7 @@ pub fn build_request_from_rb(
     limit: usize,
     offset: usize,
     highlight: Option<&HighlightOptions>,
+    rescore: Option<&RescoreOptions>,
 ) -> Result<laurus::SearchRequest, Error> {
     // Full SearchRequest object
     if let Ok(req) = <&RbSearchRequest>::try_convert(query) {
@@ -508,6 +630,9 @@ pub fn build_request_from_rb(
         builder = builder
             .highlight(options.fields.clone())
             .highlight_config(options.config.clone());
+    }
+    if let Some(rescore) = rescore {
+        builder = builder.rescore(rescore.clone());
     }
 
     // DSL string
@@ -549,6 +674,22 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
     ws.define_singleton_method("new", magnus::function!(RbWeightedSum::new, -1))?;
     ws.define_method("inspect", magnus::method!(RbWeightedSum::inspect, 0))?;
     ws.define_method("to_s", magnus::method!(RbWeightedSum::inspect, 0))?;
+
+    // LateInteractionRescore
+    let lir = module.define_class("LateInteractionRescore", ruby.class_object())?;
+    lir.define_singleton_method("new", magnus::function!(RbLateInteractionRescore::new, -1))?;
+    lir.define_method(
+        "window_size",
+        magnus::method!(RbLateInteractionRescore::window_size, 0),
+    )?;
+    lir.define_method(
+        "inspect",
+        magnus::method!(RbLateInteractionRescore::inspect, 0),
+    )?;
+    lir.define_method(
+        "to_s",
+        magnus::method!(RbLateInteractionRescore::inspect, 0),
+    )?;
 
     // SearchResult
     let sr = module.define_class("SearchResult", ruby.class_object())?;

@@ -6,8 +6,8 @@ use std::str::FromStr;
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
-    GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema,
-    TextOption, TokenFilterConfig, TokenizerConfig,
+    GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption, QuantizationMethod,
+    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use magnus::prelude::*;
 use magnus::r_hash::ForEach;
@@ -112,8 +112,8 @@ fn parse_rerank_storage(name: Option<&str>) -> Result<Option<RerankStorageKind>,
 }
 
 /// Convert a Ruby value into a [`serde_json::Value`], for decoding analyzer
-/// definition components (`tokenizer`/`char_filters`/`token_filters`) via
-/// `serde_json::from_value`.
+/// definition components (`tokenizer`/`char_filters`/`token_filters`) and
+/// embedder definitions via `serde_json::from_value`.
 ///
 /// Mirrors `laurus-python`'s `py_to_json_value`, but additionally accepts
 /// Symbol keys and values (both stringified) since a Ruby Hash literal like
@@ -845,82 +845,77 @@ impl RbSchema {
         self.insert_field(name, FieldOption::Ivf(opt))
     }
 
+    /// Add a multi-vector field holding a variable number of token vectors
+    /// per document, for the late-interaction rescore (Issue #1351).
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Positional and keyword arguments:
+    ///   - `name` (String): Field name.
+    ///   - `dimension` (usize): Dimensionality of each token vector.
+    ///   - `distance:` (String, default "cosine"): `"cosine"` or
+    ///     `"dot_product"`.
+    ///   - `embedder:` (String, optional): A token-level embedder registered
+    ///     via `add_embedder` (a `"candle_colbert"` one), which embeds text
+    ///     values and rescore query text.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
+    /// if `dimension` is 0, or if `distance:` is neither cosine nor
+    /// dot_product.
+    fn add_multi_vector_field(&self, args: &[Value]) -> Result<(), Error> {
+        let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
+        let (name, dimension) = args.required;
+        let kwargs = get_kwargs::<_, (), (Option<String>, Option<Option<String>>), ()>(
+            args.keywords,
+            &[],
+            &["distance", "embedder"],
+        )?;
+        let (distance, embedder) = kwargs.optional;
+        let mut opt = MultiVectorOption::new(dimension)
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+        opt.embedder = embedder.flatten();
+        opt.validate(&name).map_err(laurus_err)?;
+        self.insert_field(name, FieldOption::MultiVector(opt))
+    }
+
     /// Register a named embedder definition in the schema.
     ///
-    /// The `config` Hash must have a `"type"` key selecting the backend:
+    /// The `config` Hash (String or Symbol keys) must have a `"type"` key
+    /// selecting the backend:
     ///
-    /// | type              | required keys | feature flag            |
-    /// |-------------------|---------------|-------------------------|
-    /// | `"precomputed"`   | —             | (always available)      |
-    /// | `"candle_bert"`   | `"model"`     | `embeddings-candle`     |
-    /// | `"candle_clip"`   | `"model"`     | `embeddings-multimodal` |
-    /// | `"openai"`        | `"model"`     | `embeddings-openai`     |
+    /// | type               | required keys | optional keys                                  | feature flag            |
+    /// |--------------------|---------------|------------------------------------------------|-------------------------|
+    /// | `"precomputed"`    | —             | —                                              | (always available)      |
+    /// | `"candle_bert"`    | `"model"`     | —                                              | `embeddings-candle`     |
+    /// | `"candle_clip"`    | `"model"`     | —                                              | `embeddings-multimodal` |
+    /// | `"openai"`         | `"model"`     | —                                              | `embeddings-openai`     |
+    /// | `"candle_colbert"` | `"model"`     | `"revision"`, `"query_maxlen"`, `"doc_maxlen"` | `embeddings-candle`     |
+    ///
+    /// `"candle_colbert"` produces token vectors and only serves a
+    /// multi-vector field (`add_multi_vector_field`).
     ///
     /// # Arguments
     ///
     /// * `name` - Unique embedder name referenced from vector fields.
     /// * `config` - Hash describing the embedder.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if the type is missing or unknown, or a
+    /// required key is missing.
     fn add_embedder(&self, name: String, config: RHash) -> Result<(), Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
-        let embedder_type: Option<Value> = config.get(ruby.str_new("type"));
-        let embedder_type: String = embedder_type
-            .ok_or_else(|| {
+        // The core definition's serde decides the accepted types and keys,
+        // so every embedder type the engine knows is available here.
+        let definition: EmbedderDefinition =
+            serde_json::from_value(rb_to_json_value(&ruby, config.as_value())?).map_err(|e| {
                 Error::new(
                     ruby.exception_arg_error(),
-                    "embedder config must have a 'type' key",
+                    format!("invalid embedder config: {e}"),
                 )
-            })
-            .and_then(magnus::TryConvert::try_convert)?;
-
-        let definition = match embedder_type.as_str() {
-            "precomputed" => EmbedderDefinition::Precomputed,
-            "candle_bert" => {
-                let model_val: Option<Value> = config.get(ruby.str_new("model"));
-                let model: String = model_val
-                    .ok_or_else(|| {
-                        Error::new(
-                            ruby.exception_arg_error(),
-                            "candle_bert embedder requires a 'model' key",
-                        )
-                    })
-                    .and_then(magnus::TryConvert::try_convert)?;
-                EmbedderDefinition::CandleBert { model }
-            }
-            "candle_clip" => {
-                let model_val: Option<Value> = config.get(ruby.str_new("model"));
-                let model: String = model_val
-                    .ok_or_else(|| {
-                        Error::new(
-                            ruby.exception_arg_error(),
-                            "candle_clip embedder requires a 'model' key",
-                        )
-                    })
-                    .and_then(magnus::TryConvert::try_convert)?;
-                EmbedderDefinition::CandleClip { model }
-            }
-            "openai" => {
-                let model_val: Option<Value> = config.get(ruby.str_new("model"));
-                let model: String = model_val
-                    .ok_or_else(|| {
-                        Error::new(
-                            ruby.exception_arg_error(),
-                            "openai embedder requires a 'model' key",
-                        )
-                    })
-                    .and_then(magnus::TryConvert::try_convert)?;
-                EmbedderDefinition::Openai { model }
-            }
-            other => {
-                return Err(Error::new(
-                    ruby.exception_arg_error(),
-                    format!(
-                        "Unknown embedder type: '{}'. Valid types: precomputed, candle_bert, candle_clip, openai",
-                        other
-                    ),
-                ));
-            }
-        };
-
+            })?;
         self.inner.borrow_mut().embedders.insert(name, definition);
         Ok(())
     }
@@ -1157,6 +1152,10 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
     class.define_method(
         "add_ivf_field",
         magnus::method!(RbSchema::add_ivf_field, -1),
+    )?;
+    class.define_method(
+        "add_multi_vector_field",
+        magnus::method!(RbSchema::add_multi_vector_field, -1),
     )?;
     class.define_method("add_embedder", magnus::method!(RbSchema::add_embedder, 2))?;
     class.define_method("add_analyzer", magnus::method!(RbSchema::add_analyzer, -1))?;

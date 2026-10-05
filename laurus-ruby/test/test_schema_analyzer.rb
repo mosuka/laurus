@@ -219,7 +219,8 @@ class TestSchemaAnalyzer < Minitest::Test
     add_bytes_field: [],
     add_hnsw_field: [4],
     add_flat_field: [4],
-    add_ivf_field: [4]
+    add_ivf_field: [4],
+    add_multi_vector_field: [4]
   }.freeze
 
   def test_add_field_methods_reject_reserved_name
