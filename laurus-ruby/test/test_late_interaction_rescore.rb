@@ -81,6 +81,7 @@ class TestLateInteractionRescore < Minitest::Test
 
   def test_default_window_size_and_inspect
     assert_equal 100, rescore.window_size
+    assert_equal 100, rescore(window_size: nil).window_size
     assert_equal 'LateInteractionRescore(field="tokens", window_size=100)', rescore.inspect
   end
 

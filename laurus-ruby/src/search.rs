@@ -198,7 +198,7 @@ impl RbLateInteractionRescore {
     ///     field's token-level embedder (a `"candle_colbert"` one), or the
     ///     query's token vectors.
     ///   - `window_size:` (Integer, default 100, at most 10,000): How many
-    ///     top results to rescore.
+    ///     top results to rescore. `nil` keeps the default.
     ///
     /// # Errors
     ///
@@ -208,9 +208,12 @@ impl RbLateInteractionRescore {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(String, Value), (), (), (), RHash, ()>(args)?;
         let (field, query) = args.required;
-        let kwargs =
-            get_kwargs::<_, (), (Option<usize>,), ()>(args.keywords, &[], &["window_size"])?;
-        let (window_size,) = kwargs.optional;
+        let kwargs = get_kwargs::<_, (), (Option<Option<usize>>,), ()>(
+            args.keywords,
+            &[],
+            &["window_size"],
+        )?;
+        let window_size = kwargs.optional.0.flatten();
 
         let options = if let Some(text) = RString::from_value(query) {
             RescoreOptions::late_interaction_text(field.clone(), text.to_string()?)
