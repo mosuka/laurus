@@ -13,6 +13,11 @@
 //! of a document shadows older ones, and merges collapse both.
 
 pub(crate) mod format;
+pub mod reader;
+pub mod segmented;
+
+pub use reader::MultiVectorSnapshot;
+pub use segmented::MultiVectorIndex;
 
 use crate::vector::index::segment::manager::SegmentFileLayout;
 

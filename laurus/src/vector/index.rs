@@ -295,6 +295,31 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     fn field_dimensions(&self) -> std::collections::BTreeMap<String, usize> {
         std::collections::BTreeMap::new()
     }
+
+    /// A point-in-time view of the token vectors of the multi-vector field
+    /// `field` (Issue #1177), read by late-interaction rescoring.
+    ///
+    /// Defaults to `Ok(None)`: only a multi-vector index (and a multi-field
+    /// index routing to one) holds token vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field's segments fail to load.
+    fn multi_vector_snapshot(
+        &self,
+        _field: &str,
+    ) -> Result<Option<multivector::MultiVectorSnapshot>> {
+        Ok(None)
+    }
+
+    /// Names of the fields that hold token vectors for late-interaction
+    /// rescoring rather than searchable vectors (Issue #1177).
+    ///
+    /// They are excluded from field-less vector search and from prefix
+    /// field selectors. Defaults to empty.
+    fn late_interaction_fields(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
 }
 
 /// Statistics about a vector index.

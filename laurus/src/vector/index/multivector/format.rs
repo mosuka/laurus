@@ -297,15 +297,14 @@ impl SegmentReader {
             check_len(file_name, &header, file_len)?;
             let table_end = header.payload_offset().expect("checked by check_len") as usize;
             let footer = &bytes[bytes.len() - FOOTER_LEN..];
-            let (doc_ids, spans, payload_crc) =
-                parse_meta(file_name, &header, &bytes[..table_end], footer)?;
+            let table = parse_meta(file_name, &header, &bytes[..table_end], footer)?;
             return Ok(Self {
                 dimension: header.dimension,
                 vector_count: header.vector_count,
-                doc_ids,
-                spans,
+                doc_ids: table.doc_ids,
+                spans: table.spans,
                 payload_offset: table_end as u64,
-                payload_crc,
+                payload_crc: table.payload_crc,
                 mapped: Some(input),
                 stream: None,
             });
@@ -322,14 +321,14 @@ impl SegmentReader {
         let mut footer = [0u8; FOOTER_LEN];
         input.seek(SeekFrom::Start(file_len - FOOTER_LEN as u64))?;
         input.read_exact(&mut footer)?;
-        let (doc_ids, spans, payload_crc) = parse_meta(file_name, &header, &meta, &footer)?;
+        let table = parse_meta(file_name, &header, &meta, &footer)?;
         Ok(Self {
             dimension: header.dimension,
             vector_count: header.vector_count,
-            doc_ids,
-            spans,
+            doc_ids: table.doc_ids,
+            spans: table.spans,
             payload_offset: table_end as u64,
-            payload_crc,
+            payload_crc: table.payload_crc,
             mapped: None,
             stream: Some(Mutex::new(input)),
         })
@@ -338,16 +337,6 @@ impl SegmentReader {
     /// Dimension of every vector.
     pub(crate) fn dimension(&self) -> usize {
         self.dimension
-    }
-
-    /// Number of documents.
-    pub(crate) fn doc_count(&self) -> usize {
-        self.doc_ids.len()
-    }
-
-    /// Total number of vectors.
-    pub(crate) fn vector_count(&self) -> u64 {
-        self.vector_count
     }
 
     /// Document ids, ascending.
@@ -364,11 +353,6 @@ impl SegmentReader {
                 doc_id,
                 vector_count,
             })
-    }
-
-    /// Whether this segment holds `doc_id`.
-    pub(crate) fn contains(&self, doc_id: u64) -> bool {
-        self.doc_ids.binary_search(&doc_id).is_ok()
     }
 
     /// The vectors of `doc_id`, row-major (`vector count × dimension`
@@ -472,13 +456,16 @@ fn check_len(file_name: &str, header: &Header, file_len: u64) -> Result<()> {
     }
 }
 
+/// The decoded document table of a segment, with its payload checksum.
+struct DocTable {
+    doc_ids: Vec<u64>,
+    /// `(first vector, vector count)` per entry of `doc_ids`.
+    spans: Vec<(u64, u32)>,
+    payload_crc: u32,
+}
+
 /// Verify the footer and the header + table checksum, then decode the table.
-fn parse_meta(
-    file_name: &str,
-    header: &Header,
-    meta: &[u8],
-    footer: &[u8],
-) -> Result<(Vec<u64>, Vec<(u64, u32)>, u32)> {
+fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> Result<DocTable> {
     if footer[8..12] != FOOTER_MAGIC {
         return Err(corrupt(file_name, "bad footer magic"));
     }
@@ -495,7 +482,7 @@ fn parse_meta(
     let mut doc_ids = Vec::with_capacity(doc_count);
     let mut spans = Vec::with_capacity(doc_count);
     let mut next_vector = 0u64;
-    for entry in meta[HEADER_LEN..].chunks_exact(DOC_ENTRY_LEN) {
+    for entry in meta[HEADER_LEN..].as_chunks::<DOC_ENTRY_LEN>().0 {
         let doc_id = u64::from_le_bytes(entry[0..8].try_into().expect("8 bytes"));
         let first = u64::from_le_bytes(entry[8..16].try_into().expect("8 bytes"));
         let count = u32::from_le_bytes(entry[16..20].try_into().expect("4 bytes"));
@@ -518,7 +505,11 @@ fn parse_meta(
             "document table does not cover the declared vector count",
         ));
     }
-    Ok((doc_ids, spans, payload_crc))
+    Ok(DocTable {
+        doc_ids,
+        spans,
+        payload_crc,
+    })
 }
 
 /// Reinterpret little-endian `f32` bytes in place, if they are aligned.
@@ -534,8 +525,10 @@ fn as_f32_slice(bytes: &[u8]) -> Option<&[f32]> {
 
 fn decode_f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(F32_LEN)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<F32_LEN>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -602,8 +595,6 @@ mod tests {
         write(storage, "seg.mv", 3, &sample());
         let reader = SegmentReader::open(storage, "seg.mv").unwrap();
         assert_eq!(reader.dimension(), 3);
-        assert_eq!(reader.doc_count(), 2);
-        assert_eq!(reader.vector_count(), 3);
         assert_eq!(reader.doc_ids(), &[4, 9]);
         assert_eq!(
             reader.entries().collect::<Vec<_>>(),
@@ -627,7 +618,6 @@ mod tests {
             &[7.0, 8.0, 9.0]
         );
         assert!(reader.vectors(5).unwrap().is_none());
-        assert!(reader.contains(9) && !reader.contains(5));
         reader.verify_payload().unwrap();
         assert!(!storage.file_exists("seg.mv.tmp"));
     }
@@ -672,7 +662,7 @@ mod tests {
         let storage = memory();
         write(storage.as_ref(), "empty.mv", 4, &[]);
         let reader = SegmentReader::open(storage.as_ref(), "empty.mv").unwrap();
-        assert_eq!(reader.doc_count(), 0);
+        assert!(reader.doc_ids().is_empty());
         assert!(reader.vectors(1).unwrap().is_none());
         reader.verify_payload().unwrap();
     }

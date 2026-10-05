@@ -107,13 +107,14 @@ impl VectorIndexFactory {
     /// Multi-vector indexes only exist in the segmented layout and never
     /// write a `metadata.json`, so creating and opening take the same path.
     fn dispatch_multi_vector(
-        _storage: Arc<dyn Storage>,
+        storage: Arc<dyn Storage>,
         name: &str,
-        _config: crate::vector::index::config::MultiVectorIndexConfig,
+        config: crate::vector::index::config::MultiVectorIndexConfig,
     ) -> Result<Box<dyn VectorIndex>> {
-        Err(crate::error::LaurusError::NotImplemented(format!(
-            "multi-vector index '{name}' is not implemented yet"
-        )))
+        let index = crate::vector::index::multivector::MultiVectorIndex::open_or_create(
+            storage, name, config,
+        )?;
+        Ok(Box::new(index))
     }
 
     /// Dispatch a Flat config to the segmented or monolithic implementation
