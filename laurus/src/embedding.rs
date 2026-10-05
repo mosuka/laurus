@@ -20,6 +20,10 @@ pub mod precomputed;
 // Embedder registry for creating embedders from schema definitions
 pub mod registry;
 
+// Hugging Face Hub access shared by the candle embedders
+#[cfg(any(feature = "embeddings-candle", feature = "embeddings-multimodal"))]
+pub(crate) mod candle_hub;
+
 // Candle implementation (requires feature flag)
 #[cfg(feature = "embeddings-candle")]
 pub mod candle_bert_embedder;
