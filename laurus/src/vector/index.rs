@@ -15,6 +15,7 @@ pub mod hnsw;
 pub mod io;
 pub mod ivf;
 pub mod multi_field;
+pub mod multivector;
 pub mod pq_codebook;
 pub mod pq_fastscan_avx2;
 #[cfg(feature = "pq-fastscan")]
