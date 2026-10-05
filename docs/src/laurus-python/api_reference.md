@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, *, limit=10, offset=0, highlight=None) -> list[SearchResult]` | Execute a search query. |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` applies identically to every query in the batch. |
+| `search(query, *, limit=10, offset=0, highlight=None, rescore=None) -> list[SearchResult]` | Execute a search query. `rescore` takes a [`LateInteractionRescore`](#lateinteractionrescore) that reorders the top results by late interaction over a multi-vector field (Issue #1351). When `query` is a `SearchRequest`, the request's own `rescore` is used and this keyword is ignored. |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` applies identically to every query in the batch. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. |
 | `stats() -> dict` | Return index statistics (`document_count`, `vector_fields`). |
 
 ### `search` query argument
@@ -214,6 +214,7 @@ class Schema:
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat (brute-force) vector field. |
 | `add_ivf_field(name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0)` | IVF approximate nearest-neighbor vector field. |
+| `add_multi_vector_field(name, dimension, *, distance="cosine", embedder=None)` | Multi-vector field holding a variable number of token vectors per document (e.g. ColBERT embeddings), read only by the [late-interaction rescore](#lateinteractionrescore) (Issue #1351). It has no ANN index and is not a vector-search target. `distance` must be `"cosine"` (default; vectors are L2-normalized when written) or `"dot_product"`, and `dimension` must be greater than 0; both are checked here and raise `ValueError`. `embedder` names a token-level embedder (`"candle_colbert"`, see [Embedder types](#embedder-types)) that embeds text values and the text query of a rescore. A document gives the field a list of float lists (see [Field value types](#field-value-types)) or, with `embedder`, text. The token vectors live only in the vector store: `get_documents` and search results do not return them. See [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields). |
 
 **Vector quantization & rerank storage** (HNSW fields):
 
@@ -227,7 +228,7 @@ Every `add_*_field` method above raises `ValueError` when `name` starts with `_`
 
 | Method | Description |
 | :--- | :--- |
-| `add_embedder(name, config)` | Register a named embedder definition. `config` is a dict with a `"type"` key (see below). |
+| `add_embedder(name, config)` | Register a named embedder definition. `config` is a dict with a `"type"` key (see below), read with the same rules as the schema TOML's `[embedders]` table. A `config` that is not a dict, or has a missing or unknown `"type"` or a missing required key, raises `ValueError` (`invalid embedder config: ...`). |
 | `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | Register a custom analyzer definition. `tokenizer` is required; `char_filters`/`token_filters` are optional lists of dicts. Each dict uses the same `{"type": "..."}` shape as the schema TOML/JSON format (see below). A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) raises `ValueError`, and so does creating a new `Index` from a schema that defines one (e.g. loaded with `from_toml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzer_names()` | Return the names of custom analyzers registered via `add_analyzer` or loaded from TOML. |
 | `Schema.from_toml(toml_str)` *(static)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
@@ -264,6 +265,16 @@ See [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embed
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+| `"candle_colbert"` | `"model"` | `embeddings-candle` |
+
+`"candle_colbert"` is a token-level embedder: it produces one vector per token and serves only a multi-vector field (`add_multi_vector_field`). It also takes the optional keys `"revision"` (branch, tag, or commit of the model repository), `"query_maxlen"`, and `"doc_maxlen"`; see [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embedders) for their defaults.
+
+```python
+schema = laurus.Schema()
+schema.add_text_field("body")
+schema.add_embedder("colbert", {"type": "candle_colbert", "model": "colbert-ir/colbertv2.0"})
+schema.add_multi_vector_field("body_colbert", dimension=128, embedder="colbert")
+```
 
 ### Analyzer components
 
@@ -539,6 +550,7 @@ class SearchRequest:
         limit: int = 10,
         offset: int = 0,
         highlight=None,
+        rescore: LateInteractionRescore | None = None,
     ) -> None: ...
 ```
 
@@ -552,6 +564,64 @@ class SearchRequest:
 | `limit` | Maximum number of results (default 10). |
 | `offset` | Pagination offset (default 0). |
 | `highlight` | Same list-or-dict shape as `Index.search`'s `highlight` parameter (Issue #1134). See [Highlighting](#highlighting). |
+| `rescore` | A [`LateInteractionRescore`](#lateinteractionrescore) applied to the top results of this request, whichever query shape is set (Issue #1351). It takes the place of `Index.search`'s `rescore` keyword, which is ignored when a `SearchRequest` is passed. |
+
+---
+
+## LateInteractionRescore
+
+Late-interaction (ColBERT MaxSim) rescore of the top search results (Issue #1351). Pass it as `rescore=` to `Index.search` or `SearchRequest`.
+
+```python
+class LateInteractionRescore:
+    def __init__(
+        self,
+        field: str,
+        query: str | list[list[float]],
+        *,
+        window_size: int | None = None,
+    ) -> None: ...
+
+    @property
+    def window_size(self) -> int: ...
+```
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | `str` | -- | A multi-vector field (see `add_multi_vector_field`). |
+| `query` | `str \| list[list[float]]` | -- | The query text, embedded by the field's token-level embedder (a `"candle_colbert"` one), or the query's token vectors, computed with the same model as the documents' token vectors. Integers are accepted as vector elements. |
+| `window_size` | `int \| None` | `None` (100) | How many top first-stage results to rescore, `1..=10,000`. Keyword-only. |
+
+The `window_size` property returns the window the rescore uses (`100` when omitted).
+
+The top `window_size` first-stage results — lexical, vector, or hybrid — are reordered by their MaxSim against the field, highest first, and a rescored result's `score` is its MaxSim. Window results without token vectors in the field follow in their first-stage order, and results beyond the window follow last, keeping their first-stage order and score. `offset` and `limit` are cut from this rescored ranking. See [Vector Search → Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore) for the ordering, similarity, and cost details.
+
+**Errors**:
+
+- `TypeError` at construction when `query` is neither a `str` nor a list of lists, or a token vector holds a `bool` or `str`.
+- `ValueError` (`Invalid argument: rescore: ...`) from `Index.search` for every other invalid value, checked before the search runs: `field` is not a multi-vector field, the query does not hold 1 to 1,024 vectors of the field's dimension with finite values, `window_size` is outside `1..=10,000`, or a text query is blank or the field has no token-level embedder.
+
+```python
+import laurus
+
+schema = laurus.Schema()
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
+
+index = laurus.Index(schema=schema)
+index.put_document("a", {"title": "rust", "tokens": [[0.1, 0.0]]})
+index.put_document("b", {"title": "rust language", "tokens": [[0.9, 0.2]]})
+index.commit()
+
+rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size=50)
+results = index.search("title:rust", rescore=rescore)  # "b" (MaxSim 1.1) before "a" (0.1)
+
+# The same rescore inside a SearchRequest (also usable in search_batch)
+request = laurus.SearchRequest(query="title:rust", rescore=rescore, limit=5)
+results = index.search(request)
+```
+
+With a `"candle_colbert"` embedder on the field, documents can give the field text and the query can be text too: `laurus.LateInteractionRescore("body_colbert", "how do lifetimes work")`.
 
 ---
 
@@ -568,6 +638,8 @@ class SearchResult:
 ```
 
 `highlights` maps each field named in `highlight` to its highlighted fragments (best first); a field that did not highlight is absent from the dict, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
+
+With `rescore`, a rescored result's `score` is its MaxSim, while results outside the rescore window keep their first-stage score. See [LateInteractionRescore](#lateinteractionrescore).
 
 ---
 
@@ -659,6 +731,7 @@ Python values are automatically converted to Laurus `DataValue` types:
 | `list[bytes]` | `BytesArray` | Multi-valued bytes field (Issue #1176); each element takes the same direct-bytes path as a single `bytes` value, so MIME is always `None`. `Bytes` is never indexed, so this has no query-matching semantics — it only governs the stored shape. Requires `multi_valued=True` on the field |
 | `list[int]` | `Int64Array` | Multi-valued integer field (a list of `bool` becomes a `BoolArray` instead, which a multi-valued Float / Integer field widens to 0/1 in the core); vector fields cast the list to `f32`. An empty list is an empty `Int64Array` |
 | `list[float \| int]` | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the list to `f32` |
+| `list[list[float \| int]]` | `VectorArray` | Token vectors of a multi-vector field (Issue #1351), one inner list per token, e.g. `{"tokens": [[0.1, 0.2], [0.3, 0.4]]}`. Integers are widened; a `bool` or `str` element raises `TypeError`. The vectors' count and dimension are checked against the field when the document is written (`ValueError`, e.g. for ragged lists). Not returned by `get_documents` or search results |
 | `(lat, lon)` tuple | `Geo` | Two `float` values |
 | `(x, y, z)` tuple | `Geo3d` | Three `float` values (ECEF Cartesian, metres) |
 | `list[(lat, lon)]` | `GeoArray` | List of `(lat, lon)` tuples; requires `multi_valued=True` on the field |

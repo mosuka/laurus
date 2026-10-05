@@ -38,7 +38,7 @@ class Index {
 | `deleteDocuments(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush writes and make pending changes searchable. |
 | `flushWal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, limit?, offset?, highlight?)` | Search with a DSL string. |
+| `search(query, limit?, offset?, highlight?, rescore?)` | Search with a DSL string. `rescore` reorders the top results by late interaction; see [Late-interaction rescore](#late-interaction-rescore). |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | Search with an exact term match. |
 | `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector. |
 | `searchVectorText(field, text, limit?, offset?)` | Search with text (auto-embedded). |
@@ -205,7 +205,8 @@ class Schema {
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW vector field. `baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat (brute-force) vector field. |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF vector field. |
-| `addEmbedder(name, config)` | Register a named embedder. |
+| `addMultiVectorField(name, dimension, distance?, embedder?)` | Multi-vector field holding a variable number of token vectors per document, for the [late-interaction rescore](#late-interaction-rescore) (Issue #1351); see [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields). `dimension` is the dimension of each token vector and must be greater than 0; `distance` is `"cosine"` (default) or `"dot_product"`. Both are checked when the field is added, which throws with code `InvalidArg`. `embedder` names a token-level (`"candle_colbert"`) embedder, which embeds text values and rescore query text. The field is not searchable on its own, and its token vectors are not stored, so `getDocuments` and search results do not return them. |
+| `addEmbedder(name, config)` | Register a named embedder. See [Embedders](#embedders). |
 | `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | Register a custom analyzer definition. `tokenizer` is required; `charFilters`/`tokenFilters` are optional arrays of objects. Each object uses the same `{ type: "...", ... }` shape as the schema TOML/JSON format (see below) — keys stay snake_case, matching that wire format. A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) throws, and so does `Index.create` with a new index's schema that defines one (e.g. loaded with `fromToml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzerNames()` | Return the names of custom analyzers registered via `addAnalyzer` or loaded from TOML. |
 | `Schema.fromToml(tomlStr)` *(static)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
@@ -294,6 +295,48 @@ schema.addAnalyzer(
   [{ type: "lowercase" }],
 );
 schema.addTextField("title", true, true, true, true, "ja_ipadic");
+```
+
+### Embedders
+
+Used by `addEmbedder(name, config)` and by the `[embedders.<name>]` TOML
+section. `config` is an object whose `type` key selects the backend; like the
+analyzer components, its keys stay snake_case, matching the schema TOML/JSON
+format.
+
+See [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embedders) for the canonical description of each type.
+
+| `type` | Required keys | Optional keys | Feature flag |
+| :--- | :--- | :--- | :--- |
+| `"precomputed"` | -- | -- | *(always available)* |
+| `"candle_bert"` | `model` | -- | `embeddings-candle` |
+| `"candle_clip"` | `model` | -- | `embeddings-multimodal` |
+| `"openai"` | `model` | -- | `embeddings-openai` |
+| `"candle_colbert"` | `model` | `revision`, `query_maxlen`, `doc_maxlen` | `embeddings-candle` |
+
+`"candle_colbert"` runs a BERT-based ColBERT checkpoint (such as
+`"colbert-ir/colbertv2.0"`) and produces one vector per token, so only a
+multi-vector field (`addMultiVectorField`) can use it; a multi-vector field in
+turn accepts only `"candle_colbert"` or `"precomputed"`, and any other
+combination makes `Index.create` throw. `revision` pins a branch, tag or
+commit of the model repository (pin a commit, so that re-embedding reproduces
+the same vectors); `query_maxlen` and `doc_maxlen` override the checkpoint's
+query and document token lengths.
+
+`addEmbedder` throws `embedder config must be an object` when `config` is not
+an object, and `invalid embedder config: ...` when `type` is missing or
+unknown or a required key is missing. A type whose feature flag the binding
+was not built with still registers, but `Index.create` throws.
+
+```javascript
+const schema = new Schema();
+schema.addEmbedder("colbert", {
+  type: "candle_colbert",
+  model: "answerdotai/answerai-colbert-small-v1",
+  revision: "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e",
+});
+schema.addTextField("body");
+schema.addMultiVectorField("body_colbert", 96, "cosine", "colbert");
 ```
 
 ### Distance metrics
@@ -532,6 +575,7 @@ interface SearchRequestOptions {
   limit?: number;   // default 10
   offset?: number;  // default 0
   highlight?: HighlightOptions;
+  rescore?: RescoreOptions;
 }
 
 class SearchRequest {
@@ -542,8 +586,9 @@ class SearchRequest {
 Construct with primitive options first; attach polymorphic clauses with
 the per-type setters below. As with `BooleanQuery`, the binding exposes
 per-type setters because of `napi-derive`'s limitation on `Either<&T, ...>`
-arguments. `highlight` is plain data (not a class-instance union), so it
-lives directly on `SearchRequestOptions` rather than behind a setter.
+arguments. `highlight` and `rescore` are plain data (not class-instance
+unions), so they live directly on `SearchRequestOptions` rather than behind a
+setter.
 
 ### DSL and fusion setters
 
@@ -604,6 +649,73 @@ Only `fields` is required. Highlighting follows the query passed to the same cal
 ```javascript
 const results = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language."] }
+```
+
+### Late-interaction rescore
+
+`search` (its trailing `rescore` argument) and `SearchRequestOptions` accept
+an optional `rescore` object (Issue #1351). It reorders the top results of the
+first stage — lexical, vector or hybrid — by ColBERT-style late interaction
+(MaxSim) against a
+[multi-vector field](../concepts/schema_and_fields.md#multi-vector-fields).
+See [Vector Search → Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)
+for how it works.
+
+```typescript
+// Exported from index.d.ts as JsRescoreOptions.
+interface RescoreOptions {
+  field: string;          // a multi-vector field
+  vectors?: number[][];   // the query's token vectors
+  text?: string;          // query text, embedded by the field's embedder
+  windowSize?: number;    // default 100, at most 10,000
+}
+```
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | `string` | -- | The multi-vector field to score against. |
+| `vectors` | `number[][]` | -- | The query's token vectors: 1 to 1,024 of them, each of the field's dimension, with finite values. Compute them with the model that produced the documents' token vectors. |
+| `text` | `string` | -- | Query text, embedded as a query by the field's token-level (`"candle_colbert"`) embedder. Must not be blank. |
+| `windowSize` | `number` | `100` | How many top first-stage results to rescore, `1` to `10,000`. |
+
+Set exactly one of `vectors` and `text`; otherwise the search rejects with
+code `InvalidArg` and the message
+`rescore needs exactly one of vectors or text`. The engine checks the other
+values when the search runs, and rejects with code `InvalidArg` and a message
+containing `rescore: ...` when `field` is unknown or not a multi-vector field,
+a `text` query is blank or the field has no token-level embedder, the query
+holds too few or too many vectors or one of the wrong dimension, or
+`windowSize` is out of range.
+
+Ordering and scores:
+
+- The top `windowSize` first-stage results are sorted by MaxSim, highest
+  first, and a rescored result's `score` is its MaxSim.
+- Window results without token vectors in the field follow in their
+  first-stage order, then the results beyond the window, unchanged. Both keep
+  their first-stage score, which is not comparable with a MaxSim.
+
+`searchTerm`, `searchVector`, `searchVectorText` and `searchBatch` take no
+`rescore` argument; build a `SearchRequest` instead, which rescores any first
+stage, including a hybrid one.
+
+```javascript
+// A DSL search, rescored with the query's token vectors.
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]],
+});
+
+// A hybrid search, rescored with query text (the field needs a
+// "candle_colbert" embedder).
+const req = new SearchRequest({
+  limit: 10,
+  rescore: { field: "body_colbert", text: "how do lifetimes work", windowSize: 50 },
+});
+req.setLexicalTerm(new TermQuery("body", "lifetimes"));
+req.setVectorQuery(new VectorQuery("body_vec", queryEmbedding));
+req.setRrfFusion(new RRF(60.0));
+const reranked = await index.searchWithRequest(req);
 ```
 
 ---
@@ -724,6 +836,7 @@ JavaScript values are automatically converted to Laurus
 | `{ x, y, z }` | `GeoEcef` | Three `number` values, meters (3D ECEF Cartesian) |
 | `{ lat, lon }[]` | `GeoArray` | Array of `{ lat, lon }` objects; requires `multiValued: true` on the field |
 | `{ x, y, z }[]` | `GeoEcefArray` | Array of `{ x, y, z }` objects; requires `multiValued: true` on the field |
+| `number[][]` | `VectorArray` | Token vectors of a multi-vector field (`addMultiVectorField`): 1 to 8,192 arrays of the field's dimension. All inner arrays must have the same length, otherwise ingestion rejects with `token vectors must share one dimension`. A field with a token-level embedder also accepts a `string`, which is embedded into token vectors. Not stored, so absent from `getDocuments` and search results |
 | `string[]` (all RFC 3339) | `DateTimeArray` | Array of RFC 3339 datetime strings (same `infer_from_json` rules as the HTTP gateway); requires `multiValued: true` on the field |
 | `string[]` (not all RFC 3339) | `TextArray` | Array of strings (Issue #1175); requires `multiValued: true` on the field. Read back as `string[]`. On a declared multi-valued `Bytes` field, the same array of base64 strings is instead decoded element-wise into `BytesArray` by the schema-aware coercion (Issue #1176) |
 | `boolean[]` | `BoolArray` | Array of booleans (same `infer_from_json` rules as the HTTP gateway); requires `multiValued: true` on the field. A mixed array such as `[true, 1]` is rejected |

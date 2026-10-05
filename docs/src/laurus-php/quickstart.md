@@ -97,7 +97,32 @@ $request = new SearchRequest(
 $results = $index->search($request);
 ```
 
-## 6. Update and delete
+## 6. Late-interaction rescore
+
+A late-interaction rescore reorders the top results of any search by ColBERT-style MaxSim against a multi-vector field, which holds a variable number of token vectors per document.
+
+```php
+<?php
+
+use Laurus\Index;
+use Laurus\Schema;
+
+$schema = new Schema();
+$schema->addTextField("title");
+$schema->addMultiVectorField("tokens", 2, "dot_product");
+
+$index = new Index(null, $schema);
+$index->putDocument("doc1", ["title" => "Rust", "tokens" => [[0.1, 0.0]]]);
+$index->putDocument("doc2", ["title" => "Rust language", "tokens" => [[0.9, 0.2], [0.0, 0.3]]]);
+$index->commit();
+
+// Reorder the top 100 (default) results of "title:rust" by MaxSim
+$results = $index->search("title:rust", 10, 0, null, new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+```
+
+A rescored result's score is its MaxSim. To pass the query as text instead of token vectors, register a `candle_colbert` embedder (Cargo feature `embeddings-candle`) with `addEmbedder` and name it in `addMultiVectorField`'s `$embedder`; see [LateInteractionRescore](api_reference.md#lateinteractionrescore).
+
+## 7. Update and delete
 
 ```php
 // Update: putDocument replaces all existing versions
@@ -116,7 +141,7 @@ $index->deleteDocuments("doc1");
 $index->commit();
 ```
 
-## 7. Schema management
+## 8. Schema management
 
 ```php
 $schema = new \Laurus\Schema();
@@ -131,9 +156,10 @@ $schema->addDatetimeField("created_at");
 $schema->addHnswField("embedding", 384);
 $schema->addFlatField("small_vec", 64);
 $schema->addIvfField("ivf_vec", 128, "cosine", 100, 1);
+$schema->addMultiVectorField("colbert", 128);
 ```
 
-## 8. Index statistics
+## 9. Index statistics
 
 ```php
 $stats = $index->stats();

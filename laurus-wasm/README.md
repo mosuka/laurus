@@ -11,11 +11,14 @@ unified lexical, vector, and hybrid search in the browser.
 - **Vector search** — HNSW, Flat, and IVF indexes with multiple distance metrics
 - **Hybrid search** — Combine lexical and vector search
   with RRF or Weighted Sum fusion
+- **Late-interaction rescore** — Reorder the top results by ColBERT-style
+  MaxSim over per-token vectors in a multi-vector field
 - **CJK support** — Japanese, Chinese, and Korean tokenization via [Lindera](https://github.com/lindera/lindera)
 - **OPFS persistence** — Data survives page reloads using the
   browser's Origin Private File System
 - **JS callback embedder** — Supply your own embedding function
-  (e.g. Transformers.js) via a JavaScript callback
+  (e.g. Transformers.js) via a JavaScript callback, including a token-level
+  one (`"token_callback"`) for multi-vector fields
 
 ## Quick Start
 
@@ -76,6 +79,13 @@ const results = await index.searchTerm("field", "term", limit);
 const results = await index.searchVector("field", [0.1, ...], limit);
 const results = await index.searchVectorText("field", "text", limit);
 
+// Late-interaction rescore of the top results (also on searchVector / searchVectorText)
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",            // a multi-vector field
+  vectors: [[0.1, ...], ...], // or text: "query" with a token_callback embedder
+  windowSize: 100,            // optional (default 100)
+});
+
 // Stats
 const stats = index.stats();
 // { documentCount: 42, vectorFields: {
@@ -124,12 +134,21 @@ schema.addBytesField("thumbnail");
 schema.addHnswField("embedding", 384, "cosine", 16, 200, undefined, "minilm");
 schema.addFlatField("embedding", 384);
 schema.addIvfField("embedding", 384, "cosine", 100, 1);
+schema.addMultiVectorField("tokens", 128, "cosine", "colbert"); // token vectors for the rescore
 schema.addEmbedder("minilm", {
   type: "callback",
   embed: async (text) => {
     // Your embedding function here (e.g. Transformers.js)
     return [0.1, 0.2, ...];
   },
+});
+schema.addEmbedder("colbert", {
+  type: "token_callback",
+  embed: async (text, role) => {
+    // role is "query" or "document"; return one 128-dim vector per token
+    return [[0.1, 0.2, ...], [0.3, 0.4, ...]];
+  },
+  dimension: 128,
 });
 schema.setDefaultFields(["title", "body"]);
 ```

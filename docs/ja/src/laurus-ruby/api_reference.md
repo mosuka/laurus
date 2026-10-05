@@ -31,8 +31,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync し、`nil` を返します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(query, limit: 10, offset: 0, highlight: nil) -> Array<SearchResult>` | 検索クエリを実行します。 |
-| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空の配列の場合は `[]` を返します。`highlight:` はバッチ内のすべてのクエリに同一に適用されます。 |
+| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil) -> Array<SearchResult>` | 検索クエリを実行します。`rescore:` には上位の結果を並べ替える `LateInteractionRescore` を渡します（Issue #1351）。それ以外の値は `TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。 |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空の配列の場合は `[]` を返します。`highlight:` はバッチ内のすべてのクエリに同一に適用されます。`rescore:` キーワードはありません。要素の `SearchRequest` は、その `rescore:` で再採点されます。 |
 | `stats -> Hash` | インデックス統計（`"document_count"`、`"vector_fields"`）を返します。 |
 
 ### `search` の query 引数
@@ -43,6 +43,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 - **Lexical クエリオブジェクト**（`TermQuery`、`PhraseQuery`、`BooleanQuery` など）
 - **Vector クエリオブジェクト**（`VectorQuery`、`VectorTextQuery`）
 - **`SearchRequest`**（完全な制御が必要な場合）
+
+`query` が `SearchRequest` の場合は、その `limit:`・`offset:`・`highlight:`・`rescore:` が使われ、`search` のキーワード引数は無視されます。
 
 `search_batch` の `queries` 配列の各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
 
@@ -180,6 +182,7 @@ Laurus::Schema.new
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat（総当たり）ベクトルフィールド。 |
 | `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil, base_weight: 1.0)` | IVF 近似最近傍ベクトルフィールド。 |
+| `add_multi_vector_field(name, dimension, distance: "cosine", embedder: nil)` | 文書ごとに可変個のトークンベクトル（ColBERT のトークンごとの埋め込みなど）を保持する MultiVector フィールド（Issue #1351）。値は数値の Array の Array で、トークンごとに要素数 `dimension` の Array を 1 つ持ちます。ANN 索引は持たず、[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)だけが読み取ります（[LateInteractionRescore](#lateinteractionrescore) を参照）。トークンベクトルは保存されないため、`get_documents` や検索結果にこのフィールドは含まれません。`distance:` は `"cosine"` か `"dot_product"`、`dimension` は 0 より大きい値でなければならず、どちらもフィールド追加時に検査されます（`ArgumentError`）。`embedder:` にはトークン単位のエンベダー（`"candle_colbert"` のもの。[エンベダータイプ](#エンベダータイプ)を参照）の名前を指定し、テキストの値と再採点のクエリテキストを埋め込みます。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。 |
 
 **ベクトル量子化とリランクストレージ**（HNSW フィールド）:
 
@@ -193,7 +196,7 @@ Laurus::Schema.new
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ Hash です（下記参照）。 |
+| `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ Hash で、キーは String / Symbol どちらでも構いません（下記参照）。type が無い・未知である、または必須キーが無い場合は `ArgumentError`（`invalid embedder config: ...`）になります。 |
 | `add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`char_filters:`/`token_filters:` は省略可能な Hash の配列です。各 Hash はスキーマ TOML/JSON 形式と同じ `{type: "..."}` 形式で、キーは String / Symbol どちらでも構いません（下記参照）。組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `ArgumentError` になり、その名前を定義したスキーマ（`from_toml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
 | `analyzer_names -> Array<String>` | `add_analyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
 | `Laurus::Schema.from_toml(toml_str) -> Schema` *(クラスメソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
@@ -225,6 +228,18 @@ Laurus::Schema.new
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+| `"candle_colbert"` | `"model"` | `embeddings-candle` |
+
+`"candle_colbert"` は、省略可能なキー `"revision"`、`"query_maxlen"`、`"doc_maxlen"` も受け付けます。トークンベクトルを生成するため、使えるのは MultiVector フィールド（`add_multi_vector_field`）だけです。キーは String / Symbol どちらでも構いません。
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_embedder(
+  "colbert",
+  { type: "candle_colbert", model: "colbert-ir/colbertv2.0", query_maxlen: 32 },
+)
+schema.add_multi_vector_field("body_colbert", 128, embedder: "colbert")
+```
 
 ### アナライザコンポーネント
 
@@ -462,6 +477,7 @@ Laurus::SearchRequest.new(
   limit: 10,
   offset: 0,
   highlight: nil,
+  rescore: nil,
 )
 ```
 
@@ -475,6 +491,50 @@ Laurus::SearchRequest.new(
 | `limit:` | 最大結果件数（デフォルト 10）。 |
 | `offset:` | ページネーションオフセット（デフォルト 0）。 |
 | `highlight:` | `Index#search` の `highlight:` と同じ配列または Hash の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
+| `rescore:` | リクエスト（lexical・vector・ハイブリッドのいずれも可）の上位の結果を並べ替える `LateInteractionRescore`（Issue #1351）。それ以外の値は `TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。 |
+
+---
+
+## LateInteractionRescore
+
+検索結果の上位を late interaction（ColBERT の MaxSim）で再採点します（Issue #1351）。`Index#search` または `SearchRequest.new` の `rescore:` に渡します。
+
+```ruby
+Laurus::LateInteractionRescore.new(field, query, window_size: nil)
+```
+
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | `String` | -- | MultiVector フィールド（`add_multi_vector_field`）。 |
+| `query` | `String \| Array<Array<Numeric>>` | -- | クエリテキスト（フィールドのトークン単位のエンベダー、つまり `"candle_colbert"` のものが埋め込みます）、またはクエリのトークンベクトル（文書のトークンベクトルと同じモデルで計算したもの）。要素には `Integer` も使えます。 |
+| `window_size:` | `Integer \| nil` | `nil`（100） | 再採点する 1 段目の上位結果の件数。最大 10,000。`nil` のときは既定値の 100 になります。 |
+
+| メソッド | 説明 |
+| :--- | :--- |
+| `window_size -> Integer` | 再採点する上位結果の件数を返します。 |
+| `inspect -> String` | `LateInteractionRescore(field="tokens", window_size=100)` のような要約を返します。 |
+
+1 段目の上位 `window_size` 件の結果を、フィールドに対する MaxSim で並べ替えます。再採点された結果の `score` はその MaxSim です。ウィンドウ外の結果は 1 段目の順序とスコアのまま、再採点された結果の後に続きます。順序の規則と類似度の詳細は [ベクトル検索 → late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore) を参照してください。
+
+**エラー**: `query` が String でも数値の Array の Array でもない場合、コンストラクタが `TypeError` を発生させます。それ以外の値は検索時にエンジンが検査し、フィールドが存在しない・MultiVector フィールドでない、テキストクエリが空・フィールドにトークン単位のエンベダーが無い、クエリがフィールドの次元のトークンベクトルを 1〜1,024 個持たない、`window_size` が 1〜10,000 の範囲外、のいずれかの場合に、メッセージに `rescore: ...` を含む `ArgumentError` を発生させます。
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", 2, distance: "dot_product")
+
+index = Laurus::Index.new(schema: schema)
+index.put_document("a", { "title" => "rust", "tokens" => [[0.1, 0.0]] })
+index.put_document("b", { "title" => "rust language", "tokens" => [[0.9, 0.2]] })
+index.commit
+
+rescore = Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size: 50)
+results = index.search("title:rust", rescore: rescore)
+results.map(&:id) # => ["b", "a"] -- "b" の MaxSim は 1.1、"a" は 0.1
+
+# フィールドに "candle_colbert" のエンベダーがあれば、クエリをテキストで渡せる。
+rescore = Laurus::LateInteractionRescore.new("body_colbert", "how do lifetimes work")
+```
 
 ---
 
@@ -575,6 +635,7 @@ Ruby の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `String` | `Text` | |
 | `Array`（`Integer`） | `Int64Array` | 多値整数フィールド。ベクトルフィールドでは配列を `f32` にキャスト。空の `Array` は空の `Int64Array` |
 | `Array`（数値） | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドでは配列を `f32` にキャスト |
+| `Array`（数値の `Array` の配列） | `VectorArray` | MultiVector フィールド（`add_multi_vector_field`）のトークンベクトル。トークンごとにフィールドの次元の `Array` を 1 つ持つ（Issue #1351）。`Integer` の要素も可。`true` や `String` などそれ以外の要素は `TypeError`。`get_documents` や検索結果には返されない |
 | `Hash`（`"lat"`, `"lon"`） | `Geo` | 2 つの `Float` 値 |
 | `Hash`（`"x"`, `"y"`, `"z"`） | `GeoEcef` | 3 つの `Float` 値（メートル単位、3D ECEF 直交座標） |
 | `Array`（`"lat"`, `"lon"` を持つ `Hash` の配列） | `GeoArray` | フィールドに `multi_valued: true` が必要 |

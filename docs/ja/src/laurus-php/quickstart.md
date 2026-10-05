@@ -97,7 +97,32 @@ $request = new SearchRequest(
 $results = $index->search($request);
 ```
 
-## 6. 更新と削除
+## 6. Late interaction による再採点
+
+late interaction による再採点は、どの検索でも上位の結果を、MultiVector フィールドに対する ColBERT 型の MaxSim で並べ替えます。MultiVector フィールドは、文書ごとに可変本数のトークンベクトルを保持します。
+
+```php
+<?php
+
+use Laurus\Index;
+use Laurus\Schema;
+
+$schema = new Schema();
+$schema->addTextField("title");
+$schema->addMultiVectorField("tokens", 2, "dot_product");
+
+$index = new Index(null, $schema);
+$index->putDocument("doc1", ["title" => "Rust", "tokens" => [[0.1, 0.0]]]);
+$index->putDocument("doc2", ["title" => "Rust language", "tokens" => [[0.9, 0.2], [0.0, 0.3]]]);
+$index->commit();
+
+// "title:rust" の上位 100 件（デフォルト）を MaxSim で並べ替える
+$results = $index->search("title:rust", 10, 0, null, new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+```
+
+再採点した結果のスコアは MaxSim の値です。トークンベクトルの代わりにテキストでクエリを渡すには、`candle_colbert` エンベダー（Cargo の feature `embeddings-candle`）を `addEmbedder` で登録し、`addMultiVectorField` の `$embedder` に指定します。詳細は [LateInteractionRescore](api_reference.md#lateinteractionrescore) を参照してください。
+
+## 7. 更新と削除
 
 ```php
 // 更新: putDocument は同じ ID の全バージョンを置換する
@@ -116,7 +141,7 @@ $index->deleteDocuments("doc1");
 $index->commit();
 ```
 
-## 7. スキーマ管理
+## 8. スキーマ管理
 
 ```php
 $schema = new \Laurus\Schema();
@@ -131,9 +156,10 @@ $schema->addDatetimeField("created_at");
 $schema->addHnswField("embedding", 384);
 $schema->addFlatField("small_vec", 64);
 $schema->addIvfField("ivf_vec", 128, "cosine", 100, 1);
+$schema->addMultiVectorField("colbert", 128);
 ```
 
-## 8. インデックス統計
+## 9. インデックス統計
 
 ```php
 $stats = $index->stats();

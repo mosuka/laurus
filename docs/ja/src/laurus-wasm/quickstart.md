@@ -156,6 +156,46 @@ const results = await index.searchVector("embedding", [0.9, 0.1, 0.0]);
 console.log(results[0].document.title); // "Rust"
 ```
 
+## Late interaction による再採点
+
+トークンごとのベクトル（ColBERT モデルの出力など）を MultiVector フィールドに保持し、
+検索の上位の結果を MaxSim で並べ替えます。ここではトークンベクトルを事前に計算し、
+入れ子の配列として渡します:
+
+```javascript
+import init, { Index, Schema } from 'laurus-wasm';
+
+await init();
+
+const schema = new Schema();
+schema.addTextField("title");
+schema.addMultiVectorField("tokens", 2, "dot_product"); // 2次元のトークンベクトル
+
+const index = await Index.create(schema);
+
+await index.putDocument("doc1", {
+  title: "Rust",
+  tokens: [[0.1, 0.0]]
+});
+await index.putDocument("doc2", {
+  title: "The Rust language",
+  tokens: [[0.9, 0.2]]
+});
+await index.commit();
+
+// lexical 検索の上位を、クエリのトークンベクトルで再採点
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]]
+});
+console.log(results[0].id, results[0].score); // "doc2" 約 1.1（MaxSim: 0.9 + 0.2）
+```
+
+再採点した結果の `score` は MaxSim の値です。トークンベクトルは
+`results[i].document` には含まれません。テキストでインデックス・検索するには、
+フィールドに `"token_callback"` Embedder を登録します。詳細は
+[API リファレンス](api_reference.md#late-interaction-による再採点)を参照してください。
+
 ## バンドラーでの利用
 
 ### Vite

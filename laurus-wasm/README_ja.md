@@ -11,11 +11,14 @@ WebAssembly バインディング —
 - **Vector 検索** — HNSW、Flat、IVF インデックスと複数の距離メトリクス
 - **Hybrid 検索** — Lexical 検索と Vector 検索を
   RRF または Weighted Sum フュージョンで組み合わせ
+- **Late interaction による再採点** — MultiVector フィールドのトークンごとの
+  ベクトルを使い、ColBERT 型の MaxSim で上位の結果を並べ替え
 - **CJK 対応** — [Lindera](https://github.com/lindera/lindera) による日本語・中国語・韓国語のトークナイズ
 - **OPFS 永続化** — ブラウザの Origin Private File System を使用し、
   ページリロード後もデータを保持
 - **JS コールバック Embedder** — JavaScript コールバックで
-  任意のエンベディング関数を提供可能（例: Transformers.js）
+  任意のエンベディング関数を提供可能（例: Transformers.js）。MultiVector
+  フィールド用のトークン単位のコールバック（`"token_callback"`）にも対応
 
 ## クイックスタート
 
@@ -76,6 +79,13 @@ const results = await index.searchTerm("field", "term", limit);
 const results = await index.searchVector("field", [0.1, ...], limit);
 const results = await index.searchVectorText("field", "text", limit);
 
+// 上位の結果を late interaction で再採点（searchVector / searchVectorText でも可）
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",            // MultiVector フィールド
+  vectors: [[0.1, ...], ...], // token_callback Embedder があれば text: "query" も可
+  windowSize: 100,            // 省略可（既定 100）
+});
+
 // 統計情報
 const stats = index.stats();
 // { documentCount: 42, vectorFields: {
@@ -126,12 +136,21 @@ schema.addBytesField("thumbnail");
 schema.addHnswField("embedding", 384, "cosine", 16, 200, undefined, "minilm");
 schema.addFlatField("embedding", 384);
 schema.addIvfField("embedding", 384, "cosine", 100, 1);
+schema.addMultiVectorField("tokens", 128, "cosine", "colbert"); // 再採点用のトークンベクトル
 schema.addEmbedder("minilm", {
   type: "callback",
   embed: async (text) => {
     // エンベディング関数を指定（例: Transformers.js）
     return [0.1, 0.2, ...];
   },
+});
+schema.addEmbedder("colbert", {
+  type: "token_callback",
+  embed: async (text, role) => {
+    // role は "query" または "document"。トークンごとに 128 次元のベクトルを返す
+    return [[0.1, 0.2, ...], [0.3, 0.4, ...]];
+  },
+  dimension: 128,
 });
 schema.setDefaultFields(["title", "body"]);
 ```

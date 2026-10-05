@@ -100,7 +100,45 @@ req.setRrfFusion(new RRF(60.0));
 const results = await index.searchWithRequest(req);
 ```
 
-## 6. Update and delete
+## 6. Late-interaction rescore
+
+A multi-vector field holds several token vectors per document (for example
+ColBERT token embeddings). Passing a `rescore` object reorders the top results
+of any search by late interaction (MaxSim) against that field.
+
+```javascript
+import { Index, Schema } from "laurus-nodejs";
+
+const schema = new Schema();
+schema.addTextField("title");
+schema.addMultiVectorField("tokens", 2, "dot_product");
+
+const index = await Index.create(null, schema);
+await index.putDocument("a", {
+  title: "rust",
+  tokens: [[0.1, 0.0]],
+});
+await index.putDocument("b", {
+  title: "rust language",
+  tokens: [[0.9, 0.2], [0.0, 0.5]],
+});
+await index.commit();
+
+// Lexical first stage, then reorder the top results by MaxSim:
+// "b" (score 1.4) now ranks above "a" (score 0.1).
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]],
+});
+```
+
+Token vectors are not stored, so `getDocuments` and search results do not
+return them. With a `candle_colbert` embedder registered via `addEmbedder` and
+named as the field's 4th argument, documents can give the field text and the
+rescore can take `text` instead of `vectors`; see
+[Late-interaction rescore](api_reference.md#late-interaction-rescore).
+
+## 7. Update and delete
 
 ```javascript
 // Update: putDocument replaces all existing versions
@@ -125,7 +163,7 @@ await index.deleteDocuments("express");
 await index.commit();
 ```
 
-## 7. Schema management
+## 8. Schema management
 
 ```javascript
 const schema = new Schema();
@@ -140,9 +178,10 @@ schema.addDatetimeField("createdAt");
 schema.addHnswField("embedding", 384);
 schema.addFlatField("smallVec", 64);
 schema.addIvfField("ivfVec", 128, "cosine", 100, 1);
+schema.addMultiVectorField("tokens", 128);
 ```
 
-## 8. Index statistics
+## 9. Index statistics
 
 ```javascript
 const stats = index.stats();

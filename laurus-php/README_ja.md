@@ -151,6 +151,7 @@ if (Laurus\peek_commit_generation($path) !== $before) {
 | `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, quantizer, subvectorCount, rerankStorage, pqCodebookPath, baseWeight)` | HNSW ベクトルインデックスフィールド |
 | `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat（総当たり）ベクトルインデックスフィールド |
 | `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF ベクトルインデックスフィールド |
+| `addMultiVectorField(name, dimension, distance, embedder)` | late interaction による再採点に使う、文書ごとのトークンベクトル（`distance` は `cosine` または `dot_product`） |
 | `addEmbedder(name, config)` | 名前付きエンベダーの登録 |
 | `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | 名前付きカスタムアナライザーの登録 |
 | `setDefaultFields(fieldNames)` | デフォルト検索フィールドの設定 |
@@ -231,6 +232,16 @@ $results = $index->search($request);
 | `RRF(k)` | 逆順位フュージョン（ランクベース、ハイブリッドのデフォルト） |
 | `WeightedSum(lexicalWeight, vectorWeight)` | スコア正規化後の加重和 |
 
+## Late Interaction による再採点
+
+`LateInteractionRescore(field, query, windowSize)` は、どの検索でも上位 `windowSize` 件（デフォルト 100）を、MultiVector フィールドに対する ColBERT の MaxSim で並べ替えます。`query` はトークンベクトルのリスト、またはフィールドに `candle_colbert` エンベダーがある場合はテキストです。
+
+```php
+use Laurus\LateInteractionRescore;
+
+$results = $index->search("title:rust", 10, 0, null, new LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+```
+
 ## テキスト解析
 
 ```php
@@ -307,7 +318,7 @@ $index->flushWal(); // バッチが満杯になるのを待たずに今すぐ永
 
 | 機能フラグ | 説明 |
 | :--- | :--- |
-| `embeddings-candle` | [Candle](https://github.com/huggingface/candle) によるローカル BERT エンベディング |
+| `embeddings-candle` | [Candle](https://github.com/huggingface/candle) によるローカル BERT・ColBERT エンベディング |
 | `embeddings-multimodal` | テキストと画像のマルチモーダル（CLIP）エンベディング |
 | `embeddings-openai` | OpenAI API によるクラウドベースエンベディング |
 | `embeddings-all` | 全エンベディングバックエンドを有効化 |

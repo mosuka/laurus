@@ -82,7 +82,31 @@ request = laurus.SearchRequest(
 results = index.search(request)
 ```
 
-## 6. 更新と削除
+## 6. Late interaction による再採点
+
+late interaction による再採点は、どの検索の上位の結果も ColBERT 型の MaxSim で並べ替えます。MaxSim は、文書ごとのトークンベクトルを保持する MultiVector フィールドに対して計算します。
+
+```python
+import laurus
+
+schema = laurus.Schema()
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
+
+index = laurus.Index(schema=schema)
+index.put_document("doc1", {"title": "Rust", "tokens": [[0.1, 0.0]]})
+index.put_document("doc2", {"title": "Rust language", "tokens": [[0.9, 0.2], [0.0, 0.3]]})
+index.commit()
+
+results = index.search(
+    "title:rust",
+    rescore=laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]),
+)
+```
+
+トークンベクトルの代わりにテキストを渡すには、`"candle_colbert"` のエンベダーを登録し（`schema.add_embedder("colbert", {"type": "candle_colbert", "model": "colbert-ir/colbertv2.0"})`）、MultiVector フィールドに `embedder="colbert"` を指定します。すると文書はフィールドにテキストを与えられ、再採点のクエリも文字列で渡せます。詳細は [API リファレンス → LateInteractionRescore](api_reference.md#lateinteractionrescore) を参照してください。
+
+## 7. 更新と削除
 
 ```python
 # 更新: put_document は同じ ID の全バージョンを置換する
@@ -101,7 +125,7 @@ index.delete_documents("doc1")
 index.commit()
 ```
 
-## 7. スキーマ管理
+## 8. スキーマ管理
 
 ```python
 schema = laurus.Schema()
@@ -116,9 +140,10 @@ schema.add_datetime_field("created_at")
 schema.add_hnsw_field("embedding", dimension=384)
 schema.add_flat_field("small_vec", dimension=64)
 schema.add_ivf_field("ivf_vec", dimension=128, n_clusters=100)
+schema.add_multi_vector_field("tokens", dimension=128)
 ```
 
-## 8. インデックス統計
+## 9. インデックス統計
 
 ```python
 stats = index.stats()

@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit()` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal()` | WAL の永続性バリアを強制します。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。 |
-| `search(query, *, limit=10, offset=0, highlight=None) -> list[SearchResult]` | 検索クエリを実行します。 |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` はバッチ内のすべてのクエリに同一に適用されます。 |
+| `search(query, *, limit=10, offset=0, highlight=None, rescore=None) -> list[SearchResult]` | 検索クエリを実行します。`rescore` には、MultiVector フィールドに対する late interaction で上位の結果を並べ替える [`LateInteractionRescore`](#lateinteractionrescore) を渡します（Issue #1351）。`query` が `SearchRequest` の場合はリクエスト自身の `rescore` を使い、このキーワードは無視されます。 |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` はバッチ内のすべてのクエリに同一に適用されます。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。 |
 | `stats() -> dict` | インデックス統計（`document_count`、`vector_fields`）を返します。 |
 
 ### `search` の query 引数
@@ -217,6 +217,7 @@ class Schema:
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, *, distance="cosine", embedder=None, base_weight=1.0)` | Flat（総当たり）ベクトルフィールド。 |
 | `add_ivf_field(name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0)` | IVF 近似最近傍ベクトルフィールド。 |
+| `add_multi_vector_field(name, dimension, *, distance="cosine", embedder=None)` | 文書ごとに可変個のトークンベクトル（ColBERT の埋め込みなど）を保持する MultiVector フィールド。[late interaction による再採点](#lateinteractionrescore)だけが読み取ります（Issue #1351）。ANN 索引は持たず、ベクトル検索の対象にはなりません。`distance` は `"cosine"`（デフォルト。書き込み時にベクトルを L2 正規化）か `"dot_product"` のどちらかで、`dimension` は 0 より大きい必要があります。どちらもこのメソッドの呼び出し時に検査し、不正なら `ValueError` を送出します。`embedder` にはトークン単位のエンベダー（`"candle_colbert"`。[エンベダータイプ](#エンベダータイプ)を参照）の名前を指定し、テキストの値と再採点のテキストクエリを埋め込みます。文書はこのフィールドに float のリストのリスト（[フィールド値の型マッピング](#フィールド値の型マッピング)を参照）か、`embedder` がある場合はテキストを与えます。トークンベクトルはベクトルストアにだけ保持されるため、`get_documents` や検索結果には含まれません。詳細は [MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。 |
 
 **ベクトル量子化とリランクストレージ**（HNSW フィールド）:
 
@@ -230,7 +231,7 @@ class Schema:
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ辞書です（下記参照）。 |
+| `add_embedder(name, config)` | 名前付きエンベダー定義を登録します。`config` は `"type"` キーを持つ辞書で（下記参照）、スキーマ TOML の `[embedders]` テーブルと同じ規則で読み取ります。`config` が辞書でない場合、`"type"` が無いか未知の場合、必須キーが無い場合は `ValueError`（`invalid embedder config: ...`）を送出します。 |
 | `add_analyzer(name, tokenizer, *, char_filters=None, token_filters=None)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`char_filters`/`token_filters` は省略可能な辞書のリストです。各辞書はスキーマ TOML/JSON 形式と同じ `{"type": "..."}` 形式です（下記参照）。組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `ValueError` になり、その名前を定義したスキーマ（`from_toml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
 | `analyzer_names()` | `add_analyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
 | `Schema.from_toml(toml_str)` *(静的メソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
@@ -262,6 +263,16 @@ class Schema:
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+| `"candle_colbert"` | `"model"` | `embeddings-candle` |
+
+`"candle_colbert"` はトークン単位のエンベダーです。トークンごとに 1 本のベクトルを生成し、MultiVector フィールド（`add_multi_vector_field`）でだけ使えます。省略可能なキーとして `"revision"`（モデルリポジトリのブランチ・タグ・コミット）、`"query_maxlen"`、`"doc_maxlen"` も受け付けます。各キーのデフォルトは [スキーマフォーマットリファレンス → エンベダー](../laurus-cli/schema_format.md#エンベダー) を参照してください。
+
+```python
+schema = laurus.Schema()
+schema.add_text_field("body")
+schema.add_embedder("colbert", {"type": "candle_colbert", "model": "colbert-ir/colbertv2.0"})
+schema.add_multi_vector_field("body_colbert", dimension=128, embedder="colbert")
+```
 
 ### アナライザコンポーネント
 
@@ -537,6 +548,7 @@ class SearchRequest:
         limit: int = 10,
         offset: int = 0,
         highlight=None,
+        rescore: LateInteractionRescore | None = None,
     ) -> None: ...
 ```
 
@@ -550,6 +562,64 @@ class SearchRequest:
 | `limit` | 最大結果件数（デフォルト 10）。 |
 | `offset` | ページネーションオフセット（デフォルト 0）。 |
 | `highlight` | `Index.search` の `highlight` パラメータと同じリストまたは辞書の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
+| `rescore` | このリクエストの上位の結果に適用する [`LateInteractionRescore`](#lateinteractionrescore)（Issue #1351）。どのクエリの形を指定した場合でも適用されます。`SearchRequest` を渡すと `Index.search` の `rescore` キーワードは無視され、こちらが使われます。 |
+
+---
+
+## LateInteractionRescore
+
+検索の上位の結果を late interaction（ColBERT の MaxSim）で再採点します（Issue #1351）。`Index.search` または `SearchRequest` の `rescore=` に渡します。
+
+```python
+class LateInteractionRescore:
+    def __init__(
+        self,
+        field: str,
+        query: str | list[list[float]],
+        *,
+        window_size: int | None = None,
+    ) -> None: ...
+
+    @property
+    def window_size(self) -> int: ...
+```
+
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | `str` | -- | MultiVector フィールド（`add_multi_vector_field` を参照）。 |
+| `query` | `str \| list[list[float]]` | -- | クエリのテキスト、またはクエリのトークンベクトル。テキストはフィールドのトークン単位のエンベダー（`"candle_colbert"`）が埋め込みます。トークンベクトルは、文書のトークンベクトルと同じモデルで計算したものを渡します。ベクトルの要素には整数も使えます。 |
+| `window_size` | `int \| None` | `None`（100） | 再採点する 1 段目の上位の結果の件数。`1..=10,000`。キーワード専用引数です。 |
+
+`window_size` プロパティは、再採点で使う window の件数を返します（省略時は `100`）。
+
+1 段目（lexical・vector・ハイブリッド）の上位 `window_size` 件を、フィールドに対する MaxSim の降順に並べ替えます。再採点した結果の `score` は MaxSim の値です。フィールドにトークンベクトルを持たない window 内の結果は 1 段目の順で続き、window の外の結果は 1 段目の順とスコアのまま最後に続きます。`offset` と `limit` は、この再採点済みの順位から切り出されます。並び順・類似度・コストの詳細は [ベクトル検索 → Late Interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore) を参照してください。
+
+**エラー**:
+
+- `query` が `str` でもリストのリストでもない場合、またはトークンベクトルに `bool` か `str` が含まれる場合は、構築時に `TypeError` を送出します。
+- それ以外の不正な値は、`Index.search` が検索を始める前に検査し、`ValueError`（`Invalid argument: rescore: ...`）を送出します。対象は、`field` が MultiVector フィールドでない場合、クエリがフィールドの次元で有限値のベクトルを 1〜1,024 本持たない場合、`window_size` が `1..=10,000` の範囲外の場合、テキストのクエリが空かフィールドにトークン単位のエンベダーがない場合です。
+
+```python
+import laurus
+
+schema = laurus.Schema()
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
+
+index = laurus.Index(schema=schema)
+index.put_document("a", {"title": "rust", "tokens": [[0.1, 0.0]]})
+index.put_document("b", {"title": "rust language", "tokens": [[0.9, 0.2]]})
+index.commit()
+
+rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size=50)
+results = index.search("title:rust", rescore=rescore)  # "b"（MaxSim 1.1）が "a"（0.1）より先
+
+# 同じ再採点を SearchRequest で指定する（search_batch でも使える）
+request = laurus.SearchRequest(query="title:rust", rescore=rescore, limit=5)
+results = index.search(request)
+```
+
+フィールドに `"candle_colbert"` のエンベダーがあれば、文書はフィールドにテキストを与えられ、クエリもテキストで渡せます: `laurus.LateInteractionRescore("body_colbert", "how do lifetimes work")`。
 
 ---
 
@@ -566,6 +636,8 @@ class SearchResult:
 ```
 
 `highlights` は `highlight` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドは辞書に現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
+
+`rescore` を指定した場合、再採点した結果の `score` は MaxSim の値になり、再採点の window の外の結果は 1 段目のスコアのままです。詳細は [LateInteractionRescore](#lateinteractionrescore) を参照してください。
 
 ---
 
@@ -657,6 +729,7 @@ Python の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `list[bytes]` | `BytesArray` | 多値バイトフィールド（Issue #1176）。各要素は単一の `bytes` 値と同じ直接バイト経路をたどるため、MIME は常に `None`。`Bytes` はそもそもインデックスされないため、クエリ一致の意味論はなく保存時の形を変えるだけ。フィールドに `multi_valued=True` が必要 |
 | `list[int]` | `Int64Array` | 多値整数フィールド（`bool` のリストは代わりに `BoolArray` になり、多値の Float / Integer フィールドではコアが 0/1 に拡張する）。ベクトルフィールドではリストを `f32` にキャスト。空リストは空の `Int64Array` |
 | `list[float \| int]` | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドではリストを `f32` にキャスト |
+| `list[list[float \| int]]` | `VectorArray` | MultiVector フィールドのトークンベクトル（Issue #1351）。内側のリストが 1 トークンに対応する（例: `{"tokens": [[0.1, 0.2], [0.3, 0.4]]}`）。整数は拡張し、`bool` や `str` の要素は `TypeError`。ベクトルの本数と次元はドキュメントの書き込み時にフィールドと照合する（長さの揃わないリストなどは `ValueError`）。`get_documents` や検索結果には含まれない |
 | `(lat, lon)` タプル | `Geo` | 2 つの `float` 値 |
 | `(x, y, z)` タプル | `Geo3d` | 3 つの `float` 値（ECEF 直交座標系、メートル単位） |
 | `list[(lat, lon)]` | `GeoArray` | `(lat, lon)` タプルのリスト。フィールドに `multi_valued=True` が必要 |

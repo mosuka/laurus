@@ -152,6 +152,7 @@ The `Schema` class defines the structure of your index. Use the following method
 | `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, quantizer, subvectorCount, rerankStorage, pqCodebookPath, baseWeight)` | HNSW vector index field |
 | `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat (brute-force) vector index field |
 | `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF vector index field |
+| `addMultiVectorField(name, dimension, distance, embedder)` | Per-document token vectors for the late-interaction rescore (`distance` is `cosine` or `dot_product`) |
 | `addEmbedder(name, config)` | Register a named embedder |
 | `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | Register a named custom analyzer |
 | `setDefaultFields(fieldNames)` | Set default search fields |
@@ -232,6 +233,16 @@ $results = $index->search($request);
 | `RRF(k)` | Reciprocal Rank Fusion (rank-based, default for hybrid) |
 | `WeightedSum(lexicalWeight, vectorWeight)` | Score-normalised weighted sum |
 
+## Late-Interaction Rescore
+
+`LateInteractionRescore(field, query, windowSize)` reorders the top `windowSize` (default 100) results of any search by ColBERT MaxSim against a multi-vector field. `query` is a list of token vectors, or text when the field has a `candle_colbert` embedder.
+
+```php
+use Laurus\LateInteractionRescore;
+
+$results = $index->search("title:rust", 10, 0, null, new LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+```
+
 ## Text Analysis
 
 ```php
@@ -307,7 +318,7 @@ Optional Cargo feature flags enable additional embedding backends:
 
 | Feature flag | Description |
 | :--- | :--- |
-| `embeddings-candle` | Local BERT embeddings via [Candle](https://github.com/huggingface/candle) |
+| `embeddings-candle` | Local BERT and ColBERT embeddings via [Candle](https://github.com/huggingface/candle) |
 | `embeddings-multimodal` | Multimodal (CLIP) embeddings for text and image search |
 | `embeddings-openai` | Cloud-based embeddings via the OpenAI API |
 | `embeddings-all` | Enable all embedding backends |

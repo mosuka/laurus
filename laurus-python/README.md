@@ -10,6 +10,7 @@ Python bindings for the [Laurus](https://github.com/mosuka/laurus) search engine
 - **Lexical Search** -- Full-text search powered by an inverted index with BM25 scoring
 - **Vector Search** -- Approximate nearest neighbor (ANN) search using Flat, HNSW, or IVF indexes
 - **Hybrid Search** -- Combine lexical and vector results with fusion algorithms (RRF, WeightedSum)
+- **Late-Interaction Rescore** -- Reorder the top results by ColBERT-style MaxSim over multi-vector (token vector) fields
 - **Rich Query DSL** -- Term, Phrase, Fuzzy, Wildcard, NumericRange, Geo, Boolean, Span queries
 - **Text Analysis** -- Tokenizers, filters, stemmers, and synonym expansion
 - **Flexible Storage** -- In-memory (ephemeral) or file-based (persistent) indexes
@@ -191,6 +192,21 @@ results = index.search(request)
 | :--- | :--- |
 | `RRF(k=60.0)` | Reciprocal Rank Fusion (rank-based, default for hybrid) |
 | `WeightedSum(lexical_weight=0.5, vector_weight=0.5)` | Score-normalised weighted sum |
+
+## Late-Interaction Rescore
+
+A multi-vector field holds each document's token vectors (e.g. ColBERT embeddings). `LateInteractionRescore` reorders the top `window_size` results (default 100) of any search by MaxSim against it:
+
+```python
+schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
+# ...
+index.put_document("doc1", {"title": "Rust", "tokens": [[0.9, 0.2], [0.0, 0.3]]})
+# ...
+rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]])
+results = index.search("title:rust", rescore=rescore)
+```
+
+With a `"candle_colbert"` embedder on the field, documents and the rescore query can be text instead.
 
 ## Text Analysis
 

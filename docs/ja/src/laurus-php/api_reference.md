@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
 | `commit(): void` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flushWal(): void` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。 |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` はバッチ内のすべてのクエリに同一に適用されます。 |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore` を使い、他の引数は無視されます。 |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` はバッチ内のすべてのクエリに同一に適用されます。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。 |
 | `stats(): array` | インデックス統計（`"documentCount"`、`"vectorFields"`）を返します。 |
 
 ### `search` の query 引数
@@ -188,6 +188,7 @@ new \Laurus\Schema()
 | `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW 近似最近傍ベクトルフィールド。`$baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0): void` | Flat（総当たり）ベクトルフィールド。 |
 | `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0): void` | IVF 近似最近傍ベクトルフィールド。 |
+| `addMultiVectorField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null): void` | 文書ごとに可変本数のトークンベクトルを保持する MultiVector フィールド。[late interaction による再採点](#lateinteractionrescore)が読み取ります（Issue #1351）。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。`$dimension` は各トークンベクトルの長さで、正の値でなければなりません。`$distance` は `"cosine"`（デフォルト）または `"dot_product"` です。どちらもフィールドの追加時にチェックされます（`\ValueError`）。`$embedder` にはトークン単位のエンベダー（`"candle_colbert"` のもの）の名前を指定し、フィールドのテキスト値と再採点のクエリテキストを埋め込みます。このフィールドはベクトル検索の対象にならず、トークンベクトルは保存されません。`getDocuments` や検索結果には含まれません。 |
 
 **ベクトル量子化とリランクストレージ**（HNSW フィールド）:
 
@@ -201,7 +202,7 @@ new \Laurus\Schema()
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addEmbedder(string $name, array $config): void` | 名前付きエンベダー定義を登録します。`$config` は `"type"` キーを持つ連想配列です（下記参照）。 |
+| `addEmbedder(string $name, array $config): void` | 名前付きエンベダー定義を登録します。`$config` は `"type"` キーを持つ連想配列で（下記参照）、スキーマ TOML 形式と同じ規則でデコードされます。型が無い・未知の型である・必須キーが無い場合は `\Exception`（`invalid embedder config: ...`）を投げます。 |
 | `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$charFilters`/`$tokenFilters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。組み込みアナライザー用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `\ValueError` になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
 | `analyzerNames(): array` | `addAnalyzer` で登録済み、または TOML から読み込んだカスタムアナライザー名の一覧を返します。 |
 | `Schema::fromToml(string $tomlStr): Schema` | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。TOML がスキーマとして正しくない場合は `ValueError` を投げます。 |
@@ -227,12 +228,20 @@ new \Laurus\Schema()
 
 各型の説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → エンベダー](../laurus-cli/schema_format.md#エンベダー) を参照してください。
 
-| `"type"` | 必須キー | Feature Flag |
-| :--- | :--- | :--- |
-| `"precomputed"` | -- | （常に利用可能） |
-| `"candle_bert"` | `"model"` | `embeddings-candle` |
-| `"candle_clip"` | `"model"` | `embeddings-multimodal` |
-| `"openai"` | `"model"` | `embeddings-openai` |
+| `"type"` | 必須キー | 任意キー | Feature Flag |
+| :--- | :--- | :--- | :--- |
+| `"precomputed"` | -- | -- | （常に利用可能） |
+| `"candle_bert"` | `"model"` | -- | `embeddings-candle` |
+| `"candle_clip"` | `"model"` | -- | `embeddings-multimodal` |
+| `"openai"` | `"model"` | -- | `embeddings-openai` |
+| `"candle_colbert"` | `"model"` | `"revision"`、`"query_maxlen"`、`"doc_maxlen"` | `embeddings-candle` |
+
+`"candle_colbert"` はトークンごとに 1 本のベクトルを出力するため、MultiVector フィールド（`addMultiVectorField`）専用です。
+
+```php
+$schema->addEmbedder("colbert", ["type" => "candle_colbert", "model" => "colbert-ir/colbertv2.0"]);
+$schema->addMultiVectorField("body_colbert", 128, null, "colbert");
+```
 
 ### アナライザーコンポーネント
 
@@ -299,6 +308,8 @@ $schema->addTextField("title", analyzer: "ja_ipadic");
 | `"dot_product"` | 内積 |
 | `"manhattan"` | マンハッタン距離 |
 | `"angular"` | 角度距離 |
+
+`addMultiVectorField` が受け付けるのは `"cosine"` と `"dot_product"` だけです。
 
 ---
 
@@ -483,6 +494,7 @@ new \Laurus\SearchRequest(
     int $limit = 10,
     int $offset = 0,
     ?array $highlight = null,
+    ?LateInteractionRescore $rescore = null,
 )
 ```
 
@@ -496,6 +508,66 @@ new \Laurus\SearchRequest(
 | `$limit` | 最大結果件数（デフォルト 10）。 |
 | `$offset` | ページネーションオフセット（デフォルト 0）。 |
 | `$highlight` | `Index->search()` の `$highlight` と同じリストまたは連想配列の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。`$limit`/`$offset` 以外は PHP レベルのデフォルトを持たないため、`$highlight` を名前付き引数で渡す場合もそれ以前の引数はすべて位置または名前で渡す必要があります。 |
+| `$rescore` | 上位の結果を並べ替える `LateInteractionRescore`（Issue #1351）。それ以外のオブジェクトは `\TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
+
+`SearchRequest` を `Index->search()` に渡すと、リクエスト自身の `$limit`・`$offset`・`$highlight`・`$rescore` が使われ、`search` の他の引数は無視されます。
+
+---
+
+## LateInteractionRescore
+
+上位の検索結果を late interaction（ColBERT の MaxSim）で再採点します（Issue #1351）。`Index->search()` の 5 番目の引数、または `SearchRequest` の `$rescore` に渡します。仕組みは [Vector 検索 → Late Interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore) を参照してください。
+
+```php
+new \Laurus\LateInteractionRescore(string $field, string|array $query, ?int $windowSize = null)
+```
+
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `$field` | `string` | -- | MultiVector フィールド（`addMultiVectorField`）。 |
+| `$query` | `string\|array` | -- | フィールドのトークン単位のエンベダー（`"candle_colbert"` のもの）が埋め込むクエリテキスト、またはクエリのトークンベクトルを数値リストのリストで渡したもの（例: `[[1.0, 0.0], [0.0, 1.0]]`。整数は拡張されます）。 |
+| `$windowSize` | `int\|null` | `null`（100） | 再採点する 1 段目の上位結果の件数。最大 10,000。 |
+
+### メソッド
+
+| メソッド | 説明 |
+| :--- | :--- |
+| `getWindowSize(): int` | 再採点する上位結果の件数を返します（`$windowSize` を指定しなければ `100`）。 |
+| `__toString(): string` | `LateInteractionRescore(field="tokens", window_size=100)` のような文字列表現を返します。 |
+
+### 並び順とスコア
+
+1 段目（lexical・vector・ハイブリッド）の上位 `$windowSize` 件を、フィールドに対する MaxSim で並べ替えます。再採点した結果の `getScore()` は MaxSim の値です。window の外の結果は 1 段目の順位とスコアのまま、再採点した結果の後に続きます（フィールドにトークンベクトルを持たない window 内の結果は、両者の間に 1 段目の順で並びます）。2 種類のスコアは比較できません。
+
+### エラー
+
+- コンストラクタは、`$query` が文字列でも数値リストのリストでもない場合に `\TypeError`（`query must be a string or a list of numeric lists`）を、トークンベクトルが `bool` や `string` など数値以外を含む場合に `\Exception`（`token vector N must hold only numbers`）を投げます。
+- `Index->search()` と `SearchRequest` は、`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError`（`rescore must be a Laurus\LateInteractionRescore`）を投げます。
+- それ以外の値は検索時、検索を始める前にエンジンがチェックし、`rescore: ...` を含むメッセージの `\ValueError` を投げます。フィールドが存在しないか MultiVector フィールドでない場合、クエリがフィールドの次元を持つ有限値のベクトルを 1〜1,024 本含まない場合、テキストのクエリが空かフィールドにトークン単位のエンベダーがない場合、`$windowSize` が `1..=10,000` の範囲外の場合です。
+
+### 例
+
+```php
+$schema = new Laurus\Schema();
+$schema->addTextField("title");
+$schema->addMultiVectorField("tokens", 2, "dot_product");
+
+$index = new Laurus\Index(null, $schema);
+$index->putDocument("a", ["title" => "rust", "tokens" => [[0.1, 0.0]]]);
+$index->putDocument("b", ["title" => "rust language", "tokens" => [[0.9, 0.2]]]);
+$index->commit();
+
+$rescore = new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], 50);
+$results = $index->search("title:rust", 10, 0, null, $rescore);
+$results[0]->getId();    // "b"
+$results[0]->getScore(); // ≈ 1.1 = 0.9 + 0.2（MaxSim）
+
+// SearchRequest で同じ再採点を行う（9 番目の引数）
+$results = $index->search(new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $rescore));
+
+// テキストのクエリには、フィールドにトークン単位のエンベダーが必要（「エンベダータイプ」を参照）
+$rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes work");
+```
 
 ---
 
@@ -610,6 +682,7 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（`"x"`, `"y"`, `"z"`） | `GeoEcef` | 3 つの `float` 値（メートル単位、3D ECEF 直交座標） |
 | `array`（`["lat" => .., "lon" => ..]` 配列の配列） | `GeoArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
+| `array`（数値リストのリスト、シーケンシャル。例: `[[0.1, 0.2], [0.3, 0.4]]`） | `VectorArray` | MultiVector フィールドのトークンベクトル（Issue #1351）。内側の配列はキー付きの地理座標ではなくリストなので、両者が衝突することはない。整数は拡張される。`bool` や `string` の要素はエラー（"token vector N must hold only numbers"）。ベクトルの本数と次元はフィールドに対してチェックされる（`\ValueError`）。保存されないため、`getDocuments` や検索結果には含まれない |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
 | `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 全要素が ISO 8601 としてパースできる場合のみ選ばれる。フィールドに `$multiValued = true` が必要 |
 | `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multiValued = true` が必要。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列が要素ごとにデコードされる（Issue #1176） |

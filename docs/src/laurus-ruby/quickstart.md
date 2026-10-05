@@ -83,7 +83,29 @@ request = Laurus::SearchRequest.new(
 results = index.search(request)
 ```
 
-## 6. Update and delete
+## 6. Late-interaction rescore
+
+A multi-vector field keeps a variable number of token vectors per document, for example ColBERT per-token embeddings. A `LateInteractionRescore` reorders the top results of any search by their MaxSim against that field, and a rescored result's score is its MaxSim.
+
+```ruby
+require "laurus"
+
+schema = Laurus::Schema.new
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", 2, distance: "dot_product")
+
+index = Laurus::Index.new(schema: schema)
+index.put_document("doc1", { "title" => "rust", "tokens" => [[0.1, 0.0]] })
+index.put_document("doc2", { "title" => "rust language", "tokens" => [[0.9, 0.2], [0.1, 0.8]] })
+index.commit
+
+results = index.search("title:rust", rescore: Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]]))
+# doc2 (MaxSim 1.7) now ranks above doc1 (MaxSim 0.1)
+```
+
+With a `candle_colbert` embedder on the field (`schema.add_embedder("colbert", { type: "candle_colbert", model: "colbert-ir/colbertv2.0" })` and `add_multi_vector_field("tokens", 128, embedder: "colbert")`), documents can give the field text and the query can be text, as in `Laurus::LateInteractionRescore.new("tokens", "how do lifetimes work")`. See [LateInteractionRescore](api_reference.md#lateinteractionrescore).
+
+## 7. Update and delete
 
 ```ruby
 # Update: put_document replaces all existing versions
@@ -102,7 +124,7 @@ index.delete_documents("doc1")
 index.commit
 ```
 
-## 7. Schema management
+## 8. Schema management
 
 ```ruby
 schema = Laurus::Schema.new
@@ -117,9 +139,10 @@ schema.add_datetime_field("created_at")
 schema.add_hnsw_field("embedding", 384)
 schema.add_flat_field("small_vec", 64)
 schema.add_ivf_field("ivf_vec", 128, n_clusters: 100)
+schema.add_multi_vector_field("tokens", 128)
 ```
 
-## 8. Index statistics
+## 9. Index statistics
 
 ```ruby
 stats = index.stats

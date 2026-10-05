@@ -120,7 +120,7 @@ durable persistence.
 
 - **Returns:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?)`
+#### `search(query, limit?, offset?, highlight?, rescore?)`
 
 Search using a DSL string query.
 
@@ -128,7 +128,8 @@ Search using a DSL string query.
   - `query` (string) -- Query DSL (e.g. `"title:hello"`).
   - `limit` (number, default 10)
   - `offset` (number, default 0)
-  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below.
+  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below. Pass `undefined` to skip it when you only need `rescore`.
+  - `rescore` (`RescoreOptions`, optional) -- Reorder the top results by late interaction against a multi-vector field (Issue #1351). See [Late-interaction rescore](#late-interaction-rescore) below.
 - **Returns:** `Promise<SearchResult[]>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
@@ -179,7 +180,7 @@ const results = await index.search("body:rust", 10, 0, {
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language"] }
 ```
 
-#### `searchVector(field, vector, limit?, offset?)`
+#### `searchVector(field, vector, limit?, offset?, rescore?)`
 
 Search by vector similarity.
 
@@ -187,9 +188,10 @@ Search by vector similarity.
   - `field` (string) -- Vector field name.
   - `vector` (number[]) -- Query embedding.
   - `limit`, `offset` (number, optional)
+  - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
 - **Returns:** `Promise<SearchResult[]>`
 
-#### `searchVectorText(field, text, limit?, offset?)`
+#### `searchVectorText(field, text, limit?, offset?, rescore?)`
 
 Search by text (embedded by the registered embedder).
 
@@ -197,7 +199,47 @@ Search by text (embedded by the registered embedder).
   - `field` (string) -- Vector field name.
   - `text` (string) -- Text to embed.
   - `limit`, `offset` (number, optional)
+  - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
 - **Returns:** `Promise<SearchResult[]>`
+
+#### Late-interaction rescore
+
+`search`, `searchVector` and `searchVectorText` accept an optional trailing `rescore` argument (Issue #1351). It reorders the top first-stage results — lexical, vector or hybrid — by ColBERT-style late interaction (MaxSim) against the token vectors of a [multi-vector field](#addmultivectorfieldname-dimension-distance-embedder). The other search methods have no `rescore` argument. The argument is a plain object shaped like:
+
+```typescript
+interface RescoreOptions {
+  field: string;
+  vectors?: number[][];
+  text?: string;
+  windowSize?: number;
+}
+```
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | string | -- | The multi-vector field to score against. |
+| `vectors` | `number[][]` | -- | The query's token vectors, computed with the model that produced the documents' token vectors. |
+| `text` | string | -- | The query text, embedded with role `"query"` by the field's `"token_callback"` embedder. |
+| `windowSize` | number | `100` | How many top first-stage results to rescore, `1`–`10,000`. |
+
+Set exactly one of `vectors` and `text`; otherwise the call throws `Invalid rescore options: set exactly one of vectors or text`. A value of the wrong type (for example a non-numeric element in `vectors`) also throws `Invalid rescore options: ...`, while unknown keys are ignored. The engine checks the other values when the search runs and throws an error containing `rescore: ...` for a bad one — for example `text` on a field without a token-level embedder, a field that is not a multi-vector field, a `windowSize` out of range, or query vectors of the wrong dimension.
+
+The top `windowSize` results are sorted by MaxSim, and a rescored result's `score` is its MaxSim. Results beyond the window (and results in it that have no token vectors in the field) keep their first-stage order and score, after the rescored ones. See [Vector Search → Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore) for the scoring, ordering and pagination details.
+
+```js
+// Rescore the top lexical hits with precomputed query token vectors.
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]],
+});
+
+// Or let the field's token_callback embedder embed the query text.
+const reranked = await index.searchVectorText("embedding", "how do lifetimes work", 10, 0, {
+  field: "body_colbert",
+  text: "how do lifetimes work",
+  windowSize: 50,
+});
+```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
 
@@ -513,6 +555,24 @@ Add an IVF vector index field.
 - `rerankStorage` — set to `"f32"` to write a full-precision `*.hnsw.f32` sidecar enabling exact Stage-2 rerank; omit to keep the int8-only segment.
 - `pqCodebookPath` — storage-relative file name of a shared PQ codebook (Issue #631), trained once via the `laurus train pq-codebook` CLI command. Only meaningful with `quantizer: "product_quantization"`; commits then encode against the pre-trained codebook instead of re-training k-means per segment. Omit to keep per-segment training.
 
+#### `addMultiVectorField(name, dimension, distance?, embedder?)`
+
+Add a multi-vector field (Issue #1351): a variable number of token vectors per document, such as the per-token embeddings of a ColBERT-style model. It has no ANN index and is never a search target; only the [late-interaction rescore](#late-interaction-rescore) reads it. See [Schema & Fields → Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields).
+
+- `dimension`: length of every token vector; must be greater than 0
+- `distance`: `"cosine"` (default; vectors are L2-normalized when written) or `"dot_product"`
+- `embedder`: optional name of a `"token_callback"` embedder registered via [`addEmbedder`](#addembeddername-config), which embeds text values and rescore query text
+
+The options are validated when the field is added: a `dimension` of 0 or any other `distance` throws.
+
+A value is a nested number array with one array per token (`tokens: [[0.1, 0.2], [0.3, 0.4]]`), holding 1 to 8,192 vectors of the field's dimension. With a `"token_callback"` embedder on the field, a string value works too: the callback embeds it with role `"document"` when the document is indexed. The token vectors are not stored, so `getDocuments` and search results never include the field.
+
+```javascript
+schema.addMultiVectorField("tokens", 2, "dot_product");
+// ...
+await index.putDocument("doc1", { title: "Rust", tokens: [[0.9, 0.2], [0.1, 0.8]] });
+```
+
 Every `add*Field` method above throws when `name` starts with `_` (other than `_id`), and adds nothing. A schema loaded with `fromToml` keeps accepting such a field, so a persisted schema still loads; creating a new `Index` from it throws. See [Field Naming](../laurus-cli/schema_format.md#field-naming).
 
 #### `addAnalyzer(name, analyzer)`
@@ -546,7 +606,7 @@ schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipad
 
 #### `addEmbedder(name, config)`
 
-Register a named embedder. WASM supports two `type` values:
+Register a named embedder. WASM supports three `type` values:
 
 - `"precomputed"` — No embedding is performed; vectors are passed directly via
   `putDocument()` / `searchVector()`.
@@ -554,6 +614,28 @@ Register a named embedder. WASM supports two `type` values:
   that the engine will invoke during ingestion and `searchVectorText()`. This
   enables in-engine auto-embedding using Transformers.js or any other in-browser
   embedding library.
+- `"token_callback"` — Provide a JavaScript callback
+  `embed: (text, role) => number[][] | Promise<number[][]>` and a `dimension`
+  (positive integer) for a
+  [multi-vector field](#addmultivectorfieldname-dimension-distance-embedder)
+  (Issue #1351). `role` is `"query"` or `"document"`, because late-interaction
+  models encode the two differently. The callback returns one
+  `dimension`-long vector per token, either directly or as a Promise. The
+  engine calls it with role `"document"` for a text value of the field and with
+  role `"query"` for a rescore's `text`. `dimension` is checked against the
+  multi-vector field when the index is created or opened: on a mismatch
+  `Index.create` / `Index.open` throws
+  (`... produces N-dimensional token vectors`). A non-numeric element in the
+  returned arrays is an error, not a silent 0.
+
+Both callback types are recorded as `"precomputed"` in the schema TOML
+(`toToml()` and the schema persisted by `Index.open`), because a function cannot
+be serialized. Register the callbacks again in the schema passed to
+`Index.open` whenever a session needs them.
+
+`"token_callback"` takes the place of the native `candle_colbert` embedder,
+which WASM does not have (see
+[Embedding Strategies](../laurus-wasm.md#embedding-strategies)).
 
 ```javascript
 // Precomputed embedder
@@ -567,6 +649,14 @@ schema.addEmbedder("callback-embedder", {
     return Array.from(output.data);
   },
 });
+
+// Token callback embedder for a multi-vector field (e.g. a browser ColBERT model)
+schema.addEmbedder("colbert", {
+  type: "token_callback",
+  embed: async (text, role) => myColbert.encode(text, role), // number[][]
+  dimension: 128,
+});
+schema.addMultiVectorField("body_colbert", 128, "cosine", "colbert");
 ```
 
 #### `addAnalyzerDefinition(name, definition)`
