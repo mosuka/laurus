@@ -314,6 +314,8 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
             let items: Vec<_> = arr.iter().map(|(b, _mime)| PyBytes::new(py, b)).collect();
             Ok(PyList::new(py, items)?.unbind().into_any())
         }
+        // A list of float lists, one per token vector (#1177).
+        DataValue::VectorArray(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
     }
 }
 

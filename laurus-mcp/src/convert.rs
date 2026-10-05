@@ -4,6 +4,7 @@
 //! types and `serde_json::Value` for the MCP tool input/output.
 
 use base64::Engine as _;
+use laurus_server::convert::document::vector_array_from_proto;
 use laurus_server::proto::laurus::v1;
 use serde_json::{Value, json};
 
@@ -105,6 +106,9 @@ fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|b| Value::String(base64::engine::general_purpose::STANDARD.encode(b)))
                 .collect(),
         ),
+        // Nested arrays, the same shape JSON input uses for a MultiVector
+        // field (#1177).
+        Some(Kind::VectorArrayValue(arr)) => json!(vector_array_from_proto(arr)),
     }
 }
 
@@ -722,5 +726,24 @@ mod tests {
         let doc = v1::Document { fields };
         let json = document_to_json(&doc);
         assert_eq!(json["fields"]["thumbs"], json!(["aGk=", "Ynll"]));
+    }
+
+    #[test]
+    fn proto_vector_array_to_json_is_nested_arrays() {
+        // #1177: a packed `VectorArrayValue` is surfaced as nested arrays,
+        // the shape JSON input uses for a MultiVector field.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "tokens".to_string(),
+            v1::Value {
+                kind: Some(v1::value::Kind::VectorArrayValue(v1::VectorArrayValue {
+                    dimension: 2,
+                    values: vec![1.0, 0.5, -1.0, 2.0],
+                })),
+            },
+        );
+        let doc = v1::Document { fields };
+        let json = document_to_json(&doc);
+        assert_eq!(json["fields"]["tokens"], json!([[1.0, 0.5], [-1.0, 2.0]]));
     }
 }

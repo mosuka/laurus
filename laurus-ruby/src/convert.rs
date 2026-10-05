@@ -414,5 +414,17 @@ pub fn data_value_to_rb(ruby: &Ruby, value: &DataValue) -> Result<Value, Error> 
             }
             Ok(out.as_value())
         }
+        // An Array of Float Arrays, one per token vector (#1177).
+        DataValue::VectorArray(arr) => {
+            let out = ruby.ary_new_capa(arr.len());
+            for v in arr {
+                let inner = ruby.ary_new_capa(v.len());
+                for &f in v {
+                    inner.push(ruby.float_from_f64(f as f64))?;
+                }
+                out.push(inner)?;
+            }
+            Ok(out.as_value())
+        }
     }
 }

@@ -79,6 +79,11 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|b| Value::String(base64_encode(&base64_engine(), b)))
                 .collect(),
         ),
+        // Nested arrays, the same shape JSON input uses for a MultiVector
+        // field (#1177).
+        Some(Kind::VectorArrayValue(arr)) => {
+            json!(crate::convert::document::vector_array_from_proto(arr))
+        }
         None => Value::Null,
     }
 }
@@ -1674,6 +1679,22 @@ mod tests {
             })),
         };
         assert_eq!(proto_value_to_json(&proto), json!(["aGk=", "dGhlcmU=", ""]));
+    }
+
+    /// #1177: a packed `VectorArrayValue` renders as nested arrays, the
+    /// shape JSON input uses for a MultiVector field.
+    #[test]
+    fn test_proto_vector_array_value_renders_as_nested_arrays() {
+        let proto = v1::Value {
+            kind: Some(v1::value::Kind::VectorArrayValue(v1::VectorArrayValue {
+                dimension: 2,
+                values: vec![0.5, 1.0, -2.0, 0.25],
+            })),
+        };
+        assert_eq!(
+            proto_value_to_json(&proto),
+            json!([[0.5, 1.0], [-2.0, 0.25]])
+        );
     }
 
     /// #1174: `multi_valued` is read from and written to the JSON schema

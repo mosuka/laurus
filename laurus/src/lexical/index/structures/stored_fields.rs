@@ -131,6 +131,10 @@ const TAG_TEXT_ARRAY: u8 = 17;
 // empty mime string means `None`, exactly like the scalar case. Same
 // no-version-bump policy as tags 10–17 (recorded on Issue #1040).
 const TAG_BYTES_ARRAY: u8 = 18;
+// Multi-vector token vectors (#1177): varint element count + per element the
+// same varint-length-prefixed f32 LE body the scalar tag 9 uses. Same
+// no-version-bump policy as tags 10–18 (recorded on Issue #1040).
+const TAG_VECTOR_ARRAY: u8 = 19;
 
 // ---------------------------------------------------------------------------
 // Encoding (document -> plain bytes, before compression)
@@ -266,6 +270,16 @@ fn encode_document(buf: &mut Vec<u8>, doc_id: u64, fields: &AHashMap<String, Dat
                     buf.extend_from_slice(mime_str.as_bytes());
                     write_varint(buf, data.len() as u64);
                     buf.extend_from_slice(data);
+                }
+            }
+            DataValue::VectorArray(arr) => {
+                buf.push(TAG_VECTOR_ARRAY);
+                write_varint(buf, arr.len() as u64);
+                for v in arr {
+                    write_varint(buf, v.len() as u64);
+                    for &f in v {
+                        buf.extend_from_slice(&f.to_le_bytes());
+                    }
                 }
             }
         }
@@ -530,6 +544,36 @@ fn decode_document(bytes: &[u8], cursor: &mut usize) -> Result<(u64, Document)> 
                     arr.push((data, if mime.is_empty() { None } else { Some(mime) }));
                 }
                 DataValue::BytesArray(arr)
+            }
+            TAG_VECTOR_ARRAY => {
+                let len = read_varint(bytes, cursor, "stored VectorArray field length")?;
+                // Each element is at least its 1-byte varint length prefix.
+                let len = checked_capacity_u64(
+                    len,
+                    1,
+                    (bytes.len() - *cursor) as u64,
+                    "stored VectorArray field length",
+                )?;
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let dim = read_varint(bytes, cursor, "stored VectorArray element length")?;
+                    let dim = checked_capacity_u64(
+                        dim,
+                        4,
+                        (bytes.len() - *cursor) as u64,
+                        "stored VectorArray element length",
+                    )?;
+                    let mut v = Vec::with_capacity(dim);
+                    for _ in 0..dim {
+                        v.push(read_f32_le(
+                            bytes,
+                            cursor,
+                            "stored VectorArray element value",
+                        )?);
+                    }
+                    arr.push(v);
+                }
+                DataValue::VectorArray(arr)
             }
             other => {
                 return Err(LaurusError::index(format!(
@@ -970,6 +1014,13 @@ mod tests {
                     ]),
                 ),
                 ("y_bytes_array_empty", DataValue::BytesArray(Vec::new())),
+                // Multi-vector token vectors (#1177): two elements, an empty
+                // element, and the empty list.
+                (
+                    "z_vector_array",
+                    DataValue::VectorArray(vec![vec![0.5, -1.0], Vec::new(), vec![2.25, 0.0]]),
+                ),
+                ("z_vector_array_empty", DataValue::VectorArray(Vec::new())),
             ]),
         )];
 
@@ -1082,6 +1133,40 @@ mod tests {
         assert_eq!(
             d.fields.get("y_bytes_array_empty"),
             Some(&DataValue::BytesArray(Vec::new()))
+        );
+        assert_eq!(
+            d.fields.get("z_vector_array"),
+            Some(&DataValue::VectorArray(vec![
+                vec![0.5, -1.0],
+                Vec::new(),
+                vec![2.25, 0.0],
+            ]))
+        );
+        assert_eq!(
+            d.fields.get("z_vector_array_empty"),
+            Some(&DataValue::VectorArray(Vec::new()))
+        );
+    }
+
+    /// #1177: an element length that overshoots the bytes left is rejected
+    /// up front instead of over-allocating.
+    #[test]
+    fn rejects_a_truncated_vector_array() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // doc id
+        write_varint(&mut buf, 1); // field count
+        write_varint(&mut buf, 1); // name length
+        buf.extend_from_slice(b"t");
+        buf.push(TAG_VECTOR_ARRAY);
+        write_varint(&mut buf, 1); // one element ...
+        write_varint(&mut buf, 64); // ... declaring 64 floats ...
+        buf.extend_from_slice(&1.0f32.to_le_bytes()); // ... but holding one.
+
+        let err = decode_document(&buf, &mut 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("stored VectorArray element length"),
+            "unexpected error: {err}"
         );
     }
 

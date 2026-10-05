@@ -937,7 +937,7 @@ impl FieldOption {
             FieldValue::Int64(_) => FieldOption::Integer(IntegerOption::default()),
             FieldValue::Float64(_) => FieldOption::Float(FloatOption::default()),
             FieldValue::Bool(_) => FieldOption::Boolean(BooleanOption::default()),
-            FieldValue::Vector(_) | FieldValue::Bytes(_, _) => {
+            FieldValue::Vector(_) | FieldValue::VectorArray(_) | FieldValue::Bytes(_, _) => {
                 FieldOption::Bytes(BytesOption::default())
             }
             FieldValue::DateTime(_) => FieldOption::DateTime(DateTimeOption::default()),

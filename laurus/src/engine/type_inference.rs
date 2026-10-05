@@ -95,6 +95,8 @@ pub enum InferredValue {
 /// supported by the dynamic schema:
 ///
 /// - [`DataValue::Vector`]: vector fields must be declared explicitly.
+/// - [`DataValue::VectorArray`]: multi-vector fields must be declared
+///   explicitly.
 /// - [`DataValue::Bytes`]: bytes fields must be declared explicitly.
 pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOption>> {
     match value {
@@ -155,6 +157,10 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
         // `BytesOption::multi_valued = true` can hold it (Issue #1176).
         DataValue::BytesArray(_) => Err(LaurusError::invalid_argument(
             "bytes array values require an explicit multi-valued bytes field declaration \
+             in the schema",
+        )),
+        DataValue::VectorArray(_) => Err(LaurusError::invalid_argument(
+            "vector array values require an explicit MultiVector field declaration \
              in the schema",
         )),
     }

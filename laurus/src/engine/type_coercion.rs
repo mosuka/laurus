@@ -615,6 +615,7 @@ fn describe(value: &DataValue) -> &'static str {
         DataValue::BoolArray(_) => "bool array",
         DataValue::TextArray(_) => "text array",
         DataValue::BytesArray(_) => "bytes array",
+        DataValue::VectorArray(_) => "vector array",
     }
 }
 
