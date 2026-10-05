@@ -97,7 +97,7 @@ pub use engine::schema::analyzer::{
     AnalyzerDefinition, AnalyzerSpec, BuiltinAnalyzerSpec, CharFilterConfig, TokenFilterConfig,
     TokenizerConfig,
 };
-pub use engine::schema::embedder::EmbedderDefinition;
+pub use engine::schema::embedder::{EmbedderDefinition, EmbedderOutput};
 pub use engine::schema::{
     DynamicFieldPolicy, FieldChangeKind, FieldOption, Schema, classify_change, validate_field_name,
 };

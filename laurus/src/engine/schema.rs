@@ -349,6 +349,7 @@ impl FieldOption {
             Self::Hnsw(o) => o.embedder.as_deref(),
             Self::Flat(o) => o.embedder.as_deref(),
             Self::Ivf(o) => o.embedder.as_deref(),
+            Self::MultiVector(o) => o.embedder.as_deref(),
             _ => None,
         }
     }
@@ -1847,6 +1848,18 @@ mod tests {
                 "multi_vector: dimension change is destructive",
                 multi_vector(|o| o),
                 multi_vector(|o| o.dimension(96)),
+                Destructive,
+            ),
+            (
+                "multi_vector: adding an embedder is destructive",
+                multi_vector(|o| o),
+                multi_vector(|o| o.embedder("colbert")),
+                Destructive,
+            ),
+            (
+                "multi_vector: changing the embedder is destructive",
+                multi_vector(|o| o.embedder("colbert")),
+                multi_vector(|o| o.embedder("colbert-small")),
                 Destructive,
             ),
             (
