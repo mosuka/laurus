@@ -9,6 +9,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::data::{DataValue, Document};
+use crate::embedding::embedder::{EmbedInput, EmbedInputType, EmbedRole, Embedder, TokenEmbedder};
+use crate::embedding::per_field::PerFieldEmbedder;
+use crate::embedding::precomputed::PrecomputedEmbedder;
 use crate::engine::schema::{FieldOption, Schema};
 use crate::engine::search::SearchRequestBuilder;
 use crate::engine::{Engine, UpdateFieldOptions};
@@ -347,5 +350,172 @@ async fn test_add_update_and_delete_a_multi_vector_field() -> Result<()> {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("MultiVector"), "{err}");
+    Ok(())
+}
+
+/// Token embedder turning each character into the vector
+/// `[code point, role]`, where `role` is 1 for documents and 2 for queries.
+#[derive(Debug)]
+struct CharTokenEmbedder;
+
+#[async_trait::async_trait]
+impl TokenEmbedder for CharTokenEmbedder {
+    async fn embed_tokens(
+        &self,
+        inputs: &[EmbedInput<'_>],
+        role: EmbedRole,
+    ) -> Result<Vec<Vec<Vector>>> {
+        let marker = match role {
+            EmbedRole::Document => 1.0,
+            EmbedRole::Query => 2.0,
+        };
+        Ok(inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_text()
+                    .unwrap_or_default()
+                    .chars()
+                    .map(|c| Vector::new(vec![c as u32 as f32, marker]))
+                    .collect()
+            })
+            .collect())
+    }
+
+    fn token_dimension(&self) -> usize {
+        2
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for CharTokenEmbedder {
+    async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
+        Err(LaurusError::invalid_argument("token embedder"))
+    }
+
+    fn supported_input_types(&self) -> Vec<EmbedInputType> {
+        vec![EmbedInputType::Text]
+    }
+
+    fn name(&self) -> &str {
+        "char-tokens"
+    }
+
+    fn as_token_embedder(&self) -> Option<&dyn TokenEmbedder> {
+        Some(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// An engine whose `tokens` field embeds text with [`CharTokenEmbedder`].
+async fn text_engine(storage: Arc<dyn Storage>, schema: Schema) -> Result<Engine> {
+    let per_field = PerFieldEmbedder::new(Arc::new(PrecomputedEmbedder::new()));
+    per_field.add_embedder(TOKENS, Arc::new(CharTokenEmbedder));
+    Engine::builder(storage, schema)
+        .embedder(Arc::new(per_field))
+        .build()
+        .await
+}
+
+fn text_doc(title: &str, tokens: &str) -> Document {
+    Document::builder()
+        .add_text("title", title)
+        .add_text(TOKENS, tokens)
+        .build()
+}
+
+/// Issue #1349: text in a multi-vector field is embedded into one vector
+/// per token, as a document, and stays out of the stored document.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_text_is_embedded_into_token_vectors() -> Result<()> {
+    let engine = text_engine(storage(), schema()).await?;
+    engine.put_document("a", text_doc("first", "ab")).await?;
+    engine.commit().await?;
+
+    assert_eq!(
+        stored_tokens(&engine, "a"),
+        Some(vec![97.0, 1.0, 98.0, 1.0])
+    );
+    let docs = engine.get_documents("a").await?;
+    assert!(!docs[0].fields.contains_key(TOKENS));
+    Ok(())
+}
+
+/// Issue #1349: without a token-level embedder, text is rejected before
+/// the WAL append, so the previous version of the document stays intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_text_without_a_token_embedder_is_rejected() -> Result<()> {
+    let engine = Engine::new(storage(), schema()).await?;
+    engine
+        .put_document("a", doc("first", [1.0, 0.0], &[[3.0, 4.0]]))
+        .await?;
+    engine.commit().await?;
+
+    let err = engine
+        .put_document("a", text_doc("second", "ab"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
+    assert!(err.to_string().contains("token-level embedder"), "{err}");
+    engine.commit().await?;
+    assert_eq!(stored_tokens(&engine, "a"), Some(vec![3.0, 4.0]));
+    assert_eq!(engine.get_documents("a").await?.len(), 1);
+
+    // Unlike a coercion failure, this also rejects the document when the
+    // schema ignores what it cannot use.
+    let ignoring = Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .add_field(TOKENS, tokens_option())
+        .dynamic_field_policy(crate::engine::schema::DynamicFieldPolicy::Ignore)
+        .build();
+    let engine = Engine::new(storage(), ignoring).await?;
+    let err = engine
+        .put_document("b", text_doc("third", "ab"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
+    Ok(())
+}
+
+/// Issue #1349: the WAL keeps the text, and recovery embeds it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wal_text_is_embedded_again_on_recovery() -> Result<()> {
+    let storage = storage();
+    {
+        let engine = text_engine(storage.clone(), schema()).await?;
+        engine.put_document("a", text_doc("first", "xyz")).await?;
+        // Dropped without commit: only the WAL holds the document.
+    }
+    let engine = text_engine(storage, schema()).await?;
+    engine.commit().await?;
+    assert_eq!(
+        stored_tokens(&engine, "a"),
+        Some(vec![120.0, 1.0, 121.0, 1.0, 122.0, 1.0])
+    );
+    Ok(())
+}
+
+/// Issue #1349: an embedder producing vectors of another dimension is
+/// rejected like a document carrying them.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_text_embedded_to_the_wrong_dimension_is_rejected() -> Result<()> {
+    let schema = Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .add_field(TOKENS, FieldOption::MultiVector(MultiVectorOption::new(3)))
+        .build();
+    // Served by the default embedder, which the build does not check.
+    let per_field = PerFieldEmbedder::new(Arc::new(CharTokenEmbedder));
+    let engine = Engine::builder(storage(), schema)
+        .embedder(Arc::new(per_field))
+        .build()
+        .await?;
+    let err = engine
+        .put_document("a", text_doc("first", "ab"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("dimension 2, expected 3"), "{err}");
     Ok(())
 }

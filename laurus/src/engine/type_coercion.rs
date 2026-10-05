@@ -609,9 +609,14 @@ fn coerce_to_vector_array(
             opt.validate_vectors(field_name, &vectors)?;
             Ok(DataValue::VectorArray(vectors))
         }
+        // Embedded into token vectors by the field's token-level embedder
+        // when the document is indexed (Issue #1349), like a dense field's
+        // text. Whether such an embedder exists is checked there, so an
+        // embedder supplied through `EngineBuilder::embedder` works too.
+        DataValue::Text(_) | DataValue::Bytes(..) => Ok(value),
         other => Err(LaurusError::invalid_argument(format!(
             "field '{field_name}': MultiVector fields accept an array of token vectors \
-             (an array of numeric arrays); got {}",
+             (an array of numeric arrays) or a value for the field's embedder; got {}",
             describe(&other)
         ))),
     }
@@ -723,11 +728,18 @@ mod tests {
         for value in [
             DataValue::Vector(vec![1.0, 0.0]),
             DataValue::Float64Array(vec![1.0, 0.0]),
-            DataValue::Text("hello".to_string()),
+            DataValue::TextArray(vec!["hello".to_string()]),
         ] {
             let err = coerce_value("tokens", &multi_vector(2), value).unwrap_err();
             assert!(err.to_string().contains("array of token vectors"), "{err}");
         }
+
+        // #1349: text is left for the field's token-level embedder.
+        let text = DataValue::Text("hello".to_string());
+        assert_eq!(
+            coerce_value("tokens", &multi_vector(2), text.clone()).unwrap(),
+            text
+        );
     }
 
     /// #1177: a single-vector field does not take token vectors.
