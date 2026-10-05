@@ -216,6 +216,9 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
                 })
                 .collect(),
         ),
+        // Nested number arrays, which `infer_from_json` reads back as a
+        // MultiVector value (#1177).
+        DataValue::VectorArray(arr) => serde_json::json!(arr),
     }
 }
 

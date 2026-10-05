@@ -25,6 +25,8 @@
 //! - `object` with all three numeric keys `x`, `y`, `z` → [`FieldOption::Geo3d`]
 //! - `object` with a `data` key (base64-encoded string, optional `mime`
 //!   string) → [`DataValue::Bytes`]
+//! - array of equal-length numeric arrays → [`DataValue::VectorArray`]
+//!   (token vectors; a multi-vector field must be declared explicitly)
 //!
 //! Vector fields are never inferred; a numeric array always maps to a
 //! multi-valued Integer/Float field, never to [`DataValue::Vector`]. This is
@@ -95,6 +97,8 @@ pub enum InferredValue {
 /// supported by the dynamic schema:
 ///
 /// - [`DataValue::Vector`]: vector fields must be declared explicitly.
+/// - [`DataValue::VectorArray`]: multi-vector fields must be declared
+///   explicitly.
 /// - [`DataValue::Bytes`]: bytes fields must be declared explicitly.
 pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOption>> {
     match value {
@@ -157,6 +161,10 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
             "bytes array values require an explicit multi-valued bytes field declaration \
              in the schema",
         )),
+        DataValue::VectorArray(_) => Err(LaurusError::invalid_argument(
+            "vector array values require an explicit MultiVector field declaration \
+             in the schema",
+        )),
     }
 }
 
@@ -180,6 +188,7 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
 /// | `array` of `x`/`y`/`z` objects | [`DataValue::GeoEcefArray`] | [`FieldOption::Geo3d`] with `multi_valued = true` |
 /// | `array` of RFC 3339 strings | [`DataValue::DateTimeArray`] | [`FieldOption::DateTime`] with `multi_valued = true` (a *single* string stays `Text`) |
 /// | `array` of booleans | [`DataValue::BoolArray`] | [`FieldOption::Boolean`] with `multi_valued = true` |
+/// | `array` of equal-length numeric `array`s | [`DataValue::VectorArray`] | [`FieldOption::MultiVector`] (must still be declared; see [`infer_option_from_data_value`]) |
 /// | empty `array` | (none) | (none) — returns [`InferredValue::Skip`] |
 ///
 /// # Arguments
@@ -239,7 +248,9 @@ pub fn infer_from_json(value: &JsonValue) -> Result<InferredValue> {
 /// `multi_valued = true` (Issue #1184; a single string still infers
 /// [`DataValue::Text`]). Arrays whose elements are all booleans map to
 /// [`DataValue::BoolArray`] backed by a [`BooleanOption`] with
-/// `multi_valued = true` (Issue #1180). Empty arrays return
+/// `multi_valued = true` (Issue #1180). Arrays whose elements are all
+/// arrays map to the token vectors of a multi-vector field
+/// ([`DataValue::VectorArray`], Issue #1177). Empty arrays return
 /// [`InferredValue::Skip`] because their element type cannot be determined.
 ///
 /// # Arguments
@@ -279,6 +290,9 @@ fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
                 ..Default::default()
             }),
         });
+    }
+    if arr.iter().all(JsonValue::is_array) {
+        return infer_vector_array(arr);
     }
 
     let mut all_i64 = true;
@@ -332,6 +346,60 @@ fn infer_from_array(arr: &[JsonValue]) -> Result<InferredValue> {
             }),
         })
     }
+}
+
+/// Infer the token vectors of a multi-vector field from an array whose
+/// elements are all arrays (Issue #1177).
+///
+/// Every inner array must be a non-empty array of numbers, and all must have
+/// the same length; values are cast to `f32`. The inferred option is a
+/// [`FieldOption::MultiVector`] of that dimension, but, like bytes, a
+/// multi-vector field is never registered dynamically:
+/// [`infer_option_from_data_value`] rejects an undeclared field holding a
+/// [`DataValue::VectorArray`].
+///
+/// # Errors
+///
+/// Returns [`LaurusError::invalid_argument`] when an inner array is empty,
+/// holds a non-number, or differs in length from the first one.
+fn infer_vector_array(arr: &[JsonValue]) -> Result<InferredValue> {
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(arr.len());
+    for (i, inner) in arr.iter().enumerate() {
+        let inner = inner.as_array().expect("gated on all-arrays by the caller");
+        let vector = inner
+            .iter()
+            .map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Option<Vec<f32>>>()
+            .ok_or_else(|| {
+                LaurusError::invalid_argument(format!(
+                    "nested array {i} must contain only numbers \
+                     (an array of arrays is read as token vectors)"
+                ))
+            })?;
+        if vector.is_empty() {
+            return Err(LaurusError::invalid_argument(format!(
+                "nested array {i} is empty (an array of arrays is read as token vectors)"
+            )));
+        }
+        if let Some(first) = vectors.first()
+            && first.len() != vector.len()
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "nested array {i} has {} values but nested array 0 has {} \
+                 (token vectors must share one dimension)",
+                vector.len(),
+                first.len()
+            )));
+        }
+        vectors.push(vector);
+    }
+    let dimension = vectors[0].len();
+    Ok(InferredValue::Inferred {
+        value: DataValue::VectorArray(vectors),
+        option: FieldOption::MultiVector(crate::vector::core::field::MultiVectorOption::new(
+            dimension,
+        )),
+    })
 }
 
 /// Infer a multi-valued field from an array whose elements are all strings.
@@ -1068,5 +1136,44 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    // ---- Token vectors (#1177) ----
+
+    #[test]
+    fn infer_nested_numeric_arrays_to_vector_array() {
+        let (v, o) = inferred(infer_from_json(&json!([[1, 0.5], [-2, 3]])).unwrap());
+        assert_eq!(
+            v,
+            DataValue::VectorArray(vec![vec![1.0, 0.5], vec![-2.0, 3.0]])
+        );
+        match o {
+            FieldOption::MultiVector(opt) => assert_eq!(opt.dimension, 2),
+            other => panic!("expected MultiVector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infer_malformed_nested_arrays_rejected() {
+        for (bad, expected) in [
+            (json!([[1.0, 2.0], [3.0]]), "share one dimension"),
+            (json!([[1.0], []]), "nested array 1 is empty"),
+            (json!([[1.0], ["x"]]), "only numbers"),
+            (json!([[1.0], [[2.0]]]), "only numbers"),
+        ] {
+            let err = infer_from_json(&bad).unwrap_err();
+            assert!(err.to_string().contains(expected), "{bad}: {err}");
+        }
+        // An array mixing a nested array with a number is not gated as
+        // token vectors and keeps the numeric-array error.
+        let err = infer_from_json(&json!([[1.0], 2.0])).unwrap_err();
+        assert!(err.to_string().contains("only numeric"), "{err}");
+    }
+
+    #[test]
+    fn infer_option_from_vector_array_requires_declaration() {
+        let err =
+            infer_option_from_data_value(&DataValue::VectorArray(vec![vec![1.0]])).unwrap_err();
+        assert!(err.to_string().contains("MultiVector"), "{err}");
     }
 }

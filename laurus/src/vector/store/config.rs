@@ -187,7 +187,8 @@ pub fn build_field_index_config(
 ) -> crate::vector::index::config::VectorIndexTypeConfig {
     use crate::vector::core::distance::DistanceMetric;
     use crate::vector::index::config::{
-        FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, VectorIndexTypeConfig,
+        FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, MultiVectorIndexConfig,
+        VectorIndexTypeConfig,
     };
 
     match vector_opt {
@@ -221,6 +222,16 @@ pub fn build_field_index_config(
             embedder,
             ..Default::default()
         }),
+        FieldOption::MultiVector(opt) => {
+            VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+                dimension: opt.dimension,
+                distance_metric: opt.distance,
+                auto_compaction: deletion_config.auto_compaction,
+                compaction_threshold: deletion_config.compaction_threshold,
+                embedder,
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -666,6 +677,11 @@ mod tests {
                 VectorIndexTypeConfig::HNSW(c) => c.normalize_vectors,
                 VectorIndexTypeConfig::Flat(c) => c.normalize_vectors,
                 VectorIndexTypeConfig::IVF(c) => c.normalize_vectors,
+                // The multi-vector index normalizes exactly when its metric
+                // is Cosine; it has no separate flag.
+                VectorIndexTypeConfig::MultiVector(c) => {
+                    c.distance_metric == DistanceMetric::Cosine
+                }
             }
         }
 

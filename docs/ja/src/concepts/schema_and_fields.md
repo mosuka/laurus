@@ -140,6 +140,42 @@ let opt = HnswOption {
 
 パラメータの詳細なガイダンスについては、[Vector インデクシング](indexing/vector_indexing.md)を参照してください。
 
+### MultiVector フィールド
+
+`MultiVector` フィールドは、**文書のトークンベクトルをすべて**保持します。たとえば
+ColBERT 型の late interaction モデルが出力するトークンごとの埋め込み（1 パッセージあたり
+128 次元のベクトルが 100〜300 本程度）です。ANN 索引は持ちません。ベクトル検索の対象には
+ならず、別のクエリ（lexical・vector・hybrid）が見つけた候補を再採点するときにだけ読まれます。
+
+| 型 | Rust 型 | SchemaBuilder メソッド | 説明 |
+| :--- | :--- | :--- | :--- |
+| **MultiVector** | `MultiVectorOption` | `add_multi_vector_field()` | late interaction の再採点に使う、文書ごとのトークンベクトル。検索対象ではない |
+
+```rust
+use laurus::{MultiVectorOption, Schema};
+use laurus::vector::core::distance::DistanceMetric;
+
+let schema = Schema::builder()
+    .add_multi_vector_field(
+        "body_colbert",
+        MultiVectorOption::new(128).distance(DistanceMetric::Cosine), // Cosine（既定）または DotProduct
+    )
+    .build();
+```
+
+- **オプション**: `dimension`（各トークンベクトルの長さ）と `distance`。受け付けるのは
+  `Cosine`（書き込み時に L2 正規化するので、類似度は内積になる。ゼロベクトルはそのまま
+  保存する）と `DotProduct` だけで、それ以外はインデックスの作成時に拒否されます。
+- **値**: `DataValue::VectorArray(Vec<Vec<f32>>)`。1 本以上 8,192 本以下で、各ベクトルは
+  フィールドの次元を持ち、有限値でなければなりません。JSON では、同じ長さの数値配列の
+  配列（`[[0.1, 0.2, ...], [0.3, 0.4, ...]]`）です。
+- **保存しない**: トークンベクトルはベクトル索引にだけ置きます（300 本 × 128 次元の
+  `f32` で 1 文書約 150 KB）。そのため `get_documents` や検索結果には含まれません。
+- **検索できない**: フィールド指定なしのベクトル検索と prefix のフィールド指定は、この
+  フィールドを対象にしません。ベクトル検索や DSL でこのフィールドを指定するとエラーです。
+- **スキーマの変更**: 次元や距離の変更、他のベクトルフィールド型との相互変更は、
+  破壊的な変更（Destructive）です。
+
 ## Document
 
 `Document` は名前付きフィールド値のコレクションです。`DocumentBuilder` を使用してドキュメントを構築します。
@@ -226,6 +262,7 @@ graph LR
 | `add_geo_ecef(name, x, y, z)` | `(f64, f64, f64)` | 3D ECEF 直交座標ポイントを追加（メートル） |
 | `add_bytes(name, data)` | `Vec<u8>` | バイナリデータを追加 |
 | `add_bytes_array(name, values)` | `Vec<(Vec<u8>, Option<String>)>` | 多値バイナリフィールドを追加。各要素が独自の任意 MIME タイプを持つ |
+| `add_vector_array(name, vectors)` | `Vec<Vec<f32>>` | `MultiVector` フィールドのトークンベクトルを追加 |
 | `add_field(name, value)` | `DataValue` | 任意の値型を追加 |
 
 ## DataValue
@@ -252,6 +289,7 @@ pub enum DataValue {
     BoolArray(Vec<bool>),            // 多値ブールフィールド
     TextArray(Vec<String>),          // 多値テキストフィールド
     BytesArray(Vec<(Vec<u8>, Option<String>)>), // 多値バイトフィールド（要素ごとに MIME）
+    VectorArray(Vec<Vec<f32>>),      // MultiVector フィールドのトークンベクトル
 }
 ```
 
@@ -326,10 +364,12 @@ let schema = Schema::builder()
 | それ以外の文字列の配列（例: `["rust", "search"]`） | `Text`（`multi_valued = true`） |
 | ブール値の配列（例: `[true, false]`） | `Boolean`（`multi_valued = true`） |
 | `data` キー（base64 エンコードされた文字列）と任意の `mime` キーを持つ object | `Bytes` 値 |
+| 同じ長さの空でない数値配列の配列（例: `[[0.1, 0.2], [0.3, 0.4]]`） | `VectorArray` 値（トークンベクトル） |
 
-ベクトルフィールド（`Hnsw` / `Flat` / `Ivf`）は **自動推論の対象外**です。
+ベクトルフィールド（`Hnsw` / `Flat` / `Ivf` / `MultiVector`）は **自動推論の対象外**です。
 次元数・距離関数・embedder の設定は値だけからは復元できないため、
-スキーマへ明示的に宣言してください。`Bytes` の値は上記の `{data, mime}`
+スキーマへ明示的に宣言してください。未宣言のフィールドにトークンベクトルが来た場合は
+拒否されます。`Bytes` の値は上記の `{data, mime}`
 オブジェクト形式から**解析**できるようになりましたが、**未宣言**の
 フィールドに `Bytes` の値が来た場合は、ベクトルフィールドと同様に
 自動登録されず拒否されます（Bytes フィールドは常に明示的な宣言が
@@ -506,6 +546,9 @@ posting もなく、保存された値しかないためです。
 | `Bytes`（`multi_valued = true`） | 上記以外 | エラー |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | `Text` または `Bytes` | フィールドの embedder にそのまま渡す |
 | ベクトル（`Hnsw`/`Flat`/`Ivf`） | 数値配列 | 要素ごとに `f32` へキャスト |
+| ベクトル（`Hnsw`/`Flat`/`Ivf`） | `VectorArray` | エラー（トークンベクトルには `MultiVector` フィールドが必要） |
+| `MultiVector` | フィールドの次元を持つ有限値のベクトル 1〜8,192 本の `VectorArray` | そのまま格納 |
+| `MultiVector` | それ以外（単一のベクトル、平坦な数値配列、テキスト） | エラー |
 
 変換エラーの扱いはポリシーに依存します:
 

@@ -301,6 +301,23 @@ base_weight = 1.0
 - `n_clusters`: 一般的な経験則は `sqrt(N)`（N はベクトルの総数）です。
 - `n_probe`: 1 から始めて、再現率が許容範囲になるまで増やしてください。一般的な範囲は 1〜20 です。
 
+#### MultiVector
+
+文書のトークンベクトル（ColBERT 型のトークンごとの埋め込みなど）をすべて保持し、late interaction の再採点に使います。ANN 索引は持たず、ベクトル検索の対象にはなりません。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照してください。
+
+```toml
+[fields.body_colbert.MultiVector]
+dimension = 128
+distance = "Cosine"
+```
+
+| オプション | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `dimension` | `integer` | `128` | 各トークンベクトルの次元数 |
+| `distance` | `string` | `"Cosine"` | トークン間の類似度。`"Cosine"`（書き込み時に L2 正規化する）または `"DotProduct"`。それ以外は拒否されます |
+
+文書の値は、同じ長さの数値配列の配列（1〜8,192 本）です。このフィールドは文書ストアに保存されません。
+
 ## 距離メトリクス
 
 Vector フィールドの `distance` オプションは以下の値を受け付けます:

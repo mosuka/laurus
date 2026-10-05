@@ -22,6 +22,7 @@ message Value {
     BoolArrayValue bool_array_value = 16;
     TextArrayValue text_array_value = 17;
     BytesArrayValue bytes_array_value = 18;
+    VectorArrayValue vector_array_value = 19;
   }
 }
 
@@ -106,6 +107,16 @@ message TextArrayValue {
 // `bytes_value`, which likewise drops it. Requires `BytesOption.multi_valued`.
 message BytesArrayValue {
   repeated bytes values = 1;
+}
+
+// The token vectors of one document for a `MultiVector` field (e.g. the
+// per-token embeddings of a ColBERT-style late-interaction model), packed
+// row-major: `values` holds `values.len() / dimension` vectors of
+// `dimension` floats each. `values.len()` must be a multiple of `dimension`,
+// and `dimension` must be non-zero unless `values` is empty.
+message VectorArrayValue {
+  uint32 dimension = 1;
+  repeated float values = 2;
 }
 
 // A document consisting of named fields.

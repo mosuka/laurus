@@ -79,6 +79,11 @@ pub fn proto_value_to_json(val: &v1::Value) -> Value {
                 .map(|b| Value::String(base64_encode(&base64_engine(), b)))
                 .collect(),
         ),
+        // Nested arrays, the same shape JSON input uses for a MultiVector
+        // field (#1177).
+        Some(Kind::VectorArrayValue(arr)) => {
+            json!(crate::convert::document::vector_array_from_proto(arr))
+        }
         None => Value::Null,
     }
 }
@@ -552,6 +557,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         Opt::Flat(json_to_flat_option(v)?)
     } else if let Some(v) = obj.get("ivf") {
         Opt::Ivf(json_to_ivf_option(v)?)
+    } else if let Some(v) = obj.get("multi_vector") {
+        Opt::MultiVector(json_to_multi_vector_option(v))
     } else {
         return Err("unknown field option type".to_string());
     };
@@ -674,6 +681,12 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
         Some(Opt::Hnsw(v)) => json!({ "hnsw": hnsw_option_to_json(v) }),
         Some(Opt::Flat(v)) => json!({ "flat": flat_option_to_json(v) }),
         Some(Opt::Ivf(v)) => json!({ "ivf": ivf_option_to_json(v) }),
+        Some(Opt::MultiVector(v)) => json!({
+            "multi_vector": {
+                "dimension": v.dimension,
+                "distance": distance_metric_to_string(v.distance),
+            }
+        }),
         None => Value::Null,
     }
 }
@@ -826,6 +839,20 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
         // Issue #793: optional Stage-2 rerank sidecar storage.
         rerank_storage: json_to_rerank_storage(json),
     })
+}
+
+/// A multi-vector field option (#1177); the engine rejects a zero
+/// dimension or a distance other than cosine / dot product when the index
+/// is created.
+fn json_to_multi_vector_option(json: &Value) -> v1::MultiVectorOption {
+    v1::MultiVectorOption {
+        dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        distance: json
+            .get("distance")
+            .and_then(|v| v.as_str())
+            .map(parse_distance_metric)
+            .unwrap_or(v1::DistanceMetric::Cosine as i32),
+    }
 }
 
 fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
@@ -1676,6 +1703,22 @@ mod tests {
         assert_eq!(proto_value_to_json(&proto), json!(["aGk=", "dGhlcmU=", ""]));
     }
 
+    /// #1177: a packed `VectorArrayValue` renders as nested arrays, the
+    /// shape JSON input uses for a MultiVector field.
+    #[test]
+    fn test_proto_vector_array_value_renders_as_nested_arrays() {
+        let proto = v1::Value {
+            kind: Some(v1::value::Kind::VectorArrayValue(v1::VectorArrayValue {
+                dimension: 2,
+                values: vec![0.5, 1.0, -2.0, 0.25],
+            })),
+        };
+        assert_eq!(
+            proto_value_to_json(&proto),
+            json!([[0.5, 1.0], [-2.0, 0.25]])
+        );
+    }
+
     /// #1174: `multi_valued` is read from and written to the JSON schema
     /// shape for every option that carries it (the BKD-backed ones and,
     /// since #1180, Boolean). Integer/Float used to accept it on input but
@@ -1721,6 +1764,40 @@ mod tests {
         let proto = json_to_proto_field_option(&json).unwrap();
         let back = proto_field_option_to_json(&proto);
         assert_eq!(back["bytes"]["multi_valued"], json!(false));
+    }
+
+    /// #1177: the `multi_vector` field option round-trips its dimension and
+    /// distance, and an omitted distance means cosine.
+    #[test]
+    fn test_multi_vector_option_round_trips_through_json() {
+        let json = json!({ "multi_vector": {"dimension": 128, "distance": "dot_product"} });
+        let proto = json_to_proto_field_option(&json).unwrap();
+        assert!(matches!(
+            proto.option,
+            Some(v1::field_option::Option::MultiVector(_))
+        ));
+        let back = proto_field_option_to_json(&proto);
+        assert_eq!(back, json);
+
+        let json = json!({ "multi_vector": {"dimension": 96} });
+        let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
+        assert_eq!(back["multi_vector"]["distance"], json!("cosine"));
+    }
+
+    /// #1177: nested numeric arrays in a document become a packed
+    /// `VectorArrayValue` and render back as the same nested arrays.
+    #[test]
+    fn test_json_nested_arrays_round_trip_as_vector_array_value() {
+        let input = json!([[0.5, 1.0], [-2.0, 0.25]]);
+        let proto = json_value_to_proto(&input).unwrap();
+        match &proto.kind {
+            Some(v1::value::Kind::VectorArrayValue(a)) => {
+                assert_eq!(a.dimension, 2);
+                assert_eq!(a.values, vec![0.5, 1.0, -2.0, 0.25]);
+            }
+            other => panic!("expected VectorArrayValue, got {other:?}"),
+        }
+        assert_eq!(proto_value_to_json(&proto), input);
     }
 
     #[test]

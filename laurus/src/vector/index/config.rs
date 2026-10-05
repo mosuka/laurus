@@ -206,6 +206,8 @@ pub enum VectorIndexTypeConfig {
     HNSW(HnswIndexConfig),
     /// IVF index configuration
     IVF(IvfIndexConfig),
+    /// Multi-vector (late-interaction) index configuration
+    MultiVector(MultiVectorIndexConfig),
 }
 
 impl Default for VectorIndexTypeConfig {
@@ -221,6 +223,7 @@ impl VectorIndexTypeConfig {
             VectorIndexTypeConfig::Flat(_) => "Flat",
             VectorIndexTypeConfig::HNSW(_) => "HNSW",
             VectorIndexTypeConfig::IVF(_) => "IVF",
+            VectorIndexTypeConfig::MultiVector(_) => "MultiVector",
         }
     }
 
@@ -230,6 +233,7 @@ impl VectorIndexTypeConfig {
             VectorIndexTypeConfig::Flat(config) => config.dimension,
             VectorIndexTypeConfig::HNSW(config) => config.dimension,
             VectorIndexTypeConfig::IVF(config) => config.dimension,
+            VectorIndexTypeConfig::MultiVector(config) => config.dimension,
         }
     }
 
@@ -239,15 +243,20 @@ impl VectorIndexTypeConfig {
             VectorIndexTypeConfig::Flat(config) => config.distance_metric,
             VectorIndexTypeConfig::HNSW(config) => config.distance_metric,
             VectorIndexTypeConfig::IVF(config) => config.distance_metric,
+            VectorIndexTypeConfig::MultiVector(config) => config.distance_metric,
         }
     }
 
     /// Get the max vectors per segment from the config.
+    ///
+    /// For [`VectorIndexTypeConfig::MultiVector`] this is a document count
+    /// ([`MultiVectorIndexConfig::max_documents_per_segment`]).
     pub fn max_vectors_per_segment(&self) -> u64 {
         match self {
             VectorIndexTypeConfig::Flat(config) => config.max_vectors_per_segment,
             VectorIndexTypeConfig::HNSW(config) => config.max_vectors_per_segment,
             VectorIndexTypeConfig::IVF(config) => config.max_vectors_per_segment,
+            VectorIndexTypeConfig::MultiVector(config) => config.max_documents_per_segment,
         }
     }
 
@@ -257,7 +266,14 @@ impl VectorIndexTypeConfig {
             VectorIndexTypeConfig::Flat(config) => config.merge_factor,
             VectorIndexTypeConfig::HNSW(config) => config.merge_factor,
             VectorIndexTypeConfig::IVF(config) => config.merge_factor,
+            VectorIndexTypeConfig::MultiVector(config) => config.merge_factor,
         }
+    }
+
+    /// Whether this config describes a multi-vector (late-interaction)
+    /// index, which stores token vectors but is not a search target.
+    pub fn is_multi_vector(&self) -> bool {
+        matches!(self, VectorIndexTypeConfig::MultiVector(_))
     }
 }
 
@@ -416,6 +432,83 @@ impl std::fmt::Debug for FlatIndexConfig {
             .field("merge_factor", &self.merge_factor)
             .field("max_segments", &self.max_segments)
             .field("segmented", &self.segmented)
+            .field("auto_compaction", &self.auto_compaction)
+            .field("compaction_threshold", &self.compaction_threshold)
+            .field("embedder", &self.embedder.name())
+            .finish()
+    }
+}
+
+/// Configuration of a multi-vector index (Issue #1177).
+///
+/// The index stores every token vector of a document for late-interaction
+/// rescoring and has no ANN structure, so it has no search parameters.
+/// Segment counts in its manifest are **document** counts.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MultiVectorIndexConfig {
+    /// Dimension of every token vector.
+    pub dimension: usize,
+
+    /// Token similarity: [`DistanceMetric::Cosine`] (vectors are
+    /// L2-normalized at write time) or [`DistanceMetric::DotProduct`].
+    pub distance_metric: DistanceMetric,
+
+    /// Most documents a merge may combine into one segment.
+    ///
+    /// The default (16,384) keeps a merged segment around 2.4 GiB for
+    /// ColBERT-sized documents (about 300 token vectors of 128 `f32`).
+    #[serde(default = "default_multi_vector_max_documents_per_segment")]
+    pub max_documents_per_segment: u64,
+
+    /// Number of size-similar segments merged at once.
+    pub merge_factor: u32,
+
+    /// Segment count above which segments are merged regardless of size.
+    pub max_segments: u32,
+
+    /// Automatically compact on commit when the deletion ratio (deleted
+    /// documents / documents) reaches [`Self::compaction_threshold`].
+    #[serde(default)]
+    pub auto_compaction: bool,
+
+    /// Deletion ratio (`0.0`–`1.0`) at or above which
+    /// [`Self::auto_compaction`] triggers a compaction.
+    #[serde(default = "default_compaction_threshold")]
+    pub compaction_threshold: f64,
+
+    /// Embedder shared with the other fields of the store.
+    #[serde(skip)]
+    #[serde(default = "default_embedder")]
+    pub embedder: Arc<dyn Embedder>,
+}
+
+fn default_multi_vector_max_documents_per_segment() -> u64 {
+    16_384
+}
+
+impl Default for MultiVectorIndexConfig {
+    fn default() -> Self {
+        Self {
+            dimension: 128,
+            distance_metric: DistanceMetric::Cosine,
+            max_documents_per_segment: default_multi_vector_max_documents_per_segment(),
+            merge_factor: 10,
+            max_segments: 100,
+            auto_compaction: false,
+            compaction_threshold: default_compaction_threshold(),
+            embedder: default_embedder(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MultiVectorIndexConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiVectorIndexConfig")
+            .field("dimension", &self.dimension)
+            .field("distance_metric", &self.distance_metric)
+            .field("max_documents_per_segment", &self.max_documents_per_segment)
+            .field("merge_factor", &self.merge_factor)
+            .field("max_segments", &self.max_segments)
             .field("auto_compaction", &self.auto_compaction)
             .field("compaction_threshold", &self.compaction_threshold)
             .field("embedder", &self.embedder.name())

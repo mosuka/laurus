@@ -332,6 +332,9 @@ fn open_cached_reader(
         VectorIndexTypeConfig::HNSW(_) => {
             Arc::new(HnswIndexReader::load(storage, CACHE_INDEX_NAME, distance)?)
         }
+        VectorIndexTypeConfig::MultiVector(_) => {
+            unreachable!("the search benchmark only builds Flat, IVF and HNSW indexes")
+        }
     };
     Ok(reader)
 }

@@ -183,5 +183,6 @@ fn format_data_value(value: &DataValue) -> String {
                 .collect();
             format!("[{}]", parts.join(", "))
         }
+        DataValue::VectorArray(arr) => format!("[{} vectors]", arr.len()),
     }
 }

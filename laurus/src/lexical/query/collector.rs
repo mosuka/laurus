@@ -431,7 +431,7 @@ fn compare_sort_key(
 /// Deterministic precedence for mixed-type sort-key pairs (#945):
 /// `Bool < numeric < DateTime < Text < Geo < GeoEcef < Bytes < Vector <
 /// Int64Array < Float64Array < GeoArray < GeoEcefArray < DateTimeArray <
-/// BoolArray < TextArray`. `Null` never
+/// BoolArray < TextArray < BytesArray < VectorArray`. `Null` never
 /// reaches this (handled first in [`compare_sort_key`]); `Int64` and
 /// `Float64` share a rank because they compare numerically instead.
 /// Exhaustive on purpose: adding a `FieldValue` variant must force a rank
@@ -457,6 +457,7 @@ fn sort_type_rank(v: &crate::lexical::core::field::FieldValue) -> u8 {
         FieldValue::BoolArray(_) => 14,
         FieldValue::TextArray(_) => 15,
         FieldValue::BytesArray(_) => 16,
+        FieldValue::VectorArray(_) => 17,
     }
 }
 

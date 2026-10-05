@@ -289,6 +289,14 @@ pub enum DataValue {
     /// multi-valued types) — `multi_valued` only governs the stored shape
     /// and ingestion arity.
     BytesArray(Vec<(Vec<u8>, Option<String>)>),
+
+    /// Pre-computed token vectors of one document (Issue #1177), e.g. the
+    /// per-token embeddings of a ColBERT-style late-interaction model.
+    ///
+    /// Used by fields declared as
+    /// [`FieldOption::MultiVector`](crate::vector::core::field::FieldOption::MultiVector).
+    /// Every inner vector must have the field's dimension.
+    VectorArray(Vec<Vec<f32>>),
 }
 
 impl DataValue {
@@ -427,6 +435,14 @@ impl DataValue {
             _ => None,
         }
     }
+
+    /// Returns the token vectors if this is a `VectorArray` variant.
+    pub fn as_vector_array(&self) -> Option<&[Vec<f32>]> {
+        match self {
+            DataValue::VectorArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 // --- Conversions ---
@@ -530,6 +546,12 @@ impl From<Vec<String>> for DataValue {
 impl From<Vec<(Vec<u8>, Option<String>)>> for DataValue {
     fn from(v: Vec<(Vec<u8>, Option<String>)>) -> Self {
         DataValue::BytesArray(v)
+    }
+}
+
+impl From<Vec<Vec<f32>>> for DataValue {
+    fn from(v: Vec<Vec<f32>>) -> Self {
+        DataValue::VectorArray(v)
     }
 }
 
@@ -757,6 +779,15 @@ impl DocumentBuilder {
         self.add_field(name.into(), DataValue::BytesArray(values))
     }
 
+    /// Add the token vectors of a multi-vector field.
+    ///
+    /// The schema field must be declared as
+    /// [`FieldOption::MultiVector`](crate::vector::core::field::FieldOption::MultiVector),
+    /// and every vector must have its dimension.
+    pub fn add_vector_array(self, name: impl Into<String>, vectors: Vec<Vec<f32>>) -> Self {
+        self.add_field(name.into(), DataValue::VectorArray(vectors))
+    }
+
     pub fn build(self) -> Document {
         Document {
             fields: self.fields,
@@ -820,16 +851,22 @@ mod tests {
                 "BytesArray",
                 archive(&DataValue::BytesArray(vec![(vec![7u8], None)])),
             ),
+            (
+                "VectorArray",
+                archive(&DataValue::VectorArray(vec![vec![1.5f32]])),
+            ),
         ];
         // Little-endian rkyv 0.8 layout: the root enum sits at the end of
         // the buffer, its first byte being the archived discriminant (Geo =
         // 8, Int64Array = 10, Float64Array = 11, GeoArray = 12, GeoEcefArray
         // = 13, DateTimeArray = 14, BoolArray = 15, TextArray = 16,
-        // BytesArray = 17), followed by the payload — `ArchivedVec` is a
-        // relative pointer to the element data written before the root,
-        // plus a length. `BytesArray`'s element is a tuple, but
-        // `ArchivedVec`'s own header size never depends on what it points
-        // to, so it archives the same size as every other array variant.
+        // BytesArray = 17, VectorArray = 18), followed by the payload —
+        // `ArchivedVec` is a relative pointer to the element data written
+        // before the root, plus a length. `BytesArray`'s element is a tuple,
+        // but `ArchivedVec`'s own header size never depends on what it
+        // points to, so it archives the same size as every other array
+        // variant. `VectorArray`'s element is itself an `ArchivedVec`, written
+        // after the inner `f32` data and padded to the 8-aligned root.
         // `DateTimeArray` archives its elements as micro-second `i64`s, so
         // its bytes are `Int64Array`'s with the discriminant changed; a
         // `bool` element is a single byte, so `BoolArray`'s element data is
@@ -901,6 +938,14 @@ mod tests {
                     7, 0, 0, 0, 252, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     17, 0, 0, 0, 232, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                "VectorArray",
+                vec![
+                    0, 0, 192, 63, 252, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 240,
+                    255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0,
                 ],
             ),
         ];
@@ -1019,6 +1064,39 @@ mod tests {
         assert_eq!(doc.get_field("flags").and_then(DataValue::as_boolean), None);
         assert_eq!(DataValue::Bool(true).as_bool_array(), None);
         assert_eq!(DataValue::from(flags.clone()), DataValue::BoolArray(flags));
+    }
+
+    /// #1177: token vectors round-trip through rkyv (the WAL format),
+    /// including the empty list.
+    #[test]
+    fn vector_arrays_round_trip_through_rkyv() {
+        for value in [
+            DataValue::VectorArray(vec![vec![0.25, -1.5, 3.0], vec![0.0, 1.0, f32::MIN]]),
+            DataValue::VectorArray(Vec::new()),
+        ] {
+            let bytes = archive(&value);
+            let back = rkyv::from_bytes::<DataValue, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialization");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn vector_array_accessors_and_builders() {
+        let vectors = vec![vec![1.0f32, 2.0], vec![3.0, 4.0]];
+        let doc = Document::builder()
+            .add_vector_array("tokens", vectors.clone())
+            .build();
+        assert_eq!(
+            doc.get_field("tokens").and_then(DataValue::as_vector_array),
+            Some(vectors.as_slice())
+        );
+        assert_eq!(doc.get_field("tokens").and_then(DataValue::as_vector), None);
+        assert_eq!(DataValue::Vector(vec![1.0]).as_vector_array(), None);
+        assert_eq!(
+            DataValue::from(vectors.clone()),
+            DataValue::VectorArray(vectors)
+        );
     }
 
     /// #1176: each element round-trips its own bytes and optional MIME type,

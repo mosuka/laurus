@@ -303,6 +303,23 @@ base_weight = 1.0
 - `n_clusters`: A common heuristic is `sqrt(N)` where N is the total number of vectors.
 - `n_probe`: Start with 1 and increase until recall is acceptable. Typical range is 1–20.
 
+#### MultiVector
+
+Every token vector of a document (for example ColBERT-style per-token embeddings), kept for late-interaction rescoring. It has no ANN index and is not a vector-search target; see [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields).
+
+```toml
+[fields.body_colbert.MultiVector]
+dimension = 128
+distance = "Cosine"
+```
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `dimension` | `integer` | `128` | Dimensionality of every token vector |
+| `distance` | `string` | `"Cosine"` | Token similarity: `"Cosine"` (vectors are L2-normalized when written) or `"DotProduct"`. Other metrics are rejected |
+
+A document's value is an array of equal-length numeric arrays, between 1 and 8,192 of them. The field is not stored in the document store.
+
 ## Distance Metrics
 
 The `distance` option for vector fields accepts the following values:

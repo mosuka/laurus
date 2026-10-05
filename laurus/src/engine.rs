@@ -1,4 +1,6 @@
 pub mod json_document;
+#[cfg(test)]
+mod multi_vector_tests;
 pub mod query;
 pub mod schema;
 pub mod search;
@@ -838,7 +840,9 @@ impl Engine {
 
                     // Update seq only after BOTH stores succeed to maintain atomicity.
                     if record.seq > lexical_last_seq
-                        && let Err(e) = self.lexical.upsert_document(doc_id, document.clone())
+                        && let Err(e) = self
+                            .lexical
+                            .upsert_document(doc_id, self.without_multi_vector_fields(&document))
                     {
                         if neither_checkpointed && is_quarantinable(&e) {
                             log::warn!(
@@ -1175,6 +1179,7 @@ impl Engine {
         // at step 2 (see `VectorStore::write_vectors`'s doc comment); it can
         // still fail on e.g. a writer-creation I/O error, so the lexical
         // rollback on failure is kept.
+        self.strip_multi_vector_fields(&mut doc);
         self.lexical.upsert_document(doc_id, doc)?;
         if let Err(e) = self.vector.write_vectors(doc_id, vectors).await {
             // Rollback lexical insert to maintain consistency
@@ -1611,10 +1616,19 @@ impl Engine {
         let embedder = self.embedder();
 
         let schema = self.schema.read();
+        // Multi-vector fields are not vector-search targets (Issue #1177):
+        // they are kept out of the default vector fields and the DSL's
+        // vector-clause routing, and the parser rejects a clause naming one.
         let vector_fields: Vec<String> = schema
             .fields
             .iter()
-            .filter(|(_, opt)| opt.is_vector())
+            .filter(|(_, opt)| opt.is_vector() && !opt.is_multi_vector())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let multi_vector_fields: std::collections::HashSet<String> = schema
+            .fields
+            .iter()
+            .filter(|(_, opt)| opt.is_multi_vector())
             .map(|(name, _)| name.clone())
             .collect();
 
@@ -1645,7 +1659,8 @@ impl Engine {
 
         Ok(
             self::query::UnifiedQueryParser::new(lexical_parser, vector_parser, vector_field_set)
-                .with_known_fields(known_fields),
+                .with_known_fields(known_fields)
+                .with_multi_vector_fields(multi_vector_fields),
         )
     }
 
@@ -2327,10 +2342,46 @@ impl Engine {
                 FieldOption::Bytes(o) => o.stored,
                 // Vector fields are always stored
                 FieldOption::Hnsw(_) | FieldOption::Flat(_) | FieldOption::Ivf(_) => true,
+                // Token vectors (~150 KB per document as JSON floats) live
+                // only in the vector store; the WAL keeps them for recovery.
+                FieldOption::MultiVector(_) => false,
             }
         } else {
             false
         }
+    }
+
+    /// Remove multi-vector fields from a document bound for the lexical
+    /// store (Issue #1177).
+    ///
+    /// The lexical store ignores fields it does not know, except when its
+    /// field list is empty: it then stores every field, which would copy
+    /// each document's token vectors into its stored fields.
+    fn strip_multi_vector_fields(&self, doc: &mut Document) {
+        let schema = self.schema.read();
+        doc.fields
+            .retain(|name, _| !Self::is_multi_vector_field(&schema, name));
+    }
+
+    /// A copy of `doc` without its multi-vector fields, for the lexical
+    /// store (see [`Self::strip_multi_vector_fields`]); the token vectors
+    /// are never cloned.
+    fn without_multi_vector_fields(&self, doc: &Document) -> Document {
+        let schema = self.schema.read();
+        let mut copy = Document::new();
+        for (name, value) in &doc.fields {
+            if !Self::is_multi_vector_field(&schema, name) {
+                copy.fields.insert(name.clone(), value.clone());
+            }
+        }
+        copy
+    }
+
+    fn is_multi_vector_field(schema: &Schema, name: &str) -> bool {
+        schema
+            .fields
+            .get(name)
+            .is_some_and(|option| option.is_multi_vector())
     }
 
     /// Filter a document to only include fields that should be stored.

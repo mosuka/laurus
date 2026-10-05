@@ -395,6 +395,7 @@ fn push_facet_paths(value: &crate::data::DataValue, out: &mut FacetPaths) {
         | V::GeoArray(_)
         | V::GeoEcefArray(_)
         | V::Vector(_)
+        | V::VectorArray(_)
         | V::Bytes(_, _)
         | V::BytesArray(_) => {}
     }

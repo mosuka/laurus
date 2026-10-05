@@ -103,6 +103,10 @@ pub fn data_value_to_proto(val: &DataValue) -> v1::Value {
         DataValue::BytesArray(arr) => Some(Kind::BytesArrayValue(v1::BytesArrayValue {
             values: arr.iter().map(|(b, _mime)| b.clone()).collect(),
         })),
+        DataValue::VectorArray(arr) => Some(Kind::VectorArrayValue(v1::VectorArrayValue {
+            dimension: arr.first().map_or(0, Vec::len) as u32,
+            values: arr.iter().flatten().copied().collect(),
+        })),
     };
     v1::Value { kind }
 }
@@ -148,7 +152,30 @@ pub fn data_value_from_proto(val: &v1::Value) -> DataValue {
         Some(Kind::BytesArrayValue(arr)) => {
             DataValue::BytesArray(arr.values.iter().map(|b| (b.clone(), None)).collect())
         }
+        Some(Kind::VectorArrayValue(arr)) => DataValue::VectorArray(vector_array_from_proto(arr)),
         None => DataValue::Null,
+    }
+}
+
+/// Split a packed `VectorArrayValue` into its vectors.
+///
+/// A malformed value is not repaired: a `values` length that is not a
+/// multiple of `dimension` leaves a shorter last vector, and a zero
+/// `dimension` keeps all values as one vector, so the engine's dimension
+/// check rejects the document instead of indexing silently altered data.
+///
+/// # Arguments
+///
+/// * `arr` - The packed proto value.
+///
+/// # Returns
+///
+/// The vectors in their original order.
+pub fn vector_array_from_proto(arr: &v1::VectorArrayValue) -> Vec<Vec<f32>> {
+    match arr.dimension as usize {
+        _ if arr.values.is_empty() => Vec::new(),
+        0 => vec![arr.values.clone()],
+        dim => arr.values.chunks(dim).map(<[f32]>::to_vec).collect(),
     }
 }
 
@@ -342,6 +369,52 @@ mod tests {
 
         let empty = DataValue::BytesArray(Vec::new());
         assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
+    }
+
+    /// #1177: token vectors are packed row-major into `VectorArrayValue`
+    /// and split back by `dimension`, including the empty list.
+    #[test]
+    fn data_value_vector_arrays_round_trip() {
+        let value = DataValue::VectorArray(vec![vec![0.5, -1.0, 2.0], vec![3.0, 0.0, -0.25]]);
+        let proto = data_value_to_proto(&value);
+        match &proto.kind {
+            Some(v1::value::Kind::VectorArrayValue(a)) => {
+                assert_eq!(a.dimension, 3);
+                assert_eq!(a.values, vec![0.5, -1.0, 2.0, 3.0, 0.0, -0.25]);
+            }
+            other => panic!("expected VectorArrayValue, got {other:?}"),
+        }
+        assert_eq!(data_value_from_proto(&proto), value);
+
+        let empty = DataValue::VectorArray(Vec::new());
+        assert_eq!(data_value_from_proto(&data_value_to_proto(&empty)), empty);
+    }
+
+    /// #1177: a malformed packed value is passed on in a shape the engine
+    /// rejects (ragged, or one vector of the wrong length), never repaired.
+    #[test]
+    fn malformed_vector_array_value_is_not_repaired() {
+        let ragged = v1::Value {
+            kind: Some(v1::value::Kind::VectorArrayValue(v1::VectorArrayValue {
+                dimension: 2,
+                values: vec![1.0, 2.0, 3.0],
+            })),
+        };
+        assert_eq!(
+            data_value_from_proto(&ragged),
+            DataValue::VectorArray(vec![vec![1.0, 2.0], vec![3.0]])
+        );
+
+        let no_dimension = v1::Value {
+            kind: Some(v1::value::Kind::VectorArrayValue(v1::VectorArrayValue {
+                dimension: 0,
+                values: vec![1.0, 2.0],
+            })),
+        };
+        assert_eq!(
+            data_value_from_proto(&no_dimension),
+            DataValue::VectorArray(vec![vec![1.0, 2.0]])
+        );
     }
 
     /// `DataValue::Geo` continues to use the 2D `GeoValue` proto kind,

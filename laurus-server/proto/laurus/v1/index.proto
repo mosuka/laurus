@@ -98,6 +98,7 @@ message FieldOption {
     FlatOption flat = 9;
     IvfOption ivf = 10;
     Geo3dOption geo3d = 11;
+    MultiVectorOption multi_vector = 12;
   }
 }
 
@@ -359,6 +360,15 @@ message IvfOption {
   // for schema round-tripping; the IVF index does not emit a sidecar
   // yet, so this is currently inert for IVF fields.
   optional RerankStorageKind rerank_storage = 8;
+}
+
+// A multi-vector field (Issue #1177): each document's token vectors (e.g.
+// the per-token embeddings of a ColBERT-style model) with no ANN index,
+// read by late-interaction rescoring. Values are `VectorArrayValue`s.
+message MultiVectorOption {
+  uint32 dimension = 1;
+  // Only COSINE (vectors are L2-normalized) and DOT_PRODUCT are accepted.
+  DistanceMetric distance = 2;
 }
 
 // An embedder configuration.

@@ -11,8 +11,8 @@ use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
     CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
     FieldChangeKind, FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, QuantizationMethod, Schema, TextOption, TokenFilterConfig,
-    TokenizerConfig,
+    IntegerOption, IvfOption, MultiVectorOption, QuantizationMethod, Schema, TextOption,
+    TokenFilterConfig, TokenizerConfig,
 };
 
 use crate::proto::laurus::v1;
@@ -201,6 +201,10 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             embedder: o.embedder.clone().unwrap_or_default(),
             rerank_storage: o.rerank_storage.map(|k| rerank_storage_to_proto(k) as i32),
         })),
+        FieldOption::MultiVector(o) => Some(Opt::MultiVector(v1::MultiVectorOption {
+            dimension: o.dimension as u32,
+            distance: distance_to_proto(&o.distance) as i32,
+        })),
     };
     v1::FieldOption { option }
 }
@@ -332,6 +336,10 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             } else {
                 Some(o.embedder.clone())
             },
+        })),
+        Some(Opt::MultiVector(o)) => Some(FieldOption::MultiVector(MultiVectorOption {
+            dimension: o.dimension as usize,
+            distance: distance_from_proto(o.distance),
         })),
         None => None,
     }
@@ -1281,6 +1289,26 @@ mod tests {
                 assert!(o.multi_valued);
             }
             other => panic!("expected FieldOption::Bytes, got {other:?}"),
+        }
+    }
+
+    /// #1177: `MultiVectorOption` (proto field 12) round-trips its
+    /// dimension and distance.
+    #[test]
+    fn schema_field_option_multi_vector_round_trip() {
+        let schema = Schema::builder()
+            .add_multi_vector_field(
+                "tokens",
+                MultiVectorOption::new(96).distance(DistanceMetric::DotProduct),
+            )
+            .build();
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("tokens") {
+            Some(FieldOption::MultiVector(o)) => {
+                assert_eq!(o.dimension, 96);
+                assert_eq!(o.distance, DistanceMetric::DotProduct);
+            }
+            other => panic!("expected FieldOption::MultiVector, got {other:?}"),
         }
     }
 

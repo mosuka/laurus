@@ -64,6 +64,7 @@ cargo doc --open
 | `.add_hnsw_field(name, HnswOption)` | HNSWベクトルフィールドを追加 |
 | `.add_flat_field(name, FlatOption)` | Flatベクトルフィールドを追加 |
 | `.add_ivf_field(name, IvfOption)` | IVFベクトルフィールドを追加 |
+| `.add_multi_vector_field(name, MultiVectorOption)` | MultiVector フィールドを追加。late interaction の再採点に使う文書ごとのトークンベクトルで、検索対象ではない |
 | `.add_default_field(name)` | デフォルト検索フィールドを設定 |
 | `.add_analyzer(name, AnalyzerDefinition)` | カスタム Analyzer パイプラインを登録。組み込み Analyzer 用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）を使うと `.build()` は panic し、`.try_build()` はエラーを返す。ほかの方法で作った `Schema`（`Schema::from_toml` など）は `Schema::validate_for_create` で検査する |
 | `.add_embedder(name, EmbedderDefinition)` | Embedder 定義を登録 |
@@ -105,6 +106,7 @@ cargo doc --open
 | `.add_text_array(name, values)` | 多値テキストフィールドを追加（`Vec<String>`） |
 | `.add_bytes(name, data)` | バイナリデータを追加 |
 | `.add_bytes_array(name, values)` | 多値バイナリフィールドを追加（`Vec<(Vec<u8>, Option<String>)>`。各要素が独自の任意 MIME タイプを持つ） |
+| `.add_vector_array(name, vectors)` | MultiVector フィールドのトークンベクトルを追加（`Vec<Vec<f32>>`） |
 | `.build()` | `Document` を構築 |
 
 ## Search
@@ -242,3 +244,4 @@ cargo doc --open
 | `DataValue::BoolArray(Vec<bool>)` | 多値の真偽値（`multi_valued` フィールドオプションが必要） |
 | `DataValue::TextArray(Vec<String>)` | 多値の文字列（`multi_valued` フィールドオプションが必要） |
 | `DataValue::BytesArray(Vec<(Vec<u8>, Option<String>)>)` | 多値のバイナリデータ。各要素が独自の任意 MIME タイプを持つ（`multi_valued` フィールドオプションが必要。インデックスされない） |
+| `DataValue::VectorArray(Vec<Vec<f32>>)` | MultiVector フィールドのトークンベクトル（フィールドの次元を持つベクトル 1〜8,192 本。文書ストアには保存されない） |

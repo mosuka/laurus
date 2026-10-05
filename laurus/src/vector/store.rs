@@ -218,10 +218,37 @@ impl VectorStore {
         // This allows multiple concurrent upserts to perform embedding in parallel
         // rather than being serialized by the writer Mutex.
         let embedder = self.index.embedder();
+        let late_interaction_fields = self.index.late_interaction_fields();
         let mut embedded_vectors: Vec<(String, Vector)> = Vec::new();
 
         for (field_name, value) in &doc.fields {
+            // A multi-vector field takes exactly a token-vector array, and
+            // only a multi-vector field takes one (Issue #1177). Checked
+            // here as well as in the engine's coercion: this store is public,
+            // and a WAL record written before a field changed kind can carry
+            // the old shape.
+            let multi_vector = late_interaction_fields.contains(field_name);
             let vector = match value {
+                DataValue::VectorArray(vectors) if multi_vector => {
+                    Self::check_token_vector_count(field_name, vectors.len())?;
+                    embedded_vectors.extend(
+                        vectors
+                            .iter()
+                            .map(|v| (field_name.clone(), Vector::new(v.clone()))),
+                    );
+                    continue;
+                }
+                DataValue::VectorArray(_) => {
+                    return Err(LaurusError::invalid_argument(format!(
+                        "field '{field_name}' is not a MultiVector field; only MultiVector \
+                         fields accept an array of token vectors"
+                    )));
+                }
+                _ if multi_vector => {
+                    return Err(LaurusError::invalid_argument(format!(
+                        "MultiVector field '{field_name}' accepts only an array of token vectors"
+                    )));
+                }
                 DataValue::Vector(v) => Vector::new(v.clone()),
                 DataValue::Text(_) | DataValue::Bytes(_, _) => {
                     Self::embed_value(&*embedder, field_name, value).await?
@@ -296,6 +323,26 @@ impl VectorStore {
                 .collect(),
         )?;
 
+        Ok(())
+    }
+
+    /// Reject a token-vector array that is empty or longer than a document
+    /// may hold; each vector's dimension and values are checked with every
+    /// other vector in [`Self::embed_document`].
+    fn check_token_vector_count(field_name: &str, count: usize) -> Result<()> {
+        use crate::vector::core::field::MultiVectorOption;
+
+        if count == 0 {
+            return Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': a multi-vector value needs at least one vector"
+            )));
+        }
+        if count > MultiVectorOption::MAX_VECTORS_PER_DOCUMENT {
+            return Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': a multi-vector value holds at most {} vectors, got {count}",
+                MultiVectorOption::MAX_VECTORS_PER_DOCUMENT
+            )));
+        }
         Ok(())
     }
 
@@ -787,7 +834,12 @@ impl VectorStore {
                 // where the reader-based lookup below is still correct.
                 let dims = self.index.field_dimensions();
                 if !dims.is_empty() {
-                    dims.into_keys().collect()
+                    // Multi-vector fields are not search targets (Issue
+                    // #1177), so a prefix never expands to one.
+                    let late_interaction = self.index.late_interaction_fields();
+                    dims.into_keys()
+                        .filter(|name| !late_interaction.contains(name))
+                        .collect()
                 } else {
                     self.index.reader()?.field_names().unwrap_or_default()
                 }
@@ -1087,6 +1139,32 @@ impl VectorStore {
             vectors.truncate(limit);
         }
         Ok(vectors)
+    }
+
+    /// A point-in-time view of the committed token vectors of the
+    /// multi-vector field `field` (Issue #1177).
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - A multi-vector field.
+    ///
+    /// # Returns
+    ///
+    /// The snapshot; documents committed or deleted afterwards are not
+    /// reflected in its segments (deletions may be).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when `field` is unknown or
+    /// is not a multi-vector field, and an error when a segment fails to
+    /// load.
+    pub fn multi_vector_snapshot(
+        &self,
+        field: &str,
+    ) -> Result<crate::vector::index::multivector::MultiVectorSnapshot> {
+        self.index.multi_vector_snapshot(field)?.ok_or_else(|| {
+            LaurusError::invalid_argument(format!("field '{field}' is not a MultiVector field"))
+        })
     }
 
     /// Get the storage backend.

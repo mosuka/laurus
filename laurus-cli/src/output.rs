@@ -354,6 +354,11 @@ fn format_data_value(value: &DataValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        DataValue::VectorArray(arr) => format!(
+            "<{} vectors dim={}>",
+            arr.len(),
+            arr.first().map_or(0, Vec::len)
+        ),
     }
 }
 
@@ -420,6 +425,9 @@ fn data_value_to_json(value: &DataValue) -> serde_json::Value {
                 }))
                 .collect::<Vec<_>>()
         ),
+        // Nested arrays, the shape `json_to_document` infers back into a
+        // MultiVector value (#1177).
+        DataValue::VectorArray(arr) => json!(arr),
     }
 }
 

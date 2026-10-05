@@ -15,6 +15,7 @@ pub mod hnsw;
 pub mod io;
 pub mod ivf;
 pub mod multi_field;
+pub mod multivector;
 pub mod pq_codebook;
 pub mod pq_fastscan_avx2;
 #[cfg(feature = "pq-fastscan")]
@@ -294,6 +295,31 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     fn field_dimensions(&self) -> std::collections::BTreeMap<String, usize> {
         std::collections::BTreeMap::new()
     }
+
+    /// A point-in-time view of the token vectors of the multi-vector field
+    /// `field` (Issue #1177), read by late-interaction rescoring.
+    ///
+    /// Defaults to `Ok(None)`: only a multi-vector index (and a multi-field
+    /// index routing to one) holds token vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field's segments fail to load.
+    fn multi_vector_snapshot(
+        &self,
+        _field: &str,
+    ) -> Result<Option<multivector::MultiVectorSnapshot>> {
+        Ok(None)
+    }
+
+    /// Names of the fields that hold token vectors for late-interaction
+    /// rescoring rather than searchable vectors (Issue #1177).
+    ///
+    /// They are excluded from field-less vector search and from prefix
+    /// field selectors. Defaults to empty.
+    fn late_interaction_fields(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
 }
 
 /// Statistics about a vector index.
@@ -388,6 +414,9 @@ impl ManagedVectorIndex {
                     storage.clone(),
                 )?)
             }
+            VectorIndexTypeConfig::MultiVector(_) => {
+                return Err(Self::multi_vector_unsupported());
+            }
         };
 
         Ok(Self {
@@ -402,6 +431,14 @@ impl ManagedVectorIndex {
     /// Helper to create a default writer config.
     fn default_writer_config() -> crate::vector::writer::VectorIndexWriterConfig {
         crate::vector::writer::VectorIndexWriterConfig::default()
+    }
+
+    /// A multi-vector index exists only in the segmented layout opened
+    /// through [`factory::VectorIndexFactory`].
+    fn multi_vector_unsupported() -> LaurusError {
+        LaurusError::invalid_config(
+            "ManagedVectorIndex does not support MultiVector; open it through VectorIndexFactory",
+        )
     }
 
     /// Add vectors to the index.
@@ -521,6 +558,9 @@ impl ManagedVectorIndex {
                         VectorIndexTypeConfig::IVF(c) => {
                             IvfIndexReader::load(storage.clone(), path, c.distance_metric)
                                 .map(|r| Arc::new(r) as _)
+                        }
+                        VectorIndexTypeConfig::MultiVector(_) => {
+                            Err(Self::multi_vector_unsupported())
                         }
                     };
                 if let Ok(reader) = storage_result {

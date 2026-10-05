@@ -96,7 +96,25 @@ impl VectorIndexFactory {
             VectorIndexTypeConfig::IVF(ivf_config) => {
                 Self::dispatch_ivf(storage, name, ivf_config, false)
             }
+            VectorIndexTypeConfig::MultiVector(mv_config) => {
+                Self::dispatch_multi_vector(storage, name, mv_config)
+            }
         }
+    }
+
+    /// Open or create a multi-vector index (Issue #1177).
+    ///
+    /// Multi-vector indexes only exist in the segmented layout and never
+    /// write a `metadata.json`, so creating and opening take the same path.
+    fn dispatch_multi_vector(
+        storage: Arc<dyn Storage>,
+        name: &str,
+        config: crate::vector::index::config::MultiVectorIndexConfig,
+    ) -> Result<Box<dyn VectorIndex>> {
+        let index = crate::vector::index::multivector::MultiVectorIndex::open_or_create(
+            storage, name, config,
+        )?;
+        Ok(Box::new(index))
     }
 
     /// Dispatch a Flat config to the segmented or monolithic implementation
@@ -310,6 +328,9 @@ impl VectorIndexFactory {
                 // migrates legacy monolithic indexes; the flag-off path is
                 // reverse-guarded against segmented directories.
                 Self::dispatch_ivf(storage, name, ivf_config, true)
+            }
+            VectorIndexTypeConfig::MultiVector(mv_config) => {
+                Self::dispatch_multi_vector(storage, name, mv_config)
             }
         }
     }

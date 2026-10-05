@@ -493,6 +493,16 @@ pub fn data_value_to_zval(value: &DataValue) -> PhpResult<Zval> {
             }
             zv.set_hashtable(arr);
         }
+        // An array of float arrays, one per token vector, each shaped like
+        // the scalar `Vector` arm above (#1177).
+        DataValue::VectorArray(vectors) => {
+            let mut arr = ZendHashTable::new();
+            for v in vectors {
+                arr.push(data_value_to_zval(&DataValue::Vector(v.clone()))?)
+                    .map_err(|_| "failed to push vector")?;
+            }
+            zv.set_hashtable(arr);
+        }
     }
     Ok(zv)
 }

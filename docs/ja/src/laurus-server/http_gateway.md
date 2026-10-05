@@ -85,6 +85,8 @@ curl http://localhost:8080/v1/schema
 
 レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
 
+MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` のように宣言します（`distance` は `"cosine"` または `"dot_product"`、省略時は `"cosine"`）。文書での値は、トークンベクトルごとの同じ長さの数値配列の配列です（`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`）。このフィールドは late interaction の再採点のためにトークンベクトルを保持するもので、ベクトル検索の対象にはならず、文書とともに返されることもありません。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:
