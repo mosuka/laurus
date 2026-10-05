@@ -76,6 +76,38 @@ pub async fn create_embedder_from_definition(
         EmbedderDefinition::Openai { .. } => Err(LaurusError::not_implemented(
             "openai embedder requires the 'embeddings-openai' feature to be enabled",
         )),
+
+        #[cfg(feature = "embeddings-candle")]
+        EmbedderDefinition::CandleColbert {
+            model,
+            revision,
+            query_maxlen,
+            doc_maxlen,
+        } => {
+            use crate::embedding::candle_colbert_embedder::{
+                CandleColbertEmbedder, CandleColbertOptions,
+            };
+            let model = model.clone();
+            let options = CandleColbertOptions {
+                revision: revision.clone(),
+                query_maxlen: *query_maxlen,
+                doc_maxlen: *doc_maxlen,
+            };
+            // Downloading and memory-mapping the checkpoint blocks, so keep
+            // it off the async worker threads.
+            let embedder = tokio::task::spawn_blocking(move || {
+                CandleColbertEmbedder::with_options(&model, options)
+            })
+            .await
+            .map_err(|e| {
+                LaurusError::internal(format!("loading the ColBERT model failed: {e}"))
+            })??;
+            Ok(Arc::new(embedder))
+        }
+        #[cfg(not(feature = "embeddings-candle"))]
+        EmbedderDefinition::CandleColbert { .. } => Err(LaurusError::not_implemented(
+            "candle_colbert embedder requires the 'embeddings-candle' feature to be enabled",
+        )),
     }
 }
 

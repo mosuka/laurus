@@ -204,6 +204,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::MultiVector(o) => Some(Opt::MultiVector(v1::MultiVectorOption {
             dimension: o.dimension as u32,
             distance: distance_to_proto(&o.distance) as i32,
+            embedder: o.embedder.clone().unwrap_or_default(),
         })),
     };
     v1::FieldOption { option }
@@ -340,6 +341,11 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
         Some(Opt::MultiVector(o)) => Some(FieldOption::MultiVector(MultiVectorOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
+            embedder: if o.embedder.is_empty() {
+                None
+            } else {
+                Some(o.embedder.clone())
+            },
         })),
         None => None,
     }
@@ -790,11 +796,47 @@ fn embedder_definition_to_proto(def: &EmbedderDefinition) -> v1::EmbedderConfig 
             p.insert("model".into(), model.clone());
             ("openai", p)
         }
+        EmbedderDefinition::CandleColbert {
+            model,
+            revision,
+            query_maxlen,
+            doc_maxlen,
+        } => {
+            let mut p = HashMap::new();
+            p.insert("model".into(), model.clone());
+            if let Some(revision) = revision {
+                p.insert("revision".into(), revision.clone());
+            }
+            if let Some(n) = query_maxlen {
+                p.insert("query_maxlen".into(), n.to_string());
+            }
+            if let Some(n) = doc_maxlen {
+                p.insert("doc_maxlen".into(), n.to_string());
+            }
+            ("candle_colbert", p)
+        }
     };
     v1::EmbedderConfig {
         r#type: type_name.into(),
         params,
     }
+}
+
+/// Parse the optional count parameter `key` of a `kind` embedder.
+fn optional_count(
+    proto: &v1::EmbedderConfig,
+    kind: &str,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    proto
+        .params
+        .get(key)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| format!("{kind}: {key} must be a non-negative integer, got '{value}'"))
+        })
+        .transpose()
 }
 
 fn embedder_definition_from_proto(
@@ -822,6 +864,16 @@ fn embedder_definition_from_proto(
                 .get("model")
                 .cloned()
                 .ok_or("openai: missing model")?,
+        }),
+        "candle_colbert" => Ok(EmbedderDefinition::CandleColbert {
+            model: proto
+                .params
+                .get("model")
+                .cloned()
+                .ok_or("candle_colbert: missing model")?,
+            revision: proto.params.get("revision").cloned(),
+            query_maxlen: optional_count(proto, "candle_colbert", "query_maxlen")?,
+            doc_maxlen: optional_count(proto, "candle_colbert", "doc_maxlen")?,
         }),
         other => Err(format!("Unknown embedder type: {other}")),
     }
@@ -1307,9 +1359,71 @@ mod tests {
             Some(FieldOption::MultiVector(o)) => {
                 assert_eq!(o.dimension, 96);
                 assert_eq!(o.distance, DistanceMetric::DotProduct);
+                assert_eq!(o.embedder, None);
             }
             other => panic!("expected FieldOption::MultiVector, got {other:?}"),
         }
+    }
+
+    /// #1349: a `candle_colbert` embedder definition and the multi-vector
+    /// field naming it round-trip, with and without the optional params.
+    #[test]
+    fn candle_colbert_embedder_round_trips_through_proto() {
+        let full = EmbedderDefinition::CandleColbert {
+            model: "colbert-ir/colbertv2.0".to_string(),
+            revision: Some("c1e84128".to_string()),
+            query_maxlen: Some(32),
+            doc_maxlen: Some(180),
+        };
+        let bare = EmbedderDefinition::CandleColbert {
+            model: "answerdotai/answerai-colbert-small-v1".to_string(),
+            revision: None,
+            query_maxlen: None,
+            doc_maxlen: None,
+        };
+        let schema = Schema::builder()
+            .add_embedder("colbert", full)
+            .add_embedder("small", bare)
+            .add_multi_vector_field("tokens", MultiVectorOption::new(128).embedder("colbert"))
+            .build();
+        let proto = to_proto(&schema);
+        assert_eq!(proto.embedders["colbert"].params["query_maxlen"], "32");
+        assert!(!proto.embedders["small"].params.contains_key("revision"));
+
+        let back = from_proto(&proto).expect("from_proto must succeed");
+        assert!(matches!(
+            &back.embedders["colbert"],
+            EmbedderDefinition::CandleColbert {
+                revision: Some(r),
+                query_maxlen: Some(32),
+                doc_maxlen: Some(180),
+                ..
+            } if r == "c1e84128"
+        ));
+        assert!(matches!(
+            &back.embedders["small"],
+            EmbedderDefinition::CandleColbert {
+                revision: None,
+                query_maxlen: None,
+                doc_maxlen: None,
+                ..
+            }
+        ));
+        assert_eq!(back.fields["tokens"].embedder_name(), Some("colbert"));
+    }
+
+    /// #1349: a non-numeric `candle_colbert` length is rejected.
+    #[test]
+    fn candle_colbert_rejects_a_non_numeric_length() {
+        let proto = v1::EmbedderConfig {
+            r#type: "candle_colbert".to_string(),
+            params: HashMap::from([
+                ("model".to_string(), "colbert-ir/colbertv2.0".to_string()),
+                ("doc_maxlen".to_string(), "long".to_string()),
+            ]),
+        };
+        let err = embedder_definition_from_proto(&proto).unwrap_err();
+        assert!(err.contains("doc_maxlen"), "{err}");
     }
 
     /// #1175: `TextOption.multi_valued` (proto field 6) and

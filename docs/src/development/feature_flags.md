@@ -6,7 +6,7 @@ The `laurus` crate ships with no default features. Enable embedding support as n
 
 | Feature | Description | Key Dependencies |
 | :--- | :--- | :--- |
-| `embeddings-candle` | Local BERT embeddings via Hugging Face Candle | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
+| `embeddings-candle` | Local BERT embeddings and ColBERT token vectors via Hugging Face Candle | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `embeddings-openai` | OpenAI API embeddings | reqwest |
 | `embeddings-multimodal` | CLIP multimodal embeddings (text + image) | image, embeddings-candle |
 | `embeddings-all` | All embedding features combined | All of the above |
@@ -15,7 +15,7 @@ The `laurus` crate ships with no default features. Enable embedding support as n
 
 ### `embeddings-candle`
 
-Enables `CandleBertEmbedder` for running BERT models locally on the CPU. Models are downloaded from Hugging Face Hub on first use.
+Enables `CandleBertEmbedder` for running BERT models locally on the CPU, and `CandleColbertEmbedder` (the `candle_colbert` schema embedder) for ColBERT token vectors used by late-interaction rescoring. Models are downloaded from Hugging Face Hub on first use.
 
 ```toml
 [dependencies]

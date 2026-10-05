@@ -170,8 +170,9 @@ A collection of named field values.
 | Item | Description |
 | :--- | :--- |
 | `RescoreOptions::late_interaction(field, query_vectors)` | Rescore by late interaction (MaxSim) against a multi-vector field, with the query's token vectors (`Vec<Vector>`) |
+| `RescoreOptions::late_interaction_text(field, text)` | Same, with query text that the field's token-level embedder embeds |
 | `.window_size(n)` | How many top first-stage candidates to rescore (default `100`, at most `RescoreOptions::MAX_WINDOW_SIZE` = `10,000`) |
-| `Rescorer::LateInteraction { field, query }` | The rescorer the constructor builds; `query` is `LateInteractionQuery::Vectors(Vec<Vector>)` |
+| `Rescorer::LateInteraction { field, query }` | The rescorer the constructors build; `query` is `LateInteractionQuery::Vectors(Vec<Vector>)` or `LateInteractionQuery::Text(String)`. Both enums are `#[non_exhaustive]` |
 
 ## Query Types (Lexical)
 
@@ -220,8 +221,11 @@ A collection of named field values.
 | `CandleBertEmbedder` | `embeddings-candle` | Local BERT model |
 | `OpenAIEmbedder` | `embeddings-openai` | OpenAI API |
 | `CandleClipEmbedder` | `embeddings-multimodal` | Local CLIP model |
+| `CandleColbertEmbedder` | `embeddings-candle` | Local ColBERT model producing token vectors for multi-vector fields (`with_options(model, CandleColbertOptions)` pins a revision and lengths) |
 | `PrecomputedEmbedder` | *(default)* | Pre-computed vectors |
 | `PerFieldEmbedder` | *(default)* | Per-field embedder dispatch |
+
+A token-level embedder also implements `TokenEmbedder` (`embed_tokens(inputs, EmbedRole)`, `token_dimension()`) and returns it from `Embedder::as_token_embedder()`; see [Token-Level Embedders](../concepts/embedding.md#token-level-embedders).
 
 ## Storage
 

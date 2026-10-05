@@ -26,6 +26,28 @@ The `embed()` method returns a `Vector` (a struct wrapping `Vec<f32>`).
 | `EmbedInput::Text(&str)` | Text input |
 | `EmbedInput::Bytes(&[u8], Option<&str>)` | Binary input with optional MIME type (for images) |
 
+### Token-Level Embedders
+
+Late-interaction models such as ColBERT turn an input into one vector per
+token instead of one vector in total, and encode queries and documents
+differently. Such an embedder also implements `TokenEmbedder` and returns
+itself from `Embedder::as_token_embedder` (Issue #1349):
+
+```rust
+#[async_trait]
+pub trait TokenEmbedder: Send + Sync + Debug {
+    async fn embed_tokens(&self, inputs: &[EmbedInput<'_>], role: EmbedRole)
+        -> Result<Vec<Vec<Vector>>>;
+    fn token_dimension(&self) -> usize;
+}
+
+pub enum EmbedRole { Query, Document }
+```
+
+A [multi-vector field](schema_and_fields.md#multi-vector-fields) embeds text
+only through this trait. An embedder without it (any single-vector model)
+is rejected rather than silently producing a one-token document.
+
 ## Built-in Embedders
 
 ### CandleBertEmbedder
@@ -96,6 +118,67 @@ let embedder = CandleClipEmbedder::new(
 | Input types | Text AND images |
 | Use case | Text-to-image search, image-to-image search |
 
+### CandleColbertEmbedder
+
+Runs a BERT-based ColBERT checkpoint locally and produces one vector per
+token, for [late-interaction rescoring](search/vector_search.md#late-interaction-rescore)
+over a multi-vector field. It is a token-level embedder only: `embed()`
+returns an error.
+
+**Feature flag:** `embeddings-candle`
+
+```rust
+use laurus::{CandleColbertEmbedder, CandleColbertOptions};
+
+// Uses the checkpoint's own settings (artifact.metadata).
+let embedder = CandleColbertEmbedder::new("colbert-ir/colbertv2.0")?;
+
+// Pin the model commit and override the lengths.
+let embedder = CandleColbertEmbedder::with_options(
+    "answerdotai/answerai-colbert-small-v1",
+    CandleColbertOptions::default()
+        .revision("934fa8bb4ce2284f4c2baa232d81aca4d076fa5e")
+        .doc_maxlen(300),
+)?;
+```
+
+| Property | `colbert-ir/colbertv2.0` | `answerdotai/answerai-colbert-small-v1` |
+| :--- | :--- | :--- |
+| Token dimension | 128 | 96 |
+| Query length (`query_maxlen`) | 32 | 32 |
+| Document length (`doc_maxlen`) | 180 | 300 |
+| License | MIT | Apache-2.0 |
+| Runtime | Local (CPU) | Local (CPU) |
+
+It encodes like colbert-ai, the reference implementation:
+
+```text
+query:    [CLS] [unused0] w1 … wn [SEP] [MASK] … [MASK]   exactly query_maxlen tokens
+document: [CLS] [unused1] w1 … wn [SEP]                   at most doc_maxlen tokens
+```
+
+- The query's `[MASK]` padding is not attended to, but its vectors are kept:
+  they expand the query.
+- Document vectors of punctuation tokens are dropped.
+- Every vector goes through the checkpoint's `linear` projection and is
+  L2-normalized.
+
+The lengths, the markers and these switches come from the checkpoint's
+`artifact.metadata` (colbert-ai's defaults, 32 and 220, apply when the file
+is missing); `CandleColbertOptions` overrides the lengths. For both
+checkpoints above, its vectors match colbert-ai's within 1e-6 per element.
+
+Inference runs on the CPU in a blocking task, in batches of up to 32
+inputs. As a guide, on an Apple M4 one query takes about 55 ms with
+`colbertv2.0` and 18 ms with `answerai-colbert-small-v1`, and a document of
+about 110 tokens about 135 ms and 45 ms.
+
+Pin `revision` to a commit: the write-ahead log keeps the text of
+documents that are not committed yet and embeds it again on recovery, and a
+changed model would produce different vectors. Only BERT-based checkpoints
+are supported (ModernBERT-based ones such as `lightonai/GTE-ModernColBERT-v1`
+are not).
+
 ### PrecomputedEmbedder
 
 Use pre-computed vectors directly without any embedding computation. Useful when vectors are generated externally.
@@ -164,6 +247,9 @@ engine.add_document("doc-1", doc).await?;
 // The embedder converts the text to a vector before indexing
 ```
 
+A multi-vector field whose embedder is a token-level one takes text the
+same way: the text is embedded into one vector per token, as a document.
+
 ### At Search Time
 
 When you search with text, the engine embeds the query text as well:
@@ -180,6 +266,10 @@ let request = vector_parser.parse(r#"text_vec:"systems programming""#).await?;
 
 Both approaches embed the query text using the same embedder that was used at index time, ensuring consistent vector spaces.
 
+A late-interaction rescore takes its query as text too
+(`RescoreOptions::late_interaction_text`); the multi-vector field's
+token-level embedder embeds it as a query.
+
 ## Feature Flags Summary
 
 Each embedder requires a specific feature flag to be enabled in `Cargo.toml`:
@@ -187,6 +277,7 @@ Each embedder requires a specific feature flag to be enabled in `Cargo.toml`:
 | Embedder | Feature Flag | Dependencies |
 | :--- | :--- | :--- |
 | `CandleBertEmbedder` | `embeddings-candle` | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
+| `CandleColbertEmbedder` | `embeddings-candle` | same as `CandleBertEmbedder` |
 | `OpenAIEmbedder` | `embeddings-openai` | reqwest |
 | `CandleClipEmbedder` | `embeddings-multimodal` | image + embeddings-candle |
 | `PrecomputedEmbedder` | *(none -- always available)* | -- |
@@ -200,5 +291,6 @@ The `embeddings-all` feature enables all embedding features at once. See [Featur
 | Quick prototyping, offline use | `CandleBertEmbedder` |
 | Production with high accuracy | `OpenAIEmbedder` |
 | Text + image search | `CandleClipEmbedder` |
+| Late-interaction rescoring (multi-vector fields) | `CandleColbertEmbedder` |
 | Pre-computed vectors from external pipeline | `PrecomputedEmbedder` |
 | Multiple models per field | `PerFieldEmbedder` wrapping others |

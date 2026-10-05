@@ -369,13 +369,20 @@ message MultiVectorOption {
   uint32 dimension = 1;
   // Only COSINE (vectors are L2-normalized) and DOT_PRODUCT are accepted.
   DistanceMetric distance = 2;
+  // Name of a token-level embedder (e.g. a "candle_colbert" one) that turns
+  // text values into token vectors. Empty means documents supply the token
+  // vectors.
+  string embedder = 3;
 }
 
 // An embedder configuration.
 message EmbedderConfig {
-  // Embedder type name (e.g. "precomputed", "candle_bert", "openai").
+  // Embedder type name (e.g. "precomputed", "candle_bert", "candle_colbert",
+  // "openai").
   string type = 1;
   // Type-specific parameters (e.g. "model" -> "sentence-transformers/all-MiniLM-L6-v2").
+  // "candle_colbert" also takes the optional "revision", "query_maxlen" and
+  // "doc_maxlen" (numbers written as decimal strings).
   map<string, string> params = 2;
 }
 

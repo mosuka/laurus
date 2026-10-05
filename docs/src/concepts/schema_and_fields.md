@@ -177,22 +177,29 @@ let schema = Schema::builder()
     .build();
 ```
 
-- **Options**: `dimension` (every token vector's length) and `distance`.
-  Only `Cosine` (vectors are L2-normalized when written, so the similarity is
-  their dot product; a zero vector is kept as-is) and `DotProduct` are
-  accepted; other metrics are rejected when the index is created.
+- **Options**: `dimension` (every token vector's length), `distance` and
+  `embedder`. Only `Cosine` (vectors are L2-normalized when written, so the
+  similarity is their dot product; a zero vector is kept as-is) and
+  `DotProduct` are accepted; other metrics are rejected when the index is
+  created. `embedder` names a token-level embedder, such as a
+  [`candle_colbert`](../laurus-cli/schema_format.md#embedders) one
+  (`MultiVectorOption::new(96).embedder("colbert")`).
 - **Values**: a `DataValue::VectorArray(Vec<Vec<f32>>)` holding at least one
   and at most 8,192 vectors, each of the field's dimension and with finite
   values. In JSON it is an array of equal-length numeric arrays
-  (`[[0.1, 0.2, ...], [0.3, 0.4, ...]]`).
+  (`[[0.1, 0.2, ...], [0.3, 0.4, ...]]`). When a token-level embedder
+  serves the field (named in `embedder`, or registered through
+  `EngineBuilder::embedder`), a text value works too: it is embedded into
+  token vectors when the document is indexed (Issue #1349), and a document
+  is rejected if the field has no such embedder.
 - **Not stored**: the token vectors are kept only in the vector index (about
   150 KB per document for 300 × 128 `f32`), so `get_documents` and search
   results never include the field.
 - **Not queryable**: a field-less vector query and a prefix field selector
   skip it, naming it in a vector query is an error, and so is naming it in a
   DSL query.
-- **Schema changes**: changing its dimension or distance, or changing it to
-  or from another vector field type, is a destructive change.
+- **Schema changes**: changing its dimension, distance or embedder, or
+  changing it to or from another vector field type, is a destructive change.
 
 ## Document
 

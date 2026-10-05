@@ -658,22 +658,96 @@ fn analyzer_resolution_error(
     }
 }
 
-/// Look up the definition of the embedder that vector field `field` names.
+/// Look up the definition of the embedder that vector field `field` names
+/// in `option`, if it names one, and check that it fits the field.
+///
+/// A multi-vector field needs an embedder that produces token vectors, and
+/// a single-vector field one that produces a vector per input; a
+/// precomputed embedder fits either (Issue #1349).
 ///
 /// # Errors
 ///
 /// Returns [`InvalidArgument`](crate::error::LaurusError::InvalidArgument)
-/// if `schema.embedders` does not declare `embedder`.
-fn embedder_definition<'a>(
+/// if `schema.embedders` does not declare the embedder or its output does
+/// not fit the field.
+fn field_embedder_definition<'a>(
     schema: &'a Schema,
     field: &str,
-    embedder: &str,
-) -> Result<&'a schema::embedder::EmbedderDefinition> {
-    schema.embedders.get(embedder).ok_or_else(|| {
+    option: &schema::FieldOption,
+) -> Result<Option<&'a schema::embedder::EmbedderDefinition>> {
+    use schema::embedder::EmbedderOutput;
+
+    let Some(embedder) = option.embedder_name() else {
+        return Ok(None);
+    };
+    let definition = schema.embedders.get(embedder).ok_or_else(|| {
         crate::error::LaurusError::invalid_argument(format!(
             "Unknown embedder '{embedder}' for field '{field}': not defined in schema.embedders"
         ))
-    })
+    })?;
+    let multi_vector = matches!(option, schema::FieldOption::MultiVector(_));
+    let kind = definition.type_name();
+    match (multi_vector, definition.output()) {
+        (_, EmbedderOutput::Precomputed)
+        | (true, EmbedderOutput::TokenVectors)
+        | (false, EmbedderOutput::Vector) => Ok(Some(definition)),
+        (true, EmbedderOutput::Vector) => {
+            Err(crate::error::LaurusError::invalid_argument(format!(
+                "Embedder '{embedder}' ({kind}) produces one vector per input, but field \
+                 '{field}' is a multi-vector field that needs token vectors"
+            )))
+        }
+        (false, EmbedderOutput::TokenVectors) => {
+            Err(crate::error::LaurusError::invalid_argument(format!(
+                "Embedder '{embedder}' ({kind}) produces token vectors, so it can only serve a \
+                 multi-vector field, but field '{field}' holds one vector per document"
+            )))
+        }
+    }
+}
+
+/// Check an embedder that serves multi-vector field `field` against the
+/// field (Issue #1349): it must produce token vectors of the field's
+/// dimension, or be a [`PrecomputedEmbedder`](crate::embedding::precomputed::PrecomputedEmbedder).
+///
+/// Single-vector fields are not checked: their dimension is only known
+/// once a vector is embedded, which ingestion already validates.
+///
+/// # Errors
+///
+/// Returns [`InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+/// when the embedder does not fit.
+fn check_field_embedder(
+    field: &str,
+    option: &schema::FieldOption,
+    embedder: &dyn Embedder,
+) -> Result<()> {
+    let schema::FieldOption::MultiVector(multi) = option else {
+        return Ok(());
+    };
+    match embedder.as_token_embedder() {
+        Some(tokens) if tokens.token_dimension() != multi.dimension => {
+            Err(crate::error::LaurusError::invalid_argument(format!(
+                "Field '{field}' has dimension {}, but its embedder '{}' produces {}-dimensional \
+                 token vectors",
+                multi.dimension,
+                embedder.name(),
+                tokens.token_dimension()
+            )))
+        }
+        Some(_) => Ok(()),
+        None if embedder
+            .as_any()
+            .is::<crate::embedding::precomputed::PrecomputedEmbedder>() =>
+        {
+            Ok(())
+        }
+        None => Err(crate::error::LaurusError::invalid_argument(format!(
+            "Field '{field}' is a multi-vector field, but its embedder '{}' produces one vector \
+             per input instead of token vectors",
+            embedder.name()
+        ))),
+    }
 }
 
 /// Combine lexical and vector hits into one ranking, best first.
@@ -1758,29 +1832,42 @@ impl Engine {
         Ok(())
     }
 
+    /// Drop every cached query embedding.
+    ///
+    /// Called after a vector field is added, deleted or rebuilt: the
+    /// embedder behind a field name may have changed, and the cache keys
+    /// entries by field name.
+    fn clear_embedding_cache(&self) {
+        if let Some(cache) = &self.embedding_cache {
+            cache.clear();
+        }
+    }
+
     /// Build the embedder that a vector field option names, if any.
     ///
     /// # Errors
     ///
     /// Returns an error if the schema does not declare the named embedder,
-    /// or if constructing it fails.
+    /// if it does not fit the field (see [`field_embedder_definition`] and
+    /// [`check_field_embedder`]), or if constructing it fails.
     async fn field_embedder(
         &self,
         field: &str,
         option: &schema::FieldOption,
     ) -> Result<Option<Arc<dyn Embedder>>> {
-        let Some(embedder_name) = option.embedder_name() else {
-            return Ok(None);
-        };
         // Clone the definition out of the `parking_lot` guard, which is not
         // `Send`, before the `await`.
         let def = {
             let schema = self.schema.read();
-            embedder_definition(&schema, field, embedder_name)?.clone()
+            field_embedder_definition(&schema, field, option)?.cloned()
+        };
+        let (Some(def), Some(embedder_name)) = (def, option.embedder_name()) else {
+            return Ok(None);
         };
         let embedder =
             crate::embedding::registry::create_embedder_from_definition(embedder_name, &def)
                 .await?;
+        check_field_embedder(field, option, embedder.as_ref())?;
         Ok(Some(embedder))
     }
 
@@ -1863,6 +1950,7 @@ impl Engine {
             self.vector
                 .add_field(name, &vector_opt, field_embedder)
                 .await?;
+            self.clear_embedding_cache();
         }
 
         // 3. Update the schema.
@@ -1927,6 +2015,7 @@ impl Engine {
 
         if option.is_vector() {
             self.vector.delete_field(name).await?;
+            self.clear_embedding_cache();
         }
 
         // 3. Update the schema.
@@ -2026,9 +2115,7 @@ impl Engine {
 
         // Checked before the dry-run return so that a dry run reports what
         // the real call would do.
-        if let Some(embedder_name) = option.embedder_name() {
-            embedder_definition(&self.schema.read(), name, embedder_name)?;
-        }
+        field_embedder_definition(&self.schema.read(), name, &option)?;
 
         let classification = schema::classify_change(&old_option, &option);
 
@@ -2078,6 +2165,7 @@ impl Engine {
                     self.vector
                         .rebuild_field(name, &vector_opt, field_embedder, purge)
                         .await?;
+                    self.clear_embedding_cache();
                 } else {
                     let lexical_opt = option
                         .to_lexical()
@@ -2629,18 +2717,34 @@ impl Engine {
 
         let lexical_config = lexical_builder.build();
 
-        // Every embedder name must be declared even when an explicit embedder
-        // serves the fields: the persisted schema is also opened by front ends
-        // that do not pass that embedder (Issue #1309).
+        // Every embedder name must be declared, and fit its field, even when
+        // an explicit embedder serves the fields: the persisted schema is
+        // also opened by front ends that do not pass that embedder (Issue
+        // #1309).
         for (name, field_option) in &schema.fields {
-            if let Some(embedder_name) = field_option.embedder_name() {
-                embedder_definition(schema, name, embedder_name)?;
-            }
+            field_embedder_definition(schema, name, field_option)?;
         }
 
         // Construct Vector Config — resolve embedder from schema if not explicitly provided.
-        let embedder = if embedder.is_some() {
-            embedder
+        let embedder = if let Some(explicit) = embedder {
+            // The fields an explicit `PerFieldEmbedder` routes must fit their
+            // embedder; fields falling back to its default embedder are left
+            // alone, since they may receive precomputed vectors.
+            if let Some(per_field) = explicit
+                .as_any()
+                .downcast_ref::<crate::embedding::per_field::PerFieldEmbedder>()
+            {
+                for name in per_field.configured_fields() {
+                    if let Some(field_option) = schema.fields.get(&name) {
+                        check_field_embedder(
+                            &name,
+                            field_option,
+                            per_field.get_embedder(&name).as_ref(),
+                        )?;
+                    }
+                }
+            }
+            Some(explicit)
         } else if !schema.embedders.is_empty() {
             // Build a PerFieldEmbedder from schema.embedders declarations.
             let mut embedder_cache: HashMap<String, Arc<dyn crate::embedding::embedder::Embedder>> =
@@ -2650,11 +2754,13 @@ impl Engine {
             let per_field = crate::embedding::per_field::PerFieldEmbedder::new(default_embedder);
 
             for (name, field_option) in &schema.fields {
-                if let Some(embedder_name) = field_option.embedder_name() {
+                if let (Some(embedder_name), Some(def)) = (
+                    field_option.embedder_name(),
+                    field_embedder_definition(schema, name, field_option)?,
+                ) {
                     let emb = if let Some(cached) = embedder_cache.get(embedder_name) {
                         cached.clone()
                     } else {
-                        let def = embedder_definition(schema, name, embedder_name)?;
                         let emb = crate::embedding::registry::create_embedder_from_definition(
                             embedder_name,
                             def,
@@ -2663,6 +2769,7 @@ impl Engine {
                         embedder_cache.insert(embedder_name.to_string(), emb.clone());
                         emb
                     };
+                    check_field_embedder(name, field_option, emb.as_ref())?;
                     per_field.add_embedder(name, emb);
                 }
             }
@@ -2952,13 +3059,21 @@ impl Engine {
             rescore: request_rescore,
         } = request;
 
-        // Validate the rescore options before any search runs.
-        let rescore = match &request_rescore {
-            Some(options) => Some(self::rescore::PreparedRescore::prepare(
+        // Validate the rescore options, and embed a text query, before any
+        // search runs. Two statements on purpose: the `parking_lot` schema
+        // guard is not `Send`, so it must be dropped before the `await`
+        // (holding it across would make this future `!Send`).
+        let plan = match request_rescore {
+            Some(options) => Some(self::rescore::RescorePlan::new(
                 &self.schema.read(),
+                self.vector.embedder(),
                 options,
                 &lexical_options.sort_by,
             )?),
+            None => None,
+        };
+        let rescore = match plan {
+            Some(plan) => Some(plan.prepare(self.embedding_cache.as_ref()).await?),
             None => None,
         };
 
@@ -3956,6 +4071,197 @@ mod tests {
             );
         }
         assert_eq!(persisted.load(Ordering::SeqCst), 0);
+    }
+
+    /// A 2-dimensional multi-vector field option that names `embedder`.
+    fn multi_vector_naming(embedder: &str) -> schema::FieldOption {
+        schema::FieldOption::MultiVector(
+            crate::vector::core::field::MultiVectorOption::new(2).embedder(embedder),
+        )
+    }
+
+    fn assert_invalid_containing(err: &crate::error::LaurusError, expected: &str) {
+        assert!(
+            matches!(err, crate::error::LaurusError::InvalidArgument(m) if m.contains(expected)),
+            "expected InvalidArgument containing {expected:?}, got {err:?}"
+        );
+    }
+
+    /// Issue #1349: build, `add_field` and `update_field` reject an
+    /// embedder whose output does not fit the field. The check runs on the
+    /// definition, before any embedder is built, so no model is downloaded.
+    #[tokio::test]
+    async fn embedder_output_must_fit_the_field() {
+        use crate::engine::schema::embedder::EmbedderDefinition;
+
+        let colbert = EmbedderDefinition::CandleColbert {
+            model: "colbert-ir/colbertv2.0".to_string(),
+            revision: None,
+            query_maxlen: None,
+            doc_maxlen: None,
+        };
+        let bert = EmbedderDefinition::CandleBert {
+            model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+        };
+
+        let cases = [
+            (
+                Schema::builder()
+                    .add_embedder("colbert", colbert.clone())
+                    .add_field("vec", hnsw_naming("colbert"))
+                    .build(),
+                "produces token vectors",
+            ),
+            (
+                Schema::builder()
+                    .add_embedder("bert", bert.clone())
+                    .add_field("tokens", multi_vector_naming("bert"))
+                    .build(),
+                "needs token vectors",
+            ),
+        ];
+        for (schema, expected) in cases {
+            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+            let err = Engine::builder(storage, schema)
+                .build()
+                .await
+                .err()
+                .unwrap();
+            assert_invalid_containing(&err, expected);
+        }
+
+        // A precomputed embedder fits a multi-vector field.
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_embedder("colbert", colbert)
+            .add_embedder("bert", bert)
+            .add_embedder("pre", EmbedderDefinition::Precomputed)
+            .add_field("tokens", multi_vector_naming("pre"))
+            .build();
+        let engine = Engine::builder(storage, schema).build().await.unwrap();
+
+        let err = engine
+            .add_field("vec", hnsw_naming("colbert"))
+            .await
+            .unwrap_err();
+        assert_invalid_containing(&err, "produces token vectors");
+        let err = engine
+            .add_field("more", multi_vector_naming("bert"))
+            .await
+            .unwrap_err();
+        assert_invalid_containing(&err, "needs token vectors");
+        let dry_run = UpdateFieldOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let err = engine
+            .update_field("tokens", multi_vector_naming("bert"), dry_run)
+            .await
+            .unwrap_err();
+        assert_invalid_containing(&err, "needs token vectors");
+        assert_eq!(
+            engine.schema().fields["tokens"].embedder_name(),
+            Some("pre")
+        );
+    }
+
+    /// Embedder producing `tokens`-dimensional token vectors, or plain
+    /// 2-d vectors when `tokens` is `None`.
+    #[derive(Debug)]
+    struct ShapeEmbedder {
+        tokens: Option<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embedding::embedder::TokenEmbedder for ShapeEmbedder {
+        async fn embed_tokens(
+            &self,
+            inputs: &[crate::embedding::embedder::EmbedInput<'_>],
+            _role: crate::embedding::embedder::EmbedRole,
+        ) -> Result<Vec<Vec<crate::vector::core::vector::Vector>>> {
+            let dim = self.tokens.unwrap_or(2);
+            Ok(inputs
+                .iter()
+                .map(|_| vec![crate::vector::core::vector::Vector::new(vec![1.0; dim])])
+                .collect())
+        }
+
+        fn token_dimension(&self) -> usize {
+            self.tokens.unwrap_or(2)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for ShapeEmbedder {
+        async fn embed(
+            &self,
+            _input: &crate::embedding::embedder::EmbedInput<'_>,
+        ) -> Result<crate::vector::core::vector::Vector> {
+            Ok(crate::vector::core::vector::Vector::new(vec![1.0; 2]))
+        }
+
+        fn supported_input_types(&self) -> Vec<crate::embedding::embedder::EmbedInputType> {
+            vec![crate::embedding::embedder::EmbedInputType::Text]
+        }
+
+        fn name(&self) -> &str {
+            "shape"
+        }
+
+        fn as_token_embedder(&self) -> Option<&dyn crate::embedding::embedder::TokenEmbedder> {
+            self.tokens
+                .map(|_| self as &dyn crate::embedding::embedder::TokenEmbedder)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #1349: an explicit `PerFieldEmbedder` must route a
+    /// multi-vector field to a token embedder of the field's dimension (or
+    /// to a precomputed embedder); the default embedder is not checked.
+    #[tokio::test]
+    async fn build_checks_the_embedder_routed_to_a_multi_vector_field() {
+        let schema = Schema::builder()
+            .add_field(
+                "tokens",
+                schema::FieldOption::MultiVector(
+                    crate::vector::core::field::MultiVectorOption::new(2),
+                ),
+            )
+            .build();
+        let cases: [(&str, Arc<dyn Embedder>, Option<&str>); 4] = [
+            (
+                "single-vector",
+                Arc::new(ShapeEmbedder { tokens: None }),
+                Some("instead of token vectors"),
+            ),
+            (
+                "wrong dimension",
+                Arc::new(ShapeEmbedder { tokens: Some(3) }),
+                Some("3-dimensional"),
+            ),
+            (
+                "matching",
+                Arc::new(ShapeEmbedder { tokens: Some(2) }),
+                None,
+            ),
+            ("precomputed", Arc::new(PrecomputedEmbedder::new()), None),
+        ];
+        for (case, routed, expected) in cases {
+            let per_field = PerFieldEmbedder::new(Arc::new(ShapeEmbedder { tokens: None }));
+            per_field.add_embedder("tokens", routed);
+            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+            let result = Engine::builder(storage, schema.clone())
+                .embedder(Arc::new(per_field))
+                .build()
+                .await;
+            match expected {
+                Some(expected) => assert_invalid_containing(&result.err().unwrap(), expected),
+                None => assert!(result.is_ok(), "{case}: {:?}", result.err()),
+            }
+        }
     }
 
     /// Companion to the above: once the first `Engine` is dropped, its

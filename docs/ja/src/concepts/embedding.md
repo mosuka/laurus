@@ -26,6 +26,29 @@ pub trait Embedder: Send + Sync + Debug {
 | `EmbedInput::Text(&str)` | テキスト入力 |
 | `EmbedInput::Bytes(&[u8], Option<&str>)` | バイナリ入力（オプションの MIME タイプ付き、画像用） |
 
+### トークン単位の Embedder
+
+ColBERT のような late interaction のモデルは、入力全体で 1 本ではなく、
+トークンごとに 1 本のベクトルを出し、クエリと文書を異なる方法で符号化します。
+このような Embedder は `TokenEmbedder` も実装し、`Embedder::as_token_embedder`
+で自分自身を返します（Issue #1349）。
+
+```rust
+#[async_trait]
+pub trait TokenEmbedder: Send + Sync + Debug {
+    async fn embed_tokens(&self, inputs: &[EmbedInput<'_>], role: EmbedRole)
+        -> Result<Vec<Vec<Vector>>>;
+    fn token_dimension(&self) -> usize;
+}
+
+pub enum EmbedRole { Query, Document }
+```
+
+[MultiVector フィールド](schema_and_fields.md#multivector-フィールド)は、テキストを
+この trait でだけ埋め込みます。この trait を持たない Embedder（1 入力 1 本の
+ベクトルを出すモデル）は、1 トークンだけの文書を黙って作るのではなく、
+エラーになります。
+
 ## 組み込み Embedder
 
 ### CandleBertEmbedder
@@ -96,6 +119,65 @@ let embedder = CandleClipEmbedder::new(
 | 入力タイプ | テキストおよび画像 |
 | ユースケース | テキストから画像への検索、画像から画像への検索 |
 
+### CandleColbertEmbedder
+
+BERT ベースの ColBERT のチェックポイントをローカルで実行し、トークンごとに
+1 本のベクトルを出します。MultiVector フィールドに対する
+[late interaction による再採点](search/vector_search.md#late-interaction-による再採点rescore)
+に使います。トークン単位の Embedder 専用で、`embed()` はエラーを返します。
+
+**Feature flag:** `embeddings-candle`
+
+```rust
+use laurus::{CandleColbertEmbedder, CandleColbertOptions};
+
+// Uses the checkpoint's own settings (artifact.metadata).
+let embedder = CandleColbertEmbedder::new("colbert-ir/colbertv2.0")?;
+
+// Pin the model commit and override the lengths.
+let embedder = CandleColbertEmbedder::with_options(
+    "answerdotai/answerai-colbert-small-v1",
+    CandleColbertOptions::default()
+        .revision("934fa8bb4ce2284f4c2baa232d81aca4d076fa5e")
+        .doc_maxlen(300),
+)?;
+```
+
+| プロパティ | `colbert-ir/colbertv2.0` | `answerdotai/answerai-colbert-small-v1` |
+| :--- | :--- | :--- |
+| トークンベクトルの次元数 | 128 | 96 |
+| クエリの長さ（`query_maxlen`） | 32 | 32 |
+| 文書の長さ（`doc_maxlen`） | 180 | 300 |
+| ライセンス | MIT | Apache-2.0 |
+| 実行環境 | ローカル（CPU） | ローカル（CPU） |
+
+参照実装の colbert-ai と同じ方法で符号化します。
+
+```text
+query:    [CLS] [unused0] w1 … wn [SEP] [MASK] … [MASK]   exactly query_maxlen tokens
+document: [CLS] [unused1] w1 … wn [SEP]                   at most doc_maxlen tokens
+```
+
+- クエリの `[MASK]` による埋め草には attention を向けませんが、そのベクトルは
+  残します。クエリを拡張する役割を持つためです。
+- 文書では、句読点のトークンのベクトルを取り除きます。
+- どのベクトルも、チェックポイントの `linear` 層で射影してから L2 正規化します。
+
+長さ、マーカー、これらの切り替えは、チェックポイントの `artifact.metadata`
+から読みます（ファイルがない場合は colbert-ai の既定値の 32 と 220）。
+`CandleColbertOptions` で長さを上書きできます。上の 2 つのチェックポイントでは、
+出力のベクトルが colbert-ai と要素ごとに 1e-6 以内で一致します。
+
+推論は CPU 上のブロッキングタスクで、最大 32 件ずつのバッチで行います。
+目安として、Apple M4 ではクエリ 1 件が `colbertv2.0` で約 55 ms、
+`answerai-colbert-small-v1` で約 18 ms、約 110 トークンの文書 1 件が約 135 ms と
+約 45 ms です。
+
+`revision` はコミットに固定してください。write-ahead log はまだコミットされて
+いない文書のテキストを保持し、復旧時に埋め込み直すため、モデルが変わると
+異なるベクトルになります。対応するのは BERT ベースのチェックポイントだけです
+（`lightonai/GTE-ModernColBERT-v1` のような ModernBERT ベースのものは対象外）。
+
 ### PrecomputedEmbedder
 
 Embedding 計算を行わず、事前計算済みのベクトルを直接使用します。ベクトルが外部で生成される場合に便利です。
@@ -164,6 +246,9 @@ engine.add_document("doc-1", doc).await?;
 // The embedder converts the text to a vector before indexing
 ```
 
+トークン単位の Embedder を持つ MultiVector フィールドも、同じようにテキストを
+受け付けます。テキストは文書として、トークンごとに 1 本のベクトルへ埋め込まれます。
+
 ### 検索時
 
 テキストで検索すると、Engine がクエリテキストも同様に Embedding 化します。
@@ -180,6 +265,10 @@ let request = vector_parser.parse(r#"text_vec:"systems programming""#).await?;
 
 どちらのアプローチも、インデクシング時と同じ Embedder を使用してクエリテキストを Embedding 化するため、一貫したベクトル空間が保証されます。
 
+late interaction による再採点も、クエリをテキストで受け取れます
+（`RescoreOptions::late_interaction_text`）。MultiVector フィールドのトークン単位の
+Embedder が、それをクエリとして埋め込みます。
+
 ## Feature Flag まとめ
 
 各 Embedder は `Cargo.toml` で特定の Feature Flag を有効にする必要があります。
@@ -187,6 +276,7 @@ let request = vector_parser.parse(r#"text_vec:"systems programming""#).await?;
 | Embedder | Feature Flag | 依存関係 |
 | :--- | :--- | :--- |
 | `CandleBertEmbedder` | `embeddings-candle` | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
+| `CandleColbertEmbedder` | `embeddings-candle` | `CandleBertEmbedder` と同じ |
 | `OpenAIEmbedder` | `embeddings-openai` | reqwest |
 | `CandleClipEmbedder` | `embeddings-multimodal` | image + embeddings-candle |
 | `PrecomputedEmbedder` | *（なし -- 常に利用可能）* | -- |
@@ -200,5 +290,6 @@ let request = vector_parser.parse(r#"text_vec:"systems programming""#).await?;
 | クイックプロトタイピング、オフライン利用 | `CandleBertEmbedder` |
 | 高精度が求められる本番環境 | `OpenAIEmbedder` |
 | テキスト + 画像検索 | `CandleClipEmbedder` |
+| late interaction による再採点（MultiVector フィールド） | `CandleColbertEmbedder` |
 | 外部パイプラインからの事前計算済みベクトル | `PrecomputedEmbedder` |
 | フィールドごとに複数モデルを使用 | 他の Embedder をラップした `PerFieldEmbedder` |

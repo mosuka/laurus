@@ -124,6 +124,57 @@ pub enum EmbedInputType {
     Image,
 }
 
+/// The side of a retrieval pair an input is embedded for.
+///
+/// Late-interaction models such as ColBERT encode queries and documents
+/// differently (different marker tokens, query padding), so a
+/// [`TokenEmbedder`] needs to know which one it is embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmbedRole {
+    /// A search query.
+    Query,
+    /// A document being indexed.
+    Document,
+}
+
+/// Token-level (multi-vector) embedding for late-interaction models such as
+/// ColBERT (Issue #1349).
+///
+/// An input becomes one vector per token instead of one vector in total.
+/// Embedders that can do this expose it through
+/// [`Embedder::as_token_embedder`]; a multi-vector field embeds text only
+/// through this trait, never by wrapping [`Embedder::embed`], so a
+/// single-vector model on such a field is an error rather than a silent
+/// one-token document.
+#[async_trait]
+pub trait TokenEmbedder: Send + Sync + Debug {
+    /// Embed every input into its token vectors.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - The inputs to embed.
+    /// * `role` - Whether the inputs are queries or documents.
+    ///
+    /// # Returns
+    ///
+    /// One list of token vectors per input, in input order. Every vector
+    /// has [`token_dimension`](Self::token_dimension) elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// for an input the embedder cannot handle, and another error kind when
+    /// the model itself fails.
+    async fn embed_tokens(
+        &self,
+        inputs: &[EmbedInput<'_>],
+        role: EmbedRole,
+    ) -> Result<Vec<Vec<Vector>>>;
+
+    /// Dimension of every token vector this embedder produces.
+    fn token_dimension(&self) -> usize;
+}
+
 /// Unified embedder trait for vector indexing.
 ///
 /// This trait provides a common interface for embedders that can be used
@@ -269,6 +320,14 @@ pub trait Embedder: Send + Sync + Debug {
     /// A string identifying the embedder (e.g., model name)
     fn name(&self) -> &str {
         "unknown"
+    }
+
+    /// The token-level embedding capability of this embedder, if it has one.
+    ///
+    /// Defaults to `None`. A late-interaction embedder returns `Some(self)`;
+    /// see [`TokenEmbedder`].
+    fn as_token_embedder(&self) -> Option<&dyn TokenEmbedder> {
+        None
     }
 
     /// Downcast support for runtime type identification.

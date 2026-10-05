@@ -78,7 +78,9 @@ pub use data::{DataValue, Document, GeoEcefPoint, GeoPoint};
 pub use embedding::candle_bert_embedder::CandleBertEmbedder;
 #[cfg(feature = "embeddings-multimodal")]
 pub use embedding::candle_clip_embedder::CandleClipEmbedder;
-pub use embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
+#[cfg(feature = "embeddings-candle")]
+pub use embedding::candle_colbert_embedder::{CandleColbertEmbedder, CandleColbertOptions};
+pub use embedding::embedder::{EmbedInput, EmbedInputType, EmbedRole, Embedder, TokenEmbedder};
 #[cfg(feature = "embeddings-openai")]
 pub use embedding::openai_embedder::OpenAIEmbedder;
 pub use embedding::per_field::PerFieldEmbedder;
@@ -95,7 +97,7 @@ pub use engine::schema::analyzer::{
     AnalyzerDefinition, AnalyzerSpec, BuiltinAnalyzerSpec, CharFilterConfig, TokenFilterConfig,
     TokenizerConfig,
 };
-pub use engine::schema::embedder::EmbedderDefinition;
+pub use engine::schema::embedder::{EmbedderDefinition, EmbedderOutput};
 pub use engine::schema::{
     DynamicFieldPolicy, FieldChangeKind, FieldOption, Schema, classify_change, validate_field_name,
 };

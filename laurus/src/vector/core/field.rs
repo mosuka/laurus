@@ -355,6 +355,11 @@ pub struct MultiVectorOption {
     /// [`DistanceMetric::Cosine`].
     #[serde(default = "default_distance_metric")]
     pub distance: DistanceMetric,
+    /// Name of the schema embedder that turns text into this field's token
+    /// vectors; it must be a token-level embedder such as `candle_colbert`
+    /// (Issue #1349). `None` means documents supply the token vectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedder: Option<String>,
 }
 
 impl Default for MultiVectorOption {
@@ -362,6 +367,7 @@ impl Default for MultiVectorOption {
         Self {
             dimension: default_dimension(),
             distance: default_distance_metric(),
+            embedder: None,
         }
     }
 }
@@ -388,6 +394,13 @@ impl MultiVectorOption {
     /// Set the token similarity (`Cosine` or `DotProduct`).
     pub fn distance(mut self, distance: DistanceMetric) -> Self {
         self.distance = distance;
+        self
+    }
+
+    /// Embed text values with the schema embedder `name`, which must be a
+    /// token-level embedder.
+    pub fn embedder(mut self, name: impl Into<String>) -> Self {
+        self.embedder = Some(name.into());
         self
     }
 
@@ -723,6 +736,13 @@ mod tests {
         let defaulted: MultiVectorOption = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted.dimension, 128);
         assert_eq!(defaulted.distance, DistanceMetric::Cosine);
+        assert_eq!(defaulted.embedder, None);
+        assert!(!json.contains("embedder"), "an unset embedder is omitted");
+
+        let named = MultiVectorOption::new(128).embedder("colbert");
+        let back: MultiVectorOption =
+            serde_json::from_str(&serde_json::to_string(&named).unwrap()).unwrap();
+        assert_eq!(back.embedder.as_deref(), Some("colbert"));
     }
 
     #[test]

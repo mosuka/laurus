@@ -33,8 +33,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::data::{DataValue, Document};
-use crate::embedding::embedder::{EmbedInput, Embedder};
-use crate::embedding::per_field::PerFieldEmbedder;
+use crate::embedding::embedder::{EmbedInput, EmbedRole, Embedder};
+use crate::embedding::per_field::{PerFieldEmbedder, embed_field_tokens};
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::vector::core::vector::Vector;
@@ -244,9 +244,30 @@ impl VectorStore {
                          fields accept an array of token vectors"
                     )));
                 }
+                DataValue::Text(text) if multi_vector => {
+                    Self::embed_tokens_into(
+                        &embedder,
+                        field_name,
+                        EmbedInput::Text(text),
+                        &mut embedded_vectors,
+                    )
+                    .await?;
+                    continue;
+                }
+                DataValue::Bytes(bytes, mime) if multi_vector => {
+                    Self::embed_tokens_into(
+                        &embedder,
+                        field_name,
+                        EmbedInput::Bytes(bytes, mime.as_deref()),
+                        &mut embedded_vectors,
+                    )
+                    .await?;
+                    continue;
+                }
                 _ if multi_vector => {
                     return Err(LaurusError::invalid_argument(format!(
-                        "MultiVector field '{field_name}' accepts only an array of token vectors"
+                        "MultiVector field '{field_name}' accepts only an array of token vectors \
+                         or a value for its token-level embedder"
                     )));
                 }
                 DataValue::Vector(v) => Vector::new(v.clone()),
@@ -329,6 +350,34 @@ impl VectorStore {
     /// Reject a token-vector array that is empty or longer than a document
     /// may hold; each vector's dimension and values are checked with every
     /// other vector in [`Self::embed_document`].
+    /// Embed a multi-vector field's value into token vectors with the
+    /// field's token-level embedder, as a document (Issue #1349), and
+    /// append them to `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when the field has no
+    /// token-level embedder or the embedder produces no or too many
+    /// vectors, and the embedder's error when embedding fails.
+    async fn embed_tokens_into(
+        embedder: &Arc<dyn Embedder>,
+        field_name: &str,
+        input: EmbedInput<'_>,
+        out: &mut Vec<(String, Vector)>,
+    ) -> Result<()> {
+        let tokens = embed_field_tokens(
+            embedder,
+            field_name,
+            std::slice::from_ref(&input),
+            EmbedRole::Document,
+        )
+        .await?
+        .swap_remove(0);
+        Self::check_token_vector_count(field_name, tokens.len())?;
+        out.extend(tokens.into_iter().map(|v| (field_name.to_string(), v)));
+        Ok(())
+    }
+
     fn check_token_vector_count(field_name: &str, count: usize) -> Result<()> {
         use crate::vector::core::field::MultiVectorOption;
 

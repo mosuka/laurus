@@ -141,6 +141,8 @@ embeddings-candle = [
     "candle-transformers",
     "hf-hub",
     "tokenizers",
+    # CandleColbertEmbedder runs inference on `spawn_blocking`.
+    "tokio/rt",
 ]
 embeddings-multimodal = [
     "candle-core",

@@ -1,16 +1,20 @@
 //! End-to-end tests of the late-interaction rescore stage (Issue #1345).
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use laurus::lexical::TermQuery;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use laurus::vector::Vector;
 use laurus::{
-    DistanceMetric, Document, Engine, FieldOption, FlatOption, FusionAlgorithm, HybridMode,
-    LaurusError, LexicalSearchQuery, MultiVectorOption, QueryVector, RescoreOptions, Result,
-    Schema, SearchQuery, SearchRequest, SearchRequestBuilder, SearchResult, SortField, SortOrder,
-    TextOption, VectorSearchQuery,
+    DistanceMetric, Document, EmbedInput, EmbedInputType, EmbedRole, Embedder, Engine, FieldOption,
+    FlatOption, FusionAlgorithm, HybridMode, LaurusError, LexicalSearchQuery, MultiVectorOption,
+    PerFieldEmbedder, PrecomputedEmbedder, QueryVector, RescoreOptions, Result, Schema,
+    SearchQuery, SearchRequest, SearchRequestBuilder, SearchResult, SortField, SortOrder,
+    TextOption, TokenEmbedder, VectorSearchQuery,
 };
 
 const TOKENS: &str = "tokens";
@@ -429,5 +433,168 @@ async fn test_invalid_rescore_options_are_rejected() -> Result<()> {
         assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
         assert!(err.to_string().contains(expected), "{err}");
     }
+    Ok(())
+}
+
+// ── Text queries (Issue #1349) ──────────────────────────────────────────────
+
+/// Token embedder that embeds the query text "q" into [`QUERY`] and counts
+/// its calls. Documents keep their precomputed token vectors.
+#[derive(Debug, Default)]
+struct QueryTextEmbedder {
+    calls: AtomicUsize,
+}
+
+impl QueryTextEmbedder {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TokenEmbedder for QueryTextEmbedder {
+    async fn embed_tokens(
+        &self,
+        inputs: &[EmbedInput<'_>],
+        role: EmbedRole,
+    ) -> Result<Vec<Vec<Vector>>> {
+        assert_eq!(role, EmbedRole::Query);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        inputs
+            .iter()
+            .map(|input| match input.as_text() {
+                Some("q") => Ok(query_vectors(&QUERY)),
+                other => Err(LaurusError::invalid_argument(format!(
+                    "unknown query {other:?}"
+                ))),
+            })
+            .collect()
+    }
+
+    fn token_dimension(&self) -> usize {
+        2
+    }
+}
+
+#[async_trait]
+impl Embedder for QueryTextEmbedder {
+    async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
+        Err(LaurusError::invalid_argument("token embedder"))
+    }
+
+    fn supported_input_types(&self) -> Vec<EmbedInputType> {
+        vec![EmbedInputType::Text]
+    }
+
+    fn name(&self) -> &str {
+        "query-text"
+    }
+
+    fn as_token_embedder(&self) -> Option<&dyn TokenEmbedder> {
+        Some(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// The corpus engine with `embedder` serving the `tokens` field.
+async fn text_engine(embedder: Arc<QueryTextEmbedder>, cache: bool) -> Result<Engine> {
+    let per_field = PerFieldEmbedder::new(Arc::new(PrecomputedEmbedder::new()));
+    per_field.add_embedder(TOKENS, embedder);
+    let mut builder = Engine::builder(
+        Arc::new(MemoryStorage::new(MemoryStorageConfig::default())),
+        schema(DistanceMetric::DotProduct),
+    )
+    .embedder(Arc::new(per_field));
+    if cache {
+        builder = builder.embedding_cache_capacity(16);
+    }
+    let engine = builder.build().await?;
+    for (id, title, vec, tokens) in corpus() {
+        engine.put_document(id, doc(title, vec, &tokens)).await?;
+    }
+    engine.commit().await?;
+    Ok(engine)
+}
+
+fn text_rescore() -> RescoreOptions {
+    RescoreOptions::late_interaction_text(TOKENS, "q")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_text_query_ranks_like_its_token_vectors() -> Result<()> {
+    let embedder = Arc::new(QueryTextEmbedder::default());
+    let engine = text_engine(embedder.clone(), false).await?;
+
+    let by_text = engine.search(lexical(Some(text_rescore()), 0, 10)).await?;
+    let by_vectors = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    assert_eq!(ids(&by_text), ["c", "b", "d", "a", "e"]);
+    assert_eq!(ids(&by_text), ids(&by_vectors));
+    for (text, vectors) in by_text.iter().zip(&by_vectors) {
+        assert_eq!(text.score, vectors.score);
+    }
+    assert_eq!(embedder.calls(), 1);
+
+    // Each request of a batch embeds its own query.
+    let batch = engine
+        .search_batch(vec![
+            lexical(Some(text_rescore()), 0, 10),
+            lexical(Some(text_rescore().window_size(2)), 0, 10),
+        ])
+        .await?;
+    assert_eq!(ids(&batch[0]), ids(&by_text));
+    assert_eq!(batch[1].len(), 5);
+    assert_eq!(embedder.calls(), 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_text_query_embedding_is_cached() -> Result<()> {
+    let embedder = Arc::new(QueryTextEmbedder::default());
+    let engine = text_engine(embedder.clone(), true).await?;
+    for offset in [0, 2, 4] {
+        engine
+            .search(lexical(Some(text_rescore()), offset, 2))
+            .await?;
+    }
+    assert_eq!(embedder.calls(), 1, "pages of one query embed it once");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invalid_text_queries_fail_before_embedding() -> Result<()> {
+    let embedder = Arc::new(QueryTextEmbedder::default());
+    let with_embedder = text_engine(embedder.clone(), false).await?;
+    let cases = [
+        (text_rescore().window_size(0), "window_size must be between"),
+        (
+            RescoreOptions::late_interaction_text(TOKENS, "  "),
+            "query text is empty",
+        ),
+        (
+            RescoreOptions::late_interaction_text("vec", "q"),
+            "needs a MultiVector field",
+        ),
+    ];
+    for (options, expected) in cases {
+        let err = with_embedder
+            .search(lexical(Some(options), 0, 10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+    assert_eq!(embedder.calls(), 0);
+
+    // Without a token-level embedder for the field.
+    let without_embedder = engine(DistanceMetric::DotProduct).await?;
+    let err = without_embedder
+        .search(lexical(Some(text_rescore()), 0, 10))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err}");
+    assert!(err.to_string().contains("no token-level embedder"), "{err}");
     Ok(())
 }

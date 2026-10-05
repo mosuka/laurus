@@ -681,12 +681,16 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
         Some(Opt::Hnsw(v)) => json!({ "hnsw": hnsw_option_to_json(v) }),
         Some(Opt::Flat(v)) => json!({ "flat": flat_option_to_json(v) }),
         Some(Opt::Ivf(v)) => json!({ "ivf": ivf_option_to_json(v) }),
-        Some(Opt::MultiVector(v)) => json!({
-            "multi_vector": {
+        Some(Opt::MultiVector(v)) => {
+            let mut obj = json!({
                 "dimension": v.dimension,
                 "distance": distance_metric_to_string(v.distance),
+            });
+            if !v.embedder.is_empty() {
+                obj["embedder"] = json!(v.embedder);
             }
-        }),
+            json!({ "multi_vector": obj })
+        }
         None => Value::Null,
     }
 }
@@ -852,6 +856,11 @@ fn json_to_multi_vector_option(json: &Value) -> v1::MultiVectorOption {
             .and_then(|v| v.as_str())
             .map(parse_distance_metric)
             .unwrap_or(v1::DistanceMetric::Cosine as i32),
+        embedder: json
+            .get("embedder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
@@ -1351,14 +1360,25 @@ fn json_to_proto_embedder_definition(json: &Value) -> Result<v1::EmbedderConfig,
         .ok_or("embedder definition missing 'type'")?
         .to_string();
 
+    // The proto carries every parameter as a string, so scalars are written
+    // in their JSON form (`32` -> "32"); only nested values are rejected.
     let mut params = HashMap::new();
     for (k, v) in obj {
         if k == "type" {
             continue;
         }
-        if let Some(s) = v.as_str() {
-            params.insert(k.clone(), s.to_string());
-        }
+        let value = match v {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => continue,
+            Value::Array(_) | Value::Object(_) => {
+                return Err(format!(
+                    "embedder parameter '{k}' must be a string, number or boolean"
+                ));
+            }
+        };
+        params.insert(k.clone(), value);
     }
 
     Ok(v1::EmbedderConfig {
@@ -1367,10 +1387,16 @@ fn json_to_proto_embedder_definition(json: &Value) -> Result<v1::EmbedderConfig,
     })
 }
 
+/// Embedder parameters rendered as JSON numbers rather than strings.
+const NUMERIC_EMBEDDER_PARAMS: [&str; 2] = ["query_maxlen", "doc_maxlen"];
+
 fn proto_embedder_definition_to_json(def: &v1::EmbedderConfig) -> Value {
     let mut obj = json!({"type": def.r#type});
     for (k, v) in &def.params {
-        obj[k] = json!(v);
+        obj[k] = match v.parse::<u64>() {
+            Ok(n) if NUMERIC_EMBEDDER_PARAMS.contains(&k.as_str()) => json!(n),
+            _ => json!(v),
+        };
     }
     obj
 }
@@ -1782,6 +1808,38 @@ mod tests {
         let json = json!({ "multi_vector": {"dimension": 96} });
         let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
         assert_eq!(back["multi_vector"]["distance"], json!("cosine"));
+        assert!(back["multi_vector"].get("embedder").is_none());
+
+        let json = json!({
+            "multi_vector": {"dimension": 128, "distance": "cosine", "embedder": "colbert"}
+        });
+        let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
+        assert_eq!(back, json);
+    }
+
+    /// #1349: numeric and boolean embedder parameters reach the proto as
+    /// strings instead of being dropped, the ColBERT lengths render back as
+    /// numbers, and nested values are rejected.
+    #[test]
+    fn test_embedder_definition_scalar_params_round_trip() {
+        let json = json!({
+            "type": "candle_colbert",
+            "model": "colbert-ir/colbertv2.0",
+            "revision": "c1e84128",
+            "query_maxlen": 32,
+            "doc_maxlen": 180,
+        });
+        let proto = json_to_proto_embedder_definition(&json).unwrap();
+        assert_eq!(proto.params["query_maxlen"], "32");
+        assert_eq!(proto.params["doc_maxlen"], "180");
+        assert_eq!(proto_embedder_definition_to_json(&proto), json);
+
+        let proto = json_to_proto_embedder_definition(&json!({"type": "x", "flag": true})).unwrap();
+        assert_eq!(proto.params["flag"], "true");
+
+        let err =
+            json_to_proto_embedder_definition(&json!({"type": "x", "bad": [1, 2]})).unwrap_err();
+        assert!(err.contains("'bad'"), "{err}");
     }
 
     /// #1177: nested numeric arrays in a document become a packed

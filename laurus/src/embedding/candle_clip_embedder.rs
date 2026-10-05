@@ -16,10 +16,10 @@ use candle_nn::{Linear, VarBuilder};
 #[cfg(feature = "embeddings-multimodal")]
 use candle_transformers::models::clip;
 #[cfg(feature = "embeddings-multimodal")]
-use hf_hub::{HFClientBuilder, split_id};
-#[cfg(feature = "embeddings-multimodal")]
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "embeddings-multimodal")]
+use crate::embedding::candle_hub::{HubModel, legacy_cache_dir};
 #[cfg(feature = "embeddings-multimodal")]
 use crate::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
 #[cfg(feature = "embeddings-multimodal")]
@@ -183,18 +183,7 @@ impl CandleClipEmbedder {
             .map_err(|e| LaurusError::InvalidOperation(format!("Device setup failed: {}", e)))?;
 
         // Download model from HuggingFace Hub
-        let cache_dir = std::env::var("HF_HOME")
-            .or_else(|_| std::env::var("HOME").map(|home| format!("{}/.cache/huggingface", home)))
-            .unwrap_or_else(|_| "/tmp/huggingface".to_string());
-
-        let client = HFClientBuilder::new()
-            .cache_dir(cache_dir)
-            .build_sync()
-            .map_err(|e| {
-                LaurusError::InvalidOperation(format!("HF API initialization failed: {}", e))
-            })?;
-        let (owner, name) = split_id(model_name);
-        let repo = client.model(owner, name);
+        let repo = HubModel::open(model_name, None, Some(legacy_cache_dir()))?;
 
         // Load config
         // Currently defaults to ViT-B/32 configuration. To support other CLIP variants
@@ -203,13 +192,8 @@ impl CandleClipEmbedder {
 
         // Load weights - try safetensors first, fall back to pytorch
         let weights_filename = repo
-            .download_file()
-            .filename("model.safetensors")
-            .send()
-            .or_else(|_| repo.download_file().filename("pytorch_model.bin").send())
-            .map_err(|e| {
-                LaurusError::InvalidOperation(format!("Weights download failed: {}", e))
-            })?;
+            .file("model.safetensors")
+            .or_else(|_| repo.file("pytorch_model.bin"))?;
 
         let vb = if weights_filename.to_string_lossy().ends_with(".safetensors") {
             unsafe {
@@ -261,13 +245,7 @@ impl CandleClipEmbedder {
         })?;
 
         // Load tokenizer
-        let tokenizer_filename = repo
-            .download_file()
-            .filename("tokenizer.json")
-            .send()
-            .map_err(|e| {
-                LaurusError::InvalidOperation(format!("Tokenizer download failed: {}", e))
-            })?;
+        let tokenizer_filename = repo.file("tokenizer.json")?;
         let tokenizer = Tokenizer::from_file(tokenizer_filename)
             .map_err(|e| LaurusError::InvalidOperation(format!("Tokenizer load failed: {}", e)))?;
 

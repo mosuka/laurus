@@ -329,23 +329,33 @@ score(q, d) = Σ_i max_j (q_i · d_j)
           offset / limit → 文書を取得
 ```
 
+MultiVector フィールドにトークン単位の Embedder（[`candle_colbert`](../../laurus-cli/schema_format.md#エンベダー)
+など。[CandleColbertEmbedder](../embedding.md#candlecolbertembedder) を参照）が
+あれば、文書をテキストのまま取り込め、クエリもテキストで渡せます。
+
 ```rust
 use laurus::{RescoreOptions, SearchRequestBuilder};
-use laurus::vector::Vector;
-
-// クエリのトークンベクトル。文書のトークンベクトルを作ったのと同じモデル
-// （例: ColBERT のチェックポイント）で生成する。
-let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
 
 let request = SearchRequestBuilder::new()
     .query_dsl("body:lifetimes body_vec:\"how do lifetimes work\"")
     .rescore(
-        RescoreOptions::late_interaction("body_colbert", query_tokens)
+        RescoreOptions::late_interaction_text("body_colbert", "how do lifetimes work")
             .window_size(100),
     )
     .limit(10)
     .build();
 let results = engine.search(request).await?;
+```
+
+Embedder がない場合は、文書のトークンベクトルを作ったのと同じモデルで、
+クエリのトークンベクトルを計算して渡します。
+
+```rust
+use laurus::RescoreOptions;
+use laurus::vector::Vector;
+
+let query_tokens: Vec<Vector> = colbert_query_vectors("how do lifetimes work");
+let rescore = RescoreOptions::late_interaction("body_colbert", query_tokens);
 ```
 
 再採点は Rust API の機能です。サーバーと各言語バインディングからはまだ
@@ -356,13 +366,19 @@ let results = engine.search(request).await?;
 | フィールド | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `window_size` | `usize` | `100` | 再採点する 1 段目の上位候補の件数。`1..=10,000` |
-| `rescorer` | `Rescorer` | — | `Rescorer::LateInteraction { field, query }`: 対象の MultiVector フィールドと、クエリのトークンベクトル（`LateInteractionQuery::Vectors`） |
+| `rescorer` | `Rescorer` | — | `Rescorer::LateInteraction { field, query }`: 対象の MultiVector フィールドとクエリ。クエリはトークンベクトル（`LateInteractionQuery::Vectors`）かテキスト（`LateInteractionQuery::Text`） |
+
+テキストのクエリは、1 段目の検索の前に、フィールドのトークン単位の Embedder が
+クエリとして埋め込みます。
+[`EngineBuilder::embedding_cache_capacity`](../../laurus/engine.md#クエリembeddingキャッシュ)
+を設定していれば、同じクエリ（次のページなど）はキャッシュから返ります。
 
 クエリのベクトルは 1〜1,024 本で、どれもフィールドの次元と一致し、有限値で
 なければなりません。オプションが不正な場合、対象が MultiVector フィールドで
-ない場合、フィールドによるソート（`sort_by` に `SortField::Field`）を同時に
-指定した場合は、検索を始める前に `LaurusError::InvalidArgument` で失敗します。
-フィールドによるソートはスコアで並べないため、再採点する対象がないからです。
+ない場合、テキストのクエリが空かフィールドにトークン単位の Embedder がない場合、
+フィールドによるソート（`sort_by` に `SortField::Field`）を同時に指定した場合は、
+検索を始める前に `LaurusError::InvalidArgument` で失敗します。フィールドによる
+ソートはスコアで並べないため、再採点する対象がないからです。
 
 ### 並び順とスコア
 

@@ -6,7 +6,7 @@
 
 | Feature | 説明 | 主な依存クレート |
 | :--- | :--- | :--- |
-| `embeddings-candle` | Hugging Face Candle によるローカル BERT Embedding | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
+| `embeddings-candle` | Hugging Face Candle によるローカル BERT Embedding と ColBERT のトークンベクトル | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `embeddings-openai` | OpenAI API Embedding | reqwest |
 | `embeddings-multimodal` | CLIP マルチモーダル Embedding（テキスト + 画像） | image, embeddings-candle |
 | `embeddings-all` | すべての Embedding Feature を統合 | 上記すべて |
@@ -15,7 +15,7 @@
 
 ### `embeddings-candle`
 
-`CandleBertEmbedder` を有効にし、CPU 上でローカルに BERT モデルを実行できるようにします。モデルは初回使用時に Hugging Face Hub からダウンロードされます。
+`CandleBertEmbedder` を有効にし、CPU 上でローカルに BERT モデルを実行できるようにします。あわせて、late interaction の再採点に使う ColBERT のトークンベクトルを作る `CandleColbertEmbedder`（スキーマのエンベダー `candle_colbert`）も有効にします。モデルは初回使用時に Hugging Face Hub からダウンロードされます。
 
 ```toml
 [dependencies]
