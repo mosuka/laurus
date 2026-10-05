@@ -482,7 +482,7 @@ Errors surface at three points:
 
 - An unknown `type` or a missing required key is rejected when the schema is parsed; `create index` creates nothing.
 - An entry named after a built-in is rejected when the index is created, with `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name`; `create index` creates nothing. Every binding's `addAnalyzer` / `add_analyzer` (WASM: `addAnalyzerDefinition`) raises the same error. An index created before this check keeps opening and the entry stays unused; opening it emits a warning through the `log` crate, which `laurus-server` prints in its log.
-- An invalid value (a malformed regular expression, an unknown `form` or `stem_type`, a missing Lindera dictionary) or an `analyzer` name that resolves to nothing is rejected when the index is built, with an error such as `Failed to resolve analyzer for field 'body': ...`.
+- An invalid value (a malformed regular expression, an unknown `form` or `stem_type`, a missing Lindera dictionary) or an `analyzer` name that resolves to nothing is rejected when the index is built, with an error such as `Failed to resolve analyzer for field 'body': ...`; `create index` creates nothing — `schema.toml` and `store/` are rolled back to whatever state (if any) existed before the call.
 
 ### Example: English text with stemming
 

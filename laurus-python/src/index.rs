@@ -7,6 +7,7 @@ use crate::convert::{dict_to_document, document_to_dict};
 use crate::errors::{closed_err, index_dir_err, laurus_err, reload_requires_path_err};
 use crate::schema::PySchema;
 use crate::search::{PySearchResult, build_request_from_py, to_py_search_result};
+use laurus::index_dir::CreateRollback;
 use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Embedder, Engine,
     EngineStats, Schema, Storage, StorageConfig, StorageFactory, WalSyncPolicy,
@@ -362,6 +363,12 @@ impl PyIndex {
     ///         pre-existing (pre-Issue-1059) flat layout, or if a new
     ///         index's `schema` defines a custom analyzer under a name
     ///         reserved for a built-in analyzer (nothing is written then).
+    ///         A failure while *building* the engine (e.g. analyzer
+    ///         resolution against a malformed regex, or embedder
+    ///         construction) likewise leaves nothing behind -- `schema.toml`
+    ///         and `store/` are rolled back to whatever `path` held before
+    ///         this call, so retrying with a fixed schema at the same `path`
+    ///         works (Issue #1308).
     #[new]
     #[pyo3(signature = (path=None, schema=None, wal_sync_policy=None, commit_policy=None))]
     pub fn new(
@@ -380,7 +387,7 @@ impl PyIndex {
         let path_for_resolve = path.clone();
 
         let engine = py.detach(|| -> PyResult<Engine> {
-            let (schema_arg, storage) =
+            let (schema_arg, storage, rollback) =
                 resolve_storage_and_schema(path_for_resolve.as_deref(), schema_arg)?;
 
             let mut builder = Engine::builder(storage, schema_arg);
@@ -391,7 +398,17 @@ impl PyIndex {
                 builder = builder.commit_policy(p);
             }
 
-            rt.block_on(builder.build()).map_err(laurus_err)
+            match rt.block_on(builder.build()) {
+                Ok(engine) => Ok(engine),
+                Err(e) => {
+                    // A failure here must not leave schema.toml/store/
+                    // behind to block a retry (Issue #1308).
+                    if let Some(rollback) = rollback {
+                        rollback.rollback();
+                    }
+                    Err(laurus_err(e))
+                }
+            }
         })?;
 
         Ok(Self {
@@ -878,25 +895,34 @@ fn pairs_to_documents(
 // Storage factory helper
 // ---------------------------------------------------------------------------
 
-/// Resolve the `(Schema, Storage)` pair for [`PyIndex::new`].
+/// Resolve the `(Schema, Storage, CreateRollback)` triple for [`PyIndex::new`].
 ///
 /// `path=None` keeps the pre-existing in-memory behavior (schema defaults
-/// to empty, no persistence, no conflict checking). `path=Some(p)` defers
-/// to [`laurus::index_dir::open_or_create`], which applies the
-/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`.
+/// to empty, no persistence, no conflict checking) and returns `None` for
+/// the rollback, since nothing is ever written to disk on that path.
+/// `path=Some(p)` snapshots `p` with [`CreateRollback::snapshot`] *before*
+/// deferring to [`laurus::index_dir::open_or_create`] (which applies the
+/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`),
+/// and returns the rollback so the caller can undo the write if building the
+/// engine then fails (Issue #1308).
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<Schema>,
-) -> PyResult<(Schema, Arc<dyn Storage>)> {
+) -> PyResult<(Schema, Arc<dyn Storage>, Option<CreateRollback>)> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
             schema.validate_for_create().map_err(laurus_err)?;
             let storage = StorageFactory::create(StorageConfig::Memory(Default::default()))
                 .map_err(laurus_err)?;
-            Ok((schema, storage))
+            Ok((schema, storage, None))
         }
-        Some(p) => laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err),
+        Some(p) => {
+            let rollback = CreateRollback::snapshot(Path::new(p));
+            let (schema, storage) =
+                laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err)?;
+            Ok((schema, storage, Some(rollback)))
+        }
     }
 }
 

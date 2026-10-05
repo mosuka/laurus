@@ -86,4 +86,72 @@ class TestIndexDirLayout < Minitest::Test
       assert File.file?(File.join(dir, "schema.toml"))
     end
   end
+
+  # ---------------------------------------------------------------------
+  # Engine build failure must leave nothing behind (Issue #1308)
+  # ---------------------------------------------------------------------
+
+  # A schema that persists fine (schema.toml validation never sees the bad
+  # regex) but fails once the engine actually resolves the analyzer.
+  MALFORMED_REGEX_SCHEMA_TOML = <<~TOML
+    [analyzers.bad]
+    tokenizer = { type = "regex", pattern = "(" }
+
+    [fields.body.Text]
+    analyzer = "bad"
+  TOML
+
+  def test_build_failure_leaves_nothing_and_retry_succeeds
+    Dir.mktmpdir do |dir|
+      index_dir = File.join(dir, "idx")
+      bad_schema = Laurus::Schema.from_toml(MALFORMED_REGEX_SCHEMA_TOML)
+
+      # A bad regex is only caught once the engine resolves the analyzer at
+      # build time -- it surfaces as `LaurusError::Analysis`, which
+      # `laurus_err` maps to `RuntimeError` (not `ArgumentError`).
+      err = assert_raises(RuntimeError) do
+        Laurus::Index.new(path: index_dir, schema: bad_schema)
+      end
+      assert_match(/Failed to resolve analyzer for field 'body'/, err.message)
+      refute File.exist?(File.join(index_dir, "schema.toml")),
+             "a build failure in a directory this call created must leave nothing behind"
+      refute File.exist?(index_dir),
+             "a build failure in a directory this call created must leave nothing behind"
+
+      # Retry with a fixed schema at the same path must succeed without
+      # deleting anything by hand.
+      schema = Laurus::Schema.new
+      schema.add_text_field("body")
+      idx = Laurus::Index.new(path: index_dir, schema: schema)
+      idx.put_document("doc1", { "body" => "hello world" })
+      idx.commit
+      assert_equal 1, idx.search("body:hello", limit: 5).length
+    end
+  end
+
+  def test_build_failure_in_a_pre_existing_directory_only_removes_schema_and_store
+    Dir.mktmpdir do |dir|
+      # An unrelated file already in the directory before the failed attempt.
+      File.write(File.join(dir, "README.txt"), "keep me")
+
+      bad_schema = Laurus::Schema.from_toml(MALFORMED_REGEX_SCHEMA_TOML)
+      err = assert_raises(RuntimeError) do
+        Laurus::Index.new(path: dir, schema: bad_schema)
+      end
+      assert_match(/Failed to resolve analyzer for field 'body'/, err.message)
+
+      assert File.file?(File.join(dir, "README.txt")),
+             "unrelated pre-existing files must survive"
+      refute File.exist?(File.join(dir, "schema.toml"))
+      refute File.exist?(File.join(dir, "store"))
+
+      schema = Laurus::Schema.new
+      schema.add_text_field("body")
+      idx = Laurus::Index.new(path: dir, schema: schema)
+      idx.put_document("doc1", { "body" => "hello world" })
+      idx.commit
+      assert_equal 1, idx.search("body:hello", limit: 5).length
+      assert File.file?(File.join(dir, "README.txt")), "unrelated file must still survive"
+    end
+  end
 end

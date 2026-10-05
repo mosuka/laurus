@@ -480,7 +480,7 @@ analyzer = "english_stemmed"
 
 - 未知の `type` や必須キーの欠落は、スキーマの解析時にエラーになります。このとき `create index` は何も作りません。
 - 組み込みと同じ名前のエントリは、インデックスの作成時に `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name` というエラーになります。このとき `create index` は何も作りません。各バインディングの `addAnalyzer` / `add_analyzer`（WASM では `addAnalyzerDefinition`）も同じエラーを返します。この検査より前に作ったインデックスは、これまでどおり開けます。エントリは使われないままで、開くときに `log` クレートで警告を出します（`laurus-server` はこれをログに表示します）。
-- 不正な値（誤った正規表現、未知の `form` や `stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。
+- 不正な値（誤った正規表現、未知の `form` や `stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。このとき `create index` は何も作りません — `schema.toml` と `store/` は、呼び出し前の状態（何もなければ「何もない」状態）まで巻き戻されます。
 
 ### 例: ステミング付きの英語テキスト
 
