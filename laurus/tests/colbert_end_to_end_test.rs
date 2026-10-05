@@ -54,7 +54,10 @@ async fn test_text_ingest_and_text_rescore_with_a_real_model() -> Result<()> {
             },
         )
         .add_text_field("body", TextOption::default())
-        .add_multi_vector_field("body_colbert", MultiVectorOption::new(96).embedder("colbert"))
+        .add_multi_vector_field(
+            "body_colbert",
+            MultiVectorOption::new(96).embedder("colbert"),
+        )
         .build();
     let engine = Engine::builder(
         Arc::new(MemoryStorage::new(MemoryStorageConfig::default())),
