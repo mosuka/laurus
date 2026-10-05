@@ -700,4 +700,216 @@ mod tests {
         assert_eq!(options.query_maxlen, Some(16));
         assert_eq!(options.doc_maxlen, Some(300));
     }
+
+    // Parity with colbert-ai, the reference implementation. The fixtures in
+    // `tests/fixtures/colbert/` come from `scripts/colbert_reference.py`.
+    // These tests download the models, so they are ignored by default:
+    //
+    //     cargo test -p laurus --features embeddings-candle --lib -- \
+    //         --ignored colbert_parity --nocapture
+
+    #[derive(Deserialize)]
+    struct Fixture {
+        model: String,
+        revision: String,
+        config: FixtureConfig,
+        queries: Vec<FixtureQuery>,
+        documents: Vec<FixtureDocument>,
+        /// MaxSim of every (query, document) pair.
+        scores: Vec<Vec<f32>>,
+    }
+
+    #[derive(Deserialize)]
+    struct FixtureConfig {
+        query_maxlen: usize,
+        doc_maxlen: usize,
+        dim: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct FixtureQuery {
+        text: String,
+        input_ids: Vec<u32>,
+        attention_mask: Vec<u32>,
+        rows: usize,
+        vectors: String,
+    }
+
+    #[derive(Deserialize)]
+    struct FixtureDocument {
+        text: String,
+        input_ids: Vec<u32>,
+        kept: Vec<usize>,
+        rows: usize,
+        /// Rows whose vectors `vectors` holds (all but the middle of a long
+        /// document).
+        stored_rows: Vec<usize>,
+        vectors: String,
+    }
+
+    /// Little-endian f32 rows from base64.
+    fn decode_rows(encoded: &str, dim: usize) -> Vec<Vec<f32>> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let (words, rest) = bytes.as_chunks::<4>();
+        assert!(rest.is_empty());
+        let values: Vec<f32> = words.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        values.chunks(dim).map(<[f32]>::to_vec).collect()
+    }
+
+    fn dot(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    /// Largest element difference and smallest cosine seen so far.
+    struct Drift {
+        max_abs: f32,
+        min_cosine: f32,
+    }
+
+    impl Drift {
+        fn add(&mut self, ours: &[f32], reference: &[f32]) {
+            assert_eq!(ours.len(), reference.len());
+            for (a, b) in ours.iter().zip(reference) {
+                self.max_abs = self.max_abs.max((a - b).abs());
+            }
+            let cosine =
+                dot(ours, reference) / (dot(ours, ours).sqrt() * dot(reference, reference).sqrt());
+            self.min_cosine = self.min_cosine.min(cosine);
+        }
+    }
+
+    async fn check_parity(file: &str) {
+        let path = format!(
+            "{}/tests/fixtures/colbert/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture: Fixture =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (model, revision) = (fixture.model.clone(), fixture.revision.clone());
+        let embedder = tokio::task::spawn_blocking(move || {
+            CandleColbertEmbedder::with_options(
+                &model,
+                CandleColbertOptions::default().revision(revision),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let dim = fixture.config.dim;
+        let layout = &embedder.model.layout;
+        assert_eq!(layout.query_maxlen, fixture.config.query_maxlen);
+        assert_eq!(layout.doc_maxlen, fixture.config.doc_maxlen);
+        assert_eq!(embedder.token_dimension(), dim);
+
+        // Token ids, attention and kept positions match exactly.
+        let content = |text: &str| {
+            embedder
+                .model
+                .tokenizer
+                .encode(text, false)
+                .unwrap()
+                .get_ids()
+                .to_vec()
+        };
+        for query in &fixture.queries {
+            let encoded = layout.encode(&content(&query.text), EmbedRole::Query);
+            assert_eq!(encoded.ids, query.input_ids, "{}", query.text);
+            assert_eq!(encoded.attention, query.attention_mask, "{}", query.text);
+        }
+        for document in &fixture.documents {
+            let encoded = layout.encode(&content(&document.text), EmbedRole::Document);
+            assert_eq!(encoded.ids, document.input_ids, "{}", document.text);
+            let kept: Vec<usize> = (0..encoded.keep.len())
+                .filter(|&i| encoded.keep[i])
+                .collect();
+            assert_eq!(kept, document.kept, "{}", document.text);
+        }
+
+        let query_inputs: Vec<EmbedInput<'_>> = fixture
+            .queries
+            .iter()
+            .map(|q| EmbedInput::Text(&q.text))
+            .collect();
+        let queries = embedder
+            .embed_tokens(&query_inputs, EmbedRole::Query)
+            .await
+            .unwrap();
+        let document_inputs: Vec<EmbedInput<'_>> = fixture
+            .documents
+            .iter()
+            .map(|d| EmbedInput::Text(&d.text))
+            .collect();
+        let documents = embedder
+            .embed_tokens(&document_inputs, EmbedRole::Document)
+            .await
+            .unwrap();
+
+        let mut drift = Drift {
+            max_abs: 0.0,
+            min_cosine: 1.0,
+        };
+        for (ours, query) in queries.iter().zip(&fixture.queries) {
+            assert_eq!(ours.len(), query.rows, "{}", query.text);
+            for (vector, reference) in ours.iter().zip(decode_rows(&query.vectors, dim)) {
+                drift.add(&vector.data, &reference);
+            }
+        }
+        for (ours, document) in documents.iter().zip(&fixture.documents) {
+            assert_eq!(ours.len(), document.rows, "{}", document.text);
+            for (&row, reference) in document
+                .stored_rows
+                .iter()
+                .zip(decode_rows(&document.vectors, dim))
+            {
+                drift.add(&ours[row].data, &reference);
+            }
+        }
+
+        let mut max_score_diff = 0.0f32;
+        for (query, expected) in queries.iter().zip(&fixture.scores) {
+            for (document, expected) in documents.iter().zip(expected) {
+                let score: f32 = query
+                    .iter()
+                    .map(|q| {
+                        document
+                            .iter()
+                            .map(|d| dot(&q.data, &d.data))
+                            .fold(f32::NEG_INFINITY, f32::max)
+                    })
+                    .sum();
+                max_score_diff = max_score_diff.max((score - expected).abs());
+            }
+        }
+
+        println!(
+            "{file}: max |Δ| {:.2e}, min cosine {:.8}, max |ΔMaxSim| {:.2e}",
+            drift.max_abs, drift.min_cosine, max_score_diff
+        );
+        // Observed on Apple M4 (candle 0.11 vs. torch 2.14, fp32): max |Δ|
+        // below 1e-6 and max |ΔMaxSim| below 2e-5. The limits leave room for
+        // other CPUs' summation order; encoding bugs (attending to [MASK], a
+        // wrong marker or token type, no normalization) are far above them.
+        assert!(drift.max_abs <= 1e-5, "max |Δ| {}", drift.max_abs);
+        assert!(
+            drift.min_cosine >= 0.99999,
+            "min cosine {}",
+            drift.min_cosine
+        );
+        assert!(max_score_diff <= 2e-4, "max |ΔMaxSim| {max_score_diff}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads colbert-ir/colbertv2.0"]
+    async fn colbert_parity_colbertv2() {
+        check_parity("colbertv2.0.json").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads answerdotai/answerai-colbert-small-v1"]
+    async fn colbert_parity_answerai_small() {
+        check_parity("answerai-colbert-small-v1.json").await;
+    }
 }
