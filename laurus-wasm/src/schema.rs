@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use laurus::{
     Analyzer, AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
-    DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
-    Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod,
-    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
+    DistanceMetric, DynamicFieldPolicy, Embedder, EmbedderDefinition, FieldOption, FlatOption,
+    FloatOption, Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption,
+    QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use wasm_bindgen::prelude::*;
 
 use crate::analysis::WasmJapaneseAnalyzer;
-use crate::embedder::JsCallbackEmbedder;
+use crate::embedder::{JsCallbackEmbedder, JsTokenCallbackEmbedder};
 use crate::errors::laurus_err;
 
 /// Parse a distance metric string into [`DistanceMetric`].
@@ -89,6 +89,23 @@ fn parse_rerank_storage(name: Option<&str>) -> Result<Option<RerankStorageKind>,
     }
 }
 
+/// Read the `embed` function of a callback embedder config.
+///
+/// # Arguments
+///
+/// * `config` - The `addEmbedder` config object.
+/// * `signature` - The expected function shape, for the error message.
+fn embed_function(config: &JsValue, signature: &str) -> Result<js_sys::Function, JsValue> {
+    js_sys::Reflect::get(config, &JsValue::from_str("embed"))
+        .ok()
+        .and_then(|embed| embed.dyn_into::<js_sys::Function>().ok())
+        .ok_or_else(|| {
+            JsValue::from_str(&format!(
+                "Callback embedder config must have an 'embed' function: {signature}"
+            ))
+        })
+}
+
 /// Schema builder for defining index fields and embedders.
 ///
 /// ```javascript
@@ -102,9 +119,10 @@ fn parse_rerank_storage(name: Option<&str>) -> Result<Option<RerankStorageKind>,
 #[wasm_bindgen(js_name = "Schema")]
 pub struct WasmSchema {
     pub(crate) inner: Schema,
-    /// JS callback embedders registered via `addEmbedder({ type: "callback" })`.
-    /// Stored separately because they can't be serialized into `EmbedderDefinition`.
-    pub(crate) js_embedders: HashMap<String, JsCallbackEmbedder>,
+    /// JS callback embedders registered via `addEmbedder({ type: "callback" })`
+    /// or `addEmbedder({ type: "token_callback" })`. Stored separately
+    /// because they can't be serialized into `EmbedderDefinition`.
+    pub(crate) js_embedders: HashMap<String, Arc<dyn Embedder>>,
     /// Pre-constructed analyzers registered via `addAnalyzer(...)`.
     /// These are injected into the Engine at build time as runtime
     /// analyzers because they hold non-serializable state (e.g. a
@@ -546,14 +564,48 @@ impl WasmSchema {
         self.insert_field(name, FieldOption::Ivf(opt))
     }
 
+    /// Add a multi-vector field holding a variable number of token vectors
+    /// per document, for the late-interaction rescore (Issue #1351).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Field name.
+    /// * `dimension` - Dimensionality of each token vector.
+    /// * `distance` - "cosine" (default) or "dot_product".
+    /// * `embedder` - Optional `"token_callback"` embedder registered via
+    ///   `addEmbedder`, which embeds text values and rescore query text.
+    ///
+    /// # Errors
+    ///
+    /// Throws if `name` starts with `_` (other than `_id`), if `dimension`
+    /// is 0, or if `distance` is neither cosine nor dot_product.
+    #[wasm_bindgen(js_name = "addMultiVectorField")]
+    pub fn add_multi_vector_field(
+        &mut self,
+        name: String,
+        dimension: u32,
+        distance: Option<String>,
+        embedder: Option<String>,
+    ) -> Result<(), JsValue> {
+        let mut opt = MultiVectorOption::new(dimension as usize)
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+        opt.embedder = embedder;
+        opt.validate(&name).map_err(laurus_err)?;
+        self.insert_field(name, FieldOption::MultiVector(opt))
+    }
+
     /// Register a named embedder definition in the schema.
     ///
     /// The `config` object must have a `type` key:
     ///
-    /// | type           | extra keys | description                             |
-    /// |----------------|------------|-----------------------------------------|
-    /// | `"precomputed"` | —         | No embedding; vectors passed directly   |
-    /// | `"callback"`   | `embed`    | JS function `(text) => Promise<number[]>` |
+    /// | type               | extra keys           | description                             |
+    /// |--------------------|----------------------|-----------------------------------------|
+    /// | `"precomputed"`    | —                    | No embedding; vectors passed directly   |
+    /// | `"callback"`       | `embed`              | JS function `(text) => Promise<number[]>` |
+    /// | `"token_callback"` | `embed`, `dimension` | JS function `(text, role) => number[][] \| Promise<number[][]>`, for a multi-vector field |
+    ///
+    /// A `"token_callback"` function receives `role` as `"query"` or
+    /// `"document"`, and returns one `dimension`-long vector per token.
     ///
     /// ## Example — callback embedder with Transformers.js
     ///
@@ -576,39 +628,51 @@ impl WasmSchema {
             .as_string()
             .ok_or_else(|| JsValue::from_str("Embedder 'type' must be a string"))?;
 
-        match embedder_type.as_str() {
+        let embedder: Arc<dyn Embedder> = match embedder_type.as_str() {
             "precomputed" => {
                 self.inner
                     .embedders
                     .insert(name, EmbedderDefinition::Precomputed);
+                return Ok(());
             }
             "callback" => {
-                // Extract the "embed" function from the config
-                let embed_fn =
-                    js_sys::Reflect::get(&config, &JsValue::from_str("embed")).map_err(|_| {
-                        JsValue::from_str("Callback embedder config must have an 'embed' key")
+                let func = embed_function(&config, "(text: string) => Promise<number[]>")?;
+                Arc::new(JsCallbackEmbedder::new(name.clone(), func))
+            }
+            "token_callback" => {
+                let func = embed_function(
+                    &config,
+                    "(text: string, role: \"query\" | \"document\") => number[][] | Promise<number[][]>",
+                )?;
+                let dimension = js_sys::Reflect::get(&config, &JsValue::from_str("dimension"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .filter(|d| d.fract() == 0.0 && *d >= 1.0 && *d <= u32::MAX as f64)
+                    .ok_or_else(|| {
+                        JsValue::from_str(
+                            "Token callback embedder config must have a positive integer 'dimension'",
+                        )
                     })?;
-                let func = embed_fn.dyn_into::<js_sys::Function>().map_err(|_| {
-                    JsValue::from_str(
-                        "'embed' must be a function: (text: string) => Promise<number[]>",
-                    )
-                })?;
-
-                // Register as precomputed in the schema (so the engine creates the field)
-                // and store the actual JS embedder separately.
-                self.inner
-                    .embedders
-                    .insert(name.clone(), EmbedderDefinition::Precomputed);
-                self.js_embedders
-                    .insert(name.clone(), JsCallbackEmbedder::new(name, func));
+                Arc::new(JsTokenCallbackEmbedder::new(
+                    name.clone(),
+                    func,
+                    dimension as usize,
+                ))
             }
             other => {
                 return Err(JsValue::from_str(&format!(
-                    "Unsupported embedder type: '{other}'. Valid: 'precomputed', 'callback'"
+                    "Unsupported embedder type: '{other}'. Valid: 'precomputed', 'callback', \
+                     'token_callback'"
                 )));
             }
-        }
+        };
 
+        // Register as precomputed in the schema (so the engine creates the field)
+        // and store the actual JS embedder separately.
+        self.inner
+            .embedders
+            .insert(name.clone(), EmbedderDefinition::Precomputed);
+        self.js_embedders.insert(name, embedder);
         Ok(())
     }
 
