@@ -73,6 +73,33 @@ let embedder = CandleBertEmbedder::new(
 | Runtime | Local (CPU) |
 | First-run download | ~80 MB |
 
+It encodes like sentence-transformers, and its vectors match
+sentence-transformers' within 1e-6 per element for
+`all-MiniLM-L6-v2` and `paraphrase-multilingual-MiniLM-L12-v2`:
+
+- An input is truncated to the model's `max_seq_length` from
+  `sentence_bert_config.json` (256 tokens for `all-MiniLM-L6-v2`, 128 for
+  `paraphrase-multilingual-MiniLM-L12-v2`), special tokens included. A
+  repository without that file falls back to the truncation length in
+  `tokenizer.json`, then to the model's `max_position_embeddings`. The
+  padding configured in `tokenizer.json` is ignored.
+- The vector is the mean of the token vectors, L2-normalized. This is
+  done for every model, also for one whose sentence-transformers pipeline
+  does not normalize (such as `paraphrase-multilingual-MiniLM-L12-v2`) or
+  pools differently.
+
+`CandleBertEmbedder::with_options(model, CandleBertOptions::default().revision("<commit>"))`
+pins the model to a commit.
+
+> **Migration note (Issue #1340):** earlier versions passed the attention
+> mask to the model as token type ids and padded every input to the
+> `tokenizer.json` length, so their vectors were off (for
+> `all-MiniLM-L6-v2`, a cosine of only 0.61–0.70 with sentence-transformers'
+> on short texts). `candle_bert` vectors are now different, and long inputs
+> keep up to `max_seq_length` tokens instead of 128 for `all-MiniLM-L6-v2`.
+> Re-embed indexes built with `candle_bert`: otherwise new query vectors are
+> compared with old document vectors.
+
 ### OpenAIEmbedder
 
 Calls the OpenAI Embeddings API. Requires an API key.

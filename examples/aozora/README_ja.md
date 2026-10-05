@@ -50,7 +50,7 @@
 [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
 （384 次元、HuggingFace Hub から初回のみダウンロード — 約 470MB — `$HF_HOME`（未設定なら `~/.cache/huggingface`）配下にキャッシュされます）を使用しています。これは日本語専用モデルではありません。このスキーマを作成した時点で、日本語専用の代替モデル（`cl-nagoya/sup-simcse-ja-base`、`sonoisa/sentence-bert-base-ja-mean-tokens-v2`、`pkshatech/GLuCoSE-base-ja`）はいずれも、laurus の `CandleBertEmbedder` が必要とする `model.safetensors` または `tokenizer.json` のいずれかを Hub 上に欠いており、実際にロードして動作することを確認できたのはこの多言語モデルでした。
 
-このモデルの `tokenizer.json` には切り詰めルール（`max_length = 128` トークン）が埋め込まれており、自動的に適用されます。そのため、青空文庫の長い本文を渡してもエラーにはならず安全に切り詰められます — `body_vec` の埋め込みは本文全体ではなく作品冒頭部分の意味を反映します。
+`CandleBertEmbedder` は、sentence-transformers と同じく、`sentence_bert_config.json` にあるモデルの `max_seq_length`（このモデルでは 128 トークン）で入力を切り詰めます。そのため、青空文庫の長い本文を渡してもエラーにはならず安全に切り詰められます — `body_vec` の埋め込みは本文全体ではなく作品冒頭部分の意味を反映します。
 
 `author` は意図的にベクトル化していません。人名は固有名詞であり、名前同士の意味的類似検索には実用上の意味がないためです。代わりに既存の `author`（部分一致）/ `author_exact`（完全一致）のレキシカルフィールドを使用してください。
 

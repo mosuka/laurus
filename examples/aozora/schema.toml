@@ -99,10 +99,11 @@ term_vectors = false
 # `tokenizer.json` on the Hub, which `CandleBertEmbedder` requires — this
 # multilingual model was the one confirmed to actually load.
 #
-# The model's tokenizer.json embeds a truncation rule (max_length = 128),
-# applied automatically by the `tokenizers` crate, so a long Aozora Bunko
-# body is safely truncated to its first ~128 tokens rather than causing an
-# error — the embedding reflects the opening of the work, not the whole text.
+# `CandleBertEmbedder` truncates input to the model's max_seq_length from
+# sentence_bert_config.json (128 tokens for this model), like
+# sentence-transformers, so a long Aozora Bunko body is safely truncated to
+# its first 128 tokens rather than causing an error — the embedding reflects
+# the opening of the work, not the whole text.
 [embedders.ja_text_embedder]
 type = "candle_bert"
 model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
