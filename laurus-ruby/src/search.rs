@@ -411,9 +411,10 @@ impl RbSearchRequest {
             builder = builder.fusion_algorithm(*fusion);
         }
 
-        // Filter query - we cannot move out of &self, so we need to handle this differently.
-        // Since build() takes &self, we cannot consume filter_query. This is a design issue.
-        // For now, we skip filter in the &self case. The actual search path uses build_request_from_rb.
+        // Filter query. `build` takes `&self`, so pass a copy of the query.
+        if let Some(filter) = &self.filter_query {
+            builder = builder.filter_query(filter.clone_box());
+        }
 
         // Highlighting (Issue #1134). Applied before every branch below
         // returns, so it takes effect regardless of which query shape is set.

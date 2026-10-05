@@ -250,6 +250,15 @@ class TestIndex < Minitest::Test
     assert results.length >= 1
   end
 
+  def test_search_request_applies_filter_query
+    idx = create_index
+    query = "body:programming OR body:python"
+    assert_equal %w[doc1 doc2], idx.search(query).map(&:id).sort
+
+    req = Laurus::SearchRequest.new(query: query, filter_query: Laurus::TermQuery.new("title", "rust"))
+    assert_equal ["doc1"], idx.search(req).map(&:id)
+  end
+
   # ---------------------------------------------------------------------------
   # Query types
   # ---------------------------------------------------------------------------
