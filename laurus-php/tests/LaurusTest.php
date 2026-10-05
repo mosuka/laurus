@@ -878,6 +878,22 @@ class LaurusTest extends TestCase
         $this->assertCount(1, $results);
     }
 
+    public function testSearchRequestAppliesFilterQuery(): void
+    {
+        $idx = $this->createIndex();
+        $query = "body:programming OR body:python";
+        $this->assertSame(["doc1", "doc2"], $this->idsOf($idx->search($query)));
+
+        $req = new Laurus\SearchRequest(
+            $query, // query
+            null, // lexical_query
+            null, // vector_query
+            new Laurus\TermQuery("title", "rust"), // filter_query
+            null, // fusion
+        );
+        $this->assertSame(["doc1"], $this->idsOf($idx->search($req)));
+    }
+
     // ── Fusion algorithms ───────────────────────────────────────────────
 
     public function testRRFRepr(): void

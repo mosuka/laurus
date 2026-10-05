@@ -295,7 +295,6 @@ pub struct PhpSearchRequest {
     /// Vector component for explicit hybrid search.
     vector_query: Option<VectorSearchQuery>,
     /// Optional lexical filter query applied after scoring.
-    #[allow(dead_code)]
     filter_query: Option<Box<dyn laurus::lexical::Query>>,
     /// Fusion algorithm for hybrid results.
     fusion: Option<FusionAlgorithm>,
@@ -421,6 +420,11 @@ impl PhpSearchRequest {
         // Fusion algorithm
         if let Some(ref fusion) = self.fusion {
             builder = builder.fusion_algorithm(*fusion);
+        }
+
+        // Filter query. `build` takes `&self`, so pass a copy of the query.
+        if let Some(filter) = &self.filter_query {
+            builder = builder.filter_query(filter.clone_box());
         }
 
         // Highlighting (Issue #1134). Applied before every branch below
