@@ -25,6 +25,7 @@ pub mod writer;
 // Re-exports
 pub use core::distance::DistanceMetric;
 pub use core::field::{FieldOption, FlatOption, HnswOption, IvfOption, MultiVectorOption};
+pub use core::multi_vector::MultiVectorStorage;
 pub use core::vector::{StoredVector, Vector};
 pub use index::config::FlatIndexConfig;
 pub use index::config::{HnswIndexConfig, IvfIndexConfig};

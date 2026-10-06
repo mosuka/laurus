@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
 use crate::error::Result;
 use crate::vector::core::distance::DistanceMetric;
+use crate::vector::core::multi_vector::MultiVectorStorage;
 use crate::vector::core::quantization;
 use crate::vector::core::rerank::RerankStorageKind;
 use crate::vector::core::vector::Vector;
@@ -453,6 +454,12 @@ pub struct MultiVectorIndexConfig {
     /// L2-normalized at write time) or [`DistanceMetric::DotProduct`].
     pub distance_metric: DistanceMetric,
 
+    /// On-disk element kind of every token vector (#1346). Defaults to
+    /// [`MultiVectorStorage::F32`], the only kind ever written before
+    /// this field existed.
+    #[serde(default)]
+    pub storage: MultiVectorStorage,
+
     /// Most documents a merge may combine into one segment.
     ///
     /// The default (16,384) keeps a merged segment around 2.4 GiB for
@@ -491,6 +498,7 @@ impl Default for MultiVectorIndexConfig {
         Self {
             dimension: 128,
             distance_metric: DistanceMetric::Cosine,
+            storage: MultiVectorStorage::default(),
             max_documents_per_segment: default_multi_vector_max_documents_per_segment(),
             merge_factor: 10,
             max_segments: 100,
@@ -506,6 +514,7 @@ impl std::fmt::Debug for MultiVectorIndexConfig {
         f.debug_struct("MultiVectorIndexConfig")
             .field("dimension", &self.dimension)
             .field("distance_metric", &self.distance_metric)
+            .field("storage", &self.storage)
             .field("max_documents_per_segment", &self.max_documents_per_segment)
             .field("merge_factor", &self.merge_factor)
             .field("max_segments", &self.max_segments)

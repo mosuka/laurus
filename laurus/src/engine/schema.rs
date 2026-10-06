@@ -491,10 +491,8 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         (FieldOption::Ivf(o), FieldOption::Ivf(n)) => {
             classify_vector_common(old, new).max(classify_ivf_specific(o, n))
         }
-        // A multi-vector field has no other options than dimension and
-        // distance, both covered by the common rule.
-        (FieldOption::MultiVector(_), FieldOption::MultiVector(_)) => {
-            classify_vector_common(old, new)
+        (FieldOption::MultiVector(o), FieldOption::MultiVector(n)) => {
+            classify_vector_common(old, new).max(classify_multi_vector_specific(o, n))
         }
         // Token vectors and a single searchable vector share no on-disk
         // layout, so there is nothing to rebuild from.
@@ -771,6 +769,22 @@ fn classify_hnsw_specific(old: &HnswOption, new: &HnswOption) -> FieldChangeKind
         kind = kind.max(FieldChangeKind::Reindex);
     }
     kind
+}
+
+/// Classification for `MultiVector`-specific parameters (Issue #1346).
+/// `storage` (the on-disk element kind) changes the LMV1 payload layout of
+/// every segment already on disk, so it requires rebuilding from the raw
+/// vectors — exactly like `quantizer` on the ANN vector kinds (see
+/// `classify_flat_specific`).
+fn classify_multi_vector_specific(
+    old: &MultiVectorOption,
+    new: &MultiVectorOption,
+) -> FieldChangeKind {
+    if old.storage != new.storage {
+        FieldChangeKind::Reindex
+    } else {
+        FieldChangeKind::MetadataOnly
+    }
 }
 
 /// Classification for Flat-specific parameters. `base_weight` is
@@ -1212,6 +1226,7 @@ mod tests {
     #[test]
     fn classify_change_table() {
         use crate::vector::core::distance::DistanceMetric;
+        use crate::vector::core::multi_vector::MultiVectorStorage;
         use crate::vector::core::quantization::QuantizationMethod;
         use crate::vector::core::rerank::RerankStorageKind;
         use FieldChangeKind::{Destructive, MetadataOnly, Reindex};
@@ -1866,6 +1881,30 @@ mod tests {
                 "multi_vector: distance change is destructive",
                 multi_vector(|o| o),
                 multi_vector(|o| o.distance(DistanceMetric::DotProduct)),
+                Destructive,
+            ),
+            (
+                "multi_vector: storage f32 -> f16 requires reindex (#1346)",
+                multi_vector(|o| o),
+                multi_vector(|o| o.storage(MultiVectorStorage::F16)),
+                Reindex,
+            ),
+            (
+                "multi_vector: storage f16 -> int8 requires reindex (#1346)",
+                multi_vector(|o| o.storage(MultiVectorStorage::F16)),
+                multi_vector(|o| o.storage(MultiVectorStorage::Int8)),
+                Reindex,
+            ),
+            (
+                "multi_vector: storage int8 -> f32 requires reindex (#1346)",
+                multi_vector(|o| o.storage(MultiVectorStorage::Int8)),
+                multi_vector(|o| o),
+                Reindex,
+            ),
+            (
+                "multi_vector: storage change combined with a destructive dimension change stays destructive",
+                multi_vector(|o| o),
+                multi_vector(|o| o.dimension(96).storage(MultiVectorStorage::Int8)),
                 Destructive,
             ),
             (

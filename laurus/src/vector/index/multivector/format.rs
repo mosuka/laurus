@@ -16,8 +16,9 @@
 //! [`SegmentReader::verify_payload`] (merges and validation), so opening a
 //! multi-gigabyte segment does not read it.
 //!
-//! Element kinds other than `f32` (`1` = f16, `2` = int8, `3` = 1-bit) are
-//! reserved for compressed storage and rejected by this version.
+//! Element kind `3` is reserved for a future 1-bit kind and rejected by
+//! this version. See [`crate::vector::core::multi_vector`] for the f32 /
+//! f16 / int8 row layouts and codecs.
 
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,16 +27,15 @@ use parking_lot::Mutex;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::{Storage, StorageInput, StorageOutput};
+use crate::vector::core::multi_vector::{MultiVectorRows, MultiVectorStorage};
 
 const MAGIC: [u8; 4] = *b"LMV1";
 const FOOTER_MAGIC: [u8; 4] = *b"LMVF";
 const VERSION: u16 = 1;
-const ELEMENT_F32: u8 = 0;
 
 const HEADER_LEN: usize = 64;
 const DOC_ENTRY_LEN: usize = 24;
 const FOOTER_LEN: usize = 16;
-const F32_LEN: usize = std::mem::size_of::<f32>();
 
 /// One document of a segment: its id and how many vectors it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +46,10 @@ pub(crate) struct DocEntry {
     pub vector_count: u32,
 }
 
-/// Counts declared by a segment header.
+/// Counts and element kind declared by a segment header.
 #[derive(Debug, Clone, Copy)]
 struct Header {
+    kind: MultiVectorStorage,
     dimension: usize,
     doc_count: u64,
     vector_count: u64,
@@ -59,7 +60,7 @@ impl Header {
         let mut bytes = [0u8; HEADER_LEN];
         bytes[0..4].copy_from_slice(&MAGIC);
         bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
-        bytes[6] = ELEMENT_F32;
+        bytes[6] = self.kind.tag();
         bytes[8..12].copy_from_slice(&(self.dimension as u32).to_le_bytes());
         bytes[16..24].copy_from_slice(&self.doc_count.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.vector_count.to_le_bytes());
@@ -78,12 +79,12 @@ impl Header {
                 "multi-vector segment version {version} is not supported (expected {VERSION})"
             )));
         }
-        if bytes[6] != ELEMENT_F32 {
-            return Err(LaurusError::IncompatibleFormat(format!(
+        let kind = MultiVectorStorage::from_tag(bytes[6]).ok_or_else(|| {
+            LaurusError::IncompatibleFormat(format!(
                 "multi-vector element kind {} is not supported by this version",
                 bytes[6]
-            )));
-        }
+            ))
+        })?;
         let dimension = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) as usize;
         if dimension == 0 {
             return Err(LaurusError::index(
@@ -91,6 +92,7 @@ impl Header {
             ));
         }
         Ok(Self {
+            kind,
             dimension,
             doc_count: u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")),
             vector_count: u64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes")),
@@ -107,8 +109,7 @@ impl Header {
     /// Byte length of the payload.
     fn payload_len(&self) -> Option<u64> {
         self.vector_count
-            .checked_mul(self.dimension as u64)?
-            .checked_mul(F32_LEN as u64)
+            .checked_mul(self.kind.row_bytes(self.dimension) as u64)
     }
 
     /// Exact byte length of a segment with these counts.
@@ -124,29 +125,68 @@ pub(crate) struct PayloadSink<'a> {
     output: &'a mut Box<dyn StorageOutput>,
     hasher: &'a mut crc32fast::Hasher,
     buffer: &'a mut Vec<u8>,
+    kind: MultiVectorStorage,
+    dimension: usize,
+    /// Rows still expected for the current document.
     remaining: usize,
 }
 
 impl PayloadSink<'_> {
-    /// Append `values` (whole vectors, row-major) to the current document.
+    /// Encode and append `values` (whole vectors, row-major) to the
+    /// current document.
     ///
     /// # Errors
     ///
-    /// Returns an error when `values` exceeds what the document's table
-    /// entry declared, or when writing fails.
+    /// Returns an error when `values` is not a whole number of rows, when
+    /// it holds more rows than the document's table entry declared, or
+    /// when writing fails.
     pub(crate) fn write(&mut self, values: &[f32]) -> Result<()> {
-        if values.len() > self.remaining {
+        if !values.len().is_multiple_of(self.dimension) {
+            return Err(LaurusError::internal(
+                "multi-vector payload is not a whole number of rows",
+            ));
+        }
+        let rows = values.len() / self.dimension;
+        if rows > self.remaining {
             return Err(LaurusError::internal(
                 "multi-vector payload is longer than its table entry declares",
             ));
         }
         self.buffer.clear();
-        for v in values {
-            self.buffer.extend_from_slice(&v.to_le_bytes());
+        for row in values.chunks_exact(self.dimension) {
+            self.kind.encode_row(row, self.buffer);
         }
         self.hasher.update(self.buffer);
         self.output.write_all(self.buffer)?;
-        self.remaining -= values.len();
+        self.remaining -= rows;
+        Ok(())
+    }
+
+    /// Append already-encoded row bytes verbatim (the merge byte-copy
+    /// fast path): `bytes.len()` must be a whole number of
+    /// `self.kind.row_bytes(self.dimension)`-sized rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `bytes` is not a whole number of rows, when
+    /// it holds more rows than the document's table entry declared, or
+    /// when writing fails.
+    pub(crate) fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        let row_bytes = self.kind.row_bytes(self.dimension);
+        if !bytes.len().is_multiple_of(row_bytes) {
+            return Err(LaurusError::internal(
+                "multi-vector payload is not a whole number of rows",
+            ));
+        }
+        let rows = bytes.len() / row_bytes;
+        if rows > self.remaining {
+            return Err(LaurusError::internal(
+                "multi-vector payload is longer than its table entry declares",
+            ));
+        }
+        self.hasher.update(bytes);
+        self.output.write_all(bytes)?;
+        self.remaining -= rows;
         Ok(())
     }
 }
@@ -160,6 +200,7 @@ impl PayloadSink<'_> {
 ///
 /// * `storage` - Storage to write into.
 /// * `file_name` - Final file name (e.g. `segment_000003.mv`).
+/// * `kind` - On-disk element kind every vector is encoded as.
 /// * `dimension` - Dimension of every vector.
 /// * `docs` - The documents, strictly ascending by doc id, each with at
 ///   least one vector.
@@ -173,12 +214,13 @@ impl PayloadSink<'_> {
 pub(crate) fn write_segment(
     storage: &dyn Storage,
     file_name: &str,
+    kind: MultiVectorStorage,
     dimension: usize,
     docs: &[DocEntry],
     fill: impl FnMut(usize, &mut PayloadSink<'_>) -> Result<()>,
 ) -> Result<()> {
     let tmp = format!("{file_name}.tmp");
-    match write_segment_to(storage, &tmp, dimension, docs, fill) {
+    match write_segment_to(storage, &tmp, kind, dimension, docs, fill) {
         Ok(()) => storage.rename_file(&tmp, file_name),
         Err(e) => {
             if storage.file_exists(&tmp) {
@@ -192,6 +234,7 @@ pub(crate) fn write_segment(
 fn write_segment_to(
     storage: &dyn Storage,
     file_name: &str,
+    kind: MultiVectorStorage,
     dimension: usize,
     docs: &[DocEntry],
     mut fill: impl FnMut(usize, &mut PayloadSink<'_>) -> Result<()>,
@@ -213,6 +256,7 @@ fn write_segment_to(
     }
 
     let header = Header {
+        kind,
         dimension,
         doc_count: docs.len() as u64,
         vector_count: docs.iter().map(|d| u64::from(d.vector_count)).sum(),
@@ -239,7 +283,9 @@ fn write_segment_to(
             output: &mut output,
             hasher: &mut payload_hasher,
             buffer: &mut buffer,
-            remaining: doc.vector_count as usize * dimension,
+            kind,
+            dimension,
+            remaining: doc.vector_count as usize,
         };
         fill(i, &mut sink)?;
         if sink.remaining != 0 {
@@ -262,6 +308,7 @@ fn write_segment_to(
 /// Read access to one sealed multi-vector segment.
 #[derive(Debug)]
 pub(crate) struct SegmentReader {
+    kind: MultiVectorStorage,
     dimension: usize,
     vector_count: u64,
     doc_ids: Vec<u64>,
@@ -299,6 +346,7 @@ impl SegmentReader {
             let footer = &bytes[bytes.len() - FOOTER_LEN..];
             let table = parse_meta(file_name, &header, &bytes[..table_end], footer)?;
             return Ok(Self {
+                kind: header.kind,
                 dimension: header.dimension,
                 vector_count: header.vector_count,
                 doc_ids: table.doc_ids,
@@ -323,6 +371,7 @@ impl SegmentReader {
         input.read_exact(&mut footer)?;
         let table = parse_meta(file_name, &header, &meta, &footer)?;
         Ok(Self {
+            kind: header.kind,
             dimension: header.dimension,
             vector_count: header.vector_count,
             doc_ids: table.doc_ids,
@@ -355,22 +404,23 @@ impl SegmentReader {
             })
     }
 
-    /// The vectors of `doc_id`, row-major (`vector count × dimension`
-    /// values), or `None` when this segment does not hold it.
+    /// The still-encoded rows of `doc_id`, or `None` when this segment
+    /// does not hold it.
     ///
-    /// Borrowed without copying when the storage offers a zero-copy view
-    /// and the payload is suitably aligned; decoded into a new buffer
-    /// otherwise.
+    /// The returned bytes are borrowed without copying when the storage
+    /// offers a zero-copy view; read into a new buffer otherwise. Used
+    /// both for scoring (via [`MultiVectorRows::to_f32`]) and for a
+    /// same-kind merge byte copy (via the raw bytes it wraps).
     ///
     /// # Errors
     ///
     /// Returns an error when reading from storage fails.
-    pub(crate) fn vectors(&self, doc_id: u64) -> Result<Option<Cow<'_, [f32]>>> {
+    pub(crate) fn rows(&self, doc_id: u64) -> Result<Option<MultiVectorRows<'_>>> {
         let Ok(index) = self.doc_ids.binary_search(&doc_id) else {
             return Ok(None);
         };
         let (first, count) = self.spans[index];
-        let row = (self.dimension * F32_LEN) as u64;
+        let row = self.kind.row_bytes(self.dimension) as u64;
         let start = self.payload_offset + first * row;
         let len = (u64::from(count) * row) as usize;
 
@@ -379,10 +429,11 @@ impl SegmentReader {
                 .as_slice()
                 .ok_or_else(|| LaurusError::internal("zero-copy view disappeared"))?;
             let bytes = &bytes[start as usize..start as usize + len];
-            return Ok(Some(match as_f32_slice(bytes) {
-                Some(floats) => Cow::Borrowed(floats),
-                None => Cow::Owned(decode_f32s(bytes)),
-            }));
+            return Ok(Some(MultiVectorRows::new(
+                self.kind,
+                self.dimension,
+                Cow::Borrowed(bytes),
+            )));
         }
 
         let stream = self
@@ -393,7 +444,11 @@ impl SegmentReader {
         input.seek(SeekFrom::Start(start))?;
         let mut bytes = vec![0u8; len];
         input.read_exact(&mut bytes)?;
-        Ok(Some(Cow::Owned(decode_f32s(&bytes))))
+        Ok(Some(MultiVectorRows::new(
+            self.kind,
+            self.dimension,
+            Cow::Owned(bytes),
+        )))
     }
 
     /// Check the payload checksum, which opening does not verify.
@@ -403,7 +458,7 @@ impl SegmentReader {
     /// Returns an index error when the payload does not match its checksum,
     /// or an I/O error when reading fails.
     pub(crate) fn verify_payload(&self) -> Result<()> {
-        let payload_len = (self.vector_count * (self.dimension * F32_LEN) as u64) as usize;
+        let payload_len = (self.vector_count * self.kind.row_bytes(self.dimension) as u64) as usize;
         let start = self.payload_offset as usize;
         let actual = if let Some(input) = &self.mapped {
             let bytes = input
@@ -512,26 +567,6 @@ fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> R
     })
 }
 
-/// Reinterpret little-endian `f32` bytes in place, if they are aligned.
-fn as_f32_slice(bytes: &[u8]) -> Option<&[f32]> {
-    if cfg!(target_endian = "big") {
-        return None;
-    }
-    // SAFETY: every bit pattern is a valid `f32`, and `align_to` only puts
-    // bytes into the middle slice when they are correctly aligned for it.
-    let (head, floats, tail) = unsafe { bytes.align_to::<f32>() };
-    (head.is_empty() && tail.is_empty()).then_some(floats)
-}
-
-fn decode_f32s(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<F32_LEN>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -558,7 +593,13 @@ mod tests {
         ]
     }
 
-    fn write(storage: &dyn Storage, name: &str, dim: usize, docs: &[(u64, Vec<Vec<f32>>)]) {
+    fn write(
+        storage: &dyn Storage,
+        name: &str,
+        kind: MultiVectorStorage,
+        dim: usize,
+        docs: &[(u64, Vec<Vec<f32>>)],
+    ) {
         let entries: Vec<DocEntry> = docs
             .iter()
             .map(|(doc_id, vectors)| DocEntry {
@@ -566,7 +607,7 @@ mod tests {
                 vector_count: vectors.len() as u32,
             })
             .collect();
-        write_segment(storage, name, dim, &entries, |i, sink| {
+        write_segment(storage, name, kind, dim, &entries, |i, sink| {
             for v in &docs[i].1 {
                 sink.write(v)?;
             }
@@ -591,9 +632,36 @@ mod tests {
         output.close().unwrap();
     }
 
-    fn assert_round_trip(storage: &dyn Storage) {
-        write(storage, "seg.mv", 3, &sample());
+    /// Per-element tolerance for `vectors()`/`to_f32()`, exact for `F32`.
+    fn tolerance(kind: MultiVectorStorage) -> f32 {
+        match kind {
+            MultiVectorStorage::F32 => 0.0,
+            MultiVectorStorage::F16 => 2e-3,
+            MultiVectorStorage::Int8 => 5e-2,
+        }
+    }
+
+    /// Test-only convenience wrapping [`SegmentReader::rows`] +
+    /// [`MultiVectorRows::to_f32`], mirroring the removed
+    /// `SegmentReader::vectors` that only tests still needed.
+    fn vectors(reader: &SegmentReader, doc_id: u64) -> Option<Cow<'_, [f32]>> {
+        reader.rows(doc_id).unwrap().map(|rows| rows.to_f32())
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tol: f32) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!(
+                (a - e).abs() <= tol,
+                "{actual:?} vs {expected:?} (tol {tol})"
+            );
+        }
+    }
+
+    fn assert_round_trip(storage: &dyn Storage, kind: MultiVectorStorage) {
+        write(storage, "seg.mv", kind, 3, &sample());
         let reader = SegmentReader::open(storage, "seg.mv").unwrap();
+        assert_eq!(reader.rows(4).unwrap().unwrap().kind(), kind);
         assert_eq!(reader.dimension(), 3);
         assert_eq!(reader.doc_ids(), &[4, 9]);
         assert_eq!(
@@ -609,70 +677,118 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            reader.vectors(4).unwrap().unwrap().as_ref(),
-            &[1.0, 2.0, 3.0, -1.0, 0.5, 0.25]
+        let tol = tolerance(kind);
+        assert_close(
+            &vectors(&reader, 4).unwrap(),
+            &[1.0, 2.0, 3.0, -1.0, 0.5, 0.25],
+            tol,
         );
-        assert_eq!(
-            reader.vectors(9).unwrap().unwrap().as_ref(),
-            &[7.0, 8.0, 9.0]
-        );
-        assert!(reader.vectors(5).unwrap().is_none());
+        assert_close(&vectors(&reader, 9).unwrap(), &[7.0, 8.0, 9.0], tol);
+        assert!(vectors(&reader, 5).is_none());
         reader.verify_payload().unwrap();
         assert!(!storage.file_exists("seg.mv.tmp"));
     }
 
     #[test]
-    fn test_round_trip_in_memory() {
-        assert_round_trip(memory().as_ref());
+    fn test_round_trip_in_memory_for_every_storage_kind() {
+        for kind in [
+            MultiVectorStorage::F32,
+            MultiVectorStorage::F16,
+            MultiVectorStorage::Int8,
+        ] {
+            assert_round_trip(memory().as_ref(), kind);
+        }
     }
 
     #[test]
-    fn test_round_trip_on_file_with_mmap_is_zero_copy() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = file(&dir, true);
-        assert_round_trip(storage.as_ref());
-        // A memory map is page-aligned and the payload offset is a multiple
-        // of 8, so the vectors are borrowed, not copied.
-        let reader = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap();
-        assert!(matches!(reader.vectors(4).unwrap(), Some(Cow::Borrowed(_))));
+    fn test_round_trip_on_file_with_mmap_is_zero_copy_only_for_f32() {
+        for kind in [
+            MultiVectorStorage::F32,
+            MultiVectorStorage::F16,
+            MultiVectorStorage::Int8,
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = file(&dir, true);
+            assert_round_trip(storage.as_ref(), kind);
+            // A memory map is page-aligned and the payload offset is a
+            // multiple of 8, so an `F32` row set is borrowed, not copied.
+            // `F16`/`Int8` rows can never be reinterpreted as `&[f32]`.
+            let reader = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap();
+            let rows = reader.rows(4).unwrap().unwrap();
+            assert_eq!(rows.as_f32().is_some(), kind == MultiVectorStorage::F32);
+        }
     }
 
     #[test]
     fn test_round_trip_on_file_without_mmap() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert_round_trip(file(&dir, false).as_ref());
+        assert_round_trip(file(&dir, false).as_ref(), MultiVectorStorage::F32);
     }
 
     #[test]
-    fn test_unaligned_bytes_are_decoded() {
+    fn test_unaligned_f32_bytes_are_decoded() {
         let values = [1.5f32, -2.0, 0.125];
         let mut bytes = vec![0u8];
         for v in values {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        let unaligned = &bytes[1..];
-        // At most one of the two offsets can be 4-byte aligned.
-        assert!(as_f32_slice(unaligned).is_none() || as_f32_slice(&bytes[..12]).is_none());
-        assert_eq!(decode_f32s(unaligned), values);
+        let unaligned = Cow::Borrowed(&bytes[1..]);
+        let rows = MultiVectorRows::new(MultiVectorStorage::F32, 3, unaligned);
+        // At most one of the two offsets can be 4-byte aligned, but
+        // `to_f32` decodes correctly either way.
+        assert_eq!(&*rows.to_f32(), &values);
     }
 
     #[test]
     fn test_empty_segment_round_trips() {
         let storage = memory();
-        write(storage.as_ref(), "empty.mv", 4, &[]);
+        write(
+            storage.as_ref(),
+            "empty.mv",
+            MultiVectorStorage::F32,
+            4,
+            &[],
+        );
         let reader = SegmentReader::open(storage.as_ref(), "empty.mv").unwrap();
         assert!(reader.doc_ids().is_empty());
-        assert!(reader.vectors(1).unwrap().is_none());
+        assert!(vectors(&reader, 1).is_none());
         reader.verify_payload().unwrap();
     }
 
     #[test]
     fn test_table_corruption_is_detected_on_open() {
         let storage = memory();
-        write(storage.as_ref(), "seg.mv", 3, &sample());
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            MultiVectorStorage::F32,
+            3,
+            &sample(),
+        );
         let mut bytes = read_all(storage.as_ref(), "seg.mv");
         bytes[HEADER_LEN] ^= 0x01; // first doc id
+        overwrite(storage.as_ref(), "seg.mv", &bytes);
+        let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    /// Byte 6 holds the element kind; at dimension 2 an `F16` row set
+    /// (`2 * dim` = 4 bytes/row) and an `Int8` one (`dim + 2` = 4
+    /// bytes/row) are the same file length, so only this checksum tells
+    /// them apart.
+    #[test]
+    fn test_element_kind_tamper_is_caught_by_the_table_checksum_even_at_matching_file_length() {
+        let storage = memory();
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            MultiVectorStorage::Int8,
+            2,
+            &[(1, vec![vec![1.0, 2.0]])],
+        );
+        let mut bytes = read_all(storage.as_ref(), "seg.mv");
+        assert_eq!(bytes[6], MultiVectorStorage::Int8.tag());
+        bytes[6] = MultiVectorStorage::F16.tag();
         overwrite(storage.as_ref(), "seg.mv", &bytes);
         let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
@@ -681,7 +797,13 @@ mod tests {
     #[test]
     fn test_payload_corruption_is_detected_by_verify() {
         let storage = memory();
-        write(storage.as_ref(), "seg.mv", 3, &sample());
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            MultiVectorStorage::F32,
+            3,
+            &sample(),
+        );
         let mut bytes = read_all(storage.as_ref(), "seg.mv");
         let payload_start = HEADER_LEN + 2 * DOC_ENTRY_LEN;
         bytes[payload_start] ^= 0x01;
@@ -694,7 +816,13 @@ mod tests {
     #[test]
     fn test_truncated_file_is_rejected() {
         let storage = memory();
-        write(storage.as_ref(), "seg.mv", 3, &sample());
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            MultiVectorStorage::F32,
+            3,
+            &sample(),
+        );
         let bytes = read_all(storage.as_ref(), "seg.mv");
         overwrite(storage.as_ref(), "seg.mv", &bytes[..bytes.len() - 4]);
         let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
@@ -702,18 +830,37 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_element_kind_and_magic_are_incompatible() {
+    fn test_reserved_and_out_of_range_element_kinds_are_incompatible() {
         let storage = memory();
-        write(storage.as_ref(), "seg.mv", 3, &sample());
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            MultiVectorStorage::F32,
+            3,
+            &sample(),
+        );
         let original = read_all(storage.as_ref(), "seg.mv");
 
-        let mut bytes = original.clone();
-        bytes[6] = 2; // int8, reserved for compressed storage
-        overwrite(storage.as_ref(), "seg.mv", &bytes);
-        let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
-        assert!(matches!(err, LaurusError::IncompatibleFormat(_)), "{err}");
+        for bad_kind in [3u8, 4, 255] {
+            let mut bytes = original.clone();
+            bytes[6] = bad_kind;
+            overwrite(storage.as_ref(), "seg.mv", &bytes);
+            let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
+            assert!(matches!(err, LaurusError::IncompatibleFormat(_)), "{err}");
+        }
+    }
 
-        let mut bytes = original;
+    #[test]
+    fn test_bad_magic_is_incompatible() {
+        let storage = memory();
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            MultiVectorStorage::F32,
+            3,
+            &sample(),
+        );
+        let mut bytes = read_all(storage.as_ref(), "seg.mv");
         bytes[0] = b'X';
         overwrite(storage.as_ref(), "seg.mv", &bytes);
         let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
@@ -733,24 +880,64 @@ mod tests {
                 vector_count: 1,
             },
         ];
-        assert!(write_segment(storage.as_ref(), "a.mv", 2, &unsorted, |_, _| Ok(())).is_err());
+        assert!(
+            write_segment(
+                storage.as_ref(),
+                "a.mv",
+                MultiVectorStorage::F32,
+                2,
+                &unsorted,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
 
         let one = [DocEntry {
             doc_id: 1,
             vector_count: 2,
         }];
-        let short = write_segment(storage.as_ref(), "b.mv", 2, &one, |_, sink| {
-            sink.write(&[1.0, 2.0])
-        });
+        let short = write_segment(
+            storage.as_ref(),
+            "b.mv",
+            MultiVectorStorage::F32,
+            2,
+            &one,
+            |_, sink| sink.write(&[1.0, 2.0]),
+        );
         assert!(short.unwrap_err().to_string().contains("shorter"));
-        let long = write_segment(storage.as_ref(), "c.mv", 2, &one, |_, sink| {
-            sink.write(&[1.0; 6])
-        });
+        let long = write_segment(
+            storage.as_ref(),
+            "c.mv",
+            MultiVectorStorage::F32,
+            2,
+            &one,
+            |_, sink| sink.write(&[1.0; 6]),
+        );
         assert!(long.unwrap_err().to_string().contains("longer"));
 
         for name in ["a.mv", "b.mv", "c.mv"] {
             assert!(!storage.file_exists(name));
             assert!(!storage.file_exists(&format!("{name}.tmp")));
         }
+    }
+
+    #[test]
+    fn test_writer_rejects_a_partial_row() {
+        let storage = memory();
+        let one = [DocEntry {
+            doc_id: 1,
+            vector_count: 2,
+        }];
+        // Dimension 2, but 3 values: not a whole number of rows.
+        let err = write_segment(
+            storage.as_ref(),
+            "partial.mv",
+            MultiVectorStorage::F32,
+            2,
+            &one,
+            |_, sink| sink.write(&[1.0, 2.0, 3.0]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("whole number of rows"), "{err}");
     }
 }

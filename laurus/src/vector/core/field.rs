@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LaurusError, Result};
 use crate::vector::core::distance::DistanceMetric;
+use crate::vector::core::multi_vector::MultiVectorStorage;
 use crate::vector::core::quantization;
 use crate::vector::core::rerank::RerankStorageKind;
 
@@ -355,6 +356,12 @@ pub struct MultiVectorOption {
     /// [`DistanceMetric::Cosine`].
     #[serde(default = "default_distance_metric")]
     pub distance: DistanceMetric,
+    /// On-disk element kind of every token vector (Issue #1346). Defaults
+    /// to [`MultiVectorStorage::F32`], the only kind ever written before
+    /// this option existed, so a schema with no `storage` key keeps
+    /// reading old segments unchanged.
+    #[serde(default)]
+    pub storage: MultiVectorStorage,
     /// Name of the schema embedder that turns text into this field's token
     /// vectors; it must be a token-level embedder such as `candle_colbert`
     /// (Issue #1349). `None` means documents supply the token vectors.
@@ -367,6 +374,7 @@ impl Default for MultiVectorOption {
         Self {
             dimension: default_dimension(),
             distance: default_distance_metric(),
+            storage: MultiVectorStorage::default(),
             embedder: None,
         }
     }
@@ -394,6 +402,12 @@ impl MultiVectorOption {
     /// Set the token similarity (`Cosine` or `DotProduct`).
     pub fn distance(mut self, distance: DistanceMetric) -> Self {
         self.distance = distance;
+        self
+    }
+
+    /// Set the on-disk element kind of every token vector.
+    pub fn storage(mut self, storage: MultiVectorStorage) -> Self {
+        self.storage = storage;
         self
     }
 
@@ -738,11 +752,20 @@ mod tests {
         assert_eq!(defaulted.distance, DistanceMetric::Cosine);
         assert_eq!(defaulted.embedder, None);
         assert!(!json.contains("embedder"), "an unset embedder is omitted");
+        // Issue #1346: a schema persisted before `storage` existed has no
+        // such key and must keep reading as F32 -- the only kind LMV1 v1
+        // ever wrote.
+        assert_eq!(defaulted.storage, MultiVectorStorage::F32);
 
         let named = MultiVectorOption::new(128).embedder("colbert");
         let back: MultiVectorOption =
             serde_json::from_str(&serde_json::to_string(&named).unwrap()).unwrap();
         assert_eq!(back.embedder.as_deref(), Some("colbert"));
+
+        let compressed = MultiVectorOption::new(128).storage(MultiVectorStorage::Int8);
+        let back: MultiVectorOption =
+            serde_json::from_str(&serde_json::to_string(&compressed).unwrap()).unwrap();
+        assert_eq!(back.storage, MultiVectorStorage::Int8);
     }
 
     #[test]

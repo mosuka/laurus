@@ -122,6 +122,7 @@ pub use storage::{Storage, StorageConfig, StorageFactory};
 pub use store::log::{DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, WalSyncPolicy};
 pub use vector::core::distance::DistanceMetric;
 pub use vector::core::field::{FlatOption, HnswOption, IvfOption, MultiVectorOption};
+pub use vector::core::multi_vector::MultiVectorStorage;
 pub use vector::core::quantization::QuantizationMethod;
 pub use vector::core::rerank::RerankStorageKind;
 pub use vector::store::request::{

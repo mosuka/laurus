@@ -23,6 +23,7 @@ use crate::storage::Storage;
 use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::{FlatOption, HnswOption, MultiVectorOption};
+use crate::vector::core::multi_vector::MultiVectorStorage;
 use crate::vector::core::vector::Vector;
 use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery, VectorSearchRequest};
 use crate::vector::store::request::{FieldSelector, QueryVector};
@@ -517,5 +518,88 @@ async fn test_text_embedded_to_the_wrong_dimension_is_rejected() -> Result<()> {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("dimension 2, expected 3"), "{err}");
+    Ok(())
+}
+
+/// Issue #1346: changing `storage` (the on-disk element kind) requires an
+/// explicit reindex, actually re-encodes the existing segment under the
+/// new kind (not just the persisted schema), and loses precision only in
+/// the direction the new kind can represent -- it never resurrects it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_field_storage_compression_reindexes_and_is_lossy_one_way() -> Result<()> {
+    let engine = Engine::new(storage(), schema()).await?;
+    let original = vec![vec![0.6, 0.8], vec![-0.280_267_7, 0.959_940_1]];
+    engine
+        .put_document(
+            "a",
+            Document::builder()
+                .add_text("title", "first")
+                .add_vector("vec", vec![1.0, 0.0])
+                .add_vector_array(TOKENS, original.clone())
+                .build(),
+        )
+        .await?;
+    engine.commit().await?;
+    let before = stored_tokens(&engine, "a").unwrap();
+    assert_eq!(before, original.concat());
+
+    // Without `reindex: true`, a storage change is rejected (it requires
+    // rebuilding every existing segment).
+    let compressed = FieldOption::MultiVector(
+        MultiVectorOption::new(2)
+            .distance(DistanceMetric::DotProduct)
+            .storage(MultiVectorStorage::F16),
+    );
+    let rejected = engine
+        .update_field(TOKENS, compressed.clone(), UpdateFieldOptions::default())
+        .await;
+    assert!(rejected.is_err());
+
+    let outcome = engine
+        .update_field(
+            TOKENS,
+            compressed,
+            UpdateFieldOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        outcome.classification,
+        crate::engine::schema::FieldChangeKind::Reindex
+    );
+    assert!(matches!(
+        outcome.schema.fields.get(TOKENS),
+        Some(FieldOption::MultiVector(o)) if o.storage == MultiVectorStorage::F16
+    ));
+
+    // The existing segment was actually re-encoded, not just the schema:
+    // values read back are close to, but not bit-identical to, the f32
+    // originals.
+    let after_f16 = stored_tokens(&engine, "a").unwrap();
+    assert_ne!(after_f16, before, "f16 re-encoding must be lossy");
+    for (a, b) in before.iter().zip(&after_f16) {
+        assert!((a - b).abs() <= 2e-3, "{a} vs {b}");
+    }
+
+    // Switching back to F32 cannot resurrect the precision already lost:
+    // the values read back match the f16-quantized ones, not the
+    // originals.
+    let back_to_f32 =
+        FieldOption::MultiVector(MultiVectorOption::new(2).distance(DistanceMetric::DotProduct));
+    engine
+        .update_field(
+            TOKENS,
+            back_to_f32,
+            UpdateFieldOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let after_round_trip = stored_tokens(&engine, "a").unwrap();
+    assert_eq!(after_round_trip, after_f16);
+    assert_ne!(after_round_trip, before);
     Ok(())
 }
