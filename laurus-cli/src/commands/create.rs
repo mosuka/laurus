@@ -170,6 +170,7 @@ use laurus::lexical::core::field::{
 };
 use laurus::vector::DistanceMetric;
 use laurus::vector::core::field::{FlatOption, HnswOption, IvfOption, MultiVectorOption};
+use laurus::vector::core::multi_vector::MultiVectorStorage;
 use laurus::vector::core::rerank::RerankStorageKind;
 use laurus::{AnalyzerSpec, BuiltinAnalyzerSpec, FieldOption, Schema};
 
@@ -194,6 +195,9 @@ const DISTANCE_METRICS: &[&str] = &["Cosine", "Euclidean", "Manhattan", "DotProd
 
 /// The token similarities a MultiVector field accepts.
 const MULTI_VECTOR_DISTANCE_METRICS: &[&str] = &["Cosine", "DotProduct"];
+
+/// The on-disk element kinds a MultiVector field accepts (Issue #1346).
+const MULTI_VECTOR_STORAGE_KINDS: &[&str] = &["F32 (exact)", "F16 (2x)", "Int8 (~4x)"];
 
 /// Run the interactive schema generation wizard (`create schema`).
 ///
@@ -711,9 +715,21 @@ fn prompt_multi_vector_option() -> Result<FieldOption> {
         "DotProduct" => DistanceMetric::DotProduct,
         _ => unreachable!(),
     };
+    let idx = Select::new()
+        .with_prompt("Token vector storage")
+        .items(MULTI_VECTOR_STORAGE_KINDS)
+        .default(0)
+        .interact()?;
+    let storage = match idx {
+        0 => MultiVectorStorage::F32,
+        1 => MultiVectorStorage::F16,
+        _ => MultiVectorStorage::Int8,
+    };
 
     Ok(FieldOption::MultiVector(
-        MultiVectorOption::new(dimension).distance(distance),
+        MultiVectorOption::new(dimension)
+            .distance(distance)
+            .storage(storage),
     ))
 }
 
