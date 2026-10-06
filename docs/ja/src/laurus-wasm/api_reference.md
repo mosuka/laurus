@@ -201,7 +201,7 @@ const results = await index.search("body:rust", 10, 0, {
 
 #### Late interaction による再採点
 
-`search`、`searchVector`、`searchVectorText` は、末尾に省略可能な `rescore` 引数を受け付けます（Issue #1351）。1 段目（lexical・vector・ハイブリッド）の上位の結果を、[MultiVector フィールド](#addmultivectorfieldname-dimension-distance-embedder)のトークンベクトルに対する ColBERT 型の late interaction（MaxSim）で並べ替えます。ほかの検索メソッドには `rescore` 引数はありません。引数は以下の形の単純なオブジェクトです。
+`search`、`searchVector`、`searchVectorText` は、末尾に省略可能な `rescore` 引数を受け付けます（Issue #1351）。1 段目（lexical・vector・ハイブリッド）の上位の結果を、[MultiVector フィールド](#addmultivectorfieldname-dimension-distance-embedder-storage)のトークンベクトルに対する ColBERT 型の late interaction（MaxSim）で並べ替えます。ほかの検索メソッドには `rescore` 引数はありません。引数は以下の形の単純なオブジェクトです。
 
 ```typescript
 interface RescoreOptions {
@@ -542,15 +542,16 @@ IVF ベクトルインデックスフィールドを追加します。
 - `rerankStorage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
 - `pqCodebookPath` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`quantizer: "product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
 
-#### `addMultiVectorField(name, dimension, distance?, embedder?)`
+#### `addMultiVectorField(name, dimension, distance?, embedder?, storage?)`
 
 MultiVector フィールドを追加します（Issue #1351）。ColBERT 型モデルのトークンごとの埋め込みのように、文書ごとに可変本数のトークンベクトルを保持します。ANN 索引は持たず、検索の対象にもなりません。読むのは [late interaction による再採点](#late-interaction-による再採点)だけです。[スキーマとフィールド → MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照してください。
 
 - `dimension`: 各トークンベクトルの長さ。0 より大きい値
 - `distance`: `"cosine"`（デフォルト。書き込み時に L2 正規化）または `"dot_product"`
 - `embedder`: [`addEmbedder`](#addembeddername-config) で登録した `"token_callback"` Embedder の名前（省略可）。テキストの値と再採点のクエリテキストを埋め込みます
+- `storage`: トークンベクトルのディスク上の要素種別（Issue #1346）— `"f32"`（デフォルト、正確）、`"f16"`（2倍小さい）、`"int8"`（約4倍小さい）
 
-オプションはフィールドの追加時に検証され、`dimension` が 0 の場合や上記以外の `distance` は例外になります。
+オプションはフィールドの追加時に検証され、`dimension` が 0 の場合、上記以外の `distance`、または認識できない `storage` は例外になります。
 
 値は、トークンごとに 1 つの配列を持つ入れ子の数値配列（`tokens: [[0.1, 0.2], [0.3, 0.4]]`）で、フィールドの次元のベクトルを 1〜8,192 本保持します。フィールドに `"token_callback"` Embedder がある場合は文字列の値も使え、文書のインデックス時にコールバックが role `"document"` で埋め込みます。トークンベクトルは保存されないため、`getDocuments` や検索結果にこのフィールドは含まれません。
 
@@ -600,7 +601,7 @@ schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipad
   登録します。エンジンがインジェスト時および `searchVectorText()` で呼び出します。
   Transformers.js などのブラウザ内埋め込みライブラリと組み合わせることで、
   エンジン内自動埋め込みが可能になります。
-- `"token_callback"` — [MultiVector フィールド](#addmultivectorfieldname-dimension-distance-embedder)
+- `"token_callback"` — [MultiVector フィールド](#addmultivectorfieldname-dimension-distance-embedder-storage)
   用に、JavaScript コールバック
   `embed: (text, role) => number[][] | Promise<number[][]>` と `dimension`
   （正の整数）を登録します（Issue #1351）。late interaction モデルはクエリと

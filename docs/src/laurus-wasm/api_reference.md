@@ -204,7 +204,7 @@ Search by text (embedded by the registered embedder).
 
 #### Late-interaction rescore
 
-`search`, `searchVector` and `searchVectorText` accept an optional trailing `rescore` argument (Issue #1351). It reorders the top first-stage results — lexical, vector or hybrid — by ColBERT-style late interaction (MaxSim) against the token vectors of a [multi-vector field](#addmultivectorfieldname-dimension-distance-embedder). The other search methods have no `rescore` argument. The argument is a plain object shaped like:
+`search`, `searchVector` and `searchVectorText` accept an optional trailing `rescore` argument (Issue #1351). It reorders the top first-stage results — lexical, vector or hybrid — by ColBERT-style late interaction (MaxSim) against the token vectors of a [multi-vector field](#addmultivectorfieldname-dimension-distance-embedder-storage). The other search methods have no `rescore` argument. The argument is a plain object shaped like:
 
 ```typescript
 interface RescoreOptions {
@@ -555,15 +555,16 @@ Add an IVF vector index field.
 - `rerankStorage` — set to `"f32"` to write a full-precision `*.hnsw.f32` sidecar enabling exact Stage-2 rerank; omit to keep the int8-only segment.
 - `pqCodebookPath` — storage-relative file name of a shared PQ codebook (Issue #631), trained once via the `laurus train pq-codebook` CLI command. Only meaningful with `quantizer: "product_quantization"`; commits then encode against the pre-trained codebook instead of re-training k-means per segment. Omit to keep per-segment training.
 
-#### `addMultiVectorField(name, dimension, distance?, embedder?)`
+#### `addMultiVectorField(name, dimension, distance?, embedder?, storage?)`
 
 Add a multi-vector field (Issue #1351): a variable number of token vectors per document, such as the per-token embeddings of a ColBERT-style model. It has no ANN index and is never a search target; only the [late-interaction rescore](#late-interaction-rescore) reads it. See [Schema & Fields → Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields).
 
 - `dimension`: length of every token vector; must be greater than 0
 - `distance`: `"cosine"` (default; vectors are L2-normalized when written) or `"dot_product"`
 - `embedder`: optional name of a `"token_callback"` embedder registered via [`addEmbedder`](#addembeddername-config), which embeds text values and rescore query text
+- `storage`: on-disk element kind of every token vector (Issue #1346) — `"f32"` (default, exact), `"f16"` (2x smaller), or `"int8"` (~4x smaller)
 
-The options are validated when the field is added: a `dimension` of 0 or any other `distance` throws.
+The options are validated when the field is added: a `dimension` of 0, any other `distance`, or an unrecognized `storage` throws.
 
 A value is a nested number array with one array per token (`tokens: [[0.1, 0.2], [0.3, 0.4]]`), holding 1 to 8,192 vectors of the field's dimension. With a `"token_callback"` embedder on the field, a string value works too: the callback embeds it with role `"document"` when the document is indexed. The token vectors are not stored, so `getDocuments` and search results never include the field.
 
@@ -617,7 +618,7 @@ Register a named embedder. WASM supports three `type` values:
 - `"token_callback"` — Provide a JavaScript callback
   `embed: (text, role) => number[][] | Promise<number[][]>` and a `dimension`
   (positive integer) for a
-  [multi-vector field](#addmultivectorfieldname-dimension-distance-embedder)
+  [multi-vector field](#addmultivectorfieldname-dimension-distance-embedder-storage)
   (Issue #1351). `role` is `"query"` or `"document"`, because late-interaction
   models encode the two differently. The callback returns one
   `dimension`-long vector per token, either directly or as a Promise. The

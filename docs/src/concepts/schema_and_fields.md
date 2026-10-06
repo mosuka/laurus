@@ -177,11 +177,15 @@ let schema = Schema::builder()
     .build();
 ```
 
-- **Options**: `dimension` (every token vector's length), `distance` and
-  `embedder`. Only `Cosine` (vectors are L2-normalized when written, so the
-  similarity is their dot product; a zero vector is kept as-is) and
-  `DotProduct` are accepted; other metrics are rejected when the index is
-  created. `embedder` names a token-level embedder, such as a
+- **Options**: `dimension` (every token vector's length), `distance`,
+  `storage` and `embedder`. Only `Cosine` (vectors are L2-normalized when
+  written, so the similarity is their dot product; a zero vector is kept
+  as-is) and `DotProduct` are accepted for `distance`; other metrics are
+  rejected when the index is created. `storage` picks the on-disk element
+  kind of every token vector — `F32` (default, exact), `F16`, or `Int8` —
+  trading some precision for a smaller index; see [MultiVector
+  Storage](indexing/vector_indexing.md#multivector-storage) for the size
+  and error figures. `embedder` names a token-level embedder, such as a
   [`candle_colbert`](../laurus-cli/schema_format.md#embedders) one
   (`MultiVectorOption::new(96).embedder("colbert")`).
 - **Values**: a `DataValue::VectorArray(Vec<Vec<f32>>)` holding at least one
@@ -199,7 +203,11 @@ let schema = Schema::builder()
   skip it, naming it in a vector query is an error, and so is naming it in a
   DSL query.
 - **Schema changes**: changing its dimension, distance or embedder, or
-  changing it to or from another vector field type, is a destructive change.
+  changing it to or from another vector field type, is a destructive
+  change. Changing `storage` is a **Reindex** change instead — the
+  existing values are still there to re-encode, so
+  `Engine::update_field(.., UpdateFieldOptions { reindex: true, .. })`
+  rebuilds the field's existing segments under the new on-disk kind.
 
 ## Document
 

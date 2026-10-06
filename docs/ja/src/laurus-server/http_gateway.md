@@ -89,6 +89,8 @@ MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector"
 
 MultiVector フィールドには、トークン単位のエンベッダーも指定できます（Issue #1349）。エンベッダーはスキーマの `embedders` で宣言し、数値のオプションは JSON の数値で書きます。例: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` と `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`。こうすると、文書はこのフィールドにテキスト（`"body_colbert": "how lifetimes work in rust"`）を与えられ、テキストはトークンベクトルに埋め込まれます。エンベッダーのパラメータのうち数値と真偽値は文字列として渡され、配列とオブジェクトは拒否されます。
 
+MultiVector フィールドには `storage`（Issue #1346）も指定でき、各トークンベクトルのディスク上の要素形式を選べます。`"f32"`（デフォルト、誤差なし）、`"f16"`（`"f32"` の半分のサイズ、要素あたり相対誤差 ~2⁻¹¹）、`"int8"`（典型的な次元数で `"f32"` の約 1/4 のサイズ、ベクトルごとのスケールを使用）のいずれかです。値は小文字の文字列で、入力時は大文字小文字を区別せずに受け付けます。例: `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`。認識できない値は拒否されます。`storage` がデフォルトの `"f32"` の場合、このキーはレスポンスから省略されます。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:

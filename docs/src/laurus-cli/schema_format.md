@@ -311,12 +311,14 @@ Every token vector of a document (for example ColBERT-style per-token embeddings
 [fields.body_colbert.MultiVector]
 dimension = 128
 distance = "Cosine"
+storage = "Int8"  # optional; omit for F32 (exact, default)
 ```
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `dimension` | `integer` | `128` | Dimensionality of every token vector |
 | `distance` | `string` | `"Cosine"` | Token similarity: `"Cosine"` (vectors are L2-normalized when written) or `"DotProduct"`. Other metrics are rejected |
+| `storage` | `string` | `"F32"` | On-disk element kind of every token vector: `"F32"` (exact, 4 bytes/element), `"F16"` (2 bytes/element, ~2⁻¹¹ relative error/element), or `"Int8"` (~1 byte/element plus a small per-vector scale, `dimension + 2` bytes/row total). See [MultiVector Storage](../concepts/indexing/vector_indexing.md#multivector-storage). Changing it on an existing field requires a reindex |
 | `embedder` | `string` | -- | Name of a token-level embedder (`type = "candle_colbert"`) declared under `[embedders]`. When set, documents may give the field text, which is embedded into token vectors (see [Embedders](#embedders)) |
 
 A document's value is an array of equal-length numeric arrays, between 1 and 8,192 of them, or text when the field has an embedder. The field is not stored in the document store.

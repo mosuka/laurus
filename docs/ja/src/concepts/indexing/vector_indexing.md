@@ -601,6 +601,38 @@ Stage 3 の rerank は PQ ADC の候補集合を `top_k * rerank_factor` まで
 走ったかどうかに関わらず、マルチセグメント fan-out はそのスコアを
 引き続き exact でセグメント間比較可能な basis として扱います。
 
+### MultiVector ストレージ
+
+上記の量子化方式は ANN インデックスタイプ（Flat、HNSW、IVF）に適用され
+ます。[`MultiVector` フィールド](../schema_and_fields.md#multivector-フィールド)
+は ANN 索引を持たないため `quantizer` は適用されません。代わりに独自の
+`storage` オプション（Issue #1346）で、各トークンベクトルのディスク上
+での要素形式を選びます。
+
+| 種類 | Rust Enum バリアント | バイト数/要素 | 誤差 | 1 文書あたりのサイズ（300 × 128 トークン） |
+| :--- | :--- | :--- | :--- | :--- |
+| **F32** *(デフォルト)* | `MultiVectorStorage::F32` | 4 | 厳密 | 約 150 KB |
+| **F16** | `MultiVectorStorage::F16` | 2 | 要素あたり約 2⁻¹¹ の相対誤差 | 約 75 KB |
+| **Int8** | `MultiVectorStorage::Int8` | 約 1（1 行あたり `dimension + 2` バイト） | ベクトルごとのスケール `max(abs(vector)) / 127` で上界が決まる | 約 38 KB |
+
+```rust
+use laurus::{MultiVectorOption, MultiVectorStorage};
+
+let opt = MultiVectorOption::new(128).storage(MultiVectorStorage::Int8);
+```
+
+`quantizer` の per-segment グローバルスケールとは異なり、`Int8` のスケー
+ルは**ベクトルごと**です: `scale = max(abs(vector)) / 127` を各トークン
+ベクトルごとに個別に計算し、corpus や segment にまたがる学習済み状態は
+持ちません。これにより segment のマージ時に行を再量子化せずバイト単位
+でコピーできます。
+
+既存フィールドの `storage` を変更するのは **Reindex** 扱いの変更です。
+`Engine::update_field` を `reindex: true` で呼び出すと、フィールドの
+既存セグメントを新しいディスク上の形式で再構築します。`storage` キーを
+持たないスキーマ（このオプションが存在する前に書かれたもの）はデフォルト
+の `F32` として扱われ、マイグレーションは不要です。
+
 ## セグメントファイル
 
 | インデックスタイプ | ファイル拡張子 | 内容 |

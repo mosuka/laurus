@@ -93,6 +93,8 @@ A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vecto
 
 A multi-vector field may also name a token-level embedder (Issue #1349), declared in the schema's `embedders` with its numeric options as JSON numbers: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` and `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`. A document can then give the field text (`"body_colbert": "how lifetimes work in rust"`), which is embedded into token vectors. Embedder parameters that are numbers or booleans are passed on as strings, and arrays or objects are rejected.
 
+A multi-vector field may also set `storage` (Issue #1346) to pick the on-disk element kind of every token vector: `"f32"` (default, exact), `"f16"` (2x smaller than `"f32"`, ~2⁻¹¹ relative error per element), or `"int8"` (~4x smaller than `"f32"` at typical dimensions, using a per-vector scale). The value is a lowercase string, accepted case-insensitively on input, e.g. `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`; an unrecognized value is rejected. The key is omitted from the response when `storage` is `"f32"`, the default.
+
 ### Add a Field (Dynamic Schema)
 
 Adds a new field to the running index. The request body uses the same `FieldOption` JSON shape as `POST /v1/index`:
