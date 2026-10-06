@@ -14,6 +14,7 @@
 //! per pair before summing would change the ranking.
 
 use crate::vector::core::distance::dot_product;
+use crate::vector::core::multi_vector::MultiVectorRows;
 
 /// MaxSim of one document.
 ///
@@ -39,6 +40,34 @@ pub(crate) fn max_sim(query: &[f32], document: &[f32], dimension: usize) -> f32 
                 .fold(f32::NEG_INFINITY, f32::max)
         })
         .sum()
+}
+
+/// MaxSim of one document stored under any [`MultiVectorStorage`] kind
+/// (#1346).
+///
+/// A compressed `document` (`F16`/`Int8`) is decoded into `scratch` first:
+/// MaxSim is `O(query_rows * document_rows)` dot products but decoding a
+/// document is only `O(document_rows)`, so at typical query/document token
+/// counts (tens vs. hundreds) decoding once and reusing the plain `max_sim`
+/// kernel is cheaper than a fused per-kind kernel would be, and scores are
+/// bit-identical to the f32 reference for a document that happens to be
+/// `F32`. An `F32` document that is also borrowed and aligned is scored
+/// zero-copy, exactly as before this kind existed.
+///
+/// [`MultiVectorStorage`]: crate::vector::core::multi_vector::MultiVectorStorage
+pub(crate) fn max_sim_rows(
+    query: &[f32],
+    document: &MultiVectorRows<'_>,
+    scratch: &mut Vec<f32>,
+) -> f32 {
+    let dimension = document.dimension();
+    match document.as_f32() {
+        Some(floats) => max_sim(query, floats, dimension),
+        None => {
+            document.decode_into(scratch);
+            max_sim(query, scratch, dimension)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +141,54 @@ mod tests {
         let query = [1.0, 2.0, 3.0, 4.0];
         let document = [0.5, 0.5];
         assert_eq!(max_sim(&query, &document, 2), 1.5 + 3.5);
+    }
+
+    use std::borrow::Cow;
+
+    use crate::vector::core::multi_vector::MultiVectorStorage;
+
+    fn encode(kind: MultiVectorStorage, dimension: usize, rows: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in rows.chunks_exact(dimension) {
+            kind.encode_row(row, &mut out);
+        }
+        out
+    }
+
+    /// Per-kind tolerance derived in the implementation plan: f16's 11-bit
+    /// significand bounds its relative error to ~2⁻¹¹; int8's per-vector
+    /// scale (dividing the `[-1, 1]`-ish ColBERT range into 254 steps)
+    /// accumulates more, with ample safety margin at these dimensions.
+    fn tolerance(kind: MultiVectorStorage, query_rows: usize) -> f32 {
+        match kind {
+            MultiVectorStorage::F32 => 0.0,
+            MultiVectorStorage::F16 => 2e-3 * query_rows as f32,
+            MultiVectorStorage::Int8 => 5e-2 * query_rows as f32,
+        }
+    }
+
+    #[test]
+    fn test_max_sim_rows_matches_plain_max_sim_for_every_storage_kind() {
+        let dimension = 128;
+        for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
+            let query = values(1, query_rows * dimension);
+            let document = values(2, doc_rows * dimension);
+            let expected = max_sim(&query, &document, dimension);
+            for kind in [
+                MultiVectorStorage::F32,
+                MultiVectorStorage::F16,
+                MultiVectorStorage::Int8,
+            ] {
+                let encoded = encode(kind, dimension, &document);
+                let view = MultiVectorRows::new(kind, dimension, Cow::Owned(encoded));
+                let mut scratch = Vec::new();
+                let actual = max_sim_rows(&query, &view, &mut scratch);
+                let tol = tolerance(kind, query_rows);
+                assert!(
+                    (actual - expected).abs() <= tol,
+                    "{kind:?} {query_rows}x{doc_rows}: {actual} vs {expected} (tol {tol})"
+                );
+            }
+        }
     }
 }

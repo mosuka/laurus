@@ -20,7 +20,7 @@ use crate::engine::search::{LateInteractionQuery, RescoreOptions, Rescorer};
 use crate::error::{LaurusError, Result};
 use crate::lexical::search::searcher::SortField;
 use crate::vector::core::distance::DistanceMetric;
-use crate::vector::core::late_interaction::max_sim;
+use crate::vector::core::late_interaction::max_sim_rows;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::multivector::MultiVectorSnapshot;
 use crate::vector::store::VectorStore;
@@ -261,9 +261,10 @@ impl PreparedRescore {
         candidates: &[(u64, f32)],
     ) -> Result<Vec<Option<f32>>> {
         let score_one = |&(doc_id, _): &(u64, f32)| -> Result<Option<f32>> {
+            let mut scratch = Vec::new();
             Ok(snapshot
-                .vectors(doc_id)?
-                .map(|document| max_sim(&self.query, &document, self.dimension)))
+                .rows(doc_id)?
+                .map(|document| max_sim_rows(&self.query, &document, &mut scratch)))
         };
         #[cfg(feature = "native")]
         {
