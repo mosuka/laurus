@@ -10,9 +10,10 @@ use crate::query::{
     JsVectorQueryInner, JsVectorTextQuery, JsWildcardQuery, extract_lexical_query,
     query_to_lexical_search_query, vector_query_to_search_query,
 };
+use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
-    SearchResult,
+    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, RescoreOptions,
+    SearchRequestBuilder, SearchResult,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -66,6 +67,60 @@ pub fn js_highlight_options_to_core(options: &JsHighlightOptions) -> HighlightOp
         config = config.require_field_match(require_field_match);
     }
     HighlightOptions::new(options.fields.clone()).with_config(config)
+}
+
+// ---------------------------------------------------------------------------
+// Rescore (Issue #1351)
+// ---------------------------------------------------------------------------
+
+/// Late-interaction (ColBERT MaxSim) rescore of the top search results,
+/// accepted by `search`'s `rescore` parameter and by
+/// [`JsSearchRequestOptions::rescore`].
+///
+/// The top `windowSize` first-stage results are reordered by their MaxSim
+/// against a multi-vector field, and a rescored result's score is that
+/// MaxSim. Set exactly one of `vectors` and `text`.
+#[napi(object)]
+pub struct JsRescoreOptions {
+    /// A multi-vector field.
+    pub field: String,
+    /// The query's token vectors.
+    pub vectors: Option<Vec<Vec<f64>>>,
+    /// Query text, embedded by the field's token-level embedder (a
+    /// "candle_colbert" one).
+    pub text: Option<String>,
+    /// How many top results to rescore (default 100, at most 10,000).
+    pub window_size: Option<u32>,
+}
+
+/// Convert [`JsRescoreOptions`] into the core [`RescoreOptions`]. Only the
+/// shape is checked here; the engine checks the values when searching.
+///
+/// # Errors
+///
+/// Returns `InvalidArg` unless exactly one of `vectors` and `text` is set.
+pub fn js_rescore_options_to_core(options: &JsRescoreOptions) -> Result<RescoreOptions> {
+    let field = options.field.clone();
+    let rescore = match (&options.vectors, &options.text) {
+        (Some(vectors), None) => RescoreOptions::late_interaction(
+            field,
+            vectors
+                .iter()
+                .map(|v| Vector::new(v.iter().map(|&x| x as f32).collect()))
+                .collect(),
+        ),
+        (None, Some(text)) => RescoreOptions::late_interaction_text(field, text.clone()),
+        _ => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "rescore needs exactly one of vectors or text",
+            ));
+        }
+    };
+    Ok(match options.window_size {
+        Some(window_size) => rescore.window_size(window_size as usize),
+        None => rescore,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +272,8 @@ pub struct JsSearchRequest {
     pub(crate) offset: usize,
     /// Highlight request (Issue #1134).
     pub(crate) highlight: Option<JsHighlightOptions>,
+    /// Late-interaction rescore of the top results (Issue #1351).
+    pub(crate) rescore: Option<JsRescoreOptions>,
 }
 
 pub enum FusionChoice {
@@ -247,6 +304,9 @@ pub struct JsSearchRequestOptions {
     /// so — unlike the polymorphic fields below — it lives here directly
     /// rather than behind a setter.
     pub highlight: Option<JsHighlightOptions>,
+    /// Late-interaction rescore of the top results (Issue #1351). Plain
+    /// data, like `highlight`.
+    pub rescore: Option<JsRescoreOptions>,
 }
 
 #[napi]
@@ -276,6 +336,7 @@ impl JsSearchRequest {
             limit: None,
             offset: None,
             highlight: None,
+            rescore: None,
         });
         Self {
             query_dsl: options.query_dsl,
@@ -286,6 +347,7 @@ impl JsSearchRequest {
             limit: options.limit.unwrap_or(10) as usize,
             offset: options.offset.unwrap_or(0) as usize,
             highlight: options.highlight,
+            rescore: options.rescore,
         }
     }
 
@@ -527,6 +589,9 @@ impl JsSearchRequest {
             builder = builder
                 .highlight(options.fields)
                 .highlight_config(options.config);
+        }
+        if let Some(rescore) = &self.rescore {
+            builder = builder.rescore(js_rescore_options_to_core(rescore)?);
         }
 
         // Explicit hybrid: lexical_query + vector_query both set

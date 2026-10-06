@@ -2,17 +2,18 @@
 
 use std::collections::HashMap;
 
-use crate::convert::document_to_dict;
+use crate::convert::{document_to_dict, py_token_vectors};
 use crate::query::{
     extract_lexical_query, is_vector_query, py_to_lexical_search_query, py_to_vector_search_query,
 };
+use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
-    SearchResult,
+    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, RescoreOptions,
+    SearchRequestBuilder, SearchResult,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList, PyString};
 
 // ---------------------------------------------------------------------------
 // Highlighting (Issue #1134)
@@ -131,6 +132,83 @@ impl PyWeightedSum {
     }
 }
 
+/// Late-interaction (ColBERT MaxSim) rescore of the top search results
+/// (Issue #1351).
+///
+/// The top ``window_size`` first-stage results are reordered by their
+/// MaxSim against a multi-vector field, and a rescored result's score is
+/// that MaxSim. ``query`` is either text, embedded by the field's
+/// token-level embedder (a ``"candle_colbert"`` one), or the query's token
+/// vectors as a list of float lists.
+///
+/// ## Example
+///
+/// ```python
+/// rescore = laurus.LateInteractionRescore("body_colbert", "how do lifetimes work")
+/// results = index.search("body:lifetimes", rescore=rescore)
+///
+/// rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size=50)
+/// ```
+#[pyclass(name = "LateInteractionRescore", from_py_object)]
+#[derive(Clone)]
+pub struct PyLateInteractionRescore {
+    field: String,
+    options: RescoreOptions,
+}
+
+#[pymethods]
+impl PyLateInteractionRescore {
+    /// Args:
+    ///     field: A multi-vector field.
+    ///     query: Query text, or the query's token vectors.
+    ///     window_size: How many top results to rescore (default 100, at
+    ///         most 10,000).
+    ///
+    /// Raises:
+    ///     TypeError: if ``query`` is neither a ``str`` nor a list of
+    ///         float lists. The other values are checked when searching.
+    #[new]
+    #[pyo3(signature = (field, query, *, window_size=None))]
+    pub fn new(field: String, query: &Bound<PyAny>, window_size: Option<usize>) -> PyResult<Self> {
+        let options = if let Ok(text) = query.cast::<PyString>() {
+            RescoreOptions::late_interaction_text(field.clone(), text.to_str()?)
+        } else {
+            let vectors = query
+                .cast::<PyList>()
+                .ok()
+                .filter(|list| list.iter().all(|item| item.is_instance_of::<PyList>()))
+                .ok_or_else(|| {
+                    PyTypeError::new_err("query must be a str or a list of float lists")
+                })?;
+            RescoreOptions::late_interaction(
+                field.clone(),
+                py_token_vectors(vectors)?
+                    .into_iter()
+                    .map(Vector::new)
+                    .collect(),
+            )
+        };
+        let options = match window_size {
+            Some(window_size) => options.window_size(window_size),
+            None => options,
+        };
+        Ok(Self { field, options })
+    }
+
+    /// How many top results are rescored.
+    #[getter]
+    fn window_size(&self) -> usize {
+        self.options.window_size
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LateInteractionRescore(field={:?}, window_size={})",
+            self.field, self.options.window_size
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
@@ -225,6 +303,8 @@ pub struct PySearchRequest {
     /// `HighlightConfig` knobs (Issue #1134). See `Index.search`'s
     /// `highlight` parameter for the accepted shapes.
     pub highlight: Option<Py<PyAny>>,
+    /// Late-interaction rescore of the top results (Issue #1351).
+    pub rescore: Option<PyLateInteractionRescore>,
 }
 
 #[pymethods]
@@ -239,7 +319,8 @@ impl PySearchRequest {
         fusion=None,
         limit=10,
         offset=0,
-        highlight=None
+        highlight=None,
+        rescore=None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -251,6 +332,7 @@ impl PySearchRequest {
         limit: usize,
         offset: usize,
         highlight: Option<Py<PyAny>>,
+        rescore: Option<PyLateInteractionRescore>,
     ) -> Self {
         Self {
             query,
@@ -261,6 +343,7 @@ impl PySearchRequest {
             limit,
             offset,
             highlight,
+            rescore,
         }
     }
 
@@ -308,6 +391,12 @@ impl PySearchRequest {
             builder = builder
                 .highlight(options.fields)
                 .highlight_config(options.config);
+        }
+
+        // ── Rescore (Issue #1351) ───────────────────────────────────────────
+        // Also before the branches below, for the same reason.
+        if let Some(rescore) = &self.rescore {
+            builder = builder.rescore(rescore.options.clone());
         }
 
         // ── Explicit hybrid: lexical_query + vector_query both set ────────
@@ -368,15 +457,17 @@ impl PySearchRequest {
 /// - `VectorQuery` or `VectorTextQuery`
 /// - A `PyRRF` / `PyWeightedSum` are not valid here
 ///
-/// When `query` is a `PySearchRequest`, `limit`/`offset`/`highlight` are
-/// used as-is from the request without overriding — same precedent as
-/// `limit`/`offset` already had here before highlighting existed.
+/// When `query` is a `PySearchRequest`, `limit`/`offset`/`highlight`/
+/// `rescore` are used as-is from the request without overriding — same
+/// precedent as `limit`/`offset` already had here before highlighting
+/// existed.
 pub fn build_request_from_py(
     py: Python,
     query: &Bound<PyAny>,
     limit: usize,
     offset: usize,
     highlight: Option<&Bound<PyAny>>,
+    rescore: Option<&PyLateInteractionRescore>,
 ) -> PyResult<laurus::SearchRequest> {
     // Full SearchRequest object — use limit/offset as-is without overriding.
     if let Ok(req) = query.extract::<PyRef<PySearchRequest>>() {
@@ -390,6 +481,9 @@ pub fn build_request_from_py(
         builder = builder
             .highlight(options.fields)
             .highlight_config(options.config);
+    }
+    if let Some(rescore) = rescore {
+        builder = builder.rescore(rescore.options.clone());
     }
 
     // DSL string

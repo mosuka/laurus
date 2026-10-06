@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | Delete all versions for the given ID. |
 | `commit(): void` | Flush buffered writes and make all pending changes searchable. |
 | `flushWal(): void` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records. Useful when running under a group-commit policy (see below). |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | Execute a search query. Returns an array of `SearchResult`. |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` applies identically to every query in the batch. |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null): array` | Execute a search query. Returns an array of `SearchResult`. `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore` are used and the other arguments are ignored. |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` applies identically to every query in the batch. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. |
 | `stats(): array` | Return index statistics (`"documentCount"`, `"vectorFields"`). |
 
 ### `search` query argument
@@ -186,6 +186,7 @@ new \Laurus\Schema()
 | `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW approximate nearest-neighbor vector field. `$baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0): void` | Flat (brute-force) vector field. |
 | `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0): void` | IVF approximate nearest-neighbor vector field. |
+| `addMultiVectorField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null): void` | Multi-vector field holding a variable number of token vectors per document, read by the [late-interaction rescore](#lateinteractionrescore) (Issue #1351); see [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields). `$dimension` is each token vector's length and must be positive; `$distance` is `"cosine"` (default) or `"dot_product"`. Both are checked when the field is added (`\ValueError`). `$embedder` names a token-level embedder (a `"candle_colbert"` one) that embeds the field's text values and the rescore's query text. The field is not a vector-search target, and its token vectors are not stored: `getDocuments` and search results omit it. |
 
 **Vector quantization & rerank storage** (HNSW fields):
 
@@ -199,7 +200,7 @@ Every `add*Field` method above throws `\ValueError` when `name` starts with `_` 
 
 | Method | Description |
 | :--- | :--- |
-| `addEmbedder(string $name, array $config): void` | Register a named embedder definition. `$config` is an associative array with a `"type"` key (see below). |
+| `addEmbedder(string $name, array $config): void` | Register a named embedder definition. `$config` is an associative array with a `"type"` key (see below), decoded with the same rules as the schema TOML format. A missing or unknown type, or a missing required key, throws `\Exception` (`invalid embedder config: ...`). |
 | `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | Register a custom analyzer definition. `$tokenizer` is required; `$charFilters`/`$tokenFilters` are optional arrays of associative arrays. Each uses the same `{"type": "...", ...}` shape as the schema TOML/JSON format (see below). A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) throws `\ValueError`, and so does creating a new `Index` from a schema that defines one (e.g. loaded with `fromToml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzerNames(): array` | Return the names of custom analyzers registered via `addAnalyzer` or loaded from TOML. |
 | `Schema::fromToml(string $tomlStr): Schema` | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. Throws `ValueError` if the TOML is not a valid schema. |
@@ -230,12 +231,20 @@ the full behaviour matrix.
 
 See [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embedders) for the canonical description of each type.
 
-| `"type"` | Required keys | Feature flag |
-| :--- | :--- | :--- |
-| `"precomputed"` | -- | (always available) |
-| `"candle_bert"` | `"model"` | `embeddings-candle` |
-| `"candle_clip"` | `"model"` | `embeddings-multimodal` |
-| `"openai"` | `"model"` | `embeddings-openai` |
+| `"type"` | Required keys | Optional keys | Feature flag |
+| :--- | :--- | :--- | :--- |
+| `"precomputed"` | -- | -- | (always available) |
+| `"candle_bert"` | `"model"` | -- | `embeddings-candle` |
+| `"candle_clip"` | `"model"` | -- | `embeddings-multimodal` |
+| `"openai"` | `"model"` | -- | `embeddings-openai` |
+| `"candle_colbert"` | `"model"` | `"revision"`, `"query_maxlen"`, `"doc_maxlen"` | `embeddings-candle` |
+
+`"candle_colbert"` produces one vector per token, so it serves only a multi-vector field (`addMultiVectorField`):
+
+```php
+$schema->addEmbedder("colbert", ["type" => "candle_colbert", "model" => "colbert-ir/colbertv2.0"]);
+$schema->addMultiVectorField("body_colbert", 128, null, "colbert");
+```
 
 ### Analyzer components
 
@@ -302,6 +311,8 @@ $schema->addTextField("title", analyzer: "ja_ipadic");
 | `"dot_product"` | Dot product |
 | `"manhattan"` | Manhattan distance |
 | `"angular"` | Angular distance |
+
+`addMultiVectorField` accepts only `"cosine"` and `"dot_product"`.
 
 ---
 
@@ -487,6 +498,7 @@ new \Laurus\SearchRequest(
     int $limit = 10,
     int $offset = 0,
     ?array $highlight = null,
+    ?LateInteractionRescore $rescore = null,
 )
 ```
 
@@ -500,6 +512,66 @@ new \Laurus\SearchRequest(
 | `$limit` | Maximum number of results (default 10). |
 | `$offset` | Pagination offset (default 0). |
 | `$highlight` | Same list-or-associative-array shape as `Index->search()`'s `$highlight` (Issue #1134). See [Highlighting](#highlighting). Only `$limit`/`$offset` have PHP-level defaults today, so a call that names `$highlight` must still pass every earlier parameter positionally or by name. |
+| `$rescore` | A `LateInteractionRescore` that reorders the top results (Issue #1351); any other object throws `\TypeError`. See [LateInteractionRescore](#lateinteractionrescore). As with `$highlight`, pass every earlier parameter too. |
+
+When a `SearchRequest` is passed to `Index->search()`, its own `$limit`, `$offset`, `$highlight` and `$rescore` are used; `search`'s other arguments are ignored.
+
+---
+
+## LateInteractionRescore
+
+Late-interaction (ColBERT MaxSim) rescore of the top search results (Issue #1351). Pass it as `Index->search()`'s 5th argument or as `SearchRequest`'s `$rescore`. See [Vector Search → Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore) for how it works.
+
+```php
+new \Laurus\LateInteractionRescore(string $field, string|array $query, ?int $windowSize = null)
+```
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `$field` | `string` | -- | A multi-vector field (`addMultiVectorField`). |
+| `$query` | `string\|array` | -- | Query text, embedded by the field's token-level embedder (a `"candle_colbert"` one), or the query's token vectors as a list of numeric lists, e.g. `[[1.0, 0.0], [0.0, 1.0]]` (integers are widened). |
+| `$windowSize` | `int\|null` | `null` (100) | How many top first-stage results to rescore, at most 10,000. |
+
+### Methods
+
+| Method | Description |
+| :--- | :--- |
+| `getWindowSize(): int` | Return how many top results are rescored (`100` unless `$windowSize` was given). |
+| `__toString(): string` | Return a representation such as `LateInteractionRescore(field="tokens", window_size=100)`. |
+
+### Ordering and scores
+
+The top `$windowSize` first-stage results -- lexical, vector, or hybrid -- are reordered by their MaxSim against the field, and a rescored result's `getScore()` is its MaxSim. Results beyond the window keep their first-stage order and score, after the rescored ones (window results without token vectors in the field come between the two, in first-stage order). The two kinds of score are not comparable.
+
+### Errors
+
+- The constructor throws `\TypeError` (`query must be a string or a list of numeric lists`) when `$query` is neither, and `\Exception` (`token vector N must hold only numbers`) when a token vector holds a non-number such as a `bool` or `string`.
+- `Index->search()` and `SearchRequest` throw `\TypeError` (`rescore must be a Laurus\LateInteractionRescore`) for any other `$rescore` object.
+- Everything else is checked by the engine when searching, before any search runs, and throws `\ValueError` with a message containing `rescore: ...`: the field is unknown or not a multi-vector field, the query does not hold between 1 and 1,024 finite vectors of the field's dimension, a text query is blank or the field has no token-level embedder, or `$windowSize` is outside `1..=10,000`.
+
+### Example
+
+```php
+$schema = new Laurus\Schema();
+$schema->addTextField("title");
+$schema->addMultiVectorField("tokens", 2, "dot_product");
+
+$index = new Laurus\Index(null, $schema);
+$index->putDocument("a", ["title" => "rust", "tokens" => [[0.1, 0.0]]]);
+$index->putDocument("b", ["title" => "rust language", "tokens" => [[0.9, 0.2]]]);
+$index->commit();
+
+$rescore = new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], 50);
+$results = $index->search("title:rust", 10, 0, null, $rescore);
+$results[0]->getId();    // "b"
+$results[0]->getScore(); // ≈ 1.1 = 0.9 + 0.2 (MaxSim)
+
+// The same rescore through a SearchRequest (9th argument)
+$results = $index->search(new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $rescore));
+
+// A text query needs a token-level embedder on the field (see "Embedder types")
+$rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes work");
+```
 
 ---
 
@@ -614,6 +686,7 @@ PHP values are automatically converted to Laurus `DataValue` types:
 | `array` with `"x"`, `"y"`, `"z"` | `GeoEcef` | Three `float` values, meters (3D ECEF Cartesian) |
 | `array` of `["lat" => .., "lon" => ..]` arrays | `GeoArray` | Sequential array; requires `$multiValued = true` on the field |
 | `array` of `["x" => .., "y" => .., "z" => ..]` arrays | `GeoEcefArray` | Sequential array; requires `$multiValued = true` on the field |
+| `array` of numeric lists (sequential, e.g. `[[0.1, 0.2], [0.3, 0.4]]`) | `VectorArray` | Token vectors of a multi-vector field (Issue #1351). The inner arrays are lists, not keyed geo points, so the two never collide. Integers are widened; a `bool` or `string` element throws ("token vector N must hold only numbers"). The vector count and dimension are checked against the field (`\ValueError`). Not stored: `getDocuments` and search results omit the field |
 | `string` (ISO 8601) | `DateTime` | Parsed from ISO 8601 format |
 | `array` of ISO 8601 strings (sequential) | `DateTimeArray` | Chosen only when every element parses as ISO 8601. Requires `$multiValued = true` on the field |
 | `array` of `string` (sequential, not all ISO 8601) | `TextArray` | Multi-valued text field (Issue #1175); read back as an array of strings. Requires `$multiValued = true` on the field. On a declared multi-valued `Bytes` field, the same array of base64 strings is instead decoded element-wise (Issue #1176) |

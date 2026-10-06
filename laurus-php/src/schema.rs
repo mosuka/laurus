@@ -3,14 +3,13 @@
 use std::cell::RefCell;
 use std::str::FromStr;
 
-use ext_php_rs::convert::FromZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::ZendHashTable;
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
-    GeoOption, HnswOption, IntegerOption, IvfOption, QuantizationMethod, RerankStorageKind, Schema,
-    TextOption, TokenFilterConfig, TokenizerConfig,
+    GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption, QuantizationMethod,
+    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 
 use crate::convert::hashtable_to_json_value;
@@ -87,12 +86,6 @@ fn parse_rerank_storage(name: Option<&str>) -> PhpResult<Option<RerankStorageKin
         Some("f32") => Ok(Some(RerankStorageKind::F32)),
         Some(other) => Err(format!("Unknown rerank_storage: '{other}'. Valid: f32").into()),
     }
-}
-
-/// Helper to extract a string from a [`ZendHashTable`] by key.
-fn ht_get_string(ht: &ZendHashTable, key: &str) -> PhpResult<String> {
-    let zv = ht.get(key).ok_or(format!("missing key '{key}'"))?;
-    String::from_zval(zv).ok_or_else(|| format!("'{key}' must be a string").into())
 }
 
 /// Convert a PHP array into a [`TokenizerConfig`], using the same
@@ -633,47 +626,69 @@ impl PhpSchema {
         self.insert_field(name, FieldOption::Ivf(opt))
     }
 
+    /// Add a multi-vector field holding a variable number of token vectors
+    /// per document, for the late-interaction rescore (Issue #1351).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Field name.
+    /// * `dimension` - Dimensionality of each token vector.
+    /// * `distance` - `"cosine"` (default) or `"dot_product"`.
+    /// * `embedder` - A token-level embedder registered via `addEmbedder`
+    ///   (a `"candle_colbert"` one), which embeds text values and rescore
+    ///   query text (default: none).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `name` starts with `_` (other than `_id`), if
+    /// `dimension` is not positive, or if `distance` is neither cosine nor
+    /// dot_product.
+    pub fn add_multi_vector_field(
+        &self,
+        name: String,
+        dimension: i64,
+        distance: Option<String>,
+        embedder: Option<String>,
+    ) -> PhpResult<()> {
+        // A negative dimension is rejected by `validate` like 0.
+        let dimension = usize::try_from(dimension).unwrap_or(0);
+        let mut opt = MultiVectorOption::new(dimension)
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+        opt.embedder = embedder;
+        opt.validate(&name).map_err(laurus_err)?;
+        self.insert_field(name, FieldOption::MultiVector(opt))
+    }
+
     /// Register a named embedder definition in the schema.
     ///
     /// The `config` array must have a `"type"` key selecting the backend:
     ///
-    /// | type              | required keys | feature flag            |
-    /// |-------------------|---------------|-------------------------|
-    /// | `"precomputed"`   | —             | (always available)      |
-    /// | `"candle_bert"`   | `"model"`     | `embeddings-candle`     |
-    /// | `"candle_clip"`   | `"model"`     | `embeddings-multimodal` |
-    /// | `"openai"`        | `"model"`     | `embeddings-openai`     |
+    /// | type               | required keys | optional keys                                  | feature flag            |
+    /// |--------------------|---------------|------------------------------------------------|-------------------------|
+    /// | `"precomputed"`    | —             | —                                              | (always available)      |
+    /// | `"candle_bert"`    | `"model"`     | —                                              | `embeddings-candle`     |
+    /// | `"candle_clip"`    | `"model"`     | —                                              | `embeddings-multimodal` |
+    /// | `"openai"`         | `"model"`     | —                                              | `embeddings-openai`     |
+    /// | `"candle_colbert"` | `"model"`     | `"revision"`, `"query_maxlen"`, `"doc_maxlen"` | `embeddings-candle`     |
+    ///
+    /// `"candle_colbert"` produces token vectors and only serves a
+    /// multi-vector field (`addMultiVectorField`).
     ///
     /// # Arguments
     ///
     /// * `name` - Unique embedder name referenced from vector fields.
     /// * `config` - Associative array describing the embedder.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\Exception` if the type is missing or unknown, or a required
+    /// key is missing.
     pub fn add_embedder(&self, name: String, config: &ZendHashTable) -> PhpResult<()> {
-        let embedder_type = ht_get_string(config, "type")?;
-
-        let definition = match embedder_type.as_str() {
-            "precomputed" => EmbedderDefinition::Precomputed,
-            "candle_bert" => {
-                let model = ht_get_string(config, "model")?;
-                EmbedderDefinition::CandleBert { model }
-            }
-            "candle_clip" => {
-                let model = ht_get_string(config, "model")?;
-                EmbedderDefinition::CandleClip { model }
-            }
-            "openai" => {
-                let model = ht_get_string(config, "model")?;
-                EmbedderDefinition::Openai { model }
-            }
-            other => {
-                return Err(format!(
-                    "Unknown embedder type: '{}'. Valid types: precomputed, candle_bert, candle_clip, openai",
-                    other
-                )
-                .into());
-            }
-        };
-
+        // The core definition's serde decides the accepted types and keys,
+        // so every embedder type the engine knows is available here.
+        let definition: EmbedderDefinition =
+            serde_json::from_value(hashtable_to_json_value(config)?)
+                .map_err(|e| format!("invalid embedder config: {e}"))?;
         self.inner.borrow_mut().embedders.insert(name, definition);
         Ok(())
     }

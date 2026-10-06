@@ -126,6 +126,8 @@ schema.addHnswField(
 
 The wasm-bindgen glue holds the JS callback via a `Closure`, so it stays alive for the lifetime of the index. There is no `Send + Sync` requirement on the callback because it only runs on the main thread.
 
+A `"token_callback"` embedder (`{ type: "token_callback", embed: (text, role) => number[][] | Promise<number[][]>, dimension }`) backs a multi-vector field and the late-interaction rescore instead. `JsTokenCallbackEmbedder` (`src/embedder.rs`) implements both `Embedder` and `TokenEmbedder` by hand, for the same reason as the callback embedder: `JsFuture` is not `Send`, so the futures are wrapped instead of going through `#[async_trait]`. It wraps the return value in `Promise.resolve`, so a synchronous return works too, and its `dimension` is checked against the field when the index is created. See [API Reference](api_reference.md) for the options.
+
 ## Testing
 
 ```bash

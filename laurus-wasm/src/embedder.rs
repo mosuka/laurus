@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 
 use wasm_bindgen::prelude::*;
 
-use laurus::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
+use laurus::embedding::embedder::{EmbedInput, EmbedInputType, EmbedRole, Embedder, TokenEmbedder};
 use laurus::vector::core::vector::Vector;
 use laurus::{LaurusError, Result};
 
@@ -173,5 +173,186 @@ impl Embedder for JsCallbackEmbedder {
             })?;
             self.embed_text(&text).await
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JsTokenCallbackEmbedder
+// ---------------------------------------------------------------------------
+
+/// A token-level embedder that delegates to a JavaScript callback, serving
+/// a multi-vector field and the late-interaction rescore (Issue #1351).
+///
+/// The JS function receives the text and the role (`"query"` or
+/// `"document"`) and returns the token vectors as `number[][]`, or a
+/// Promise of them.
+///
+/// # Example (JavaScript)
+///
+/// ```javascript
+/// schema.addEmbedder("colbert", {
+///   type: "token_callback",
+///   embed: async (text, role) => myColbert.encode(text, role),
+///   dimension: 128,
+/// });
+/// schema.addMultiVectorField("body_colbert", 128, "cosine", "colbert");
+/// ```
+pub struct JsTokenCallbackEmbedder {
+    func: Arc<JsFunction>,
+    name: String,
+    dimension: usize,
+}
+
+impl fmt::Debug for JsTokenCallbackEmbedder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsTokenCallbackEmbedder")
+            .field("name", &self.name)
+            .field("dimension", &self.dimension)
+            .finish()
+    }
+}
+
+impl JsTokenCallbackEmbedder {
+    /// Create a new JS token callback embedder.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Identifier for this embedder (used in logging).
+    /// * `func` - A JS function
+    ///   `(text: string, role: "query" | "document") => number[][] | Promise<number[][]>`.
+    /// * `dimension` - The dimension of every token vector the function
+    ///   returns, checked against the field when the index opens.
+    pub fn new(name: String, func: js_sys::Function, dimension: usize) -> Self {
+        Self {
+            func: Arc::new(JsFunction(func)),
+            name,
+            dimension,
+        }
+    }
+
+    /// Call the JS function on one text and await its token vectors.
+    async fn embed_text(&self, text: &str, role: EmbedRole) -> Result<Vec<Vector>> {
+        let role = match role {
+            EmbedRole::Query => "query",
+            EmbedRole::Document => "document",
+        };
+        let returned = self
+            .func
+            .0
+            .call2(
+                &JsValue::NULL,
+                &JsValue::from_str(text),
+                &JsValue::from_str(role),
+            )
+            .map_err(|e| LaurusError::internal(format!("JS token embedder call failed: {e:?}")))?;
+        // `Promise.resolve` accepts a plain return value as well as a Promise.
+        let resolved = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&returned))
+            .await
+            .map_err(|e| {
+                LaurusError::internal(format!("JS token embedder promise rejected: {e:?}"))
+            })?;
+        token_vectors_from_js(&resolved)
+    }
+}
+
+/// Read the `number[][]` a JS token embedder returned. A non-numeric
+/// element is an error rather than a silent 0.
+fn token_vectors_from_js(value: &JsValue) -> Result<Vec<Vector>> {
+    let not_token_vectors = || LaurusError::internal("JS token embedder must return number[][]");
+    if !js_sys::Array::is_array(value) {
+        return Err(not_token_vectors());
+    }
+    js_sys::Array::from(value)
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if !js_sys::Array::is_array(&row) {
+                return Err(not_token_vectors());
+            }
+            js_sys::Array::from(&row)
+                .iter()
+                .map(|v| {
+                    v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                        LaurusError::internal(format!(
+                            "JS token embedder returned a non-number in token vector {i}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<f32>>>()
+                .map(Vector::new)
+        })
+        .collect()
+}
+
+// Manual trait implementations, for the same `!Send` reason as
+// `JsCallbackEmbedder` above.
+impl TokenEmbedder for JsTokenCallbackEmbedder {
+    fn embed_tokens<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        inputs: &'life1 [EmbedInput<'life2>],
+        role: EmbedRole,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<Vector>>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        let texts: Option<Vec<String>> = inputs
+            .iter()
+            .map(|input| input.as_text().map(str::to_string))
+            .collect();
+        Box::pin(AssertSend(async move {
+            let texts = texts.ok_or_else(|| {
+                LaurusError::invalid_argument("JsTokenCallbackEmbedder only supports text input")
+            })?;
+            let mut out = Vec::with_capacity(texts.len());
+            for text in &texts {
+                out.push(self.embed_text(text, role).await?);
+            }
+            Ok(out)
+        }))
+    }
+
+    fn token_dimension(&self) -> usize {
+        self.dimension
+    }
+}
+
+impl Embedder for JsTokenCallbackEmbedder {
+    fn supported_input_types(&self) -> Vec<EmbedInputType> {
+        vec![EmbedInputType::Text]
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn as_token_embedder(&self) -> Option<&dyn TokenEmbedder> {
+        Some(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    /// Always an error: this embedder produces token vectors, not one
+    /// vector per input.
+    fn embed<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _input: &'life1 EmbedInput<'life2>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vector>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        let name = self.name.clone();
+        Box::pin(async move {
+            Err(LaurusError::invalid_argument(format!(
+                "'{name}' is a token-level embedder; use it for a multi-vector field"
+            )))
+        })
     }
 }

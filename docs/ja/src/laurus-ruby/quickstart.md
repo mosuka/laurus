@@ -83,7 +83,29 @@ request = Laurus::SearchRequest.new(
 results = index.search(request)
 ```
 
-## 6. 更新と削除
+## 6. Late interaction による再採点
+
+MultiVector フィールドは、文書ごとに可変個のトークンベクトル（ColBERT のトークンごとの埋め込みなど）を保持します。`LateInteractionRescore` は、どの検索でも上位の結果をそのフィールドに対する MaxSim で並べ替え、再採点された結果のスコアはその MaxSim になります。
+
+```ruby
+require "laurus"
+
+schema = Laurus::Schema.new
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", 2, distance: "dot_product")
+
+index = Laurus::Index.new(schema: schema)
+index.put_document("doc1", { "title" => "rust", "tokens" => [[0.1, 0.0]] })
+index.put_document("doc2", { "title" => "rust language", "tokens" => [[0.9, 0.2], [0.1, 0.8]] })
+index.commit
+
+results = index.search("title:rust", rescore: Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]]))
+# doc2（MaxSim 1.7）が doc1（MaxSim 0.1）より上位になる
+```
+
+フィールドに `candle_colbert` のエンベダーを設定すると（`schema.add_embedder("colbert", { type: "candle_colbert", model: "colbert-ir/colbertv2.0" })` と `add_multi_vector_field("tokens", 128, embedder: "colbert")`）、文書はこのフィールドにテキストを与えられ、クエリも `Laurus::LateInteractionRescore.new("tokens", "how do lifetimes work")` のようにテキストで渡せます。[LateInteractionRescore](api_reference.md#lateinteractionrescore) を参照してください。
+
+## 7. 更新と削除
 
 ```ruby
 # 更新: put_document は同じ ID の全バージョンを置換する
@@ -102,7 +124,7 @@ index.delete_documents("doc1")
 index.commit
 ```
 
-## 7. スキーマ管理
+## 8. スキーマ管理
 
 ```ruby
 schema = Laurus::Schema.new
@@ -117,9 +139,10 @@ schema.add_datetime_field("created_at")
 schema.add_hnsw_field("embedding", 384)
 schema.add_flat_field("small_vec", 64)
 schema.add_ivf_field("ivf_vec", 128, n_clusters: 100)
+schema.add_multi_vector_field("tokens", 128)
 ```
 
-## 8. インデックス統計
+## 9. インデックス統計
 
 ```ruby
 stats = index.stats

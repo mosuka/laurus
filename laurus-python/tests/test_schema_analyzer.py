@@ -233,6 +233,7 @@ ADD_FIELD_CALLS = [
     ("add_hnsw_field", (4,)),
     ("add_flat_field", (4,)),
     ("add_ivf_field", (4,)),
+    ("add_multi_vector_field", (4,)),
 ]
 
 

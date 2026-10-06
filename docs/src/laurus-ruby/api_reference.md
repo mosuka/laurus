@@ -31,8 +31,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records and returns `nil`. Useful when running under a group-commit policy (see below). |
-| `search(query, limit: 10, offset: 0, highlight: nil) -> Array<SearchResult>` | Execute a search query. |
-| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight:` applies identically to every query in the batch. |
+| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil) -> Array<SearchResult>` | Execute a search query. `rescore:` takes a `LateInteractionRescore` that reorders the top results (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight:` applies identically to every query in the batch. There is no `rescore:` keyword; a `SearchRequest` element is rescored by its own `rescore:`. |
 | `stats -> Hash` | Return index statistics (`"document_count"`, `"vector_fields"`). |
 
 ### `search` query argument
@@ -43,6 +43,8 @@ The `query` parameter accepts any of the following:
 - A **lexical query object** (`TermQuery`, `PhraseQuery`, `BooleanQuery`, ...)
 - A **vector query object** (`VectorQuery`, `VectorTextQuery`)
 - A **`SearchRequest`** for full control
+
+When `query` is a `SearchRequest`, its own `limit:`, `offset:`, `highlight:` and `rescore:` are used and the keyword arguments of `search` are ignored.
 
 The same value kinds are accepted as the elements of `search_batch`'s `queries` Array — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
 
@@ -178,6 +180,7 @@ Laurus::Schema.new
 | `add_hnsw_field(name, dimension, distance: "cosine", m: 16, ef_construction: 200, quantizer: nil, subvector_count: nil, rerank_storage: nil, embedder: nil, pq_codebook_path: nil, base_weight: 1.0)` | HNSW approximate nearest-neighbor vector field. `base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). |
 | `add_flat_field(name, dimension, distance: "cosine", embedder: nil, base_weight: 1.0)` | Flat (brute-force) vector field. |
 | `add_ivf_field(name, dimension, distance: "cosine", n_clusters: 100, n_probe: 1, embedder: nil, base_weight: 1.0)` | IVF approximate nearest-neighbor vector field. |
+| `add_multi_vector_field(name, dimension, distance: "cosine", embedder: nil)` | Multi-vector field holding a variable number of token vectors per document, for example ColBERT per-token embeddings (Issue #1351). Its value is an Array of numeric Arrays, one per token, each of `dimension` elements. It has no ANN index and is read only by the [late-interaction rescore](../concepts/search/vector_search.md#late-interaction-rescore) (see [LateInteractionRescore](#lateinteractionrescore)); its token vectors are not stored, so `get_documents` and search results never include the field. `distance:` must be `"cosine"` or `"dot_product"` and `dimension` greater than 0, both checked when the field is added (`ArgumentError`). `embedder:` names a token-level embedder (a `"candle_colbert"` one, see [Embedder types](#embedder-types)), which embeds text values and rescore query text. See [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields). |
 
 **Vector quantization & rerank storage** (HNSW fields):
 
@@ -191,7 +194,7 @@ Every `add_*_field` method above raises `ArgumentError` when `name` starts with 
 
 | Method | Description |
 | :--- | :--- |
-| `add_embedder(name, config)` | Register a named embedder definition. `config` is a Hash with a `"type"` key (see below). |
+| `add_embedder(name, config)` | Register a named embedder definition. `config` is a Hash with a `"type"` key, with either String or Symbol keys (see below). A missing or unknown type, or a missing required key, raises `ArgumentError` (`invalid embedder config: ...`). |
 | `add_analyzer(name, tokenizer, char_filters: nil, token_filters: nil)` | Register a custom analyzer definition. `tokenizer` is required; `char_filters:`/`token_filters:` are optional Arrays of Hashes. Each Hash uses the same `{type: "..."}` shape as the schema TOML/JSON format (see below), with either String or Symbol keys. A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) raises `ArgumentError`, and so does creating a new `Index` from a schema that defines one (e.g. loaded with `from_toml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzer_names -> Array<String>` | Return the names of custom analyzers registered via `add_analyzer` or loaded from TOML. |
 | `Laurus::Schema.from_toml(toml_str) -> Schema` *(class method)* | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. |
@@ -228,6 +231,18 @@ See [Schema Format Reference → Embedders](../laurus-cli/schema_format.md#embed
 | `"candle_bert"` | `"model"` | `embeddings-candle` |
 | `"candle_clip"` | `"model"` | `embeddings-multimodal` |
 | `"openai"` | `"model"` | `embeddings-openai` |
+| `"candle_colbert"` | `"model"` | `embeddings-candle` |
+
+`"candle_colbert"` also takes the optional keys `"revision"`, `"query_maxlen"` and `"doc_maxlen"`. It produces token vectors, so only a multi-vector field (`add_multi_vector_field`) can use it. Keys may be Strings or Symbols:
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_embedder(
+  "colbert",
+  { type: "candle_colbert", model: "colbert-ir/colbertv2.0", query_maxlen: 32 },
+)
+schema.add_multi_vector_field("body_colbert", 128, embedder: "colbert")
+```
 
 ### Analyzer components
 
@@ -466,6 +481,7 @@ Laurus::SearchRequest.new(
   limit: 10,
   offset: 0,
   highlight: nil,
+  rescore: nil,
 )
 ```
 
@@ -479,6 +495,50 @@ Laurus::SearchRequest.new(
 | `limit:` | Maximum number of results (default 10). |
 | `offset:` | Pagination offset (default 0). |
 | `highlight:` | Same Array-or-Hash shape as `Index#search`'s `highlight:` (Issue #1134). See [Highlighting](#highlighting). |
+| `rescore:` | A `LateInteractionRescore` that reorders the top results of the request — lexical, vector, or hybrid (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). |
+
+---
+
+## LateInteractionRescore
+
+Late-interaction (ColBERT MaxSim) rescore of the top search results (Issue #1351). Pass it as `rescore:` to `Index#search` or `SearchRequest.new`.
+
+```ruby
+Laurus::LateInteractionRescore.new(field, query, window_size: nil)
+```
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | `String` | -- | A multi-vector field (`add_multi_vector_field`). |
+| `query` | `String \| Array<Array<Numeric>>` | -- | Query text, embedded by the field's token-level embedder (a `"candle_colbert"` one), or the query's token vectors, computed with the same model as the documents' token vectors. Integer elements are accepted. |
+| `window_size:` | `Integer \| nil` | `nil` (100) | How many top first-stage results to rescore, at most 10,000. `nil` keeps the default of 100. |
+
+| Method | Description |
+| :--- | :--- |
+| `window_size -> Integer` | Return how many top results are rescored. |
+| `inspect -> String` | Return a summary such as `LateInteractionRescore(field="tokens", window_size=100)`. |
+
+The top `window_size` first-stage results are reordered by their MaxSim against the field, and a rescored result's `score` is its MaxSim. Results beyond the window keep their first-stage order and score, after the rescored ones. See [Vector Search → Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore) for the ordering rules and the similarity.
+
+**Errors**: the constructor raises `TypeError` when `query` is neither a String nor an Array of numeric Arrays. The other values are checked by the engine when searching, which raises `ArgumentError` with a message containing `rescore: ...` when the field is unknown or not a multi-vector field, a text query is blank or the field has no token-level embedder, the query does not hold between 1 and 1,024 token vectors of the field's dimension, or `window_size` is not between 1 and 10,000.
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_text_field("title")
+schema.add_multi_vector_field("tokens", 2, distance: "dot_product")
+
+index = Laurus::Index.new(schema: schema)
+index.put_document("a", { "title" => "rust", "tokens" => [[0.1, 0.0]] })
+index.put_document("b", { "title" => "rust language", "tokens" => [[0.9, 0.2]] })
+index.commit
+
+rescore = Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size: 50)
+results = index.search("title:rust", rescore: rescore)
+results.map(&:id) # => ["b", "a"] -- "b" has MaxSim 1.1, "a" 0.1
+
+# With a "candle_colbert" embedder on the field, the query can be text.
+rescore = Laurus::LateInteractionRescore.new("body_colbert", "how do lifetimes work")
+```
 
 ---
 
@@ -579,6 +639,7 @@ Ruby values are automatically converted to Laurus `DataValue` types:
 | `String` | `Text` | |
 | `Array` of `Integer` | `Int64Array` | Multi-valued integer field; vector fields cast the array to `f32`. An empty `Array` is an empty `Int64Array` |
 | `Array` of numerics | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the array to `f32` |
+| `Array` of numeric `Array`s | `VectorArray` | Token vectors of a multi-vector field (`add_multi_vector_field`), one `Array` per token, each of the field's dimension (Issue #1351). `Integer` elements are accepted; any other element, such as `true` or a `String`, raises `TypeError`. Not returned by `get_documents` or search results |
 | `Hash` with `"lat"`, `"lon"` | `Geo` | Two `Float` values |
 | `Hash` with `"x"`, `"y"`, `"z"` | `GeoEcef` | Three `Float` values, meters (3D ECEF Cartesian) |
 | `Array` of `Hash` with `"lat"`, `"lon"` | `GeoArray` | Requires `multi_valued: true` on the field |

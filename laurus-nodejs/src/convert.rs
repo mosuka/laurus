@@ -44,6 +44,8 @@ pub fn json_to_document(value: &Value) -> napi::Result<Document> {
 ///   cast either array to `Vector` downstream; an empty array is an empty `Int64Array`)
 /// - `array` of `{ "lat", "lon" }` -> `DataValue::GeoArray` (multi-valued geo, #1174)
 /// - `array` of `{ "x", "y", "z" }` -> `DataValue::GeoEcefArray`
+/// - `array` of number arrays -> `DataValue::VectorArray` (multi-vector field token
+///   vectors, #1351)
 /// - `array` of RFC 3339 strings -> `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `array` of booleans     -> `DataValue::BoolArray` (multi-valued boolean, #1180)
 /// - `array` of other strings -> `DataValue::TextArray` (multi-valued text, #1175); on a

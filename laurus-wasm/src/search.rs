@@ -4,8 +4,10 @@ use crate::query::{
     JsQuery, JsVectorQuery, extract_lexical_query, query_to_lexical_search_query,
     vector_query_to_search_query,
 };
+use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, SearchRequestBuilder,
+    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, RescoreOptions,
+    SearchRequestBuilder,
 };
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
@@ -65,6 +67,53 @@ pub fn parse_highlight_options(
     Ok(Some(
         HighlightOptions::new(parsed.fields).with_config(config),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Rescore (Issue #1351)
+// ---------------------------------------------------------------------------
+
+/// JS-facing shape of a late-interaction rescore, deserialized via
+/// `serde_wasm_bindgen` from a plain JS object, e.g.
+/// `{ field: "tokens", vectors: [[1, 0], [0, 1]], windowSize: 50 }` or
+/// `{ field: "body_colbert", text: "how do lifetimes work" }`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmRescoreOptions {
+    field: String,
+    vectors: Option<Vec<Vec<f32>>>,
+    text: Option<String>,
+    window_size: Option<u32>,
+}
+
+/// Parse an optional rescore JS object into [`RescoreOptions`]. Only the
+/// shape is checked here; the engine checks the values when searching.
+/// `None` (no object passed) means "don't rescore" and returns `Ok(None)`.
+pub fn parse_rescore_options(
+    options: Option<js_sys::Object>,
+) -> Result<Option<RescoreOptions>, JsValue> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let parsed: WasmRescoreOptions = serde_wasm_bindgen::from_value(options.into())
+        .map_err(|e| JsValue::from_str(&format!("Invalid rescore options: {e}")))?;
+
+    let rescore = match (parsed.vectors, parsed.text) {
+        (Some(vectors), None) => RescoreOptions::late_interaction(
+            parsed.field,
+            vectors.into_iter().map(Vector::new).collect(),
+        ),
+        (None, Some(text)) => RescoreOptions::late_interaction_text(parsed.field, text),
+        _ => {
+            return Err(JsValue::from_str(
+                "Invalid rescore options: set exactly one of vectors or text",
+            ));
+        }
+    };
+    Ok(Some(match parsed.window_size {
+        Some(window_size) => rescore.window_size(window_size as usize),
+        None => rescore,
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ Lexical検索、Vector検索、ハイブリッド検索を統合的に提供し�
 - **Lexical検索** — BM25スコアリング、Term/Phrase/Fuzzy/Wildcard/Geo/Boolean/Spanクエリ
 - **Vector検索** — HNSW、Flat、IVFインデックス、複数の距離指標対応
 - **ハイブリッド検索** — Lexical + Vector を RRF または WeightedSum で融合
+- **Late interaction による再採点** — どの検索でも上位の結果を MultiVector フィールドに対する ColBERT 型の MaxSim で並べ替え
 - **CJK対応** — [Lindera](https://github.com/lindera/lindera) による日本語・中国語・韓国語トークナイズ
 - **ネイティブ性能** — [napi-rs](https://napi.rs) によるRustコア直接呼び出し、C APIオーバーヘッドなし
 - **TypeScript型定義** — `.d.ts` ファイルの自動生成
@@ -151,6 +152,7 @@ schema.addBytesField("thumbnail");
 schema.addHnswField("embedding", 384, "cosine", 16, 200, undefined, "bert");
 schema.addFlatField("embedding", 384);
 schema.addIvfField("embedding", 384, "cosine", 100, 1);
+schema.addMultiVectorField("tokens", 128, "dot_product"); // 再採点用のトークンベクトル
 schema.addEmbedder("bert", {
   type: "candle_bert",
   model: "sentence-transformers/all-MiniLM-L6-v2",
@@ -184,6 +186,29 @@ req.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
 const results = await index.searchWithRequest(req);
 ```
 
+### Late interaction による再採点
+
+どの検索でも、上位の結果を MultiVector フィールドに対する MaxSim で並べ替えます。
+トークンベクトルは入れ子の数値配列で渡し、保存はされません:
+
+```javascript
+const schema = new Schema();
+schema.addTextField("title");
+schema.addMultiVectorField("tokens", 2, "dot_product");
+
+const index = await Index.create(null, schema);
+await index.putDocument("doc1", { title: "rust", tokens: [[0.9, 0.2], [0.0, 0.5]] });
+await index.commit();
+
+const rescore = { field: "tokens", vectors: [[1, 0], [0, 1]], windowSize: 100 };
+const results = await index.search("title:rust", 10, 0, undefined, rescore);
+const results2 = await index.searchWithRequest(new SearchRequest({ queryDsl: "title:rust", rescore }));
+```
+
+`vectors` と `text` はちょうど一方だけを指定します。`text` クエリには、フィールドに
+`candle_colbert` の Embedder が必要です（`addEmbedder` で登録し、
+`addMultiVectorField` の第 4 引数に指定）。
+
 ### テキスト解析
 
 ```javascript
@@ -209,6 +234,7 @@ const expanded = filter.apply(tokens);
 | `boolean` | Boolean |
 | `null` | Null |
 | `number[]` | Vector |
+| `number[][]` | MultiVector（トークンベクトル。保存されない） |
 | `{ lat, lon }` | Geo |
 | `Date` / ISO8601文字列 | DateTime |
 | `Buffer` | Bytes |

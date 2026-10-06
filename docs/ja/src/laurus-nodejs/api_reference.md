@@ -38,7 +38,7 @@ class Index {
 | `deleteDocuments(id)` | 指定 ID の全バージョンを削除。 |
 | `commit()` | 書き込みをフラッシュし変更を検索可能にする。 |
 | `flushWal()` | WAL の永続性バリアを強制する。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照。 |
-| `search(query, limit?, offset?, highlight?)` | DSL 文字列で検索。 |
+| `search(query, limit?, offset?, highlight?, rescore?)` | DSL 文字列で検索。`rescore` は上位の結果を late interaction で並べ替えます。[Late interaction による再採点（Rescore）](#late-interaction-による再採点rescore)を参照。 |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | 完全一致 Term 検索。 |
 | `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。 |
 | `searchVectorText(field, text, limit?, offset?)` | テキストを自動埋め込みして検索。 |
@@ -207,7 +207,8 @@ class Schema {
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW ベクトルフィールド。`baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
 | `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |
-| `addEmbedder(name, config)` | 名前付き Embedder を登録。 |
+| `addMultiVectorField(name, dimension, distance?, embedder?)` | 文書ごとに可変個のトークンベクトルを保持する MultiVector フィールド。[late interaction による再採点](#late-interaction-による再採点rescore)に使います（Issue #1351）。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。`dimension` は各トークンベクトルの次元で、0 より大きくなければなりません。`distance` は `"cosine"`（デフォルト）または `"dot_product"` です。どちらもフィールド追加時に検証され、不正なら code `InvalidArg` の例外を投げます。`embedder` にはトークン単位の Embedder（`"candle_colbert"`）の名前を指定し、テキスト値と再採点のクエリテキストを埋め込みます。このフィールド単体では検索できず、トークンベクトルは保存されないため、`getDocuments` や検索結果には含まれません。 |
+| `addEmbedder(name, config)` | 名前付き Embedder を登録。[Embedder](#embedder)を参照。 |
 | `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`charFilters`/`tokenFilters` は省略可能なオブジェクトの配列です。各オブジェクトはスキーマ TOML/JSON 形式と同じ `{ type: "...", ... }` 形式で、キーは snake_case のままです（下記参照）。組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は例外になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）で新しいインデックスを `Index.create` する場合も同じです。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
 | `analyzerNames()` | `addAnalyzer` で登録された、または TOML から読み込まれたカスタムアナライザの名前一覧を返します。 |
 | `Schema.fromToml(tomlStr)` *(静的メソッド)* | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。 |
@@ -291,6 +292,48 @@ schema.addAnalyzer(
   [{ type: "lowercase" }],
 );
 schema.addTextField("title", true, true, true, true, "ja_ipadic");
+```
+
+### Embedder
+
+`addEmbedder(name, config)` と `[embedders.<name>]` TOML セクションで使用します。
+`config` は `type` キーでバックエンドを選ぶオブジェクトです。アナライザ
+コンポーネントと同じく、キーはスキーマ TOML/JSON 形式に合わせて snake_case の
+ままです。
+
+各タイプの正規の説明は [スキーマフォーマットリファレンス → エンベダー](../laurus-cli/schema_format.md#エンベダー) を参照してください。
+
+| `type` | 必須キー | 省略可能キー | フィーチャーフラグ |
+| :--- | :--- | :--- | :--- |
+| `"precomputed"` | -- | -- | *（常に利用可能）* |
+| `"candle_bert"` | `model` | -- | `embeddings-candle` |
+| `"candle_clip"` | `model` | -- | `embeddings-multimodal` |
+| `"openai"` | `model` | -- | `embeddings-openai` |
+| `"candle_colbert"` | `model` | `revision`、`query_maxlen`、`doc_maxlen` | `embeddings-candle` |
+
+`"candle_colbert"` は BERT ベースの ColBERT チェックポイント（`"colbert-ir/colbertv2.0"`
+など）を実行してトークンごとに 1 本のベクトルを出力するため、MultiVector
+フィールド（`addMultiVectorField`）でしか使えません。逆に MultiVector フィールドが
+受け付けるのは `"candle_colbert"` か `"precomputed"` だけで、それ以外の組み合わせでは
+`Index.create` が例外を投げます。`revision` はモデルリポジトリのブランチ・タグ・
+コミットを固定します（再埋め込みで同じベクトルを再現できるよう、コミットを
+固定してください）。`query_maxlen` と `doc_maxlen` はチェックポイントのクエリ長と
+文書長（トークン数）を上書きします。
+
+`addEmbedder` は、`config` がオブジェクトでない場合は `embedder config must be an object`、
+`type` が無いか未知の値である場合や必須キーが無い場合は `invalid embedder config: ...`
+の例外を投げます。バインディングのビルドで有効にしていないフィーチャーフラグの
+タイプも登録はできますが、`Index.create` が例外を投げます。
+
+```javascript
+const schema = new Schema();
+schema.addEmbedder("colbert", {
+  type: "candle_colbert",
+  model: "answerdotai/answerai-colbert-small-v1",
+  revision: "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e",
+});
+schema.addTextField("body");
+schema.addMultiVectorField("body_colbert", 96, "cosine", "colbert");
 ```
 
 ### 距離指標
@@ -525,6 +568,7 @@ interface SearchRequestOptions {
   limit?: number;   // デフォルト 10
   offset?: number;  // デフォルト 0
   highlight?: HighlightOptions;
+  rescore?: RescoreOptions;
 }
 
 class SearchRequest {
@@ -535,8 +579,8 @@ class SearchRequest {
 コンストラクタにはプリミティブな options を渡し、多態クエリ句は下記の
 per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` の
 `Either<&T, ...>` バリデーション制限を回避するため per-type 化されています。
-`highlight` はプレーンなデータ（クラスインスタンスのユニオンではない）なので、
-セッターを介さず `SearchRequestOptions` に直接持たせています。
+`highlight` と `rescore` はプレーンなデータ（クラスインスタンスのユニオンではない）
+なので、セッターを介さず `SearchRequestOptions` に直接持たせています。
 
 ### DSL とフュージョンセッター
 
@@ -597,6 +641,72 @@ interface HighlightOptions {
 ```javascript
 const results = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language."] }
+```
+
+### Late interaction による再採点（Rescore）
+
+`search`（末尾の `rescore` 引数）と `SearchRequestOptions` は省略可能な `rescore`
+オブジェクトを受け付けます（Issue #1351）。lexical・vector・ハイブリッドのどの
+第 1 段階の検索でも、上位の結果を
+[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)
+に対する ColBERT 型の late interaction（MaxSim）で並べ替えます。仕組みは
+[ベクトル検索 → Late Interaction による再採点（Rescore）](../concepts/search/vector_search.md#late-interaction-による再採点rescore)
+を参照してください。
+
+```typescript
+// index.d.ts では JsRescoreOptions としてエクスポートされます。
+interface RescoreOptions {
+  field: string;          // MultiVector フィールド
+  vectors?: number[][];   // クエリのトークンベクトル
+  text?: string;          // フィールドの Embedder で埋め込むクエリテキスト
+  windowSize?: number;    // デフォルト 100、最大 10,000
+}
+```
+
+| フィールド | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | `string` | -- | 採点に使う MultiVector フィールド。 |
+| `vectors` | `number[][]` | -- | クエリのトークンベクトル。1〜1,024 本で、どれもフィールドの次元を持ち、値は有限でなければなりません。文書のトークンベクトルを作ったのと同じモデルで計算してください。 |
+| `text` | `string` | -- | クエリテキスト。フィールドのトークン単位の Embedder（`"candle_colbert"`）がクエリとして埋め込みます。空白のみは不可。 |
+| `windowSize` | `number` | `100` | 再採点する第 1 段階の上位件数。`1`〜`10,000`。 |
+
+`vectors` と `text` はちょうど一方だけを指定します。そうでない場合、検索は
+code `InvalidArg`、メッセージ `rescore needs exactly one of vectors or text`
+で reject されます。それ以外の値はエンジンが検索時に検証し、`field` が未知または
+MultiVector フィールドでない、`text` が空白のみまたはフィールドにトークン単位の
+Embedder が無い、クエリのベクトル数が範囲外または次元が異なる、`windowSize` が
+範囲外、のいずれかの場合に code `InvalidArg`、`rescore: ...` を含むメッセージで
+reject されます。
+
+並び順とスコア:
+
+- 第 1 段階の上位 `windowSize` 件を MaxSim の高い順に並べ替え、再採点された結果の
+  `score` はその MaxSim になります。
+- ウィンドウ内でフィールドにトークンベクトルを持たない結果が第 1 段階の順で続き、
+  最後にウィンドウ外の結果がそのまま続きます。どちらも第 1 段階のスコアを保ち、
+  そのスコアは MaxSim と比較できません。
+
+`searchTerm`、`searchVector`、`searchVectorText`、`searchBatch` は `rescore`
+引数を取りません。代わりに `SearchRequest` を組み立ててください。`SearchRequest`
+はハイブリッドを含むどの第 1 段階でも再採点できます。
+
+```javascript
+// DSL 検索を、クエリのトークンベクトルで再採点します。
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]],
+});
+
+// ハイブリッド検索を、クエリテキストで再採点します
+// （フィールドに "candle_colbert" の Embedder が必要）。
+const req = new SearchRequest({
+  limit: 10,
+  rescore: { field: "body_colbert", text: "how do lifetimes work", windowSize: 50 },
+});
+req.setLexicalTerm(new TermQuery("body", "lifetimes"));
+req.setVectorQuery(new VectorQuery("body_vec", queryEmbedding));
+req.setRrfFusion(new RRF(60.0));
+const reranked = await index.searchWithRequest(req);
 ```
 
 ---
@@ -716,6 +826,7 @@ JavaScript の値は自動的に Laurus の `DataValue` 型に変換されます
 | `{ x, y, z }` | `GeoEcef` | 3 つの `number` 値（メートル単位、3D ECEF 直交座標） |
 | `{ lat, lon }[]` | `GeoArray` | `{ lat, lon }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
 | `{ x, y, z }[]` | `GeoEcefArray` | `{ x, y, z }` オブジェクトの配列。フィールドに `multiValued: true` が必要 |
+| `number[][]` | `VectorArray` | MultiVector フィールド（`addMultiVectorField`）のトークンベクトル。フィールドの次元を持つ配列 1〜8,192 個。内側の配列の長さがそろっていないと、取り込みは `token vectors must share one dimension` で拒否される。トークン単位の Embedder を持つフィールドは `string` も受け付け、トークンベクトルに埋め込む。保存されないため、`getDocuments` や検索結果には含まれない |
 | `string[]`（すべて RFC 3339） | `DateTimeArray` | RFC 3339 日時文字列の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要 |
 | `string[]`（すべてが RFC 3339 ではない） | `TextArray` | 文字列の配列（Issue #1175）。フィールドに `multiValued: true` が必要。`string[]` として読み戻される。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列がスキーマ対応の変換によって要素ごとに `BytesArray` にデコードされる（Issue #1176） |
 | `boolean[]` | `BoolArray` | 真偽値の配列（HTTP ゲートウェイと同じ `infer_from_json` の規則）。フィールドに `multiValued: true` が必要。`[true, 1]` のような混在配列は拒否される |

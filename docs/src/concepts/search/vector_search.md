@@ -403,8 +403,12 @@ Besides the Rust API, the rescore stage is available over
 [gRPC](../../laurus-server/grpc_api.md#rescoreparams) and the
 [HTTP gateway](../../laurus-server/http_gateway.md), in the
 [MCP `search` tool](../../laurus-mcp/tools.md#rescore-example) and in
-[`laurus search`](../../laurus-cli/commands.md#search). The language
-bindings do not expose it yet.
+[`laurus search`](../../laurus-cli/commands.md#search), and in the
+[Python](../../laurus-python/api_reference.md#lateinteractionrescore),
+[Ruby](../../laurus-ruby/api_reference.md#lateinteractionrescore),
+[PHP](../../laurus-php/api_reference.md#lateinteractionrescore),
+[Node.js](../../laurus-nodejs/api_reference.md#late-interaction-rescore) and
+[WASM](../../laurus-wasm/api_reference.md#late-interaction-rescore) bindings.
 
 ### Options
 

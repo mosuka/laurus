@@ -12,6 +12,7 @@ use crate::query::{
 use crate::schema::WasmSchema;
 use crate::search::{
     build_dsl_request, build_lexical_request, build_vector_request, parse_highlight_options,
+    parse_rescore_options,
 };
 use crate::storage::OpfsPersistence;
 use crate::wal::WasmWalSyncPolicy;
@@ -145,24 +146,17 @@ fn unused_embedder_names<'a>(
 /// (see [`unused_embedder_names`]).
 fn build_per_field_embedder(
     schema: &laurus::Schema,
-    js_embedders: std::collections::HashMap<String, crate::embedder::JsCallbackEmbedder>,
+    embedder_map: std::collections::HashMap<String, Arc<dyn Embedder>>,
 ) -> Arc<dyn Embedder> {
     let default: Arc<dyn Embedder> = Arc::new(PrecomputedEmbedder::new());
     let per_field = PerFieldEmbedder::new(default);
-
-    // Build a map: embedder_name -> Arc<dyn Embedder>
-    let mut embedder_map: std::collections::HashMap<String, Arc<dyn Embedder>> =
-        std::collections::HashMap::new();
-    for (name, embedder) in js_embedders {
-        embedder_map.insert(name, Arc::new(embedder));
-    }
 
     for name in unused_embedder_names(schema, embedder_map.keys()) {
         web_sys::console::warn_1(
             &format!(
                 "laurus-wasm: embedder '{name}' is registered but no schema field references \
                  it, so it will never run. Check the `embedder` argument position in \
-                 addHnswField / addFlatField / addIvfField \
+                 addHnswField / addFlatField / addIvfField / addMultiVectorField \
                  (https://github.com/mosuka/laurus/issues/978)."
             )
             .into(),
@@ -526,6 +520,11 @@ impl WasmIndex {
     ///   requireFieldMatch? }`. Only `fields` is required. Highlighting
     ///   follows this query, and only `stored: true` text fields can be
     ///   highlighted.
+    /// * `rescore` - Optional late-interaction rescore of the top results
+    ///   (Issue #1351): `{ field, vectors?, text?, windowSize? }` with
+    ///   exactly one of `vectors` (`number[][]`) and `text`. The top
+    ///   `windowSize` results (default 100) are reordered by MaxSim against
+    ///   the multi-vector `field`.
     ///
     /// # Returns
     ///
@@ -537,6 +536,7 @@ impl WasmIndex {
         limit: Option<u32>,
         offset: Option<u32>,
         highlight: Option<js_sys::Object>,
+        rescore: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let mut request = build_dsl_request(
             query,
@@ -544,6 +544,7 @@ impl WasmIndex {
             offset.unwrap_or(0) as usize,
         );
         request.lexical_options.highlight = parse_highlight_options(highlight)?;
+        request.rescore = parse_rescore_options(rescore)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -745,6 +746,8 @@ impl WasmIndex {
     /// * `vector` - The embedding vector as a Float64Array or number[].
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    /// * `rescore` - Optional late-interaction rescore; same shape as
+    ///   `search`'s `rescore` argument (Issue #1351).
     #[wasm_bindgen(js_name = "searchVector")]
     pub async fn search_vector(
         &self,
@@ -752,16 +755,18 @@ impl WasmIndex {
         vector: Vec<f64>,
         limit: Option<u32>,
         offset: Option<u32>,
+        rescore: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let query = JsVectorQuery::VectorQuery(JsVectorQueryInner {
             field,
             vector: vector.into_iter().map(|v| v as f32).collect(),
         });
-        let request = build_vector_request(
+        let mut request = build_vector_request(
             &query,
             limit.unwrap_or(10) as usize,
             offset.unwrap_or(0) as usize,
         );
+        request.rescore = parse_rescore_options(rescore)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -774,6 +779,8 @@ impl WasmIndex {
     /// * `text` - The text to embed and search with.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    /// * `rescore` - Optional late-interaction rescore; same shape as
+    ///   `search`'s `rescore` argument (Issue #1351).
     #[wasm_bindgen(js_name = "searchVectorText")]
     pub async fn search_vector_text(
         &self,
@@ -781,13 +788,15 @@ impl WasmIndex {
         text: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        rescore: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let query = JsVectorQuery::VectorTextQuery(JsVectorTextQuery { field, text });
-        let request = build_vector_request(
+        let mut request = build_vector_request(
             &query,
             limit.unwrap_or(10) as usize,
             offset.unwrap_or(0) as usize,
         );
+        request.rescore = parse_rescore_options(rescore)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -932,7 +941,7 @@ mod tests {
         let highlight = highlight_object(serde_json::json!({ "fields": ["body"] }));
 
         let js_results = index
-            .search("body:rust".to_string(), None, None, Some(highlight))
+            .search("body:rust".to_string(), None, None, Some(highlight), None)
             .await
             .expect("search must succeed");
         let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
@@ -951,7 +960,7 @@ mod tests {
         let index = text_index().await;
 
         let js_results = index
-            .search("body:rust".to_string(), None, None, None)
+            .search("body:rust".to_string(), None, None, None, None)
             .await
             .expect("search must succeed");
         let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
@@ -1036,14 +1045,14 @@ mod tests {
 
         // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
         let title_hits = index
-            .search("title:ell".to_string(), None, None, None)
+            .search("title:ell".to_string(), None, None, None, None)
             .await
             .expect("search must succeed");
         let title_hits: serde_json::Value = serde_wasm_bindgen::from_value(title_hits).unwrap();
         assert_eq!(title_hits.as_array().unwrap().len(), 1);
 
         let plain_hits = index
-            .search("plain:ell".to_string(), None, None, None)
+            .search("plain:ell".to_string(), None, None, None, None)
             .await
             .expect("search must succeed");
         let plain_hits: serde_json::Value = serde_wasm_bindgen::from_value(plain_hits).unwrap();
@@ -1093,7 +1102,7 @@ mod tests {
         index.commit().await.expect("commit must succeed");
 
         let hits = index
-            .search("title:ell".to_string(), None, None, None)
+            .search("title:ell".to_string(), None, None, None, None)
             .await
             .expect("search must succeed");
         let hits: serde_json::Value = serde_wasm_bindgen::from_value(hits).unwrap();
@@ -1206,7 +1215,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn add_field_methods_reject_reserved_field_name() {
         type AddField = fn(&mut WasmSchema, String) -> Result<(), JsValue>;
-        let methods: [(&str, AddField); 11] = [
+        let methods: [(&str, AddField); 12] = [
             ("addTextField", |s, n| {
                 s.add_text_field(n, None, None, None, None, None, None, None)
             }),
@@ -1240,6 +1249,9 @@ mod tests {
             ("addIvfField", |s, n| {
                 s.add_ivf_field(n, 3, None, None, None, None, None)
             }),
+            ("addMultiVectorField", |s, n| {
+                s.add_multi_vector_field(n, 3, None, None)
+            }),
         ];
         for (method, add_field) in methods {
             let mut schema = WasmSchema::new();
@@ -1252,6 +1264,342 @@ mod tests {
                 "{method}: {message}"
             );
             assert!(schema.field_names().is_empty(), "{method}");
+        }
+    }
+
+    // ── Late-interaction rescore (Issue #1351) ─────────────────────────────
+    //
+    // Uses the same corpus as the Rust test
+    // (`laurus/tests/late_interaction_rescore_test.rs`): against the query
+    // token vectors [[1, 0], [0, 1]] the MaxSim scores are c 1.1, b 1.0,
+    // d 0.9, a 0.1, e 0.05 — an order that matches neither the BM25 nor
+    // the `vec` ranking — so the binding must rank exactly like the Rust
+    // API.
+
+    const EXPECTED: [&str; 5] = ["c", "b", "d", "a", "e"];
+
+    /// `(id, title, vec, tokens)` of each corpus document.
+    fn corpus() -> serde_json::Value {
+        serde_json::json!([
+            ["a", "rust", [1.0, 0.0], [[0.1, 0.0]]],
+            ["b", "rust rust", [0.9, 0.1], [[0.5, 0.5], [0.0, 0.2]]],
+            ["c", "rust language", [0.5, 0.5], [[0.9, 0.2]]],
+            ["d", "rust rust rust", [0.2, 0.8], [[0.3, 0.3], [0.6, 0.0]]],
+            ["e", "learning rust today", [0.0, 1.0], [[0.02, 0.03]]]
+        ])
+    }
+
+    /// A token callback that returns the corpus token vectors of the
+    /// document whose id is the text, and the test query for any query.
+    /// `wrap` is the returned expression around `out`, so a test can return
+    /// the vectors synchronously or as a Promise.
+    fn token_callback(wrap: &str) -> js_sys::Function {
+        let tokens: serde_json::Map<String, serde_json::Value> = corpus()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|doc| (doc[0].as_str().unwrap().to_string(), doc[3].clone()))
+            .collect();
+        js_sys::Function::new_with_args(
+            "text, role",
+            &format!(
+                "const tokens = {}; \
+                 const out = role === 'query' ? [[1, 0], [0, 1]] : tokens[text]; \
+                 return {wrap};",
+                serde_json::Value::Object(tokens)
+            ),
+        )
+    }
+
+    /// A `token_callback` embedder config, with `embed` set when given.
+    fn token_callback_config(embed: Option<&js_sys::Function>, dimension: Option<u32>) -> JsValue {
+        let config = highlight_object(serde_json::json!({ "type": "token_callback" }));
+        if let Some(embed) = embed {
+            js_sys::Reflect::set(&config, &JsValue::from_str("embed"), embed).unwrap();
+        }
+        if let Some(dimension) = dimension {
+            js_sys::Reflect::set(&config, &JsValue::from_str("dimension"), &dimension.into())
+                .unwrap();
+        }
+        config.into()
+    }
+
+    /// A schema with the corpus fields; `tokens` is embedded by `callback`
+    /// when given.
+    fn rescore_schema(callback: Option<&js_sys::Function>) -> WasmSchema {
+        let mut schema = WasmSchema::new();
+        schema
+            .add_text_field(
+                "title".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        schema
+            .add_flat_field("vec".to_string(), 2, None, None, None)
+            .unwrap();
+        if let Some(func) = callback {
+            schema
+                .add_embedder(
+                    "colbert".to_string(),
+                    token_callback_config(Some(func), Some(2)),
+                )
+                .unwrap();
+        }
+        schema
+            .add_multi_vector_field(
+                "tokens".to_string(),
+                2,
+                Some("dot_product".to_string()),
+                callback.map(|_| "colbert".to_string()),
+            )
+            .unwrap();
+        schema
+    }
+
+    /// Build the corpus index. With a token callback, the `tokens` values
+    /// are the document ids, embedded by the callback; otherwise they are
+    /// the token vectors themselves.
+    async fn rescore_index(callback: Option<js_sys::Function>) -> WasmIndex {
+        let embedded = callback.is_some();
+        let index = WasmIndex::create(Some(rescore_schema(callback.as_ref())), None, None)
+            .await
+            .expect("index creation must succeed");
+        for doc in corpus().as_array().unwrap() {
+            let tokens = if embedded {
+                doc[0].clone()
+            } else {
+                doc[3].clone()
+            };
+            let value = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "title": doc[1], "vec": doc[2], "tokens": tokens
+            }))
+            .unwrap();
+            index
+                .put_document(doc[0].as_str().unwrap().to_string(), value)
+                .await
+                .expect("put_document must succeed");
+        }
+        index.commit().await.expect("commit must succeed");
+        index
+    }
+
+    fn ids(js_results: JsValue) -> Vec<String> {
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn vectors_rescore() -> js_sys::Object {
+        highlight_object(serde_json::json!({
+            "field": "tokens",
+            "vectors": [[1.0, 0.0], [0.0, 1.0]]
+        }))
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_is_reordered_by_late_interaction() {
+        let index = rescore_index(None).await;
+        let baseline = index
+            .search("title:rust".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+        assert_ne!(ids(baseline), EXPECTED);
+
+        let results = index
+            .search(
+                "title:rust".to_string(),
+                None,
+                None,
+                None,
+                Some(vectors_rescore()),
+            )
+            .await
+            .unwrap();
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(results).unwrap();
+        let scores: Vec<(String, f64)> = results
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["score"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        let expected = [("c", 1.1), ("b", 1.0), ("d", 0.9), ("a", 0.1), ("e", 0.05)];
+        assert_eq!(scores.len(), expected.len());
+        for ((id, score), (expected_id, expected_score)) in scores.iter().zip(expected) {
+            assert_eq!(id, expected_id);
+            assert!((score - expected_score).abs() < 1e-5, "{scores:?}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn vector_search_is_reordered_by_late_interaction() {
+        let index = rescore_index(None).await;
+        let results = index
+            .search_vector(
+                "vec".to_string(),
+                vec![1.0, 0.0],
+                None,
+                None,
+                Some(vectors_rescore()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(results), EXPECTED);
+    }
+
+    #[wasm_bindgen_test]
+    async fn token_callback_embeds_documents_and_the_query_text() {
+        for wrap in ["out", "Promise.resolve(out)"] {
+            let index = rescore_index(Some(token_callback(wrap))).await;
+            let rescore = highlight_object(serde_json::json!({
+                "field": "tokens",
+                "text": "how fast is rust"
+            }));
+            let results = index
+                .search("title:rust".to_string(), None, None, None, Some(rescore))
+                .await
+                .unwrap();
+            assert_eq!(ids(results), EXPECTED, "{wrap}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn token_callback_dimension_must_match_the_field() {
+        let mut schema = WasmSchema::new();
+        schema
+            .add_embedder(
+                "colbert".to_string(),
+                token_callback_config(Some(&token_callback("out")), Some(3)),
+            )
+            .unwrap();
+        schema
+            .add_multi_vector_field("tokens".to_string(), 2, None, Some("colbert".to_string()))
+            .unwrap();
+        let Err(err) = WasmIndex::create(Some(schema), None, None).await else {
+            panic!("a dimension mismatch must be rejected");
+        };
+        let message = err.as_string().unwrap();
+        assert!(
+            message.contains("produces 3-dimensional token vectors"),
+            "{message}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn token_callback_must_return_numbers() {
+        let callback = js_sys::Function::new_with_args("text, role", "return [[1, 'x']];");
+        let index = WasmIndex::create(Some(rescore_schema(Some(&callback))), None, None)
+            .await
+            .unwrap();
+        let doc = serde_wasm_bindgen::to_value(&serde_json::json!({ "tokens": "a" })).unwrap();
+        let Err(err) = index.put_document("a".to_string(), doc).await else {
+            panic!("a non-numeric token vector must be rejected");
+        };
+        let message = err.as_string().unwrap();
+        assert!(
+            message.contains("returned a non-number in token vector 0"),
+            "{message}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn token_callback_config_is_checked() {
+        let embed = token_callback("out");
+        let cases = [
+            (None, Some(2), "'embed' function"),
+            (Some(&embed), None, "positive integer 'dimension'"),
+            (Some(&embed), Some(0), "positive integer 'dimension'"),
+        ];
+        for (embed, dimension, message) in cases {
+            let config = token_callback_config(embed, dimension);
+            let Err(err) = WasmSchema::new().add_embedder("colbert".to_string(), config) else {
+                panic!("an invalid token_callback config must be rejected: {message}");
+            };
+            let error = err.as_string().unwrap();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn invalid_rescore_is_rejected() {
+        let index = rescore_index(None).await;
+        let cases = [
+            (
+                serde_json::json!({ "field": "tokens" }),
+                "exactly one of vectors or text",
+            ),
+            (
+                serde_json::json!({ "field": "tokens", "vectors": [[1.0, 0.0]], "text": "x" }),
+                "exactly one of vectors or text",
+            ),
+            (
+                serde_json::json!({ "field": "tokens", "vectors": [[1.0, "x"]] }),
+                "Invalid rescore options",
+            ),
+            (
+                serde_json::json!({ "field": "tokens", "text": "rust" }),
+                "has no token-level embedder",
+            ),
+            (
+                serde_json::json!({ "field": "tokens", "vectors": [[1.0, 0.0]], "windowSize": 0 }),
+                "window_size must be between",
+            ),
+        ];
+        for (rescore, message) in cases {
+            let Err(err) = index
+                .search(
+                    "title:rust".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(highlight_object(rescore)),
+                )
+                .await
+            else {
+                panic!("an invalid rescore must be rejected: {message}");
+            };
+            let error = err.as_string().unwrap();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn add_multi_vector_field_rejects_invalid_options() {
+        let cases = [
+            (0, None, "dimension must be greater than 0"),
+            (
+                2,
+                Some("euclidean"),
+                "distance must be Cosine or DotProduct",
+            ),
+        ];
+        for (dimension, distance, message) in cases {
+            let mut schema = WasmSchema::new();
+            let Err(err) = schema.add_multi_vector_field(
+                "tokens".to_string(),
+                dimension,
+                distance.map(str::to_string),
+                None,
+            ) else {
+                panic!("invalid multi-vector options must be rejected: {message}");
+            };
+            let error = err.as_string().unwrap();
+            assert!(error.contains(message), "{error}");
+            assert!(schema.field_names().is_empty());
         }
     }
 }

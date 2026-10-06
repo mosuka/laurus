@@ -156,6 +156,46 @@ const results = await index.searchVector("embedding", [0.9, 0.1, 0.0]);
 console.log(results[0].document.title); // "Rust"
 ```
 
+## Late-Interaction Rescore
+
+Keep per-token vectors (for example from a ColBERT model) in a multi-vector
+field, and use them to reorder the top results of a search by MaxSim. Here the
+token vectors are precomputed and passed as nested arrays:
+
+```javascript
+import init, { Index, Schema } from 'laurus-wasm';
+
+await init();
+
+const schema = new Schema();
+schema.addTextField("title");
+schema.addMultiVectorField("tokens", 2, "dot_product"); // 2-dimensional token vectors
+
+const index = await Index.create(schema);
+
+await index.putDocument("doc1", {
+  title: "Rust",
+  tokens: [[0.1, 0.0]]
+});
+await index.putDocument("doc2", {
+  title: "The Rust language",
+  tokens: [[0.9, 0.2]]
+});
+await index.commit();
+
+// Rescore the top lexical hits with the query's token vectors
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]]
+});
+console.log(results[0].id, results[0].score); // "doc2" ~1.1 (MaxSim: 0.9 + 0.2)
+```
+
+A rescored result's `score` is its MaxSim. The token vectors are not returned
+in `results[i].document`. To index and query with text instead, register a
+`"token_callback"` embedder for the field; see the
+[API Reference](api_reference.md#late-interaction-rescore).
+
 ## Usage with Bundlers
 
 ### Vite

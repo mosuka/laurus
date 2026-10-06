@@ -117,7 +117,7 @@ OPFS で永続化されたインデックスを開くか、新規作成します
 
 - **戻り値:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?)`
+#### `search(query, limit?, offset?, highlight?, rescore?)`
 
 DSL 文字列クエリで検索します。
 
@@ -125,7 +125,8 @@ DSL 文字列クエリで検索します。
   - `query` (string) -- クエリ DSL（例: `"title:hello"`）
   - `limit` (number, デフォルト 10)
   - `offset` (number, デフォルト 0)
-  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照
+  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照。`rescore` だけを使う場合は `undefined` を渡す
+  - `rescore` (`RescoreOptions`, 省略可) -- 上位の結果を、MultiVector フィールドに対する late interaction で並べ替える（Issue #1351）。詳細は下記の [Late interaction による再採点](#late-interaction-による再採点)を参照
 - **戻り値:** `Promise<SearchResult[]>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
@@ -176,7 +177,7 @@ const results = await index.search("body:rust", 10, 0, {
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language"] }
 ```
 
-#### `searchVector(field, vector, limit?, offset?)`
+#### `searchVector(field, vector, limit?, offset?, rescore?)`
 
 ベクトル類似度で検索します。
 
@@ -184,9 +185,10 @@ const results = await index.search("body:rust", 10, 0, {
   - `field` (string) -- ベクトルフィールド名
   - `vector` (number[]) -- クエリ埋め込みベクトル
   - `limit`, `offset` (number, 省略可)
+  - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
 - **戻り値:** `Promise<SearchResult[]>`
 
-#### `searchVectorText(field, text, limit?, offset?)`
+#### `searchVectorText(field, text, limit?, offset?, rescore?)`
 
 テキストで検索します（登録された埋め込み器で変換）。
 
@@ -194,7 +196,47 @@ const results = await index.search("body:rust", 10, 0, {
   - `field` (string) -- ベクトルフィールド名
   - `text` (string) -- 埋め込み対象テキスト
   - `limit`, `offset` (number, 省略可)
+  - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
 - **戻り値:** `Promise<SearchResult[]>`
+
+#### Late interaction による再採点
+
+`search`、`searchVector`、`searchVectorText` は、末尾に省略可能な `rescore` 引数を受け付けます（Issue #1351）。1 段目（lexical・vector・ハイブリッド）の上位の結果を、[MultiVector フィールド](#addmultivectorfieldname-dimension-distance-embedder)のトークンベクトルに対する ColBERT 型の late interaction（MaxSim）で並べ替えます。ほかの検索メソッドには `rescore` 引数はありません。引数は以下の形の単純なオブジェクトです。
+
+```typescript
+interface RescoreOptions {
+  field: string;
+  vectors?: number[][];
+  text?: string;
+  windowSize?: number;
+}
+```
+
+| キー | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | string | -- | 採点に使う MultiVector フィールド |
+| `vectors` | `number[][]` | -- | クエリのトークンベクトル。文書のトークンベクトルを作ったのと同じモデルで計算する |
+| `text` | string | -- | クエリのテキスト。フィールドの `"token_callback"` Embedder が role `"query"` で埋め込む |
+| `windowSize` | number | `100` | 再採点する 1 段目の上位件数。`1`〜`10,000` |
+
+`vectors` と `text` はどちらか一方だけを指定します。そうでない場合は `Invalid rescore options: set exactly one of vectors or text` で例外になります。型の合わない値（`vectors` の数値でない要素など）も `Invalid rescore options: ...` で例外になり、未知のキーは無視されます。それ以外の値はエンジンが検索の実行時に検査し、不正な値は `rescore: ...` を含むエラーになります。たとえば、トークン単位の Embedder がないフィールドへの `text`、MultiVector ではないフィールド、範囲外の `windowSize`、次元の合わないクエリベクトルです。
+
+上位 `windowSize` 件の結果は MaxSim の降順に並び、再採点した結果の `score` は MaxSim の値になります。window の外の結果（および window 内でフィールドにトークンベクトルを持たない結果）は、1 段目の順序とスコアのまま、再採点した結果の後に続きます。採点・並び順・ページングの詳細は [Vector 検索 → Late Interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore) を参照してください。
+
+```js
+// 事前計算したクエリのトークンベクトルで、lexical 検索の上位を再採点する。
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]],
+});
+
+// フィールドの token_callback Embedder にクエリのテキストを埋め込ませることもできる。
+const reranked = await index.searchVectorText("embedding", "how do lifetimes work", 10, 0, {
+  field: "body_colbert",
+  text: "how do lifetimes work",
+  windowSize: 50,
+});
+```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
 
@@ -500,6 +542,24 @@ IVF ベクトルインデックスフィールドを追加します。
 - `rerankStorage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
 - `pqCodebookPath` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`quantizer: "product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
 
+#### `addMultiVectorField(name, dimension, distance?, embedder?)`
+
+MultiVector フィールドを追加します（Issue #1351）。ColBERT 型モデルのトークンごとの埋め込みのように、文書ごとに可変本数のトークンベクトルを保持します。ANN 索引は持たず、検索の対象にもなりません。読むのは [late interaction による再採点](#late-interaction-による再採点)だけです。[スキーマとフィールド → MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照してください。
+
+- `dimension`: 各トークンベクトルの長さ。0 より大きい値
+- `distance`: `"cosine"`（デフォルト。書き込み時に L2 正規化）または `"dot_product"`
+- `embedder`: [`addEmbedder`](#addembeddername-config) で登録した `"token_callback"` Embedder の名前（省略可）。テキストの値と再採点のクエリテキストを埋め込みます
+
+オプションはフィールドの追加時に検証され、`dimension` が 0 の場合や上記以外の `distance` は例外になります。
+
+値は、トークンごとに 1 つの配列を持つ入れ子の数値配列（`tokens: [[0.1, 0.2], [0.3, 0.4]]`）で、フィールドの次元のベクトルを 1〜8,192 本保持します。フィールドに `"token_callback"` Embedder がある場合は文字列の値も使え、文書のインデックス時にコールバックが role `"document"` で埋め込みます。トークンベクトルは保存されないため、`getDocuments` や検索結果にこのフィールドは含まれません。
+
+```javascript
+schema.addMultiVectorField("tokens", 2, "dot_product");
+// ...
+await index.putDocument("doc1", { title: "Rust", tokens: [[0.9, 0.2], [0.1, 0.8]] });
+```
+
 上記のどの `add*Field` メソッドも、`name` が `_`（`_id` を除く）で始まる場合は例外を投げ、何も追加しない。`fromToml` で読み込んだスキーマはそのようなフィールドを引き続き受け付けるため、永続化済みのスキーマも読み込めるが、そのスキーマから新しい `Index` を作成すると例外を投げる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
 
 #### `addAnalyzer(name, analyzer)`
@@ -532,7 +592,7 @@ schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipad
 
 #### `addEmbedder(name, config)`
 
-名前付き埋め込み器を登録します。WASM では以下の 2 種類の `type` をサポートします:
+名前付き埋め込み器を登録します。WASM では以下の 3 種類の `type` をサポートします:
 
 - `"precomputed"` — 埋め込みは行いません。ベクトルは `putDocument()` /
   `searchVector()` 経由で直接渡します。
@@ -540,6 +600,27 @@ schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipad
   登録します。エンジンがインジェスト時および `searchVectorText()` で呼び出します。
   Transformers.js などのブラウザ内埋め込みライブラリと組み合わせることで、
   エンジン内自動埋め込みが可能になります。
+- `"token_callback"` — [MultiVector フィールド](#addmultivectorfieldname-dimension-distance-embedder)
+  用に、JavaScript コールバック
+  `embed: (text, role) => number[][] | Promise<number[][]>` と `dimension`
+  （正の整数）を登録します（Issue #1351）。late interaction モデルはクエリと
+  文書を別々にエンコードするため、`role` には `"query"` または `"document"` が
+  渡されます。コールバックはトークンごとに長さ `dimension` のベクトルを 1 本ずつ
+  返します。値をそのまま返しても Promise で返しても構いません。エンジンは
+  フィールドのテキストの値に対して role `"document"` で、再採点の `text` に
+  対して role `"query"` で呼び出します。`dimension` はインデックスの作成時・
+  オープン時に MultiVector フィールドと照合され、一致しない場合は
+  `Index.create` / `Index.open` が例外を投げます
+  （`... produces N-dimensional token vectors`）。返された配列に数値でない要素が
+  あるとエラーになります（0 として黙って扱われることはありません）。
+
+関数はシリアライズできないため、どちらのコールバック型もスキーマ TOML
+（`toToml()` や `Index.open` が永続化するスキーマ）には `"precomputed"` として
+記録されます。コールバックが必要なセッションでは、`Index.open` に渡すスキーマで
+毎回登録し直してください。
+
+`"token_callback"` は、WASM にはないネイティブの `candle_colbert` Embedder の
+代わりになります（[Embedding 戦略](../laurus-wasm.md#embedding-戦略)を参照）。
 
 ```javascript
 // Precomputed embedder
@@ -553,6 +634,14 @@ schema.addEmbedder("callback-embedder", {
     return Array.from(output.data);
   },
 });
+
+// MultiVector フィールド用の Token callback embedder（例: ブラウザで動く ColBERT モデル）
+schema.addEmbedder("colbert", {
+  type: "token_callback",
+  embed: async (text, role) => myColbert.encode(text, role), // number[][]
+  dimension: 128,
+});
+schema.addMultiVectorField("body_colbert", 128, "cosine", "colbert");
 ```
 
 #### `addAnalyzerDefinition(name, definition)`

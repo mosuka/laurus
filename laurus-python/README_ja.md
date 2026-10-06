@@ -10,6 +10,7 @@
 - **Lexical 検索** -- BM25 スコアリングを備えた転置インデックスによる全文検索
 - **Vector 検索** -- Flat、HNSW、IVF インデックスを使用した近似最近傍（ANN）検索
 - **ハイブリッド検索** -- フュージョンアルゴリズム（RRF、WeightedSum）で Lexical と Vector の結果を統合
+- **Late Interaction による再採点** -- MultiVector（トークンベクトル）フィールドに対する ColBERT 型の MaxSim で上位の結果を並べ替え
 - **豊富なクエリ DSL** -- Term、Phrase、Fuzzy、Wildcard、NumericRange、Geo、Boolean、Span クエリ
 - **テキスト解析** -- トークナイザー、フィルター、ステマー、同義語展開
 - **柔軟なストレージ** -- インメモリ（一時的）またはファイルベース（永続的）インデックス
@@ -191,6 +192,21 @@ results = index.search(request)
 | :--- | :--- |
 | `RRF(k=60.0)` | 逆順位フュージョン（ランクベース、ハイブリッドのデフォルト） |
 | `WeightedSum(lexical_weight=0.5, vector_weight=0.5)` | スコア正規化後の加重和 |
+
+## Late Interaction による再採点
+
+MultiVector フィールドは、文書ごとのトークンベクトル（ColBERT の埋め込みなど）を保持します。`LateInteractionRescore` は、どの検索でも上位 `window_size` 件（デフォルト 100）を、このフィールドに対する MaxSim で並べ替えます:
+
+```python
+schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
+# ...
+index.put_document("doc1", {"title": "Rust", "tokens": [[0.9, 0.2], [0.0, 0.3]]})
+# ...
+rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]])
+results = index.search("title:rust", rescore=rescore)
+```
+
+フィールドに `"candle_colbert"` のエンベダーがあれば、文書と再採点のクエリをテキストで渡せます。
 
 ## テキスト解析
 

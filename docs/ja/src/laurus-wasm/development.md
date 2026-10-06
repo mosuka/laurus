@@ -126,6 +126,8 @@ schema.addHnswField(
 
 wasm-bindgen のグルーコードが JS コールバックを `Closure` で保持するため、インデックスの寿命中ずっと有効です。コールバックは常にメインスレッドで実行されるため、`Send + Sync` 制約は付きません。
 
+MultiVector フィールドと late interaction による再採点には、`"token_callback"` Embedder（`{ type: "token_callback", embed: (text, role) => number[][] | Promise<number[][]>, dimension }`）を使います。`JsTokenCallbackEmbedder`（`src/embedder.rs`）は `Embedder` と `TokenEmbedder` の両方を手書きで実装しています。理由は callback Embedder と同じで、`JsFuture` が `Send` でないため、`#[async_trait]` を使わずに future を包んでいます。戻り値は `Promise.resolve` で包むので同期の戻り値でも動き、`dimension` はインデックスの作成時にフィールドと照合します。オプションは [API リファレンス](api_reference.md) を参照してください。
+
 ## テスト
 
 ```bash

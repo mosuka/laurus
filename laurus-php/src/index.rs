@@ -17,7 +17,8 @@ use crate::convert::{document_to_hashtable, hashtable_to_document};
 use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::schema::PhpSchema;
 use crate::search::{
-    PhpSearchResult, build_request_from_php, parse_highlight_option, to_php_search_result,
+    PhpSearchResult, build_request_from_php, parse_highlight_option, parse_rescore_option,
+    to_php_search_result,
 };
 
 // ---------------------------------------------------------------------------
@@ -546,6 +547,11 @@ impl PhpIndex {
     ///   #1134): a list of field names or an associative array adding
     ///   `HighlightConfig` knobs. Highlighting follows this query, and only
     ///   `stored: true` text fields can be highlighted.
+    /// * `rescore` - `LateInteractionRescore` reordering the top results by
+    ///   MaxSim against a multi-vector field (Issue #1351).
+    ///
+    /// When `$query` is a `SearchRequest`, the other arguments are ignored
+    /// in favor of the request's own values.
     ///
     /// # Returns
     ///
@@ -557,10 +563,17 @@ impl PhpIndex {
         limit: i64,
         offset: i64,
         highlight: Option<&ZendHashTable>,
+        rescore: Option<&Zval>,
     ) -> PhpResult<Vec<PhpSearchResult>> {
         let highlight = parse_highlight_option(highlight)?;
-        let request =
-            build_request_from_php(query, limit as usize, offset as usize, highlight.as_ref())?;
+        let rescore = parse_rescore_option(rescore)?;
+        let request = build_request_from_php(
+            query,
+            limit as usize,
+            offset as usize,
+            highlight.as_ref(),
+            rescore.as_ref(),
+        )?;
 
         let engine = self.engine()?;
         let results = self
@@ -623,6 +636,7 @@ impl PhpIndex {
                 limit as usize,
                 offset as usize,
                 highlight.as_ref(),
+                None,
             )?);
         }
 

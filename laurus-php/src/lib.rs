@@ -37,6 +37,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<search::PhpWeightedSum>()
         .class::<search::PhpSearchResult>()
         .class::<search::PhpSearchRequest>()
+        // Rescore (Issue #1351)
+        .class::<search::PhpLateInteractionRescore>()
         // Query types
         .class::<query::PhpTermQuery>()
         .class::<query::PhpPhraseQuery>()

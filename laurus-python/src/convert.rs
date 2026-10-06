@@ -85,6 +85,12 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
         if list.iter().all(|item| item.is_instance_of::<PyTuple>()) {
             return py_tuple_list_to_geo_array(py, list);
         }
+        // A list of lists is the token vectors of a multi-vector field
+        // (#1351). Their count and dimension are checked against the field
+        // by the core's schema-aware coercion.
+        if list.iter().all(|item| item.is_instance_of::<PyList>()) {
+            return py_token_vectors(list).map(DataValue::VectorArray);
+        }
         // A list of `str` / `datetime` objects (#1184, #1175). Any element
         // that is a `datetime` (exposes `isoformat()`) keeps the datetime
         // path, where a non-datetime element is an error; an all-`str` list
@@ -230,6 +236,28 @@ fn py_string_list_to_data_value(list: &Bound<PyList>) -> PyResult<DataValue> {
         Some(dts) => DataValue::DateTimeArray(dts),
         None => DataValue::TextArray(strings),
     })
+}
+
+/// Convert a list of numeric lists into token vectors (#1351), for both a
+/// multi-vector field's value and a rescore query. `bool` and `str`
+/// elements are rejected rather than read as numbers.
+pub fn py_token_vectors(list: &Bound<PyList>) -> PyResult<Vec<Vec<f32>>> {
+    list.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            row.cast::<PyList>()?
+                .iter()
+                .map(|value| {
+                    if value.is_instance_of::<PyBool>() || value.is_instance_of::<PyString>() {
+                        return Err(PyTypeError::new_err(format!(
+                            "token vector {i} must hold only numbers"
+                        )));
+                    }
+                    Ok(value.extract::<f64>()? as f32)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn py_tuple_list_to_geo_array(py: Python, list: &Bound<PyList>) -> PyResult<DataValue> {

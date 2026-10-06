@@ -57,6 +57,7 @@ pub fn hash_to_document(ruby: &Ruby, hash: RHash) -> Result<Document, Error> {
 /// | `Array` of numerics           | `Float64Array` (vector fields cast either array to `Vector`; empty is an empty `Int64Array`) |
 /// | `Array` of `lat`/`lon` Hashes | `GeoArray` (multi-valued geo, #1174) |
 /// | `Array` of `x`/`y`/`z` Hashes | `GeoEcefArray`       |
+/// | `Array` of numeric Arrays     | `VectorArray` (multi-vector field token vectors, #1351) |
 /// | `Array` of `Time` / RFC 3339 Strings | `DateTimeArray` (multi-valued datetime, #1184) |
 /// | `Array` of `true` / `false`   | `BoolArray` (multi-valued boolean, #1180) |
 /// | `Array` of Strings            | `TextArray` (multi-valued text, #1175), or `DateTimeArray` when every element parses as a datetime |
@@ -122,6 +123,12 @@ pub fn rb_to_data_value(ruby: &Ruby, value: Value) -> Result<DataValue, Error> {
         // below, so key semantics and range validation are shared.
         if elements.iter().all(|v| v.is_kind_of(ruby.class_hash())) {
             return rb_hash_array_to_geo_array(ruby, &elements);
+        }
+        // An Array of Arrays is the token vectors of a multi-vector field
+        // (#1351). Their count and dimension are checked against the field
+        // by the core's schema-aware coercion.
+        if elements.iter().all(|v| v.is_kind_of(ruby.class_array())) {
+            return rb_token_vectors(ruby, &elements).map(DataValue::VectorArray);
         }
         // An Array of Strings / `iso8601`-responding objects (`Time`)
         // (#1184, #1175). Any `Time`-like element keeps the datetime path,
@@ -238,6 +245,36 @@ fn rb_datetime_array(ruby: &Ruby, elements: &[Value]) -> Result<DataValue, Error
         out.push(dt);
     }
     Ok(DataValue::DateTimeArray(out))
+}
+
+/// Convert Arrays of numbers into token vectors (#1351), for both a
+/// multi-vector field's value and a rescore query. Any element other than an
+/// `Integer` or a `Float` is a `TypeError`.
+pub fn rb_token_vectors(ruby: &Ruby, rows: &[Value]) -> Result<Vec<Vec<f32>>, Error> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, &row)| {
+            let row = RArray::from_value(row).ok_or_else(|| {
+                Error::new(
+                    ruby.exception_type_error(),
+                    format!("token vector {i} must be an Array"),
+                )
+            })?;
+            row.into_iter()
+                .map(|value| {
+                    if !value.is_kind_of(ruby.class_integer())
+                        && !value.is_kind_of(ruby.class_float())
+                    {
+                        return Err(Error::new(
+                            ruby.exception_type_error(),
+                            format!("token vector {i} must hold only numbers"),
+                        ));
+                    }
+                    Ok(f64::try_convert(value)? as f32)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Convert a non-empty Array whose elements are all Hashes into a

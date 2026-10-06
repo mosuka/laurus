@@ -100,7 +100,46 @@ req.setRrfFusion(new RRF(60.0));
 const results = await index.searchWithRequest(req);
 ```
 
-## 6. 更新と削除
+## 6. Late interaction による再採点
+
+MultiVector フィールドは文書ごとに複数のトークンベクトル（たとえば ColBERT の
+トークン埋め込み）を保持します。`rescore` オブジェクトを渡すと、どの検索でも
+上位の結果をそのフィールドに対する late interaction（MaxSim）で並べ替えます。
+
+```javascript
+import { Index, Schema } from "laurus-nodejs";
+
+const schema = new Schema();
+schema.addTextField("title");
+schema.addMultiVectorField("tokens", 2, "dot_product");
+
+const index = await Index.create(null, schema);
+await index.putDocument("a", {
+  title: "rust",
+  tokens: [[0.1, 0.0]],
+});
+await index.putDocument("b", {
+  title: "rust language",
+  tokens: [[0.9, 0.2], [0.0, 0.5]],
+});
+await index.commit();
+
+// Lexical 検索の上位を MaxSim で並べ替える:
+// "b"（スコア 1.4）が "a"（スコア 0.1）より上位になる。
+const results = await index.search("title:rust", 10, 0, undefined, {
+  field: "tokens",
+  vectors: [[1, 0], [0, 1]],
+});
+```
+
+トークンベクトルは保存されないため、`getDocuments` や検索結果には含まれません。
+`addEmbedder` で `candle_colbert` の Embedder を登録してフィールドの第 4 引数に
+指定すると、文書はフィールドにテキストを渡せ、再採点も `vectors` の代わりに
+`text` を受け付けます。詳細は
+[Late interaction による再採点（Rescore）](api_reference.md#late-interaction-による再採点rescore)
+を参照してください。
+
+## 7. 更新と削除
 
 ```javascript
 // 更新: putDocument は既存バージョンをすべて置換
@@ -125,7 +164,7 @@ await index.deleteDocuments("express");
 await index.commit();
 ```
 
-## 7. スキーマ管理
+## 8. スキーマ管理
 
 ```javascript
 const schema = new Schema();
@@ -140,9 +179,10 @@ schema.addDatetimeField("createdAt");
 schema.addHnswField("embedding", 384);
 schema.addFlatField("smallVec", 64);
 schema.addIvfField("ivfVec", 128, "cosine", 100, 1);
+schema.addMultiVectorField("tokens", 128);
 ```
 
-## 8. インデックス統計
+## 9. インデックス統計
 
 ```javascript
 const stats = index.stats();

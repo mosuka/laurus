@@ -11,6 +11,8 @@ unified lexical, vector, and hybrid search.
 - **Vector search** — HNSW, Flat, and IVF indexes with multiple distance metrics
 - **Hybrid search** — Combine lexical and vector search
   with RRF or Weighted Sum fusion
+- **Late-interaction rescore** — Reorder the top results of any search
+  by ColBERT-style MaxSim over a multi-vector field
 - **CJK support** — Japanese, Chinese, and Korean tokenization via [Lindera](https://github.com/lindera/lindera)
 - **Native performance** — Rust core via [napi-rs](https://napi.rs), no C API overhead
 - **TypeScript types** — Auto-generated `.d.ts` type definitions
@@ -152,6 +154,7 @@ schema.addBytesField("thumbnail");
 schema.addHnswField("embedding", 384, "cosine", 16, 200, undefined, "bert");
 schema.addFlatField("embedding", 384);
 schema.addIvfField("embedding", 384, "cosine", 100, 1);
+schema.addMultiVectorField("tokens", 128, "dot_product"); // token vectors for the rescore
 schema.addEmbedder("bert", {
   type: "candle_bert",
   model: "sentence-transformers/all-MiniLM-L6-v2",
@@ -185,6 +188,29 @@ req.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
 const results = await index.searchWithRequest(req);
 ```
 
+### Late-Interaction Rescore
+
+Reorder the top results of any search by MaxSim against a multi-vector field.
+Token vectors are given as nested number arrays and are not stored:
+
+```javascript
+const schema = new Schema();
+schema.addTextField("title");
+schema.addMultiVectorField("tokens", 2, "dot_product");
+
+const index = await Index.create(null, schema);
+await index.putDocument("doc1", { title: "rust", tokens: [[0.9, 0.2], [0.0, 0.5]] });
+await index.commit();
+
+const rescore = { field: "tokens", vectors: [[1, 0], [0, 1]], windowSize: 100 };
+const results = await index.search("title:rust", 10, 0, undefined, rescore);
+const results2 = await index.searchWithRequest(new SearchRequest({ queryDsl: "title:rust", rescore }));
+```
+
+Set exactly one of `vectors` and `text`; a `text` query needs a
+`candle_colbert` embedder on the field (`addEmbedder`, then the 4th argument
+of `addMultiVectorField`).
+
 ### Text Analysis
 
 ```javascript
@@ -210,6 +236,7 @@ const expanded = filter.apply(tokens);
 | `boolean` | Boolean |
 | `null` | Null |
 | `number[]` | Vector |
+| `number[][]` | MultiVector (token vectors, not stored) |
 | `{ lat, lon }` | Geo |
 | `Date` / ISO8601 string | DateTime |
 | `Buffer` | Bytes |
