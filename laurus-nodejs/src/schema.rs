@@ -6,7 +6,8 @@ use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
     Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption,
-    QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
+    MultiVectorStorage, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    TokenFilterConfig, TokenizerConfig,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -31,6 +32,28 @@ fn parse_distance(s: &str) -> Result<DistanceMetric> {
         "angular" => Ok(DistanceMetric::Angular),
         other => Err(napi::Error::from_reason(format!(
             "Unknown distance metric: '{other}'. Valid: cosine, euclidean, dot_product, manhattan, angular"
+        ))),
+    }
+}
+
+/// Parse a multi-vector storage kind string into [`MultiVectorStorage`]
+/// (Issue #1346).
+///
+/// # Arguments
+///
+/// * `s` - Storage kind name: "f32" (default, exact), "f16" (2x smaller),
+///   "int8" (~4x smaller).
+///
+/// # Returns
+///
+/// The corresponding [`MultiVectorStorage`] variant.
+fn parse_multi_vector_storage(s: &str) -> Result<MultiVectorStorage> {
+    match s.to_lowercase().as_str() {
+        "f32" => Ok(MultiVectorStorage::F32),
+        "f16" => Ok(MultiVectorStorage::F16),
+        "int8" => Ok(MultiVectorStorage::Int8),
+        other => Err(napi::Error::from_reason(format!(
+            "Unknown multi-vector storage: '{other}'. Valid: f32, f16, int8"
         ))),
     }
 }
@@ -593,11 +616,15 @@ impl JsSchema {
     /// * `embedder` - Optional token-level embedder registered via
     ///   `addEmbedder` (a "candle_colbert" one), which embeds text values
     ///   and rescore query text.
+    /// * `storage` - On-disk element kind of every token vector (Issue
+    ///   #1346): "f32" (default, exact), "f16" (2x smaller), "int8" (~4x
+    ///   smaller).
     ///
     /// # Errors
     ///
     /// Throws if `name` starts with `_` (other than `_id`), if `dimension`
-    /// is 0, or if `distance` is neither cosine nor dot_product.
+    /// is 0, if `distance` is neither cosine nor dot_product, or if
+    /// `storage` is not a known kind.
     #[napi]
     pub fn add_multi_vector_field(
         &mut self,
@@ -605,9 +632,13 @@ impl JsSchema {
         dimension: u32,
         distance: Option<String>,
         embedder: Option<String>,
+        storage: Option<String>,
     ) -> Result<()> {
         let mut opt = MultiVectorOption::new(dimension as usize)
-            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
+            .storage(parse_multi_vector_storage(
+                storage.as_deref().unwrap_or("f32"),
+            )?);
         opt.embedder = embedder;
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))

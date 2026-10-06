@@ -146,14 +146,22 @@ def test_integer_token_vectors_are_accepted(index):
     [
         ({"dimension": 0}, "dimension"),
         ({"dimension": 2, "distance": "euclidean"}, "distance"),
+        ({"dimension": 2, "storage": "bogus"}, "storage"),
     ],
-    ids=["zero-dimension", "euclidean"],
+    ids=["zero-dimension", "euclidean", "unknown-storage"],
 )
 def test_add_multi_vector_field_rejects_invalid_options(kwargs, message):
     schema = laurus.Schema()
     with pytest.raises(ValueError, match=message):
         schema.add_multi_vector_field("tokens", **kwargs)
     assert schema.field_names() == []
+
+
+@pytest.mark.parametrize("storage", ["f32", "f16", "int8"])
+def test_add_multi_vector_field_accepts_valid_storage(storage):
+    schema = laurus.Schema()
+    schema.add_multi_vector_field("tokens", dimension=2, storage=storage)
+    assert schema.field_names() == ["tokens"]
 
 
 def test_add_embedder_accepts_every_core_type():

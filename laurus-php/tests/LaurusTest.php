@@ -2336,6 +2336,20 @@ class LaurusTest extends TestCase
         }
     }
 
+    public function testAddMultiVectorFieldAcceptsStorageOption(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addMultiVectorField("tokens", 2, "cosine", null, "int8");
+        $this->assertSame(["tokens"], $schema->fieldNames());
+    }
+
+    public function testUnknownMultiVectorStorageRejected(): void
+    {
+        $schema = new Laurus\Schema();
+        $this->expectException(\Throwable::class);
+        $schema->addMultiVectorField("tokens", 2, "cosine", null, "bogus");
+    }
+
     public function testAddEmbedderAcceptsEveryCoreType(): void
     {
         $schema = new Laurus\Schema();
