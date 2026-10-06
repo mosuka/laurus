@@ -1,10 +1,10 @@
-# Laurus : Lexical Augmented Unified Retrieval Using Semantics
+# Laurus : Lexically Augmented Unified Retrieval Using Semantics
 
 [![Crates.io](https://img.shields.io/crates/v/laurus.svg)](https://crates.io/crates/laurus)
 [![Documentation](https://docs.rs/laurus/badge.svg)](https://docs.rs/laurus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Laurus is a search platform written in Rust — built for Lexical Augmented Unified Retrieval Using Semantics.
+Laurus is a search platform written in Rust — built for Lexically Augmented Unified Retrieval Using Semantics.
 Built on a core library covering lexical search, vector search, and hybrid search, it provides multiple ready-to-use interfaces:
 
 - **Core Library** — Modular search engine embeddable into any application
