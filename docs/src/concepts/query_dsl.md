@@ -363,7 +363,7 @@ title:hello content:"cute kitten"^0.8
 
 ### How It Works
 
-1. **Split**: The parser checks each field name against the schema. Fields defined as vector fields (e.g., HNSW, Flat, IVF) are routed to the vector parser; all other fields are routed to the lexical parser.
+1. **Split**: The parser checks each field name against the schema. Fields defined as vector fields (e.g., HNSW, Flat, IVF) are routed to the vector parser; all other fields are routed to the lexical parser. The whole field name must match: with a vector field `content`, `subcontent:x` or `my.content:x` stays a lexical clause (Issue #1373).
 2. **Delegate**: Vector portion goes to `VectorQueryParser`, remainder goes to lexical `QueryParser`.
 3. **Fuse**: If both lexical and vector results exist, they are combined using a fusion algorithm.
 

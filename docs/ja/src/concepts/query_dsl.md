@@ -351,7 +351,7 @@ title:hello content:"cute kitten"^0.8
 
 ### 仕組み
 
-1. **分割（Split）**: スキーマのフィールド型に基づいて、各句が Lexical か Vector かを判定する。ベクトルフィールドとして定義されたフィールド名を持つ句は Vector 句として抽出される
+1. **分割（Split）**: スキーマのフィールド型に基づいて、各句が Lexical か Vector かを判定する。ベクトルフィールドとして定義されたフィールド名を持つ句は Vector 句として抽出される。フィールド名全体が一致する必要があり、ベクトルフィールド `content` があっても `subcontent:x` や `my.content:x` は Lexical 句のままになる（Issue #1373）
 2. **委譲（Delegate）**: Vector 部分は `VectorQueryParser` に、残りは Lexical の `QueryParser` に渡される
 3. **フュージョン（Fuse）**: Lexical と Vector の両方の結果が存在する場合、フュージョンアルゴリズムで結合される
 

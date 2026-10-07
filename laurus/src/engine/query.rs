@@ -43,6 +43,15 @@ use crate::lexical::query::parser::LexicalQueryParser;
 use crate::lexical::search::searcher::LexicalSearchQuery;
 use crate::vector::query::parser::VectorQueryParser;
 
+/// A character that cannot be part of a DSL field name: both query grammars
+/// define a field name as `[A-Za-z_][A-Za-z0-9_.]*`.
+///
+/// A vector clause starts only at the start of input or right after such a
+/// character (Issue #1373); otherwise a vector field name would match inside
+/// a longer field name (`content` in `subcontent:x`). Rust's `regex` has no
+/// lookbehind, so callers put this in a group before the field name.
+const NON_FIELD_NAME_CHAR: &str = r"[^A-Za-z0-9_.]";
+
 /// Unified query parser that composes lexical and vector parsers.
 ///
 /// Parses a single DSL string into a [`SearchRequest`] by splitting the input
@@ -266,10 +275,13 @@ impl UnifiedQueryParser {
         self.check_unsupported_vector_syntax(input, &fields_pattern)?;
 
         // Match vector field clauses with an optional leading `+` prefix.
-        // Group 1: optional `+` prefix
-        // Group 2: the vector clause itself (field:value[^boost])
+        // Group 1: the clause start — start of input or a non-field-name
+        //          character, which stays in the lexical part (Issue #1373)
+        // Group 2: optional `+` prefix
+        // Group 3: the vector clause itself (field:value[^boost])
         let clause_pattern = format!(
-            r#"(\+)?({fields})(?::(?:"[^"]*"|[^\s"^~\[\{{]+)(?:\^[\d]+(?:\.[\d]+)?)?)"#,
+            r#"(^|{boundary})(\+)?((?:{fields}):(?:"[^"]*"|[^\s"^~\[\{{]+)(?:\^[\d]+(?:\.[\d]+)?)?)"#,
+            boundary = NON_FIELD_NAME_CHAR,
             fields = fields_pattern,
         );
         let vector_re = Regex::new(&clause_pattern).unwrap();
@@ -278,17 +290,15 @@ impl UnifiedQueryParser {
         let mut has_required = false;
 
         for caps in vector_re.captures_iter(input) {
-            if caps.get(1).is_some() {
+            if caps.get(2).is_some() {
                 has_required = true;
             }
-            // Group 0 minus the `+` prefix = the actual vector clause
-            let full_match = caps.get(0).unwrap().as_str();
-            let clause = full_match.strip_prefix('+').unwrap_or(full_match);
-            vector_clauses.push(clause.to_string());
+            vector_clauses.push(caps[3].to_string());
         }
 
-        // Remove the full matches (including `+`) from input to get lexical part
-        let lexical_raw = vector_re.replace_all(input, " ");
+        // Remove the clauses (including `+`) but keep the clause start, so a
+        // `(` or `-` before a clause still belongs to the lexical part.
+        let lexical_raw = vector_re.replace_all(input, "${1} ");
         let lexical_cleaned = clean_lexical_string(&lexical_raw);
 
         let lexical = if lexical_cleaned.is_empty() {
@@ -392,7 +402,8 @@ impl UnifiedQueryParser {
     fn check_unsupported_vector_syntax(&self, input: &str, fields_pattern: &str) -> Result<()> {
         // Proximity/fuzzy: vector_field:value~[digits]
         let tilde_pattern = format!(
-            r#"((?:{fields})(?::(?:"[^"]*"|[^\s"^~]+)(?:\^[\d]+(?:\.[\d]+)?)?))(~[\d]*)"#,
+            r#"(?:^|{boundary})((?:{fields})(?::(?:"[^"]*"|[^\s"^~]+)(?:\^[\d]+(?:\.[\d]+)?)?))(~[\d]*)"#,
+            boundary = NON_FIELD_NAME_CHAR,
             fields = fields_pattern,
         );
         let tilde_re = Regex::new(&tilde_pattern).unwrap();
@@ -407,7 +418,11 @@ impl UnifiedQueryParser {
         }
 
         // Range queries: vector_field:[...] or vector_field:{...}
-        let range_pattern = format!(r#"({fields}):(\[|\{{)"#, fields = fields_pattern,);
+        let range_pattern = format!(
+            r#"(?:^|{boundary})({fields}):(\[|\{{)"#,
+            boundary = NON_FIELD_NAME_CHAR,
+            fields = fields_pattern,
+        );
         let range_re = Regex::new(&range_pattern).unwrap();
         if let Some(caps) = range_re.captures(input) {
             let field = caps.get(1).unwrap().as_str();
@@ -1128,5 +1143,67 @@ mod tests {
         // `make_parser` uses default field "title", so this query parses
         // successfully and the lexical AST targets only `title`.
         parser.parse("title:anything_goes").await.unwrap();
+    }
+
+    /// Issue #1373: a lexical field whose name ends with a vector field's
+    /// name (`content` here) is not a vector clause. The vector-clause regex
+    /// had no boundary before the field name, so `subcontent:hello` was
+    /// split into a vector clause `content:hello` and a lexical `sub`.
+    #[tokio::test]
+    async fn test_vector_field_name_inside_a_longer_field_name_is_lexical() {
+        let parser = make_parser();
+        for query in ["subcontent:hello", "my.content:hello", "x_content:hello"] {
+            let request = parser
+                .parse(query)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e:?}"));
+            assert!(
+                matches!(request.query, SearchQuery::Lexical(_)),
+                "{query} must stay lexical, got {:?}",
+                request.query
+            );
+        }
+    }
+
+    /// Issue #1373: lexical-only syntax on such a field is not rejected as
+    /// vector syntax.
+    #[tokio::test]
+    async fn test_lexical_syntax_on_a_longer_field_name_is_not_rejected() {
+        let parser = make_parser();
+        for query in ["subcontent:hello~2", "subcontent:[a TO z]"] {
+            let request = parser
+                .parse(query)
+                .await
+                .unwrap_or_else(|e| panic!("{query} must not be rejected: {e:?}"));
+            assert!(
+                matches!(request.query, SearchQuery::Lexical(_)),
+                "{query} must stay lexical, got {:?}",
+                request.query
+            );
+        }
+    }
+
+    /// Issue #1373: a vector clause still splits after every character that
+    /// cannot be part of a field name: start, whitespace, `(`, `+`, `-`.
+    #[tokio::test]
+    async fn test_vector_clause_boundaries_still_split() {
+        let parser = make_parser();
+        for query in [
+            "content:cats",
+            "title:hello content:cats",
+            r#"(content:"cats")"#,
+            "+content:cats",
+            "title:hello -content:cats",
+        ] {
+            let request = parser
+                .parse(query)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e:?}"));
+            assert!(
+                !matches!(request.query, SearchQuery::Lexical(_)),
+                "{query} must contain a vector clause, got {:?}",
+                request.query
+            );
+        }
     }
 }
