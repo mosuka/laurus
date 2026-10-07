@@ -164,26 +164,27 @@ schema.setDefaultFields(["title", "body"]);
 
 ```javascript
 import {
-  PhraseQuery,
   RRF,
   SearchRequest,
   TermQuery,
   VectorQuery,
   VectorTextQuery,
-  WeightedSum,
 } from "laurus-nodejs";
 
+// Lexical とベクトルの句を RRF で融合する。各セッターは同じ種類の句を
+// 置き換える（`setLexicalPhrase`、`setWeightedSumFusion` など）。
 const req = new SearchRequest({ limit: 10, offset: 0 });
-req.setQueryDsl("title:hello");
 req.setLexicalTerm(new TermQuery("body", "programming"));
-req.setLexicalPhrase(new PhraseQuery("title", ["machine", "learning"]));
 req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, ...]));
-req.setVectorTextQuery(new VectorTextQuery("embedding", "クエリテキスト"));
 req.setFilterTerm(new TermQuery("category", "tech"));
 req.setRrfFusion(new RRF(60.0));
-req.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
-
 const results = await index.searchWithRequest(req);
+
+// DSL はベクトルクエリと組み合わせられ、両方で検索する。
+// DSL と `setLexicalX` のセッターを組み合わせると例外になる。Lexical の句は DSL に書く。
+const req2 = new SearchRequest({ queryDsl: "title:hello", limit: 10 });
+req2.setVectorTextQuery(new VectorTextQuery("embedding", "クエリテキスト"));
+const results2 = await index.searchWithRequest(req2);
 ```
 
 ### Late interaction による再採点

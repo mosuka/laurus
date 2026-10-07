@@ -334,6 +334,47 @@ describe("Hybrid search", () => {
     expect(results.length).toBeGreaterThanOrEqual(1);
   });
 
+  // Issue #1372: a DSL given with a vector query keeps the DSL.
+  it("searches with SearchRequest (DSL with vector query)", async () => {
+    const schema = new Schema();
+    schema.addTextField("title");
+    schema.addHnswField("embedding", 4);
+    const index = await Index.create(null, schema);
+    // Reachable only through the DSL: it has no vector.
+    await index.putDocument("lexical", { title: "rust" });
+    // Reachable only through the vector: its title does not match.
+    await index.putDocument("vector", {
+      title: "python",
+      embedding: [0.1, 0.2, 0.3, 0.4],
+    });
+    await index.commit();
+    const req = new SearchRequest({ queryDsl: "title:rust", limit: 5 });
+    req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
+    const results = await index.searchWithRequest(req);
+    expect(results.map((r) => r.id).sort()).toEqual(["lexical", "vector"]);
+  });
+
+  // Issue #1372: a DSL that cannot be combined is rejected, not dropped.
+  it("rejects SearchRequest with a DSL and a lexical query", async () => {
+    const index = await createVectorIndex();
+    const lexicalOnly = new SearchRequest({ queryDsl: "title:rust" });
+    lexicalOnly.setLexicalTerm(new TermQuery("title", "rust"));
+    const both = new SearchRequest({ queryDsl: "title:rust" });
+    both.setLexicalTerm(new TermQuery("title", "rust"));
+    both.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
+    for (const req of [lexicalOnly, both]) {
+      await expect(index.searchWithRequest(req)).rejects.toThrow(/queryDsl/);
+    }
+  });
+
+  // Issue #1372: an empty DSL is rejected with vectors as it is alone.
+  it("rejects SearchRequest with an empty DSL and a vector query", async () => {
+    const index = await createVectorIndex();
+    const req = new SearchRequest({ queryDsl: "" });
+    req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
+    await expect(index.searchWithRequest(req)).rejects.toThrow();
+  });
+
   it("searches with SearchRequest constructed via options object only", async () => {
     // The constructor accepts an options object with primitive fields.
     // Polymorphic clauses are still attached via per-type setters.

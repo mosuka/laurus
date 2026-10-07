@@ -556,7 +556,7 @@ class SearchRequest:
 
 | Parameter | Description |
 | :--- | :--- |
-| `query` | A DSL string or single query object. Mutually exclusive with `lexical_query` / `vector_query`. |
+| `query` | A DSL string or single query object. A DSL string can be combined with `vector_query`: both are searched, and `vector_query` is added to the DSL's vector part (fused by `fusion`, `RRF(k=60)` by default). Any other combination with `lexical_query` / `vector_query` raises `ValueError` (Issue #1372): write the lexical clauses in the DSL, or pass a query object as `lexical_query` / `vector_query` instead. |
 | `lexical_query` | Lexical component for explicit hybrid search. |
 | `vector_query` | Vector component for explicit hybrid search. |
 | `filter_query` | Lexical filter applied after scoring. |

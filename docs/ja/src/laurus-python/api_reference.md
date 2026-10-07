@@ -554,7 +554,7 @@ class SearchRequest:
 
 | パラメータ | 説明 |
 | :--- | :--- |
-| `query` | DSL 文字列または単一クエリオブジェクト。`lexical_query` / `vector_query` と排他的。 |
+| `query` | DSL 文字列または単一クエリオブジェクト。DSL 文字列は `vector_query` と組み合わせられます。両方で検索し、`vector_query` は DSL のベクトル部分に加わります（融合は `fusion`、デフォルトは `RRF(k=60)`）。それ以外で `lexical_query` / `vector_query` と組み合わせると `ValueError` になります（Issue #1372）。Lexical の句は DSL に書くか、クエリオブジェクトを `lexical_query` / `vector_query` として渡してください。 |
 | `lexical_query` | 明示的なハイブリッド検索の Lexical コンポーネント。 |
 | `vector_query` | 明示的なハイブリッド検索の Vector コンポーネント。 |
 | `filter_query` | スコアリング後に適用する Lexical フィルター。 |

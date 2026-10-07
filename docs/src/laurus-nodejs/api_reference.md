@@ -594,7 +594,7 @@ setter.
 
 | Method | Description |
 | :--- | :--- |
-| `setQueryDsl(dsl: string)` | Set a DSL string query. |
+| `setQueryDsl(dsl: string)` | Set a DSL string query (same as the `queryDsl` option). It can be combined with a vector setter: both are searched, and the vector query is added to the DSL's vector part (fused by the fusion setter, `RRF(60)` by default). Combining it with a `setLexicalX` setter makes `searchWithRequest` throw (Issue #1372): write the lexical clauses in the DSL, or use `setLexicalX` without a DSL. |
 | `setRrfFusion(rrf: RRF)` | Use RRF fusion. |
 | `setWeightedSumFusion(ws: WeightedSum)` | Use weighted-sum fusion. |
 

@@ -166,26 +166,27 @@ schema.setDefaultFields(["title", "body"]);
 
 ```javascript
 import {
-  PhraseQuery,
   RRF,
   SearchRequest,
   TermQuery,
   VectorQuery,
   VectorTextQuery,
-  WeightedSum,
 } from "laurus-nodejs";
 
+// Lexical + vector clauses, fused with RRF. Each setter replaces the
+// previous clause of its kind (`setLexicalPhrase`, `setWeightedSumFusion`, ...).
 const req = new SearchRequest({ limit: 10, offset: 0 });
-req.setQueryDsl("title:hello");
 req.setLexicalTerm(new TermQuery("body", "programming"));
-req.setLexicalPhrase(new PhraseQuery("title", ["machine", "learning"]));
 req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, ...]));
-req.setVectorTextQuery(new VectorTextQuery("embedding", "query text"));
 req.setFilterTerm(new TermQuery("category", "tech"));
 req.setRrfFusion(new RRF(60.0));
-req.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
-
 const results = await index.searchWithRequest(req);
+
+// A DSL can be combined with a vector query, and both are searched.
+// A DSL with a `setLexicalX` setter throws: write the lexical clauses in the DSL.
+const req2 = new SearchRequest({ queryDsl: "title:hello", limit: 10 });
+req2.setVectorTextQuery(new VectorTextQuery("embedding", "query text"));
+const results2 = await index.searchWithRequest(req2);
 ```
 
 ### Late-Interaction Rescore

@@ -500,7 +500,7 @@ new \Laurus\SearchRequest(
 
 | パラメータ | 説明 |
 | :--- | :--- |
-| `$query` | DSL 文字列または単一クエリオブジェクト。`$lexicalQuery` / `$vectorQuery` と排他的。 |
+| `$query` | DSL 文字列または単一クエリオブジェクト。DSL 文字列は `$vectorQuery` と組み合わせられます。両方で検索し、`$vectorQuery` は DSL のベクトル部分に加わります（融合は `$fusion`、デフォルトは `RRF(k: 60)`）。それ以外で `$lexicalQuery` / `$vectorQuery` と組み合わせると `\ValueError` になります（Issue #1372）。Lexical の句は DSL に書くか、クエリオブジェクトを `$lexicalQuery` / `$vectorQuery` として渡してください。 |
 | `$lexicalQuery` | 明示的なハイブリッド検索の Lexical コンポーネント。 |
 | `$vectorQuery` | 明示的なハイブリッド検索の Vector コンポーネント。 |
 | `$filterQuery` | スコアリング後に適用する Lexical フィルター。 |

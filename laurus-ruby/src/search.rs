@@ -394,7 +394,10 @@ impl RbSearchRequest {
     /// # Arguments
     ///
     /// * `args` - Keyword arguments:
-    ///   - `query:` - DSL string or query object (mutually exclusive with lexical/vector_query).
+    ///   - `query:` - DSL string or query object. A DSL string may be combined
+    ///     with `vector_query:`, which is added to the DSL's vector part; any
+    ///     other combination with `lexical_query:` / `vector_query:` raises
+    ///     `ArgumentError` when the request is built (Issue #1372).
     ///   - `lexical_query:` - Lexical query for hybrid search.
     ///   - `vector_query:` - Vector query for hybrid search.
     ///   - `filter_query:` - Post-scoring filter query.
@@ -545,6 +548,39 @@ impl RbSearchRequest {
         }
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(rescore.clone());
+        }
+
+        // `query` with `lexical_query` / `vector_query` (Issue #1372). A DSL
+        // string is searched together with `vector_query` (the engine adds
+        // the vectors to the DSL's vector part). Any other combination would
+        // drop `query`, so it is rejected.
+        if let Some(q) = &self.query
+            && (self.lexical_query.is_some() || self.vector_query.is_some())
+        {
+            let (kind, slot) = match (q, &self.lexical_query, &self.vector_query) {
+                (QueryRepr::Dsl(dsl), None, Some(vq)) => {
+                    builder = builder.query_dsl(dsl.clone()).vector_query(vq.clone());
+                    return Ok(builder.build());
+                }
+                (QueryRepr::Dsl(_), _, _) => {
+                    let ruby = Ruby::get().expect("called from Ruby thread");
+                    return Err(Error::new(
+                        ruby.exception_arg_error(),
+                        "a DSL `query` cannot be combined with `lexical_query`; write the \
+                         lexical clauses in the DSL, or pass `lexical_query` without `query`",
+                    ));
+                }
+                (QueryRepr::Lexical(_), _, _) => ("lexical", "lexical_query"),
+                (QueryRepr::Vector(_), _, _) => ("vector", "vector_query"),
+            };
+            let ruby = Ruby::get().expect("called from Ruby thread");
+            return Err(Error::new(
+                ruby.exception_arg_error(),
+                format!(
+                    "a {kind} query object in `query` cannot be combined with \
+                     `lexical_query` or `vector_query`; pass it as `{slot}` instead"
+                ),
+            ));
         }
 
         // Explicit hybrid: lexical_query + vector_query both set

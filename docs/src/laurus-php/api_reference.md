@@ -504,7 +504,7 @@ new \Laurus\SearchRequest(
 
 | Parameter | Description |
 | :--- | :--- |
-| `$query` | A DSL string or single query object. Mutually exclusive with `$lexicalQuery` / `$vectorQuery`. |
+| `$query` | A DSL string or single query object. A DSL string can be combined with `$vectorQuery`: both are searched, and `$vectorQuery` is added to the DSL's vector part (fused by `$fusion`, `RRF(k: 60)` by default). Any other combination with `$lexicalQuery` / `$vectorQuery` throws `\ValueError` (Issue #1372): write the lexical clauses in the DSL, or pass a query object as `$lexicalQuery` / `$vectorQuery` instead. |
 | `$lexicalQuery` | Lexical component for explicit hybrid search. |
 | `$vectorQuery` | Vector component for explicit hybrid search. |
 | `$filterQuery` | Lexical filter applied after scoring. |
