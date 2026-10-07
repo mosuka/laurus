@@ -11,11 +11,11 @@ use crate::vector::index::segment::manager::SegmentFileLayout;
 
 pub mod merge_engine;
 
-/// On-disk file-suffix layout for IVF segments: a primary `.ivf` file, no
-/// sidecars (IVF has no rerank sidecar), staged through a `.ivf.tmp` temp
-/// file.
+/// On-disk file-suffix layout for IVF segments: a primary `.ivf` file plus
+/// its `.ivf.f32` rerank sidecar (Issue #932), staged through a `.ivf.tmp`
+/// temp file.
 pub const LAYOUT: SegmentFileLayout = SegmentFileLayout {
     primary: ".ivf",
-    sidecars: &[],
+    sidecars: &[".ivf.f32"],
     tmp: ".ivf.tmp",
 };

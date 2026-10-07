@@ -312,9 +312,8 @@ pub struct FlatIndexConfig {
     /// alongside the main int8 segment so the searcher can do a wide
     /// candidate fetch over int8 and rescore against the original
     /// full-precision vectors. `None` keeps Stage 1 behavior
-    /// (int8-only). Stage 2 sidecar is currently consumed only by
-    /// the HNSW searcher; Flat / IVF accept the field for schema
-    /// symmetry but do not yet emit or consume the sidecar.
+    /// (int8-only). Flat and IVF emit and consume the sidecar too
+    /// (Issue #932), with the same merge handling as HNSW (Issue #1348).
     #[serde(default)]
     pub rerank_storage: Option<RerankStorageKind>,
 
@@ -864,9 +863,9 @@ pub struct IvfIndexConfig {
 
     /// Optional Stage 2 rerank sidecar storage (Issue #481).
     ///
-    /// IVF accepts the field for schema symmetry with the HNSW
-    /// configuration but does not currently emit or consume the
-    /// sidecar — Stage 2 lands HNSW only. See [`HnswIndexConfig::rerank_storage`].
+    /// IVF emits and consumes the sidecar (`<path>.ivf.f32`) the same way
+    /// HNSW does (Issue #932), including through a merge (Issue #1348).
+    /// See [`HnswIndexConfig::rerank_storage`].
     #[serde(default)]
     pub rerank_storage: Option<RerankStorageKind>,
 

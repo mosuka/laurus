@@ -22,6 +22,11 @@
 //! already uses is sufficient to re-derive the adaptive K for the merged
 //! union's size — including the zero-vectors case (Issue #889 PR-6), which
 //! trains zero clusters instead of erroring.
+//!
+//! Like HNSW (Issue #795), a source segment's f32 rerank sidecar value is
+//! preferred over the iterator's int8-dequantized one when present, so a
+//! merge does not bake quantization error into the merged sidecar (Issue
+//! #1348).
 
 use std::sync::Arc;
 
@@ -105,6 +110,18 @@ impl MergeEngine {
                 self.index_config.distance_metric,
             )?;
 
+            // Issue #1348 (mirrors #795): prefer the source segment's
+            // original f32 rerank sidecar (lossless) over the
+            // int8-dequantized iterator value, so a merge does not bake
+            // one round of quantization error into the merged sidecar.
+            // The pool is already loaded by the reader; when absent (no
+            // sidecar configured, or a source predating this fix) we
+            // keep the int8-dequantized vector -- the best available
+            // source. The iterator's own doc-id re-sort (Issue #1152)
+            // does not matter here: the sidecar is addressed by
+            // `(doc_id, field)`, never by iterator position.
+            let rerank_pool = reader.rerank_storage().cloned();
+
             let mut iterator = reader.vector_iterator()?;
             while let Some((doc_id, field, vector)) = iterator.next()? {
                 if let Some(bitmap) = &self.deletion_bitmap
@@ -118,6 +135,13 @@ impl MergeEngine {
                     duplicates_removed += 1;
                     continue;
                 }
+                let vector = match rerank_pool
+                    .as_ref()
+                    .and_then(|pool| pool.get_f32_slice(doc_id, &field))
+                {
+                    Some(f32_vector) => Vector::new(f32_vector.to_vec()),
+                    None => vector,
+                };
                 all_vectors.push((doc_id, field, vector));
             }
         }
