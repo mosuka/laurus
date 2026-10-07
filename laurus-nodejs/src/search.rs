@@ -243,18 +243,19 @@ pub fn to_js_search_result(r: SearchResult) -> JsSearchResult {
 /// Full-featured search request for advanced control over query, fusion, and
 /// filtering.
 ///
+/// The constructor takes the primitive fields; query objects and fusion
+/// are attached with the per-type setters (see [`JsSearchRequestOptions`]).
+///
 /// ## Example — hybrid search with filter
 ///
 /// ```javascript
-/// const { SearchRequest, VectorTextQuery, TermQuery, RRF } = require("laurus-nodejs");
+/// import { SearchRequest, VectorTextQuery, TermQuery, RRF } from "laurus-nodejs";
 ///
-/// const request = new SearchRequest({
-///     vectorQuery: new VectorTextQuery("text_vec", "type system"),
-///     filterQuery: new TermQuery("category", "type-system"),
-///     fusion: new RRF(60.0),
-///     limit: 3,
-/// });
-/// const results = await index.search(request);
+/// const request = new SearchRequest({ queryDsl: "title:rust", limit: 3 });
+/// request.setVectorTextQuery(new VectorTextQuery("text_vec", "type system"));
+/// request.setFilterTerm(new TermQuery("category", "type-system"));
+/// request.setRrfFusion(new RRF(60.0));
+/// const results = await index.searchWithRequest(request);
 /// ```
 #[napi(js_name = "SearchRequest")]
 pub struct JsSearchRequest {
@@ -294,7 +295,8 @@ pub enum FusionChoice {
 /// napi options struct rejects every instance at runtime.
 #[napi(object)]
 pub struct JsSearchRequestOptions {
-    /// Optional query DSL string (e.g. `"title:hello"`).
+    /// Optional query DSL string (e.g. `"title:hello"`). See
+    /// [`JsSearchRequest::set_query_dsl`] for combining it with other queries.
     pub query_dsl: Option<String>,
     /// Maximum number of results (default 10).
     pub limit: Option<u32>,
@@ -352,6 +354,11 @@ impl JsSearchRequest {
     }
 
     /// Set a DSL string query.
+    ///
+    /// It may be combined with a vector query (`setVectorQuery` /
+    /// `setVectorTextQuery`), which is added to the DSL's vector part.
+    /// Combining it with a `setLexicalX` query makes `searchWithRequest`
+    /// throw (Issue #1372).
     #[napi]
     pub fn set_query_dsl(&mut self, dsl: String) {
         self.query_dsl = Some(dsl);
@@ -592,6 +599,27 @@ impl JsSearchRequest {
         }
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(js_rescore_options_to_core(rescore)?);
+        }
+
+        // DSL with a lexical / vector query (Issue #1372). A DSL is searched
+        // together with the vector query (the engine adds the vectors to the
+        // DSL's vector part). A lexical query would be dropped, so it is
+        // rejected.
+        if let Some(dsl) = &self.query_dsl {
+            if self.lexical_query.is_some() {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "a DSL query (`queryDsl`) cannot be combined with a `setLexicalX` query; \
+                     write the lexical clauses in the DSL, or use `setLexicalX` without \
+                     `queryDsl`",
+                ));
+            }
+            if let Some(vq) = &self.vector_query {
+                builder = builder
+                    .query_dsl(dsl.clone())
+                    .vector_query(vector_query_to_search_query(vq));
+                return Ok(builder.build());
+            }
         }
 
         // Explicit hybrid: lexical_query + vector_query both set

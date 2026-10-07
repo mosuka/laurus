@@ -894,6 +894,75 @@ class LaurusTest extends TestCase
         $this->assertSame(["doc1"], $this->idsOf($idx->search($req)));
     }
 
+    /**
+     * Issue #1372: a DSL `query` given with `vector_query` keeps the DSL.
+     */
+    public function testSearchRequestDslWithVectorQuery(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addHnswField("embedding", 4);
+        $idx = new Laurus\Index(null, $schema);
+        // Reachable only through the DSL: it has no vector.
+        $idx->putDocument("lexical", ["title" => "rust"]);
+        // Reachable only through the vector: its title does not match.
+        $idx->putDocument("vector", ["title" => "python", "embedding" => [0.1, 0.2, 0.3, 0.4]]);
+        $idx->commit();
+        $req = new Laurus\SearchRequest(
+            "title:rust", // query
+            null, // lexical_query
+            new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), // vector_query
+            null, // filter_query
+            null, // fusion
+            5, // limit
+        );
+        $this->assertSame(["lexical", "vector"], $this->idsOf($idx->search($req)));
+    }
+
+    /**
+     * Issue #1372: a `query` that cannot be combined is rejected, not dropped.
+     */
+    public function testSearchRequestRejectsQueryThatWouldBeDropped(): void
+    {
+        $idx = $this->createVectorIndex();
+        $lexical = new Laurus\TermQuery("title", "rust");
+        $vector = new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]);
+        // [query, lexical_query, vector_query, expected hint]
+        $cases = [
+            ["title:rust", $lexical, null, "DSL"],
+            ["title:rust", $lexical, $vector, "DSL"],
+            [$lexical, null, $vector, "as `lexical_query`"],
+            [$lexical, $lexical, null, "as `lexical_query`"],
+            [$vector, $lexical, null, "as `vector_query`"],
+            [$vector, null, $vector, "as `vector_query`"],
+        ];
+        foreach ($cases as $i => [$query, $lexicalQuery, $vectorQuery, $hint]) {
+            try {
+                $idx->search(new Laurus\SearchRequest($query, $lexicalQuery, $vectorQuery, null, null));
+                $this->fail("case {$i}: expected ValueError");
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString($hint, $e->getMessage(), "case {$i}");
+            }
+        }
+    }
+
+    /**
+     * Issue #1372: an empty DSL is rejected with vectors as it is alone.
+     */
+    public function testSearchRequestRejectsEmptyDslWithVectorQuery(): void
+    {
+        $idx = $this->createVectorIndex();
+        $req = new Laurus\SearchRequest(
+            "", // query
+            null, // lexical_query
+            new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), // vector_query
+            null, // filter_query
+            null, // fusion
+        );
+        $this->expectException(\ValueError::class);
+        $idx->search($req);
+    }
+
     // ── Fusion algorithms ───────────────────────────────────────────────
 
     public function testRRFRepr(): void

@@ -586,7 +586,7 @@ per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` 
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `setQueryDsl(dsl: string)` | DSL 文字列クエリを設定。 |
+| `setQueryDsl(dsl: string)` | DSL 文字列クエリを設定（`queryDsl` オプションと同じ）。ベクトルのセッターと組み合わせられます。両方で検索し、ベクトルクエリは DSL のベクトル部分に加わります（融合はフュージョンのセッター、デフォルトは `RRF(60)`）。`setLexicalX` のセッターと組み合わせると `searchWithRequest` が例外を投げます（Issue #1372）。Lexical の句は DSL に書くか、DSL を使わずに `setLexicalX` を使ってください。 |
 | `setRrfFusion(rrf: RRF)` | RRF フュージョンを使用。 |
 | `setWeightedSumFusion(ws: WeightedSum)` | 加重和フュージョンを使用。 |
 

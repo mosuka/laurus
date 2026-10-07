@@ -250,6 +250,55 @@ class TestIndex < Minitest::Test
     assert results.length >= 1
   end
 
+  # Issue #1372: a DSL `query` given with `vector_query` keeps the DSL.
+  def test_search_request_dsl_with_vector_query
+    schema = Laurus::Schema.new
+    schema.add_text_field("title")
+    schema.add_hnsw_field("embedding", 4)
+    idx = Laurus::Index.new(schema: schema)
+    # Reachable only through the DSL: it has no vector.
+    idx.put_document("lexical", { "title" => "rust" })
+    # Reachable only through the vector: its title does not match.
+    idx.put_document("vector", { "title" => "python", "embedding" => [0.1, 0.2, 0.3, 0.4] })
+    idx.commit
+    req = Laurus::SearchRequest.new(
+      query: "title:rust",
+      vector_query: Laurus::VectorQuery.new("embedding", [0.1, 0.2, 0.3, 0.4]),
+      limit: 5
+    )
+    assert_equal %w[lexical vector], idx.search(req).map(&:id).sort
+  end
+
+  # Issue #1372: a `query` that cannot be combined is rejected, not dropped.
+  def test_search_request_rejects_query_that_would_be_dropped
+    idx = create_vector_index
+    lexical = Laurus::TermQuery.new("title", "rust")
+    vector = Laurus::VectorQuery.new("embedding", [0.1, 0.2, 0.3, 0.4])
+    [
+      [{ query: "title:rust", lexical_query: lexical }, "DSL"],
+      [{ query: "title:rust", lexical_query: lexical, vector_query: vector }, "DSL"],
+      [{ query: lexical, vector_query: vector }, "as `lexical_query`"],
+      [{ query: lexical, lexical_query: lexical }, "as `lexical_query`"],
+      [{ query: vector, lexical_query: lexical }, "as `vector_query`"],
+      [{ query: vector, vector_query: vector }, "as `vector_query`"]
+    ].each do |kwargs, hint|
+      err = assert_raises(ArgumentError, kwargs.keys.inspect) do
+        idx.search(Laurus::SearchRequest.new(**kwargs))
+      end
+      assert_includes err.message, hint
+    end
+  end
+
+  # Issue #1372: an empty DSL is rejected with vectors as it is alone.
+  def test_search_request_rejects_empty_dsl_with_vector_query
+    idx = create_vector_index
+    req = Laurus::SearchRequest.new(
+      query: "",
+      vector_query: Laurus::VectorQuery.new("embedding", [0.1, 0.2, 0.3, 0.4])
+    )
+    assert_raises(ArgumentError) { idx.search(req) }
+  end
+
   def test_search_request_applies_filter_query
     idx = create_index
     query = "body:programming OR body:python"

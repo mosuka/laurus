@@ -287,7 +287,9 @@ pub fn to_py_search_result(py: Python, r: SearchResult) -> PyResult<PySearchResu
 #[pyclass(name = "SearchRequest")]
 pub struct PySearchRequest {
     /// A DSL string, or any single lexical/vector query object.
-    /// Mutually exclusive with `lexical_query` + `vector_query`.
+    /// A DSL string may be combined with `vector_query`, which is added to
+    /// the DSL's vector part; any other combination with `lexical_query` /
+    /// `vector_query` raises `ValueError` (Issue #1372).
     pub query: Option<Py<PyAny>>,
     /// Lexical component for explicit hybrid search.
     pub lexical_query: Option<Py<PyAny>>,
@@ -397,6 +399,41 @@ impl PySearchRequest {
         // Also before the branches below, for the same reason.
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(rescore.options.clone());
+        }
+
+        // ── `query` with `lexical_query` / `vector_query` (Issue #1372) ───
+        // A DSL string is searched together with `vector_query` (the
+        // engine adds the vectors to the DSL's vector part). Any other
+        // combination would drop `query`, so it is rejected.
+        if let Some(q) = &self.query
+            && (self.lexical_query.is_some() || self.vector_query.is_some())
+        {
+            let qobj: &Bound<'_, PyAny> = q.bind(py);
+            let (kind, slot) = match (
+                qobj.extract::<String>(),
+                &self.lexical_query,
+                &self.vector_query,
+            ) {
+                (Ok(dsl), None, Some(vq)) => {
+                    let vq_obj: &Bound<'_, PyAny> = vq.bind(py);
+                    builder = builder
+                        .query_dsl(dsl)
+                        .vector_query(py_to_vector_search_query(vq_obj)?);
+                    return Ok(builder.build());
+                }
+                (Ok(_), _, _) => {
+                    return Err(PyValueError::new_err(
+                        "a DSL `query` cannot be combined with `lexical_query`; write the \
+                         lexical clauses in the DSL, or pass `lexical_query` without `query`",
+                    ));
+                }
+                (Err(_), _, _) if is_vector_query(qobj) => ("vector", "vector_query"),
+                (Err(_), _, _) => ("lexical", "lexical_query"),
+            };
+            return Err(PyValueError::new_err(format!(
+                "a {kind} query object in `query` cannot be combined with \
+                 `lexical_query` or `vector_query`; pass it as `{slot}` instead"
+            )));
         }
 
         // ── Explicit hybrid: lexical_query + vector_query both set ────────

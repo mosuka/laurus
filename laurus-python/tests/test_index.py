@@ -272,6 +272,52 @@ def test_search_request_hybrid(vector_index):
     assert len(results) >= 1
 
 
+def test_search_request_dsl_with_vector_query():
+    """Issue #1372: a DSL `query` given with `vector_query` keeps the DSL."""
+    schema = laurus.Schema()
+    schema.add_text_field("title")
+    schema.add_hnsw_field("embedding", dimension=4)
+    idx = laurus.Index(schema=schema)
+    # Reachable only through the DSL: it has no vector.
+    idx.put_document("lexical", {"title": "rust"})
+    # Reachable only through the vector: its title does not match.
+    idx.put_document("vector", {"title": "python", "embedding": [0.1, 0.2, 0.3, 0.4]})
+    idx.commit()
+    req = laurus.SearchRequest(
+        query="title:rust",
+        vector_query=laurus.VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]),
+        limit=5,
+    )
+    assert sorted(r.id for r in idx.search(req)) == ["lexical", "vector"]
+
+
+def test_search_request_rejects_query_that_would_be_dropped(vector_index):
+    """Issue #1372: a `query` that cannot be combined is rejected, not dropped."""
+    lexical = laurus.TermQuery("title", "rust")
+    vector = laurus.VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4])
+    cases = [
+        (dict(query="title:rust", lexical_query=lexical), "DSL"),
+        (dict(query="title:rust", lexical_query=lexical, vector_query=vector), "DSL"),
+        (dict(query=lexical, vector_query=vector), "as `lexical_query`"),
+        (dict(query=lexical, lexical_query=lexical), "as `lexical_query`"),
+        (dict(query=vector, lexical_query=lexical), "as `vector_query`"),
+        (dict(query=vector, vector_query=vector), "as `vector_query`"),
+    ]
+    for kwargs, hint in cases:
+        with pytest.raises(ValueError, match=hint):
+            vector_index.search(laurus.SearchRequest(**kwargs))
+
+
+def test_search_request_rejects_empty_dsl_with_vector_query(vector_index):
+    """Issue #1372: an empty DSL is rejected with vectors as it is alone."""
+    req = laurus.SearchRequest(
+        query="",
+        vector_query=laurus.VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]),
+    )
+    with pytest.raises(ValueError):
+        vector_index.search(req)
+
+
 # ---------------------------------------------------------------------------
 # Query types
 # ---------------------------------------------------------------------------
