@@ -132,3 +132,23 @@ async fn test_unknown_field_is_rejected_with_lexical_overrides() {
         .expect_err("an unknown field must be rejected");
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
 }
+
+/// Issue #1374: a `field_boosts` key that names no lexical field (a typo, or
+/// the vector field) is rejected instead of being silently ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_field_boost_on_a_non_lexical_field_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let service = search_service(&dir).await;
+
+    for key in ["titel", "vec"] {
+        let request = v1::SearchRequest {
+            query: "title:rust".to_string(),
+            field_boosts: [(key.to_string(), 2.0)].into_iter().collect(),
+            limit: 10,
+            ..Default::default()
+        };
+        let status = service.search(Request::new(request)).await.expect_err(key);
+        assert_eq!(status.code(), Code::InvalidArgument, "{key}: {status:?}");
+        assert!(status.message().contains(key), "{key}: {status:?}");
+    }
+}

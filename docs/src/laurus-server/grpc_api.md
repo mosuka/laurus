@@ -425,7 +425,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search |
 | `lexical_params` | `LexicalParams` | No | Lexical search parameters |
 | `vector_params` | `VectorParams` | No | Vector search parameters |
-| `field_boosts` | `map<string, float>` | No | Per-field score boosting |
+| `field_boosts` | `map<string, float>` | No | Per-field score boosting for the lexical part. A key must name a lexical field of the schema (or `_id`); an unknown or vector field is rejected with `INVALID_ARGUMENT` (Issue #1374). A lexical field the query does not use is accepted and has no effect |
 | `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
 | `rescore` | `RescoreParams` | No | Rescore the top first-stage results with late interaction (Issue #1351) |
 

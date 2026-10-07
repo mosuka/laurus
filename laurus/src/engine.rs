@@ -2294,6 +2294,54 @@ impl Engine {
         }
     }
 
+    /// Reject `field_boosts` keys that name no lexical field (Issue #1374).
+    ///
+    /// A boost on an unknown field (e.g. a typo) or on a vector field can
+    /// never match a lexical clause, so it used to be silently ignored. This
+    /// uses the same field set as the DSL's unknown-field check (#1253): the
+    /// schema's fields plus `_id`. A lexical field the query does not
+    /// reference is accepted; its boost is simply unused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// naming the unknown fields, or else the non-lexical ones, in sorted
+    /// order.
+    fn validate_field_boosts(&self, boosts: &std::collections::HashMap<String, f32>) -> Result<()> {
+        if boosts.is_empty() {
+            return Ok(());
+        }
+        let schema = self.schema.read();
+        let mut unknown = Vec::new();
+        let mut not_lexical = Vec::new();
+        for field in boosts.keys() {
+            if field == schema::RESERVED_ID_FIELD {
+                continue;
+            }
+            match schema.fields.get(field) {
+                None => unknown.push(field.as_str()),
+                Some(option) if !option.is_lexical() => not_lexical.push(field.as_str()),
+                Some(_) => {}
+            }
+        }
+        unknown.sort_unstable();
+        not_lexical.sort_unstable();
+        if !unknown.is_empty() {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "field_boosts names unknown field(s): {}",
+                unknown.join(", ")
+            )));
+        }
+        if !not_lexical.is_empty() {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "field_boosts names field(s) that are not a lexical field: {}; boosts apply \
+                 to lexical clauses only",
+                not_lexical.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Reject phrase and span queries on fields that store no positions.
     ///
     /// A `Text` field indexed with `term_vectors: false` has no positions,
@@ -3199,6 +3247,8 @@ impl Engine {
             vector_options,
             rescore: request_rescore,
         } = request;
+
+        self.validate_field_boosts(&lexical_options.field_boosts)?;
 
         // Validate the rescore options, and embed a text query, before any
         // search runs. Two statements on purpose: the `parking_lot` schema

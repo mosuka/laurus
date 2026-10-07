@@ -227,6 +227,10 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
+Each key must name a lexical field of the schema (or `_id`). An unknown
+field, such as a typo, or a vector field is rejected with `400 Bad Request`
+instead of being silently ignored (Issue #1374).
+
 #### Hybrid Search
 
 ```bash
