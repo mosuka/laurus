@@ -209,6 +209,13 @@ uniform per-field scalar. What both weighting mechanisms DO affect is the
 relative priority *among* vector fields when a query targets two or more
 at once.
 
+This per-field summing only happens when the query names its target
+fields. A field-less query cannot apply `base_weight` (it has no single
+field to look it up against — Issue #1084), so when it reaches a document
+through more than one same-dimension field it takes that document's
+best-scoring field instead of summing across them (Issue #1343; see [Field
+Routing](#field-routing) below).
+
 ### Field Routing
 
 In a multi-field schema, each vector field has its own HNSW graph. By
@@ -227,6 +234,13 @@ Two routing inputs are honored, in priority order:
 
 When neither is set, all fields are searched (the default). A query routed
 to a field never returns documents that lack a vector in that field.
+
+A document that holds vectors in two or more of the searched fields still
+comes back only once: the field-less fanout collapses to that document's
+best-scoring field (Issue #1343), so `limit`/`top_k` counts documents, not
+`(document, field)` pairs. This is unlike an explicit multi-field query
+(`fields: [Exact("a"), Exact("b")]`), which sums the fields' scores — see
+[Weights](#weights) above.
 
 You can apply lexical filters to narrow the vector search results:
 

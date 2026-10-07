@@ -964,6 +964,7 @@ impl VectorStore {
         if index_queries.len() == 1 {
             let weight = query_weights[0];
             let results = searcher.search(&index_queries[0])?;
+            let field_less = index_queries[0].field_name.is_none();
 
             let mut hits: Vec<VectorHit> = results
                 .results
@@ -982,6 +983,32 @@ impl VectorStore {
                     field_hits: vec![],
                 })
                 .collect();
+
+            // Issue #1343: a field-less query run on a single-index store
+            // (`with_index_type_config`) is not routed through
+            // `MultiFieldFanoutSearcher` (which already de-duplicates), so
+            // the underlying searcher's unfiltered `field_name: None` scan
+            // can still emit one hit per `(doc_id, field)` pair. Collapse to
+            // one hit per document (best score wins) before ranking, so
+            // `limit` counts documents.
+            if field_less {
+                use std::collections::hash_map::Entry;
+                let mut best: std::collections::HashMap<u64, VectorHit> =
+                    std::collections::HashMap::with_capacity(hits.len());
+                for hit in hits {
+                    match best.entry(hit.doc_id) {
+                        Entry::Occupied(mut e) => {
+                            if hit.score > e.get().score {
+                                e.insert(hit);
+                            }
+                        }
+                        Entry::Vacant(e) => {
+                            e.insert(hit);
+                        }
+                    }
+                }
+                hits = best.into_values().collect();
+            }
 
             // Use partial sort for top-K selection when the result set is larger
             // than the requested limit.
@@ -1010,7 +1037,18 @@ impl VectorStore {
         // not know about). `query_weights[i]` is the weight for the query that
         // produced `per_query_results[i]`.
         let mut all_hits: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
+        // Issue #1343: a single query vector must contribute at most one
+        // term per document (that is what `score_mode`'s doc comment on
+        // `VectorScoreMode` promises), but a field-less query — or one
+        // routed to a single-index store — can still return the same
+        // document through more than one field. Collapse each query's own
+        // results to its best-similarity hit per document first, then fold
+        // across queries by `score_mode`. Reused per query to avoid an
+        // allocation per iteration.
+        let mut per_query_best: std::collections::HashMap<u64, f32> =
+            std::collections::HashMap::new();
         for (weight, results) in query_weights.iter().zip(per_query_results) {
+            per_query_best.clear();
             for result in results.results {
                 if let Some(ref allowed) = filter_set
                     && !allowed.contains(result.doc_id)
@@ -1020,15 +1058,25 @@ impl VectorStore {
                 if result.similarity < request.params.min_score {
                     continue;
                 }
-                let weighted_score = result.similarity * weight;
-                let entry = all_hits.entry(result.doc_id).or_insert(0.0);
+                per_query_best
+                    .entry(result.doc_id)
+                    .and_modify(|best| {
+                        if result.similarity > *best {
+                            *best = result.similarity;
+                        }
+                    })
+                    .or_insert(result.similarity);
+            }
+            for (&doc_id, &similarity) in per_query_best.iter() {
+                let weighted_score = similarity * weight;
+                let entry = all_hits.entry(doc_id).or_insert(0.0);
                 match request.params.score_mode {
                     VectorScoreMode::WeightedSum | VectorScoreMode::LateInteraction => {
                         // WeightedSum: sum of similarity * weight across all query vectors.
                         // LateInteraction: for each query vector, find the max similarity
-                        // across document vectors, then sum. In the current single-vector-
-                        // per-field architecture, this is equivalent to WeightedSum since
-                        // each query vector already gets a single best match per document.
+                        // across document vectors, then sum. Each query vector contributes
+                        // a single best match per document (collapsed above), so this is
+                        // equivalent to WeightedSum.
                         *entry += weighted_score;
                     }
                     VectorScoreMode::MaxSim => {

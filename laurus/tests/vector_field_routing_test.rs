@@ -238,3 +238,75 @@ async fn test_per_query_overrides_params() {
         "per-query img_vec wins, only docs (1, 2) may be returned: {ids:?}"
     );
 }
+
+/// [`setup_store`] plus doc 5, which holds a vector in BOTH fields:
+/// `img_vec` matches the query exactly, `txt_vec` is orthogonal to it.
+async fn setup_store_with_multi_field_doc(dimension: usize) -> laurus::vector::VectorStore {
+    let store = setup_store(dimension).await;
+    let doc = Document::builder()
+        .add_field("img_vec", DataValue::Vector(vec![1.0, 0.0, 0.0]))
+        .add_field("txt_vec", DataValue::Vector(vec![0.0, 1.0, 0.0]))
+        .build();
+    store.upsert_document_by_internal_id(5, doc).await.unwrap();
+    store.commit().await.unwrap();
+    store
+}
+
+fn hit_scores(results: &laurus::vector::VectorSearchResults, doc_id: u64) -> Vec<f32> {
+    results
+        .hits
+        .iter()
+        .filter(|h| h.doc_id == doc_id)
+        .map(|h| h.score)
+        .collect()
+}
+
+/// Issue #1343: a field-less query must not return a multi-field document
+/// twice, and its score must be the best of the per-field scores (not their
+/// sum).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_no_fields_dedupes_multi_field_document() {
+    let store = setup_store_with_multi_field_doc(3).await;
+
+    let img_only = store
+        .search(request(
+            None,
+            Some(vec![FieldSelector::Exact("img_vec".into())]),
+        ))
+        .unwrap();
+    let img_scores = hit_scores(&img_only, 5);
+    assert_eq!(
+        img_scores.len(),
+        1,
+        "doc 5 must have exactly one img_vec hit: {img_scores:?}"
+    );
+
+    let txt_only = store
+        .search(request(
+            None,
+            Some(vec![FieldSelector::Exact("txt_vec".into())]),
+        ))
+        .unwrap();
+    let txt_scores = hit_scores(&txt_only, 5);
+    assert_eq!(
+        txt_scores.len(),
+        1,
+        "doc 5 must have exactly one txt_vec hit: {txt_scores:?}"
+    );
+
+    let fieldless = store.search(request(None, None)).unwrap();
+    let fieldless_scores = hit_scores(&fieldless, 5);
+    assert_eq!(
+        fieldless_scores.len(),
+        1,
+        "a field-less query must return doc 5 exactly once, not once per \
+         matching field: {fieldless_scores:?}"
+    );
+    let best = img_scores[0].max(txt_scores[0]);
+    assert!(
+        (fieldless_scores[0] - best).abs() < 1e-5,
+        "the field-less score ({}) must equal the best per-field score \
+         ({best}), not their sum",
+        fieldless_scores[0]
+    );
+}
