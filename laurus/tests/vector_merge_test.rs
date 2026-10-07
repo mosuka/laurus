@@ -5,9 +5,15 @@ use laurus::vector::StoredVector;
 use laurus::vector::Vector;
 use laurus::vector::VectorFieldConfig;
 use laurus::vector::core::rerank::RerankStorageKind;
+use laurus::vector::index::VectorIndex;
+use laurus::vector::index::config::{FlatIndexConfig, IvfIndexConfig};
 use laurus::vector::index::field::{FieldSearchInput, VectorFieldReader, VectorFieldWriter};
+use laurus::vector::index::flat::reader::FlatVectorIndexReader;
+use laurus::vector::index::flat::segmented::SegmentedFlatIndex;
 use laurus::vector::index::hnsw;
 use laurus::vector::index::hnsw::reader::HnswIndexReader;
+use laurus::vector::index::ivf::reader::IvfIndexReader;
+use laurus::vector::index::ivf::segmented::SegmentedIvfIndex;
 use laurus::vector::index::segment::manager::{SegmentManager, SegmentManagerConfig};
 use laurus::vector::index::segmented_field::SegmentedVectorField;
 use laurus::vector::store::request::QueryVector;
@@ -584,6 +590,388 @@ async fn segmented_merge_preserves_rerank_sidecar_f32_losslessly()
     );
 
     Ok(())
+}
+
+/// Issue #1348: `flat::segment::LAYOUT` previously declared no sidecar
+/// suffix, so `SegmentManager::delete_segment_files` and the orphan sweep
+/// never recognized a merged-away source segment's `.flat.f32` rerank
+/// sidecar — it leaked on every merge. `SegmentedVectorField` is HNSW-only,
+/// so this drives `SegmentedFlatIndex` directly through `VectorIndex`,
+/// mirroring `vector_segmented_flat_test.rs`'s style.
+#[test]
+fn flat_merge_deletes_source_rerank_sidecars() {
+    let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = FlatIndexConfig {
+        dimension: 4,
+        distance_metric: DistanceMetric::Cosine,
+        normalize_vectors: false,
+        rerank_storage: Some(RerankStorageKind::F32),
+        ..Default::default()
+    };
+    let index = SegmentedFlatIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        config,
+    )
+    .unwrap();
+
+    for (doc_id, vec) in [
+        (1u64, vec![1.0, 0.0, 0.0, 0.0]),
+        (2, vec![0.0, 1.0, 0.0, 0.0]),
+        (3, vec![0.0, 0.0, 1.0, 0.0]),
+    ] {
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_vectors(vec![(doc_id, "embedding".to_string(), Vector::new(vec))])
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
+    let before_sidecars: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".flat.f32"))
+        .collect();
+    assert_eq!(
+        before_sidecars.len(),
+        3,
+        "each committed segment must emit its own sidecar"
+    );
+
+    index.optimize().unwrap();
+
+    let after_main: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".flat"))
+        .collect();
+    let after_sidecars: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".flat.f32"))
+        .collect();
+    assert_eq!(
+        after_main.len(),
+        1,
+        "optimize must force-merge to one segment"
+    );
+    assert_eq!(
+        after_sidecars.len(),
+        1,
+        "the 3 source sidecars must not survive the merge, only the \
+         merged segment's own"
+    );
+    for sidecar in &before_sidecars {
+        assert!(
+            !storage.file_exists(sidecar),
+            "merge must delete the source segment's rerank sidecar \
+             ({sidecar}), not leak it forever"
+        );
+    }
+
+    // Acceptance criterion: no `.f32` files remain after merge + reopen --
+    // re-open to also exercise the orphan sweep (`SegmentManager::new` runs
+    // it unconditionally) on the manifest the merge just published.
+    drop(index);
+    let reopened = SegmentedFlatIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        FlatIndexConfig {
+            dimension: 4,
+            distance_metric: DistanceMetric::Cosine,
+            normalize_vectors: false,
+            rerank_storage: Some(RerankStorageKind::F32),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(reopened);
+    let sidecars_after_reopen: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".flat.f32"))
+        .collect();
+    assert_eq!(
+        sidecars_after_reopen.len(),
+        1,
+        "reopening must not resurrect or leave behind any source sidecar"
+    );
+    for sidecar in &before_sidecars {
+        assert!(!storage.file_exists(sidecar));
+    }
+}
+
+/// Issue #1348: `flat::segment::merge_engine::MergeEngine` read every
+/// source vector through `vector_iterator()` (int8-dequantized) and never
+/// consulted `rerank_storage()`, so a merge rebuilt the sidecar from
+/// already-quantized values. Mirrors HNSW's
+/// `segmented_merge_preserves_rerank_sidecar_f32_losslessly` above, driven
+/// through `SegmentedFlatIndex` (`SegmentedVectorField` is HNSW-only).
+#[test]
+fn flat_merge_preserves_rerank_sidecar_f32_losslessly() {
+    let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = FlatIndexConfig {
+        dimension: 4,
+        distance_metric: DistanceMetric::Euclidean,
+        normalize_vectors: false,
+        rerank_storage: Some(RerankStorageKind::F32),
+        ..Default::default()
+    };
+    let index = SegmentedFlatIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        config,
+    )
+    .unwrap();
+
+    // Same anchor trick as the HNSW test: pairing each probe with a
+    // large-magnitude vector widens the int8 range so the probe's
+    // fractional components land well off the quantization grid
+    // (dequant error ~0.05, far above f32::EPSILON).
+    let probes: [(u64, [f32; 4]); 3] = [
+        (1, [0.137, 0.642, 0.319, 0.808]),
+        (2, [0.251, 0.563, 0.174, 0.926]),
+        (3, [0.488, 0.071, 0.655, 0.302]),
+    ];
+    let anchor = [40.0_f32, 40.0, 40.0, 40.0];
+    for (i, (doc_id, vec)) in probes.iter().enumerate() {
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_vectors(vec![
+                (*doc_id, "embedding".to_string(), Vector::new(vec.to_vec())),
+                (
+                    100 + i as u64,
+                    "embedding".to_string(),
+                    Vector::new(anchor.to_vec()),
+                ),
+            ])
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
+    index.optimize().unwrap();
+
+    let merged_file = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.ends_with(".flat"))
+        .expect("optimize must leave exactly one merged segment");
+    let merged_id = merged_file.strip_suffix(".flat").unwrap().to_string();
+
+    let reader = FlatVectorIndexReader::load(
+        storage.clone() as Arc<dyn Storage>,
+        &merged_id,
+        DistanceMetric::Euclidean,
+    )
+    .unwrap();
+    let pool = reader
+        .rerank_storage()
+        .expect("merged sidecar must load into the rerank pool");
+
+    for (doc_id, original) in &probes {
+        let slice = pool
+            .get_f32_slice(*doc_id, "embedding")
+            .unwrap_or_else(|| panic!("doc {doc_id} must be in the merged sidecar"));
+        for (i, (got, want)) in slice.iter().zip(original.iter()).enumerate() {
+            assert!(
+                (got - want).abs() <= f32::EPSILON,
+                "probe doc {doc_id} component {i}: merged f32 {got} != original {want} \
+                 (diff {:.2e}); a coarse difference means the merge rebuilt the \
+                 sidecar from int8-dequantized values (Issue #1348)",
+                (got - want).abs()
+            );
+        }
+    }
+}
+
+/// Issue #1348: `ivf::segment::LAYOUT` equivalent of
+/// `flat_merge_deletes_source_rerank_sidecars` above.
+#[test]
+fn ivf_merge_deletes_source_rerank_sidecars() {
+    let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = IvfIndexConfig {
+        dimension: 4,
+        distance_metric: DistanceMetric::Cosine,
+        normalize_vectors: false,
+        rerank_storage: Some(RerankStorageKind::F32),
+        ..Default::default()
+    };
+    let index = SegmentedIvfIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        config,
+    )
+    .unwrap();
+
+    for (doc_id, vec) in [
+        (1u64, vec![1.0, 0.0, 0.0, 0.0]),
+        (2, vec![0.0, 1.0, 0.0, 0.0]),
+        (3, vec![0.0, 0.0, 1.0, 0.0]),
+    ] {
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_vectors(vec![(doc_id, "embedding".to_string(), Vector::new(vec))])
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
+    let before_sidecars: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".ivf.f32"))
+        .collect();
+    assert_eq!(
+        before_sidecars.len(),
+        3,
+        "each committed segment must emit its own sidecar"
+    );
+
+    index.optimize().unwrap();
+
+    let after_main: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".ivf"))
+        .collect();
+    let after_sidecars: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".ivf.f32"))
+        .collect();
+    assert_eq!(
+        after_main.len(),
+        1,
+        "optimize must force-merge to one segment"
+    );
+    assert_eq!(
+        after_sidecars.len(),
+        1,
+        "the 3 source sidecars must not survive the merge, only the \
+         merged segment's own"
+    );
+    for sidecar in &before_sidecars {
+        assert!(
+            !storage.file_exists(sidecar),
+            "merge must delete the source segment's rerank sidecar \
+             ({sidecar}), not leak it forever"
+        );
+    }
+
+    // Acceptance criterion: no `.f32` files remain after merge + reopen --
+    // re-open to also exercise the orphan sweep (`SegmentManager::new` runs
+    // it unconditionally) on the manifest the merge just published.
+    drop(index);
+    let reopened = SegmentedIvfIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        IvfIndexConfig {
+            dimension: 4,
+            distance_metric: DistanceMetric::Cosine,
+            normalize_vectors: false,
+            rerank_storage: Some(RerankStorageKind::F32),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(reopened);
+    let sidecars_after_reopen: Vec<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.ends_with(".ivf.f32"))
+        .collect();
+    assert_eq!(
+        sidecars_after_reopen.len(),
+        1,
+        "reopening must not resurrect or leave behind any source sidecar"
+    );
+    for sidecar in &before_sidecars {
+        assert!(!storage.file_exists(sidecar));
+    }
+}
+
+/// Issue #1348: `ivf::segment::merge_engine::MergeEngine` equivalent of
+/// `flat_merge_preserves_rerank_sidecar_f32_losslessly` above.
+#[test]
+fn ivf_merge_preserves_rerank_sidecar_f32_losslessly() {
+    let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = IvfIndexConfig {
+        dimension: 4,
+        distance_metric: DistanceMetric::Euclidean,
+        normalize_vectors: false,
+        rerank_storage: Some(RerankStorageKind::F32),
+        ..Default::default()
+    };
+    let index = SegmentedIvfIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        config,
+    )
+    .unwrap();
+
+    let probes: [(u64, [f32; 4]); 3] = [
+        (1, [0.137, 0.642, 0.319, 0.808]),
+        (2, [0.251, 0.563, 0.174, 0.926]),
+        (3, [0.488, 0.071, 0.655, 0.302]),
+    ];
+    let anchor = [40.0_f32, 40.0, 40.0, 40.0];
+    for (i, (doc_id, vec)) in probes.iter().enumerate() {
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_vectors(vec![
+                (*doc_id, "embedding".to_string(), Vector::new(vec.to_vec())),
+                (
+                    100 + i as u64,
+                    "embedding".to_string(),
+                    Vector::new(anchor.to_vec()),
+                ),
+            ])
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
+    index.optimize().unwrap();
+
+    let merged_file = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.ends_with(".ivf"))
+        .expect("optimize must leave exactly one merged segment");
+    let merged_id = merged_file.strip_suffix(".ivf").unwrap().to_string();
+
+    let reader = IvfIndexReader::load(
+        storage.clone() as Arc<dyn Storage>,
+        &merged_id,
+        DistanceMetric::Euclidean,
+    )
+    .unwrap();
+    let pool = reader
+        .rerank_storage()
+        .expect("merged sidecar must load into the rerank pool");
+
+    for (doc_id, original) in &probes {
+        let slice = pool
+            .get_f32_slice(*doc_id, "embedding")
+            .unwrap_or_else(|| panic!("doc {doc_id} must be in the merged sidecar"));
+        for (i, (got, want)) in slice.iter().zip(original.iter()).enumerate() {
+            assert!(
+                (got - want).abs() <= f32::EPSILON,
+                "probe doc {doc_id} component {i}: merged f32 {got} != original {want} \
+                 (diff {:.2e}); a coarse difference means the merge rebuilt the \
+                 sidecar from int8-dequantized values (Issue #1348)",
+                (got - want).abs()
+            );
+        }
+    }
 }
 
 /// Build a Cosine-metric `SegmentedVectorField` over in-memory storage

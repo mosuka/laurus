@@ -2,12 +2,14 @@
 //!
 //! This module handles the actual merging of segments. [`MergeStats`] and
 //! [`MergeResult`] are the shared, index-type-agnostic data shapes defined
-//! in [`crate::vector::index::segment::merge`]; this
-//! engine's own logic (below) is Flat-typed. Unlike HNSW, Flat has no f32
-//! rerank sidecar (Issue #795 does not apply) and no graph, so a merge is
-//! just: read every live vector from the source segments (newest
-//! generation first, deletion-filtered, deduplicated), then write the
-//! survivors into a new segment.
+//! in [`crate::vector::index::segment::merge`]; this engine's own logic
+//! (below) is Flat-typed. Flat has no graph, so a merge is: read every live
+//! vector from the source segments (newest generation first,
+//! deletion-filtered, deduplicated), then write the survivors into a new
+//! segment. Like HNSW (Issue #795), a source segment's f32 rerank sidecar
+//! value is preferred over the iterator's int8-dequantized one when present,
+//! so a merge does not bake quantization error into the merged sidecar
+//! (Issue #1348).
 
 use std::sync::Arc;
 
@@ -89,6 +91,16 @@ impl MergeEngine {
                 self.index_config.distance_metric,
             )?;
 
+            // Issue #1348 (mirrors #795): prefer the source segment's
+            // original f32 rerank sidecar (lossless) over the
+            // int8-dequantized iterator value, so a merge does not bake
+            // one round of quantization error into the merged sidecar.
+            // The pool is already loaded by the reader; when absent (no
+            // sidecar configured, or a source predating this fix) we
+            // keep the int8-dequantized vector -- the best available
+            // source.
+            let rerank_pool = reader.rerank_storage().cloned();
+
             let mut iterator = reader.vector_iterator()?;
             while let Some((doc_id, field, vector)) = iterator.next()? {
                 if let Some(bitmap) = &self.deletion_bitmap
@@ -102,6 +114,13 @@ impl MergeEngine {
                     duplicates_removed += 1;
                     continue;
                 }
+                let vector = match rerank_pool
+                    .as_ref()
+                    .and_then(|pool| pool.get_f32_slice(doc_id, &field))
+                {
+                    Some(f32_vector) => Vector::new(f32_vector.to_vec()),
+                    None => vector,
+                };
                 all_vectors.push((doc_id, field, vector));
             }
         }

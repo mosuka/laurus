@@ -988,10 +988,12 @@ mod tests {
         assert!(storage.file_exists("not_a_segment.hnsw"), "foreign spared");
     }
 
-    /// #889: a distinct layout (Flat-shaped: no sidecars, a different
-    /// primary/tmp suffix) sweeps its own orphans and spares foreign/HNSW
-    /// files — proving the layout parameterization, not just the HNSW
-    /// default, actually drives the sweep.
+    /// #889: a distinct layout (no sidecars, a different primary/tmp
+    /// suffix) sweeps its own orphans and spares foreign/HNSW files —
+    /// proving the layout parameterization, not just the HNSW default,
+    /// actually drives the sweep. This is a synthetic no-sidecar layout,
+    /// not `flat::segment::LAYOUT` itself: since Issue #1348, Flat's real
+    /// layout has a `.flat.f32` sidecar like HNSW's.
     #[test]
     fn test_cleanup_orphans_respects_a_different_layout() {
         const FLAT_LAYOUT: SegmentFileLayout = SegmentFileLayout {

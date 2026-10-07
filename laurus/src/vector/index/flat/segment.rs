@@ -10,11 +10,11 @@ use crate::vector::index::segment::manager::SegmentFileLayout;
 
 pub mod merge_engine;
 
-/// On-disk file-suffix layout for Flat segments: a primary `.flat` file, no
-/// sidecars (Flat has no rerank sidecar), staged through a `.flat.tmp` temp
-/// file.
+/// On-disk file-suffix layout for Flat segments: a primary `.flat` file plus
+/// its `.flat.f32` rerank sidecar (Issue #932), staged through a `.flat.tmp`
+/// temp file.
 pub const LAYOUT: SegmentFileLayout = SegmentFileLayout {
     primary: ".flat",
-    sidecars: &[],
+    sidecars: &[".flat.f32"],
     tmp: ".flat.tmp",
 };
