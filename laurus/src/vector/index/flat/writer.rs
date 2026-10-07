@@ -498,8 +498,11 @@ impl VectorIndexWriter for FlatIndexWriter {
                 self.index_config.dimension as u32,
                 self.vectors.iter().map(|(_, _, v)| v.data.as_slice()),
             )?;
-            sidecar_out.flush()?;
-            drop(sidecar_out);
+            // Close with an fsync BEFORE the rename, same as the main
+            // segment file above (Issue #1348): a flush alone leaves the
+            // content in the page cache, so a power loss could surface a
+            // published-but-hollow sidecar.
+            sidecar_out.close()?;
             storage.rename_file(&sidecar_tmp, &sidecar_name)?;
         }
         Ok(())
