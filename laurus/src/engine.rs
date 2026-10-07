@@ -2432,7 +2432,7 @@ impl Engine {
     /// # Parameters
     ///
     /// * `query` - The vector search query (payloads or pre-embedded vectors).
-    /// * `opts` - Vector search options (score mode, min score).
+    /// * `opts` - Vector search options; every field is forwarded.
     /// * `limit` - Maximum number of results to fetch.
     fn build_vector_request(
         &self,
@@ -2443,10 +2443,10 @@ impl Engine {
         crate::vector::store::request::VectorSearchRequest {
             query,
             params: crate::vector::search::searcher::VectorSearchParams {
-                fields: None,
+                fields: opts.fields.clone(),
                 limit,
                 score_mode: opts.score_mode,
-                overfetch: 2.0,
+                overfetch: opts.overfetch,
                 min_score: opts.min_score,
                 allowed_ids: None,
                 allowed_filter: None,
@@ -3828,6 +3828,43 @@ mod tests {
     use crate::embedding::per_field::PerFieldEmbedder;
     use crate::embedding::precomputed::PrecomputedEmbedder;
     use crate::storage::memory::MemoryStorage;
+
+    /// Issue #1342: every `VectorSearchOptions` field reaches the vector
+    /// search parameters; `fields` and `overfetch` used to be hard-coded.
+    #[tokio::test]
+    async fn build_vector_request_forwards_every_vector_option() {
+        use crate::vector::store::request::{FieldSelector, VectorScoreMode};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let engine = Engine::builder(storage, Schema::new())
+            .build()
+            .await
+            .unwrap();
+        let opts = search::VectorSearchOptions {
+            score_mode: VectorScoreMode::MaxSim,
+            min_score: 0.5,
+            rerank_factor: Some(3),
+            ef_search: Some(64),
+            fields: Some(vec![FieldSelector::Exact("a".to_string())]),
+            overfetch: 4.0,
+        };
+
+        let request =
+            engine.build_vector_request(search::VectorSearchQuery::Vectors(Vec::new()), &opts, 7);
+
+        let params = &request.params;
+        assert!(matches!(params.score_mode, VectorScoreMode::MaxSim));
+        assert_eq!(params.min_score, 0.5);
+        assert_eq!(params.rerank_factor, Some(3));
+        assert_eq!(params.ef_search, Some(64));
+        assert!(
+            matches!(params.fields.as_deref(), Some([FieldSelector::Exact(f)]) if f == "a"),
+            "{:?}",
+            params.fields
+        );
+        assert_eq!(params.overfetch, 4.0);
+        assert_eq!(params.limit, 7);
+    }
 
     /// Issue #1086: a second `Engine` built over the same storage (the
     /// realistic in-process analogue of two processes opening the same

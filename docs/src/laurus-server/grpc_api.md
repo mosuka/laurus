@@ -474,14 +474,22 @@ A `oneof` with two options:
 
 ### VectorParams
 
+`vector_params` applies to the request's vector part: `query_vectors`, or
+the vector clauses of a `query` sent without `lexical_params` /
+`field_boosts` (Issue #1342). A request with neither is rejected with
+`INVALID_ARGUMENT`. The server cannot tell whether such a `query` has
+vector clauses without parsing it; on one that has none, `vector_params`
+has no effect. Every other value either takes effect or is rejected with
+`INVALID_ARGUMENT`.
+
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `fields` | `repeated string` | Target vector fields |
-| `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, or `LATE_INTERACTION` |
-| `overfetch` | `float` | Overfetch factor (default: 2.0) |
-| `min_score` | `float` | Minimum score threshold |
+| `fields` | `repeated string` | Vector fields (exact names) to search with query vectors that name no field. A query vector's own `fields` take precedence, and every DSL vector clause names its field, so `fields` is rejected when no searched `query_vectors` entry names no field. An unknown name is rejected. Empty means every vector field whose dimension matches. |
+| `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, or `LATE_INTERACTION`. Any other value is rejected. |
+| `overfetch` | `float` | Each per-field index query fetches `ceil(limit * overfetch)` candidates before scores are combined. `0` (unset) means the default, `2.0`; a value in `(0, 1]` turns overfetch off. Negative or non-finite values are rejected. |
+| `min_score` | `float` | Minimum per-field similarity, compared before query and field weights are applied. `0` (unset) means no threshold. A non-finite value is rejected. |
 | `rerank_factor` | `optional uint32` | Stage 2 rerank widening factor (Issue #481). When set on a field whose schema enabled `rerank_storage`, the server widens the int8/PQ candidate fetch to `top_k * rerank_factor` and rescores the candidates against the original full-precision vectors before returning the top `top_k`. Honored on all three vector index types since #932 (HNSW, Flat, IVF — on Flat/IVF this applies to field-routed queries); fields without `rerank_storage = "F32"` silently fall back to int8 ranking — there is no f32 information to recover. A value of `0` or omitting the field disables rerank. |
-| `ef_search` | `optional uint32` | Per-query override for the HNSW `ef_search` candidate-list size (Issue #644). Also gates the PQ → SQ → f32 three-stage rerank chain (Issue #673): on a PQ field with `rerank_storage` enabled, setting `ef_search` wider than `top_k * rerank_factor` activates an extra int8 stage that rescores the graph's full candidate set — derived from the same `rerank_storage` sidecar, no extra configuration needed — before the exact stage's narrower budget is carved out of it. Ignored on non-HNSW fields. |
+| `ef_search` | `optional uint32` | Per-query override for the HNSW `ef_search` candidate-list size (Issue #644). Also gates the PQ → SQ → f32 three-stage rerank chain (Issue #673): on a PQ field with `rerank_storage` enabled, setting `ef_search` wider than `top_k * rerank_factor` activates an extra int8 stage that rescores the graph's full candidate set — derived from the same `rerank_storage` sidecar, no extra configuration needed — before the exact stage's narrower budget is carved out of it. `0` is rejected. Ignored on non-HNSW fields. |
 
 ### HighlightParams
 

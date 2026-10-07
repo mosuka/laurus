@@ -233,6 +233,27 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
+#### Search with Vector Parameters
+
+`vector_params` takes the keys of the gRPC
+[`VectorParams`](grpc_api.md#vectorparams) message in snake_case:
+`fields`, `score_mode` (`"weighted_sum"`, `"max_sim"` or
+`"late_interaction"`), `overfetch`, `min_score`, `rerank_factor` and
+`ef_search`. A key that is `null` or absent keeps its default. A key with the
+wrong type, an unknown `score_mode`, or a `rerank_factor` / `ef_search` that
+does not fit a 32-bit unsigned integer is rejected with `400 Bad Request`, as
+is any value the gRPC API rejects (Issue #1342).
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query_vectors": [{"vector": [0.1, 0.2, 0.3]}],
+    "vector_params": {"fields": ["title_vec"], "min_score": 0.5, "ef_search": 128},
+    "limit": 10
+  }'
+```
+
 #### Search with Highlighting
 
 `highlight` requests highlighted fragments per field (Issue #1134). The

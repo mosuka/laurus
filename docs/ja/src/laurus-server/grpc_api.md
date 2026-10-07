@@ -473,14 +473,16 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 ### VectorParams
 
+`vector_params` は、リクエストのベクトル部分に適用されます。ベクトル部分とは、`query_vectors` か、`lexical_params` / `field_boosts` を付けずに送った `query` に含まれるベクトル句です（Issue #1342）。どちらも無いリクエストは `INVALID_ARGUMENT` で拒否されます。そうした `query` にベクトル句が含まれるかは、パースしないとサーバには分かりません。ベクトル句を含まない `query` では、`vector_params` は効果を持ちません。それ以外の値は、効くか `INVALID_ARGUMENT` で拒否されるかのどちらかです。
+
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `fields` | `repeated string` | 対象のベクトルフィールド |
-| `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, または `LATE_INTERACTION` |
-| `overfetch` | `float` | オーバーフェッチ係数（デフォルト: 2.0） |
-| `min_score` | `float` | 最小スコア閾値 |
+| `fields` | `repeated string` | フィールドを指定していないクエリベクトルで検索するベクトルフィールド（完全一致の名前）。クエリベクトル自身の `fields` が優先され、DSL のベクトル句は必ず自分のフィールドを指定するため、検索に使われる `query_vectors` のうちフィールドを指定していないものが1本も無ければ拒否されます。未知の名前も拒否されます。空なら、次元の一致するすべてのベクトルフィールドを検索します。 |
+| `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, または `LATE_INTERACTION`。それ以外の値は拒否されます。 |
+| `overfetch` | `float` | フィールドごとの index クエリは、スコアを結合する前に `ceil(limit * overfetch)` 件の候補を取得します。`0`（未指定）は既定値の `2.0`、`(0, 1]` の値は overfetch 無効を意味します。負の値や非有限値は拒否されます。 |
+| `min_score` | `float` | フィールドごとの類似度の下限で、クエリやフィールドの重みを掛ける前の値と比べます。`0`（未指定）は閾値なしです。非有限値は拒否されます。 |
 | `rerank_factor` | `optional uint32` | Stage 2 rerank の widening 係数（Issue #481）。`rerank_storage` を有効にしたフィールドに対してこの値を設定すると、サーバは int8/PQ 候補取得を `top_k * rerank_factor` まで広げ、元の完全精度ベクトルで再スコアしてから上位 `top_k` を返します。#932 以降 3 つのベクトルインデックスタイプ（HNSW・Flat・IVF）すべてで反映されます（Flat/IVF はフィールド指定クエリに適用）。`rerank_storage = "F32"` を設定していないフィールドでは silent に int8 ランキングへフォールバックします — f32 情報を復元することはできません。`0` または省略で rerank 無効。 |
-| `ef_search` | `optional uint32` | HNSW の `ef_search` 候補リストサイズをクエリ単位で上書き（Issue #644）。PQ → SQ → f32 の3段 rerank チェーン（Issue #673）も、この値がゲートとなります。`rerank_storage` を有効にした PQ フィールドで `ef_search` を `top_k * rerank_factor` より広く設定すると、グラフが計算した候補集合全体を安価な int8 段で再ランキングしてから exact 段の狭い予算を切り出すようになります（`rerank_storage` サイドカーから導出、追加設定不要）。HNSW 以外のフィールドでは無視されます。 |
+| `ef_search` | `optional uint32` | HNSW の `ef_search` 候補リストサイズをクエリ単位で上書き（Issue #644）。PQ → SQ → f32 の3段 rerank チェーン（Issue #673）も、この値がゲートとなります。`rerank_storage` を有効にした PQ フィールドで `ef_search` を `top_k * rerank_factor` より広く設定すると、グラフが計算した候補集合全体を安価な int8 段で再ランキングしてから exact 段の狭い予算を切り出すようになります（`rerank_storage` サイドカーから導出、追加設定不要）。`0` は拒否されます。HNSW 以外のフィールドでは無視されます。 |
 
 ### HighlightParams
 

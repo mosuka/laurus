@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use laurus::vector::Vector;
+use laurus::vector::store::request::FieldSelector;
 use laurus::{
     FusionAlgorithm, HighlightConfig, LexicalSearchQuery, QueryVector, RescoreOptions,
     SearchRequestBuilder, SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
@@ -88,30 +89,10 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
             .collect();
 
         builder = builder.vector_query(VectorSearchQuery::Vectors(query_vectors));
+    }
 
-        // Apply vector params
-        if let Some(vp) = &proto.vector_params {
-            let score_mode = match v1::VectorScoreMode::try_from(vp.score_mode) {
-                Ok(v1::VectorScoreMode::MaxSim) => VectorScoreMode::MaxSim,
-                Ok(v1::VectorScoreMode::LateInteraction) => VectorScoreMode::LateInteraction,
-                _ => VectorScoreMode::WeightedSum,
-            };
-            builder = builder.vector_score_mode(score_mode);
-            if vp.min_score > 0.0 {
-                builder = builder.vector_min_score(vp.min_score);
-            }
-            // Issue #481 Stage 2: forward rerank_factor to the engine
-            // (which forwards it to the HNSW searcher). Per-field
-            // capability checks happen later: HNSW fields with
-            // rerank_storage configured honor the value; everything
-            // else silently ignores it. A zero value disables rerank
-            // (defensive: matches `None` semantics).
-            if let Some(factor) = vp.rerank_factor
-                && factor > 0
-            {
-                builder = builder.vector_rerank_factor(factor as usize);
-            }
-        }
+    if let Some(vp) = &proto.vector_params {
+        builder = apply_vector_params(builder, vp, proto, has_lexical_overrides)?;
     }
 
     // Limit and offset
@@ -156,6 +137,110 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
     }
 
     Ok(builder.build())
+}
+
+/// Apply proto `VectorParams` to the builder (Issue #1342).
+///
+/// Every field either takes effect or fails the request: nothing is
+/// silently ignored. proto3 cannot tell an unset `float` from `0.0`, so a
+/// zero `min_score` sets no threshold and a zero `overfetch` keeps the
+/// engine default.
+///
+/// # Errors
+///
+/// Returns `INVALID_ARGUMENT` when the request has no vector part, when
+/// `fields` would reach no query vector, or when a value is out of range.
+#[allow(clippy::result_large_err)]
+fn apply_vector_params(
+    mut builder: SearchRequestBuilder,
+    vp: &v1::VectorParams,
+    proto: &v1::SearchRequest,
+    has_lexical_overrides: bool,
+) -> Result<SearchRequestBuilder, tonic::Status> {
+    let invalid =
+        |message: String| tonic::Status::invalid_argument(format!("vector_params: {message}"));
+
+    // `query_vectors` are searched unless a DSL `query` without lexical
+    // overrides takes the request's place (Issue #1366).
+    let uses_query_vectors =
+        !proto.query_vectors.is_empty() && (proto.query.is_empty() || has_lexical_overrides);
+    // Such a DSL query may carry vector clauses; the server cannot tell
+    // without parsing it, so the params are applied to them.
+    let dsl_may_have_vectors = !proto.query.is_empty() && !has_lexical_overrides;
+    if !uses_query_vectors && !dsl_may_have_vectors {
+        return Err(invalid(
+            "the request has no vector part (no query_vectors, and no query without \
+             lexical_params or field_boosts that could contain vector clauses)"
+                .to_string(),
+        ));
+    }
+
+    let score_mode = match v1::VectorScoreMode::try_from(vp.score_mode) {
+        Ok(v1::VectorScoreMode::WeightedSum) => VectorScoreMode::WeightedSum,
+        Ok(v1::VectorScoreMode::MaxSim) => VectorScoreMode::MaxSim,
+        Ok(v1::VectorScoreMode::LateInteraction) => VectorScoreMode::LateInteraction,
+        Err(_) => return Err(invalid(format!("unknown score_mode {}", vp.score_mode))),
+    };
+    builder = builder.vector_score_mode(score_mode);
+
+    if !vp.min_score.is_finite() {
+        return Err(invalid(format!(
+            "min_score must be finite, got {}",
+            vp.min_score
+        )));
+    }
+    if vp.min_score > 0.0 {
+        builder = builder.vector_min_score(vp.min_score);
+    }
+
+    // Issue #481 Stage 2: HNSW fields with rerank_storage honor the
+    // factor; other fields fall back to Stage 1 ranking. A zero value
+    // disables rerank, matching `None`.
+    if let Some(factor) = vp.rerank_factor
+        && factor > 0
+    {
+        builder = builder.vector_rerank_factor(factor as usize);
+    }
+
+    match vp.ef_search {
+        Some(0) => return Err(invalid("ef_search must be greater than 0".to_string())),
+        Some(ef) => builder = builder.vector_ef_search(ef as usize),
+        None => {}
+    }
+
+    if !vp.overfetch.is_finite() || vp.overfetch < 0.0 {
+        return Err(invalid(format!(
+            "overfetch must be a finite, non-negative number, got {}",
+            vp.overfetch
+        )));
+    }
+    if vp.overfetch > 0.0 {
+        builder = builder.vector_overfetch(vp.overfetch);
+    }
+
+    if !vp.fields.is_empty() {
+        // A query vector's own fields win, and every DSL vector clause
+        // names its field, so `fields` reaches only searched query_vectors
+        // entries that name none.
+        let reaches_a_query_vector =
+            uses_query_vectors && proto.query_vectors.iter().any(|qv| qv.fields.is_empty());
+        if !reaches_a_query_vector {
+            return Err(invalid(
+                "fields applies only to searched query_vectors entries that name no field; \
+                 DSL vector clauses and query_vectors with their own fields ignore it"
+                    .to_string(),
+            ));
+        }
+        builder = builder.vector_fields(
+            vp.fields
+                .iter()
+                .cloned()
+                .map(FieldSelector::Exact)
+                .collect(),
+        );
+    }
+
+    Ok(builder)
 }
 
 /// Build [`RescoreOptions`] from proto `RescoreParams`.
@@ -655,5 +740,198 @@ mod tests {
 
         let proto = result_to_proto(&result);
         assert!(proto.highlights.is_empty());
+    }
+
+    // ── vector_params (Issue #1342) ─────────────────────────────────────
+
+    fn query_vector(fields: &[&str]) -> v1::QueryVector {
+        v1::QueryVector {
+            vector: vec![1.0, 0.0],
+            weight: 1.0,
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    /// Every field set to a value distinct from its default.
+    fn every_vector_param() -> v1::VectorParams {
+        v1::VectorParams {
+            fields: vec!["a".to_string()],
+            score_mode: v1::VectorScoreMode::MaxSim as i32,
+            overfetch: 3.0,
+            min_score: 0.25,
+            rerank_factor: Some(4),
+            ef_search: Some(80),
+        }
+    }
+
+    fn assert_fields(request: &laurus::SearchRequest, expected: &[&str]) {
+        let fields = request
+            .vector_options
+            .fields
+            .as_ref()
+            .expect("fields must be set");
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|f| match f {
+                FieldSelector::Exact(name) => name.as_str(),
+                other => panic!("unexpected selector {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    fn assert_non_field_params(request: &laurus::SearchRequest) {
+        let options = &request.vector_options;
+        assert!(matches!(options.score_mode, VectorScoreMode::MaxSim));
+        assert_eq!(options.min_score, 0.25);
+        assert_eq!(options.rerank_factor, Some(4));
+        assert_eq!(options.ef_search, Some(80));
+        assert_eq!(options.overfetch, 3.0);
+    }
+
+    #[test]
+    fn from_proto_applies_every_vector_param_to_query_vectors() {
+        let request = from_proto(&v1::SearchRequest {
+            query_vectors: vec![query_vector(&[])],
+            vector_params: Some(every_vector_param()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_non_field_params(&request);
+        assert_fields(&request, &["a"]);
+    }
+
+    /// The vector part of a DSL query gets `vector_params` too; `fields`
+    /// is left out because a DSL vector clause names its own field.
+    #[test]
+    fn from_proto_applies_vector_params_to_a_dsl_query() {
+        let request = from_proto(&v1::SearchRequest {
+            query: "vec:\"rust\"".to_string(),
+            vector_params: Some(v1::VectorParams {
+                fields: Vec::new(),
+                ..every_vector_param()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(request.query, laurus::SearchQuery::Dsl(_)));
+        assert_non_field_params(&request);
+        assert!(request.vector_options.fields.is_none());
+    }
+
+    /// `fields` is accepted when some query vector names no field,
+    /// including alongside a lexical query that has lexical overrides.
+    #[test]
+    fn from_proto_accepts_fields_when_a_query_vector_names_none() {
+        let mixed = v1::SearchRequest {
+            query_vectors: vec![query_vector(&["b"]), query_vector(&[])],
+            vector_params: Some(every_vector_param()),
+            ..Default::default()
+        };
+        let hybrid = v1::SearchRequest {
+            query: "title:rust".to_string(),
+            lexical_params: Some(v1::LexicalParams::default()),
+            query_vectors: vec![query_vector(&[])],
+            vector_params: Some(every_vector_param()),
+            ..Default::default()
+        };
+        for proto in [mixed, hybrid] {
+            let request = from_proto(&proto).unwrap();
+            assert_fields(&request, &["a"]);
+        }
+    }
+
+    /// proto3 cannot tell an unset `float` from `0.0`: `overfetch == 0`
+    /// keeps the engine default and `min_score == 0` sets no threshold.
+    #[test]
+    fn from_proto_treats_zero_floats_as_unset() {
+        let request = from_proto(&v1::SearchRequest {
+            query_vectors: vec![query_vector(&[])],
+            vector_params: Some(v1::VectorParams::default()),
+            ..Default::default()
+        })
+        .unwrap();
+        let defaults = laurus::VectorSearchOptions::default();
+        assert_eq!(request.vector_options.overfetch, defaults.overfetch);
+        assert_eq!(request.vector_options.min_score, defaults.min_score);
+        assert_eq!(request.vector_options.ef_search, None);
+        assert!(request.vector_options.fields.is_none());
+    }
+
+    #[test]
+    fn from_proto_rejects_vector_params_that_would_be_ignored() {
+        let with = |f: fn(&mut v1::SearchRequest)| {
+            let mut proto = v1::SearchRequest {
+                query_vectors: vec![query_vector(&[])],
+                vector_params: Some(every_vector_param()),
+                ..Default::default()
+            };
+            f(&mut proto);
+            proto
+        };
+        let cases = [
+            (
+                "lexical-only request",
+                with(|p| {
+                    p.query = "title:rust".to_string();
+                    p.lexical_params = Some(v1::LexicalParams::default());
+                    p.query_vectors.clear();
+                }),
+            ),
+            ("no query at all", with(|p| p.query_vectors.clear())),
+            (
+                "fields with a DSL-only request",
+                with(|p| {
+                    p.query = "vec:\"rust\"".to_string();
+                    p.query_vectors.clear();
+                }),
+            ),
+            (
+                "fields when every query vector names its own",
+                with(|p| p.query_vectors = vec![query_vector(&["b"])]),
+            ),
+            (
+                "fields when the DSL query drops query_vectors (#1366)",
+                with(|p| p.query = "title:rust".to_string()),
+            ),
+            (
+                "unknown score_mode",
+                with(|p| p.vector_params.as_mut().unwrap().score_mode = 99),
+            ),
+            (
+                "NaN min_score",
+                with(|p| p.vector_params.as_mut().unwrap().min_score = f32::NAN),
+            ),
+            (
+                "negative overfetch",
+                with(|p| p.vector_params.as_mut().unwrap().overfetch = -1.0),
+            ),
+            (
+                "NaN overfetch",
+                with(|p| p.vector_params.as_mut().unwrap().overfetch = f32::NAN),
+            ),
+            (
+                "infinite overfetch",
+                with(|p| p.vector_params.as_mut().unwrap().overfetch = f32::INFINITY),
+            ),
+            (
+                "zero ef_search",
+                with(|p| p.vector_params.as_mut().unwrap().ef_search = Some(0)),
+            ),
+        ];
+        for (case, proto) in cases {
+            let Err(status) = from_proto(&proto) else {
+                panic!("{case}: expected INVALID_ARGUMENT");
+            };
+            assert_eq!(
+                status.code(),
+                tonic::Code::InvalidArgument,
+                "{case}: {status:?}"
+            );
+            assert!(
+                status.message().contains("vector_params"),
+                "{case}: {status:?}"
+            );
+        }
     }
 }

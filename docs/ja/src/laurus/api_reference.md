@@ -132,6 +132,10 @@ cargo doc --open
 | `.highlight_config(HighlightConfig)` | ハイライトに使うタグ・フラグメント・`require_field_match` の設定を指定 |
 | `.vector_score_mode(VectorScoreMode)` | Vector検索のスコア結合モードを設定 |
 | `.vector_min_score(f32)` | Vector検索の最小スコアしきい値 |
+| `.vector_rerank_factor(usize)` | Vector検索の Stage 2 rerank の widening 係数を設定 |
+| `.vector_ef_search(usize)` | この検索での HNSW の `ef_search` 候補リストサイズを上書き |
+| `.vector_fields(Vec<FieldSelector>)` | フィールドを指定していないクエリベクトルの検索対象をこれらのフィールドに絞る（クエリベクトル自身のフィールド指定が優先） |
+| `.vector_overfetch(f32)` | フィールドごとのベクトル候補の overfetch 係数を設定（既定 `2.0`、`<= 1.0` で無効） |
 | `.rescore(RescoreOptions)` | 1段目の上位候補を late interaction で並べ替える（[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)） |
 | `.build()` | `SearchRequest` を構築 |
 

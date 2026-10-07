@@ -7,6 +7,7 @@ use crate::lexical::search::searcher::{LexicalSearchQuery, SortField};
 // via `self::search::VectorSearchQuery` without reaching into vector internals.
 use crate::vector::VectorScoreMode;
 pub use crate::vector::search::searcher::VectorSearchQuery;
+use crate::vector::store::request::FieldSelector;
 
 // ── Query types (what to search for) ─────────────────────────────────────────
 
@@ -192,6 +193,25 @@ pub struct VectorSearchOptions {
     /// (and `top_k * rerank_factor` when both are set) so the candidate
     /// heap is never undersized for the requested `top_k`.
     pub ef_search: Option<usize>,
+
+    /// Vector fields to search when a query vector names none (Issue #1342).
+    ///
+    /// A query vector's own fields take precedence: `QueryVector.fields`, the
+    /// field a DSL vector clause names, or a payload's field. So this only
+    /// routes [`VectorSearchQuery::Vectors`] entries whose `fields` is
+    /// `None`. `None` (the default) searches every vector field whose
+    /// dimension matches. An unknown [`FieldSelector::Exact`] name fails the
+    /// search with `InvalidArgument`.
+    pub fields: Option<Vec<FieldSelector>>,
+
+    /// Overfetch factor (Issue #1342): each per-field index query fetches
+    /// `ceil(limit * overfetch)` candidates before the score-mode merge and
+    /// the final truncation to `limit`.
+    ///
+    /// A factor `<= 1.0` (or non-finite) disables overfetch. It multiplies
+    /// only the per-field index `top_k`; a hybrid search's widening of the
+    /// vector fetch count is applied separately. Defaults to `2.0`.
+    pub overfetch: f32,
 }
 
 impl Default for VectorSearchOptions {
@@ -201,6 +221,8 @@ impl Default for VectorSearchOptions {
             min_score: 0.0,
             rerank_factor: None,
             ef_search: None,
+            fields: None,
+            overfetch: crate::vector::search::searcher::DEFAULT_OVERFETCH,
         }
     }
 }
@@ -633,6 +655,19 @@ impl SearchRequestBuilder {
     /// take precedence. Ignored by non-HNSW index types.
     pub fn vector_ef_search(mut self, ef: usize) -> Self {
         self.vector_options.ef_search = Some(ef);
+        self
+    }
+
+    /// Restrict query vectors that name no field to `fields`
+    /// (see [`VectorSearchOptions::fields`]).
+    pub fn vector_fields(mut self, fields: Vec<FieldSelector>) -> Self {
+        self.vector_options.fields = Some(fields);
+        self
+    }
+
+    /// Set the overfetch factor (see [`VectorSearchOptions::overfetch`]).
+    pub fn vector_overfetch(mut self, overfetch: f32) -> Self {
+        self.vector_options.overfetch = overfetch;
         self
     }
 

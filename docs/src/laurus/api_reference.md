@@ -132,6 +132,10 @@ A collection of named field values.
 | `.highlight_config(HighlightConfig)` | Set the tag/fragment/`require_field_match` settings used for highlighting |
 | `.vector_score_mode(VectorScoreMode)` | Set score combination mode for vector search |
 | `.vector_min_score(f32)` | Set minimum score threshold for vector search |
+| `.vector_rerank_factor(usize)` | Set the Stage 2 rerank widening factor for vector search |
+| `.vector_ef_search(usize)` | Override the HNSW `ef_search` candidate-list size for this search |
+| `.vector_fields(Vec<FieldSelector>)` | Restrict query vectors that name no field to these fields (a query vector's own fields take precedence) |
+| `.vector_overfetch(f32)` | Set the overfetch factor for per-field vector candidates (default `2.0`; `<= 1.0` disables it) |
 | `.rescore(RescoreOptions)` | Reorder the top first-stage candidates with late interaction ([Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)) |
 | `.build()` | Build the `SearchRequest` |
 

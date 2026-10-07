@@ -140,10 +140,38 @@ enum SortOrder {
   SORT_ORDER_DESC = 1;
 }
 
+// Vector search options (Issue #1342).
+//
+// They apply to the request's vector part: `query_vectors`, or the vector
+// clauses of a `query` sent without `lexical_params` / `field_boosts`.
+// A request with neither is rejected with INVALID_ARGUMENT. The server
+// cannot tell whether such a `query` contains vector clauses without
+// parsing it; on one that has none, these options have no effect.
+// Out-of-range values are rejected with INVALID_ARGUMENT, never ignored.
 message VectorParams {
+  // Vector fields to search with query vectors that name no field
+  // (`QueryVector.fields` empty), as exact field names. A query vector's
+  // own fields take precedence, and every DSL vector clause names its
+  // field, so this is rejected with INVALID_ARGUMENT when no searched
+  // `query_vectors` entry names no field. An unknown name fails the
+  // search with INVALID_ARGUMENT. Empty means every vector field whose
+  // dimension matches.
   repeated string fields = 1;
+
+  // How to combine scores across query vectors. An unknown value is
+  // rejected with INVALID_ARGUMENT.
   VectorScoreMode score_mode = 2;
+
+  // Overfetch factor: each per-field index query fetches
+  // `ceil(limit * overfetch)` candidates before scores are combined and
+  // the result is cut to `limit`. `0` (unset) means the default, `2.0`;
+  // a value in `(0, 1]` turns overfetch off. Negative or non-finite
+  // values are rejected with INVALID_ARGUMENT.
   float overfetch = 3;
+
+  // Minimum per-field similarity, compared before query and field
+  // weights are applied. `0` (unset) means no threshold. A non-finite
+  // value is rejected with INVALID_ARGUMENT.
   float min_score = 4;
 
   // Two-stage rerank multiplier (Issue #481 Stage 2).
@@ -163,7 +191,8 @@ message VectorParams {
   // `HnswOption.default_ef_search` or an internal fallback (`50`).
   // The effective ef is always lifted to `max(top_k, top_k * rerank_factor)`
   // so the candidate heap is never undersized for the requested
-  // `top_k`.
+  // `top_k`. `0` is rejected with INVALID_ARGUMENT. Ignored by non-HNSW
+  // fields.
   optional uint32 ef_search = 6;
 }
 
