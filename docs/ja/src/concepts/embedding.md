@@ -318,7 +318,7 @@ Embedder が、それをクエリとして埋め込みます。
 | `CandleBertEmbedder` | `embeddings-candle` | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `CandleColbertEmbedder` | `embeddings-candle` | `CandleBertEmbedder` と同じ |
 | `OpenAIEmbedder` | `embeddings-openai` | reqwest |
-| `CandleClipEmbedder` | `embeddings-multimodal` | image + embeddings-candle |
+| `CandleClipEmbedder` | `embeddings-multimodal` | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers, image |
 | `PrecomputedEmbedder` | *（なし -- 常に利用可能）* | -- |
 
 `embeddings-all` Feature ですべての Embedding 機能を一括で有効にできます。詳細は [Feature Flags](../development/feature_flags.md) を参照してください。

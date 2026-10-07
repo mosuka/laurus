@@ -320,7 +320,7 @@ Each embedder requires a specific feature flag to be enabled in `Cargo.toml`:
 | `CandleBertEmbedder` | `embeddings-candle` | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `CandleColbertEmbedder` | `embeddings-candle` | same as `CandleBertEmbedder` |
 | `OpenAIEmbedder` | `embeddings-openai` | reqwest |
-| `CandleClipEmbedder` | `embeddings-multimodal` | image + embeddings-candle |
+| `CandleClipEmbedder` | `embeddings-multimodal` | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers, image |
 | `PrecomputedEmbedder` | *(none -- always available)* | -- |
 
 The `embeddings-all` feature enables all embedding features at once. See [Feature Flags](../development/feature_flags.md) for details.

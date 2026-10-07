@@ -38,17 +38,19 @@ tar -xzf "laurus-${VERSION}-${TARGET}.tar.gz"
 
 ```dockerfile
 FROM alpine:3.22
-# Only needed if you use `embeddings-openai`: reqwest's rustls backend
-# verifies against the OS trust store. Hugging Face model downloads
-# (`embeddings-candle` / `embeddings-multimodal`) use root certificates
-# bundled into the binary and work without this. See "Feature Flags" in
-# the development guide for details.
+# Needed whenever an embedding feature makes an HTTPS call: reqwest's
+# rustls backend verifies against the OS trust store for Hugging Face
+# model downloads (`embeddings-candle` / `embeddings-multimodal`) as well
+# as `embeddings-openai`. The prebuilt binary is built with
+# `--features embeddings-all`, so install this even for a lexical-only
+# workload. See "Feature Flags" in the development guide for details.
 RUN apk add --no-cache ca-certificates
 COPY laurus /usr/local/bin/laurus
 ENTRYPOINT ["laurus"]
 ```
 
-or, with no package manager at all:
+or, with no package manager at all (only safe if you never call an embedding feature, since
+there is no CA bundle to verify HTTPS downloads):
 
 ```dockerfile
 FROM scratch

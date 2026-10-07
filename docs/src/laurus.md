@@ -36,27 +36,28 @@ graph TB
 
 ## Feature Flags
 
-The `laurus` crate has no default features enabled. Enable embedding support as needed:
+The `laurus` crate enables the `native` feature by default. Enable embedding support as needed:
 
 | Feature | Description | Dependencies |
 | :--- | :--- | :--- |
+| `native` (default) | File-based storage, rayon parallelism, multi-threaded tokio | crossbeam-channel, crossbeam-deque, memmap2, num_cpus, rayon, tempfile |
 | `embeddings-candle` | Local BERT embeddings via Hugging Face Candle | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `embeddings-openai` | OpenAI API embeddings | reqwest |
-| `embeddings-multimodal` | CLIP multimodal embeddings (text + image) | image, embeddings-candle |
+| `embeddings-multimodal` | CLIP multimodal embeddings (text + image) | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers, image |
 | `embeddings-all` | All embedding features combined | All of the above |
 
 ```toml
 # Lexical search only (no embedding)
 [dependencies]
-laurus = "0.12"
+laurus = "0.13"
 
 # With local BERT embeddings
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-candle"] }
+laurus = { version = "0.13", features = ["embeddings-candle"] }
 
 # All features
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-all"] }
+laurus = { version = "0.13", features = ["embeddings-all"] }
 ```
 
 ## Sections

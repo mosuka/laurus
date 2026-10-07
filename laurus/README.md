@@ -23,15 +23,15 @@ Core search engine library for the [Laurus](https://github.com/mosuka/laurus) pr
 ```toml
 # Lexical search only (no embedding)
 [dependencies]
-laurus = "0.12"
+laurus = "0.13"
 
 # With local BERT embeddings
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-candle"] }
+laurus = { version = "0.13", features = ["embeddings-candle"] }
 
 # All embedding backends
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-all"] }
+laurus = { version = "0.13", features = ["embeddings-all"] }
 ```
 
 ## Feature Flags
