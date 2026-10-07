@@ -30,8 +30,8 @@ use crate::storage::Storage;
 use crate::storage::prefixed::PrefixedStorage;
 use crate::store::log::{DocumentLog, LogEntry, WalSyncPolicy};
 use crate::vector::core::vector::Vector;
-use crate::vector::store::VectorStore;
 use crate::vector::store::config::VectorIndexConfig;
+use crate::vector::store::{FieldEmbedderChange, VectorStore};
 
 use self::schema::Schema;
 
@@ -2157,13 +2157,24 @@ impl Engine {
                 }
 
                 if option.is_vector() {
-                    let field_embedder = self.field_embedder(name, &option).await?;
+                    // Issue #1354: `field_embedder` is `None` both when the
+                    // name is removed and when there never was one; only
+                    // the former may drop the registration, so that an
+                    // embedder registered directly through
+                    // `EngineBuilder::embedder` survives unrelated changes.
+                    let embedder_change = match self.field_embedder(name, &option).await? {
+                        Some(embedder) => FieldEmbedderChange::Register(embedder),
+                        None if old_option.embedder_name().is_some() => {
+                            FieldEmbedderChange::Unregister
+                        }
+                        None => FieldEmbedderChange::Keep,
+                    };
 
                     let vector_opt = option
                         .to_vector()
                         .expect("is_vector() was true but to_vector() returned None");
                     self.vector
-                        .rebuild_field(name, &vector_opt, field_embedder, purge)
+                        .rebuild_field(name, &vector_opt, embedder_change, purge)
                         .await?;
                     self.clear_embedding_cache();
                 } else {

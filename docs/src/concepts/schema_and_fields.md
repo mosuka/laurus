@@ -755,6 +755,13 @@ Solr failure mode where the schema and the index silently drift apart —
 check it via `GetSchema` / `laurus get schema` to find fields whose data
 no longer matches the schema, and re-ingest their documents as needed.
 
+A vector field's registered embedder follows its new `embedder` option
+(Issue #1354): naming one registers it, and removing the name unregisters
+the previous one, so the field falls back to the default embedder (text
+sent to it is rejected when that default is `PrecomputedEmbedder`). A
+change to a field that names no embedder, before or after, leaves an
+embedder registered directly through `EngineBuilder::embedder` in place.
+
 Pass `UpdateFieldOptions { dry_run: true, .. }` to see how a change would
 be classified without applying anything.
 

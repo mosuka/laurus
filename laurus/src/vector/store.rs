@@ -49,6 +49,26 @@ use self::config::VectorIndexConfig;
 use self::request::{FieldSelector, QueryVector, VectorScoreMode, VectorSearchRequest};
 use self::response::{VectorHit, VectorSearchResults, VectorStats};
 
+/// What [`VectorStore::rebuild_field`] does with the field's entry in the
+/// store's [`PerFieldEmbedder`] (Issue #1354).
+///
+/// Every variant is a no-op when the store's embedder is not a
+/// `PerFieldEmbedder`.
+#[derive(Debug)]
+pub enum FieldEmbedderChange {
+    /// Leave the field's registration, if any, as it is. Used when neither
+    /// the old nor the new option names a schema embedder, so an embedder
+    /// registered directly through `EngineBuilder::embedder` is kept.
+    Keep,
+    /// Register this embedder for the field, replacing any registration.
+    Register(Arc<dyn Embedder>),
+    /// Remove the field's registration, so the field falls back to the
+    /// `PerFieldEmbedder`'s default embedder. Used when the old option
+    /// names a schema embedder and the new one does not; this also removes
+    /// an embedder registered directly for the field.
+    Unregister,
+}
+
 /// A simplified vector storage component following the LexicalStore pattern.
 ///
 /// This structure mirrors `LexicalStore` with only 3 members:
@@ -1417,14 +1437,7 @@ impl VectorStore {
 
         self.base_weights.write().remove(name);
 
-        // Remove the field-specific embedder from the PerFieldEmbedder if present.
-        let index_embedder = self.index.embedder();
-        if let Some(pfe) = index_embedder
-            .as_any()
-            .downcast_ref::<crate::embedding::per_field::PerFieldEmbedder>()
-        {
-            pfe.remove_embedder(name);
-        }
+        self.unregister_field_embedder(name);
 
         // Invalidate caches so the next writer/searcher uses updated config.
         // Same commit-then-drop-on-success guard as `add_field` (#882
@@ -1445,6 +1458,15 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Remove `name`'s field-specific embedder from the store's
+    /// `PerFieldEmbedder`, if the store has one.
+    fn unregister_field_embedder(&self, name: &str) {
+        let index_embedder = self.index.embedder();
+        if let Some(pfe) = index_embedder.as_any().downcast_ref::<PerFieldEmbedder>() {
+            pfe.remove_embedder(name);
+        }
+    }
+
     /// Rebuild a field's on-disk data under a new type/option configuration
     /// (Issue #1080: `Engine::update_field`'s `Reindex`/`Destructive`
     /// classified vector changes).
@@ -1453,8 +1475,10 @@ impl VectorStore {
     ///
     /// * `name` - The vector field to rebuild. Must already exist.
     /// * `new_option` - The field's new schema-level vector option.
-    /// * `embedder` - Optional field-specific embedder to register under
-    ///   the new option (same as [`Self::add_field`]).
+    /// * `embedder` - What to do with the field's registration in the
+    ///   store's `PerFieldEmbedder` (see [`FieldEmbedderChange`]). Applied
+    ///   only after the rebuild succeeds, so a failed rebuild leaves the
+    ///   registration as it was.
     /// * `purge` - `false` for a [`FieldChangeKind::Reindex`]-classified
     ///   change: rebuilds in place from the field's existing segments via
     ///   [`VectorIndex::rebuild_field`]. `true` for a
@@ -1480,7 +1504,7 @@ impl VectorStore {
         &self,
         name: &str,
         new_option: &crate::vector::core::field::FieldOption,
-        embedder: Option<Arc<dyn Embedder>>,
+        embedder: FieldEmbedderChange,
         purge: bool,
     ) -> Result<()> {
         let deletion_config = self
@@ -1514,11 +1538,15 @@ impl VectorStore {
             Self::sanitize_base_weight(new_option.base_weight()),
         );
 
-        if let Some(field_embedder) = embedder {
-            let index_embedder = self.index.embedder();
-            if let Some(pfe) = index_embedder.as_any().downcast_ref::<PerFieldEmbedder>() {
-                pfe.add_embedder(name, field_embedder);
+        match embedder {
+            FieldEmbedderChange::Keep => {}
+            FieldEmbedderChange::Register(field_embedder) => {
+                let index_embedder = self.index.embedder();
+                if let Some(pfe) = index_embedder.as_any().downcast_ref::<PerFieldEmbedder>() {
+                    pfe.add_embedder(name, field_embedder);
+                }
             }
+            FieldEmbedderChange::Unregister => self.unregister_field_embedder(name),
         }
 
         drop(writer_guard);
