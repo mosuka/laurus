@@ -417,8 +417,8 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 | フィールド | 型 | 必須 | 説明 |
 | :--- | :--- | :--- | :--- |
-| `query` | `string` | いいえ | [Query DSL](../concepts/query_dsl.md) による Lexical 検索クエリ |
-| `query_vectors` | `repeated QueryVector` | いいえ | ベクトル検索クエリ |
+| `query` | `string` | いいえ | [Query DSL](../concepts/query_dsl.md) による統合クエリ（lexical 句とベクトル句）。未知のフィールドは `INVALID_ARGUMENT` で拒否される。`lexical_params` と `field_boosts` はその lexical 部分に適用される |
+| `query_vectors` | `repeated QueryVector` | いいえ | 埋め込み済みのクエリベクトル。`query` と一緒に送ると、そのベクトル部分に追加される。lexical 句だけの `query` はハイブリッド検索になる（Issue #1366） |
 | `limit` | `uint32` | いいえ | 最大結果件数（`0` はエンジンの既定値 10）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索は `INVALID_ARGUMENT` で拒否される（Issue #1367） |
 | `offset` | `uint32` | いいえ | スキップする結果件数。`limit` と合わせて `max_result_window` の対象になる |
 | `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム |
@@ -445,7 +445,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `vector` | `repeated float` | クエリベクトル |
-| `weight` | `float` | このベクトルの重み（デフォルト: 1.0） |
+| `weight` | `float` | このベクトルの重み（デフォルト: 1.0。proto3 では未指定と区別できないため、`0` も 1.0 として扱う） |
 | `fields` | `repeated string` | 対象のベクトルフィールド（空の場合は全フィールド） |
 
 ### FusionAlgorithm
@@ -473,7 +473,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 ### VectorParams
 
-`vector_params` は、リクエストのベクトル部分に適用されます。ベクトル部分とは、`query_vectors` か、`lexical_params` / `field_boosts` を付けずに送った `query` に含まれるベクトル句です（Issue #1342）。どちらも無いリクエストは `INVALID_ARGUMENT` で拒否されます。そうした `query` にベクトル句が含まれるかは、パースしないとサーバには分かりません。ベクトル句を含まない `query` では、`vector_params` は効果を持ちません。それ以外の値は、効くか `INVALID_ARGUMENT` で拒否されるかのどちらかです。
+`vector_params` は、リクエストのベクトル部分に適用されます。ベクトル部分とは、`query_vectors` と `query` に含まれるベクトル句です（Issue #1342、#1366）。`query_vectors` も `query` も無いリクエストは `INVALID_ARGUMENT` で拒否されます。`query` にベクトル句が含まれるかは、パースしないとサーバには分かりません。ベクトル部分になりうるのがベクトル句を含まない `query` だけのリクエストでは、`vector_params` は効果を持ちません。それ以外の値は、効くか `INVALID_ARGUMENT` で拒否されるかのどちらかです。
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use laurus::vector::Vector;
 use laurus::vector::store::request::FieldSelector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, LexicalSearchQuery, QueryVector, RescoreOptions,
-    SearchRequestBuilder, SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
+    FusionAlgorithm, HighlightConfig, QueryVector, RescoreOptions, SearchRequestBuilder,
+    SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
 };
 
 use crate::convert::document;
@@ -19,56 +19,44 @@ use crate::proto::laurus::v1;
 
 /// Build a laurus SearchRequest from a proto SearchRequest.
 ///
-/// The proto `query` field is mapped to [`SearchQuery::Dsl`] so the engine
-/// handles unified query DSL parsing (including vector clauses) internally.
-///
-/// When `lexical_params` or `field_boosts` are provided, the query is
-/// wrapped as [`LexicalSearchQuery::Dsl`] and lexical options are set
-/// directly on the builder.
+/// The proto `query` field is always the unified query DSL
+/// ([`SearchQuery::Dsl`](laurus::SearchQuery::Dsl)): the engine parses its
+/// lexical and vector clauses. `query_vectors` are added to its vector part
+/// (Issue #1366). `lexical_params` and `field_boosts` set the lexical options
+/// of a request that has a `query`.
 #[allow(clippy::result_large_err)]
 pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, tonic::Status> {
     let mut builder = SearchRequestBuilder::new();
 
-    let has_lexical_overrides = proto.lexical_params.is_some() || !proto.field_boosts.is_empty();
-
     if !proto.query.is_empty() {
-        if has_lexical_overrides {
-            // Wrap query as LexicalSearchQuery::Dsl so that lexical options
-            // are preserved via builder methods.
-            builder = builder.lexical_query(LexicalSearchQuery::Dsl(proto.query.clone()));
+        builder = builder.query_dsl(proto.query.clone());
 
-            // Apply field boosts
-            for (field, boost) in &proto.field_boosts {
-                builder = builder.add_field_boost(field.clone(), *boost);
-            }
+        for (field, boost) in &proto.field_boosts {
+            builder = builder.add_field_boost(field.clone(), *boost);
+        }
 
-            // Apply lexical params
-            if let Some(p) = &proto.lexical_params {
-                builder = builder.lexical_min_score(p.min_score);
-                if let Some(timeout_ms) = p.timeout_ms
-                    && timeout_ms > 0
-                {
-                    builder = builder.lexical_timeout_ms(timeout_ms);
-                }
-                if p.parallel {
-                    builder = builder.lexical_parallel(true);
-                }
-                if let Some(spec) = &p.sort_by
-                    && !spec.field.is_empty()
-                {
-                    let order = match v1::SortOrder::try_from(spec.order) {
-                        Ok(v1::SortOrder::Desc) => SortOrder::Desc,
-                        _ => SortOrder::Asc,
-                    };
-                    builder = builder.sort_by(SortField::Field {
-                        name: spec.field.clone(),
-                        order,
-                    });
-                }
+        if let Some(p) = &proto.lexical_params {
+            builder = builder.lexical_min_score(p.min_score);
+            if let Some(timeout_ms) = p.timeout_ms
+                && timeout_ms > 0
+            {
+                builder = builder.lexical_timeout_ms(timeout_ms);
             }
-        } else {
-            // Use the DSL variant — engine will parse with UnifiedQueryParser
-            builder = builder.query_dsl(proto.query.clone());
+            if p.parallel {
+                builder = builder.lexical_parallel(true);
+            }
+            if let Some(spec) = &p.sort_by
+                && !spec.field.is_empty()
+            {
+                let order = match v1::SortOrder::try_from(spec.order) {
+                    Ok(v1::SortOrder::Desc) => SortOrder::Desc,
+                    _ => SortOrder::Asc,
+                };
+                builder = builder.sort_by(SortField::Field {
+                    name: spec.field.clone(),
+                    order,
+                });
+            }
         }
     }
 
@@ -92,7 +80,7 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
     }
 
     if let Some(vp) = &proto.vector_params {
-        builder = apply_vector_params(builder, vp, proto, has_lexical_overrides)?;
+        builder = apply_vector_params(builder, vp, proto)?;
     }
 
     // Limit and offset
@@ -155,23 +143,16 @@ fn apply_vector_params(
     mut builder: SearchRequestBuilder,
     vp: &v1::VectorParams,
     proto: &v1::SearchRequest,
-    has_lexical_overrides: bool,
 ) -> Result<SearchRequestBuilder, tonic::Status> {
     let invalid =
         |message: String| tonic::Status::invalid_argument(format!("vector_params: {message}"));
 
-    // `query_vectors` are searched unless a DSL `query` without lexical
-    // overrides takes the request's place (Issue #1366).
-    let uses_query_vectors =
-        !proto.query_vectors.is_empty() && (proto.query.is_empty() || has_lexical_overrides);
-    // Such a DSL query may carry vector clauses; the server cannot tell
-    // without parsing it, so the params are applied to them.
-    let dsl_may_have_vectors = !proto.query.is_empty() && !has_lexical_overrides;
-    if !uses_query_vectors && !dsl_may_have_vectors {
+    // The vector part is `query_vectors` plus any vector clauses of `query`
+    // (Issue #1366); the server cannot tell whether `query` has vector
+    // clauses without parsing it, so the params are applied to them.
+    if proto.query_vectors.is_empty() && proto.query.is_empty() {
         return Err(invalid(
-            "the request has no vector part (no query_vectors, and no query without \
-             lexical_params or field_boosts that could contain vector clauses)"
-                .to_string(),
+            "the request has no vector part (no query_vectors and no query)".to_string(),
         ));
     }
 
@@ -220,13 +201,11 @@ fn apply_vector_params(
 
     if !vp.fields.is_empty() {
         // A query vector's own fields win, and every DSL vector clause
-        // names its field, so `fields` reaches only searched query_vectors
-        // entries that name none.
-        let reaches_a_query_vector =
-            uses_query_vectors && proto.query_vectors.iter().any(|qv| qv.fields.is_empty());
-        if !reaches_a_query_vector {
+        // names its field, so `fields` reaches only query_vectors entries
+        // that name none.
+        if !proto.query_vectors.iter().any(|qv| qv.fields.is_empty()) {
             return Err(invalid(
-                "fields applies only to searched query_vectors entries that name no field; \
+                "fields applies only to query_vectors entries that name no field; \
                  DSL vector clauses and query_vectors with their own fields ignore it"
                     .to_string(),
             ));
@@ -819,8 +798,8 @@ mod tests {
         assert!(request.vector_options.fields.is_none());
     }
 
-    /// `fields` is accepted when some query vector names no field,
-    /// including alongside a lexical query that has lexical overrides.
+    /// `fields` is accepted when some query vector names no field, also
+    /// alongside a DSL `query` with or without lexical overrides (#1366).
     #[test]
     fn from_proto_accepts_fields_when_a_query_vector_names_none() {
         let mixed = v1::SearchRequest {
@@ -828,17 +807,86 @@ mod tests {
             vector_params: Some(every_vector_param()),
             ..Default::default()
         };
-        let hybrid = v1::SearchRequest {
+        let with_overrides = v1::SearchRequest {
             query: "title:rust".to_string(),
             lexical_params: Some(v1::LexicalParams::default()),
             query_vectors: vec![query_vector(&[])],
             vector_params: Some(every_vector_param()),
             ..Default::default()
         };
-        for proto in [mixed, hybrid] {
+        let without_overrides = v1::SearchRequest {
+            query: "title:rust".to_string(),
+            query_vectors: vec![query_vector(&[])],
+            vector_params: Some(every_vector_param()),
+            ..Default::default()
+        };
+        for proto in [mixed, with_overrides, without_overrides] {
             let request = from_proto(&proto).unwrap();
             assert_fields(&request, &["a"]);
         }
+    }
+
+    /// Issue #1366: `query_vectors` sent with a DSL `query` are kept and
+    /// added to the DSL's vector part.
+    #[test]
+    fn from_proto_keeps_query_vectors_with_a_dsl_query() {
+        let request = from_proto(&v1::SearchRequest {
+            query: "title:rust".to_string(),
+            query_vectors: vec![query_vector(&[])],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                request.query,
+                laurus::SearchQuery::DslWithVectors {
+                    ref dsl,
+                    vectors: VectorSearchQuery::Vectors(ref v),
+                } if dsl == "title:rust" && v.len() == 1
+            ),
+            "{:?}",
+            request.query
+        );
+    }
+
+    /// Issue #1366: `lexical_params` / `field_boosts` no longer turn `query`
+    /// into a lexical-only query; it stays a unified DSL query and the
+    /// lexical options still apply.
+    #[test]
+    fn from_proto_parses_query_as_dsl_with_lexical_overrides() {
+        let request = from_proto(&v1::SearchRequest {
+            query: "title:rust".to_string(),
+            lexical_params: Some(v1::LexicalParams {
+                min_score: 0.5,
+                ..Default::default()
+            }),
+            field_boosts: [("title".to_string(), 2.0)].into_iter().collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            matches!(request.query, laurus::SearchQuery::Dsl(ref d) if d == "title:rust"),
+            "{:?}",
+            request.query
+        );
+        assert_eq!(request.lexical_options.min_score, 0.5);
+        assert_eq!(
+            request.lexical_options.field_boosts.get("title"),
+            Some(&2.0)
+        );
+
+        // vector_params without `fields` now apply to the DSL's vector clauses.
+        let with_vector_params = from_proto(&v1::SearchRequest {
+            query: "title:rust".to_string(),
+            lexical_params: Some(v1::LexicalParams::default()),
+            vector_params: Some(v1::VectorParams {
+                fields: Vec::new(),
+                ..every_vector_param()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_non_field_params(&with_vector_params);
     }
 
     /// proto3 cannot tell an unset `float` from `0.0`: `overfetch == 0`
@@ -870,14 +918,6 @@ mod tests {
             proto
         };
         let cases = [
-            (
-                "lexical-only request",
-                with(|p| {
-                    p.query = "title:rust".to_string();
-                    p.lexical_params = Some(v1::LexicalParams::default());
-                    p.query_vectors.clear();
-                }),
-            ),
             ("no query at all", with(|p| p.query_vectors.clear())),
             (
                 "fields with a DSL-only request",
@@ -889,10 +929,6 @@ mod tests {
             (
                 "fields when every query vector names its own",
                 with(|p| p.query_vectors = vec![query_vector(&["b"])]),
-            ),
-            (
-                "fields when the DSL query drops query_vectors (#1366)",
-                with(|p| p.query = "title:rust".to_string()),
             ),
             (
                 "unknown score_mode",

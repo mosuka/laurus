@@ -2379,7 +2379,8 @@ impl Engine {
         self::search::HybridMode,
     )> {
         match query {
-            self::search::SearchQuery::Dsl(_) => {
+            self::search::SearchQuery::Dsl(_)
+            | self::search::SearchQuery::DslWithVectors { .. } => {
                 // DSL should be parsed by UnifiedQueryParser before calling this
                 unreachable!("DSL should be resolved before resolve_search_query_from_parts")
             }
@@ -2424,6 +2425,135 @@ impl Engine {
                 Ok((Some(lex_req), Some(vec_req), fusion, mode))
             }
         }
+    }
+
+    /// Embed query payloads into query vectors.
+    ///
+    /// Text and bytes payloads are embedded in one batch (Issue #671), through
+    /// the embedding cache and per-field routing; other payloads are skipped.
+    /// Each vector keeps its payload's weight and is routed to its field.
+    async fn embed_query_payloads(
+        &self,
+        payloads: &[crate::vector::store::request::QueryPayload],
+    ) -> Result<Vec<crate::vector::store::request::QueryVector>> {
+        use crate::data::DataValue;
+        use crate::embedding::embedder::EmbedInput;
+        use crate::vector::store::request::QueryVector;
+
+        // Owned payload data for the embeddable (Text / Bytes) payloads,
+        // keeping each one's field and weight. Owned buffers must outlive the
+        // borrowed `EmbedInput`s handed to the batch call below.
+        enum Owned {
+            Text(String),
+            Bytes(Vec<u8>, Option<String>),
+        }
+        let mut owned: Vec<(String, f32, Owned)> = Vec::new();
+        for payload in payloads {
+            let data = match &payload.payload {
+                DataValue::Text(t) => Owned::Text(t.clone()),
+                DataValue::Bytes(b, m) => Owned::Bytes(b.clone(), m.clone()),
+                _ => continue,
+            };
+            owned.push((payload.field.clone(), payload.weight, data));
+        }
+
+        let items: Vec<(String, EmbedInput<'_>)> = owned
+            .iter()
+            .map(|(field, _, data)| {
+                let input = match data {
+                    Owned::Text(t) => EmbedInput::Text(t),
+                    Owned::Bytes(b, m) => EmbedInput::Bytes(b, m.as_deref()),
+                };
+                (field.clone(), input)
+            })
+            .collect();
+        let embedder = self.vector.embedder();
+        let vectors =
+            embed_batch_with_cache(self.embedding_cache.as_ref(), &embedder, &items).await?;
+
+        Ok(owned
+            .iter()
+            .zip(vectors)
+            .map(|((field, weight, _), vector)| QueryVector {
+                vector,
+                weight: *weight,
+                fields: Some(vec![field.clone()]),
+            })
+            .collect())
+    }
+
+    /// Parse a unified DSL string into a Lexical / Vector / Hybrid query.
+    async fn parse_unified_dsl(
+        &self,
+        dsl: &str,
+        fusion: Option<FusionAlgorithm>,
+    ) -> Result<self::search::SearchQuery> {
+        let parser = self.unified_query_parser()?;
+        let parser = match fusion {
+            Some(fusion) => parser.with_fusion(fusion),
+            None => parser,
+        };
+        Ok(parser.parse(dsl).await?.query)
+    }
+
+    /// The query vectors of `query`, embedding `Payloads` first.
+    async fn query_vectors_of(
+        &self,
+        query: self::search::VectorSearchQuery,
+    ) -> Result<Vec<crate::vector::store::request::QueryVector>> {
+        match query {
+            self::search::VectorSearchQuery::Vectors(vectors) => Ok(vectors),
+            self::search::VectorSearchQuery::Payloads(payloads) => {
+                self.embed_query_payloads(&payloads).await
+            }
+        }
+    }
+
+    /// Add `extra` to the vector part of a query parsed from a DSL string
+    /// (Issue #1366, [`SearchQuery::DslWithVectors`](self::search::SearchQuery::DslWithVectors)).
+    ///
+    /// A lexical-only query becomes a [`Union`](self::search::HybridMode::Union)
+    /// hybrid; a hybrid query keeps its mode. With no extra vectors (or none
+    /// left after embedding) the parsed query is returned unchanged.
+    async fn add_vectors_to_parsed_dsl(
+        &self,
+        parsed: self::search::SearchQuery,
+        extra: self::search::VectorSearchQuery,
+    ) -> Result<self::search::SearchQuery> {
+        use self::search::{HybridMode, SearchQuery, VectorSearchQuery};
+
+        let extra = self.query_vectors_of(extra).await?;
+        if extra.is_empty() {
+            return Ok(parsed);
+        }
+        let with_extra = |mut vectors: Vec<_>| {
+            vectors.extend(extra.iter().cloned());
+            VectorSearchQuery::Vectors(vectors)
+        };
+        Ok(match parsed {
+            SearchQuery::Lexical(lexical) => SearchQuery::Hybrid {
+                lexical,
+                vector: VectorSearchQuery::Vectors(extra.clone()),
+                mode: HybridMode::Union,
+            },
+            SearchQuery::Vector(vector) => {
+                SearchQuery::Vector(with_extra(self.query_vectors_of(vector).await?))
+            }
+            SearchQuery::Hybrid {
+                lexical,
+                vector,
+                mode,
+            } => SearchQuery::Hybrid {
+                lexical,
+                vector: with_extra(self.query_vectors_of(vector).await?),
+                mode,
+            },
+            SearchQuery::Dsl(_) | SearchQuery::DslWithVectors { .. } => {
+                return Err(crate::error::LaurusError::internal(
+                    "a parsed DSL query cannot itself be a DSL query",
+                ));
+            }
+        })
     }
 
     /// Build a [`VectorSearchRequest`](crate::vector::store::request::VectorSearchRequest)
@@ -3095,33 +3225,30 @@ impl Engine {
             .as_ref()
             .map_or(page_end, |rescore| rescore.depth(page_end));
 
-        let (lexical_search_request, vector_search_request, fusion_algorithm, hybrid_mode) =
-            match request_query {
-                self::search::SearchQuery::Dsl(ref dsl) => {
-                    let parser = self.unified_query_parser()?;
-                    let parser = if let Some(fusion) = request_fusion {
-                        parser.with_fusion(fusion)
-                    } else {
-                        parser
-                    };
-                    let parsed = parser.parse(dsl).await?;
-                    // UnifiedQueryParser now returns Lexical/Vector/Hybrid variants
-                    self.resolve_search_query_from_parts(
-                        parsed.query,
-                        fetch_count,
-                        request_fusion,
-                        &lexical_options,
-                        &vector_options,
-                    )?
-                }
-                other => self.resolve_search_query_from_parts(
-                    other,
-                    fetch_count,
-                    request_fusion,
-                    &lexical_options,
-                    &vector_options,
-                )?,
-            };
+        // Turn a DSL string into Lexical / Vector / Hybrid parts first. Every
+        // variant is listed explicitly, so a new one fails to compile here
+        // instead of reaching `resolve_search_query_from_parts`'s
+        // `unreachable!` at run time.
+        let resolved = match request_query {
+            self::search::SearchQuery::Dsl(dsl) => {
+                self.parse_unified_dsl(&dsl, request_fusion).await?
+            }
+            self::search::SearchQuery::DslWithVectors { dsl, vectors } => {
+                let parsed = self.parse_unified_dsl(&dsl, request_fusion).await?;
+                self.add_vectors_to_parsed_dsl(parsed, vectors).await?
+            }
+            query @ (self::search::SearchQuery::Lexical(_)
+            | self::search::SearchQuery::Vector(_)
+            | self::search::SearchQuery::Hybrid { .. }) => query,
+        };
+        let (lexical_search_request, vector_search_request, fusion_algorithm, hybrid_mode) = self
+            .resolve_search_query_from_parts(
+            resolved,
+            fetch_count,
+            request_fusion,
+            &lexical_options,
+            &vector_options,
+        )?;
 
         // 0b. Resolve the user's lexical query once. The searcher gets it
         // filter-wrapped and boosted below; the highlighter gets this
@@ -3232,57 +3359,9 @@ impl Engine {
             if let crate::vector::search::searcher::VectorSearchQuery::Payloads(ref payloads) =
                 vreq.query
             {
-                use crate::data::DataValue;
-                use crate::embedding::embedder::EmbedInput;
-                use crate::vector::store::request::QueryVector;
-
-                // Owned payload data for the embeddable (Text / Bytes) payloads,
-                // keeping each one's field and weight. Non-text / non-bytes
-                // payloads are skipped, as before. Owned buffers must outlive the
-                // borrowed `EmbedInput`s handed to the batch call below.
-                enum Owned {
-                    Text(String),
-                    Bytes(Vec<u8>, Option<String>),
-                }
-                let mut owned: Vec<(String, f32, Owned)> = Vec::new();
-                for payload in payloads {
-                    let data = match &payload.payload {
-                        DataValue::Text(t) => Owned::Text(t.clone()),
-                        DataValue::Bytes(b, m) => Owned::Bytes(b.clone(), m.clone()),
-                        _ => continue,
-                    };
-                    owned.push((payload.field.clone(), payload.weight, data));
-                }
-
-                // Embed every payload in one batch (Issue #671) so a
-                // batch-capable embedder pays one round trip instead of one per
-                // payload, while preserving cache and per-field routing.
-                let items: Vec<(String, EmbedInput<'_>)> = owned
-                    .iter()
-                    .map(|(field, _, data)| {
-                        let input = match data {
-                            Owned::Text(t) => EmbedInput::Text(t),
-                            Owned::Bytes(b, m) => EmbedInput::Bytes(b, m.as_deref()),
-                        };
-                        (field.clone(), input)
-                    })
-                    .collect();
-                let embedder = self.vector.embedder();
-                let vectors =
-                    embed_batch_with_cache(self.embedding_cache.as_ref(), &embedder, &items)
-                        .await?;
-
-                let query_vectors: Vec<QueryVector> = owned
-                    .iter()
-                    .zip(vectors)
-                    .map(|((field, weight, _), vector)| QueryVector {
-                        vector,
-                        weight: *weight,
-                        fields: Some(vec![field.clone()]),
-                    })
-                    .collect();
-                vreq.query =
-                    crate::vector::search::searcher::VectorSearchQuery::Vectors(query_vectors);
+                vreq.query = crate::vector::search::searcher::VectorSearchQuery::Vectors(
+                    self.embed_query_payloads(payloads).await?,
+                );
             }
             Some(vreq)
         } else {

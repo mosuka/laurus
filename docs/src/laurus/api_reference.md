@@ -116,7 +116,7 @@ A collection of named field values.
 | Method | Description |
 | :--- | :--- |
 | `SearchRequestBuilder::new()` | Create a new builder |
-| `.query_dsl(dsl)` | Set a unified DSL string (parsed at search time) |
+| `.query_dsl(dsl)` | Set a unified DSL string (parsed at search time). A `.vector_query(..)` set with it is added to the DSL's vector part; a `.lexical_query(..)` is ignored |
 | `.lexical_query(query)` | Set the lexical search query (`LexicalSearchQuery`) |
 | `.vector_query(query)` | Set the vector search query (`VectorSearchQuery`) |
 | `.filter_query(query)` | Set a pre-filter query |

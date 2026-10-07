@@ -1,6 +1,8 @@
-//! `SearchRequest.vector_params` end to end through the gRPC services
-//! (Issue #1342): values that used to be dropped now change the results,
-//! and values that cannot apply are rejected.
+//! Issue #1366: `query` (unified DSL) and `query_vectors` sent together
+//! through the gRPC services form one search: the vectors used to be
+//! silently dropped. With `lexical_params` / `field_boosts`, `query` is still
+//! the unified DSL, so an unknown field is rejected instead of matching
+//! nothing.
 
 use std::sync::Arc;
 
@@ -20,20 +22,17 @@ use laurus_server::service::document::DocumentService;
 use laurus_server::service::index::IndexService;
 use laurus_server::service::search::SearchService;
 
-/// Two 2-d vector fields `a` and `b`. Against the query `[1, 0]`, `in_a`
-/// and `in_b` match exactly and `far_a` is orthogonal.
-const CORPUS: [(&str, &str, [f32; 2]); 3] = [
-    ("in_a", "a", [1.0, 0.0]),
-    ("in_b", "b", [1.0, 0.0]),
-    ("far_a", "a", [0.0, 1.0]),
+/// `lexical` matches `title:rust` only; `vector` is close to `[1, 0]` only.
+const CORPUS: [(&str, &str, [f32; 2]); 2] = [
+    ("lexical", "rust", [0.0, 1.0]),
+    ("vector", "go", [1.0, 0.0]),
 ];
 
 async fn search_service(dir: &tempfile::TempDir) -> SearchService {
     let engine = Arc::new(RwLock::new(None));
     let schema = Schema::builder()
         .add_text_field("title", TextOption::default())
-        .add_flat_field("a", FlatOption::new(2))
-        .add_flat_field("b", FlatOption::new(2))
+        .add_flat_field("vec", FlatOption::new(2))
         .build();
     IndexService {
         engine: engine.clone(),
@@ -49,12 +48,12 @@ async fn search_service(dir: &tempfile::TempDir) -> SearchService {
 
     let documents = CORPUS
         .iter()
-        .map(|(id, field, vector)| DocumentEntry {
+        .map(|(id, title, vector)| DocumentEntry {
             id: id.to_string(),
             document: Some(doc_convert::to_proto(
                 &Document::builder()
-                    .add_text("title", "rust")
-                    .add_vector(*field, vector.to_vec())
+                    .add_text("title", *title)
+                    .add_vector("vec", vector.to_vec())
                     .build(),
             )),
         })
@@ -76,15 +75,14 @@ async fn search_service(dir: &tempfile::TempDir) -> SearchService {
     }
 }
 
-/// A search with one field-less query vector `[1, 0]`.
-fn vector_request(vector_params: v1::VectorParams) -> v1::SearchRequest {
+fn hybrid_request(query: &str) -> v1::SearchRequest {
     v1::SearchRequest {
+        query: query.to_string(),
         query_vectors: vec![v1::QueryVector {
             vector: vec![1.0, 0.0],
             weight: 1.0,
             fields: Vec::new(),
         }],
-        vector_params: Some(vector_params),
         limit: 10,
         ..Default::default()
     }
@@ -105,60 +103,32 @@ async fn ids(service: &SearchService, request: v1::SearchRequest) -> Vec<String>
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_fields_routes_a_field_less_query_vector() {
+async fn test_query_with_query_vectors_is_a_hybrid_search() {
     let dir = tempfile::TempDir::new().unwrap();
     let service = search_service(&dir).await;
 
-    let all = ids(&service, vector_request(v1::VectorParams::default())).await;
-    assert_eq!(all, ["far_a", "in_a", "in_b"]);
+    let found = ids(&service, hybrid_request("title:rust")).await;
+    assert_eq!(found, ["lexical", "vector"]);
 
-    let only_a = ids(
-        &service,
-        vector_request(v1::VectorParams {
-            fields: vec!["a".to_string()],
-            ..Default::default()
-        }),
-    )
-    .await;
-    assert_eq!(only_a, ["far_a", "in_a"]);
+    let mut with_boosts = hybrid_request("title:rust");
+    with_boosts.field_boosts = [("title".to_string(), 2.0)].into_iter().collect();
+    assert_eq!(ids(&service, with_boosts).await, ["lexical", "vector"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_min_score_filters_results() {
+async fn test_unknown_field_is_rejected_with_lexical_overrides() {
     let dir = tempfile::TempDir::new().unwrap();
     let service = search_service(&dir).await;
 
-    let close = ids(
-        &service,
-        vector_request(v1::VectorParams {
-            min_score: 0.9,
-            ..Default::default()
-        }),
-    )
-    .await;
-    assert_eq!(close, ["in_a", "in_b"]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_unusable_vector_params_are_invalid_argument() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let service = search_service(&dir).await;
-
-    let zero_ef = vector_request(v1::VectorParams {
-        ef_search: Some(0),
-        ..Default::default()
-    });
-    // No query_vectors and no query: nothing the params could apply to.
-    let no_vector_part = v1::SearchRequest {
-        vector_params: Some(v1::VectorParams::default()),
+    let request = v1::SearchRequest {
+        query: "titl:rust".to_string(),
+        field_boosts: [("title".to_string(), 2.0)].into_iter().collect(),
         limit: 10,
         ..Default::default()
     };
-    for request in [zero_ef, no_vector_part] {
-        let status = service
-            .search(Request::new(request))
-            .await
-            .expect_err("expected INVALID_ARGUMENT");
-        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
-    }
+    let status = service
+        .search(Request::new(request))
+        .await
+        .expect_err("an unknown field must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
 }

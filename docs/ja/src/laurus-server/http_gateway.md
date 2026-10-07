@@ -225,6 +225,8 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
+`query_vectors` は `query` のベクトル部分に追加されるので、lexical 句だけの `query` は、`lexical_params` / `field_boosts` の有無にかかわらずハイブリッド検索になります（Issue #1366）。各要素には空でない数値の配列 `vector` が必要です。`weight`（数値）と `fields`（文字列の配列）は省略でき、`null` なら既定値のままです。それ以外の形は、黙って捨てずに `400 Bad Request` で拒否されます。
+
 #### ベクトル検索パラメータ付き検索
 
 `vector_params` には、gRPC の [`VectorParams`](grpc_api.md#vectorparams) メッセージのキーを snake_case で指定します。キーは `fields`、`score_mode`（`"weighted_sum"`、`"max_sim"`、`"late_interaction"` のいずれか）、`overfetch`、`min_score`、`rerank_factor`、`ef_search` です。値が `null` のキーや省略したキーは既定値のままになります。型の違うキー、未知の `score_mode`、32 ビット符号なし整数に収まらない `rerank_factor` / `ef_search` は `400 Bad Request` で拒否されます。gRPC API が拒否する値も同様です（Issue #1342）。

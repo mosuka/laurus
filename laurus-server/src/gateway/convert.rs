@@ -1002,11 +1002,20 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         .unwrap_or("")
         .to_string();
 
-    let query_vectors = json
-        .get("query_vectors")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(json_to_query_vector).collect())
-        .unwrap_or_default();
+    // A malformed `query_vectors` is rejected (400) rather than dropped,
+    // shortened or defaulted (Issue #1366).
+    let query_vectors = match json.get("query_vectors").filter(|v| !v.is_null()) {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "query_vectors must be an array".to_string())?
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                json_to_query_vector(entry).map_err(|e| format!("query_vectors[{i}]: {e}"))
+            })
+            .collect::<Result<_, _>>()?,
+    };
 
     // Absent or `null` keeps the default; anything else must fit `u32`
     // rather than wrap around (Issue #1367).
@@ -1062,24 +1071,53 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
     })
 }
 
-fn json_to_query_vector(json: &Value) -> Option<v1::QueryVector> {
-    let vector = json
-        .get("vector")?
-        .as_array()?
-        .iter()
-        .filter_map(|v| v.as_f64().map(|f| f as f32))
-        .collect();
-    let weight = json.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-    let fields = json
-        .get("fields")
+/// Converts one JSON `query_vectors` entry to a proto `QueryVector`.
+///
+/// `vector` must be a non-empty array of numbers. `weight` (a number) and
+/// `fields` (an array of strings) are optional; absent or `null` keeps the
+/// defaults (weight 1.0, no fields).
+///
+/// # Errors
+///
+/// Returns a message for HTTP 400 describing the offending key.
+fn json_to_query_vector(json: &Value) -> Result<v1::QueryVector, String> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| "must be an object".to_string())?;
+    let get = |key: &str| obj.get(key).filter(|v| !v.is_null());
+
+    let vector: Vec<f32> = get("vector")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
+        .filter(|items| !items.is_empty())
+        .and_then(|items| {
+            items
+                .iter()
+                .map(|item| item.as_f64().map(|f| f as f32))
+                .collect::<Option<Vec<_>>>()
         })
-        .unwrap_or_default();
-    Some(v1::QueryVector {
+        .ok_or_else(|| "vector must be a non-empty array of numbers".to_string())?;
+
+    let weight = match get("weight") {
+        None => 1.0,
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| "weight must be a number".to_string())? as f32,
+    };
+
+    let fields = match get("fields") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| "fields must be an array of strings".to_string())?,
+    };
+
+    Ok(v1::QueryVector {
         vector,
         weight,
         fields,
@@ -2366,6 +2404,63 @@ mod tests {
             laurus::VectorScoreMode::WeightedSum
         ));
         assert_eq!(options.ef_search, Some(32));
+    }
+
+    /// Issue #1366: `query_vectors` entries keep their values; `null` keeps
+    /// the defaults (no vectors, weight 1.0, no fields).
+    #[test]
+    fn test_json_to_proto_search_request_query_vectors() {
+        let req = json_to_proto_search_request(&json!({
+            "query_vectors": [
+                {"vector": [1.0, 0.5], "weight": 2.0, "fields": ["vec"]},
+                {"vector": [0.0, 1.0], "weight": null, "fields": null}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(req.query_vectors.len(), 2);
+        assert_eq!(req.query_vectors[0].vector, [1.0, 0.5]);
+        assert_eq!(req.query_vectors[0].weight, 2.0);
+        assert_eq!(req.query_vectors[0].fields, ["vec"]);
+        assert_eq!(req.query_vectors[1].weight, 1.0);
+        assert!(req.query_vectors[1].fields.is_empty());
+
+        let req =
+            json_to_proto_search_request(&json!({"query": "q", "query_vectors": null})).unwrap();
+        assert!(req.query_vectors.is_empty());
+    }
+
+    /// Issue #1366: a malformed `query_vectors` value is rejected (400)
+    /// instead of being dropped, shortened or defaulted.
+    #[test]
+    fn test_json_to_proto_search_request_rejects_malformed_query_vectors() {
+        let cases = [
+            ("not an array", json!({"vector": [1.0]})),
+            ("entry is not an object", json!([1.0])),
+            ("missing vector", json!([{}])),
+            (
+                "vector is a string",
+                json!([{"vector": "systems programming"}]),
+            ),
+            ("empty vector", json!([{"vector": []}])),
+            ("non-numeric element", json!([{"vector": [1.0, "x"]}])),
+            (
+                "weight is not a number",
+                json!([{"vector": [1.0], "weight": "2"}]),
+            ),
+            (
+                "fields is not an array",
+                json!([{"vector": [1.0], "fields": "vec"}]),
+            ),
+            (
+                "a field is not a string",
+                json!([{"vector": [1.0], "fields": [1]}]),
+            ),
+        ];
+        for (case, query_vectors) in cases {
+            let err = json_to_proto_search_request(&json!({"query_vectors": query_vectors}))
+                .expect_err(case);
+            assert!(err.contains("query_vectors"), "{case}: {err}");
+        }
     }
 
     /// Issue #1367: `limit` / `offset` keep their defaults when absent or

@@ -474,25 +474,19 @@ curl -X PUT http://localhost:8080/v1/documents/doc002 \
 curl -X POST http://localhost:8080/v1/commit
 ```
 
-テキストクエリで lexical 検索、ベクトルクエリでセマンティック検索を同時に行います。検索時もテキストからベクトルへの変換が自動的に行われます:
+1 つの `query` で lexical 検索とセマンティック検索を同時に行います。`systems programming` は lexical 句、`embedding:"..."` はベクトル句で、そのテキストは検索時にエンベッダーがベクトルに変換します:
 
 ```bash
 curl -X POST http://localhost:8080/v1/search \
   -H 'Content-Type: application/json' \
   -d '{
-    "query": "systems programming",
-    "query_vectors": [
-      {
-        "vector": "systems programming language",
-        "fields": ["embedding"]
-      }
-    ],
+    "query": "systems programming embedding:\"systems programming language\"",
     "fusion": {"rrf": {"k": 60.0}},
     "limit": 10
   }'
 ```
 
-`precomputed` エンベッダーではベクトルを直接渡す必要がありますが、`candle_bert` のようなテキスト対応エンベッダーを使うと、インデックス時も検索時もテキストを直接渡せます。
+`precomputed` エンベッダーではベクトルを直接渡す必要があります（`query_vectors` の `vector` は数値の配列）が、`candle_bert` のようなテキスト対応エンベッダーを使うと、インデックス時も検索時もテキストを直接渡せます。
 
 ### OpenAI Embeddings の利用
 
