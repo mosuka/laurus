@@ -627,6 +627,39 @@ the pipeline still ends in the exact f32 stage, so multi-segment
 fan-out keeps treating those scores as the exact, cross-segment-
 comparable basis regardless of whether an SQ stage ran ahead of it.
 
+### MultiVector Storage
+
+The quantization methods above apply to the ANN index types (Flat, HNSW,
+IVF). A [`MultiVector` field](../schema_and_fields.md#multi-vector-fields)
+has no ANN index, so `quantizer` does not apply to it — instead its own
+`storage` option (Issue #1346) picks the on-disk element kind of every
+token vector:
+
+| Kind | Rust Enum Variant | Bytes/element | Error | Size per document (300 × 128 tokens) |
+| :--- | :--- | :--- | :--- | :--- |
+| **F32** *(default)* | `MultiVectorStorage::F32` | 4 | Exact | ~150 KB |
+| **F16** | `MultiVectorStorage::F16` | 2 | ~2⁻¹¹ relative error per element | ~75 KB |
+| **Int8** | `MultiVectorStorage::Int8` | ~1 (`dimension + 2` bytes/row total) | Bounded by the per-vector scale `max(abs(vector)) / 127` | ~38 KB |
+
+```rust
+use laurus::{MultiVectorOption, MultiVectorStorage};
+
+let opt = MultiVectorOption::new(128).storage(MultiVectorStorage::Int8);
+```
+
+Unlike `quantizer`'s per-segment global scale, `Int8`'s scale is
+per-**vector**: `scale = max(abs(vector)) / 127`, computed independently
+for each token vector, with no corpus- or segment-trained state — which is
+what lets a segment merge copy rows byte-for-byte instead of
+re-quantizing on every merge.
+
+Changing `storage` on an existing field is a
+[Reindex change](../schema_and_fields.md#multi-vector-fields):
+`Engine::update_field` with `reindex: true` rebuilds the field's existing
+segments under the new on-disk kind. A schema with no `storage` key
+(written before this option existed) defaults to `F32` and needs no
+migration.
+
 ## Segment Files
 
 | Index Type | File Extension | Contents |

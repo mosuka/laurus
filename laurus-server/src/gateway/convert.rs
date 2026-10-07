@@ -558,7 +558,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
     } else if let Some(v) = obj.get("ivf") {
         Opt::Ivf(json_to_ivf_option(v)?)
     } else if let Some(v) = obj.get("multi_vector") {
-        Opt::MultiVector(json_to_multi_vector_option(v))
+        Opt::MultiVector(json_to_multi_vector_option(v)?)
     } else {
         return Err("unknown field option type".to_string());
     };
@@ -688,6 +688,9 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             });
             if !v.embedder.is_empty() {
                 obj["embedder"] = json!(v.embedder);
+            }
+            if let Some(storage) = multi_vector_storage_to_json(v.storage) {
+                obj["storage"] = json!(storage);
             }
             json!({ "multi_vector": obj })
         }
@@ -848,8 +851,21 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 /// A multi-vector field option (#1177); the engine rejects a zero
 /// dimension or a distance other than cosine / dot product when the index
 /// is created.
-fn json_to_multi_vector_option(json: &Value) -> v1::MultiVectorOption {
-    v1::MultiVectorOption {
+///
+/// # Errors
+///
+/// Returns an error when `storage` is present but not one of
+/// `"f32"` / `"f16"` / `"int8"` (case-insensitive), so a typo 400s
+/// instead of silently defaulting to f32 (Issue #1346).
+fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
+    let storage = match json.get("storage").and_then(|v| v.as_str()) {
+        None => v1::MultiVectorStorage::F32 as i32,
+        Some(s) if s.eq_ignore_ascii_case("f32") => v1::MultiVectorStorage::F32 as i32,
+        Some(s) if s.eq_ignore_ascii_case("f16") => v1::MultiVectorStorage::F16 as i32,
+        Some(s) if s.eq_ignore_ascii_case("int8") => v1::MultiVectorStorage::Int8 as i32,
+        Some(s) => return Err(format!("unknown multi_vector storage '{s}'")),
+    };
+    Ok(v1::MultiVectorOption {
         dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         distance: json
             .get("distance")
@@ -861,6 +877,18 @@ fn json_to_multi_vector_option(json: &Value) -> v1::MultiVectorOption {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        storage: Some(storage),
+    })
+}
+
+/// Render a proto `storage` value as a lowercase JSON string (Issue
+/// #1346). Returns `None` for F32/`UNSPECIFIED`/unknown, the default, so
+/// the field is omitted from the JSON object.
+fn multi_vector_storage_to_json(value: Option<i32>) -> Option<&'static str> {
+    match value.and_then(|v| v1::MultiVectorStorage::try_from(v).ok()) {
+        Some(v1::MultiVectorStorage::F16) => Some("f16"),
+        Some(v1::MultiVectorStorage::Int8) => Some("int8"),
+        _ => None,
     }
 }
 
@@ -1824,6 +1852,34 @@ mod tests {
         });
         let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
         assert_eq!(back, json);
+    }
+
+    /// #1346: `storage` round-trips for every kind, case-insensitively,
+    /// is omitted from the rendered JSON when f32 (the default), and an
+    /// unknown value is a 400-worthy error rather than a silent default.
+    #[test]
+    fn test_multi_vector_storage_round_trips_through_json() {
+        for (input, expected) in [("f32", "f32"), ("F16", "f16"), ("int8", "int8")] {
+            let json = json!({ "multi_vector": {"dimension": 32, "storage": input} });
+            let proto = json_to_proto_field_option(&json).unwrap();
+            let back = proto_field_option_to_json(&proto);
+            if input.eq_ignore_ascii_case("f32") {
+                assert!(
+                    back["multi_vector"].get("storage").is_none(),
+                    "f32 is the default and should be omitted: {back}"
+                );
+            } else {
+                assert_eq!(back["multi_vector"]["storage"], json!(expected));
+            }
+        }
+
+        let json = json!({ "multi_vector": {"dimension": 32} });
+        let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
+        assert!(back["multi_vector"].get("storage").is_none());
+
+        let json = json!({ "multi_vector": {"dimension": 32, "storage": "bf16"} });
+        let err = json_to_proto_field_option(&json).unwrap_err();
+        assert!(err.contains("bf16"), "{err}");
     }
 
     /// #1349: numeric and boolean embedder parameters reach the proto as

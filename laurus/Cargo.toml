@@ -32,6 +32,7 @@ crc32fast = "1.5.0"
 csv = "1.4.0"
 fst = "0.4.7"
 futures = "0.3.33"
+half = { version = "2", default-features = false, features = ["std"] }
 lazy_static = "1.5.0"
 lindera = { version = "6.2.0" }
 lindera-dictionary = { version = "6.2.0", default-features = false }

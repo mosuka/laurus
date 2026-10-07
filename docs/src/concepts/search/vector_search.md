@@ -459,6 +459,13 @@ each pair contributes its cosine similarity and a score is at most the
 number of query vectors. With `DistanceMetric::DotProduct` the vectors are
 used as given.
 
+The field's stored vectors may also be compressed: its
+[`storage` option](../indexing/vector_indexing.md#multivector-storage) can
+encode them as `F16` or `Int8` instead of the exact `F32` default, trading
+some score precision for a smaller index — `F16` carries ~2⁻¹¹ relative
+error per element, and `Int8`'s error is bounded by its per-vector scale
+(`max(abs(vector)) / 127`).
+
 ### Cost
 
 Rescoring takes `window_size × query vectors × document vectors` dot

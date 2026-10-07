@@ -2828,6 +2828,7 @@ dependencies = [
  "fst",
  "futures",
  "getrandom 0.4.3",
+ "half",
  "hf-hub",
  "image",
  "lazy_static",

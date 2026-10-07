@@ -1250,7 +1250,7 @@ mod tests {
                 s.add_ivf_field(n, 3, None, None, None, None, None)
             }),
             ("addMultiVectorField", |s, n| {
-                s.add_multi_vector_field(n, 3, None, None)
+                s.add_multi_vector_field(n, 3, None, None, None)
             }),
         ];
         for (method, add_field) in methods {
@@ -1357,6 +1357,7 @@ mod tests {
                 2,
                 Some("dot_product".to_string()),
                 callback.map(|_| "colbert".to_string()),
+                None,
             )
             .unwrap();
         schema
@@ -1487,7 +1488,13 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_multi_vector_field("tokens".to_string(), 2, None, Some("colbert".to_string()))
+            .add_multi_vector_field(
+                "tokens".to_string(),
+                2,
+                None,
+                Some("colbert".to_string()),
+                None,
+            )
             .unwrap();
         let Err(err) = WasmIndex::create(Some(schema), None, None).await else {
             panic!("a dimension mismatch must be rejected");
@@ -1580,26 +1587,46 @@ mod tests {
     #[wasm_bindgen_test]
     fn add_multi_vector_field_rejects_invalid_options() {
         let cases = [
-            (0, None, "dimension must be greater than 0"),
+            (0, None, None, "dimension must be greater than 0"),
             (
                 2,
                 Some("euclidean"),
+                None,
                 "distance must be Cosine or DotProduct",
             ),
+            (2, None, Some("bogus"), "Unknown multi-vector storage"),
         ];
-        for (dimension, distance, message) in cases {
+        for (dimension, distance, storage, message) in cases {
             let mut schema = WasmSchema::new();
             let Err(err) = schema.add_multi_vector_field(
                 "tokens".to_string(),
                 dimension,
                 distance.map(str::to_string),
                 None,
+                storage.map(str::to_string),
             ) else {
                 panic!("invalid multi-vector options must be rejected: {message}");
             };
             let error = err.as_string().unwrap();
             assert!(error.contains(message), "{error}");
             assert!(schema.field_names().is_empty());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn add_multi_vector_field_accepts_valid_storage() {
+        for storage in ["f32", "f16", "int8"] {
+            let mut schema = WasmSchema::new();
+            schema
+                .add_multi_vector_field(
+                    "tokens".to_string(),
+                    2,
+                    None,
+                    None,
+                    Some(storage.to_string()),
+                )
+                .unwrap_or_else(|err| panic!("storage={storage} must be accepted: {err:?}"));
+            assert_eq!(schema.field_names(), vec!["tokens".to_string()]);
         }
     }
 }

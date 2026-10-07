@@ -121,14 +121,24 @@ impl Shared {
         write_segment(
             self.core.storage().as_ref(),
             &Self::file_name(&merged_id),
+            self.config.storage,
             self.config.dimension,
             &entries,
             |i, sink| {
                 let (entry, source) = survivors[i];
-                let vectors = readers[source].vectors(entry.doc_id)?.ok_or_else(|| {
+                let rows = readers[source].rows(entry.doc_id)?.ok_or_else(|| {
                     LaurusError::internal("merge source lost a document listed in its table")
                 })?;
-                sink.write(&vectors)
+                // Same element kind: copy the encoded bytes verbatim (no
+                // re-quantization, no compounding loss across merges).
+                // Different kind (the field's `storage` just changed):
+                // transcode through f32, which is also how `update_field`
+                // migrates every existing segment to the new kind.
+                if rows.kind() == self.config.storage {
+                    sink.write_raw(rows.as_bytes())
+                } else {
+                    sink.write(&rows.to_f32())
+                }
             },
         )?;
 
@@ -468,6 +478,7 @@ impl VectorIndexWriter for MultiVectorWriter {
         write_segment(
             self.shared.core.storage().as_ref(),
             &Shared::file_name(&self.segment_id),
+            self.shared.config.storage,
             self.shared.config.dimension,
             &entries,
             |i, sink| {

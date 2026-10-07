@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::error::{LaurusError, Result};
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::vector::core::distance::DistanceMetric;
+use crate::vector::core::multi_vector::MultiVectorRows;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::multivector::format::SegmentReader;
 use crate::vector::reader::{
@@ -57,22 +58,37 @@ impl MultiVectorSnapshot {
         self.distance
     }
 
+    /// The still-encoded token vector rows of `doc_id`, or `None` when the
+    /// document has none or is deleted. Prefer this over [`Self::vectors`]
+    /// when the caller can score a compressed element kind directly (see
+    /// [`crate::vector::core::late_interaction::max_sim_rows`]), to avoid
+    /// decoding a document that was never going to be borrowed anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reading a segment fails.
+    pub fn rows(&self, doc_id: u64) -> Result<Option<MultiVectorRows<'_>>> {
+        if self.is_deleted(doc_id) {
+            return Ok(None);
+        }
+        for segment in &self.segments {
+            if let Some(rows) = segment.rows(doc_id)? {
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
+    }
+
     /// The token vectors of `doc_id`, row-major (`vector count × dimension`
     /// values), or `None` when the document has none or is deleted.
+    /// Decodes a compressed element kind into f32; see [`Self::rows`] to
+    /// avoid decoding when the raw bytes suffice.
     ///
     /// # Errors
     ///
     /// Returns an error when reading a segment fails.
     pub fn vectors(&self, doc_id: u64) -> Result<Option<Cow<'_, [f32]>>> {
-        if self.is_deleted(doc_id) {
-            return Ok(None);
-        }
-        for segment in &self.segments {
-            if let Some(vectors) = segment.vectors(doc_id)? {
-                return Ok(Some(vectors));
-            }
-        }
-        Ok(None)
+        Ok(self.rows(doc_id)?.map(|rows| rows.to_f32()))
     }
 
     fn is_deleted(&self, doc_id: u64) -> bool {

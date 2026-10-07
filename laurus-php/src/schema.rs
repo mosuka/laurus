@@ -8,8 +8,8 @@ use ext_php_rs::types::ZendHashTable;
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
-    GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption, QuantizationMethod,
-    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
+    GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption, MultiVectorStorage,
+    QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 
 use crate::convert::hashtable_to_json_value;
@@ -85,6 +85,28 @@ fn parse_rerank_storage(name: Option<&str>) -> PhpResult<Option<RerankStorageKin
         None => Ok(None),
         Some("f32") => Ok(Some(RerankStorageKind::F32)),
         Some(other) => Err(format!("Unknown rerank_storage: '{other}'. Valid: f32").into()),
+    }
+}
+
+/// Parse an on-disk storage kind string into [`MultiVectorStorage`].
+///
+/// # Arguments
+///
+/// * `s` - Storage kind name (e.g. "f32", "f16", "int8").
+///
+/// # Returns
+///
+/// The corresponding `MultiVectorStorage`.
+fn parse_multi_vector_storage(s: &str) -> PhpResult<MultiVectorStorage> {
+    match s.to_lowercase().as_str() {
+        "f32" => Ok(MultiVectorStorage::F32),
+        "f16" => Ok(MultiVectorStorage::F16),
+        "int8" => Ok(MultiVectorStorage::Int8),
+        other => Err(format!(
+            "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8",
+            other
+        )
+        .into()),
     }
 }
 
@@ -637,23 +659,30 @@ impl PhpSchema {
     /// * `embedder` - A token-level embedder registered via `addEmbedder`
     ///   (a `"candle_colbert"` one), which embeds text values and rescore
     ///   query text (default: none).
+    /// * `storage` - On-disk element kind of every token vector (Issue
+    ///   #1346): `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"`
+    ///   (~4x smaller).
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`), if
-    /// `dimension` is not positive, or if `distance` is neither cosine nor
-    /// dot_product.
+    /// `dimension` is not positive, if `distance` is neither cosine nor
+    /// dot_product, or if `storage` is not a known kind.
     pub fn add_multi_vector_field(
         &self,
         name: String,
         dimension: i64,
         distance: Option<String>,
         embedder: Option<String>,
+        storage: Option<String>,
     ) -> PhpResult<()> {
         // A negative dimension is rejected by `validate` like 0.
         let dimension = usize::try_from(dimension).unwrap_or(0);
         let mut opt = MultiVectorOption::new(dimension)
-            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
+            .storage(parse_multi_vector_storage(
+                storage.as_deref().unwrap_or("f32"),
+            )?);
         opt.embedder = embedder;
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))

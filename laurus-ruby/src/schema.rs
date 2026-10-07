@@ -6,8 +6,8 @@ use std::str::FromStr;
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
-    GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption, QuantizationMethod,
-    RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
+    GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption, MultiVectorStorage,
+    QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use magnus::prelude::*;
 use magnus::r_hash::ForEach;
@@ -30,6 +30,23 @@ fn parse_distance(s: &str) -> Result<DistanceMetric, Error> {
             ruby.exception_arg_error(),
             format!(
                 "Unknown distance metric: '{}'. Valid: cosine, euclidean, dot_product, manhattan, angular",
+                other
+            ),
+        )),
+    }
+}
+
+/// Parse an on-disk storage kind string into [`MultiVectorStorage`].
+fn parse_multi_vector_storage(s: &str) -> Result<MultiVectorStorage, Error> {
+    let ruby = Ruby::get().expect("called from Ruby thread");
+    match s.to_lowercase().as_str() {
+        "f32" => Ok(MultiVectorStorage::F32),
+        "f16" => Ok(MultiVectorStorage::F16),
+        "int8" => Ok(MultiVectorStorage::Int8),
+        other => Err(Error::new(
+            ruby.exception_arg_error(),
+            format!(
+                "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8",
                 other
             ),
         )),
@@ -855,6 +872,9 @@ impl RbSchema {
     ///   - `dimension` (usize): Dimensionality of each token vector.
     ///   - `distance:` (String, default "cosine"): `"cosine"` or
     ///     `"dot_product"`.
+    ///   - `storage:` (String, default "f32"): On-disk element kind of
+    ///     every token vector — `"f32"` (exact), `"f16"` (2x smaller), or
+    ///     `"int8"` (~4x smaller, lossy quantization).
     ///   - `embedder:` (String, optional): A token-level embedder registered
     ///     via `add_embedder` (a `"candle_colbert"` one), which embeds text
     ///     values and rescore query text.
@@ -862,19 +882,23 @@ impl RbSchema {
     /// # Errors
     ///
     /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
-    /// if `dimension` is 0, or if `distance:` is neither cosine nor
-    /// dot_product.
+    /// if `dimension` is 0, if `distance:` is neither cosine nor
+    /// dot_product, or if `storage:` is not a recognized kind.
     fn add_multi_vector_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<String>, Option<Option<String>>), ()>(
-            args.keywords,
-            &[],
-            &["distance", "embedder"],
-        )?;
-        let (distance, embedder) = kwargs.optional;
+        let kwargs = get_kwargs::<
+            _,
+            (),
+            (Option<String>, Option<String>, Option<Option<String>>),
+            (),
+        >(args.keywords, &[], &["distance", "storage", "embedder"])?;
+        let (distance, storage, embedder) = kwargs.optional;
         let mut opt = MultiVectorOption::new(dimension)
-            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?);
+            .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
+            .storage(parse_multi_vector_storage(
+                storage.as_deref().unwrap_or("f32"),
+            )?);
         opt.embedder = embedder.flatten();
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))

@@ -365,6 +365,18 @@ message IvfOption {
 // A multi-vector field (Issue #1177): each document's token vectors (e.g.
 // the per-token embeddings of a ColBERT-style model) with no ANN index,
 // read by late-interaction rescoring. Values are `VectorArrayValue`s.
+// On-disk element kind of a MultiVector field's token vectors (#1346).
+enum MultiVectorStorage {
+  // Unset on the wire; treated the same as F32.
+  MULTI_VECTOR_STORAGE_UNSPECIFIED = 0;
+  // IEEE-754 binary32, 4 bytes/element. Exact. Default.
+  MULTI_VECTOR_STORAGE_F32 = 1;
+  // IEEE-754 binary16, 2 bytes/element.
+  MULTI_VECTOR_STORAGE_F16 = 2;
+  // Signed 8-bit codes with a trailing per-vector f16 scale.
+  MULTI_VECTOR_STORAGE_INT8 = 3;
+}
+
 message MultiVectorOption {
   uint32 dimension = 1;
   // Only COSINE (vectors are L2-normalized) and DOT_PRODUCT are accepted.
@@ -373,6 +385,8 @@ message MultiVectorOption {
   // text values into token vectors. Empty means documents supply the token
   // vectors.
   string embedder = 3;
+  // On-disk element kind of every token vector. Unset means F32.
+  optional MultiVectorStorage storage = 4;
 }
 
 // An embedder configuration.

@@ -163,10 +163,15 @@ let schema = Schema::builder()
     .build();
 ```
 
-- **オプション**: `dimension`（各トークンベクトルの長さ）、`distance`、`embedder`。
-  距離として受け付けるのは `Cosine`（書き込み時に L2 正規化するので、類似度は内積に
-  なる。ゼロベクトルはそのまま保存する）と `DotProduct` だけで、それ以外はインデックスの
-  作成時に拒否されます。`embedder` には、[`candle_colbert`](../laurus-cli/schema_format.md#エンベダー)
+- **オプション**: `dimension`（各トークンベクトルの長さ）、`distance`、`storage`、
+  `embedder`。`distance` として受け付けるのは `Cosine`（書き込み時に L2 正規化
+  するので、類似度は内積になる。ゼロベクトルはそのまま保存する）と `DotProduct`
+  だけで、それ以外はインデックスの作成時に拒否されます。`storage` は各トークン
+  ベクトルのディスク上での要素形式を選びます — `F32`（デフォルト、厳密）、
+  `F16`、`Int8` のいずれかで、精度とインデックスサイズのトレードオフです。
+  サイズと誤差の数値は [MultiVector
+  ストレージ](indexing/vector_indexing.md#multivector-ストレージ)を参照してください。
+  `embedder` には、[`candle_colbert`](../laurus-cli/schema_format.md#エンベダー)
   のようなトークン単位の Embedder の名前を指定します
   （`MultiVectorOption::new(96).embedder("colbert")`）。
 - **値**: `DataValue::VectorArray(Vec<Vec<f32>>)`。1 本以上 8,192 本以下で、各ベクトルは
@@ -181,7 +186,10 @@ let schema = Schema::builder()
 - **検索できない**: フィールド指定なしのベクトル検索と prefix のフィールド指定は、この
   フィールドを対象にしません。ベクトル検索や DSL でこのフィールドを指定するとエラーです。
 - **スキーマの変更**: 次元・距離・Embedder の変更、他のベクトルフィールド型との
-  相互変更は、破壊的な変更（Destructive）です。
+  相互変更は、破壊的な変更（Destructive）です。`storage` の変更は
+  **Reindex** 扱いです。既存の値から再エンコードできるため、
+  `Engine::update_field(.., UpdateFieldOptions { reindex: true, .. })`
+  でフィールドの既存セグメントを新しいディスク上の形式へ再構築します。
 
 ## Document
 

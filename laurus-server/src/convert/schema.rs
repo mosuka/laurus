@@ -11,8 +11,8 @@ use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
     CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
     FieldChangeKind, FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, MultiVectorOption, QuantizationMethod, Schema, TextOption,
-    TokenFilterConfig, TokenizerConfig,
+    IntegerOption, IvfOption, MultiVectorOption, MultiVectorStorage, QuantizationMethod, Schema,
+    TextOption, TokenFilterConfig, TokenizerConfig,
 };
 
 use crate::proto::laurus::v1;
@@ -205,6 +205,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             dimension: o.dimension as u32,
             distance: distance_to_proto(&o.distance) as i32,
             embedder: o.embedder.clone().unwrap_or_default(),
+            storage: Some(multi_vector_storage_to_proto(o.storage) as i32),
         })),
     };
     v1::FieldOption { option }
@@ -346,6 +347,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             } else {
                 Some(o.embedder.clone())
             },
+            storage: multi_vector_storage_from_proto(o.storage),
         })),
         None => None,
     }
@@ -438,6 +440,29 @@ fn rerank_storage_from_proto(value: i32) -> Option<RerankStorageKind> {
     match v1::RerankStorageKind::try_from(value) {
         Ok(v1::RerankStorageKind::F32) => Some(RerankStorageKind::F32),
         Ok(v1::RerankStorageKind::Unspecified) | Err(_) => None,
+    }
+}
+
+/// Convert a laurus [`MultiVectorStorage`] into the proto wire form
+/// (Issue #1346).
+fn multi_vector_storage_to_proto(storage: MultiVectorStorage) -> v1::MultiVectorStorage {
+    match storage {
+        MultiVectorStorage::F32 => v1::MultiVectorStorage::F32,
+        MultiVectorStorage::F16 => v1::MultiVectorStorage::F16,
+        MultiVectorStorage::Int8 => v1::MultiVectorStorage::Int8,
+    }
+}
+
+/// Convert an optional proto `storage` enum value into a laurus
+/// [`MultiVectorStorage`]. `UNSPECIFIED`, absent, and any unknown value
+/// all map to [`MultiVectorStorage::F32`], the default.
+fn multi_vector_storage_from_proto(value: Option<i32>) -> MultiVectorStorage {
+    match value.and_then(|v| v1::MultiVectorStorage::try_from(v).ok()) {
+        Some(v1::MultiVectorStorage::F16) => MultiVectorStorage::F16,
+        Some(v1::MultiVectorStorage::Int8) => MultiVectorStorage::Int8,
+        Some(v1::MultiVectorStorage::F32 | v1::MultiVectorStorage::Unspecified) | None => {
+            MultiVectorStorage::F32
+        }
     }
 }
 
@@ -1348,21 +1373,46 @@ mod tests {
     /// dimension and distance.
     #[test]
     fn schema_field_option_multi_vector_round_trip() {
-        let schema = Schema::builder()
-            .add_multi_vector_field(
-                "tokens",
-                MultiVectorOption::new(96).distance(DistanceMetric::DotProduct),
-            )
-            .build();
-        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
-        match back.fields.get("tokens") {
-            Some(FieldOption::MultiVector(o)) => {
-                assert_eq!(o.dimension, 96);
-                assert_eq!(o.distance, DistanceMetric::DotProduct);
-                assert_eq!(o.embedder, None);
+        // #1346: every storage kind round-trips through proto.
+        for storage in [
+            MultiVectorStorage::F32,
+            MultiVectorStorage::F16,
+            MultiVectorStorage::Int8,
+        ] {
+            let schema = Schema::builder()
+                .add_multi_vector_field(
+                    "tokens",
+                    MultiVectorOption::new(96)
+                        .distance(DistanceMetric::DotProduct)
+                        .storage(storage),
+                )
+                .build();
+            let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+            match back.fields.get("tokens") {
+                Some(FieldOption::MultiVector(o)) => {
+                    assert_eq!(o.dimension, 96);
+                    assert_eq!(o.distance, DistanceMetric::DotProduct);
+                    assert_eq!(o.embedder, None);
+                    assert_eq!(o.storage, storage, "{storage:?}");
+                }
+                other => panic!("expected FieldOption::MultiVector, got {other:?}"),
             }
-            other => panic!("expected FieldOption::MultiVector, got {other:?}"),
         }
+    }
+
+    /// #1346: an absent or `UNSPECIFIED` proto `storage` value (as every
+    /// segment written before this field existed would decode to) maps to
+    /// [`MultiVectorStorage::F32`], not a parse error.
+    #[test]
+    fn schema_field_option_multi_vector_storage_absent_or_unspecified_defaults_to_f32() {
+        assert_eq!(
+            multi_vector_storage_from_proto(None),
+            MultiVectorStorage::F32
+        );
+        assert_eq!(
+            multi_vector_storage_from_proto(Some(v1::MultiVectorStorage::Unspecified as i32)),
+            MultiVectorStorage::F32
+        );
     }
 
     /// #1349: a `candle_colbert` embedder definition and the multi-vector

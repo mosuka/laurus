@@ -148,6 +148,25 @@ describe("addMultiVectorField", () => {
     );
     expect(schema.fieldNames()).toEqual([]);
   });
+
+  it.each([["f16"], ["int8"]])("accepts a compressed storage kind: %s", (storage) => {
+    const schema = new Schema();
+    expect(() =>
+      schema.addMultiVectorField("tokens", 2, undefined, undefined, storage),
+    ).not.toThrow();
+    expect(schema.fieldNames()).toEqual(["tokens"]);
+  });
+
+  it("rejects an unknown storage kind", () => {
+    const schema = new Schema();
+    expect(() => schema.addMultiVectorField("tokens", 2, undefined, undefined, "bf16")).toThrow(
+      expect.objectContaining({
+        code: "GenericFailure",
+        message: expect.stringContaining("Unknown multi-vector storage"),
+      }),
+    );
+    expect(schema.fieldNames()).toEqual([]);
+  });
 });
 
 describe("addEmbedder", () => {

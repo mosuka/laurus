@@ -309,12 +309,14 @@ base_weight = 1.0
 [fields.body_colbert.MultiVector]
 dimension = 128
 distance = "Cosine"
+storage = "Int8"  # 任意。省略時は F32（厳密、デフォルト）
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
 | `dimension` | `integer` | `128` | 各トークンベクトルの次元数 |
 | `distance` | `string` | `"Cosine"` | トークン間の類似度。`"Cosine"`（書き込み時に L2 正規化する）または `"DotProduct"`。それ以外は拒否されます |
+| `storage` | `string` | `"F32"` | 各トークンベクトルのディスク上での要素形式。`"F32"`（厳密、4 バイト/要素）、`"F16"`（2 バイト/要素、要素あたり約 2⁻¹¹ の相対誤差）、`"Int8"`（約 1 バイト/要素 + ベクトルごとの小さなスケール、1 行あたり `dimension + 2` バイト）のいずれか。詳細は [MultiVector ストレージ](../concepts/indexing/vector_indexing.md#multivector-ストレージ)を参照。既存フィールドで変更すると reindex が必要 |
 | `embedder` | `string` | -- | `[embedders]` で宣言したトークン単位のエンベダー（`type = "candle_colbert"`）の名前。指定すると、文書はこのフィールドにテキストを与えられ、テキストはトークンベクトルに埋め込まれます（[エンベダー](#エンベダー)を参照） |
 
 文書の値は、同じ長さの数値配列の配列（1〜8,192 本）です。エンベダーを指定したフィールドではテキストも使えます。このフィールドは文書ストアに保存されません。

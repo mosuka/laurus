@@ -7,8 +7,8 @@ use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
     CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
     FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption, IntegerOption,
-    IvfOption, MultiVectorOption, QuantizationMethod, RerankStorageKind, Schema, TextOption,
-    TokenFilterConfig, TokenizerConfig,
+    IvfOption, MultiVectorOption, MultiVectorStorage, QuantizationMethod, RerankStorageKind,
+    Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -130,6 +130,19 @@ fn parse_distance(s: &str) -> PyResult<DistanceMetric> {
         "angular" => Ok(DistanceMetric::Angular),
         other => Err(PyValueError::new_err(format!(
             "Unknown distance metric: '{}'. Valid: cosine, euclidean, dot_product, manhattan, angular",
+            other
+        ))),
+    }
+}
+
+/// Parse an on-disk storage kind string into [`MultiVectorStorage`].
+fn parse_multi_vector_storage(s: &str) -> PyResult<MultiVectorStorage> {
+    match s.to_lowercase().as_str() {
+        "f32" => Ok(MultiVectorStorage::F32),
+        "f16" => Ok(MultiVectorStorage::F16),
+        "int8" => Ok(MultiVectorStorage::Int8),
+        other => Err(PyValueError::new_err(format!(
+            "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8",
             other
         ))),
     }
@@ -639,21 +652,28 @@ impl PySchema {
     ///     dimension: Dimensionality of every token vector.
     ///     distance: ``"cosine"`` (default; vectors are L2-normalized when
     ///         written) or ``"dot_product"``.
+    ///     storage: On-disk element kind of every token vector —
+    ///         ``"f32"`` (default; exact), ``"f16"`` (2x smaller), or
+    ///         ``"int8"`` (~4x smaller, lossy quantization).
     ///     embedder: Optional token-level embedder registered via
     ///         `add_embedder`.
     ///
     /// Raises:
-    ///     ValueError: if ``name`` is reserved, ``dimension`` is zero, or
-    ///         ``distance`` is neither cosine nor dot product.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", embedder=None))]
+    ///     ValueError: if ``name`` is reserved, ``dimension`` is zero,
+    ///         ``distance`` is neither cosine nor dot product, or
+    ///         ``storage`` is not a recognized kind.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", storage="f32", embedder=None))]
     pub fn add_multi_vector_field(
         &mut self,
         name: &str,
         dimension: usize,
         distance: &str,
+        storage: &str,
         embedder: Option<String>,
     ) -> PyResult<()> {
-        let mut opt = MultiVectorOption::new(dimension).distance(parse_distance(distance)?);
+        let mut opt = MultiVectorOption::new(dimension)
+            .distance(parse_distance(distance)?)
+            .storage(parse_multi_vector_storage(storage)?);
         opt.embedder = embedder;
         opt.validate(name)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
