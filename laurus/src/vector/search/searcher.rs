@@ -469,10 +469,12 @@ fn default_query_limit() -> usize {
 /// [`VectorStore::search`](crate::vector::store::VectorStore::search) applied
 /// before the factor was honoured, and the documented gRPC default. Keeping the
 /// declared default at `2.0` means callers that do not set `overfetch`
-/// (including the engine, which passes `2.0` explicitly) see no behaviour
+/// (including the engine's `VectorSearchOptions` default) see no behaviour
 /// change now that the factor drives `top_k`.
+pub(crate) const DEFAULT_OVERFETCH: f32 = 2.0;
+
 fn default_overfetch() -> f32 {
-    2.0
+    DEFAULT_OVERFETCH
 }
 
 /// Parameters for vector search operations.

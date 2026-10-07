@@ -1013,7 +1013,13 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
 
     let fusion = json.get("fusion").and_then(json_to_fusion_algorithm);
     let lexical_params = json.get("lexical_params").and_then(json_to_lexical_params);
-    let vector_params = json.get("vector_params").and_then(json_to_vector_params);
+    // A malformed `vector_params` is rejected (400) rather than dropped:
+    // see `json_to_vector_params`.
+    let vector_params = json
+        .get("vector_params")
+        .filter(|v| !v.is_null())
+        .map(json_to_vector_params)
+        .transpose()?;
 
     let field_boosts = json
         .get("field_boosts")
@@ -1120,43 +1126,84 @@ fn json_to_lexical_params(json: &Value) -> Option<v1::LexicalParams> {
     })
 }
 
-fn json_to_vector_params(json: &Value) -> Option<v1::VectorParams> {
-    let obj = json.as_object()?;
-    Some(v1::VectorParams {
-        fields: obj
-            .get("fields")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
+/// Converts a JSON `vector_params` object to proto `VectorParams`.
+///
+/// A key that is absent or `null` keeps its proto default. A key with the
+/// wrong type, an unknown `score_mode` or an integer that does not fit
+/// `u32` is rejected, so a value is never silently dropped or wrapped
+/// around (Issue #1342). Range checks shared with gRPC happen in
+/// [`crate::convert::search::from_proto`].
+///
+/// # Errors
+///
+/// Returns a message for HTTP 400 describing the offending key.
+fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
+    let error = |message: String| format!("vector_params: {message}");
+    let obj = json
+        .as_object()
+        .ok_or_else(|| error("must be an object".to_string()))?;
+    let get = |key: &str| obj.get(key).filter(|v| !v.is_null());
+
+    let fields = match get("fields") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
             })
-            .unwrap_or_default(),
-        score_mode: obj
-            .get("score_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| match s.to_lowercase().as_str() {
-                "max_sim" => v1::VectorScoreMode::MaxSim as i32,
-                "late_interaction" => v1::VectorScoreMode::LateInteraction as i32,
-                _ => v1::VectorScoreMode::WeightedSum as i32,
+            .ok_or_else(|| error("fields must be an array of strings".to_string()))?,
+    };
+
+    let score_mode = match get("score_mode") {
+        None => v1::VectorScoreMode::WeightedSum,
+        Some(value) => match value.as_str().map(str::to_lowercase).as_deref() {
+            Some("weighted_sum") => v1::VectorScoreMode::WeightedSum,
+            Some("max_sim") => v1::VectorScoreMode::MaxSim,
+            Some("late_interaction") => v1::VectorScoreMode::LateInteraction,
+            _ => {
+                return Err(error(format!(
+                    "score_mode must be \"weighted_sum\", \"max_sim\" or \"late_interaction\", \
+                     got {value}"
+                )));
+            }
+        },
+    };
+
+    let number = |key: &str| -> Result<f32, String> {
+        get(key).map_or(Ok(0.0), |value| {
+            value
+                .as_f64()
+                .map(|n| n as f32)
+                .ok_or_else(|| error(format!("{key} must be a number")))
+        })
+    };
+    // Issue #481 Stage 2 (`rerank_factor`) and Issue #644 (`ef_search`).
+    let uint32 = |key: &str| -> Result<Option<u32>, String> {
+        get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        error(format!(
+                            "{key} must be an integer between 0 and {}",
+                            u32::MAX
+                        ))
+                    })
             })
-            .unwrap_or(v1::VectorScoreMode::WeightedSum as i32),
-        overfetch: obj.get("overfetch").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        min_score: obj.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        // Issue #481 Stage 2 (rerank). Optional in proto so older
-        // gateway clients can omit the field; the engine forwards it
-        // to the HNSW searcher, which honors it when the queried
-        // field has rerank_storage enabled and otherwise silently
-        // falls back to Stage 1 ranking.
-        rerank_factor: obj
-            .get("rerank_factor")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
-        // Issue #644: per-query override for HNSW `ef_search`.
-        ef_search: obj
-            .get("ef_search")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
+            .transpose()
+    };
+
+    Ok(v1::VectorParams {
+        fields,
+        score_mode: score_mode as i32,
+        overfetch: number("overfetch")?,
+        min_score: number("min_score")?,
+        rerank_factor: uint32("rerank_factor")?,
+        ef_search: uint32("ef_search")?,
     })
 }
 
@@ -2257,6 +2304,94 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("rescore"), "{err}");
+    }
+
+    /// Issue #1342: every `vector_params` key reaches the engine's vector
+    /// options, for `query_vectors` and for a DSL query.
+    #[test]
+    fn test_json_to_proto_search_request_vector_params() {
+        let json = json!({
+            "query_vectors": [{"vector": [1.0, 0.0]}],
+            "vector_params": {
+                "fields": ["a"],
+                "score_mode": "MAX_SIM",
+                "overfetch": 3.0,
+                "min_score": 0.25,
+                "rerank_factor": 4,
+                "ef_search": 80
+            }
+        });
+        let req = json_to_proto_search_request(&json).unwrap();
+        let vp = req.vector_params.as_ref().unwrap();
+        assert_eq!(vp.fields, ["a"]);
+        assert_eq!(vp.score_mode, v1::VectorScoreMode::MaxSim as i32);
+        assert_eq!(vp.overfetch, 3.0);
+        assert_eq!(vp.min_score, 0.25);
+        assert_eq!(vp.rerank_factor, Some(4));
+        assert_eq!(vp.ef_search, Some(80));
+
+        let options = crate::convert::search::from_proto(&req)
+            .unwrap()
+            .vector_options;
+        assert!(matches!(
+            options.score_mode,
+            laurus::VectorScoreMode::MaxSim
+        ));
+        assert_eq!(options.overfetch, 3.0);
+        assert_eq!(options.min_score, 0.25);
+        assert_eq!(options.rerank_factor, Some(4));
+        assert_eq!(options.ef_search, Some(80));
+        assert!(matches!(
+            options.fields.as_deref(),
+            Some([laurus::vector::store::request::FieldSelector::Exact(f)]) if f == "a"
+        ));
+
+        let dsl = json_to_proto_search_request(&json!({
+            "query": "vec:\"rust\"",
+            "vector_params": {"score_mode": "weighted_sum", "ef_search": 32}
+        }))
+        .unwrap();
+        let options = crate::convert::search::from_proto(&dsl)
+            .unwrap()
+            .vector_options;
+        assert!(matches!(
+            options.score_mode,
+            laurus::VectorScoreMode::WeightedSum
+        ));
+        assert_eq!(options.ef_search, Some(32));
+    }
+
+    /// Issue #1342: a malformed `vector_params` value is rejected (400)
+    /// instead of being dropped or wrapped around.
+    #[test]
+    fn test_json_to_proto_search_request_rejects_malformed_vector_params() {
+        let cases = [
+            ("not an object", json!("max_sim")),
+            ("fields is not an array", json!({"fields": "a"})),
+            ("a field is not a string", json!({"fields": ["a", 1]})),
+            ("unknown score_mode", json!({"score_mode": "best"})),
+            ("score_mode is not a string", json!({"score_mode": 1})),
+            ("overfetch is not a number", json!({"overfetch": "2"})),
+            ("min_score is not a number", json!({"min_score": true})),
+            (
+                "rerank_factor does not fit u32",
+                json!({"rerank_factor": 4_294_967_296u64}),
+            ),
+            (
+                "ef_search does not fit u32",
+                json!({"ef_search": 4_294_967_296u64}),
+            ),
+            ("negative ef_search", json!({"ef_search": -1})),
+            ("fractional rerank_factor", json!({"rerank_factor": 1.5})),
+        ];
+        for (case, vector_params) in cases {
+            let err = json_to_proto_search_request(&json!({
+                "query_vectors": [{"vector": [1.0, 0.0]}],
+                "vector_params": vector_params
+            }))
+            .expect_err(case);
+            assert!(err.contains("vector_params"), "{case}: {err}");
+        }
     }
 
     /// Every concrete `FieldChangeKind` value maps to its own distinct
