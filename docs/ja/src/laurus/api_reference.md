@@ -123,7 +123,7 @@ cargo doc --open
 | `.fusion_algorithm(algo)` | フュージョンアルゴリズムを設定（デフォルト: RRF） |
 | `.limit(n)` | 最大結果数（デフォルト: 10） |
 | `.offset(n)` | N件スキップ（デフォルト: 0） |
-| `.add_field_boost(field, boost)` | Lexical検索のフィールドブーストを追加 |
+| `.add_field_boost(field, boost)` | Lexical検索のフィールドブーストを追加。`field` がスキーマの lexical フィールド（または `_id`）でなければ、検索は `InvalidArgument` で失敗する |
 | `.lexical_min_score(f32)` | Lexical検索の最小スコアしきい値 |
 | `.lexical_timeout_ms(u64)` | Lexical検索のタイムアウト（ミリ秒） |
 | `.lexical_parallel(bool)` | Lexical検索の並列実行を有効化 |

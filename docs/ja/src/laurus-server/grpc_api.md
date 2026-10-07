@@ -424,7 +424,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム |
 | `lexical_params` | `LexicalParams` | いいえ | Lexical 検索パラメータ |
 | `vector_params` | `VectorParams` | いいえ | ベクトル検索パラメータ |
-| `field_boosts` | `map<string, float>` | いいえ | フィールドごとのスコアブースト |
+| `field_boosts` | `map<string, float>` | いいえ | lexical 部分のフィールドごとのスコアブースト。キーはスキーマの lexical フィールド（または `_id`）でなければならず、未知のフィールドやベクトルフィールドは `INVALID_ARGUMENT` で拒否される（Issue #1374）。クエリで使っていない lexical フィールドは受け付けられ、効果は無い |
 | `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
 | `rescore` | `RescoreParams` | いいえ | 1 段目の上位の結果を late interaction で再採点する（Issue #1351） |
 

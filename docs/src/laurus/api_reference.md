@@ -123,7 +123,7 @@ A collection of named field values.
 | `.fusion_algorithm(algo)` | Set the fusion algorithm (default: RRF) |
 | `.limit(n)` | Maximum results (default: 10) |
 | `.offset(n)` | Skip N results (default: 0) |
-| `.add_field_boost(field, boost)` | Add a field-level boost for lexical search |
+| `.add_field_boost(field, boost)` | Add a field-level boost for lexical search. The search fails with `InvalidArgument` if `field` is not a lexical field of the schema (or `_id`) |
 | `.lexical_min_score(f32)` | Set minimum score threshold for lexical search |
 | `.lexical_timeout_ms(u64)` | Set lexical search timeout in milliseconds |
 | `.lexical_parallel(bool)` | Enable parallel lexical search |
