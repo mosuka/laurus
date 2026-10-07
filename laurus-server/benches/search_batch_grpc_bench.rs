@@ -88,7 +88,10 @@ async fn start_server(engine: Arc<RwLock<Option<Engine>>>) -> SocketAddr {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
-    let svc = SearchService { engine };
+    let svc = SearchService {
+        engine,
+        max_result_window: laurus_server::config::DEFAULT_MAX_RESULT_WINDOW,
+    };
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(|conn| {
         if let Ok(ref stream) = conn {
             let _ = stream.set_nodelay(true);

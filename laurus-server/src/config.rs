@@ -6,8 +6,13 @@
 
 use laurus::{CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, WalSyncPolicy};
 use serde::Deserialize;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Default for [`ServerConfig::max_result_window`], matching Elasticsearch's
+/// `index.max_result_window`.
+pub const DEFAULT_MAX_RESULT_WINDOW: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Top-level configuration loaded from a TOML file.
 #[derive(Debug, Deserialize, Default)]
@@ -32,6 +37,11 @@ pub struct ServerConfig {
     /// Listen port for the HTTP Gateway. The Gateway is started only when this is set.
     #[serde(default)]
     pub http_port: Option<u16>,
+    /// Largest `offset + limit` a search may request (Issue #1367). Larger
+    /// requests are rejected with `INVALID_ARGUMENT` (HTTP 400). Must be at
+    /// least 1.
+    #[serde(default = "default_max_result_window")]
+    pub max_result_window: NonZeroUsize,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +50,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             http_port: None,
+            max_result_window: default_max_result_window(),
         }
     }
 }
@@ -205,6 +216,10 @@ fn default_port() -> u16 {
     50051
 }
 
+fn default_max_result_window() -> NonZeroUsize {
+    DEFAULT_MAX_RESULT_WINDOW
+}
+
 fn default_data_dir() -> PathBuf {
     PathBuf::from("./laurus_data")
 }
@@ -330,5 +345,24 @@ mod tests {
             config.index.commit.to_policy(),
             CommitPolicy::Interval(Duration::from_millis(500))
         );
+    }
+
+    #[test]
+    fn max_result_window_defaults_to_10000_and_reads_toml() {
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.server.max_result_window.get(), 10_000);
+        assert_eq!(
+            ServerConfig::default().max_result_window,
+            DEFAULT_MAX_RESULT_WINDOW
+        );
+
+        let set: Config = toml::from_str("[server]\nmax_result_window = 50000").unwrap();
+        assert_eq!(set.server.max_result_window.get(), 50_000);
+    }
+
+    #[test]
+    fn max_result_window_rejects_zero() {
+        let err = toml::from_str::<Config>("[server]\nmax_result_window = 0").unwrap_err();
+        assert!(err.to_string().contains("max_result_window"), "{err}");
     }
 }

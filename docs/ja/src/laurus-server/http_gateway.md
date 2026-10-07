@@ -198,6 +198,8 @@ curl -X POST http://localhost:8080/v1/search \
   -d '{"query": "body:test", "limit": 10}'
 ```
 
+`limit` と `offset` は、省略または `null` のとき既定値（10 と 0）になります。Issue #1367 以降、0 以上の整数でない値や、32 ビット符号なし整数に収まらない値は `400 Bad Request` で拒否されます（以前は既定値に置き換わるか、折り返していました）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索も `400 Bad Request` で拒否されます。
+
 #### フィールドブースト付き検索
 
 ```bash

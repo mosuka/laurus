@@ -49,6 +49,9 @@ pub async fn run(cmd: ServeCommand, index_dir: &Path) -> Result<()> {
     if cmd.http_port.is_some() {
         config.server.http_port = cmd.http_port;
     }
+    if let Some(max_result_window) = cmd.max_result_window {
+        config.server.max_result_window = max_result_window;
+    }
     config.index.data_dir = index_dir.to_path_buf();
 
     laurus_server::server::run(&config).await

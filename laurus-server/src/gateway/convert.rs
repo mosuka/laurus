@@ -1008,8 +1008,15 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         .map(|arr| arr.iter().filter_map(json_to_query_vector).collect())
         .unwrap_or_default();
 
-    let limit = json.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
-    let offset = json.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    // Absent or `null` keeps the default; anything else must fit `u32`
+    // rather than wrap around (Issue #1367).
+    let page_value = |key: &str, default: u32| -> Result<u32, String> {
+        json.get(key)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| json_to_u32(v, key))
+    };
+    let limit = page_value("limit", 10)?;
+    let offset = page_value("offset", 0)?;
 
     let fusion = json.get("fusion").and_then(json_to_fusion_algorithm);
     let lexical_params = json.get("lexical_params").and_then(json_to_lexical_params);
@@ -1126,6 +1133,16 @@ fn json_to_lexical_params(json: &Value) -> Option<v1::LexicalParams> {
     })
 }
 
+/// Parse a JSON integer that must fit `u32`, naming `key` in the error, so
+/// an out-of-range or mistyped value is rejected rather than wrapped or
+/// replaced by a default.
+fn json_to_u32(value: &Value, key: &str) -> Result<u32, String> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u32::MAX))
+}
+
 /// Converts a JSON `vector_params` object to proto `VectorParams`.
 ///
 /// A key that is absent or `null` keeps its proto default. A key with the
@@ -1183,17 +1200,7 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
     // Issue #481 Stage 2 (`rerank_factor`) and Issue #644 (`ef_search`).
     let uint32 = |key: &str| -> Result<Option<u32>, String> {
         get(key)
-            .map(|value| {
-                value
-                    .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(|| {
-                        error(format!(
-                            "{key} must be an integer between 0 and {}",
-                            u32::MAX
-                        ))
-                    })
-            })
+            .map(|value| json_to_u32(value, key).map_err(error))
             .transpose()
     };
 
@@ -2359,6 +2366,35 @@ mod tests {
             laurus::VectorScoreMode::WeightedSum
         ));
         assert_eq!(options.ef_search, Some(32));
+    }
+
+    /// Issue #1367: `limit` / `offset` keep their defaults when absent or
+    /// `null`, and a value of the wrong type or beyond `u32` is rejected
+    /// (400) instead of falling back to the default or wrapping around.
+    #[test]
+    fn test_json_to_proto_search_request_limit_and_offset() {
+        let req = json_to_proto_search_request(&json!({"query": "q"})).unwrap();
+        assert_eq!((req.limit, req.offset), (10, 0));
+        let req =
+            json_to_proto_search_request(&json!({"query": "q", "limit": null, "offset": null}))
+                .unwrap();
+        assert_eq!((req.limit, req.offset), (10, 0));
+        let req = json_to_proto_search_request(&json!({"query": "q", "limit": 25, "offset": 50}))
+            .unwrap();
+        assert_eq!((req.limit, req.offset), (25, 50));
+
+        let cases = [
+            ("limit", json!(4_294_967_296u64)),
+            ("limit", json!(-1)),
+            ("limit", json!("10")),
+            ("offset", json!(4_294_967_296u64)),
+            ("offset", json!(1.5)),
+        ];
+        for (key, value) in cases {
+            let err =
+                json_to_proto_search_request(&json!({"query": "q", key: value})).expect_err(key);
+            assert!(err.contains(key), "{key} = {value}: {err}");
+        }
     }
 
     /// Issue #1342: a malformed `vector_params` value is rejected (400)

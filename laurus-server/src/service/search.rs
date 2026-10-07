@@ -5,6 +5,7 @@
 //! (including vector clauses like `field:"text"`) is handled by the engine
 //! internally — no query-syntax branching is needed in the service layer.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -25,6 +26,28 @@ pub struct SearchService {
     /// Shared, mutable reference to the current search engine instance.
     /// `None` when no index has been created yet.
     pub engine: Arc<RwLock<Option<Engine>>>,
+    /// Largest `offset + limit` a search may request (Issue #1367; see
+    /// [`ServerConfig::max_result_window`](crate::config::ServerConfig::max_result_window)).
+    pub max_result_window: NonZeroUsize,
+}
+
+impl SearchService {
+    /// Convert a proto request and reject it when `offset + limit` exceeds
+    /// [`Self::max_result_window`] (Issue #1367). The check runs on the
+    /// converted request, so an unset `limit` counts as the engine default.
+    #[allow(clippy::result_large_err)]
+    fn convert(&self, proto: &SearchRequest) -> Result<laurus::SearchRequest, Status> {
+        let request = search_convert::from_proto(proto)?;
+        let window = request.offset.saturating_add(request.limit);
+        let max = self.max_result_window.get();
+        if window > max {
+            return Err(Status::invalid_argument(format!(
+                "offset + limit ({window}) exceeds the max result window ({max}); page with a \
+                 smaller offset, or raise server.max_result_window (--max-result-window)"
+            )));
+        }
+        Ok(request)
+    }
 }
 
 #[tonic::async_trait]
@@ -35,7 +58,7 @@ impl SearchServiceTrait for SearchService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
-        let search_request = search_convert::from_proto(&req)?;
+        let search_request = self.convert(&req)?;
 
         let guard = self.engine.read().await;
         let engine = guard
@@ -66,7 +89,7 @@ impl SearchServiceTrait for SearchService {
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
         let req = request.into_inner();
-        let search_request = search_convert::from_proto(&req)?;
+        let search_request = self.convert(&req)?;
 
         let guard = self.engine.read().await;
         let engine = guard
@@ -116,7 +139,12 @@ impl SearchServiceTrait for SearchService {
         let search_requests: Vec<laurus::SearchRequest> = req
             .queries
             .iter()
-            .map(search_convert::from_proto)
+            .enumerate()
+            .map(|(i, query)| {
+                self.convert(query).map_err(|status| {
+                    Status::new(status.code(), format!("queries[{i}]: {}", status.message()))
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let guard = self.engine.read().await;
@@ -155,6 +183,10 @@ mod tests {
     use laurus::{Schema, Storage, TextOption};
 
     async fn service_with_title_field() -> SearchService {
+        service_with_window(crate::config::DEFAULT_MAX_RESULT_WINDOW.get()).await
+    }
+
+    async fn service_with_window(max_result_window: usize) -> SearchService {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
         let schema = Schema::builder()
             .add_text_field("title", TextOption::default())
@@ -162,7 +194,78 @@ mod tests {
         let engine = Engine::builder(storage, schema).build().await.unwrap();
         SearchService {
             engine: Arc::new(RwLock::new(Some(engine))),
+            max_result_window: NonZeroUsize::new(max_result_window).unwrap(),
         }
+    }
+
+    fn page(offset: u32, limit: u32) -> SearchRequest {
+        SearchRequest {
+            query: "title:rust".to_string(),
+            offset,
+            limit,
+            ..Default::default()
+        }
+    }
+
+    fn assert_over_window(status: &Status) {
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("max result window"),
+            "unexpected message: {}",
+            status.message()
+        );
+    }
+
+    /// Issue #1367: `offset + limit` up to the window is served; one more is
+    /// rejected. An unset `limit` counts as the engine default of 10.
+    #[tokio::test]
+    async fn search_rejects_offset_plus_limit_above_the_window() {
+        let service = service_with_window(20).await;
+
+        service.search(Request::new(page(10, 10))).await.unwrap();
+        assert_over_window(
+            &service
+                .search(Request::new(page(11, 10)))
+                .await
+                .unwrap_err(),
+        );
+
+        service.search(Request::new(page(10, 0))).await.unwrap();
+        assert_over_window(&service.search(Request::new(page(11, 0))).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn search_stream_rejects_offset_plus_limit_above_the_window() {
+        let service = service_with_window(20).await;
+
+        assert!(
+            service
+                .search_stream(Request::new(page(10, 10)))
+                .await
+                .is_ok()
+        );
+        let Err(status) = service.search_stream(Request::new(page(11, 10))).await else {
+            panic!("expected INVALID_ARGUMENT");
+        };
+        assert_over_window(&status);
+    }
+
+    #[tokio::test]
+    async fn search_batch_names_the_query_above_the_window() {
+        let service = service_with_window(20).await;
+
+        let status = service
+            .search_batch(Request::new(SearchBatchRequest {
+                queries: vec![page(0, 10), page(11, 10)],
+            }))
+            .await
+            .unwrap_err();
+        assert_over_window(&status);
+        assert!(
+            status.message().starts_with("queries[1]: "),
+            "unexpected message: {}",
+            status.message()
+        );
     }
 
     /// Issue #1253: a DSL query that names an undeclared field is the

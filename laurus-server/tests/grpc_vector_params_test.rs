@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tonic::{Code, Request};
 
 use laurus::{CommitPolicy, Document, FlatOption, Schema, TextOption, WalSyncPolicy};
+use laurus_server::config::DEFAULT_MAX_RESULT_WINDOW;
 use laurus_server::convert::{document as doc_convert, schema as schema_convert};
 use laurus_server::proto::laurus::v1::document_service_server::DocumentService as _;
 use laurus_server::proto::laurus::v1::index_service_server::IndexService as _;
@@ -69,7 +70,10 @@ async fn search_service(dir: &tempfile::TempDir) -> SearchService {
         .commit(Request::new(CommitRequest {}))
         .await
         .unwrap();
-    SearchService { engine }
+    SearchService {
+        engine,
+        max_result_window: DEFAULT_MAX_RESULT_WINDOW,
+    }
 }
 
 /// A search with one field-less query vector `[1, 0]`.

@@ -89,6 +89,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     };
     let search_service = SearchService {
         engine: engine.clone(),
+        max_result_window: config.server.max_result_window,
     };
 
     let grpc_addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
