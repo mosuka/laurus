@@ -232,6 +232,91 @@ fn fieldless_query_merges_across_homogeneous_fields() {
     );
 }
 
+/// Issue #1343: a document holding vectors in two same-dimension fields
+/// must come back exactly once from a field-less query, not once per
+/// matching field. The surviving hit must be the document's best-scoring
+/// field (`a_vec`, which equals the query exactly; `b_vec` is orthogonal).
+#[test]
+fn fieldless_query_returns_each_document_once() {
+    let mut fields = BTreeMap::new();
+    fields.insert("a_vec".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    fields.insert("b_vec".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![
+            (1, "a_vec".to_string(), vec_of(&[1.0, 0.0, 0.0])),
+            (1, "b_vec".to_string(), vec_of(&[0.0, 1.0, 0.0])),
+        ])
+        .unwrap();
+    writer.commit().unwrap();
+
+    let searcher = index.searcher().unwrap();
+    let results = searcher
+        .search(&query(vec_of(&[1.0, 0.0, 0.0]), None, 10))
+        .unwrap();
+    assert_eq!(
+        results.results.len(),
+        1,
+        "doc 1 must be returned once, not once per matching field: {:?}",
+        results.results
+    );
+    assert_eq!(results.results[0].doc_id, 1);
+    assert_eq!(
+        results.results[0].field_name, "a_vec",
+        "the surviving hit must be the best-scoring field"
+    );
+}
+
+/// Issue #1343: `top_k` on a field-less query must count documents, not
+/// `(document, field)` pairs. Three documents each hold vectors in both
+/// fields; `top_k = 2` must still surface 2 distinct documents rather than
+/// exhausting the budget on two field-hits of the same document.
+#[test]
+fn fieldless_query_top_k_counts_documents() {
+    let mut fields = BTreeMap::new();
+    fields.insert("a_vec".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    fields.insert("b_vec".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![
+            (1, "a_vec".to_string(), vec_of(&[1.0, 0.0, 0.0])),
+            (1, "b_vec".to_string(), vec_of(&[1.0, 0.0, 0.0])),
+            (2, "a_vec".to_string(), vec_of(&[0.0, 1.0, 0.0])),
+            (2, "b_vec".to_string(), vec_of(&[0.0, 1.0, 0.0])),
+            (3, "a_vec".to_string(), vec_of(&[0.0, 0.0, 1.0])),
+            (3, "b_vec".to_string(), vec_of(&[0.0, 0.0, 1.0])),
+        ])
+        .unwrap();
+    writer.commit().unwrap();
+
+    let searcher = index.searcher().unwrap();
+    let results = searcher
+        .search(&query(vec_of(&[1.0, 0.0, 0.0]), None, 2))
+        .unwrap();
+    let ids: Vec<u64> = results.results.iter().map(|r| r.doc_id).collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "top_k = 2 must surface 2 documents, not 2 field-hits of the same one: {ids:?}"
+    );
+    let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "documents must not repeat: {ids:?}"
+    );
+    assert!(
+        ids.contains(&1),
+        "doc 1 (exact match in both fields) must be among the top 2: {ids:?}"
+    );
+}
+
 /// `add_vectors` with an unknown field name must reject the whole batch --
 /// never silently drop just the unknown field's vectors while applying the
 /// known ones.

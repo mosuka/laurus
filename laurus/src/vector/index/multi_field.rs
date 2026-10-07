@@ -743,6 +743,11 @@ struct SearcherEntry {
 /// field whose configured dimension matches the query vector's, merging
 /// results by distance (ascending) when every candidate field shares the
 /// same metric, or by similarity (descending) when metrics differ.
+///
+/// A document present in several candidate fields collapses to a single
+/// hit, keeping its best-scoring field (Issue #1343) — so `top_k` counts
+/// documents, not `(document, field)` pairs. [`Self::count`] is unaffected
+/// and stays per-vector: a document in N fields still counts as N.
 #[derive(Debug)]
 struct MultiFieldFanoutSearcher {
     fields: BTreeMap<String, SearcherEntry>,
@@ -804,6 +809,16 @@ impl MultiFieldFanoutSearcher {
         } else {
             merged.sort_by_similarity();
         }
+        // Issue #1343: a document present in several candidate fields must
+        // count once, not once per field, otherwise `top_k` is cut at
+        // (doc_id, field) granularity and the same document can surface
+        // twice. The sort above already orders each doc_id's hits
+        // best-first — ties break by field name, since `candidates` walks
+        // the fields `BTreeMap` in that order and `sort_by` is stable — so
+        // keeping the first occurrence per doc_id keeps its best-scoring
+        // field.
+        let mut seen_doc_ids = std::collections::HashSet::with_capacity(merged.results.len());
+        merged.results.retain(|r| seen_doc_ids.insert(r.doc_id));
         merged.take_top_k(request.params.top_k);
         Ok(merged)
     }

@@ -38,6 +38,16 @@ pub enum FieldSelector {
 /// [`WeightedSum`](Self::WeightedSum) works well when all query vectors contribute
 /// additively, while [`MaxSim`](Self::MaxSim) is better for alternative-interpretation
 /// queries.
+///
+/// Combination always happens *across query vectors*: for a given document,
+/// each query vector contributes at most one term, never one per matching
+/// field. A field-less query vector that reaches a document through several
+/// same-dimension fields collapses to that document's best-scoring field
+/// before this combination runs (Issue #1343); a query vector targeting
+/// fields by name keeps summing across them, weighted by
+/// [`HnswOption::base_weight`](crate::vector::core::field::HnswOption::base_weight),
+/// since it is explicitly querying several fields at once rather than
+/// fanning out to find whichever one matches.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorScoreMode {
