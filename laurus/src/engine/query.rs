@@ -279,8 +279,13 @@ impl UnifiedQueryParser {
         //          character, which stays in the lexical part (Issue #1373)
         // Group 2: optional `+` prefix
         // Group 3: the vector clause itself (field:value[^boost])
+        //
+        // An unquoted value also ends at `(` / `)` (Issue #1377): they group
+        // clauses in the DSL and end a lexical term too, so
+        // `(content:cats)` closes its group instead of taking `cats)` as the
+        // value. A quoted value may contain them.
         let clause_pattern = format!(
-            r#"(^|{boundary})(\+)?((?:{fields}):(?:"[^"]*"|[^\s"^~\[\{{]+)(?:\^[\d]+(?:\.[\d]+)?)?)"#,
+            r#"(^|{boundary})(\+)?((?:{fields}):(?:"[^"]*"|[^\s"^~\[\{{()]+)(?:\^[\d]+(?:\.[\d]+)?)?)"#,
             boundary = NON_FIELD_NAME_CHAR,
             fields = fields_pattern,
         );
@@ -1205,5 +1210,52 @@ mod tests {
                 request.query
             );
         }
+    }
+
+    /// Issue #1377: an unquoted vector value ends at a parenthesis, so a
+    /// clause can close a group. The value pattern used to take the `)`
+    /// (`cats)`), leaving a lone `(` the lexical parser rejected.
+    #[tokio::test]
+    async fn test_unquoted_vector_clause_closing_a_group() {
+        let parser = make_parser();
+        let cases = [
+            ("(content:cats)", None, "content:cats"),
+            ("(content:cats^0.5)", None, "content:cats^0.5"),
+            (
+                "title:hello OR (content:cats)",
+                Some("title:hello"),
+                "content:cats",
+            ),
+            (
+                "+(content:cats) +title:hello",
+                Some("+title:hello"),
+                "content:cats",
+            ),
+            (
+                "-(content:cats) title:hello",
+                Some("title:hello"),
+                "content:cats",
+            ),
+        ];
+        for (query, lexical, vector) in cases {
+            let (lexical_part, vector_part, _) = parser.split_query(query).unwrap();
+            assert_eq!(lexical_part.as_deref(), lexical, "{query}");
+            assert_eq!(vector_part.as_deref(), Some(vector), "{query}");
+            parser
+                .parse(query)
+                .await
+                .unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+        }
+    }
+
+    /// Issue #1377: the fuzzy check reports the clause without the `)`.
+    #[tokio::test]
+    async fn test_fuzzy_vector_clause_in_a_group_is_rejected_without_the_paren() {
+        let parser = make_parser();
+        let Err(err) = parser.parse("(content:cats~2)").await else {
+            panic!("fuzzy syntax on a vector field must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("'content:cats'"), "got: {msg}");
     }
 }
