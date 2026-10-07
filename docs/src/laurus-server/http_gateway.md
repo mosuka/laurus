@@ -240,6 +240,13 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
+`query_vectors` are added to the vector part of `query`, so a `query` with
+only lexical clauses becomes a hybrid search, with or without
+`lexical_params` / `field_boosts` (Issue #1366). Each entry needs a
+non-empty numeric `vector`; `weight` (a number) and `fields` (an array of
+strings) are optional, and `null` keeps their defaults. Any other shape is
+rejected with `400 Bad Request` instead of being dropped.
+
 #### Search with Vector Parameters
 
 `vector_params` takes the keys of the gRPC

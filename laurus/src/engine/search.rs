@@ -16,9 +16,11 @@ use crate::vector::store::request::FieldSelector;
 /// Determines **what** to search for. Search parameters (limits, score
 /// thresholds, fusion, etc.) are separate fields on [`SearchRequest`].
 ///
-/// Four variants cover all search modes:
+/// Five variants cover all search modes:
 ///
 /// - [`Dsl`](Self::Dsl) — unified query DSL string, parsed at search time.
+/// - [`DslWithVectors`](Self::DslWithVectors) — a unified query DSL string
+///   plus vectors added to its vector part.
 /// - [`Lexical`](Self::Lexical) — lexical (BM25) search only.
 /// - [`Vector`](Self::Vector) — vector (nearest-neighbor) search only.
 /// - [`Hybrid`](Self::Hybrid) — both lexical and vector search with fusion.
@@ -35,6 +37,22 @@ pub enum SearchQuery {
     /// - **Vector**: `field:"text"`, `field:text^0.8` (with boost).
     /// - **Hybrid**: mix both — `title:hello content:"cute kitten"^0.8`.
     Dsl(String),
+
+    /// A unified query DSL string, parsed as [`Dsl`](Self::Dsl), plus a vector
+    /// query added to its vector part (Issue #1366).
+    ///
+    /// The vectors join the DSL's vector clauses, combined by the request's
+    /// [`VectorSearchOptions::score_mode`]. A DSL with no vector clauses
+    /// becomes a hybrid search ([`HybridMode::Union`]); a DSL that is
+    /// already hybrid keeps its mode. `Payloads` are embedded first. If
+    /// there are no vectors (or none left after embedding), this is the
+    /// same as [`Dsl`](Self::Dsl).
+    DslWithVectors {
+        /// The unified query DSL string.
+        dsl: String,
+        /// Vectors added to the DSL's vector part.
+        vectors: VectorSearchQuery,
+    },
 
     /// Pre-built lexical (BM25) search query.
     Lexical(LexicalSearchQuery),
@@ -371,8 +389,9 @@ pub struct SearchRequest {
     /// Fusion algorithm for combining lexical and vector scores.
     ///
     /// Only used when both lexical and vector search components are
-    /// present (i.e., [`SearchQuery::Hybrid`] or a [`SearchQuery::Dsl`]
-    /// that contains both clause types). Defaults to
+    /// present (i.e., [`SearchQuery::Hybrid`], a [`SearchQuery::Dsl`]
+    /// that contains both clause types, or a [`SearchQuery::DslWithVectors`]
+    /// whose DSL has lexical clauses). Defaults to
     /// [`FusionAlgorithm::RRF { k: 60.0 }`](FusionAlgorithm::RRF) when
     /// `None`.
     pub fusion_algorithm: Option<FusionAlgorithm>,
@@ -455,8 +474,9 @@ impl Default for SearchRequest {
 ///    [`vector_query`](Self::vector_query)): Set both for hybrid search.
 ///
 /// If [`query_dsl`](Self::query_dsl) is called, the builder produces a
-/// [`SearchQuery::Dsl`] variant. Otherwise, it determines the variant from
-/// which query methods were called.
+/// [`SearchQuery::Dsl`] variant, or [`SearchQuery::DslWithVectors`] when
+/// [`vector_query`](Self::vector_query) is also set. Otherwise, it
+/// determines the variant from which query methods were called.
 pub struct SearchRequestBuilder {
     dsl: Option<String>,
     lexical_query: Option<LexicalSearchQuery>,
@@ -497,8 +517,10 @@ impl SearchRequestBuilder {
 
     /// Set a unified query DSL string.
     ///
-    /// When set, the built request uses [`SearchQuery::Dsl`] and any
-    /// lexical/vector queries set via other methods are ignored.
+    /// When set, the built request uses [`SearchQuery::Dsl`]. A query set
+    /// with [`vector_query`](Self::vector_query) is added to the DSL's
+    /// vector part ([`SearchQuery::DslWithVectors`], Issue #1366); a query
+    /// set with [`lexical_query`](Self::lexical_query) is ignored.
     pub fn query_dsl(mut self, dsl: impl Into<String>) -> Self {
         self.dsl = Some(dsl.into());
         self
@@ -684,7 +706,10 @@ impl SearchRequestBuilder {
     /// Consume the builder and return the constructed [`SearchRequest`].
     pub fn build(self) -> SearchRequest {
         let query = if let Some(dsl) = self.dsl {
-            SearchQuery::Dsl(dsl)
+            match self.vector_query {
+                Some(vectors) => SearchQuery::DslWithVectors { dsl, vectors },
+                None => SearchQuery::Dsl(dsl),
+            }
         } else {
             match (self.lexical_query, self.vector_query) {
                 (Some(lexical), Some(vector)) => SearchQuery::Hybrid {
@@ -796,5 +821,23 @@ mod tests {
             assert_eq!(options.config.tag, "em");
             assert_eq!(options.config.css_class.as_deref(), Some("hl"));
         }
+    }
+
+    /// Issue #1366: a vector query set together with a DSL string is kept
+    /// (`DslWithVectors`) instead of being dropped.
+    #[test]
+    fn build_keeps_a_vector_query_set_with_a_dsl() {
+        let dsl_only = SearchRequestBuilder::new().query_dsl("title:rust").build();
+        assert!(matches!(dsl_only.query, SearchQuery::Dsl(ref d) if d == "title:rust"));
+
+        let with_vectors = SearchRequestBuilder::new()
+            .query_dsl("title:rust")
+            .vector_query(VectorSearchQuery::Vectors(Vec::new()))
+            .build();
+        assert!(matches!(
+            with_vectors.query,
+            SearchQuery::DslWithVectors { ref dsl, vectors: VectorSearchQuery::Vectors(_) }
+                if dsl == "title:rust"
+        ));
     }
 }

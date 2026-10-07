@@ -468,25 +468,19 @@ Commit:
 curl -X POST http://localhost:8080/v1/commit
 ```
 
-Search with both lexical and semantic queries. The embedder also handles text-to-vector conversion at search time:
+Search with both lexical and semantic queries in one `query`: `systems programming` is a lexical clause, and `embedding:"..."` is a vector clause whose text the embedder converts to a vector at search time:
 
 ```bash
 curl -X POST http://localhost:8080/v1/search \
   -H 'Content-Type: application/json' \
   -d '{
-    "query": "systems programming",
-    "query_vectors": [
-      {
-        "vector": "systems programming language",
-        "fields": ["embedding"]
-      }
-    ],
+    "query": "systems programming embedding:\"systems programming language\"",
     "fusion": {"rrf": {"k": 60.0}},
     "limit": 10
   }'
 ```
 
-With the `precomputed` embedder you must pass raw vectors, but text-capable embedders like `candle_bert` accept text directly for both indexing and searching.
+With the `precomputed` embedder you must pass raw vectors (in `query_vectors`, whose `vector` must be an array of numbers), but text-capable embedders like `candle_bert` accept text directly for both indexing and searching.
 
 ### Using OpenAI Embeddings
 

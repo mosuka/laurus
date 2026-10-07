@@ -33,10 +33,15 @@ message SearchBatchResponse {
 }
 
 message SearchRequest {
-  // Lexical query in Laurus DSL syntax.
+  // Unified query in Laurus DSL syntax: lexical clauses and vector clauses
+  // (`field:"text"`, embedded by the field's embedder). An unknown field is
+  // rejected with INVALID_ARGUMENT. `lexical_params` and `field_boosts`
+  // apply to its lexical part.
   string query = 1;
 
-  // Vector queries (pre-embedded).
+  // Pre-embedded query vectors. Sent together with `query`, they are added
+  // to its vector part: a `query` with only lexical clauses becomes a hybrid
+  // search (Issue #1366).
   repeated QueryVector query_vectors = 2;
 
   // Maximum number of results to return.
@@ -101,8 +106,12 @@ message LateInteractionRescore {
 }
 
 message QueryVector {
+  // The query embedding.
   repeated float vector = 1;
+  // Multiplier on this vector's similarity. `0` (unset) means `1.0`.
   float weight = 2;
+  // Vector fields to search. Empty means `VectorParams.fields` if set,
+  // otherwise every vector field whose dimension matches.
   repeated string fields = 3;
 }
 
@@ -142,11 +151,12 @@ enum SortOrder {
 
 // Vector search options (Issue #1342).
 //
-// They apply to the request's vector part: `query_vectors`, or the vector
-// clauses of a `query` sent without `lexical_params` / `field_boosts`.
-// A request with neither is rejected with INVALID_ARGUMENT. The server
-// cannot tell whether such a `query` contains vector clauses without
-// parsing it; on one that has none, these options have no effect.
+// They apply to the request's vector part: `query_vectors` and the vector
+// clauses of `query`. A request with neither `query_vectors` nor `query`
+// is rejected with INVALID_ARGUMENT. The server cannot tell whether
+// `query` contains vector clauses without parsing it; on a request whose
+// only vector part could be `query` and whose `query` has none, these
+// options have no effect.
 // Out-of-range values are rejected with INVALID_ARGUMENT, never ignored.
 message VectorParams {
   // Vector fields to search with query vectors that name no field

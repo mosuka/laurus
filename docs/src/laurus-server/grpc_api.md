@@ -418,8 +418,8 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 | Field | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `query` | `string` | No | Lexical search query in [Query DSL](../concepts/query_dsl.md) |
-| `query_vectors` | `repeated QueryVector` | No | Vector search queries |
+| `query` | `string` | No | Unified query in [Query DSL](../concepts/query_dsl.md): lexical clauses and vector clauses. An unknown field is rejected with `INVALID_ARGUMENT`. `lexical_params` and `field_boosts` apply to its lexical part |
+| `query_vectors` | `repeated QueryVector` | No | Pre-embedded query vectors. Sent with `query`, they are added to its vector part; a `query` with only lexical clauses becomes a hybrid search (Issue #1366) |
 | `limit` | `uint32` | No | Maximum number of results (`0` means the engine default, 10). `offset + limit` must not exceed the server's [`max_result_window`](configuration.md) (default 10,000), or the search is rejected with `INVALID_ARGUMENT` (Issue #1367) |
 | `offset` | `uint32` | No | Number of results to skip; counts toward `max_result_window` with `limit` |
 | `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search |
@@ -446,7 +446,7 @@ At least one of `query` or `query_vectors` must be provided.
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `vector` | `repeated float` | Query vector |
-| `weight` | `float` | Weight for this vector (default: 1.0) |
+| `weight` | `float` | Weight for this vector (default: 1.0; `0` also means 1.0, since proto3 cannot tell it from unset) |
 | `fields` | `repeated string` | Target vector fields (empty = all) |
 
 ### FusionAlgorithm
@@ -474,13 +474,13 @@ A `oneof` with two options:
 
 ### VectorParams
 
-`vector_params` applies to the request's vector part: `query_vectors`, or
-the vector clauses of a `query` sent without `lexical_params` /
-`field_boosts` (Issue #1342). A request with neither is rejected with
-`INVALID_ARGUMENT`. The server cannot tell whether such a `query` has
-vector clauses without parsing it; on one that has none, `vector_params`
-has no effect. Every other value either takes effect or is rejected with
-`INVALID_ARGUMENT`.
+`vector_params` applies to the request's vector part: `query_vectors` and
+the vector clauses of `query` (Issues #1342, #1366). A request with neither
+`query_vectors` nor `query` is rejected with `INVALID_ARGUMENT`. The server
+cannot tell whether `query` has vector clauses without parsing it; on a
+request whose only possible vector part is a `query` without vector
+clauses, `vector_params` has no effect. Every other value either takes
+effect or is rejected with `INVALID_ARGUMENT`.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |

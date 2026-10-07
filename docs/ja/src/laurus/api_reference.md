@@ -116,7 +116,7 @@ cargo doc --open
 | メソッド | 説明 |
 | :--- | :--- |
 | `SearchRequestBuilder::new()` | 新しいBuilderを作成 |
-| `.query_dsl(dsl)` | 統合DSLクエリ文字列を設定 |
+| `.query_dsl(dsl)` | 統合DSLクエリ文字列を設定（検索時にパース）。一緒に設定した `.vector_query(..)` は DSL のベクトル部分に追加され、`.lexical_query(..)` は無視される |
 | `.lexical_query(query)` | Lexical検索クエリを設定（`LexicalSearchQuery`） |
 | `.vector_query(query)` | Vector検索クエリを設定（`VectorSearchQuery`） |
 | `.filter_query(query)` | プレフィルタクエリを設定 |
