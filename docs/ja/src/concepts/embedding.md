@@ -97,6 +97,14 @@ sentence-transformers と要素ごとに 1e-6 以内で一致します。
 > `all-MiniLM-L6-v2` で 128 ではなく `max_seq_length` トークンまで使うようになりました。
 > `candle_bert` で作った索引は埋め込み直してください。そうしないと、新しいクエリの
 > ベクトルが古い文書のベクトルと比べられます。
+>
+> **マイグレーション注記（Issue #1355）:** 以前の版は、ダウンロードしたモデルを
+> hf-hub 本来のデフォルトである `~/.cache/huggingface/hub/models--*` ではなく
+> `~/.cache/huggingface/models--*` にキャッシュしており、`HF_HUB_CACHE`・
+> `XDG_CACHE_HOME` も無視していました。モデルは今後 hf-hub 本来のデフォルトの
+> 場所にダウンロードされ、Python の `huggingface_hub` ライブラリとキャッシュを
+> 共有します。古いパスに残っている既存のダウンロードは再利用されないため、
+> 削除してかまいません。
 
 ### OpenAIEmbedder
 
@@ -142,6 +150,14 @@ let embedder = CandleClipEmbedder::new(
 | 次元数 | 512 |
 | 入力タイプ | テキストおよび画像 |
 | ユースケース | テキストから画像への検索、画像から画像への検索 |
+
+> **マイグレーション注記（Issue #1355）:** 以前の版は、ダウンロードしたモデルを
+> hf-hub 本来のデフォルトである `~/.cache/huggingface/hub/models--*` ではなく
+> `~/.cache/huggingface/models--*` にキャッシュしており、`HF_HUB_CACHE`・
+> `XDG_CACHE_HOME` も無視していました。モデルは今後 hf-hub 本来のデフォルトの
+> 場所にダウンロードされ、Python の `huggingface_hub` ライブラリとキャッシュを
+> 共有します。古いパスに残っている既存のダウンロードは再利用されないため、
+> 削除してかまいません。
 
 ### CandleColbertEmbedder
 

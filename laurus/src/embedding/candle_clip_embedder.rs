@@ -19,7 +19,7 @@ use candle_transformers::models::clip;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "embeddings-multimodal")]
-use crate::embedding::candle_hub::{HubModel, legacy_cache_dir};
+use crate::embedding::candle_hub::HubModel;
 #[cfg(feature = "embeddings-multimodal")]
 use crate::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
 #[cfg(feature = "embeddings-multimodal")]
@@ -183,7 +183,7 @@ impl CandleClipEmbedder {
             .map_err(|e| LaurusError::InvalidOperation(format!("Device setup failed: {}", e)))?;
 
         // Download model from HuggingFace Hub
-        let repo = HubModel::open(model_name, None, Some(legacy_cache_dir()))?;
+        let repo = HubModel::open(model_name, None, None)?;
 
         // Load config
         // Currently defaults to ViT-B/32 configuration. To support other CLIP variants

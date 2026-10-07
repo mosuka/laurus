@@ -99,6 +99,13 @@ pins the model to a commit.
 > keep up to `max_seq_length` tokens instead of 128 for `all-MiniLM-L6-v2`.
 > Re-embed indexes built with `candle_bert`: otherwise new query vectors are
 > compared with old document vectors.
+>
+> **Migration note (Issue #1355):** earlier versions cached downloaded
+> models under `~/.cache/huggingface/models--*` instead of hf-hub's own
+> default `~/.cache/huggingface/hub/models--*` (also ignoring
+> `HF_HUB_CACHE`/`XDG_CACHE_HOME`). Models now download to hf-hub's
+> default location, shared with the Python `huggingface_hub` library.
+> Existing downloads under the old path are not reused and can be deleted.
 
 ### OpenAIEmbedder
 
@@ -144,6 +151,13 @@ let embedder = CandleClipEmbedder::new(
 | Dimensions | 512 |
 | Input types | Text AND images |
 | Use case | Text-to-image search, image-to-image search |
+
+> **Migration note (Issue #1355):** earlier versions cached downloaded
+> models under `~/.cache/huggingface/models--*` instead of hf-hub's own
+> default `~/.cache/huggingface/hub/models--*` (also ignoring
+> `HF_HUB_CACHE`/`XDG_CACHE_HOME`). Models now download to hf-hub's
+> default location, shared with the Python `huggingface_hub` library.
+> Existing downloads under the old path are not reused and can be deleted.
 
 ### CandleColbertEmbedder
 

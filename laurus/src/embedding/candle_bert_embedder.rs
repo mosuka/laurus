@@ -18,7 +18,7 @@ use candle_transformers::models::bert::{BertModel, Config};
 use tokenizers::{Tokenizer, TruncationParams};
 
 #[cfg(feature = "embeddings-candle")]
-use crate::embedding::candle_hub::{HubModel, legacy_cache_dir};
+use crate::embedding::candle_hub::HubModel;
 #[cfg(feature = "embeddings-candle")]
 use crate::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
 #[cfg(feature = "embeddings-candle")]
@@ -144,11 +144,7 @@ impl CandleBertEmbedder {
             .map_err(|e| LaurusError::InvalidOperation(format!("Device setup failed: {}", e)))?;
 
         // Download model from HuggingFace Hub
-        let repo = HubModel::open(
-            model_name,
-            options.revision.as_deref(),
-            Some(legacy_cache_dir()),
-        )?;
+        let repo = HubModel::open(model_name, options.revision.as_deref(), None)?;
 
         // Load config
         let config_filename = repo.file("config.json")?;
