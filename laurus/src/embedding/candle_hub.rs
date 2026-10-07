@@ -77,13 +77,3 @@ impl HubModel {
         ))
     }
 }
-
-/// The cache directory `CandleBertEmbedder` and `CandleClipEmbedder` have
-/// always used: `$HF_HOME`, then `~/.cache/huggingface`, then
-/// `/tmp/huggingface` (not hf-hub's `.../hub` default, see Issue #1355).
-pub(crate) fn legacy_cache_dir() -> PathBuf {
-    std::env::var("HF_HOME")
-        .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.cache/huggingface")))
-        .unwrap_or_else(|_| "/tmp/huggingface".to_string())
-        .into()
-}
