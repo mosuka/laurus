@@ -283,7 +283,7 @@ The field name must refer to a vector field defined in the schema. The parser us
 | Element | Required | Description | Example |
 | :--- | :---: | :--- | :--- |
 | `field:` | **Yes** | Target vector field name (must be a vector field in the schema) | `content:` |
-| `"text"` or `text` | **Yes** | Text to embed (quoted or unquoted) | `"cute kitten"`, `python` |
+| `"text"` or `text` | **Yes** | Text to embed (quoted or unquoted). In the unified DSL an unquoted value ends at whitespace or a parenthesis, so `(content:cats)` closes its group; quote the text to include them (Issue #1377) | `"cute kitten"`, `python` |
 | `^weight` | No | Score weight (default: 1.0) | `^0.8` |
 
 ### Vector Query Examples
