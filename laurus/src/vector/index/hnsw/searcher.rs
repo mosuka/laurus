@@ -322,12 +322,23 @@ impl VectorIndexSearcher for HnswSearcher {
         // correct approach: usage of downcast_ref to check if we can use graph search
         if let Some(reader) = self.index_reader.as_any().downcast_ref::<HnswIndexReader>()
             && let Some(graph) = &reader.graph
-            && let Some(ref field_name) = request.field_name
         {
-            // Perform Graph Search
-            let mut results = self.search_graph(reader, graph, request, field_name)?;
-            results.search_time_ms = start.elapsed().as_secs_f64() * 1000.0;
-            return Ok(results);
+            // Issue #1371: a field-less request (`field_name: None`) can
+            // still take the graph path when this reader unambiguously
+            // belongs to one field (see `HnswIndexReader::sole_field_name`).
+            // Falls through to the brute-force path below only when the
+            // field cannot be resolved (empty or genuinely multi-field
+            // reader -- the legacy, non-multi-field single-index layout).
+            let field_name = request
+                .field_name
+                .as_deref()
+                .or_else(|| reader.sole_field_name());
+            if let Some(field_name) = field_name {
+                // Perform Graph Search
+                let mut results = self.search_graph(reader, graph, request, field_name)?;
+                results.search_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+                return Ok(results);
+            }
         }
 
         // Fallback to Linear Scan (brute-force over all vectors)
@@ -1039,7 +1050,19 @@ impl HnswSearcher {
             }
         }
 
-        self.finalize_graph_results(reader, query, request, field_name, found, visited.len())
+        // Issue #1371: `visited.len()` is the `BitVec`'s fixed bit count
+        // (the segment's node count), not the number of nodes actually
+        // visited -- `count_ones()` is the real popcount. Diagnostics-only
+        // (no other logic reads `candidates_examined`), so this cannot
+        // change search results, only what the metric reports.
+        self.finalize_graph_results(
+            reader,
+            query,
+            request,
+            field_name,
+            found,
+            visited.count_ones() as usize,
+        )
     }
 
     /// Turn the result heap from a graph search (or the brute-force scan, see
