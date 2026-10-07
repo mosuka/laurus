@@ -810,11 +810,18 @@ impl HnswSearcher {
         // Issue #680: pre-size both heaps instead of growing geometrically
         // from empty on every query. `found` never holds more than
         // `ef_search + 1` entries (pushed then immediately popped back down
-        // once it overflows, below); `candidates` has no hard cap, but stays
-        // in the same order of magnitude in practice, so the same estimate
-        // is used for both.
-        let mut candidates = BinaryHeap::with_capacity(ef_search * 2); // Min-heap (nearest first)
-        let mut found = BinaryHeap::with_capacity(ef_search * 2); // Max-heap (furthest first)
+        // once it overflows, below); `candidates` has no hard cap but stays
+        // around `2 * ef_search` in practice.
+        //
+        // Issue #1367: `ef_search` comes from the request (or a schema
+        // default), so cap both estimates at the node count. The `visited`
+        // guard below lets each node into each heap at most once, so neither
+        // heap can grow past it; without the cap an extreme `ef_search`,
+        // `top_k` or `rerank_factor` overflowed `ef_search * 2` or requested
+        // an allocation the process could not make.
+        let node_count = graph.node_count();
+        let mut candidates = BinaryHeap::with_capacity(ef_search.saturating_mul(2).min(node_count)); // Min-heap (nearest first)
+        let mut found = BinaryHeap::with_capacity(ef_search.saturating_add(1).min(node_count)); // Max-heap (furthest first)
 
         // A node enters the result heap only if it satisfies the admission
         // predicate; the frontier (`candidates`) always expands through every

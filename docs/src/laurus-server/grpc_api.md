@@ -420,8 +420,8 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | :--- | :--- | :--- | :--- |
 | `query` | `string` | No | Lexical search query in [Query DSL](../concepts/query_dsl.md) |
 | `query_vectors` | `repeated QueryVector` | No | Vector search queries |
-| `limit` | `uint32` | No | Maximum number of results (default: engine default) |
-| `offset` | `uint32` | No | Number of results to skip |
+| `limit` | `uint32` | No | Maximum number of results (`0` means the engine default, 10). `offset + limit` must not exceed the server's [`max_result_window`](configuration.md) (default 10,000), or the search is rejected with `INVALID_ARGUMENT` (Issue #1367) |
+| `offset` | `uint32` | No | Number of results to skip; counts toward `max_result_window` with `limit` |
 | `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search |
 | `lexical_params` | `LexicalParams` | No | Lexical search parameters |
 | `vector_params` | `VectorParams` | No | Vector search parameters |
@@ -628,7 +628,7 @@ gRPC errors are returned as standard `Status` codes:
 
 | Laurus Error | gRPC Status | When |
 | :--- | :--- | :--- |
-| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query |
+| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query, a search whose `offset + limit` exceeds `max_result_window` |
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
 | Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |

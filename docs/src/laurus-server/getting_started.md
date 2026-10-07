@@ -16,6 +16,7 @@ laurus serve [OPTIONS]
 | `--host <HOST>` | `-H` | `LAURUS_HOST` | `0.0.0.0` | Listen address |
 | `--port <PORT>` | `-p` | `LAURUS_PORT` | `50051` | Listen port |
 | `--http-port <PORT>` | -- | `LAURUS_HTTP_PORT` | -- | HTTP Gateway port (enables HTTP gateway when set) |
+| `--max-result-window <N>` | -- | `LAURUS_MAX_RESULT_WINDOW` | `10000` | Largest `offset + limit` per search; larger searches are rejected |
 
 Log verbosity is controlled by the standard `RUST_LOG` environment variable (default: `info`).
 See [env_logger syntax](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for filter directives such as `RUST_LOG=laurus=debug,tonic=warn`.

@@ -37,6 +37,7 @@ laurus serve --config config.toml
 host = "0.0.0.0"
 port = 50051
 http_port = 8080  # オプション: HTTP ゲートウェイを有効化
+max_result_window = 10000  # オプション: 1 回の検索の offset + limit の上限
 
 [index]
 data_dir = "./laurus_data"
@@ -64,6 +65,7 @@ interval_ms = 1000             # "interval" のみ; 最低 N ミリ秒ごとに 
 | `host` | String | `"0.0.0.0"` | gRPC サーバーのリッスンアドレス |
 | `port` | Integer | `50051` | gRPC サーバーのリッスンポート |
 | `http_port` | Integer | -- | HTTP ゲートウェイポート。設定すると gRPC と並行して HTTP/JSON ゲートウェイが起動 |
+| `max_result_window` | Integer | `10000` | 1 回の検索で要求できる `offset + limit` の上限（`limit` 未指定時は既定の 10 を数える）。超える検索（gRPC・HTTP・MCP）は `INVALID_ARGUMENT` / HTTP 400 で拒否される。1 以上。Elasticsearch の `index.max_result_window` に相当（Issue #1367） |
 
 #### `[index]` セクション
 
@@ -121,6 +123,7 @@ WebAssembly では background thread がないため no-op になります。
 | `LAURUS_HOST` | `server.host` | リッスンアドレス |
 | `LAURUS_PORT` | `server.port` | gRPC リッスンポート |
 | `LAURUS_HTTP_PORT` | `server.http_port` | HTTP ゲートウェイポート |
+| `LAURUS_MAX_RESULT_WINDOW` | `server.max_result_window` | 1 回の検索の `offset + limit` の上限 |
 | `LAURUS_INDEX_DIR` | `index.data_dir` | インデックスデータディレクトリ |
 | `RUST_LOG` | -- | ログフィルタディレクティブ（例: `info`, `debug`, `laurus=debug,tonic=warn`） |
 | `LAURUS_CONFIG` | -- | TOML 設定ファイルのパス |
@@ -133,6 +136,7 @@ WebAssembly では background thread がないため no-op になります。
 | `--host <HOST>` | `-H` | `0.0.0.0` | リッスンアドレス |
 | `--port <PORT>` | `-p` | `50051` | gRPC リッスンポート |
 | `--http-port <PORT>` | -- | -- | HTTP ゲートウェイポート |
+| `--max-result-window <N>` | -- | `10000` | 1 回の検索の `offset + limit` の上限 |
 | `--index-dir <PATH>` | -- | `./laurus_index` | インデックスデータディレクトリ（グローバルオプション） |
 
 ## よくある設定例

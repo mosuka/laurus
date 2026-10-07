@@ -37,6 +37,7 @@ laurus serve --config config.toml
 host = "0.0.0.0"
 port = 50051
 http_port = 8080  # Optional: enables HTTP Gateway
+max_result_window = 10000  # Optional; largest offset + limit per search
 
 [index]
 data_dir = "./laurus_data"
@@ -64,6 +65,7 @@ Log verbosity is controlled by the `RUST_LOG` environment variable (default: `in
 | `host` | String | `"0.0.0.0"` | Listen address for the gRPC server |
 | `port` | Integer | `50051` | Listen port for the gRPC server |
 | `http_port` | Integer | -- | HTTP Gateway port. When set, the HTTP/JSON gateway starts alongside gRPC. |
+| `max_result_window` | Integer | `10000` | Largest `offset + limit` a search may request (the default `limit` of 10 counts when `limit` is unset). Larger searches (gRPC, HTTP and MCP) are rejected with `INVALID_ARGUMENT` / HTTP 400. Must be at least 1. Like Elasticsearch's `index.max_result_window` (Issue #1367). |
 
 #### `[index]` Section
 
@@ -122,6 +124,7 @@ WAL flush.
 | `LAURUS_HOST` | `server.host` | Listen address |
 | `LAURUS_PORT` | `server.port` | gRPC listen port |
 | `LAURUS_HTTP_PORT` | `server.http_port` | HTTP Gateway port |
+| `LAURUS_MAX_RESULT_WINDOW` | `server.max_result_window` | Largest `offset + limit` per search |
 | `LAURUS_INDEX_DIR` | `index.data_dir` | Index data directory |
 | `RUST_LOG` | -- | Log filter directive (e.g. `info`, `debug`, `laurus=debug,tonic=warn`) |
 | `LAURUS_CONFIG` | -- | Path to TOML config file |
@@ -134,6 +137,7 @@ WAL flush.
 | `--host <HOST>` | `-H` | `0.0.0.0` | Listen address |
 | `--port <PORT>` | `-p` | `50051` | gRPC listen port |
 | `--http-port <PORT>` | -- | -- | HTTP Gateway port |
+| `--max-result-window <N>` | -- | `10000` | Largest `offset + limit` per search |
 | `--index-dir <PATH>` | -- | `./laurus_index` | Index data directory (global option) |
 
 ## Common Configurations

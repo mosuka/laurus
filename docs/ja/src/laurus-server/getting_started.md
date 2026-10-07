@@ -16,6 +16,7 @@ laurus serve [OPTIONS]
 | `--host <HOST>` | `-H` | `LAURUS_HOST` | `0.0.0.0` | リッスンアドレス |
 | `--port <PORT>` | `-p` | `LAURUS_PORT` | `50051` | リッスンポート |
 | `--http-port <PORT>` | -- | `LAURUS_HTTP_PORT` | -- | HTTP ゲートウェイポート（設定すると HTTP ゲートウェイが有効化） |
+| `--max-result-window <N>` | -- | `LAURUS_MAX_RESULT_WINDOW` | `10000` | 1 回の検索の `offset + limit` の上限。超える検索は拒否される |
 
 ログの詳細度は標準の `RUST_LOG` 環境変数で制御します（デフォルト: `info`）。
 `RUST_LOG=laurus=debug,tonic=warn` のようなフィルタディレクティブの詳細は [env_logger の構文](https://docs.rs/env_logger/latest/env_logger/#enabling-logging)を参照してください。

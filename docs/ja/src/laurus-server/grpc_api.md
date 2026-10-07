@@ -419,8 +419,8 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | :--- | :--- | :--- | :--- |
 | `query` | `string` | いいえ | [Query DSL](../concepts/query_dsl.md) による Lexical 検索クエリ |
 | `query_vectors` | `repeated QueryVector` | いいえ | ベクトル検索クエリ |
-| `limit` | `uint32` | いいえ | 最大結果件数（デフォルト: エンジンのデフォルト値） |
-| `offset` | `uint32` | いいえ | スキップする結果件数 |
+| `limit` | `uint32` | いいえ | 最大結果件数（`0` はエンジンの既定値 10）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索は `INVALID_ARGUMENT` で拒否される（Issue #1367） |
+| `offset` | `uint32` | いいえ | スキップする結果件数。`limit` と合わせて `max_result_window` の対象になる |
 | `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム |
 | `lexical_params` | `LexicalParams` | いいえ | Lexical 検索パラメータ |
 | `vector_params` | `VectorParams` | いいえ | ベクトル検索パラメータ |
@@ -614,7 +614,7 @@ gRPC エラーは標準の `Status` コードとして返されます。
 
 | Laurus エラー | gRPC ステータス | 発生条件 |
 | :--- | :--- | :--- |
-| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ、クエリ内の不明なフィールド |
+| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ、クエリ内の不明なフィールド、`offset + limit` が `max_result_window` を超える検索 |
 | インデックス未オープン | `FAILED_PRECONDITION` | `CreateIndex` の前に RPC が呼び出された場合 |
 | インデックスが既に存在 | `ALREADY_EXISTS` | `CreateIndex` が 2 回呼び出された場合 |
 | 未実装 | `UNIMPLEMENTED` | まだサポートされていない機能 |

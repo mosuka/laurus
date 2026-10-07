@@ -345,7 +345,7 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | Name | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `query` | string | Yes | Search query in laurus unified query DSL |
-| `limit` | integer | No | Maximum results (default: 10) |
+| `limit` | integer | No | Maximum results (default: 10). `offset + limit` must not exceed the server's `max_result_window` (default 10,000) |
 | `offset` | integer | No | Results to skip for pagination (default: 0) |
 | `fusion` | string | No | Fusion algorithm as JSON (for hybrid search) |
 | `field_boosts` | string | No | Per-field boost factors as JSON |
@@ -486,7 +486,7 @@ query. Useful for agents issuing several sub-queries per turn.
 | Name | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `queries` | array of string | Yes | Query strings, each in the laurus unified query DSL (same syntax as `search`) |
-| `limit` | integer | No | Maximum results per query (default: 10) |
+| `limit` | integer | No | Maximum results per query (default: 10). `offset + limit` must not exceed the server's `max_result_window` (default 10,000) |
 | `offset` | integer | No | Results to skip per query for pagination (default: 0) |
 | `highlight` | string | No | Highlighted fragments per field, as JSON — same format as `search`'s `highlight`, applied identically to every query |
 

@@ -385,6 +385,11 @@ pub struct ServeCommand {
     /// HTTP Gateway port. If set, starts an HTTP gateway alongside the gRPC server.
     #[arg(long = "http-port", env = "LAURUS_HTTP_PORT")]
     pub http_port: Option<u16>,
+
+    /// Largest `offset + limit` a search may request (default 10000). Larger
+    /// searches are rejected with INVALID_ARGUMENT (HTTP 400).
+    #[arg(long = "max-result-window", env = "LAURUS_MAX_RESULT_WINDOW")]
+    pub max_result_window: Option<std::num::NonZeroUsize>,
 }
 
 // --- Search ---
@@ -438,4 +443,31 @@ pub struct SearchCommand {
     /// How many top results to rescore (default 100, at most 10,000).
     #[arg(long, value_name = "N", requires = "rescore_field")]
     pub rescore_window: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    fn serve_max_result_window(args: &[&str]) -> Result<Option<usize>, clap::Error> {
+        let cli = Cli::try_parse_from(["laurus", "serve"].iter().chain(args))?;
+        match cli.command {
+            Command::Serve(serve) => Ok(serve.max_result_window.map(|n| n.get())),
+            _ => unreachable!("parsed a serve command"),
+        }
+    }
+
+    /// Issue #1367: `serve --max-result-window` overrides the config value
+    /// and must be at least 1.
+    #[test]
+    fn serve_parses_max_result_window() {
+        assert_eq!(serve_max_result_window(&[]).unwrap(), None);
+        assert_eq!(
+            serve_max_result_window(&["--max-result-window", "50000"]).unwrap(),
+            Some(50_000)
+        );
+        assert!(serve_max_result_window(&["--max-result-window", "0"]).is_err());
+    }
 }

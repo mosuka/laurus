@@ -1430,3 +1430,68 @@ fn graph_build_levels_are_deterministic_across_writers() -> Result<()> {
     );
     Ok(())
 }
+
+/// Issue #1367: extreme `ef_search`, `top_k` or `rerank_factor` must not size
+/// the layer-0 heaps from the request. `ef_search * 2` overflowed (a panic)
+/// at `usize::MAX`, and a merely huge value asked for an allocation the
+/// process could not make. Each node enters the heaps at most once, so
+/// bounding them by the node count leaves the results unchanged.
+#[test]
+fn test_hnsw_extreme_search_size_matches_an_ordinary_search() -> Result<()> {
+    use crate::vector::index::hnsw::searcher::HnswSearcher;
+    use crate::vector::search::searcher::{VectorIndexQuery, VectorIndexSearcher};
+
+    let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let config = HnswIndexConfig {
+        dimension: 3,
+        m: 16,
+        ef_construction: 100,
+        distance_metric: DistanceMetric::Cosine,
+        ..Default::default()
+    };
+    let index = HnswIndex::create(storage, "default_index", config)?;
+    let mut writer = index.writer()?;
+    let vectors = (0..30u64)
+        .map(|i| {
+            let angle = i as f32 * 0.2;
+            (
+                i + 1,
+                "test".to_string(),
+                Vector::new(vec![angle.cos(), angle.sin(), i as f32 * 0.01]),
+            )
+        })
+        .collect();
+    writer.build(vectors)?;
+    writer.finalize()?;
+    writer.commit()?;
+
+    let searcher = HnswSearcher::new(index.reader()?)?;
+    let query =
+        VectorIndexQuery::new(Vector::new(vec![1.0, 0.1, 0.0])).field_name("test".to_string());
+    let top5 = |request: &VectorIndexQuery| -> Result<Vec<u64>> {
+        Ok(searcher
+            .search(request)?
+            .results
+            .iter()
+            .take(5)
+            .map(|r| r.doc_id)
+            .collect())
+    };
+
+    let expected = top5(&query.clone().top_k(5))?;
+    assert_eq!(expected.len(), 5);
+    for (case, request) in [
+        (
+            "ef_search = usize::MAX",
+            query.clone().top_k(5).ef_search(usize::MAX),
+        ),
+        ("top_k = usize::MAX", query.clone().top_k(usize::MAX)),
+        (
+            "rerank_factor = usize::MAX",
+            query.clone().top_k(5).rerank_factor(usize::MAX),
+        ),
+    ] {
+        assert_eq!(top5(&request)?, expected, "{case}");
+    }
+    Ok(())
+}

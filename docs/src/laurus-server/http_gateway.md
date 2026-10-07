@@ -208,6 +208,13 @@ curl -X POST http://localhost:8080/v1/search \
   -d '{"query": "body:test", "limit": 10}'
 ```
 
+`limit` defaults to 10 and `offset` to 0 when absent or `null`. Since
+Issue #1367 a value that is not a non-negative integer, or that does not fit a
+32-bit unsigned integer, is rejected with `400 Bad Request`; it used to fall
+back to the default or wrap around. A search whose `offset + limit` exceeds
+the server's [`max_result_window`](configuration.md) (default 10,000) is
+rejected with `400 Bad Request` as well.
+
 #### Search with Field Boosts
 
 ```bash
