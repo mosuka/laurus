@@ -317,6 +317,66 @@ fn fieldless_query_top_k_counts_documents() {
     );
 }
 
+/// Issue #1371: a field-less query over a single HNSW field must walk the
+/// graph, not scan every vector linearly. `candidates_examined` is the ANN
+/// graph's visited-node count on the graph path, and exactly the corpus
+/// size on the brute-force fallback -- a decisive signal between the two
+/// without timing.
+#[test]
+fn fieldless_query_takes_hnsw_graph_path() {
+    const N: usize = 3000;
+    let mut fields = BTreeMap::new();
+    fields.insert("v".to_string(), hnsw_config(8, DistanceMetric::Cosine));
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+
+    let mut writer = index.writer().unwrap();
+    // Deterministic, no RNG dependency (mirrors `hnsw_coldstart_recall_test.rs`'s `doc_vec`).
+    let vectors: Vec<(u64, String, Vector)> = (0..N as u64)
+        .map(|i| {
+            let t = i as f32 * 0.001;
+            (
+                i,
+                "v".to_string(),
+                vec_of(&[
+                    t.cos(),
+                    t.sin(),
+                    (t * 2.0).cos(),
+                    (t * 3.0).sin(),
+                    0.1,
+                    0.2,
+                    0.3,
+                    0.4,
+                ]),
+            )
+        })
+        .collect();
+    writer.add_vectors(vectors).unwrap();
+    writer.commit().unwrap();
+
+    let searcher = index.searcher().unwrap();
+    let probe = vec_of(&[1.0, 0.0, 1.0, 0.0, 0.1, 0.2, 0.3, 0.4]);
+
+    let fieldless = searcher.search(&query(probe.clone(), None, 10)).unwrap();
+    assert!(
+        fieldless.candidates_examined < N / 2,
+        "field-less search must take the HNSW graph path (visited << {N}), got {}",
+        fieldless.candidates_examined
+    );
+
+    // Recall/results must match a field-targeted search on the same field.
+    // Both requests now execute the same code once the field is resolved,
+    // so this is exact, not probabilistic.
+    let routed = searcher.search(&query(probe, Some("v"), 10)).unwrap();
+    let ids = |r: &laurus::vector::search::searcher::VectorIndexQueryResults| {
+        r.results
+            .iter()
+            .map(|h| (h.doc_id, h.distance))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&fieldless), ids(&routed));
+}
+
 /// `add_vectors` with an unknown field name must reject the whole batch --
 /// never silently drop just the unknown field's vectors while applying the
 /// known ones.

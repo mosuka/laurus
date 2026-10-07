@@ -989,6 +989,22 @@ impl HnswIndexReader {
         self.deletion_bitmap = Some(bitmap);
     }
 
+    /// This reader's sole field name, when its dictionary holds exactly one
+    /// (Issue #1371). Every `MultiFieldVectorIndex` sub-index's HNSW segments
+    /// hold exactly one field's vectors (Issue #948), so a field-less
+    /// request can still be attributed to that field. Returns `None` when
+    /// the dictionary is empty or holds more than one name -- the legacy,
+    /// non-multi-field single-index layout, where one graph can mix several
+    /// fields' vectors and a field-less candidate cannot be attributed to a
+    /// single one.
+    pub(crate) fn sole_field_name(&self) -> Option<&str> {
+        if self.field_dict.len() == 1 {
+            Some(&*self.field_dict[0])
+        } else {
+            None
+        }
+    }
+
     /// Returns whether `doc_id` has been logically deleted.
     ///
     /// `pub(crate)` so the HNSW searcher can consult it during graph traversal
