@@ -38,17 +38,20 @@ tar -xzf "laurus-${VERSION}-${TARGET}.tar.gz"
 
 ```dockerfile
 FROM alpine:3.22
-# embeddings-openai を使う場合のみ必要: reqwest の rustls backend は
-# OS の信頼ストアを参照します。Hugging Face からのモデルダウンロード
-# （embeddings-candle / embeddings-multimodal）はバイナリに埋め込まれた
-# ルート証明書を使うため、これがなくても動作します。詳細は開発ガイドの
+# Embedding Feature が HTTPS 通信を行う場合は常に必要です: reqwest の
+# rustls backend は、embeddings-openai だけでなく Hugging Face からの
+# モデルダウンロード（embeddings-candle / embeddings-multimodal）でも
+# OS の信頼ストアを参照して検証します。ビルド済みバイナリは
+# --features embeddings-all でビルドされているため、Lexical 検索のみの
+# 用途でもインストールしておいてください。詳細は開発ガイドの
 # 「Feature Flags」を参照してください。
 RUN apk add --no-cache ca-certificates
 COPY laurus /usr/local/bin/laurus
 ENTRYPOINT ["laurus"]
 ```
 
-パッケージマネージャすら無い環境でも動作します:
+パッケージマネージャすら無い環境でも動作しますが、Embedding Feature を一切呼び出さない場合に限ります
+（HTTPS ダウンロードを検証する CA バンドルが無いため）:
 
 ```dockerfile
 FROM scratch

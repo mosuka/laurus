@@ -1,15 +1,21 @@
 # Feature Flags
 
-`laurus` クレートはデフォルトでは Feature が無効の状態で提供されます。必要に応じて Embedding サポートを有効にしてください。
+`laurus` クレートはデフォルトで `native` Feature が有効です。`native` はファイルベースのストレージ
+（mmap）、rayon によるマルチスレッド並列化、マルチスレッド tokio ランタイムを提供します。これを無効化する
+（`default-features = false`）のは `laurus-wasm` が使う `wasm32-unknown-unknown` 向けの構成であり、
+mmap を使うファイルストレージなど native 専用のモジュールがこの Feature に依存しているため、
+ネイティブターゲットではビルドできません。必要に応じて Embedding サポートを有効にしてください。
 
 ## 利用可能な Feature
 
 | Feature | 説明 | 主な依存クレート |
 | :--- | :--- | :--- |
+| `native`（デフォルト） | ファイルベースのストレージ、rayon 並列化、マルチスレッド tokio | crossbeam-channel, crossbeam-deque, memmap2, num_cpus, rayon, tempfile |
 | `embeddings-candle` | Hugging Face Candle によるローカル BERT Embedding と ColBERT のトークンベクトル | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `embeddings-openai` | OpenAI API Embedding | reqwest |
-| `embeddings-multimodal` | CLIP マルチモーダル Embedding（テキスト + 画像） | image, embeddings-candle |
+| `embeddings-multimodal` | CLIP マルチモーダル Embedding（テキスト + 画像） | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers, image |
 | `embeddings-all` | すべての Embedding Feature を統合 | 上記すべて |
+| `pq-fastscan` | HNSW インデックス向けの実験的な SIMD 高速化 PQ FastScan パス | -- |
 
 ## 各 Feature の詳細
 
@@ -19,7 +25,7 @@
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-candle"] }
+laurus = { version = "0.13", features = ["embeddings-candle"] }
 ```
 
 ### `embeddings-openai`
@@ -28,16 +34,18 @@ laurus = { version = "0.12", features = ["embeddings-candle"] }
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-openai"] }
+laurus = { version = "0.13", features = ["embeddings-openai"] }
 ```
 
 ### `embeddings-multimodal`
 
-`CandleClipEmbedder` を有効にし、CLIP ベースのテキストおよび画像 Embedding を使用できるようにします。`embeddings-candle` を暗黙的に有効にします。
+`CandleClipEmbedder` を有効にし、CLIP ベースのテキストおよび画像 Embedding を使用できるようにします。
+`embeddings-candle` とは独立しており、`CandleBertEmbedder` や `CandleColbertEmbedder` は有効になりません。
+BERT/ColBERT と CLIP の両方が必要な場合は `embeddings-candle` も併せて有効にしてください。
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-multimodal"] }
+laurus = { version = "0.13", features = ["embeddings-multimodal"] }
 ```
 
 ### `embeddings-all`
@@ -46,32 +54,28 @@ laurus = { version = "0.12", features = ["embeddings-multimodal"] }
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-all"] }
+laurus = { version = "0.13", features = ["embeddings-all"] }
 ```
 
 ## TLS とネットワークの挙動
 
-Embedding Feature は、信頼するルート証明書のソースが異なる 2 系統の TLS
-スタックを使用します。
+HTTP 通信を行う 3 つの Embedding Feature は、いずれも単一の TLS スタックを共有します。
 
 | Feature | HTTP クライアント | TLS backend | 信頼するルート証明書のソース |
 | :--- | :--- | :--- | :--- |
-| `embeddings-candle`, `embeddings-multimodal` | `hf-hub`（`ureq`） | rustls | バイナリに埋め込まれた Mozilla ルート証明書（`webpki-roots`） |
+| `embeddings-candle`, `embeddings-multimodal` | `hf-hub`（`blocking` Feature 経由の `reqwest`） | rustls | OS の信頼ストア（`rustls-platform-verifier` 経由） |
 | `embeddings-openai` | `reqwest` | rustls | OS の信頼ストア（`rustls-platform-verifier` 経由） |
 
-Hugging Face Hub からのモデルダウンロード（`embeddings-candle` /
-`embeddings-multimodal`）は、OS の信頼ストアではなくバイナリに埋め込まれた
-証明書を使用します。これは意図的な設計です。`ca-certificates` パッケージが
-入っていない `scratch` や distroless コンテナ内でも、完全静的リンクの musl
-バイナリがモデルをダウンロードできるようにするためです。トレードオフとして、
-このパスでは `SSL_CERT_FILE` / `SSL_CERT_DIR` は尊重されず、OS の信頼ストア
-にのみ導入された独自 CA（例: 社内の TLS インスペクションプロキシ配下）は
-信頼されません。そのようなプロキシ経由で Hugging Face へのダウンロードを
-行う必要がある場合は、キャッシュを事前に用意して `HF_HOME` でそれを指すか、
-信頼された内部ミラーを `HF_ENDPOINT` で指定してください。
-
-`embeddings-openai` は OS の信頼ストアを参照するため、これを使用する
-コンテナには引き続き `ca-certificates` のインストールが必要です。
+いずれも `rustls-platform-verifier` 経由で信頼を解決します。Linux では `rustls-native-certs` が
+システムの CA バンドルを読み込み（`SSL_CERT_FILE` / `SSL_CERT_DIR` も尊重します）、macOS では
+Keychain、Windows ではシステムの証明書ストアを使用します。これらの Feature のいずれかを使う
+コンテナには、信頼ストアが入っている必要があります（Debian/Alpine 系イメージなら
+`ca-certificates`、対象 OS に応じた同等のパッケージ）。CA バンドルの無い `scratch` や distroless
+イメージでは、Hugging Face Hub からのダウンロードも OpenAI API 呼び出しも TLS ハンドシェイクに
+失敗します。動作する Dockerfile の例は `laurus-cli` の
+[インストールガイド](../laurus-cli/installation.md)を参照してください。OS の信頼ストアにのみ
+導入された独自 CA（例: 社内の TLS インスペクションプロキシ配下）は、3 つの Feature いずれでも
+信頼されます。
 
 ## Feature Flag がバイナリサイズに与える影響
 
@@ -79,10 +83,10 @@ Embedding Feature を有効にすると、コンパイル時間とバイナリ�
 
 | 構成 | おおよその影響 |
 | :--- | :--- |
-| Feature なし（Lexical のみ） | ベースライン |
+| デフォルト（`native`、Embedding なし） | ベースライン |
 | `embeddings-candle` | + Candle ML フレームワーク |
 | `embeddings-openai` | + reqwest HTTP クライアント |
 | `embeddings-multimodal` | + 画像処理 + Candle |
 | `embeddings-all` | 上記すべて |
 
-Lexical（キーワード）検索のみが必要な場合は、Feature を有効にせずに Laurus を使用することで、最小のバイナリサイズと最速のコンパイル時間を実現できます。
+Lexical（キーワード）検索のみが必要な場合は、デフォルトの Feature 構成（`native`、Embedding なし）のまま Laurus を使用することで、最小のバイナリサイズと最速のコンパイル時間を実現できます。

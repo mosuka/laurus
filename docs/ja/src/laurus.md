@@ -36,27 +36,28 @@ graph TB
 
 ## Feature Flag
 
-`laurus` クレートはデフォルトではFeatureが有効化されていません。必要に応じてEmbeddingサポートを有効にしてください。
+`laurus` クレートはデフォルトで `native` Featureが有効です。必要に応じてEmbeddingサポートを有効にしてください。
 
 | Feature | 説明 | 依存クレート |
 | :--- | :--- | :--- |
+| `native`（デフォルト） | ファイルベースのストレージ、rayon並列化、マルチスレッドtokio | crossbeam-channel, crossbeam-deque, memmap2, num_cpus, rayon, tempfile |
 | `embeddings-candle` | Hugging Face CandleによるローカルBERT Embedding | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers |
 | `embeddings-openai` | OpenAI API Embedding | reqwest |
-| `embeddings-multimodal` | CLIPマルチモーダルEmbedding（テキスト + 画像） | image, embeddings-candle |
+| `embeddings-multimodal` | CLIPマルチモーダルEmbedding（テキスト + 画像） | candle-core, candle-nn, candle-transformers, hf-hub, tokenizers, image |
 | `embeddings-all` | すべてのEmbedding Featureを含む | 上記すべて |
 
 ```toml
 # Lexical検索のみ（Embeddingなし）
 [dependencies]
-laurus = "0.12"
+laurus = "0.13"
 
 # ローカルBERT Embeddingを使用
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-candle"] }
+laurus = { version = "0.13", features = ["embeddings-candle"] }
 
 # すべてのFeatureを有効化
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-all"] }
+laurus = { version = "0.13", features = ["embeddings-all"] }
 ```
 
 ## セクション

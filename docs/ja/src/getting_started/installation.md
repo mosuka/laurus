@@ -6,7 +6,7 @@
 
 ```toml
 [dependencies]
-laurus = "0.12"
+laurus = "0.13"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -16,7 +16,7 @@ Laurus はデフォルトで最小限の機能セットで提供されます。�
 
 | Feature | 説明 | ユースケース |
 | :--- | :--- | :--- |
-| *(default)* | コアライブラリ（Lexical 検索、ストレージ、アナライザ — エンベディングなし） | キーワード検索のみ |
+| `native` *(デフォルト)* | コアライブラリ（Lexical 検索、ストレージ、アナライザ — エンベディングなし） | キーワード検索のみ |
 | `embeddings-candle` | Hugging Face Candle によるローカル BERT エンベディング | 外部 API 不要の Vector 検索 |
 | `embeddings-openai` | OpenAI API エンベディング（text-embedding-3-small 等） | クラウドベースの Vector 検索 |
 | `embeddings-multimodal` | Candle による CLIP エンベディング（テキスト + 画像） | マルチモーダル（テキスト→画像）検索 |
@@ -28,28 +28,28 @@ Laurus はデフォルトで最小限の機能セットで提供されます。�
 
 ```toml
 [dependencies]
-laurus = "0.12"
+laurus = "0.13"
 ```
 
 **ローカルモデルによる Vector 検索**（API キー不要）:
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-candle"] }
+laurus = { version = "0.13", features = ["embeddings-candle"] }
 ```
 
 **OpenAI による Vector 検索**:
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-openai"] }
+laurus = { version = "0.13", features = ["embeddings-openai"] }
 ```
 
 **すべての機能**:
 
 ```toml
 [dependencies]
-laurus = { version = "0.12", features = ["embeddings-all"] }
+laurus = { version = "0.13", features = ["embeddings-all"] }
 ```
 
 ## インストールの確認
