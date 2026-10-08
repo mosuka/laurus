@@ -869,9 +869,9 @@ class LaurusTest extends TestCase
         $idx = $this->createIndex();
         $req = new Laurus\SearchRequest(
             null, // query
-            new Laurus\TermQuery("title", "rust"), // lexical_query
-            null, // vector_query
-            null, // filter_query
+            new Laurus\TermQuery("title", "rust"), // lexicalQuery
+            null, // vectorQuery
+            null, // filterQuery
             null, // fusion
         );
         $results = $idx->search($req);
@@ -886,16 +886,16 @@ class LaurusTest extends TestCase
 
         $req = new Laurus\SearchRequest(
             $query, // query
-            null, // lexical_query
-            null, // vector_query
-            new Laurus\TermQuery("title", "rust"), // filter_query
+            null, // lexicalQuery
+            null, // vectorQuery
+            new Laurus\TermQuery("title", "rust"), // filterQuery
             null, // fusion
         );
         $this->assertSame(["doc1"], $this->idsOf($idx->search($req)));
     }
 
     /**
-     * Issue #1372: a DSL `query` given with `vector_query` keeps the DSL.
+     * Issue #1372: a DSL `query` given with `vectorQuery` keeps the DSL.
      */
     public function testSearchRequestDslWithVectorQuery(): void
     {
@@ -910,9 +910,9 @@ class LaurusTest extends TestCase
         $idx->commit();
         $req = new Laurus\SearchRequest(
             "title:rust", // query
-            null, // lexical_query
-            new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), // vector_query
-            null, // filter_query
+            null, // lexicalQuery
+            new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), // vectorQuery
+            null, // filterQuery
             null, // fusion
             5, // limit
         );
@@ -927,14 +927,14 @@ class LaurusTest extends TestCase
         $idx = $this->createVectorIndex();
         $lexical = new Laurus\TermQuery("title", "rust");
         $vector = new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]);
-        // [query, lexical_query, vector_query, expected hint]
+        // [query, lexicalQuery, vectorQuery, expected hint]
         $cases = [
             ["title:rust", $lexical, null, "DSL"],
             ["title:rust", $lexical, $vector, "DSL"],
-            [$lexical, null, $vector, "as `lexical_query`"],
-            [$lexical, $lexical, null, "as `lexical_query`"],
-            [$vector, $lexical, null, "as `vector_query`"],
-            [$vector, null, $vector, "as `vector_query`"],
+            [$lexical, null, $vector, "as `lexicalQuery`"],
+            [$lexical, $lexical, null, "as `lexicalQuery`"],
+            [$vector, $lexical, null, "as `vectorQuery`"],
+            [$vector, null, $vector, "as `vectorQuery`"],
         ];
         foreach ($cases as $i => [$query, $lexicalQuery, $vectorQuery, $hint]) {
             try {
@@ -954,13 +954,32 @@ class LaurusTest extends TestCase
         $idx = $this->createVectorIndex();
         $req = new Laurus\SearchRequest(
             "", // query
-            null, // lexical_query
-            new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), // vector_query
-            null, // filter_query
+            null, // lexicalQuery
+            new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), // vectorQuery
+            null, // filterQuery
             null, // fusion
         );
         $this->expectException(\ValueError::class);
         $idx->search($req);
+    }
+
+    /**
+     * Issue #1379: the documented parameter names work as named arguments.
+     */
+    public function testSearchRequestAcceptsNamedArguments(): void
+    {
+        $idx = $this->createVectorIndex();
+        $req = new Laurus\SearchRequest(
+            query: null,
+            lexicalQuery: new Laurus\TermQuery("title", "rust"),
+            vectorQuery: new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]),
+            filterQuery: null,
+            fusion: new Laurus\RRF(60.0),
+            limit: 10,
+            offset: 0,
+        );
+        $results = $idx->search($req);
+        $this->assertSame("doc1", $results[0]->getId());
     }
 
     // ── Fusion algorithms ───────────────────────────────────────────────
@@ -2272,9 +2291,9 @@ class LaurusTest extends TestCase
 
         $hybrid = new Laurus\SearchRequest(
             null, // query
-            new Laurus\TermQuery("title", "rust"), // lexical_query
-            new Laurus\VectorQuery("vec", [1.0, 0.0]), // vector_query
-            null, // filter_query
+            new Laurus\TermQuery("title", "rust"), // lexicalQuery
+            new Laurus\VectorQuery("vec", [1.0, 0.0]), // vectorQuery
+            null, // filterQuery
             new Laurus\RRF(), // fusion
             10, // limit
             0, // offset

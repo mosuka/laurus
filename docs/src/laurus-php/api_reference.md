@@ -58,7 +58,7 @@ $results = $index->search("body:rust", 10, 0, ["body"]);
 $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems programming language."]]
 ```
 
-Highlighting follows the query passed to `search`/`searchBatch` (or `SearchRequest`'s `$query`/`$lexical_query` — see below), and only `stored: true` text fields can be highlighted; a field that is absent, not stored, or not text is silently skipped. Omitting `$highlight` leaves every result's highlights empty. The same `highlight` argument is also accepted by `SearchRequest`'s constructor.
+Highlighting follows the query passed to `search`/`searchBatch` (or `SearchRequest`'s `$query`/`$lexicalQuery` — see below), and only `stored: true` text fields can be highlighted; a field that is absent, not stored, or not text is silently skipped. Omitting `$highlight` leaves every result's highlights empty. The same `highlight` argument is also accepted by `SearchRequest`'s constructor.
 
 ### WAL sync policy & durability
 
