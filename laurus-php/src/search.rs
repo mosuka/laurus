@@ -1,4 +1,10 @@
 //! PHP wrappers for search request/result and fusion algorithm types.
+//!
+//! `SearchRequest::__construct`'s multi-word parameters are camelCase (not
+//! Rust-idiomatic snake_case) because `#[php_impl]` exposes a parameter's
+//! literal Rust identifier as its PHP named-argument name, and the rest of
+//! this binding's public surface is camelCase (Issue #1379).
+#![allow(non_snake_case)]
 
 use std::collections::HashMap;
 
@@ -425,12 +431,12 @@ impl PhpSearchRequest {
     /// # Arguments
     ///
     /// * `query` - DSL string or query object. A DSL string may be combined
-    ///   with `vector_query`, which is added to the DSL's vector part; any
-    ///   other combination with `lexical_query` / `vector_query` throws
+    ///   with `vectorQuery`, which is added to the DSL's vector part; any
+    ///   other combination with `lexicalQuery` / `vectorQuery` throws
     ///   `ValueError` when the request is built (Issue #1372).
-    /// * `lexical_query` - Lexical query for hybrid search.
-    /// * `vector_query` - Vector query for hybrid search.
-    /// * `filter_query` - Post-scoring filter query.
+    /// * `lexicalQuery` - Lexical query for hybrid search.
+    /// * `vectorQuery` - Vector query for hybrid search.
+    /// * `filterQuery` - Post-scoring filter query.
     /// * `fusion` - `RRF` or `WeightedSum` fusion algorithm.
     /// * `limit` - Maximum results (default: 10).
     /// * `offset` - Pagination offset (default: 0).
@@ -442,9 +448,9 @@ impl PhpSearchRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
         query: &Zval,
-        lexical_query: &Zval,
-        vector_query: &Zval,
-        filter_query: &Zval,
+        lexicalQuery: &Zval,
+        vectorQuery: &Zval,
+        filterQuery: &Zval,
         fusion: &Zval,
         limit: i64,
         offset: i64,
@@ -470,22 +476,22 @@ impl PhpSearchRequest {
         };
 
         // Convert filter query
-        let filter = if !filter_query.is_null() {
-            Some(extract_lexical_query(filter_query)?)
+        let filter = if !filterQuery.is_null() {
+            Some(extract_lexical_query(filterQuery)?)
         } else {
             None
         };
 
         // Convert lexical query
-        let lex_q = if !lexical_query.is_null() {
-            Some(zval_to_lexical_search_query(lexical_query)?)
+        let lex_q = if !lexicalQuery.is_null() {
+            Some(zval_to_lexical_search_query(lexicalQuery)?)
         } else {
             None
         };
 
         // Convert vector query
-        let vec_q = if !vector_query.is_null() {
-            Some(zval_to_vector_search_query(vector_query)?)
+        let vec_q = if !vectorQuery.is_null() {
+            Some(zval_to_vector_search_query(vectorQuery)?)
         } else {
             None
         };
@@ -570,20 +576,20 @@ impl PhpSearchRequest {
                 }
                 (QueryRepr::Dsl(_), _, _) => {
                     return Err(PhpException::new(
-                        "a DSL `query` cannot be combined with `lexical_query`; write the \
-                         lexical clauses in the DSL, or pass `lexical_query` without `query`"
+                        "a DSL `query` cannot be combined with `lexicalQuery`; write the \
+                         lexical clauses in the DSL, or pass `lexicalQuery` without `query`"
                             .to_string(),
                         0,
                         ce::value_error(),
                     ));
                 }
-                (QueryRepr::Lexical(_), _, _) => ("lexical", "lexical_query"),
-                (QueryRepr::Vector(_), _, _) => ("vector", "vector_query"),
+                (QueryRepr::Lexical(_), _, _) => ("lexical", "lexicalQuery"),
+                (QueryRepr::Vector(_), _, _) => ("vector", "vectorQuery"),
             };
             return Err(PhpException::new(
                 format!(
                     "a {kind} query object in `query` cannot be combined with \
-                     `lexical_query` or `vector_query`; pass it as `{slot}` instead"
+                     `lexicalQuery` or `vectorQuery`; pass it as `{slot}` instead"
                 ),
                 0,
                 ce::value_error(),
