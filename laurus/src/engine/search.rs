@@ -196,9 +196,10 @@ pub struct VectorSearchOptions {
     /// When `Some(factor)`, the underlying vector index searcher widens
     /// the int8 candidate fetch to `top_k * factor` and rescores the
     /// candidates against the original full-precision vectors via the
-    /// LRS1 sidecar. Honored only on HNSW fields whose schema enabled
-    /// `rerank_storage`; other configurations silently ignore the value.
-    /// `None` keeps Stage 1 behavior (int8-only).
+    /// f32 sidecar. Honored on HNSW, Flat and IVF fields whose schema
+    /// enabled `rerank_storage` (on Flat and IVF, only for a query that
+    /// names the field); other fields silently ignore the value. `None`
+    /// keeps Stage 1 behavior (int8-only).
     pub rerank_factor: Option<usize>,
 
     /// Per-query override for the HNSW `ef_search` candidate-list size
@@ -661,8 +662,9 @@ impl SearchRequestBuilder {
 
     /// Set the Stage 2 rerank factor (Issue #481) for vector search.
     ///
-    /// Honored by HNSW fields whose schema enabled `rerank_storage`.
-    /// Other vector configurations silently ignore the value.
+    /// Honored by HNSW, Flat and IVF fields whose schema enabled
+    /// `rerank_storage`; other fields silently ignore the value. See
+    /// [`VectorSearchOptions::rerank_factor`] for details.
     pub fn vector_rerank_factor(mut self, factor: usize) -> Self {
         self.vector_options.rerank_factor = Some(factor);
         self

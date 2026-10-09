@@ -190,10 +190,10 @@ message VectorParams {
   // via the int8 quantized hot path and then re-scores them with the
   // full f32 vectors before returning the final top_k.
   //
-  // STAGE 2 STATUS: not yet implemented in laurus core. Requesting a
-  // value here today returns LaurusError::NotImplemented. The field
-  // is reserved at proto tag 5 so older / newer clients can negotiate
-  // the upgrade without another schema bump.
+  // Honored on HNSW, Flat and IVF fields whose schema enabled
+  // `rerank_storage`; on Flat and IVF fields, only for queries that
+  // name the field. Fields without `rerank_storage` silently fall back
+  // to the int8 ranking. `0` or omitting the field disables rerank.
   optional uint32 rerank_factor = 5;
 
   // Per-query override for the HNSW `ef_search` candidate-list size
