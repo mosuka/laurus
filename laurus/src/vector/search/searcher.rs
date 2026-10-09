@@ -167,13 +167,9 @@ impl VectorIndexQuery {
         self
     }
 
-    /// Set two-stage rerank multiplier (Issue #481 Stage 2 — pre-design).
+    /// Set the two-stage rerank multiplier (Issue #481).
     ///
-    /// Currently the searcher returns
-    /// [`crate::error::LaurusError::NotImplemented`] when this is set
-    /// to `Some(_)`. The API surface is reserved here so existing
-    /// callers can opt in once Stage 2 lands without further proto /
-    /// binding revisions.
+    /// See [`VectorIndexQueryParams::rerank_factor`] for when it applies.
     pub fn rerank_factor(mut self, factor: usize) -> Self {
         self.params.rerank_factor = Some(factor);
         self
@@ -214,18 +210,20 @@ pub struct VectorIndexQueryParams {
     pub include_vectors: bool,
     /// Search timeout in milliseconds.
     pub timeout_ms: Option<u64>,
-    /// Two-stage rerank multiplier (Issue #481 Stage 2 — pre-design).
+    /// Two-stage rerank multiplier (Issue #481).
     ///
-    /// When set to `Some(n)`, the index searcher will first fetch
+    /// When set to `Some(n)`, the index searcher first fetches
     /// `top_k * n` candidates via the int8 quantized hot path and then
-    /// re-score them against the full f32 vectors before returning
+    /// re-scores them against the full f32 vectors before returning
     /// the top `top_k`. This recovers the recall lost to scalar
     /// quantization at modest extra cost.
     ///
-    /// **Stage 2 of Issue #481 — currently returns
-    /// [`crate::error::LaurusError::NotImplemented`] when set to
-    /// `Some(_)`.** `None` (the default) runs the Stage 1
-    /// quantized-only search.
+    /// Honored by HNSW, Flat and IVF segments written with
+    /// `rerank_storage` (the f32 sidecar); without it the value is
+    /// silently ignored and the int8 ranking is returned. Flat and IVF
+    /// rerank only a query that names its field; HNSW also resolves a
+    /// single-field segment for a field-less query. `None` (the
+    /// default) runs the quantized-only search.
     #[serde(default)]
     pub rerank_factor: Option<usize>,
     /// Per-query override for the HNSW `ef_search` candidate-list size
@@ -529,10 +527,12 @@ pub struct VectorSearchParams {
     pub allowed_filter: Option<Arc<RoaringTreemap>>,
     /// Optional Stage 2 rerank factor (Issue #481).
     ///
-    /// When `Some(factor)`, the HNSW searcher widens the int8 candidate
-    /// fetch to `top_k * factor` and rescores against the LRS1 sidecar's
-    /// f32 vectors. Honored only on HNSW fields with `rerank_storage`
-    /// configured at index time; otherwise silently ignored.
+    /// When `Some(factor)`, the field's searcher widens the int8
+    /// candidate fetch to `top_k * factor` and rescores against the f32
+    /// sidecar. Honored on HNSW, Flat and IVF fields with
+    /// `rerank_storage` configured at index time; otherwise silently
+    /// ignored. On Flat and IVF fields only a query that names the field
+    /// is reranked.
     #[serde(default)]
     pub rerank_factor: Option<usize>,
     /// Per-query override for the HNSW `ef_search` candidate-list size

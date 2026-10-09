@@ -174,9 +174,9 @@ fn apply_vector_params(
         builder = builder.vector_min_score(vp.min_score);
     }
 
-    // Issue #481 Stage 2: HNSW fields with rerank_storage honor the
-    // factor; other fields fall back to Stage 1 ranking. A zero value
-    // disables rerank, matching `None`.
+    // Issue #481 Stage 2: fields with rerank_storage (HNSW, Flat, IVF)
+    // honor the factor; other fields fall back to Stage 1 ranking. A
+    // zero value disables rerank, matching `None`.
     if let Some(factor) = vp.rerank_factor
         && factor > 0
     {
