@@ -1,9 +1,13 @@
 //! PHP wrappers for search request/result and fusion algorithm types.
 //!
-//! `SearchRequest::__construct`'s multi-word parameters are camelCase (not
-//! Rust-idiomatic snake_case) because `#[php_impl]` exposes a parameter's
-//! literal Rust identifier as its PHP named-argument name, and the rest of
-//! this binding's public surface is camelCase (Issue #1379).
+//! The multi-word parameters of `SearchRequest::__construct` (Issue #1379),
+//! `WeightedSum::__construct` and `LateInteractionRescore::__construct`
+//! (Issue #1384) are camelCase (not Rust-idiomatic snake_case) because
+//! `#[php_impl]` exposes a parameter's literal Rust identifier as its PHP
+//! named-argument name, and the rest of this binding's public surface is
+//! camelCase. The lint is allowed for the whole module because the macro
+//! binds each argument by that identifier in code it generates outside the
+//! `impl` block, where a function-level `#[allow]` does not reach.
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
@@ -176,13 +180,13 @@ impl PhpWeightedSum {
     ///
     /// # Arguments
     ///
-    /// * `lexical_weight` - Weight for lexical scores (default: 0.5).
-    /// * `vector_weight` - Weight for vector scores (default: 0.5).
-    #[php(defaults(lexical_weight = 0.5, vector_weight = 0.5))]
-    pub fn __construct(lexical_weight: f64, vector_weight: f64) -> Self {
+    /// * `lexicalWeight` - Weight for lexical scores (default: 0.5).
+    /// * `vectorWeight` - Weight for vector scores (default: 0.5).
+    #[php(defaults(lexicalWeight = 0.5, vectorWeight = 0.5))]
+    pub fn __construct(lexicalWeight: f64, vectorWeight: f64) -> Self {
         Self {
-            lexical_weight: lexical_weight as f32,
-            vector_weight: vector_weight as f32,
+            lexical_weight: lexicalWeight as f32,
+            vector_weight: vectorWeight as f32,
         }
     }
 
@@ -230,14 +234,14 @@ impl PhpLateInteractionRescore {
     /// * `query` - Query text, embedded by the field's token-level embedder
     ///   (a `"candle_colbert"` one), or the query's token vectors as a list
     ///   of numeric lists.
-    /// * `window_size` - How many top results to rescore (default 100, at
+    /// * `windowSize` - How many top results to rescore (default 100, at
     ///   most 10,000).
     ///
     /// # Errors
     ///
     /// Throws `\TypeError` if `query` is neither a string nor a list of
     /// numeric lists. The other values are checked when searching.
-    pub fn __construct(field: String, query: &Zval, window_size: Option<i64>) -> PhpResult<Self> {
+    pub fn __construct(field: String, query: &Zval, windowSize: Option<i64>) -> PhpResult<Self> {
         let options = if let Some(text) = query.str() {
             RescoreOptions::late_interaction_text(field.clone(), text)
         } else {
@@ -259,9 +263,9 @@ impl PhpLateInteractionRescore {
                     .collect(),
             )
         };
-        let options = match window_size {
+        let options = match windowSize {
             // A negative window is rejected by the engine like 0.
-            Some(window_size) => options.window_size(usize::try_from(window_size).unwrap_or(0)),
+            Some(size) => options.window_size(usize::try_from(size).unwrap_or(0)),
             None => options,
         };
         Ok(Self { field, options })

@@ -2,6 +2,15 @@
 //!
 //! Each PHP query class stores the data needed to construct the Rust query.
 //! Vector query classes produce [`VectorSearchQuery`] instead.
+//!
+//! `FuzzyQuery::__construct`'s `maxEdits` parameter is camelCase (not
+//! Rust-idiomatic snake_case) because `#[php_impl]` exposes a parameter's
+//! literal Rust identifier as its PHP named-argument name, and the rest of
+//! this binding's public surface is camelCase (Issue #1384). The lint is
+//! allowed for the whole module because the macro binds each argument by
+//! that identifier in code it generates outside the `impl` block, where a
+//! function-level `#[allow]` does not reach.
+#![allow(non_snake_case)]
 
 use std::cell::RefCell;
 
@@ -285,13 +294,13 @@ impl PhpFuzzyQuery {
     ///
     /// * `field` - Field name.
     /// * `term` - Term to match approximately.
-    /// * `max_edits` - Maximum edit distance (default: 2).
-    #[php(defaults(max_edits = 2))]
-    pub fn __construct(field: String, term: String, max_edits: i64) -> Self {
+    /// * `maxEdits` - Maximum edit distance (default: 2).
+    #[php(defaults(maxEdits = 2))]
+    pub fn __construct(field: String, term: String, maxEdits: i64) -> Self {
         Self {
             field,
             term,
-            max_edits: max_edits as u32,
+            max_edits: maxEdits as u32,
         }
     }
 

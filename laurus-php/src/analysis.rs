@@ -1,4 +1,13 @@
 //! PHP wrappers for the Laurus analysis pipeline.
+//!
+//! `SynonymGraphFilter::__construct`'s `keepOriginal` parameter is camelCase
+//! (not Rust-idiomatic snake_case) because `#[php_impl]` exposes a
+//! parameter's literal Rust identifier as its PHP named-argument name, and
+//! the rest of this binding's public surface is camelCase (Issue #1384). The
+//! lint is allowed for the whole module because the macro binds each
+//! argument by that identifier in code it generates outside the `impl`
+//! block, where a function-level `#[allow]` does not reach.
+#![allow(non_snake_case)]
 
 use std::cell::RefCell;
 
@@ -240,12 +249,12 @@ impl PhpSynonymGraphFilter {
     /// # Arguments
     ///
     /// * `dictionary` - The `SynonymDictionary` to use for expansion.
-    /// * `keep_original` - Whether to retain the original token (default: true).
+    /// * `keepOriginal` - Whether to retain the original token (default: true).
     /// * `boost` - Weight multiplier for synonym tokens (default: 1.0).
-    #[php(defaults(keep_original = true, boost = 1.0))]
-    pub fn __construct(dictionary: &PhpSynonymDictionary, keep_original: bool, boost: f64) -> Self {
+    #[php(defaults(keepOriginal = true, boost = 1.0))]
+    pub fn __construct(dictionary: &PhpSynonymDictionary, keepOriginal: bool, boost: f64) -> Self {
         let boost = boost as f32;
-        let mut filt = SynonymGraphFilter::new(dictionary.inner.borrow().clone(), keep_original);
+        let mut filt = SynonymGraphFilter::new(dictionary.inner.borrow().clone(), keepOriginal);
         if (boost - 1.0f32).abs() > f32::EPSILON {
             filt = filt.with_boost(boost);
         }

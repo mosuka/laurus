@@ -264,6 +264,19 @@ class LaurusTest extends TestCase
         $this->assertCount(1, $results);
     }
 
+    /**
+     * Issue #1384: the documented parameter names work as named arguments.
+     */
+    public function testFuzzyQueryAcceptsNamedArguments(): void
+    {
+        $idx = $this->createIndex();
+        // "rast" is one edit away from "rust", so only the default (2) or 1 finds it.
+        $exact = new Laurus\FuzzyQuery(field: "title", term: "rast", maxEdits: 0);
+        $this->assertCount(0, $idx->search($exact));
+        $oneEdit = new Laurus\FuzzyQuery(field: "title", term: "rast", maxEdits: 1);
+        $this->assertSame(["doc1"], $this->idsOf($idx->search($oneEdit)));
+    }
+
     public function testBooleanQuery(): void
     {
         $idx = $this->createIndex();
@@ -996,6 +1009,15 @@ class LaurusTest extends TestCase
         $this->assertEquals("WeightedSum(lexical_weight=0.5, vector_weight=0.5)", (string)$ws);
     }
 
+    /**
+     * Issue #1384: the documented parameter names work as named arguments.
+     */
+    public function testWeightedSumAcceptsNamedArguments(): void
+    {
+        $ws = new Laurus\WeightedSum(lexicalWeight: 0.25, vectorWeight: 0.75);
+        $this->assertEquals("WeightedSum(lexical_weight=0.25, vector_weight=0.75)", (string)$ws);
+    }
+
     // ── Analysis pipeline ───────────────────────────────────────────────
 
     public function testWhitespaceTokenizer(): void
@@ -1025,6 +1047,20 @@ class LaurusTest extends TestCase
         $expanded = $filter->apply($tokens);
         $texts = array_map(fn($t) => $t->getText(), $expanded);
         $this->assertContains("happy", $texts);
+        $this->assertContains("joyful", $texts);
+    }
+
+    /**
+     * Issue #1384: the documented parameter names work as named arguments.
+     */
+    public function testSynonymGraphFilterAcceptsNamedArguments(): void
+    {
+        $dict = new Laurus\SynonymDictionary();
+        $dict->addSynonymGroup(["happy", "joyful"]);
+        $tokens = (new Laurus\WhitespaceTokenizer())->tokenize("I am happy");
+        $filter = new Laurus\SynonymGraphFilter(dictionary: $dict, keepOriginal: false, boost: 1.0);
+        $texts = array_map(fn($t) => $t->getText(), $filter->apply($tokens));
+        $this->assertNotContains("happy", $texts);
         $this->assertContains("joyful", $texts);
     }
 
@@ -2324,6 +2360,15 @@ class LaurusTest extends TestCase
     {
         $this->assertSame(100, $this->rescore()->getWindowSize());
         $this->assertSame('LateInteractionRescore(field="tokens", window_size=100)', (string)$this->rescore());
+    }
+
+    /**
+     * Issue #1384: the documented parameter names work as named arguments.
+     */
+    public function testLateInteractionRescoreAcceptsNamedArguments(): void
+    {
+        $rescore = new Laurus\LateInteractionRescore(field: "tokens", query: self::RESCORE_QUERY, windowSize: 1);
+        $this->assertSame(1, $rescore->getWindowSize());
     }
 
     public function testTokenVectorsAreNotStored(): void
