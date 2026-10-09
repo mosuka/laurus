@@ -198,31 +198,40 @@ impl VectorIndexSearcher for IvfSearcher {
         // the already-filtered results, so recall is unchanged.
 
         // Issue #481 Stage 2 rerank (extended to IVF by #650 PR-2 /
-        // #932): honored below when the query is field-routed and the
-        // reader has the `.f32` sidecar loaded. Otherwise `rerank_factor`
+        // #932): honored below when the query is routed to one field and
+        // the reader has the `.f32` sidecar loaded. Otherwise `rerank_factor`
         // silently falls back to Stage 1 ranking — the same convention as
         // HNSW, where a missing prerequisite (here: a single field to key
         // the sidecar position index) cannot be recovered at query time.
+        // Issue #1388: a field-less request can still be routed to one
+        // field when the reader unambiguously belongs to it (see
+        // `IvfIndexReader::sole_field_name`).
 
         let start = Timer::now();
         let mut results = VectorIndexQueryResults::new();
+
+        // Downcast once up front: the resolved reader supplies both the
+        // int8 quantized pool below and, for a field-less request, the
+        // sole field to route to (Issue #1388).
+        let ivf_reader = self
+            .index_reader
+            .as_any()
+            .downcast_ref::<crate::vector::index::ivf::reader::IvfIndexReader>();
+        let field_name = request
+            .field_name
+            .as_deref()
+            .or_else(|| ivf_reader.and_then(|r| r.sole_field_name()));
 
         // Probe the configured number of nearest clusters (Issue #741).
         // `probe_clusters` already caps the effective count at the number of
         // available centroids via `take`, so no artificial upper clamp is
         // applied here.
-        let vector_ids =
-            self.probe_clusters(&request.query, self.n_probe, request.field_name.as_deref())?;
+        let vector_ids = self.probe_clusters(&request.query, self.n_probe, field_name)?;
 
-        // The probe above already rejected non-IVF readers, so the
-        // downcast below is guaranteed to succeed; the dictionary maps
-        // the probe results' u16 ids back to names at emission.
-        let field_dict = self
-            .index_reader
-            .as_any()
-            .downcast_ref::<crate::vector::index::ivf::reader::IvfIndexReader>()
-            .map(|r| r.field_dict())
-            .unwrap_or_default();
+        // The probe above already rejected non-IVF readers, so `ivf_reader`
+        // is guaranteed to be `Some`; the dictionary maps the probe
+        // results' u16 ids back to names at emission.
+        let field_dict = ivf_reader.map(|r| r.field_dict()).unwrap_or_default();
 
         // Calculate distances for vectors in the probed clusters.
         // Cache the query-side norm once per search (#414); for Cosine /
@@ -233,10 +242,6 @@ impl VectorIndexSearcher for IvfSearcher {
         // Issue #481 Stage 1, Step 7: try the int8 hot path when the
         // reader holds an OwnedQuantized pool. Build per-search
         // QuantizedQuery once before the candidate loop.
-        let ivf_reader = self
-            .index_reader
-            .as_any()
-            .downcast_ref::<crate::vector::index::ivf::reader::IvfIndexReader>();
         let quant_pool = ivf_reader.and_then(|r| r.vectors().quantized_pool().cloned());
         let prepared_quantized = quant_pool.as_ref().map(|pool| {
             crate::vector::core::distance_quantized::QuantizedQuery::prepare(
@@ -293,15 +298,17 @@ impl VectorIndexSearcher for IvfSearcher {
         candidates.sort_unstable_by(|a, b| a.3.total_cmp(&b.3).then(a.0.cmp(&b.0)));
 
         // Stage 2 (Issue #481 / #932): run the shared rerank pipeline over
-        // the sorted quantized candidates when the query is field-routed
-        // (every candidate then shares one sidecar position index). The
-        // survivors carry exact f32 distances — stamped below as the
-        // fan-out's `score_basis` (#927).
+        // the sorted quantized candidates when the query is routed to one
+        // field, whether named explicitly or resolved via
+        // `IvfIndexReader::sole_field_name` (Issue #1388) — every
+        // candidate then shares one sidecar position index. The survivors
+        // carry exact f32 distances — stamped below as the fan-out's
+        // `score_basis` (#927).
         let mut rerank_applied = false;
         if let (Some(factor), Some(pool), Some(field_name)) = (
             request.params.rerank_factor,
             ivf_reader.and_then(|r| r.rerank_storage()),
-            request.field_name.as_deref(),
+            field_name,
         ) {
             use crate::vector::search::rerank::{
                 F32SidecarStage, RerankCandidates, RerankPipeline,

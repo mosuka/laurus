@@ -33,11 +33,20 @@ const DOCS: [(&str, [f32; 4]); 4] = [
 const QUERY: [f32; 4] = [0.87, 0.36, 0.21, 0.09];
 
 fn vector_request(rerank_factor: Option<usize>) -> laurus::SearchRequest {
+    vector_request_for_fields(Some(vec!["embedding".to_string()]), rerank_factor)
+}
+
+/// Like [`vector_request`], but lets the caller pick `fields` -- `None`
+/// builds a field-less query (Issue #1388).
+fn vector_request_for_fields(
+    fields: Option<Vec<String>>,
+    rerank_factor: Option<usize>,
+) -> laurus::SearchRequest {
     let mut builder = SearchRequestBuilder::new()
         .vector_query(VectorSearchQuery::Vectors(vec![QueryVector {
             vector: Vector::new(QUERY.to_vec()),
             weight: 1.0,
-            fields: Some(vec!["embedding".to_string()]),
+            fields,
         }]))
         .limit(1);
     if let Some(factor) = rerank_factor {
@@ -127,6 +136,80 @@ async fn ivf_rerank_succeeds_on_stage2_field() -> laurus::Result<()> {
         // #948: `MultiFieldVectorIndex`).
         "vector/embedding/segment_000000.ivf.f32",
     )
+    .await
+}
+
+/// Issue #1388: a field-less query (no `fields` selector) over a Flat or
+/// IVF field with `rerank_storage` must apply the Stage-2 rerank exactly
+/// like a field-routed query on the same field — same top hit, same exact
+/// f32 score — instead of silently keeping the int8 Stage-1 score. Mirrors
+/// `vector_multi_field_test.rs`'s `fieldless_query_takes_hnsw_graph_path`
+/// (the equivalent HNSW gap, #1371 / #1381).
+async fn assert_fieldless_rerank_matches_routed(field_option: FieldOption) -> laurus::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let storage =
+        StorageFactory::create(StorageConfig::File(FileStorageConfig::new(temp_dir.path())))?;
+    let schema = Schema::builder()
+        .add_field("embedding", field_option)
+        .build();
+    let engine = Engine::new(storage, schema).await?;
+    ingest(&engine).await?;
+
+    let routed = engine
+        .search(vector_request_for_fields(
+            Some(vec!["embedding".to_string()]),
+            Some(4),
+        ))
+        .await?;
+    let fieldless = engine
+        .search(vector_request_for_fields(None, Some(4)))
+        .await?;
+
+    assert_eq!(
+        routed[0].id, "doc1",
+        "field-routed query must find doc1 first"
+    );
+    assert_eq!(
+        fieldless[0].id, routed[0].id,
+        "a field-less query must pick the same top hit as the field-routed one"
+    );
+    assert_eq!(
+        fieldless[0].score.to_bits(),
+        routed[0].score.to_bits(),
+        "a field-less query must apply the same exact-f32 rerank score as the field-routed one"
+    );
+
+    let fieldless_without_rerank = engine.search(vector_request_for_fields(None, None)).await?;
+    assert_ne!(
+        fieldless[0].score.to_bits(),
+        fieldless_without_rerank[0].score.to_bits(),
+        "rerank_factor must change the field-less score via the f32 sidecar; \
+         identical scores mean the silent Stage-1 fallback was taken"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flat_rerank_succeeds_on_fieldless_stage2_field() -> laurus::Result<()> {
+    assert_fieldless_rerank_matches_routed(FieldOption::Flat(FlatOption {
+        dimension: 4,
+        distance: DistanceMetric::Cosine,
+        rerank_storage: Some(RerankStorageKind::F32),
+        ..FlatOption::default()
+    }))
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ivf_rerank_succeeds_on_fieldless_stage2_field() -> laurus::Result<()> {
+    assert_fieldless_rerank_matches_routed(FieldOption::Ivf(IvfOption {
+        dimension: 4,
+        distance: DistanceMetric::Cosine,
+        n_clusters: 2,
+        n_probe: 2,
+        rerank_storage: Some(RerankStorageKind::F32),
+        ..IvfOption::default()
+    }))
     .await
 }
 

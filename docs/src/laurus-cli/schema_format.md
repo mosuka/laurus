@@ -403,8 +403,8 @@ full-precision vectors alongside the int8 segment so the searcher
 can do a wide candidate fetch over int8 (cheap) and then rescore
 the top `top_k * rerank_factor` candidates against the exact f32
 values (accurate). Supported by all three vector index types —
-HNSW, Flat, and IVF (#932); on Flat/IVF the rescoring applies to
-field-routed queries.
+HNSW, Flat, and IVF (#932) — including a field-less query when the
+segment holds only one field (#1388).
 
 The sidecar is configured per field with `rerank_storage`:
 
@@ -424,10 +424,6 @@ Stage 1 int8-only search path. Queries that pass `rerank_factor`
 against a field without `rerank_storage` silently fall back to
 Stage 1 ranking — the searcher cannot recover f32 information that
 was discarded at index time.
-
-> **Scope:** Stage 2 lands HNSW only. Flat / IVF accept the field
-> for schema symmetry but currently neither emit nor consume the
-> sidecar.
 
 ## Analyzers
 

@@ -197,9 +197,9 @@ pub struct VectorSearchOptions {
     /// the int8 candidate fetch to `top_k * factor` and rescores the
     /// candidates against the original full-precision vectors via the
     /// f32 sidecar. Honored on HNSW, Flat and IVF fields whose schema
-    /// enabled `rerank_storage` (on Flat and IVF, only for a query that
-    /// names the field); other fields silently ignore the value. `None`
-    /// keeps Stage 1 behavior (int8-only).
+    /// enabled `rerank_storage`, including a field-less query when the
+    /// segment holds only one field; other fields silently ignore the
+    /// value. `None` keeps Stage 1 behavior (int8-only).
     pub rerank_factor: Option<usize>,
 
     /// Per-query override for the HNSW `ef_search` candidate-list size

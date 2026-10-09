@@ -300,6 +300,22 @@ impl FlatVectorIndexReader {
         self.rerank_storage.as_ref()
     }
 
+    /// This reader's sole field name, when its dictionary holds exactly one
+    /// (Issue #1388). Every `MultiFieldVectorIndex` sub-index's Flat
+    /// segments hold exactly one field's vectors (Issue #948), so a
+    /// field-less request can still be attributed to that field. Returns
+    /// `None` when the dictionary is empty or holds more than one name --
+    /// the legacy, non-multi-field single-index layout, where one segment
+    /// can mix several fields' vectors and a field-less candidate cannot be
+    /// attributed to a single one.
+    pub(crate) fn sole_field_name(&self) -> Option<&str> {
+        if self.field_dict.len() == 1 {
+            Some(&*self.field_dict[0])
+        } else {
+            None
+        }
+    }
+
     pub fn set_deletion_bitmap(&mut self, bitmap: Arc<DeletionBitmap>) {
         self.deletion_bitmap = Some(bitmap);
     }
