@@ -184,6 +184,19 @@ endif
 build-laurus-wasm: ## Build laurus-wasm (wasm-pack, --target web)
 	cd laurus-wasm && wasm-pack build --target web --release
 
+# ── Evaluation ─────────────────────────────────────────────────────────────
+#
+# BEIR_DATASET selects the dataset (scifact or nfcorpus). BEIR_ARGS passes
+# extra flags through, e.g. a reduced-scale run:
+#   make beir-ladr-eval BEIR_DATASET=scifact BEIR_ARGS="--corpus-size 1000 --max-queries 50"
+# Downloads the dataset into .cache/beir/ on first use (gitignored).
+BEIR_DATASET ?= scifact
+BEIR_ARGS ?=
+
+beir-ladr-eval: venv ## Measure the LADR adaptive-rerank recall gap on a BEIR subset (Issue #1350)
+	cd laurus-python && VIRTUAL_ENV=$(abspath $(PYTHON_VENV_DIR)) $(abspath $(MATURIN)) develop --quiet --features embeddings-candle
+	$(PYTHON) -u scripts/beir_ladr_eval.py $(BEIR_DATASET) $(BEIR_ARGS)
+
 # ── Benchmark ──────────────────────────────────────────────────────────────
 #
 # BENCH (optional) selects a single criterion bench by name, e.g.
