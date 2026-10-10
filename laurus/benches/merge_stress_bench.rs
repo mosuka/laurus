@@ -15,6 +15,15 @@
 //!   `cargo bench` run impractically slow (the same reason `bkd_bench.rs`'s
 //!   own `bench_build` caps its sweep well below its query benches' 1M-point
 //!   case).
+//! - Two corpus shapes (Issue #1168): `short` (4-word bodies, the original
+//!   workload) and `long` (200-word bodies). Short bodies make term data a
+//!   small share of the peak, so changes to how analyzed terms and postings
+//!   are held only show up clearly on `long`. `merge_optimize` keeps its
+//!   original short-shape IDs (`merge_optimize/{n}`) so earlier results stay
+//!   comparable, and adds one `merge_optimize/long/4000` case.
+//! - `ingest` measures the normal write path — one segment's worth of
+//!   documents upserted into a fresh store, then committed — for both
+//!   shapes. The documents are built outside the measured closure.
 //! - Peak-memory measurement: this is the first bench in the suite to
 //!   instrument the allocator. `TrackingAllocator` (`#[global_allocator]`)
 //!   tracks a high-water mark of net allocated bytes; it is scoped to this
@@ -56,10 +65,15 @@
 //! cargo bench --bench merge_stress_bench --no-run
 //! ```
 //!
-//! Peak-memory reports print to stdout once per size (and, for
-//! `merge_bounded`, once per size/budget pair), before the timed Criterion
-//! loop starts for that case — look for `peak bytes for N=...` lines in the
-//! `cargo bench` output.
+//! Peak-memory reports print to stdout once per case, before the timed
+//! Criterion loop starts for it — look for `peak bytes for ...` lines in the
+//! `cargo bench` output. `merge_bounded` lines also report how many output
+//! segments the merge produced. To print every peak without running any
+//! timed loop, pass a filter that matches no benchmark ID:
+//!
+//! ```sh
+//! cargo bench --bench merge_stress_bench -- peaks-only
+//! ```
 
 mod common;
 
@@ -122,33 +136,73 @@ const SIZES: &[usize] = &[1_000, 5_000, 20_000];
 /// Fixed segment count across every size (docs are split evenly).
 const SEGMENTS: usize = 4;
 
-/// Build a `total_docs`-document, `SEGMENTS`-segment `LexicalStore` (one
-/// commit per segment), with a text field, a single-valued numeric field,
-/// and a multi-valued numeric field — the same three-field shape
+/// Document body length for a corpus. See the file-level doc comment for
+/// why both shapes exist.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// 4-word bodies — the original workload.
+    Short,
+    /// 200-word bodies, so analyzed terms and postings dominate.
+    Long,
+}
+
+impl Shape {
+    fn label(self) -> &'static str {
+        match self {
+            Shape::Short => "short",
+            Shape::Long => "long",
+        }
+    }
+
+    fn words_per_doc(self) -> u64 {
+        match self {
+            Shape::Short => 4,
+            Shape::Long => 200,
+        }
+    }
+}
+
+/// Document `doc_id` of a corpus: a text body, a single-valued numeric
+/// field, and a multi-valued numeric field — the same three-field shape
 /// `lexical_merge_stress_test.rs` uses, so this bench and that test track
 /// the same workload.
-fn build_multi_segment_store(total_docs: usize) -> (std::sync::Arc<dyn Storage>, LexicalStore) {
+fn make_doc(doc_id: u64, shape: Shape) -> Document {
+    let words: Vec<String> = (0..shape.words_per_doc())
+        .map(|k| format!("word{}", (doc_id.wrapping_mul(7).wrapping_add(k)) % 2_000))
+        .collect();
+    let score = (doc_id.wrapping_mul(37) % 1000) as i64 - 500;
+    let tags: Vec<i64> = (0..3u64)
+        .map(|k| ((doc_id.wrapping_mul(11).wrapping_add(k)) % 2000) as i64)
+        .collect();
+    Document::builder()
+        .add_text("body", words.join(" "))
+        .add_integer("score", score)
+        .add_int64_array("tags_num", tags)
+        .build()
+}
+
+/// An empty `LexicalStore` over fresh in-memory storage.
+fn empty_store() -> (std::sync::Arc<dyn Storage>, LexicalStore) {
     let storage: std::sync::Arc<dyn Storage> =
         std::sync::Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
     let store = LexicalStore::new(storage.clone(), LexicalIndexConfig::default()).unwrap();
+    (storage, store)
+}
 
+/// Build a `total_docs`-document, `SEGMENTS`-segment `LexicalStore` (one
+/// commit per segment).
+fn build_multi_segment_store(
+    total_docs: usize,
+    shape: Shape,
+) -> (std::sync::Arc<dyn Storage>, LexicalStore) {
+    let (storage, store) = empty_store();
     let docs_per_segment = total_docs / SEGMENTS;
     let mut doc_id = 0u64;
     for _ in 0..SEGMENTS {
         for _ in 0..docs_per_segment {
-            let words: Vec<String> = (0..4u64)
-                .map(|k| format!("word{}", (doc_id.wrapping_mul(7).wrapping_add(k)) % 2_000))
-                .collect();
-            let score = (doc_id.wrapping_mul(37) % 1000) as i64 - 500;
-            let tags: Vec<i64> = (0..3u64)
-                .map(|k| ((doc_id.wrapping_mul(11).wrapping_add(k)) % 2000) as i64)
-                .collect();
-            let doc = Document::builder()
-                .add_text("body", words.join(" "))
-                .add_integer("score", score)
-                .add_int64_array("tags_num", tags)
-                .build();
-            store.upsert_document(doc_id, doc).unwrap();
+            store
+                .upsert_document(doc_id, make_doc(doc_id, shape))
+                .unwrap();
             doc_id += 1;
         }
         store.commit().unwrap();
@@ -156,25 +210,95 @@ fn build_multi_segment_store(total_docs: usize) -> (std::sync::Arc<dyn Storage>,
     (storage, store)
 }
 
+/// Number of distinct `merged_*` segments in `storage`, counted by file stem
+/// so it works for both the loose and the compound (`.cfs`) layout.
+fn merged_segment_count(storage: &std::sync::Arc<dyn Storage>) -> usize {
+    let stems: std::collections::BTreeSet<String> = storage
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("merged_"))
+        .filter_map(|f| f.split('.').next().map(str::to_string))
+        .collect();
+    stems.len()
+}
+
+/// `(shape, total_docs)` cases for `merge_optimize`: the original short
+/// sweep, plus one long-body case sized to build in about the same time as
+/// the largest short one.
+fn merge_optimize_cases() -> Vec<(Shape, usize)> {
+    let mut cases: Vec<(Shape, usize)> = SIZES.iter().map(|&n| (Shape::Short, n)).collect();
+    cases.push((Shape::Long, 4_000));
+    cases
+}
+
 fn bench_merge_optimize(c: &mut Criterion) {
     let mut group = c.benchmark_group("merge_optimize");
     group.sample_size(SAMPLE_SIZE_SLOW);
 
-    for &n in SIZES {
+    for (shape, n) in merge_optimize_cases() {
         // One-time sanity call + peak-memory report (common.rs hygiene
         // rule #3's slot), before the timed Criterion loop for this size.
-        let (_, store) = build_multi_segment_store(n);
+        let (_, store) = build_multi_segment_store(n, shape);
         let (result, peak_bytes) = measure_peak_bytes(|| store.optimize());
         result.unwrap();
-        println!("peak bytes for N={n}: {peak_bytes}");
+        println!(
+            "peak bytes for merge, shape={}, N={n}: {peak_bytes}",
+            shape.label()
+        );
 
+        // The short sweep keeps its original IDs so earlier results stay
+        // comparable.
+        let id = match shape {
+            Shape::Short => BenchmarkId::from_parameter(n),
+            Shape::Long => BenchmarkId::new(shape.label(), n),
+        };
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+        group.bench_with_input(id, &n, |b, &n| {
             b.iter_batched(
-                || build_multi_segment_store(n),
+                || build_multi_segment_store(n, shape),
                 |(_, store)| {
                     store.optimize().unwrap();
                 },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// `(shape, docs)` cases for `ingest`: one segment's worth of documents,
+/// each under the default `max_buffered_docs` so the whole batch is buffered
+/// before the commit flushes it.
+const INGEST_CASES: &[(Shape, usize)] = &[(Shape::Short, 5_000), (Shape::Long, 1_000)];
+
+fn bench_ingest(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingest");
+    group.sample_size(SAMPLE_SIZE_SLOW);
+
+    let ingest = |store: &LexicalStore, docs: Vec<Document>| {
+        for (doc_id, doc) in docs.into_iter().enumerate() {
+            store.upsert_document(doc_id as u64, doc).unwrap();
+        }
+        store.commit().unwrap();
+    };
+
+    for &(shape, n) in INGEST_CASES {
+        let make_docs = || -> Vec<Document> { (0..n as u64).map(|i| make_doc(i, shape)).collect() };
+
+        let (_, store) = empty_store();
+        let docs = make_docs();
+        let ((), peak_bytes) = measure_peak_bytes(|| ingest(&store, docs));
+        println!(
+            "peak bytes for ingest, shape={}, N={n}: {peak_bytes}",
+            shape.label()
+        );
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new(shape.label(), n), &n, |b, _| {
+            b.iter_batched(
+                || (empty_store(), make_docs()),
+                |((_, store), docs)| ingest(&store, docs),
                 BatchSize::LargeInput,
             );
         });
@@ -200,10 +324,14 @@ fn bench_merge_bounded(c: &mut Criterion) {
 
     for &n in SIZES {
         for &(label, budget) in BUDGETS {
-            let (_, store) = build_multi_segment_store(n);
+            let (storage, store) = build_multi_segment_store(n, Shape::Short);
             let (result, peak_bytes) = measure_peak_bytes(|| store.optimize_within_budget(budget));
             result.unwrap();
-            println!("peak bytes for N={n}, budget={label}: {peak_bytes}");
+            println!(
+                "peak bytes for merge_bounded, N={n}, budget={label}: {peak_bytes} \
+                 ({} output segments)",
+                merged_segment_count(&storage)
+            );
 
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(
@@ -211,7 +339,7 @@ fn bench_merge_bounded(c: &mut Criterion) {
                 &(n, budget),
                 |b, &(n, budget)| {
                     b.iter_batched(
-                        || build_multi_segment_store(n),
+                        || build_multi_segment_store(n, Shape::Short),
                         |(_, store)| {
                             store.optimize_within_budget(budget).unwrap();
                         },
@@ -224,5 +352,10 @@ fn bench_merge_bounded(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_merge_optimize, bench_merge_bounded);
+criterion_group!(
+    benches,
+    bench_merge_optimize,
+    bench_merge_bounded,
+    bench_ingest
+);
 criterion_main!(benches);
