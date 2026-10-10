@@ -59,7 +59,7 @@ use std::collections::BTreeMap;
 use ahash::AHashMap;
 
 use crate::error::{LaurusError, Result};
-use crate::lexical::core::analyzed::AnalyzedDocument;
+use crate::lexical::core::analyzed::BufferedDocument;
 use crate::lexical::reader::FieldStats;
 use crate::storage::Storage;
 use crate::storage::structured::{StructReader, StructWriter};
@@ -183,9 +183,8 @@ pub(crate) struct NormsBuilder {
 
 impl NormsBuilder {
     /// Build from the writer's buffered documents (fresh flush or merge
-    /// reconstruction -- both hand this the same `&[(u64, AnalyzedDocument)]`
-    /// shape `write_field_lengths` used to consume).
-    pub(crate) fn from_buffered(docs: &[(u64, AnalyzedDocument)]) -> Self {
+    /// reconstruction -- both hand this the same buffered documents).
+    pub(crate) fn from_buffered(docs: &[(u64, BufferedDocument)]) -> Self {
         let mut doc_ids: Vec<u64> = docs.iter().map(|(id, _)| *id).collect();
         doc_ids.sort_unstable();
         // The field promises deduplicated ids, and `write_to`'s delta
@@ -740,8 +739,8 @@ mod format_tests {
     use super::*;
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 
-    fn doc(lengths: &[(&str, u32)]) -> AnalyzedDocument {
-        let mut d = AnalyzedDocument::new();
+    fn doc(lengths: &[(&str, u32)]) -> BufferedDocument {
+        let mut d = BufferedDocument::default();
         for &(field, len) in lengths {
             d.field_lengths.insert(field.to_string(), len);
         }
@@ -969,7 +968,7 @@ mod format_tests {
     #[test]
     fn an_empty_segment_round_trips_through_both_readers() {
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
-        let docs: Vec<(u64, AnalyzedDocument)> = Vec::new();
+        let docs: Vec<(u64, BufferedDocument)> = Vec::new();
         let reader = round_trip(&storage, "seg_empty", &NormsBuilder::from_buffered(&docs));
 
         assert!(reader.field_names().is_empty());

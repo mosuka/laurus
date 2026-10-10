@@ -14,7 +14,9 @@ use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::analysis::token::{Token, TokenPositions, flatten_token_graph};
 use crate::data::DataValue;
 use crate::error::{LaurusError, Result};
-use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm, field_length_from_terms};
+use crate::lexical::core::analyzed::{
+    AnalyzedDocument, AnalyzedTerm, BufferedDocument, field_length_from_terms,
+};
 use crate::lexical::core::document::Document;
 
 use crate::lexical::core::field::FieldOption;
@@ -256,8 +258,10 @@ pub struct InvertedIndexWriter {
     /// In-memory inverted index being built.
     inverted_index: TermPostingIndex,
 
-    /// Buffered analyzed documents with their assigned doc IDs.
-    buffered_docs: Vec<(u64, AnalyzedDocument)>,
+    /// Buffered documents with their assigned doc IDs. Their analyzed terms
+    /// are already in [`Self::inverted_index`] and are not kept here (Issue
+    /// #1168).
+    buffered_docs: Vec<(u64, BufferedDocument)>,
     /// Running estimate of the heap `buffered_docs` occupies (#557).
     ///
     /// Maintained incrementally because `should_flush` consults it on every
@@ -1004,12 +1008,28 @@ impl InvertedIndexWriter {
             self.purge_stale_postings();
         }
 
-        // Add to inverted index
-        self.add_analyzed_document_to_index(doc_id, &analyzed_doc)?;
+        // Destructured in full so a new `AnalyzedDocument` field cannot be
+        // silently dropped here: it must be either indexed or buffered.
+        let AnalyzedDocument {
+            field_terms,
+            stored_fields,
+            field_lengths,
+            point_values,
+        } = analyzed_doc;
 
-        // Buffer the document with its assigned ID
-        self.track_buffered(&analyzed_doc);
-        self.buffered_docs.push((doc_id, analyzed_doc));
+        // The postings are the only consumer of the analyzed terms, so they
+        // are dropped once indexed rather than buffered too (Issue #1168).
+        self.add_analyzed_document_to_index(doc_id, &field_terms)?;
+        drop(field_terms);
+
+        // Buffer the rest with the assigned ID
+        let buffered = BufferedDocument {
+            stored_fields,
+            field_lengths,
+            point_values,
+        };
+        self.track_buffered(&buffered);
+        self.buffered_docs.push((doc_id, buffered));
         self.buffered_doc_ids.insert(doc_id);
         self.stats.docs_added += 1;
 
@@ -1255,13 +1275,13 @@ impl InvertedIndexWriter {
         })
     }
 
-    /// Add an analyzed document to the inverted index.
+    /// Add a document's analyzed terms to the inverted index.
     fn add_analyzed_document_to_index(
         &mut self,
         doc_id: u64,
-        doc: &AnalyzedDocument,
+        field_terms: &AHashMap<String, Vec<AnalyzedTerm>>,
     ) -> Result<()> {
-        for (field_name, terms) in &doc.field_terms {
+        for (field_name, terms) in field_terms {
             let store_positions = self.config.stores_term_positions(field_name);
 
             // `terms` holds one `AnalyzedTerm` per occurrence, so the same
@@ -1346,19 +1366,21 @@ impl InvertedIndexWriter {
         )
     }
 
-    /// Estimate the heap an [`AnalyzedDocument`] occupies while buffered.
+    /// Estimate the heap a [`BufferedDocument`] occupies while buffered.
     ///
     /// Deliberately an estimate, not an exact accounting: it exists to keep
     /// `max_buffer_memory` proportional to what a document actually costs, so
-    /// point-heavy or text-heavy documents cannot slip past the flush budget
-    /// (#557). The three terms that scale with document content are counted —
-    /// BKD points, analyzed terms, and stored values — plus a small constant
-    /// for the per-field map entries.
-    fn estimate_analyzed_size(doc: &AnalyzedDocument) -> usize {
+    /// point-heavy or stored-payload-heavy documents cannot slip past the
+    /// flush budget (#557). BKD points and stored values scale with document
+    /// content; field lengths and the buffer entry itself are a fixed cost
+    /// per field and per document. Analyzed terms are not buffered (Issue
+    /// #1168): their postings are counted by the posting index instead (see
+    /// [`Self::estimate_memory_usage`]).
+    fn estimate_buffered_size(doc: &BufferedDocument) -> usize {
         /// Per-field overhead: the name plus its slot in each of the maps.
         const FIELD_OVERHEAD: usize = 64;
 
-        let mut bytes = 0usize;
+        let mut bytes = std::mem::size_of::<(u64, BufferedDocument)>();
 
         for (name, points) in &doc.point_values {
             // A point is a `Vec<f64>`: its header plus `dims` doubles.
@@ -1367,11 +1389,8 @@ impl InvertedIndexWriter {
             bytes += FIELD_OVERHEAD + name.len() + points.len() * per_point;
         }
 
-        for (name, terms) in &doc.field_terms {
-            bytes +=
-                FIELD_OVERHEAD + name.len() + terms.len() * std::mem::size_of::<AnalyzedTerm>();
-            // The term strings themselves live on the heap.
-            bytes += terms.iter().map(|t| t.term.len()).sum::<usize>();
+        for name in doc.field_lengths.keys() {
+            bytes += FIELD_OVERHEAD + name.len();
         }
 
         for (name, value) in &doc.stored_fields {
@@ -1450,10 +1469,10 @@ impl InvertedIndexWriter {
     }
 
     /// Add `doc`'s estimated footprint to the buffered total.
-    fn track_buffered(&mut self, doc: &AnalyzedDocument) {
+    fn track_buffered(&mut self, doc: &BufferedDocument) {
         self.buffered_bytes = self
             .buffered_bytes
-            .saturating_add(Self::estimate_analyzed_size(doc));
+            .saturating_add(Self::estimate_buffered_size(doc));
     }
 
     /// Flush the current segment to disk.
@@ -2392,7 +2411,7 @@ impl InvertedIndexWriter {
             .buffered_docs
             .iter()
             .filter(|(id, _)| *id == doc_id)
-            .map(|(_, doc)| Self::estimate_analyzed_size(doc))
+            .map(|(_, doc)| Self::estimate_buffered_size(doc))
             .sum();
         self.buffered_bytes = self.buffered_bytes.saturating_sub(removed_bytes);
         self.buffered_docs.retain(|(id, _)| *id != doc_id);
@@ -2954,7 +2973,7 @@ mod tests {
     #[test]
     fn score_bound_uses_decoded_length_and_never_tightens_relative_to_exact() {
         let exact_len = 10_000u32; // above EXACT_LENGTH_BOUND, so quantisation is lossy
-        let mut doc = AnalyzedDocument::new();
+        let mut doc = BufferedDocument::default();
         doc.field_lengths.insert("body".to_string(), exact_len);
         let docs = vec![(7u64, doc)];
         let norms = NormsBuilder::from_buffered(&docs);
@@ -3001,18 +3020,16 @@ mod tests {
         );
     }
 
-    /// An `AnalyzedDocument` carrying only `point_values`.
-    fn doc_with_points(count: usize, dims: usize) -> AnalyzedDocument {
+    /// A `BufferedDocument` carrying only `point_values`.
+    fn doc_with_points(count: usize, dims: usize) -> BufferedDocument {
         let mut point_values = AHashMap::new();
         point_values.insert(
             "coords".to_string(),
             (0..count).map(|i| vec![i as f64; dims]).collect(),
         );
-        AnalyzedDocument {
-            field_terms: AHashMap::new(),
-            stored_fields: AHashMap::new(),
-            field_lengths: AHashMap::new(),
+        BufferedDocument {
             point_values,
+            ..Default::default()
         }
     }
 
@@ -3078,8 +3095,8 @@ mod tests {
     /// even with the point accounting removed.
     #[test]
     fn size_estimate_scales_with_point_count() {
-        let few = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(10, 2));
-        let many = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(1000, 2));
+        let few = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(10, 2));
+        let many = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 2));
 
         assert!(
             many > few * 50,
@@ -3091,8 +3108,8 @@ mod tests {
     /// more doubles than a 1D one.
     #[test]
     fn size_estimate_scales_with_point_dimensionality() {
-        let one_d = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(1000, 1));
-        let three_d = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(1000, 3));
+        let one_d = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 1));
+        let three_d = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 3));
 
         assert!(
             three_d > one_d,
@@ -3124,11 +3141,9 @@ mod tests {
 
         let mut point_values = AHashMap::new();
         point_values.insert("empty_field".to_string(), Vec::<Vec<f64>>::new());
-        let doc = AnalyzedDocument {
-            field_terms: AHashMap::new(),
-            stored_fields: AHashMap::new(),
-            field_lengths: AHashMap::new(),
+        let doc = BufferedDocument {
             point_values,
+            ..Default::default()
         };
         writer.buffered_docs.push((1, doc));
         writer.flush_segment().unwrap();
@@ -3283,12 +3298,7 @@ mod tests {
     /// and no points.
     #[test]
     fn size_estimate_scales_with_stored_payload() {
-        let mut small = AnalyzedDocument {
-            field_terms: AHashMap::new(),
-            stored_fields: AHashMap::new(),
-            field_lengths: AHashMap::new(),
-            point_values: AHashMap::new(),
-        };
+        let mut small = BufferedDocument::default();
         let mut large = small.clone();
         small
             .stored_fields
@@ -3298,8 +3308,8 @@ mod tests {
             DataValue::Bytes(vec![0u8; 64 * 1024], None),
         );
 
-        let small_estimate = InvertedIndexWriter::estimate_analyzed_size(&small);
-        let large_estimate = InvertedIndexWriter::estimate_analyzed_size(&large);
+        let small_estimate = InvertedIndexWriter::estimate_buffered_size(&small);
+        let large_estimate = InvertedIndexWriter::estimate_buffered_size(&large);
         assert!(
             large_estimate > small_estimate + 60_000,
             "a 64 KiB payload must dominate the estimate, got {large_estimate} vs {small_estimate}"
