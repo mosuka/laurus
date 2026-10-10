@@ -2,7 +2,7 @@
 //!
 //! This module provides the writer for building inverted indexes in schema-less mode.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
@@ -14,7 +14,9 @@ use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::analysis::token::{Token, TokenPositions, flatten_token_graph};
 use crate::data::DataValue;
 use crate::error::{LaurusError, Result};
-use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm, field_length_from_terms};
+use crate::lexical::core::analyzed::{
+    AnalyzedDocument, AnalyzedTerm, BufferedDocument, field_length_from_terms,
+};
 use crate::lexical::core::document::Document;
 
 use crate::lexical::core::field::FieldOption;
@@ -27,7 +29,7 @@ use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermI
 use crate::lexical::index::structures::doc_id_set::{
     DOC_ID_SET_SUFFIX, load_segment_doc_ids, write_doc_id_set,
 };
-use crate::lexical::index::structures::doc_values::DocValuesWriter;
+use crate::lexical::index::structures::doc_values;
 use crate::lexical::index::structures::norms::NormsBuilder;
 use crate::lexical::writer::LexicalIndexWriter;
 
@@ -256,28 +258,30 @@ pub struct InvertedIndexWriter {
     /// In-memory inverted index being built.
     inverted_index: TermPostingIndex,
 
-    /// Buffered analyzed documents with their assigned doc IDs.
-    buffered_docs: Vec<(u64, AnalyzedDocument)>,
+    /// Buffered documents with their assigned doc IDs. Their analyzed terms
+    /// are already in [`Self::inverted_index`] and are not kept here (Issue
+    /// #1168).
+    buffered_docs: Vec<(u64, BufferedDocument)>,
     /// Running estimate of the heap `buffered_docs` occupies (#557).
     ///
     /// Maintained incrementally because `should_flush` consults it on every
     /// document; walking the buffer instead would make ingestion quadratic.
     buffered_bytes: usize,
 
-    /// Whether [`Self::inverted_index`] / [`Self::doc_values_writer`] are stale
-    /// relative to [`Self::buffered_docs`] and need a rebuild before flush.
+    /// Doc ids removed from [`Self::buffered_docs`] whose postings are still
+    /// in [`Self::inverted_index`].
     ///
-    /// Set by [`Self::remove_pending_document`], which drops the doc from
-    /// `buffered_docs` (cheap, order-preserving `retain`) but **defers** the
-    /// expensive `rebuild_in_memory_index` rather than running it per removal.
-    /// The rebuild runs once at flush time (and eagerly on the same-id re-upsert
-    /// path), turning an `update × M` over an `N`-doc uncommitted buffer from
-    /// `O(M·N)` into `O(M) + O(N)` (Issue #828). While dirty, the in-memory
-    /// index still holds the removed doc's postings, so the NRT lookups
-    /// ([`Self::find_doc_id_by_term`] / [`Self::find_doc_ids_by_term`]) filter
-    /// their results by [`Self::buffered_doc_ids`] (the physically-correct live
-    /// set).
-    index_dirty: bool,
+    /// Filled by [`Self::remove_pending_document`], which drops the doc from
+    /// `buffered_docs` (cheap, order-preserving `retain`) but **defers**
+    /// purging its postings rather than paying for it per removal. The
+    /// purge ([`Self::purge_stale_postings`]) runs once at flush time, and
+    /// before any of these ids is added again, turning an `update × M` over
+    /// an `N`-doc uncommitted buffer from `O(M·N)` into `O(M) + O(N)` (Issue
+    /// #828). Until then the in-memory index still holds the removed docs'
+    /// postings, so the NRT lookups ([`Self::find_doc_id_by_term`] /
+    /// [`Self::find_doc_ids_by_term`]) filter their results by
+    /// [`Self::buffered_doc_ids`] (the physically-correct live set).
+    stale_doc_ids: AHashSet<u64>,
 
     /// Membership index of the doc IDs currently in [`Self::buffered_docs`].
     ///
@@ -288,9 +292,6 @@ pub struct InvertedIndexWriter {
     /// `add × N` ingest, since newly assigned doc IDs are never already
     /// buffered yet still paid the full scan (Issue #570).
     buffered_doc_ids: AHashSet<u64>,
-
-    /// DocValues writer for the current segment.
-    doc_values_writer: DocValuesWriter,
 
     /// Document ID counter.
     next_doc_id: u64,
@@ -859,8 +860,15 @@ impl InvertedIndexWriter {
     }
 
     /// Same idea as [`Self::pin_field_term_positions`], for DocValues (see
-    /// [`InvertedIndexWriterConfig::stores_doc_values`], resolved per
-    /// document at [`Self::upsert_analyzed_document`] time).
+    /// [`InvertedIndexWriterConfig::stores_doc_values`]).
+    ///
+    /// DocValues columns are built from the buffer at flush time (Issue
+    /// #1168), so `stores_doc_values` is resolved then, not at upsert. That
+    /// gives the same answer as resolving it per upsert only because a pin
+    /// is insert-only and a merge pins a field before upserting any
+    /// document that carries it (`MergeEngine::replay_segment_into_writer`):
+    /// the setting a buffered document's value is written under can never
+    /// change after the document arrives.
     pub(crate) fn pin_field_doc_values(&mut self, field_name: &str, detect: impl FnOnce() -> bool) {
         if !self.config.field_doc_values.contains_key(field_name) {
             let value = detect();
@@ -907,10 +915,6 @@ impl InvertedIndexWriter {
             current_segment = state.next_generation;
         }
 
-        // Create initial DocValuesWriter (will be reset per segment)
-        let initial_segment_name = format!("{}_{:06}", config.segment_prefix, current_segment);
-        let doc_values_writer = DocValuesWriter::new(storage.clone(), initial_segment_name);
-
         // The WAL checkpoint starts at the shared authority's current value;
         // a handle-less writer has no checkpoint to maintain. The old code
         // read `metadata.json` here and silently defaulted on failure, which
@@ -924,9 +928,8 @@ impl InvertedIndexWriter {
             inverted_index: TermPostingIndex::new(),
             buffered_docs: Vec::new(),
             buffered_bytes: 0,
-            index_dirty: false,
+            stale_doc_ids: AHashSet::new(),
             buffered_doc_ids: AHashSet::new(),
-            doc_values_writer,
             next_doc_id,
             current_segment,
             closed: false,
@@ -972,26 +975,12 @@ impl InvertedIndexWriter {
         // Analyze the document
         let analyzed_doc = self.analyze_document(doc)?;
 
-        // Same-id re-upsert detection: if this exact id is already buffered, the
-        // deferred-rebuild scheme cannot distinguish the old version's stale
-        // postings from the new version's (both carry this id), so we must purge
-        // the old version from the in-memory index *before* re-indexing. This
-        // never happens on the production engine path (every add gets a fresh
-        // monotonic doc_id), so the eager rebuild here costs nothing in
-        // production and only restores exact NRT state for direct re-upserts.
-        let was_buffered = self.buffered_doc_ids.contains(&doc_id);
-
-        // Upsert: remove any pending document with the same ID before adding
+        // Upsert: remove any pending document with the same ID before adding.
+        // The removed version's postings stay until purged, and
+        // `upsert_analyzed_document` purges them before re-adding this id.
         self.remove_pending_document(doc_id)?;
         // Upsert: mark persisted occurrences as deleted (flushed segments)
         self.mark_persisted_doc_deleted(doc_id)?;
-
-        if was_buffered {
-            // Purge the just-removed old version's postings now (eager), so the
-            // re-added version below is the only one in the in-memory index.
-            self.rebuild_in_memory_index()?;
-            self.index_dirty = false;
-        }
 
         // Add the analyzed document with the specified ID
         self.upsert_analyzed_document(doc_id, analyzed_doc)
@@ -1010,22 +999,37 @@ impl InvertedIndexWriter {
             self.next_doc_id = doc_id + 1;
         }
 
-        // Add field values to DocValues, skipping payloads no consumer of
-        // DocValues can use (#1047) and fields opted out of DocValues via
-        // `doc_values: false`.
-        for (field_name, value) in &analyzed_doc.stored_fields {
-            if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name) {
-                self.doc_values_writer
-                    .add_value(doc_id, field_name, value.clone());
-            }
+        // A removed version of this id may still have postings in the
+        // in-memory index. They carry the same doc_id as the postings about
+        // to be added, so once added nothing could tell them apart: purge
+        // them first (Issue #1168). This covers a same-id re-upsert and a
+        // delete followed by a re-upsert alike.
+        if self.stale_doc_ids.contains(&doc_id) {
+            self.purge_stale_postings();
         }
 
-        // Add to inverted index
-        self.add_analyzed_document_to_index(doc_id, &analyzed_doc)?;
+        // Destructured in full so a new `AnalyzedDocument` field cannot be
+        // silently dropped here: it must be either indexed or buffered.
+        let AnalyzedDocument {
+            field_terms,
+            stored_fields,
+            field_lengths,
+            point_values,
+        } = analyzed_doc;
 
-        // Buffer the document with its assigned ID
-        self.track_buffered(&analyzed_doc);
-        self.buffered_docs.push((doc_id, analyzed_doc));
+        // The postings are the only consumer of the analyzed terms, so they
+        // are dropped once indexed rather than buffered too (Issue #1168).
+        self.add_analyzed_document_to_index(doc_id, &field_terms)?;
+        drop(field_terms);
+
+        // Buffer the rest with the assigned ID
+        let buffered = BufferedDocument {
+            stored_fields,
+            field_lengths,
+            point_values,
+        };
+        self.track_buffered(&buffered);
+        self.buffered_docs.push((doc_id, buffered));
         self.buffered_doc_ids.insert(doc_id);
         self.stats.docs_added += 1;
 
@@ -1271,13 +1275,13 @@ impl InvertedIndexWriter {
         })
     }
 
-    /// Add an analyzed document to the inverted index.
+    /// Add a document's analyzed terms to the inverted index.
     fn add_analyzed_document_to_index(
         &mut self,
         doc_id: u64,
-        doc: &AnalyzedDocument,
+        field_terms: &AHashMap<String, Vec<AnalyzedTerm>>,
     ) -> Result<()> {
-        for (field_name, terms) in &doc.field_terms {
+        for (field_name, terms) in field_terms {
             let store_positions = self.config.stores_term_positions(field_name);
 
             // `terms` holds one `AnalyzedTerm` per occurrence, so the same
@@ -1362,19 +1366,21 @@ impl InvertedIndexWriter {
         )
     }
 
-    /// Estimate the heap an [`AnalyzedDocument`] occupies while buffered.
+    /// Estimate the heap a [`BufferedDocument`] occupies while buffered.
     ///
     /// Deliberately an estimate, not an exact accounting: it exists to keep
     /// `max_buffer_memory` proportional to what a document actually costs, so
-    /// point-heavy or text-heavy documents cannot slip past the flush budget
-    /// (#557). The three terms that scale with document content are counted —
-    /// BKD points, analyzed terms, and stored values — plus a small constant
-    /// for the per-field map entries.
-    fn estimate_analyzed_size(doc: &AnalyzedDocument) -> usize {
+    /// point-heavy or stored-payload-heavy documents cannot slip past the
+    /// flush budget (#557). BKD points and stored values scale with document
+    /// content; field lengths and the buffer entry itself are a fixed cost
+    /// per field and per document. Analyzed terms are not buffered (Issue
+    /// #1168): their postings are counted by the posting index instead (see
+    /// [`Self::estimate_memory_usage`]).
+    fn estimate_buffered_size(doc: &BufferedDocument) -> usize {
         /// Per-field overhead: the name plus its slot in each of the maps.
         const FIELD_OVERHEAD: usize = 64;
 
-        let mut bytes = 0usize;
+        let mut bytes = std::mem::size_of::<(u64, BufferedDocument)>();
 
         for (name, points) in &doc.point_values {
             // A point is a `Vec<f64>`: its header plus `dims` doubles.
@@ -1383,11 +1389,8 @@ impl InvertedIndexWriter {
             bytes += FIELD_OVERHEAD + name.len() + points.len() * per_point;
         }
 
-        for (name, terms) in &doc.field_terms {
-            bytes +=
-                FIELD_OVERHEAD + name.len() + terms.len() * std::mem::size_of::<AnalyzedTerm>();
-            // The term strings themselves live on the heap.
-            bytes += terms.iter().map(|t| t.term.len()).sum::<usize>();
+        for name in doc.field_lengths.keys() {
+            bytes += FIELD_OVERHEAD + name.len();
         }
 
         for (name, value) in &doc.stored_fields {
@@ -1445,15 +1448,16 @@ impl InvertedIndexWriter {
 
     /// Estimate current memory usage.
     ///
-    /// The buffered-document half is a running total maintained by
-    /// [`Self::track_buffered`] and the removal path, not a walk of
-    /// `buffered_docs`: this runs from [`Self::should_flush`] on every
-    /// document, so recomputing it would make ingestion quadratic.
+    /// Both halves are running totals, not walks of the buffer or the
+    /// index: this runs from [`Self::should_flush`] on every document, so
+    /// recomputing either would make ingestion quadratic. The
+    /// buffered-document half is maintained by [`Self::track_buffered`] and
+    /// the removal path. The posting index counts its own heap (Issue
+    /// #1168): postings grow with every term occurrence, not with the
+    /// vocabulary, so a per-distinct-term constant undercounts long text by
+    /// a wide margin.
     fn estimate_memory_usage(&self) -> usize {
-        // 256 bytes per distinct term covers the in-memory posting index,
-        // whose size tracks the vocabulary rather than the document count.
-        let index_memory = self.inverted_index.term_count() as usize * 256;
-        self.buffered_bytes + index_memory
+        self.buffered_bytes + self.inverted_index.heap_bytes()
     }
 
     /// Public wrapper over [`Self::estimate_memory_usage`] for callers
@@ -1465,10 +1469,10 @@ impl InvertedIndexWriter {
     }
 
     /// Add `doc`'s estimated footprint to the buffered total.
-    fn track_buffered(&mut self, doc: &AnalyzedDocument) {
+    fn track_buffered(&mut self, doc: &BufferedDocument) {
         self.buffered_bytes = self
             .buffered_bytes
-            .saturating_add(Self::estimate_analyzed_size(doc));
+            .saturating_add(Self::estimate_buffered_size(doc));
     }
 
     /// Flush the current segment to disk.
@@ -1477,12 +1481,9 @@ impl InvertedIndexWriter {
             return Ok(());
         }
 
-        // Materialize any deferred removals (#828) so the in-memory index +
-        // DocValues match `buffered_docs` before they are written to disk.
-        if self.index_dirty {
-            self.rebuild_in_memory_index()?;
-            self.index_dirty = false;
-        }
+        // Materialize any deferred removals (#828) so the in-memory index
+        // matches `buffered_docs` before it is written to disk.
+        self.purge_stale_postings();
 
         // Reserve the generation ordinal from the shared counter (#1024) —
         // at flush time, not at construction, so a merge that ran since
@@ -1526,16 +1527,8 @@ impl InvertedIndexWriter {
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
-        self.index_dirty = false;
+        self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
-
-        // Reset DocValuesWriter for next segment
-        let next_segment_name = format!(
-            "{}_{:06}",
-            self.config.segment_prefix,
-            self.current_segment + 1
-        );
-        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), next_segment_name);
 
         self.current_segment += 1;
         self.stats.segments_created += 1;
@@ -1615,11 +1608,8 @@ impl InvertedIndexWriter {
         }
         // Materialize any deferred removals (#828) before writing. The merge
         // path only adds distinct, pre-deduped docs so this is normally a no-op,
-        // but the guard keeps the invariant if that ever changes.
-        if self.index_dirty {
-            self.rebuild_in_memory_index()?;
-            self.index_dirty = false;
-        }
+        // but it keeps the invariant if that ever changes.
+        self.purge_stale_postings();
         // Published immediately, unlike a buffer flush. The merge's inputs
         // were already visible, and the merge engine deletes them once this
         // returns — hiding the output until some later commit would make an
@@ -1629,7 +1619,7 @@ impl InvertedIndexWriter {
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
-        self.index_dirty = false;
+        self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
         self.stats.segments_created += 1;
         Ok(paths)
@@ -1856,10 +1846,49 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Write DocValues to storage.
+    /// Write the `.dv` part.
+    ///
+    /// Each column is built from the buffer here, at flush time, and one
+    /// column is collected, serialized and dropped before the next (Issue
+    /// #1168). Building every column at upsert time instead, as a
+    /// writer-wide DocValues buffer used to, kept a second copy of every
+    /// eligible value alive until the flush — and the flush is the peak.
+    /// The filter is the one the upsert path used to apply
+    /// (`is_doc_values_candidate` and `stores_doc_values`); see
+    /// [`Self::pin_field_doc_values`] for why applying it at flush time
+    /// gives the same columns.
     fn write_doc_values(&self, sink: &mut PartSink<'_>) -> Result<()> {
+        // Pass 1: which columns exist, and how many values each holds.
+        let mut column_sizes: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, doc) in &self.buffered_docs {
+            for (field_name, value) in &doc.stored_fields {
+                if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name)
+                {
+                    *column_sizes.entry(field_name.as_str()).or_default() += 1;
+                }
+            }
+        }
+
+        // Pass 2, lazily: one column at a time, in field-name order.
+        let columns = column_sizes.into_iter().map(|(field_name, size)| {
+            let mut values = Vec::with_capacity(size);
+            // Newest first, so that after the stable sort `dedup_by_key`
+            // keeps the value buffered last for a doc_id — the
+            // last-write-wins a doc_id-keyed map used to give.
+            for (doc_id, doc) in self.buffered_docs.iter().rev() {
+                if let Some(value) = doc.stored_fields.get(field_name)
+                    && Self::is_doc_values_candidate(value)
+                {
+                    values.push((*doc_id, value.clone()));
+                }
+            }
+            values.sort_by_key(|(doc_id, _)| *doc_id);
+            values.dedup_by_key(|(doc_id, _)| *doc_id);
+            (field_name, values)
+        });
+
         let mut output = sink.part("dv")?;
-        self.doc_values_writer.write_to_output(&mut output)?;
+        doc_values::write_columns(&mut output, columns)?;
         output.flush()?;
         sink.seal()?;
         Ok(())
@@ -2236,15 +2265,14 @@ impl InvertedIndexWriter {
         // segments (Issue #1212).
         self.stats.docs_added = self.stats.docs_added.saturating_sub(rolled_back);
 
-        // Clear all buffers — the DocValues included, which would otherwise
-        // be written into the next segment's `.dv`.
+        // Clear all buffers. DocValues are built from `buffered_docs` at
+        // flush time (Issue #1168), so clearing the buffer discards the
+        // rolled-back documents' DocValues too.
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
-        self.index_dirty = false;
+        self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
-        let segment_name = format!("{}_{:06}", self.config.segment_prefix, self.current_segment);
-        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), segment_name);
 
         if dropped.is_empty() {
             return Ok(());
@@ -2307,12 +2335,9 @@ impl InvertedIndexWriter {
     }
 
     /// Get the writer's configuration, so a bounded merge can clone it into
-    /// a fresh writer on rollover (Issue #1164) -- carrying forward the
-    /// pinned `field_term_positions`/`field_doc_values` state instead of
-    /// losing it, since [`Self::flush_buffered_to_segment`] does not reset
-    /// [`Self::doc_values_writer`] and so cannot be called twice on the same
-    /// instance (it would leak the first bucket's DocValues into the
-    /// second's `.dv`).
+    /// a fresh writer on rollover (Issue #1164), carrying the pinned
+    /// `field_term_positions`/`field_doc_values` state forward instead of
+    /// re-detecting it.
     pub(crate) fn config(&self) -> &InvertedIndexWriterConfig {
         &self.config
     }
@@ -2372,11 +2397,11 @@ impl InvertedIndexWriter {
 
         // The id was buffered: drop it from the buffer (cheap, order-preserving
         // so postings stay doc-id-ascending for the skip-table encode) and
-        // **defer** the expensive in-memory index / DocValues rebuild. The
-        // rebuild runs once at flush time (and eagerly on the same-id re-upsert
-        // path in `upsert_document`), so updating M docs in an N-doc uncommitted
-        // buffer is O(M)+O(N) instead of O(M·N) (Issue #828). Until the rebuild,
-        // the in-memory index still holds this doc's postings; the NRT lookups
+        // **defer** purging its postings, recording the id in
+        // `stale_doc_ids`. The purge runs once at flush time, or before this
+        // id is added again, so updating M docs in an N-doc uncommitted
+        // buffer is O(M)+O(N) instead of O(M·N) (Issue #828). Until then the
+        // in-memory index still holds this doc's postings; the NRT lookups
         // filter them out via `buffered_doc_ids`.
         // Drop the removed documents' footprint from the running total
         // before they go (#557). Summed over every match, because `retain`
@@ -2386,11 +2411,11 @@ impl InvertedIndexWriter {
             .buffered_docs
             .iter()
             .filter(|(id, _)| *id == doc_id)
-            .map(|(_, doc)| Self::estimate_analyzed_size(doc))
+            .map(|(_, doc)| Self::estimate_buffered_size(doc))
             .sum();
         self.buffered_bytes = self.buffered_bytes.saturating_sub(removed_bytes);
         self.buffered_docs.retain(|(id, _)| *id != doc_id);
-        self.index_dirty = true;
+        self.stale_doc_ids.insert(doc_id);
 
         // Decrement docs_added for the removed (un-done) document.
         if self.stats.docs_added > 0 {
@@ -2399,52 +2424,28 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Rebuild the in-memory index and DocValues from buffered docs (used after removals).
-    fn rebuild_in_memory_index(&mut self) -> Result<()> {
-        // Reset structures
-        self.inverted_index = TermPostingIndex::new();
-        let segment_name = format!("{}_{:06}", self.config.segment_prefix, self.current_segment);
-        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), segment_name);
-
-        // Reset stats counters that depend on buffered content
-        // Do NOT reset docs_added here, as it includes flushed docs.
-        // docs_added is adjusted in remove_pending_document directly.
-        self.stats.unique_terms = 0;
-        self.stats.total_postings = 0;
-
-        // Re-add all buffered analyzed docs. `buffered_docs` is moved out
-        // rather than cloned (Issue #1169): `add_analyzed_document_to_index`
-        // only needs `&AnalyzedDocument`, and this function never changes
-        // `buffered_docs`'s contents, so there is nothing a clone buys here
-        // over borrowing `self` and `buffered_docs` separately via
-        // `mem::take` -- for a large buffer, a full deep clone of every
-        // `field_terms`/`stored_fields`/`point_values`/`field_lengths` was
-        // pure waste. Restored before returning on every path, including
-        // error, so a future fallible change to the loop body can't lose
-        // the buffer.
-        let buffered = std::mem::take(&mut self.buffered_docs);
-        let result = (|| -> Result<()> {
-            for (id, analyzed_doc) in &buffered {
-                // Re-add stored fields to DocValues, under the same filter
-                // as the ingest path (#1047) so a rebuild cannot
-                // reintroduce them.
-                for (field_name, value) in &analyzed_doc.stored_fields {
-                    if Self::is_doc_values_candidate(value)
-                        && self.config.stores_doc_values(field_name)
-                    {
-                        self.doc_values_writer
-                            .add_value(*id, field_name, value.clone());
-                    }
-                }
-
-                // Re-add postings
-                self.add_analyzed_document_to_index(*id, analyzed_doc)?;
-                // stats.docs_added is ALREADY accounting for these docs (except the one removed)
-            }
-            Ok(())
-        })();
-        self.buffered_docs = buffered;
-        result
+    /// Drop the postings of every id in [`Self::stale_doc_ids`] from the
+    /// in-memory index (Issue #1168), leaving it exactly as if only the
+    /// documents still buffered had ever been added. A no-op when nothing is
+    /// stale.
+    ///
+    /// Filters the postings the index already holds instead of re-deriving
+    /// them from the buffer: each remaining doc_id's postings come from the
+    /// single upsert that added it (`upsert_analyzed_document` purges a
+    /// stale id before it can be added again), so they are exactly what a
+    /// re-derivation would produce — positions, the replayed frequency of a
+    /// collapsed frequency-only posting (#1234), weights and doc_id order
+    /// included.
+    fn purge_stale_postings(&mut self) {
+        if self.stale_doc_ids.is_empty() {
+            return;
+        }
+        let stale = std::mem::take(&mut self.stale_doc_ids);
+        let remaining = self.inverted_index.retain_docs(|id| !stale.contains(&id));
+        // Counts for the buffer only, as a full rebuild left them; docs_added
+        // is adjusted in `remove_pending_document`.
+        self.stats.unique_terms = self.inverted_index.term_count();
+        self.stats.total_postings = remaining;
     }
 
     /// Mark a persisted document as deleted.
@@ -2972,7 +2973,7 @@ mod tests {
     #[test]
     fn score_bound_uses_decoded_length_and_never_tightens_relative_to_exact() {
         let exact_len = 10_000u32; // above EXACT_LENGTH_BOUND, so quantisation is lossy
-        let mut doc = AnalyzedDocument::new();
+        let mut doc = BufferedDocument::default();
         doc.field_lengths.insert("body".to_string(), exact_len);
         let docs = vec![(7u64, doc)];
         let norms = NormsBuilder::from_buffered(&docs);
@@ -3019,18 +3020,16 @@ mod tests {
         );
     }
 
-    /// An `AnalyzedDocument` carrying only `point_values`.
-    fn doc_with_points(count: usize, dims: usize) -> AnalyzedDocument {
+    /// A `BufferedDocument` carrying only `point_values`.
+    fn doc_with_points(count: usize, dims: usize) -> BufferedDocument {
         let mut point_values = AHashMap::new();
         point_values.insert(
             "coords".to_string(),
             (0..count).map(|i| vec![i as f64; dims]).collect(),
         );
-        AnalyzedDocument {
-            field_terms: AHashMap::new(),
-            stored_fields: AHashMap::new(),
-            field_lengths: AHashMap::new(),
+        BufferedDocument {
             point_values,
+            ..Default::default()
         }
     }
 
@@ -3096,8 +3095,8 @@ mod tests {
     /// even with the point accounting removed.
     #[test]
     fn size_estimate_scales_with_point_count() {
-        let few = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(10, 2));
-        let many = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(1000, 2));
+        let few = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(10, 2));
+        let many = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 2));
 
         assert!(
             many > few * 50,
@@ -3109,8 +3108,8 @@ mod tests {
     /// more doubles than a 1D one.
     #[test]
     fn size_estimate_scales_with_point_dimensionality() {
-        let one_d = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(1000, 1));
-        let three_d = InvertedIndexWriter::estimate_analyzed_size(&doc_with_points(1000, 3));
+        let one_d = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 1));
+        let three_d = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 3));
 
         assert!(
             three_d > one_d,
@@ -3142,11 +3141,9 @@ mod tests {
 
         let mut point_values = AHashMap::new();
         point_values.insert("empty_field".to_string(), Vec::<Vec<f64>>::new());
-        let doc = AnalyzedDocument {
-            field_terms: AHashMap::new(),
-            stored_fields: AHashMap::new(),
-            field_lengths: AHashMap::new(),
+        let doc = BufferedDocument {
             point_values,
+            ..Default::default()
         };
         writer.buffered_docs.push((1, doc));
         writer.flush_segment().unwrap();
@@ -3162,11 +3159,8 @@ mod tests {
     #[test]
     fn doc_values_payload_does_not_scale_with_binary_fields() {
         let build = |payload: usize| -> usize {
-            let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-                crate::storage::memory::MemoryStorageConfig::default(),
-            ));
-            let mut writer =
-                InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+            let storage = memory_storage();
+            let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
             for i in 0..20u64 {
                 let doc = Document::builder()
                     .add_field("title", crate::data::DataValue::Text(format!("doc {i}")))
@@ -3177,9 +3171,7 @@ mod tests {
                     .build();
                 writer.upsert_document(i, doc).unwrap();
             }
-            let mut out: Vec<u8> = Vec::new();
-            writer.doc_values_writer.write_to_output(&mut out).unwrap();
-            out.len()
+            flushed_dv(&mut writer, &storage).len()
         };
 
         let small = build(64);
@@ -3226,11 +3218,8 @@ mod tests {
     /// the next flushed segment's `.dv`, under ids that segment does not hold.
     #[test]
     fn rollback_discards_buffered_doc_values() {
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let mut writer =
-            InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+        let storage = memory_storage();
+        let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
         writer
             .add_document(
                 Document::builder()
@@ -3243,11 +3232,7 @@ mod tests {
             .add_document(Document::builder().add_text("title", "kept").build())
             .unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        writer
-            .doc_values_writer
-            .write_to_output(&mut serialized)
-            .unwrap();
+        let serialized = flushed_dv(&mut writer, &storage);
         let names = String::from_utf8_lossy(&serialized).to_string();
         assert!(names.contains("title"));
         assert!(
@@ -3269,11 +3254,8 @@ mod tests {
     /// internals: bytes on disk are what this is about.
     #[test]
     fn binary_payloads_are_kept_out_of_doc_values() {
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let mut writer =
-            InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+        let storage = memory_storage();
+        let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
 
         const PAYLOAD: usize = 32 * 1024;
         let doc = Document::builder()
@@ -3289,11 +3271,7 @@ mod tests {
             .build();
         writer.add_document(doc).unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        writer
-            .doc_values_writer
-            .write_to_output(&mut serialized)
-            .unwrap();
+        let serialized = flushed_dv(&mut writer, &storage);
 
         let names = String::from_utf8_lossy(&serialized).to_string();
         assert!(
@@ -3320,12 +3298,7 @@ mod tests {
     /// and no points.
     #[test]
     fn size_estimate_scales_with_stored_payload() {
-        let mut small = AnalyzedDocument {
-            field_terms: AHashMap::new(),
-            stored_fields: AHashMap::new(),
-            field_lengths: AHashMap::new(),
-            point_values: AHashMap::new(),
-        };
+        let mut small = BufferedDocument::default();
         let mut large = small.clone();
         small
             .stored_fields
@@ -3335,8 +3308,8 @@ mod tests {
             DataValue::Bytes(vec![0u8; 64 * 1024], None),
         );
 
-        let small_estimate = InvertedIndexWriter::estimate_analyzed_size(&small);
-        let large_estimate = InvertedIndexWriter::estimate_analyzed_size(&large);
+        let small_estimate = InvertedIndexWriter::estimate_buffered_size(&small);
+        let large_estimate = InvertedIndexWriter::estimate_buffered_size(&large);
         assert!(
             large_estimate > small_estimate + 60_000,
             "a 64 KiB payload must dominate the estimate, got {large_estimate} vs {small_estimate}"
@@ -3452,10 +3425,8 @@ mod tests {
     fn doc_values_false_excludes_a_sortable_field() {
         use crate::lexical::core::field::{FieldOption, TextOption};
 
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let mut config = InvertedIndexWriterConfig::default();
+        let storage = memory_storage();
+        let mut config = loose_config();
         // Declaring any field switches `analyze_document` out of
         // schema-less mode (undeclared, non-`_`-prefixed fields are then
         // skipped entirely) -- so "title" must be declared too, with the
@@ -3471,7 +3442,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
 
         let doc = Document::builder()
             .add_field("title", crate::data::DataValue::Text("sortable".into()))
@@ -3482,11 +3453,7 @@ mod tests {
             .build();
         writer.add_document(doc).unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        writer
-            .doc_values_writer
-            .write_to_output(&mut serialized)
-            .unwrap();
+        let serialized = flushed_dv(&mut writer, &storage);
         let names = String::from_utf8_lossy(&serialized).to_string();
 
         assert!(
@@ -3509,10 +3476,8 @@ mod tests {
         use crate::lexical::core::field::{FieldOption, TextOption};
 
         let build = |doc_values: bool| -> usize {
-            let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-                crate::storage::memory::MemoryStorageConfig::default(),
-            ));
-            let mut config = InvertedIndexWriterConfig::default();
+            let storage = memory_storage();
+            let mut config = loose_config();
             config.fields.insert(
                 "title".to_string(),
                 FieldOption::Text(TextOption::default()),
@@ -3524,7 +3489,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
+            let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
             for i in 0..20u64 {
                 let doc = Document::builder()
                     .add_field("title", crate::data::DataValue::Text(format!("doc {i}")))
@@ -3532,9 +3497,7 @@ mod tests {
                     .build();
                 writer.upsert_document(i, doc).unwrap();
             }
-            let mut out: Vec<u8> = Vec::new();
-            writer.doc_values_writer.write_to_output(&mut out).unwrap();
-            out.len()
+            flushed_dv(&mut writer, &storage).len()
         };
 
         let with_dv = build(true);
@@ -3992,5 +3955,352 @@ mod tests {
             positions(&[&["the", "a"]], "big the dog"),
             expected(&[("big", 0), ("a", 1), ("dog", 2)])
         );
+    }
+
+    // ---- Issue #1168: rebuild equivalence and `.dv` byte pins ------------
+
+    fn memory_storage() -> Arc<dyn Storage> {
+        Arc::new(crate::storage::memory::MemoryStorage::new(
+            crate::storage::memory::MemoryStorageConfig::default(),
+        ))
+    }
+
+    /// Loose layout, so each part of a flushed segment is its own file.
+    fn loose_config() -> InvertedIndexWriterConfig {
+        InvertedIndexWriterConfig {
+            use_compound: false,
+            ..Default::default()
+        }
+    }
+
+    /// Every file in `storage`, keyed by name.
+    fn stored_files(storage: &Arc<dyn Storage>) -> std::collections::BTreeMap<String, Vec<u8>> {
+        storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .map(|name| {
+                let mut input = storage.open_input(&name).unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut input, &mut bytes).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    /// Commits `writer` (a loose-layout writer over `storage` holding no
+    /// earlier segment) and returns the `.dv` part it flushed.
+    fn flushed_dv(writer: &mut InvertedIndexWriter, storage: &Arc<dyn Storage>) -> Vec<u8> {
+        writer.commit().unwrap();
+        let mut dv: Vec<(String, Vec<u8>)> = stored_files(storage)
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(".dv"))
+            .collect();
+        assert_eq!(dv.len(), 1, "expected exactly one .dv part");
+        dv.pop().unwrap().1
+    }
+
+    fn golden_doc(id: u64) -> Document {
+        let builder = Document::builder()
+            .add_text("title", format!("title {id}"))
+            .add_integer("count", id as i64 * 10)
+            .add_boolean("flag", id.is_multiple_of(2))
+            .add_int64_array("tags", vec![id as i64, 100 - id as i64])
+            .add_field("blob", DataValue::Bytes(vec![1, 2, 3], None));
+        // A sparse column: one document has no `price`.
+        if id == 5 {
+            builder.build()
+        } else {
+            builder.add_float("price", id as f64 + 0.5).build()
+        }
+    }
+
+    /// Pins the exact `.dv` bytes a flush writes (Issue #1168), so changing
+    /// when or how DocValues are built cannot change the on-disk format.
+    /// Documents go in out of doc_id order on purpose, and a second writer
+    /// fed the same documents in another order must write the same bytes.
+    #[test]
+    fn flushed_doc_values_bytes_are_pinned() {
+        let build = |order: &[u64]| -> Vec<u8> {
+            let storage = memory_storage();
+            let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
+            for &id in order {
+                writer.upsert_document(id, golden_doc(id)).unwrap();
+            }
+            flushed_dv(&mut writer, &storage)
+        };
+
+        let bytes = build(&[7, 2, 5]);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_DV_HEX, "the flushed .dv bytes changed");
+        assert_eq!(
+            build(&[2, 5, 7]),
+            bytes,
+            "insertion order must not change the flushed .dv bytes"
+        );
+    }
+
+    /// `golden_doc` for ids 2, 5 and 7, as `DocValuesWriter` serialized it
+    /// before Issue #1168. Columns `count`, `flag`, `price` (absent for 5),
+    /// `tags`, `title`; the `Bytes` field `blob` is excluded by type.
+    const GOLDEN_DV_HEX: &str = concat!(
+        "4456464601000500000005000000636f756e7403000000000000008000000000",
+        "0000000200000000000000020000000000000014000000000000000000000000",
+        "0000000000000000000000050000000000000002000000000000003200000000",
+        "0000000000000000000000000000000000000007000000000000000200000000",
+        "00000046000000000000000000000000000000000000000000000088ffffff03",
+        "00000004000000666c6167030000000000000080000000000000000200000000",
+        "0000000101000000000000000000000000000000000000000000000000000000",
+        "0000000500000000000000010000000000000000000000000000000000000000",
+        "0000000000000000000000070000000000000001000000000000000000000000",
+        "0000000000000000000000000000000000000088ffffff030000000500000070",
+        "7269636502000000000000005800000000000000020000000000000003000000",
+        "0000000000000000000004400000000000000000000000000000000007000000",
+        "0000000003000000000000000000000000001e40000000000000000000000000",
+        "00000000b0ffffff0200000004000000746167730300000000000000b0000000",
+        "000000000200000000000000620000000000000005000000000000005f000000",
+        "0000000007000000000000005d0000000000000002000000000000000a000000",
+        "c4ffffff02000000000000000000000000000000000000000000000005000000",
+        "000000000a000000acffffff0200000000000000000000000000000000000000",
+        "0000000007000000000000000a00000094ffffff020000000000000000000000",
+        "00000000000000000000000088ffffff03000000050000007469746c65030000",
+        "000000000080000000000000000200000000000000040000007469746c652032",
+        "ff00000000000000000000000000000000000000000500000000000000040000",
+        "007469746c652035ff0000000000000000000000000000000000000000070000",
+        "0000000000040000007469746c652037ff000000000000000000000000000000",
+        "000000000088ffffff03000000",
+    );
+
+    /// Deterministic 64-bit LCG (Knuth's MMIX constants), so the oracle
+    /// below replays identically without a `rand` dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// `body` keeps positions, `tags` does not, `n` is numeric (points and
+    /// DocValues).
+    fn oracle_config() -> InvertedIndexWriterConfig {
+        use crate::lexical::core::field::{FieldOption, IntegerOption, TextOption};
+
+        let mut config = loose_config();
+        config
+            .fields
+            .insert("body".to_string(), FieldOption::Text(TextOption::default()));
+        config.fields.insert(
+            "tags".to_string(),
+            FieldOption::Text(TextOption {
+                term_vectors: false,
+                ..Default::default()
+            }),
+        );
+        config.fields.insert(
+            "n".to_string(),
+            FieldOption::Integer(IntegerOption::default()),
+        );
+        config
+    }
+
+    const ORACLE_WORDS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
+
+    fn oracle_words(rng: &mut Lcg, count: u64) -> String {
+        (0..count)
+            .map(|_| ORACLE_WORDS[rng.below(ORACLE_WORDS.len() as u64) as usize])
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn oracle_doc(rng: &mut Lcg) -> Document {
+        let body_len = 2 + rng.below(4);
+        let body = oracle_words(rng, body_len);
+        let tags_len = 1 + rng.below(3);
+        let tags = oracle_words(rng, tags_len);
+        Document::builder()
+            .add_text("body", body)
+            .add_text("tags", tags)
+            .add_integer("n", rng.below(50) as i64)
+            .build()
+    }
+
+    /// A merge-replay-shaped document: one analyzed term carrying an
+    /// already-aggregated frequency on a positions-off field (#1234).
+    fn collapsed_frequency_doc() -> AnalyzedDocument {
+        let mut doc = AnalyzedDocument::new();
+        doc.field_terms.insert(
+            "tags".to_string(),
+            vec![AnalyzedTerm {
+                term: "gamma".to_string(),
+                position: 0,
+                frequency: 5,
+                offset: (0, 0),
+            }],
+        );
+        doc.field_lengths.insert("tags".to_string(), 5);
+        doc
+    }
+
+    #[derive(Clone)]
+    enum OracleEntry {
+        Document(Document),
+        Analyzed(Box<AnalyzedDocument>),
+    }
+
+    /// Runs a seeded mix of upserts, same-id re-upserts, deletes,
+    /// delete-then-re-upserts and #1234-shaped analyzed documents against
+    /// writer A, and returns A plus the surviving entries in A's final
+    /// buffer order (a re-upserted document moves to the end, exactly as
+    /// `remove_pending_document`'s `retain` and the following push do).
+    fn run_oracle_ops(
+        seed: u64,
+        storage: &Arc<dyn Storage>,
+    ) -> (InvertedIndexWriter, Vec<(u64, OracleEntry)>) {
+        let mut rng = Lcg(seed);
+        let mut writer = InvertedIndexWriter::new(storage.clone(), oracle_config()).unwrap();
+        let mut live: Vec<(u64, OracleEntry)> = Vec::new();
+        let mut deleted: AHashSet<u64> = AHashSet::new();
+        let mut next_fresh_id = 1_000u64;
+        let mut delete_then_reupserts = 0;
+        let mut same_id_reupserts = 0;
+
+        for _ in 0..300 {
+            match rng.below(10) {
+                0..=5 => {
+                    let id = rng.below(12);
+                    let doc = oracle_doc(&mut rng);
+                    if deleted.remove(&id) {
+                        delete_then_reupserts += 1;
+                    }
+                    if live.iter().any(|(live_id, _)| *live_id == id) {
+                        same_id_reupserts += 1;
+                    }
+                    writer.upsert_document(id, doc.clone()).unwrap();
+                    live.retain(|(live_id, _)| *live_id != id);
+                    live.push((id, OracleEntry::Document(doc)));
+                }
+                6..=8 => {
+                    let id = rng.below(12);
+                    writer.delete_document(id).unwrap();
+                    if live.iter().any(|(live_id, _)| *live_id == id) {
+                        deleted.insert(id);
+                    }
+                    live.retain(|(live_id, _)| *live_id != id);
+                }
+                _ => {
+                    let id = next_fresh_id;
+                    next_fresh_id += 1;
+                    let doc = collapsed_frequency_doc();
+                    writer.upsert_analyzed_document(id, doc.clone()).unwrap();
+                    live.push((id, OracleEntry::Analyzed(Box::new(doc))));
+                }
+            }
+        }
+        assert!(
+            delete_then_reupserts > 0 && same_id_reupserts > 0,
+            "seed {seed} must exercise both re-upsert paths \
+             ({delete_then_reupserts} delete-then-re-upserts, {same_id_reupserts} same-id)"
+        );
+        (writer, live)
+    }
+
+    /// Writer B: only the surviving entries, in A's final buffer order.
+    fn clean_writer(
+        storage: &Arc<dyn Storage>,
+        live: &[(u64, OracleEntry)],
+    ) -> InvertedIndexWriter {
+        let mut writer = InvertedIndexWriter::new(storage.clone(), oracle_config()).unwrap();
+        for (id, entry) in live {
+            match entry {
+                OracleEntry::Document(doc) => writer.upsert_document(*id, doc.clone()).unwrap(),
+                OracleEntry::Analyzed(doc) => writer
+                    .upsert_analyzed_document(*id, doc.as_ref().clone())
+                    .unwrap(),
+            }
+        }
+        writer
+    }
+
+    /// Issue #1168: a document deleted and then upserted again under the
+    /// same id before a flush must not keep answering NRT lookups for terms
+    /// only its deleted version had. `delete_document` drops the id from
+    /// `buffered_doc_ids`, so the re-upsert used to skip the eager purge and
+    /// merge its new postings into the deleted version's stale ones.
+    #[test]
+    fn delete_then_reupsert_leaves_no_stale_postings() {
+        let mut writer = InvertedIndexWriter::new(memory_storage(), loose_config()).unwrap();
+        writer
+            .upsert_document(
+                1,
+                Document::builder().add_text("body", "alpha beta").build(),
+            )
+            .unwrap();
+        writer.delete_document(1).unwrap();
+        writer
+            .upsert_document(
+                1,
+                Document::builder().add_text("body", "alpha gamma").build(),
+            )
+            .unwrap();
+
+        let nrt = |term: &str| writer.find_doc_ids_by_term("body", term).unwrap();
+        assert_eq!(nrt("beta"), None, "only the deleted version had `beta`");
+        assert_eq!(nrt("gamma"), Some(vec![1]));
+        assert_eq!(nrt("alpha"), Some(vec![1]));
+
+        let alpha = writer
+            .inverted_index
+            .get_posting_list("body:alpha")
+            .unwrap();
+        assert_eq!(alpha.postings.len(), 1);
+        assert_eq!(
+            alpha.postings[0].frequency, 1,
+            "the live version has one `alpha`; the deleted one's must not be merged in"
+        );
+    }
+
+    /// Issue #1168: whatever the writer does with removed documents before a
+    /// flush, its NRT lookups must answer, and its flushed segment must be
+    /// byte-identical to, those of a writer that only ever saw the surviving
+    /// documents.
+    #[test]
+    fn deferred_removals_flush_the_same_bytes_as_a_clean_writer() {
+        let nrt = |writer: &InvertedIndexWriter, field: &str, term: &str| {
+            let mut ids = writer.find_doc_ids_by_term(field, term).unwrap();
+            if let Some(ids) = ids.as_mut() {
+                ids.sort_unstable();
+            }
+            ids
+        };
+
+        for seed in [1u64, 7, 42, 1168] {
+            let storage_a = memory_storage();
+            let (mut a, live) = run_oracle_ops(seed, &storage_a);
+            let storage_b = memory_storage();
+            let mut b = clean_writer(&storage_b, &live);
+
+            for field in ["body", "tags"] {
+                for term in ORACLE_WORDS {
+                    assert_eq!(
+                        nrt(&a, field, term),
+                        nrt(&b, field, term),
+                        "seed {seed}: NRT lookup of {field}:{term} before the flush"
+                    );
+                }
+            }
+
+            a.commit().unwrap();
+            b.commit().unwrap();
+            assert_eq!(
+                stored_files(&storage_a),
+                stored_files(&storage_b),
+                "seed {seed}: the flushed segment must not depend on removal history"
+            );
+        }
     }
 }

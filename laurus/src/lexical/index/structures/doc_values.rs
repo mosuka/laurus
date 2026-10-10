@@ -16,6 +16,10 @@
 //! } x num_fields
 //! ```
 //!
+//! [`write_columns`] writes the layout one column at a time, so a writer
+//! that builds each column on demand holds only one in memory (Issue
+//! #1168).
+//!
 //! [`DocValuesReader::load`] (Issue #1047 Phase 2) reads only the header and
 //! each field's directory entry (name, offset, length); the rkyv payload
 //! itself is skipped over via `seek` and deserialized lazily, on first
@@ -53,19 +57,6 @@ pub struct FieldDocValues {
 }
 
 impl FieldDocValues {
-    /// Create a new FieldDocValues
-    pub fn new(field_name: String) -> Self {
-        FieldDocValues {
-            field_name,
-            values: ahash::AHashMap::new(),
-        }
-    }
-
-    /// Set a value for a document
-    pub fn set(&mut self, doc_id: u64, value: FieldValue) {
-        self.values.insert(doc_id, value);
-    }
-
     /// Get a value for a document
     pub fn get(&self, doc_id: u64) -> Option<&FieldValue> {
         self.values.get(&doc_id)
@@ -82,116 +73,72 @@ impl FieldDocValues {
     }
 }
 
-/// Writer for DocValues
-pub struct DocValuesWriter {
-    /// Storage for writing DocValues
-    storage: Arc<dyn Storage>,
-    /// Segment name
-    segment_name: String,
-    /// Field DocValues being built (field_name -> FieldDocValues).
-    ///
-    /// `BTreeMap`, not `HashMap`: [`Self::write_to_output`] iterates this
-    /// in field-name order, so two writers fed the same documents in a
-    /// different field-insertion order still produce byte-identical `.dv`
-    /// files for identical content (Issue #1047).
-    fields: BTreeMap<String, FieldDocValues>,
-}
+/// Write a DocValues payload (the DVFF layout in the module doc) to
+/// `output`, one column at a time.
+///
+/// `columns` must yield `(field_name, values)` with field names strictly
+/// ascending and each `values` sorted by strictly ascending doc_id — the
+/// canonical order that makes identical content serialize to identical
+/// bytes (Issue #1047). Each column is serialized and dropped before the
+/// next is pulled from the iterator, so a caller that builds columns lazily
+/// holds at most one in memory at a time (Issue #1168). The format is
+/// position-independent, so the payload is the same whether `output` is a
+/// loose `.dv` file or a compound-container part (#554); `output` is
+/// neither flushed nor closed here.
+///
+/// # Errors
+///
+/// Returns an error, possibly after part of the payload was written, if
+/// the columns are out of order, if `columns` yields a different number of
+/// columns than its `len()` promised (the header would misdescribe the
+/// payload), or if serialization or a write fails.
+pub(crate) fn write_columns<'a, I>(output: &mut dyn Write, columns: I) -> Result<()>
+where
+    I: ExactSizeIterator<Item = (&'a str, Vec<(u64, FieldValue)>)>,
+{
+    let declared = columns.len();
+    let num_fields = u32::try_from(declared).map_err(|_| {
+        LaurusError::Index(format!("Too many DocValues columns to write: {declared}"))
+    })?;
+    output.write_all(b"DVFF")?;
+    output.write_all(&[1u8, 0u8])?; // version 1.0
+    output.write_all(&num_fields.to_le_bytes())?;
 
-impl DocValuesWriter {
-    /// Create a new DocValuesWriter
-    pub fn new(storage: Arc<dyn Storage>, segment_name: String) -> Self {
-        DocValuesWriter {
-            storage,
-            segment_name,
-            fields: BTreeMap::new(),
+    let mut written = 0usize;
+    let mut previous: Option<&str> = None;
+    for (field_name, values) in columns {
+        if previous.is_some_and(|previous| previous >= field_name) {
+            return Err(LaurusError::Index(format!(
+                "DocValues columns out of order: {field_name:?} after {previous:?}"
+            )));
         }
-    }
-
-    /// Add a field value for a document
-    pub fn add_value(&mut self, doc_id: u64, field_name: &str, value: FieldValue) {
-        self.fields
-            .entry(field_name.to_string())
-            .or_insert_with(|| FieldDocValues::new(field_name.to_string()))
-            .set(doc_id, value);
-    }
-
-    /// Write DocValues to storage under this writer's configured segment name.
-    pub fn write(&self) -> Result<()> {
-        self.write_to(&self.segment_name)
-    }
-
-    /// Write DocValues to storage under an explicit `segment_name`.
-    ///
-    /// Used by the segment merge path (Issue #753), which accumulates values in
-    /// a writer constructed with a placeholder name and then flushes them to the
-    /// final merged segment's name. The normal flush path calls [`Self::write`],
-    /// which delegates here with the writer's own `segment_name`.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_name` - Segment name the `.dv` file is written under.
-    pub fn write_to(&self, segment_name: &str) -> Result<()> {
-        let dv_filename = format!("{}{}", segment_name, DOC_VALUES_EXTENSION);
-        let mut output = self.storage.create_output(&dv_filename)?;
-        self.write_to_output(&mut output)?;
-        output.flush()?;
-        Ok(())
-    }
-
-    /// Write the DocValues payload to an already-open output (#554).
-    ///
-    /// The format is position-independent, so it serializes identically
-    /// into a loose `.dv` file or a compound-container part. The output is
-    /// neither flushed nor closed here — the caller owns its lifecycle.
-    ///
-    /// # Arguments
-    ///
-    /// * `output` - Destination for the DVFF payload.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization or a write fails.
-    pub fn write_to_output(&self, output: &mut dyn std::io::Write) -> Result<()> {
-        // Write magic number and version
-        output.write_all(b"DVFF")?; // DocValues File Format
-        output.write_all(&[1u8, 0u8])?; // Version 1.0
-
-        // Write number of fields
-        let num_fields = self.fields.len() as u32;
-        output.write_all(&num_fields.to_le_bytes())?;
-
-        // Write each field's DocValues, in field-name order (`fields` is a
-        // `BTreeMap`).
-        for (field_name, field_dv) in &self.fields {
-            // Write field name length and name
-            let name_bytes = field_name.as_bytes();
-            output.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
-            output.write_all(name_bytes)?;
-
-            // Write number of values
-            let num_values = field_dv.values.len() as u64;
-            output.write_all(&num_values.to_le_bytes())?;
-
-            // `values` is an `AHashMap`, whose iteration order is not
-            // stable across insertion patterns -- sort by doc_id so
-            // identical content always serializes to identical bytes
-            // (Issue #1047), not just identical field order.
-            let mut values_vec: Vec<(u64, FieldValue)> = field_dv
-                .values
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            values_vec.sort_by_key(|(doc_id, _)| *doc_id);
-
-            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&values_vec)
-                .map_err(|e| LaurusError::Index(format!("Failed to serialize DocValues: {}", e)))?;
-
-            output.write_all(&(serialized.len() as u64).to_le_bytes())?;
-            output.write_all(&serialized)?;
+        if values.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(LaurusError::Index(format!(
+                "DocValues column {field_name:?} is not sorted by unique doc_id"
+            )));
         }
 
-        Ok(())
+        let name_bytes = field_name.as_bytes();
+        output.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        output.write_all(name_bytes)?;
+        output.write_all(&(values.len() as u64).to_le_bytes())?;
+
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&values)
+            .map_err(|e| LaurusError::Index(format!("Failed to serialize DocValues: {e}")))?;
+        drop(values);
+        output.write_all(&(serialized.len() as u64).to_le_bytes())?;
+        output.write_all(&serialized)?;
+
+        previous = Some(field_name);
+        written += 1;
     }
+
+    if written != declared {
+        return Err(LaurusError::Index(format!(
+            "DocValues header declared {declared} columns but {written} were written"
+        )));
+    }
+    Ok(())
 }
 
 /// One field's on-disk location within a `.dv` file's directory, resolved
@@ -422,42 +369,114 @@ impl DocValuesReader {
 mod tests {
     use super::*;
 
+    use crate::data::DataValue;
     use crate::storage::memory::MemoryStorage;
     use crate::storage::memory::MemoryStorageConfig;
 
+    fn memory_storage() -> Arc<dyn Storage> {
+        Arc::new(MemoryStorage::new(MemoryStorageConfig::default()))
+    }
+
+    /// Writes `columns` as `{segment_name}.dv` through [`write_columns`].
+    fn write_fixture(
+        storage: &Arc<dyn Storage>,
+        segment_name: &str,
+        columns: Vec<(&str, Vec<(u64, FieldValue)>)>,
+    ) {
+        let mut output = storage
+            .create_output(&format!("{segment_name}{DOC_VALUES_EXTENSION}"))
+            .unwrap();
+        write_columns(&mut output, columns.into_iter()).unwrap();
+        output.flush().unwrap();
+    }
+
+    fn write_to_vec(columns: Vec<(&str, Vec<(u64, FieldValue)>)>) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        write_columns(&mut bytes, columns.into_iter())?;
+        Ok(bytes)
+    }
+
     #[test]
-    fn test_field_doc_values() {
-        let mut dv = FieldDocValues::new("test_field".to_string());
+    fn write_columns_rejects_columns_out_of_name_order() {
+        let err = write_to_vec(vec![
+            ("beta", vec![(0, DataValue::Int64(1))]),
+            ("alpha", vec![(0, DataValue::Int64(2))]),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("out of order"), "{err}");
 
-        // Set some values
-        dv.set(0, crate::data::DataValue::Int64(100));
-        dv.set(1, crate::data::DataValue::Text("hello".to_string()));
-        dv.set(5, crate::data::DataValue::Float64(3.15));
+        let err = write_to_vec(vec![
+            ("alpha", vec![(0, DataValue::Int64(1))]),
+            ("alpha", vec![(1, DataValue::Int64(2))]),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("out of order"), "{err}");
+    }
 
-        // Get values
-        assert_eq!(dv.get(0), Some(&crate::data::DataValue::Int64(100)));
-        assert_eq!(
-            dv.get(1),
-            Some(&crate::data::DataValue::Text("hello".to_string()))
-        );
-        assert_eq!(dv.get(2), None);
-        assert_eq!(dv.get(5), Some(&crate::data::DataValue::Float64(3.15)));
+    #[test]
+    fn write_columns_rejects_values_not_sorted_by_unique_doc_id() {
+        for values in [
+            vec![(1, DataValue::Int64(1)), (0, DataValue::Int64(2))],
+            vec![(3, DataValue::Int64(1)), (3, DataValue::Int64(2))],
+        ] {
+            let err = write_to_vec(vec![("alpha", values)]).unwrap_err();
+            assert!(err.to_string().contains("not sorted"), "{err}");
+        }
+    }
+
+    /// The header's `num_fields` is written before any column, so an
+    /// iterator whose `len()` lies must fail the write rather than leave a
+    /// header that misdescribes the payload.
+    #[test]
+    fn write_columns_rejects_an_iterator_whose_len_lies() {
+        struct Lying<I> {
+            inner: I,
+            claimed: usize,
+        }
+        impl<I: Iterator> Iterator for Lying<I> {
+            type Item = I::Item;
+            fn next(&mut self) -> Option<I::Item> {
+                self.inner.next()
+            }
+        }
+        impl<I: Iterator> ExactSizeIterator for Lying<I> {
+            fn len(&self) -> usize {
+                self.claimed
+            }
+        }
+
+        let columns = vec![("alpha", vec![(0, DataValue::Int64(1))])];
+        let mut bytes = Vec::new();
+        let err = write_columns(
+            &mut bytes,
+            Lying {
+                inner: columns.into_iter(),
+                claimed: 2,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("declared 2"), "{err}");
     }
 
     #[test]
     fn test_doc_values_write_read() {
-        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let storage = memory_storage();
         let segment_name = "segment_0".to_string();
 
-        // Write DocValues
-        {
-            let mut writer = DocValuesWriter::new(storage.clone(), segment_name.clone());
-            writer.add_value(0, "year", crate::data::DataValue::Int64(2023));
-            writer.add_value(1, "year", crate::data::DataValue::Int64(2024));
-            writer.add_value(0, "rating", crate::data::DataValue::Float64(4.5));
-            writer.add_value(1, "rating", crate::data::DataValue::Float64(5.0));
-            writer.write().unwrap();
-        }
+        write_fixture(
+            &storage,
+            &segment_name,
+            vec![
+                (
+                    "rating",
+                    vec![(0, DataValue::Float64(4.5)), (1, DataValue::Float64(5.0))],
+                ),
+                (
+                    "year",
+                    vec![(0, DataValue::Int64(2023)), (1, DataValue::Int64(2024))],
+                ),
+            ],
+        );
 
         // Read DocValues
         {
@@ -490,14 +509,16 @@ mod tests {
         // A corrupted payload for a field that is never queried through
         // `get_value` must not matter to `has_field`/`field_names` -- both
         // stop at the directory.
-        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let storage = memory_storage();
         let segment_name = "segment_dir_only".to_string();
-        {
-            let mut writer = DocValuesWriter::new(storage.clone(), segment_name.clone());
-            writer.add_value(0, "a", crate::data::DataValue::Int64(1));
-            writer.add_value(0, "z", crate::data::DataValue::Int64(2));
-            writer.write().unwrap();
-        }
+        write_fixture(
+            &storage,
+            &segment_name,
+            vec![
+                ("a", vec![(0, DataValue::Int64(1))]),
+                ("z", vec![(0, DataValue::Int64(2))]),
+            ],
+        );
 
         let reader = DocValuesReader::load(storage.clone(), &segment_name).unwrap();
         assert_eq!(reader.field_names(), vec!["a".to_string(), "z".to_string()]);
@@ -508,45 +529,16 @@ mod tests {
 
     #[test]
     fn get_value_on_a_missing_field_is_ok_none_not_an_error() {
-        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let storage = memory_storage();
         let segment_name = "segment_missing_field".to_string();
-        {
-            let mut writer = DocValuesWriter::new(storage.clone(), segment_name.clone());
-            writer.add_value(0, "present", crate::data::DataValue::Int64(1));
-            writer.write().unwrap();
-        }
+        write_fixture(
+            &storage,
+            &segment_name,
+            vec![("present", vec![(0, DataValue::Int64(1))])],
+        );
 
         let reader = DocValuesReader::load(storage.clone(), &segment_name).unwrap();
         assert_eq!(reader.get_value("absent", 0).unwrap(), None);
-    }
-
-    #[test]
-    fn written_bytes_are_deterministic_regardless_of_insertion_order() {
-        // Same (doc_id, field, value) triples fed in two different orders
-        // must produce byte-identical `.dv` files (Issue #1047): the
-        // `BTreeMap` field ordering and the doc_id-sorted `values_vec`
-        // together remove every source of nondeterminism `AHashMap`
-        // iteration would otherwise introduce.
-        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-
-        let mut forward = DocValuesWriter::new(storage.clone(), "fwd".to_string());
-        forward.add_value(0, "alpha", crate::data::DataValue::Int64(1));
-        forward.add_value(1, "alpha", crate::data::DataValue::Int64(2));
-        forward.add_value(0, "beta", crate::data::DataValue::Int64(3));
-        forward.add_value(1, "beta", crate::data::DataValue::Int64(4));
-
-        let mut reverse = DocValuesWriter::new(storage.clone(), "rev".to_string());
-        reverse.add_value(1, "beta", crate::data::DataValue::Int64(4));
-        reverse.add_value(0, "beta", crate::data::DataValue::Int64(3));
-        reverse.add_value(1, "alpha", crate::data::DataValue::Int64(2));
-        reverse.add_value(0, "alpha", crate::data::DataValue::Int64(1));
-
-        let mut forward_bytes = Vec::new();
-        forward.write_to_output(&mut forward_bytes).unwrap();
-        let mut reverse_bytes = Vec::new();
-        reverse.write_to_output(&mut reverse_bytes).unwrap();
-
-        assert_eq!(forward_bytes, reverse_bytes);
     }
 
     #[test]
@@ -708,12 +700,14 @@ mod tests {
 
         let segment_name = "segment_lazy".to_string();
         let huge_text: String = "x".repeat(1_000_000);
-        {
-            let mut writer = DocValuesWriter::new(inner.clone(), segment_name.clone());
-            writer.add_value(0, "small", crate::data::DataValue::Int64(42));
-            writer.add_value(0, "huge", crate::data::DataValue::Text(huge_text));
-            writer.write().unwrap();
-        }
+        write_fixture(
+            &inner,
+            &segment_name,
+            vec![
+                ("huge", vec![(0, DataValue::Text(huge_text))]),
+                ("small", vec![(0, DataValue::Int64(42))]),
+            ],
+        );
 
         let reader = DocValuesReader::load(storage, &segment_name).unwrap();
         let bytes_for_load = bytes_read.load(Ordering::Relaxed);

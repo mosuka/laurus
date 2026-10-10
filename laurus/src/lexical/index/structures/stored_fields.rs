@@ -29,7 +29,7 @@
 //!   ever seeks to an individual chunk, so the Lucene-style `doc_id -> chunk_offset` directory
 //!   this issue's suggested format described has no consumer and is intentionally omitted. A
 //!   directory can be added later as a pure tail-append without touching this layout.
-//! - **Documents and field names are sorted before encoding.** `AnalyzedDocument::stored_fields`
+//! - **Documents and field names are sorted before encoding.** `BufferedDocument::stored_fields`
 //!   is an `AHashMap` (hash-seed-dependent iteration order), so sorting makes the on-disk bytes
 //!   deterministic and improves LZ4's ability to match repeated byte sequences (e.g. identical
 //!   field-name sequences) across adjacent documents in the same chunk.
@@ -58,7 +58,7 @@ use ahash::AHashMap;
 
 use crate::data::{DataValue, Document, GeoEcefPoint, GeoPoint};
 use crate::error::{LaurusError, Result};
-use crate::lexical::core::analyzed::AnalyzedDocument;
+use crate::lexical::core::analyzed::BufferedDocument;
 use crate::storage::structured::{StructReader, StructWriter};
 use crate::storage::{StorageInput, StorageOutput};
 use crate::util::alloc_bounds::{checked_capacity_u64, checked_len_u64, checked_usize};
@@ -597,7 +597,7 @@ impl StoredFieldsWriter {
     /// format described in the module docs.
     pub(crate) fn write_to<W: StorageOutput>(
         writer: &mut StructWriter<W>,
-        docs: &[(u64, AnalyzedDocument)],
+        docs: &[(u64, BufferedDocument)],
     ) -> Result<()> {
         writer.write_raw(MAGIC)?;
         writer.write_raw(&[VERSION_MAJOR, VERSION_MINOR])?;
@@ -825,8 +825,8 @@ mod tests {
     use crate::storage::Storage;
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 
-    fn doc(fields: &[(&str, DataValue)]) -> AnalyzedDocument {
-        let mut d = AnalyzedDocument::new();
+    fn doc(fields: &[(&str, DataValue)]) -> BufferedDocument {
+        let mut d = BufferedDocument::default();
         for (name, value) in fields {
             d.stored_fields.insert((*name).to_string(), value.clone());
         }
@@ -836,7 +836,7 @@ mod tests {
     fn round_trip(
         storage: &MemoryStorage,
         segment_id: &str,
-        docs: &[(u64, AnalyzedDocument)],
+        docs: &[(u64, BufferedDocument)],
     ) -> BTreeMap<u64, Document> {
         let output = storage
             .create_output(&format!("{segment_id}.docs"))
@@ -1296,7 +1296,7 @@ mod tests {
     fn splits_into_multiple_chunks_at_the_target_size() {
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
         // MAX_DOCS_PER_CHUNK=128, so 300 tiny docs alone force >= 3 chunks.
-        let docs: Vec<(u64, AnalyzedDocument)> = (0..300)
+        let docs: Vec<(u64, BufferedDocument)> = (0..300)
             .map(|i| (i as u64, doc(&[("id", DataValue::Int64(i))])))
             .collect();
 
@@ -1348,7 +1348,7 @@ mod tests {
     #[test]
     fn a_document_with_no_stored_fields_round_trips() {
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
-        let docs = vec![(1u64, AnalyzedDocument::new())];
+        let docs = vec![(1u64, BufferedDocument::default())];
         let documents = round_trip(&storage, "seg", &docs);
         assert!(documents[&1].fields.is_empty());
     }
@@ -1358,7 +1358,7 @@ mod tests {
         // Enough documents to span several chunks: the count comes from the
         // header, not from walking them.
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
-        let docs: Vec<(u64, AnalyzedDocument)> = (0..300u64)
+        let docs: Vec<(u64, BufferedDocument)> = (0..300u64)
             .map(|id| (id, doc(&[("body", DataValue::Text(format!("doc {id}")))])))
             .collect();
         round_trip(&storage, "seg", &docs);

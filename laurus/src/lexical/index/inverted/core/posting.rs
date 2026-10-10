@@ -532,8 +532,14 @@ impl PostingList {
         }
     }
 
-    /// Add a posting to this list.
-    pub fn add_posting(&mut self, posting: Posting) {
+    /// Add a posting to this list, returning how many heap bytes the list
+    /// grew by. Capacity-based, so it follows what the allocator holds
+    /// rather than what is in use (Issue #1168: the writer's memory estimate
+    /// counts postings through it).
+    pub fn add_posting(&mut self, posting: Posting) -> usize {
+        let postings_capacity = self.postings.capacity();
+        let mut positions_growth = 0;
+
         // Insert in sorted order by doc_id
         match self
             .postings
@@ -548,8 +554,15 @@ impl PostingList {
 
                 if let Some(new_positions) = posting.positions {
                     match &mut existing.positions {
-                        Some(positions) => positions.extend(new_positions),
-                        None => existing.positions = Some(new_positions),
+                        Some(positions) => {
+                            let before = positions.capacity();
+                            positions.extend(new_positions);
+                            positions_growth = positions.capacity() - before;
+                        }
+                        None => {
+                            positions_growth = new_positions.capacity();
+                            existing.positions = Some(new_positions);
+                        }
                     }
                 }
             }
@@ -557,9 +570,26 @@ impl PostingList {
                 // Insert new posting. Update both counters.
                 self.total_frequency += posting.frequency as u64;
                 self.doc_frequency += 1;
+                positions_growth = posting.positions.as_ref().map_or(0, Vec::capacity);
                 self.postings.insert(pos, posting);
             }
         }
+
+        (self.postings.capacity() - postings_capacity) * std::mem::size_of::<Posting>()
+            + positions_growth * std::mem::size_of::<u32>()
+    }
+
+    /// Heap bytes this list holds: its term string, its postings vector and
+    /// every posting's positions, all by capacity.
+    fn heap_bytes(&self) -> usize {
+        self.term.capacity()
+            + self.postings.capacity() * std::mem::size_of::<Posting>()
+            + self
+                .postings
+                .iter()
+                .map(|p| p.positions.as_ref().map_or(0, Vec::capacity))
+                .sum::<usize>()
+                * std::mem::size_of::<u32>()
     }
 
     /// Get the length of the posting list.
@@ -1530,6 +1560,11 @@ pub struct TermPostingIndex {
     doc_count: u64,
     /// Total number of terms indexed.
     term_count: u64,
+    /// Heap bytes held by the posting lists and every term string, keys
+    /// included (Issue #1168). Kept up to date by [`Self::add_posting`] and
+    /// recomputed by [`Self::retain_docs`]; [`Self::heap_bytes`] adds the
+    /// hash table's own slots on top.
+    list_bytes: usize,
 }
 
 impl TermPostingIndex {
@@ -1539,17 +1574,37 @@ impl TermPostingIndex {
             terms: AHashMap::new(),
             doc_count: 0,
             term_count: 0,
+            list_bytes: 0,
         }
     }
 
     /// Add a posting to the index.
     pub fn add_posting(&mut self, term: String, posting: Posting) {
-        let posting_list = self.terms.entry(term.clone()).or_insert_with(|| {
-            self.term_count += 1;
-            PostingList::new(term)
-        });
+        if let Some(list) = self.terms.get_mut(&term) {
+            self.list_bytes += list.add_posting(posting);
+            return;
+        }
+        let mut list = PostingList::new(term.clone());
+        self.list_bytes += term.capacity() + list.term.capacity() + list.add_posting(posting);
+        self.terms.insert(term, list);
+        self.term_count += 1;
+    }
 
-        posting_list.add_posting(posting);
+    /// Estimated heap bytes this index holds: every posting list (postings,
+    /// positions, term strings) by capacity, plus the hash table's slots
+    /// (Issue #1168). O(1); feeds the writer's flush budget.
+    pub fn heap_bytes(&self) -> usize {
+        // One `(key, list)` pair plus hashbrown's one control byte per slot.
+        let slot = std::mem::size_of::<(String, PostingList)>() + 1;
+        self.list_bytes + self.terms.capacity() * slot
+    }
+
+    /// [`Self::list_bytes`] computed from the lists themselves.
+    fn list_bytes_from_scratch(&self) -> usize {
+        self.terms
+            .iter()
+            .map(|(key, list)| key.capacity() + list.heap_bytes())
+            .sum()
     }
 
     /// Add multiple postings for a document.
@@ -1600,6 +1655,33 @@ impl TermPostingIndex {
         for posting_list in self.terms.values_mut() {
             posting_list.optimize();
         }
+    }
+
+    /// Keep only the postings whose doc_id satisfies `keep`, and drop every
+    /// posting list that ends up empty (Issue #1168: how the writer purges
+    /// removed documents without re-deriving the postings it keeps).
+    ///
+    /// Each list keeps its order, so a doc_id-ascending list stays
+    /// ascending. `total_frequency` and `doc_frequency` are recomputed from
+    /// the postings left, which is what `PostingList::add_posting` keeps them
+    /// equal to. `term_count` follows the lists that remain; `doc_count` is
+    /// left alone.
+    ///
+    /// # Returns
+    ///
+    /// The number of postings left across all lists.
+    pub fn retain_docs(&mut self, keep: impl Fn(u64) -> bool) -> u64 {
+        let mut remaining = 0u64;
+        self.terms.retain(|_, list| {
+            list.postings.retain(|posting| keep(posting.doc_id));
+            list.doc_frequency = list.postings.len() as u64;
+            list.total_frequency = list.postings.iter().map(|p| p.frequency as u64).sum();
+            remaining += list.doc_frequency;
+            !list.postings.is_empty()
+        });
+        self.term_count = self.terms.len() as u64;
+        self.list_bytes = self.list_bytes_from_scratch();
+        remaining
     }
 
     /// On-disk version of the [`TermPostingIndex`] format used by
@@ -1684,11 +1766,14 @@ impl TermPostingIndex {
             terms.insert(posting_list.term.clone(), posting_list);
         }
 
-        Ok(TermPostingIndex {
+        let mut index = TermPostingIndex {
             terms,
             doc_count,
             term_count,
-        })
+            list_bytes: 0,
+        };
+        index.list_bytes = index.list_bytes_from_scratch();
+        Ok(index)
     }
 }
 
@@ -1748,6 +1833,68 @@ mod tests {
     use crate::storage::memory::MemoryStorage;
     use crate::storage::memory::MemoryStorageConfig;
     use std::sync::Arc;
+
+    /// Issue #1168: `retain_docs` must leave each list's counters equal to
+    /// what `add_posting` would have built from the postings kept, and must
+    /// drop lists it empties.
+    #[test]
+    fn retain_docs_keeps_order_and_recomputes_counters() {
+        let mut index = TermPostingIndex::new();
+        index.add_posting("body:a".to_string(), Posting::with_positions(1, vec![0, 3]));
+        index.add_posting("body:a".to_string(), Posting::with_positions(2, vec![1]));
+        index.add_posting("body:a".to_string(), Posting::with_positions(4, vec![0]));
+        index.add_posting("body:b".to_string(), Posting::with_frequency(2, 5));
+        // Same doc again: merged into one posting with summed frequency.
+        index.add_posting("body:a".to_string(), Posting::with_positions(4, vec![7]));
+
+        let remaining = index.retain_docs(|id| id != 2);
+
+        assert_eq!(remaining, 2);
+        assert_eq!(index.term_count(), 1, "`body:b` only had doc 2");
+        assert!(index.get_posting_list("body:b").is_none());
+
+        let list = index.get_posting_list("body:a").unwrap();
+        let ids: Vec<u64> = list.postings.iter().map(|p| p.doc_id).collect();
+        assert_eq!(ids, vec![1, 4], "order is kept");
+        assert_eq!(list.doc_frequency, 2);
+        assert_eq!(list.total_frequency, 2 + 2);
+        assert_eq!(list.postings[1].positions(), Some(&[0u32, 7][..]));
+    }
+
+    /// Issue #1168: the heap estimate `add_posting` maintains incrementally
+    /// must equal the one computed from the lists, both while growing and
+    /// after `retain_docs`.
+    #[test]
+    fn incremental_heap_bytes_match_a_recomputation() {
+        let mut index = TermPostingIndex::new();
+        assert_eq!(index.heap_bytes(), 0);
+
+        for doc_id in 0..200u64 {
+            for term in ["body:alpha", "body:beta", "tags:gamma"] {
+                let positions: Vec<u32> = (0..(doc_id % 4) as u32 + 1).collect();
+                index.add_posting(term.to_string(), Posting::with_positions(doc_id, positions));
+            }
+            // A second occurrence batch for the same doc merges positions in.
+            index.add_posting(
+                "body:alpha".to_string(),
+                Posting::with_positions(doc_id, vec![9, 10]),
+            );
+            index.add_posting(
+                format!("body:rare{doc_id}"),
+                Posting::with_frequency(doc_id, 2),
+            );
+        }
+        assert_eq!(index.list_bytes, index.list_bytes_from_scratch());
+        let grown = index.heap_bytes();
+        assert!(grown > 200 * 3 * std::mem::size_of::<Posting>());
+
+        index.retain_docs(|id| id % 3 == 0);
+        assert_eq!(index.list_bytes, index.list_bytes_from_scratch());
+        assert!(
+            index.heap_bytes() < grown,
+            "dropped postings free their positions"
+        );
+    }
 
     #[test]
     fn test_posting_creation() {

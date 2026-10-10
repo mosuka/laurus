@@ -3144,17 +3144,17 @@ mod tests {
         docs: &[(u64, Vec<(&str, crate::data::DataValue)>)],
         has_deletions: bool,
     ) -> (Arc<dyn crate::storage::Storage>, SegmentInfo) {
-        use crate::lexical::core::analyzed::AnalyzedDocument;
+        use crate::lexical::core::analyzed::BufferedDocument;
         use crate::lexical::index::structures::stored_fields::StoredFieldsWriter;
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
         use crate::storage::structured::StructWriter;
 
         let storage: Arc<dyn crate::storage::Storage> =
             Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-        let analyzed: Vec<(u64, AnalyzedDocument)> = docs
+        let analyzed: Vec<(u64, BufferedDocument)> = docs
             .iter()
             .map(|(doc_id, fields)| {
-                let mut doc = AnalyzedDocument::new();
+                let mut doc = BufferedDocument::default();
                 for (field, value) in fields {
                     doc.stored_fields
                         .insert((*field).to_string(), value.clone());
@@ -4896,7 +4896,7 @@ mod tests {
     /// path just because those files happen to exist.
     #[test]
     fn norms_file_takes_precedence_over_stale_legacy_files() {
-        use crate::lexical::core::analyzed::AnalyzedDocument;
+        use crate::lexical::core::analyzed::BufferedDocument;
         use crate::lexical::index::structures::norms::NormsBuilder;
         use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
         use crate::storage::structured::StructWriter;
@@ -4921,7 +4921,7 @@ mod tests {
 
         // The current .norms file claiming length 25 -- this must win.
         {
-            let mut doc = AnalyzedDocument::new();
+            let mut doc = BufferedDocument::default();
             doc.field_lengths.insert("body".to_string(), 25); // within the exact window (< 40)
             let norms = NormsBuilder::from_buffered(&[(0u64, doc)]);
             let output = storage

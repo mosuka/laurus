@@ -326,25 +326,23 @@ fn bounded_merge_preserves_positions_pinning_across_bucket_boundaries() {
     );
 }
 
-/// Regression test for the `doc_values_writer` leak found during Issue
-/// #1164's design review: `InvertedIndexWriter::flush_buffered_to_segment`
-/// (the merge-only flush) does not reset `doc_values_writer`, unlike the
-/// normal flush path. Reusing one writer instance across a rollover would
-/// NOT corrupt any individual value (`FieldDocValues` keys by doc_id in an
-/// `AHashMap`, so an old entry is never overwritten by a new one at a
-/// different doc_id -- confirmed by deliberately reverting the fix locally
-/// and observing every value-correctness assertion still pass). The actual
-/// damage is each later bucket's `.dv` file silently re-accumulating every
-/// earlier bucket's entries on top of its own: bucket K's `.dv` would hold
-/// K times as many entries as it needs, and the writer never frees the
-/// earlier buckets' memory either -- exactly the unbounded growth Issue
-/// #1164 exists to bound. The fix rebuilds the writer on every rollover.
+/// A later bucket's `.dv` must hold only its own documents' DocValues.
+///
+/// Found during Issue #1164's design review: the merge writer used to keep
+/// a writer-wide DocValues buffer that `flush_buffered_to_segment` never
+/// reset, so a writer reused across a rollover re-accumulated every earlier
+/// bucket's entries on top of its own. No individual value was corrupted
+/// (entries were keyed by doc_id); bucket K's `.dv` just held K times the
+/// entries it needed, and that memory was never freed — the unbounded
+/// growth #1164 exists to bound. Since #1168 the writer builds `.dv` from
+/// the buffer at flush time and holds no DocValues state at all, so the
+/// leak can no longer arise; this test keeps guarding the invariant.
 ///
 /// With `TINY_BUDGET` forcing one source segment per bucket (so every
-/// bucket holds the same `DOCS_PER_SEGMENT` live documents), a fixed
-/// writer makes every bucket's `.dv` file about the same size; a reused one
-/// makes bucket K's file grow roughly linearly with K. Asserts the last
-/// bucket's `.dv` is not meaningfully larger than the first's.
+/// bucket holds the same `DOCS_PER_SEGMENT` live documents), every bucket's
+/// `.dv` file is about the same size; a leak would make bucket K's grow
+/// roughly linearly with K. Asserts the last bucket's `.dv` is not
+/// meaningfully larger than the first's.
 #[test]
 fn bounded_merge_does_not_accumulate_doc_values_across_bucket_boundaries() {
     const SEGMENTS: u64 = 6;

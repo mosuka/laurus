@@ -79,9 +79,10 @@ pub struct MergeConfig {
     /// (`InvertedIndexWriter::buffered_memory_usage`) reaches this budget
     /// and sources remain, the current bucket is flushed and a fresh writer
     /// takes over for the rest. This bounds the writer's own buffer only --
-    /// it does not bound `DocValuesWriter`'s accumulation, BKD write
-    /// spikes, or the per-source-segment `replay_segment_into_writer` Pass 1
-    /// / stored-document-cache floor, so it is a best-effort reduction in
+    /// it does not bound BKD write spikes, the one DocValues column a flush
+    /// builds at a time, or the per-source-segment
+    /// `replay_segment_into_writer` Pass 1 / stored-document-cache floor,
+    /// so it is a best-effort reduction in
     /// peak memory, not a hard ceiling. `usize::MAX` (the default) always
     /// produces exactly one output segment, matching every merge path's
     /// behavior before this field existed.
@@ -346,8 +347,9 @@ impl MergeEngine {
         // `field_term_positions`/`field_doc_values` start empty (aside from
         // the schema seed) and get pinned lazily, per field, the moment
         // `replay_segment_into_writer` first encounters that field — sound
-        // because both are resolved per document at upsert time, never
-        // cached at construction (see
+        // because neither is cached at construction: term positions are
+        // resolved per document at upsert time, DocValues at flush time,
+        // and a pin never changes once set (see
         // `InvertedIndexWriter::pin_field_term_positions`/
         // `pin_field_doc_values`). A rollover (Issue #1164) rebuilds the
         // writer from the retiring one's config, so this pinned state
@@ -431,11 +433,13 @@ impl MergeEngine {
                     bucket_segments_merged = 0;
                     bucket_deleted_docs_removed = 0;
                     // Roll over to a fresh writer instead of reusing this
-                    // one: `flush_buffered_to_segment` does not reset
-                    // `doc_values_writer`, so a second flush on the same
-                    // instance would leak this bucket's DocValues into the
-                    // next bucket's `.dv`. Cloning the config carries
-                    // forward the pinned field settings noted above.
+                    // one, so nothing but the config carries into the next
+                    // bucket: the retiring writer's NRT caches
+                    // (`segment_ranges`, and `segment_members` with every
+                    // flushed doc id) would otherwise pile up across all
+                    // the buckets of a bounded merge. Cloning the config
+                    // carries forward the pinned field settings noted
+                    // above.
                     writer =
                         InvertedIndexWriter::new(self.storage.clone(), writer.config().clone())?;
                 }

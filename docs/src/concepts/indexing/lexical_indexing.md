@@ -21,8 +21,8 @@ sequenceDiagram
 ### Step by Step
 
 1. **Analyze**: The text passes through the configured analyzer (tokenizer + filters), producing a stream of normalized terms
-2. **Buffer**: Terms are stored in an in-memory write buffer, organized by field
-3. **Flush and commit**: When the buffer reaches `max_buffered_docs` (default 10,000) or `max_buffer_memory` (default 64 MiB) of estimated memory, it is flushed to a new, not yet visible segment; `commit()` flushes what remains and publishes those segments together
+2. **Buffer**: Each term goes straight into in-memory posting lists, organized by field; the write buffer keeps only what the flush still needs from the document — its stored values, field lengths, and numeric points
+3. **Flush and commit**: When the buffer reaches `max_buffered_docs` (default 10,000) or `max_buffer_memory` (default 64 MiB) of estimated memory (the buffered documents plus the posting lists), it is flushed to a new, not yet visible segment; `commit()` flushes what remains and publishes those segments together
 
 ## The Inverted Index
 
