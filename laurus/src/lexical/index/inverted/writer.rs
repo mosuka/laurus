@@ -2,7 +2,7 @@
 //!
 //! This module provides the writer for building inverted indexes in schema-less mode.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
@@ -27,7 +27,7 @@ use crate::lexical::index::structures::dictionary::{TermDictionaryBuilder, TermI
 use crate::lexical::index::structures::doc_id_set::{
     DOC_ID_SET_SUFFIX, load_segment_doc_ids, write_doc_id_set,
 };
-use crate::lexical::index::structures::doc_values::DocValuesWriter;
+use crate::lexical::index::structures::doc_values;
 use crate::lexical::index::structures::norms::NormsBuilder;
 use crate::lexical::writer::LexicalIndexWriter;
 
@@ -264,8 +264,8 @@ pub struct InvertedIndexWriter {
     /// document; walking the buffer instead would make ingestion quadratic.
     buffered_bytes: usize,
 
-    /// Whether [`Self::inverted_index`] / [`Self::doc_values_writer`] are stale
-    /// relative to [`Self::buffered_docs`] and need a rebuild before flush.
+    /// Whether [`Self::inverted_index`] is stale relative to
+    /// [`Self::buffered_docs`] and needs a rebuild before flush.
     ///
     /// Set by [`Self::remove_pending_document`], which drops the doc from
     /// `buffered_docs` (cheap, order-preserving `retain`) but **defers** the
@@ -288,9 +288,6 @@ pub struct InvertedIndexWriter {
     /// `add × N` ingest, since newly assigned doc IDs are never already
     /// buffered yet still paid the full scan (Issue #570).
     buffered_doc_ids: AHashSet<u64>,
-
-    /// DocValues writer for the current segment.
-    doc_values_writer: DocValuesWriter,
 
     /// Document ID counter.
     next_doc_id: u64,
@@ -859,8 +856,15 @@ impl InvertedIndexWriter {
     }
 
     /// Same idea as [`Self::pin_field_term_positions`], for DocValues (see
-    /// [`InvertedIndexWriterConfig::stores_doc_values`], resolved per
-    /// document at [`Self::upsert_analyzed_document`] time).
+    /// [`InvertedIndexWriterConfig::stores_doc_values`]).
+    ///
+    /// DocValues columns are built from the buffer at flush time (Issue
+    /// #1168), so `stores_doc_values` is resolved then, not at upsert. That
+    /// gives the same answer as resolving it per upsert only because a pin
+    /// is insert-only and a merge pins a field before upserting any
+    /// document that carries it (`MergeEngine::replay_segment_into_writer`):
+    /// the setting a buffered document's value is written under can never
+    /// change after the document arrives.
     pub(crate) fn pin_field_doc_values(&mut self, field_name: &str, detect: impl FnOnce() -> bool) {
         if !self.config.field_doc_values.contains_key(field_name) {
             let value = detect();
@@ -907,10 +911,6 @@ impl InvertedIndexWriter {
             current_segment = state.next_generation;
         }
 
-        // Create initial DocValuesWriter (will be reset per segment)
-        let initial_segment_name = format!("{}_{:06}", config.segment_prefix, current_segment);
-        let doc_values_writer = DocValuesWriter::new(storage.clone(), initial_segment_name);
-
         // The WAL checkpoint starts at the shared authority's current value;
         // a handle-less writer has no checkpoint to maintain. The old code
         // read `metadata.json` here and silently defaulted on failure, which
@@ -926,7 +926,6 @@ impl InvertedIndexWriter {
             buffered_bytes: 0,
             index_dirty: false,
             buffered_doc_ids: AHashSet::new(),
-            doc_values_writer,
             next_doc_id,
             current_segment,
             closed: false,
@@ -1008,16 +1007,6 @@ impl InvertedIndexWriter {
         // Update next_doc_id if necessary to avoid ID collisions
         if doc_id >= self.next_doc_id {
             self.next_doc_id = doc_id + 1;
-        }
-
-        // Add field values to DocValues, skipping payloads no consumer of
-        // DocValues can use (#1047) and fields opted out of DocValues via
-        // `doc_values: false`.
-        for (field_name, value) in &analyzed_doc.stored_fields {
-            if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name) {
-                self.doc_values_writer
-                    .add_value(doc_id, field_name, value.clone());
-            }
         }
 
         // Add to inverted index
@@ -1529,14 +1518,6 @@ impl InvertedIndexWriter {
         self.index_dirty = false;
         self.inverted_index = TermPostingIndex::new();
 
-        // Reset DocValuesWriter for next segment
-        let next_segment_name = format!(
-            "{}_{:06}",
-            self.config.segment_prefix,
-            self.current_segment + 1
-        );
-        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), next_segment_name);
-
         self.current_segment += 1;
         self.stats.segments_created += 1;
 
@@ -1856,10 +1837,49 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Write DocValues to storage.
+    /// Write the `.dv` part.
+    ///
+    /// Each column is built from the buffer here, at flush time, and one
+    /// column is collected, serialized and dropped before the next (Issue
+    /// #1168). Building every column at upsert time instead, as a
+    /// writer-wide DocValues buffer used to, kept a second copy of every
+    /// eligible value alive until the flush — and the flush is the peak.
+    /// The filter is the one the upsert path used to apply
+    /// (`is_doc_values_candidate` and `stores_doc_values`); see
+    /// [`Self::pin_field_doc_values`] for why applying it at flush time
+    /// gives the same columns.
     fn write_doc_values(&self, sink: &mut PartSink<'_>) -> Result<()> {
+        // Pass 1: which columns exist, and how many values each holds.
+        let mut column_sizes: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, doc) in &self.buffered_docs {
+            for (field_name, value) in &doc.stored_fields {
+                if Self::is_doc_values_candidate(value) && self.config.stores_doc_values(field_name)
+                {
+                    *column_sizes.entry(field_name.as_str()).or_default() += 1;
+                }
+            }
+        }
+
+        // Pass 2, lazily: one column at a time, in field-name order.
+        let columns = column_sizes.into_iter().map(|(field_name, size)| {
+            let mut values = Vec::with_capacity(size);
+            // Newest first, so that after the stable sort `dedup_by_key`
+            // keeps the value buffered last for a doc_id — the
+            // last-write-wins a doc_id-keyed map used to give.
+            for (doc_id, doc) in self.buffered_docs.iter().rev() {
+                if let Some(value) = doc.stored_fields.get(field_name)
+                    && Self::is_doc_values_candidate(value)
+                {
+                    values.push((*doc_id, value.clone()));
+                }
+            }
+            values.sort_by_key(|(doc_id, _)| *doc_id);
+            values.dedup_by_key(|(doc_id, _)| *doc_id);
+            (field_name, values)
+        });
+
         let mut output = sink.part("dv")?;
-        self.doc_values_writer.write_to_output(&mut output)?;
+        doc_values::write_columns(&mut output, columns)?;
         output.flush()?;
         sink.seal()?;
         Ok(())
@@ -2236,15 +2256,14 @@ impl InvertedIndexWriter {
         // segments (Issue #1212).
         self.stats.docs_added = self.stats.docs_added.saturating_sub(rolled_back);
 
-        // Clear all buffers — the DocValues included, which would otherwise
-        // be written into the next segment's `.dv`.
+        // Clear all buffers. DocValues are built from `buffered_docs` at
+        // flush time (Issue #1168), so clearing the buffer discards the
+        // rolled-back documents' DocValues too.
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
         self.index_dirty = false;
         self.inverted_index = TermPostingIndex::new();
-        let segment_name = format!("{}_{:06}", self.config.segment_prefix, self.current_segment);
-        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), segment_name);
 
         if dropped.is_empty() {
             return Ok(());
@@ -2307,12 +2326,9 @@ impl InvertedIndexWriter {
     }
 
     /// Get the writer's configuration, so a bounded merge can clone it into
-    /// a fresh writer on rollover (Issue #1164) -- carrying forward the
-    /// pinned `field_term_positions`/`field_doc_values` state instead of
-    /// losing it, since [`Self::flush_buffered_to_segment`] does not reset
-    /// [`Self::doc_values_writer`] and so cannot be called twice on the same
-    /// instance (it would leak the first bucket's DocValues into the
-    /// second's `.dv`).
+    /// a fresh writer on rollover (Issue #1164), carrying the pinned
+    /// `field_term_positions`/`field_doc_values` state forward instead of
+    /// re-detecting it.
     pub(crate) fn config(&self) -> &InvertedIndexWriterConfig {
         &self.config
     }
@@ -2399,12 +2415,10 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Rebuild the in-memory index and DocValues from buffered docs (used after removals).
+    /// Rebuild the in-memory index from buffered docs (used after removals).
     fn rebuild_in_memory_index(&mut self) -> Result<()> {
         // Reset structures
         self.inverted_index = TermPostingIndex::new();
-        let segment_name = format!("{}_{:06}", self.config.segment_prefix, self.current_segment);
-        self.doc_values_writer = DocValuesWriter::new(self.storage.clone(), segment_name);
 
         // Reset stats counters that depend on buffered content
         // Do NOT reset docs_added here, as it includes flushed docs.
@@ -2425,19 +2439,6 @@ impl InvertedIndexWriter {
         let buffered = std::mem::take(&mut self.buffered_docs);
         let result = (|| -> Result<()> {
             for (id, analyzed_doc) in &buffered {
-                // Re-add stored fields to DocValues, under the same filter
-                // as the ingest path (#1047) so a rebuild cannot
-                // reintroduce them.
-                for (field_name, value) in &analyzed_doc.stored_fields {
-                    if Self::is_doc_values_candidate(value)
-                        && self.config.stores_doc_values(field_name)
-                    {
-                        self.doc_values_writer
-                            .add_value(*id, field_name, value.clone());
-                    }
-                }
-
-                // Re-add postings
                 self.add_analyzed_document_to_index(*id, analyzed_doc)?;
                 // stats.docs_added is ALREADY accounting for these docs (except the one removed)
             }

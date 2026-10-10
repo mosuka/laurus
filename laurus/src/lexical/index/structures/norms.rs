@@ -176,8 +176,8 @@ pub(crate) struct NormsBuilder {
     doc_ids: Vec<u64>,
     /// Field name -> (doc_id -> exact, pre-quantisation length). A
     /// `BTreeMap` so [`Self::write_to`] emits fields in a deterministic
-    /// order regardless of insertion order (mirrors
-    /// [`super::doc_values::DocValuesWriter`]'s rationale).
+    /// order regardless of insertion order (mirrors the field-name order
+    /// [`super::doc_values::write_columns`] requires).
     fields: BTreeMap<String, AHashMap<u64, u32>>,
 }
 
