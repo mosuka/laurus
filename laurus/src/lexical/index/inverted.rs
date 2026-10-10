@@ -40,6 +40,7 @@ pub mod core;
 pub(crate) mod deleted_docs;
 pub mod parsed_query_cache;
 pub(crate) mod per_segment_view;
+pub(crate) mod point_columns;
 pub mod posting_cache;
 pub mod query_cache;
 pub mod reader;

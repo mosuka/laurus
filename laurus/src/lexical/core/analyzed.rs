@@ -107,13 +107,15 @@ pub struct AnalyzedDocument {
     pub point_values: AHashMap<String, Vec<Vec<f64>>>,
 }
 
-/// What an index writer keeps of an [`AnalyzedDocument`] once the document's
-/// postings are built: everything except `field_terms` (Issue #1168).
+/// What an index writer keeps per document of an [`AnalyzedDocument`] once
+/// the document's postings are built: its stored fields and field lengths.
 ///
 /// The postings are the only consumer of the analyzed terms, so keeping
 /// them in the buffer as well would hold every term of every buffered
-/// document twice until the flush. Making the buffered type lack the field
-/// means no flush-time code can read terms that are no longer there.
+/// document twice until the flush (Issue #1168). The point values go to the
+/// writer's per-field columns instead of a per-document map (Issue #1165).
+/// Making the buffered type lack both fields means no flush-time code can
+/// read them from here.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BufferedDocument {
     /// Stored field values with original types preserved.
@@ -121,9 +123,6 @@ pub(crate) struct BufferedDocument {
     /// Field name to field length (distinct positions), as
     /// [`AnalyzedDocument::field_lengths`].
     pub(crate) field_lengths: AHashMap<String, u32>,
-    /// Field name to numeric point values, as
-    /// [`AnalyzedDocument::point_values`].
-    pub(crate) point_values: AHashMap<String, Vec<Vec<f64>>>,
 }
 
 /// An analyzed term with position and metadata.

@@ -22,6 +22,7 @@ use crate::lexical::core::document::Document;
 use crate::lexical::core::field::FieldOption;
 use crate::lexical::index::inverted::IndexMetadata;
 use crate::lexical::index::inverted::core::posting::{Posting, TermPostingIndex};
+use crate::lexical::index::inverted::point_columns::{PointColumn, PointColumns};
 use crate::lexical::index::inverted::reader::SegmentReader;
 use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
 use crate::lexical::index::structures::bkd_tree::BKDWriter;
@@ -292,6 +293,12 @@ pub struct InvertedIndexWriter {
     /// `add × N` ingest, since newly assigned doc IDs are never already
     /// buffered yet still paid the full scan (Issue #570).
     buffered_doc_ids: AHashSet<u64>,
+
+    /// The buffered documents' BKD points, as per-field columns (Issue
+    /// #1165). Holds the points of every entry in [`Self::buffered_docs`],
+    /// plus those of removed entries until [`Self::purge_stale_postings`]
+    /// drops them along with their postings.
+    point_columns: PointColumns,
 
     /// Document ID counter.
     next_doc_id: u64,
@@ -930,6 +937,7 @@ impl InvertedIndexWriter {
             buffered_bytes: 0,
             stale_doc_ids: AHashSet::new(),
             buffered_doc_ids: AHashSet::new(),
+            point_columns: PointColumns::default(),
             next_doc_id,
             current_segment,
             closed: false,
@@ -1022,11 +1030,18 @@ impl InvertedIndexWriter {
         self.add_analyzed_document_to_index(doc_id, &field_terms)?;
         drop(field_terms);
 
+        // Points go to the per-field columns (Issue #1165). Appended after
+        // the stale purge above, so a removed version's points are already
+        // gone, and with nothing fallible between here and the push below,
+        // so the columns never hold points of an entry that was not buffered.
+        for (field, points) in point_values {
+            self.point_columns.append(field, doc_id, points);
+        }
+
         // Buffer the rest with the assigned ID
         let buffered = BufferedDocument {
             stored_fields,
             field_lengths,
-            point_values,
         };
         self.track_buffered(&buffered);
         self.buffered_docs.push((doc_id, buffered));
@@ -1370,24 +1385,17 @@ impl InvertedIndexWriter {
     ///
     /// Deliberately an estimate, not an exact accounting: it exists to keep
     /// `max_buffer_memory` proportional to what a document actually costs, so
-    /// point-heavy or stored-payload-heavy documents cannot slip past the
-    /// flush budget (#557). BKD points and stored values scale with document
-    /// content; field lengths and the buffer entry itself are a fixed cost
-    /// per field and per document. Analyzed terms are not buffered (Issue
-    /// #1168): their postings are counted by the posting index instead (see
-    /// [`Self::estimate_memory_usage`]).
+    /// stored-payload-heavy documents cannot slip past the flush budget
+    /// (#557). Stored values scale with document content; field lengths and
+    /// the buffer entry itself are a fixed cost per field and per document.
+    /// Analyzed terms and BKD points are not buffered per document (Issues
+    /// #1168, #1165): the posting index and the point columns count their
+    /// own heap instead (see [`Self::estimate_memory_usage`]).
     fn estimate_buffered_size(doc: &BufferedDocument) -> usize {
         /// Per-field overhead: the name plus its slot in each of the maps.
         const FIELD_OVERHEAD: usize = 64;
 
         let mut bytes = std::mem::size_of::<(u64, BufferedDocument)>();
-
-        for (name, points) in &doc.point_values {
-            // A point is a `Vec<f64>`: its header plus `dims` doubles.
-            let dims = points.first().map_or(0, Vec::len);
-            let per_point = std::mem::size_of::<Vec<f64>>() + dims * std::mem::size_of::<f64>();
-            bytes += FIELD_OVERHEAD + name.len() + points.len() * per_point;
-        }
 
         for name in doc.field_lengths.keys() {
             bytes += FIELD_OVERHEAD + name.len();
@@ -1448,16 +1456,18 @@ impl InvertedIndexWriter {
 
     /// Estimate current memory usage.
     ///
-    /// Both halves are running totals, not walks of the buffer or the
-    /// index: this runs from [`Self::should_flush`] on every document, so
-    /// recomputing either would make ingestion quadratic. The
-    /// buffered-document half is maintained by [`Self::track_buffered`] and
-    /// the removal path. The posting index counts its own heap (Issue
-    /// #1168): postings grow with every term occurrence, not with the
-    /// vocabulary, so a per-distinct-term constant undercounts long text by
-    /// a wide margin.
+    /// None of the parts walks the buffered documents or postings: this runs
+    /// from [`Self::should_flush`] on every document, so doing so would make
+    /// ingestion quadratic. The buffered-document part is a running total
+    /// maintained by [`Self::track_buffered`] and the removal path. The
+    /// posting index counts its own heap (Issue #1168): postings grow with
+    /// every term occurrence, not with the vocabulary, so a per-distinct-term
+    /// constant undercounts long text by a wide margin. The point columns
+    /// are summed from their capacities, one step per point field (Issue
+    /// #1165); points of removed documents stay counted until the columns
+    /// are dropped, because their memory is not returned before then.
     fn estimate_memory_usage(&self) -> usize {
-        self.buffered_bytes + self.inverted_index.heap_bytes()
+        self.buffered_bytes + self.inverted_index.heap_bytes() + self.point_columns.heap_bytes()
     }
 
     /// Public wrapper over [`Self::estimate_memory_usage`] for callers
@@ -1473,6 +1483,21 @@ impl InvertedIndexWriter {
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_add(Self::estimate_buffered_size(doc));
+    }
+
+    /// Empty everything that holds buffered documents: the entries, their
+    /// postings, their points, and the bookkeeping over them. Shared by a
+    /// successful flush, a merge flush, and a rollback, so none of them can
+    /// leave one of these behind. The point columns are dropped rather than
+    /// cleared so their capacity is returned and counted out of
+    /// [`Self::estimate_memory_usage`].
+    fn reset_buffer(&mut self) {
+        self.buffered_docs.clear();
+        self.buffered_bytes = 0;
+        self.buffered_doc_ids.clear();
+        self.stale_doc_ids.clear();
+        self.inverted_index = TermPostingIndex::new();
+        self.point_columns = PointColumns::default();
     }
 
     /// Flush the current segment to disk.
@@ -1523,12 +1548,7 @@ impl InvertedIndexWriter {
         self.pending_publish
             .push(self.segment_info_for(&segment_name));
 
-        // Clear buffers
-        self.buffered_docs.clear();
-        self.buffered_bytes = 0;
-        self.buffered_doc_ids.clear();
-        self.stale_doc_ids.clear();
-        self.inverted_index = TermPostingIndex::new();
+        self.reset_buffer();
 
         self.current_segment += 1;
         self.stats.segments_created += 1;
@@ -1548,6 +1568,9 @@ impl InvertedIndexWriter {
     ///
     /// * `segment_name` - Name the segment's files are written under.
     fn write_segment_files(&self, segment_name: &str) -> Result<Vec<String>> {
+        // Fails on a field with points of two dimensionalities, so it runs
+        // before anything is created, leaving no partial segment behind.
+        let point_columns = self.point_columns.flush_columns()?;
         // Data files only (#1024): a segment becomes discoverable through
         // the manifest at publication, never through its files — which is
         // also what makes a crash mid-write harmless (the sweep reclaims
@@ -1587,7 +1610,7 @@ impl InvertedIndexWriter {
         // The same sorted, deduplicated ids the `.norms` slot map records.
         self.write_doc_ids(&mut sink, norms.doc_ids())?;
         self.write_doc_values(&mut sink)?;
-        self.write_bkd_trees(&mut sink)?;
+        self.write_bkd_trees(&mut sink, &point_columns)?;
         sink.finish()
     }
 
@@ -1616,11 +1639,7 @@ impl InvertedIndexWriter {
         // `optimize()` lose everything it just consolidated (#1017).
         let paths = self.write_segment_files(segment_name)?;
         self.extend_segment_cache(segment_name);
-        self.buffered_docs.clear();
-        self.buffered_bytes = 0;
-        self.buffered_doc_ids.clear();
-        self.stale_doc_ids.clear();
-        self.inverted_index = TermPostingIndex::new();
+        self.reset_buffer();
         self.stats.segments_created += 1;
         Ok(paths)
     }
@@ -1894,78 +1913,27 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Write BKD trees for numeric and geo fields.
+    /// Write one BKD tree per point-bearing field, in field-name order, from
+    /// `columns` (see [`PointColumns::flush_columns`]).
     ///
-    /// Processes one point-bearing field at a time: a discovery pass over
-    /// `self.buffered_docs` first counts each field's total point count and
-    /// captures its dimensionality (from the first point seen, matching
-    /// prior behavior), then a second pass builds and writes one field's
-    /// exactly-sized flat buffers before moving to the next. This keeps at
-    /// most one field's buffer resident at a time (rather than every
-    /// point-bearing field's buffer simultaneously) and avoids the
-    /// reallocation-doubling overhead of growing from `Vec::new()`
-    /// (Issue #557).
-    fn write_bkd_trees(&self, sink: &mut PartSink<'_>) -> Result<()> {
-        // field -> (point_count, num_dims). `entry`'s key argument is
-        // evaluated even on a hit, so cloning is deferred to the `None`
-        // (first-seen) branch — one clone per distinct field, not per
-        // point. A field whose point list is empty (e.g. an empty
-        // `Int64Array`) is never registered here, matching the pre-#557
-        // behavior where such fields never produced a `.bkd` part.
-        let mut field_info: AHashMap<String, (usize, usize)> = AHashMap::new();
-        for (_, doc) in &self.buffered_docs {
-            for (field, points) in &doc.point_values {
-                let Some(first) = points.first() else {
-                    continue;
-                };
-                match field_info.get_mut(field) {
-                    Some(entry) => entry.0 += points.len(),
-                    None => {
-                        field_info.insert(field.clone(), (points.len(), first.len()));
-                    }
-                }
-            }
-        }
-
-        // Sorted for a deterministic `.cfs` part-write order; part lookup
-        // is by name, so this has no effect on correctness.
-        let mut fields: Vec<&String> = field_info.keys().collect();
-        fields.sort_unstable();
-
-        // Issue #1163: visit `buffered_docs` in doc_id order regardless of
-        // its underlying push order, so `.bkd` output is byte-identical
-        // whether documents arrived via the normal flush path (already
-        // doc_id-ascending) or a segment-grouped merge replay. `buffered_docs`
-        // never holds two entries for the same doc_id (`RoaringTreemap`
-        // dedup in the merge path; single-writer upsert dedup otherwise),
-        // so this sort has no ties to break.
-        let mut doc_id_order: Vec<usize> = (0..self.buffered_docs.len()).collect();
-        doc_id_order.sort_by_key(|&i| self.buffered_docs[i].0);
-
-        for field in fields {
-            let &(count, num_dims) = &field_info[field];
-
-            let mut points_buf: Vec<f64> = Vec::with_capacity(count * num_dims);
-            let mut doc_ids_buf: Vec<u64> = Vec::with_capacity(count);
-            for &i in &doc_id_order {
-                let (doc_id, doc) = &self.buffered_docs[i];
-                if let Some(points) = doc.point_values.get(field) {
-                    for point in points {
-                        points_buf.extend_from_slice(point);
-                        doc_ids_buf.push(*doc_id);
-                    }
-                }
-            }
-            debug_assert_eq!(points_buf.capacity(), count * num_dims);
-            debug_assert_eq!(doc_ids_buf.capacity(), count);
-
+    /// Each column holds a field's points in arrival order, which is
+    /// [`Self::buffered_docs`]' push order with each entry's points in
+    /// document order (Issue #1165). [`BKDWriter::write_sorted_by_doc_id`]
+    /// feeds them to the builder stably sorted by doc id, the order the
+    /// writer used to copy them into a flat buffer in, so the trees are
+    /// byte-identical to that copy's without making it. A doc id buffered
+    /// twice (Issue #1210) contributes both entries' points, in push order.
+    fn write_bkd_trees(
+        &self,
+        sink: &mut PartSink<'_>,
+        columns: &[(&str, &PointColumn)],
+    ) -> Result<()> {
+        for (field, column) in columns {
             let output = sink.part(&format!("{field}.bkd"))?;
-            let mut writer = BKDWriter::new(output, num_dims as u32);
-            writer.write(&points_buf, &doc_ids_buf)?;
+            let mut writer = BKDWriter::new(output, column.dims() as u32);
+            writer.write_sorted_by_doc_id(column.values(), column.doc_ids())?;
             writer.finish()?;
             sink.seal()?;
-            // `points_buf`/`doc_ids_buf` drop here, before the next field's
-            // buffers are allocated.
         }
         Ok(())
     }
@@ -2268,11 +2236,7 @@ impl InvertedIndexWriter {
         // Clear all buffers. DocValues are built from `buffered_docs` at
         // flush time (Issue #1168), so clearing the buffer discards the
         // rolled-back documents' DocValues too.
-        self.buffered_docs.clear();
-        self.buffered_bytes = 0;
-        self.buffered_doc_ids.clear();
-        self.stale_doc_ids.clear();
-        self.inverted_index = TermPostingIndex::new();
+        self.reset_buffer();
 
         if dropped.is_empty() {
             return Ok(());
@@ -2425,9 +2389,9 @@ impl InvertedIndexWriter {
     }
 
     /// Drop the postings of every id in [`Self::stale_doc_ids`] from the
-    /// in-memory index (Issue #1168), leaving it exactly as if only the
-    /// documents still buffered had ever been added. A no-op when nothing is
-    /// stale.
+    /// in-memory index (Issue #1168), and their points from the point
+    /// columns (Issue #1165), leaving both exactly as if only the documents
+    /// still buffered had ever been added. A no-op when nothing is stale.
     ///
     /// Filters the postings the index already holds instead of re-deriving
     /// them from the buffer: each remaining doc_id's postings come from the
@@ -2442,6 +2406,9 @@ impl InvertedIndexWriter {
         }
         let stale = std::mem::take(&mut self.stale_doc_ids);
         let remaining = self.inverted_index.retain_docs(|id| !stale.contains(&id));
+        // Same reasoning as for the postings: a stale id's points all come
+        // from entries already removed, since its re-add waits for this.
+        self.point_columns.retain_docs(|id| !stale.contains(&id));
         // Counts for the buffer only, as a full rebuild left them; docs_added
         // is adjusted in `remove_pending_document`.
         self.stats.unique_terms = self.inverted_index.term_count();
@@ -3020,17 +2987,37 @@ mod tests {
         );
     }
 
-    /// A `BufferedDocument` carrying only `point_values`.
-    fn doc_with_points(count: usize, dims: usize) -> BufferedDocument {
-        let mut point_values = AHashMap::new();
-        point_values.insert(
+    /// An `AnalyzedDocument` carrying only `count` points of `dims`
+    /// dimensions in one field.
+    fn analyzed_with_points(count: usize, dims: usize) -> AnalyzedDocument {
+        let mut doc = AnalyzedDocument::new();
+        doc.point_values.insert(
             "coords".to_string(),
             (0..count).map(|i| vec![i as f64; dims]).collect(),
         );
-        BufferedDocument {
-            point_values,
+        doc
+    }
+
+    /// How much the writer's memory estimate grows when one document with
+    /// `count` points of `dims` dimensions is buffered.
+    fn estimate_growth_for_points(count: usize, dims: usize) -> usize {
+        let config = InvertedIndexWriterConfig {
+            max_buffered_docs: usize::MAX,
+            max_buffer_memory: usize::MAX,
             ..Default::default()
-        }
+        };
+        let mut writer = InvertedIndexWriter::new(memory_storage(), config).unwrap();
+        let before = writer.buffered_memory_usage();
+        writer
+            .upsert_analyzed_document(1, analyzed_with_points(count, dims))
+            .unwrap();
+        writer.buffered_memory_usage() - before
+    }
+
+    /// The raw bytes `count` points of `dims` dimensions occupy in the point
+    /// columns: their coordinates plus one doc id each.
+    fn raw_point_bytes(count: usize, dims: usize) -> usize {
+        count * (dims * std::mem::size_of::<f64>() + std::mem::size_of::<u64>())
     }
 
     /// Issue #1163: `pin_field_term_positions`/`pin_field_doc_values` are
@@ -3087,44 +3074,45 @@ mod tests {
         );
     }
 
-    /// #557: the size estimate must scale with the number of BKD points.
+    /// #557, #1165: the memory estimate must cover every buffered point.
     ///
     /// Probed on a document with *no* terms and *no* stored fields, because
     /// every field type that produces points also produces terms — so an
     /// end-to-end test is satisfied by the term half alone and would pass
-    /// even with the point accounting removed.
+    /// even with the point accounting removed. The bound is a floor, not a
+    /// ratio: the point columns are counted by capacity, which grows in
+    /// steps.
     #[test]
     fn size_estimate_scales_with_point_count() {
-        let few = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(10, 2));
-        let many = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 2));
-
-        assert!(
-            many > few * 50,
-            "1000 points must estimate far above 10 points, got {many} vs {few}"
-        );
+        for count in [10, 1000] {
+            let growth = estimate_growth_for_points(count, 2);
+            let floor = raw_point_bytes(count, 2);
+            assert!(
+                growth >= floor,
+                "{count} points must estimate at least their {floor} raw bytes, got {growth}"
+            );
+        }
     }
 
     /// #557: dimensionality is part of a point's cost — a 3D point holds
     /// more doubles than a 1D one.
     #[test]
     fn size_estimate_scales_with_point_dimensionality() {
-        let one_d = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 1));
-        let three_d = InvertedIndexWriter::estimate_buffered_size(&doc_with_points(1000, 3));
+        let one_d = estimate_growth_for_points(1000, 1);
+        let three_d = estimate_growth_for_points(1000, 3);
 
         assert!(
             three_d > one_d,
             "3D points must estimate above 1D points, got {three_d} vs {one_d}"
         );
+        assert!(three_d >= raw_point_bytes(1000, 3), "got {three_d}");
     }
 
-    /// #557: `write_bkd_trees`'s discovery pass must not register a field
-    /// whose point list is empty, even though no current production path
-    /// can construct one (`upsert_analyzed_document`'s ingestion and the
-    /// merge replay path both filter on `!points.is_empty()` before ever
-    /// inserting into `point_values` — see `writer.rs`'s field-analysis
-    /// loop and `merge_engine.rs`'s re-analysis block). This is
-    /// defense-in-depth, constructed directly here since the public
-    /// `Document`/`add_document` API cannot reach this state.
+    /// #557: a field whose point list is empty must not produce a `.bkd`
+    /// part. Documents never carry one (field analysis and the merge replay
+    /// both skip empty lists), but a caller-built `AnalyzedDocument` can,
+    /// and since #1165 it reaches the point columns, which create no column
+    /// for an empty list.
     #[test]
     fn write_bkd_trees_skips_a_field_whose_points_are_empty() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::memory::MemoryStorage::new(
@@ -3139,13 +3127,10 @@ mod tests {
         };
         let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
 
-        let mut point_values = AHashMap::new();
-        point_values.insert("empty_field".to_string(), Vec::<Vec<f64>>::new());
-        let doc = BufferedDocument {
-            point_values,
-            ..Default::default()
-        };
-        writer.buffered_docs.push((1, doc));
+        let mut doc = AnalyzedDocument::new();
+        doc.point_values
+            .insert("empty_field".to_string(), Vec::<Vec<f64>>::new());
+        writer.upsert_analyzed_document(1, doc).unwrap();
         writer.flush_segment().unwrap();
 
         assert!(
@@ -4302,5 +4287,136 @@ mod tests {
                 "seed {seed}: the flushed segment must not depend on removal history"
             );
         }
+    }
+
+    // ---- Issue #1165: buffered points as per-field columns ---------------
+
+    /// A loose-layout writer that flushes only when told to.
+    fn manual_flush_writer(storage: Arc<dyn Storage>) -> InvertedIndexWriter {
+        let config = InvertedIndexWriterConfig {
+            max_buffered_docs: usize::MAX,
+            max_buffer_memory: usize::MAX,
+            ..loose_config()
+        };
+        InvertedIndexWriter::new(storage, config).unwrap()
+    }
+
+    fn float_doc(field: &str, value: f64) -> Document {
+        Document::builder().add_float(field, value).build()
+    }
+
+    /// Whether any committed `.bkd` part belongs to `field`.
+    fn has_bkd(storage: &Arc<dyn Storage>, field: &str) -> bool {
+        let suffix = format!(".{field}.bkd");
+        storage
+            .list_files()
+            .unwrap()
+            .iter()
+            .any(|f| f.ends_with(&suffix))
+    }
+
+    /// The columns are dropped with the rest of the buffer, so the estimate
+    /// returns to an empty writer's after a flush and after a rollback.
+    #[test]
+    fn estimate_returns_to_baseline_after_commit_and_rollback() {
+        let mut writer = manual_flush_writer(memory_storage());
+        let baseline = writer.buffered_memory_usage();
+        let tagged = |id: u64| {
+            Document::builder()
+                .add_int64_array("tags", vec![id as i64, 1, 2])
+                .build()
+        };
+
+        for id in 0..50 {
+            writer.upsert_document(id, tagged(id)).unwrap();
+        }
+        assert!(writer.buffered_memory_usage() > baseline);
+        writer.commit().unwrap();
+        assert_eq!(writer.buffered_memory_usage(), baseline, "after commit");
+
+        for id in 50..100 {
+            writer.upsert_document(id, tagged(id)).unwrap();
+        }
+        writer.rollback().unwrap();
+        assert_eq!(writer.buffered_memory_usage(), baseline, "after rollback");
+    }
+
+    /// Rolled-back points must not reach the next segment.
+    #[test]
+    fn rollback_discards_buffered_points() {
+        let storage = memory_storage();
+        let mut writer = manual_flush_writer(storage.clone());
+        writer.upsert_document(1, float_doc("gone", 1.0)).unwrap();
+        writer.rollback().unwrap();
+        writer.upsert_document(2, float_doc("kept", 2.0)).unwrap();
+        writer.commit().unwrap();
+
+        assert!(has_bkd(&storage, "kept"));
+        assert!(!has_bkd(&storage, "gone"));
+    }
+
+    /// A deleted document's points are purged with its postings, so a field
+    /// only it carried writes no `.bkd`.
+    #[test]
+    fn a_field_whose_points_were_all_deleted_writes_no_bkd() {
+        let storage = memory_storage();
+        let mut writer = manual_flush_writer(storage.clone());
+        let both = Document::builder()
+            .add_float("gone", 1.0)
+            .add_float("kept", 1.0)
+            .build();
+        writer.upsert_document(1, both).unwrap();
+        writer.upsert_document(2, float_doc("kept", 2.0)).unwrap();
+        writer.delete_document(1).unwrap();
+        writer.commit().unwrap();
+
+        assert!(has_bkd(&storage, "kept"));
+        assert!(!has_bkd(&storage, "gone"));
+    }
+
+    /// A NaN in a version replaced while buffered never reaches the BKD
+    /// writer (which rejects NaN), and the replacement's point survives the
+    /// purge that removes it.
+    #[test]
+    fn a_replaced_nan_point_does_not_fail_the_flush() {
+        let storage = memory_storage();
+        let mut writer = manual_flush_writer(storage.clone());
+        writer.upsert_document(1, float_doc("f", f64::NAN)).unwrap();
+        writer.upsert_document(1, float_doc("f", 1.0)).unwrap();
+        writer.commit().unwrap();
+
+        assert!(has_bkd(&storage, "f"));
+    }
+
+    /// A field whose buffered points have two dimensionalities fails the
+    /// flush before any part is written; the buffer is kept, so once the
+    /// offending document is deleted the retried commit succeeds.
+    #[test]
+    fn mixed_point_dimensionalities_fail_the_flush_before_any_part() {
+        let storage = memory_storage();
+        let mut writer = manual_flush_writer(storage.clone());
+        let points = |points: Vec<Vec<f64>>| {
+            let mut doc = AnalyzedDocument::new();
+            doc.point_values.insert("x".to_string(), points);
+            doc
+        };
+        writer
+            .upsert_analyzed_document(1, points(vec![vec![1.0]]))
+            .unwrap();
+        writer
+            .upsert_analyzed_document(2, points(vec![vec![1.0, 2.0]]))
+            .unwrap();
+
+        let err = writer.commit().unwrap_err().to_string();
+        assert!(err.contains("1 and 2 dimensions"), "{err}");
+        let files = storage.list_files().unwrap();
+        assert!(
+            files.iter().all(|f| !f.starts_with("segment_")),
+            "a failed flush must leave no segment parts: {files:?}"
+        );
+
+        writer.delete_document(2).unwrap();
+        writer.commit().unwrap();
+        assert!(has_bkd(&storage, "x"));
     }
 }
