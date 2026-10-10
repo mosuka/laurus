@@ -104,7 +104,14 @@ fn point_doc(id: u64, version: u64) -> Document {
 /// integers, NaN, and a field (`gone`) that only deleted documents carry.
 fn doomed_doc(id: u64) -> Document {
     Document::builder()
-        .add_integer("n", if id.is_multiple_of(2) { i64::MAX } else { i64::MIN })
+        .add_integer(
+            "n",
+            if id.is_multiple_of(2) {
+                i64::MAX
+            } else {
+                i64::MIN
+            },
+        )
         .add_float("f", f64::NAN)
         .add_int64_array("tags", vec![i64::MAX, i64::MIN, 0])
         .add_integer("gone", id as i64)
