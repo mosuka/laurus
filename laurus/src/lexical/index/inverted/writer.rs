@@ -3162,11 +3162,8 @@ mod tests {
     #[test]
     fn doc_values_payload_does_not_scale_with_binary_fields() {
         let build = |payload: usize| -> usize {
-            let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-                crate::storage::memory::MemoryStorageConfig::default(),
-            ));
-            let mut writer =
-                InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+            let storage = memory_storage();
+            let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
             for i in 0..20u64 {
                 let doc = Document::builder()
                     .add_field("title", crate::data::DataValue::Text(format!("doc {i}")))
@@ -3177,9 +3174,7 @@ mod tests {
                     .build();
                 writer.upsert_document(i, doc).unwrap();
             }
-            let mut out: Vec<u8> = Vec::new();
-            writer.doc_values_writer.write_to_output(&mut out).unwrap();
-            out.len()
+            flushed_dv(&mut writer, &storage).len()
         };
 
         let small = build(64);
@@ -3226,11 +3221,8 @@ mod tests {
     /// the next flushed segment's `.dv`, under ids that segment does not hold.
     #[test]
     fn rollback_discards_buffered_doc_values() {
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let mut writer =
-            InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+        let storage = memory_storage();
+        let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
         writer
             .add_document(
                 Document::builder()
@@ -3243,11 +3235,7 @@ mod tests {
             .add_document(Document::builder().add_text("title", "kept").build())
             .unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        writer
-            .doc_values_writer
-            .write_to_output(&mut serialized)
-            .unwrap();
+        let serialized = flushed_dv(&mut writer, &storage);
         let names = String::from_utf8_lossy(&serialized).to_string();
         assert!(names.contains("title"));
         assert!(
@@ -3269,11 +3257,8 @@ mod tests {
     /// internals: bytes on disk are what this is about.
     #[test]
     fn binary_payloads_are_kept_out_of_doc_values() {
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let mut writer =
-            InvertedIndexWriter::new(storage, InvertedIndexWriterConfig::default()).unwrap();
+        let storage = memory_storage();
+        let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
 
         const PAYLOAD: usize = 32 * 1024;
         let doc = Document::builder()
@@ -3289,11 +3274,7 @@ mod tests {
             .build();
         writer.add_document(doc).unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        writer
-            .doc_values_writer
-            .write_to_output(&mut serialized)
-            .unwrap();
+        let serialized = flushed_dv(&mut writer, &storage);
 
         let names = String::from_utf8_lossy(&serialized).to_string();
         assert!(
@@ -3452,10 +3433,8 @@ mod tests {
     fn doc_values_false_excludes_a_sortable_field() {
         use crate::lexical::core::field::{FieldOption, TextOption};
 
-        let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-            crate::storage::memory::MemoryStorageConfig::default(),
-        ));
-        let mut config = InvertedIndexWriterConfig::default();
+        let storage = memory_storage();
+        let mut config = loose_config();
         // Declaring any field switches `analyze_document` out of
         // schema-less mode (undeclared, non-`_`-prefixed fields are then
         // skipped entirely) -- so "title" must be declared too, with the
@@ -3471,7 +3450,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
 
         let doc = Document::builder()
             .add_field("title", crate::data::DataValue::Text("sortable".into()))
@@ -3482,11 +3461,7 @@ mod tests {
             .build();
         writer.add_document(doc).unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        writer
-            .doc_values_writer
-            .write_to_output(&mut serialized)
-            .unwrap();
+        let serialized = flushed_dv(&mut writer, &storage);
         let names = String::from_utf8_lossy(&serialized).to_string();
 
         assert!(
@@ -3509,10 +3484,8 @@ mod tests {
         use crate::lexical::core::field::{FieldOption, TextOption};
 
         let build = |doc_values: bool| -> usize {
-            let storage = Arc::new(crate::storage::memory::MemoryStorage::new(
-                crate::storage::memory::MemoryStorageConfig::default(),
-            ));
-            let mut config = InvertedIndexWriterConfig::default();
+            let storage = memory_storage();
+            let mut config = loose_config();
             config.fields.insert(
                 "title".to_string(),
                 FieldOption::Text(TextOption::default()),
@@ -3524,7 +3497,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let mut writer = InvertedIndexWriter::new(storage, config).unwrap();
+            let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
             for i in 0..20u64 {
                 let doc = Document::builder()
                     .add_field("title", crate::data::DataValue::Text(format!("doc {i}")))
@@ -3532,9 +3505,7 @@ mod tests {
                     .build();
                 writer.upsert_document(i, doc).unwrap();
             }
-            let mut out: Vec<u8> = Vec::new();
-            writer.doc_values_writer.write_to_output(&mut out).unwrap();
-            out.len()
+            flushed_dv(&mut writer, &storage).len()
         };
 
         let with_dv = build(true);
@@ -3992,5 +3963,295 @@ mod tests {
             positions(&[&["the", "a"]], "big the dog"),
             expected(&[("big", 0), ("a", 1), ("dog", 2)])
         );
+    }
+
+    // ---- Issue #1168: rebuild equivalence and `.dv` byte pins ------------
+
+    fn memory_storage() -> Arc<dyn Storage> {
+        Arc::new(crate::storage::memory::MemoryStorage::new(
+            crate::storage::memory::MemoryStorageConfig::default(),
+        ))
+    }
+
+    /// Loose layout, so each part of a flushed segment is its own file.
+    fn loose_config() -> InvertedIndexWriterConfig {
+        InvertedIndexWriterConfig {
+            use_compound: false,
+            ..Default::default()
+        }
+    }
+
+    /// Every file in `storage`, keyed by name.
+    fn stored_files(storage: &Arc<dyn Storage>) -> std::collections::BTreeMap<String, Vec<u8>> {
+        storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .map(|name| {
+                let mut input = storage.open_input(&name).unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut input, &mut bytes).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    /// Commits `writer` (a loose-layout writer over `storage` holding no
+    /// earlier segment) and returns the `.dv` part it flushed.
+    fn flushed_dv(writer: &mut InvertedIndexWriter, storage: &Arc<dyn Storage>) -> Vec<u8> {
+        writer.commit().unwrap();
+        let mut dv: Vec<(String, Vec<u8>)> = stored_files(storage)
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(".dv"))
+            .collect();
+        assert_eq!(dv.len(), 1, "expected exactly one .dv part");
+        dv.pop().unwrap().1
+    }
+
+    fn golden_doc(id: u64) -> Document {
+        let builder = Document::builder()
+            .add_text("title", format!("title {id}"))
+            .add_integer("count", id as i64 * 10)
+            .add_boolean("flag", id % 2 == 0)
+            .add_int64_array("tags", vec![id as i64, 100 - id as i64])
+            .add_field("blob", DataValue::Bytes(vec![1, 2, 3], None));
+        // A sparse column: one document has no `price`.
+        if id == 5 {
+            builder.build()
+        } else {
+            builder.add_float("price", id as f64 + 0.5).build()
+        }
+    }
+
+    /// Pins the exact `.dv` bytes a flush writes (Issue #1168), so changing
+    /// when or how DocValues are built cannot change the on-disk format.
+    /// Documents go in out of doc_id order on purpose, and a second writer
+    /// fed the same documents in another order must write the same bytes.
+    #[test]
+    fn flushed_doc_values_bytes_are_pinned() {
+        let build = |order: &[u64]| -> Vec<u8> {
+            let storage = memory_storage();
+            let mut writer = InvertedIndexWriter::new(storage.clone(), loose_config()).unwrap();
+            for &id in order {
+                writer.upsert_document(id, golden_doc(id)).unwrap();
+            }
+            flushed_dv(&mut writer, &storage)
+        };
+
+        let bytes = build(&[7, 2, 5]);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_DV_HEX, "the flushed .dv bytes changed");
+        assert_eq!(
+            build(&[2, 5, 7]),
+            bytes,
+            "insertion order must not change the flushed .dv bytes"
+        );
+    }
+
+    /// `golden_doc` for ids 2, 5 and 7, as `DocValuesWriter` serialized it
+    /// before Issue #1168. Columns `count`, `flag`, `price` (absent for 5),
+    /// `tags`, `title`; the `Bytes` field `blob` is excluded by type.
+    const GOLDEN_DV_HEX: &str = concat!(
+        "4456464601000500000005000000636f756e7403000000000000008000000000",
+        "0000000200000000000000020000000000000014000000000000000000000000",
+        "0000000000000000000000050000000000000002000000000000003200000000",
+        "0000000000000000000000000000000000000007000000000000000200000000",
+        "00000046000000000000000000000000000000000000000000000088ffffff03",
+        "00000004000000666c6167030000000000000080000000000000000200000000",
+        "0000000101000000000000000000000000000000000000000000000000000000",
+        "0000000500000000000000010000000000000000000000000000000000000000",
+        "0000000000000000000000070000000000000001000000000000000000000000",
+        "0000000000000000000000000000000000000088ffffff030000000500000070",
+        "7269636502000000000000005800000000000000020000000000000003000000",
+        "0000000000000000000004400000000000000000000000000000000007000000",
+        "0000000003000000000000000000000000001e40000000000000000000000000",
+        "00000000b0ffffff0200000004000000746167730300000000000000b0000000",
+        "000000000200000000000000620000000000000005000000000000005f000000",
+        "0000000007000000000000005d0000000000000002000000000000000a000000",
+        "c4ffffff02000000000000000000000000000000000000000000000005000000",
+        "000000000a000000acffffff0200000000000000000000000000000000000000",
+        "0000000007000000000000000a00000094ffffff020000000000000000000000",
+        "00000000000000000000000088ffffff03000000050000007469746c65030000",
+        "000000000080000000000000000200000000000000040000007469746c652032",
+        "ff00000000000000000000000000000000000000000500000000000000040000",
+        "007469746c652035ff0000000000000000000000000000000000000000070000",
+        "0000000000040000007469746c652037ff000000000000000000000000000000",
+        "000000000088ffffff03000000",
+    );
+
+    /// Deterministic 64-bit LCG (Knuth's MMIX constants), so the oracle
+    /// below replays identically without a `rand` dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// `body` keeps positions, `tags` does not, `n` is numeric (points and
+    /// DocValues).
+    fn oracle_config() -> InvertedIndexWriterConfig {
+        use crate::lexical::core::field::{FieldOption, IntegerOption, TextOption};
+
+        let mut config = loose_config();
+        config
+            .fields
+            .insert("body".to_string(), FieldOption::Text(TextOption::default()));
+        config.fields.insert(
+            "tags".to_string(),
+            FieldOption::Text(TextOption {
+                term_vectors: false,
+                ..Default::default()
+            }),
+        );
+        config.fields.insert(
+            "n".to_string(),
+            FieldOption::Integer(IntegerOption::default()),
+        );
+        config
+    }
+
+    const ORACLE_WORDS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
+
+    fn oracle_words(rng: &mut Lcg, count: u64) -> String {
+        (0..count)
+            .map(|_| ORACLE_WORDS[rng.below(ORACLE_WORDS.len() as u64) as usize])
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn oracle_doc(rng: &mut Lcg) -> Document {
+        let body_len = 2 + rng.below(4);
+        let body = oracle_words(rng, body_len);
+        let tags_len = 1 + rng.below(3);
+        let tags = oracle_words(rng, tags_len);
+        Document::builder()
+            .add_text("body", body)
+            .add_text("tags", tags)
+            .add_integer("n", rng.below(50) as i64)
+            .build()
+    }
+
+    /// A merge-replay-shaped document: one analyzed term carrying an
+    /// already-aggregated frequency on a positions-off field (#1234).
+    fn collapsed_frequency_doc() -> AnalyzedDocument {
+        let mut doc = AnalyzedDocument::new();
+        doc.field_terms.insert(
+            "tags".to_string(),
+            vec![AnalyzedTerm {
+                term: "gamma".to_string(),
+                position: 0,
+                frequency: 5,
+                offset: (0, 0),
+            }],
+        );
+        doc.field_lengths.insert("tags".to_string(), 5);
+        doc
+    }
+
+    #[derive(Clone)]
+    enum OracleEntry {
+        Document(Document),
+        Analyzed(AnalyzedDocument),
+    }
+
+    /// Runs a seeded mix of upserts, same-id re-upserts, deletes,
+    /// delete-then-re-upserts and #1234-shaped analyzed documents against
+    /// writer A, and returns A plus the surviving entries in A's final
+    /// buffer order (a re-upserted document moves to the end, exactly as
+    /// `remove_pending_document`'s `retain` and the following push do).
+    fn run_oracle_ops(
+        seed: u64,
+        storage: &Arc<dyn Storage>,
+    ) -> (InvertedIndexWriter, Vec<(u64, OracleEntry)>) {
+        let mut rng = Lcg(seed);
+        let mut writer = InvertedIndexWriter::new(storage.clone(), oracle_config()).unwrap();
+        let mut live: Vec<(u64, OracleEntry)> = Vec::new();
+        let mut deleted: AHashSet<u64> = AHashSet::new();
+        let mut next_fresh_id = 1_000u64;
+        let mut delete_then_reupserts = 0;
+        let mut same_id_reupserts = 0;
+
+        for _ in 0..300 {
+            match rng.below(10) {
+                0..=5 => {
+                    let id = rng.below(12);
+                    let doc = oracle_doc(&mut rng);
+                    if deleted.remove(&id) {
+                        delete_then_reupserts += 1;
+                    }
+                    if live.iter().any(|(live_id, _)| *live_id == id) {
+                        same_id_reupserts += 1;
+                    }
+                    writer.upsert_document(id, doc.clone()).unwrap();
+                    live.retain(|(live_id, _)| *live_id != id);
+                    live.push((id, OracleEntry::Document(doc)));
+                }
+                6..=8 => {
+                    let id = rng.below(12);
+                    writer.delete_document(id).unwrap();
+                    if live.iter().any(|(live_id, _)| *live_id == id) {
+                        deleted.insert(id);
+                    }
+                    live.retain(|(live_id, _)| *live_id != id);
+                }
+                _ => {
+                    let id = next_fresh_id;
+                    next_fresh_id += 1;
+                    let doc = collapsed_frequency_doc();
+                    writer.upsert_analyzed_document(id, doc.clone()).unwrap();
+                    live.push((id, OracleEntry::Analyzed(doc)));
+                }
+            }
+        }
+        assert!(
+            delete_then_reupserts > 0 && same_id_reupserts > 0,
+            "seed {seed} must exercise both re-upsert paths \
+             ({delete_then_reupserts} delete-then-re-upserts, {same_id_reupserts} same-id)"
+        );
+        (writer, live)
+    }
+
+    /// Writer B: only the surviving entries, in A's final buffer order.
+    fn clean_writer(
+        storage: &Arc<dyn Storage>,
+        live: &[(u64, OracleEntry)],
+    ) -> InvertedIndexWriter {
+        let mut writer = InvertedIndexWriter::new(storage.clone(), oracle_config()).unwrap();
+        for (id, entry) in live {
+            match entry {
+                OracleEntry::Document(doc) => writer.upsert_document(*id, doc.clone()).unwrap(),
+                OracleEntry::Analyzed(doc) => {
+                    writer.upsert_analyzed_document(*id, doc.clone()).unwrap()
+                }
+            }
+        }
+        writer
+    }
+
+    /// Issue #1168: whatever the writer does with removed documents before a
+    /// flush, the flushed segment must be byte-identical to one written by a
+    /// writer that only ever saw the surviving documents.
+    #[test]
+    fn deferred_removals_flush_the_same_bytes_as_a_clean_writer() {
+        for seed in [1u64, 7, 42, 1168] {
+            let storage_a = memory_storage();
+            let (mut a, live) = run_oracle_ops(seed, &storage_a);
+            let storage_b = memory_storage();
+            let mut b = clean_writer(&storage_b, &live);
+
+            a.commit().unwrap();
+            b.commit().unwrap();
+            assert_eq!(
+                stored_files(&storage_a),
+                stored_files(&storage_b),
+                "seed {seed}: the flushed segment must not depend on removal history"
+            );
+        }
     }
 }
