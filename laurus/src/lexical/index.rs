@@ -68,6 +68,20 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// Uses interior mutability for thread-safe access.
     fn optimize(&self) -> Result<()>;
 
+    /// Like [`Self::optimize`], but caps a single output segment's buffered
+    /// memory during the merge at `max_merge_buffer_memory` bytes (Issue
+    /// #1164), trading `optimize()`'s usual single-output-segment result
+    /// for a bound on peak merge memory. The default implementation simply
+    /// calls [`Self::optimize`] (ignoring the budget), matching every
+    /// `LexicalIndex` implementation's behavior before this method existed;
+    /// [`InvertedIndex`](crate::lexical::index::inverted::InvertedIndex) is
+    /// the only implementation that currently honors the budget. See
+    /// [`MergeConfig::max_merge_buffer_memory`](crate::lexical::index::inverted::segment::merge_engine::MergeConfig::max_merge_buffer_memory)
+    /// for exactly what this does and does not bound.
+    fn optimize_within_budget(&self, _max_merge_buffer_memory: usize) -> Result<()> {
+        self.optimize()
+    }
+
     /// Auto-merge hook invoked after each commit (Issue #755).
     ///
     /// Implementations may opportunistically merge segments to keep their

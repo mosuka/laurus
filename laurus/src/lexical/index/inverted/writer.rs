@@ -1456,6 +1456,14 @@ impl InvertedIndexWriter {
         self.buffered_bytes + index_memory
     }
 
+    /// Public wrapper over [`Self::estimate_memory_usage`] for callers
+    /// outside this module (Issue #1164: a bounded merge checks this after
+    /// replaying each source segment to decide whether to roll over to a
+    /// new output segment).
+    pub(crate) fn buffered_memory_usage(&self) -> usize {
+        self.estimate_memory_usage()
+    }
+
     /// Add `doc`'s estimated footprint to the buffered total.
     fn track_buffered(&mut self, doc: &AnalyzedDocument) {
         self.buffered_bytes = self
@@ -1954,6 +1962,16 @@ impl InvertedIndexWriter {
         (min_id, max_id)
     }
 
+    /// `(min_doc_id, max_doc_id, doc_count)` of the currently buffered
+    /// documents, read right before a bounded merge flushes this writer's
+    /// buffer to a bucket segment (Issue #1164) -- mirrors what
+    /// [`Self::extend_segment_cache`] computes from the same buffer for its
+    /// own `SegmentRange`.
+    pub(crate) fn buffered_doc_stats(&self) -> (u64, u64, u64) {
+        let (min_id, max_id) = self.buffered_doc_id_range();
+        (min_id, max_id, self.buffered_docs.len() as u64)
+    }
+
     /// Append the segment just written from the current buffer to
     /// [`Self::segment_ranges`] and raise [`Self::max_committed_doc_id`]
     /// (Issue #559 / #864). Callers must invoke this after
@@ -2286,6 +2304,17 @@ impl InvertedIndexWriter {
     /// Get writer statistics.
     pub fn stats(&self) -> &WriterStats {
         &self.stats
+    }
+
+    /// Get the writer's configuration, so a bounded merge can clone it into
+    /// a fresh writer on rollover (Issue #1164) -- carrying forward the
+    /// pinned `field_term_positions`/`field_doc_values` state instead of
+    /// losing it, since [`Self::flush_buffered_to_segment`] does not reset
+    /// [`Self::doc_values_writer`] and so cannot be called twice on the same
+    /// instance (it would leak the first bucket's DocValues into the
+    /// second's `.dv`).
+    pub(crate) fn config(&self) -> &InvertedIndexWriterConfig {
+        &self.config
     }
 
     /// Close the writer.
