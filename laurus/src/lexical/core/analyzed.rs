@@ -113,9 +113,9 @@ pub struct AnalyzedDocument {
 /// The postings are the only consumer of the analyzed terms, so keeping
 /// them in the buffer as well would hold every term of every buffered
 /// document twice until the flush (Issue #1168). The point values go to the
-/// writer's per-field columns instead of a per-document map (Issue #1165).
-/// Making the buffered type lack both fields means no flush-time code can
-/// read them from here.
+/// writer's per-field columns instead of a per-document map (Issue #1165),
+/// tagged with this entry's [`Self::seq`]. Making the buffered type lack
+/// both fields means no flush-time code can read them from here.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BufferedDocument {
     /// Stored field values with original types preserved.
@@ -123,6 +123,11 @@ pub(crate) struct BufferedDocument {
     /// Field name to field length (distinct positions), as
     /// [`AnalyzedDocument::field_lengths`].
     pub(crate) field_lengths: AHashMap<String, u32>,
+    /// This entry's sequence number since the writer's buffer was last
+    /// emptied: the tag its points carry in the point columns, so a flush
+    /// can tell the points of entries still buffered from those of entries
+    /// since removed (Issue #1165).
+    pub(crate) seq: u32,
 }
 
 /// An analyzed term with position and metadata.

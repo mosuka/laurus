@@ -295,10 +295,16 @@ pub struct InvertedIndexWriter {
     buffered_doc_ids: AHashSet<u64>,
 
     /// The buffered documents' BKD points, as per-field columns (Issue
-    /// #1165). Holds the points of every entry in [`Self::buffered_docs`],
-    /// plus those of removed entries until [`Self::purge_stale_postings`]
-    /// drops them along with their postings.
+    /// #1165), each tagged with its entry's [`BufferedDocument::seq`]. Also
+    /// holds the points of entries removed since the buffer was last
+    /// emptied: removing an entry leaves its points in place, and the flush
+    /// skips them because the entry is no longer in [`Self::buffered_docs`].
     point_columns: PointColumns,
+
+    /// Sequence number the next buffered entry takes (Issue #1165). Reset
+    /// with the buffer, so it also counts the entries since then, removed
+    /// ones included.
+    next_seq: u32,
 
     /// Document ID counter.
     next_doc_id: u64,
@@ -938,6 +944,7 @@ impl InvertedIndexWriter {
             stale_doc_ids: AHashSet::new(),
             buffered_doc_ids: AHashSet::new(),
             point_columns: PointColumns::default(),
+            next_seq: 0,
             next_doc_id,
             current_segment,
             closed: false,
@@ -1002,6 +1009,18 @@ impl InvertedIndexWriter {
     ) -> Result<()> {
         self.check_closed()?;
 
+        // Checked before anything changes, so a writer that has buffered
+        // `u32::MAX` entries since its last flush rejects the document
+        // whole. Unreachable in practice: that many entries would need
+        // hundreds of gigabytes of buffer.
+        let seq = self.next_seq;
+        let next_seq = seq.checked_add(1).ok_or_else(|| {
+            LaurusError::index(
+                "Writer buffered u32::MAX entries since its last flush; flush before adding more"
+                    .to_string(),
+            )
+        })?;
+
         // Update next_doc_id if necessary to avoid ID collisions
         if doc_id >= self.next_doc_id {
             self.next_doc_id = doc_id + 1;
@@ -1030,18 +1049,20 @@ impl InvertedIndexWriter {
         self.add_analyzed_document_to_index(doc_id, &field_terms)?;
         drop(field_terms);
 
-        // Points go to the per-field columns (Issue #1165). Appended after
-        // the stale purge above, so a removed version's points are already
-        // gone, and with nothing fallible between here and the push below,
-        // so the columns never hold points of an entry that was not buffered.
+        // Points go to the per-field columns, tagged with this entry's
+        // sequence number (Issue #1165). Nothing fallible runs between here
+        // and the push below, so the columns never hold points of an entry
+        // that was not buffered.
         for (field, points) in point_values {
-            self.point_columns.append(field, doc_id, points);
+            self.point_columns.append(field, seq, points);
         }
+        self.next_seq = next_seq;
 
         // Buffer the rest with the assigned ID
         let buffered = BufferedDocument {
             stored_fields,
             field_lengths,
+            seq,
         };
         self.track_buffered(&buffered);
         self.buffered_docs.push((doc_id, buffered));
@@ -1498,6 +1519,7 @@ impl InvertedIndexWriter {
         self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
         self.point_columns = PointColumns::default();
+        self.next_seq = 0;
     }
 
     /// Flush the current segment to disk.
@@ -1568,9 +1590,12 @@ impl InvertedIndexWriter {
     ///
     /// * `segment_name` - Name the segment's files are written under.
     fn write_segment_files(&self, segment_name: &str) -> Result<Vec<String>> {
-        // Fails on a field with points of two dimensionalities, so it runs
-        // before anything is created, leaving no partial segment behind.
-        let point_columns = self.point_columns.flush_columns()?;
+        // Which entries' points to write: those still buffered. Worked out
+        // before anything is created, together with the column list, which
+        // fails on a field whose live points have two dimensionalities and
+        // so must not leave a partial segment behind.
+        let live = self.live_entries();
+        let point_columns = self.point_columns.flush_columns(|seq| live[seq as usize])?;
         // Data files only (#1024): a segment becomes discoverable through
         // the manifest at publication, never through its files — which is
         // also what makes a crash mid-write harmless (the sweep reclaims
@@ -1610,7 +1635,7 @@ impl InvertedIndexWriter {
         // The same sorted, deduplicated ids the `.norms` slot map records.
         self.write_doc_ids(&mut sink, norms.doc_ids())?;
         self.write_doc_values(&mut sink)?;
-        self.write_bkd_trees(&mut sink, &point_columns)?;
+        self.write_bkd_trees(&mut sink, &point_columns, &live)?;
         sink.finish()
     }
 
@@ -1913,25 +1938,60 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
+    /// Whether each entry sequence number belongs to an entry still in
+    /// [`Self::buffered_docs`], indexed by sequence number (Issue #1165).
+    /// The point columns only hold sequence numbers below
+    /// [`Self::next_seq`], so every point's entry has a slot.
+    fn live_entries(&self) -> Vec<bool> {
+        let mut live = vec![false; self.next_seq as usize];
+        for (_, doc) in &self.buffered_docs {
+            if let Some(slot) = live.get_mut(doc.seq as usize) {
+                *slot = true;
+            }
+        }
+        live
+    }
+
     /// Write one BKD tree per point-bearing field, in field-name order, from
-    /// `columns` (see [`PointColumns::flush_columns`]).
+    /// `columns` (see [`PointColumns::flush_columns`]), skipping every point
+    /// whose entry `live` marks as removed.
     ///
-    /// Each column holds a field's points in arrival order, which is
-    /// [`Self::buffered_docs`]' push order with each entry's points in
-    /// document order (Issue #1165). [`BKDWriter::write_sorted_by_doc_id`]
-    /// feeds them to the builder stably sorted by doc id, the order the
-    /// writer used to copy them into a flat buffer in, so the trees are
-    /// byte-identical to that copy's without making it. A doc id buffered
-    /// twice (Issue #1210) contributes both entries' points, in push order.
+    /// Each column holds a field's points in arrival order, which is the
+    /// order entries were pushed onto [`Self::buffered_docs`], with each
+    /// entry's points in document order (Issue #1165). Points carry their
+    /// entry's sequence number, resolved to a doc id here, at the only
+    /// stage that needs one. [`BKDWriter::write_sorted_by_doc_id`] then
+    /// feeds the live points to the builder stably sorted by doc id, the
+    /// order the writer used to copy them into a flat buffer in, so the
+    /// trees are byte-identical to that copy's without making it. A doc id
+    /// buffered twice (Issue #1210) contributes both entries' points, in
+    /// push order.
     fn write_bkd_trees(
         &self,
         sink: &mut PartSink<'_>,
         columns: &[(&str, &PointColumn)],
+        live: &[bool],
     ) -> Result<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+        // Each entry's doc id, by sequence number. Removed entries keep 0:
+        // their points are skipped, so the slot is never read.
+        let mut entry_doc_ids = vec![0u64; live.len()];
+        for (doc_id, doc) in &self.buffered_docs {
+            if let Some(slot) = entry_doc_ids.get_mut(doc.seq as usize) {
+                *slot = *doc_id;
+            }
+        }
         for (field, column) in columns {
+            let seqs = column.seqs();
+            let doc_ids: Vec<u64> = seqs
+                .iter()
+                .map(|&seq| entry_doc_ids[seq as usize])
+                .collect();
             let output = sink.part(&format!("{field}.bkd"))?;
             let mut writer = BKDWriter::new(output, column.dims() as u32);
-            writer.write_sorted_by_doc_id(column.values(), column.doc_ids())?;
+            writer.write_sorted_by_doc_id(column.values(), &doc_ids, |i| live[seqs[i] as usize])?;
             writer.finish()?;
             sink.seal()?;
         }
@@ -2389,9 +2449,10 @@ impl InvertedIndexWriter {
     }
 
     /// Drop the postings of every id in [`Self::stale_doc_ids`] from the
-    /// in-memory index (Issue #1168), and their points from the point
-    /// columns (Issue #1165), leaving both exactly as if only the documents
-    /// still buffered had ever been added. A no-op when nothing is stale.
+    /// in-memory index (Issue #1168), leaving it exactly as if only the
+    /// documents still buffered had ever been added. A no-op when nothing is
+    /// stale. (Their points stay in the point columns, where the flush skips
+    /// them; see [`Self::point_columns`].)
     ///
     /// Filters the postings the index already holds instead of re-deriving
     /// them from the buffer: each remaining doc_id's postings come from the
@@ -2406,9 +2467,6 @@ impl InvertedIndexWriter {
         }
         let stale = std::mem::take(&mut self.stale_doc_ids);
         let remaining = self.inverted_index.retain_docs(|id| !stale.contains(&id));
-        // Same reasoning as for the postings: a stale id's points all come
-        // from entries already removed, since its re-add waits for this.
-        self.point_columns.retain_docs(|id| !stale.contains(&id));
         // Counts for the buffer only, as a full rebuild left them; docs_added
         // is adjusted in `remove_pending_document`.
         self.stats.unique_terms = self.inverted_index.term_count();
@@ -3015,9 +3073,9 @@ mod tests {
     }
 
     /// The raw bytes `count` points of `dims` dimensions occupy in the point
-    /// columns: their coordinates plus one doc id each.
+    /// columns: their coordinates plus one entry sequence number each.
     fn raw_point_bytes(count: usize, dims: usize) -> usize {
-        count * (dims * std::mem::size_of::<f64>() + std::mem::size_of::<u64>())
+        count * (dims * std::mem::size_of::<f64>() + std::mem::size_of::<u32>())
     }
 
     /// Issue #1163: `pin_field_term_positions`/`pin_field_doc_values` are
@@ -4355,7 +4413,7 @@ mod tests {
         assert!(!has_bkd(&storage, "gone"));
     }
 
-    /// A deleted document's points are purged with its postings, so a field
+    /// A deleted document's points are skipped at flush time, so a field
     /// only it carried writes no `.bkd`.
     #[test]
     fn a_field_whose_points_were_all_deleted_writes_no_bkd() {
@@ -4375,8 +4433,8 @@ mod tests {
     }
 
     /// A NaN in a version replaced while buffered never reaches the BKD
-    /// writer (which rejects NaN), and the replacement's point survives the
-    /// purge that removes it.
+    /// writer (which rejects NaN), and the replacement's point, which shares
+    /// the doc id, is written.
     #[test]
     fn a_replaced_nan_point_does_not_fail_the_flush() {
         let storage = memory_storage();

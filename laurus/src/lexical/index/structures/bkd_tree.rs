@@ -522,19 +522,28 @@ impl<W: StorageOutput> BKDWriter<W> {
         self.write_permuted(points, doc_ids, (0..point_count).collect())
     }
 
-    /// Like [`Self::write`], but feeds the points to the builder in doc-id
-    /// order, keeping buffer order among points with the same doc id
-    /// (Issue #1165).
+    /// Like [`Self::write`], but writes only the points at the positions
+    /// `keep` accepts, and feeds them to the builder in doc-id order,
+    /// keeping buffer order among points with the same doc id (Issue
+    /// #1165).
     ///
     /// The tree, and every byte written, is exactly what [`Self::write`]
-    /// produces for a copy of the buffers stably sorted by doc id: the
+    /// produces for a copy of the kept points stably sorted by doc id: the
     /// builder reads points only through its index permutation and never
-    /// compares the indices themselves, so starting it from a sorted
-    /// permutation is the same as starting it from sorted buffers. This lets
-    /// a caller whose buffers hold points in arrival order skip that copy.
-    pub(crate) fn write_sorted_by_doc_id(&mut self, points: &[f64], doc_ids: &[u64]) -> Result<()> {
+    /// compares the indices themselves, so starting it from a filtered,
+    /// sorted permutation is the same as starting it from filtered, sorted
+    /// buffers. Points left out are never read, so their coordinates and
+    /// doc ids may be anything, NaN included. This lets a caller whose
+    /// buffers hold points in arrival order, some of them stale, skip that
+    /// copy.
+    pub(crate) fn write_sorted_by_doc_id(
+        &mut self,
+        points: &[f64],
+        doc_ids: &[u64],
+        keep: impl Fn(usize) -> bool,
+    ) -> Result<()> {
         let point_count = self.check_buffers(points, doc_ids)?;
-        let mut order: Vec<u32> = (0..point_count).collect();
+        let mut order: Vec<u32> = (0..point_count).filter(|&i| keep(i as usize)).collect();
         order.sort_by_key(|&i| doc_ids[i as usize]);
         self.write_permuted(points, doc_ids, order)
     }
@@ -2780,8 +2789,13 @@ mod tests {
 
     /// `points`/`doc_ids` stably sorted by doc id: the copy
     /// `write_sorted_by_doc_id` must behave as if it were given.
-    fn sorted_copy(points: &[f64], doc_ids: &[u64], dims: usize) -> (Vec<f64>, Vec<u64>) {
-        let mut order: Vec<usize> = (0..doc_ids.len()).collect();
+    fn sorted_copy(
+        points: &[f64],
+        doc_ids: &[u64],
+        dims: usize,
+        keep: impl Fn(usize) -> bool,
+    ) -> (Vec<f64>, Vec<u64>) {
+        let mut order: Vec<usize> = (0..doc_ids.len()).filter(|&i| keep(i)).collect();
         order.sort_by_key(|&i| doc_ids[i]);
         let points = order
             .iter()
@@ -2804,11 +2818,12 @@ mod tests {
 
     /// Issue #1165: feeding arrival-order buffers through
     /// `write_sorted_by_doc_id` writes the same bytes as `write` on a copy
-    /// stably sorted by doc id. Many equal coordinates and repeated doc ids
-    /// make the stable-sort ties decide the layout, and a 4-point block
-    /// size splits the tree into many leaves. (At 1000 points an unstable
-    /// doc-id sort reorders a document's own points enough to show; at a
-    /// few hundred it may not.)
+    /// of the kept points stably sorted by doc id. Many equal coordinates
+    /// and repeated doc ids make the stable-sort ties decide the layout, a
+    /// 4-point block size splits the tree into many leaves, and the points
+    /// left out carry NaN and extreme doc ids that must never be read. (At
+    /// 1000 points an unstable doc-id sort reorders a document's own points
+    /// enough to show; at a few hundred it may not.)
     #[test]
     fn write_sorted_by_doc_id_matches_write_on_a_sorted_copy() {
         let mut state = 1165u64;
@@ -2820,9 +2835,20 @@ mod tests {
         };
         for dims in 1..=3usize {
             let n = 1000;
-            let doc_ids: Vec<u64> = (0..n).map(|_| below(40)).collect();
-            let points: Vec<f64> = (0..n * dims).map(|_| below(6) as f64).collect();
-            let (sorted_points, sorted_doc_ids) = sorted_copy(&points, &doc_ids, dims);
+            let keep = |i: usize| i % 5 != 2;
+            let doc_ids: Vec<u64> = (0..n)
+                .map(|i| if keep(i) { below(40) } else { u64::MAX })
+                .collect();
+            let points: Vec<f64> = (0..n * dims)
+                .map(|v| {
+                    if keep(v / dims) {
+                        below(6) as f64
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            let (sorted_points, sorted_doc_ids) = sorted_copy(&points, &doc_ids, dims, keep);
 
             let storage = MemoryStorage::new(MemoryStorageConfig::default());
             let mut copy = BKDWriter::new(storage.create_output("copy.bkd").unwrap(), dims as u32)
@@ -2832,7 +2858,9 @@ mod tests {
             let mut direct =
                 BKDWriter::new(storage.create_output("direct.bkd").unwrap(), dims as u32)
                     .with_block_size(4);
-            direct.write_sorted_by_doc_id(&points, &doc_ids).unwrap();
+            direct
+                .write_sorted_by_doc_id(&points, &doc_ids, keep)
+                .unwrap();
             direct.finish().unwrap();
 
             let (direct, copy) = (
@@ -2855,11 +2883,11 @@ mod tests {
     fn write_sorted_by_doc_id_reports_nan_at_its_sorted_position() {
         let points = [1.0, f64::NAN, 2.0];
         let doc_ids = [5, 1, 3];
-        let (sorted_points, sorted_doc_ids) = sorted_copy(&points, &doc_ids, 1);
+        let (sorted_points, sorted_doc_ids) = sorted_copy(&points, &doc_ids, 1, |_| true);
 
         let storage = MemoryStorage::new(MemoryStorageConfig::default());
         let direct = BKDWriter::new(storage.create_output("direct.bkd").unwrap(), 1)
-            .write_sorted_by_doc_id(&points, &doc_ids)
+            .write_sorted_by_doc_id(&points, &doc_ids, |_| true)
             .unwrap_err()
             .to_string();
         let copy = BKDWriter::new(storage.create_output("copy.bkd").unwrap(), 1)
