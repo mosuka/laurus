@@ -39,7 +39,10 @@ impl VectorIndexSearcher for FlatVectorSearcher {
         // the sidecar is absent) `rerank_factor` silently falls back to
         // Stage 1 ranking — the same convention as HNSW, where a missing
         // prerequisite (here: a single field to key the sidecar position
-        // index) cannot be recovered at query time.
+        // index) cannot be recovered at query time. Issue #1388: a
+        // field-less request can still take this path when the reader
+        // unambiguously belongs to one field (see
+        // `FlatVectorIndexReader::sole_field_name`).
 
         let start = Timer::now();
         let mut results = VectorIndexQueryResults::new();
@@ -65,7 +68,18 @@ impl VectorIndexSearcher for FlatVectorSearcher {
         // the rayon-parallel candidate loops below.
         let filter = request.filter.as_deref();
 
-        if let Some(ref field_name) = request.field_name {
+        // Issue #1388: a field-less request (`field_name: None`) can still
+        // take the field-filtered path when this reader unambiguously
+        // belongs to one field (see `FlatVectorIndexReader::sole_field_name`).
+        // Falls through to the unfiltered path below only when the field
+        // cannot be resolved (empty or genuinely multi-field reader -- the
+        // legacy, non-multi-field single-index layout).
+        let field_name = request
+            .field_name
+            .as_deref()
+            .or_else(|| flat_reader.and_then(|r| r.sole_field_name()));
+
+        if let Some(field_name) = field_name {
             // Field-filtered path: fetch the per-field doc-id slice from the
             // reader's pre-built index (#405 — O(1) Arc clone, avoids the full
             // `Vec<(u64, String)>` clone and the linear filter scan). Since
@@ -202,7 +216,7 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                     .results
                     .push(crate::vector::search::searcher::VectorIndexQueryResult {
                         doc_id,
-                        field_name: field_name.clone(),
+                        field_name: field_name.to_string(),
                         similarity,
                         distance,
                         vector: vector_output,

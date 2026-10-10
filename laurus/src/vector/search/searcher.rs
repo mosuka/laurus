@@ -530,9 +530,9 @@ pub struct VectorSearchParams {
     /// When `Some(factor)`, the field's searcher widens the int8
     /// candidate fetch to `top_k * factor` and rescores against the f32
     /// sidecar. Honored on HNSW, Flat and IVF fields with
-    /// `rerank_storage` configured at index time; otherwise silently
-    /// ignored. On Flat and IVF fields only a query that names the field
-    /// is reranked.
+    /// `rerank_storage` configured at index time, including a field-less
+    /// query when the segment holds only one field; otherwise silently
+    /// ignored.
     #[serde(default)]
     pub rerank_factor: Option<usize>,
     /// Per-query override for the HNSW `ef_search` candidate-list size

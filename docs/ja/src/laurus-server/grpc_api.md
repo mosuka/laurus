@@ -125,7 +125,7 @@ message AnalyzerDefinition {
 
 `NONE`（量子化なし）は Issue #481 Stage 1 で廃止されました。proto enum 値 0（`QUANTIZATION_METHOD_NONE`）は wire 互換のため予約されていますが、サーバ側で受信すると `Default::default()`（`SCALAR_8BIT`）にフォールバックします。
 
-**Rerank storage:** オプションの `rerank_storage` フィールド（enum `RerankStorageKind`: `UNSPECIFIED` = サイドカーなし、`F32`）は Stage-2 rerank サイドカー（Issue #481 / #793）を有効化します。HNSW フィールドで `F32` を設定すると、commit 時に完全精度の `.hnsw.f32` サイドカーを追加で書き出し、`rerank_factor` を指定した検索が int8 候補を元のベクトルで再スコアします。フィールドを省略（または `UNSPECIFIED`）すると Stage-1 の int8 のみのランキングになります。#932 以降、サイドカーは 3 つのベクトルインデックスタイプ（HNSW / Flat / IVF）すべてで出力・利用されます（Flat / IVF の再スコアはフィールド指定クエリに適用）。
+**Rerank storage:** オプションの `rerank_storage` フィールド（enum `RerankStorageKind`: `UNSPECIFIED` = サイドカーなし、`F32`）は Stage-2 rerank サイドカー（Issue #481 / #793）を有効化します。HNSW フィールドで `F32` を設定すると、commit 時に完全精度の `.hnsw.f32` サイドカーを追加で書き出し、`rerank_factor` を指定した検索が int8 候補を元のベクトルで再スコアします。フィールドを省略（または `UNSPECIFIED`）すると Stage-1 の int8 のみのランキングになります。#932 以降、サイドカーは 3 つのベクトルインデックスタイプ（HNSW / Flat / IVF）すべてで出力・利用されます。セグメントが単一フィールドしか持たない場合はフィールド指定なしのクエリでも再スコアされます（Issue #1388）。
 
 **共有 PQ codebook:** `HnswOption` のオプションフィールド `pq_codebook_path`（Issue #631）は、`laurus train pq-codebook` CLI コマンドで一度だけ学習するストレージ相対の共有 PQ codebook ファイルを指定します。設定すると segment は commit / merge のたびに k-means を再学習する代わりに、学習済み codebook で encode されます。`PRODUCT_QUANTIZATION` quantizer との組み合わせでのみ意味を持ち、設定済みで未学習の場合、commit は学習コマンドを示すエラーで失敗します（per-segment 学習への無言のフォールバック無し）。未設定なら per-segment 学習のままです。
 
@@ -481,7 +481,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, または `LATE_INTERACTION`。それ以外の値は拒否されます。 |
 | `overfetch` | `float` | フィールドごとの index クエリは、スコアを結合する前に `ceil(limit * overfetch)` 件の候補を取得します。`0`（未指定）は既定値の `2.0`、`(0, 1]` の値は overfetch 無効を意味します。負の値や非有限値は拒否されます。 |
 | `min_score` | `float` | フィールドごとの類似度の下限で、クエリやフィールドの重みを掛ける前の値と比べます。`0`（未指定）は閾値なしです。非有限値は拒否されます。 |
-| `rerank_factor` | `optional uint32` | Stage 2 rerank の widening 係数（Issue #481）。`rerank_storage` を有効にしたフィールドに対してこの値を設定すると、サーバは int8/PQ 候補取得を `top_k * rerank_factor` まで広げ、元の完全精度ベクトルで再スコアしてから上位 `top_k` を返します。#932 以降 3 つのベクトルインデックスタイプ（HNSW・Flat・IVF）すべてで反映されます（Flat/IVF はフィールド指定クエリに適用）。`rerank_storage = "F32"` を設定していないフィールドでは silent に int8 ランキングへフォールバックします — f32 情報を復元することはできません。`0` または省略で rerank 無効。 |
+| `rerank_factor` | `optional uint32` | Stage 2 rerank の widening 係数（Issue #481）。`rerank_storage` を有効にしたフィールドに対してこの値を設定すると、サーバは int8/PQ 候補取得を `top_k * rerank_factor` まで広げ、元の完全精度ベクトルで再スコアしてから上位 `top_k` を返します。#932 以降 3 つのベクトルインデックスタイプ（HNSW・Flat・IVF）すべてで反映されます。セグメントが単一フィールドしか持たない場合はフィールド指定なしのクエリでも適用されます（Issue #1388）。`rerank_storage = "F32"` を設定していないフィールドでは silent に int8 ランキングへフォールバックします — f32 情報を復元することはできません。`0` または省略で rerank 無効。 |
 | `ef_search` | `optional uint32` | HNSW の `ef_search` 候補リストサイズをクエリ単位で上書き（Issue #644）。PQ → SQ → f32 の3段 rerank チェーン（Issue #673）も、この値がゲートとなります。`rerank_storage` を有効にした PQ フィールドで `ef_search` を `top_k * rerank_factor` より広く設定すると、グラフが計算した候補集合全体を安価な int8 段で再ランキングしてから exact 段の狭い予算を切り出すようになります（`rerank_storage` サイドカーから導出、追加設定不要）。`0` は拒否されます。HNSW 以外のフィールドでは無視されます。 |
 
 ### HighlightParams

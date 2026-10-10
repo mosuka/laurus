@@ -191,8 +191,8 @@ message VectorParams {
   // full f32 vectors before returning the final top_k.
   //
   // Honored on HNSW, Flat and IVF fields whose schema enabled
-  // `rerank_storage`; on Flat and IVF fields, only for queries that
-  // name the field. Fields without `rerank_storage` silently fall back
+  // `rerank_storage`, including a field-less query when the segment holds
+  // only one field. Fields without `rerank_storage` silently fall back
   // to the int8 ranking. `0` or omitting the field disables rerank.
   optional uint32 rerank_factor = 5;
 
