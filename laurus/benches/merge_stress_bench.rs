@@ -44,15 +44,22 @@
 //! cargo bench --bench merge_stress_bench -- merge_optimize/20000
 //! ```
 //!
+//! Filter to the bounded-merge budget sweep (Issue #1164):
+//!
+//! ```sh
+//! cargo bench --bench merge_stress_bench -- merge_bounded
+//! ```
+//!
 //! Compile-only smoke check (skips the runtime, used by CI):
 //!
 //! ```sh
 //! cargo bench --bench merge_stress_bench --no-run
 //! ```
 //!
-//! Peak-memory reports print to stdout once per size, before the timed
-//! Criterion loop starts for that size — look for `peak bytes for N=...`
-//! lines in the `cargo bench` output.
+//! Peak-memory reports print to stdout once per size (and, for
+//! `merge_bounded`, once per size/budget pair), before the timed Criterion
+//! loop starts for that case — look for `peak bytes for N=...` lines in the
+//! `cargo bench` output.
 
 mod common;
 
@@ -175,5 +182,47 @@ fn bench_merge_optimize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_merge_optimize);
+/// `(label, budget_bytes)` sweep for the bounded-merge peak-memory
+/// comparison (Issue #1164). `usize::MAX` reproduces `bench_merge_optimize`
+/// exactly (always one output segment); the smaller budgets are chosen to
+/// force a rollover into multiple output segments at this bench's sizes, so
+/// the `peak bytes for ...` lines printed for each show the directional
+/// before/after signal this file's doc comment promises for #1164.
+const BUDGETS: &[(&str, usize)] = &[
+    ("8mib", 8 * 1024 * 1024),
+    ("32mib", 32 * 1024 * 1024),
+    ("unbounded", usize::MAX),
+];
+
+fn bench_merge_bounded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("merge_bounded");
+    group.sample_size(SAMPLE_SIZE_SLOW);
+
+    for &n in SIZES {
+        for &(label, budget) in BUDGETS {
+            let (_, store) = build_multi_segment_store(n);
+            let (result, peak_bytes) = measure_peak_bytes(|| store.optimize_within_budget(budget));
+            result.unwrap();
+            println!("peak bytes for N={n}, budget={label}: {peak_bytes}");
+
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(
+                BenchmarkId::new(label, n),
+                &(n, budget),
+                |b, &(n, budget)| {
+                    b.iter_batched(
+                        || build_multi_segment_store(n),
+                        |(_, store)| {
+                            store.optimize_within_budget(budget).unwrap();
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_merge_optimize, bench_merge_bounded);
 criterion_main!(benches);

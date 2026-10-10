@@ -566,16 +566,25 @@ impl InvertedIndex {
     /// ([`Self::load_segments`]) sees only the merged result. A no-op when
     /// fewer than two segments exist.
     fn force_merge_all(&self) -> Result<()> {
+        self.force_merge_all_within_budget(usize::MAX)
+    }
+
+    /// Like [`Self::force_merge_all`], but caps a single output segment's
+    /// buffered memory during the merge at `budget` bytes (Issue #1164).
+    ///
+    /// `usize::MAX` reproduces [`Self::force_merge_all`] exactly (always one
+    /// output segment); a smaller budget may split the result into several
+    /// output segments instead of the usual one, trading a single-segment
+    /// index for a bounded peak merge memory. See
+    /// [`MergeConfig::max_merge_buffer_memory`](self::segment::merge_engine::MergeConfig::max_merge_buffer_memory)
+    /// for exactly what this does and does not bound.
+    fn force_merge_all_within_budget(&self, budget: usize) -> Result<()> {
         let segments = self.load_segments()?;
         if segments.len() < 2 {
             // Zero or one segment: nothing to compact.
             return Ok(());
         }
-        // The merged segment must sort as the newest, so its generation is
-        // one past the highest on storage — including segments flushed but
-        // not yet published, which a merge must not collide with (#1017).
-        let next_generation = self.next_generation()?;
-        self.merge_segment_set(&segments, next_generation)
+        self.merge_segment_set_bounded(&segments, budget)
     }
 
     /// Auto-merge implementation behind the [`LexicalIndex::maybe_merge`] hook
@@ -607,8 +616,13 @@ impl InvertedIndex {
         let take = (self.config.merge_factor as usize).clamp(2, segments.len());
         let subset: Vec<SegmentInfo> = by_size.into_iter().take(take).map(|(s, _)| s).collect();
 
-        let next_generation = self.next_generation()?;
-        self.merge_segment_set(&subset, next_generation)
+        // Issue #1164: auto-merge is not budget-aware -- it always targets
+        // exactly one output segment. A budget-aware auto-merge would need
+        // to account for the follow-up risk noted on that issue (a bounded
+        // `optimize()` leaving more segments than `max_segments` would let
+        // the very next commit's auto-merge start an unbounded merge
+        // anyway), which is left for a future issue.
+        self.merge_segment_set_bounded(&subset, usize::MAX)
     }
 
     /// Reserve the generation for a newly merged segment (#1024).
@@ -663,7 +677,24 @@ impl InvertedIndex {
         out
     }
 
-    fn merge_segment_set(&self, sources: &[SegmentInfo], next_generation: u64) -> Result<()> {
+    /// Merge a set of source segments, producing one or more new segments
+    /// (Issue #1164: more than one only when `budget` is reached before
+    /// every source has been replayed; `usize::MAX` always produces one,
+    /// the pre-#1164 behavior).
+    ///
+    /// Shared by [`Self::force_merge_all_within_budget`] (all segments) and
+    /// [`Self::maybe_merge`] (a policy-selected subset, always called with
+    /// `usize::MAX`). Runs the (correct, typed)
+    /// [`MergeEngine`](self::segment::merge_engine::MergeEngine), reserving one
+    /// fresh generation per source up front -- output count is structurally
+    /// `<= sources.len()`, so this always reserves enough (an unused
+    /// reservation is a harmless gap, see [`Self::next_generation`]'s doc
+    /// comment) -- and deletes the source segments (their `.meta` first, so
+    /// they drop out of `.meta` file-scan discovery before their
+    /// now-orphaned data files are removed — minimizing any window in which
+    /// a document could be seen in both a source and a merged output). A
+    /// no-op for fewer than two sources.
+    fn merge_segment_set_bounded(&self, sources: &[SegmentInfo], budget: usize) -> Result<()> {
         use self::segment::merge_engine::{MergeConfig, MergeEngine};
         use self::segment::{ManagedSegmentInfo, MergeCandidate, MergeStrategy};
 
@@ -686,31 +717,51 @@ impl InvertedIndex {
             strategy: MergeStrategy::SizeBased,
         };
 
+        // The merged output must sort as the newest, so each reserved
+        // generation is one past the highest on storage — including
+        // segments flushed but not yet published, which a merge must not
+        // collide with (#1017).
+        let mut new_segment_ids = Vec::with_capacity(sources.len());
+        for _ in sources {
+            let generation = self.next_generation()?;
+            new_segment_ids.push(format!("merged_{generation}"));
+        }
+
         let engine = MergeEngine::new(
             MergeConfig {
                 use_compound: self.config.use_compound,
                 field_doc_values: self.current_field_doc_values(),
                 default_doc_values: self.config.store_doc_values,
                 index_analyzer: Some(self.config.analyzer.clone()),
+                max_merge_buffer_memory: budget,
                 ..MergeConfig::default()
             },
             self.storage.clone(),
         );
-        let result = engine.merge_segments(&candidate, &managed, next_generation)?;
+        let results = engine.merge_segments(&candidate, &managed, &new_segment_ids)?;
 
-        // Publish the merge transition as ONE manifest write (#1021): drop
-        // the sources and insert the merged segment with its final
-        // generation, applied as a delta to the LIVE list — never a
-        // snapshot replacement, which would lose a mutation that landed
-        // since this merge computed its sources. Everything after this is
-        // advisory (`.meta`) or physical cleanup, and every crash window
-        // below resolves in the manifest's favor.
-        let mut merged_info = result.new_segment.segment_info.clone();
-        merged_info.generation = next_generation;
+        // Publish the merge transition as ONE manifest write (#1021/#1164):
+        // drop the sources and insert every output segment with its final
+        // generation (recovered from its id, same as `Self::rebuild_field`),
+        // applied as a delta to the LIVE list — never a snapshot
+        // replacement, which would lose a mutation that landed since this
+        // merge computed its sources. Everything after this is advisory
+        // (`.meta`) or physical cleanup, and every crash window below
+        // resolves in the manifest's favor.
+        let mut new_infos: Vec<SegmentInfo> = Vec::with_capacity(results.len());
+        for result in &results {
+            let mut info = result.new_segment.segment_info.clone();
+            if let Some(generation) = segment_manifest::stem_ordinal(&info.segment_id) {
+                info.generation = generation;
+            }
+            new_infos.push(info);
+        }
         let source_ids: Vec<String> = sources.iter().map(|s| s.segment_id.clone()).collect();
         segment_manifest::publish_with(self.storage.as_ref(), &self.segment_manifest, |list| {
             list.retain(|entry| !source_ids.contains(&entry.segment_id));
-            segment_manifest::upsert_entry(list, merged_info);
+            for info in new_infos {
+                segment_manifest::upsert_entry(list, info);
+            }
         })?;
 
         // Physical cleanup only (#1024): the manifest write above already
@@ -912,6 +963,13 @@ impl LexicalIndex for InvertedIndex {
     fn optimize(&self) -> Result<()> {
         self.check_closed()?;
         self.force_merge_all()?;
+        self.update_metadata()?;
+        Ok(())
+    }
+
+    fn optimize_within_budget(&self, max_merge_buffer_memory: usize) -> Result<()> {
+        self.check_closed()?;
+        self.force_merge_all_within_budget(max_merge_buffer_memory)?;
         self.update_metadata()?;
         Ok(())
     }

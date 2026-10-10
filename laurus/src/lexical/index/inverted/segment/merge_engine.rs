@@ -70,6 +70,22 @@ pub struct MergeConfig {
     /// field's* new analyzer that `rebuild_field_across_segments` takes as a
     /// parameter.
     pub index_analyzer: Option<Arc<dyn Analyzer>>,
+
+    /// Soft budget (bytes) for a single output segment's buffered memory
+    /// during [`MergeEngine::perform_merge`] (Issue #1164).
+    ///
+    /// Checked only at source-segment boundaries, after each source has
+    /// been fully replayed: when the writer's estimated buffered memory
+    /// (`InvertedIndexWriter::buffered_memory_usage`) reaches this budget
+    /// and sources remain, the current bucket is flushed and a fresh writer
+    /// takes over for the rest. This bounds the writer's own buffer only --
+    /// it does not bound `DocValuesWriter`'s accumulation, BKD write
+    /// spikes, or the per-source-segment `replay_segment_into_writer` Pass 1
+    /// / stored-document-cache floor, so it is a best-effort reduction in
+    /// peak memory, not a hard ceiling. `usize::MAX` (the default) always
+    /// produces exactly one output segment, matching every merge path's
+    /// behavior before this field existed.
+    pub max_merge_buffer_memory: usize,
 }
 
 impl Default for MergeConfig {
@@ -80,6 +96,7 @@ impl Default for MergeConfig {
             field_doc_values: HashMap::new(),
             default_doc_values: true,
             index_analyzer: None,
+            max_merge_buffer_memory: usize::MAX,
         }
     }
 }
@@ -158,13 +175,19 @@ impl MergeEngine {
         MergeEngine { config, storage }
     }
 
-    /// Merge segments according to the merge candidate.
+    /// Merge segments according to the merge candidate into one or more
+    /// output segments (Issue #1164: more than one only when
+    /// [`MergeConfig::max_merge_buffer_memory`] is reached before every
+    /// source has been replayed). `new_segment_ids` must hold at least
+    /// `segments.len()` entries reserved by the caller (mirrors
+    /// [`Self::rebuild_field_across_segments`]'s reservation pattern); not
+    /// every id is necessarily consumed.
     pub fn merge_segments(
         &self,
         candidate: &MergeCandidate,
         segments: &[ManagedSegmentInfo],
-        next_generation: u64,
-    ) -> Result<MergeResult> {
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
         let start_millis = crate::util::time::now_millis();
 
         // Filter segments to merge
@@ -177,89 +200,92 @@ impl MergeEngine {
             return Err(LaurusError::index("No segments found to merge"));
         }
 
-        // Create new segment ID
-        let new_segment_id = format!("merged_{next_generation}");
-
         // Perform merge based on strategy. `perform_merge` already fills in
         // `segments_merged`, `docs_processed`, `deleted_docs_removed`,
-        // `postings_merged`, `terms_merged`, and `shard_id` on its result's
+        // `postings_merged`, `terms_merged`, and `shard_id` on each result's
         // `stats` -- only the fields below are this function's to compute,
-        // so they're added onto that result instead of overwriting it
+        // so they're added onto every result instead of overwriting them
         // wholesale (that used to discard every field `perform_merge` set).
-        let mut final_result = match candidate.strategy {
-            MergeStrategy::SizeBased => self.merge_by_size(&segments_to_merge, &new_segment_id)?,
+        let mut results = match candidate.strategy {
+            MergeStrategy::SizeBased => self.merge_by_size(&segments_to_merge, new_segment_ids)?,
             MergeStrategy::DeletionBased => {
-                self.merge_by_deletion(&segments_to_merge, &new_segment_id)?
+                self.merge_by_deletion(&segments_to_merge, new_segment_ids)?
             }
-            MergeStrategy::TimeBased => self.merge_by_time(&segments_to_merge, &new_segment_id)?,
-            MergeStrategy::Balanced => self.merge_balanced(&segments_to_merge, &new_segment_id)?,
+            MergeStrategy::TimeBased => self.merge_by_time(&segments_to_merge, new_segment_ids)?,
+            MergeStrategy::Balanced => self.merge_balanced(&segments_to_merge, new_segment_ids)?,
         };
 
         let end_millis = crate::util::time::now_millis();
+        let merge_time_ms = end_millis.saturating_sub(start_millis);
         let size_before: u64 = segments_to_merge.iter().map(|s| s.size_bytes).sum();
-        let size_after = final_result.new_segment.size_bytes;
-        final_result.stats.merge_time_ms = end_millis.saturating_sub(start_millis);
-        final_result.stats.size_before = size_before;
-        final_result.stats.size_after = size_after;
-        final_result.stats.compression_ratio = if size_before > 0 {
+        let size_after: u64 = results.iter().map(|r| r.new_segment.size_bytes).sum();
+        let compression_ratio = if size_before > 0 {
             size_after as f64 / size_before as f64
         } else {
             1.0
         };
+        for result in &mut results {
+            result.stats.merge_time_ms = merge_time_ms;
+            result.stats.size_before = size_before;
+            result.stats.size_after = size_after;
+            result.stats.compression_ratio = compression_ratio;
+        }
 
         // Verify merge if configured
         if self.config.verify_after_merge {
-            self.verify_merged_segment(&final_result.new_segment)?;
+            for result in &results {
+                self.verify_merged_segment(&result.new_segment)?;
+            }
         }
 
-        Ok(final_result)
+        Ok(results)
     }
 
     /// Merge segments prioritizing size efficiency.
     fn merge_by_size(
         &self,
         segments: &[&ManagedSegmentInfo],
-        new_segment_id: &str,
-    ) -> Result<MergeResult> {
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
         // Sort segments by size (smallest first for better merging efficiency)
         let mut sorted_segments = segments.to_vec();
         sorted_segments.sort_by_key(|s| s.size_bytes);
 
-        self.perform_merge(&sorted_segments, new_segment_id)
+        self.perform_merge(&sorted_segments, new_segment_ids)
     }
 
     /// Merge segments prioritizing deletion removal.
     fn merge_by_deletion(
         &self,
         segments: &[&ManagedSegmentInfo],
-        new_segment_id: &str,
-    ) -> Result<MergeResult> {
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
         // Sort by deletion ratio (highest first for better compaction)
         let mut sorted_segments = segments.to_vec();
         sorted_segments.sort_by(|a, b| b.deletion_ratio().total_cmp(&a.deletion_ratio()));
 
-        self.perform_merge(&sorted_segments, new_segment_id)
+        self.perform_merge(&sorted_segments, new_segment_ids)
     }
 
     /// Merge segments prioritizing age.
     fn merge_by_time(
         &self,
         segments: &[&ManagedSegmentInfo],
-        new_segment_id: &str,
-    ) -> Result<MergeResult> {
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
         // Sort by creation time (oldest first)
         let mut sorted_segments = segments.to_vec();
         sorted_segments.sort_by_key(|s| s.created_at);
 
-        self.perform_merge(&sorted_segments, new_segment_id)
+        self.perform_merge(&sorted_segments, new_segment_ids)
     }
 
     /// Balanced merge considering multiple factors.
     fn merge_balanced(
         &self,
         segments: &[&ManagedSegmentInfo],
-        new_segment_id: &str,
-    ) -> Result<MergeResult> {
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
         // Calculate composite score for each segment
         let mut scored_segments: Vec<_> = segments
             .iter()
@@ -278,23 +304,26 @@ impl MergeEngine {
 
         let sorted_segments: Vec<_> = scored_segments.into_iter().map(|(seg, _)| seg).collect();
 
-        self.perform_merge(&sorted_segments, new_segment_id)
+        self.perform_merge(&sorted_segments, new_segment_ids)
     }
 
-    /// Core merge implementation.
+    /// Core merge implementation, producing one or more output segments
+    /// (Issue #1164: more than one only when a source-segment boundary is
+    /// reached with [`MergeConfig::max_merge_buffer_memory`] already met).
+    /// `new_segment_ids` must hold at least `segments.len()` entries,
+    /// pre-reserved by the caller -- output count is structurally
+    /// `<= segments.len()` since rollover only happens between sources, so
+    /// this many ids always suffice. An id left unused is a harmless gap
+    /// (see `InvertedIndex::next_generation`'s doc comment).
     fn perform_merge(
         &self,
         segments: &[&ManagedSegmentInfo],
-        new_segment_id: &str,
-    ) -> Result<MergeResult> {
-        let mut stats = MergeStats {
-            segments_merged: segments.len(),
-            shard_id: segments
-                .first()
-                .map(|s| s.segment_info.shard_id)
-                .unwrap_or(0),
-            ..Default::default()
-        };
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
+        let shard_id = segments
+            .first()
+            .map(|s| s.segment_info.shard_id)
+            .unwrap_or(0);
 
         // Issue #1163: which doc_ids each source segment is authoritative
         // for (last-processed segment wins, matching this function's
@@ -311,10 +340,8 @@ impl MergeEngine {
         // index, so index-only (non-stored) fields are preserved, and
         // original doc_ids are kept: they encode the shard and are
         // referenced by deletion bitmaps / external-id maps) through a
-        // writer so the merged segment is written by the same complete,
-        // typed write path as a normal flush, then flush to the merged
-        // segment's name. Buffers are unbounded so the merge produces
-        // exactly one output segment.
+        // writer so each output segment is written by the same complete,
+        // typed write path as a normal flush.
         //
         // `field_term_positions`/`field_doc_values` start empty (aside from
         // the schema seed) and get pinned lazily, per field, the moment
@@ -322,24 +349,34 @@ impl MergeEngine {
         // because both are resolved per document at upsert time, never
         // cached at construction (see
         // `InvertedIndexWriter::pin_field_term_positions`/
-        // `pin_field_doc_values`).
-        let writer_config = InvertedIndexWriterConfig {
+        // `pin_field_doc_values`). A rollover (Issue #1164) rebuilds the
+        // writer from the retiring one's config, so this pinned state
+        // carries forward into the next output segment instead of being
+        // re-detected from scratch.
+        let base_writer_config = InvertedIndexWriterConfig {
             field_term_positions: HashMap::new(),
             field_doc_values: self.config.field_doc_values.clone(),
             store_doc_values: self.config.default_doc_values,
-            shard_id: stats.shard_id,
+            shard_id,
             max_buffered_docs: usize::MAX,
             max_buffer_memory: usize::MAX,
             use_compound: self.config.use_compound,
             ..Default::default()
         };
         // Deliberately `new`, not `with_shared_metadata` (#1023): this
-        // writer exists only to replay documents into the merged segment.
-        // With no metadata handle, its implicit Drop-commit at the end of
-        // this function cannot touch `metadata.json` — the historical bug
-        // here re-added the whole merged output to `doc_count` on every
-        // merge, compounding on each auto-merging commit.
-        let mut writer = InvertedIndexWriter::new(self.storage.clone(), writer_config)?;
+        // writer exists only to replay documents into merged output
+        // segments. With no metadata handle, its implicit Drop-commit
+        // cannot touch `metadata.json` — the historical bug here re-added
+        // the whole merged output to `doc_count` on every merge,
+        // compounding on each auto-merging commit.
+        let mut writer = InvertedIndexWriter::new(self.storage.clone(), base_writer_config)?;
+
+        let budget = self.config.max_merge_buffer_memory;
+        let mut emitted = RoaringTreemap::new();
+        let mut results: Vec<MergeResult> = Vec::new();
+        let mut next_id = 0usize;
+        let mut bucket_segments_merged = 0usize;
+        let mut bucket_deleted_docs_removed: u64 = 0;
 
         // Reconstruct + replay + flush as one fallible unit. On ANY error
         // the writer is aborted before it can drop: `Drop` would otherwise
@@ -349,14 +386,16 @@ impl MergeEngine {
         // closure's scope is wider than it used to be (Issue #1163):
         // reconstruction errors used to surface before the writer existed;
         // streaming interleaves them with replay, so they need the same
-        // abort coverage.
-        let mut emitted = RoaringTreemap::new();
-        let mut deleted_docs_removed: u64 = 0;
-        let replayed = (|| -> Result<Vec<String>> {
+        // abort coverage. A bucket already flushed to disk before a later
+        // error stays unpublished (the manifest publish happens once, after
+        // this whole function returns) and is reclaimed as an orphan by the
+        // next open's sweep — the same safety `rebuild_field` relies on.
+        let merge_outcome = (|| -> Result<()> {
             for (i, segment) in segments.iter().enumerate() {
                 let reader = self.open_source_segment(&segment.segment_info)?;
                 let deleted = self.load_deleted_docs(&segment.segment_info)?;
-                deleted_docs_removed += deleted.len();
+                bucket_deleted_docs_removed += deleted.len();
+                bucket_segments_merged += 1;
                 let owned = owned_doc_ids.as_ref().map(|o| &o[i]);
                 self.replay_segment_into_writer(
                     &reader,
@@ -365,38 +404,109 @@ impl MergeEngine {
                     &mut emitted,
                     &mut writer,
                 )?;
+
+                // Issue #1164: only roll over between sources, never mid-
+                // replay, and never after the last source (whose bucket is
+                // always the function's final flush below).
+                let is_last_source = i + 1 == segments.len();
+                if !is_last_source && writer.buffered_memory_usage() >= budget {
+                    let new_segment_id = &new_segment_ids[next_id];
+                    next_id += 1;
+                    // Sampled before the flush below resets `inverted_index`
+                    // (and with it `WriterStats::unique_terms`).
+                    let terms_merged = writer.stats().unique_terms;
+                    let (min_doc_id, max_doc_id, doc_count) = writer.buffered_doc_stats();
+                    let file_paths = writer.flush_buffered_to_segment(new_segment_id)?;
+                    results.push(self.build_merge_result(
+                        new_segment_id,
+                        doc_count,
+                        min_doc_id,
+                        max_doc_id,
+                        shard_id,
+                        bucket_segments_merged,
+                        bucket_deleted_docs_removed,
+                        terms_merged,
+                        file_paths,
+                    )?);
+                    bucket_segments_merged = 0;
+                    bucket_deleted_docs_removed = 0;
+                    // Roll over to a fresh writer instead of reusing this
+                    // one: `flush_buffered_to_segment` does not reset
+                    // `doc_values_writer`, so a second flush on the same
+                    // instance would leak this bucket's DocValues into the
+                    // next bucket's `.dv`. Cloning the config carries
+                    // forward the pinned field settings noted above.
+                    writer =
+                        InvertedIndexWriter::new(self.storage.clone(), writer.config().clone())?;
+                }
             }
-            writer.flush_buffered_to_segment(new_segment_id)
+            Ok(())
         })();
-        let file_paths = match replayed {
+        if let Err(e) = merge_outcome {
+            writer.abort();
+            return Err(e);
+        }
+
+        // Final bucket: whatever remains buffered. Always produced when
+        // `results` is still empty, even if nothing is buffered (every
+        // source was fully deleted) — matching every merge path's
+        // pre-#1164 behavior of returning exactly one `MergeResult`
+        // (doc_count 0, no files) in that case.
+        let new_segment_id = &new_segment_ids[next_id];
+        let terms_merged = writer.stats().unique_terms;
+        let (min_doc_id, max_doc_id, doc_count) = writer.buffered_doc_stats();
+        let file_paths = match writer.flush_buffered_to_segment(new_segment_id) {
             Ok(paths) => paths,
             Err(e) => {
                 writer.abort();
                 return Err(e);
             }
         };
+        if doc_count > 0 || results.is_empty() {
+            results.push(self.build_merge_result(
+                new_segment_id,
+                doc_count,
+                min_doc_id,
+                max_doc_id,
+                shard_id,
+                bucket_segments_merged,
+                bucket_deleted_docs_removed,
+                terms_merged,
+                file_paths,
+            )?);
+        }
 
-        stats.deleted_docs_removed = deleted_docs_removed;
-        let doc_count = emitted.len();
-        let min_doc_id = emitted.min().unwrap_or(0);
-        let max_doc_id = emitted.max().unwrap_or(0);
-        stats.docs_processed = doc_count;
-        stats.postings_merged = doc_count;
-        stats.terms_merged = writer.stats().unique_terms;
+        Ok(results)
+    }
 
-        // Create new segment info
+    /// Assemble one bucket's [`MergeResult`] from its flushed file paths and
+    /// per-bucket tallies (Issue #1164). [`Self::merge_segments`] fills in
+    /// the cross-bucket `size_before`/`size_after`/`compression_ratio`/
+    /// `merge_time_ms` stats afterward.
+    #[allow(clippy::too_many_arguments)]
+    fn build_merge_result(
+        &self,
+        segment_id: &str,
+        doc_count: u64,
+        min_doc_id: u64,
+        max_doc_id: u64,
+        shard_id: u16,
+        segments_merged: usize,
+        deleted_docs_removed: u64,
+        terms_merged: u64,
+        file_paths: Vec<String>,
+    ) -> Result<MergeResult> {
         let segment_info = SegmentInfo {
-            segment_id: new_segment_id.to_string(),
+            segment_id: segment_id.to_string(),
             doc_count,
             min_doc_id,
             max_doc_id,
             generation: 0,        // Will be assigned by segment manager
             has_deletions: false, // New merged segment has no deleted docs until updated
             deleted_count: Some(0),
-            shard_id: stats.shard_id,
+            shard_id,
         };
 
-        // Calculate segment size
         let size_bytes = file_paths
             .iter()
             .map(|path| {
@@ -407,14 +517,21 @@ impl MergeEngine {
             })
             .sum();
 
-        // Create managed segment info
         let mut managed_info = ManagedSegmentInfo::new(segment_info);
         managed_info.size_bytes = size_bytes;
         managed_info.file_paths = file_paths.clone();
 
         Ok(MergeResult {
             new_segment: managed_info,
-            stats,
+            stats: MergeStats {
+                segments_merged,
+                deleted_docs_removed,
+                docs_processed: doc_count,
+                postings_merged: doc_count,
+                terms_merged,
+                shard_id,
+                ..Default::default()
+            },
             file_paths,
         })
     }
@@ -1484,8 +1601,11 @@ mod tests {
             .merge_segments(
                 &candidate,
                 &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-                1,
+                &["merged_1".to_string()],
             )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         // All three docs survive the merge (verify_after_merge also checks this).
@@ -1595,8 +1715,11 @@ mod tests {
                 .merge_segments(
                     &candidate,
                     &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-                    1,
+                    &["merged_1".to_string()],
                 )
+                .unwrap()
+                .into_iter()
+                .next()
                 .unwrap();
 
             let reader = InvertedIndexReader::new(
@@ -1626,6 +1749,119 @@ mod tests {
         // Both orderings, so the result cannot depend on field-name sort order.
         run("a_vec", "b_novec");
         run("a_novec", "b_vec");
+    }
+
+    /// Issue #1164: a rollover must carry the pinned `field_term_positions`
+    /// state forward into the next output segment's writer, not just the
+    /// first one. Three single-document source segments, merged with a
+    /// one-byte budget that forces a rollover after every source, so each
+    /// of the three output buckets is built by its own writer -- if the
+    /// rollover dropped the pin, only the FIRST bucket's writer would have
+    /// detected `vec_field`'s positions from its source; buckets 2 and 3
+    /// would re-detect from an empty `field_term_positions` map and could
+    /// disagree.
+    #[test]
+    fn bounded_merge_carries_positions_pinning_into_every_rolled_over_bucket() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+        use crate::lexical::query::Query;
+        use crate::lexical::query::phrase::PhraseQuery;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "vec_field".to_string(),
+            FieldOption::Text(TextOption {
+                term_vectors: true,
+                ..Default::default()
+            }),
+        );
+        let config = InvertedIndexWriterConfig {
+            fields,
+            ..Default::default()
+        };
+
+        let mut writer = InvertedIndexWriter::new(storage.clone(), config).unwrap();
+        let mut doc_ids = Vec::new();
+        for _ in 0..3 {
+            let doc_id = writer
+                .add_document(
+                    Document::builder()
+                        .add_field("vec_field", DataValue::Text("quick brown fox".to_string()))
+                        .build(),
+                )
+                .unwrap();
+            writer.commit().unwrap(); // one segment per document
+            doc_ids.push(doc_id);
+        }
+        drop(writer);
+
+        let managed: Vec<ManagedSegmentInfo> = (0..3)
+            .map(|i| {
+                ManagedSegmentInfo::new(segment_info(
+                    &format!("segment_{i:06}"),
+                    1,
+                    doc_ids[i],
+                    doc_ids[i],
+                    i as u64,
+                ))
+            })
+            .collect();
+        let candidate = MergeCandidate {
+            segments: managed
+                .iter()
+                .map(|m| m.segment_info.segment_id.clone())
+                .collect(),
+            priority: 1.0,
+            estimated_size: 0,
+            strategy: MergeStrategy::SizeBased,
+        };
+        let engine = MergeEngine::new(
+            MergeConfig {
+                max_merge_buffer_memory: 1,
+                ..MergeConfig::default()
+            },
+            storage.clone(),
+        );
+        let results = engine
+            .merge_segments(
+                &candidate,
+                &managed,
+                &[
+                    "merged_1".to_string(),
+                    "merged_2".to_string(),
+                    "merged_3".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            3,
+            "sanity: the one-byte budget must have rolled over after every source"
+        );
+
+        let reader = InvertedIndexReader::new(
+            results
+                .iter()
+                .map(|r| r.new_segment.segment_info.clone())
+                .collect(),
+            storage.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let phrase = PhraseQuery::new("vec_field", vec!["quick".to_string(), "brown".to_string()]);
+        let mut matcher = phrase.matcher(&reader).unwrap();
+        let mut hits = 0;
+        while !matcher.is_exhausted() {
+            hits += 1;
+            matcher.next().unwrap();
+        }
+        assert_eq!(
+            hits, 3,
+            "the term_vectors pin must survive every rollover, so all three \
+             single-document buckets keep their positions"
+        );
     }
 
     /// #1234: a merge must not reset a term's frequency to 1 in a field
@@ -1691,8 +1927,11 @@ mod tests {
             .merge_segments(
                 &candidate,
                 &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-                1,
+                &["merged_1".to_string()],
             )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         let reader = InvertedIndexReader::new(
@@ -1786,8 +2025,11 @@ mod tests {
                 .merge_segments(
                     &candidate,
                     &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-                    1,
+                    &["merged_1".to_string()],
                 )
+                .unwrap()
+                .into_iter()
+                .next()
                 .unwrap();
 
             let merged =
@@ -1860,7 +2102,14 @@ mod tests {
         };
         let engine = MergeEngine::new(config, storage.clone());
         let result = engine
-            .merge_segments(&candidate, &[ManagedSegmentInfo::new(si0)], 1)
+            .merge_segments(
+                &candidate,
+                &[ManagedSegmentInfo::new(si0)],
+                &["merged_1".to_string()],
+            )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         let merged =
@@ -1925,8 +2174,11 @@ mod tests {
             .merge_segments(
                 &candidate,
                 &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-                1,
+                &["merged_1".to_string()],
             )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         let merged =
@@ -2020,8 +2272,11 @@ mod tests {
             .merge_segments(
                 &candidate,
                 &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-                1,
+                &["merged_1".to_string()],
             )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         let merged =
@@ -2245,8 +2500,11 @@ mod tests {
                     ManagedSegmentInfo::new(seg_a),
                     ManagedSegmentInfo::new(seg_b),
                 ],
-                1,
+                &["merged_1".to_string()],
             )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(
@@ -2666,7 +2924,7 @@ mod tests {
         let result = engine.merge_segments(
             &candidate,
             &[ManagedSegmentInfo::new(si0), ManagedSegmentInfo::new(si1)],
-            1,
+            &["merged_1".to_string()],
         );
         assert!(result.is_err(), "the injected read failure must surface");
 
@@ -2732,8 +2990,11 @@ mod tests {
                     ManagedSegmentInfo::new(segment_info("segment_000000", 2, d0, d1, 0)),
                     ManagedSegmentInfo::new(segment_info("segment_000001", 1, d2, d2, 1)),
                 ],
-                1,
+                &["merged_1".to_string()],
             )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
         (storage, engine, result.new_segment)
     }
@@ -2874,9 +3135,12 @@ mod tests {
                     deleted("segment_000000", d0, 0),
                     deleted("segment_000001", d1, 1),
                 ],
-                1,
+                &["merged_1".to_string()],
             )
-            .expect("a merge of fully deleted segments must not fail verification");
+            .expect("a merge of fully deleted segments must not fail verification")
+            .into_iter()
+            .next()
+            .unwrap();
         // Had the deletions not been applied, both documents would have
         // been emitted and the merged segment would claim 2.
         assert_eq!(result.new_segment.segment_info.doc_count, 0);
@@ -2893,6 +3157,76 @@ mod tests {
         assert_eq!(result.stats.docs_processed, 0);
         assert_eq!(result.stats.postings_merged, 0);
         assert_eq!(result.stats.terms_merged, 0);
+    }
+
+    /// Issue #1164: a tiny `max_merge_buffer_memory` budget must not change
+    /// `merge_of_fully_deleted_segments_verifies_as_empty`'s outcome --
+    /// sources that are entirely logical deletions still produce exactly
+    /// one empty `MergeResult`, never zero, regardless of the budget (there
+    /// is nothing buffered to roll over on, so no rollover can fire).
+    #[test]
+    fn bounded_merge_of_fully_deleted_segments_still_produces_one_empty_result() {
+        use crate::maintenance::deletion::{DeletionConfig, DeletionManager};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer =
+            InvertedIndexWriter::new(storage.clone(), InvertedIndexWriterConfig::default())
+                .unwrap();
+        let d0 = writer.add_document(text_int_doc("alpha", 1)).unwrap();
+        writer.commit().unwrap();
+        let d1 = writer.add_document(text_int_doc("bravo", 2)).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let manager = DeletionManager::new(
+            DeletionConfig {
+                enable_deletion_log: false,
+                ..Default::default()
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        for (segment_id, doc_id) in [("segment_000000", d0), ("segment_000001", d1)] {
+            manager
+                .initialize_segment(segment_id, doc_id, doc_id)
+                .unwrap();
+            manager.delete_document(segment_id, doc_id, "test").unwrap();
+        }
+        manager.flush().unwrap();
+
+        let deleted = |id: &str, doc_id: u64, generation: u64| {
+            ManagedSegmentInfo::new(SegmentInfo {
+                has_deletions: true,
+                deleted_count: None,
+                ..segment_info(id, 1, doc_id, doc_id, generation)
+            })
+        };
+        let engine = MergeEngine::new(
+            MergeConfig {
+                max_merge_buffer_memory: 1,
+                ..MergeConfig::default()
+            },
+            storage.clone(),
+        );
+        let results = engine
+            .merge_segments(
+                &two_segment_candidate(),
+                &[
+                    deleted("segment_000000", d0, 0),
+                    deleted("segment_000001", d1, 1),
+                ],
+                &["merged_1".to_string(), "merged_2".to_string()],
+            )
+            .expect("a bounded merge of fully deleted segments must not fail verification");
+
+        assert_eq!(
+            results.len(),
+            1,
+            "a tiny budget must not fabricate extra output segments when \
+             nothing was ever buffered to roll over"
+        );
+        assert_eq!(results[0].new_segment.segment_info.doc_count, 0);
     }
 
     /// Issue #1202: the stats a merge reports for the documents it actually
@@ -2933,7 +3267,14 @@ mod tests {
 
         let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
         let result = engine
-            .merge_segments(&two_segment_candidate(), &[seg0, seg1], 1)
+            .merge_segments(
+                &two_segment_candidate(),
+                &[seg0, seg1],
+                &["merged_1".to_string()],
+            )
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(result.stats.segments_merged, 2);
@@ -3009,7 +3350,11 @@ mod tests {
         ];
         let engine = MergeEngine::new(MergeConfig::default(), storage.clone());
         let err = engine
-            .merge_segments(&two_segment_candidate(), &sources, 1)
+            .merge_segments(
+                &two_segment_candidate(),
+                &sources,
+                &["merged_1".to_string()],
+            )
             .expect_err("a merge must not read an unreadable deletion bitmap as empty");
         assert!(
             err.to_string()

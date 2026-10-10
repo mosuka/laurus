@@ -357,6 +357,19 @@ impl LexicalStore {
     /// engine.optimize().unwrap();
     /// ```
     pub fn optimize(&self) -> Result<()> {
+        self.optimize_within_budget(usize::MAX)
+    }
+
+    /// Like [`Self::optimize`], but caps a single output segment's buffered
+    /// memory during the merge at `max_merge_buffer_memory` bytes (Issue
+    /// #1164). `usize::MAX` reproduces [`Self::optimize`] exactly (always
+    /// one output segment); a smaller budget may split the result into
+    /// several output segments instead, trading `optimize()`'s usual
+    /// single-segment result for a bound on peak merge memory. See
+    /// [`MergeConfig::max_merge_buffer_memory`](crate::lexical::index::inverted::segment::merge_engine::MergeConfig::max_merge_buffer_memory)
+    /// for exactly what this does and does not bound -- it is a best-effort
+    /// reduction in peak memory, not a hard ceiling.
+    pub fn optimize_within_budget(&self, max_merge_buffer_memory: usize) -> Result<()> {
         // Hold the writer-cache lock across the force-merge (Issue #864):
         // without it a concurrent upsert can run against the live writer's
         // stale segment cache while the merge deletes those segments, marking
@@ -384,7 +397,7 @@ impl LexicalStore {
         if let Some(writer) = writer_guard.as_mut() {
             writer.commit()?;
         }
-        let merge_result = self.index.optimize();
+        let merge_result = self.index.optimize_within_budget(max_merge_buffer_memory);
         // The force-merge replaces committed segments (and their deletion
         // bitmaps) behind any live writer — rebuild its cached segment view
         // even when the merge errored partway, since segments may already
