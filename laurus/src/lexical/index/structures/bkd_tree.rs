@@ -373,7 +373,6 @@ fn checked_point_count_u32(len: usize) -> Result<u32> {
         ))
     })
 }
-
 /// Sortable-space anchor and bit width for one dimension's delta-from-min
 /// packing, derived from that dimension's `leaf_min`/`leaf_max`.
 ///
@@ -519,6 +518,39 @@ impl<W: StorageOutput> BKDWriter<W> {
     /// `Ok(())` on success, otherwise a `LaurusError::index` describing the
     /// dimensional mismatch, the NaN position, or an underlying I/O error.
     pub fn write(&mut self, points: &[f64], doc_ids: &[u64]) -> Result<()> {
+        let point_count = self.check_buffers(points, doc_ids)?;
+        self.write_permuted(points, doc_ids, (0..point_count).collect())
+    }
+
+    /// Like [`Self::write`], but writes only the points at the positions
+    /// `keep` accepts, and feeds them to the builder in doc-id order,
+    /// keeping buffer order among points with the same doc id (Issue
+    /// #1165).
+    ///
+    /// The tree, and every byte written, is exactly what [`Self::write`]
+    /// produces for a copy of the kept points stably sorted by doc id: the
+    /// builder reads points only through its index permutation and never
+    /// compares the indices themselves, so starting it from a filtered,
+    /// sorted permutation is the same as starting it from filtered, sorted
+    /// buffers. Points left out are never read, so their coordinates and
+    /// doc ids may be anything, NaN included. This lets a caller whose
+    /// buffers hold points in arrival order, some of them stale, skip that
+    /// copy.
+    pub(crate) fn write_sorted_by_doc_id(
+        &mut self,
+        points: &[f64],
+        doc_ids: &[u64],
+        keep: impl Fn(usize) -> bool,
+    ) -> Result<()> {
+        let point_count = self.check_buffers(points, doc_ids)?;
+        let mut order: Vec<u32> = (0..point_count).filter(|&i| keep(i as usize)).collect();
+        order.sort_by_key(|&i| doc_ids[i as usize]);
+        self.write_permuted(points, doc_ids, order)
+    }
+
+    /// Check that `points` holds `num_dims` coordinates per doc id, and that
+    /// the point count fits the `u32` index permutation, before any I/O.
+    fn check_buffers(&self, points: &[f64], doc_ids: &[u64]) -> Result<u32> {
         let num_dims = self.num_dims as usize;
         let expected = doc_ids.len().checked_mul(num_dims).ok_or_else(|| {
             crate::error::LaurusError::index(
@@ -535,11 +567,22 @@ impl<W: StorageOutput> BKDWriter<W> {
             )));
         }
 
-        // The index permutation built below is `Vec<u32>`; reject inputs that
-        // wouldn't fit before any I/O happens rather than silently truncating.
-        let point_count = checked_point_count_u32(doc_ids.len())?;
+        // The index permutation is `Vec<u32>`; reject inputs that wouldn't
+        // fit rather than silently truncating.
+        checked_point_count_u32(doc_ids.len())
+    }
 
-        if doc_ids.is_empty() {
+    /// Build and write the tree from `indices`, a permutation of the points
+    /// in the order they are to be fed to the builder.
+    fn write_permuted(
+        &mut self,
+        points: &[f64],
+        doc_ids: &[u64],
+        mut indices: Vec<u32>,
+    ) -> Result<()> {
+        let num_dims = self.num_dims as usize;
+
+        if indices.is_empty() {
             // An empty tree is its header alone.
             self.writer
                 .reserve_header(Self::header_size(self.num_dims))?;
@@ -548,23 +591,25 @@ impl<W: StorageOutput> BKDWriter<W> {
 
         // Reject any NaN coordinate up-front. NaN's `partial_cmp` is `None`,
         // so silently allowing it would corrupt sort order and AABB
-        // containment in subtle, query-dependent ways.
-        for (offset, &v) in points.iter().enumerate() {
-            if v.is_nan() {
-                let doc_idx = offset / num_dims;
-                let dim = offset % num_dims;
-                return Err(crate::error::LaurusError::index(format!(
-                    "Point at doc index {doc_idx} dim {dim} is NaN; BKD requires \
-                     totally-ordered values (NaN has no defined ordering)"
-                )));
+        // containment in subtle, query-dependent ways. Positions are
+        // reported in permutation order, which is buffer order for `write`.
+        for (doc_idx, &i) in indices.iter().enumerate() {
+            let base = i as usize * num_dims;
+            for dim in 0..num_dims {
+                if points[base + dim].is_nan() {
+                    return Err(crate::error::LaurusError::index(format!(
+                        "Point at doc index {doc_idx} dim {dim} is NaN; BKD requires \
+                         totally-ordered values (NaN has no defined ordering)"
+                    )));
+                }
             }
         }
 
         // Calculate global min/max. Uses total-order comparison (not `f64::min`/
         // `f64::max`, which treat -0.0 and +0.0 as interchangeable) for the same
         // reason `compute_aabb` does — see `total_min`/`total_max`.
-        for i in 0..doc_ids.len() {
-            let base = i * num_dims;
+        for &i in &indices {
+            let base = i as usize * num_dims;
             for d in 0..num_dims {
                 let v = points[base + d];
                 self.min_values[d] = total_min(self.min_values[d], v);
@@ -572,7 +617,7 @@ impl<W: StorageOutput> BKDWriter<W> {
             }
         }
 
-        let total_count = doc_ids.len() as u64;
+        let total_count = indices.len() as u64;
 
         // The header records where the leaves and the index ended up, so it
         // is reserved now and written once they are.
@@ -581,7 +626,6 @@ impl<W: StorageOutput> BKDWriter<W> {
 
         // Sort an index permutation instead of the data: this keeps the
         // point/doc_id buffers immutable and avoids per-point allocations.
-        let mut indices: Vec<u32> = (0..point_count).collect();
         let ctx = BuildContext {
             points,
             doc_ids,
@@ -796,12 +840,12 @@ impl<W: StorageOutput> BKDWriter<W> {
         //
         // This MUST be a stable sort, not `sort_unstable_by_key`: when the
         // same doc_id contributes more than one point to this leaf (a
-        // multi-valued field), `GeoBoxPointsVisitor::into_candidates`
-        // (`lexical/query/geo.rs`) dedups by "first one seen in leaf
-        // traversal order wins". A stable sort preserves each doc's
-        // duplicate points in their original (split-dimension-sorted)
-        // relative order, so which point wins is unchanged by this
-        // revision; an unstable sort could silently change it.
+        // multi-valued field), a stable sort keeps those points in their
+        // incoming (split-dimension-sorted) relative order. That makes a
+        // leaf's bytes a function of the input sequence alone, and it fixes
+        // which of a document's equidistant points a geo distance query
+        // reports: `find_matches` (`lexical/query/geo.rs`) keeps the first
+        // of them in traversal order after its stable sort by distance.
         //
         // The point-packing loop below iterates `indices` after this sort,
         // so it inherits doc_id order automatically -- nothing else reads
@@ -2741,5 +2785,117 @@ mod tests {
         let err = checked_point_count_u32(u32::MAX as usize + 1).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("exceeds u32::MAX"), "unexpected error: {msg}");
+    }
+
+    /// `points`/`doc_ids` stably sorted by doc id: the copy
+    /// `write_sorted_by_doc_id` must behave as if it were given.
+    fn sorted_copy(
+        points: &[f64],
+        doc_ids: &[u64],
+        dims: usize,
+        keep: impl Fn(usize) -> bool,
+    ) -> (Vec<f64>, Vec<u64>) {
+        let mut order: Vec<usize> = (0..doc_ids.len()).filter(|&i| keep(i)).collect();
+        order.sort_by_key(|&i| doc_ids[i]);
+        let points = order
+            .iter()
+            .flat_map(|&i| points[i * dims..(i + 1) * dims].iter().copied())
+            .collect();
+        let doc_ids = order.iter().map(|&i| doc_ids[i]).collect();
+        (points, doc_ids)
+    }
+
+    fn file_bytes(storage: &MemoryStorage, name: &str) -> Vec<u8> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        storage
+            .open_input(name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// Issue #1165: feeding arrival-order buffers through
+    /// `write_sorted_by_doc_id` writes the same bytes as `write` on a copy
+    /// of the kept points stably sorted by doc id. Many equal coordinates
+    /// and repeated doc ids make the stable-sort ties decide the layout, a
+    /// 4-point block size splits the tree into many leaves, and the points
+    /// left out carry NaN and extreme doc ids that must never be read. (At
+    /// 1000 points an unstable doc-id sort reorders a document's own points
+    /// enough to show; at a few hundred it may not.)
+    #[test]
+    fn write_sorted_by_doc_id_matches_write_on_a_sorted_copy() {
+        let mut state = 1165u64;
+        let mut below = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        for dims in 1..=3usize {
+            let n = 1000;
+            let keep = |i: usize| i % 5 != 2;
+            let doc_ids: Vec<u64> = (0..n)
+                .map(|i| if keep(i) { below(40) } else { u64::MAX })
+                .collect();
+            let points: Vec<f64> = (0..n * dims)
+                .map(|v| {
+                    if keep(v / dims) {
+                        below(6) as f64
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            let (sorted_points, sorted_doc_ids) = sorted_copy(&points, &doc_ids, dims, keep);
+
+            let storage = MemoryStorage::new(MemoryStorageConfig::default());
+            let mut copy = BKDWriter::new(storage.create_output("copy.bkd").unwrap(), dims as u32)
+                .with_block_size(4);
+            copy.write(&sorted_points, &sorted_doc_ids).unwrap();
+            copy.finish().unwrap();
+            let mut direct =
+                BKDWriter::new(storage.create_output("direct.bkd").unwrap(), dims as u32)
+                    .with_block_size(4);
+            direct
+                .write_sorted_by_doc_id(&points, &doc_ids, keep)
+                .unwrap();
+            direct.finish().unwrap();
+
+            let (direct, copy) = (
+                file_bytes(&storage, "direct.bkd"),
+                file_bytes(&storage, "copy.bkd"),
+            );
+            assert!(
+                direct == copy,
+                "{dims}D: {} vs {} bytes, first difference at byte {:?}",
+                direct.len(),
+                copy.len(),
+                direct.iter().zip(&copy).position(|(a, b)| a != b)
+            );
+        }
+    }
+
+    /// A NaN is reported at its position in doc-id order, the position
+    /// `write` reports for the sorted copy.
+    #[test]
+    fn write_sorted_by_doc_id_reports_nan_at_its_sorted_position() {
+        let points = [1.0, f64::NAN, 2.0];
+        let doc_ids = [5, 1, 3];
+        let (sorted_points, sorted_doc_ids) = sorted_copy(&points, &doc_ids, 1, |_| true);
+
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let direct = BKDWriter::new(storage.create_output("direct.bkd").unwrap(), 1)
+            .write_sorted_by_doc_id(&points, &doc_ids, |_| true)
+            .unwrap_err()
+            .to_string();
+        let copy = BKDWriter::new(storage.create_output("copy.bkd").unwrap(), 1)
+            .write(&sorted_points, &sorted_doc_ids)
+            .unwrap_err()
+            .to_string();
+
+        assert!(direct.contains("doc index 0 dim 0"), "{direct}");
+        assert_eq!(direct, copy);
     }
 }
