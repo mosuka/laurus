@@ -1429,15 +1429,16 @@ impl InvertedIndexWriter {
 
     /// Estimate current memory usage.
     ///
-    /// The buffered-document half is a running total maintained by
-    /// [`Self::track_buffered`] and the removal path, not a walk of
-    /// `buffered_docs`: this runs from [`Self::should_flush`] on every
-    /// document, so recomputing it would make ingestion quadratic.
+    /// Both halves are running totals, not walks of the buffer or the
+    /// index: this runs from [`Self::should_flush`] on every document, so
+    /// recomputing either would make ingestion quadratic. The
+    /// buffered-document half is maintained by [`Self::track_buffered`] and
+    /// the removal path. The posting index counts its own heap (Issue
+    /// #1168): postings grow with every term occurrence, not with the
+    /// vocabulary, so a per-distinct-term constant undercounts long text by
+    /// a wide margin.
     fn estimate_memory_usage(&self) -> usize {
-        // 256 bytes per distinct term covers the in-memory posting index,
-        // whose size tracks the vocabulary rather than the document count.
-        let index_memory = self.inverted_index.term_count() as usize * 256;
-        self.buffered_bytes + index_memory
+        self.buffered_bytes + self.inverted_index.heap_bytes()
     }
 
     /// Public wrapper over [`Self::estimate_memory_usage`] for callers
