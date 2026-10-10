@@ -8,6 +8,9 @@
 //! The writer's flush thresholds (`max_buffered_docs` / `max_buffer_memory`,
 //! Issue #1200) decide how many segments one commit publishes, so they are
 //! pinned here too, together with the guarantee that a merge ignores them.
+//!
+//! `max_merged_segment_bytes` (Issue #1394) limits which segments one
+//! auto-merge takes; its cap and convergence are pinned here as well.
 
 use std::sync::Arc;
 
@@ -48,6 +51,49 @@ fn segment_count(storage: &Arc<dyn Storage>) -> usize {
         }
     };
     payload["segments"].as_array().unwrap().len()
+}
+
+fn segment_ids(storage: &Arc<dyn Storage>) -> Vec<String> {
+    let mut input = storage.open_input("segments.json").unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut input, &mut bytes).unwrap();
+    let payload: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            let mut len: u64 = 0;
+            let mut shift = 0;
+            let mut cursor = 0usize;
+            loop {
+                let byte = bytes[cursor];
+                cursor += 1;
+                len |= u64::from(byte & 0x7F) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            serde_json::from_slice(&bytes[cursor..cursor + len as usize]).unwrap()
+        }
+    };
+    payload["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["segment_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Sum the on-disk size of every file belonging to `segment_id`, mirroring
+/// `InvertedIndex::segment_size_bytes` (Issue #1394).
+fn segment_size_bytes(storage: &Arc<dyn Storage>, segment_id: &str) -> u64 {
+    let prefix = format!("{segment_id}.");
+    storage
+        .list_files()
+        .unwrap()
+        .iter()
+        .filter(|f| f.starts_with(&prefix))
+        .map(|f| storage.metadata(f).unwrap().size)
+        .sum()
 }
 
 fn hits(store: &LexicalStore, field: &str, term: &str) -> usize {
@@ -237,4 +283,157 @@ fn auto_merge_of_field_less_segments_does_not_fail_the_commit() {
 
     assert_eq!(segment_count(&storage), 1, "the second commit merged");
     assert_eq!(store.stats().unwrap().doc_count, 60);
+}
+
+/// A one-document segment's on-disk size, used to scale
+/// `max_merged_segment_bytes` to a cap independent of the on-disk encoding.
+fn one_doc_segment_bytes() -> u64 {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder().max_segments(1000).build();
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+    store.upsert_document(1, doc("alpha")).unwrap();
+    store.commit().unwrap();
+    let id = segment_ids(&storage).into_iter().next().unwrap();
+    segment_size_bytes(&storage, &id)
+}
+
+const DOCS_PER_BATCH: u64 = 20;
+
+/// A document whose 20 body terms are unique to `(batch, i)`, so a segment's
+/// on-disk size grows with its document count. (A one-document segment of
+/// [`doc`] is mostly fixed per-segment overhead: ten of them merged are still
+/// under three times its size.)
+fn batch_doc(batch: u64, i: u64) -> Document {
+    let body: Vec<String> = (0..20).map(|w| format!("b{batch}d{i}w{w}")).collect();
+    Document::builder().add_text("body", body.join(" ")).build()
+}
+
+/// Upsert batch `batch` of [`DOCS_PER_BATCH`] documents and commit it as one
+/// segment.
+fn commit_batch(store: &LexicalStore, batch: u64) {
+    for i in 0..DOCS_PER_BATCH {
+        let id = batch * DOCS_PER_BATCH + i + 1;
+        store.upsert_document(id, batch_doc(batch, i)).unwrap();
+    }
+    store.commit().unwrap();
+}
+
+/// The on-disk size of the largest committed segment.
+fn largest_segment_bytes(storage: &Arc<dyn Storage>) -> u64 {
+    segment_ids(storage)
+        .iter()
+        .map(|id| segment_size_bytes(storage, id))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Commit `batches` batches into a store whose auto-merge fires on every
+/// commit with no `merge_factor` limit, and return the store together with
+/// the largest segment seen after any commit.
+fn largest_segment_over_batches(batches: u64, cap: u64) -> (LexicalStore, u64) {
+    let config = LexicalIndexConfig::builder()
+        .max_segments(1)
+        .merge_factor(100)
+        .max_merged_segment_bytes(cap)
+        .build();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+    let mut largest = 0;
+    for batch in 0..batches {
+        commit_batch(&store, batch);
+        largest = largest.max(largest_segment_bytes(&storage));
+    }
+    (store, largest)
+}
+
+/// Issue #1394: `max_merged_segment_bytes` bounds the combined on-disk size
+/// auto-merge will take, even though `merge_factor` is high enough to pull in
+/// every segment every time.
+#[test]
+fn auto_merge_never_exceeds_the_merged_segment_cap() {
+    const BATCHES: u64 = 8;
+
+    let probe_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let probe_config = LexicalIndexConfig::builder().max_segments(1000).build();
+    let probe = LexicalStore::new(probe_storage.clone(), probe_config).unwrap();
+    commit_batch(&probe, 0);
+    // Room for two batches merged together, but not three.
+    let cap = largest_segment_bytes(&probe_storage) * 5 / 2;
+
+    let (_, uncapped_largest) = largest_segment_over_batches(BATCHES, u64::MAX);
+    assert!(
+        uncapped_largest > cap,
+        "sanity: without a cap, auto-merge must grow a segment past {cap} bytes \
+         (largest was {uncapped_largest}) for this test to mean anything"
+    );
+
+    let (store, capped_largest) = largest_segment_over_batches(BATCHES, cap);
+    assert!(
+        capped_largest <= cap,
+        "a segment reached {capped_largest} bytes, over the cap of {cap}"
+    );
+    assert_eq!(store.stats().unwrap().doc_count, BATCHES * DOCS_PER_BATCH);
+    assert_eq!(hits(&store, "body", "b5d3w7"), 1);
+}
+
+/// Issue #1394: a segment at or over the cap is left out of every future
+/// auto-merge -- it is never rewritten, and the smaller segments around it
+/// keep converging on their own instead of looping on the same selection.
+#[test]
+fn auto_merge_leaves_segments_at_the_cap_alone() {
+    let cap = one_doc_segment_bytes() * 5;
+    let config = LexicalIndexConfig::builder()
+        .max_segments(1)
+        .merge_factor(100)
+        .max_merged_segment_bytes(cap)
+        .build();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+
+    // One commit of many documents makes one oversized segment (no flush
+    // threshold is crossed mid-commit, so it never splits), comfortably over
+    // the cap above.
+    for id in 1..=30u64 {
+        store
+            .upsert_document(id, doc(&format!("big-{id}")))
+            .unwrap();
+    }
+    store.commit().unwrap();
+    let big_ids = segment_ids(&storage);
+    assert_eq!(big_ids.len(), 1, "one commit => one segment");
+    let big_id = big_ids.into_iter().next().unwrap();
+    let big_size = segment_size_bytes(&storage, &big_id);
+    assert!(
+        big_size > cap,
+        "the big segment ({big_size} bytes) must exceed the cap ({cap}) for this test to be meaningful"
+    );
+
+    // Repeated single-document commits: each one is small enough to merge
+    // with its siblings, but the big segment above must never be touched.
+    for id in 31..=40u64 {
+        store
+            .upsert_document(id, doc(&format!("small-{id}")))
+            .unwrap();
+        store.commit().unwrap();
+
+        assert!(
+            segment_ids(&storage).contains(&big_id),
+            "the oversized segment must survive every commit unmerged"
+        );
+        assert_eq!(
+            segment_size_bytes(&storage, &big_id),
+            big_size,
+            "the oversized segment's content must never be rewritten"
+        );
+    }
+
+    // The small segments still converged among themselves instead of
+    // accumulating one per commit (10 small commits, far fewer segments).
+    assert!(
+        segment_count(&storage) < 10,
+        "segments below the cap must still merge together: got {} segments",
+        segment_count(&storage)
+    );
+    assert_eq!(store.stats().unwrap().doc_count, 40);
 }

@@ -238,6 +238,9 @@ impl LexicalStore {
     ///   count exceeds `max_segments`, the smallest `merge_factor` segments are
     ///   merged so the count stays bounded without a manual `optimize()`. It is
     ///   a no-op below the threshold; raise `max_segments` to disable it.
+    ///   `max_merged_segment_bytes` (Issue #1394) caps the combined on-disk
+    ///   size of the segments one auto-merge takes; a segment at or over the
+    ///   cap is never merged again.
     ///
     /// # Example
     ///

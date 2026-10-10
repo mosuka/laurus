@@ -130,6 +130,26 @@ pub struct InvertedIndexConfig {
     /// will be triggered to consolidate them.
     pub max_segments: u32,
 
+    /// Upper bound, in bytes, on the estimated on-disk size of a segment
+    /// auto-merge is willing to produce (Issue #1394). Defaults to
+    /// `u64::MAX`: no cap, the pre-#1394 behavior.
+    ///
+    /// Auto-merge takes the smallest segments, up to [`Self::merge_factor`]
+    /// of them, only while their combined on-disk size stays within this
+    /// cap, and still merges them into exactly one segment. A segment at or
+    /// over the cap is never merged again, so once the remaining segments
+    /// no longer fit together the count can stay above
+    /// [`Self::max_segments`]. A cap smaller than two freshly flushed
+    /// segments stops auto-merge altogether, and `0` disables it.
+    ///
+    /// The cap approximates merge memory rather than bounding it: the
+    /// sources' on-disk size and the merge writer's buffered memory are not
+    /// 1:1 (a 20,000-document, 4-segment force-merge peaked at about 79 MB
+    /// in `merge_stress_bench`), so set it well below the memory you can
+    /// afford and confirm with a measurement.
+    #[serde(default = "default_max_merged_segment_bytes")]
+    pub max_merged_segment_bytes: u64,
+
     /// Analyzer for text fields.
     ///
     /// This analyzer is used to tokenize text during indexing and querying.
@@ -201,6 +221,11 @@ fn default_query_filter_cache_capacity() -> usize {
     1024
 }
 
+/// serde default for [`InvertedIndexConfig::max_merged_segment_bytes`].
+fn default_max_merged_segment_bytes() -> u64 {
+    u64::MAX
+}
+
 fn default_parsed_query_cache_capacity() -> usize {
     1024
 }
@@ -215,6 +240,7 @@ impl Default for InvertedIndexConfig {
             store_doc_values: true,
             merge_factor: 10,
             max_segments: 100,
+            max_merged_segment_bytes: default_max_merged_segment_bytes(),
             analyzer: std::sync::Arc::new(
                 crate::analysis::analyzer::standard::StandardAnalyzer::new()
                     .expect("StandardAnalyzer should be creatable"),
@@ -239,6 +265,7 @@ impl std::fmt::Debug for InvertedIndexConfig {
             .field("store_doc_values", &self.store_doc_values)
             .field("merge_factor", &self.merge_factor)
             .field("max_segments", &self.max_segments)
+            .field("max_merged_segment_bytes", &self.max_merged_segment_bytes)
             .field("analyzer", &self.analyzer.name())
             .field("default_fields", &self.default_fields)
             .field(

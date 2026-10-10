@@ -134,6 +134,7 @@ pub struct LexicalIndexConfigBuilder {
     store_doc_values: Option<bool>,
     merge_factor: Option<u32>,
     max_segments: Option<u32>,
+    max_merged_segment_bytes: Option<u64>,
     default_fields: Vec<String>,
     fields: HashMap<String, FieldOption>,
     query_filter_cache_capacity: Option<usize>,
@@ -161,6 +162,7 @@ impl LexicalIndexConfigBuilder {
             store_doc_values: None,
             merge_factor: None,
             max_segments: None,
+            max_merged_segment_bytes: None,
             default_fields: Vec::new(),
             fields: HashMap::new(),
             query_filter_cache_capacity: None,
@@ -265,6 +267,18 @@ impl LexicalIndexConfigBuilder {
         self
     }
 
+    /// Set the upper bound, in bytes, on the estimated on-disk size of a
+    /// segment auto-merge is willing to produce (Issue #1394).
+    ///
+    /// A segment at or over this cap is excluded from every future
+    /// auto-merge, so the segment count can stabilize above `max_segments`.
+    /// See [`InvertedIndexConfig::max_merged_segment_bytes`].
+    /// Default: `u64::MAX` (no cap)
+    pub fn max_merged_segment_bytes(mut self, bytes: u64) -> Self {
+        self.max_merged_segment_bytes = Some(bytes);
+        self
+    }
+
     /// Add a default field to search when no field is specified.
     pub fn default_field(mut self, field: impl Into<String>) -> Self {
         let field = field.into();
@@ -364,6 +378,9 @@ impl LexicalIndexConfigBuilder {
         }
         if let Some(max) = self.max_segments {
             config.max_segments = max;
+        }
+        if let Some(bytes) = self.max_merged_segment_bytes {
+            config.max_merged_segment_bytes = bytes;
         }
         if !self.default_fields.is_empty() {
             config.default_fields = self.default_fields;

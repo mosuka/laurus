@@ -140,6 +140,50 @@ fn segment_count(storage: &Arc<dyn Storage>) -> usize {
     payload["segments"].as_array().unwrap().len()
 }
 
+/// The committed segment ids, in manifest order (Issue #1394).
+fn segment_ids(storage: &Arc<dyn Storage>) -> Vec<String> {
+    let mut input = storage.open_input("segments.json").unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut input, &mut bytes).unwrap();
+    let payload: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            let mut len: u64 = 0;
+            let mut shift = 0;
+            let mut cursor = 0usize;
+            loop {
+                let byte = bytes[cursor];
+                cursor += 1;
+                len |= u64::from(byte & 0x7F) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            serde_json::from_slice(&bytes[cursor..cursor + len as usize]).unwrap()
+        }
+    };
+    payload["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["segment_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Sum the on-disk size of every file belonging to `segment_id`, mirroring
+/// `InvertedIndex::segment_size_bytes` (Issue #1394).
+fn segment_size_bytes(storage: &Arc<dyn Storage>, segment_id: &str) -> u64 {
+    let prefix = format!("{segment_id}.");
+    storage
+        .list_files()
+        .unwrap()
+        .iter()
+        .filter(|f| f.starts_with(&prefix))
+        .map(|f| storage.metadata(f).unwrap().size)
+        .sum()
+}
+
 /// Builds `SEGMENTS` committed segments of `DOCS_PER_SEGMENT` documents
 /// each, returning the storage, the store, and the recorded ground truth.
 fn build_index(segments: u64, docs_per_segment: u64) -> (Arc<dyn Storage>, LexicalStore, Corpus) {
@@ -411,5 +455,105 @@ fn bounded_merge_does_not_accumulate_doc_values_across_bucket_boundaries() {
          the same size as the first's ({first_size} bytes), not grow with \
          the number of buckets already flushed -- sizes by generation: \
          {dv_sizes:?}"
+    );
+}
+
+/// Issue #1394: after a bounded `optimize_within_budget` leaves multiple
+/// segments, the very next commit's auto-merge must still respect
+/// `max_merged_segment_bytes` -- not silently re-consolidate everything with
+/// an unbounded merge the way it did before this cap existed, which would
+/// undo the peak-memory reduction the budgeted optimize just bought.
+#[test]
+fn auto_merge_after_a_bounded_optimize_respects_the_cap() {
+    const SEGMENTS: u64 = 6;
+    const DOCS_PER_SEGMENT: u64 = 200;
+    const TOTAL_DOCS: u64 = SEGMENTS * DOCS_PER_SEGMENT;
+
+    // Probe a single bucket's on-disk size so the cap below is independent
+    // of the on-disk encoding.
+    let (probe_storage, _probe_store, _) = build_index(1, DOCS_PER_SEGMENT);
+    let bucket_bytes: u64 = probe_storage
+        .list_files()
+        .unwrap()
+        .iter()
+        .map(|f| probe_storage.metadata(f).unwrap().size)
+        .sum();
+
+    // Room for one bucket plus the tiny single-document commit below, but
+    // not two buckets.
+    let cap = bucket_bytes + bucket_bytes / 2;
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let inverted_config = InvertedIndexConfig {
+        max_segments: SEGMENTS as u32,
+        merge_factor: 100,
+        max_merged_segment_bytes: cap,
+        ..Default::default()
+    };
+    let store = LexicalStore::new(
+        storage.clone(),
+        LexicalIndexConfig::Inverted(inverted_config),
+    )
+    .unwrap();
+
+    let mut corpus = Corpus::new();
+    let mut doc_id = 0u64;
+    for _ in 0..SEGMENTS {
+        for _ in 0..DOCS_PER_SEGMENT {
+            let doc = corpus.build_and_record(doc_id);
+            store.upsert_document(doc_id, doc).unwrap();
+            doc_id += 1;
+        }
+        store.commit().unwrap();
+    }
+    assert_eq!(
+        segment_count(&storage),
+        SEGMENTS as usize,
+        "sanity: max_segments == SEGMENTS, so building must not have \
+         triggered auto-merge yet"
+    );
+
+    store.optimize_within_budget(TINY_BUDGET).unwrap();
+    assert_eq!(
+        segment_count(&storage),
+        SEGMENTS as usize,
+        "sanity: the tiny budget rolls over after every source, producing \
+         one output bucket per source -- still == max_segments, so this \
+         optimize alone must not have triggered auto-merge either"
+    );
+
+    // One more commit pushes the count past `max_segments`, firing
+    // auto-merge for the first time since the build. `merge_factor` is high
+    // enough that, without the cap, it would fold every one of the 7
+    // segments into a single unbounded merge, undoing the budget the
+    // optimize above just bought.
+    let doc = corpus.build_and_record(doc_id);
+    store.upsert_document(doc_id, doc).unwrap();
+    store.commit().unwrap();
+
+    assert!(
+        segment_count(&storage) > 1,
+        "the cap must have stopped auto-merge from folding every segment \
+         into one, the way an unbounded auto-merge would have"
+    );
+    for id in segment_ids(&storage) {
+        let size = segment_size_bytes(&storage, &id);
+        assert!(
+            size <= cap,
+            "segment {id} is {size} bytes, over the cap of {cap}"
+        );
+    }
+
+    assert_eq!(
+        term_hits(&store, "kind", "doc").len(),
+        (TOTAL_DOCS + 1) as usize,
+        "every document, including the one that triggered auto-merge, \
+         must survive"
+    );
+    let (lo, hi) = (-100i64, 100i64);
+    assert_eq!(
+        numeric_range_hits(&store, "score", NumericType::Integer, lo as f64, hi as f64),
+        corpus.expected_score_range(lo, hi),
+        "numeric range results must survive the capped auto-merge"
     );
 }

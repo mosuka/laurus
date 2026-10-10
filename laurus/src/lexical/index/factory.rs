@@ -237,6 +237,7 @@ mod tests {
                 assert!(inverted.store_term_vectors);
                 assert_eq!(inverted.merge_factor, 10);
                 assert_eq!(inverted.max_segments, 100);
+                assert_eq!(inverted.max_merged_segment_bytes, u64::MAX);
             }
         }
     }
