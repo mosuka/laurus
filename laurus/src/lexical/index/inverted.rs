@@ -598,6 +598,14 @@ impl InvertedIndex {
     /// performed per call; repeated commits converge the count. Cheap when no
     /// merge is needed (a segment count check). Disable by raising
     /// `max_segments`.
+    ///
+    /// [`InvertedIndexConfig::max_merged_segment_bytes`] (Issue #1394) limits
+    /// which segments are taken, like Lucene's `maxMergedSegmentMB`: only as
+    /// many of the smallest as fit under it, and never one already at or
+    /// over it. The cap is applied to the candidates and not passed as the
+    /// merge budget, because a budgeted merge can split into as many
+    /// outputs as it has sources, which would leave the count unchanged and
+    /// re-run the same merge on every commit.
     fn auto_merge(&self) -> Result<()> {
         let segments = self.load_segments()?;
         if segments.len() <= self.config.max_segments as usize {
@@ -605,23 +613,28 @@ impl InvertedIndex {
             return Ok(());
         }
 
-        // Merge the smallest `merge_factor` segments (small-first keeps merge
-        // cost low and bounds per-commit latency).
-        let mut by_size: Vec<(SegmentInfo, u64)> = segments
-            .iter()
-            .map(|s| (s.clone(), self.segment_size_bytes(&s.segment_id)))
-            .collect();
-        by_size.sort_by_key(|(_, size)| *size);
+        let segment_ids: Vec<String> = segments.iter().map(|s| s.segment_id.clone()).collect();
+        let Ok(sizes) = self.segment_sizes(&segment_ids) else {
+            // Listing failed: skip this commit's merge rather than fail it,
+            // the next commit's auto-merge will retry.
+            return Ok(());
+        };
 
-        let take = (self.config.merge_factor as usize).clamp(2, segments.len());
+        // Smallest first: keeps merge cost low and bounds per-commit latency.
+        let mut by_size: Vec<(SegmentInfo, u64)> = segments.into_iter().zip(sizes).collect();
+        by_size.sort_by_key(|(_, size)| *size);
+        let sizes_sorted: Vec<u64> = by_size.iter().map(|(_, size)| *size).collect();
+
+        let take = auto_merge_take(
+            &sizes_sorted,
+            self.config.merge_factor as usize,
+            self.config.max_merged_segment_bytes,
+        );
+        if take == 0 {
+            return Ok(());
+        }
         let subset: Vec<SegmentInfo> = by_size.into_iter().take(take).map(|(s, _)| s).collect();
 
-        // Issue #1164: auto-merge is not budget-aware -- it always targets
-        // exactly one output segment. A budget-aware auto-merge would need
-        // to account for the follow-up risk noted on that issue (a bounded
-        // `optimize()` leaving more segments than `max_segments` would let
-        // the very next commit's auto-merge start an unbounded merge
-        // anyway), which is left for a future issue.
         self.merge_segment_set_bounded(&subset, usize::MAX)
     }
 
@@ -790,6 +803,31 @@ impl InvertedIndex {
             .unwrap_or(0)
     }
 
+    /// Sum the on-disk size of every file belonging to each of `segment_ids`,
+    /// in the same order, from a single directory listing (Issue #1394).
+    ///
+    /// [`Self::segment_size_bytes`] does the same lookup per segment, which
+    /// on [`FileStorage`] is a full
+    /// recursive directory walk; calling it once per segment in
+    /// [`Self::auto_merge`] would redo that walk on every commit once a
+    /// [`InvertedIndexConfig::max_merged_segment_bytes`] cap can leave
+    /// "computed every size, merged nothing" as a steady state. This lists
+    /// once and buckets by segment id instead.
+    fn segment_sizes(&self, segment_ids: &[String]) -> Result<Vec<u64>> {
+        let files = self.storage.list_files()?;
+        Ok(segment_ids
+            .iter()
+            .map(|id| {
+                let prefix = format!("{id}.");
+                files
+                    .iter()
+                    .filter(|f| f.starts_with(&prefix))
+                    .map(|f| self.storage.metadata(f).map(|m| m.size).unwrap_or(0))
+                    .sum()
+            })
+            .collect())
+    }
+
     /// Delete every file belonging to `segment_id`.
     fn delete_segment_files(&self, segment_id: &str) -> Result<()> {
         let prefix = format!("{segment_id}.");
@@ -864,6 +902,32 @@ impl InvertedIndex {
         }
         self.update_metadata()
     }
+}
+
+/// How many of the size-ascending `sizes` [`InvertedIndex::auto_merge`]
+/// should merge (Issue #1394). `0` means no merge: fewer than two segments
+/// exist, or fewer than two fit under `cap`.
+///
+/// Takes the smallest segments, up to `merge_factor` of them, and stops at
+/// the first one that is at or over `cap` or would push the running total
+/// over it. Whatever is taken still becomes exactly one segment, so every
+/// merge lowers the count by at least one and auto-merge cannot loop.
+/// `cap == u64::MAX` always takes `merge_factor.clamp(2, sizes.len())`, the
+/// pre-#1394 behavior.
+fn auto_merge_take(sizes: &[u64], merge_factor: usize, cap: u64) -> usize {
+    if sizes.len() < 2 {
+        return 0;
+    }
+    let limit = merge_factor.clamp(2, sizes.len());
+    let (mut sum, mut take) = (0u64, 0usize);
+    for &size in &sizes[..limit] {
+        if size >= cap || sum.saturating_add(size) > cap {
+            break;
+        }
+        sum += size;
+        take += 1;
+    }
+    if take < 2 { 0 } else { take }
 }
 
 impl LexicalIndex for InvertedIndex {
@@ -1160,6 +1224,53 @@ mod tests {
             .add_text("title", title)
             .add_text("body", body)
             .build()
+    }
+
+    /// Issue #1394: an uncapped merge always takes `merge_factor` (clamped)
+    /// of the smallest segments -- identical to auto-merge's pre-#1394
+    /// behavior.
+    #[test]
+    fn auto_merge_take_uncapped_matches_merge_factor() {
+        assert_eq!(auto_merge_take(&[10, 20, 30, 40], 2, u64::MAX), 2);
+        assert_eq!(auto_merge_take(&[10, 20, 30, 40], 10, u64::MAX), 4);
+    }
+
+    /// A segment at or over the cap, and everything after it (sizes are
+    /// ascending), is excluded.
+    #[test]
+    fn auto_merge_take_excludes_segments_at_or_over_the_cap() {
+        assert_eq!(auto_merge_take(&[10, 90, 100, 200], 10, 100), 2);
+    }
+
+    /// The running total stops growing the candidate set before it would
+    /// exceed the cap, even if more segments would otherwise fit
+    /// `merge_factor`.
+    #[test]
+    fn auto_merge_take_stops_before_the_cumulative_total_overflows() {
+        assert_eq!(auto_merge_take(&[30, 30, 30, 30], 10, 70), 2);
+    }
+
+    /// Fewer than two candidates fit under the cap: no merge.
+    #[test]
+    fn auto_merge_take_is_zero_below_two_candidates() {
+        // Only the smallest segment fits; the second is excluded by the cap.
+        assert_eq!(auto_merge_take(&[1, 1000], 10, 2), 0);
+        assert_eq!(auto_merge_take(&[500, 1000], 10, 600), 0);
+    }
+
+    /// `cap == 0` disables auto-merge entirely: no segment is ever eligible.
+    #[test]
+    fn auto_merge_take_zero_cap_disables_merging() {
+        assert_eq!(auto_merge_take(&[1, 2, 3], 10, 0), 0);
+    }
+
+    /// Regression: fewer than two segments must never reach
+    /// `merge_factor.clamp(2, sizes.len())`, which panics when
+    /// `sizes.len() == 1` (`Ord::clamp` requires `min <= max`).
+    #[test]
+    fn auto_merge_take_single_segment_does_not_panic() {
+        assert_eq!(auto_merge_take(&[], 10, u64::MAX), 0);
+        assert_eq!(auto_merge_take(&[100], 0, u64::MAX), 0);
     }
 
     #[test]

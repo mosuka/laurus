@@ -259,7 +259,7 @@ graph TB
 
 1. **Create**: A new segment is flushed each time the writer's buffer reaches `max_buffered_docs` (default 10,000) or `max_buffer_memory` (default 64 MiB), and once more by `commit()` for what remains; `commit()` publishes them all at once, so one commit can add several segments. Both thresholds are set on the index config (`LexicalIndexConfig::builder().max_buffered_docs(..)` / `.max_buffer_memory(..)`)
 2. **Search**: All segments are searched in parallel and results are merged
-3. **Merge**: After each `commit()`, an auto-merge merges the smallest segments once the count exceeds `max_segments`, keeping the segment count bounded; a manual `optimize()` force-merges everything into one segment
+3. **Merge**: After each `commit()`, an auto-merge merges the smallest segments once the count exceeds `max_segments`, keeping the segment count bounded; a manual `optimize()` force-merges everything into one segment. `max_merged_segment_bytes` (default: unbounded) caps the combined estimated size of the segments a single auto-merge will take, so a segment at or over the cap is left unmerged and the count can stabilize above `max_segments` once the survivors no longer fit together
 4. **Delete**: When a document is deleted, its ID is added to a deletion bitmap rather than physically removed (see [Deletions & Compaction](../../laurus/deletions.md))
 
 ## BM25 Scoring
