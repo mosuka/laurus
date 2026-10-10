@@ -139,6 +139,14 @@ impl RerankStage for F32SidecarStage {
         candidates: &mut RerankCandidates,
         take_n: usize,
     ) -> Result<bool> {
+        // Issue #1390: no position index for this field at all means this
+        // stage has nothing to rescore against -- honor the trait's
+        // "backing data unavailable" contract (leave `candidates`
+        // untouched, report `false`) instead of emptying the buffer while
+        // reporting `true`.
+        let Some(positions) = self.positions.as_ref() else {
+            return Ok(false);
+        };
         let prepared = self.metric.prepare_query(&query.data);
         let take_n = take_n.min(candidates.len());
         let mut rescored = RerankCandidates::with_capacity(take_n);
@@ -148,11 +156,7 @@ impl RerankStage for F32SidecarStage {
             // scored on the exact basis — drop it (pre-refactor
             // behavior: the inline arm `continue`d on a missing
             // position).
-            let Some(pos) = self
-                .positions
-                .as_ref()
-                .and_then(|idx| idx.get(&doc_id).copied())
-            else {
+            let Some(pos) = positions.get(&doc_id).copied() else {
                 continue;
             };
             let distance = self
@@ -401,5 +405,35 @@ mod tests {
             .unwrap();
         assert!(applied);
         assert_eq!(c.doc_ids, vec![1]);
+    }
+
+    /// Issue #1390: when the pool has records for other fields but none
+    /// for the field this stage was built against, `positions` is `None`
+    /// -- distinct from a single missing `doc_id` within an existing
+    /// index (covered by `sq_stage_drops_candidates_absent_from_the_pool`
+    /// for the sibling stage).
+    #[test]
+    fn f32_sidecar_stage_without_position_index_reports_false_and_leaves_candidates_untouched() {
+        let pool = Arc::new(
+            crate::vector::index::rerank_storage::RerankStoragePool::build(
+                crate::vector::core::rerank::RerankStorageKind::F32,
+                2,
+                vec![(1, "other".to_string(), vec![1.0, 2.0])],
+            ),
+        );
+        let stage = F32SidecarStage::new(pool, "embedding", DistanceMetric::Euclidean);
+
+        let mut c = buffer(&[(1, 0.5), (2, 1.5)]);
+        let applied = stage
+            .rescore(&Vector::new(vec![0.0, 0.0]), &mut c, 2)
+            .unwrap();
+
+        assert!(!applied, "a stage with no backing data must report false");
+        assert_eq!(c.doc_ids, vec![1, 2], "candidates must be left untouched");
+        assert_eq!(
+            c.distances,
+            vec![0.5, 1.5],
+            "candidates must be left untouched"
+        );
     }
 }
