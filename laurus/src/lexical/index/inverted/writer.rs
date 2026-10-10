@@ -4012,7 +4012,7 @@ mod tests {
         let builder = Document::builder()
             .add_text("title", format!("title {id}"))
             .add_integer("count", id as i64 * 10)
-            .add_boolean("flag", id % 2 == 0)
+            .add_boolean("flag", id.is_multiple_of(2))
             .add_int64_array("tags", vec![id as i64, 100 - id as i64])
             .add_field("blob", DataValue::Bytes(vec![1, 2, 3], None));
         // A sparse column: one document has no `price`.
@@ -4157,7 +4157,7 @@ mod tests {
     #[derive(Clone)]
     enum OracleEntry {
         Document(Document),
-        Analyzed(AnalyzedDocument),
+        Analyzed(Box<AnalyzedDocument>),
     }
 
     /// Runs a seeded mix of upserts, same-id re-upserts, deletes,
@@ -4205,7 +4205,7 @@ mod tests {
                     next_fresh_id += 1;
                     let doc = collapsed_frequency_doc();
                     writer.upsert_analyzed_document(id, doc.clone()).unwrap();
-                    live.push((id, OracleEntry::Analyzed(doc)));
+                    live.push((id, OracleEntry::Analyzed(Box::new(doc))));
                 }
             }
         }
@@ -4226,9 +4226,9 @@ mod tests {
         for (id, entry) in live {
             match entry {
                 OracleEntry::Document(doc) => writer.upsert_document(*id, doc.clone()).unwrap(),
-                OracleEntry::Analyzed(doc) => {
-                    writer.upsert_analyzed_document(*id, doc.clone()).unwrap()
-                }
+                OracleEntry::Analyzed(doc) => writer
+                    .upsert_analyzed_document(*id, doc.as_ref().clone())
+                    .unwrap(),
             }
         }
         writer
