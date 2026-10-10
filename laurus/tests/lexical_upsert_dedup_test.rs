@@ -166,15 +166,15 @@ fn nrt_find_excludes_deferred_removed_doc() {
     );
 }
 
-/// #828: a removal sets the deferred-rebuild dirty flag; `rollback` must clear
-/// the buffer AND that flag so a later batch starts clean and is not corrupted
-/// by leftover deferred state.
+/// #828: a removal records the id as stale and defers purging its postings;
+/// `rollback` must clear the buffer AND that deferred state so a later batch
+/// starts clean and is not corrupted by it.
 #[test]
 fn rollback_clears_deferred_removed_state() {
     let mut w = writer();
 
     w.upsert_document(1, doc("alpha")).unwrap();
-    w.delete_document(1).unwrap(); // sets index_dirty, defers rebuild
+    w.delete_document(1).unwrap(); // records 1 as stale, defers the purge
     assert_eq!(w.pending_docs(), 0);
 
     w.rollback().unwrap();

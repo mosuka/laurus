@@ -264,20 +264,20 @@ pub struct InvertedIndexWriter {
     /// document; walking the buffer instead would make ingestion quadratic.
     buffered_bytes: usize,
 
-    /// Whether [`Self::inverted_index`] is stale relative to
-    /// [`Self::buffered_docs`] and needs a rebuild before flush.
+    /// Doc ids removed from [`Self::buffered_docs`] whose postings are still
+    /// in [`Self::inverted_index`].
     ///
-    /// Set by [`Self::remove_pending_document`], which drops the doc from
-    /// `buffered_docs` (cheap, order-preserving `retain`) but **defers** the
-    /// expensive `rebuild_in_memory_index` rather than running it per removal.
-    /// The rebuild runs once at flush time (and eagerly on the same-id re-upsert
-    /// path), turning an `update × M` over an `N`-doc uncommitted buffer from
-    /// `O(M·N)` into `O(M) + O(N)` (Issue #828). While dirty, the in-memory
-    /// index still holds the removed doc's postings, so the NRT lookups
-    /// ([`Self::find_doc_id_by_term`] / [`Self::find_doc_ids_by_term`]) filter
-    /// their results by [`Self::buffered_doc_ids`] (the physically-correct live
-    /// set).
-    index_dirty: bool,
+    /// Filled by [`Self::remove_pending_document`], which drops the doc from
+    /// `buffered_docs` (cheap, order-preserving `retain`) but **defers**
+    /// purging its postings rather than paying for it per removal. The
+    /// purge ([`Self::purge_stale_postings`]) runs once at flush time, and
+    /// before any of these ids is added again, turning an `update × M` over
+    /// an `N`-doc uncommitted buffer from `O(M·N)` into `O(M) + O(N)` (Issue
+    /// #828). Until then the in-memory index still holds the removed docs'
+    /// postings, so the NRT lookups ([`Self::find_doc_id_by_term`] /
+    /// [`Self::find_doc_ids_by_term`]) filter their results by
+    /// [`Self::buffered_doc_ids`] (the physically-correct live set).
+    stale_doc_ids: AHashSet<u64>,
 
     /// Membership index of the doc IDs currently in [`Self::buffered_docs`].
     ///
@@ -924,7 +924,7 @@ impl InvertedIndexWriter {
             inverted_index: TermPostingIndex::new(),
             buffered_docs: Vec::new(),
             buffered_bytes: 0,
-            index_dirty: false,
+            stale_doc_ids: AHashSet::new(),
             buffered_doc_ids: AHashSet::new(),
             next_doc_id,
             current_segment,
@@ -971,26 +971,12 @@ impl InvertedIndexWriter {
         // Analyze the document
         let analyzed_doc = self.analyze_document(doc)?;
 
-        // Same-id re-upsert detection: if this exact id is already buffered, the
-        // deferred-rebuild scheme cannot distinguish the old version's stale
-        // postings from the new version's (both carry this id), so we must purge
-        // the old version from the in-memory index *before* re-indexing. This
-        // never happens on the production engine path (every add gets a fresh
-        // monotonic doc_id), so the eager rebuild here costs nothing in
-        // production and only restores exact NRT state for direct re-upserts.
-        let was_buffered = self.buffered_doc_ids.contains(&doc_id);
-
-        // Upsert: remove any pending document with the same ID before adding
+        // Upsert: remove any pending document with the same ID before adding.
+        // The removed version's postings stay until purged, and
+        // `upsert_analyzed_document` purges them before re-adding this id.
         self.remove_pending_document(doc_id)?;
         // Upsert: mark persisted occurrences as deleted (flushed segments)
         self.mark_persisted_doc_deleted(doc_id)?;
-
-        if was_buffered {
-            // Purge the just-removed old version's postings now (eager), so the
-            // re-added version below is the only one in the in-memory index.
-            self.rebuild_in_memory_index()?;
-            self.index_dirty = false;
-        }
 
         // Add the analyzed document with the specified ID
         self.upsert_analyzed_document(doc_id, analyzed_doc)
@@ -1007,6 +993,15 @@ impl InvertedIndexWriter {
         // Update next_doc_id if necessary to avoid ID collisions
         if doc_id >= self.next_doc_id {
             self.next_doc_id = doc_id + 1;
+        }
+
+        // A removed version of this id may still have postings in the
+        // in-memory index. They carry the same doc_id as the postings about
+        // to be added, so once added nothing could tell them apart: purge
+        // them first (Issue #1168). This covers a same-id re-upsert and a
+        // delete followed by a re-upsert alike.
+        if self.stale_doc_ids.contains(&doc_id) {
+            self.purge_stale_postings();
         }
 
         // Add to inverted index
@@ -1466,12 +1461,9 @@ impl InvertedIndexWriter {
             return Ok(());
         }
 
-        // Materialize any deferred removals (#828) so the in-memory index +
-        // DocValues match `buffered_docs` before they are written to disk.
-        if self.index_dirty {
-            self.rebuild_in_memory_index()?;
-            self.index_dirty = false;
-        }
+        // Materialize any deferred removals (#828) so the in-memory index
+        // matches `buffered_docs` before it is written to disk.
+        self.purge_stale_postings();
 
         // Reserve the generation ordinal from the shared counter (#1024) —
         // at flush time, not at construction, so a merge that ran since
@@ -1515,7 +1507,7 @@ impl InvertedIndexWriter {
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
-        self.index_dirty = false;
+        self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
 
         self.current_segment += 1;
@@ -1596,11 +1588,8 @@ impl InvertedIndexWriter {
         }
         // Materialize any deferred removals (#828) before writing. The merge
         // path only adds distinct, pre-deduped docs so this is normally a no-op,
-        // but the guard keeps the invariant if that ever changes.
-        if self.index_dirty {
-            self.rebuild_in_memory_index()?;
-            self.index_dirty = false;
-        }
+        // but it keeps the invariant if that ever changes.
+        self.purge_stale_postings();
         // Published immediately, unlike a buffer flush. The merge's inputs
         // were already visible, and the merge engine deletes them once this
         // returns — hiding the output until some later commit would make an
@@ -1610,7 +1599,7 @@ impl InvertedIndexWriter {
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
-        self.index_dirty = false;
+        self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
         self.stats.segments_created += 1;
         Ok(paths)
@@ -2262,7 +2251,7 @@ impl InvertedIndexWriter {
         self.buffered_docs.clear();
         self.buffered_bytes = 0;
         self.buffered_doc_ids.clear();
-        self.index_dirty = false;
+        self.stale_doc_ids.clear();
         self.inverted_index = TermPostingIndex::new();
 
         if dropped.is_empty() {
@@ -2388,11 +2377,11 @@ impl InvertedIndexWriter {
 
         // The id was buffered: drop it from the buffer (cheap, order-preserving
         // so postings stay doc-id-ascending for the skip-table encode) and
-        // **defer** the expensive in-memory index / DocValues rebuild. The
-        // rebuild runs once at flush time (and eagerly on the same-id re-upsert
-        // path in `upsert_document`), so updating M docs in an N-doc uncommitted
-        // buffer is O(M)+O(N) instead of O(M·N) (Issue #828). Until the rebuild,
-        // the in-memory index still holds this doc's postings; the NRT lookups
+        // **defer** purging its postings, recording the id in
+        // `stale_doc_ids`. The purge runs once at flush time, or before this
+        // id is added again, so updating M docs in an N-doc uncommitted
+        // buffer is O(M)+O(N) instead of O(M·N) (Issue #828). Until then the
+        // in-memory index still holds this doc's postings; the NRT lookups
         // filter them out via `buffered_doc_ids`.
         // Drop the removed documents' footprint from the running total
         // before they go (#557). Summed over every match, because `retain`
@@ -2406,7 +2395,7 @@ impl InvertedIndexWriter {
             .sum();
         self.buffered_bytes = self.buffered_bytes.saturating_sub(removed_bytes);
         self.buffered_docs.retain(|(id, _)| *id != doc_id);
-        self.index_dirty = true;
+        self.stale_doc_ids.insert(doc_id);
 
         // Decrement docs_added for the removed (un-done) document.
         if self.stats.docs_added > 0 {
@@ -2415,37 +2404,28 @@ impl InvertedIndexWriter {
         Ok(())
     }
 
-    /// Rebuild the in-memory index from buffered docs (used after removals).
-    fn rebuild_in_memory_index(&mut self) -> Result<()> {
-        // Reset structures
-        self.inverted_index = TermPostingIndex::new();
-
-        // Reset stats counters that depend on buffered content
-        // Do NOT reset docs_added here, as it includes flushed docs.
-        // docs_added is adjusted in remove_pending_document directly.
-        self.stats.unique_terms = 0;
-        self.stats.total_postings = 0;
-
-        // Re-add all buffered analyzed docs. `buffered_docs` is moved out
-        // rather than cloned (Issue #1169): `add_analyzed_document_to_index`
-        // only needs `&AnalyzedDocument`, and this function never changes
-        // `buffered_docs`'s contents, so there is nothing a clone buys here
-        // over borrowing `self` and `buffered_docs` separately via
-        // `mem::take` -- for a large buffer, a full deep clone of every
-        // `field_terms`/`stored_fields`/`point_values`/`field_lengths` was
-        // pure waste. Restored before returning on every path, including
-        // error, so a future fallible change to the loop body can't lose
-        // the buffer.
-        let buffered = std::mem::take(&mut self.buffered_docs);
-        let result = (|| -> Result<()> {
-            for (id, analyzed_doc) in &buffered {
-                self.add_analyzed_document_to_index(*id, analyzed_doc)?;
-                // stats.docs_added is ALREADY accounting for these docs (except the one removed)
-            }
-            Ok(())
-        })();
-        self.buffered_docs = buffered;
-        result
+    /// Drop the postings of every id in [`Self::stale_doc_ids`] from the
+    /// in-memory index (Issue #1168), leaving it exactly as if only the
+    /// documents still buffered had ever been added. A no-op when nothing is
+    /// stale.
+    ///
+    /// Filters the postings the index already holds instead of re-deriving
+    /// them from the buffer: each remaining doc_id's postings come from the
+    /// single upsert that added it (`upsert_analyzed_document` purges a
+    /// stale id before it can be added again), so they are exactly what a
+    /// re-derivation would produce — positions, the replayed frequency of a
+    /// collapsed frequency-only posting (#1234), weights and doc_id order
+    /// included.
+    fn purge_stale_postings(&mut self) {
+        if self.stale_doc_ids.is_empty() {
+            return;
+        }
+        let stale = std::mem::take(&mut self.stale_doc_ids);
+        let remaining = self.inverted_index.retain_docs(|id| !stale.contains(&id));
+        // Counts for the buffer only, as a full rebuild left them; docs_added
+        // is adjusted in `remove_pending_document`.
+        self.stats.unique_terms = self.inverted_index.term_count();
+        self.stats.total_postings = remaining;
     }
 
     /// Mark a persisted document as deleted.
@@ -4235,16 +4215,73 @@ mod tests {
         writer
     }
 
+    /// Issue #1168: a document deleted and then upserted again under the
+    /// same id before a flush must not keep answering NRT lookups for terms
+    /// only its deleted version had. `delete_document` drops the id from
+    /// `buffered_doc_ids`, so the re-upsert used to skip the eager purge and
+    /// merge its new postings into the deleted version's stale ones.
+    #[test]
+    fn delete_then_reupsert_leaves_no_stale_postings() {
+        let mut writer = InvertedIndexWriter::new(memory_storage(), loose_config()).unwrap();
+        writer
+            .upsert_document(
+                1,
+                Document::builder().add_text("body", "alpha beta").build(),
+            )
+            .unwrap();
+        writer.delete_document(1).unwrap();
+        writer
+            .upsert_document(
+                1,
+                Document::builder().add_text("body", "alpha gamma").build(),
+            )
+            .unwrap();
+
+        let nrt = |term: &str| writer.find_doc_ids_by_term("body", term).unwrap();
+        assert_eq!(nrt("beta"), None, "only the deleted version had `beta`");
+        assert_eq!(nrt("gamma"), Some(vec![1]));
+        assert_eq!(nrt("alpha"), Some(vec![1]));
+
+        let alpha = writer
+            .inverted_index
+            .get_posting_list("body:alpha")
+            .unwrap();
+        assert_eq!(alpha.postings.len(), 1);
+        assert_eq!(
+            alpha.postings[0].frequency, 1,
+            "the live version has one `alpha`; the deleted one's must not be merged in"
+        );
+    }
+
     /// Issue #1168: whatever the writer does with removed documents before a
-    /// flush, the flushed segment must be byte-identical to one written by a
-    /// writer that only ever saw the surviving documents.
+    /// flush, its NRT lookups must answer, and its flushed segment must be
+    /// byte-identical to, those of a writer that only ever saw the surviving
+    /// documents.
     #[test]
     fn deferred_removals_flush_the_same_bytes_as_a_clean_writer() {
+        let nrt = |writer: &InvertedIndexWriter, field: &str, term: &str| {
+            let mut ids = writer.find_doc_ids_by_term(field, term).unwrap();
+            if let Some(ids) = ids.as_mut() {
+                ids.sort_unstable();
+            }
+            ids
+        };
+
         for seed in [1u64, 7, 42, 1168] {
             let storage_a = memory_storage();
             let (mut a, live) = run_oracle_ops(seed, &storage_a);
             let storage_b = memory_storage();
             let mut b = clean_writer(&storage_b, &live);
+
+            for field in ["body", "tags"] {
+                for term in ORACLE_WORDS {
+                    assert_eq!(
+                        nrt(&a, field, term),
+                        nrt(&b, field, term),
+                        "seed {seed}: NRT lookup of {field}:{term} before the flush"
+                    );
+                }
+            }
 
             a.commit().unwrap();
             b.commit().unwrap();

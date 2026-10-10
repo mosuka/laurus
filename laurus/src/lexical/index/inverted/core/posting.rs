@@ -1602,6 +1602,32 @@ impl TermPostingIndex {
         }
     }
 
+    /// Keep only the postings whose doc_id satisfies `keep`, and drop every
+    /// posting list that ends up empty (Issue #1168: how the writer purges
+    /// removed documents without re-deriving the postings it keeps).
+    ///
+    /// Each list keeps its order, so a doc_id-ascending list stays
+    /// ascending. `total_frequency` and `doc_frequency` are recomputed from
+    /// the postings left, which is what `PostingList::add_posting` keeps them
+    /// equal to. `term_count` follows the lists that remain; `doc_count` is
+    /// left alone.
+    ///
+    /// # Returns
+    ///
+    /// The number of postings left across all lists.
+    pub fn retain_docs(&mut self, keep: impl Fn(u64) -> bool) -> u64 {
+        let mut remaining = 0u64;
+        self.terms.retain(|_, list| {
+            list.postings.retain(|posting| keep(posting.doc_id));
+            list.doc_frequency = list.postings.len() as u64;
+            list.total_frequency = list.postings.iter().map(|p| p.frequency as u64).sum();
+            remaining += list.doc_frequency;
+            !list.postings.is_empty()
+        });
+        self.term_count = self.terms.len() as u64;
+        remaining
+    }
+
     /// On-disk version of the [`TermPostingIndex`] format used by
     /// [`Self::write_to_storage`]. Version 2 introduces the
     /// multi-level skip table per posting list (#503); version 3 makes
@@ -1748,6 +1774,33 @@ mod tests {
     use crate::storage::memory::MemoryStorage;
     use crate::storage::memory::MemoryStorageConfig;
     use std::sync::Arc;
+
+    /// Issue #1168: `retain_docs` must leave each list's counters equal to
+    /// what `add_posting` would have built from the postings kept, and must
+    /// drop lists it empties.
+    #[test]
+    fn retain_docs_keeps_order_and_recomputes_counters() {
+        let mut index = TermPostingIndex::new();
+        index.add_posting("body:a".to_string(), Posting::with_positions(1, vec![0, 3]));
+        index.add_posting("body:a".to_string(), Posting::with_positions(2, vec![1]));
+        index.add_posting("body:a".to_string(), Posting::with_positions(4, vec![0]));
+        index.add_posting("body:b".to_string(), Posting::with_frequency(2, 5));
+        // Same doc again: merged into one posting with summed frequency.
+        index.add_posting("body:a".to_string(), Posting::with_positions(4, vec![7]));
+
+        let remaining = index.retain_docs(|id| id != 2);
+
+        assert_eq!(remaining, 2);
+        assert_eq!(index.term_count(), 1, "`body:b` only had doc 2");
+        assert!(index.get_posting_list("body:b").is_none());
+
+        let list = index.get_posting_list("body:a").unwrap();
+        let ids: Vec<u64> = list.postings.iter().map(|p| p.doc_id).collect();
+        assert_eq!(ids, vec![1, 4], "order is kept");
+        assert_eq!(list.doc_frequency, 2);
+        assert_eq!(list.total_frequency, 2 + 2);
+        assert_eq!(list.postings[1].positions(), Some(&[0u32, 7][..]));
+    }
 
     #[test]
     fn test_posting_creation() {
