@@ -68,10 +68,11 @@ pub struct InvertedIndexConfig {
     /// what remains and publishes all of them at once. Lower values bound
     /// ingestion memory more tightly, but one commit then publishes more
     /// segments, each flush pays its own write and fsync, and every query
-    /// searches every segment. Auto-merge merges only
-    /// [`Self::merge_factor`] segments per commit, so the count can stay
-    /// above [`Self::max_segments`] for several commits. `0` flushes after
-    /// every document. Merges are unaffected: their writers are unbounded.
+    /// searches every segment. Auto-merge removes at most
+    /// `merge_factor - 1` segments per commit (see [`Self::merge_factor`]),
+    /// so the count can stay above [`Self::max_segments`] for several
+    /// commits. `0` flushes after every document. Merges are unaffected:
+    /// their writers are unbounded.
     #[serde(default = "default_max_buffered_docs")]
     pub max_buffered_docs: usize,
 
@@ -120,26 +121,36 @@ pub struct InvertedIndexConfig {
 
     /// Merge factor for segment merging.
     ///
-    /// Controls how many segments are merged at once. Higher values reduce
-    /// the number of merge operations but create larger temporary segments.
+    /// Controls how many segments are merged at once: one merge takes at
+    /// most this many segments, and one commit's auto-merge keeps merging
+    /// until it has removed `merge_factor - 1` segments, the count is back
+    /// at [`Self::max_segments`], or no segments of similar size are left to
+    /// merge. Higher values reduce the number of merge operations but create
+    /// larger temporary segments. Values below `2` act as `2`.
     pub merge_factor: u32,
 
     /// Maximum number of segments before merging.
     ///
-    /// When the number of segments exceeds this threshold, a merge operation
-    /// will be triggered to consolidate them.
+    /// When the number of segments exceeds this threshold, auto-merge runs
+    /// after the commit to consolidate them. It only merges segments of
+    /// similar size, at most 8 times apart (Issue #1397), so that a large
+    /// segment is not rewritten every time it absorbs a small one. The
+    /// count can therefore stay above this threshold while small segments
+    /// wait for partners of similar size: as long as each commit publishes
+    /// fewer than [`Self::merge_factor`] segments, it stays within
+    /// `max(max_segments, 1 + log_8(index size / smallest segment))`.
     pub max_segments: u32,
 
     /// Upper bound, in bytes, on the estimated on-disk size of a segment
     /// auto-merge is willing to produce (Issue #1394). Defaults to
-    /// `u64::MAX`: no cap, the pre-#1394 behavior.
+    /// `u64::MAX`: no cap.
     ///
-    /// Auto-merge takes the smallest segments, up to [`Self::merge_factor`]
-    /// of them, only while their combined on-disk size stays within this
-    /// cap, and still merges them into exactly one segment. A segment at or
-    /// over the cap is never merged again, so once the remaining segments
-    /// no longer fit together the count can stay above
-    /// [`Self::max_segments`]. A cap smaller than two freshly flushed
+    /// Auto-merge takes segments of similar size, up to
+    /// [`Self::merge_factor`] of them, only while their combined on-disk
+    /// size stays within this cap, and still merges them into exactly one
+    /// segment. A segment at or over the cap is never merged again, so once
+    /// the remaining segments no longer fit together the count can stay
+    /// above [`Self::max_segments`]. A cap smaller than two freshly flushed
     /// segments stops auto-merge altogether, and `0` disables it.
     ///
     /// The cap approximates merge memory rather than bounding it: the

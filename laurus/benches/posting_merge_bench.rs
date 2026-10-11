@@ -11,9 +11,9 @@
 //!   [`InvertedIndexPostingIterator`]s with overlapping doc IDs
 //!   (interleaved across segments) so the merger has to interleave reads,
 //!   then drives the merged iterator's `next()` to exhaustion.
-//! - The bench bypasses `Engine` entirely so the auto-merge policy
-//!   (`TieredMergePolicy::max_segments_per_tier = 4`) cannot collapse
-//!   segments under our feet.
+//! - The bench bypasses `Engine` entirely so auto-merge (which runs after
+//!   a commit once the segment count exceeds `max_segments`) cannot
+//!   collapse segments under our feet.
 //! - Sweep `N ∈ {1, 2, 4, 8, 16}` × fixed `postings_per_segment = 10_000`.
 //!   For `N = 1` the merger holds a single iterator, exposing the
 //!   `MergedPostingIterator` wrapper overhead even when no merging is

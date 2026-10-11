@@ -1,19 +1,26 @@
 //! Integration test for the post-commit auto-merge hook (Issue #755).
 //!
-//! After each commit, `LexicalStore` invokes `maybe_merge`, which merges the
-//! smallest `merge_factor` segments once the segment count exceeds
-//! `max_segments`. This keeps the segment count bounded without a manual
-//! `optimize()`, and is a no-op below the threshold.
+//! After each commit, `LexicalStore` invokes `maybe_merge`, which, once the
+//! segment count exceeds `max_segments`, merges runs of up to
+//! `merge_factor` segments of similar size (Issue #1397). This keeps the
+//! segment count bounded without a manual `optimize()`, and is a no-op below
+//! the threshold.
 //!
 //! The writer's flush thresholds (`max_buffered_docs` / `max_buffer_memory`,
 //! Issue #1200) decide how many segments one commit publishes, so they are
 //! pinned here too, together with the guarantee that a merge ignores them.
 //!
 //! `max_merged_segment_bytes` (Issue #1394) limits which segments one
-//! auto-merge takes; its cap and convergence are pinned here as well.
+//! auto-merge takes; its cap and convergence are pinned here as well, and so
+//! are the write amplification and segment-count bound of the size-similar
+//! selection (Issue #1397).
+
+mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use common::ByteCountingStorage;
 use laurus::Document;
 use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore, TermQuery};
 use laurus::storage::Storage;
@@ -107,7 +114,10 @@ fn hits(store: &LexicalStore, field: &str, term: &str) -> usize {
 
 /// With a low `max_segments`, repeated commits stay bounded: each commit adds a
 /// segment, and `maybe_merge` compacts the smallest ones back down once the
-/// threshold is crossed — without any manual `optimize()`.
+/// threshold is crossed — without any manual `optimize()`. The count stays at
+/// or below `max_segments` here because one-document segments are mostly
+/// fixed overhead, so they and their merges stay within the tier ratio of
+/// each other (Issue #1397).
 #[test]
 fn auto_merge_keeps_segment_count_bounded() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
@@ -436,4 +446,149 @@ fn auto_merge_leaves_segments_at_the_cap_alone() {
         segment_count(&storage)
     );
     assert_eq!(store.stats().unwrap().doc_count, 40);
+}
+
+/// The largest size ratio within one auto-merge, mirroring the crate's
+/// private `AUTO_MERGE_TIER_RATIO` (Issue #1397).
+const TIER_RATIO: u64 = 8;
+
+/// The on-disk size of every committed segment.
+fn segment_sizes(storage: &Arc<dyn Storage>) -> Vec<u64> {
+    segment_ids(storage)
+        .iter()
+        .map(|id| segment_size_bytes(storage, id))
+        .collect()
+}
+
+/// Issue #1397's bound on the segment count after a commit (uncapped, and
+/// every commit publishing fewer than `merge_factor` segments): at most
+/// `max_segments`, or `1 + log_TIER_RATIO(index size / smallest segment
+/// seen)`, whichever is larger.
+///
+/// The count only grows past `max_segments` when no run of similar size is
+/// left; then every two size-adjacent segments differ by more than
+/// [`TIER_RATIO`], so there are at most `1 + log_TIER_RATIO(largest /
+/// smallest)` of them. Otherwise one auto-merge removes at least as many
+/// segments as the commit added, so the count never rises above an earlier
+/// high-water mark. `smallest_seen` carries the smallest segment size seen
+/// so far across calls.
+fn assert_segment_count_bounded(
+    storage: &Arc<dyn Storage>,
+    max_segments: usize,
+    smallest_seen: &mut u64,
+    when: &str,
+) {
+    let sizes = segment_sizes(storage);
+    *smallest_seen = sizes.iter().copied().fold(*smallest_seen, u64::min).max(1);
+    let total: u64 = sizes.iter().sum();
+    let waiting = 1 + (total / *smallest_seen).max(1).ilog(TIER_RATIO) as usize;
+    assert!(
+        sizes.len() <= max_segments.max(waiting),
+        "{when}: {} segments exceed both max_segments ({max_segments}) and the {waiting} \
+         that can be left waiting for a partner; sizes: {sizes:?}",
+        sizes.len()
+    );
+}
+
+/// Issue #1397: under a steady stream of small commits, the cumulative bytes
+/// written per byte indexed grow like a logarithm of the commit count, not
+/// in proportion to it. Taking the smallest segments regardless of size
+/// rewrote the largest segment on every other commit, so four times the
+/// commits roughly quadrupled the ratio (measured 9.42 -> 33.27 with the
+/// tier ratio check disabled, against 6.99 -> 9.94 with it).
+///
+/// The ratio is bytes written through storage (flushes, merges, manifest and
+/// metadata) over the bytes of the live segment files, counted by
+/// [`ByteCountingStorage`] so the result does not depend on timing.
+#[test]
+fn auto_merge_write_amplification_grows_logarithmically() {
+    const MAX_SEGMENTS: u32 = 2;
+    let counting = Arc::new(ByteCountingStorage::new(Arc::new(MemoryStorage::new(
+        MemoryStorageConfig::default(),
+    ))));
+    let written = counting.written.clone();
+    let storage: Arc<dyn Storage> = counting;
+    let config = LexicalIndexConfig::builder()
+        .max_segments(MAX_SEGMENTS)
+        .merge_factor(2)
+        .build();
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+
+    let write_amplification = || {
+        written.load(Ordering::Relaxed) as f64 / segment_sizes(&storage).iter().sum::<u64>() as f64
+    };
+    let mut at = Vec::new();
+    let mut smallest_seen = u64::MAX;
+    for batch in 0..128 {
+        commit_batch(&store, batch);
+        assert_segment_count_bounded(
+            &storage,
+            MAX_SEGMENTS as usize,
+            &mut smallest_seen,
+            &format!("after commit {}", batch + 1),
+        );
+        if batch + 1 == 32 || batch + 1 == 128 {
+            at.push(write_amplification());
+        }
+    }
+
+    let (short, long) = (at[0], at[1]);
+    eprintln!("write amplification: {short:.2} after 32 commits, {long:.2} after 128");
+    assert!(
+        long < 2.0 * short,
+        "4x the commits must not double the write amplification: {short:.2} -> {long:.2}"
+    );
+    assert_eq!(store.stats().unwrap().doc_count, 128 * DOCS_PER_BATCH);
+    assert_eq!(hits(&store, "body", "b100d3w7"), 1);
+}
+
+/// Issue #1397: a commit can publish segments of very different sizes (a
+/// full `max_buffered_docs` flush plus a small remainder), while a merge of
+/// the small tier may remove only one segment. Auto-merge keeps merging
+/// until it has removed `merge_factor - 1` segments, so the count stays
+/// within its bound; one merge per commit would fall a segment behind on
+/// almost every commit.
+#[test]
+fn auto_merge_keeps_up_with_multi_segment_commits() {
+    const FLUSH: u64 = 100;
+    const MAX_SEGMENTS: u32 = 4;
+    const COMMITS: u64 = 30;
+    let config = LexicalIndexConfig::builder()
+        .max_buffered_docs(FLUSH as usize)
+        .max_segments(MAX_SEGMENTS)
+        .merge_factor(10)
+        .build();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let store = LexicalStore::new(storage.clone(), config).unwrap();
+
+    let mut smallest_seen = u64::MAX;
+    for commit in 0..COMMITS {
+        // `FLUSH` documents fill one flush; the last one is left for
+        // `commit()` to flush as a second, much smaller segment.
+        for i in 0..=FLUSH {
+            let id = commit * (FLUSH + 1) + i + 1;
+            store.upsert_document(id, batch_doc(commit, i)).unwrap();
+        }
+        store.commit().unwrap();
+
+        if commit == 0 {
+            let sizes = segment_sizes(&storage);
+            assert_eq!(sizes.len(), 2, "sanity: one commit, two segments");
+            let (small, large) = (sizes.iter().min().unwrap(), sizes.iter().max().unwrap());
+            assert!(
+                *large > TIER_RATIO * small,
+                "sanity: the two segments of one commit ({sizes:?}) must be more than \
+                 {TIER_RATIO}x apart for this test to be meaningful"
+            );
+        }
+        assert_segment_count_bounded(
+            &storage,
+            MAX_SEGMENTS as usize,
+            &mut smallest_seen,
+            &format!("after commit {}", commit + 1),
+        );
+    }
+
+    assert_eq!(store.stats().unwrap().doc_count, COMMITS * (FLUSH + 1));
+    assert_eq!(hits(&store, "body", "b17d42w3"), 1);
 }

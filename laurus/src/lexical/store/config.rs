@@ -249,8 +249,10 @@ impl LexicalIndexConfigBuilder {
 
     /// Set the merge factor for segment merging.
     ///
-    /// Controls how many segments are merged at once. Higher values reduce
-    /// the number of merge operations but create larger temporary segments.
+    /// Controls how many segments are merged at once, and how many one
+    /// commit's auto-merge removes at most (`merge_factor - 1`). Higher
+    /// values reduce the number of merge operations but create larger
+    /// temporary segments. See [`InvertedIndexConfig::merge_factor`].
     /// Default: 10
     pub fn merge_factor(mut self, factor: u32) -> Self {
         self.merge_factor = Some(factor);
@@ -259,8 +261,10 @@ impl LexicalIndexConfigBuilder {
 
     /// Set the maximum number of segments before merging.
     ///
-    /// When the number of segments exceeds this threshold, a merge operation
-    /// will be triggered to consolidate them.
+    /// When the number of segments exceeds this threshold, auto-merge
+    /// consolidates segments of similar size after the commit. The count
+    /// can stay above it while small segments wait for partners of similar
+    /// size. See [`InvertedIndexConfig::max_segments`].
     /// Default: 100
     pub fn max_segments(mut self, max: u32) -> Self {
         self.max_segments = Some(max);

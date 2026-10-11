@@ -87,10 +87,10 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// Implementations may opportunistically merge segments to keep their
     /// number bounded (e.g. when it exceeds a configured threshold), without a
     /// manual [`optimize()`](Self::optimize). The default is a no-op; the
-    /// inverted index merges its smallest segments when the count exceeds
-    /// `max_segments`, skipping any whose combined estimated size would
-    /// exceed `max_merged_segment_bytes` (Issue #1394). Must be cheap when no
-    /// merge is needed.
+    /// inverted index merges segments of similar size, smallest first, when
+    /// the count exceeds `max_segments` (Issue #1397), skipping any whose
+    /// combined estimated size would exceed `max_merged_segment_bytes`
+    /// (Issue #1394). Must be cheap when no merge is needed.
     fn maybe_merge(&self) -> Result<()> {
         Ok(())
     }

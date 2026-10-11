@@ -235,12 +235,15 @@ impl LexicalStore {
     /// - After commit, the reader cache is invalidated automatically
     /// - The writer cache is cleared and will be recreated on the next write operation
     /// - An auto-merge runs after the commit (Issue #755): once the segment
-    ///   count exceeds `max_segments`, the smallest `merge_factor` segments are
-    ///   merged so the count stays bounded without a manual `optimize()`. It is
-    ///   a no-op below the threshold; raise `max_segments` to disable it.
-    ///   `max_merged_segment_bytes` (Issue #1394) caps the combined on-disk
-    ///   size of the segments one auto-merge takes; a segment at or over the
-    ///   cap is never merged again.
+    ///   count exceeds `max_segments`, runs of up to `merge_factor` segments
+    ///   of similar size (at most 8 times apart, Issue #1397) are merged, so
+    ///   the count stays bounded without a manual `optimize()` and a large
+    ///   segment is not rewritten to absorb each small one. The count can
+    ///   stay above `max_segments` while small segments wait for partners of
+    ///   similar size. It is a no-op below the threshold; raise
+    ///   `max_segments` to disable it. `max_merged_segment_bytes` (Issue
+    ///   #1394) caps the combined on-disk size of the segments one merge
+    ///   takes; a segment at or over the cap is never merged again.
     ///
     /// # Example
     ///

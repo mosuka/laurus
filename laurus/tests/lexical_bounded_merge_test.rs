@@ -467,7 +467,11 @@ fn bounded_merge_does_not_accumulate_doc_values_across_bucket_boundaries() {
 fn auto_merge_after_a_bounded_optimize_respects_the_cap() {
     const SEGMENTS: u64 = 6;
     const DOCS_PER_SEGMENT: u64 = 200;
-    const TOTAL_DOCS: u64 = SEGMENTS * DOCS_PER_SEGMENT;
+    // Large enough to stay within auto-merge's 8x tier ratio of a bucket
+    // (Issue #1397) -- a single document would be too small to merge with
+    // one at all -- and small enough to fit under the cap together with one.
+    const TRIGGER_DOCS: u64 = 50;
+    const TOTAL_DOCS: u64 = SEGMENTS * DOCS_PER_SEGMENT + TRIGGER_DOCS;
 
     // Probe a single bucket's on-disk size so the cap below is independent
     // of the on-disk encoding.
@@ -479,8 +483,7 @@ fn auto_merge_after_a_bounded_optimize_respects_the_cap() {
         .map(|f| probe_storage.metadata(f).unwrap().size)
         .sum();
 
-    // Room for one bucket plus the tiny single-document commit below, but
-    // not two buckets.
+    // Room for one bucket plus the small commit below, but not two buckets.
     let cap = bucket_bytes + bucket_bytes / 2;
 
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
@@ -527,13 +530,18 @@ fn auto_merge_after_a_bounded_optimize_respects_the_cap() {
     // enough that, without the cap, it would fold every one of the 7
     // segments into a single unbounded merge, undoing the budget the
     // optimize above just bought.
-    let doc = corpus.build_and_record(doc_id);
-    store.upsert_document(doc_id, doc).unwrap();
+    for _ in 0..TRIGGER_DOCS {
+        let doc = corpus.build_and_record(doc_id);
+        store.upsert_document(doc_id, doc).unwrap();
+        doc_id += 1;
+    }
     store.commit().unwrap();
 
-    assert!(
-        segment_count(&storage) > 1,
-        "the cap must have stopped auto-merge from folding every segment \
+    assert_eq!(
+        segment_count(&storage),
+        SEGMENTS as usize,
+        "auto-merge must have merged the new segment into one bucket, and \
+         the cap must have stopped it there instead of folding every segment \
          into one, the way an unbounded auto-merge would have"
     );
     for id in segment_ids(&storage) {
@@ -546,9 +554,9 @@ fn auto_merge_after_a_bounded_optimize_respects_the_cap() {
 
     assert_eq!(
         term_hits(&store, "kind", "doc").len(),
-        (TOTAL_DOCS + 1) as usize,
-        "every document, including the one that triggered auto-merge, \
-         must survive"
+        TOTAL_DOCS as usize,
+        "every document, including those that triggered auto-merge, must \
+         survive"
     );
     let (lo, hi) = (-100i64, 100i64);
     assert_eq!(

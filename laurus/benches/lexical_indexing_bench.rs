@@ -18,10 +18,9 @@
 //!    "how long to ingest N docs?" number.
 //! 4. **`bench_multi_segment_commit`** — `(add × K + commit) × M` so M
 //!    segments accumulate. M ∈ {2, 4, 8} at K = 1 000. Exposes the
-//!    cost of repeated commits and any auto-merge work the
-//!    `TieredMergePolicy` triggers (default `max_segments_per_tier = 4`,
-//!    so M = 8 typically crosses the merge threshold and the cost shape
-//!    differs from M = 2).
+//!    cost of repeated commits. Auto-merge only runs once the segment
+//!    count exceeds `max_segments` (default 100), so no M here triggers
+//!    it.
 //!
 //! Each scenario uses `iter_batched` with `BatchSize::SmallInput` so
 //! every timed iteration receives a fresh `Engine`. The Engine
@@ -376,9 +375,9 @@ fn bench_bulk_ingest_batch_api(c: &mut Criterion) {
     group.finish();
 }
 
-/// `(add × K + commit) × M` so M segments accumulate. M = 8 typically
-/// crosses the default `TieredMergePolicy::max_segments_per_tier = 4`
-/// threshold, so the M-sweep also exposes any auto-merge work.
+/// `(add × K + commit) × M` so M segments accumulate. Every M stays under
+/// the default `max_segments` (100), so auto-merge never runs and the
+/// M-sweep measures repeated commits alone.
 fn bench_multi_segment_commit(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("ingest/multi_segment");
