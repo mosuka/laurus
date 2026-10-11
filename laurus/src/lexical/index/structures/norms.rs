@@ -161,6 +161,18 @@ fn is_contiguous(sorted_doc_ids: &[u64]) -> bool {
     }
 }
 
+/// Exact average of one field's lengths, computed the same way
+/// `calculate_field_stats` did (`sum as f64 / count as f64`, narrowed to
+/// `f32` only after the division) so `avg_field_length` stays bit-identical
+/// to before #555. `0.0` when there are no lengths.
+fn exact_avg_length(lengths: &AHashMap<u64, u32>) -> f32 {
+    if lengths.is_empty() {
+        return 0.0;
+    }
+    let sum: u64 = lengths.values().map(|&v| v as u64).sum();
+    (sum as f64 / lengths.len() as f64) as f32
+}
+
 /// Accumulates flush-time field lengths for one segment and serializes them
 /// into the `.norms` part.
 ///
@@ -179,6 +191,11 @@ pub(crate) struct NormsBuilder {
     /// order regardless of insertion order (mirrors the field-name order
     /// [`super::doc_values::write_columns`] requires).
     fields: BTreeMap<String, AHashMap<u64, u32>>,
+    /// Field name -> exact average length, folded once from `fields` in
+    /// [`Self::from_buffered`]. The flush's term loop asks for a field's
+    /// average once per term, so re-summing the field on every call made a
+    /// flush O(terms x documents) (Issue #1398).
+    avg_lengths: BTreeMap<String, f32>,
 }
 
 impl NormsBuilder {
@@ -203,7 +220,19 @@ impl NormsBuilder {
             }
         }
 
-        NormsBuilder { doc_ids, fields }
+        // Folded only once every document is in: a repeated doc id
+        // overwrites its earlier length above, so a running sum kept while
+        // inserting would count both.
+        let avg_lengths = fields
+            .iter()
+            .map(|(name, lengths)| (name.clone(), exact_avg_length(lengths)))
+            .collect();
+
+        NormsBuilder {
+            doc_ids,
+            fields,
+            avg_lengths,
+        }
     }
 
     /// The segment's doc ids, sorted and deduplicated — the ids the
@@ -229,20 +258,14 @@ impl NormsBuilder {
             .map(|&len| norm_to_length(length_to_norm(len)))
     }
 
-    /// Exact average length for `field`, computed the same way
-    /// `calculate_field_stats` did (`sum as f64 / count as f64`, narrowed to
-    /// `f32` only after the division) so `avg_field_length` stays
-    /// bit-identical to before #555. `0.0` when the field is absent from
-    /// this segment, matching the pre-#555 fallback.
+    /// Exact average length for `field` (see [`exact_avg_length`]). `0.0`
+    /// when the field is absent from this segment, matching the pre-#555
+    /// fallback.
+    ///
+    /// A lookup: the average was folded once in [`Self::from_buffered`]
+    /// (Issue #1398).
     pub(crate) fn avg_length_f32(&self, field: &str) -> f32 {
-        let Some(lengths) = self.fields.get(field) else {
-            return 0.0;
-        };
-        if lengths.is_empty() {
-            return 0.0;
-        }
-        let sum: u64 = lengths.values().map(|&v| v as u64).sum();
-        (sum as f64 / lengths.len() as f64) as f32
+        self.avg_lengths.get(field).copied().unwrap_or(0.0)
     }
 
     /// Serialize into the `.norms` format documented in the module docs.
@@ -1376,6 +1399,46 @@ mod format_tests {
         let builder = NormsBuilder::from_buffered(&docs);
         assert_eq!(builder.avg_length_f32("body"), 20.0);
         assert_eq!(builder.avg_length_f32("missing"), 0.0);
+    }
+
+    /// The averages are folded once, after every document is in (Issue
+    /// #1398). A repeated doc id (Issue #1210) replaces the earlier length,
+    /// so the average counts that document once, with its last length.
+    #[test]
+    fn avg_length_f32_counts_a_repeated_doc_id_once() {
+        let docs = vec![
+            (0u64, doc(&[("body", 10)])),
+            (1u64, doc(&[("body", 30)])),
+            (0u64, doc(&[("body", 50)])),
+        ];
+        let builder = NormsBuilder::from_buffered(&docs);
+        // {0: 50, 1: 30}, not 10 + 30 + 50 over two or three documents.
+        assert_eq!(builder.avg_length_f32("body"), 40.0);
+    }
+
+    /// The average the writer's score bounds use must equal the one a reader
+    /// folds from the written `.norms` header, narrowed to `f32`. `title` is
+    /// on only some documents, so the divisor is its present count, not the
+    /// segment's document count.
+    #[test]
+    fn avg_length_f32_matches_the_written_field_stats() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let docs = vec![
+            (3u64, doc(&[("body", 7), ("title", 2)])),
+            (5u64, doc(&[("body", 1_000_003)])),
+            (9u64, doc(&[("body", 11), ("title", 5)])),
+        ];
+        let builder = NormsBuilder::from_buffered(&docs);
+        let reader = round_trip(&storage, "seg_avg", &builder);
+        for field in ["body", "title"] {
+            let stats = reader.field_stats(field).unwrap();
+            assert_eq!(
+                builder.avg_length_f32(field),
+                stats.avg_length as f32,
+                "{field}"
+            );
+        }
+        assert_eq!(builder.avg_length_f32("title"), 3.5);
     }
 
     #[test]
