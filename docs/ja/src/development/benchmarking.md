@@ -163,6 +163,25 @@ Reproduce: `cargo bench -p laurus --bench distance_bench -- --baseline main`
 
 ファイル間でヘルパを共有する必要がある場合は、`benches/common.rs` を拡張してコード重複を避けてください。
 
+## 検索品質の測定（probe）
+
+Criterion は速度を測ります。順位付けの品質は BEIR データセットで [`laurus/examples/beir_multi_vector_probe.rs`](https://github.com/mosuka/laurus/blob/main/laurus/examples/beir_multi_vector_probe.rs) を使って測ります。この probe は [`MultiVector` のストレージ形式](../concepts/indexing/vector_indexing.md#multivector-ストレージ)ごとに、ColBERT の MaxSim による rescore の nDCG@10 を出力します。今後のストレージ方式（1-bit、token pooling）もこの probe で測ります。
+
+```bash
+./scripts/fetch-beir.sh scifact          # BEIR の zip を MD5 で検証して .cache/beir/ に展開
+cargo run --release --features embeddings-candle \
+    --example beir_multi_vector_probe -- --dataset scifact
+make beir-storage-eval BEIR_DATASET=nfcorpus   # 上の 2 手順をまとめたターゲット
+```
+
+- コーパスは `answerdotai/answerai-colbert-small-v1`（revision 固定）で 1 回だけエンコードし、f32 のトークンベクトルを `.cache/beir/<dataset>/` にキャッシュします。2 回目以降はエンコードを省きます。
+- 1 つの engine にストレージ形式ごとのフィールドを置き、全形式に同じベクトルを取り込みます。第 1 段は同一で、違いはディスク上の要素形式だけです。
+- 条件は 2 つです。コーパス全体に対する MaxSim（ストレージ形式の影響だけを取り出す。コーパスは `RescoreOptions::MAX_WINDOW_SIZE` に収まる必要がある）と、BM25 の上位 100 件を MaxSim で rescore するものです。
+- nDCG@10 は BEIR と同じく trec_eval の `ndcg_cut_10` に従います。`--trec-run <dir>` で TREC 形式の run ファイルを書き出し、trec_eval や pytrec_eval で別途検算できます。
+- F32 との差には、対応のあるブートストラップ（paired bootstrap、10,000 回、seed 固定）による 95% 信頼区間を添えます。検索時間は参考値です。
+
+probe の指標とキャッシュのコードは `cargo test` の単体テストで検証します（ダウンロード不要）。probe 自体は CI では実行しません。
+
 ## CI 連携
 
 現状、CI ではリグレッション検出のベンチジョブは実行していません。perf 系の PR は、推奨環境下で取得した baseline-vs-after 数値を手動で投稿することが想定されています。

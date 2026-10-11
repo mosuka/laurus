@@ -660,6 +660,42 @@ segments under the new on-disk kind. A schema with no `storage` key
 (written before this option existed) defaults to `F32` and needs no
 migration.
 
+#### Measured quality
+
+Measured on two BEIR datasets with the
+[BEIR probe](../../development/benchmarking.md#retrieval-quality-probes):
+`answerdotai/answerai-colbert-small-v1` (96-dimension token vectors,
+about 236 tokens per document), every storage kind ingesting the same
+vectors. **Exhaustive** ranks every document by MaxSim; **BM25 → rescore**
+rescores the BM25 top 100. Each cell is nDCG@10, then its paired
+difference from F32 with a 95% bootstrap confidence interval.
+
+| Kind | Bytes/token (96 dims) | Size vs F32 | SciFact exhaustive | SciFact BM25 → rescore | NFCorpus exhaustive | NFCorpus BM25 → rescore |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **F32** | 384 | 1 | 0.7456 | 0.7284 | 0.3690 | 0.3458 |
+| **F16** | 192 | 1/2 | 0.7446 (−0.0010 [−0.0029, 0.0000]) | 0.7284 (−0.0001 [−0.0002, 0.0000]) | 0.3689 (−0.0001 [−0.0008, +0.0006]) | 0.3457 (−0.0001 [−0.0009, +0.0007]) |
+| **Int8** | 98 | 1/3.92 | 0.7457 (+0.0002 [−0.0038, +0.0044]) | 0.7264 (−0.0021 [−0.0052, +0.0000]) | 0.3686 (−0.0004 [−0.0043, +0.0034]) | 0.3460 (+0.0002 [−0.0034, +0.0037]) |
+
+- Every 95% interval contains 0, so neither F16 nor Int8 shows a
+  measurable nDCG@10 loss on these datasets. The largest point estimate
+  is Int8's −0.0021 on SciFact BM25 → rescore.
+- F16 changes the nDCG@10 of at most 1 of SciFact's 300 queries and 18 of
+  NFCorpus's 323. Int8 reorders the top 10 of most queries (237 of 300
+  on SciFact exhaustive), but the gains and losses cancel out
+  (6 queries up, 7 down).
+- F32's exhaustive nDCG@10 is within 0.005 of the model card's published
+  numbers (SciFact 0.7477, NFCorpus 0.373), which do not state how they
+  were measured.
+- On SciFact the payload is 469 MB (F32), 235 MB (F16) and 120 MB (Int8)
+  for 1.22 M token vectors; segment files add 24 bytes per document and
+  80 bytes per segment.
+- 25 NFCorpus queries have no BM25 hit (single words such as `okra` that
+  never occur in the corpus; the default analyzer does not stem), so
+  BM25 → rescore scores them 0 under every kind.
+
+Reproduce with `make beir-storage-eval BEIR_DATASET=scifact` (or
+`nfcorpus`).
+
 ## Segment Files
 
 | Index Type | File Extension | Contents |

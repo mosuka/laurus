@@ -164,6 +164,25 @@ When adding a new bench file, follow the suite-wide hygiene rules from [`laurus/
 
 If your bench needs to share helpers across files, extend `benches/common.rs` rather than duplicating code.
 
+## Retrieval-quality probes
+
+Criterion measures speed; ranking quality is measured on BEIR datasets with [`laurus/examples/beir_multi_vector_probe.rs`](https://github.com/mosuka/laurus/blob/main/laurus/examples/beir_multi_vector_probe.rs). It reports nDCG@10 of ColBERT MaxSim rescoring for every [`MultiVector` storage kind](../concepts/indexing/vector_indexing.md#multivector-storage) and is the harness later storage options (1-bit, token pooling) are measured with.
+
+```bash
+./scripts/fetch-beir.sh scifact          # download and MD5-check the BEIR zip into .cache/beir/
+cargo run --release --features embeddings-candle \
+    --example beir_multi_vector_probe -- --dataset scifact
+make beir-storage-eval BEIR_DATASET=nfcorpus   # both steps in one target
+```
+
+- The corpus is encoded once with `answerdotai/answerai-colbert-small-v1` (pinned revision) and the f32 token vectors are cached under `.cache/beir/<dataset>/`; later runs skip the encoding.
+- Every storage kind ingests the same vectors into its own field of one engine, so the first stage is identical and only the on-disk element kind differs.
+- Two conditions: an exhaustive MaxSim over the whole corpus (isolates the storage effect; the corpus must fit in `RescoreOptions::MAX_WINDOW_SIZE`), and a BM25 top-100 first stage rescored by MaxSim.
+- nDCG@10 follows trec_eval's `ndcg_cut_10` as BEIR runs it. `--trec-run <dir>` writes TREC run files for an independent check with trec_eval or pytrec_eval.
+- Differences from F32 come with a paired-bootstrap 95% confidence interval (10,000 resamples, fixed seed). The reported search times are informational only.
+
+The probe's metric and cache code is unit-tested under `cargo test` (no download needed). The probe itself is not run in CI.
+
 ## Continuous integration
 
 CI does not currently run a regression-detection bench job. Each perf-changing PR is expected to post baseline-vs-after numbers manually, captured under the recommended environment.

@@ -1,8 +1,9 @@
 //! Intrinsic-fidelity tests for `MultiVector` storage compression (Issue
 //! #1346): f16/int8-compressed late-interaction (MaxSim) scores are
-//! compared against the f32 baseline, not against an external IR benchmark
-//! (the repository has no BEIR/nDCG harness, and this issue's accepted
-//! scope is intrinsic fidelity only — see the implementation plan).
+//! compared against the f32 baseline on synthetic data, so they run in CI
+//! without a model or dataset. Ranking quality on real queries (BEIR
+//! nDCG@10) is measured separately by
+//! `laurus/examples/beir_multi_vector_probe.rs`.
 //!
 //! The per-element error bounds below are derived, not guessed:
 //! - f16 has an 11-bit significand, so its relative error per element is
