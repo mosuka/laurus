@@ -202,6 +202,14 @@ name = "sift_rerank_probe"
 [[example]]
 name = "pq_brute_force_probe"
 
+# BEIR nDCG@10 per MultiVector storage kind (Issue #1346). `test = true`
+# runs its metric / cache unit tests under `cargo test`; they need no
+# download.
+[[example]]
+name = "beir_multi_vector_probe"
+required-features = ["embeddings-candle"]
+test = true
+
 [[bench]]
 name = "distance_bench"
 harness = false
