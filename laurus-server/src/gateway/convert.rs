@@ -849,20 +849,21 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 }
 
 /// A multi-vector field option (#1177); the engine rejects a zero
-/// dimension or a distance other than cosine / dot product when the index
-/// is created.
+/// dimension, a distance other than cosine / dot product, or `"binary"`
+/// storage with a distance other than cosine when the index is created.
 ///
 /// # Errors
 ///
 /// Returns an error when `storage` is present but not one of
-/// `"f32"` / `"f16"` / `"int8"` (case-insensitive), so a typo 400s
-/// instead of silently defaulting to f32 (Issue #1346).
+/// `"f32"` / `"f16"` / `"int8"` / `"binary"` (case-insensitive), so a typo
+/// 400s instead of silently defaulting to f32 (Issue #1346).
 fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
     let storage = match json.get("storage").and_then(|v| v.as_str()) {
         None => v1::MultiVectorStorage::F32 as i32,
         Some(s) if s.eq_ignore_ascii_case("f32") => v1::MultiVectorStorage::F32 as i32,
         Some(s) if s.eq_ignore_ascii_case("f16") => v1::MultiVectorStorage::F16 as i32,
         Some(s) if s.eq_ignore_ascii_case("int8") => v1::MultiVectorStorage::Int8 as i32,
+        Some(s) if s.eq_ignore_ascii_case("binary") => v1::MultiVectorStorage::Binary as i32,
         Some(s) => return Err(format!("unknown multi_vector storage '{s}'")),
     };
     Ok(v1::MultiVectorOption {
@@ -883,12 +884,14 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
 
 /// Render a proto `storage` value as a lowercase JSON string (Issue
 /// #1346). Returns `None` for F32/`UNSPECIFIED`/unknown, the default, so
-/// the field is omitted from the JSON object.
+/// the field is omitted from the JSON object. Every kind is matched by
+/// name, so a new one cannot silently render as the default.
 fn multi_vector_storage_to_json(value: Option<i32>) -> Option<&'static str> {
-    match value.and_then(|v| v1::MultiVectorStorage::try_from(v).ok()) {
-        Some(v1::MultiVectorStorage::F16) => Some("f16"),
-        Some(v1::MultiVectorStorage::Int8) => Some("int8"),
-        _ => None,
+    match value.and_then(|v| v1::MultiVectorStorage::try_from(v).ok())? {
+        v1::MultiVectorStorage::F16 => Some("f16"),
+        v1::MultiVectorStorage::Int8 => Some("int8"),
+        v1::MultiVectorStorage::Binary => Some("binary"),
+        v1::MultiVectorStorage::F32 | v1::MultiVectorStorage::Unspecified => None,
     }
 }
 
@@ -1951,7 +1954,12 @@ mod tests {
     /// unknown value is a 400-worthy error rather than a silent default.
     #[test]
     fn test_multi_vector_storage_round_trips_through_json() {
-        for (input, expected) in [("f32", "f32"), ("F16", "f16"), ("int8", "int8")] {
+        for (input, expected) in [
+            ("f32", "f32"),
+            ("F16", "f16"),
+            ("int8", "int8"),
+            ("Binary", "binary"),
+        ] {
             let json = json!({ "multi_vector": {"dimension": 32, "storage": input} });
             let proto = json_to_proto_field_option(&json).unwrap();
             let back = proto_field_option_to_json(&proto);

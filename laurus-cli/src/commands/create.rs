@@ -196,8 +196,28 @@ const DISTANCE_METRICS: &[&str] = &["Cosine", "Euclidean", "Manhattan", "DotProd
 /// The token similarities a MultiVector field accepts.
 const MULTI_VECTOR_DISTANCE_METRICS: &[&str] = &["Cosine", "DotProduct"];
 
-/// The on-disk element kinds a MultiVector field accepts (Issue #1346).
-const MULTI_VECTOR_STORAGE_KINDS: &[&str] = &["F32 (exact)", "F16 (2x)", "Int8 (~4x)"];
+/// The on-disk element kinds a MultiVector field accepts (Issue #1346), as
+/// (prompt label, kind).
+const MULTI_VECTOR_STORAGE_KINDS: &[(&str, MultiVectorStorage)] = &[
+    ("F32 (exact)", MultiVectorStorage::F32),
+    ("F16 (2x)", MultiVectorStorage::F16),
+    ("Int8 (~4x)", MultiVectorStorage::Int8),
+    ("Binary (~32x)", MultiVectorStorage::Binary),
+];
+
+/// The element kinds offered for a field with token similarity `distance`:
+/// `Binary` requires `Cosine`.
+fn multi_vector_storage_choices(
+    distance: DistanceMetric,
+) -> Vec<(&'static str, MultiVectorStorage)> {
+    MULTI_VECTOR_STORAGE_KINDS
+        .iter()
+        .copied()
+        .filter(|(_, kind)| {
+            *kind != MultiVectorStorage::Binary || distance == DistanceMetric::Cosine
+        })
+        .collect()
+}
 
 /// Run the interactive schema generation wizard (`create schema`).
 ///
@@ -715,16 +735,14 @@ fn prompt_multi_vector_option() -> Result<FieldOption> {
         "DotProduct" => DistanceMetric::DotProduct,
         _ => unreachable!(),
     };
+    let choices = multi_vector_storage_choices(distance);
+    let labels: Vec<&str> = choices.iter().map(|(label, _)| *label).collect();
     let idx = Select::new()
         .with_prompt("Token vector storage")
-        .items(MULTI_VECTOR_STORAGE_KINDS)
+        .items(&labels)
         .default(0)
         .interact()?;
-    let storage = match idx {
-        0 => MultiVectorStorage::F32,
-        1 => MultiVectorStorage::F16,
-        _ => MultiVectorStorage::Int8,
-    };
+    let storage = choices[idx].1;
 
     Ok(FieldOption::MultiVector(
         MultiVectorOption::new(dimension)
@@ -806,6 +824,35 @@ fn field_type_label(option: &FieldOption) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1346: every element kind is offered, mapped by its own table
+    /// entry rather than by position, and `Binary` only for `Cosine`.
+    #[test]
+    fn multi_vector_storage_choices_offer_binary_only_for_cosine() {
+        let kinds = |distance| -> Vec<MultiVectorStorage> {
+            multi_vector_storage_choices(distance)
+                .into_iter()
+                .map(|(_, kind)| kind)
+                .collect()
+        };
+        assert_eq!(
+            kinds(DistanceMetric::Cosine),
+            [
+                MultiVectorStorage::F32,
+                MultiVectorStorage::F16,
+                MultiVectorStorage::Int8,
+                MultiVectorStorage::Binary,
+            ]
+        );
+        assert_eq!(
+            kinds(DistanceMetric::DotProduct),
+            [
+                MultiVectorStorage::F32,
+                MultiVectorStorage::F16,
+                MultiVectorStorage::Int8,
+            ]
+        );
+    }
 
     /// The interactive wizard must list `Geo3d` so users can declare a 3D
     /// ECEF field without dropping down to TOML hand-editing. Tracked
