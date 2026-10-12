@@ -507,10 +507,10 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
 /// Buffers new vectors in an ordinary backend writer whose path is a fresh
 /// `segment_NNNNNN`; [`VectorIndexWriter::commit`] seals it as a new
 /// immutable segment file and registers it in the manifest exactly once. A
-/// sealed writer is DONE: committing again with new changes is rejected —
-/// re-writing a registered segment would carry its original generation
-/// while newer segments may have sealed in between, inverting the
-/// newest-wins ordering. The store never does this
+/// sealed writer is DONE, even after a rollback: committing again with new
+/// changes is rejected — re-writing a registered segment would carry its
+/// original generation while newer segments may have sealed in between,
+/// inverting the newest-wins ordering. The store never does this
 /// (`retain_writer_after_commit` is false); direct API users get a loud
 /// error instead of silent metadata corruption.
 struct SegmentedWriter<B: SegmentedBackend> {
@@ -518,10 +518,11 @@ struct SegmentedWriter<B: SegmentedBackend> {
     segment_id: String,
     inner: B::Writer,
     /// `None` until this writer's segment is sealed and registered, then
-    /// whether the buffer has changed since. The inner buffer is retained
-    /// after commit, so this keeps the post-commit `close()` a no-op while
-    /// any later change makes `commit` fail — including a same-size
-    /// replacement, which a buffer-length comparison would miss.
+    /// whether the buffer has changed since the seal or the last rollback.
+    /// The inner buffer is retained after commit, so this keeps the
+    /// post-commit `close()` a no-op while any later change makes `commit`
+    /// fail — including a same-size replacement, which a buffer-length
+    /// comparison would miss.
     changed_since_seal: Option<bool>,
 }
 
@@ -661,13 +662,21 @@ impl<B: SegmentedBackend> VectorIndexWriter for SegmentedWriter<B> {
         Ok(())
     }
 
+    /// Discard the changes buffered since the last commit. A sealed writer
+    /// stays sealed: its segment is registered, so a later change must still
+    /// make `commit` fail, while `has_pending_changes` is `false` right after
+    /// the rollback, which emptied the buffer.
     fn rollback(&mut self) -> Result<()> {
         // Rolled-back mutations are discarded, so the pending WAL
         // checkpoint must not keep covering their sequence numbers: roll
         // it back to the published value; their WAL records then stay
         // replayable.
         self.shared.core.rollback_pending_wal_seq();
-        self.inner.rollback()
+        self.inner.rollback()?;
+        if let Some(changed) = &mut self.changed_since_seal {
+            *changed = false;
+        }
+        Ok(())
     }
 
     fn pending_docs(&self) -> u64 {

@@ -306,6 +306,43 @@ fn dropping_a_closed_sealed_writer_keeps_the_wal_checkpoint() {
     assert_eq!(index.last_wal_seq(), 7);
 }
 
+/// Dropping a sealed writer after a change was rolled back must not roll back
+/// the WAL checkpoint: the rollback discarded every buffered change, so a
+/// sequence number set afterwards, here for deleting a sealed document, must
+/// be published (Issue #1419).
+#[test]
+fn dropping_a_rolled_back_sealed_writer_keeps_the_wal_checkpoint() {
+    let storage = storage();
+    let index = SegmentedHnswIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    index.set_last_wal_seq(7).unwrap();
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![(1, "v".to_string(), doc_vec(1))])
+        .unwrap();
+    writer.commit().unwrap();
+    index.persist_deletions().unwrap();
+
+    writer
+        .add_vectors(vec![(2, "v".to_string(), doc_vec(2))])
+        .unwrap();
+    writer.rollback().unwrap();
+
+    // Doc 1 is sealed and no longer buffered: this only marks the deletion
+    // bitmap.
+    writer.delete_document(1).unwrap();
+    index.set_last_wal_seq(9).unwrap();
+    drop(writer);
+    index.persist_deletions().unwrap();
+
+    assert_eq!(index.last_wal_seq(), 9);
+}
+
 /// Migrating a legacy monolithic index whose stored dimension does not match
 /// the config's dimension must fail loudly instead of silently proceeding
 /// (Issue #1409: HNSW did not validate this; Flat and IVF already did —
@@ -558,8 +595,8 @@ fn sealed_writer_rejects_second_commit_and_close_is_noop() {
 /// (delete-first, then re-add, as the store's upsert does) leaves the buffer
 /// length unchanged; the writer must still report the change and refuse to
 /// commit it instead of silently dropping the new version (Issue #1410).
-/// Deleting an id that is not buffered changes nothing, and rolling back does
-/// not unseal the writer.
+/// Deleting an id that is not buffered changes nothing, and rolling back
+/// discards the change without unsealing the writer (Issue #1419).
 #[test]
 fn sealed_writer_rejects_a_same_size_replacement() {
     let storage = storage();
@@ -588,13 +625,59 @@ fn sealed_writer_rejects_a_same_size_replacement() {
     let err = writer.commit().unwrap_err();
     assert!(err.to_string().contains("already sealed"), "{err}");
 
-    // Sealing again would overwrite the registered segment.
+    // Once sealed, the writer no longer consults the inner writer's own
+    // `has_pending_changes`, which the rollback resets to `true`.
     writer.rollback().unwrap();
+    assert!(!writer.has_pending_changes());
+    assert_eq!(writer.pending_docs(), 0);
+
+    // Sealing again would overwrite the registered segment.
     writer
         .add_vectors(vec![(1, "v".to_string(), doc_vec(9000))])
         .unwrap();
     let err = writer.commit().unwrap_err();
     assert!(err.to_string().contains("already sealed"), "{err}");
+}
+
+/// Rolling back before the first commit discards the buffer and leaves the
+/// writer unsealed: the next commit seals only the documents added after the
+/// rollback (Issue #1419). Until the seal, HNSW's writer still reports
+/// pending changes after the rollback, since the inner writer's own
+/// `has_pending_changes` is `true` until it is finalized (Issue #1409).
+#[test]
+fn rollback_before_the_first_commit_discards_the_buffer() {
+    let storage = storage();
+    let index = SegmentedHnswIndex::open_or_create(
+        storage.clone() as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![(1, "v".to_string(), doc_vec(1))])
+        .unwrap();
+    writer.rollback().unwrap();
+    assert!(writer.has_pending_changes());
+    assert_eq!(writer.pending_docs(), 0);
+
+    writer
+        .add_vectors(vec![(2, "v".to_string(), doc_vec(2))])
+        .unwrap();
+    writer.commit().unwrap();
+    index.persist_deletions().unwrap();
+
+    let reopened = SegmentedHnswIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.reader().unwrap().vector_ids().unwrap(),
+        vec![(2, "v".to_string())]
+    );
 }
 
 /// #881 review: count() excludes soft-deleted docs.
