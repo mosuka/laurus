@@ -375,9 +375,9 @@ impl VectorIndex for MultiVectorIndex {
 /// Buffers each document's token vectors under its doc id, so an upsert
 /// costs time proportional to the document's own tokens rather than to the
 /// whole buffer, and seals them as one new segment on commit. A sealed
-/// writer is done: committing further changes is rejected, since
-/// re-writing a registered segment would keep its generation while newer
-/// segments may have been sealed meanwhile.
+/// writer is done, even after a rollback: committing further changes is
+/// rejected, since re-writing a registered segment would keep its
+/// generation while newer segments may have been sealed meanwhile.
 #[derive(Debug)]
 struct MultiVectorWriter {
     shared: Arc<Shared>,
@@ -386,7 +386,7 @@ struct MultiVectorWriter {
     /// so written) by doc id.
     buffer: BTreeMap<u64, Vec<Vector>>,
     /// `None` until the segment is sealed, then whether the buffer has
-    /// changed since.
+    /// changed since the seal or the last rollback.
     changed_since_seal: Option<bool>,
     closed: bool,
 }
@@ -589,11 +589,17 @@ impl VectorIndexWriter for MultiVectorWriter {
         Ok(())
     }
 
+    /// Discard the changes buffered since the last commit. A sealed writer
+    /// stays sealed: its segment is registered, so a later change must still
+    /// make `commit` fail rather than rewrite the segment's file and register
+    /// its id again.
     fn rollback(&mut self) -> Result<()> {
         // The discarded mutations' WAL records must stay replayable.
         self.shared.core.rollback_pending_wal_seq();
         self.buffer.clear();
-        self.changed_since_seal = None;
+        if let Some(changed) = &mut self.changed_since_seal {
+            *changed = false;
+        }
         Ok(())
     }
 
@@ -636,6 +642,8 @@ impl Drop for MultiVectorWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 
@@ -948,6 +956,80 @@ mod tests {
         assert!(writer.has_pending_changes());
         assert!(writer.commit().is_err());
         writer.rollback().unwrap();
+    }
+
+    /// `(segment_id, vector_count, generation)` of every registered segment,
+    /// and the bytes of the first one's file.
+    fn sealed_state(index: &MultiVectorIndex) -> (Vec<(String, u64, u64)>, Vec<u8>) {
+        let segments: Vec<(String, u64, u64)> = index
+            .shared
+            .core
+            .manager()
+            .list_segments()
+            .into_iter()
+            .map(|segment| (segment.segment_id, segment.vector_count, segment.generation))
+            .collect();
+        let mut bytes = Vec::new();
+        index
+            .shared
+            .core
+            .storage()
+            .open_input(&Shared::file_name(&segments[0].0))
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        (segments, bytes)
+    }
+
+    #[test]
+    fn test_rollback_after_commit_keeps_the_writer_sealed() {
+        let storage = storage();
+        let index = open(&storage);
+        let mut writer = index.writer().unwrap();
+        writer.add_vectors(tokens(1, &[[1.0, 1.0]])).unwrap();
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+        let sealed = sealed_state(&index);
+
+        // Re-sealing would rewrite the registered segment's file and
+        // register its id a second time.
+        writer.rollback().unwrap();
+        writer.add_vectors(tokens(2, &[[2.0, 2.0]])).unwrap();
+        let err = writer.commit().unwrap_err();
+        assert!(err.to_string().contains("already sealed"), "{err}");
+
+        // Rolling back discards the change, so nothing is pending.
+        writer.rollback().unwrap();
+        assert!(!writer.has_pending_changes());
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+        assert_eq!(sealed_state(&index), sealed);
+
+        let reopened = open(&storage);
+        assert_eq!(sealed_state(&reopened), sealed);
+        assert_eq!(vectors_of(&reopened, 1), Some(vec![1.0, 1.0]));
+        assert_eq!(vectors_of(&reopened, 2), None);
+        assert_eq!(reopened.stats().unwrap().vector_count, 1);
+    }
+
+    #[test]
+    fn test_rollback_before_commit_discards_the_buffer() {
+        let storage = storage();
+        let index = open(&storage);
+        let mut writer = index.writer().unwrap();
+        writer.add_vectors(tokens(1, &[[1.0, 1.0]])).unwrap();
+        writer.rollback().unwrap();
+        assert!(!writer.has_pending_changes());
+        assert_eq!(writer.pending_docs(), 0);
+
+        writer.add_vectors(tokens(2, &[[2.0, 2.0]])).unwrap();
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+        assert_eq!(newest_segment_entries(&index), vec![(2, 1)]);
+
+        let reopened = open(&storage);
+        assert_eq!(vectors_of(&reopened, 1), None);
+        assert_eq!(vectors_of(&reopened, 2), Some(vec![2.0, 2.0]));
     }
 
     /// One field's token vectors in the shape `VectorStore::write_vectors`
