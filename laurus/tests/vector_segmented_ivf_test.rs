@@ -248,6 +248,73 @@ fn wal_checkpoint_publishes_only_after_persist_deletions() {
     assert_eq!(index.last_wal_seq(), 7);
 }
 
+/// Migrating a legacy monolithic index whose stored dimension does not match
+/// the config's dimension must fail loudly instead of silently proceeding
+/// (Issue #1409: this guards the dimension check staying in place once IVF
+/// shares its migration code with HNSW and Flat).
+#[test]
+fn legacy_migration_rejects_a_dimension_mismatch() {
+    let storage = storage();
+    {
+        let index = IvfIndex::create(
+            storage.clone() as Arc<dyn Storage>,
+            "vector_index",
+            config(false),
+        )
+        .unwrap();
+        commit_batch(&index, 0..10);
+    }
+
+    let mut mismatched = config(true);
+    mismatched.dimension = 8;
+    let err =
+        SegmentedIvfIndex::open_or_create(storage as Arc<dyn Storage>, "vector_index", mismatched);
+    assert!(
+        err.is_err(),
+        "a dimension mismatch during migration must fail"
+    );
+}
+
+/// A freshly obtained writer that was never mutated reports no pending
+/// changes. IVF's inner writer never overrides `has_pending_changes` (the
+/// trait default is unconditionally `true`), so the segmented writer only
+/// looks at its own buffer, not the inner writer's own flag (Issue #1409:
+/// this is the behavior HNSW's writer deliberately does NOT share).
+#[test]
+fn fresh_writer_has_no_pending_changes_before_any_mutation() {
+    let storage = storage();
+    let index = SegmentedIvfIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    let writer = index.writer().unwrap();
+    assert!(!writer.has_pending_changes());
+}
+
+/// Dropping a writer that was never mutated must not roll back a WAL
+/// checkpoint: the `Drop` backstop is guarded by `has_pending_changes`,
+/// which is `false` for an untouched IVF writer (Issue #1409: HNSW's own
+/// writer differs here — see `vector_segmented_index_test.rs`).
+#[test]
+fn dropping_an_unused_writer_does_not_roll_back_the_wal_checkpoint() {
+    let storage = storage();
+    let index = SegmentedIvfIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    index.set_last_wal_seq(7).unwrap();
+    drop(index.writer().unwrap());
+    index.persist_deletions().unwrap();
+
+    assert_eq!(index.last_wal_seq(), 7);
+}
+
 /// Self-recall of a multi-segment index matches a monolithic build of the
 /// same corpus. IVF self-lookup is always exact (see the module docs), so
 /// this pins that the newest-wins containment masking across segments does

@@ -237,6 +237,48 @@ fn wal_checkpoint_publishes_only_after_persist_deletions() {
     assert_eq!(index.last_wal_seq(), 7);
 }
 
+/// A freshly obtained writer that was never mutated still reports pending
+/// changes: `HnswIndexWriter` is constructed with `is_finalized: false`, and
+/// HNSW's segmented writer ORs in the inner writer's own
+/// `has_pending_changes` (Issue #1409: unlike Flat/IVF, whose inner writer
+/// never overrides the trait's unconditional `true` default, so they cannot
+/// use the same check without being permanently "pending").
+#[test]
+fn fresh_writer_reports_pending_changes_before_any_mutation() {
+    let storage = storage();
+    let index = SegmentedHnswIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    let writer = index.writer().unwrap();
+    assert!(writer.has_pending_changes());
+}
+
+/// Dropping a writer that was never mutated rolls back a pending WAL
+/// checkpoint: HNSW's `has_pending_changes` reports `true` even for an
+/// untouched writer (see above), so the `Drop` backstop fires and restores
+/// the published value (Issue #1409: Flat/IVF do not share this behavior —
+/// see `vector_segmented_flat_test.rs` / `vector_segmented_ivf_test.rs`).
+#[test]
+fn dropping_an_unused_writer_rolls_back_the_wal_checkpoint() {
+    let storage = storage();
+    let index = SegmentedHnswIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    index.set_last_wal_seq(7).unwrap();
+    drop(index.writer().unwrap());
+    index.persist_deletions().unwrap();
+
+    assert_eq!(index.last_wal_seq(), 0);
+}
+
 /// #881: self-recall@10 of a 5-segment index matches a monolithic build of
 /// the same corpus within tolerance (#872-style gate).
 #[test]
