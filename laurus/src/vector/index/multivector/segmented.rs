@@ -11,7 +11,7 @@
 //! older ones. Merges drop deleted documents and stale copies, and copy the
 //! surviving payloads without re-encoding them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -271,8 +271,8 @@ impl VectorIndex for MultiVectorIndex {
         Ok(Box::new(MultiVectorWriter {
             segment_id: self.shared.core.manager().generate_segment_id(),
             shared: self.shared.clone(),
-            buffer: Vec::new(),
-            sealed_len: None,
+            buffer: BTreeMap::new(),
+            changed_since_seal: None,
             closed: false,
         }))
     }
@@ -372,42 +372,39 @@ impl VectorIndex for MultiVectorIndex {
 
 /// Active-segment writer of a [`MultiVectorIndex`].
 ///
-/// Buffers token vectors as `(doc_id, field, vector)` triples, one per
-/// token, and seals them as one new segment on commit. A sealed writer is
-/// done: committing further changes is rejected, since re-writing a
-/// registered segment would keep its generation while newer segments may
-/// have been sealed meanwhile.
+/// Buffers each document's token vectors under its doc id, so an upsert
+/// costs time proportional to the document's own tokens rather than to the
+/// whole buffer, and seals them as one new segment on commit. A sealed
+/// writer is done: committing further changes is rejected, since
+/// re-writing a registered segment would keep its generation while newer
+/// segments may have been sealed meanwhile.
 #[derive(Debug)]
 struct MultiVectorWriter {
     shared: Arc<Shared>,
     segment_id: String,
-    buffer: Vec<(u64, String, Vector)>,
-    /// Buffer length when the segment was sealed; `None` until then.
-    sealed_len: Option<usize>,
+    /// Each buffered document's token vectors in arrival order, keyed (and
+    /// so written) by doc id.
+    buffer: BTreeMap<u64, Vec<Vector>>,
+    /// `None` until the segment is sealed, then whether the buffer has
+    /// changed since.
+    changed_since_seal: Option<bool>,
     closed: bool,
 }
 
 impl MultiVectorWriter {
-    /// Buffered documents, ascending by doc id, with the buffer positions
-    /// of their vectors in insertion order.
-    fn documents(&self) -> Vec<(u64, Vec<usize>)> {
-        let mut by_doc: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (i, (doc_id, _, _)) in self.buffer.iter().enumerate() {
-            by_doc.entry(*doc_id).or_default().push(i);
+    /// Record a buffer change; after sealing, it makes `commit` fail.
+    fn mark_changed(&mut self) {
+        if let Some(changed) = &mut self.changed_since_seal {
+            *changed = true;
         }
-        let mut docs: Vec<(u64, Vec<usize>)> = by_doc.into_iter().collect();
-        docs.sort_unstable_by_key(|(doc_id, _)| *doc_id);
-        docs
     }
 }
 
 impl VectorIndexWriter for MultiVectorWriter {
     fn next_vector_id(&self) -> u64 {
         self.buffer
-            .iter()
-            .map(|(doc_id, _, _)| doc_id + 1)
-            .max()
-            .unwrap_or(0)
+            .last_key_value()
+            .map_or(0, |(doc_id, _)| doc_id + 1)
     }
 
     fn build(&mut self, vectors: Vec<(u64, String, Vector)>) -> Result<()> {
@@ -427,19 +424,20 @@ impl VectorIndexWriter for MultiVectorWriter {
                 vector.dimension()
             )));
         }
-        let incoming: HashSet<u64> = vectors.iter().map(|(doc_id, _, _)| *doc_id).collect();
-        self.buffer
-            .retain(|(doc_id, _, _)| !incoming.contains(doc_id));
-        self.shared.core.unmark_deleted(incoming.iter().copied())?;
-
         let normalize = self.shared.config.distance_metric == DistanceMetric::Cosine;
-        self.buffer
-            .extend(vectors.into_iter().map(|(doc_id, field, mut vector)| {
-                if normalize {
-                    vector.normalize();
-                }
-                (doc_id, field, vector)
-            }));
+        let mut incoming: BTreeMap<u64, Vec<Vector>> = BTreeMap::new();
+        for (doc_id, _, mut vector) in vectors {
+            if normalize {
+                vector.normalize();
+            }
+            incoming.entry(doc_id).or_default().push(vector);
+        }
+        self.shared.core.unmark_deleted(incoming.keys().copied())?;
+        if !incoming.is_empty() {
+            self.mark_changed();
+        }
+        // Replaces the entry of every document already buffered.
+        self.buffer.extend(incoming);
         Ok(())
     }
 
@@ -448,31 +446,38 @@ impl VectorIndexWriter for MultiVectorWriter {
     }
 
     fn progress(&self) -> f32 {
-        if self.sealed_len.is_some() { 1.0 } else { 0.0 }
+        if self.changed_since_seal.is_some() {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     fn estimated_memory_usage(&self) -> usize {
         self.buffer
-            .iter()
-            .map(|(_, field, vector)| {
-                field.len() + vector.dimension() * std::mem::size_of::<f32>() + 64
-            })
+            .values()
+            .flatten()
+            .map(|vector| vector.dimension() * std::mem::size_of::<f32>() + 64)
             .sum()
     }
 
     fn vectors(&self) -> &[(u64, String, Vector)] {
-        &self.buffer
+        // Contract mismatch, as in `MultiFieldWriter::vectors`: the buffer
+        // is keyed by document, so there is no slice of per-token triples
+        // to lend. Committed documents are read through `build_reader`.
+        &[]
     }
 
     /// Write the buffered documents as this writer's segment file (without
     /// registering it; see [`VectorIndexWriter::commit`]).
     fn write(&self) -> Result<()> {
-        let docs = self.documents();
-        let entries: Vec<DocEntry> = docs
+        let docs: Vec<&Vec<Vector>> = self.buffer.values().collect();
+        let entries: Vec<DocEntry> = self
+            .buffer
             .iter()
-            .map(|(doc_id, positions)| DocEntry {
+            .map(|(doc_id, vectors)| DocEntry {
                 doc_id: *doc_id,
-                vector_count: positions.len() as u32,
+                vector_count: vectors.len() as u32,
             })
             .collect();
         write_segment(
@@ -482,8 +487,8 @@ impl VectorIndexWriter for MultiVectorWriter {
             self.shared.config.dimension,
             &entries,
             |i, sink| {
-                for &position in &docs[i].1 {
-                    sink.write(self.buffer[position].2.data.as_slice())?;
+                for vector in docs[i] {
+                    sink.write(vector.data.as_slice())?;
                 }
                 Ok(())
             },
@@ -497,13 +502,15 @@ impl VectorIndexWriter for MultiVectorWriter {
     /// Upsert delete-first: drop the buffered copy and hide the sealed ones.
     fn delete_document(&mut self, doc_id: u64) -> Result<()> {
         self.shared.core.mark_deleted(doc_id)?;
-        self.buffer.retain(|(id, _, _)| *id != doc_id);
+        if self.buffer.remove(&doc_id).is_some() {
+            self.mark_changed();
+        }
         Ok(())
     }
 
     fn has_pending_changes(&self) -> bool {
-        match self.sealed_len {
-            Some(sealed) => self.buffer.len() != sealed,
+        match self.changed_since_seal {
+            Some(changed) => changed,
             None => !self.buffer.is_empty(),
         }
     }
@@ -512,8 +519,8 @@ impl VectorIndexWriter for MultiVectorWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        if let Some(sealed) = self.sealed_len {
-            if self.buffer.len() == sealed {
+        if let Some(changed) = self.changed_since_seal {
+            if !changed {
                 return Ok(());
             }
             return Err(LaurusError::InvalidOperation(format!(
@@ -522,11 +529,10 @@ impl VectorIndexWriter for MultiVectorWriter {
             )));
         }
         self.write()?;
-        let doc_count = self.documents().len() as u64;
         // Generation 0: the manager stamps max + 1 and measures the size.
-        let info = ManagedSegmentInfo::new(self.segment_id.clone(), doc_count, 0, 0);
+        let info = ManagedSegmentInfo::new(self.segment_id.clone(), self.buffer.len() as u64, 0, 0);
         self.shared.core.manager().add_segment(info)?;
-        self.sealed_len = Some(self.buffer.len());
+        self.changed_since_seal = Some(false);
         self.shared.readers.invalidate(&self.segment_id);
         Ok(())
     }
@@ -535,19 +541,15 @@ impl VectorIndexWriter for MultiVectorWriter {
         // The discarded mutations' WAL records must stay replayable.
         self.shared.core.rollback_pending_wal_seq();
         self.buffer.clear();
-        self.sealed_len = None;
+        self.changed_since_seal = None;
         Ok(())
     }
 
     fn pending_docs(&self) -> u64 {
-        if self.sealed_len.is_some() {
+        if self.changed_since_seal.is_some() {
             return 0;
         }
-        self.buffer
-            .iter()
-            .map(|(doc_id, _, _)| *doc_id)
-            .collect::<HashSet<_>>()
-            .len() as u64
+        self.buffer.len() as u64
     }
 
     fn close(&mut self) -> Result<()> {
@@ -806,6 +808,92 @@ mod tests {
         writer.commit().unwrap();
         writer.commit().unwrap();
         writer.add_vectors(tokens(2, &[[1.0, 1.0]])).unwrap();
+        assert!(writer.commit().is_err());
+        writer.rollback().unwrap();
+    }
+
+    /// `(doc_id, vector_count)` of every document in the newest segment.
+    fn newest_segment_entries(index: &MultiVectorIndex) -> Vec<(u64, u32)> {
+        index.shared.readers_newest_first().unwrap()[0]
+            .entries()
+            .map(|entry| (entry.doc_id, entry.vector_count))
+            .collect()
+    }
+
+    #[test]
+    fn test_delete_drops_the_buffered_copy() {
+        let index = open(&storage());
+        let mut writer = index.writer().unwrap();
+        for doc_id in 1..=3 {
+            writer.add_vectors(tokens(doc_id, &[[1.0, 1.0]])).unwrap();
+        }
+        writer.delete_document(2).unwrap();
+        assert_eq!(writer.pending_docs(), 2);
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+        assert_eq!(newest_segment_entries(&index), vec![(1, 1), (3, 1)]);
+        assert_eq!(vectors_of(&index, 2), None);
+    }
+
+    #[test]
+    fn test_reput_of_a_buffered_document_keeps_only_the_latest_copy() {
+        let index = open(&storage());
+        let mut writer = index.writer().unwrap();
+        for (doc_id, v) in [(1, [1.0, 0.0]), (2, [2.0, 0.0]), (3, [3.0, 0.0])] {
+            writer.delete_document(doc_id).unwrap();
+            writer.add_vectors(tokens(doc_id, &[v, v])).unwrap();
+        }
+        // The store's upsert sequence, on a document between two others.
+        writer.delete_document(2).unwrap();
+        writer
+            .add_vectors(tokens(2, &[[7.0, 7.0], [8.0, 8.0], [9.0, 9.0]]))
+            .unwrap();
+        assert_eq!(writer.pending_docs(), 3);
+        assert_eq!(writer.next_vector_id(), 4);
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+
+        assert_eq!(newest_segment_entries(&index), vec![(1, 2), (2, 3), (3, 2)]);
+        assert_eq!(vectors_of(&index, 1), Some(vec![1.0, 0.0, 1.0, 0.0]));
+        assert_eq!(
+            vectors_of(&index, 2),
+            Some(vec![7.0, 7.0, 8.0, 8.0, 9.0, 9.0])
+        );
+        assert_eq!(vectors_of(&index, 3), Some(vec![3.0, 0.0, 3.0, 0.0]));
+    }
+
+    #[test]
+    fn test_interleaved_documents_keep_their_token_order() {
+        let index = open(&storage());
+        let mut writer = index.writer().unwrap();
+        let mut vectors = Vec::new();
+        for (doc_id, v) in [
+            (2, [1.0, 0.0]),
+            (1, [2.0, 0.0]),
+            (2, [3.0, 0.0]),
+            (1, [4.0, 0.0]),
+        ] {
+            vectors.extend(tokens(doc_id, &[v]));
+        }
+        writer.add_vectors(vectors).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(newest_segment_entries(&index), vec![(1, 2), (2, 2)]);
+        assert_eq!(vectors_of(&index, 1), Some(vec![2.0, 0.0, 4.0, 0.0]));
+        assert_eq!(vectors_of(&index, 2), Some(vec![1.0, 0.0, 3.0, 0.0]));
+    }
+
+    #[test]
+    fn test_sealed_writer_rejects_a_same_size_replacement() {
+        let index = open(&storage());
+        let mut writer = index.writer().unwrap();
+        writer.add_vectors(tokens(1, &[[1.0, 1.0]])).unwrap();
+        writer.commit().unwrap();
+        assert!(!writer.has_pending_changes());
+
+        // Same token count as the sealed copy: the buffer size is unchanged.
+        writer.delete_document(1).unwrap();
+        writer.add_vectors(tokens(1, &[[2.0, 2.0]])).unwrap();
+        assert!(writer.has_pending_changes());
         assert!(writer.commit().is_err());
         writer.rollback().unwrap();
     }
