@@ -14,3 +14,4 @@ pub mod merge;
 pub mod merge_policy;
 pub mod reader_cache;
 pub(crate) mod segmented_core;
+pub mod segmented_index;
