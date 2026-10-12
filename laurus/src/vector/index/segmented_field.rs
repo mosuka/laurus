@@ -355,22 +355,13 @@ impl VectorFieldWriter for SegmentedVectorField {
         // not take this lock, so the reverse order would open a window where
         // the active copy is gone but the stale sealed copy is not yet
         // masked.
-        let mut newly_deleted = false;
-        {
-            let mut active_opt = self.active_segment.write();
-            if let Some(bitmap) = &self.deletion_bitmap {
-                newly_deleted = bitmap.delete_document(doc_id)?;
-            }
-            // Remove from the active (unflushed) buffer.
-            if let Some((_, writer)) = active_opt.as_mut() {
-                let _ = writer.delete_document(doc_id);
-            }
+        let mut active_opt = self.active_segment.write();
+        if let Some(bitmap) = &self.deletion_bitmap {
+            bitmap.delete_document(doc_id)?;
         }
-
-        // Flag `has_deletions` so the merge policy prioritizes the affected
-        // segments (outside the active lock — it persists the manifest).
-        if newly_deleted && !self.segment_manager.list_segments().is_empty() {
-            self.segment_manager.mark_all_has_deletions()?;
+        // Remove from the active (unflushed) buffer.
+        if let Some((_, writer)) = active_opt.as_mut() {
+            let _ = writer.delete_document(doc_id);
         }
         Ok(())
     }
@@ -778,10 +769,10 @@ mod tests {
 
     /// #880: deleting a doc that lives in a SEALED segment must make it
     /// search-invisible (previously a silent no-op — only the active buffer
-    /// was touched) and flag `has_deletions` for the merge policy.
+    /// was touched).
     #[tokio::test]
-    async fn sealed_segment_delete_is_search_invisible_and_flagged() {
-        let (field, bitmap, manager) = field_with_bitmap();
+    async fn sealed_segment_delete_is_search_invisible() {
+        let (field, bitmap, _manager) = field_with_bitmap();
 
         field
             .add_stored_vector(1, &StoredVector::new(vec![1.0, 0.0, 0.0, 0.0]), 0)
@@ -807,10 +798,6 @@ mod tests {
             "a sealed-segment doc must be search-invisible after delete \
              (#880), got {:?}",
             results.hits
-        );
-        assert!(
-            manager.list_segments().iter().all(|s| s.has_deletions),
-            "has_deletions must be flagged for the merge policy (#880)"
         );
 
         // The deletion also survives a force merge (the merge engine filters

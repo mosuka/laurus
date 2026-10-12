@@ -193,7 +193,6 @@ mod tests {
             vector_count: count,
             vector_offset: 0,
             generation: 1,
-            has_deletions: false,
             size_bytes: count * 100,
         }
     }

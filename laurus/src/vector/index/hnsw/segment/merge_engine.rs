@@ -156,7 +156,6 @@ impl MergeEngine {
             // max+1 at flush) and the sources are removed with the merge, so
             // inheriting the maximum cannot collide with a live segment.
             generation: segments.iter().map(|s| s.generation).max().unwrap_or(0),
-            has_deletions: false,
             size_bytes: total_size,
         };
 

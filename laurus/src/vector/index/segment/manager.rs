@@ -147,9 +147,6 @@ pub struct ManagedSegmentInfo {
     /// Generation number of this segment.
     pub generation: u64,
 
-    /// Whether this segment has deletions.
-    pub has_deletions: bool,
-
     /// Size of the segment in bytes.
     pub size_bytes: u64,
 }
@@ -162,7 +159,6 @@ impl ManagedSegmentInfo {
             vector_count,
             vector_offset,
             generation,
-            has_deletions: false,
             size_bytes: 0,
         }
     }
@@ -197,9 +193,6 @@ pub struct SegmentManagerStats {
 
     /// Total size of all segments in bytes.
     pub total_size: u64,
-
-    /// Number of segments with deletions.
-    pub segments_with_deletions: u32,
 
     /// Average vectors per segment.
     pub avg_vectors_per_segment: f64,
@@ -474,35 +467,6 @@ impl SegmentManager {
         Ok(())
     }
 
-    /// Flag every registered segment as containing deletions (Issue #880).
-    ///
-    /// The vector-side [`ManagedSegmentInfo`] carries no per-segment doc-id
-    /// range, so a delete that may target a sealed segment cannot be
-    /// attributed to a specific one; flagging all of them is conservative
-    /// but correct — the flag only feeds the merge policy's prioritization,
-    /// while actual filtering always goes through the shared deletion
-    /// bitmap. Saves the manifest once (not per segment). No-op when every
-    /// segment is already flagged.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if persisting the manifest fails.
-    pub fn mark_all_has_deletions(&self) -> Result<()> {
-        let mut segments = self.segments.write();
-        let mut changed = false;
-        for segment in segments.iter_mut() {
-            if !segment.has_deletions {
-                segment.has_deletions = true;
-                changed = true;
-            }
-        }
-        if changed {
-            self.save_state_locked(&segments)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Update a segment info.
     pub fn update_segment(&self, info: ManagedSegmentInfo) -> Result<()> {
         let mut segments = self.segments.write();
@@ -611,7 +575,6 @@ impl SegmentManager {
         let segment_count = segments.len() as u32;
         let total_vectors: u64 = segments.iter().map(|s| s.vector_count).sum();
         let total_size: u64 = segments.iter().map(|s| s.size_bytes).sum();
-        let segments_with_deletions = segments.iter().filter(|s| s.has_deletions).count() as u32;
         let avg_vectors_per_segment = if segment_count > 0 {
             total_vectors as f64 / segment_count as f64
         } else {
@@ -622,7 +585,6 @@ impl SegmentManager {
             segment_count,
             total_vectors,
             total_size,
-            segments_with_deletions,
             avg_vectors_per_segment,
         }
     }
@@ -649,7 +611,6 @@ mod tests {
             vector_count: count,
             vector_offset: 0,
             generation: 1,
-            has_deletions: false,
             size_bytes: count * 100,
         }
     }
@@ -1154,5 +1115,25 @@ mod tests {
         assert!(ids.contains(&"1".to_string()));
         assert!(ids.contains(&"2".to_string()));
         assert!(ids.contains(&"3".to_string()));
+    }
+
+    /// Manifests written before #1411 carry a `has_deletions` key on every
+    /// segment. They must still load: `ManagedSegmentInfo` does not deny
+    /// unknown fields, so serde skips the key.
+    #[test]
+    fn test_manifest_with_removed_has_deletions_field_still_loads() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let json = br#"{"version":1,"next_segment_id":1,"last_wal_seq":0,"segments":[{"segment_id":"segment_000000","vector_count":2,"vector_offset":0,"generation":1,"has_deletions":true,"size_bytes":42}]}"#;
+        crate::storage::manifest::save_checksummed(storage.as_ref(), MANIFEST_FILE, None, json)
+            .unwrap();
+
+        let manager =
+            SegmentManager::new(SegmentManagerConfig::default(), storage, TEST_LAYOUT).unwrap();
+        let segments = manager.list_segments();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_id, "segment_000000");
+        assert_eq!(segments[0].vector_count, 2);
+        assert_eq!(segments[0].generation, 1);
     }
 }

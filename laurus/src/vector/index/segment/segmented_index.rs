@@ -273,10 +273,8 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
             // `add_segment` stamps generation 1, measures the on-storage
             // size, and saves the manifest atomically — the moment it
             // returns, the index is segmented; before that, it is still a
-            // valid legacy index. A legacy delmap (same file in both
-            // layouts) means the segment carries deletions.
-            let mut info = ManagedSegmentInfo::new(name.to_string(), vector_count, 0, 0);
-            info.has_deletions = storage.file_exists(&format!("{name}.delmap"));
+            // valid legacy index.
+            let info = ManagedSegmentInfo::new(name.to_string(), vector_count, 0, 0);
             manager.add_segment(info)?;
 
             // Drop the monolithic index's now-stale `metadata.json` so the

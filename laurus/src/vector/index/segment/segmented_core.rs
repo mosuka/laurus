@@ -137,6 +137,10 @@ impl SegmentedCore {
 
     /// Logically delete `doc_id` in every sealed segment.
     ///
+    /// Every put through the engine calls this with a fresh internal id (the
+    /// upsert's delete-before-add in `VectorStore::write_vectors`), so it is
+    /// on the put hot path and must not do per-segment work (#1411).
+    ///
     /// # Returns
     ///
     /// `true` when the document was not already marked deleted.
@@ -144,13 +148,7 @@ impl SegmentedCore {
         let bitmap = self
             .load_or_get_bitmap(true)?
             .ok_or_else(|| LaurusError::internal("deletion bitmap unexpectedly missing"))?;
-        let newly_deleted = bitmap.delete_document(doc_id)?;
-        if newly_deleted && !self.manager.list_segments().is_empty() {
-            // Segment infos carry no doc-id range, and the flag only feeds
-            // merge-policy prioritization, so every segment is flagged.
-            self.manager.mark_all_has_deletions()?;
-        }
-        Ok(newly_deleted)
+        bitmap.delete_document(doc_id)
     }
 
     /// Clear the deletion marks of re-added documents.
@@ -542,5 +540,30 @@ mod tests {
         let segments = core.manager().list_segments();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].segment_id, first.segment_id);
+    }
+
+    /// Through the engine, every put deletes the fresh internal id before
+    /// adding it (`VectorStore::write_vectors`'s upsert dance), so
+    /// `mark_deleted` always sees a newly-deleted id once a segment is
+    /// sealed. It must not save the manifest (#1411).
+    ///
+    /// The manifest is removed first so that ANY save recreates it; a
+    /// byte-for-byte comparison would miss a save that rewrites identical
+    /// content.
+    #[test]
+    fn test_fresh_id_delete_after_seal_does_not_save_manifest() {
+        let storage = memory_storage();
+        let core = open(&storage);
+        add_segment(&core, 4);
+        storage.delete_file("segments.json").unwrap();
+
+        for doc_id in 100..200 {
+            assert!(core.mark_deleted(doc_id).unwrap());
+        }
+
+        assert!(
+            !storage.file_exists("segments.json"),
+            "a fresh-id delete must not save the segment manifest once a segment is sealed"
+        );
     }
 }
