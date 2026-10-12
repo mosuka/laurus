@@ -1,6 +1,6 @@
 //! Segment-per-commit HNSW vector index (Issue #634, PR-3 / #881).
 //!
-//! [`SegmentedHnswIndex`] implements [`VectorIndex`] over a set of immutable
+//! [`SegmentedHnswIndex`] implements [`VectorIndex`](crate::vector::index::VectorIndex) over a set of immutable
 //! per-segment `.hnsw` files registered in an atomic, checksummed
 //! `segments.json` manifest (#879), instead of the monolithic single-file
 //! layout of [`super::HnswIndex`]: each commit seals only the newly added
@@ -30,7 +30,7 @@
 //! checkpoint, checkpoint before WAL truncate). Set the flag to `false` to
 //! keep the monolithic layout.
 //!
-//! The generic implementation ([`SegmentedIndex`], [`SegmentedWriter`]) lives
+//! The generic implementation ([`SegmentedIndex`] and its writer) lives
 //! in [`crate::vector::index::segment::segmented_index`] (Issue #1409); this
 //! module supplies only [`HnswSegmentedBackend`], the type that tells the
 //! generic layer how to build HNSW's reader, writer, searcher and merge

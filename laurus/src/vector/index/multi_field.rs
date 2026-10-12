@@ -27,8 +27,9 @@
 //! patched over.
 //!
 //! No on-disk format changes: each field's sub-index is a completely
-//! ordinary [`SegmentedHnswIndex`]/`SegmentedFlatIndex`/`SegmentedIvfIndex`,
-//! read exactly as before. Only the *routing* above them is new.
+//! ordinary `SegmentedHnswIndex`/`SegmentedFlatIndex`/`SegmentedIvfIndex`
+//! (see [`SegmentedHnswIndex`](crate::vector::index::hnsw::segmented::SegmentedHnswIndex)
+//! above), read exactly as before. Only the *routing* above them is new.
 //!
 //! # No migration from the pre-#948 layout
 //!
@@ -514,7 +515,7 @@ impl VectorIndex for MultiFieldVectorIndex {
 /// field's vectors.
 ///
 /// No cross-field "poisoning" on a partial [`Self::commit`] failure: each
-/// field's own writer (e.g. `SegmentedHnswWriter`) already refuses to
+/// field's own writer (e.g. a segmented backend's writer) already refuses to
 /// re-seal itself once sealed, so mutating and retrying after a failure is
 /// exactly as safe here as it is for a single-field writer -- a field that
 /// failed to seal still holds its unsealed buffer and simply retries; a

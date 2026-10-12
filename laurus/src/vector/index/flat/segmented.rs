@@ -1,7 +1,7 @@
 //! Segment-per-commit Flat vector index (Issue #889 PR-4, mirroring HNSW's
 //! #634/#882 design — see [`crate::vector::index::hnsw::segmented`]).
 //!
-//! [`SegmentedFlatIndex`] implements [`VectorIndex`] over a set of immutable
+//! [`SegmentedFlatIndex`] implements [`VectorIndex`](crate::vector::index::VectorIndex) over a set of immutable
 //! per-segment `.flat` files registered in an atomic, checksummed
 //! `segments.json` manifest, instead of the monolithic single-file layout
 //! of [`super::FlatIndex`]: each commit seals only the newly added vectors
@@ -31,7 +31,7 @@
 //! flag on (its `.flat` becomes segment 0 of the manifest, no data
 //! movement).
 //!
-//! The generic implementation ([`SegmentedIndex`], [`SegmentedWriter`]) lives
+//! The generic implementation ([`SegmentedIndex`] and its writer) lives
 //! in [`crate::vector::index::segment::segmented_index`] (Issue #1409); this
 //! module supplies only [`FlatSegmentedBackend`], the type that tells the
 //! generic layer how to build Flat's reader, writer, searcher and merge

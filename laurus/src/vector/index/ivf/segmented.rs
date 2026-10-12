@@ -3,7 +3,7 @@
 //! [`crate::vector::index::hnsw::segmented`] and
 //! [`crate::vector::index::flat::segmented`]).
 //!
-//! [`SegmentedIvfIndex`] implements [`VectorIndex`] over a set of immutable
+//! [`SegmentedIvfIndex`] implements [`VectorIndex`](crate::vector::index::VectorIndex) over a set of immutable
 //! per-segment `.ivf` files registered in an atomic, checksummed
 //! `segments.json` manifest, instead of the monolithic single-file layout
 //! of [`super::IvfIndex`]: each commit trains centroids and seals only the
@@ -40,7 +40,7 @@
 //! flag on (its `.ivf` becomes segment 0 of the manifest, no data
 //! movement).
 //!
-//! The generic implementation ([`SegmentedIndex`], [`SegmentedWriter`]) lives
+//! The generic implementation ([`SegmentedIndex`] and its writer) lives
 //! in [`crate::vector::index::segment::segmented_index`] (Issue #1409); this
 //! module supplies only [`IvfSegmentedBackend`], the type that tells the
 //! generic layer how to build IVF's reader, writer, searcher and merge
