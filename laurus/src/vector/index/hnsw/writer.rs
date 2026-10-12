@@ -358,7 +358,9 @@ pub struct HnswIndexWriter {
     path: String,
     _ml: f64, // Level normalization factor
     vectors: Vec<(u64, String, Vector)>,
-    // Map from doc_id to index in vectors for fast access
+    /// Map from doc_id to its index in `vectors`. Every method that changes
+    /// `vectors` keeps it in step, so `add_vectors` and `delete_document`
+    /// can trust it without a rebuild.
     doc_id_map: HashMap<u64, usize>,
     #[allow(dead_code)] // Maintained during build but not yet read; reserved for future use
     levels: Vec<Vec<u64>>,
@@ -1937,9 +1939,13 @@ impl VectorIndexWriter for HnswIndexWriter {
         self.validate_vectors(&vectors)?;
         Self::normalize_vectors_internal(&self.index_config, &self.writer_config, &mut vectors);
 
-        // Ensure doc_id_map is up to date
-        self.rebuild_doc_id_map();
+        // `next_vec_id` is above every buffered id, so the largest id in
+        // this call is the only candidate for raising it (#1405).
+        let max_id = vectors.iter().map(|(id, _, _)| *id).max();
 
+        // Every method that changes `vectors` keeps `doc_id_map` in step, so
+        // it is not rebuilt here: a rebuild per call made each put cost
+        // O(buffer) (#1405).
         for (doc_id, field, vector) in vectors {
             if let Some(&idx) = self.doc_id_map.get(&doc_id) {
                 // Update existing vector
@@ -1952,11 +1958,10 @@ impl VectorIndexWriter for HnswIndexWriter {
             }
         }
 
-        // Update next_vec_id
-        if let Some((max_id, _, _)) = self.vectors.iter().max_by_key(|(id, _, _)| id)
-            && *max_id >= self.next_vec_id
+        if let Some(max_id) = max_id
+            && max_id >= self.next_vec_id
         {
-            self.next_vec_id = *max_id + 1;
+            self.next_vec_id = max_id + 1;
         }
 
         self.check_memory_limit()?;
@@ -2443,11 +2448,10 @@ impl VectorIndexWriter for HnswIndexWriter {
             self.is_finalized = false;
         }
 
-        // Logical deletion from buffer
-        let initial_len = self.vectors.len();
-        self.vectors.retain(|(id, _, _)| *id != doc_id);
-
-        if self.vectors.len() < initial_len {
+        // Scan the buffer only when the id is buffered: the store deletes
+        // before every add, almost always with a fresh id (#1405).
+        if self.doc_id_map.contains_key(&doc_id) {
+            self.vectors.retain(|(id, _, _)| *id != doc_id);
             self.rebuild_doc_id_map();
             // Invalidate the HNSW graph — it still contains edges
             // referencing the deleted doc_id.  The graph will be rebuilt
@@ -3019,5 +3023,179 @@ mod par_for_each_in_order_tests {
             })
         });
         assert!(result.is_err(), "the error must propagate");
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+    use crate::vector::core::distance::DistanceMetric;
+    use crate::vector::index::HnswIndexConfig;
+
+    fn config() -> HnswIndexConfig {
+        HnswIndexConfig {
+            dimension: 2,
+            m: 4,
+            ef_construction: 8,
+            normalize_vectors: false,
+            distance_metric: DistanceMetric::Euclidean,
+            ..Default::default()
+        }
+    }
+
+    fn writer_with(writer_config: VectorIndexWriterConfig) -> HnswIndexWriter {
+        HnswIndexWriter::new(config(), writer_config, "test").unwrap()
+    }
+
+    fn writer() -> HnswIndexWriter {
+        writer_with(VectorIndexWriterConfig::default())
+    }
+
+    fn vector(doc_id: u64, x: f32) -> (u64, String, Vector) {
+        (doc_id, "v".to_string(), Vector::new(vec![x, 1.0]))
+    }
+
+    /// (doc id, first component) of every buffered vector, in buffer order.
+    fn buffered(writer: &HnswIndexWriter) -> Vec<(u64, f32)> {
+        writer
+            .vectors
+            .iter()
+            .map(|(id, _, v)| (*id, v.data[0]))
+            .collect()
+    }
+
+    fn ids(writer: &HnswIndexWriter) -> Vec<u64> {
+        writer.vectors.iter().map(|(id, _, _)| *id).collect()
+    }
+
+    /// `doc_id_map` must equal the map `rebuild_doc_id_map` would build.
+    fn assert_map_in_step(writer: &HnswIndexWriter) {
+        let expected: HashMap<u64, usize> = writer
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, (id, _, _))| (*id, idx))
+            .collect();
+        assert_eq!(writer.doc_id_map, expected);
+    }
+
+    /// Deleting a document moves the ones after it; a later overwrite must
+    /// land in the moved slot, not the old one.
+    #[test]
+    fn overwrite_after_deleting_an_earlier_vector_lands_in_its_slot() {
+        let mut writer = writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.delete_document(1).unwrap();
+        assert_map_in_step(&writer);
+        writer.add_vectors(vec![vector(3, 30.0)]).unwrap();
+        assert_eq!(buffered(&writer), vec![(2, 2.0), (3, 30.0)]);
+        assert_map_in_step(&writer);
+    }
+
+    #[test]
+    fn a_repeated_id_overwrites_within_and_across_calls() {
+        let mut writer = writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(1, 10.0)])
+            .unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 10.0), (2, 2.0)]);
+        writer.add_vectors(vec![vector(2, 20.0)]).unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 10.0), (2, 20.0)]);
+        assert_map_in_step(&writer);
+    }
+
+    #[test]
+    fn overwrite_and_delete_after_build() {
+        let mut writer = writer();
+        writer.build(vec![vector(1, 1.0), vector(2, 2.0)]).unwrap();
+        writer.add_vectors(vec![vector(2, 20.0)]).unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 1.0), (2, 20.0)]);
+        writer.delete_document(1).unwrap();
+        assert_eq!(buffered(&writer), vec![(2, 20.0)]);
+        assert_map_in_step(&writer);
+    }
+
+    #[test]
+    fn overwrite_and_delete_after_load() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer = HnswIndexWriter::with_storage(
+            config(),
+            VectorIndexWriterConfig::default(),
+            "test",
+            storage.clone(),
+        )
+        .unwrap();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.finalize().unwrap();
+        writer.write().unwrap();
+
+        let mut loaded = HnswIndexWriter::load(
+            config(),
+            VectorIndexWriterConfig::default(),
+            storage,
+            "test",
+        )
+        .unwrap();
+        assert_map_in_step(&loaded);
+        loaded.add_vectors(vec![vector(2, 20.0)]).unwrap();
+        assert_eq!(ids(&loaded), vec![1, 2, 3]);
+        assert_map_in_step(&loaded);
+        loaded.delete_document(2).unwrap();
+        assert_eq!(ids(&loaded), vec![1, 3]);
+        assert_map_in_step(&loaded);
+    }
+
+    #[test]
+    fn next_vector_id_stays_above_every_id_seen() {
+        let mut writer = writer();
+        writer.add_vectors(vec![vector(5, 5.0)]).unwrap();
+        assert_eq!(writer.next_vector_id(), 6);
+        writer.add_vectors(vec![vector(1, 1.0)]).unwrap();
+        assert_eq!(writer.next_vector_id(), 6);
+        writer.delete_document(5).unwrap();
+        writer.add_vectors(vec![vector(2, 2.0)]).unwrap();
+        assert_eq!(writer.next_vector_id(), 6);
+        writer.rollback().unwrap();
+        writer.add_vectors(vec![vector(3, 3.0)]).unwrap();
+        assert_eq!(writer.next_vector_id(), 4);
+    }
+
+    /// The store deletes before every add, almost always with an id the
+    /// buffer does not hold: that must neither drop the built graph nor
+    /// leave the writer looking finalized.
+    #[test]
+    fn deleting_an_unbuffered_id_keeps_the_graph() {
+        let mut writer = writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.finalize().unwrap();
+        assert!(writer.graph.is_some());
+        writer.delete_document(99).unwrap();
+        assert!(writer.graph.is_some());
+        assert!(writer.has_pending_changes());
+        assert_eq!(ids(&writer), vec![1, 2, 3]);
+    }
+
+    /// `add_vectors` buffers the vectors before it checks the memory limit,
+    /// so a vector stays buffered after the error and a delete must still
+    /// find it.
+    #[test]
+    fn delete_removes_a_vector_buffered_before_a_memory_limit_error() {
+        let mut writer = writer_with(VectorIndexWriterConfig {
+            memory_limit: Some(1),
+            ..Default::default()
+        });
+        assert!(writer.add_vectors(vec![vector(1, 1.0)]).is_err());
+        assert!(writer.contains_doc(1));
+        writer.delete_document(1).unwrap();
+        assert!(writer.vectors.is_empty());
+        assert_map_in_step(&writer);
     }
 }

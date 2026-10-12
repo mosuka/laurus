@@ -1,5 +1,6 @@
 //! Flat vector index builder for exact search.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -29,6 +30,10 @@ pub struct FlatIndexWriter {
     storage: Option<Arc<dyn Storage>>,
     path: String,
     vectors: Vec<(u64, String, Vector)>,
+    /// The doc ids present in `vectors`, so that `delete_document` only
+    /// scans the buffer when the id is actually buffered. The store
+    /// deletes before every add, almost always with a fresh id (#1405).
+    buffered_ids: HashSet<u64>,
     is_finalized: bool,
     total_vectors_to_add: Option<usize>,
     next_vec_id: u64,
@@ -47,6 +52,7 @@ impl FlatIndexWriter {
             storage: None,
             path: path.into(),
             vectors: Vec::new(),
+            buffered_ids: HashSet::new(),
             is_finalized: false,
             total_vectors_to_add: None,
             next_vec_id: 0,
@@ -77,6 +83,7 @@ impl FlatIndexWriter {
             storage: Some(storage),
             path,
             vectors: Vec::new(),
+            buffered_ids: HashSet::new(),
             is_finalized: false,
             total_vectors_to_add: None,
             next_vec_id: 0,
@@ -185,6 +192,7 @@ impl FlatIndexWriter {
         // Calculate next_vec_id from loaded vectors
         let max_id = vectors.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
         let next_vec_id = if num_vectors > 0 { max_id + 1 } else { 0 };
+        let buffered_ids = vectors.iter().map(|(id, _, _)| *id).collect();
 
         Ok(Self {
             index_config,
@@ -192,6 +200,7 @@ impl FlatIndexWriter {
             storage: Some(storage),
             path: path.to_string(),
             vectors,
+            buffered_ids,
             is_finalized: true,
             total_vectors_to_add: Some(num_vectors),
             next_vec_id,
@@ -335,6 +344,7 @@ impl VectorIndexWriter for FlatIndexWriter {
             self.next_vec_id = max_id + 1;
         }
 
+        self.buffered_ids = vectors.iter().map(|(id, _, _)| *id).collect();
         self.vectors = vectors;
         self.total_vectors_to_add = Some(self.vectors.len());
 
@@ -357,6 +367,8 @@ impl VectorIndexWriter for FlatIndexWriter {
             self.next_vec_id = max_id + 1;
         }
 
+        self.buffered_ids
+            .extend(vectors.iter().map(|(id, _, _)| *id));
         self.vectors.extend(vectors);
         self.check_memory_limit()?;
         Ok(())
@@ -517,9 +529,9 @@ impl VectorIndexWriter for FlatIndexWriter {
             self.is_finalized = false;
         }
 
-        // Logical deletion from buffer
-        // Note: usage of retain might be slow for large buffers, but acceptable for this stage
-        self.vectors.retain(|(id, _, _)| *id != doc_id);
+        if self.buffered_ids.remove(&doc_id) {
+            self.vectors.retain(|(id, _, _)| *id != doc_id);
+        }
         Ok(())
     }
 
@@ -538,6 +550,7 @@ impl VectorIndexWriter for FlatIndexWriter {
     fn rollback(&mut self) -> Result<()> {
         // Clear pending vectors and reset state
         self.vectors.clear();
+        self.buffered_ids.clear();
         self.is_finalized = false;
         self.next_vec_id = 0;
         Ok(())
@@ -554,6 +567,7 @@ impl VectorIndexWriter for FlatIndexWriter {
     fn close(&mut self) -> Result<()> {
         // Clear all data and mark as closed
         self.vectors.clear();
+        self.buffered_ids.clear();
         self.is_finalized = true;
         Ok(())
     }
@@ -577,5 +591,153 @@ impl VectorIndexWriter for FlatIndexWriter {
         )?;
 
         Ok(Arc::new(reader))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+    fn config() -> FlatIndexConfig {
+        FlatIndexConfig {
+            dimension: 2,
+            normalize_vectors: false,
+            ..Default::default()
+        }
+    }
+
+    fn writer() -> FlatIndexWriter {
+        FlatIndexWriter::new(config(), VectorIndexWriterConfig::default(), "test").unwrap()
+    }
+
+    fn vector(doc_id: u64, x: f32) -> (u64, String, Vector) {
+        (doc_id, "v".to_string(), Vector::new(vec![x, 1.0]))
+    }
+
+    /// (doc id, first component) of every buffered vector, in buffer order.
+    fn buffered(writer: &FlatIndexWriter) -> Vec<(u64, f32)> {
+        writer
+            .vectors
+            .iter()
+            .map(|(id, _, v)| (*id, v.data[0]))
+            .collect()
+    }
+
+    /// `buffered_ids` must name exactly the doc ids in `vectors`.
+    fn assert_ids_in_step(writer: &FlatIndexWriter) {
+        let expected: HashSet<u64> = writer.vectors.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(writer.buffered_ids, expected);
+    }
+
+    #[test]
+    fn delete_removes_a_vector_added_by_add_vectors() {
+        let mut writer = writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.delete_document(2).unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 1.0), (3, 3.0)]);
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn delete_removes_a_vector_added_by_build() {
+        let mut writer = writer();
+        writer.build(vec![vector(1, 1.0), vector(2, 2.0)]).unwrap();
+        writer.delete_document(1).unwrap();
+        assert_eq!(buffered(&writer), vec![(2, 2.0)]);
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn delete_removes_a_vector_loaded_from_storage() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer = FlatIndexWriter::with_storage(
+            config(),
+            VectorIndexWriterConfig::default(),
+            "test",
+            storage.clone(),
+        )
+        .unwrap();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0)])
+            .unwrap();
+        writer.finalize().unwrap();
+        writer.write().unwrap();
+
+        let mut loaded = FlatIndexWriter::load(
+            config(),
+            VectorIndexWriterConfig::default(),
+            storage,
+            "test",
+        )
+        .unwrap();
+        assert_ids_in_step(&loaded);
+        loaded.delete_document(1).unwrap();
+        let ids: Vec<u64> = loaded.vectors.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![2]);
+        assert_ids_in_step(&loaded);
+    }
+
+    /// `add_vectors` buffers the vectors before it checks the memory limit,
+    /// so a vector stays buffered after the error and a delete must still
+    /// find it.
+    #[test]
+    fn delete_removes_a_vector_buffered_before_a_memory_limit_error() {
+        let writer_config = VectorIndexWriterConfig {
+            memory_limit: Some(1),
+            ..Default::default()
+        };
+        let mut writer = FlatIndexWriter::new(config(), writer_config, "test").unwrap();
+        assert!(writer.add_vectors(vec![vector(1, 1.0)]).is_err());
+        assert_eq!(buffered(&writer), vec![(1, 1.0)]);
+        writer.delete_document(1).unwrap();
+        assert!(writer.vectors.is_empty());
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn deleting_an_unbuffered_id_unfinalizes_the_writer() {
+        let mut writer = writer();
+        writer.add_vectors(vec![vector(1, 1.0)]).unwrap();
+        writer.finalize().unwrap();
+        writer.delete_document(99).unwrap();
+        assert!(!writer.is_finalized);
+        assert_eq!(writer.pending_docs(), 1);
+    }
+
+    /// The store's upsert (delete, then add) on a buffered document leaves
+    /// one copy, the latest, and keeps the other documents in order.
+    #[test]
+    fn reput_of_a_buffered_vector_keeps_only_the_latest_copy() {
+        let mut writer = writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.delete_document(2).unwrap();
+        writer.add_vectors(vec![vector(2, 20.0)]).unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 1.0), (3, 3.0), (2, 20.0)]);
+        assert_ids_in_step(&writer);
+
+        writer.finalize().unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 1.0), (2, 20.0), (3, 3.0)]);
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn buffered_ids_follow_build_rollback_and_close() {
+        let mut writer = writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0)])
+            .unwrap();
+        writer.build(vec![vector(3, 3.0)]).unwrap();
+        assert_ids_in_step(&writer);
+        writer.rollback().unwrap();
+        assert_ids_in_step(&writer);
+        writer.add_vectors(vec![vector(4, 4.0)]).unwrap();
+        writer.close().unwrap();
+        assert_ids_in_step(&writer);
     }
 }

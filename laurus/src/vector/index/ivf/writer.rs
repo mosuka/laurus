@@ -1,5 +1,6 @@
 //! IVF (Inverted File) index builder for memory-efficient search.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -87,6 +88,10 @@ pub struct IvfIndexWriter {
     centroids: Vec<Vector>,              // Cluster centroids
     inverted_lists: IvfInvertedLists,    // Per-cluster CSR view into `vectors`
     vectors: Vec<(u64, String, Vector)>, // All vectors (used during construction)
+    /// The doc ids present in `vectors`, so that `delete_document` only
+    /// scans the buffer when the id is actually buffered. The store
+    /// deletes before every add, almost always with a fresh id (#1405).
+    buffered_ids: HashSet<u64>,
     is_finalized: bool,
     total_vectors_to_add: Option<usize>,
     next_vec_id: u64,
@@ -125,6 +130,7 @@ impl IvfIndexWriter {
             centroids: Vec::new(),
             inverted_lists: IvfInvertedLists::default(),
             vectors: Vec::new(),
+            buffered_ids: HashSet::new(),
             is_finalized: false,
             total_vectors_to_add: None,
             next_vec_id: 0,
@@ -159,6 +165,7 @@ impl IvfIndexWriter {
             centroids: Vec::new(),
             inverted_lists: IvfInvertedLists::default(),
             vectors: Vec::new(),
+            buffered_ids: HashSet::new(),
             is_finalized: false,
             total_vectors_to_add: None,
             next_vec_id: 0,
@@ -318,6 +325,7 @@ impl IvfIndexWriter {
         // Calculate next_vec_id from loaded vectors
         let max_id = vectors.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
         let next_vec_id = if num_vectors > 0 { max_id + 1 } else { 0 };
+        let buffered_ids = vectors.iter().map(|(id, _, _)| *id).collect();
 
         let configured_n_clusters = index_config.n_clusters;
         Ok(Self {
@@ -329,6 +337,7 @@ impl IvfIndexWriter {
             centroids,
             inverted_lists,
             vectors,
+            buffered_ids,
             is_finalized: true,
             total_vectors_to_add: Some(num_vectors),
             next_vec_id,
@@ -1172,6 +1181,7 @@ impl VectorIndexWriter for IvfIndexWriter {
             self.next_vec_id = max_id + 1;
         }
 
+        self.buffered_ids = vectors.iter().map(|(id, _, _)| *id).collect();
         self.vectors = vectors;
         self.total_vectors_to_add = Some(self.vectors.len());
 
@@ -1197,6 +1207,8 @@ impl VectorIndexWriter for IvfIndexWriter {
             self.next_vec_id = max_id + 1;
         }
 
+        self.buffered_ids
+            .extend(vectors.iter().map(|(id, _, _)| *id));
         self.vectors.extend(vectors);
         self.check_memory_limit()?;
         Ok(())
@@ -1418,7 +1430,9 @@ impl VectorIndexWriter for IvfIndexWriter {
         if self.is_finalized {
             self.is_finalized = false;
         }
-        self.vectors.retain(|(id, _, _)| *id != doc_id);
+        if self.buffered_ids.remove(&doc_id) {
+            self.vectors.retain(|(id, _, _)| *id != doc_id);
+        }
         Ok(())
     }
 
@@ -1436,6 +1450,7 @@ impl VectorIndexWriter for IvfIndexWriter {
 
     fn rollback(&mut self) -> Result<()> {
         self.vectors.clear();
+        self.buffered_ids.clear();
         self.is_finalized = false;
         self.next_vec_id = 0;
         Ok(())
@@ -1451,6 +1466,7 @@ impl VectorIndexWriter for IvfIndexWriter {
 
     fn close(&mut self) -> Result<()> {
         self.vectors.clear();
+        self.buffered_ids.clear();
         // `inverted_lists.order` permutes into `self.vectors` (Issue
         // #629); clearing it here keeps `get_cluster_stats` (whose only
         // guard is `is_finalized`, which this method sets to `true`
@@ -1748,5 +1764,147 @@ mod tests {
             stats.iter().all(|s| s.count == 0),
             "no vectors remain after close(), so every cluster must report zero members"
         );
+    }
+
+    fn buffer_config() -> IvfIndexConfig {
+        IvfIndexConfig {
+            dimension: 2,
+            n_clusters: 2,
+            normalize_vectors: false,
+            ..Default::default()
+        }
+    }
+
+    fn buffer_writer() -> IvfIndexWriter {
+        IvfIndexWriter::new(buffer_config(), VectorIndexWriterConfig::default(), "test").unwrap()
+    }
+
+    fn vector(doc_id: u64, x: f32) -> (u64, String, Vector) {
+        (doc_id, "v".to_string(), Vector::new(vec![x, 1.0]))
+    }
+
+    /// (doc id, first component) of every buffered vector, in buffer order.
+    fn buffered(writer: &IvfIndexWriter) -> Vec<(u64, f32)> {
+        writer
+            .vectors
+            .iter()
+            .map(|(id, _, v)| (*id, v.data[0]))
+            .collect()
+    }
+
+    /// `buffered_ids` must name exactly the doc ids in `vectors`.
+    fn assert_ids_in_step(writer: &IvfIndexWriter) {
+        let expected: HashSet<u64> = writer.vectors.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(writer.buffered_ids, expected);
+    }
+
+    #[test]
+    fn delete_removes_a_vector_added_by_add_vectors() {
+        let mut writer = buffer_writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.delete_document(2).unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 1.0), (3, 3.0)]);
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn delete_removes_a_vector_added_by_build() {
+        let mut writer = buffer_writer();
+        writer.build(vec![vector(1, 1.0), vector(2, 2.0)]).unwrap();
+        writer.delete_document(1).unwrap();
+        assert_eq!(buffered(&writer), vec![(2, 2.0)]);
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn delete_removes_a_vector_loaded_from_storage() {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut writer = IvfIndexWriter::with_storage(
+            buffer_config(),
+            VectorIndexWriterConfig::default(),
+            "test",
+            storage.clone(),
+        )
+        .unwrap();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0)])
+            .unwrap();
+        writer.finalize().unwrap();
+        writer.write().unwrap();
+
+        let mut loaded = IvfIndexWriter::load(
+            buffer_config(),
+            VectorIndexWriterConfig::default(),
+            storage,
+            "test",
+        )
+        .unwrap();
+        assert_ids_in_step(&loaded);
+        loaded.delete_document(1).unwrap();
+        let ids: Vec<u64> = loaded.vectors.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![2]);
+        assert_ids_in_step(&loaded);
+    }
+
+    /// `add_vectors` buffers the vectors before it checks the memory limit,
+    /// so a vector stays buffered after the error and a delete must still
+    /// find it.
+    #[test]
+    fn delete_removes_a_vector_buffered_before_a_memory_limit_error() {
+        let writer_config = VectorIndexWriterConfig {
+            memory_limit: Some(1),
+            ..Default::default()
+        };
+        let mut writer = IvfIndexWriter::new(buffer_config(), writer_config, "test").unwrap();
+        assert!(writer.add_vectors(vec![vector(1, 1.0)]).is_err());
+        assert_eq!(buffered(&writer), vec![(1, 1.0)]);
+        writer.delete_document(1).unwrap();
+        assert!(writer.vectors.is_empty());
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn deleting_an_unbuffered_id_unfinalizes_the_writer() {
+        let mut writer = buffer_writer();
+        writer.add_vectors(vec![vector(1, 1.0)]).unwrap();
+        writer.finalize().unwrap();
+        writer.delete_document(99).unwrap();
+        assert!(!writer.is_finalized);
+        assert_eq!(writer.pending_docs(), 1);
+    }
+
+    /// The store's upsert (delete, then add) on a buffered document leaves
+    /// one copy, the latest, and keeps the other documents in their order,
+    /// which k-means++ depends on.
+    #[test]
+    fn reput_of_a_buffered_vector_keeps_only_the_latest_copy() {
+        let mut writer = buffer_writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0), vector(3, 3.0)])
+            .unwrap();
+        writer.delete_document(2).unwrap();
+        writer.add_vectors(vec![vector(2, 20.0)]).unwrap();
+        assert_eq!(buffered(&writer), vec![(1, 1.0), (3, 3.0), (2, 20.0)]);
+        assert_ids_in_step(&writer);
+    }
+
+    #[test]
+    fn buffered_ids_follow_build_rollback_and_close() {
+        let mut writer = buffer_writer();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0)])
+            .unwrap();
+        writer.build(vec![vector(3, 3.0)]).unwrap();
+        assert_ids_in_step(&writer);
+        writer.rollback().unwrap();
+        assert_ids_in_step(&writer);
+        writer.add_vectors(vec![vector(4, 4.0)]).unwrap();
+        writer.close().unwrap();
+        assert_ids_in_step(&writer);
     }
 }
