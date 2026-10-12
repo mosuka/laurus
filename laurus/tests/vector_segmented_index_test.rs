@@ -279,6 +279,33 @@ fn dropping_an_unused_writer_rolls_back_the_wal_checkpoint() {
     assert_eq!(index.last_wal_seq(), 0);
 }
 
+/// Migrating a legacy monolithic index whose stored dimension does not match
+/// the config's dimension must fail loudly instead of silently proceeding
+/// (Issue #1409: HNSW did not validate this; Flat and IVF already did —
+/// see `vector_segmented_flat_test.rs` / `vector_segmented_ivf_test.rs`).
+#[test]
+fn legacy_migration_rejects_a_dimension_mismatch() {
+    let storage = storage();
+    {
+        let index = HnswIndex::create(
+            storage.clone() as Arc<dyn Storage>,
+            "vector_index",
+            config(false),
+        )
+        .unwrap();
+        commit_batch(&index, 0..10);
+    }
+
+    let mut mismatched = config(true);
+    mismatched.dimension = 8;
+    let err =
+        SegmentedHnswIndex::open_or_create(storage as Arc<dyn Storage>, "vector_index", mismatched);
+    assert!(
+        err.is_err(),
+        "a dimension mismatch during migration must fail"
+    );
+}
+
 /// #881: self-recall@10 of a 5-segment index matches a monolithic build of
 /// the same corpus within tolerance (#872-style gate).
 #[test]

@@ -34,9 +34,9 @@
 //! in [`crate::vector::index::segment::segmented_index`] (Issue #1409); this
 //! module supplies only [`HnswSegmentedBackend`], the type that tells the
 //! generic layer how to build HNSW's reader, writer, searcher and merge
-//! engine, and the two behaviors HNSW does not share with Flat/IVF: the
-//! legacy header has no dimension field, and the inner writer's own
-//! `has_pending_changes` must be consulted before a segment is sealed.
+//! engine, and the one behavior HNSW does not share with Flat/IVF: the inner
+//! writer's own `has_pending_changes` must be consulted before a segment is
+//! sealed.
 
 use std::sync::Arc;
 
@@ -153,19 +153,32 @@ impl SegmentedBackend for HnswSegmentedBackend {
     }
 
     fn read_legacy_vector_count(
-        _config: &Self::Config,
+        config: &Self::Config,
         storage: &Arc<dyn Storage>,
         legacy_file: &str,
     ) -> Result<u64> {
-        // Unlike Flat/IVF, the `.hnsw` header's leading `u64` is the only
-        // field migration needs; no dimension check here (issue #1409 task
-        // list: tracked as a known gap, not yet closed in this commit).
+        // The `.hnsw` header is `u64 num_vectors` followed by `u32
+        // dimension` (then `m` and `ef_construction`, unneeded here).
+        // Unlike the trait default's `u32` count, HNSW's count is `u64`, so
+        // this cannot reuse the default implementation.
+        use crate::error::LaurusError;
         use std::io::Read;
 
         let mut input = storage.open_input(legacy_file)?;
-        let mut buf = [0u8; 8];
-        input.read_exact(&mut buf)?;
-        Ok(u64::from_le_bytes(buf))
+        let mut count_buf = [0u8; 8];
+        input.read_exact(&mut count_buf)?;
+        let mut dim_buf = [0u8; 4];
+        input.read_exact(&mut dim_buf)?;
+        let vector_count = u64::from_le_bytes(count_buf);
+        let dimension = u32::from_le_bytes(dim_buf) as usize;
+
+        let expected = Self::dimension(config);
+        if dimension != expected {
+            return Err(LaurusError::index(format!(
+                "Dimension mismatch during migration: stored {dimension}, config {expected}"
+            )));
+        }
+        Ok(vector_count)
     }
 
     fn writer_tracks_pending_changes(writer: &Self::Writer) -> bool {
