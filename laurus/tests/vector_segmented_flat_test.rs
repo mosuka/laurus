@@ -462,6 +462,58 @@ fn count_excludes_soft_deleted_docs() {
     assert_eq!(count, 9, "count must exclude soft-deleted docs");
 }
 
+/// Assert `doc_id` is the top hit for its own vector, then soft delete it
+/// and assert a fresh searcher no longer returns it.
+///
+/// The first search caches the segment readers. Segment readers filter
+/// deletions through the bitmap attached when they were loaded, so this
+/// fails if readers cached before the delete created the bitmap are reused.
+fn assert_soft_delete_reaches_cached_readers(index: &SegmentedFlatIndex, doc_id: u64) {
+    let hits = index.searcher().unwrap().search(&query(doc_id, 1)).unwrap();
+    assert_eq!(hits.results[0].doc_id, doc_id);
+
+    index.soft_delete_document(doc_id).unwrap();
+    let hits = index.searcher().unwrap().search(&query(doc_id, 5)).unwrap();
+    assert!(
+        hits.results.iter().all(|r| r.doc_id != doc_id),
+        "doc {doc_id} was soft deleted after its readers were cached"
+    );
+}
+
+/// The first soft delete creates the deletion bitmap; readers cached before
+/// it must not keep serving the deleted doc.
+#[test]
+fn first_soft_delete_hides_doc_from_cached_readers() {
+    let index = SegmentedFlatIndex::open_or_create(
+        storage() as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+    commit_batch(&index, 0..10);
+    commit_batch(&index, 10..20);
+
+    assert_soft_delete_reaches_cached_readers(&index, 4);
+}
+
+/// `optimize` drops the deletion bitmap; the next soft delete creates a new
+/// one, which readers cached in between must pick up.
+#[test]
+fn soft_delete_after_optimize_hides_doc_from_cached_readers() {
+    let index = SegmentedFlatIndex::open_or_create(
+        storage() as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+    commit_batch(&index, 0..10);
+    commit_batch(&index, 10..20);
+    index.soft_delete_document(1).unwrap();
+    index.optimize().unwrap();
+
+    assert_soft_delete_reaches_cached_readers(&index, 14);
+}
+
 /// The migration must fire through the PRODUCTION factory path. A legacy
 /// index always has a `metadata.json`, so it always takes the factory's
 /// OPEN arm — which must be exactly where the migration fires.
