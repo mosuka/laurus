@@ -470,15 +470,17 @@ The similarity of a query vector and a document vector is their dot
 product. In a field with `DistanceMetric::Cosine` (the default), document
 vectors are L2-normalized when written and query vectors when searched, so
 each pair contributes its cosine similarity and a score is at most the
-number of query vectors. With `DistanceMetric::DotProduct` the vectors are
-used as given.
+number of query vectors (up to rounding in a compressed kind). With
+`DistanceMetric::DotProduct` the vectors are used as given.
 
 The field's stored vectors may also be compressed: its
 [`storage` option](../indexing/vector_indexing.md#multivector-storage) can
-encode them as `F16` or `Int8` instead of the exact `F32` default, trading
-some score precision for a smaller index — `F16` carries ~2⁻¹¹ relative
-error per element, and `Int8`'s error is bounded by its per-vector scale
-(`max(abs(vector)) / 127`).
+encode them as `F16`, `Int8` or `Binary` instead of the exact `F32`
+default, trading some score precision for a smaller index — `F16` carries
+~2⁻¹¹ relative error per element, `Int8`'s error is bounded by its
+per-vector scale (`max(abs(vector)) / 127`), and `Binary` keeps one bit
+per element against a center the field learns, at a measurable cost in
+nDCG@10. The query vectors are never compressed.
 
 ### Cost
 

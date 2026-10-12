@@ -182,10 +182,11 @@ let schema = Schema::builder()
   written, so the similarity is their dot product; a zero vector is kept
   as-is) and `DotProduct` are accepted for `distance`; other metrics are
   rejected when the index is created. `storage` picks the on-disk element
-  kind of every token vector — `F32` (default, exact), `F16`, or `Int8` —
-  trading some precision for a smaller index; see [MultiVector
+  kind of the token vectors — `F32` (default, exact), `F16`, `Int8`, or
+  `Binary` (1 bit per element; requires `Cosine`) — trading some precision
+  for a smaller index; see [MultiVector
   Storage](indexing/vector_indexing.md#multivector-storage) for the size
-  and error figures. `embedder` names a token-level embedder, such as a
+  and quality figures. `embedder` names a token-level embedder, such as a
   [`candle_colbert`](../laurus-cli/schema_format.md#embedders) one
   (`MultiVectorOption::new(96).embedder("colbert")`).
 - **Values**: a `DataValue::VectorArray(Vec<Vec<f32>>)` holding at least one
@@ -205,9 +206,12 @@ let schema = Schema::builder()
 - **Schema changes**: changing its dimension, distance or embedder, or
   changing it to or from another vector field type, is a destructive
   change. Changing `storage` is a **Reindex** change instead — the
-  existing values are still there to re-encode, so
+  stored values are decoded and re-encoded, so
   `Engine::update_field(.., UpdateFieldOptions { reindex: true, .. })`
-  rebuilds the field's existing segments under the new on-disk kind.
+  rebuilds the field's existing segments under the new on-disk kind
+  (precision a lossy kind already dropped does not come back). An option
+  the field's index would reject, such as `Binary` with `DotProduct`, is
+  rejected before any data is touched.
 
 ## Document
 

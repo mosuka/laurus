@@ -549,7 +549,7 @@ MultiVector フィールドを追加します（Issue #1351）。ColBERT 型モ�
 - `dimension`: 各トークンベクトルの長さ。0 より大きい値
 - `distance`: `"cosine"`（デフォルト。書き込み時に L2 正規化）または `"dot_product"`
 - `embedder`: [`addEmbedder`](#addembeddername-config) で登録した `"token_callback"` Embedder の名前（省略可）。テキストの値と再採点のクエリテキストを埋め込みます
-- `storage`: トークンベクトルのディスク上の要素種別（Issue #1346）— `"f32"`（デフォルト、正確）、`"f16"`（2倍小さい）、`"int8"`（約4倍小さい）
+- `storage`: トークンベクトルのディスク上の要素種別（Issue #1346）— `"f32"`（デフォルト、正確）、`"f16"`（2倍小さい）、`"int8"`（約4倍小さい）、`"binary"`（32倍小さい、要素あたり 1 bit。`"cosine"` が必要）
 
 オプションはフィールドの追加時に検証され、`dimension` が 0 の場合、上記以外の `distance`、または認識できない `storage` は例外になります。
 

@@ -632,14 +632,15 @@ comparable basis regardless of whether an SQ stage ran ahead of it.
 The quantization methods above apply to the ANN index types (Flat, HNSW,
 IVF). A [`MultiVector` field](../schema_and_fields.md#multi-vector-fields)
 has no ANN index, so `quantizer` does not apply to it — instead its own
-`storage` option (Issue #1346) picks the on-disk element kind of every
-token vector:
+`storage` option (Issue #1346) picks the on-disk element kind of its token
+vectors:
 
 | Kind | Rust Enum Variant | Bytes/element | Error | Size per document (300 × 128 tokens) |
 | :--- | :--- | :--- | :--- | :--- |
 | **F32** *(default)* | `MultiVectorStorage::F32` | 4 | Exact | ~150 KB |
 | **F16** | `MultiVectorStorage::F16` | 2 | ~2⁻¹¹ relative error per element | ~75 KB |
 | **Int8** | `MultiVectorStorage::Int8` | ~1 (`dimension + 2` bytes/row total) | Bounded by the per-vector scale `max(abs(vector)) / 127` | ~38 KB |
+| **Binary** | `MultiVectorStorage::Binary` | 1/8 (`ceil(dimension / 8)` bytes/row) | Lossy: one bit per element against a field-level center (see [Binary](#binary)); requires `Cosine` | ~4.7 KB |
 
 ```rust
 use laurus::{MultiVectorOption, MultiVectorStorage};
@@ -656,9 +657,50 @@ re-quantizing on every merge.
 Changing `storage` on an existing field is a
 [Reindex change](../schema_and_fields.md#multi-vector-fields):
 `Engine::update_field` with `reindex: true` rebuilds the field's existing
-segments under the new on-disk kind. A schema with no `storage` key
-(written before this option existed) defaults to `F32` and needs no
-migration.
+segments under the new on-disk kind. It decodes what is stored, so it
+cannot restore precision a lossy kind already dropped. A schema with no
+`storage` key (written before this option existed) defaults to `F32` and
+needs no migration.
+
+#### Binary
+
+`Binary` stores one bit per element: 12 bytes per token vector at 96
+dimensions, 32 times smaller than `F32`. Token vectors of a
+late-interaction model are highly anisotropic — they share one dominant
+direction — so the plain sign of each element would come out nearly the
+same for every token. `Binary` stores the sign of each element's offset
+from a center instead, and decodes a row as
+
+```text
+x_i     = w_i * (bit_i ? +1 : -1)
+decoded = c + x - ((x · c) / (c · c)) * c
+```
+
+where `c` is the mean token vector and `w_i` the mean of `|v_i - c_i|`,
+both stored as f16. The decoded offset is projected off `c`: without
+that, the bits' spurious component along `c` acts as a query-independent
+bias in MaxSim and ranking quality collapses. Queries are not binarized:
+the stored rows are decoded and scored against the float query vectors.
+
+- **The field learns `c` and `w` once**, from the first commit or merge
+  that holds at least 2,048 token vectors (a sample of at most 16,384 of
+  them, spread over the documents). Every later segment is encoded with
+  them, and every `Binary` segment stores its own copy (4 bytes per
+  dimension), so each segment decodes on its own and merges copy rows
+  verbatim. They are never re-learned, so they do not follow a corpus that
+  drifts afterwards.
+- **Until then, the field writes its segments as `F16`.** A merge that
+  brings at least 2,048 token vectors together learns the parameters and
+  converts them; converting an existing field to `Binary` with
+  `update_field` learns them from the stored vectors. An `F16` segment that
+  no merge reaches only costs space.
+- **`Binary` requires `DistanceMetric::Cosine`**: it keeps each token
+  vector's direction, not its magnitude. Under `Cosine` a decoded vector
+  has a norm of at most 1 (up to f16 rounding), so a score stays at most
+  the number of query vectors.
+- **It is clearly lossy** (see [Measured quality](#measured-quality)), and
+  changing `storage` away from `Binary` does not bring the dropped
+  precision back.
 
 #### Measured quality
 
@@ -668,17 +710,31 @@ Measured on two BEIR datasets with the
 about 236 tokens per document), every storage kind ingesting the same
 vectors. **Exhaustive** ranks every document by MaxSim; **BM25 → rescore**
 rescores the BM25 top 100. Each cell is nDCG@10, then its paired
-difference from F32 with a 95% bootstrap confidence interval.
+difference from F32 with a 95% bootstrap confidence interval. The probe
+commits every 500 documents, so the `Binary` field learns its parameters
+in the first commit.
 
 | Kind | Bytes/token (96 dims) | Size vs F32 | SciFact exhaustive | SciFact BM25 → rescore | NFCorpus exhaustive | NFCorpus BM25 → rescore |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **F32** | 384 | 1 | 0.7456 | 0.7284 | 0.3690 | 0.3458 |
 | **F16** | 192 | 1/2 | 0.7446 (−0.0010 [−0.0029, 0.0000]) | 0.7284 (−0.0001 [−0.0002, 0.0000]) | 0.3689 (−0.0001 [−0.0008, +0.0006]) | 0.3457 (−0.0001 [−0.0009, +0.0007]) |
 | **Int8** | 98 | 1/3.92 | 0.7457 (+0.0002 [−0.0038, +0.0044]) | 0.7264 (−0.0021 [−0.0052, +0.0000]) | 0.3686 (−0.0004 [−0.0043, +0.0034]) | 0.3460 (+0.0002 [−0.0034, +0.0037]) |
+| **Binary** | 12 | 1/32 | 0.7176 (−0.0280 [−0.0481, −0.0087]) | 0.7139 (−0.0145 [−0.0297, +0.0008]) | 0.3192 (−0.0498 [−0.0626, −0.0373]) | 0.3264 (−0.0194 [−0.0279, −0.0116]) |
 
-- Every 95% interval contains 0, so neither F16 nor Int8 shows a
-  measurable nDCG@10 loss on these datasets. The largest point estimate
-  is Int8's −0.0021 on SciFact BM25 → rescore.
+- Every F16 and Int8 interval contains 0, so neither shows a measurable
+  nDCG@10 loss on these datasets. The largest point estimate is Int8's
+  −0.0021 on SciFact BM25 → rescore.
+- `Binary` loses 1.5 to 5.0 points of nDCG@10. It loses less under
+  BM25 → rescore, where BM25 has already narrowed the candidates, than
+  when MaxSim alone ranks the whole corpus.
+- The plain sign of each element (what Vespa's ColBERT binarization
+  stores, also 12 bytes per token) scored 0.7018 / 0.6978 / 0.3113 /
+  0.3202 in the same columns. Pooled over both datasets' 623 queries,
+  `Binary` is ahead by +0.0117 [−0.0014, +0.0254] exhaustive and +0.0110
+  [−0.0001, +0.0225] BM25 → rescore. The gain depends on the tokens the
+  parameters are learned from: learning them from the leading 5, 20, 50,
+  100 or 500 documents instead gave +0.016 to +0.023 exhaustive, and no
+  sample came out behind the plain sign (Issue #1346).
 - F16 changes the nDCG@10 of at most 1 of SciFact's 300 queries and 18 of
   NFCorpus's 323. Int8 reorders the top 10 of most queries (237 of 300
   on SciFact exhaustive), but the gains and losses cancel out
@@ -686,9 +742,10 @@ difference from F32 with a 95% bootstrap confidence interval.
 - F32's exhaustive nDCG@10 is within 0.005 of the model card's published
   numbers (SciFact 0.7477, NFCorpus 0.373), which do not state how they
   were measured.
-- On SciFact the payload is 469 MB (F32), 235 MB (F16) and 120 MB (Int8)
-  for 1.22 M token vectors; segment files add 24 bytes per document and
-  80 bytes per segment.
+- On SciFact the payload is 469 MB (F32), 235 MB (F16), 120 MB (Int8)
+  and 14.7 MB (Binary) for 1.22 M token vectors; segment files add 24
+  bytes per document and 80 bytes per segment, plus 4 bytes per dimension
+  (384 here) per `Binary` segment.
 - 25 NFCorpus queries have no BM25 hit (single words such as `okra` that
   never occur in the corpus; the default analyzer does not stem), so
   BM25 → rescore scores them 0 under every kind.

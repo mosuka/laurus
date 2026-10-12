@@ -166,10 +166,10 @@ let schema = Schema::builder()
 - **オプション**: `dimension`（各トークンベクトルの長さ）、`distance`、`storage`、
   `embedder`。`distance` として受け付けるのは `Cosine`（書き込み時に L2 正規化
   するので、類似度は内積になる。ゼロベクトルはそのまま保存する）と `DotProduct`
-  だけで、それ以外はインデックスの作成時に拒否されます。`storage` は各トークン
+  だけで、それ以外はインデックスの作成時に拒否されます。`storage` はトークン
   ベクトルのディスク上での要素形式を選びます — `F32`（デフォルト、厳密）、
-  `F16`、`Int8` のいずれかで、精度とインデックスサイズのトレードオフです。
-  サイズと誤差の数値は [MultiVector
+  `F16`、`Int8`、`Binary`（要素あたり 1 bit。`Cosine` が必要）のいずれかで、
+  精度とインデックスサイズのトレードオフです。サイズと品質の数値は [MultiVector
   ストレージ](indexing/vector_indexing.md#multivector-ストレージ)を参照してください。
   `embedder` には、[`candle_colbert`](../laurus-cli/schema_format.md#エンベダー)
   のようなトークン単位の Embedder の名前を指定します
@@ -187,9 +187,11 @@ let schema = Schema::builder()
   フィールドを対象にしません。ベクトル検索や DSL でこのフィールドを指定するとエラーです。
 - **スキーマの変更**: 次元・距離・Embedder の変更、他のベクトルフィールド型との
   相互変更は、破壊的な変更（Destructive）です。`storage` の変更は
-  **Reindex** 扱いです。既存の値から再エンコードできるため、
+  **Reindex** 扱いです。保存されている値を展開して再エンコードするため、
   `Engine::update_field(.., UpdateFieldOptions { reindex: true, .. })`
-  でフィールドの既存セグメントを新しいディスク上の形式へ再構築します。
+  でフィールドの既存セグメントを新しいディスク上の形式へ再構築します（非可逆な
+  形式で失われた精度は戻りません）。`DotProduct` の `Binary` のように、
+  フィールドのインデックスが拒否するオプションは、データに触れる前に拒否されます。
 
 ## Document
 

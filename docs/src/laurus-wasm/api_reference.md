@@ -562,7 +562,7 @@ Add a multi-vector field (Issue #1351): a variable number of token vectors per d
 - `dimension`: length of every token vector; must be greater than 0
 - `distance`: `"cosine"` (default; vectors are L2-normalized when written) or `"dot_product"`
 - `embedder`: optional name of a `"token_callback"` embedder registered via [`addEmbedder`](#addembeddername-config), which embeds text values and rescore query text
-- `storage`: on-disk element kind of every token vector (Issue #1346) — `"f32"` (default, exact), `"f16"` (2x smaller), or `"int8"` (~4x smaller)
+- `storage`: on-disk element kind of the token vectors (Issue #1346) — `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"` (~4x smaller), or `"binary"` (32x smaller, 1 bit per element; requires `"cosine"`)
 
 The options are validated when the field is added: a `dimension` of 0, any other `distance`, or an unrecognized `storage` throws.
 
