@@ -5,29 +5,34 @@
 //! | Offset | Size | Content |
 //! | --- | --- | --- |
 //! | 0 | 64 | Header: magic `LMV1`, version `u16`, element kind `u8`, reserved `u8`, dimension `u32`, reserved `u32`, document count `u64`, vector count `u64`, zero padding |
-//! | 64 | 24 × documents | Document table, ascending by doc id: doc id `u64`, first vector `u64`, vector count `u32`, reserved `u32` |
-//! | | 4 × dimension × vectors | Payload: `f32` values, one document's vectors after another |
-//! | end − 16 | 16 | Footer: CRC-32 of header + table `u32`, CRC-32 of payload `u32`, magic `LMVF`, reserved `u32` |
+//! | 64 | element kind's parameter block | `Binary` only: `dimension` f16 values of the center, then `dimension` of the spread, zero-padded to a multiple of 8 bytes; empty for every other kind |
+//! | | 24 × documents | Document table, ascending by doc id: doc id `u64`, first vector `u64`, vector count `u32`, reserved `u32` |
+//! | | row size × vectors | Payload: encoded rows, one document's vectors after another |
+//! | end − 16 | 16 | Footer: CRC-32 of header + parameters + table `u32`, CRC-32 of payload `u32`, magic `LMVF`, reserved `u32` |
 //!
-//! The payload starts at an 8-byte-aligned offset, so a memory-mapped
-//! segment is read as `&[f32]` without copying. Opening a segment checks the
-//! header, the exact file size and the header + table checksum; the payload
-//! checksum, which covers nearly the whole file, is checked only by
-//! [`SegmentReader::verify_payload`] (merges and validation), so opening a
-//! multi-gigabyte segment does not read it.
+//! The payload starts at an 8-byte-aligned offset, so a memory-mapped `F32`
+//! segment is read as `&[f32]` without copying. Opening a segment checks
+//! the header, the exact file size and the header + parameters + table
+//! checksum; the payload checksum, which covers nearly the whole file, is
+//! checked only by [`SegmentReader::verify_payload`] (merges and
+//! validation), so opening a multi-gigabyte segment does not read it.
 //!
-//! Element kind `3` is reserved for a future 1-bit kind and rejected by
-//! this version. See [`crate::vector::core::multi_vector`] for the f32 /
-//! f16 / int8 row layouts and codecs.
+//! See [`crate::vector::core::multi_vector`] for the element kinds' row
+//! layouts and codecs. Every segment carries what it takes to decode its
+//! own rows, so segments written under different kinds (or different
+//! `Binary` parameters) coexist in one field.
 
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::{Storage, StorageInput, StorageOutput};
-use crate::vector::core::multi_vector::{MultiVectorRows, MultiVectorStorage};
+use crate::vector::core::multi_vector::{
+    BinaryParams, MultiVectorRows, MultiVectorStorage, OwnedCodec, RowCodec,
+};
 
 const MAGIC: [u8; 4] = *b"LMV1";
 const FOOTER_MAGIC: [u8; 4] = *b"LMVF";
@@ -99,11 +104,17 @@ impl Header {
         })
     }
 
+    /// Byte length of the element kind's parameter block.
+    fn params_len(&self) -> usize {
+        self.kind.params_len(self.dimension)
+    }
+
     /// Byte offset of the payload.
     fn payload_offset(&self) -> Option<u64> {
         self.doc_count
             .checked_mul(DOC_ENTRY_LEN as u64)?
-            .checked_add(HEADER_LEN as u64)
+            .checked_add(HEADER_LEN as u64)?
+            .checked_add(self.params_len() as u64)
     }
 
     /// Byte length of the payload.
@@ -125,7 +136,7 @@ pub(crate) struct PayloadSink<'a> {
     output: &'a mut Box<dyn StorageOutput>,
     hasher: &'a mut crc32fast::Hasher,
     buffer: &'a mut Vec<u8>,
-    kind: MultiVectorStorage,
+    codec: RowCodec<'a>,
     dimension: usize,
     /// Rows still expected for the current document.
     remaining: usize,
@@ -154,7 +165,7 @@ impl PayloadSink<'_> {
         }
         self.buffer.clear();
         for row in values.chunks_exact(self.dimension) {
-            self.kind.encode_row(row, self.buffer);
+            self.codec.encode_row(row, self.buffer);
         }
         self.hasher.update(self.buffer);
         self.output.write_all(self.buffer)?;
@@ -162,17 +173,38 @@ impl PayloadSink<'_> {
         Ok(())
     }
 
-    /// Append already-encoded row bytes verbatim (the merge byte-copy
-    /// fast path): `bytes.len()` must be a whole number of
-    /// `self.kind.row_bytes(self.dimension)`-sized rows.
+    /// Append rows read from another segment (a merge): copied verbatim
+    /// when they are encoded exactly as this segment encodes (same kind
+    /// and, for `Binary`, equal parameters), transcoded through f32
+    /// otherwise.
+    ///
+    /// This is the only place that decides whether encoded bytes may be
+    /// copied. Re-encoding a decoded `Binary` row can flip bits even under
+    /// the same parameters, so a copy across different encodings would
+    /// misread the rows, and a needless transcode would lose precision on
+    /// every merge.
     ///
     /// # Errors
     ///
-    /// Returns an error when `bytes` is not a whole number of rows, when
-    /// it holds more rows than the document's table entry declared, or
-    /// when writing fails.
-    pub(crate) fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
-        let row_bytes = self.kind.row_bytes(self.dimension);
+    /// Returns an error when `rows` has another dimension, holds more rows
+    /// than the document's table entry declared, or when writing fails.
+    pub(crate) fn append(&mut self, rows: &MultiVectorRows<'_>) -> Result<()> {
+        if rows.dimension() != self.dimension {
+            return Err(LaurusError::internal(
+                "multi-vector rows have another dimension than the segment",
+            ));
+        }
+        if rows.codec().same_encoding(self.codec) {
+            self.write_encoded(rows.as_bytes())
+        } else {
+            self.write(&rows.to_f32())
+        }
+    }
+
+    /// Append already-encoded row bytes verbatim: `bytes.len()` must be a
+    /// whole number of `self.codec.row_bytes(self.dimension)`-sized rows.
+    fn write_encoded(&mut self, bytes: &[u8]) -> Result<()> {
+        let row_bytes = self.codec.row_bytes(self.dimension);
         if !bytes.len().is_multiple_of(row_bytes) {
             return Err(LaurusError::internal(
                 "multi-vector payload is not a whole number of rows",
@@ -200,7 +232,8 @@ impl PayloadSink<'_> {
 ///
 /// * `storage` - Storage to write into.
 /// * `file_name` - Final file name (e.g. `segment_000003.mv`).
-/// * `kind` - On-disk element kind every vector is encoded as.
+/// * `codec` - How every vector is encoded: the element kind and, for
+///   `Binary`, the parameters stored in the segment.
 /// * `dimension` - Dimension of every vector.
 /// * `docs` - The documents, strictly ascending by doc id, each with at
 ///   least one vector.
@@ -214,13 +247,13 @@ impl PayloadSink<'_> {
 pub(crate) fn write_segment(
     storage: &dyn Storage,
     file_name: &str,
-    kind: MultiVectorStorage,
+    codec: RowCodec<'_>,
     dimension: usize,
     docs: &[DocEntry],
     fill: impl FnMut(usize, &mut PayloadSink<'_>) -> Result<()>,
 ) -> Result<()> {
     let tmp = format!("{file_name}.tmp");
-    match write_segment_to(storage, &tmp, kind, dimension, docs, fill) {
+    match write_segment_to(storage, &tmp, codec, dimension, docs, fill) {
         Ok(()) => storage.rename_file(&tmp, file_name),
         Err(e) => {
             if storage.file_exists(&tmp) {
@@ -234,7 +267,7 @@ pub(crate) fn write_segment(
 fn write_segment_to(
     storage: &dyn Storage,
     file_name: &str,
-    kind: MultiVectorStorage,
+    codec: RowCodec<'_>,
     dimension: usize,
     docs: &[DocEntry],
     mut fill: impl FnMut(usize, &mut PayloadSink<'_>) -> Result<()>,
@@ -242,6 +275,14 @@ fn write_segment_to(
     if dimension == 0 {
         return Err(LaurusError::internal(
             "multi-vector segment dimension must be greater than 0",
+        ));
+    }
+    if codec
+        .binary_params()
+        .is_some_and(|params| params.dimension() != dimension)
+    {
+        return Err(LaurusError::internal(
+            "binary parameters do not match the segment dimension",
         ));
     }
     if docs.windows(2).any(|w| w[0].doc_id >= w[1].doc_id) {
@@ -256,13 +297,18 @@ fn write_segment_to(
     }
 
     let header = Header {
-        kind,
+        kind: codec.kind(),
         dimension,
         doc_count: docs.len() as u64,
         vector_count: docs.iter().map(|d| u64::from(d.vector_count)).sum(),
     };
-    let mut meta = Vec::with_capacity(HEADER_LEN + docs.len() * DOC_ENTRY_LEN);
+    let mut meta =
+        Vec::with_capacity(HEADER_LEN + header.params_len() + docs.len() * DOC_ENTRY_LEN);
     meta.extend_from_slice(&header.encode());
+    if let Some(params) = codec.binary_params() {
+        params.write_block(&mut meta);
+    }
+    debug_assert_eq!(meta.len(), HEADER_LEN + header.params_len());
     let mut first_vector = 0u64;
     for doc in docs {
         meta.extend_from_slice(&doc.doc_id.to_le_bytes());
@@ -283,7 +329,7 @@ fn write_segment_to(
             output: &mut output,
             hasher: &mut payload_hasher,
             buffer: &mut buffer,
-            kind,
+            codec,
             dimension,
             remaining: doc.vector_count as usize,
         };
@@ -308,7 +354,8 @@ fn write_segment_to(
 /// Read access to one sealed multi-vector segment.
 #[derive(Debug)]
 pub(crate) struct SegmentReader {
-    kind: MultiVectorStorage,
+    /// The segment's element kind and, for `Binary`, its own parameters.
+    codec: OwnedCodec,
     dimension: usize,
     vector_count: u64,
     doc_ids: Vec<u64>,
@@ -346,7 +393,7 @@ impl SegmentReader {
             let footer = &bytes[bytes.len() - FOOTER_LEN..];
             let table = parse_meta(file_name, &header, &bytes[..table_end], footer)?;
             return Ok(Self {
-                kind: header.kind,
+                codec: table.codec,
                 dimension: header.dimension,
                 vector_count: header.vector_count,
                 doc_ids: table.doc_ids,
@@ -371,7 +418,7 @@ impl SegmentReader {
         input.read_exact(&mut footer)?;
         let table = parse_meta(file_name, &header, &meta, &footer)?;
         Ok(Self {
-            kind: header.kind,
+            codec: table.codec,
             dimension: header.dimension,
             vector_count: header.vector_count,
             doc_ids: table.doc_ids,
@@ -386,6 +433,14 @@ impl SegmentReader {
     /// Dimension of every vector.
     pub(crate) fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    /// This segment's `Binary` parameters, `None` for any other kind.
+    pub(crate) fn binary_params(&self) -> Option<&Arc<BinaryParams>> {
+        match &self.codec {
+            OwnedCodec::Binary(params) => Some(params),
+            OwnedCodec::F32 | OwnedCodec::F16 | OwnedCodec::Int8 => None,
+        }
     }
 
     /// Document ids, ascending.
@@ -420,7 +475,7 @@ impl SegmentReader {
             return Ok(None);
         };
         let (first, count) = self.spans[index];
-        let row = self.kind.row_bytes(self.dimension) as u64;
+        let row = self.codec.kind().row_bytes(self.dimension) as u64;
         let start = self.payload_offset + first * row;
         let len = (u64::from(count) * row) as usize;
 
@@ -430,7 +485,7 @@ impl SegmentReader {
                 .ok_or_else(|| LaurusError::internal("zero-copy view disappeared"))?;
             let bytes = &bytes[start as usize..start as usize + len];
             return Ok(Some(MultiVectorRows::new(
-                self.kind,
+                self.codec.as_codec(),
                 self.dimension,
                 Cow::Borrowed(bytes),
             )));
@@ -445,7 +500,7 @@ impl SegmentReader {
         let mut bytes = vec![0u8; len];
         input.read_exact(&mut bytes)?;
         Ok(Some(MultiVectorRows::new(
-            self.kind,
+            self.codec.as_codec(),
             self.dimension,
             Cow::Owned(bytes),
         )))
@@ -458,7 +513,8 @@ impl SegmentReader {
     /// Returns an index error when the payload does not match its checksum,
     /// or an I/O error when reading fails.
     pub(crate) fn verify_payload(&self) -> Result<()> {
-        let payload_len = (self.vector_count * self.kind.row_bytes(self.dimension) as u64) as usize;
+        let payload_len =
+            (self.vector_count * self.codec.kind().row_bytes(self.dimension) as u64) as usize;
         let start = self.payload_offset as usize;
         let actual = if let Some(input) = &self.mapped {
             let bytes = input
@@ -511,15 +567,18 @@ fn check_len(file_name: &str, header: &Header, file_len: u64) -> Result<()> {
     }
 }
 
-/// The decoded document table of a segment, with its payload checksum.
+/// The decoded parameters and document table of a segment, with its
+/// payload checksum.
 struct DocTable {
+    codec: OwnedCodec,
     doc_ids: Vec<u64>,
     /// `(first vector, vector count)` per entry of `doc_ids`.
     spans: Vec<(u64, u32)>,
     payload_crc: u32,
 }
 
-/// Verify the footer and the header + table checksum, then decode the table.
+/// Verify the footer and the header + parameters + table checksum, then
+/// decode the parameters and the table.
 fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> Result<DocTable> {
     if footer[8..12] != FOOTER_MAGIC {
         return Err(corrupt(file_name, "bad footer magic"));
@@ -533,11 +592,20 @@ fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> R
         ));
     }
 
+    let table_start = HEADER_LEN + header.params_len();
+    let codec = match OwnedCodec::plain(header.kind) {
+        Some(codec) => codec,
+        None => OwnedCodec::Binary(Arc::new(
+            BinaryParams::read_block(&meta[HEADER_LEN..table_start], header.dimension)
+                .map_err(|e| corrupt(file_name, &e.to_string()))?,
+        )),
+    };
+
     let doc_count = header.doc_count as usize;
     let mut doc_ids = Vec::with_capacity(doc_count);
     let mut spans = Vec::with_capacity(doc_count);
     let mut next_vector = 0u64;
-    for entry in meta[HEADER_LEN..].as_chunks::<DOC_ENTRY_LEN>().0 {
+    for entry in meta[table_start..].as_chunks::<DOC_ENTRY_LEN>().0 {
         let doc_id = u64::from_le_bytes(entry[0..8].try_into().expect("8 bytes"));
         let first = u64::from_le_bytes(entry[8..16].try_into().expect("8 bytes"));
         let count = u32::from_le_bytes(entry[16..20].try_into().expect("4 bytes"));
@@ -561,6 +629,7 @@ fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> R
         ));
     }
     Ok(DocTable {
+        codec,
         doc_ids,
         spans,
         payload_crc,
@@ -574,6 +643,7 @@ mod tests {
     use super::*;
     use crate::storage::file::{FileStorage, FileStorageConfig};
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+    use crate::vector::core::multi_vector::test_binary_params;
 
     fn memory() -> Arc<dyn Storage> {
         Arc::new(MemoryStorage::new(MemoryStorageConfig::default()))
@@ -596,7 +666,7 @@ mod tests {
     fn write(
         storage: &dyn Storage,
         name: &str,
-        kind: MultiVectorStorage,
+        codec: RowCodec<'_>,
         dim: usize,
         docs: &[(u64, Vec<Vec<f32>>)],
     ) {
@@ -607,7 +677,7 @@ mod tests {
                 vector_count: vectors.len() as u32,
             })
             .collect();
-        write_segment(storage, name, kind, dim, &entries, |i, sink| {
+        write_segment(storage, name, codec, dim, &entries, |i, sink| {
             for v in &docs[i].1 {
                 sink.write(v)?;
             }
@@ -632,12 +702,37 @@ mod tests {
         output.close().unwrap();
     }
 
-    /// Per-element tolerance for `vectors()`/`to_f32()`, exact for `F32`.
-    fn tolerance(kind: MultiVectorStorage) -> f32 {
-        match kind {
-            MultiVectorStorage::F32 => 0.0,
-            MultiVectorStorage::F16 => 2e-3,
-            MultiVectorStorage::Int8 => 5e-2,
+    /// Every codec, with `params` for `Binary`.
+    fn every_codec(params: &BinaryParams) -> [RowCodec<'_>; 4] {
+        [
+            RowCodec::F32,
+            RowCodec::F16,
+            RowCodec::Int8,
+            RowCodec::Binary(params),
+        ]
+    }
+
+    /// What reading `rows` back must return, and the per-element
+    /// tolerance. `Binary` is lossy by design, so it is held exactly to
+    /// its own decode of the encoded rows instead of to the input.
+    fn expected(codec: RowCodec<'_>, rows: &[Vec<f32>]) -> (Vec<f32>, f32) {
+        let flat = rows.concat();
+        match codec.kind() {
+            MultiVectorStorage::F32 => (flat, 0.0),
+            MultiVectorStorage::F16 => (flat, 2e-3),
+            MultiVectorStorage::Int8 => (flat, 5e-2),
+            MultiVectorStorage::Binary => {
+                let dim = rows[0].len();
+                let mut bytes = Vec::new();
+                for row in rows {
+                    codec.encode_row(row, &mut bytes);
+                }
+                let mut out = Vec::new();
+                for row in bytes.chunks_exact(codec.row_bytes(dim)) {
+                    codec.decode_row(row, dim, &mut out);
+                }
+                (out, 0.0)
+            }
         }
     }
 
@@ -658,10 +753,22 @@ mod tests {
         }
     }
 
-    fn assert_round_trip(storage: &dyn Storage, kind: MultiVectorStorage) {
-        write(storage, "seg.mv", kind, 3, &sample());
+    fn assert_round_trip(storage: &dyn Storage, codec: RowCodec<'_>) {
+        write(storage, "seg.mv", codec, 3, &sample());
         let reader = SegmentReader::open(storage, "seg.mv").unwrap();
-        assert_eq!(reader.rows(4).unwrap().unwrap().kind(), kind);
+        assert_eq!(reader.rows(4).unwrap().unwrap().kind(), codec.kind());
+        assert!(
+            reader
+                .rows(4)
+                .unwrap()
+                .unwrap()
+                .codec()
+                .same_encoding(codec)
+        );
+        assert_eq!(
+            reader.binary_params().map(|p| p.as_ref()),
+            codec.binary_params()
+        );
         assert_eq!(reader.dimension(), 3);
         assert_eq!(reader.doc_ids(), &[4, 9]);
         assert_eq!(
@@ -677,13 +784,10 @@ mod tests {
                 },
             ]
         );
-        let tol = tolerance(kind);
-        assert_close(
-            &vectors(&reader, 4).unwrap(),
-            &[1.0, 2.0, 3.0, -1.0, 0.5, 0.25],
-            tol,
-        );
-        assert_close(&vectors(&reader, 9).unwrap(), &[7.0, 8.0, 9.0], tol);
+        for (doc_id, rows) in sample() {
+            let (values, tol) = expected(codec, &rows);
+            assert_close(&vectors(&reader, doc_id).unwrap(), &values, tol);
+        }
         assert!(vectors(&reader, 5).is_none());
         reader.verify_payload().unwrap();
         assert!(!storage.file_exists("seg.mv.tmp"));
@@ -691,38 +795,189 @@ mod tests {
 
     #[test]
     fn test_round_trip_in_memory_for_every_storage_kind() {
-        for kind in [
-            MultiVectorStorage::F32,
-            MultiVectorStorage::F16,
-            MultiVectorStorage::Int8,
-        ] {
-            assert_round_trip(memory().as_ref(), kind);
+        let params = test_binary_params(3);
+        for codec in every_codec(&params) {
+            assert_round_trip(memory().as_ref(), codec);
         }
     }
 
     #[test]
     fn test_round_trip_on_file_with_mmap_is_zero_copy_only_for_f32() {
-        for kind in [
-            MultiVectorStorage::F32,
-            MultiVectorStorage::F16,
-            MultiVectorStorage::Int8,
-        ] {
+        let params = test_binary_params(3);
+        for codec in every_codec(&params) {
             let dir = tempfile::TempDir::new().unwrap();
             let storage = file(&dir, true);
-            assert_round_trip(storage.as_ref(), kind);
+            assert_round_trip(storage.as_ref(), codec);
             // A memory map is page-aligned and the payload offset is a
             // multiple of 8, so an `F32` row set is borrowed, not copied.
-            // `F16`/`Int8` rows can never be reinterpreted as `&[f32]`.
+            // Other kinds' rows can never be reinterpreted as `&[f32]`.
             let reader = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap();
             let rows = reader.rows(4).unwrap().unwrap();
-            assert_eq!(rows.as_f32().is_some(), kind == MultiVectorStorage::F32);
+            assert_eq!(
+                rows.as_f32().is_some(),
+                codec.kind() == MultiVectorStorage::F32
+            );
         }
     }
 
     #[test]
     fn test_round_trip_on_file_without_mmap() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert_round_trip(file(&dir, false).as_ref(), MultiVectorStorage::F32);
+        // The stream path reads the header, parameters and table itself.
+        let params = test_binary_params(3);
+        for codec in [RowCodec::F32, RowCodec::Binary(&params)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            assert_round_trip(file(&dir, false).as_ref(), codec);
+        }
+    }
+
+    /// `64 + pad8(4 * dim) + 24 * docs + ceil(dim / 8) * rows + 16`.
+    #[test]
+    fn test_binary_segment_has_the_documented_length() {
+        let storage = memory();
+        let params = test_binary_params(3);
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            RowCodec::Binary(&params),
+            3,
+            &sample(),
+        );
+        let len = read_all(storage.as_ref(), "seg.mv").len();
+        assert_eq!(len, HEADER_LEN + 16 + 2 * DOC_ENTRY_LEN + 3 + FOOTER_LEN);
+    }
+
+    #[test]
+    fn test_binary_parameter_tamper_is_caught_by_the_table_checksum() {
+        let storage = memory();
+        let params = test_binary_params(3);
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            RowCodec::Binary(&params),
+            3,
+            &sample(),
+        );
+        let mut bytes = read_all(storage.as_ref(), "seg.mv");
+        bytes[HEADER_LEN] ^= 0x01; // the first center value
+        overwrite(storage.as_ref(), "seg.mv", &bytes);
+        let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[test]
+    fn test_non_finite_binary_parameters_are_rejected_even_with_a_valid_checksum() {
+        let storage = memory();
+        let params = test_binary_params(3);
+        write(
+            storage.as_ref(),
+            "seg.mv",
+            RowCodec::Binary(&params),
+            3,
+            &sample(),
+        );
+        let mut bytes = read_all(storage.as_ref(), "seg.mv");
+        bytes[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&half::f16::NAN.to_le_bytes());
+        let meta_end = HEADER_LEN + 16 + 2 * DOC_ENTRY_LEN;
+        let meta_crc = crc32fast::hash(&bytes[..meta_end]);
+        let footer = bytes.len() - FOOTER_LEN;
+        bytes[footer..footer + 4].copy_from_slice(&meta_crc.to_le_bytes());
+        overwrite(storage.as_ref(), "seg.mv", &bytes);
+        let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
+        assert!(err.to_string().contains("non-finite"), "{err}");
+    }
+
+    #[test]
+    fn test_empty_binary_segment_keeps_its_parameters() {
+        let storage = memory();
+        let params = test_binary_params(4);
+        write(
+            storage.as_ref(),
+            "empty.mv",
+            RowCodec::Binary(&params),
+            4,
+            &[],
+        );
+        let reader = SegmentReader::open(storage.as_ref(), "empty.mv").unwrap();
+        assert!(reader.doc_ids().is_empty());
+        assert_eq!(reader.binary_params().map(|p| p.as_ref()), Some(&params));
+        reader.verify_payload().unwrap();
+    }
+
+    /// Writes `rows` of `source` into a one-document segment encoded with
+    /// `target` through [`PayloadSink::append`], and returns that segment's
+    /// raw payload bytes and decoded values.
+    fn append_into(
+        source: &SegmentReader,
+        doc_id: u64,
+        target: RowCodec<'_>,
+    ) -> (Vec<u8>, Vec<f32>) {
+        let storage = memory();
+        let rows = source.rows(doc_id).unwrap().unwrap();
+        let entry = DocEntry {
+            doc_id,
+            vector_count: rows.row_count() as u32,
+        };
+        write_segment(
+            storage.as_ref(),
+            "out.mv",
+            target,
+            3,
+            &[entry],
+            |_, sink| sink.append(&rows),
+        )
+        .unwrap();
+        let reader = SegmentReader::open(storage.as_ref(), "out.mv").unwrap();
+        let out = reader.rows(doc_id).unwrap().unwrap();
+        (out.as_bytes().to_vec(), out.to_f32().into_owned())
+    }
+
+    #[test]
+    fn test_append_copies_only_rows_encoded_with_equal_parameters() {
+        // c = [0.5; 3], w = [0.1, 0.1, 0.05]: the bits 0b111 decode to a
+        // row whose re-encoding clears bit 2, so only a verbatim copy keeps
+        // them.
+        let params = || {
+            let bits = [0.5f32, 0.5, 0.5, 0.1, 0.1, 0.05].map(|v| half::f16::from_f32(v).to_bits());
+            BinaryParams::from_f16_bits(3, bits.into()).unwrap()
+        };
+        let p1 = params();
+        let codec = RowCodec::Binary(&p1);
+        let mut bits = Vec::new();
+        codec.encode_row(&[0.6, 0.6, 0.6], &mut bits);
+        assert_eq!(bits, [0b111]);
+        let mut decoded = Vec::new();
+        codec.decode_row(&bits, 3, &mut decoded);
+        let mut again = Vec::new();
+        codec.encode_row(&decoded, &mut again);
+        assert_ne!(again, bits, "the data must exercise the copy rule");
+
+        let storage = memory();
+        let docs = [(4, vec![vec![0.6, 0.6, 0.6], vec![1.0, 2.0, 3.0]])];
+        write(storage.as_ref(), "p1.mv", codec, 3, &docs);
+        let source = SegmentReader::open(storage.as_ref(), "p1.mv").unwrap();
+        let source_rows = source.rows(4).unwrap().unwrap();
+
+        // Equal parameters in another allocation: a verbatim copy.
+        let p1_again = params();
+        let (bytes, _) = append_into(&source, 4, RowCodec::Binary(&p1_again));
+        assert_eq!(bytes, source_rows.as_bytes());
+
+        // Different parameters: decoded under P1, re-encoded under P2.
+        let p2 = test_binary_params(3);
+        let (_, values) = append_into(&source, 4, RowCodec::Binary(&p2));
+        let decoded_p1 = source_rows.to_f32();
+        let rows: Vec<Vec<f32>> = decoded_p1
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|r| r.to_vec())
+            .collect();
+        let (want, _) = expected(RowCodec::Binary(&p2), &rows);
+        assert_eq!(values, want);
+
+        // Another kind: transcoded through f32.
+        let (_, values) = append_into(&source, 4, RowCodec::F32);
+        assert_eq!(values, &*decoded_p1);
     }
 
     #[test]
@@ -733,7 +988,7 @@ mod tests {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         let unaligned = Cow::Borrowed(&bytes[1..]);
-        let rows = MultiVectorRows::new(MultiVectorStorage::F32, 3, unaligned);
+        let rows = MultiVectorRows::new(RowCodec::F32, 3, unaligned);
         // At most one of the two offsets can be 4-byte aligned, but
         // `to_f32` decodes correctly either way.
         assert_eq!(&*rows.to_f32(), &values);
@@ -742,13 +997,7 @@ mod tests {
     #[test]
     fn test_empty_segment_round_trips() {
         let storage = memory();
-        write(
-            storage.as_ref(),
-            "empty.mv",
-            MultiVectorStorage::F32,
-            4,
-            &[],
-        );
+        write(storage.as_ref(), "empty.mv", RowCodec::F32, 4, &[]);
         let reader = SegmentReader::open(storage.as_ref(), "empty.mv").unwrap();
         assert!(reader.doc_ids().is_empty());
         assert!(vectors(&reader, 1).is_none());
@@ -758,13 +1007,7 @@ mod tests {
     #[test]
     fn test_table_corruption_is_detected_on_open() {
         let storage = memory();
-        write(
-            storage.as_ref(),
-            "seg.mv",
-            MultiVectorStorage::F32,
-            3,
-            &sample(),
-        );
+        write(storage.as_ref(), "seg.mv", RowCodec::F32, 3, &sample());
         let mut bytes = read_all(storage.as_ref(), "seg.mv");
         bytes[HEADER_LEN] ^= 0x01; // first doc id
         overwrite(storage.as_ref(), "seg.mv", &bytes);
@@ -782,7 +1025,7 @@ mod tests {
         write(
             storage.as_ref(),
             "seg.mv",
-            MultiVectorStorage::Int8,
+            RowCodec::Int8,
             2,
             &[(1, vec![vec![1.0, 2.0]])],
         );
@@ -797,13 +1040,7 @@ mod tests {
     #[test]
     fn test_payload_corruption_is_detected_by_verify() {
         let storage = memory();
-        write(
-            storage.as_ref(),
-            "seg.mv",
-            MultiVectorStorage::F32,
-            3,
-            &sample(),
-        );
+        write(storage.as_ref(), "seg.mv", RowCodec::F32, 3, &sample());
         let mut bytes = read_all(storage.as_ref(), "seg.mv");
         let payload_start = HEADER_LEN + 2 * DOC_ENTRY_LEN;
         bytes[payload_start] ^= 0x01;
@@ -816,13 +1053,7 @@ mod tests {
     #[test]
     fn test_truncated_file_is_rejected() {
         let storage = memory();
-        write(
-            storage.as_ref(),
-            "seg.mv",
-            MultiVectorStorage::F32,
-            3,
-            &sample(),
-        );
+        write(storage.as_ref(), "seg.mv", RowCodec::F32, 3, &sample());
         let bytes = read_all(storage.as_ref(), "seg.mv");
         overwrite(storage.as_ref(), "seg.mv", &bytes[..bytes.len() - 4]);
         let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
@@ -830,18 +1061,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reserved_and_out_of_range_element_kinds_are_incompatible() {
+    fn test_out_of_range_element_kinds_are_incompatible() {
         let storage = memory();
-        write(
-            storage.as_ref(),
-            "seg.mv",
-            MultiVectorStorage::F32,
-            3,
-            &sample(),
-        );
+        write(storage.as_ref(), "seg.mv", RowCodec::F32, 3, &sample());
         let original = read_all(storage.as_ref(), "seg.mv");
 
-        for bad_kind in [3u8, 4, 255] {
+        for bad_kind in [4u8, 255] {
             let mut bytes = original.clone();
             bytes[6] = bad_kind;
             overwrite(storage.as_ref(), "seg.mv", &bytes);
@@ -853,13 +1078,7 @@ mod tests {
     #[test]
     fn test_bad_magic_is_incompatible() {
         let storage = memory();
-        write(
-            storage.as_ref(),
-            "seg.mv",
-            MultiVectorStorage::F32,
-            3,
-            &sample(),
-        );
+        write(storage.as_ref(), "seg.mv", RowCodec::F32, 3, &sample());
         let mut bytes = read_all(storage.as_ref(), "seg.mv");
         bytes[0] = b'X';
         overwrite(storage.as_ref(), "seg.mv", &bytes);
@@ -884,7 +1103,7 @@ mod tests {
             write_segment(
                 storage.as_ref(),
                 "a.mv",
-                MultiVectorStorage::F32,
+                RowCodec::F32,
                 2,
                 &unsorted,
                 |_, _| Ok(())
@@ -899,7 +1118,7 @@ mod tests {
         let short = write_segment(
             storage.as_ref(),
             "b.mv",
-            MultiVectorStorage::F32,
+            RowCodec::F32,
             2,
             &one,
             |_, sink| sink.write(&[1.0, 2.0]),
@@ -908,7 +1127,7 @@ mod tests {
         let long = write_segment(
             storage.as_ref(),
             "c.mv",
-            MultiVectorStorage::F32,
+            RowCodec::F32,
             2,
             &one,
             |_, sink| sink.write(&[1.0; 6]),
@@ -932,7 +1151,7 @@ mod tests {
         let err = write_segment(
             storage.as_ref(),
             "partial.mv",
-            MultiVectorStorage::F32,
+            RowCodec::F32,
             2,
             &one,
             |_, sink| sink.write(&[1.0, 2.0, 3.0]),

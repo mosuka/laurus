@@ -375,17 +375,22 @@ enum MultiVectorStorage {
   MULTI_VECTOR_STORAGE_F16 = 2;
   // Signed 8-bit codes with a trailing per-vector f16 scale.
   MULTI_VECTOR_STORAGE_INT8 = 3;
+  // One bit per element, against a center the field learns once. Requires
+  // distance COSINE. Not the LMV1 element-kind tag (3): never convert by
+  // number.
+  MULTI_VECTOR_STORAGE_BINARY = 4;
 }
 
 message MultiVectorOption {
   uint32 dimension = 1;
-  // Only COSINE (vectors are L2-normalized) and DOT_PRODUCT are accepted.
+  // Only COSINE (vectors are L2-normalized) and DOT_PRODUCT are accepted;
+  // BINARY storage requires COSINE.
   DistanceMetric distance = 2;
   // Name of a token-level embedder (e.g. a "candle_colbert" one) that turns
   // text values into token vectors. Empty means documents supply the token
   // vectors.
   string embedder = 3;
-  // On-disk element kind of every token vector. Unset means F32.
+  // On-disk element kind of the field's token vectors. Unset means F32.
   optional MultiVectorStorage storage = 4;
 }
 

@@ -9,17 +9,27 @@
 //! Deletions are logical: a document-level bitmap in [`SegmentedCore`],
 //! consulted at lookup time. A newer segment's copy of a document shadows
 //! older ones. Merges drop deleted documents and stale copies, and copy the
-//! surviving payloads without re-encoding them.
+//! surviving payloads without re-encoding them when they are already
+//! encoded the way the merged segment is.
+//!
+//! A field configured for [`MultiVectorStorage::Binary`] learns its
+//! [`BinaryParams`] once, from the first flush or merge that holds at least
+//! [`BinaryParams::MIN_TRAINING_ROWS`] token vectors, and encodes every
+//! later segment with them. Segments written before that are stored as
+//! [`INTERIM_KIND`] and converted by a later merge.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::embedding::embedder::Embedder;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::multi_vector_params_error;
+use crate::vector::core::multi_vector::{BinaryParams, MultiVectorStorage, OwnedCodec};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::MultiVectorIndexConfig;
 use crate::vector::index::multivector::LAYOUT;
@@ -38,12 +48,35 @@ use crate::vector::reader::VectorIndexReader;
 use crate::vector::search::searcher::VectorIndexSearcher;
 use crate::vector::writer::VectorIndexWriter;
 
+/// Element kind of the segments a `Binary` field writes before it has
+/// learned its parameters.
+const INTERIM_KIND: MultiVectorStorage = MultiVectorStorage::F16;
+
+/// What a field knows about its [`BinaryParams`].
+#[derive(Debug, Default)]
+enum BinaryState {
+    /// Not looked up in the sealed segments yet.
+    #[default]
+    NotLoaded,
+    /// No sealed segment holds parameters.
+    Absent,
+    /// The parameters every new `Binary` segment is encoded with: those of
+    /// the sealed `Binary` segments.
+    Known(Arc<BinaryParams>),
+}
+
 /// State shared by the index handle and its writers.
 #[derive(Debug)]
 struct Shared {
     core: SegmentedCore,
     readers: SegmentedReaderCache<SegmentReader>,
     config: MultiVectorIndexConfig,
+    /// The field's `Binary` parameters; unused for other kinds. Held from
+    /// choosing a segment's encoding until the segment is registered, so a
+    /// flush and a merge cannot learn two different parameter sets. Lock
+    /// order: taken before the reader-cache, manifest and deletion locks,
+    /// never inside a reader loader.
+    binary: Mutex<BinaryState>,
 }
 
 impl Shared {
@@ -81,6 +114,60 @@ impl Shared {
             .collect()
     }
 
+    /// How a new segment of `rows` token vectors is encoded, and whether
+    /// that took learning new [`BinaryParams`] (from `sample`, called only
+    /// then). Learned parameters must be passed to [`Self::publish`] once
+    /// the segment is registered.
+    ///
+    /// For a kind other than `Binary` this is simply that kind. A `Binary`
+    /// field uses its known parameters, learns them when `rows` reaches
+    /// [`BinaryParams::MIN_TRAINING_ROWS`], and otherwise writes
+    /// [`INTERIM_KIND`].
+    fn resolve_target(
+        &self,
+        state: &mut BinaryState,
+        rows: usize,
+        sample: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Result<(OwnedCodec, bool)> {
+        if let Some(codec) = OwnedCodec::plain(self.config.storage) {
+            return Ok((codec, false));
+        }
+        if matches!(state, BinaryState::NotLoaded) {
+            *state = self.load_binary_params()?;
+        }
+        if let BinaryState::Known(params) = state {
+            return Ok((OwnedCodec::Binary(params.clone()), false));
+        }
+        if rows >= BinaryParams::MIN_TRAINING_ROWS {
+            let params = BinaryParams::train(self.config.dimension, &sample()?)?;
+            return Ok((OwnedCodec::Binary(Arc::new(params)), true));
+        }
+        let interim =
+            OwnedCodec::plain(INTERIM_KIND).expect("the interim kind needs no parameters");
+        Ok((interim, false))
+    }
+
+    /// The parameters of the newest sealed `Binary` segment, if any.
+    fn load_binary_params(&self) -> Result<BinaryState> {
+        let mut segments = self.core.manager().list_segments();
+        segments.sort_by_key(|s| std::cmp::Reverse(s.generation));
+        for segment in segments {
+            let reader = self.load_readers(std::slice::from_ref(&segment))?;
+            if let Some(params) = reader[0].binary_params() {
+                return Ok(BinaryState::Known(params.clone()));
+            }
+        }
+        Ok(BinaryState::Absent)
+    }
+
+    /// Record parameters [`Self::resolve_target`] learned, once the segment
+    /// encoded with them is registered.
+    fn publish(state: &mut BinaryState, codec: &OwnedCodec, trained: bool) {
+        if trained && let OwnedCodec::Binary(params) = codec {
+            *state = BinaryState::Known(params.clone());
+        }
+    }
+
     fn snapshot(&self) -> Result<MultiVectorSnapshot> {
         Ok(MultiVectorSnapshot::new(
             self.config.dimension,
@@ -97,6 +184,7 @@ impl Shared {
     /// surviving document's payload, so memory stays proportional to the
     /// document count.
     fn merge(&self, segments: Vec<ManagedSegmentInfo>) -> Result<()> {
+        let mut binary = self.binary.lock();
         let mut sources = segments.clone();
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
         let readers = self.load_readers(&sources)?;
@@ -117,11 +205,27 @@ impl Shared {
         survivors.sort_unstable_by_key(|(entry, _)| entry.doc_id);
         let entries: Vec<DocEntry> = survivors.iter().map(|(entry, _)| *entry).collect();
 
+        let rows = entries.iter().map(|e| e.vector_count as usize).sum();
+        let (target, trained) = self.resolve_target(&mut binary, rows, || {
+            training_sample(
+                &survivors,
+                rows,
+                self.config.dimension,
+                |(entry, source), out| {
+                    let doc = readers[*source].rows(entry.doc_id)?.ok_or_else(|| {
+                        LaurusError::internal("merge source lost a document listed in its table")
+                    })?;
+                    out.extend_from_slice(&doc.to_f32());
+                    Ok(())
+                },
+            )
+        })?;
+
         let merged_id = self.core.manager().generate_segment_id();
         write_segment(
             self.core.storage().as_ref(),
             &Self::file_name(&merged_id),
-            self.config.storage,
+            target.as_codec(),
             self.config.dimension,
             &entries,
             |i, sink| {
@@ -129,16 +233,12 @@ impl Shared {
                 let rows = readers[source].rows(entry.doc_id)?.ok_or_else(|| {
                     LaurusError::internal("merge source lost a document listed in its table")
                 })?;
-                // Same element kind: copy the encoded bytes verbatim (no
-                // re-quantization, no compounding loss across merges).
-                // Different kind (the field's `storage` just changed):
-                // transcode through f32, which is also how `update_field`
+                // Rows encoded exactly as the target encodes are copied
+                // verbatim (no re-quantization, no compounding loss across
+                // merges); others (the field's `storage` just changed) are
+                // transcoded through f32, which is also how `update_field`
                 // migrates every existing segment to the new kind.
-                if rows.kind() == self.config.storage {
-                    sink.write_raw(rows.as_bytes())
-                } else {
-                    sink.write(&rows.to_f32())
-                }
+                sink.append(&rows)
             },
         )?;
 
@@ -158,11 +258,36 @@ impl Shared {
             .map(|s| s.segment_id.clone())
             .collect();
         self.core.manager().apply_merge(candidate, merged)?;
+        Self::publish(&mut binary, &target, trained);
         for id in &source_ids {
             self.readers.invalidate(id);
         }
         Ok(())
     }
+}
+
+/// Row-major token vectors to learn [`BinaryParams`] from: every
+/// `stride`-th document of `docs` (in order, so the sample is
+/// deterministic), with the stride chosen so that about
+/// [`BinaryParams::MAX_TRAINING_ROWS`] of the `total_rows` are taken, and
+/// never more than that. `read` appends one document's rows.
+fn training_sample<T>(
+    docs: &[T],
+    total_rows: usize,
+    dimension: usize,
+    mut read: impl FnMut(&T, &mut Vec<f32>) -> Result<()>,
+) -> Result<Vec<f32>> {
+    let stride = total_rows.div_ceil(BinaryParams::MAX_TRAINING_ROWS).max(1);
+    let cap = BinaryParams::MAX_TRAINING_ROWS * dimension;
+    let mut sample = Vec::new();
+    for doc in docs.iter().step_by(stride) {
+        read(doc, &mut sample)?;
+        if sample.len() >= cap {
+            sample.truncate(cap);
+            break;
+        }
+    }
+    Ok(sample)
 }
 
 /// Segment-per-commit store of per-document token vectors (see the module
@@ -204,7 +329,9 @@ impl MultiVectorIndex {
                  (segment_<digits>)"
             )));
         }
-        if let Some(reason) = multi_vector_params_error(config.dimension, config.distance_metric) {
+        if let Some(reason) =
+            multi_vector_params_error(config.dimension, config.distance_metric, config.storage)
+        {
             return Err(LaurusError::invalid_config(reason));
         }
 
@@ -223,6 +350,7 @@ impl MultiVectorIndex {
                 core: SegmentedCore::new(name, storage, manager),
                 readers: SegmentedReaderCache::new(),
                 config,
+                binary: Mutex::new(BinaryState::NotLoaded),
             }),
             closed: AtomicBool::new(false),
         })
@@ -440,6 +568,48 @@ impl MultiVectorWriter {
         }
         Ok(())
     }
+
+    /// The encoding of this writer's segment (see [`Shared::resolve_target`]),
+    /// learning `Binary` parameters from a sample of the buffer when needed.
+    fn resolve_target(&self, state: &mut BinaryState) -> Result<(OwnedCodec, bool)> {
+        let rows = self.buffer.values().map(Vec::len).sum();
+        self.shared.resolve_target(state, rows, || {
+            let docs: Vec<&Vec<Vector>> = self.buffer.values().collect();
+            training_sample(&docs, rows, self.shared.config.dimension, |doc, out| {
+                for vector in doc.iter() {
+                    out.extend_from_slice(&vector.data);
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Write the buffered documents as this writer's segment file, encoded
+    /// with `codec`.
+    fn write_with(&self, codec: &OwnedCodec) -> Result<()> {
+        let docs: Vec<&Vec<Vector>> = self.buffer.values().collect();
+        let entries: Vec<DocEntry> = self
+            .buffer
+            .iter()
+            .map(|(doc_id, vectors)| DocEntry {
+                doc_id: *doc_id,
+                vector_count: vectors.len() as u32,
+            })
+            .collect();
+        write_segment(
+            self.shared.core.storage().as_ref(),
+            &Shared::file_name(&self.segment_id),
+            codec.as_codec(),
+            self.shared.config.dimension,
+            &entries,
+            |i, sink| {
+                for vector in docs[i] {
+                    sink.write(vector.data.as_slice())?;
+                }
+                Ok(())
+            },
+        )
+    }
 }
 
 impl VectorIndexWriter for MultiVectorWriter {
@@ -521,30 +691,13 @@ impl VectorIndexWriter for MultiVectorWriter {
     }
 
     /// Write the buffered documents as this writer's segment file (without
-    /// registering it; see [`VectorIndexWriter::commit`]).
+    /// registering it; see [`VectorIndexWriter::commit`]). `Binary`
+    /// parameters learned here are not kept: only a registered segment
+    /// makes them the field's.
     fn write(&self) -> Result<()> {
-        let docs: Vec<&Vec<Vector>> = self.buffer.values().collect();
-        let entries: Vec<DocEntry> = self
-            .buffer
-            .iter()
-            .map(|(doc_id, vectors)| DocEntry {
-                doc_id: *doc_id,
-                vector_count: vectors.len() as u32,
-            })
-            .collect();
-        write_segment(
-            self.shared.core.storage().as_ref(),
-            &Shared::file_name(&self.segment_id),
-            self.shared.config.storage,
-            self.shared.config.dimension,
-            &entries,
-            |i, sink| {
-                for vector in docs[i] {
-                    sink.write(vector.data.as_slice())?;
-                }
-                Ok(())
-            },
-        )
+        let mut binary = self.shared.binary.lock();
+        let (codec, _) = self.resolve_target(&mut binary)?;
+        self.write_with(&codec)
     }
 
     fn has_storage(&self) -> bool {
@@ -580,10 +733,16 @@ impl VectorIndexWriter for MultiVectorWriter {
                 self.segment_id
             )));
         }
-        self.write()?;
-        // Generation 0: the manager stamps max + 1 and measures the size.
-        let info = ManagedSegmentInfo::new(self.segment_id.clone(), self.buffer.len() as u64, 0, 0);
-        self.shared.core.manager().add_segment(info)?;
+        {
+            let mut binary = self.shared.binary.lock();
+            let (codec, trained) = self.resolve_target(&mut binary)?;
+            self.write_with(&codec)?;
+            // Generation 0: the manager stamps max + 1 and measures the size.
+            let info =
+                ManagedSegmentInfo::new(self.segment_id.clone(), self.buffer.len() as u64, 0, 0);
+            self.shared.core.manager().add_segment(info)?;
+            Shared::publish(&mut binary, &codec, trained);
+        }
         self.changed_since_seal = Some(false);
         self.shared.readers.invalidate(&self.segment_id);
         Ok(())
@@ -1186,5 +1345,461 @@ mod tests {
             err.to_string().contains("not a vector-search target"),
             "{err}"
         );
+    }
+
+    /// The `Binary` lifecycle: when a field learns its parameters, how it
+    /// keeps them, and how merges treat rows encoded under them (#1346).
+    mod binary {
+        use std::sync::atomic::AtomicBool;
+
+        use super::*;
+        use crate::storage::{FileMetadata, StorageInput, StorageOutput};
+        use crate::vector::core::multi_vector::{RowCodec, test_binary_params};
+        use crate::vector::index::multivector::format::DocEntry;
+
+        const DIM: usize = 4;
+        const MIN: usize = BinaryParams::MIN_TRAINING_ROWS;
+
+        fn config(storage: MultiVectorStorage) -> MultiVectorIndexConfig {
+            MultiVectorIndexConfig {
+                dimension: DIM,
+                distance_metric: DistanceMetric::Cosine,
+                storage,
+                ..MultiVectorIndexConfig::default()
+            }
+        }
+
+        fn open(storage: &Arc<dyn Storage>, kind: MultiVectorStorage) -> MultiVectorIndex {
+            MultiVectorIndex::open_or_create(storage.clone(), "index", config(kind)).unwrap()
+        }
+
+        /// Token `i` of `doc_id`: deterministic and anisotropic (every
+        /// token leans the same way), like a late-interaction model's.
+        fn token(doc_id: u64, i: usize) -> Vec<f32> {
+            let h = |k: u64| {
+                let x = ((doc_id * 1_000 + i as u64) * 4 + k).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            };
+            vec![
+                0.8 + 0.4 * h(0),
+                0.6 + 0.4 * h(1),
+                -0.5 + 0.4 * h(2),
+                0.4 * h(3),
+            ]
+        }
+
+        /// `count` documents from `first`, each with `tokens` token vectors.
+        fn docs(first: u64, count: u64, tokens: usize) -> Vec<(u64, usize)> {
+            (first..first + count).map(|d| (d, tokens)).collect()
+        }
+
+        fn add(writer: &mut dyn VectorIndexWriter, docs: &[(u64, usize)]) {
+            for &(doc_id, count) in docs {
+                let vectors = (0..count)
+                    .map(|i| (doc_id, FIELD.to_string(), Vector::new(token(doc_id, i))))
+                    .collect();
+                writer.add_vectors(vectors).unwrap();
+            }
+        }
+
+        /// Commit `docs` as one segment.
+        fn commit_docs(index: &MultiVectorIndex, docs: &[(u64, usize)]) {
+            let mut writer = index.writer().unwrap();
+            add(writer.as_mut(), docs);
+            writer.commit().unwrap();
+        }
+
+        /// The L2-normalized token vectors of `docs`, row-major in doc-id
+        /// order: what a flush of them learns from.
+        fn normalized_rows(docs: &[(u64, usize)]) -> Vec<f32> {
+            let mut sorted = docs.to_vec();
+            sorted.sort();
+            let mut rows = Vec::new();
+            for (doc_id, count) in sorted {
+                for i in 0..count {
+                    let mut v = Vector::new(token(doc_id, i));
+                    v.normalize();
+                    rows.extend_from_slice(&v.data);
+                }
+            }
+            rows
+        }
+
+        /// `(kind, parameters)` of every sealed segment, newest first; the
+        /// kind is `None` for an empty segment.
+        fn segments(
+            index: &MultiVectorIndex,
+        ) -> Vec<(Option<MultiVectorStorage>, Option<BinaryParams>)> {
+            index
+                .shared
+                .readers_newest_first()
+                .unwrap()
+                .iter()
+                .map(|reader| {
+                    let kind = reader
+                        .entries()
+                        .next()
+                        .map(|e| reader.rows(e.doc_id).unwrap().unwrap().kind());
+                    (kind, reader.binary_params().map(|p| (**p).clone()))
+                })
+                .collect()
+        }
+
+        fn known(index: &MultiVectorIndex) -> Option<BinaryParams> {
+            match &*index.shared.binary.lock() {
+                BinaryState::Known(params) => Some((**params).clone()),
+                BinaryState::NotLoaded | BinaryState::Absent => None,
+            }
+        }
+
+        fn raw_rows(index: &MultiVectorIndex, doc_id: u64) -> Vec<u8> {
+            let snapshot = index.snapshot().unwrap();
+            let rows = snapshot.rows(doc_id).unwrap().unwrap();
+            rows.as_bytes().to_vec()
+        }
+
+        fn decode_with(params: &BinaryParams, values: &[f32]) -> Vec<f32> {
+            let codec = RowCodec::Binary(params);
+            let mut out = Vec::new();
+            for row in values.as_chunks::<DIM>().0 {
+                let mut bytes = Vec::new();
+                codec.encode_row(row, &mut bytes);
+                codec.decode_row(&bytes, DIM, &mut out);
+            }
+            out
+        }
+
+        #[test]
+        fn test_a_flush_below_the_threshold_is_interim_and_learns_nothing() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            let mut batch = docs(0, 63, 32);
+            batch.push((63, 31));
+            assert_eq!(batch.iter().map(|d| d.1).sum::<usize>(), MIN - 1);
+            commit_docs(&index, &batch);
+            assert_eq!(segments(&index), [(Some(INTERIM_KIND), None)]);
+            assert!(matches!(*index.shared.binary.lock(), BinaryState::Absent));
+        }
+
+        #[test]
+        fn test_a_flush_at_the_threshold_learns_from_its_buffer() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            let batch = docs(0, 64, 32);
+            commit_docs(&index, &batch);
+            let expected = BinaryParams::train(DIM, &normalized_rows(&batch)).unwrap();
+            assert_eq!(
+                segments(&index),
+                [(Some(MultiVectorStorage::Binary), Some(expected.clone()))]
+            );
+            assert_eq!(known(&index), Some(expected));
+        }
+
+        #[test]
+        fn test_write_without_commit_does_not_keep_learned_parameters() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            let mut writer = index.writer().unwrap();
+            add(writer.as_mut(), &docs(0, 64, 32));
+            writer.write().unwrap();
+            assert_eq!(known(&index), None);
+        }
+
+        #[test]
+        fn test_later_flushes_and_a_reopened_index_reuse_the_parameters() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            commit_docs(&index, &docs(0, 64, 32));
+            let params = known(&index).unwrap();
+            commit_docs(&index, &docs(100, 1, 1));
+            drop(index);
+
+            let reopened = open(&storage, MultiVectorStorage::Binary);
+            assert!(matches!(
+                *reopened.shared.binary.lock(),
+                BinaryState::NotLoaded
+            ));
+            commit_docs(&reopened, &docs(101, 1, 1));
+            let binary = (Some(MultiVectorStorage::Binary), Some(params));
+            assert_eq!(
+                segments(&reopened),
+                [binary.clone(), binary.clone(), binary]
+            );
+        }
+
+        #[test]
+        fn test_interim_segments_below_the_threshold_merge_into_an_interim_segment() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            for first in [0, 10, 20] {
+                commit_docs(&index, &docs(first, 10, 32));
+            }
+            let before: Vec<Vec<u8>> = (0..30).map(|d| raw_rows(&index, d)).collect();
+            index.optimize().unwrap();
+            assert_eq!(segments(&index), [(Some(INTERIM_KIND), None)]);
+            for (doc_id, bytes) in before.iter().enumerate() {
+                assert_eq!(&raw_rows(&index, doc_id as u64), bytes);
+            }
+            assert!(matches!(*index.shared.binary.lock(), BinaryState::Absent));
+        }
+
+        #[test]
+        fn test_a_merge_reaching_the_threshold_learns_and_converts_interim_segments() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            for first in [0, 25, 50] {
+                commit_docs(&index, &docs(first, 25, 32));
+            }
+            assert!(
+                segments(&index)
+                    .iter()
+                    .all(|s| *s == (Some(INTERIM_KIND), None))
+            );
+            // The merge learns from the rows as stored: the interim decode.
+            let stored: Vec<f32> = (0..75)
+                .flat_map(|d| vectors_of(&index, d).unwrap())
+                .collect();
+            let expected = BinaryParams::train(DIM, &stored).unwrap();
+
+            index.optimize().unwrap();
+            assert_eq!(
+                segments(&index),
+                [(Some(MultiVectorStorage::Binary), Some(expected.clone()))]
+            );
+            assert_eq!(
+                vectors_of(&index, 7).unwrap(),
+                decode_with(&expected, &stored[7 * 32 * DIM..8 * 32 * DIM])
+            );
+            commit_docs(&index, &docs(100, 1, 1));
+            assert_eq!(
+                segments(&index)[0],
+                (Some(MultiVectorStorage::Binary), Some(expected))
+            );
+        }
+
+        /// Register a one-document segment holding `rows` encoded with
+        /// `codec`, as if another flush had written it.
+        fn register(index: &MultiVectorIndex, doc_id: u64, codec: RowCodec<'_>, rows: &[f32]) {
+            let shared = &index.shared;
+            let id = shared.core.manager().generate_segment_id();
+            let entry = DocEntry {
+                doc_id,
+                vector_count: (rows.len() / DIM) as u32,
+            };
+            write_segment(
+                shared.core.storage().as_ref(),
+                &Shared::file_name(&id),
+                codec,
+                DIM,
+                &[entry],
+                |_, sink| sink.write(rows),
+            )
+            .unwrap();
+            shared
+                .core
+                .manager()
+                .add_segment(ManagedSegmentInfo::new(id, 1, 0, 0))
+                .unwrap();
+        }
+
+        #[test]
+        fn test_merging_segments_with_equal_parameters_copies_their_bits() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            commit_docs(&index, &docs(0, 64, 32));
+            // Equal parameters in another allocation, as a reopened field
+            // would read them back.
+            let params = known(&index).unwrap();
+            let codec = RowCodec::Binary(&params);
+            let decode_bits = |bits: u8| {
+                let mut out = Vec::new();
+                codec.decode_row(&[bits], DIM, &mut out);
+                out
+            };
+            let encode_bits = |values: &[f32]| {
+                let mut out = Vec::new();
+                codec.encode_row(values, &mut out);
+                out[0]
+            };
+
+            // A bit pattern whose decode re-encodes to other bits: only a
+            // verbatim copy keeps it. `c` is the midpoint of a pattern's
+            // decode and its complement's.
+            let pattern = (0u8..16)
+                .find(|&p| encode_bits(&decode_bits(p)) != p)
+                .expect("these parameters have a pattern that re-encodes differently");
+            let center: Vec<f32> = decode_bits(pattern)
+                .iter()
+                .zip(decode_bits(!pattern & 0x0f))
+                .map(|(a, b)| (a + b) / 2.0)
+                .collect();
+            let row: Vec<f32> = center
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if pattern >> i & 1 == 1 {
+                        c + 0.01
+                    } else {
+                        c - 0.01
+                    }
+                })
+                .collect();
+            assert_eq!(encode_bits(&row), pattern);
+            register(&index, 2_000, codec, &[row.clone(), row].concat());
+
+            let ids: Vec<u64> = (0..64).chain([2_000]).collect();
+            let before: Vec<Vec<u8>> = ids.iter().map(|&d| raw_rows(&index, d)).collect();
+            assert_eq!(before[64], [pattern, pattern]);
+
+            index.optimize().unwrap();
+            assert_eq!(segments(&index).len(), 1);
+            for (doc_id, bytes) in ids.iter().zip(&before) {
+                assert_eq!(&raw_rows(&index, *doc_id), bytes, "doc {doc_id}");
+            }
+        }
+
+        #[test]
+        fn test_merging_segments_with_different_parameters_transcodes() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            commit_docs(&index, &docs(0, 64, 32));
+            let p1 = known(&index).unwrap();
+            let p2 = test_binary_params(DIM);
+            assert_ne!(p1, p2);
+
+            // A segment encoded under other parameters.
+            let rows: Vec<f32> = (0..3).flat_map(|i| token(500, i)).collect();
+            register(&index, 500, RowCodec::Binary(&p2), &rows);
+            let under_p2 = vectors_of(&index, 500).unwrap();
+
+            index.optimize().unwrap();
+            assert_eq!(
+                vectors_of(&index, 500).unwrap(),
+                decode_with(&p1, &under_p2)
+            );
+        }
+
+        #[test]
+        fn test_binary_segments_decode_and_migrate_under_another_kind() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            commit_docs(&index, &docs(0, 64, 32));
+            let values = vectors_of(&index, 3).unwrap();
+            drop(index);
+
+            let f32_index = open(&storage, MultiVectorStorage::F32);
+            assert_eq!(vectors_of(&f32_index, 3).unwrap(), values);
+            f32_index.optimize().unwrap();
+            assert_eq!(
+                segments(&f32_index),
+                [(Some(MultiVectorStorage::F32), None)]
+            );
+            assert_eq!(vectors_of(&f32_index, 3).unwrap(), values);
+        }
+
+        #[test]
+        fn test_migrating_to_binary_learns_from_the_stored_f32_rows() {
+            for (count, learns) in [(64, true), (63, false)] {
+                let storage = storage();
+                let batch = docs(0, count, 32);
+                commit_docs(&open(&storage, MultiVectorStorage::F32), &batch);
+
+                let index = open(&storage, MultiVectorStorage::Binary);
+                index.optimize().unwrap();
+                let expected = if learns {
+                    let params = BinaryParams::train(DIM, &normalized_rows(&batch)).unwrap();
+                    (Some(MultiVectorStorage::Binary), Some(params))
+                } else {
+                    (Some(INTERIM_KIND), None)
+                };
+                assert_eq!(segments(&index), [expected], "{count} documents");
+            }
+        }
+
+        #[test]
+        fn test_deleting_every_document_keeps_the_parameters() {
+            let storage = storage();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            let batch = docs(0, 64, 32);
+            commit_docs(&index, &batch);
+            let params = known(&index).unwrap();
+            let mut writer = index.writer().unwrap();
+            for (doc_id, _) in &batch {
+                writer.delete_document(*doc_id).unwrap();
+            }
+            writer.commit().unwrap();
+            index.persist_deletions().unwrap();
+
+            index.optimize().unwrap();
+            assert_eq!(segments(&index), [(None, Some(params.clone()))]);
+            assert_eq!(known(&index), Some(params));
+        }
+
+        /// Fails every `rename_file` onto a segment file while armed, i.e.
+        /// the last step of writing a segment.
+        #[derive(Debug)]
+        struct FailingSegmentRename {
+            inner: Arc<dyn Storage>,
+            armed: AtomicBool,
+        }
+
+        impl Storage for FailingSegmentRename {
+            fn open_input(&self, name: &str) -> Result<Box<dyn StorageInput>> {
+                self.inner.open_input(name)
+            }
+            fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+                self.inner.create_output(name)
+            }
+            fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+                self.inner.create_output_append(name)
+            }
+            fn file_exists(&self, name: &str) -> bool {
+                self.inner.file_exists(name)
+            }
+            fn delete_file(&self, name: &str) -> Result<()> {
+                self.inner.delete_file(name)
+            }
+            fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+                if self.armed.load(Ordering::SeqCst) && new_name.ends_with(LAYOUT.primary) {
+                    return Err(LaurusError::storage(format!(
+                        "injected failure renaming {old_name}"
+                    )));
+                }
+                self.inner.rename_file(old_name, new_name)
+            }
+            fn list_files(&self) -> Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn file_size(&self, name: &str) -> Result<u64> {
+                self.inner.file_size(name)
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+            fn metadata(&self, name: &str) -> Result<FileMetadata> {
+                self.inner.metadata(name)
+            }
+            fn create_temp_output(&self, prefix: &str) -> Result<(String, Box<dyn StorageOutput>)> {
+                self.inner.create_temp_output(prefix)
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn test_parameters_learned_by_a_failed_flush_are_not_kept() {
+            let failing = Arc::new(FailingSegmentRename {
+                inner: storage(),
+                armed: AtomicBool::new(true),
+            });
+            let storage: Arc<dyn Storage> = failing.clone();
+            let index = open(&storage, MultiVectorStorage::Binary);
+            let mut writer = index.writer().unwrap();
+            add(writer.as_mut(), &docs(0, 64, 32));
+            assert!(writer.commit().is_err());
+            assert_eq!(known(&index), None);
+            assert!(segments(&index).is_empty());
+        }
     }
 }

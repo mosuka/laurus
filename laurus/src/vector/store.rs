@@ -1513,6 +1513,12 @@ impl VectorStore {
             &deletion_config,
         );
 
+        // `purge` discards the field's data before re-creating it, so an
+        // option the new index would reject must fail before that.
+        if let crate::vector::core::field::FieldOption::MultiVector(opt) = new_option {
+            opt.validate(name)?;
+        }
+
         let mut writer_guard = self.writer_cache.lock().await;
         let flush_result = match writer_guard.as_mut() {
             Some(writer) if writer.has_pending_changes() => writer.commit(),

@@ -1904,8 +1904,10 @@ impl Engine {
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
     pub async fn add_field(&self, name: &str, option: schema::FieldOption) -> Result<Schema> {
-        // 1a. Reject reserved field names (e.g. `_`-prefixed except `_id`).
+        // 1a. Reject reserved field names (e.g. `_`-prefixed except `_id`)
+        // and options the field's index would reject.
         schema::validate_field_name(name)?;
+        schema::validate_field_option(name, &option)?;
 
         // 1. Check for duplicates.
         {
@@ -2114,7 +2116,10 @@ impl Engine {
         };
 
         // Checked before the dry-run return so that a dry run reports what
-        // the real call would do.
+        // the real call would do, and before anything is purged: a
+        // destructive change discards the field's data before re-creating
+        // it, so an option the new index would reject must fail here.
+        schema::validate_field_option(name, &option)?;
         field_embedder_definition(&self.schema.read(), name, &option)?;
 
         let classification = schema::classify_change(&old_option, &option);

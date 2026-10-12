@@ -45,7 +45,7 @@ pub(crate) fn max_sim(query: &[f32], document: &[f32], dimension: usize) -> f32 
 /// MaxSim of one document stored under any [`MultiVectorStorage`] kind
 /// (#1346).
 ///
-/// A compressed `document` (`F16`/`Int8`) is decoded into `scratch` first:
+/// A compressed `document` (`F16`/`Int8`/`Binary`) is decoded into `scratch` first:
 /// MaxSim is `O(query_rows * document_rows)` dot products but decoding a
 /// document is only `O(document_rows)`, so at typical query/document token
 /// counts (tens vs. hundreds) decoding once and reusing the plain `max_sim`
@@ -145,48 +145,67 @@ mod tests {
 
     use std::borrow::Cow;
 
-    use crate::vector::core::multi_vector::MultiVectorStorage;
+    use crate::vector::core::multi_vector::{MultiVectorStorage, RowCodec, test_binary_params};
 
-    fn encode(kind: MultiVectorStorage, dimension: usize, rows: &[f32]) -> Vec<u8> {
+    fn encode(codec: RowCodec<'_>, dimension: usize, rows: &[f32]) -> Vec<u8> {
         let mut out = Vec::new();
         for row in rows.chunks_exact(dimension) {
-            kind.encode_row(row, &mut out);
+            codec.encode_row(row, &mut out);
         }
         out
     }
 
-    /// Per-kind tolerance derived in the implementation plan: f16's 11-bit
-    /// significand bounds its relative error to ~2⁻¹¹; int8's per-vector
-    /// scale (dividing the `[-1, 1]`-ish ColBERT range into 254 steps)
-    /// accumulates more, with ample safety margin at these dimensions.
-    fn tolerance(kind: MultiVectorStorage, query_rows: usize) -> f32 {
-        match kind {
-            MultiVectorStorage::F32 => 0.0,
-            MultiVectorStorage::F16 => 2e-3 * query_rows as f32,
-            MultiVectorStorage::Int8 => 5e-2 * query_rows as f32,
+    /// The document MaxSim is checked against, and the tolerance. For the
+    /// kinds with a per-element error bound it is the input itself: f16's
+    /// 11-bit significand bounds its relative error to ~2⁻¹¹; int8's
+    /// per-vector scale (dividing the `[-1, 1]`-ish ColBERT range into 254
+    /// steps) accumulates more, with ample safety margin at these
+    /// dimensions. The lossy `Binary` is held exactly to its own
+    /// row-by-row decode.
+    fn reference_document(
+        codec: RowCodec<'_>,
+        dimension: usize,
+        document: &[f32],
+        query_rows: usize,
+    ) -> (Vec<f32>, f32) {
+        match codec.kind() {
+            MultiVectorStorage::F32 => (document.to_vec(), 0.0),
+            MultiVectorStorage::F16 => (document.to_vec(), 2e-3 * query_rows as f32),
+            MultiVectorStorage::Int8 => (document.to_vec(), 5e-2 * query_rows as f32),
+            MultiVectorStorage::Binary => {
+                let mut decoded = Vec::new();
+                let encoded = encode(codec, dimension, document);
+                for row in encoded.chunks_exact(codec.row_bytes(dimension)) {
+                    codec.decode_row(row, dimension, &mut decoded);
+                }
+                (decoded, 0.0)
+            }
         }
     }
 
     #[test]
     fn test_max_sim_rows_matches_plain_max_sim_for_every_storage_kind() {
         let dimension = 128;
+        let params = test_binary_params(dimension);
         for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
             let query = values(1, query_rows * dimension);
             let document = values(2, doc_rows * dimension);
-            let expected = max_sim(&query, &document, dimension);
-            for kind in [
-                MultiVectorStorage::F32,
-                MultiVectorStorage::F16,
-                MultiVectorStorage::Int8,
+            for codec in [
+                RowCodec::F32,
+                RowCodec::F16,
+                RowCodec::Int8,
+                RowCodec::Binary(&params),
             ] {
-                let encoded = encode(kind, dimension, &document);
-                let view = MultiVectorRows::new(kind, dimension, Cow::Owned(encoded));
+                let (target, tol) = reference_document(codec, dimension, &document, query_rows);
+                let expected = max_sim(&query, &target, dimension);
+                let encoded = encode(codec, dimension, &document);
+                let view = MultiVectorRows::new(codec, dimension, Cow::Owned(encoded));
                 let mut scratch = Vec::new();
                 let actual = max_sim_rows(&query, &view, &mut scratch);
-                let tol = tolerance(kind, query_rows);
                 assert!(
                     (actual - expected).abs() <= tol,
-                    "{kind:?} {query_rows}x{doc_rows}: {actual} vs {expected} (tol {tol})"
+                    "{:?} {query_rows}x{doc_rows}: {actual} vs {expected} (tol {tol})",
+                    codec.kind()
                 );
             }
         }

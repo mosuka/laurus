@@ -352,7 +352,8 @@ pub struct MultiVectorOption {
     pub dimension: usize,
     /// Token similarity. Only [`DistanceMetric::Cosine`] (vectors are
     /// L2-normalized, so the similarity is their dot product) and
-    /// [`DistanceMetric::DotProduct`] are supported. Defaults to
+    /// [`DistanceMetric::DotProduct`] are supported, and
+    /// [`MultiVectorStorage::Binary`] requires `Cosine`. Defaults to
     /// [`DistanceMetric::Cosine`].
     #[serde(default = "default_distance_metric")]
     pub distance: DistanceMetric,
@@ -426,11 +427,12 @@ impl MultiVectorOption {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::invalid_argument`] when the dimension is zero
-    /// or the distance is neither `Cosine` nor `DotProduct` (see
+    /// Returns [`LaurusError::invalid_argument`] when the dimension is zero,
+    /// the distance is neither `Cosine` nor `DotProduct`, or the storage is
+    /// `Binary` and the distance is not `Cosine` (see
     /// [`multi_vector_params_error`]).
     pub fn validate(&self, field_name: &str) -> Result<()> {
-        match multi_vector_params_error(self.dimension, self.distance) {
+        match multi_vector_params_error(self.dimension, self.distance, self.storage) {
             Some(reason) => Err(LaurusError::invalid_argument(format!(
                 "field '{field_name}': {reason}"
             ))),
@@ -482,21 +484,30 @@ impl MultiVectorOption {
     }
 }
 
-/// Why `dimension` / `distance` cannot describe a multi-vector field, if
-/// they cannot.
+/// Why `dimension` / `distance` / `storage` cannot describe a multi-vector
+/// field, if they cannot.
 ///
 /// Late interaction sums each query vector's best similarity, which is
 /// meaningless for a distance where smaller is better, so only `Cosine` and
-/// `DotProduct` are accepted.
+/// `DotProduct` are accepted. `Binary` storage keeps only each token
+/// vector's direction relative to the field's center, so it requires
+/// `Cosine`, where every token is unit length anyway.
 pub(crate) fn multi_vector_params_error(
     dimension: usize,
     distance: DistanceMetric,
+    storage: MultiVectorStorage,
 ) -> Option<String> {
     if dimension == 0 {
         return Some("MultiVector dimension must be greater than 0".to_string());
     }
     match distance {
-        DistanceMetric::Cosine | DistanceMetric::DotProduct => None,
+        DistanceMetric::Cosine => None,
+        DistanceMetric::DotProduct if storage == MultiVectorStorage::Binary => Some(
+            "MultiVector storage Binary requires distance Cosine: it keeps each token \
+             vector's direction, not its magnitude"
+                .to_string(),
+        ),
+        DistanceMetric::DotProduct => None,
         other => Some(format!(
             "MultiVector distance must be Cosine or DotProduct, got {}",
             other.name()

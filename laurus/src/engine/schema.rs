@@ -110,6 +110,24 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Check that `option` describes a usable field named `name`: today, that
+/// a `MultiVector` option passes [`MultiVectorOption::validate`].
+///
+/// Called by [`Schema::validate_for_create`] and before
+/// `Engine::add_field` / `Engine::update_field` touch any data, so an
+/// option the field's index would reject never purges the field first.
+///
+/// # Errors
+///
+/// Returns [`crate::error::LaurusError::invalid_argument`] when the option
+/// is rejected.
+pub(crate) fn validate_field_option(name: &str, option: &FieldOption) -> crate::error::Result<()> {
+    if let FieldOption::MultiVector(opt) = option {
+        opt.validate(name)?;
+    }
+    Ok(())
+}
+
 /// Schema for the unified engine.
 ///
 /// Declares what fields exist, their index types (lexical or vector),
@@ -213,9 +231,7 @@ impl Schema {
     pub fn validate_for_create(&self) -> crate::error::Result<()> {
         for (name, option) in &self.fields {
             validate_field_name(name)?;
-            if let FieldOption::MultiVector(opt) = option {
-                opt.validate(name)?;
-            }
+            validate_field_option(name, option)?;
         }
         for name in self.analyzers.keys() {
             crate::analysis::analyzer::registry::validate_analyzer_name(name)?;
@@ -773,9 +789,11 @@ fn classify_hnsw_specific(old: &HnswOption, new: &HnswOption) -> FieldChangeKind
 
 /// Classification for `MultiVector`-specific parameters (Issue #1346).
 /// `storage` (the on-disk element kind) changes the LMV1 payload layout of
-/// every segment already on disk, so it requires rebuilding from the raw
-/// vectors — exactly like `quantizer` on the ANN vector kinds (see
-/// `classify_flat_specific`).
+/// every segment already on disk, so it requires re-encoding every stored
+/// vector — exactly like `quantizer` on the ANN vector kinds (see
+/// `classify_flat_specific`). The rebuild decodes what is stored, so it
+/// cannot restore precision a lossy kind (`Int8`, `Binary`) already
+/// dropped.
 fn classify_multi_vector_specific(
     old: &MultiVectorOption,
     new: &MultiVectorOption,

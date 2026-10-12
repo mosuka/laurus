@@ -603,3 +603,171 @@ async fn test_update_field_storage_compression_reindexes_and_is_lossy_one_way() 
     assert_ne!(after_round_trip, before);
     Ok(())
 }
+
+/// Issue #1346: a `Binary` field (Cosine, 4 dimensions) next to a text
+/// field.
+fn binary_option(distance: DistanceMetric) -> FieldOption {
+    FieldOption::MultiVector(
+        MultiVectorOption::new(4)
+            .distance(distance)
+            .storage(MultiVectorStorage::Binary),
+    )
+}
+
+fn binary_schema(storage: MultiVectorStorage) -> Schema {
+    Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .add_field(
+            TOKENS,
+            FieldOption::MultiVector(
+                MultiVectorOption::new(4)
+                    .distance(DistanceMetric::Cosine)
+                    .storage(storage),
+            ),
+        )
+        .build()
+}
+
+/// Token `i` of document `n`: deterministic and anisotropic, like a
+/// late-interaction model's.
+fn binary_token(n: u64, i: u64) -> Vec<f32> {
+    let h = |k: u64| {
+        let x = ((n * 1_000 + i) * 4 + k).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    };
+    vec![
+        0.8 + 0.4 * h(0),
+        0.6 + 0.4 * h(1),
+        -0.5 + 0.4 * h(2),
+        0.4 * h(3),
+    ]
+}
+
+/// Put 64 documents of 32 tokens each: 2048 token vectors, exactly what a
+/// `Binary` field needs to learn its parameters in one flush.
+async fn put_binary_corpus(engine: &Engine) -> Result<()> {
+    for n in 0..64 {
+        let tokens = (0..32).map(|i| binary_token(n, i)).collect();
+        let doc = Document::builder()
+            .add_text("title", format!("doc {n}"))
+            .add_vector_array(TOKENS, tokens)
+            .build();
+        engine.put_document(&format!("d{n}"), doc).await?;
+    }
+    Ok(())
+}
+
+/// The element kind every live document of the corpus is stored as.
+fn stored_kinds(engine: &Engine) -> Vec<MultiVectorStorage> {
+    let snapshot = engine.vector.multi_vector_snapshot(TOKENS).unwrap();
+    let mut kinds: Vec<MultiVectorStorage> = (0..64)
+        .flat_map(|n| internal_ids(engine, &format!("d{n}")))
+        .map(|doc_id| snapshot.rows(doc_id).unwrap().unwrap().kind())
+        .collect();
+    kinds.dedup();
+    kinds
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wal_replay_of_a_binary_field_learns_its_parameters() -> Result<()> {
+    let storage = storage();
+    {
+        let engine =
+            Engine::new(storage.clone(), binary_schema(MultiVectorStorage::Binary)).await?;
+        put_binary_corpus(&engine).await?;
+        // Dropped without commit: only the WAL holds the documents.
+    }
+    let engine = Engine::new(storage, binary_schema(MultiVectorStorage::Binary)).await?;
+    engine.commit().await?;
+    assert_eq!(stored_kinds(&engine), [MultiVectorStorage::Binary]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_field_to_binary_reindexes_every_segment() -> Result<()> {
+    let engine = Engine::new(storage(), binary_schema(MultiVectorStorage::F32)).await?;
+    put_binary_corpus(&engine).await?;
+    engine.commit().await?;
+    assert_eq!(stored_kinds(&engine), [MultiVectorStorage::F32]);
+
+    let outcome = engine
+        .update_field(
+            TOKENS,
+            binary_option(DistanceMetric::Cosine),
+            UpdateFieldOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        outcome.classification,
+        crate::engine::schema::FieldChangeKind::Reindex
+    );
+    assert_eq!(stored_kinds(&engine), [MultiVectorStorage::Binary]);
+    Ok(())
+}
+
+/// A distance change is destructive (the field is purged, then re-created
+/// empty). `Binary` with `DotProduct` is rejected, and that must happen
+/// before the purge: the field's data and schema stay as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rejected_binary_option_never_purges_the_field() -> Result<()> {
+    let engine = Engine::new(storage(), binary_schema(MultiVectorStorage::Binary)).await?;
+    put_binary_corpus(&engine).await?;
+    engine.commit().await?;
+    let before = stored_tokens(&engine, "d3").unwrap();
+    let schema_before = format!("{:?}", engine.schema().fields.get(TOKENS));
+
+    for dry_run in [true, false] {
+        let err = engine
+            .update_field(
+                TOKENS,
+                binary_option(DistanceMetric::DotProduct),
+                UpdateFieldOptions {
+                    reindex: true,
+                    dry_run,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires distance Cosine"),
+            "{err}"
+        );
+    }
+    assert_eq!(stored_tokens(&engine, "d3"), Some(before));
+    assert_eq!(
+        format!("{:?}", engine.schema().fields.get(TOKENS)),
+        schema_before
+    );
+
+    let err = engine
+        .add_field("more", binary_option(DistanceMetric::DotProduct))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires distance Cosine"),
+        "{err}"
+    );
+    assert!(!engine.schema().fields.contains_key("more"));
+    Ok(())
+}
+
+#[test]
+fn test_schema_rejects_binary_with_dot_product() {
+    let err = Schema::builder()
+        .add_field(TOKENS, binary_option(DistanceMetric::DotProduct))
+        .try_build()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires distance Cosine"),
+        "{err}"
+    );
+    assert!(
+        Schema::builder()
+            .add_field(TOKENS, binary_option(DistanceMetric::Cosine))
+            .try_build()
+            .is_ok()
+    );
+}

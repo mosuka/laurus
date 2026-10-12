@@ -450,6 +450,7 @@ fn multi_vector_storage_to_proto(storage: MultiVectorStorage) -> v1::MultiVector
         MultiVectorStorage::F32 => v1::MultiVectorStorage::F32,
         MultiVectorStorage::F16 => v1::MultiVectorStorage::F16,
         MultiVectorStorage::Int8 => v1::MultiVectorStorage::Int8,
+        MultiVectorStorage::Binary => v1::MultiVectorStorage::Binary,
     }
 }
 
@@ -460,6 +461,7 @@ fn multi_vector_storage_from_proto(value: Option<i32>) -> MultiVectorStorage {
     match value.and_then(|v| v1::MultiVectorStorage::try_from(v).ok()) {
         Some(v1::MultiVectorStorage::F16) => MultiVectorStorage::F16,
         Some(v1::MultiVectorStorage::Int8) => MultiVectorStorage::Int8,
+        Some(v1::MultiVectorStorage::Binary) => MultiVectorStorage::Binary,
         Some(v1::MultiVectorStorage::F32 | v1::MultiVectorStorage::Unspecified) | None => {
             MultiVectorStorage::F32
         }
@@ -1373,17 +1375,19 @@ mod tests {
     /// dimension and distance.
     #[test]
     fn schema_field_option_multi_vector_round_trip() {
-        // #1346: every storage kind round-trips through proto.
-        for storage in [
-            MultiVectorStorage::F32,
-            MultiVectorStorage::F16,
-            MultiVectorStorage::Int8,
+        // #1346: every storage kind round-trips through proto (Binary
+        // requires Cosine).
+        for (storage, distance) in [
+            (MultiVectorStorage::F32, DistanceMetric::DotProduct),
+            (MultiVectorStorage::F16, DistanceMetric::DotProduct),
+            (MultiVectorStorage::Int8, DistanceMetric::DotProduct),
+            (MultiVectorStorage::Binary, DistanceMetric::Cosine),
         ] {
             let schema = Schema::builder()
                 .add_multi_vector_field(
                     "tokens",
                     MultiVectorOption::new(96)
-                        .distance(DistanceMetric::DotProduct)
+                        .distance(distance)
                         .storage(storage),
                 )
                 .build();
@@ -1391,7 +1395,7 @@ mod tests {
             match back.fields.get("tokens") {
                 Some(FieldOption::MultiVector(o)) => {
                     assert_eq!(o.dimension, 96);
-                    assert_eq!(o.distance, DistanceMetric::DotProduct);
+                    assert_eq!(o.distance, distance);
                     assert_eq!(o.embedder, None);
                     assert_eq!(o.storage, storage, "{storage:?}");
                 }

@@ -4,9 +4,12 @@
 //! Encodes a BEIR corpus once with a real ColBERT model, caches the f32
 //! token vectors on disk, and ingests the same vectors into one engine that
 //! has one MultiVector field per storage kind (`tokens_f32`, `tokens_f16`,
-//! `tokens_int8`). Every kind therefore sees identical vectors and an
-//! identical first stage; the only difference is the on-disk element kind,
-//! decoded on the production rescore path.
+//! `tokens_int8`, `tokens_binary`). Every kind therefore sees identical
+//! vectors and an identical first stage; the only difference is the on-disk
+//! element kind, decoded on the production rescore path. The default
+//! commit interval puts 500 documents in the first commit, enough for the
+//! `Binary` field to learn its parameters there, so every segment of it is
+//! `Binary`.
 //!
 //! Two conditions are measured:
 //!
@@ -81,10 +84,11 @@ const DIMENSION: usize = 96;
 
 /// Storage kinds under test, F32 first: it is the reference the others
 /// are compared against.
-const KINDS: [MultiVectorStorage; 3] = [
+const KINDS: [MultiVectorStorage; 4] = [
     MultiVectorStorage::F32,
     MultiVectorStorage::F16,
     MultiVectorStorage::Int8,
+    MultiVectorStorage::Binary,
 ];
 
 const BODY: &str = "body";
@@ -120,6 +124,7 @@ fn field_name(kind: MultiVectorStorage) -> &'static str {
         MultiVectorStorage::F32 => "tokens_f32",
         MultiVectorStorage::F16 => "tokens_f16",
         MultiVectorStorage::Int8 => "tokens_int8",
+        MultiVectorStorage::Binary => "tokens_binary",
     }
 }
 
@@ -128,6 +133,7 @@ fn kind_label(kind: MultiVectorStorage) -> &'static str {
         MultiVectorStorage::F32 => "f32",
         MultiVectorStorage::F16 => "f16",
         MultiVectorStorage::Int8 => "int8",
+        MultiVectorStorage::Binary => "binary",
     }
 }
 
