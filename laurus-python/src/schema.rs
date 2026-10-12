@@ -141,8 +141,9 @@ fn parse_multi_vector_storage(s: &str) -> PyResult<MultiVectorStorage> {
         "f32" => Ok(MultiVectorStorage::F32),
         "f16" => Ok(MultiVectorStorage::F16),
         "int8" => Ok(MultiVectorStorage::Int8),
+        "binary" => Ok(MultiVectorStorage::Binary),
         other => Err(PyValueError::new_err(format!(
-            "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8",
+            "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8, binary",
             other
         ))),
     }
@@ -652,9 +653,10 @@ impl PySchema {
     ///     dimension: Dimensionality of every token vector.
     ///     distance: ``"cosine"`` (default; vectors are L2-normalized when
     ///         written) or ``"dot_product"``.
-    ///     storage: On-disk element kind of every token vector —
-    ///         ``"f32"`` (default; exact), ``"f16"`` (2x smaller), or
-    ///         ``"int8"`` (~4x smaller, lossy quantization).
+    ///     storage: On-disk element kind of the token vectors —
+    ///         ``"f32"`` (default; exact), ``"f16"`` (2x smaller),
+    ///         ``"int8"`` (~4x smaller, lossy quantization), or ``"binary"``
+    ///         (~32x smaller, 1 bit per element; requires ``"cosine"``).
     ///     embedder: Optional token-level embedder registered via
     ///         `add_embedder`.
     ///

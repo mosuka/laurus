@@ -43,10 +43,11 @@ fn parse_multi_vector_storage(s: &str) -> Result<MultiVectorStorage, Error> {
         "f32" => Ok(MultiVectorStorage::F32),
         "f16" => Ok(MultiVectorStorage::F16),
         "int8" => Ok(MultiVectorStorage::Int8),
+        "binary" => Ok(MultiVectorStorage::Binary),
         other => Err(Error::new(
             ruby.exception_arg_error(),
             format!(
-                "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8",
+                "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8, binary",
                 other
             ),
         )),
@@ -873,8 +874,9 @@ impl RbSchema {
     ///   - `distance:` (String, default "cosine"): `"cosine"` or
     ///     `"dot_product"`.
     ///   - `storage:` (String, default "f32"): On-disk element kind of
-    ///     every token vector — `"f32"` (exact), `"f16"` (2x smaller), or
-    ///     `"int8"` (~4x smaller, lossy quantization).
+    ///     the token vectors — `"f32"` (exact), `"f16"` (2x smaller),
+    ///     `"int8"` (~4x smaller, lossy quantization), or `"binary"` (~32x
+    ///     smaller, 1 bit per element; requires `"cosine"`).
     ///   - `embedder:` (String, optional): A token-level embedder registered
     ///     via `add_embedder` (a `"candle_colbert"` one), which embeds text
     ///     values and rescore query text.

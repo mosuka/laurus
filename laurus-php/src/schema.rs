@@ -92,7 +92,7 @@ fn parse_rerank_storage(name: Option<&str>) -> PhpResult<Option<RerankStorageKin
 ///
 /// # Arguments
 ///
-/// * `s` - Storage kind name (e.g. "f32", "f16", "int8").
+/// * `s` - Storage kind name (e.g. "f32", "f16", "int8", "binary").
 ///
 /// # Returns
 ///
@@ -102,8 +102,9 @@ fn parse_multi_vector_storage(s: &str) -> PhpResult<MultiVectorStorage> {
         "f32" => Ok(MultiVectorStorage::F32),
         "f16" => Ok(MultiVectorStorage::F16),
         "int8" => Ok(MultiVectorStorage::Int8),
+        "binary" => Ok(MultiVectorStorage::Binary),
         other => Err(format!(
-            "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8",
+            "Unknown multi-vector storage: '{}'. Valid: f32, f16, int8, binary",
             other
         )
         .into()),
@@ -659,9 +660,10 @@ impl PhpSchema {
     /// * `embedder` - A token-level embedder registered via `addEmbedder`
     ///   (a `"candle_colbert"` one), which embeds text values and rescore
     ///   query text (default: none).
-    /// * `storage` - On-disk element kind of every token vector (Issue
+    /// * `storage` - On-disk element kind of the token vectors (Issue
     ///   #1346): `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"`
-    ///   (~4x smaller).
+    ///   (~4x smaller), `"binary"` (~32x smaller, 1 bit per element;
+    ///   requires `"cosine"`).
     ///
     /// # Errors
     ///

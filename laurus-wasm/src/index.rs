@@ -1595,6 +1595,12 @@ mod tests {
                 "distance must be Cosine or DotProduct",
             ),
             (2, None, Some("bogus"), "Unknown multi-vector storage"),
+            (
+                2,
+                Some("dot_product"),
+                Some("binary"),
+                "requires distance Cosine",
+            ),
         ];
         for (dimension, distance, storage, message) in cases {
             let mut schema = WasmSchema::new();
@@ -1615,7 +1621,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn add_multi_vector_field_accepts_valid_storage() {
-        for storage in ["f32", "f16", "int8"] {
+        for storage in ["f32", "f16", "int8", "binary"] {
             let mut schema = WasmSchema::new();
             schema
                 .add_multi_vector_field(

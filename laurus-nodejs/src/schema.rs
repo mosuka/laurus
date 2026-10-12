@@ -42,7 +42,7 @@ fn parse_distance(s: &str) -> Result<DistanceMetric> {
 /// # Arguments
 ///
 /// * `s` - Storage kind name: "f32" (default, exact), "f16" (2x smaller),
-///   "int8" (~4x smaller).
+///   "int8" (~4x smaller), "binary" (~32x smaller, cosine only).
 ///
 /// # Returns
 ///
@@ -52,8 +52,9 @@ fn parse_multi_vector_storage(s: &str) -> Result<MultiVectorStorage> {
         "f32" => Ok(MultiVectorStorage::F32),
         "f16" => Ok(MultiVectorStorage::F16),
         "int8" => Ok(MultiVectorStorage::Int8),
+        "binary" => Ok(MultiVectorStorage::Binary),
         other => Err(napi::Error::from_reason(format!(
-            "Unknown multi-vector storage: '{other}'. Valid: f32, f16, int8"
+            "Unknown multi-vector storage: '{other}'. Valid: f32, f16, int8, binary"
         ))),
     }
 }
@@ -616,9 +617,10 @@ impl JsSchema {
     /// * `embedder` - Optional token-level embedder registered via
     ///   `addEmbedder` (a "candle_colbert" one), which embeds text values
     ///   and rescore query text.
-    /// * `storage` - On-disk element kind of every token vector (Issue
+    /// * `storage` - On-disk element kind of the token vectors (Issue
     ///   #1346): "f32" (default, exact), "f16" (2x smaller), "int8" (~4x
-    ///   smaller).
+    ///   smaller), "binary" (~32x smaller, 1 bit per element; requires
+    ///   "cosine").
     ///
     /// # Errors
     ///

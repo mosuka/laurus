@@ -142,7 +142,8 @@ class TestLateInteractionRescore < Minitest::Test
     [
       [[0], {}, "dimension"],
       [[2], { distance: "euclidean" }, "distance"],
-      [[2], { storage: "bogus" }, "storage"]
+      [[2], { storage: "bogus" }, "storage"],
+      [[2], { distance: "dot_product", storage: "binary" }, "requires distance Cosine"]
     ].each do |args, kwargs, message|
       schema = Laurus::Schema.new
       err = assert_raises(ArgumentError, message) { schema.add_multi_vector_field("tokens", *args, **kwargs) }
@@ -152,7 +153,7 @@ class TestLateInteractionRescore < Minitest::Test
   end
 
   def test_add_multi_vector_field_accepts_storage_kinds
-    %w[f32 f16 int8].each do |storage|
+    %w[f32 f16 int8 binary].each do |storage|
       schema = Laurus::Schema.new
       schema.add_multi_vector_field("tokens", 2, storage: storage)
       assert_equal ["tokens"], schema.field_names

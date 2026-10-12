@@ -147,8 +147,12 @@ def test_integer_token_vectors_are_accepted(index):
         ({"dimension": 0}, "dimension"),
         ({"dimension": 2, "distance": "euclidean"}, "distance"),
         ({"dimension": 2, "storage": "bogus"}, "storage"),
+        (
+            {"dimension": 2, "distance": "dot_product", "storage": "binary"},
+            "requires distance Cosine",
+        ),
     ],
-    ids=["zero-dimension", "euclidean", "unknown-storage"],
+    ids=["zero-dimension", "euclidean", "unknown-storage", "binary-dot-product"],
 )
 def test_add_multi_vector_field_rejects_invalid_options(kwargs, message):
     schema = laurus.Schema()
@@ -157,7 +161,7 @@ def test_add_multi_vector_field_rejects_invalid_options(kwargs, message):
     assert schema.field_names() == []
 
 
-@pytest.mark.parametrize("storage", ["f32", "f16", "int8"])
+@pytest.mark.parametrize("storage", ["f32", "f16", "int8", "binary"])
 def test_add_multi_vector_field_accepts_valid_storage(storage):
     schema = laurus.Schema()
     schema.add_multi_vector_field("tokens", dimension=2, storage=storage)

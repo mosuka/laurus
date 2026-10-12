@@ -149,12 +149,25 @@ describe("addMultiVectorField", () => {
     expect(schema.fieldNames()).toEqual([]);
   });
 
-  it.each([["f16"], ["int8"]])("accepts a compressed storage kind: %s", (storage) => {
+  it.each([["f16"], ["int8"], ["binary"]])("accepts a compressed storage kind: %s", (storage) => {
     const schema = new Schema();
     expect(() =>
       schema.addMultiVectorField("tokens", 2, undefined, undefined, storage),
     ).not.toThrow();
     expect(schema.fieldNames()).toEqual(["tokens"]);
+  });
+
+  it("rejects binary storage with dot_product", () => {
+    const schema = new Schema();
+    expect(() =>
+      schema.addMultiVectorField("tokens", 2, "dot_product", undefined, "binary"),
+    ).toThrow(
+      expect.objectContaining({
+        code: "InvalidArg",
+        message: expect.stringContaining("requires distance Cosine"),
+      }),
+    );
+    expect(schema.fieldNames()).toEqual([]);
   });
 
   it("rejects an unknown storage kind", () => {
