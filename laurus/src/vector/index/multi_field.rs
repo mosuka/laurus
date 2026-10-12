@@ -547,9 +547,7 @@ impl MultiFieldWriter {
         let mut grouped: FieldGroupedVectors = BTreeMap::new();
         for (doc_id, field_name, vector) in vectors {
             if !self.writers.contains_key(&field_name) {
-                return Err(LaurusError::invalid_argument(format!(
-                    "unknown vector field '{field_name}': no index configured for it"
-                )));
+                return Err(Self::unknown_field(&field_name));
             }
             grouped
                 .entry(field_name.clone())
@@ -557,6 +555,12 @@ impl MultiFieldWriter {
                 .push((doc_id, field_name, vector));
         }
         Ok(grouped)
+    }
+
+    fn unknown_field(field_name: &str) -> LaurusError {
+        LaurusError::invalid_argument(format!(
+            "unknown vector field '{field_name}': no index configured for it"
+        ))
     }
 }
 
@@ -582,6 +586,30 @@ impl VectorIndexWriter for MultiFieldWriter {
                 .get_mut(&field_name)
                 .expect("field name validated by group_by_field");
             writer.add_vectors(field_vectors)?;
+        }
+        Ok(())
+    }
+
+    /// Route each field's vectors to that field's writer, moving the name
+    /// rather than cloning it per vector. As with [`Self::add_vectors`], an
+    /// unknown field rejects the whole document before any field is routed.
+    fn add_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<(String, Vec<Vector>)>,
+    ) -> Result<()> {
+        if let Some((field_name, _)) = fields
+            .iter()
+            .find(|(field_name, _)| !self.writers.contains_key(field_name))
+        {
+            return Err(Self::unknown_field(field_name));
+        }
+        for (field_name, vectors) in fields {
+            let writer = self
+                .writers
+                .get_mut(&field_name)
+                .expect("field name validated above");
+            writer.add_document_vectors(doc_id, vec![(field_name, vectors)])?;
         }
         Ok(())
     }
@@ -1249,5 +1277,82 @@ mod tests {
         writer.commit().unwrap_err();
         assert_eq!(good_commits.load(Ordering::SeqCst), 2);
         assert_eq!(bad_commits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A writer over two Flat fields, `a` and `b`, whose sub-writers lend
+    /// their buffered triples through `vectors()`.
+    fn flat_fields_writer() -> MultiFieldWriter {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::FlatIndexConfig;
+        use crate::vector::index::flat::writer::FlatIndexWriter;
+        use crate::vector::writer::VectorIndexWriterConfig;
+
+        let mut writers: BTreeMap<String, Box<dyn VectorIndexWriter>> = BTreeMap::new();
+        for name in ["a", "b"] {
+            let storage: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let config = FlatIndexConfig {
+                dimension: 2,
+                normalize_vectors: false,
+                ..Default::default()
+            };
+            let writer = FlatIndexWriter::with_storage(
+                config,
+                VectorIndexWriterConfig::default(),
+                name.to_string(),
+                storage,
+            )
+            .unwrap();
+            writers.insert(name.to_string(), Box::new(writer));
+        }
+        MultiFieldWriter::new(writers)
+    }
+
+    fn v(x: f32) -> Vector {
+        Vector::new(vec![x, 0.0])
+    }
+
+    #[test]
+    fn add_document_vectors_routes_each_field_to_its_own_writer() {
+        let mut writer = flat_fields_writer();
+        writer
+            .add_document_vectors(
+                7,
+                vec![
+                    ("b".to_string(), vec![v(3.0)]),
+                    ("a".to_string(), vec![v(1.0), v(2.0)]),
+                ],
+            )
+            .unwrap();
+
+        // The Flat writers take the default implementation, which expands
+        // each field into one triple per vector.
+        assert_eq!(
+            writer.writers["a"].vectors(),
+            &[(7, "a".to_string(), v(1.0)), (7, "a".to_string(), v(2.0))]
+        );
+        assert_eq!(
+            writer.writers["b"].vectors(),
+            &[(7, "b".to_string(), v(3.0))]
+        );
+    }
+
+    #[test]
+    fn add_document_vectors_rejects_an_unknown_field_before_routing_any() {
+        let mut writer = flat_fields_writer();
+        let err = writer
+            .add_document_vectors(
+                7,
+                vec![
+                    ("a".to_string(), vec![v(1.0)]),
+                    ("gone".to_string(), vec![v(2.0)]),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown vector field 'gone'"),
+            "{err}"
+        );
+        assert!(writer.writers["a"].vectors().is_empty());
     }
 }

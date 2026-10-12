@@ -130,6 +130,14 @@ impl VectorIndexWriter for EmbeddingVectorIndexWriter {
         self.inner.add_vectors(vectors)
     }
 
+    fn add_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<(String, Vec<Vector>)>,
+    ) -> Result<()> {
+        self.inner.add_document_vectors(doc_id, fields)
+    }
+
     fn finalize(&mut self) -> Result<()> {
         self.inner.finalize()
     }

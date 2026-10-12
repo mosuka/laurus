@@ -97,6 +97,40 @@ pub trait VectorIndexWriter: Send + Sync + std::fmt::Debug {
     /// This allows field-specific vector search similar to lexical field search.
     fn add_vectors(&mut self, vectors: Vec<(u64, String, Vector)>) -> Result<()>;
 
+    /// Add one document's vectors, grouped by field.
+    ///
+    /// Equivalent to [`Self::add_vectors`] with one `(doc_id, field_name,
+    /// vector)` triple per vector, but carries each field name once, so a
+    /// field holding many vectors per document (a MultiVector field's
+    /// token vectors) does not allocate the name once per vector. The
+    /// default implementation expands `fields` into those triples;
+    /// writers that do not keep the name per vector override it.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - The document the vectors belong to.
+    /// * `fields` - `(field_name, vectors)` pairs, one per field.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::add_vectors`] for the expanded
+    /// triples.
+    fn add_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<(String, Vec<Vector>)>,
+    ) -> Result<()> {
+        let vectors = fields
+            .into_iter()
+            .flat_map(|(field_name, vectors)| {
+                vectors
+                    .into_iter()
+                    .map(move |vector| (doc_id, field_name.clone(), vector))
+            })
+            .collect();
+        self.add_vectors(vectors)
+    }
+
     /// Finalize the index construction.
     fn finalize(&mut self) -> Result<()>;
 

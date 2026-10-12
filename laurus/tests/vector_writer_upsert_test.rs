@@ -38,7 +38,7 @@ fn storage() -> Arc<dyn Storage> {
 fn put(writer: &mut dyn VectorIndexWriter, doc_id: u64, vector: Vector) {
     writer.delete_document(doc_id).unwrap();
     writer
-        .add_vectors(vec![(doc_id, "v".to_string(), vector)])
+        .add_document_vectors(doc_id, vec![("v".to_string(), vec![vector])])
         .unwrap();
 }
 

@@ -233,13 +233,20 @@ impl VectorStore {
     /// index has no configuration for, or if a vector's dimension or values
     /// are invalid for its field. Returns the embedder's own error if the
     /// embedding call itself fails (e.g. a remote embedder is unreachable).
-    pub async fn embed_document(&self, doc: &Document) -> Result<Vec<(String, Vector)>> {
+    ///
+    /// # Returns
+    ///
+    /// One `(field_name, vectors)` pair per vector field of `doc`: the
+    /// field's single vector, or a MultiVector field's token vectors in
+    /// order. Each field name is carried once rather than once per token
+    /// vector (Issue #1406).
+    pub async fn embed_document(&self, doc: &Document) -> Result<Vec<(String, Vec<Vector>)>> {
         // Phase 1: Embed all fields OUTSIDE the lock.
         // This allows multiple concurrent upserts to perform embedding in parallel
         // rather than being serialized by the writer Mutex.
         let embedder = self.index.embedder();
         let late_interaction_fields = self.index.late_interaction_fields();
-        let mut embedded_vectors: Vec<(String, Vector)> = Vec::new();
+        let mut embedded_fields: Vec<(String, Vec<Vector>)> = Vec::with_capacity(doc.fields.len());
 
         for (field_name, value) in &doc.fields {
             // A multi-vector field takes exactly a token-vector array, and
@@ -248,15 +255,10 @@ impl VectorStore {
             // and a WAL record written before a field changed kind can carry
             // the old shape.
             let multi_vector = late_interaction_fields.contains(field_name);
-            let vector = match value {
+            let vectors = match value {
                 DataValue::VectorArray(vectors) if multi_vector => {
                     Self::check_token_vector_count(field_name, vectors.len())?;
-                    embedded_vectors.extend(
-                        vectors
-                            .iter()
-                            .map(|v| (field_name.clone(), Vector::new(v.clone()))),
-                    );
-                    continue;
+                    vectors.iter().map(|v| Vector::new(v.clone())).collect()
                 }
                 DataValue::VectorArray(_) => {
                     return Err(LaurusError::invalid_argument(format!(
@@ -265,24 +267,15 @@ impl VectorStore {
                     )));
                 }
                 DataValue::Text(text) if multi_vector => {
-                    Self::embed_tokens_into(
-                        &embedder,
-                        field_name,
-                        EmbedInput::Text(text),
-                        &mut embedded_vectors,
-                    )
-                    .await?;
-                    continue;
+                    Self::embed_tokens(&embedder, field_name, EmbedInput::Text(text)).await?
                 }
                 DataValue::Bytes(bytes, mime) if multi_vector => {
-                    Self::embed_tokens_into(
+                    Self::embed_tokens(
                         &embedder,
                         field_name,
                         EmbedInput::Bytes(bytes, mime.as_deref()),
-                        &mut embedded_vectors,
                     )
-                    .await?;
-                    continue;
+                    .await?
                 }
                 _ if multi_vector => {
                     return Err(LaurusError::invalid_argument(format!(
@@ -290,13 +283,13 @@ impl VectorStore {
                          or a value for its token-level embedder"
                     )));
                 }
-                DataValue::Vector(v) => Vector::new(v.clone()),
+                DataValue::Vector(v) => vec![Vector::new(v.clone())],
                 DataValue::Text(_) | DataValue::Bytes(_, _) => {
-                    Self::embed_value(&*embedder, field_name, value).await?
+                    vec![Self::embed_value(&*embedder, field_name, value).await?]
                 }
                 _ => continue,
             };
-            embedded_vectors.push((field_name.clone(), vector));
+            embedded_fields.push((field_name.clone(), vectors));
         }
 
         // Validate every resulting vector against this index's configured
@@ -309,27 +302,29 @@ impl VectorStore {
         // writer's own validation remains the backstop for those, as today.
         let dims = self.index.field_dimensions();
         if !dims.is_empty() {
-            for (field_name, vector) in &embedded_vectors {
+            for (field_name, vectors) in &embedded_fields {
                 let Some(&expected_dim) = dims.get(field_name) else {
                     return Err(LaurusError::invalid_argument(format!(
                         "unknown vector field '{field_name}': no index configured for it"
                     )));
                 };
-                if vector.dimension() != expected_dim {
-                    return Err(LaurusError::invalid_argument(format!(
-                        "vector for field '{field_name}' has dimension {}, expected {expected_dim}",
-                        vector.dimension()
-                    )));
-                }
-                if !vector.is_valid() {
-                    return Err(LaurusError::invalid_argument(format!(
-                        "vector for field '{field_name}' contains invalid values (NaN or infinity)"
-                    )));
+                for vector in vectors {
+                    if vector.dimension() != expected_dim {
+                        return Err(LaurusError::invalid_argument(format!(
+                            "vector for field '{field_name}' has dimension {}, expected {expected_dim}",
+                            vector.dimension()
+                        )));
+                    }
+                    if !vector.is_valid() {
+                        return Err(LaurusError::invalid_argument(format!(
+                            "vector for field '{field_name}' contains invalid values (NaN or infinity)"
+                        )));
+                    }
                 }
             }
         }
 
-        Ok(embedded_vectors)
+        Ok(embedded_fields)
     }
 
     /// Write already-embedded vectors for `doc_id` (Phase 2 of the former
@@ -337,19 +332,24 @@ impl VectorStore {
     ///
     /// Acquires the writer lock, deletes any existing vectors for `doc_id`,
     /// and adds the given ones. Callers are expected to have produced
-    /// `vectors` via [`Self::embed_document`], which has already validated
+    /// `fields` via [`Self::embed_document`], which has already validated
     /// them; this phase performs no further validation of its own.
     ///
     /// # Arguments
     ///
     /// * `doc_id` - The internal document ID.
-    /// * `vectors` - `(field_name, Vector)` pairs, already embedded and validated.
+    /// * `fields` - `(field_name, vectors)` pairs as returned by
+    ///   [`Self::embed_document`], already embedded and validated.
     ///
     /// # Errors
     ///
     /// Returns an error if obtaining/creating the writer fails, or if
     /// deleting the existing document or adding the new vectors fails.
-    pub async fn write_vectors(&self, doc_id: u64, vectors: Vec<(String, Vector)>) -> Result<()> {
+    pub async fn write_vectors(
+        &self,
+        doc_id: u64,
+        fields: Vec<(String, Vec<Vector>)>,
+    ) -> Result<()> {
         // Phase 2: Acquire lock and write pre-computed vectors (fast, sync-only).
         let mut guard = self.writer_cache.lock().await;
         if guard.is_none() {
@@ -357,34 +357,27 @@ impl VectorStore {
         }
         let writer = guard.as_mut().unwrap();
         writer.delete_document(doc_id)?;
-        writer.add_vectors(
-            vectors
-                .into_iter()
-                .map(|(field_name, vector)| (doc_id, field_name, vector))
-                .collect(),
-        )?;
+        // One call for the whole document, so a field the writer does not
+        // know (e.g. removed concurrently by `delete_field`) rejects every
+        // field rather than leaving the others buffered.
+        writer.add_document_vectors(doc_id, fields)?;
 
         Ok(())
     }
 
-    /// Reject a token-vector array that is empty or longer than a document
-    /// may hold; each vector's dimension and values are checked with every
-    /// other vector in [`Self::embed_document`].
     /// Embed a multi-vector field's value into token vectors with the
-    /// field's token-level embedder, as a document (Issue #1349), and
-    /// append them to `out`.
+    /// field's token-level embedder, as a document (Issue #1349).
     ///
     /// # Errors
     ///
     /// Returns [`LaurusError::InvalidArgument`] when the field has no
     /// token-level embedder or the embedder produces no or too many
     /// vectors, and the embedder's error when embedding fails.
-    async fn embed_tokens_into(
+    async fn embed_tokens(
         embedder: &Arc<dyn Embedder>,
         field_name: &str,
         input: EmbedInput<'_>,
-        out: &mut Vec<(String, Vector)>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Vector>> {
         let tokens = embed_field_tokens(
             embedder,
             field_name,
@@ -394,10 +387,12 @@ impl VectorStore {
         .await?
         .swap_remove(0);
         Self::check_token_vector_count(field_name, tokens.len())?;
-        out.extend(tokens.into_iter().map(|v| (field_name.to_string(), v)));
-        Ok(())
+        Ok(tokens)
     }
 
+    /// Reject a token-vector array that is empty or longer than a document
+    /// may hold; each vector's dimension and values are checked with every
+    /// other vector in [`Self::embed_document`].
     fn check_token_vector_count(field_name: &str, count: usize) -> Result<()> {
         use crate::vector::core::field::MultiVectorOption;
 

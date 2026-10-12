@@ -398,6 +398,48 @@ impl MultiVectorWriter {
             *changed = true;
         }
     }
+
+    /// Reject the first `(doc_id, vector)` whose dimension is not the
+    /// index's.
+    fn check_dimensions<'a>(
+        &self,
+        vectors: impl IntoIterator<Item = (u64, &'a Vector)>,
+    ) -> Result<()> {
+        let dimension = self.shared.config.dimension;
+        if let Some((doc_id, vector)) = vectors
+            .into_iter()
+            .find(|(_, vector)| vector.dimension() != dimension)
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "token vector of doc {doc_id} has dimension {}, expected {dimension}",
+                vector.dimension()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Buffer `docs`, each a document's non-empty token vectors in arrival
+    /// order, already checked by [`Self::check_dimensions`]: normalize them
+    /// when the metric needs it, clear the documents' deletion marks, and
+    /// only then replace their buffered entries, so a failure leaves the
+    /// buffer untouched.
+    fn buffer_documents(&mut self, docs: &mut [(u64, Vec<Vector>)]) -> Result<()> {
+        if self.shared.config.distance_metric == DistanceMetric::Cosine {
+            docs.iter_mut()
+                .flat_map(|(_, vectors)| vectors.iter_mut())
+                .for_each(Vector::normalize);
+        }
+        self.shared
+            .core
+            .unmark_deleted(docs.iter().map(|(doc_id, _)| *doc_id))?;
+        if !docs.is_empty() {
+            self.mark_changed();
+        }
+        for (doc_id, vectors) in docs {
+            self.buffer.insert(*doc_id, std::mem::take(vectors));
+        }
+        Ok(())
+    }
 }
 
 impl VectorIndexWriter for MultiVectorWriter {
@@ -415,30 +457,40 @@ impl VectorIndexWriter for MultiVectorWriter {
     /// replace any it already buffered, and clear the document's deletion
     /// mark (the second half of an upsert).
     fn add_vectors(&mut self, vectors: Vec<(u64, String, Vector)>) -> Result<()> {
-        let dimension = self.shared.config.dimension;
-        if let Some((doc_id, _, vector)) =
-            vectors.iter().find(|(_, _, v)| v.dimension() != dimension)
-        {
-            return Err(LaurusError::invalid_argument(format!(
-                "token vector of doc {doc_id} has dimension {}, expected {dimension}",
-                vector.dimension()
-            )));
-        }
-        let normalize = self.shared.config.distance_metric == DistanceMetric::Cosine;
+        self.check_dimensions(vectors.iter().map(|(doc_id, _, vector)| (*doc_id, vector)))?;
         let mut incoming: BTreeMap<u64, Vec<Vector>> = BTreeMap::new();
-        for (doc_id, _, mut vector) in vectors {
-            if normalize {
-                vector.normalize();
-            }
+        for (doc_id, _, vector) in vectors {
             incoming.entry(doc_id).or_default().push(vector);
         }
-        self.shared.core.unmark_deleted(incoming.keys().copied())?;
-        if !incoming.is_empty() {
-            self.mark_changed();
+        let mut docs: Vec<(u64, Vec<Vector>)> = incoming.into_iter().collect();
+        self.buffer_documents(&mut docs)
+    }
+
+    /// Buffer one document's token vectors as [`Self::add_vectors`] does,
+    /// without a field name per token (Issue #1406). This writer serves a
+    /// single field, so the names are ignored and every entry's vectors
+    /// are taken in order.
+    fn add_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<(String, Vec<Vector>)>,
+    ) -> Result<()> {
+        let mut fields = fields.into_iter();
+        let Some((_, mut vectors)) = fields.next() else {
+            return Ok(());
+        };
+        for (_, more) in fields {
+            vectors.extend(more);
         }
-        // Replaces the entry of every document already buffered.
-        self.buffer.extend(incoming);
-        Ok(())
+        if vectors.is_empty() {
+            // Nothing to buffer. Clearing the deletion mark would make the
+            // sealed copy that the caller's `delete_document` hid visible
+            // again, which `add_vectors` never does for a document it was
+            // given no vectors for.
+            return Ok(());
+        }
+        self.check_dimensions(vectors.iter().map(|vector| (doc_id, vector)))?;
+        self.buffer_documents(&mut [(doc_id, vectors)])
     }
 
     fn finalize(&mut self) -> Result<()> {
@@ -894,6 +946,101 @@ mod tests {
         writer.delete_document(1).unwrap();
         writer.add_vectors(tokens(1, &[[2.0, 2.0]])).unwrap();
         assert!(writer.has_pending_changes());
+        assert!(writer.commit().is_err());
+        writer.rollback().unwrap();
+    }
+
+    /// One field's token vectors in the shape `VectorStore::write_vectors`
+    /// passes to `add_document_vectors`.
+    fn field(vectors: &[[f32; 2]]) -> (String, Vec<Vector>) {
+        (
+            FIELD.to_string(),
+            vectors.iter().map(|v| Vector::new(v.to_vec())).collect(),
+        )
+    }
+
+    #[test]
+    fn test_document_vectors_buffer_like_add_vectors() {
+        let index =
+            MultiVectorIndex::open_or_create(storage(), "index", config(DistanceMetric::Cosine))
+                .unwrap();
+        let mut writer = index.writer().unwrap();
+        let rows = [[3.0, 4.0], [0.0, 0.0], [0.0, 2.0]];
+        writer.add_vectors(tokens(1, &rows)).unwrap();
+        writer
+            .add_document_vectors(2, vec![field(&rows[..2]), field(&rows[2..])])
+            .unwrap();
+        writer.commit().unwrap();
+
+        let expected = Some(vec![0.6, 0.8, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(vectors_of(&index, 1), expected);
+        assert_eq!(vectors_of(&index, 2), expected);
+    }
+
+    #[test]
+    fn test_document_vectors_replace_a_sealed_document() {
+        let index = open(&storage());
+        commit(&index, &[(1, &[[1.0, 1.0]]), (2, &[[2.0, 2.0]])]);
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(1).unwrap();
+        writer
+            .add_document_vectors(1, vec![field(&[[7.0, 7.0], [8.0, 8.0]])])
+            .unwrap();
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+
+        assert_eq!(vectors_of(&index, 1), Some(vec![7.0, 7.0, 8.0, 8.0]));
+        assert_eq!(vectors_of(&index, 2), Some(vec![2.0, 2.0]));
+    }
+
+    #[test]
+    fn test_document_vectors_without_vectors_keep_the_deletion_mark() {
+        let index = open(&storage());
+        commit(&index, &[(1, &[[1.0, 1.0]])]);
+
+        let mut writer = index.writer().unwrap();
+        writer.delete_document(1).unwrap();
+        writer.add_document_vectors(1, vec![field(&[])]).unwrap();
+        writer.add_document_vectors(1, Vec::new()).unwrap();
+        assert!(!writer.has_pending_changes());
+        writer.commit().unwrap();
+        index.persist_deletions().unwrap();
+
+        assert_eq!(vectors_of(&index, 1), None);
+    }
+
+    #[test]
+    fn test_document_vectors_reject_a_wrong_dimension() {
+        let index = open(&storage());
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document_vectors(1, vec![field(&[[1.0, 1.0]])])
+            .unwrap();
+        let err = writer
+            .add_document_vectors(
+                2,
+                vec![(
+                    FIELD.to_string(),
+                    vec![Vector::new(vec![1.0, 1.0]), Vector::new(vec![1.0])],
+                )],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("dimension 1, expected 2"), "{err}");
+        assert_eq!(writer.pending_docs(), 1);
+    }
+
+    #[test]
+    fn test_sealed_writer_rejects_document_vectors() {
+        let index = open(&storage());
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document_vectors(1, vec![field(&[[1.0, 1.0]])])
+            .unwrap();
+        writer.commit().unwrap();
+        writer
+            .add_document_vectors(2, vec![field(&[[2.0, 2.0]])])
+            .unwrap();
         assert!(writer.commit().is_err());
         writer.rollback().unwrap();
     }
