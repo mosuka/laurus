@@ -6219,6 +6219,75 @@ mod tests {
         );
     }
 
+    /// Issue #1420 — a put finds the previous version of its id in the
+    /// segments' term dictionaries rather than through a search. With the
+    /// earlier versions spread over many sealed segments, re-putting an id
+    /// must still replace its one live version, before and after the commit.
+    #[tokio::test]
+    async fn test_put_document_replaces_a_version_among_many_sealed_segments() {
+        use crate::data::DataValue;
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+
+        let title = |text: &str| {
+            let mut doc = crate::data::Document::new();
+            doc.fields
+                .insert("title".into(), DataValue::Text(text.into()));
+            doc
+        };
+        let title_of = |docs: &[crate::data::Document]| -> Vec<String> {
+            docs.iter()
+                .filter_map(|doc| doc.fields.get("title").and_then(|v| v.as_text()))
+                .map(String::from)
+                .collect()
+        };
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+
+        // One sealed segment per id: "id0" in the first, "id6" in the middle.
+        for i in 0..12 {
+            engine
+                .put_document(&format!("id{i}"), title(&format!("v1 of id{i}")))
+                .await
+                .unwrap();
+            engine.commit().await.unwrap();
+        }
+
+        engine
+            .put_document("id0", title("v2 of id0"))
+            .await
+            .unwrap();
+        engine
+            .put_document("id6", title("v2 of id6"))
+            .await
+            .unwrap();
+        for (id, expected) in [("id0", "v2 of id0"), ("id6", "v2 of id6")] {
+            assert_eq!(
+                title_of(&engine.get_documents(id).await.unwrap()),
+                vec![expected.to_string()],
+                "before the commit, {id} must have only its new version"
+            );
+        }
+
+        engine.commit().await.unwrap();
+        for (id, expected) in [
+            ("id0", "v2 of id0"),
+            ("id6", "v2 of id6"),
+            ("id11", "v1 of id11"),
+        ] {
+            assert_eq!(
+                title_of(&engine.get_documents(id).await.unwrap()),
+                vec![expected.to_string()],
+                "after the commit, {id} must have exactly one version"
+            );
+        }
+        assert_eq!(engine.stats().unwrap().document_count, 12);
+    }
+
     /// Regression test for the geo3d-side stale-id bug: spatial queries
     /// (BKD-backed: Geo / Geo3d) used to return soft-deleted docs
     /// because the BKD tree itself does not consult the segment

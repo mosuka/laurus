@@ -173,7 +173,11 @@ impl LexicalStore {
     /// Find all internal document IDs for a given term (field:value).
     ///
     /// This searches both the uncommitted in-memory buffer (via Writer) and
-    /// the committed index (via Searcher).
+    /// the committed index (via Searcher). The committed part is looked up in
+    /// the segments' term dictionaries directly (Issue #1420) — every put
+    /// resolves its `_id` here, and a search per put cost about 1,450
+    /// instructions per segment even for an id no segment holds — and falls
+    /// back to a search only when some segment has no dictionary.
     pub(crate) fn find_doc_ids_by_term(&self, field: &str, term: &str) -> Result<Vec<u64>> {
         let mut ids = Vec::new();
         let guard = self.writer_cache.lock();
@@ -186,33 +190,40 @@ impl LexicalStore {
         }
 
         // 2. Check reader (Committed)
-        use crate::lexical::query::Query;
-        use crate::lexical::query::term::TermQuery;
+        //
+        // Safe to use the searcher while holding the writer lock: the lock
+        // order is writer_cache -> searcher_cache everywhere, and
+        // with_searcher() takes only searcher_cache. Every path that retires
+        // the writer (commit, optimize, the field operations, close) also
+        // drops the cached searcher before releasing the writer lock (Issue
+        // #1207), so this lookup never pairs a pre-commit snapshot with a
+        // missing writer. Going through the cache also builds the searcher
+        // when there is none, as a search would.
+        let committed = self.with_searcher(|searcher| {
+            use crate::lexical::query::Query;
+            use crate::lexical::query::term::TermQuery;
 
-        let query = Box::new(TermQuery::new(field, term)) as Box<dyn Query>;
-        let request = LexicalSearchRequest::new(query)
-            .limit(usize::MAX) // Retrieve all matches
-            .load_documents(false);
-
-        // Safe to call search while holding the writer lock: the lock order
-        // is writer_cache -> searcher_cache everywhere, and search() takes
-        // only searcher_cache. Every path that retires the writer (commit,
-        // optimize, the field operations, close) also drops the cached
-        // searcher before releasing the writer lock (Issue #1207), so this
-        // search never pairs a pre-commit snapshot with a missing writer.
-        let results = self.search(request)?;
-        for hit in results.hits {
-            if !ids.contains(&hit.doc_id) {
-                // Check if marked as deleted in pending set
-                let is_deleted = if let Some(writer) = guard.as_ref() {
-                    writer.is_updated_deleted(hit.doc_id)
-                } else {
-                    false
-                };
-
-                if !is_deleted {
-                    ids.push(hit.doc_id);
-                }
+            if let Some(doc_ids) = searcher.live_doc_ids_for_term(field, term)? {
+                return Ok(doc_ids);
+            }
+            let query = Box::new(TermQuery::new(field, term)) as Box<dyn Query>;
+            let request = LexicalSearchRequest::new(query)
+                .limit(usize::MAX) // Retrieve all matches
+                .load_documents(false);
+            Ok(searcher
+                .search(request)?
+                .hits
+                .into_iter()
+                .map(|hit| hit.doc_id)
+                .collect())
+        })?;
+        for doc_id in committed {
+            // Skip copies the writer has superseded since the commit.
+            let is_deleted = guard
+                .as_ref()
+                .is_some_and(|writer| writer.is_updated_deleted(doc_id));
+            if !is_deleted && !ids.contains(&doc_id) {
+                ids.push(doc_id);
             }
         }
 
@@ -560,24 +571,38 @@ impl LexicalStore {
     /// let results = engine.search(LexicalSearchRequest::new(query)).unwrap();
     /// ```
     pub fn search(&self, request: LexicalSearchRequest) -> Result<LexicalSearchResults> {
+        self.with_searcher(|searcher| searcher.search(request))
+    }
+
+    /// Run `f` against the cached searcher, building it first if the cache
+    /// is empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The work to run while the searcher is borrowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the searcher fails, or what `f` returns.
+    fn with_searcher<R>(&self, f: impl FnOnce(&dyn LexicalSearcher) -> Result<R>) -> Result<R> {
         // Fast path: read lock, cache hit — concurrent searches proceed in parallel.
         {
             let guard = self.searcher_cache.read();
             if let Some(ref searcher) = *guard {
-                return searcher.search(request);
+                return f(searcher.as_ref());
             }
         }
 
         // Slow path: write lock to populate, then downgrade to read lock so that
-        // the actual search executes under a shared read lock rather than an
-        // exclusive write lock. This allows other readers to proceed as soon as
-        // the searcher is created.
+        // `f` executes under a shared read lock rather than an exclusive write
+        // lock. This allows other readers to proceed as soon as the searcher is
+        // created.
         let mut guard = self.searcher_cache.write();
         if guard.is_none() {
             *guard = Some(self.index.searcher()?);
         }
         let guard = parking_lot::RwLockWriteGuard::downgrade(guard);
-        guard.as_ref().unwrap().search(request)
+        f(guard.as_ref().unwrap().as_ref())
     }
 
     /// Count documents matching the request.
@@ -1020,6 +1045,50 @@ mod tests {
 
         assert_eq!(store.find_doc_ids_by_term("_id", "ida2").unwrap(), vec![1]);
         assert!(store.find_doc_ids_by_term("_id", "ida").unwrap().is_empty());
+    }
+
+    /// Issue #1420 — the committed lookup reads the segments' dictionaries
+    /// directly; it must still find every committed copy across segments
+    /// and leave out one the writer superseded before the next commit.
+    #[test]
+    fn committed_copies_across_segments_resolve_without_superseded_ones() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // Three chunks of one id, one segment each, and an unrelated id.
+        for (doc_id, id) in [(1, "ida"), (2, "ida"), (3, "idb"), (4, "ida")] {
+            store.upsert_document(doc_id, id_doc(id)).unwrap();
+            store.commit().unwrap();
+        }
+        let mut found = store.find_doc_ids_by_term("_id", "ida").unwrap();
+        found.sort_unstable();
+        assert_eq!(found, vec![1, 2, 4]);
+        assert!(store.find_doc_ids_by_term("_id", "idc").unwrap().is_empty());
+
+        // Superseded before commit: hidden at once, and gone after it.
+        store.delete_document_by_internal_id(2).unwrap();
+        let mut found = store.find_doc_ids_by_term("_id", "ida").unwrap();
+        found.sort_unstable();
+        assert_eq!(found, vec![1, 4]);
+        store.commit().unwrap();
+        let mut found = store.find_doc_ids_by_term("_id", "ida").unwrap();
+        found.sort_unstable();
+        assert_eq!(found, vec![1, 4]);
+    }
+
+    /// The `_id` lookup builds the cached searcher when there is none, as the
+    /// search it replaced did. Tests of the warm-cache state rely on it
+    /// (`doc_written_before_auto_flush_still_resolves_by_id`,
+    /// `uncommitted_search_visibility_test.rs`).
+    #[test]
+    fn id_lookup_builds_the_cached_searcher() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        store.upsert_document(1, id_doc("ida")).unwrap();
+        store.commit().unwrap();
+        assert!(store.searcher_cache.read().is_none());
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
+        assert!(store.searcher_cache.read().is_some());
     }
 
     /// #1016 — a document written before the writer's automatic

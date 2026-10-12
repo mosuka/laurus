@@ -1307,12 +1307,35 @@ impl SegmentReader {
         Ok(None)
     }
 
-    /// Get term information for a field and term.
-    pub fn term_info(&self, field: &str, term: &str) -> Result<Option<TermInfo>> {
-        // Lazy load term dictionary if not loaded
+    /// Load the term dictionary on first use. Once loaded, or once the
+    /// segment has been loaded whole, `.dict` is not read again.
+    fn ensure_term_dictionary(&self) -> Result<()> {
         if self.term_dictionary.read().unwrap().is_none() && !self.loaded.load(Ordering::Acquire) {
             self.load_term_dictionary()?;
         }
+        Ok(())
+    }
+
+    /// This segment's term dictionary, loaded on first use (Issue #1420).
+    ///
+    /// Unlike [`Self::term_dictionary`], which reads `.dict` again on every
+    /// call, a dictionary already loaded is returned as is.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the segment has no `.dict` or it could not be opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `.dict` opens but cannot be parsed.
+    fn loaded_term_dictionary(&self) -> Result<Option<Arc<BlockTermDictionary>>> {
+        self.ensure_term_dictionary()?;
+        Ok(self.term_dictionary.read().unwrap().clone())
+    }
+
+    /// Get term information for a field and term.
+    pub fn term_info(&self, field: &str, term: &str) -> Result<Option<TermInfo>> {
+        self.ensure_term_dictionary()?;
 
         if let Some(ref dict) = *self.term_dictionary.read().unwrap() {
             let full_term = format!("{field}:{term}");
@@ -2081,6 +2104,12 @@ pub struct InvertedIndexReader {
     /// already loads every segment's `.dict`, so this costs no extra I/O —
     /// and shared by clones like the other snapshot-scoped state.
     term_info_complete: Arc<OnceLock<bool>>,
+
+    /// Every segment's term dictionary, in segment order, collected on the
+    /// first [`Self::live_doc_ids_for_term`] (Issue #1420); the inner `None`
+    /// when some segment has none. Holding the `Arc`s lets a lookup probe
+    /// each dictionary without taking the segment's locks.
+    term_dictionaries: Arc<OnceLock<Option<Vec<Arc<BlockTermDictionary>>>>>,
 }
 
 impl InvertedIndexReader {
@@ -2145,6 +2174,7 @@ impl InvertedIndexReader {
             total_doc_count,
             term_info_complete: Arc::new(OnceLock::new()),
             live_doc_count: Arc::new(OnceLock::new()),
+            term_dictionaries: Arc::new(OnceLock::new()),
         })
     }
 
@@ -2216,6 +2246,81 @@ impl InvertedIndexReader {
     /// can fire on each segment's local `block_max` table.
     pub fn segment_readers(&self) -> &[Arc<RwLock<SegmentReader>>] {
         &self.segment_readers
+    }
+
+    /// Every segment's term dictionary, collected once per reader (Issue
+    /// #1420); `None` when some segment has none.
+    ///
+    /// Also settles [`Self::term_info_is_authoritative`] when it is still
+    /// open, so the search path does not read every `.dict` a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment's `.dict` opens but cannot be parsed.
+    /// Nothing is cached then, so the next call tries again.
+    fn term_dictionaries(&self) -> Result<Option<&[Arc<BlockTermDictionary>]>> {
+        if let Some(cached) = self.term_dictionaries.get() {
+            return Ok(cached.as_deref());
+        }
+        let mut dictionaries = Vec::with_capacity(self.segment_readers.len());
+        for segment in &self.segment_readers {
+            match segment.read().unwrap().loaded_term_dictionary()? {
+                Some(dictionary) => dictionaries.push(dictionary),
+                None => {
+                    dictionaries.clear();
+                    break;
+                }
+            }
+        }
+        let complete = dictionaries.len() == self.segment_readers.len();
+        let _ = self.term_info_complete.set(complete);
+        let _ = self.term_dictionaries.set(complete.then_some(dictionaries));
+        Ok(self.term_dictionaries.get().and_then(Option::as_deref))
+    }
+
+    /// The live documents whose `field` holds exactly `term`, read from the
+    /// segments' term dictionaries and postings (Issue #1420).
+    ///
+    /// Gives the same documents as a
+    /// [`TermQuery`](crate::lexical::query::term::TermQuery) search for the
+    /// term, without the query machinery: the key is built once, and only a
+    /// segment whose dictionary has it decodes a posting list, which comes
+    /// back without deleted documents. A term no segment holds costs one
+    /// dictionary probe per segment.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Field the term belongs to.
+    /// * `term` - The exact term, as indexed.
+    ///
+    /// # Returns
+    ///
+    /// The document ids in segment order, or `None` when some segment has no
+    /// term dictionary (Issue #1196): it can still match through its stored
+    /// documents, so the caller has to search instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reader is closed, or if a dictionary or a
+    /// posting list cannot be read.
+    pub fn live_doc_ids_for_term(&self, field: &str, term: &str) -> Result<Option<Vec<u64>>> {
+        self.check_closed()?;
+        let Some(dictionaries) = self.term_dictionaries()? else {
+            return Ok(None);
+        };
+        let key = format!("{field}:{term}");
+        let mut doc_ids = Vec::new();
+        for (segment, dictionary) in self.segment_readers.iter().zip(dictionaries) {
+            if dictionary.get(&key).is_none() {
+                continue;
+            }
+            if let Some(mut postings) = segment.read().unwrap().postings(field, term)? {
+                while postings.next()? {
+                    doc_ids.push(postings.doc_id());
+                }
+            }
+        }
+        Ok(Some(doc_ids))
     }
 
     /// Check if the reader is closed.
@@ -3650,6 +3755,165 @@ mod tests {
             .unwrap();
         assert!(empty.term_info_is_authoritative());
         assert!(TermQuery::new("tags", "rust").is_empty(&empty).unwrap());
+    }
+
+    // ---- Direct term lookup, Issue #1420 -----------------------------------
+
+    /// An index with one committed segment per entry of `commits`, each
+    /// listing `(doc_id, _id)` pairs, then `deletions` committed on their own.
+    fn index_with_id_segments(
+        commits: &[&[(u64, &str)]],
+        deletions: &[u64],
+    ) -> crate::lexical::index::inverted::InvertedIndex {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        for commit in commits {
+            let mut writer = index.writer().unwrap();
+            for (doc_id, id) in *commit {
+                let doc = crate::Document::builder()
+                    .add_text("_id", *id)
+                    .add_text("body", "alpha")
+                    .build();
+                writer.upsert_document(*doc_id, doc).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        if !deletions.is_empty() {
+            let mut writer = index.writer().unwrap();
+            for doc_id in deletions {
+                writer.delete_document(*doc_id).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        index
+    }
+
+    /// The doc ids an unbounded `TermQuery` search returns, sorted.
+    fn searched_ids(
+        index: &crate::lexical::index::inverted::InvertedIndex,
+        field: &str,
+        term: &str,
+    ) -> Vec<u64> {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::query::term::TermQuery;
+        use crate::lexical::search::searcher::LexicalSearchRequest;
+
+        let request = LexicalSearchRequest::new(Box::new(TermQuery::new(field, term)))
+            .limit(usize::MAX)
+            .load_documents(false);
+        let mut ids: Vec<u64> = index
+            .searcher()
+            .unwrap()
+            .search(request)
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| hit.doc_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// What `live_doc_ids_for_term` returns over a fresh reader, sorted.
+    fn looked_up_ids(
+        index: &crate::lexical::index::inverted::InvertedIndex,
+        field: &str,
+        term: &str,
+    ) -> Option<Vec<u64>> {
+        use crate::lexical::index::LexicalIndex;
+
+        let reader = index.reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let mut ids = inverted.live_doc_ids_for_term(field, term).unwrap()?;
+        ids.sort_unstable();
+        Some(ids)
+    }
+
+    #[test]
+    fn live_doc_ids_for_term_matches_the_term_query_search() {
+        // "ida" has a copy in the first and the third segment (two chunks of
+        // one id), "idb" only in the second; "idc" is in no segment.
+        let index = index_with_id_segments(
+            &[&[(0, "ida"), (1, "idb")], &[(2, "idb")], &[(3, "ida")]],
+            &[],
+        );
+        for (term, expected) in [("ida", vec![0, 3]), ("idb", vec![1, 2]), ("idc", vec![])] {
+            assert_eq!(
+                searched_ids(&index, "_id", term),
+                expected,
+                "search for {term}"
+            );
+            assert_eq!(
+                looked_up_ids(&index, "_id", term),
+                Some(expected),
+                "lookup for {term}"
+            );
+        }
+        // Another field's term is not mistaken for an `_id`.
+        assert_eq!(looked_up_ids(&index, "_id", "alpha"), Some(vec![]));
+        assert_eq!(
+            looked_up_ids(&index, "body", "alpha"),
+            Some(vec![0, 1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn live_doc_ids_for_term_skips_committed_deletions() {
+        let index = index_with_id_segments(&[&[(0, "ida")], &[(1, "ida")]], &[0]);
+        assert_eq!(searched_ids(&index, "_id", "ida"), vec![1]);
+        assert_eq!(looked_up_ids(&index, "_id", "ida"), Some(vec![1]));
+    }
+
+    #[test]
+    fn live_doc_ids_for_term_defers_to_a_search_without_every_dictionary() {
+        let (storage, info) =
+            docs_only_segment("lookup_no_dict", &[(0, vec![("_id", text("ida"))])], false);
+        let reader =
+            InvertedIndexReader::new(vec![info], storage, InvertedIndexReaderConfig::default())
+                .unwrap();
+        assert_eq!(reader.live_doc_ids_for_term("_id", "ida").unwrap(), None);
+        assert_eq!(reader.term_info_complete.get(), Some(&false));
+    }
+
+    #[test]
+    fn live_doc_ids_for_term_settles_term_info_authority() {
+        use crate::lexical::index::LexicalIndex;
+
+        let index = index_with_id_segments(&[&[(0, "ida")], &[(1, "idb")]], &[]);
+        let reader = index.reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert!(inverted.term_info_complete.get().is_none());
+        inverted.live_doc_ids_for_term("_id", "ida").unwrap();
+        // The search path's authority check now answers without reading the
+        // dictionaries again.
+        assert_eq!(inverted.term_info_complete.get(), Some(&true));
+        assert!(inverted.term_info_is_authoritative());
+    }
+
+    #[test]
+    fn live_doc_ids_for_term_fails_on_a_closed_reader() {
+        use crate::lexical::reader::LexicalIndexReader;
+
+        let index = index_with_id_segments(&[&[(0, "ida")]], &[]);
+        let reader = crate::lexical::index::LexicalIndex::reader(&index).unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        // Clones share the closed flag.
+        inverted.clone().close().unwrap();
+        assert!(inverted.live_doc_ids_for_term("_id", "ida").is_err());
     }
 
     /// #1047: `has_doc_values` must reflect the schema's per-field

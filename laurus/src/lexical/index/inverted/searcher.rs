@@ -1530,6 +1530,13 @@ impl crate::lexical::search::searcher::LexicalSearcher for InvertedIndexSearcher
         InvertedIndexSearcher::count(self, request)
     }
 
+    fn live_doc_ids_for_term(&self, field: &str, term: &str) -> Result<Option<Vec<u64>>> {
+        match self.reader.as_any().downcast_ref::<InvertedIndexReader>() {
+            Some(reader) => reader.live_doc_ids_for_term(field, term),
+            None => Ok(None),
+        }
+    }
+
     fn matching_doc_ids(&self, query: Box<dyn Query>) -> Result<Arc<roaring::RoaringTreemap>> {
         // The common case: the reader is an `InvertedIndexReader`, which owns
         // the snapshot-scoped query/filter cache (Issue #578) and serves

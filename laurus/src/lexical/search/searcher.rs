@@ -243,6 +243,27 @@ pub trait LexicalSearcher: Send + Sync + std::fmt::Debug {
     /// applying the min_score threshold if specified in the request parameters.
     fn count(&self, request: LexicalSearchRequest) -> Result<u64>;
 
+    /// The live documents whose `field` holds exactly `term`, looked up
+    /// without running a search (Issue #1420).
+    ///
+    /// Must return the same documents as an unbounded search for a
+    /// `TermQuery` on the term, or `None` when the implementation cannot
+    /// answer that way; the caller then runs that search. The default
+    /// implementation always returns `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Field the term belongs to.
+    /// * `term` - The exact term, as indexed.
+    ///
+    /// # Returns
+    ///
+    /// The matching document ids, in no particular order, or `None`.
+    fn live_doc_ids_for_term(&self, field: &str, term: &str) -> Result<Option<Vec<u64>>> {
+        let _ = (field, term);
+        Ok(None)
+    }
+
     /// Return the set of document ids matching `query`, ignoring score
     /// thresholds (Issue [#578](https://github.com/mosuka/laurus/issues/578)).
     ///
