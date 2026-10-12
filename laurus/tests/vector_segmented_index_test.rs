@@ -279,6 +279,33 @@ fn dropping_an_unused_writer_rolls_back_the_wal_checkpoint() {
     assert_eq!(index.last_wal_seq(), 0);
 }
 
+/// Dropping a sealed writer after `close()` must not roll back the WAL
+/// checkpoint: `close()` empties the inner buffer, which is not a change
+/// since the seal, and the sealed segment already holds every buffered
+/// record (Issue #1410).
+#[test]
+fn dropping_a_closed_sealed_writer_keeps_the_wal_checkpoint() {
+    let storage = storage();
+    let index = SegmentedHnswIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    index.set_last_wal_seq(7).unwrap();
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![(1, "v".to_string(), doc_vec(1))])
+        .unwrap();
+    writer.commit().unwrap();
+    writer.close().unwrap();
+    drop(writer);
+    index.persist_deletions().unwrap();
+
+    assert_eq!(index.last_wal_seq(), 7);
+}
+
 /// Migrating a legacy monolithic index whose stored dimension does not match
 /// the config's dimension must fail loudly instead of silently proceeding
 /// (Issue #1409: HNSW did not validate this; Flat and IVF already did —
@@ -525,6 +552,49 @@ fn sealed_writer_rejects_second_commit_and_close_is_noop() {
         err.is_err(),
         "a sealed writer must reject a second commit with new changes (#881)"
     );
+}
+
+/// Replacing a sealed writer's buffered doc with the same number of vectors
+/// (delete-first, then re-add, as the store's upsert does) leaves the buffer
+/// length unchanged; the writer must still report the change and refuse to
+/// commit it instead of silently dropping the new version (Issue #1410).
+/// Deleting an id that is not buffered changes nothing, and rolling back does
+/// not unseal the writer.
+#[test]
+fn sealed_writer_rejects_a_same_size_replacement() {
+    let storage = storage();
+    let index = SegmentedHnswIndex::open_or_create(
+        storage as Arc<dyn Storage>,
+        "vector_index",
+        config(true),
+    )
+    .unwrap();
+
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![(1, "v".to_string(), doc_vec(1))])
+        .unwrap();
+    writer.commit().unwrap();
+
+    writer.delete_document(2).unwrap();
+    assert!(!writer.has_pending_changes());
+
+    writer.delete_document(1).unwrap();
+    assert!(writer.has_pending_changes());
+    writer
+        .add_vectors(vec![(1, "v".to_string(), doc_vec(9000))])
+        .unwrap();
+    assert!(writer.has_pending_changes());
+    let err = writer.commit().unwrap_err();
+    assert!(err.to_string().contains("already sealed"), "{err}");
+
+    // Sealing again would overwrite the registered segment.
+    writer.rollback().unwrap();
+    writer
+        .add_vectors(vec![(1, "v".to_string(), doc_vec(9000))])
+        .unwrap();
+    let err = writer.commit().unwrap_err();
+    assert!(err.to_string().contains("already sealed"), "{err}");
 }
 
 /// #881 review: count() excludes soft-deleted docs.

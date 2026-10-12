@@ -346,7 +346,7 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
             shared: self.shared.clone(),
             segment_id,
             inner,
-            sealed_len: None,
+            changed_since_seal: None,
         };
         let embedder = self.embedder();
         Ok(Box::new(EmbeddingVectorIndexWriter::new(
@@ -517,11 +517,21 @@ struct SegmentedWriter<B: SegmentedBackend> {
     shared: Arc<SegmentedShared<B>>,
     segment_id: String,
     inner: B::Writer,
-    /// Buffer length at the moment this writer's segment was sealed and
-    /// registered; `None` until then. Used to make the post-commit
-    /// `close()` a no-op (the inner buffer is retained after commit, so a
-    /// plain "buffer non-empty" check would re-enter `commit`).
-    sealed_len: Option<usize>,
+    /// `None` until this writer's segment is sealed and registered, then
+    /// whether the buffer has changed since. The inner buffer is retained
+    /// after commit, so this keeps the post-commit `close()` a no-op while
+    /// any later change makes `commit` fail — including a same-size
+    /// replacement, which a buffer-length comparison would miss.
+    changed_since_seal: Option<bool>,
+}
+
+impl<B: SegmentedBackend> SegmentedWriter<B> {
+    /// Record a buffer change; after sealing, it makes `commit` fail.
+    fn mark_changed(&mut self) {
+        if let Some(changed) = &mut self.changed_since_seal {
+            *changed = true;
+        }
+    }
 }
 
 impl<B: SegmentedBackend> fmt::Debug for SegmentedWriter<B> {
@@ -530,7 +540,7 @@ impl<B: SegmentedBackend> fmt::Debug for SegmentedWriter<B> {
             .field("shared", &self.shared)
             .field("segment_id", &self.segment_id)
             .field("inner", &self.inner)
-            .field("sealed_len", &self.sealed_len)
+            .field("changed_since_seal", &self.changed_since_seal)
             .finish()
     }
 }
@@ -559,6 +569,9 @@ impl<B: SegmentedBackend> VectorIndexWriter for SegmentedWriter<B> {
         self.shared
             .core
             .unmark_deleted(vectors.iter().map(|(doc_id, _, _)| *doc_id))?;
+        if !vectors.is_empty() {
+            self.mark_changed();
+        }
         self.inner.add_vectors(vectors)
     }
 
@@ -600,14 +613,19 @@ impl<B: SegmentedBackend> VectorIndexWriter for SegmentedWriter<B> {
         // delete stays marked; a following `add_vectors` with the same id
         // clears the mark.
         self.shared.core.mark_deleted(doc_id)?;
+        // The inner writers report success whether or not the id was
+        // buffered; only a shrunken buffer means a buffered copy was removed.
+        let buffered = self.inner.vectors().len();
         let _ = self.inner.delete_document(doc_id);
+        if self.inner.vectors().len() != buffered {
+            self.mark_changed();
+        }
         Ok(())
     }
 
     fn has_pending_changes(&self) -> bool {
-        match self.sealed_len {
-            // Sealed: pending only if the buffer changed since the seal.
-            Some(sealed) => self.inner.vectors().len() != sealed,
+        match self.changed_since_seal {
+            Some(changed) => changed,
             None => {
                 !self.inner.vectors().is_empty() || B::writer_tracks_pending_changes(&self.inner)
             }
@@ -618,8 +636,8 @@ impl<B: SegmentedBackend> VectorIndexWriter for SegmentedWriter<B> {
         if self.inner.vectors().is_empty() {
             return Ok(());
         }
-        if let Some(sealed) = self.sealed_len {
-            if self.inner.vectors().len() == sealed {
+        if let Some(changed) = self.changed_since_seal {
+            if !changed {
                 // Post-commit close(): the segment is already sealed and the
                 // buffer is unchanged — nothing to do.
                 return Ok(());
@@ -638,7 +656,7 @@ impl<B: SegmentedBackend> VectorIndexWriter for SegmentedWriter<B> {
         // from storage by `add_segment`.
         let info = ManagedSegmentInfo::new(self.segment_id.clone(), vector_count, 0, 0);
         self.shared.core.manager().add_segment(info)?;
-        self.sealed_len = Some(self.inner.vectors().len());
+        self.changed_since_seal = Some(false);
         self.shared.reader_cache.invalidate(&self.segment_id);
         Ok(())
     }
