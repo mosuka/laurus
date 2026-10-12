@@ -262,6 +262,15 @@ graph TB
 3. **Merge**: After each `commit()`, once the count exceeds `max_segments`, an auto-merge merges runs of up to `merge_factor` segments of similar size (at most 8 times apart), smallest first, keeping the segment count bounded; a manual `optimize()` force-merges everything into one segment. Merging only similar sizes keeps a large segment from being rewritten every time it absorbs a small one, so each byte is rewritten a logarithmic number of times as the index grows. One commit's auto-merge keeps merging until it has removed `merge_factor - 1` segments, the count is back at `max_segments`, or no run of similar size is left. The count can therefore stay above `max_segments` while small segments wait for partners of similar size: as long as each commit publishes fewer than `merge_factor` segments, it stays within `max(max_segments, 1 + log_8(index size / smallest segment))`. A large segment with many deleted documents is rewritten, and its deleted documents reclaimed, only when it merges with segments of similar size or on `optimize()`. `max_merged_segment_bytes` (default: unbounded) caps the combined estimated size of the segments a single merge will take, so a segment at or over the cap is left unmerged and the count can stabilize above `max_segments` once the survivors no longer fit together
 4. **Delete**: When a document is deleted, its ID is added to a deletion bitmap rather than physically removed (see [Deletions & Compaction](../../laurus/deletions.md))
 
+### Resolving Document IDs
+
+Every `put_document` first looks up the earlier versions of its `_id` so it can replace them. The committed segments are checked through a Bloom filter over every committed `_id` key, which the index keeps in memory and shares among its readers:
+
+- An `_id` the filter has never seen is in no segment, so a put of a new ID costs the same however many segments the index holds.
+- A "maybe" (an `_id` that exists, or about 1% of new IDs at most) probes each segment's term dictionary to find the exact copies.
+- The filter is built on the first lookup after the index is opened, and each lookup after a commit adds only the new segments' keys. When it fills up, it is rebuilt from the current segments, which also drops the IDs that merges removed.
+- It takes 2 bytes per committed document right after a rebuild, down to about 1.3 bytes just before the next one.
+
 ## BM25 Scoring
 
 Laurus uses the BM25 algorithm to score lexical search results. BM25 considers:

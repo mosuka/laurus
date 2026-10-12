@@ -1075,6 +1075,83 @@ mod tests {
         assert_eq!(found, vec![1, 4]);
     }
 
+    /// Issue #1420 — the committed `_id` filter must never hide a copy. A
+    /// random mix of puts (fresh and existing ids, resolved first as
+    /// `Engine::put_document` does), extra chunks, deletions, commits with
+    /// frequent auto-merges, `optimize` and reopening checks every lookup
+    /// against a model. The id space is large enough for the filter to be
+    /// rebuilt several times.
+    #[test]
+    fn id_lookups_stay_exact_through_merges_rebuilds_and_reopening() {
+        use std::collections::BTreeMap;
+
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = || {
+            LexicalIndexConfig::builder()
+                .max_segments(4)
+                .merge_factor(3)
+                .build()
+        };
+        let mut store = LexicalStore::new(storage.clone(), config()).unwrap();
+        let mut live: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut next_doc_id = 1u64;
+        let mut rng = StdRng::seed_from_u64(1420);
+        let resolve = |store: &LexicalStore, id: &str| {
+            let mut found = store.find_doc_ids_by_term("_id", id).unwrap();
+            found.sort_unstable();
+            found
+        };
+
+        for step in 0..3_000 {
+            let id = format!("id{}", rng.random_range(0..3_000));
+            let expected = live.get(&id).cloned().unwrap_or_default();
+            match rng.random_range(0..100) {
+                // Put: replace every copy of the id.
+                0..70 => {
+                    let found = resolve(&store, &id);
+                    assert_eq!(found, expected, "step {step}: before putting {id}");
+                    for doc_id in found {
+                        store.delete_document_by_internal_id(doc_id).unwrap();
+                    }
+                    store.upsert_document(next_doc_id, id_doc(&id)).unwrap();
+                    live.insert(id, vec![next_doc_id]);
+                    next_doc_id += 1;
+                }
+                // Another chunk of the id, kept beside the existing ones.
+                70..75 => {
+                    store.upsert_document(next_doc_id, id_doc(&id)).unwrap();
+                    live.entry(id).or_default().push(next_doc_id);
+                    next_doc_id += 1;
+                }
+                // Delete every copy of the id.
+                75..83 => {
+                    let found = resolve(&store, &id);
+                    assert_eq!(found, expected, "step {step}: before deleting {id}");
+                    for doc_id in found {
+                        store.delete_document_by_internal_id(doc_id).unwrap();
+                    }
+                    live.remove(&id);
+                }
+                83..96 => store.commit().unwrap(),
+                96..98 => store.optimize().unwrap(),
+                _ => {
+                    store.commit().unwrap();
+                    store = LexicalStore::new(storage.clone(), config()).unwrap();
+                }
+            }
+        }
+
+        store.commit().unwrap();
+        for i in 0..3_000 {
+            let id = format!("id{i}");
+            let expected = live.get(&id).cloned().unwrap_or_default();
+            assert_eq!(resolve(&store, &id), expected, "{id} after the last commit");
+        }
+    }
+
     /// The `_id` lookup builds the cached searcher when there is none, as the
     /// search it replaced did. Tests of the warm-cache state rely on it
     /// (`doc_written_before_auto_flush_still_resolves_by_id`,

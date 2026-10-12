@@ -39,6 +39,7 @@ pub(crate) mod bmw;
 pub(crate) mod compound;
 pub mod core;
 pub(crate) mod deleted_docs;
+pub(crate) mod id_filter;
 pub mod parsed_query_cache;
 pub(crate) mod per_segment_view;
 pub(crate) mod point_columns;
@@ -163,6 +164,11 @@ pub struct InvertedIndex {
     /// I/O, and a blocking `.read()` in `Debug` would deadlock any error
     /// path that formats the index mid-publish.
     segment_manifest: segment_manifest::SharedSegmentManifest,
+
+    /// A Bloom filter over the `_id` keys of the committed segments, handed
+    /// to every reader [`Self::reader`] builds, so a put of an id no segment
+    /// holds does not probe each segment (Issue #1420).
+    id_filter: Arc<id_filter::CommittedIdFilter>,
 }
 
 impl std::fmt::Debug for InvertedIndex {
@@ -191,6 +197,7 @@ impl InvertedIndex {
                 segments: Vec::new(),
                 next_generation: 0,
             })),
+            id_filter: Arc::new(id_filter::CommittedIdFilter::new()),
         };
 
         index.write_metadata()?;
@@ -281,6 +288,7 @@ impl InvertedIndex {
                 segments,
                 next_generation,
             })),
+            id_filter: Arc::new(id_filter::CommittedIdFilter::new()),
         })
     }
 
@@ -1010,7 +1018,8 @@ impl LexicalIndex for InvertedIndex {
             ..InvertedIndexReaderConfig::default()
         };
 
-        let reader = InvertedIndexReader::new(segments, self.storage.clone(), reader_config)?;
+        let reader = InvertedIndexReader::new(segments, self.storage.clone(), reader_config)?
+            .with_id_filter(Arc::clone(&self.id_filter));
         Ok(Arc::new(reader))
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use ahash::AHashMap;
@@ -23,6 +23,7 @@ use crate::lexical::index::inverted::core::terms::{
     InvertedIndexTerms, MergedInvertedIndexTerms, TermDictionaryAccess, Terms,
 };
 use crate::lexical::index::inverted::deleted_docs::DeletedDocs;
+use crate::lexical::index::inverted::id_filter::{CommittedIdFilter, ID_FIELD, IdCheck};
 use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
 use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
@@ -2110,6 +2111,14 @@ pub struct InvertedIndexReader {
     /// when some segment has none. Holding the `Arc`s lets a lookup probe
     /// each dictionary without taking the segment's locks.
     term_dictionaries: Arc<OnceLock<Option<Vec<Arc<BlockTermDictionary>>>>>,
+
+    /// The index's filter over committed `_id` keys, if this reader was
+    /// built by the index (Issue #1420); see [`Self::with_id_filter`].
+    id_filter: Option<Arc<CommittedIdFilter>>,
+
+    /// The filter generation this reader's segments were last covered at,
+    /// 0 for never. Shared by clones like the other snapshot-scoped state.
+    id_filter_generation: Arc<AtomicU64>,
 }
 
 impl InvertedIndexReader {
@@ -2175,7 +2184,25 @@ impl InvertedIndexReader {
             term_info_complete: Arc::new(OnceLock::new()),
             live_doc_count: Arc::new(OnceLock::new()),
             term_dictionaries: Arc::new(OnceLock::new()),
+            id_filter: None,
+            id_filter_generation: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Answer `_id` lookups for absent ids from `filter` (Issue #1420).
+    ///
+    /// The filter is shared by every reader of one index and outlives them:
+    /// a reader inserts the keys of its segments the filter has not seen yet
+    /// on its first `_id` lookup, so after a commit only the new segments are
+    /// read. Without a filter, [`Self::live_doc_ids_for_term`] probes every
+    /// segment's dictionary.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - The index's filter over committed `_id` keys.
+    pub(crate) fn with_id_filter(mut self, filter: Arc<CommittedIdFilter>) -> Self {
+        self.id_filter = Some(filter);
+        self
     }
 
     /// Get cache statistics.
@@ -2286,7 +2313,9 @@ impl InvertedIndexReader {
     /// term, without the query machinery: the key is built once, and only a
     /// segment whose dictionary has it decodes a posting list, which comes
     /// back without deleted documents. A term no segment holds costs one
-    /// dictionary probe per segment.
+    /// dictionary probe per segment, except an `_id` the index's
+    /// [`CommittedIdFilter`] has never seen, which costs one filter probe in
+    /// all (see [`Self::with_id_filter`]).
     ///
     /// # Arguments
     ///
@@ -2305,10 +2334,28 @@ impl InvertedIndexReader {
     /// posting list cannot be read.
     pub fn live_doc_ids_for_term(&self, field: &str, term: &str) -> Result<Option<Vec<u64>>> {
         self.check_closed()?;
+        let key = format!("{field}:{term}");
+        if field == ID_FIELD
+            && let Some(filter) = &self.id_filter
+        {
+            let check = filter.check(
+                &self.id_filter_generation,
+                &self.segment_infos,
+                |index| {
+                    self.segment_readers[index]
+                        .read()
+                        .unwrap()
+                        .loaded_term_dictionary()
+                },
+                &key,
+            )?;
+            if check == IdCheck::Absent {
+                return Ok(Some(Vec::new()));
+            }
+        }
         let Some(dictionaries) = self.term_dictionaries()? else {
             return Ok(None);
         };
-        let key = format!("{field}:{term}");
         let mut doc_ids = Vec::new();
         for (segment, dictionary) in self.segment_readers.iter().zip(dictionaries) {
             if dictionary.get(&key).is_none() {
@@ -3914,6 +3961,140 @@ mod tests {
         // Clones share the closed flag.
         inverted.clone().close().unwrap();
         assert!(inverted.live_doc_ids_for_term("_id", "ida").is_err());
+    }
+
+    // ---- Committed `_id` filter, Issue #1420 -------------------------------
+
+    /// `(generation, covered segments, keys inserted)` of a filter.
+    fn filter_state(filter: &CommittedIdFilter) -> (u64, usize, u64) {
+        let stats = filter.stats();
+        (stats.generation, stats.covered_segments, stats.inserted)
+    }
+
+    #[test]
+    fn id_filter_answers_an_absent_id_and_covers_only_new_segments() {
+        use crate::lexical::index::LexicalIndex;
+
+        let index = index_with_id_segments(&[&[(0, "ida"), (1, "idb")], &[(2, "idc")]], &[]);
+        let reader = index.reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+
+        // An id no segment holds is answered by the filter alone: the
+        // reader never collects its dictionaries for the exact lookup.
+        assert_eq!(
+            inverted.live_doc_ids_for_term("_id", "zzz").unwrap(),
+            Some(vec![])
+        );
+        assert!(inverted.term_dictionaries.get().is_none());
+        assert_eq!(filter_state(&index.id_filter), (1, 2, 3));
+
+        // A held id goes on to the exact lookup.
+        assert_eq!(
+            inverted.live_doc_ids_for_term("_id", "idc").unwrap(),
+            Some(vec![2])
+        );
+        assert!(inverted.term_dictionaries.get().is_some());
+
+        // A commit adds one segment; the next reader inserts only its key.
+        let mut writer = index.writer().unwrap();
+        writer
+            .upsert_document(3, crate::Document::builder().add_text("_id", "idd").build())
+            .unwrap();
+        writer.commit().unwrap();
+        assert_eq!(looked_up_ids(&index, "_id", "idd"), Some(vec![3]));
+        assert_eq!(looked_up_ids(&index, "_id", "zzz"), Some(vec![]));
+        assert_eq!(filter_state(&index.id_filter), (1, 3, 4));
+    }
+
+    /// A rebuild keeps only the rebuilding reader's segments, so a reader
+    /// that covered an earlier generation must cover its own segments again
+    /// before it trusts an "absent".
+    #[test]
+    fn id_filter_reader_covers_again_after_another_reader_rebuilt_it() {
+        use crate::lexical::index::LexicalIndex;
+
+        // Two segments of 1,000 ids each. A filter sized for its minimum of
+        // 1,024 keys takes about 1,600 before it rebuilds, so covering the
+        // second segment after the first one rebuilds it.
+        let first: Vec<(u64, String)> = (0..1_000).map(|i| (i, format!("a{i}"))).collect();
+        let second: Vec<(u64, String)> = (1_000..2_000).map(|i| (i, format!("b{i}"))).collect();
+        fn as_refs(ids: &[(u64, String)]) -> Vec<(u64, &str)> {
+            ids.iter()
+                .map(|(doc_id, id)| (*doc_id, id.as_str()))
+                .collect()
+        }
+        let index = index_with_id_segments(&[&as_refs(&first), &as_refs(&second)], &[]);
+        let full = index.reader().unwrap();
+        let infos = full
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap()
+            .segment_infos
+            .clone();
+        assert_eq!(infos.len(), 2);
+
+        // Two readers over one segment each, sharing a fresh filter.
+        let filter = Arc::new(CommittedIdFilter::new());
+        let reader_over = |info: &SegmentInfo| {
+            InvertedIndexReader::new(
+                vec![info.clone()],
+                index.storage().clone(),
+                InvertedIndexReaderConfig::default(),
+            )
+            .unwrap()
+            .with_id_filter(Arc::clone(&filter))
+        };
+        let reader_a = reader_over(&infos[0]);
+        let reader_b = reader_over(&infos[1]);
+
+        assert_eq!(
+            reader_a.live_doc_ids_for_term("_id", "a0").unwrap(),
+            Some(vec![0])
+        );
+        assert_eq!(filter_state(&filter), (1, 1, 1_000));
+        assert_eq!(
+            reader_b.live_doc_ids_for_term("_id", "b1000").unwrap(),
+            Some(vec![1_000])
+        );
+        let (generation, covered, _) = filter_state(&filter);
+        assert_eq!(
+            (generation, covered),
+            (2, 1),
+            "B's keys overflow it: rebuilt from B alone"
+        );
+
+        for (doc_id, id) in &first {
+            assert_eq!(
+                reader_a.live_doc_ids_for_term("_id", id).unwrap(),
+                Some(vec![*doc_id]),
+                "{id} must still resolve through the reader that covered generation 1"
+            );
+        }
+        for (doc_id, id) in &second {
+            assert_eq!(
+                reader_b.live_doc_ids_for_term("_id", id).unwrap(),
+                Some(vec![*doc_id]),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn id_filter_is_not_used_when_a_segment_has_no_dictionary() {
+        let (storage, info) =
+            docs_only_segment("filter_no_dict", &[(0, vec![("_id", text("ida"))])], false);
+        let filter = Arc::new(CommittedIdFilter::new());
+        let reader =
+            InvertedIndexReader::new(vec![info], storage, InvertedIndexReaderConfig::default())
+                .unwrap()
+                .with_id_filter(Arc::clone(&filter));
+        // Neither a held nor an absent id may be answered from the filter.
+        assert_eq!(reader.live_doc_ids_for_term("_id", "ida").unwrap(), None);
+        assert_eq!(reader.live_doc_ids_for_term("_id", "zzz").unwrap(), None);
+        assert_eq!(filter_state(&filter), (1, 0, 0));
     }
 
     /// #1047: `has_doc_values` must reflect the schema's per-field
