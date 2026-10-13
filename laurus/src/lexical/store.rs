@@ -874,12 +874,13 @@ impl LexicalStore {
     /// # Errors
     ///
     /// Returns an error if flushing a cached writer's pending changes
-    /// fails, or if the underlying rebuild fails. Unlike
-    /// [`Self::add_field`]/[`Self::delete_field`], a flush failure is
-    /// **propagated**, not cached for a later retry — the writer's
-    /// buffered state is not a safe starting point for a rebuild that is
-    /// about to replace every segment (same reasoning [`Self::optimize`]
-    /// already applies).
+    /// fails, or if the underlying rebuild fails. A failed flush rebuilds
+    /// nothing and keeps the writer cached with its buffered state, as
+    /// [`Self::commit`] does. Once the flush succeeds, the writer and the
+    /// cached searcher are dropped whether the rebuild succeeds or not, so
+    /// the next search and `_id` lookup see the documents the flush
+    /// committed (Issue #1424). A failed rebuild leaves the per-field
+    /// analyzer unchanged.
     pub fn rebuild_field(
         &self,
         name: &str,
@@ -895,13 +896,20 @@ impl LexicalStore {
         if let Some(writer) = writer_guard.as_mut() {
             writer.commit()?;
         }
+        // The committed writer has nothing left to lose, and the rebuild
+        // replaces every segment its view describes, so drop it now rather
+        // than keep that view when the rebuild fails after publishing
+        // (Issue #1424). The next writer is built from the manifest as the
+        // rebuild left it.
+        *writer_guard = None;
 
-        self.index.rebuild_field(name, option, analyzer.clone())?;
+        let rebuilt = self.index.rebuild_field(name, option, analyzer.clone());
 
         // Only NOW does the analyzer swap become visible to the query
         // parser — after the rebuild has fully replaced the field's
         // postings under the new analyzer (see the ordering note above).
-        if let Ok(index_analyzer) = self.analyzer()
+        if rebuilt.is_ok()
+            && let Ok(index_analyzer) = self.analyzer()
             && let Some(pfa) = index_analyzer
                 .as_any()
                 .downcast_ref::<crate::analysis::analyzer::per_field::PerFieldAnalyzer>(
@@ -913,23 +921,13 @@ impl LexicalStore {
             }
         }
 
-        // The rebuild replaced every segment, so the writer's cached
-        // segment view (if it survived the flush above) is now stale —
-        // mirrors `optimize()`'s `invalidate_segment_cache` handling.
-        if let Some(writer) = writer_guard.as_mut()
-            && let Err(e) = writer.invalidate_segment_cache()
-        {
-            *writer_guard = None;
-            *self.searcher_cache.write() = None;
-            drop(writer_guard);
-            return Err(e);
-        }
-        *writer_guard = None;
-        // Before the writer lock is released, as in `commit` (Issue #1207).
+        // Before the writer lock is released, as in `commit` (Issue #1207),
+        // and on the error path too (Issue #1424): the commit above emptied
+        // the writer, so a searcher built before it would hide the documents
+        // that commit published from the `_id` lookup.
         *self.searcher_cache.write() = None;
         drop(writer_guard);
-
-        Ok(())
+        rebuilt
     }
 
     /// Remove a field from the lexical store.
@@ -1166,6 +1164,174 @@ mod tests {
 
         assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
         assert!(store.searcher_cache.read().is_some());
+    }
+
+    /// A memory storage that fails the next `create_output` or `delete_file`
+    /// of a file whose name starts with the armed prefix.
+    #[derive(Debug)]
+    struct FailOnceStorage {
+        inner: MemoryStorage,
+        fail_create: Mutex<Option<&'static str>>,
+        fail_delete: Mutex<Option<&'static str>>,
+    }
+
+    impl FailOnceStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorage::new(MemoryStorageConfig::default()),
+                fail_create: Mutex::new(None),
+                fail_delete: Mutex::new(None),
+            }
+        }
+
+        /// Disarm `slot` and return `true` if `name` matches its prefix.
+        fn fires(slot: &Mutex<Option<&'static str>>, name: &str) -> bool {
+            let mut armed = slot.lock();
+            if armed.is_some_and(|prefix| name.starts_with(prefix)) {
+                *armed = None;
+                return true;
+            }
+            false
+        }
+    }
+
+    impl Storage for FailOnceStorage {
+        fn open_input(&self, name: &str) -> Result<Box<dyn crate::storage::StorageInput>> {
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            if Self::fires(&self.fail_create, name) {
+                return Err(crate::error::LaurusError::storage(format!(
+                    "injected failure creating {name}"
+                )));
+            }
+            self.inner.create_output(name)
+        }
+        fn create_output_append(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            if Self::fires(&self.fail_delete, name) {
+                return Err(crate::error::LaurusError::storage(format!(
+                    "injected failure deleting {name}"
+                )));
+            }
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(
+            &self,
+            prefix: &str,
+        ) -> Result<(String, Box<dyn crate::storage::StorageOutput>)> {
+            self.inner.create_temp_output(prefix)
+        }
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn lock_manager(&self) -> Option<Arc<dyn crate::storage::LockManager>> {
+            self.inner.lock_manager()
+        }
+    }
+
+    /// A store over `storage` with one rebuildable text field, `title`.
+    fn store_with_title_field(storage: Arc<FailOnceStorage>) -> LexicalStore {
+        let config = LexicalIndexConfig::builder()
+            .add_field("title", title_option())
+            .build();
+        LexicalStore::new(storage, config).unwrap()
+    }
+
+    fn title_option() -> crate::lexical::core::field::FieldOption {
+        crate::lexical::core::field::FieldOption::Text(
+            crate::lexical::core::field::TextOption::default(),
+        )
+    }
+
+    fn titled_doc(id: &str) -> Document {
+        Document::builder()
+            .add_text("_id", id)
+            .add_text("title", "rust programming")
+            .build()
+    }
+
+    /// Issue #1424 — a rebuild that fails after the writer's commit must not
+    /// leave the searcher cached before that commit. The commit has emptied
+    /// the writer, so that searcher would be the only place the `_id` lookup
+    /// looks for the documents just committed, and it does not have them.
+    #[test]
+    fn rebuild_failure_after_writer_commit_keeps_committed_ids_resolvable() {
+        let storage = Arc::new(FailOnceStorage::new());
+        let store = store_with_title_field(storage.clone());
+        store.upsert_document(1, titled_doc("ida")).unwrap();
+        store.commit().unwrap();
+        // Caches a searcher over the first commit.
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
+        store.upsert_document(2, titled_doc("idb")).unwrap();
+
+        // Fails writing the first rebuilt segment, before anything is
+        // published (`InvertedIndex::rebuild_field` names them `merged_*`).
+        *storage.fail_create.lock() = Some("merged_");
+        assert!(store.rebuild_field("title", title_option(), None).is_err());
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "idb").unwrap(), vec![2]);
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
+    }
+
+    /// Issue #1424 — a rebuild that fails after publishing the rebuilt
+    /// segments (here, deleting a source segment's files) must not leave a
+    /// writer behind whose segment view still names the replaced segments:
+    /// replacing a document through it would mark the old copy deleted in a
+    /// segment that is gone, and two copies would stay live.
+    #[test]
+    fn rebuild_failure_after_publishing_still_replaces_documents_exactly() {
+        let storage = Arc::new(FailOnceStorage::new());
+        let store = store_with_title_field(storage.clone());
+        store.upsert_document(1, titled_doc("ida")).unwrap();
+        store.commit().unwrap();
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
+        store.upsert_document(2, titled_doc("idb")).unwrap();
+
+        *storage.fail_delete.lock() = Some("segment_");
+        assert!(store.rebuild_field("title", title_option(), None).is_err());
+        let files = storage.list_files().unwrap();
+        assert!(
+            files.iter().any(|file| file.starts_with("merged_")),
+            "the rebuild must fail after publishing, not before: {files:?}"
+        );
+
+        // Replace both documents, as `Engine::put_document` does.
+        for (old_doc_id, new_doc_id, id) in [(1, 3, "ida"), (2, 4, "idb")] {
+            assert_eq!(
+                store.find_doc_ids_by_term("_id", id).unwrap(),
+                vec![old_doc_id]
+            );
+            store.delete_document_by_internal_id(old_doc_id).unwrap();
+            store.upsert_document(new_doc_id, titled_doc(id)).unwrap();
+        }
+        store.commit().unwrap();
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![3]);
+        assert_eq!(store.find_doc_ids_by_term("_id", "idb").unwrap(), vec![4]);
     }
 
     /// #1016 — a document written before the writer's automatic
