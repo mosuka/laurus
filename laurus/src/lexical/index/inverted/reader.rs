@@ -26,7 +26,7 @@ use crate::lexical::index::inverted::deleted_docs::DeletedDocs;
 use crate::lexical::index::inverted::id_filter::{CommittedIdFilter, ID_FIELD, IdCheck};
 use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
-use crate::lexical::index::inverted::segment::{Membership, SegmentInfo};
+use crate::lexical::index::inverted::segment::{Membership, SegmentInfo, SegmentKey};
 use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree};
 use crate::lexical::index::structures::dictionary::BLOCK_SIZE;
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
@@ -480,13 +480,21 @@ impl SegmentNorms {
     }
 }
 
-/// Reader for a single segment (schema-less mode).
+/// The parts of a segment that its files alone decide (Issue #1423).
+///
+/// A segment's files never change once written, except its `.delmap`, so
+/// everything read from them can serve every reader of the segment, whatever
+/// its snapshot. [`SegmentReader`] holds one of these in an `Arc` beside the
+/// state its snapshot decides (the deletions and what depends on them), the
+/// split Lucene makes between `SegmentCoreReaders` and `SegmentReader`. Each
+/// part is loaded on first use.
 #[derive(Debug)]
-pub struct SegmentReader {
-    /// Segment information.
-    info: SegmentInfo,
+pub(crate) struct SegmentCore {
+    /// Which segment this is. Holds only what the files decide: a reader's
+    /// own [`SegmentInfo`] also says whether the segment has deletions.
+    key: SegmentKey,
 
-    /// Storage backend.
+    /// Storage backend: the compound facade for a compound segment.
     storage: Arc<dyn Storage>,
 
     /// The compound-container facade when this segment is a `.cfs`
@@ -498,7 +506,7 @@ pub struct SegmentReader {
     /// Term dictionary for efficient term lookup.
     term_dictionary: RwLock<Option<Arc<BlockTermDictionary>>>,
 
-    /// Cached stored documents.
+    /// Cached stored documents, deleted ones included.
     stored_documents: RwLock<Option<BTreeMap<u64, Document>>>,
 
     /// Cached field-length/statistics source for this segment (#555 Phase
@@ -509,18 +517,41 @@ pub struct SegmentReader {
     /// DocValues reader for this segment.
     doc_values: RwLock<Option<Arc<DocValuesReader>>>,
 
+    /// Cached BKD trees: field -> tree. Unfiltered; a reader applies its
+    /// deletions when it hands one out.
+    bkd_trees: RwLock<AHashMap<String, Arc<dyn BKDTree>>>,
+
+    /// Whether the segment is loaded.
+    loaded: AtomicBool,
+
+    /// What the segment holds, resolved once (Issue #1211) — see
+    /// [`Self::membership`]. It depends only on the segment's files, so the
+    /// answer cannot go stale.
+    membership: OnceLock<Membership>,
+}
+
+/// Reader for a single segment (schema-less mode).
+///
+/// Describes the segment as of one snapshot: its deletions are read when the
+/// reader opens and fixed for its life. What the segment's files decide lives
+/// in a shared [`SegmentCore`].
+#[derive(Debug)]
+pub struct SegmentReader {
+    /// Segment information.
+    info: SegmentInfo,
+
+    /// The parts the segment's files decide.
+    core: Arc<SegmentCore>,
+
     /// The segment's deleted documents, read by [`Self::open`] and fixed for
     /// the reader's life, so a check takes no lock (Issue #1301); `None` when
     /// the segment has no deletions.
     deleted_docs: Option<Arc<DeletedDocs>>,
 
-    /// Cached BKD trees: field -> tree
-    bkd_trees: RwLock<AHashMap<String, Arc<dyn BKDTree>>>,
-
     /// Decoded posting-list cache (Issue #612). Disabled by default
     /// (`open` builds it with a zero budget); query readers enable it via
-    /// [`Self::with_posting_cache_bytes`]. Per-segment because a segment is
-    /// immutable for a reader snapshot.
+    /// [`Self::with_posting_cache_bytes`]. It holds lists with this reader's
+    /// deletions applied, so it belongs to the reader, not to the core.
     posting_cache: PostingCache,
 
     /// Index-time analyzer used by the `.post`-less scan fallback (Issue
@@ -536,35 +567,15 @@ pub struct SegmentReader {
     /// instance instead of once per term.
     warned_missing_postings: AtomicBool,
 
-    /// Whether the segment is loaded.
-    loaded: AtomicBool,
-
-    /// What the segment holds, resolved once per reader (Issue #1211) — see
-    /// [`Self::membership`]. A reader describes one snapshot, whose segment
-    /// files never change, so the answer cannot go stale.
-    membership: OnceLock<Membership>,
-
     /// The live document count, computed once per reader (Issue #1211) —
     /// see [`Self::doc_count`].
     live_doc_count: OnceLock<u64>,
 }
 
-impl SegmentReader {
-    /// Return a reference to the segment metadata.
-    ///
-    /// This is useful for callers that need to inspect segment boundaries
-    /// (e.g., `min_doc_id` / `max_doc_id`) without acquiring interior locks.
-    pub fn segment_info(&self) -> &SegmentInfo {
-        &self.info
-    }
-
-    /// Open a segment reader (schema-less mode).
-    ///
-    /// Readers that answer queries or feed a merge should chain
-    /// [`Self::with_analyzer`] with the index analyzer so the `.post`-less
-    /// scan fallback analyzes stored values like the writer did (Issue
-    /// #1196); without it the fallback uses `StandardAnalyzer`.
-    pub fn open(info: SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
+impl SegmentCore {
+    /// Open the core of the segment `info` describes. Reads nothing but the
+    /// compound container's part table; every part loads on first use.
+    fn open(info: &SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
         // Layout detection (#554): a `{segment_id}.cfs` container routes
         // every part read through a windowed facade; its absence means a
         // loose (pre-#554) segment and the storage is used as-is. Loose
@@ -577,54 +588,26 @@ impl SegmentReader {
             Some(facade) => Arc::clone(facade) as Arc<dyn Storage>,
             None => storage,
         };
-        // Unlike the other parts, `.delmap` is read here rather than on first
-        // use (Issue #1265). The deletion checks behind `doc_count` and
-        // `has_effective_deletions` cannot return an error, so a lazy load
-        // could only hide an unreadable bitmap as "no deletions"; reading it
-        // now fails the open instead. It also fixes the deletions for the
-        // reader's life, as a snapshot.
-        let deleted_docs = Self::load_deletion_bitmap(&info, storage.as_ref())?;
-        Ok(SegmentReader {
-            info,
+        Ok(SegmentCore {
+            key: SegmentKey::of(info),
             storage,
             compound,
             term_dictionary: RwLock::new(None),
             stored_documents: RwLock::new(None),
             norms: RwLock::new(None),
             doc_values: RwLock::new(None),
-            deleted_docs,
             bkd_trees: RwLock::new(AHashMap::new()),
-            // Disabled by default; query readers enable it (Issue #612).
-            posting_cache: PostingCache::new(0),
-            analyzer: None,
-            warned_missing_postings: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
             membership: OnceLock::new(),
-            live_doc_count: OnceLock::new(),
         })
     }
 
-    /// The numeric/geo field names this segment carries BKD trees for
-    /// (#554).
-    ///
-    /// Compound segments answer from the container table; loose segments
-    /// scan storage for `{segment_id}.{field}.bkd` files — the enumeration
-    /// the merge engine used to do against raw storage, which would find
-    /// nothing once the parts moved into a container and silently drop
-    /// every point at the first merge.
-    ///
-    /// # Returns
-    ///
-    /// The field names, in no particular order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if listing a loose segment's storage fails.
-    pub fn bkd_field_names(&self) -> Result<Vec<String>> {
+    /// See [`SegmentReader::bkd_field_names`].
+    fn bkd_field_names(&self) -> Result<Vec<String>> {
         if let Some(facade) = &self.compound {
             return Ok(facade.bkd_field_names());
         }
-        let prefix = format!("{}.", self.info.segment_id);
+        let prefix = format!("{}.", self.key.segment_id);
         Ok(self
             .storage
             .list_files()?
@@ -637,31 +620,9 @@ impl SegmentReader {
             .collect())
     }
 
-    /// Verify this segment's parts against their checksum footers, one
-    /// sequential pass per part (Issue #1214).
-    ///
-    /// `.post` and every `.bkd` are read by random access, so the checks
-    /// made while loading the other parts never reach them. A merge calls
-    /// this on each source before copying it, so that corruption is not
-    /// carried into the merged segment under a fresh, valid checksum.
-    ///
-    /// `strict` is for a segment this binary just wrote: it also covers
-    /// `.dict`, `.docs`, `.norms` and `.ids`, and refuses any part without a
-    /// footer. Otherwise a part with a legacy trailer passes only while the
-    /// rest of its segment has legacy trailers too — one binary writes all of
-    /// a segment's parts, so a footed part beside an unfooted one means that
-    /// part's footer was damaged.
-    ///
-    /// # Arguments
-    ///
-    /// * `strict` - Whether the segment was written with footers throughout.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LaurusError::Index`] naming the first part that fails, and
-    /// any error from reading the parts.
-    pub fn check_integrity(&self, strict: bool) -> Result<()> {
-        let segment_id = &self.info.segment_id;
+    /// See [`SegmentReader::check_integrity`].
+    fn check_integrity(&self, strict: bool) -> Result<()> {
+        let segment_id = &self.key.segment_id;
         let mut parts = vec![format!("{segment_id}.post")];
         parts.extend(
             self.bkd_field_names()?
@@ -702,6 +663,382 @@ impl SegmentReader {
         }
     }
 
+    /// Load the term dictionary, the stored documents and the doc values.
+    fn load(&self) -> Result<()> {
+        if self.loaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.load_term_dictionary()?;
+        self.load_stored_documents()?;
+        self.load_doc_values()?;
+        self.loaded.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Load the term dictionary for this segment.
+    fn load_term_dictionary(&self) -> Result<()> {
+        let dict_file = format!("{}.dict", self.key.segment_id);
+
+        if let Ok(input) = self.storage.open_input(&dict_file) {
+            let mut reader = StructReader::new(input)?;
+            // Bounded by the documents the segment holds, deleted ones
+            // included, as the posting decode is (Issue #1235). Not
+            // `SegmentReader::doc_count`, which is the live count.
+            let dictionary =
+                BlockTermDictionary::read_from_storage_for_segment(&mut reader, self.key.doc_count)
+                    .map_err(|e| {
+                        LaurusError::index(format!(
+                            "Failed to read term dictionary from {dict_file}: {e}"
+                        ))
+                    })?;
+            *self.term_dictionary.write().unwrap() = Some(Arc::new(dictionary));
+        }
+
+        Ok(())
+    }
+
+    /// This segment's term dictionary, loaded on first use (Issues #1420,
+    /// #1423). Once loaded, or once the segment has been loaded whole,
+    /// `.dict` is not read again.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the segment has no `.dict` or it could not be opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `.dict` opens but cannot be parsed.
+    fn loaded_term_dictionary(&self) -> Result<Option<Arc<BlockTermDictionary>>> {
+        self.ensure_term_dictionary()?;
+        Ok(self.term_dictionary.read().unwrap().clone())
+    }
+
+    /// Load the term dictionary unless it is loaded already, or the segment
+    /// has been loaded whole.
+    fn ensure_term_dictionary(&self) -> Result<()> {
+        if self.term_dictionary.read().unwrap().is_none() && !self.loaded.load(Ordering::Acquire) {
+            self.load_term_dictionary()?;
+        }
+        Ok(())
+    }
+
+    /// Load stored documents for this segment into the
+    /// `stored_documents` cache.
+    ///
+    /// Callers gate on the cache being `None`; after this returns the
+    /// cache is always `Some` (an empty map when the segment has no
+    /// stored-documents file), so misses stay O(1) instead of re-probing
+    /// storage on every lookup.
+    fn load_stored_documents(&self) -> Result<()> {
+        // Primary: typed, chunked, LZ4-compressed `.docs` (Issue #548), which
+        // records the real doc_id per document (correct for non-contiguous
+        // ids, e.g. merged segments). See
+        // `crate::lexical::index::structures::stored_fields` for the format.
+        let docs_file = format!("{}.docs", self.key.segment_id);
+        if let Ok(input) = self.storage.open_input(&docs_file) {
+            let mut reader = StructReader::new(input)?;
+            let documents =
+                crate::lexical::index::structures::stored_fields::StoredFieldsReader::load(
+                    &mut reader,
+                )?;
+            *self.stored_documents.write().unwrap() = Some(documents);
+            return Ok(());
+        }
+
+        // Legacy fallback: segments written before the binary `.docs` format
+        // stored fields as a positional JSON mirror (Issue #756 stopped writing
+        // it). Doc ids are assigned positionally — valid only for the
+        // contiguous ids those legacy segments used.
+        let json_file = format!("{}.json", self.key.segment_id);
+        if self.storage.file_exists(&json_file) {
+            let mut input = self.storage.open_input(&json_file)?;
+            let mut json_data = String::new();
+            std::io::Read::read_to_string(&mut input, &mut json_data)?;
+
+            let docs: Vec<Document> = serde_json::from_str(&json_data)
+                .map_err(|e| LaurusError::index(format!("Failed to parse JSON documents: {e}")))?;
+
+            let mut documents = BTreeMap::new();
+            for (idx, doc) in docs.into_iter().enumerate() {
+                let doc_id = self.key.min_doc_id + idx as u64;
+                documents.insert(doc_id, doc);
+            }
+
+            *self.stored_documents.write().unwrap() = Some(documents);
+        }
+
+        // No stored-documents file (or the primary `.docs` failed to
+        // open): cache an empty map so later lookups don't re-probe
+        // storage per call.
+        let mut docs = self.stored_documents.write().unwrap();
+        if docs.is_none() {
+            *docs = Some(BTreeMap::new());
+        }
+
+        Ok(())
+    }
+
+    /// Load the stored documents unless they are loaded already.
+    fn ensure_stored_documents(&self) -> Result<()> {
+        if self.stored_documents.read().unwrap().is_none() {
+            self.load_stored_documents()?;
+        }
+        Ok(())
+    }
+
+    /// Load DocValues for this segment.
+    fn load_doc_values(&self) -> Result<()> {
+        // Load DocValues file (required for field sorting)
+        let reader = DocValuesReader::load(self.storage.clone(), &self.key.segment_id)?;
+
+        let mut doc_values = self.doc_values.write().unwrap();
+        *doc_values = Some(Arc::new(reader));
+
+        Ok(())
+    }
+
+    /// See [`SegmentReader::membership`].
+    fn membership(&self) -> &Membership {
+        self.membership.get_or_init(|| {
+            let key = &self.key;
+            Membership::from_shape(key.min_doc_id, key.max_doc_id, key.doc_count)
+                .unwrap_or_else(|| {
+                    Membership::from_loaded(
+                        &key.segment_id,
+                        key.min_doc_id,
+                        key.max_doc_id,
+                        key.doc_count,
+                        crate::lexical::index::structures::doc_id_set::load_doc_ids_from_segment_storage(
+                            self.storage.as_ref(),
+                            &key.segment_id,
+                        ),
+                    )
+                })
+        })
+    }
+
+    /// Load this segment's field-length/statistics source (#555 Phase 4):
+    /// `.norms` if present, otherwise the pre-#555 `.lens`/`.fstats` pair
+    /// via the legacy path (empty maps if neither exists -- a segment with
+    /// no indexed fields, or one predating field-length tracking
+    /// altogether). Returns the source it stored.
+    fn load_norms(&self) -> Result<Arc<SegmentNorms>> {
+        if let Some(reader) = crate::lexical::index::structures::norms::NormsReader::load(
+            self.storage.as_ref(),
+            &self.key.segment_id,
+        )? {
+            return Ok(self.store_norms(SegmentNorms::V1(reader)));
+        }
+
+        let lens_file = format!("{}.lens", self.key.segment_id);
+        let lengths = if self.storage.file_exists(&lens_file) {
+            let lens_input = self.storage.open_input(&lens_file)?;
+            let mut lens_reader = StructReader::new(lens_input)?;
+
+            let doc_count = lens_reader.read_varint()? as usize;
+            let mut all_field_lengths = BTreeMap::new();
+            for _ in 0..doc_count {
+                let doc_id = lens_reader.read_u64()?;
+                let field_count = lens_reader.read_varint()? as usize;
+
+                let mut field_lens = AHashMap::new();
+                for _ in 0..field_count {
+                    let field_name = lens_reader.read_string()?;
+                    let length = lens_reader.read_u32()?;
+                    field_lens.insert(field_name, length);
+                }
+                all_field_lengths.insert(doc_id, field_lens);
+            }
+            all_field_lengths
+        } else {
+            BTreeMap::new()
+        };
+
+        let fstats_file = format!("{}.fstats", self.key.segment_id);
+        let stats = if self.storage.file_exists(&fstats_file) {
+            let fstats_input = self.storage.open_input(&fstats_file)?;
+            let mut fstats_reader = StructReader::new(fstats_input)?;
+
+            let field_count = fstats_reader.read_varint()? as usize;
+            let mut all_field_stats = AHashMap::new();
+            for _ in 0..field_count {
+                let field_name = fstats_reader.read_string()?;
+                let doc_count = fstats_reader.read_u64()?;
+                let avg_length = fstats_reader.read_f64()?;
+                let min_length = fstats_reader.read_u64()?;
+                let max_length = fstats_reader.read_u64()?;
+
+                all_field_stats.insert(
+                    field_name.clone(),
+                    crate::lexical::reader::FieldStats {
+                        field: field_name,
+                        unique_terms: 0, // Not stored, not needed for BM25
+                        total_terms: 0,  // Not stored, not needed for BM25
+                        doc_count,
+                        avg_length,
+                        min_length,
+                        max_length,
+                    },
+                );
+            }
+            all_field_stats
+        } else {
+            AHashMap::new()
+        };
+
+        Ok(self.store_norms(SegmentNorms::Legacy { lengths, stats }))
+    }
+
+    fn store_norms(&self, norms: SegmentNorms) -> Arc<SegmentNorms> {
+        let norms = Arc::new(norms);
+        *self.norms.write().unwrap() = Some(Arc::clone(&norms));
+        norms
+    }
+
+    /// This segment's field-length source, loaded on first use.
+    fn norms(&self) -> Result<Arc<SegmentNorms>> {
+        if let Some(norms) = self.norms.read().unwrap().as_ref() {
+            return Ok(Arc::clone(norms));
+        }
+        self.load_norms()
+    }
+
+    /// See [`SegmentReader::stored_doc_count`].
+    fn stored_doc_count(&self) -> Result<Option<u64>> {
+        let docs_file = format!("{}.docs", self.key.segment_id);
+        if !self.storage.file_exists(&docs_file) {
+            return Ok(None);
+        }
+        let input = self.storage.open_input(&docs_file)?;
+        let mut reader = StructReader::new(input)?;
+        Ok(Some(
+            crate::lexical::index::structures::stored_fields::StoredFieldsReader::read_doc_count(
+                &mut reader,
+            )?,
+        ))
+    }
+
+    /// See [`SegmentReader::get_bkd_tree`].
+    fn get_bkd_tree(&self, field: &str) -> Result<Option<Arc<dyn BKDTree>>> {
+        // Check cache
+        if let Some(tree) = self.bkd_trees.read().unwrap().get(field) {
+            return Ok(Some(tree.clone()));
+        }
+
+        // Try to open file
+        let bkd_file = format!("{}.{}.bkd", self.key.segment_id, field);
+        if self.storage.file_exists(&bkd_file) {
+            let reader = BKDReader::open(self.storage.clone(), &bkd_file)?;
+            let tree: Arc<dyn BKDTree> = Arc::new(reader);
+
+            // Update cache
+            self.bkd_trees
+                .write()
+                .unwrap()
+                .insert(field.to_string(), tree.clone());
+
+            return Ok(Some(tree));
+        }
+
+        Ok(None)
+    }
+}
+
+impl SegmentReader {
+    /// Return a reference to the segment metadata.
+    ///
+    /// This is useful for callers that need to inspect segment boundaries
+    /// (e.g., `min_doc_id` / `max_doc_id`) without acquiring interior locks.
+    pub fn segment_info(&self) -> &SegmentInfo {
+        &self.info
+    }
+
+    /// Open a segment reader (schema-less mode).
+    ///
+    /// Readers that answer queries or feed a merge should chain
+    /// [`Self::with_analyzer`] with the index analyzer so the `.post`-less
+    /// scan fallback analyzes stored values like the writer did (Issue
+    /// #1196); without it the fallback uses `StandardAnalyzer`.
+    pub fn open(info: SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
+        let core = Arc::new(SegmentCore::open(&info, storage)?);
+        Self::over_core(info, core)
+    }
+
+    /// A reader of the segment `info` describes over `core`, which must be
+    /// the same segment's: `info` brings the snapshot's deletions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment's `.delmap` exists but cannot be read
+    /// or is corrupted.
+    fn over_core(info: SegmentInfo, core: Arc<SegmentCore>) -> Result<Self> {
+        debug_assert_eq!(core.key, SegmentKey::of(&info));
+        // Unlike the other parts, `.delmap` is read here rather than on first
+        // use (Issue #1265). The deletion checks behind `doc_count` and
+        // `has_effective_deletions` cannot return an error, so a lazy load
+        // could only hide an unreadable bitmap as "no deletions"; reading it
+        // now fails the open instead. It also fixes the deletions for the
+        // reader's life, as a snapshot.
+        let deleted_docs = Self::load_deletion_bitmap(&info, core.storage.as_ref())?;
+        Ok(SegmentReader {
+            info,
+            core,
+            deleted_docs,
+            // Disabled by default; query readers enable it (Issue #612).
+            posting_cache: PostingCache::new(0),
+            analyzer: None,
+            warned_missing_postings: AtomicBool::new(false),
+            live_doc_count: OnceLock::new(),
+        })
+    }
+
+    /// The numeric/geo field names this segment carries BKD trees for
+    /// (#554).
+    ///
+    /// Compound segments answer from the container table; loose segments
+    /// scan storage for `{segment_id}.{field}.bkd` files — the enumeration
+    /// the merge engine used to do against raw storage, which would find
+    /// nothing once the parts moved into a container and silently drop
+    /// every point at the first merge.
+    ///
+    /// # Returns
+    ///
+    /// The field names, in no particular order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing a loose segment's storage fails.
+    pub fn bkd_field_names(&self) -> Result<Vec<String>> {
+        self.core.bkd_field_names()
+    }
+
+    /// Verify this segment's parts against their checksum footers, one
+    /// sequential pass per part (Issue #1214).
+    ///
+    /// `.post` and every `.bkd` are read by random access, so the checks
+    /// made while loading the other parts never reach them. A merge calls
+    /// this on each source before copying it, so that corruption is not
+    /// carried into the merged segment under a fresh, valid checksum.
+    ///
+    /// `strict` is for a segment this binary just wrote: it also covers
+    /// `.dict`, `.docs`, `.norms` and `.ids`, and refuses any part without a
+    /// footer. Otherwise a part with a legacy trailer passes only while the
+    /// rest of its segment has legacy trailers too — one binary writes all of
+    /// a segment's parts, so a footed part beside an unfooted one means that
+    /// part's footer was damaged.
+    ///
+    /// # Arguments
+    ///
+    /// * `strict` - Whether the segment was written with footers throughout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::Index`] naming the first part that fails, and
+    /// any error from reading the parts.
+    pub fn check_integrity(&self, strict: bool) -> Result<()> {
+        self.core.check_integrity(strict)
+    }
+
     /// Enable (or resize) this segment's decoded posting-list cache with a byte
     /// budget (Issue #612). `0` keeps it disabled. Returns `self` for chaining
     /// after [`Self::open`].
@@ -731,12 +1068,12 @@ impl SegmentReader {
         self.warned_missing_postings.load(Ordering::Relaxed)
     }
 
-    /// Replace this reader's term dictionary (test hook for dictionaries the
-    /// segment load would refuse, Issue #1235). A later load from storage
-    /// overwrites it, so the segment should have no `.dict` part.
+    /// Replace the segment's term dictionary (test hook for dictionaries the
+    /// segment load would refuse, Issue #1235). It is the core's, so every
+    /// reader sharing the core sees it, and nothing reads `.dict` over it.
     #[cfg(test)]
     pub(crate) fn set_term_dictionary(&self, dictionary: Arc<BlockTermDictionary>) {
-        *self.term_dictionary.write().unwrap() = Some(dictionary);
+        *self.core.term_dictionary.write().unwrap() = Some(dictionary);
     }
 
     /// Snapshot of this segment's posting-cache hit / miss counters (Issue #612).
@@ -746,12 +1083,10 @@ impl SegmentReader {
         self.posting_cache.stats()
     }
 
-    /// Get all document IDs in this segment.
+    /// Get all document IDs in this segment, deleted ones included.
     pub fn doc_ids(&self) -> Result<Vec<u64>> {
-        if self.stored_documents.read().unwrap().is_none() {
-            self.load_stored_documents()?;
-        }
-        let docs = self.stored_documents.read().unwrap();
+        self.core.ensure_stored_documents()?;
+        let docs = self.core.stored_documents.read().unwrap();
         if let Some(ref documents) = *docs {
             Ok(documents.keys().cloned().collect())
         } else {
@@ -772,116 +1107,10 @@ impl SegmentReader {
         Self::open(info, storage)
     }
 
-    /// Load the segment data.
+    /// Load the segment data: the term dictionary, the stored documents and
+    /// the doc values. The deletion bitmap is already loaded by `open`.
     pub fn load(&mut self) -> Result<()> {
-        if self.loaded.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        // Load term dictionary
-        self.load_term_dictionary()?;
-
-        // Load stored documents
-        self.load_stored_documents()?;
-
-        // Load DocValues
-        self.load_doc_values()?;
-
-        // The deletion bitmap is already loaded by `open`.
-
-        self.loaded.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// Load the term dictionary for this segment.
-    fn load_term_dictionary(&self) -> Result<()> {
-        let dict_file = format!("{}.dict", self.info.segment_id);
-
-        if let Ok(input) = self.storage.open_input(&dict_file) {
-            let mut reader = StructReader::new(input)?;
-            // Bounded by the documents the segment holds, deleted ones
-            // included, as the posting decode is (Issue #1235). Not
-            // `self.doc_count()`, which is the live count.
-            let dictionary = BlockTermDictionary::read_from_storage_for_segment(
-                &mut reader,
-                self.info.doc_count,
-            )
-            .map_err(|e| {
-                LaurusError::index(format!(
-                    "Failed to read term dictionary from {dict_file}: {e}"
-                ))
-            })?;
-            *self.term_dictionary.write().unwrap() = Some(Arc::new(dictionary));
-        }
-
-        Ok(())
-    }
-
-    /// Load stored documents for this segment into the
-    /// `stored_documents` cache.
-    ///
-    /// Callers gate on the cache being `None`; after this returns the
-    /// cache is always `Some` (an empty map when the segment has no
-    /// stored-documents file), so misses stay O(1) instead of re-probing
-    /// storage on every lookup.
-    fn load_stored_documents(&self) -> Result<()> {
-        // Primary: typed, chunked, LZ4-compressed `.docs` (Issue #548), which
-        // records the real doc_id per document (correct for non-contiguous
-        // ids, e.g. merged segments). See
-        // `crate::lexical::index::structures::stored_fields` for the format.
-        let docs_file = format!("{}.docs", self.info.segment_id);
-        if let Ok(input) = self.storage.open_input(&docs_file) {
-            let mut reader = StructReader::new(input)?;
-            let documents =
-                crate::lexical::index::structures::stored_fields::StoredFieldsReader::load(
-                    &mut reader,
-                )?;
-            *self.stored_documents.write().unwrap() = Some(documents);
-            return Ok(());
-        }
-
-        // Legacy fallback: segments written before the binary `.docs` format
-        // stored fields as a positional JSON mirror (Issue #756 stopped writing
-        // it). Doc ids are assigned positionally — valid only for the
-        // contiguous ids those legacy segments used.
-        let json_file = format!("{}.json", self.info.segment_id);
-        if self.storage.file_exists(&json_file) {
-            let mut input = self.storage.open_input(&json_file)?;
-            let mut json_data = String::new();
-            std::io::Read::read_to_string(&mut input, &mut json_data)?;
-
-            let docs: Vec<Document> = serde_json::from_str(&json_data)
-                .map_err(|e| LaurusError::index(format!("Failed to parse JSON documents: {e}")))?;
-
-            let mut documents = BTreeMap::new();
-            for (idx, doc) in docs.into_iter().enumerate() {
-                let doc_id = self.info.min_doc_id + idx as u64;
-                documents.insert(doc_id, doc);
-            }
-
-            *self.stored_documents.write().unwrap() = Some(documents);
-        }
-
-        // No stored-documents file (or the primary `.docs` failed to
-        // open): cache an empty map so later lookups don't re-probe
-        // storage per call.
-        let mut docs = self.stored_documents.write().unwrap();
-        if docs.is_none() {
-            *docs = Some(BTreeMap::new());
-        }
-
-        Ok(())
-    }
-
-    /// Load DocValues for this segment.
-    fn load_doc_values(&self) -> Result<()> {
-        // Load DocValues file (required for field sorting)
-        let reader = DocValuesReader::load(self.storage.clone(), &self.info.segment_id)?;
-
-        let mut doc_values = self.doc_values.write().unwrap();
-        *doc_values = Some(Arc::new(reader));
-
-        Ok(())
+        self.core.load()
     }
 
     /// Read the segment's deletion bitmap as its deleted documents, for
@@ -929,7 +1158,7 @@ impl SegmentReader {
         self.deleted_docs.clone()
     }
 
-    /// What this segment holds (Issue #1211), resolved once per reader.
+    /// What this segment holds (Issue #1211), resolved once for the segment.
     ///
     /// Most segments answer without I/O: an empty one holds nothing and one
     /// without gaps holds its whole range. Only a segment with gaps reads its
@@ -938,22 +1167,7 @@ impl SegmentReader {
     /// windows the part without copying the container). A set that
     /// disagrees with the segment's recorded count and range is not trusted.
     pub(crate) fn membership(&self) -> &Membership {
-        self.membership.get_or_init(|| {
-            let info = &self.info;
-            Membership::from_shape(info.min_doc_id, info.max_doc_id, info.doc_count)
-                .unwrap_or_else(|| {
-                    Membership::from_loaded(
-                        &info.segment_id,
-                        info.min_doc_id,
-                        info.max_doc_id,
-                        info.doc_count,
-                        crate::lexical::index::structures::doc_id_set::load_doc_ids_from_segment_storage(
-                            self.storage.as_ref(),
-                            &info.segment_id,
-                        ),
-                    )
-                })
-        })
+        self.core.membership()
     }
 
     /// Whether any document this segment holds is deleted (Issue #1211).
@@ -1078,11 +1292,11 @@ impl SegmentReader {
         // so gating on it re-parsed the whole `.dv` file per call —
         // #943, same class as #995). A missing `.dv` file loads as an
         // empty reader, so misses stay O(1).
-        if self.doc_values.read().unwrap().is_none() {
-            self.load_doc_values()?;
+        if self.core.doc_values.read().unwrap().is_none() {
+            self.core.load_doc_values()?;
         }
 
-        let doc_values = self.doc_values.read().unwrap();
+        let doc_values = self.core.doc_values.read().unwrap();
         if let Some(reader) = doc_values.as_ref() {
             reader.get_value(field, doc_id)
         } else {
@@ -1095,10 +1309,10 @@ impl SegmentReader {
         // Load on demand so availability is answered correctly even as
         // the first operation on a fresh reader (#943); previously this
         // reported `false` until something else loaded the cache.
-        if self.doc_values.read().unwrap().is_none() && self.load_doc_values().is_err() {
+        if self.core.doc_values.read().unwrap().is_none() && self.core.load_doc_values().is_err() {
             return false;
         }
-        let doc_values = self.doc_values.read().unwrap();
+        let doc_values = self.core.doc_values.read().unwrap();
         if let Some(reader) = doc_values.as_ref() {
             reader.has_field(field)
         } else {
@@ -1106,98 +1320,17 @@ impl SegmentReader {
         }
     }
 
-    /// Load this segment's field-length/statistics source (#555 Phase 4):
-    /// `.norms` if present, otherwise the pre-#555 `.lens`/`.fstats` pair
-    /// via the legacy path (empty maps if neither exists -- a segment with
-    /// no indexed fields, or one predating field-length tracking
-    /// altogether). Returns the source it stored.
-    fn load_norms(&self) -> Result<Arc<SegmentNorms>> {
-        if let Some(reader) = crate::lexical::index::structures::norms::NormsReader::load(
-            self.storage.as_ref(),
-            &self.info.segment_id,
-        )? {
-            return Ok(self.store_norms(SegmentNorms::V1(reader)));
-        }
-
-        let lens_file = format!("{}.lens", self.info.segment_id);
-        let lengths = if self.storage.file_exists(&lens_file) {
-            let lens_input = self.storage.open_input(&lens_file)?;
-            let mut lens_reader = StructReader::new(lens_input)?;
-
-            let doc_count = lens_reader.read_varint()? as usize;
-            let mut all_field_lengths = BTreeMap::new();
-            for _ in 0..doc_count {
-                let doc_id = lens_reader.read_u64()?;
-                let field_count = lens_reader.read_varint()? as usize;
-
-                let mut field_lens = AHashMap::new();
-                for _ in 0..field_count {
-                    let field_name = lens_reader.read_string()?;
-                    let length = lens_reader.read_u32()?;
-                    field_lens.insert(field_name, length);
-                }
-                all_field_lengths.insert(doc_id, field_lens);
-            }
-            all_field_lengths
-        } else {
-            BTreeMap::new()
-        };
-
-        let fstats_file = format!("{}.fstats", self.info.segment_id);
-        let stats = if self.storage.file_exists(&fstats_file) {
-            let fstats_input = self.storage.open_input(&fstats_file)?;
-            let mut fstats_reader = StructReader::new(fstats_input)?;
-
-            let field_count = fstats_reader.read_varint()? as usize;
-            let mut all_field_stats = AHashMap::new();
-            for _ in 0..field_count {
-                let field_name = fstats_reader.read_string()?;
-                let doc_count = fstats_reader.read_u64()?;
-                let avg_length = fstats_reader.read_f64()?;
-                let min_length = fstats_reader.read_u64()?;
-                let max_length = fstats_reader.read_u64()?;
-
-                all_field_stats.insert(
-                    field_name.clone(),
-                    crate::lexical::reader::FieldStats {
-                        field: field_name,
-                        unique_terms: 0, // Not stored, not needed for BM25
-                        total_terms: 0,  // Not stored, not needed for BM25
-                        doc_count,
-                        avg_length,
-                        min_length,
-                        max_length,
-                    },
-                );
-            }
-            all_field_stats
-        } else {
-            AHashMap::new()
-        };
-
-        Ok(self.store_norms(SegmentNorms::Legacy { lengths, stats }))
-    }
-
-    fn store_norms(&self, norms: SegmentNorms) -> Arc<SegmentNorms> {
-        let norms = Arc::new(norms);
-        *self.norms.write().unwrap() = Some(Arc::clone(&norms));
-        norms
-    }
-
     /// This segment's field-length source, loaded on first use.
     fn norms(&self) -> Result<Arc<SegmentNorms>> {
-        if let Some(norms) = self.norms.read().unwrap().as_ref() {
-            return Ok(Arc::clone(norms));
-        }
-        self.load_norms()
+        self.core.norms()
     }
 
     /// Get field statistics for a specific field.
     pub fn field_stats(&self, field: &str) -> Result<Option<FieldStats>> {
-        if self.norms.read().unwrap().is_none() {
-            self.load_norms()?;
+        if self.core.norms.read().unwrap().is_none() {
+            self.core.load_norms()?;
         }
-        let norms = self.norms.read().unwrap();
+        let norms = self.core.norms.read().unwrap();
         Ok(norms.as_ref().and_then(|n| n.field_stats(field)))
     }
 
@@ -1223,15 +1356,15 @@ impl SegmentReader {
         }
 
         // Fast path: try to read with a single lock acquisition.
-        let norms = self.norms.read().unwrap();
+        let norms = self.core.norms.read().unwrap();
         if let Some(n) = norms.as_ref() {
             return Ok(n.field_length(doc_id, field));
         }
         drop(norms);
 
         // Cold path: load (one-time), then retry.
-        self.load_norms()?;
-        let norms = self.norms.read().unwrap();
+        self.core.load_norms()?;
+        let norms = self.core.norms.read().unwrap();
         Ok(norms.as_ref().and_then(|n| n.field_length(doc_id, field)))
     }
 
@@ -1243,10 +1376,10 @@ impl SegmentReader {
     /// and so would otherwise be invisible to a `field_terms`-keyed
     /// enumeration.
     pub(crate) fn norms_field_names(&self) -> Result<Vec<String>> {
-        if self.norms.read().unwrap().is_none() {
-            self.load_norms()?;
+        if self.core.norms.read().unwrap().is_none() {
+            self.core.load_norms()?;
         }
-        let norms = self.norms.read().unwrap();
+        let norms = self.core.norms.read().unwrap();
         Ok(norms.as_ref().map(|n| n.field_names()).unwrap_or_default())
     }
 
@@ -1255,15 +1388,15 @@ impl SegmentReader {
         // Load once, on demand; the cache itself is the load gate (the
         // `loaded` flag is only set by the optional bulk `load()` path,
         // so gating on it re-decoded the whole segment per call — #994).
-        if self.stored_documents.read().unwrap().is_none() {
-            self.load_stored_documents()?;
+        if self.core.stored_documents.read().unwrap().is_none() {
+            self.core.load_stored_documents()?;
         }
 
         if self.is_deleted(doc_id)? {
             return Ok(None);
         }
 
-        let docs = self.stored_documents.read().unwrap();
+        let docs = self.core.stored_documents.read().unwrap();
         if let Some(ref documents) = *docs {
             Ok(documents.get(&doc_id).cloned())
         } else {
@@ -1285,15 +1418,15 @@ impl SegmentReader {
         doc_id: u64,
         field_names: &[&str],
     ) -> Result<Option<std::collections::HashMap<String, crate::data::DataValue>>> {
-        if self.stored_documents.read().unwrap().is_none() {
-            self.load_stored_documents()?;
+        if self.core.stored_documents.read().unwrap().is_none() {
+            self.core.load_stored_documents()?;
         }
 
         if self.is_deleted(doc_id)? {
             return Ok(None);
         }
 
-        let docs = self.stored_documents.read().unwrap();
+        let docs = self.core.stored_documents.read().unwrap();
         if let Some(ref documents) = *docs
             && let Some(doc) = documents.get(&doc_id)
         {
@@ -1308,19 +1441,9 @@ impl SegmentReader {
         Ok(None)
     }
 
-    /// Load the term dictionary on first use. Once loaded, or once the
-    /// segment has been loaded whole, `.dict` is not read again.
-    fn ensure_term_dictionary(&self) -> Result<()> {
-        if self.term_dictionary.read().unwrap().is_none() && !self.loaded.load(Ordering::Acquire) {
-            self.load_term_dictionary()?;
-        }
-        Ok(())
-    }
-
-    /// This segment's term dictionary, loaded on first use (Issue #1420).
-    ///
-    /// Unlike [`Self::term_dictionary`], which reads `.dict` again on every
-    /// call, a dictionary already loaded is returned as is.
+    /// This segment's term dictionary, loaded on first use (Issues #1420,
+    /// #1423): once loaded, or once the segment has been loaded whole,
+    /// `.dict` is not read again.
     ///
     /// # Returns
     ///
@@ -1330,15 +1453,14 @@ impl SegmentReader {
     ///
     /// Returns an error if `.dict` opens but cannot be parsed.
     fn loaded_term_dictionary(&self) -> Result<Option<Arc<BlockTermDictionary>>> {
-        self.ensure_term_dictionary()?;
-        Ok(self.term_dictionary.read().unwrap().clone())
+        self.core.loaded_term_dictionary()
     }
 
     /// Get term information for a field and term.
     pub fn term_info(&self, field: &str, term: &str) -> Result<Option<TermInfo>> {
-        self.ensure_term_dictionary()?;
+        self.core.ensure_term_dictionary()?;
 
-        if let Some(ref dict) = *self.term_dictionary.read().unwrap() {
+        if let Some(ref dict) = *self.core.term_dictionary.read().unwrap() {
             let full_term = format!("{field}:{term}");
             Ok(dict.get(&full_term).cloned())
         } else {
@@ -1346,16 +1468,19 @@ impl SegmentReader {
         }
     }
 
-    /// Get posting list for a field and term.
     /// Return this segment's term dictionary, loading it on demand.
     ///
     /// Exposes the dictionary so the segment merge (Issue #753) can enumerate
     /// every `"field:term"` key (via [`BlockTermDictionary::iter`]) and re-read
     /// each term's postings through [`Self::postings`] without re-tokenizing.
-    /// Returns `None` when the segment has no on-disk term dictionary.
+    /// Returns `None` when the segment has no on-disk term dictionary. A
+    /// dictionary already loaded is returned as is (Issue #1423).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `.dict` opens but cannot be parsed.
     pub fn term_dictionary(&self) -> Result<Option<Arc<BlockTermDictionary>>> {
-        self.load_term_dictionary()?;
-        Ok(self.term_dictionary.read().unwrap().clone())
+        self.loaded_term_dictionary()
     }
 
     /// The number of documents this segment's stored-fields part declares,
@@ -1372,17 +1497,7 @@ impl SegmentReader {
     /// Returns an error if the part exists but cannot be opened or its
     /// header is not a supported stored-fields header.
     pub fn stored_doc_count(&self) -> Result<Option<u64>> {
-        let docs_file = format!("{}.docs", self.info.segment_id);
-        if !self.storage.file_exists(&docs_file) {
-            return Ok(None);
-        }
-        let input = self.storage.open_input(&docs_file)?;
-        let mut reader = StructReader::new(input)?;
-        Ok(Some(
-            crate::lexical::index::structures::stored_fields::StoredFieldsReader::read_doc_count(
-                &mut reader,
-            )?,
-        ))
+        self.core.stored_doc_count()
     }
 
     /// Whether this segment has an on-disk term dictionary (Issue #1196).
@@ -1392,18 +1507,21 @@ impl SegmentReader {
     /// reader containing such a segment cannot treat `term_info` as the
     /// authority on which terms exist — see
     /// [`InvertedIndexReader::term_info_is_authoritative`]. A dictionary that
-    /// fails to load counts as absent.
+    /// fails to load counts as absent. Asking does not read `.dict` again
+    /// once it is loaded (Issue #1423).
     pub fn has_term_dictionary(&self) -> bool {
-        self.term_dictionary()
+        self.loaded_term_dictionary()
             .map(|dict| dict.is_some())
             .unwrap_or(false)
     }
 
+    /// Get the posting list for a field and term, with this reader's
+    /// deletions applied.
     pub fn postings(&self, field: &str, term: &str) -> Result<Option<Box<dyn PostingIterator>>> {
         // Load postings from storage
         let postings_file = format!("{}.post", self.info.segment_id);
 
-        if !self.storage.file_exists(&postings_file) {
+        if !self.core.storage.file_exists(&postings_file) {
             // No postings part: answer from the stored documents. Warn once
             // per reader instance (a reader is rebuilt on every commit, so a
             // damaged segment keeps reminding without flooding per term).
@@ -1438,7 +1556,7 @@ impl SegmentReader {
         }
 
         if let Some(term_info) = self.term_info(field, term)? {
-            let input = self.storage.open_input(&postings_file)?;
+            let input = self.core.storage.open_input(&postings_file)?;
             let mut reader = StructReader::new(input)?;
 
             // Seek directly to the posting position
@@ -1459,6 +1577,7 @@ impl SegmentReader {
             // which reads the added header byte as the next field and
             // corrupts the list silently instead of failing.
             let posting_format = self
+                .core
                 .term_dictionary
                 .read()
                 .unwrap()
@@ -1659,12 +1778,12 @@ impl SegmentReader {
         term: &str,
     ) -> Result<Option<Box<dyn PostingIterator>>> {
         // Ensure documents are loaded
-        if !self.loaded.load(Ordering::Acquire) {
+        if !self.core.loaded.load(Ordering::Acquire) {
             // Load documents on-demand
-            self.load_stored_documents()?;
+            self.core.load_stored_documents()?;
         }
 
-        let docs = self.stored_documents.read().unwrap();
+        let docs = self.core.stored_documents.read().unwrap();
 
         if let Some(ref documents) = *docs {
             let mut postings = Vec::new();
@@ -1750,27 +1869,7 @@ impl SegmentReader {
 
     /// Get BKD Tree for a field, loading it if necessary.
     pub fn get_bkd_tree(&self, field: &str) -> Result<Option<Arc<dyn BKDTree>>> {
-        // Check cache
-        if let Some(tree) = self.bkd_trees.read().unwrap().get(field) {
-            return Ok(Some(tree.clone()));
-        }
-
-        // Try to open file
-        let bkd_file = format!("{}.{}.bkd", self.info.segment_id, field);
-        if self.storage.file_exists(&bkd_file) {
-            let reader = BKDReader::open(self.storage.clone(), &bkd_file)?;
-            let tree: Arc<dyn BKDTree> = Arc::new(reader);
-
-            // Update cache
-            self.bkd_trees
-                .write()
-                .unwrap()
-                .insert(field.to_string(), tree.clone());
-
-            return Ok(Some(tree));
-        }
-
-        Ok(None)
+        self.core.get_bkd_tree(field)
     }
 
     /// Return this segment's BKD tree wrapped in a deletion filter that
@@ -2980,11 +3079,7 @@ impl TermDictionaryAccess for InvertedIndexReader {
         // Collect term dictionaries from ALL segments and merge them.
         let mut dicts = Vec::new();
         for seg_lock in &self.segment_readers {
-            let seg = seg_lock.read().unwrap();
-            if seg.term_dictionary.read().unwrap().is_none() {
-                seg.load_term_dictionary()?;
-            }
-            if let Some(dict) = seg.term_dictionary.read().unwrap().clone() {
+            if let Some(dict) = seg_lock.read().unwrap().loaded_term_dictionary()? {
                 dicts.push(dict);
             }
         }
@@ -3774,6 +3869,52 @@ mod tests {
         assert!(inverted.term_info_is_authoritative());
     }
 
+    /// Fetching a segment's dictionary, asking whether it has one, settling
+    /// term-info authority and enumerating terms all use the dictionary
+    /// loaded first (Issue #1423). `term_dictionary` and
+    /// `has_term_dictionary` used to read `.dict` again on every call, so a
+    /// reader settling authority parsed every segment's dictionary anew.
+    #[test]
+    fn the_term_dictionary_is_read_once() {
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::{InvertedIndex, InvertedIndexConfig};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document(crate::Document::builder().add_text("body", "alpha").build())
+            .unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let dictionary = || {
+            inverted.segment_readers()[0]
+                .read()
+                .unwrap()
+                .term_dictionary()
+                .unwrap()
+                .unwrap()
+        };
+
+        let first = dictionary();
+        assert!(Arc::ptr_eq(&first, &dictionary()));
+        assert!(
+            inverted.segment_readers()[0]
+                .read()
+                .unwrap()
+                .has_term_dictionary()
+        );
+        assert!(inverted.term_info_is_authoritative());
+        assert!(inverted.terms("body").unwrap().is_some());
+        assert!(Arc::ptr_eq(&first, &dictionary()));
+    }
+
     #[test]
     fn reader_with_a_dictionary_less_segment_is_not_authoritative() {
         use crate::lexical::query::term::TermQuery;
@@ -4290,7 +4431,7 @@ mod tests {
             ..info
         };
         let segment = SegmentReader::open(understated, storage).unwrap();
-        *segment.term_dictionary.write().unwrap() = Some(dictionary);
+        segment.set_term_dictionary(dictionary);
         match segment.postings("body", "alpha") {
             Err(LaurusError::Index(msg)) => {
                 assert!(
@@ -4398,7 +4539,7 @@ mod tests {
         );
         let dict = Arc::new(builder.build().unwrap());
         for segment in inverted.segment_readers() {
-            *segment.read().unwrap().term_dictionary.write().unwrap() = Some(dict.clone());
+            segment.read().unwrap().set_term_dictionary(dict.clone());
         }
 
         let info = inverted.term_info("body", "alpha").unwrap().unwrap();
@@ -4491,7 +4632,7 @@ mod tests {
         dictionary: Arc<BlockTermDictionary>,
     ) -> SegmentReader {
         let segment = SegmentReader::open(info, storage.clone()).unwrap();
-        *segment.term_dictionary.write().unwrap() = Some(dictionary);
+        segment.set_term_dictionary(dictionary);
         segment
     }
 

@@ -51,6 +51,35 @@ pub struct SegmentInfo {
     pub shard_id: u16,
 }
 
+/// What identifies a segment's contents (Issue #1420): its files never
+/// change once written, and a name alone could in principle be reused.
+///
+/// Its deletions are not part of it: the `.delmap` is rewritten in place
+/// whenever the segment gains deletions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SegmentKey {
+    /// The segment's identifier.
+    pub(crate) segment_id: String,
+    /// The lowest document id the segment's range covers.
+    pub(crate) min_doc_id: u64,
+    /// The highest document id the segment's range covers.
+    pub(crate) max_doc_id: u64,
+    /// The number of documents the segment holds, deleted ones included.
+    pub(crate) doc_count: u64,
+}
+
+impl SegmentKey {
+    /// The key of the segment `info` describes.
+    pub(crate) fn of(info: &SegmentInfo) -> Self {
+        Self {
+            segment_id: info.segment_id.clone(),
+            min_doc_id: info.min_doc_id,
+            max_doc_id: info.max_doc_id,
+            doc_count: info.doc_count,
+        }
+    }
+}
+
 /// What a segment is known to hold (Issue #1211).
 ///
 /// Deletions and counts address global doc ids, and a segment's

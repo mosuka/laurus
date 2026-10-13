@@ -19,7 +19,7 @@ use ahash::{AHashSet, RandomState};
 use parking_lot::Mutex;
 
 use crate::error::Result;
-use crate::lexical::index::inverted::segment::SegmentInfo;
+use crate::lexical::index::inverted::segment::{SegmentInfo, SegmentKey};
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
 
 /// The field whose keys the filter holds: the engine's document id.
@@ -64,27 +64,6 @@ pub(crate) enum IdCheck {
     /// Some segment of the reader has no term dictionary, so the filter
     /// cannot cover it.
     Unavailable,
-}
-
-/// What identifies a segment's contents: its files never change once
-/// written, and a name alone could in principle be reused.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SegmentKey {
-    segment_id: String,
-    min_doc_id: u64,
-    max_doc_id: u64,
-    doc_count: u64,
-}
-
-impl SegmentKey {
-    fn of(info: &SegmentInfo) -> Self {
-        Self {
-            segment_id: info.segment_id.clone(),
-            min_doc_id: info.min_doc_id,
-            max_doc_id: info.max_doc_id,
-            doc_count: info.doc_count,
-        }
-    }
 }
 
 /// A Bloom filter whose keys each set [`BITS_SET_PER_KEY`] bits inside one
