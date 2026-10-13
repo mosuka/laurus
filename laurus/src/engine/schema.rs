@@ -794,15 +794,29 @@ fn classify_hnsw_specific(old: &HnswOption, new: &HnswOption) -> FieldChangeKind
 /// `classify_flat_specific`). The rebuild decodes what is stored, so it
 /// cannot restore precision a lossy kind (`Int8`, `Binary`) already
 /// dropped.
+///
+/// `pool_factor` (token pooling) is one-way: once a field pools, the
+/// original token vectors are gone (the WAL is truncated at commit and the
+/// document store never keeps them). Turning pooling on (`1` → `f`) is a
+/// Reindex — the stored vectors are still the original ones, and the
+/// rebuild's merge pools them exactly as ingest would have. Any other
+/// change of a factor already in use is Destructive.
 fn classify_multi_vector_specific(
     old: &MultiVectorOption,
     new: &MultiVectorOption,
 ) -> FieldChangeKind {
+    let mut kind = FieldChangeKind::MetadataOnly;
     if old.storage != new.storage {
-        FieldChangeKind::Reindex
-    } else {
-        FieldChangeKind::MetadataOnly
+        kind = kind.max(FieldChangeKind::Reindex);
     }
+    if old.pool_factor != new.pool_factor {
+        kind = kind.max(if old.pool_factor <= 1 {
+            FieldChangeKind::Reindex
+        } else {
+            FieldChangeKind::Destructive
+        });
+    }
+    kind
 }
 
 /// Classification for Flat-specific parameters. `base_weight` is
@@ -1923,6 +1937,54 @@ mod tests {
                 "multi_vector: storage change combined with a destructive dimension change stays destructive",
                 multi_vector(|o| o),
                 multi_vector(|o| o.dimension(96).storage(MultiVectorStorage::Int8)),
+                Destructive,
+            ),
+            (
+                "multi_vector: turning pooling on requires reindex (#1346)",
+                multi_vector(|o| o),
+                multi_vector(|o| o.pool_factor(4)),
+                Reindex,
+            ),
+            (
+                "multi_vector: changing a pool factor in use is destructive (#1346)",
+                multi_vector(|o| o.pool_factor(2)),
+                multi_vector(|o| o.pool_factor(4)),
+                Destructive,
+            ),
+            (
+                "multi_vector: lowering a pool factor is destructive (#1346)",
+                multi_vector(|o| o.pool_factor(4)),
+                multi_vector(|o| o.pool_factor(2)),
+                Destructive,
+            ),
+            (
+                "multi_vector: turning pooling off is destructive (#1346)",
+                multi_vector(|o| o.pool_factor(4)),
+                multi_vector(|o| o),
+                Destructive,
+            ),
+            (
+                "multi_vector: turning pooling on with a storage change requires reindex (#1346)",
+                multi_vector(|o| o),
+                multi_vector(|o| o.pool_factor(4).storage(MultiVectorStorage::Int8)),
+                Reindex,
+            ),
+            (
+                "multi_vector: a storage change under an unchanged pool factor requires reindex (#1346)",
+                multi_vector(|o| o.pool_factor(4)),
+                multi_vector(|o| o.pool_factor(4).storage(MultiVectorStorage::Int8)),
+                Reindex,
+            ),
+            (
+                "multi_vector: changing a pool factor with a storage change stays destructive (#1346)",
+                multi_vector(|o| o.pool_factor(2)),
+                multi_vector(|o| o.pool_factor(3).storage(MultiVectorStorage::F16)),
+                Destructive,
+            ),
+            (
+                "multi_vector: turning pooling on with a dimension change stays destructive (#1346)",
+                multi_vector(|o| o),
+                multi_vector(|o| o.pool_factor(4).dimension(96)),
                 Destructive,
             ),
             (

@@ -71,7 +71,7 @@ impl Vector {
     ///
     /// The L2 norm as an `f32` value.
     pub fn norm(&self) -> f32 {
-        self.data.iter().map(|x| x * x).sum::<f32>().sqrt()
+        l2_norm(&self.data)
     }
 
     /// Normalize this vector to unit length.
@@ -81,9 +81,8 @@ impl Vector {
     pub fn normalize(&mut self) {
         let norm = self.norm();
         if norm > 0.0 {
-            for value in Arc::make_mut(&mut self.data) {
-                *value /= norm;
-            }
+            let data: &mut Vec<f32> = Arc::make_mut(&mut self.data);
+            divide_by(data, norm);
         }
     }
 
@@ -243,5 +242,27 @@ impl From<Vector> for StoredVector {
         // Unwrap the Arc if we are the sole owner; otherwise clone the inner Vec.
         let data = Arc::try_unwrap(vector.data).unwrap_or_else(|arc| (*arc).clone());
         Self { data, weight: 1.0 }
+    }
+}
+
+/// L2 norm, accumulated in `f32` in element order.
+fn l2_norm(values: &[f32]) -> f32 {
+    values.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+fn divide_by(values: &mut [f32], norm: f32) {
+    for value in values {
+        *value /= norm;
+    }
+}
+
+/// L2-normalize `values` in place with exactly the arithmetic of
+/// [`Vector::normalize`], so a vector normalized on ingest and one
+/// re-normalized later (e.g. a pooled token vector, #1346) agree bit for
+/// bit. A zero vector is left as is.
+pub(crate) fn normalize_slice(values: &mut [f32]) {
+    let norm = l2_norm(values);
+    if norm > 0.0 {
+        divide_by(values, norm);
     }
 }

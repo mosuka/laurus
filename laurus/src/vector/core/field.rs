@@ -363,6 +363,19 @@ pub struct MultiVectorOption {
     /// reading old segments unchanged.
     #[serde(default)]
     pub storage: MultiVectorStorage,
+    /// Token-pooling factor (Issue #1346): at index time, every document's
+    /// token vectors after the first are clustered into about `1 /
+    /// pool_factor` as many and replaced by the cluster means (see
+    /// [`crate::vector::core::token_pooling`]). `1`, the default, stores
+    /// every token vector; `0` is rejected. Pooling cannot be undone:
+    /// turning it on for an existing field re-pools the stored vectors, but
+    /// changing or turning off a factor already in use discards the field's
+    /// data.
+    #[serde(
+        default = "default_pool_factor",
+        skip_serializing_if = "is_default_pool_factor"
+    )]
+    pub pool_factor: u32,
     /// Name of the schema embedder that turns text into this field's token
     /// vectors; it must be a token-level embedder such as `candle_colbert`
     /// (Issue #1349). `None` means documents supply the token vectors.
@@ -376,9 +389,20 @@ impl Default for MultiVectorOption {
             dimension: default_dimension(),
             distance: default_distance_metric(),
             storage: MultiVectorStorage::default(),
+            pool_factor: default_pool_factor(),
             embedder: None,
         }
     }
+}
+
+/// Serde default of [`MultiVectorOption::pool_factor`]: `1`, no pooling. A
+/// plain `#[serde(default)]` would give `0`, which validation rejects.
+pub(crate) const fn default_pool_factor() -> u32 {
+    1
+}
+
+fn is_default_pool_factor(factor: &u32) -> bool {
+    *factor == default_pool_factor()
 }
 
 impl MultiVectorOption {
@@ -412,6 +436,12 @@ impl MultiVectorOption {
         self
     }
 
+    /// Set the token-pooling factor (`1` disables pooling).
+    pub fn pool_factor(mut self, factor: u32) -> Self {
+        self.pool_factor = factor;
+        self
+    }
+
     /// Embed text values with the schema embedder `name`, which must be a
     /// token-level embedder.
     pub fn embedder(mut self, name: impl Into<String>) -> Self {
@@ -432,7 +462,12 @@ impl MultiVectorOption {
     /// `Binary` and the distance is not `Cosine` (see
     /// [`multi_vector_params_error`]).
     pub fn validate(&self, field_name: &str) -> Result<()> {
-        match multi_vector_params_error(self.dimension, self.distance, self.storage) {
+        match multi_vector_params_error(
+            self.dimension,
+            self.distance,
+            self.storage,
+            self.pool_factor,
+        ) {
             Some(reason) => Err(LaurusError::invalid_argument(format!(
                 "field '{field_name}': {reason}"
             ))),
@@ -484,21 +519,26 @@ impl MultiVectorOption {
     }
 }
 
-/// Why `dimension` / `distance` / `storage` cannot describe a multi-vector
-/// field, if they cannot.
+/// Why `dimension` / `distance` / `storage` / `pool_factor` cannot
+/// describe a multi-vector field, if they cannot.
 ///
 /// Late interaction sums each query vector's best similarity, which is
 /// meaningless for a distance where smaller is better, so only `Cosine` and
 /// `DotProduct` are accepted. `Binary` storage keeps only each token
 /// vector's direction relative to the field's center, so it requires
-/// `Cosine`, where every token is unit length anyway.
+/// `Cosine`, where every token is unit length anyway. A pool factor of `0`
+/// has no meaning (`1` disables pooling).
 pub(crate) fn multi_vector_params_error(
     dimension: usize,
     distance: DistanceMetric,
     storage: MultiVectorStorage,
+    pool_factor: u32,
 ) -> Option<String> {
     if dimension == 0 {
         return Some("MultiVector dimension must be greater than 0".to_string());
+    }
+    if pool_factor == 0 {
+        return Some("MultiVector pool_factor must be at least 1 (1 disables pooling)".to_string());
     }
     match distance {
         DistanceMetric::Cosine => None,
@@ -777,6 +817,17 @@ mod tests {
         let back: MultiVectorOption =
             serde_json::from_str(&serde_json::to_string(&compressed).unwrap()).unwrap();
         assert_eq!(back.storage, MultiVectorStorage::Int8);
+
+        // Issue #1346: a schema without `pool_factor` reads as 1 (a plain
+        // `#[serde(default)]` would give 0, which validation rejects), and
+        // 1 is not written back.
+        assert_eq!(defaulted.pool_factor, 1);
+        assert!(!json.contains("pool_factor"), "{json}");
+        let pooled = MultiVectorOption::new(128).pool_factor(3);
+        let json = serde_json::to_string(&pooled).unwrap();
+        assert!(json.contains("\"pool_factor\":3"), "{json}");
+        let back: MultiVectorOption = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pool_factor, 3);
     }
 
     #[test]
@@ -803,6 +854,22 @@ mod tests {
                 .validate("t")
                 .unwrap_err();
             assert!(err.to_string().contains("Cosine or DotProduct"), "{err}");
+        }
+        let err = MultiVectorOption::new(8)
+            .pool_factor(0)
+            .validate("t")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pool_factor must be at least 1"),
+            "{err}"
+        );
+        for factor in [1, 2, 100] {
+            assert!(
+                MultiVectorOption::new(8)
+                    .pool_factor(factor)
+                    .validate("t")
+                    .is_ok()
+            );
         }
     }
 

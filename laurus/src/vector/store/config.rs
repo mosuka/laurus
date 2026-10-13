@@ -227,6 +227,7 @@ pub fn build_field_index_config(
                 dimension: opt.dimension,
                 distance_metric: opt.distance,
                 storage: opt.storage,
+                pool_factor: opt.pool_factor,
                 auto_compaction: deletion_config.auto_compaction,
                 compaction_threshold: deletion_config.compaction_threshold,
                 embedder,

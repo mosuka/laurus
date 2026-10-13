@@ -459,6 +459,13 @@ pub struct MultiVectorIndexConfig {
     #[serde(default)]
     pub storage: MultiVectorStorage,
 
+    /// Token-pooling factor (#1346): each document keeps about `1 /
+    /// pool_factor` of its token vectors (see
+    /// [`crate::vector::core::token_pooling`]). `1`, the default, stores
+    /// every token vector.
+    #[serde(default = "crate::vector::core::field::default_pool_factor")]
+    pub pool_factor: u32,
+
     /// Most documents a merge may combine into one segment.
     ///
     /// The default (16,384) keeps a merged segment around 2.4 GiB for
@@ -498,6 +505,7 @@ impl Default for MultiVectorIndexConfig {
             dimension: 128,
             distance_metric: DistanceMetric::Cosine,
             storage: MultiVectorStorage::default(),
+            pool_factor: crate::vector::core::field::default_pool_factor(),
             max_documents_per_segment: default_multi_vector_max_documents_per_segment(),
             merge_factor: 10,
             max_segments: 100,
@@ -514,6 +522,7 @@ impl std::fmt::Debug for MultiVectorIndexConfig {
             .field("dimension", &self.dimension)
             .field("distance_metric", &self.distance_metric)
             .field("storage", &self.storage)
+            .field("pool_factor", &self.pool_factor)
             .field("max_documents_per_segment", &self.max_documents_per_segment)
             .field("merge_factor", &self.merge_factor)
             .field("max_segments", &self.max_segments)

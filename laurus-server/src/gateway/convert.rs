@@ -692,6 +692,10 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             if let Some(storage) = multi_vector_storage_to_json(v.storage) {
                 obj["storage"] = json!(storage);
             }
+            // Omitted at 1 (no pooling), the default.
+            if let Some(factor) = v.pool_factor.filter(|&f| f != 1) {
+                obj["pool_factor"] = json!(factor);
+            }
             json!({ "multi_vector": obj })
         }
         None => Value::Null,
@@ -856,7 +860,9 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 ///
 /// Returns an error when `storage` is present but not one of
 /// `"f32"` / `"f16"` / `"int8"` / `"binary"` (case-insensitive), so a typo
-/// 400s instead of silently defaulting to f32 (Issue #1346).
+/// 400s instead of silently defaulting to f32, and when `pool_factor` is
+/// present but not a non-negative integer that fits in `u32` (Issue #1346).
+/// A `pool_factor` of 0 passes here and is rejected by the engine.
 fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
     let storage = match json.get("storage").and_then(|v| v.as_str()) {
         None => v1::MultiVectorStorage::F32 as i32,
@@ -865,6 +871,16 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
         Some(s) if s.eq_ignore_ascii_case("int8") => v1::MultiVectorStorage::Int8 as i32,
         Some(s) if s.eq_ignore_ascii_case("binary") => v1::MultiVectorStorage::Binary as i32,
         Some(s) => return Err(format!("unknown multi_vector storage '{s}'")),
+    };
+    let pool_factor = match json.get("pool_factor") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|f| u32::try_from(f).ok())
+                .ok_or_else(|| {
+                    format!("multi_vector pool_factor must be an integer >= 1, got {v}")
+                })?,
+        ),
     };
     Ok(v1::MultiVectorOption {
         dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -879,6 +895,7 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
             .unwrap_or("")
             .to_string(),
         storage: Some(storage),
+        pool_factor,
     })
 }
 
@@ -1980,6 +1997,30 @@ mod tests {
         let json = json!({ "multi_vector": {"dimension": 32, "storage": "bf16"} });
         let err = json_to_proto_field_option(&json).unwrap_err();
         assert!(err.contains("bf16"), "{err}");
+    }
+
+    /// #1346: `pool_factor` round-trips, is omitted when 1 (the default)
+    /// or absent, and a value that is not a non-negative integer is a
+    /// 400-worthy error.
+    #[test]
+    fn test_multi_vector_pool_factor_round_trips_through_json() {
+        let json = json!({ "multi_vector": {"dimension": 32, "pool_factor": 3} });
+        let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
+        assert_eq!(back["multi_vector"]["pool_factor"], json!(3));
+
+        for json in [
+            json!({ "multi_vector": {"dimension": 32, "pool_factor": 1} }),
+            json!({ "multi_vector": {"dimension": 32} }),
+        ] {
+            let back = proto_field_option_to_json(&json_to_proto_field_option(&json).unwrap());
+            assert!(back["multi_vector"].get("pool_factor").is_none(), "{back}");
+        }
+
+        for bad in [json!(2.5), json!(-1), json!("2"), json!(5_000_000_000u64)] {
+            let json = json!({ "multi_vector": {"dimension": 32, "pool_factor": bad} });
+            let err = json_to_proto_field_option(&json).unwrap_err();
+            assert!(err.contains("pool_factor"), "{err}");
+        }
     }
 
     /// #1349: numeric and boolean embedder parameters reach the proto as

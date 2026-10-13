@@ -771,3 +771,146 @@ fn test_schema_rejects_binary_with_dot_product() {
             .is_ok()
     );
 }
+
+/// Issue #1346: a Cosine field of 4-dimensional token vectors pooled by
+/// `pool_factor`, next to a text field.
+fn pooled_option(pool_factor: u32) -> FieldOption {
+    FieldOption::MultiVector(MultiVectorOption::new(4).pool_factor(pool_factor))
+}
+
+fn pooled_schema(pool_factor: u32) -> Schema {
+    Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .add_field(TOKENS, pooled_option(pool_factor))
+        .build()
+}
+
+/// Put 8 documents of 9 tokens each (`d0` .. `d7`).
+async fn put_pooled_corpus(engine: &Engine) -> Result<()> {
+    for n in 0..8 {
+        let tokens = (0..9).map(|i| binary_token(n, i)).collect();
+        let doc = Document::builder()
+            .add_text("title", format!("doc {n}"))
+            .add_vector_array(TOKENS, tokens)
+            .build();
+        engine.put_document(&format!("d{n}"), doc).await?;
+    }
+    Ok(())
+}
+
+fn reindex() -> UpdateFieldOptions {
+    UpdateFieldOptions {
+        reindex: true,
+        ..Default::default()
+    }
+}
+
+/// Turning pooling on re-pools the stored token vectors: the field ends up
+/// exactly as one that pooled them at ingest.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_field_turning_pooling_on_matches_ingest() -> Result<()> {
+    let migrated = Engine::new(storage(), pooled_schema(1)).await?;
+    put_pooled_corpus(&migrated).await?;
+    migrated.commit().await?;
+    let outcome = migrated
+        .update_field(TOKENS, pooled_option(4), reindex())
+        .await?;
+    assert_eq!(
+        outcome.classification,
+        crate::engine::schema::FieldChangeKind::Reindex
+    );
+
+    let fresh = Engine::new(storage(), pooled_schema(4)).await?;
+    put_pooled_corpus(&fresh).await?;
+    fresh.commit().await?;
+    for n in 0..8 {
+        let id = format!("d{n}");
+        let tokens = stored_tokens(&migrated, &id).unwrap();
+        assert_eq!(
+            tokens.len(),
+            crate::vector::core::token_pooling::pooled_count(9, 4) * 4
+        );
+        assert_eq!(Some(tokens), stored_tokens(&fresh, &id), "{id}");
+    }
+    Ok(())
+}
+
+/// The original token vectors are gone once a field pools, so changing a
+/// factor in use discards the field's data (and says so).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_field_changing_a_pool_factor_discards_the_field() -> Result<()> {
+    let engine = Engine::new(storage(), pooled_schema(2)).await?;
+    put_pooled_corpus(&engine).await?;
+    engine.commit().await?;
+    let outcome = engine
+        .update_field(TOKENS, pooled_option(4), reindex())
+        .await?;
+    assert_eq!(
+        outcome.classification,
+        crate::engine::schema::FieldChangeKind::Destructive
+    );
+    assert!(outcome.schema.pending_reindex.contains(TOKENS));
+    assert_eq!(stored_tokens(&engine, "d0"), None);
+    Ok(())
+}
+
+/// The WAL keeps the raw input, so replaying it pools each document once.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wal_replay_pools_documents_once() -> Result<()> {
+    let storage = storage();
+    {
+        let engine = Engine::new(storage.clone(), pooled_schema(2)).await?;
+        put_pooled_corpus(&engine).await?;
+        // Dropped without commit: only the WAL holds the documents.
+    }
+    let replayed = Engine::new(storage, pooled_schema(2)).await?;
+    replayed.commit().await?;
+
+    let direct = Engine::new(self::storage(), pooled_schema(2)).await?;
+    put_pooled_corpus(&direct).await?;
+    direct.commit().await?;
+    for n in 0..8 {
+        let id = format!("d{n}");
+        assert_eq!(
+            stored_tokens(&replayed, &id),
+            stored_tokens(&direct, &id),
+            "{id}"
+        );
+    }
+    Ok(())
+}
+
+/// A pool factor of 0 is rejected up front, in a dry run too, and the
+/// field's data is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pool_factor_zero_is_rejected_before_anything_is_purged() -> Result<()> {
+    let engine = Engine::new(storage(), pooled_schema(2)).await?;
+    put_pooled_corpus(&engine).await?;
+    engine.commit().await?;
+    let before = stored_tokens(&engine, "d3").unwrap();
+    for dry_run in [true, false] {
+        let err = engine
+            .update_field(
+                TOKENS,
+                pooled_option(0),
+                UpdateFieldOptions {
+                    reindex: true,
+                    dry_run,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pool_factor must be at least 1"),
+            "{err}"
+        );
+    }
+    assert_eq!(stored_tokens(&engine, "d3"), Some(before));
+    assert!(
+        Schema::builder()
+            .add_field(TOKENS, pooled_option(0))
+            .try_build()
+            .is_err()
+    );
+    Ok(())
+}

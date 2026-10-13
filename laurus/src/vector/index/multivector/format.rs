@@ -6,7 +6,7 @@
 //! | --- | --- | --- |
 //! | 0 | 64 | Header: magic `LMV1`, version `u16`, element kind `u8`, reserved `u8`, dimension `u32`, reserved `u32`, document count `u64`, vector count `u64`, zero padding |
 //! | 64 | element kind's parameter block | `Binary` only: `dimension` f16 values of the center, then `dimension` of the spread, zero-padded to a multiple of 8 bytes; empty for every other kind |
-//! | | 24 × documents | Document table, ascending by doc id: doc id `u64`, first vector `u64`, vector count `u32`, reserved `u32` |
+//! | | 24 × documents | Document table, ascending by doc id: doc id `u64`, first vector `u64`, vector count `u32`, pool factor `u32` (the factor the document's token vectors were pooled with, 0 when they are stored as ingested; reserved and written as 0 before #1346 added pooling) |
 //! | | row size × vectors | Payload: encoded rows, one document's vectors after another |
 //! | end − 16 | 16 | Footer: CRC-32 of header + parameters + table `u32`, CRC-32 of payload `u32`, magic `LMVF`, reserved `u32` |
 //!
@@ -42,13 +42,19 @@ const HEADER_LEN: usize = 64;
 const DOC_ENTRY_LEN: usize = 24;
 const FOOTER_LEN: usize = 16;
 
-/// One document of a segment: its id and how many vectors it holds.
+/// One document of a segment: its id, how many vectors it holds, and
+/// whether they were pooled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DocEntry {
     /// Internal document id.
     pub doc_id: u64,
     /// Number of token vectors.
     pub vector_count: u32,
+    /// The token-pooling factor the vectors were pooled with, `0` when
+    /// they are stored as ingested (see
+    /// [`crate::vector::core::token_pooling`]). A merge pools only
+    /// documents marked `0`, so pooled vectors are never pooled again.
+    pub pool_factor: u32,
 }
 
 /// Counts and element kind declared by a segment header.
@@ -314,7 +320,7 @@ fn write_segment_to(
         meta.extend_from_slice(&doc.doc_id.to_le_bytes());
         meta.extend_from_slice(&first_vector.to_le_bytes());
         meta.extend_from_slice(&doc.vector_count.to_le_bytes());
-        meta.extend_from_slice(&0u32.to_le_bytes());
+        meta.extend_from_slice(&doc.pool_factor.to_le_bytes());
         first_vector += u64::from(doc.vector_count);
     }
     let meta_crc = crc32fast::hash(&meta);
@@ -359,8 +365,8 @@ pub(crate) struct SegmentReader {
     dimension: usize,
     vector_count: u64,
     doc_ids: Vec<u64>,
-    /// `(first vector, vector count)` per entry of `doc_ids`.
-    spans: Vec<(u64, u32)>,
+    /// `(first vector, vector count, pool factor)` per entry of `doc_ids`.
+    spans: Vec<(u64, u32, u32)>,
     payload_offset: u64,
     payload_crc: u32,
     /// Zero-copy view of the whole file. This input is never read or
@@ -453,9 +459,10 @@ impl SegmentReader {
         self.doc_ids
             .iter()
             .zip(&self.spans)
-            .map(|(&doc_id, &(_, vector_count))| DocEntry {
+            .map(|(&doc_id, &(_, vector_count, pool_factor))| DocEntry {
                 doc_id,
                 vector_count,
+                pool_factor,
             })
     }
 
@@ -474,7 +481,7 @@ impl SegmentReader {
         let Ok(index) = self.doc_ids.binary_search(&doc_id) else {
             return Ok(None);
         };
-        let (first, count) = self.spans[index];
+        let (first, count, _) = self.spans[index];
         let row = self.codec.kind().row_bytes(self.dimension) as u64;
         let start = self.payload_offset + first * row;
         let len = (u64::from(count) * row) as usize;
@@ -572,8 +579,8 @@ fn check_len(file_name: &str, header: &Header, file_len: u64) -> Result<()> {
 struct DocTable {
     codec: OwnedCodec,
     doc_ids: Vec<u64>,
-    /// `(first vector, vector count)` per entry of `doc_ids`.
-    spans: Vec<(u64, u32)>,
+    /// `(first vector, vector count, pool factor)` per entry of `doc_ids`.
+    spans: Vec<(u64, u32, u32)>,
     payload_crc: u32,
 }
 
@@ -609,6 +616,7 @@ fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> R
         let doc_id = u64::from_le_bytes(entry[0..8].try_into().expect("8 bytes"));
         let first = u64::from_le_bytes(entry[8..16].try_into().expect("8 bytes"));
         let count = u32::from_le_bytes(entry[16..20].try_into().expect("4 bytes"));
+        let pool_factor = u32::from_le_bytes(entry[20..24].try_into().expect("4 bytes"));
         if doc_ids.last().is_some_and(|&last| last >= doc_id) {
             return Err(corrupt(file_name, "document table is not ascending"));
         }
@@ -620,7 +628,7 @@ fn parse_meta(file_name: &str, header: &Header, meta: &[u8], footer: &[u8]) -> R
         }
         next_vector += u64::from(count);
         doc_ids.push(doc_id);
-        spans.push((first, count));
+        spans.push((first, count, pool_factor));
     }
     if next_vector != header.vector_count {
         return Err(corrupt(
@@ -675,6 +683,7 @@ mod tests {
             .map(|(doc_id, vectors)| DocEntry {
                 doc_id: *doc_id,
                 vector_count: vectors.len() as u32,
+                pool_factor: 0,
             })
             .collect();
         write_segment(storage, name, codec, dim, &entries, |i, sink| {
@@ -776,11 +785,13 @@ mod tests {
             vec![
                 DocEntry {
                     doc_id: 4,
-                    vector_count: 2
+                    vector_count: 2,
+                    pool_factor: 0
                 },
                 DocEntry {
                     doc_id: 9,
-                    vector_count: 1
+                    vector_count: 1,
+                    pool_factor: 0
                 },
             ]
         );
@@ -831,6 +842,49 @@ mod tests {
     }
 
     /// `64 + pad8(4 * dim) + 24 * docs + ceil(dim / 8) * rows + 16`.
+    /// #1346: every document-table entry records the factor its vectors
+    /// were pooled with, under the header + table checksum.
+    #[test]
+    fn test_pool_factor_marker_round_trips_and_is_checksummed() {
+        let storage = memory();
+        let entries = [
+            DocEntry {
+                doc_id: 4,
+                vector_count: 2,
+                pool_factor: 3,
+            },
+            DocEntry {
+                doc_id: 9,
+                vector_count: 1,
+                pool_factor: 0,
+            },
+        ];
+        let docs = sample();
+        write_segment(
+            storage.as_ref(),
+            "seg.mv",
+            RowCodec::F32,
+            3,
+            &entries,
+            |i, sink| {
+                for v in &docs[i].1 {
+                    sink.write(v)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let reader = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap();
+        assert_eq!(reader.entries().collect::<Vec<_>>(), entries);
+
+        let mut bytes = read_all(storage.as_ref(), "seg.mv");
+        // The first entry's pool factor: entry bytes 20..24.
+        bytes[HEADER_LEN + 20] ^= 0x01;
+        overwrite(storage.as_ref(), "seg.mv", &bytes);
+        let err = SegmentReader::open(storage.as_ref(), "seg.mv").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
     #[test]
     fn test_binary_segment_has_the_documented_length() {
         let storage = memory();
@@ -916,6 +970,7 @@ mod tests {
         let entry = DocEntry {
             doc_id,
             vector_count: rows.row_count() as u32,
+            pool_factor: 0,
         };
         write_segment(
             storage.as_ref(),
@@ -1093,10 +1148,12 @@ mod tests {
             DocEntry {
                 doc_id: 2,
                 vector_count: 1,
+                pool_factor: 0,
             },
             DocEntry {
                 doc_id: 1,
                 vector_count: 1,
+                pool_factor: 0,
             },
         ];
         assert!(
@@ -1114,6 +1171,7 @@ mod tests {
         let one = [DocEntry {
             doc_id: 1,
             vector_count: 2,
+            pool_factor: 0,
         }];
         let short = write_segment(
             storage.as_ref(),
@@ -1146,6 +1204,7 @@ mod tests {
         let one = [DocEntry {
             doc_id: 1,
             vector_count: 2,
+            pool_factor: 0,
         }];
         // Dimension 2, but 3 values: not a whole number of rows.
         let err = write_segment(

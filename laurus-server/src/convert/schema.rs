@@ -206,6 +206,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             distance: distance_to_proto(&o.distance) as i32,
             embedder: o.embedder.clone().unwrap_or_default(),
             storage: Some(multi_vector_storage_to_proto(o.storage) as i32),
+            pool_factor: Some(o.pool_factor),
         })),
     };
     v1::FieldOption { option }
@@ -348,6 +349,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
                 Some(o.embedder.clone())
             },
             storage: multi_vector_storage_from_proto(o.storage),
+            // Unset (an older client) means no pooling.
+            pool_factor: o.pool_factor.unwrap_or(1),
         })),
         None => None,
     }
@@ -1402,6 +1405,31 @@ mod tests {
                 other => panic!("expected FieldOption::MultiVector, got {other:?}"),
             }
         }
+    }
+
+    /// #1346: `pool_factor` round-trips through proto, and an absent value
+    /// (a client that predates the field) reads as 1, no pooling.
+    #[test]
+    fn schema_field_option_multi_vector_pool_factor_round_trips_and_defaults_to_1() {
+        let schema = Schema::builder()
+            .add_multi_vector_field("tokens", MultiVectorOption::new(96).pool_factor(3))
+            .build();
+        let proto = to_proto(&schema);
+        let back = from_proto(&proto).expect("from_proto must succeed");
+        assert!(matches!(
+            back.fields.get("tokens"),
+            Some(FieldOption::MultiVector(o)) if o.pool_factor == 3
+        ));
+
+        let mut field =
+            field_option_to_proto(&FieldOption::MultiVector(MultiVectorOption::new(96)));
+        if let Some(v1::field_option::Option::MultiVector(o)) = &mut field.option {
+            o.pool_factor = None;
+        }
+        assert!(matches!(
+            field_option_from_proto(&field),
+            Some(FieldOption::MultiVector(o)) if o.pool_factor == 1
+        ));
     }
 
     /// #1346: an absent or `UNSPECIFIED` proto `storage` value (as every
