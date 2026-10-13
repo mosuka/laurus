@@ -32,6 +32,7 @@ use half::f16;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LaurusError, Result};
+use crate::vector::core::distance::dot_product;
 
 /// On-disk element kind of a `MultiVector` field's token vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -305,6 +306,154 @@ impl BinaryParams {
     }
 }
 
+/// A query prepared to score [`MultiVectorStorage::Binary`] rows straight
+/// from their bits, without decoding them (#1427).
+///
+/// With `s_i = ±1` from a row's bits, a row of [`BinaryParams`] decodes to
+/// a vector whose dot product with a query vector `q` is
+///
+/// ```text
+/// q · decoded = keep (q · c) + Σ_i s_i (q_i w_i),   keep = 1 − (Σ_i s_i w_i c_i) / (c · c)
+/// ```
+///
+/// For every query vector and every byte of a row, a 256-entry table holds
+/// `Σ_k ±(q ⊙ w)[8j + k]` for each bit pattern of byte `j`, so a pair costs
+/// one lookup per byte instead of a decode and a dot product: 12 lookups
+/// at 96 dimensions. `keep` comes from tables of `w ⊙ c` built the same
+/// way, once per row. Scores equal the decode followed by
+/// [`max_sim`](crate::vector::core::late_interaction::max_sim) up to f32
+/// rounding: both add up the same terms, grouped differently.
+#[derive(Debug)]
+pub(crate) struct BinaryQuery {
+    /// Bytes of one row: `ceil(dimension / 8)`.
+    row_bytes: usize,
+    /// `q · c` of every query vector.
+    center_dots: Box<[f32]>,
+    /// `row_bytes` tables of `q ⊙ w` per query vector, query vectors in
+    /// order.
+    tables: Box<[[f32; 256]]>,
+    /// `row_bytes` tables of `w ⊙ c`.
+    keep_tables: Box<[[f32; 256]]>,
+    /// `c · c`.
+    center_norm_sq: f32,
+}
+
+impl BinaryQuery {
+    /// Bytes of the tables [`Self::new`] builds for `query_rows` query
+    /// vectors of `dimension` elements: `ceil(dimension / 8)` KiB each.
+    pub(crate) const fn table_bytes(dimension: usize, query_rows: usize) -> usize {
+        query_rows * dimension.div_ceil(8) * size_of::<[f32; 256]>()
+    }
+
+    /// Prepare `query` (row-major, whole rows of `params.dimension()`
+    /// elements) for rows encoded with `params`.
+    pub(crate) fn new(params: &BinaryParams, query: &[f32]) -> Self {
+        let dimension = params.dimension();
+        debug_assert!(query.len().is_multiple_of(dimension));
+        let row_bytes = dimension.div_ceil(8);
+        let query_rows = query.len() / dimension;
+        // Lanes past the dimension stay 0: they meet a row's zero padding
+        // bits, which the decode never reads either.
+        let mut lanes = vec![0f32; row_bytes * 8];
+        let mut center_dots = Vec::with_capacity(query_rows);
+        let mut tables = Vec::with_capacity(query_rows * row_bytes);
+        for q in query.chunks_exact(dimension) {
+            center_dots.push(dot_product(q, &params.center));
+            for ((lane, x), w) in lanes.iter_mut().zip(q).zip(&*params.spread) {
+                *lane = x * w;
+            }
+            push_byte_tables(&lanes, &mut tables);
+        }
+        lanes[..dimension].copy_from_slice(&params.spread_center);
+        let mut keep_tables = Vec::with_capacity(row_bytes);
+        push_byte_tables(&lanes, &mut keep_tables);
+        Self {
+            row_bytes,
+            center_dots: center_dots.into(),
+            tables: tables.into(),
+            keep_tables: keep_tables.into(),
+            center_norm_sq: params.center_norm_sq,
+        }
+    }
+
+    /// MaxSim of one document: `Σ_q max_r q · decoded_r` over the query
+    /// vectors `q` and the document's rows `r`.
+    ///
+    /// # Arguments
+    ///
+    /// * `rows` - The document's encoded rows, at least one, as stored
+    ///   (`row_count × ceil(dimension / 8)` bytes).
+    /// * `keep` - Scratch for the per-row `keep`; cleared first.
+    pub(crate) fn max_sim(&self, rows: &[u8], keep: &mut Vec<f32>) -> f32 {
+        debug_assert!(!rows.is_empty() && rows.len().is_multiple_of(self.row_bytes));
+        keep.clear();
+        keep.extend(rows.chunks_exact(self.row_bytes).map(|row| {
+            let along = lookup_sum(&self.keep_tables, row);
+            1.0 - if self.center_norm_sq > 0.0 {
+                along / self.center_norm_sq
+            } else {
+                0.0
+            }
+        }));
+        self.center_dots
+            .iter()
+            .zip(self.tables.chunks_exact(self.row_bytes))
+            .map(|(&center_dot, tables)| {
+                rows.chunks_exact(self.row_bytes)
+                    .zip(keep.iter())
+                    .map(|(row, &keep)| center_dot * keep + lookup_sum(tables, row))
+                    .fold(f32::NEG_INFINITY, f32::max)
+            })
+            .sum()
+    }
+}
+
+/// Append one 256-entry table per 8 lanes of `lanes` (a multiple of 8
+/// long) to `out`: entry `b` of table `j` is `Σ_k ±lanes[8j + k]`, `+`
+/// where bit `k` of `b` is set. Each entry adds two 16-entry partial sums
+/// of 4 lanes each.
+fn push_byte_tables(lanes: &[f32], out: &mut Vec<[f32; 256]>) {
+    for lane in lanes.as_chunks::<8>().0 {
+        let mut low = [0f32; 16];
+        let mut high = [0f32; 16];
+        for (n, (low, high)) in low.iter_mut().zip(&mut high).enumerate() {
+            for k in 0..4 {
+                if n >> k & 1 == 1 {
+                    *low += lane[k];
+                    *high += lane[4 + k];
+                } else {
+                    *low -= lane[k];
+                    *high -= lane[4 + k];
+                }
+            }
+        }
+        let mut table = [0f32; 256];
+        for (b, entry) in table.iter_mut().enumerate() {
+            *entry = low[b & 15] + high[b >> 4];
+        }
+        out.push(table);
+    }
+}
+
+/// `Σ_j tables[j][row[j]]`, in 4 partial sums so the lookups do not wait
+/// on one another.
+#[inline(always)]
+fn lookup_sum(tables: &[[f32; 256]], row: &[u8]) -> f32 {
+    let mut partial = [0f32; 4];
+    let (table_quads, table_rest) = tables.as_chunks::<4>();
+    let (byte_quads, byte_rest) = row.as_chunks::<4>();
+    for (t, b) in table_quads.iter().zip(byte_quads) {
+        for k in 0..4 {
+            partial[k] += t[k][usize::from(b[k])];
+        }
+    }
+    let mut sum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+    for (t, &b) in table_rest.iter().zip(byte_rest) {
+        sum += t[usize::from(b)];
+    }
+    sum
+}
+
 /// How a set of rows is encoded: the element kind plus, for `Binary`, the
 /// parameters its rows were encoded with.
 #[derive(Debug, Clone, Copy)]
@@ -488,8 +637,9 @@ fn try_as_f32_slice(bytes: &[u8]) -> Option<&[f32]> {
 /// One document's token vectors, still encoded in their on-disk element
 /// kind.
 ///
-/// Returned by the multi-vector reader; decoded on demand by
-/// [`crate::vector::core::late_interaction::max_sim_rows`]. `bytes` holds
+/// Returned by the multi-vector reader; scored by
+/// [`crate::vector::core::late_interaction::MaxSimQuery`], which decodes
+/// them on demand unless it can score them as stored. `bytes` holds
 /// exactly `row_count() * kind().row_bytes(dimension)` bytes.
 pub struct MultiVectorRows<'a> {
     codec: RowCodec<'a>,
@@ -592,6 +742,71 @@ pub(crate) fn test_binary_params(dimension: usize) -> BinaryParams {
     let spread = (0..dimension).map(|i| f16::from_f32((i % 3 + 1) as f32 / 8.0));
     BinaryParams::from_f16_bits(dimension, center.chain(spread).map(f16::to_bits).collect())
         .expect("test parameters are finite")
+}
+
+/// Largest difference allowed between [`BinaryQuery::max_sim`] and the
+/// decode followed by `max_sim` for `rows` against `query`: twice what
+/// either may stray from the exact score. Every f32 sum involved has at
+/// most `n = dimension + 32` terms, so it errs by at most
+/// `γ_n = n u / (1 − n u)` (`u = 2⁻²⁴`) of its summed magnitudes: the
+/// terms of each dot product, plus the error of `keep` (from
+/// `Σ |w_i c_i| / (c · c)` and its own rounding), which `q · c` carries.
+#[cfg(test)]
+pub(crate) fn binary_max_sim_tolerance(params: &BinaryParams, query: &[f32], rows: &[u8]) -> f32 {
+    let dimension = params.dimension();
+    let unit = f64::from(f32::EPSILON) / 2.0;
+    let n = (dimension + 32) as f64;
+    let gamma = n * unit / (1.0 - n * unit);
+    let wide = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>();
+    let center = wide(&params.center);
+    let spread = wide(&params.spread);
+    let spread_center = wide(&params.spread_center);
+    let center_norm_sq = f64::from(params.center_norm_sq);
+    let keep_error = if center_norm_sq > 0.0 {
+        spread_center.iter().map(|v| v.abs()).sum::<f64>() / center_norm_sq
+    } else {
+        0.0
+    };
+    let keeps: Vec<f64> = rows
+        .chunks_exact(dimension.div_ceil(8))
+        .map(|row| {
+            if center_norm_sq == 0.0 {
+                return 1.0;
+            }
+            let along: f64 = spread_center
+                .iter()
+                .enumerate()
+                .map(|(i, wc)| {
+                    if row[i / 8] >> (i % 8) & 1 == 1 {
+                        *wc
+                    } else {
+                        -wc
+                    }
+                })
+                .sum();
+            1.0 - along / center_norm_sq
+        })
+        .collect();
+    let bound: f64 = query
+        .chunks_exact(dimension)
+        .map(|q| {
+            let q = wide(q);
+            let center_terms: f64 = q.iter().zip(&center).map(|(x, c)| (x * c).abs()).sum();
+            keeps
+                .iter()
+                .map(|keep| {
+                    let terms: f64 = q
+                        .iter()
+                        .zip(&spread)
+                        .zip(&center)
+                        .map(|((x, w), c)| x.abs() * (w + (c * keep).abs()))
+                        .sum();
+                    gamma * (terms + center_terms * (keep_error + keep.abs() + 2.0))
+                })
+                .fold(0.0, f64::max)
+        })
+        .sum();
+    (2.0 * bound) as f32
 }
 
 #[cfg(test)]
@@ -956,5 +1171,133 @@ mod tests {
         let f16_bytes = encode(RowCodec::F16, &values);
         let f16_rows = MultiVectorRows::new(RowCodec::F16, dim, Cow::Borrowed(&f16_bytes));
         assert!(f16_rows.as_f32().is_none());
+    }
+
+    /// Deterministic pseudo-random query values in `[-1, 1)`.
+    fn query_values(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// `count` rows of pseudo-random bits. The padding bits past
+    /// `dimension` are set at random only when `padding` is: an encoder
+    /// always leaves them 0.
+    fn random_rows(count: usize, dimension: usize, seed: u64, padding: bool) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            for j in 0..dimension.div_ceil(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let used = dimension - 8 * j;
+                let byte = (state >> 32) as u8;
+                out.push(if used < 8 && !padding {
+                    byte & ((1u8 << used) - 1)
+                } else {
+                    byte
+                });
+            }
+        }
+        out
+    }
+
+    /// Decode every row of `rows`, then run the plain MaxSim.
+    fn decoded_max_sim(params: &BinaryParams, query: &[f32], rows: &[u8]) -> f32 {
+        let dimension = params.dimension();
+        let mut decoded = Vec::new();
+        for row in rows.chunks_exact(dimension.div_ceil(8)) {
+            params.decode_row(row, &mut decoded);
+        }
+        crate::vector::core::late_interaction::max_sim(query, &decoded, dimension)
+    }
+
+    fn assert_binary_query_matches_decode(params: &BinaryParams, query: &[f32], rows: &[u8]) {
+        let expected = decoded_max_sim(params, query, rows);
+        let actual = BinaryQuery::new(params, query).max_sim(rows, &mut Vec::new());
+        let tolerance = binary_max_sim_tolerance(params, query, rows);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "dimension {}, {} query rows: {actual} vs {expected} (tolerance {tolerance})",
+            params.dimension(),
+            query.len() / params.dimension()
+        );
+    }
+
+    #[test]
+    fn test_binary_query_matches_decode_then_max_sim() {
+        for dimension in [1, 7, 8, 9, 96, 128] {
+            let params = test_binary_params(dimension);
+            for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
+                let query = query_values(query_rows * dimension, dimension as u64);
+                let rows = random_rows(doc_rows, dimension, 7 + dimension as u64, false);
+                assert_binary_query_matches_decode(&params, &query, &rows);
+            }
+        }
+        // Parameters learned from anisotropic unit vectors, as in a field.
+        let dimension = 96;
+        let params = BinaryParams::train(dimension, &unit_vectors(256, dimension, 3)).unwrap();
+        let codec = RowCodec::Binary(&params);
+        let mut rows = Vec::new();
+        for row in unit_vectors(40, dimension, 5).chunks_exact(dimension) {
+            codec.encode_row(row, &mut rows);
+        }
+        let query = unit_vectors(32, dimension, 9);
+        assert_binary_query_matches_decode(&params, &query, &rows);
+    }
+
+    #[test]
+    fn test_binary_query_with_a_zero_center_matches_decode() {
+        let dimension = 9;
+        let bits: Box<[u16]> = (0..dimension)
+            .map(|_| 0.0)
+            .chain((0..dimension).map(|i| (i % 3 + 1) as f32 / 8.0))
+            .map(|v| f16::from_f32(v).to_bits())
+            .collect();
+        let params = BinaryParams::from_f16_bits(dimension, bits).unwrap();
+        assert_eq!(params.center_norm_sq, 0.0);
+        let query = query_values(3 * dimension, 1);
+        let rows = random_rows(5, dimension, 2, false);
+        assert_binary_query_matches_decode(&params, &query, &rows);
+    }
+
+    #[test]
+    fn test_binary_query_ignores_padding_bits_like_the_decode() {
+        for dimension in [1, 7, 9, 10] {
+            let params = test_binary_params(dimension);
+            let query = query_values(3 * dimension, 3);
+            let clean = random_rows(5, dimension, 11, false);
+            let padded = random_rows(5, dimension, 11, true);
+            assert_ne!(clean, padded, "dimension {dimension}: no padding bit set");
+            let prepared = BinaryQuery::new(&params, &query);
+            assert_eq!(
+                prepared.max_sim(&padded, &mut Vec::new()).to_bits(),
+                prepared.max_sim(&clean, &mut Vec::new()).to_bits(),
+                "dimension {dimension}"
+            );
+            assert_eq!(
+                decoded_max_sim(&params, &query, &padded).to_bits(),
+                decoded_max_sim(&params, &query, &clean).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_query_tables_take_a_kib_per_query_vector_and_row_byte() {
+        assert_eq!(BinaryQuery::table_bytes(96, 32), 384 * 1024);
+        assert_eq!(BinaryQuery::table_bytes(9, 1), 2 * 1024);
+        let query = query_values(3 * 9, 1);
+        let prepared = BinaryQuery::new(&test_binary_params(9), &query);
+        assert_eq!(
+            prepared.tables.len() * size_of::<[f32; 256]>(),
+            BinaryQuery::table_bytes(9, 3)
+        );
     }
 }

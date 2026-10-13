@@ -13,7 +13,7 @@ use crate::embedding::embedder::{EmbedInput, EmbedInputType, EmbedRole, Embedder
 use crate::embedding::per_field::PerFieldEmbedder;
 use crate::embedding::precomputed::PrecomputedEmbedder;
 use crate::engine::schema::{FieldOption, Schema};
-use crate::engine::search::SearchRequestBuilder;
+use crate::engine::search::{RescoreOptions, SearchRequestBuilder};
 use crate::engine::{Engine, UpdateFieldOptions};
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::field::TextOption;
@@ -23,7 +23,8 @@ use crate::storage::Storage;
 use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::{FlatOption, HnswOption, MultiVectorOption};
-use crate::vector::core::multi_vector::MultiVectorStorage;
+use crate::vector::core::late_interaction::max_sim;
+use crate::vector::core::multi_vector::{MultiVectorStorage, binary_max_sim_tolerance};
 use crate::vector::core::vector::Vector;
 use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery, VectorSearchRequest};
 use crate::vector::store::request::{FieldSelector, QueryVector};
@@ -770,6 +771,145 @@ fn test_schema_rejects_binary_with_dot_product() {
             .try_build()
             .is_ok()
     );
+}
+
+/// Issue #1427: dimension of the rescore tests' `Binary` field. It is not a
+/// multiple of 8, so every row carries padding bits. At 4 dimensions a
+/// document's 32 tokens hold most of the 16 bit patterns, and no document
+/// of [`put_binary_corpus`] scores differently through the two paths.
+const RESCORE_DIMENSION: usize = 20;
+
+fn rescore_schema() -> Schema {
+    Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .add_field(
+            TOKENS,
+            FieldOption::MultiVector(
+                MultiVectorOption::new(RESCORE_DIMENSION)
+                    .distance(DistanceMetric::Cosine)
+                    .storage(MultiVectorStorage::Binary),
+            ),
+        )
+        .build()
+}
+
+/// Token `i` of document `n`: deterministic and anisotropic, like
+/// [`binary_token`], at [`RESCORE_DIMENSION`].
+fn rescore_token(n: u64, i: u64) -> Vec<f32> {
+    (0..RESCORE_DIMENSION as u64)
+        .map(|k| {
+            let x = ((n * 1_000 + i) * 64 + k).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let noise = (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+            let base = [0.6, -0.3, 0.1][(k % 3) as usize];
+            base + 0.4 * noise
+        })
+        .collect()
+}
+
+/// Put documents `n` of `ids`, 32 tokens each, titled `doc <n>`.
+async fn put_rescore_corpus(engine: &Engine, ids: std::ops::Range<u64>) -> Result<()> {
+    for n in ids {
+        let tokens = (0..32).map(|i| rescore_token(n, i)).collect();
+        let doc = Document::builder()
+            .add_text("title", format!("doc {n}"))
+            .add_vector_array(TOKENS, tokens)
+            .build();
+        engine.put_document(&format!("d{n}"), doc).await?;
+    }
+    Ok(())
+}
+
+/// Rescore every document with `title:doc` and check each score against
+/// the query the field's snapshot prepares, bit for bit, and against
+/// MaxSim over the decoded rows, within the derived tolerance. Returns the
+/// storage kinds of the scored documents.
+async fn check_binary_rescore(
+    engine: &Engine,
+    documents: usize,
+) -> Result<Vec<MultiVectorStorage>> {
+    let query: Vec<Vector> = (0..5)
+        .map(|i| Vector::new(rescore_token(1_000, i)))
+        .collect();
+    let results = engine
+        .search(
+            SearchRequestBuilder::new()
+                .query_dsl("title:doc")
+                .rescore(RescoreOptions::late_interaction(TOKENS, query.clone()).window_size(100))
+                .limit(100)
+                .build(),
+        )
+        .await?;
+    assert_eq!(results.len(), documents);
+
+    // The rescore normalizes the query of a Cosine field the same way.
+    let mut flat = Vec::new();
+    for vector in &query {
+        flat.extend_from_slice(&vector.normalized().data);
+    }
+    let snapshot = engine.vector.multi_vector_snapshot(TOKENS).unwrap();
+    let prepared = snapshot.max_sim_query(&flat);
+    assert_eq!(prepared.prepared(), 1);
+
+    let mut kinds = Vec::new();
+    let mut told_apart = 0;
+    for result in &results {
+        let doc_id = internal_ids(engine, &result.id)[0];
+        let rows = snapshot.rows(doc_id)?.unwrap();
+        let expected = prepared.max_sim(&rows, &mut Vec::new());
+        assert_eq!(result.score.to_bits(), expected.to_bits(), "{result:?}");
+
+        let through_decode = max_sim(&flat, &rows.to_f32(), RESCORE_DIMENSION);
+        if let Some(params) = rows.codec().binary_params() {
+            let tolerance = binary_max_sim_tolerance(params, &flat, rows.as_bytes());
+            assert!(
+                (result.score - through_decode).abs() <= tolerance,
+                "{result:?}: decoded {through_decode} (tolerance {tolerance})"
+            );
+            if through_decode.to_bits() != expected.to_bits() {
+                told_apart += 1;
+            }
+        } else {
+            assert_eq!(result.score.to_bits(), through_decode.to_bits());
+        }
+        kinds.push(rows.kind());
+    }
+    // Without a document that the decode scores differently, the bit-for-bit
+    // check above could not tell a rescore that skipped the tables.
+    assert!(told_apart > 0, "no document tells the two paths apart");
+    kinds.sort_by_key(|kind| kind.tag());
+    kinds.dedup();
+    Ok(kinds)
+}
+
+/// Issue #1427: a `Binary` field's documents are rescored from their bits.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_binary_rescore_scores_documents_from_their_bits() -> Result<()> {
+    let engine = Engine::new(storage(), rescore_schema()).await?;
+    // 64 documents of 32 tokens: the 2,048 a field learns its parameters from.
+    put_rescore_corpus(&engine, 0..64).await?;
+    engine.commit().await?;
+    assert_eq!(
+        check_binary_rescore(&engine, 64).await?,
+        [MultiVectorStorage::Binary]
+    );
+    Ok(())
+}
+
+/// A commit below the training threshold writes an interim `F16` segment;
+/// the rescore decodes its documents and scores the `Binary` ones from
+/// their bits in the same search.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_binary_rescore_of_a_snapshot_mixing_f16_and_binary_segments() -> Result<()> {
+    let engine = Engine::new(storage(), rescore_schema()).await?;
+    put_rescore_corpus(&engine, 100..108).await?;
+    engine.commit().await?;
+    put_rescore_corpus(&engine, 0..64).await?;
+    engine.commit().await?;
+    assert_eq!(
+        check_binary_rescore(&engine, 72).await?,
+        [MultiVectorStorage::F16, MultiVectorStorage::Binary]
+    );
+    Ok(())
 }
 
 /// Issue #1346: a Cosine field of 4-dimensional token vectors pooled by

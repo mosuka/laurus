@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::error::{LaurusError, Result};
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::vector::core::distance::DistanceMetric;
+use crate::vector::core::late_interaction::MaxSimQuery;
 use crate::vector::core::multi_vector::MultiVectorRows;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::multivector::format::SegmentReader;
@@ -61,8 +62,8 @@ impl MultiVectorSnapshot {
     /// The still-encoded token vector rows of `doc_id`, or `None` when the
     /// document has none or is deleted. Prefer this over [`Self::vectors`]
     /// when the caller can score a compressed element kind directly (see
-    /// [`crate::vector::core::late_interaction::max_sim_rows`]), to avoid
-    /// decoding a document that was never going to be borrowed anyway.
+    /// [`Self::max_sim_query`]), to avoid decoding a document that was
+    /// never going to be borrowed anyway.
     ///
     /// # Errors
     ///
@@ -89,6 +90,22 @@ impl MultiVectorSnapshot {
     /// Returns an error when reading a segment fails.
     pub fn vectors(&self, doc_id: u64) -> Result<Option<Cow<'_, [f32]>>> {
         Ok(self.rows(doc_id)?.map(|rows| rows.to_f32()))
+    }
+
+    /// `query` (row-major query vectors of this snapshot's dimension)
+    /// prepared for MaxSim against the documents of this snapshot: each
+    /// distinct `Binary` parameter set of its segments is prepared once, so
+    /// those documents are scored from their bits (#1427).
+    pub(crate) fn max_sim_query<'q>(&self, query: &'q [f32]) -> MaxSimQuery<'q> {
+        let mut prepared = MaxSimQuery::new(query, self.dimension);
+        for params in self
+            .segments
+            .iter()
+            .filter_map(|segment| segment.binary_params())
+        {
+            prepared.prepare_binary(params);
+        }
+        prepared
     }
 
     fn is_deleted(&self, doc_id: u64) -> bool {
