@@ -659,12 +659,15 @@ impl PySchema {
     ///         (~32x smaller, 1 bit per element; requires ``"cosine"``).
     ///     embedder: Optional token-level embedder registered via
     ///         `add_embedder`.
+    ///     pool_factor: Token pooling — each document keeps about
+    ///         ``1 / pool_factor`` of its token vectors (``1``, the
+    ///         default, keeps them all).
     ///
     /// Raises:
     ///     ValueError: if ``name`` is reserved, ``dimension`` is zero,
-    ///         ``distance`` is neither cosine nor dot product, or
-    ///         ``storage`` is not a recognized kind.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", storage="f32", embedder=None))]
+    ///         ``distance`` is neither cosine nor dot product, ``storage``
+    ///         is not a recognized kind, or ``pool_factor`` is 0.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", storage="f32", embedder=None, pool_factor=1))]
     pub fn add_multi_vector_field(
         &mut self,
         name: &str,
@@ -672,10 +675,12 @@ impl PySchema {
         distance: &str,
         storage: &str,
         embedder: Option<String>,
+        pool_factor: u32,
     ) -> PyResult<()> {
         let mut opt = MultiVectorOption::new(dimension)
             .distance(parse_distance(distance)?)
-            .storage(parse_multi_vector_storage(storage)?);
+            .storage(parse_multi_vector_storage(storage)?)
+            .pool_factor(pool_factor);
         opt.embedder = embedder;
         opt.validate(name)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;

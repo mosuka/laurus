@@ -1250,7 +1250,7 @@ mod tests {
                 s.add_ivf_field(n, 3, None, None, None, None, None)
             }),
             ("addMultiVectorField", |s, n| {
-                s.add_multi_vector_field(n, 3, None, None, None)
+                s.add_multi_vector_field(n, 3, None, None, None, None)
             }),
         ];
         for (method, add_field) in methods {
@@ -1357,6 +1357,7 @@ mod tests {
                 2,
                 Some("dot_product".to_string()),
                 callback.map(|_| "colbert".to_string()),
+                None,
                 None,
             )
             .unwrap();
@@ -1494,6 +1495,7 @@ mod tests {
                 None,
                 Some("colbert".to_string()),
                 None,
+                None,
             )
             .unwrap();
         let Err(err) = WasmIndex::create(Some(schema), None, None).await else {
@@ -1587,22 +1589,25 @@ mod tests {
     #[wasm_bindgen_test]
     fn add_multi_vector_field_rejects_invalid_options() {
         let cases = [
-            (0, None, None, "dimension must be greater than 0"),
+            (0, None, None, None, "dimension must be greater than 0"),
             (
                 2,
                 Some("euclidean"),
                 None,
+                None,
                 "distance must be Cosine or DotProduct",
             ),
-            (2, None, Some("bogus"), "Unknown multi-vector storage"),
+            (2, None, Some("bogus"), None, "Unknown multi-vector storage"),
             (
                 2,
                 Some("dot_product"),
                 Some("binary"),
+                None,
                 "requires distance Cosine",
             ),
+            (2, None, None, Some(0), "pool_factor must be at least 1"),
         ];
-        for (dimension, distance, storage, message) in cases {
+        for (dimension, distance, storage, pool_factor, message) in cases {
             let mut schema = WasmSchema::new();
             let Err(err) = schema.add_multi_vector_field(
                 "tokens".to_string(),
@@ -1610,6 +1615,7 @@ mod tests {
                 distance.map(str::to_string),
                 None,
                 storage.map(str::to_string),
+                pool_factor,
             ) else {
                 panic!("invalid multi-vector options must be rejected: {message}");
             };
@@ -1617,6 +1623,15 @@ mod tests {
             assert!(error.contains(message), "{error}");
             assert!(schema.field_names().is_empty());
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn add_multi_vector_field_accepts_a_pool_factor() {
+        let mut schema = WasmSchema::new();
+        schema
+            .add_multi_vector_field("tokens".to_string(), 2, None, None, None, Some(2))
+            .unwrap_or_else(|err| panic!("pool_factor=2 must be accepted: {err:?}"));
+        assert_eq!(schema.field_names(), vec!["tokens".to_string()]);
     }
 
     #[wasm_bindgen_test]
@@ -1630,6 +1645,7 @@ mod tests {
                     None,
                     None,
                     Some(storage.to_string()),
+                    None,
                 )
                 .unwrap_or_else(|err| panic!("storage={storage} must be accepted: {err:?}"));
             assert_eq!(schema.field_names(), vec!["tokens".to_string()]);

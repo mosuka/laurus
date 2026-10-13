@@ -2457,6 +2457,8 @@ class LaurusTest extends TestCase
             [[-1], "dimension must be greater than 0"],
             [[2, "euclidean"], "distance must be Cosine or DotProduct"],
             [[2, "dot_product", null, "binary"], "requires distance Cosine"],
+            [[2, null, null, null, 0], "pool_factor must be at least 1"],
+            [[2, null, null, null, -2], "pool_factor must be at least 1"],
         ];
         foreach ($cases as [$args, $message]) {
             $schema = new Laurus\Schema();
@@ -2477,6 +2479,13 @@ class LaurusTest extends TestCase
             $schema->addMultiVectorField("tokens", 2, "cosine", null, $storage);
             $this->assertSame(["tokens"], $schema->fieldNames());
         }
+    }
+
+    public function testAddMultiVectorFieldAcceptsPoolFactor(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addMultiVectorField("tokens", 2, "cosine", null, null, 2);
+        $this->assertSame(["tokens"], $schema->fieldNames());
     }
 
     public function testUnknownMultiVectorStorageRejected(): void

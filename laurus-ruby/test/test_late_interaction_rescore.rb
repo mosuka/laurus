@@ -143,13 +143,20 @@ class TestLateInteractionRescore < Minitest::Test
       [[0], {}, "dimension"],
       [[2], { distance: "euclidean" }, "distance"],
       [[2], { storage: "bogus" }, "storage"],
-      [[2], { distance: "dot_product", storage: "binary" }, "requires distance Cosine"]
+      [[2], { distance: "dot_product", storage: "binary" }, "requires distance Cosine"],
+      [[2], { pool_factor: 0 }, "pool_factor must be at least 1"]
     ].each do |args, kwargs, message|
       schema = Laurus::Schema.new
       err = assert_raises(ArgumentError, message) { schema.add_multi_vector_field("tokens", *args, **kwargs) }
       assert_includes err.message, message
       assert_equal [], schema.field_names
     end
+  end
+
+  def test_add_multi_vector_field_accepts_a_pool_factor
+    schema = Laurus::Schema.new
+    schema.add_multi_vector_field("tokens", 2, pool_factor: 2)
+    assert_equal ["tokens"], schema.field_names
   end
 
   def test_add_multi_vector_field_accepts_storage_kinds

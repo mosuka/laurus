@@ -880,27 +880,40 @@ impl RbSchema {
     ///   - `embedder:` (String, optional): A token-level embedder registered
     ///     via `add_embedder` (a `"candle_colbert"` one), which embeds text
     ///     values and rescore query text.
+    ///   - `pool_factor:` (Integer, default 1): Token pooling — each
+    ///     document keeps about `1 / pool_factor` of its token vectors.
     ///
     /// # Errors
     ///
     /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
     /// if `dimension` is 0, if `distance:` is neither cosine nor
-    /// dot_product, or if `storage:` is not a recognized kind.
+    /// dot_product, if `storage:` is not a recognized kind, or if
+    /// `pool_factor:` is 0.
     fn add_multi_vector_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
         let kwargs = get_kwargs::<
             _,
             (),
-            (Option<String>, Option<String>, Option<Option<String>>),
+            (
+                Option<String>,
+                Option<String>,
+                Option<Option<String>>,
+                Option<u32>,
+            ),
             (),
-        >(args.keywords, &[], &["distance", "storage", "embedder"])?;
-        let (distance, storage, embedder) = kwargs.optional;
+        >(
+            args.keywords,
+            &[],
+            &["distance", "storage", "embedder", "pool_factor"],
+        )?;
+        let (distance, storage, embedder, pool_factor) = kwargs.optional;
         let mut opt = MultiVectorOption::new(dimension)
             .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
             .storage(parse_multi_vector_storage(
                 storage.as_deref().unwrap_or("f32"),
-            )?);
+            )?)
+            .pool_factor(pool_factor.unwrap_or(1));
         opt.embedder = embedder.flatten();
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))

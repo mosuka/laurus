@@ -664,12 +664,15 @@ impl PhpSchema {
     ///   #1346): `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"`
     ///   (~4x smaller), `"binary"` (~32x smaller, 1 bit per element;
     ///   requires `"cosine"`).
+    /// * `pool_factor` - Token pooling (Issue #1346): each document keeps
+    ///   about `1 / pool_factor` of its token vectors (default 1, all).
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`), if
     /// `dimension` is not positive, if `distance` is neither cosine nor
-    /// dot_product, or if `storage` is not a known kind.
+    /// dot_product, if `storage` is not a known kind, or if `pool_factor`
+    /// is not positive.
     pub fn add_multi_vector_field(
         &self,
         name: String,
@@ -677,14 +680,18 @@ impl PhpSchema {
         distance: Option<String>,
         embedder: Option<String>,
         storage: Option<String>,
+        pool_factor: Option<i64>,
     ) -> PhpResult<()> {
-        // A negative dimension is rejected by `validate` like 0.
+        // A negative dimension (or pool factor) is rejected by `validate`
+        // like 0.
         let dimension = usize::try_from(dimension).unwrap_or(0);
+        let pool_factor = u32::try_from(pool_factor.unwrap_or(1)).unwrap_or(0);
         let mut opt = MultiVectorOption::new(dimension)
             .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
             .storage(parse_multi_vector_storage(
                 storage.as_deref().unwrap_or("f32"),
-            )?);
+            )?)
+            .pool_factor(pool_factor);
         opt.embedder = embedder;
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))

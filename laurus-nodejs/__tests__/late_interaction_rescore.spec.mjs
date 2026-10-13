@@ -157,6 +157,24 @@ describe("addMultiVectorField", () => {
     expect(schema.fieldNames()).toEqual(["tokens"]);
   });
 
+  it("accepts a pool factor and rejects 0", () => {
+    const schema = new Schema();
+    expect(() =>
+      schema.addMultiVectorField("tokens", 2, undefined, undefined, undefined, 2),
+    ).not.toThrow();
+    expect(schema.fieldNames()).toEqual(["tokens"]);
+    const other = new Schema();
+    expect(() =>
+      other.addMultiVectorField("tokens", 2, undefined, undefined, undefined, 0),
+    ).toThrow(
+      expect.objectContaining({
+        code: "InvalidArg",
+        message: expect.stringContaining("pool_factor must be at least 1"),
+      }),
+    );
+    expect(other.fieldNames()).toEqual([]);
+  });
+
   it("rejects binary storage with dot_product", () => {
     const schema = new Schema();
     expect(() =>

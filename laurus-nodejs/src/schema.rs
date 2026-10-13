@@ -621,12 +621,14 @@ impl JsSchema {
     ///   #1346): "f32" (default, exact), "f16" (2x smaller), "int8" (~4x
     ///   smaller), "binary" (~32x smaller, 1 bit per element; requires
     ///   "cosine").
+    /// * `pool_factor` - Token pooling (Issue #1346): each document keeps
+    ///   about `1 / pool_factor` of its token vectors (default 1, all).
     ///
     /// # Errors
     ///
     /// Throws if `name` starts with `_` (other than `_id`), if `dimension`
-    /// is 0, if `distance` is neither cosine nor dot_product, or if
-    /// `storage` is not a known kind.
+    /// is 0, if `distance` is neither cosine nor dot_product, if `storage`
+    /// is not a known kind, or if `pool_factor` is 0.
     #[napi]
     pub fn add_multi_vector_field(
         &mut self,
@@ -635,12 +637,14 @@ impl JsSchema {
         distance: Option<String>,
         embedder: Option<String>,
         storage: Option<String>,
+        pool_factor: Option<u32>,
     ) -> Result<()> {
         let mut opt = MultiVectorOption::new(dimension as usize)
             .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
             .storage(parse_multi_vector_storage(
                 storage.as_deref().unwrap_or("f32"),
-            )?);
+            )?)
+            .pool_factor(pool_factor.unwrap_or(1));
         opt.embedder = embedder;
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))
