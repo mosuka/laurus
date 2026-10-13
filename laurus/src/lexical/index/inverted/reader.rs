@@ -51,7 +51,8 @@ pub(crate) const DEFAULT_MAX_CACHE_MEMORY: usize = 128 * 1024 * 1024;
 #[derive(Clone)]
 pub struct InvertedIndexReaderConfig {
     /// Maximum memory for caching (in bytes): the budget of the reader's
-    /// term-info cache, and of each segment reader's posting cache.
+    /// term-info cache, and of each segment reader's posting cache. The
+    /// caches grow as they fill; none of the budget is reserved up front.
     /// Default: 128 MiB.
     pub max_cache_memory: usize,
 
@@ -2086,6 +2087,10 @@ pub struct CacheManager {
 impl CacheManager {
     /// Create a new cache manager.
     ///
+    /// The term cache starts empty and grows with the entries it holds; none
+    /// of the budget is reserved up front (Issue #1431), so building a reader
+    /// costs the same for any budget.
+    ///
     /// # Arguments
     ///
     /// * `memory_limit` - Soft memory budget in bytes; the term cache's entry
@@ -2095,7 +2100,7 @@ impl CacheManager {
         let capacity = NonZeroUsize::new((memory_limit / EST_TERM_ENTRY_BYTES).max(1))
             .unwrap_or(NonZeroUsize::MIN);
         CacheManager {
-            term_cache: Mutex::new(LruCache::new(capacity)),
+            term_cache: Mutex::new(LruCache::sparse(capacity)),
             memory_limit,
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
@@ -5168,6 +5173,18 @@ mod tests {
             cache.get_term_info("b").is_none(),
             "least-recently-used 'b' must be evicted, not a random entry"
         );
+    }
+
+    /// The term cache reserves nothing for its budget (Issue #1431): a
+    /// `usize::MAX` budget, whose up-front table could never be allocated,
+    /// still builds a cache that holds entries.
+    #[test]
+    fn test_cache_manager_does_not_reserve_its_budget() {
+        let cache = CacheManager::new(usize::MAX);
+        cache.cache_term_info("a".to_string(), TermInfo::new(1, 1, 7, 1));
+
+        assert_eq!(cache.get_term_info("a").unwrap().doc_frequency, 7);
+        assert_eq!(cache.stats().memory_usage, EST_TERM_ENTRY_BYTES);
     }
 
     /// A repeated `postings(field, term)` within a snapshot is served from the

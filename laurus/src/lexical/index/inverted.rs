@@ -1736,6 +1736,27 @@ mod tests {
         assert_eq!(inverted.cache_stats().memory_limit, 4096);
     }
 
+    /// `reader()` reserves none of `max_cache_memory` (Issue #1431): with a
+    /// `usize::MAX` budget, whose term-info table could never be allocated
+    /// up front, the reader still builds, and a repeated term lookup is
+    /// served from the term-info cache.
+    #[test]
+    fn reader_does_not_reserve_the_index_max_cache_memory() {
+        let reader = committed_reader(InvertedIndexConfig {
+            max_cache_memory: usize::MAX,
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            let info = reader.term_info("body", "shared").unwrap().unwrap();
+            assert_eq!(info.doc_freq, 3);
+        }
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        assert_eq!(inverted.cache_stats().hits, 1);
+    }
+
     /// `enable_posting_cache: false` on the index config reaches the reader
     /// (Issue #1200): a repeated lookup decodes again and never consults the
     /// cache. Ignored, the default-on cache records a miss and then a hit.

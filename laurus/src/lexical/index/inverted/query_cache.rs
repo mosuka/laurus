@@ -92,12 +92,16 @@ impl QueryFilterCache {
     /// A `capacity` of `0` disables the cache: [`get`](Self::get) always misses
     /// and [`put`](Self::put) is a no-op, so callers always compute fresh.
     ///
+    /// The map starts empty and grows with the entries it holds; nothing is
+    /// reserved for `capacity` up front (Issue #1431), so building a reader
+    /// costs the same for any capacity.
+    ///
     /// # Arguments
     ///
     /// * `capacity` - Maximum number of `(query key, doc-id set)` entries to
     ///   retain. The least-recently-used entry is evicted when full.
     pub fn new(capacity: usize) -> Self {
-        let inner = NonZeroUsize::new(capacity).map(|c| Mutex::new(LruCache::new(c)));
+        let inner = NonZeroUsize::new(capacity).map(|c| Mutex::new(LruCache::sparse(c)));
         QueryFilterCache {
             inner,
             hits: AtomicU64::new(0),
@@ -227,5 +231,18 @@ mod tests {
         assert!(cache.get("c").is_some(), "c was just inserted");
         assert!(cache.get("b").is_none(), "b should have been evicted");
         assert_eq!(cache.len(), 2);
+    }
+
+    /// Nothing is reserved for the capacity (Issue #1431): a `usize::MAX`
+    /// capacity, whose up-front table could never be allocated, still
+    /// caches.
+    #[test]
+    fn capacity_is_not_reserved_up_front() {
+        let cache = QueryFilterCache::new(usize::MAX);
+        cache.put("k".to_string(), set(&[1, 2]));
+
+        let got = cache.get("k").expect("entry should be present");
+        assert_eq!(got.iter().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(cache.len(), 1);
     }
 }

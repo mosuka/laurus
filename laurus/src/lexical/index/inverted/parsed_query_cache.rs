@@ -50,12 +50,17 @@ impl ParsedQueryCache {
     /// A `capacity` of `0` disables the cache: [`get`](Self::get) always misses
     /// and [`put`](Self::put) is a no-op, so callers always parse fresh.
     ///
+    /// The map starts empty and grows with the entries it holds; nothing is
+    /// reserved for `capacity` up front (Issue #1431). The per-segment search
+    /// fanout builds a searcher, and with it this cache, for every segment of
+    /// every query.
+    ///
     /// # Arguments
     ///
     /// * `capacity` - Maximum number of `(dsl string, parsed query)` entries to
     ///   retain. The least-recently-used entry is evicted when full.
     pub fn new(capacity: usize) -> Self {
-        let inner = NonZeroUsize::new(capacity).map(|c| Mutex::new(LruCache::new(c)));
+        let inner = NonZeroUsize::new(capacity).map(|c| Mutex::new(LruCache::sparse(c)));
         ParsedQueryCache {
             inner,
             hits: AtomicU64::new(0),
@@ -169,5 +174,17 @@ mod tests {
         assert!(cache.get("a:1").is_some(), "recently used");
         assert!(cache.get("c:1").is_some(), "just inserted");
         assert!(cache.get("b:1").is_none(), "should have been evicted");
+    }
+
+    /// Nothing is reserved for the capacity (Issue #1431): a `usize::MAX`
+    /// capacity, whose up-front table could never be allocated, still
+    /// caches.
+    #[test]
+    fn capacity_is_not_reserved_up_front() {
+        let cache = ParsedQueryCache::new(usize::MAX);
+        cache.put("title:rust".to_string(), term("title", "rust"));
+
+        let got = cache.get("title:rust").expect("entry should be present");
+        assert_eq!(got.description(), "title:rust");
     }
 }

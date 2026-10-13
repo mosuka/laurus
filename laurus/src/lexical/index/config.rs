@@ -217,9 +217,10 @@ pub struct InvertedIndexConfig {
     /// It bounds the reader's term-info cache and, while
     /// [`Self::enable_posting_cache`] is on, **each** segment reader's
     /// posting cache: the posting caches do not share one budget, so the
-    /// worst case is `(1 + segment count) × max_cache_memory`. `0`
-    /// effectively disables the posting cache; the term-info cache still
-    /// keeps one entry.
+    /// worst case is `(1 + segment count) × max_cache_memory`. The caches
+    /// grow as they fill; building a reader reserves none of the budget
+    /// (Issue #1431). `0` effectively disables the posting cache; the
+    /// term-info cache still keeps one entry.
     #[serde(default = "default_max_cache_memory")]
     pub max_cache_memory: usize,
 }
