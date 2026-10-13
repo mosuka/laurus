@@ -473,8 +473,10 @@ shares the cached list directly (a reference-count bump, not a copy), so evaluat
 never duplicates its posting arrays — this removed the dominant allocation cost on the
 multi-segment scoring path.
 
-Because a segment is immutable for a reader snapshot, the cached list is always consistent with
-its deletions; a commit builds new segment readers with empty caches. The cache is **byte-budget
+A segment reader's deletions are fixed for its life, so a cached list is always consistent with
+them. A commit that leaves a segment unchanged keeps its reader, and the cache with it; a segment
+whose deletions changed gets a new reader with an empty cache (see
+[Reading After a Commit](../indexing/lexical_indexing.md#reading-after-a-commit)). The cache is **byte-budget
 bounded** (posting lists vary widely in size) — least-recently-used lists are evicted once the
 budget is exceeded, and a single list larger than the whole budget is not cached. It is enabled
 by default, and each segment's cache gets its own `max_cache_memory` budget (default 128 MiB, which

@@ -237,7 +237,7 @@ graph TB
 
 | ファイル拡張子 | 内容 |
 | :--- | :--- |
-| `.dict` | Term Dictionary。v3 `LTDD` ブロックツリーレイアウト（FST + 128 ターム単位の front-coded ブロック + bit-packed `TermInfo`）。セグメント open 時に `AHashMap` バックの in-memory クエリ層へ展開 |
+| `.dict` | Term Dictionary。v3 `LTDD` ブロックツリーレイアウト（FST + 128 ターム単位の front-coded ブロック + bit-packed `TermInfo`）。セグメントを初めて読むときに `AHashMap` バックの in-memory クエリ層へ展開し、セグメントがある間は保持する（「commit 後の読み込み」を参照） |
 | `.post` | Posting Lists（ドキュメント ID、ターム頻度、位置情報）。このファイルを失ったセグメントは、索引の analyzer で stored document をスキャンして term クエリに答え（ヒットのスコアは 0）、警告ログを出す |
 | `.bkd` | 数値・日付・`Geo`（2D）・`Geo3d`（3D ECEF）フィールドの [BKD ツリー](../bkd_tree.md) データ |
 | `.docs` | 格納されたフィールド値（元のドキュメント内容）。チャンク単位（未圧縮で約16KiBまたは128ドキュメントのいずれか早い方）でLZ4圧縮され、圧縮による効果がないチャンクは無圧縮のままフォールバックする（`SDOC` v1、Issue #548） |
@@ -261,6 +261,18 @@ graph TB
 - フィルタが「あるかもしれない」と答えた場合（既存の `_id` か、新しい ID のうち最大で約 1%）は、各セグメントの term dictionary を引いて正確な版を探す
 - フィルタはインデックスを開いた後の最初の照合で作られ、commit 後の照合では新しいセグメントのキーだけを足す。埋まってきたら現在のセグメントから作り直し、そのときマージで消えた ID も落とす
 - メモリは、作り直した直後で commit 済みの文書あたり 2 バイト、次に作り直す直前で約 1.3 バイト
+
+### commit 後の読み込み
+
+commit した文書は、次の検索か put が作る新しい reader から見えるようになる。この reader を作るときに、commit が触れていないセグメントを読み直すことはない。インデックスは最後に作った reader のセグメントごとの reader を持っておき、次の reader がそれを引き継ぐ。
+
+- メタデータも削除も変わっていないセグメントは、同じ reader を使い続ける。term dictionary、norms、doc values、stored documents、BKD ツリー、[posting キャッシュ](../search/lexical_search.md#posting-キャッシュposting-cache)など、その reader が読み込んだものもそのまま使う
+- 削除だけが増えたセグメントには、新しい reader を作る。新しい reader はセグメントの `.delmap` だけを読み、ほかは古い reader と共有する
+- commit が flush したセグメントやマージが書いたセグメントなど、新しいセグメントは開き直す。各部分は初めて使うときに読み込む
+
+そのため commit 後の最初の検索や `_id` の照合は、ほかのセグメントが文書をいくつ持っていても、commit が変えた分だけを読む。commit の前に作った reader は、作ったときのセグメントの reader を持ち続けるので、自分のスナップショットを見続ける。マージとフィールドの再構築は、置き換えたセグメントの reader を publish の直後に手放す。インデックスを閉じると、すべて手放す。
+
+セグメントが読み込んだものは、commit をまたいでメモリに残る。以前は commit のたびに解放し、次の検索や更新で読み直していた。検索はどのみち全セグメントの term dictionary を読み込むので、ピークは変わらない。commit から次の読み込みまでの間に解放されなくなるだけである。
 
 ## BM25 スコアリング
 

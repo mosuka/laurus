@@ -203,11 +203,12 @@ pub struct InvertedIndexConfig {
     /// Whether query readers cache decoded posting lists per segment
     /// (Issue #612). Defaults to `true`.
     ///
-    /// A repeated `(field, term)` lookup within a reader snapshot reuses the
+    /// A repeated `(field, term)` lookup on a segment reader reuses the
     /// decoded, deletion-filtered list instead of re-reading and re-decoding
     /// the segment's `.post`. Each segment's cache is bounded by
-    /// [`Self::max_cache_memory`]; a commit builds new segment readers with
-    /// empty caches.
+    /// [`Self::max_cache_memory`]. A commit keeps the readers, and so the
+    /// caches, of the segments it left unchanged; a segment whose deletions
+    /// changed gets a new reader with an empty cache (Issue #1423).
     #[serde(default = "default_true")]
     pub enable_posting_cache: bool,
 

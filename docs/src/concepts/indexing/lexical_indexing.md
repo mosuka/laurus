@@ -246,7 +246,7 @@ graph TB
 
 | File Extension | Contents |
 | :--- | :--- |
-| `.dict` | Term dictionary in the v3 `LTDD` block-tree layout (FST over per-block representative terms + 128-term blocks of front-coded term bytes + bit-packed `TermInfo`). Loaded into an `AHashMap`-backed in-memory query layer at segment open. |
+| `.dict` | Term dictionary in the v3 `LTDD` block-tree layout (FST over per-block representative terms + 128-term blocks of front-coded term bytes + bit-packed `TermInfo`). Loaded into an `AHashMap`-backed in-memory query layer the first time the segment is read, and kept for the segment's life (see [Reading After a Commit](#reading-after-a-commit)). |
 | `.post` | Posting lists (document IDs, term frequencies, positions). A segment missing this file answers term queries by scanning its stored documents with the index analyzer (such hits score 0) and logs a warning |
 | `.bkd` | [BKD tree](../bkd_tree.md) data for numeric, date, `Geo` (2D), and `Geo3d` (3D ECEF) fields |
 | `.docs` | Stored field values (the original document content), chunked (~16 KiB uncompressed, or 128 documents, whichever comes first) and LZ4-compressed per chunk, with a per-chunk raw fallback when compression doesn't help (`SDOC` v1, Issue #548) |
@@ -270,6 +270,18 @@ Every `put_document` first looks up the earlier versions of its `_id` so it can 
 - A "maybe" (an `_id` that exists, or about 1% of new IDs at most) probes each segment's term dictionary to find the exact copies.
 - The filter is built on the first lookup after the index is opened, and each lookup after a commit adds only the new segments' keys. When it fills up, it is rebuilt from the current segments, which also drops the IDs that merges removed.
 - It takes 2 bytes per committed document right after a rebuild, down to about 1.3 bytes just before the next one.
+
+### Reading After a Commit
+
+A commit's documents become visible through a new reader, built by the next search or put. Building it does not read again the segments the commit left alone. The index keeps the per-segment readers of the last reader it built, and the next reader takes them over:
+
+- A segment whose metadata and deletions did not change keeps its reader. It keeps everything that reader has loaded: the term dictionary, norms, doc values, stored documents, BKD trees and the [posting cache](../search/lexical_search.md#posting-cache).
+- A segment that only gained deletions gets a new reader. The new reader reads the segment's `.delmap` and shares everything else with the old one.
+- A new segment, such as one the commit flushed or a merge wrote, is opened. Its parts load the first time they are used.
+
+The first search or `_id` lookup after a commit therefore reads only what the commit changed, however many documents the other segments hold. A reader built before the commit keeps the segment readers it was built with, so it still sees its own snapshot. A merge or a field rebuild releases the readers of the segments it replaced as soon as it publishes, and closing the index releases them all.
+
+What the segments have loaded stays in memory from one commit to the next. Before, it was freed at each commit and loaded again by the next search or update. A search loads every segment's term dictionary anyway, so the peak does not change. The memory is no longer released between a commit and the next read.
 
 ## BM25 Scoring
 

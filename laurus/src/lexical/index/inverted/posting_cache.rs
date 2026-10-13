@@ -10,9 +10,9 @@
 //! # Lifetime and key
 //!
 //! The cache lives on a [`SegmentReader`](crate::lexical::index::inverted::reader::SegmentReader),
-//! which is immutable for a reader snapshot (a new commit builds new segment
-//! readers), so caching the **post-deletion** list is sound — deletions are
-//! fixed for the reader's life. The key is `"field\u{1}term"` (the segment is
+//! whose deletions are fixed for its life (a commit that changes them builds
+//! a new segment reader, Issue #1423), so caching the **post-deletion** list
+//! is sound. The key is `"field\u{1}term"` (the segment is
 //! implicit — the cache is per-segment).
 //!
 //! # Eviction

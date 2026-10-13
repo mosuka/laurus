@@ -138,6 +138,14 @@ the segment's deleted documents back into results and counts, or carry them into
 segment. A segment whose metadata records deletions but has no `.delmap` file still opens as a
 segment with none.
 
+The index keeps a segment's reader from one commit to the next (see
+[Reading After a Commit](../concepts/indexing/lexical_indexing.md#reading-after-a-commit)). The
+writer rewrites a segment's `.delmap` in place, under the same name, so each time the index
+builds a reader it reads the `.delmap` of every segment with deletions again and compares its
+contents with the deletions the kept reader holds. The kept reader is used only when they match;
+otherwise the segment gets a new reader with the new deletions. A reader built earlier keeps the
+deletions it read.
+
 ### Group-Committed Persistence
 
 Deletion state is persisted **once per commit**, not once per delete. Each delete (including

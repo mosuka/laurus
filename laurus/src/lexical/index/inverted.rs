@@ -49,6 +49,7 @@ pub mod reader;
 pub mod searcher;
 pub mod segment;
 pub(crate) mod segment_manifest;
+pub(crate) mod segment_reader_cache;
 pub mod writer;
 
 use self::reader::{InvertedIndexReader, InvertedIndexReaderConfig};
@@ -169,6 +170,11 @@ pub struct InvertedIndex {
     /// to every reader [`Self::reader`] builds, so a put of an id no segment
     /// holds does not probe each segment (Issue #1420).
     id_filter: Arc<id_filter::CommittedIdFilter>,
+
+    /// The segment readers of the last reader [`Self::reader`] built, which
+    /// the next one reuses for the segments a commit left unchanged (Issue
+    /// #1423).
+    segment_readers: segment_reader_cache::SegmentReaderCache,
 }
 
 impl std::fmt::Debug for InvertedIndex {
@@ -198,6 +204,7 @@ impl InvertedIndex {
                 next_generation: 0,
             })),
             id_filter: Arc::new(id_filter::CommittedIdFilter::new()),
+            segment_readers: Default::default(),
         };
 
         index.write_metadata()?;
@@ -289,6 +296,7 @@ impl InvertedIndex {
                 next_generation,
             })),
             id_filter: Arc::new(id_filter::CommittedIdFilter::new()),
+            segment_readers: Default::default(),
         })
     }
 
@@ -812,6 +820,7 @@ impl InvertedIndex {
                 segment_manifest::upsert_entry(list, info);
             }
         })?;
+        self.release_replaced_segment_readers();
 
         // Physical cleanup only (#1024): the manifest write above already
         // removed the sources from discovery atomically, so file deletion
@@ -822,6 +831,15 @@ impl InvertedIndex {
         }
 
         Ok(())
+    }
+
+    /// Drop the cached readers of the segments the manifest no longer lists
+    /// (Issue #1423), right after a merge or a field rebuild publishes. Left
+    /// to the next reader build, the replaced segments' parts would stay in
+    /// memory until something reads the index again.
+    fn release_replaced_segment_readers(&self) {
+        let segments = self.segment_manifest.read().segments.clone();
+        self.segment_readers.retain(&segments);
     }
 
     /// Sum the on-disk size of every file belonging to `segment_id`.
@@ -1004,8 +1022,6 @@ impl LexicalIndex for InvertedIndex {
     fn reader(&self) -> Result<Arc<dyn LexicalIndexReader>> {
         self.check_closed()?;
 
-        let segments = self.load_segments()?;
-
         // Use analyzer from index config. The query/filter cache capacity
         // (Issue #578) and the posting-cache settings (Issue #1200) must be
         // set explicitly here: `InvertedIndexReaderConfig::default()` would
@@ -1018,8 +1034,19 @@ impl LexicalIndex for InvertedIndex {
             ..InvertedIndexReaderConfig::default()
         };
 
-        let reader = InvertedIndexReader::new(segments, self.storage.clone(), reader_config)?
-            .with_id_filter(Arc::clone(&self.id_filter));
+        // The segments a commit left unchanged keep their readers, and with
+        // them their term dictionaries and the rest of what they loaded
+        // (Issue #1423): the first search or `_id` lookup after a commit
+        // reads only what the commit changed. The snapshot is taken under
+        // the cache's lock, so a build of an older snapshot cannot overwrite
+        // a newer one's readers.
+        let reader = InvertedIndexReader::with_segment_cache(
+            self.storage.clone(),
+            reader_config,
+            &self.segment_readers,
+            || self.load_segments(),
+        )?
+        .with_id_filter(Arc::clone(&self.id_filter));
         Ok(Arc::new(reader))
     }
 
@@ -1070,6 +1097,8 @@ impl LexicalIndex for InvertedIndex {
 
     fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::SeqCst);
+        // A closed index builds no more readers (Issue #1423).
+        self.segment_readers.clear();
         Ok(())
     }
 
@@ -1265,6 +1294,7 @@ impl LexicalIndex for InvertedIndex {
                     }
                 },
             )?;
+            self.release_replaced_segment_readers();
 
             // Physical cleanup only: the manifest write above already
             // removed the sources from discovery atomically.
@@ -2383,5 +2413,168 @@ mod tests {
         let (_, on_disk) = segment_manifest::load(storage.as_ref()).unwrap().unwrap();
         let first = on_disk.iter().find(|s| s.min_doc_id == 0).unwrap();
         assert_eq!(first.deleted_count, Some(2), "persisted by the next write");
+    }
+
+    // ---- Segment readers kept across the readers `reader()` builds,
+    // ---- Issue #1423 ---------------------------------------------------
+
+    use segment_reader_cache::SharedSegmentReader;
+
+    /// The segment readers of `reader`, one `InvertedIndex::reader` built.
+    fn segment_readers_of(reader: &Arc<dyn LexicalIndexReader>) -> Vec<SharedSegmentReader> {
+        reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap()
+            .segment_readers()
+            .to_vec()
+    }
+
+    /// The live documents `segment` reads for `body:term`.
+    fn body_matches(segment: &SharedSegmentReader, term: &str) -> Vec<u64> {
+        let segment = segment.read().unwrap();
+        let mut postings = segment
+            .postings("body", term)
+            .unwrap()
+            .expect("the term is indexed");
+        let mut doc_ids = Vec::new();
+        while postings.next().unwrap() {
+            doc_ids.push(postings.doc_id());
+        }
+        doc_ids
+    }
+
+    /// An index holding one segment per body in `bodies`, and its writer.
+    fn index_with_segments(bodies: &[&str]) -> (InvertedIndex, Box<dyn LexicalIndexWriter>) {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for body in bodies {
+            writer.add_document(doc_with_body(body)).unwrap();
+            writer.commit().unwrap();
+        }
+        (index, writer)
+    }
+
+    /// A segment a commit left unchanged keeps its reader in the next reader
+    /// `reader()` builds: its term dictionary is not read again, and its
+    /// posting cache stays warm.
+    #[test]
+    fn reader_keeps_the_segment_readers_a_commit_left_unchanged() {
+        let (index, mut writer) = index_with_segments(&["alpha"]);
+        let first = segment_readers_of(&index.reader().unwrap());
+        let dictionary = first[0].read().unwrap().term_dictionary().unwrap().unwrap();
+        let alpha = body_matches(&first[0], "alpha");
+        assert_eq!(alpha.len(), 1);
+
+        writer.add_document(doc_with_body("beta")).unwrap();
+        writer.commit().unwrap();
+        let second = segment_readers_of(&index.reader().unwrap());
+
+        assert_eq!(second.len(), 2);
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        let again = second[0]
+            .read()
+            .unwrap()
+            .term_dictionary()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&dictionary, &again));
+        assert_eq!(body_matches(&second[0], "alpha"), alpha);
+        let stats = second[0].read().unwrap().posting_cache_stats();
+        assert_eq!((stats.hits, stats.misses), (1, 1));
+    }
+
+    /// A commit that only adds a deletion to a segment gives the next reader
+    /// a new reader of it over the same core: the new one leaves the deleted
+    /// document out, while the reader built before still has it, as its
+    /// snapshot did.
+    #[test]
+    fn a_deletion_commit_gives_a_new_segment_reader_over_the_same_core() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let mut writer = index.writer().unwrap();
+        let ids: Vec<u64> = (0..5)
+            .map(|_| writer.add_document(doc_with_body("shared")).unwrap())
+            .collect();
+        writer.commit().unwrap();
+        let before = segment_readers_of(&index.reader().unwrap());
+        assert_eq!(body_matches(&before[0], "shared"), ids);
+
+        writer.delete_document(ids[2]).unwrap();
+        writer.commit().unwrap();
+        let after = segment_readers_of(&index.reader().unwrap());
+
+        assert!(!Arc::ptr_eq(&before[0], &after[0]));
+        assert!(Arc::ptr_eq(
+            before[0].read().unwrap().core(),
+            after[0].read().unwrap().core()
+        ));
+        let live: Vec<u64> = ids.iter().copied().filter(|&id| id != ids[2]).collect();
+        assert_eq!(body_matches(&after[0], "shared"), live);
+        assert_eq!(after[0].read().unwrap().doc_count(), 4);
+        assert_eq!(body_matches(&before[0], "shared"), ids);
+        assert_eq!(before[0].read().unwrap().doc_count(), 5);
+    }
+
+    /// A merge releases the readers of the segments it replaced as soon as
+    /// it publishes, so their parts are freed once no reader uses them,
+    /// without waiting for the next reader. A reader built before the merge
+    /// keeps them and still answers from its snapshot.
+    #[test]
+    fn a_merge_releases_the_segment_readers_it_replaced() {
+        let (index, writer) = index_with_segments(&["alpha", "beta", "gamma"]);
+        drop(writer);
+        let reader = index.reader().unwrap();
+        let replaced: Vec<_> = segment_readers_of(&reader)
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        assert_eq!(replaced.len(), 3);
+        assert!(reader.term_info("body", "beta").unwrap().is_some());
+
+        index.optimize().unwrap();
+        assert_eq!(committed_segments(&index).len(), 1);
+        assert_eq!(segment_readers_of(&reader).len(), 3);
+        assert!(reader.term_info("body", "beta").unwrap().is_some());
+
+        drop(reader);
+        assert!(replaced.iter().all(|segment| segment.upgrade().is_none()));
+    }
+
+    /// A field rebuild releases the readers of the segments it rewrote as
+    /// soon as it publishes, as a merge does.
+    #[test]
+    fn a_field_rebuild_releases_the_segment_readers_it_replaced() {
+        use crate::lexical::core::field::TextOption;
+
+        let (index, writer) = index_with_segments(&["alpha", "beta"]);
+        drop(writer);
+        let replaced: Vec<_> = segment_readers_of(&index.reader().unwrap())
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        assert_eq!(replaced.len(), 2);
+
+        index
+            .rebuild_field("body", FieldOption::Text(TextOption::default()), None)
+            .unwrap();
+        assert!(replaced.iter().all(|segment| segment.upgrade().is_none()));
+    }
+
+    /// The index holds its segment readers between the readers it builds,
+    /// and releases them when it closes.
+    #[test]
+    fn closing_the_index_releases_its_segment_readers() {
+        let (index, writer) = index_with_segments(&["alpha"]);
+        drop(writer);
+        let held: Vec<_> = segment_readers_of(&index.reader().unwrap())
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        assert!(held.iter().all(|segment| segment.upgrade().is_some()));
+
+        index.close().unwrap();
+        assert!(held.iter().all(|segment| segment.upgrade().is_none()));
     }
 }

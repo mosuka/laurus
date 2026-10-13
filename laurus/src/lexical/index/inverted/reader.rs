@@ -27,6 +27,7 @@ use crate::lexical::index::inverted::id_filter::{CommittedIdFilter, ID_FIELD, Id
 use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
 use crate::lexical::index::inverted::segment::{Membership, SegmentInfo, SegmentKey};
+use crate::lexical::index::inverted::segment_reader_cache::SegmentReaderCache;
 use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree};
 use crate::lexical::index::structures::dictionary::BLOCK_SIZE;
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
@@ -534,7 +535,9 @@ pub(crate) struct SegmentCore {
 ///
 /// Describes the segment as of one snapshot: its deletions are read when the
 /// reader opens and fixed for its life. What the segment's files decide lives
-/// in a shared [`SegmentCore`].
+/// in a shared [`SegmentCore`]. An index hands the same segment reader to
+/// every reader it builds until the segment's deletions change, and then a
+/// new one over the same core (Issue #1423).
 #[derive(Debug)]
 pub struct SegmentReader {
     /// Segment information.
@@ -551,7 +554,8 @@ pub struct SegmentReader {
     /// Decoded posting-list cache (Issue #612). Disabled by default
     /// (`open` builds it with a zero budget); query readers enable it via
     /// [`Self::with_posting_cache_bytes`]. It holds lists with this reader's
-    /// deletions applied, so it belongs to the reader, not to the core.
+    /// deletions applied, so it belongs to the reader, not to the core, and
+    /// stays warm across commits that leave the segment unchanged.
     posting_cache: PostingCache,
 
     /// Index-time analyzer used by the `.post`-less scan fallback (Issue
@@ -961,26 +965,26 @@ impl SegmentReader {
     /// #1196); without it the fallback uses `StandardAnalyzer`.
     pub fn open(info: SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
         let core = Arc::new(SegmentCore::open(&info, storage)?);
-        Self::over_core(info, core)
-    }
-
-    /// A reader of the segment `info` describes over `core`, which must be
-    /// the same segment's: `info` brings the snapshot's deletions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segment's `.delmap` exists but cannot be read
-    /// or is corrupted.
-    fn over_core(info: SegmentInfo, core: Arc<SegmentCore>) -> Result<Self> {
-        debug_assert_eq!(core.key, SegmentKey::of(&info));
         // Unlike the other parts, `.delmap` is read here rather than on first
         // use (Issue #1265). The deletion checks behind `doc_count` and
         // `has_effective_deletions` cannot return an error, so a lazy load
         // could only hide an unreadable bitmap as "no deletions"; reading it
         // now fails the open instead. It also fixes the deletions for the
         // reader's life, as a snapshot.
-        let deleted_docs = Self::load_deletion_bitmap(&info, core.storage.as_ref())?;
-        Ok(SegmentReader {
+        let deleted_docs = Self::read_deleted_ids(&info, core.storage.as_ref())?
+            .map(|ids| Self::deleted_docs(&info, ids));
+        Ok(Self::with_deletions(info, core, deleted_docs))
+    }
+
+    /// A reader of the segment `info` describes over `core`, the same
+    /// segment's, with `deleted_docs` as its deletions.
+    fn with_deletions(
+        info: SegmentInfo,
+        core: Arc<SegmentCore>,
+        deleted_docs: Option<Arc<DeletedDocs>>,
+    ) -> Self {
+        debug_assert_eq!(core.key, SegmentKey::of(&info));
+        SegmentReader {
             info,
             core,
             deleted_docs,
@@ -989,7 +993,13 @@ impl SegmentReader {
             analyzer: None,
             warned_missing_postings: AtomicBool::new(false),
             live_doc_count: OnceLock::new(),
-        })
+        }
+    }
+
+    /// The parts of the segment its files decide (test hook, Issue #1423).
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> &Arc<SegmentCore> {
+        &self.core
     }
 
     /// The numeric/geo field names this segment carries BKD trees for
@@ -1113,8 +1123,50 @@ impl SegmentReader {
         self.core.load()
     }
 
-    /// Read the segment's deletion bitmap as its deleted documents, for
-    /// [`Self::open`].
+    /// A reader of this segment as `info`, a later snapshot's description of
+    /// it, has it (Issue #1423).
+    ///
+    /// The segment's files have not changed, so the new reader shares this
+    /// one's [`SegmentCore`] and reads only the `.delmap`, which the writer
+    /// rewrites in place as the segment gains deletions. The deletions are
+    /// compared by content, because `info` can be unchanged while the bitmap
+    /// is not: `deleted_count` counts only the deletions of documents the
+    /// segment holds.
+    ///
+    /// # Arguments
+    ///
+    /// * `info` - The segment as the later snapshot describes it.
+    ///
+    /// # Returns
+    ///
+    /// `None` when this reader already describes the segment as `info` does,
+    /// with the same metadata and the same deletions. Otherwise a reader of
+    /// `info` with an empty posting cache and no analyzer, as
+    /// [`Self::open`] returns one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::Index`] naming the segment if the `.delmap`
+    /// exists but cannot be read or is corrupted.
+    pub(crate) fn reopen(&self, info: &SegmentInfo) -> Result<Option<SegmentReader>> {
+        debug_assert_eq!(self.core.key, SegmentKey::of(info));
+        let ids = Self::read_deleted_ids(info, self.core.storage.as_ref())?;
+        let deleted_docs = if ids.as_ref() == self.deleted_docs.as_ref().map(|d| d.ids()) {
+            if *info == self.info {
+                return Ok(None);
+            }
+            self.deleted_docs.clone()
+        } else {
+            ids.map(|ids| Self::deleted_docs(info, ids))
+        };
+        Ok(Some(Self::with_deletions(
+            info.clone(),
+            Arc::clone(&self.core),
+            deleted_docs,
+        )))
+    }
+
+    /// Read the ids the segment's deletion bitmap marks deleted.
     ///
     /// # Returns
     ///
@@ -1127,10 +1179,10 @@ impl SegmentReader {
     /// Returns [`LaurusError::Index`] naming the segment if the `.delmap`
     /// exists but cannot be read or is corrupted, as the merge's
     /// `load_deleted_docs` does.
-    fn load_deletion_bitmap(
+    fn read_deleted_ids(
         info: &SegmentInfo,
         storage: &dyn Storage,
-    ) -> Result<Option<Arc<DeletedDocs>>> {
+    ) -> Result<Option<RoaringTreemap>> {
         if !info.has_deletions {
             return Ok(None);
         }
@@ -1145,12 +1197,17 @@ impl SegmentReader {
                 info.segment_id
             ))
         })?;
-        Ok(Some(Arc::new(DeletedDocs::new(
-            bitmap.into_deleted_docs(),
+        Ok(Some(bitmap.into_deleted_docs()))
+    }
+
+    /// `ids` as the deleted documents of the segment `info` describes.
+    fn deleted_docs(info: &SegmentInfo, ids: RoaringTreemap) -> Arc<DeletedDocs> {
+        Arc::new(DeletedDocs::new(
+            ids,
             info.min_doc_id,
             info.max_doc_id,
             info.doc_count,
-        ))))
+        ))
     }
 
     /// The segment's deleted documents; `None` when it has no deletions.
@@ -1523,8 +1580,9 @@ impl SegmentReader {
 
         if !self.core.storage.file_exists(&postings_file) {
             // No postings part: answer from the stored documents. Warn once
-            // per reader instance (a reader is rebuilt on every commit, so a
-            // damaged segment keeps reminding without flooding per term).
+            // per reader instance, not per term. The index keeps a segment's
+            // reader across commits until the segment's deletions change
+            // (Issue #1423), and every index opened builds its own.
             if !self.warned_missing_postings.swap(true, Ordering::Relaxed) {
                 log::warn!(
                     "segment {} has no .post file; term queries against it are answered by \
@@ -1535,8 +1593,8 @@ impl SegmentReader {
             return self.scan_documents_for_term(field, term);
         }
 
-        // Posting cache (#612): a repeated `(field, term)` lookup within this
-        // reader snapshot reuses the decoded, deletion-filtered list instead of
+        // Posting cache (#612): a repeated `(field, term)` lookup on this
+        // segment reader reuses the decoded, deletion-filtered list instead of
         // re-opening + re-decoding the `.post` file (the read dominates on
         // remote storage). The key allocation, lookup, and the clone are
         // skipped entirely when the cache is disabled (budget 0), so the
@@ -2239,16 +2297,81 @@ impl InvertedIndexReader {
     }
 
     /// Create a new advanced index reader (schema-less mode).
+    ///
+    /// Opens every segment anew; see [`Self::with_segment_cache`] for the
+    /// reader an index builds after a commit.
     pub fn new(
         segments: Vec<SegmentInfo>,
         storage: Arc<dyn Storage>,
         config: InvertedIndexReaderConfig,
     ) -> Result<Self> {
-        let cache_manager = Arc::new(CacheManager::new(config.max_cache_memory));
-        let query_cache = Arc::new(QueryFilterCache::new(config.query_filter_cache_capacity));
-        let mut segment_readers = Vec::new();
-        let mut total_doc_count = 0;
+        let segment_readers = segments
+            .iter()
+            .map(|info| {
+                Self::configured(SegmentReader::open(info.clone(), storage.clone())?, &config)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::from_segment_readers(
+            segments,
+            segment_readers,
+            config,
+        ))
+    }
 
+    /// Like [`Self::new`], for the segments `snapshot` lists, reusing the
+    /// segment readers `cache` holds from the readers built before (Issue
+    /// #1423).
+    ///
+    /// A segment whose metadata and deletions are unchanged keeps its reader,
+    /// with everything it has loaded and its posting cache. A segment whose
+    /// deletions changed gets a new reader over the same
+    /// [`SegmentCore`], so it reads only its `.delmap`. Any other segment is
+    /// opened. A reader built earlier keeps its own segment readers, so it
+    /// still sees exactly its snapshot.
+    ///
+    /// The cached readers were configured by an earlier call, so every call
+    /// with one `cache` must pass the same `config`, as the index's
+    /// `reader()` does.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The index's storage.
+    /// * `config` - Reader configuration.
+    /// * `cache` - The segment readers of the reader built before.
+    /// * `snapshot` - Lists the segments to read. Called with `cache` locked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `snapshot` fails, or if a segment cannot be opened
+    /// or its `.delmap` read. `cache` then keeps the readers it held.
+    pub(crate) fn with_segment_cache(
+        storage: Arc<dyn Storage>,
+        config: InvertedIndexReaderConfig,
+        cache: &SegmentReaderCache,
+        snapshot: impl FnOnce() -> Result<Vec<SegmentInfo>>,
+    ) -> Result<Self> {
+        let (segments, segment_readers) = cache.build(snapshot, |info, cached| {
+            let reader = match cached {
+                Some(cached) => match cached.read().unwrap().reopen(info)? {
+                    None => return Ok(Arc::clone(cached)),
+                    Some(reader) => reader,
+                },
+                None => SegmentReader::open(info.clone(), storage.clone())?,
+            };
+            Self::configured(reader, &config)
+        })?;
+        Ok(Self::from_segment_readers(
+            segments,
+            segment_readers,
+            config,
+        ))
+    }
+
+    /// `reader` set up for a reader with `config`, ready to share.
+    fn configured(
+        reader: SegmentReader,
+        config: &InvertedIndexReaderConfig,
+    ) -> Result<Arc<RwLock<SegmentReader>>> {
         // Enable the per-segment posting cache (Issue #612) for query readers,
         // gated by `enable_posting_cache` and budgeted by `max_cache_memory`.
         let posting_cache_bytes = if config.enable_posting_cache {
@@ -2256,27 +2379,30 @@ impl InvertedIndexReader {
         } else {
             0
         };
-        for segment_info in &segments {
-            total_doc_count += segment_info.doc_count;
-            let mut reader = SegmentReader::open(segment_info.clone(), storage.clone())?
-                .with_posting_cache_bytes(posting_cache_bytes)
-                // The `.post`-less scan fallback must analyze like the
-                // writer did (Issue #1196); the per-segment fanout shares
-                // these same readers, so this covers every query path.
-                .with_analyzer(config.analyzer.clone());
-
-            if config.preload_segments {
-                reader.load()?;
-            }
-
-            segment_readers.push(Arc::new(RwLock::new(reader)));
+        let mut reader = reader
+            .with_posting_cache_bytes(posting_cache_bytes)
+            // The `.post`-less scan fallback must analyze like the
+            // writer did (Issue #1196); the per-segment fanout shares
+            // these same readers, so this covers every query path.
+            .with_analyzer(config.analyzer.clone());
+        if config.preload_segments {
+            reader.load()?;
         }
+        Ok(Arc::new(RwLock::new(reader)))
+    }
 
-        Ok(InvertedIndexReader {
+    /// A reader over `segment_readers`, one per entry of `segments`.
+    fn from_segment_readers(
+        segments: Vec<SegmentInfo>,
+        segment_readers: Vec<Arc<RwLock<SegmentReader>>>,
+        config: InvertedIndexReaderConfig,
+    ) -> Self {
+        let total_doc_count = segments.iter().map(|info| info.doc_count).sum();
+        InvertedIndexReader {
             segment_readers,
             segment_infos: segments,
-            cache_manager,
-            query_cache,
+            cache_manager: Arc::new(CacheManager::new(config.max_cache_memory)),
+            query_cache: Arc::new(QueryFilterCache::new(config.query_filter_cache_capacity)),
             config,
             closed: Arc::new(AtomicBool::new(false)),
             total_doc_count,
@@ -2285,7 +2411,7 @@ impl InvertedIndexReader {
             term_dictionaries: Arc::new(OnceLock::new()),
             id_filter: None,
             id_filter_generation: Arc::new(AtomicU64::new(0)),
-        })
+        }
     }
 
     /// Answer `_id` lookups for absent ids from `filter` (Issue #1420).
@@ -3915,6 +4041,107 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &dictionary()));
     }
 
+    // ---- Segment readers kept across the readers an index builds,
+    // ---- Issue #1423 ---------------------------------------------------
+
+    /// A `.delmap` rewritten under an unchanged `SegmentInfo` is read again:
+    /// `deleted_count` counts only the deletions of documents the segment
+    /// holds, so the metadata alone cannot say the bitmap is unchanged. The
+    /// reader built before keeps the deletions of its snapshot, both share
+    /// the segment's core, and a build with nothing changed keeps the reader.
+    #[test]
+    fn a_rewritten_delmap_under_an_unchanged_segment_info_is_read_again() {
+        let (storage, info) = segment_marked_deleted("rewritten_delmap");
+        let cache = SegmentReaderCache::default();
+        let segment = || {
+            let reader = InvertedIndexReader::with_segment_cache(
+                storage.clone(),
+                InvertedIndexReaderConfig::default(),
+                &cache,
+                || Ok(vec![info.clone()]),
+            )
+            .unwrap();
+            Arc::clone(&reader.segment_readers()[0])
+        };
+
+        let before = segment();
+        flush_delmap(&storage, &info);
+        let after = segment();
+
+        assert!(!before.read().unwrap().is_deleted(1).unwrap());
+        assert!(after.read().unwrap().is_deleted(1).unwrap());
+        assert!(Arc::ptr_eq(
+            before.read().unwrap().core(),
+            after.read().unwrap().core()
+        ));
+        assert!(Arc::ptr_eq(&after, &segment()));
+    }
+
+    /// A cache build keeps exactly the segments it was given, so a segment
+    /// that left the snapshot is freed once no reader uses it, while a failed
+    /// build keeps what the cache held.
+    #[test]
+    fn a_cache_build_keeps_only_the_segments_it_was_given() {
+        let (a_storage, a) = docs_only_segment("cache_a", &[(0, vec![("body", text("x"))])], false);
+        let (b_storage, b) = docs_only_segment("cache_b", &[(1, vec![("body", text("y"))])], false);
+        let open = |info: &SegmentInfo,
+                    cached: Option<&Arc<RwLock<SegmentReader>>>|
+         -> Result<Arc<RwLock<SegmentReader>>> {
+            if let Some(cached) = cached {
+                return Ok(Arc::clone(cached));
+            }
+            let storage = if info.segment_id == a.segment_id {
+                &a_storage
+            } else {
+                &b_storage
+            };
+            Ok(Arc::new(RwLock::new(SegmentReader::open(
+                info.clone(),
+                storage.clone(),
+            )?)))
+        };
+        let cache = SegmentReaderCache::default();
+
+        let (_, first) = cache
+            .build(|| Ok(vec![a.clone(), b.clone()]), open)
+            .unwrap();
+        let a_reader = Arc::downgrade(&first[0]);
+        let b_reader = Arc::clone(&first[1]);
+        drop(first);
+
+        let failed = cache.build(|| Err(LaurusError::index("no snapshot")), open);
+        assert!(failed.is_err());
+        assert_eq!(cache.len(), 2);
+        assert!(a_reader.upgrade().is_some());
+
+        let (_, second) = cache.build(|| Ok(vec![b.clone()]), open).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(a_reader.upgrade().is_none());
+        assert!(Arc::ptr_eq(&second[0], &b_reader));
+    }
+
+    /// `InvertedIndexReader::new` opens every segment anew, so the readers it
+    /// builds share nothing; only an index's own readers share segments.
+    #[test]
+    fn inverted_index_reader_new_does_not_share_segment_readers() {
+        let (storage, info) =
+            docs_only_segment("unshared", &[(0, vec![("body", text("x"))])], false);
+        let open = || {
+            let reader = InvertedIndexReader::new(
+                vec![info.clone()],
+                storage.clone(),
+                InvertedIndexReaderConfig::default(),
+            )
+            .unwrap();
+            Arc::clone(&reader.segment_readers()[0])
+        };
+        let (first, second) = (open(), open());
+        assert!(!Arc::ptr_eq(
+            first.read().unwrap().core(),
+            second.read().unwrap().core()
+        ));
+    }
+
     #[test]
     fn reader_with_a_dictionary_less_segment_is_not_authoritative() {
         use crate::lexical::query::term::TermQuery;
@@ -4516,7 +4743,7 @@ mod tests {
 
         let storage: Arc<dyn crate::storage::Storage> =
             Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
-        let index = InvertedIndex::create(storage, InvertedIndexConfig::default()).unwrap();
+        let index = InvertedIndex::create(storage.clone(), InvertedIndexConfig::default()).unwrap();
         let mut writer = index.writer().unwrap();
         for _ in 0..2 {
             writer
@@ -4524,11 +4751,15 @@ mod tests {
                 .unwrap();
             writer.commit().unwrap();
         }
-        let reader = index.reader().unwrap();
-        let inverted = reader
-            .as_any()
-            .downcast_ref::<InvertedIndexReader>()
-            .unwrap();
+        // A reader with segment readers of its own: the index shares its
+        // segment readers with the readers it builds later (Issue #1423), and
+        // the dictionaries injected below must not reach them.
+        let inverted = InvertedIndexReader::new(
+            index.load_segments().unwrap(),
+            storage,
+            InvertedIndexReaderConfig::default(),
+        )
+        .unwrap();
         assert_eq!(inverted.segment_readers().len(), 2);
 
         // Both segments' dictionaries claim 2^63 documents and occurrences.
