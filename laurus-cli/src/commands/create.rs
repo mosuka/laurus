@@ -743,12 +743,32 @@ fn prompt_multi_vector_option() -> Result<FieldOption> {
         .default(0)
         .interact()?;
     let storage = choices[idx].1;
+    let pool_factor = prompt_pool_factor()?;
 
     Ok(FieldOption::MultiVector(
         MultiVectorOption::new(dimension)
             .distance(distance)
-            .storage(storage),
+            .storage(storage)
+            .pool_factor(pool_factor),
     ))
+}
+
+/// Prompt for a MultiVector field's token-pooling factor (Issue #1346):
+/// each document keeps about `1 / factor` of its token vectors. `1`, the
+/// default, keeps them all; `0` is not accepted.
+fn prompt_pool_factor() -> Result<u32> {
+    let val: u32 = Input::new()
+        .with_prompt("Token pooling factor (1 = none, 2 halves the token vectors)")
+        .default(1)
+        .validate_with(|f: &u32| {
+            if *f >= 1 {
+                Ok(())
+            } else {
+                Err("the pooling factor must be at least 1")
+            }
+        })
+        .interact_text()?;
+    Ok(val)
 }
 
 /// Prompt for IvfOption.
