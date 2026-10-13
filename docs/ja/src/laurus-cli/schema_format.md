@@ -310,6 +310,7 @@ base_weight = 1.0
 dimension = 128
 distance = "Cosine"
 storage = "Int8"  # 任意。省略時は F32（厳密、デフォルト）
+pool_factor = 2   # 任意。省略（または 1）ですべてのトークンベクトルを保存
 ```
 
 | オプション | 型 | デフォルト | 説明 |
@@ -317,6 +318,7 @@ storage = "Int8"  # 任意。省略時は F32（厳密、デフォルト）
 | `dimension` | `integer` | `128` | 各トークンベクトルの次元数 |
 | `distance` | `string` | `"Cosine"` | トークン間の類似度。`"Cosine"`（書き込み時に L2 正規化する）または `"DotProduct"`。それ以外は拒否され、`"Binary"` の storage には `"Cosine"` が必要です |
 | `storage` | `string` | `"F32"` | トークンベクトルのディスク上での要素形式。`"F32"`（厳密、4 バイト/要素）、`"F16"`（2 バイト/要素、要素あたり約 2⁻¹¹ の相対誤差）、`"Int8"`（約 1 バイト/要素 + ベクトルごとの小さなスケール、1 行あたり `dimension + 2` バイト）、`"Binary"`（1 bit/要素、1 行あたり `ceil(dimension / 8)` バイト。トークンベクトルが 2,048 個たまった時点でフィールドが学習する中心に対して符号化し、それまでのセグメントは `F16`）のいずれか。詳細は [MultiVector ストレージ](../concepts/indexing/vector_indexing.md#multivector-ストレージ)を参照。既存フィールドで変更すると reindex が必要 |
+| `pool_factor` | `integer` | `1` | Token pooling。各文書のトークンベクトルを約 `1 / pool_factor` に減らす（先頭の 1 本と、クラスタの平均）。`1` はすべて保存し、`0` は拒否される。既存のフィールドで有効にすると reindex が必要で、使用中の factor を変える、または無効にするとフィールドのデータは捨てられる。詳細は [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) を参照 |
 | `embedder` | `string` | -- | `[embedders]` で宣言したトークン単位のエンベダー（`type = "candle_colbert"`）の名前。指定すると、文書はこのフィールドにテキストを与えられ、テキストはトークンベクトルに埋め込まれます（[エンベダー](#エンベダー)を参照） |
 
 文書の値は、同じ長さの数値配列の配列（1〜8,192 本）です。エンベダーを指定したフィールドではテキストも使えます。このフィールドは文書ストアに保存されません。

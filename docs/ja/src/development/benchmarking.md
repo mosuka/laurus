@@ -165,7 +165,7 @@ Reproduce: `cargo bench -p laurus --bench distance_bench -- --baseline main`
 
 ## 検索品質の測定（probe）
 
-Criterion は速度を測ります。順位付けの品質は BEIR データセットで [`laurus/examples/beir_multi_vector_probe.rs`](https://github.com/mosuka/laurus/blob/main/laurus/examples/beir_multi_vector_probe.rs) を使って測ります。この probe は [`MultiVector` のストレージ形式](../concepts/indexing/vector_indexing.md#multivector-ストレージ)ごとに（`Binary` を含む）、ColBERT の MaxSim による rescore の nDCG@10 を出力します。今後の方式（token pooling）もこの probe で測ります。
+Criterion は速度を測ります。順位付けの品質は BEIR データセットで [`laurus/examples/beir_multi_vector_probe.rs`](https://github.com/mosuka/laurus/blob/main/laurus/examples/beir_multi_vector_probe.rs) を使って測ります。この probe は、設定した [`MultiVector` のストレージ形式](../concepts/indexing/vector_indexing.md#multivector-ストレージ)と [Token pooling の factor](../concepts/indexing/vector_indexing.md#token-pooling) の組ごとに、ColBERT の MaxSim による rescore の nDCG@10 と、セグメントの大きさを出力します。
 
 ```bash
 ./scripts/fetch-beir.sh scifact          # BEIR の zip を MD5 で検証して .cache/beir/ に展開

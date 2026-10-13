@@ -119,6 +119,8 @@ message AnalyzerDefinition {
 
 **MultiVector のストレージ:** オプションの `storage` フィールド（フィールド番号 `4`、enum `MultiVectorStorage`、Issue #1346）は、トークンベクトルのディスク上の要素形式を選びます。`UNSPECIFIED` は `F32` と同じ、`F32`（デフォルト。4 バイト/要素、誤差なし）、`F16`（2 バイト/要素、要素あたり相対誤差 ~2⁻¹¹）、`INT8`（約 1 バイト/要素に加えてベクトルごとの小さなスケールのオーバーヘッド — 1 行あたり `dimension + 2` バイト — ベクトルごとのスケール `max(abs(vector)) / 127` を使用し、セグメント単位やコーパス全体で学習するものではありません）、`BINARY`（1 bit/要素 — 1 行あたり `ceil(dimension / 8)` バイト — フィールドが一度だけ学習する中心に対して符号化。`distance` は `COSINE` が必要）のいずれかです。300 トークン × 128 次元（`F32` で約 150 KB/文書）の場合、`F16` は約 75 KB/文書、`INT8` は約 38 KB/文書、`BINARY` は約 4.7 KB/文書になります。未設定時は `F32` のままです。その値を知らない古いサーバーは、エラーにせず `F32` として扱うので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
 
+**MultiVector の Token pooling:** オプションの `pool_factor` フィールド（フィールド番号 `5`、`uint32`、Issue #1346）は、各文書のトークンベクトルを約 `1 / pool_factor` に減らします（先頭の 1 本と、ほかを Ward でまとめたクラスタの平均）。未設定は `1`（pooling なし）で、`0` は拒否されます。既存のフィールドで有効にするのは reindex、使用中の factor を変える、または無効にするのは破壊的な変更です。詳細は [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) を参照してください。
+
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
 **量子化手法:** `SCALAR_8BIT`（デフォルト）, `PRODUCT_QUANTIZATION`（Issue #481 Stage 3。HNSW インデックスがサポート — Flat / IVF は書き込み時に拒否）

@@ -702,6 +702,51 @@ the stored rows are decoded and scored against the float query vectors.
   changing `storage` away from `Binary` does not bring the dropped
   precision back.
 
+#### Token pooling
+
+`pool_factor` (Issue #1346) makes a field smaller by keeping fewer token
+vectors per document. At index time, a document's token vectors after the
+first are clustered into `max(r / pool_factor, 1)` clusters (`r` is how
+many there are) and each cluster is replaced by its mean. The stored size
+and MaxSim's cost, which grows with the stored vectors, both drop by about
+the factor, and pooling combines with every `storage` kind.
+
+```rust
+use laurus::{MultiVectorOption, MultiVectorStorage};
+
+let opt = MultiVectorOption::new(128)
+    .storage(MultiVectorStorage::Int8)
+    .pool_factor(2);
+```
+
+- **Method.** The hierarchical pooling of Clavié et al. (arXiv 2409.14683)
+  as Sentence Transformers and PyLate implement it: the first token vector
+  (`[CLS]` for a ColBERT model) is kept as is, and the others are grouped by
+  Ward agglomerative clustering on the cosine distance. laurus reproduces
+  SciPy's clustering; a test checks it against SciPy's output. In a
+  `Cosine` field the cluster means are re-normalized, which ranked better
+  on BEIR than the raw means those implementations keep.
+- **Every write is pooled once.** Pooling happens as documents are
+  buffered, so fresh documents, WAL recovery and text embedded by the
+  field's embedder are all pooled; queries are not. Each stored document
+  records the factor it was pooled with, so merges never pool it again.
+- **Turning pooling on for an existing field is a Reindex.** Its stored
+  vectors are still the original ones, so `Engine::update_field` with
+  `reindex: true` pools them exactly as ingest would have (for `F32`
+  storage; other kinds pool their decoded values, and a `Binary` field
+  keeps the parameters it already learned). Ingestion waits until it is
+  done.
+- **Changing or turning off a factor in use is Destructive.** The original
+  token vectors are gone once a document is pooled (multi-vector values
+  are not kept in the document store), so the field's data is discarded
+  and its documents must be put again.
+- **Cost.** Pooling a document of `n` token vectors takes `O(n²)` time and
+  memory: about 3 ms for 300 vectors of 128 dimensions, and about 2 s and
+  290 MB for the 8,192-vector maximum (Apple M4, release build). It runs
+  while the field's writer is held, so it adds to ingest time.
+- A `Binary` field learns its parameters from the pooled vectors, and its
+  2,048-vector threshold counts pooled vectors.
+
 #### Measured quality
 
 Measured on two BEIR datasets with the
@@ -749,6 +794,40 @@ in the first commit.
 - 25 NFCorpus queries have no BM25 hit (single words such as `okra` that
   never occur in the corpus; the default analyzer does not stem), so
   BM25 → rescore scores them 0 under every kind.
+
+With [token pooling](#token-pooling), measured the same way (the size
+is that of the segment files, relative to unpooled F32):
+
+| Kind | Bytes/token (96 dims) | Size vs F32 | SciFact exhaustive | SciFact BM25 → rescore | NFCorpus exhaustive | NFCorpus BM25 → rescore |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **F32**, `pool_factor` 2 | 384 | 1/2.00 | 0.7434 (−0.0021 [−0.0106, +0.0064]) | 0.7292 (+0.0008 [−0.0069, +0.0090]) | 0.3683 (−0.0007 [−0.0034, +0.0020]) | 0.3456 (−0.0002 [−0.0026, +0.0020]) |
+| **F32**, `pool_factor` 3 | 384 | 1/2.99 | 0.7450 (−0.0005 [−0.0095, +0.0084]) | 0.7288 (+0.0004 [−0.0085, +0.0093]) | 0.3650 (−0.0040 [−0.0083, +0.0001]) | 0.3433 (−0.0025 [−0.0066, +0.0013]) |
+| **F32**, `pool_factor` 4 | 384 | 1/3.97 | 0.7483 (+0.0028 [−0.0096, +0.0149]) | 0.7292 (+0.0008 [−0.0107, +0.0121]) | 0.3642 (−0.0048 [−0.0109, +0.0008]) | 0.3415 (−0.0043 [−0.0095, +0.0008]) |
+| **Int8**, `pool_factor` 2 | 98 | 1/7.81 | 0.7428 (−0.0028 [−0.0097, +0.0042]) | 0.7277 (−0.0008 [−0.0077, +0.0064]) | 0.3662 (−0.0028 [−0.0072, +0.0014]) | 0.3447 (−0.0011 [−0.0051, +0.0028]) |
+| **Int8**, `pool_factor` 3 | 98 | 1/11.67 | 0.7458 (+0.0002 [−0.0093, +0.0095]) | 0.7296 (+0.0012 [−0.0076, +0.0100]) | 0.3647 (−0.0043 [−0.0097, +0.0009]) | 0.3431 (−0.0027 [−0.0079, +0.0020]) |
+| **Binary**, `pool_factor` 2 | 12 | 1/62.81 | 0.7088 (−0.0368 [−0.0555, −0.0188]) | 0.7038 (−0.0246 [−0.0404, −0.0093]) | 0.3184 (−0.0506 [−0.0640, −0.0383]) | 0.3217 (−0.0241 [−0.0328, −0.0158]) |
+| **Binary**, `pool_factor` 3 | 12 | 1/93.23 | 0.7091 (−0.0365 [−0.0564, −0.0176]) | 0.7006 (−0.0278 [−0.0456, −0.0106]) | 0.3113 (−0.0577 [−0.0732, −0.0431]) | 0.3202 (−0.0256 [−0.0365, −0.0155]) |
+
+- Every interval of pooled F32 and pooled Int8 contains 0. Pooled over
+  both datasets' 623 queries, the difference from unpooled F32 under
+  exhaustive ranking is −0.0014 [−0.0057, +0.0031] at factor 2, −0.0023
+  [−0.0071, +0.0026] at factor 3 and −0.0012 [−0.0078, +0.0056] at
+  factor 4, and −0.0028 [−0.0069, +0.0014] for Int8 at factor 2; under
+  BM25 → rescore it is closer to 0. NFCorpus is where the point estimates
+  drop first (about −0.004 at factors 3 and 4).
+- Pooling and Int8 multiply: factor 2 with Int8 is 1/7.8 the size of F32
+  with no measurable loss.
+- `Binary` loses more with pooling: −0.0047 [−0.0120, +0.0024] under
+  exhaustive ranking and −0.0074 [−0.0139, −0.0009] under BM25 → rescore,
+  on top of its own loss.
+- Re-normalizing the cluster means matters. With the raw means that
+  Sentence Transformers and PyLate keep, F32 at factors 2, 3 and 4 ranked
+  0.0033, 0.0045 and 0.0098 lower under exhaustive ranking (pooled over
+  both datasets, every interval above 0; Issue #1346).
+- Rescoring time fell about in proportion to the factor: on SciFact
+  exhaustive, 104 ms per query unpooled and 50, 37 and 27 ms at factors
+  2, 3 and 4 (wall clock on a loaded machine; only the trend is
+  meaningful).
 
 Reproduce with `make beir-storage-eval BEIR_DATASET=scifact` (or
 `nfcorpus`).

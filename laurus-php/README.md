@@ -152,7 +152,7 @@ The `Schema` class defines the structure of your index. Use the following method
 | `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, quantizer, subvectorCount, rerankStorage, pqCodebookPath, baseWeight)` | HNSW vector index field |
 | `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat (brute-force) vector index field |
 | `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF vector index field |
-| `addMultiVectorField(name, dimension, distance, embedder)` | Per-document token vectors for the late-interaction rescore (`distance` is `cosine` or `dot_product`) |
+| `addMultiVectorField(name, dimension, distance, embedder, storage, poolFactor)` | Per-document token vectors for the late-interaction rescore (`distance` is `cosine` or `dot_product`; `storage` is `f32`, `f16`, `int8` or `binary`; `poolFactor` keeps about `1 / poolFactor` of each document's token vectors) |
 | `addEmbedder(name, config)` | Register a named embedder |
 | `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | Register a named custom analyzer |
 | `setDefaultFields(fieldNames)` | Set default search fields |

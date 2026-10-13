@@ -119,6 +119,8 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Multi-vector storage:** the optional `storage` field (field `4`, enum `MultiVectorStorage`, Issue #1346) picks the on-disk element kind of the token vectors: `UNSPECIFIED` = same as `F32`, `F32` (default, 4 bytes/element, exact), `F16` (2 bytes/element, ~2⁻¹¹ relative error per element), `INT8` (~1 byte/element plus a small per-vector scale overhead — `dimension + 2` bytes/row total — using a per-vector scale `max(abs(vector)) / 127`, not trained per-segment or over the corpus), or `BINARY` (1 bit/element — `ceil(dimension / 8)` bytes/row — against a center the field learns once; requires `distance` `COSINE`). At 300 tokens × 128 dimensions (~150 KB/document in `F32`), `F16` is ~75 KB/document, `INT8` ~38 KB/document and `BINARY` ~4.7 KB/document. Unset keeps `F32`. A server that predates a value maps it to `F32` without an error, so check the returned schema when talking to an older server.
 
+**Multi-vector token pooling:** the optional `pool_factor` field (field `5`, `uint32`, Issue #1346) makes each document keep about `1 / pool_factor` of its token vectors: the first one, then the means of Ward clusters of the others. Unset means `1`, no pooling; `0` is rejected. Turning pooling on for an existing field is a reindex; changing or turning off a factor in use is destructive. See [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling).
+
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
 **Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index — Flat / IVF reject it at write time).

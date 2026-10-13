@@ -3,11 +3,12 @@
 //!
 //! Encodes a BEIR corpus once with a real ColBERT model, caches the f32
 //! token vectors on disk, and ingests the same vectors into one engine that
-//! has one MultiVector field per storage kind (`tokens_f32`, `tokens_f16`,
-//! `tokens_int8`, `tokens_binary`). Every kind therefore sees identical
-//! vectors and an identical first stage; the only difference is the on-disk
-//! element kind, decoded on the production rescore path. The default
-//! commit interval puts 500 documents in the first commit, enough for the
+//! has one MultiVector field per configuration under test: a storage kind
+//! and a token-pooling factor (`tokens_f32`, `tokens_int8_p2`, ...). Every
+//! field therefore sees identical vectors and an identical first stage; the
+//! only differences are the on-disk element kind and the pooling applied at
+//! ingest, both on the production write and rescore paths. The default
+//! commit interval puts 500 documents in the first commit, enough for a
 //! `Binary` field to learn its parameters there, so every segment of it is
 //! `Binary`.
 //!
@@ -82,13 +83,35 @@ const QUERY_MAXLEN: usize = 32;
 const DOC_MAXLEN: usize = 300;
 const DIMENSION: usize = 96;
 
-/// Storage kinds under test, F32 first: it is the reference the others
-/// are compared against.
-const KINDS: [MultiVectorStorage; 4] = [
-    MultiVectorStorage::F32,
-    MultiVectorStorage::F16,
-    MultiVectorStorage::Int8,
-    MultiVectorStorage::Binary,
+/// One field configuration under test: an on-disk element kind and a
+/// token-pooling factor (`1`: no pooling).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Kind {
+    storage: MultiVectorStorage,
+    pool_factor: u32,
+}
+
+const fn kind(storage: MultiVectorStorage, pool_factor: u32) -> Kind {
+    Kind {
+        storage,
+        pool_factor,
+    }
+}
+
+/// Configurations under test, unpooled F32 first: it is the reference the
+/// others are compared against.
+const KINDS: [Kind; 11] = [
+    kind(MultiVectorStorage::F32, 1),
+    kind(MultiVectorStorage::F16, 1),
+    kind(MultiVectorStorage::Int8, 1),
+    kind(MultiVectorStorage::Binary, 1),
+    kind(MultiVectorStorage::F32, 2),
+    kind(MultiVectorStorage::Int8, 2),
+    kind(MultiVectorStorage::Binary, 2),
+    kind(MultiVectorStorage::F32, 3),
+    kind(MultiVectorStorage::Int8, 3),
+    kind(MultiVectorStorage::Binary, 3),
+    kind(MultiVectorStorage::F32, 4),
 ];
 
 const BODY: &str = "body";
@@ -119,22 +142,25 @@ fn published_ndcg(dataset: &str) -> Option<f64> {
     }
 }
 
-fn field_name(kind: MultiVectorStorage) -> &'static str {
-    match kind {
-        MultiVectorStorage::F32 => "tokens_f32",
-        MultiVectorStorage::F16 => "tokens_f16",
-        MultiVectorStorage::Int8 => "tokens_int8",
-        MultiVectorStorage::Binary => "tokens_binary",
-    }
-}
-
-fn kind_label(kind: MultiVectorStorage) -> &'static str {
-    match kind {
+fn storage_label(storage: MultiVectorStorage) -> &'static str {
+    match storage {
         MultiVectorStorage::F32 => "f32",
         MultiVectorStorage::F16 => "f16",
         MultiVectorStorage::Int8 => "int8",
         MultiVectorStorage::Binary => "binary",
     }
+}
+
+/// `f32`, `int8-p2`, ...: the label in the tables and the TREC run names.
+fn kind_label(kind: Kind) -> String {
+    match kind.pool_factor {
+        1 => storage_label(kind.storage).to_string(),
+        f => format!("{}-p{f}", storage_label(kind.storage)),
+    }
+}
+
+fn field_name(kind: Kind) -> String {
+    format!("tokens_{}", kind_label(kind).replace('-', "_"))
 }
 
 // ── Command line ───────────────────────────────────────────────────────────
@@ -510,7 +536,8 @@ fn schema() -> Schema {
             FieldOption::MultiVector(
                 MultiVectorOption::new(DIMENSION)
                     .distance(DistanceMetric::Cosine)
-                    .storage(kind),
+                    .storage(kind.storage)
+                    .pool_factor(kind.pool_factor),
             ),
         );
     }
@@ -569,11 +596,13 @@ async fn build_engine(
     Ok(engine)
 }
 
-/// Bytes of every `.mv` segment file of `field` in `storage`.
+/// Bytes of every `.mv` segment file of `field` in `storage`: files under
+/// a path component named exactly `field` (`tokens_f32` must not count
+/// `tokens_f32_p2`'s files).
 fn segment_bytes(storage: &MemoryStorage, field: &str) -> AnyResult<u64> {
     let mut total = 0;
     for name in storage.list_files()? {
-        if name.ends_with(".mv") && name.contains(field) {
+        if name.ends_with(".mv") && name.split('/').any(|part| part == field) {
             total += storage.file_size(&name)?;
         }
     }
@@ -605,7 +634,7 @@ fn match_all() -> LexicalSearchQuery {
 }
 
 /// MaxSim over the top `window` first-stage candidates on `kind`'s field.
-fn late_interaction(kind: MultiVectorStorage, query: &[Vector], window: usize) -> RescoreOptions {
+fn late_interaction(kind: Kind, query: &[Vector], window: usize) -> RescoreOptions {
     RescoreOptions::late_interaction(field_name(kind), query.to_vec()).window_size(window)
 }
 
@@ -791,7 +820,7 @@ fn report(condition: &str, dataset: &Dataset, runs: &[Run], baseline: Option<f64
         println!("bm25 only: nDCG@{NDCG_K} {bm25:.4}");
     }
     println!(
-        "{:<6} {:>9} {:>10} {:>23} {:>9} {:>11} {:>6} {:>9}",
+        "{:<9} {:>9} {:>10} {:>23} {:>9} {:>11} {:>6} {:>9}",
         "kind", "nDCG@10", "Δ vs f32", "95% CI", "+/- q", "top10≠f32", "empty", "ms/query"
     );
     let reference = runs[0].ndcg(dataset);
@@ -808,7 +837,7 @@ fn report(condition: &str, dataset: &Dataset, runs: &[Run], baseline: Option<f64
             .filter(|(a, b)| top_ids(a) != top_ids(b))
             .count();
         println!(
-            "{:<6} {:>9.4} {:>+10.5} {:>23} {:>9} {:>11} {:>6} {:>9.2}",
+            "{:<9} {:>9.4} {:>+10.5} {:>23} {:>9} {:>11} {:>6} {:>9.2}",
             kind_label(*kind),
             mean(&ndcg),
             mean(&deltas),
@@ -885,23 +914,25 @@ async fn evaluate(
     Ok(eval)
 }
 
-/// Print each kind's row size, payload bytes (`row_bytes × token count`)
-/// and the actual bytes of its segment files.
-fn print_sizes(storage: &MemoryStorage, total_rows: usize) -> AnyResult<()> {
+/// Print each configuration's row size, the actual bytes of its segment
+/// files, and how much smaller they are than the unpooled F32 field's.
+/// Pooling stores fewer rows, so the segment bytes, not `row_bytes × token
+/// count`, are what a configuration costs.
+fn print_sizes(storage: &MemoryStorage) -> AnyResult<()> {
     println!();
     println!(
-        "{:<6} {:>10} {:>14} {:>14} {:>10}",
-        "kind", "bytes/row", "payload bytes", "segment bytes", "ratio"
+        "{:<9} {:>10} {:>14} {:>10}",
+        "kind", "bytes/row", "segment bytes", "ratio"
     );
+    let reference = segment_bytes(storage, &field_name(KINDS[0]))?;
     for kind in KINDS {
-        let row_bytes = kind.row_bytes(DIMENSION);
+        let bytes = segment_bytes(storage, &field_name(kind))?;
         println!(
-            "{:<6} {:>10} {:>14} {:>14} {:>9.2}x",
+            "{:<9} {:>10} {:>14} {:>9.2}x",
             kind_label(kind),
-            row_bytes,
-            total_rows * row_bytes,
-            segment_bytes(storage, field_name(kind))?,
-            MultiVectorStorage::F32.row_bytes(DIMENSION) as f64 / row_bytes as f64
+            kind.storage.row_bytes(DIMENSION),
+            bytes,
+            reference as f64 / bytes.max(1) as f64
         );
     }
     Ok(())
@@ -915,8 +946,8 @@ fn write_runs(out: &Path, name: &str, dataset: &Dataset, eval: &Evaluation) -> i
         .write_trec(&path("bm25", "none"), dataset, "bm25")?;
     for (kind, (a, b)) in KINDS.iter().zip(eval.exhaustive.iter().zip(&eval.rescored)) {
         let label = kind_label(*kind);
-        a.write_trec(&path("exhaustive", label), dataset, label)?;
-        b.write_trec(&path("bm25-rescore", label), dataset, label)?;
+        a.write_trec(&path("exhaustive", &label), dataset, &label)?;
+        b.write_trec(&path("bm25-rescore", &label), dataset, &label)?;
     }
     Ok(())
 }
@@ -1026,7 +1057,7 @@ async fn main() -> AnyResult<()> {
     .await?;
     drop(doc_vectors);
 
-    print_sizes(&storage, total_rows)?;
+    print_sizes(&storage)?;
     if args.ingest_only {
         return Ok(());
     }

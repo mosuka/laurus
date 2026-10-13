@@ -166,7 +166,7 @@ If your bench needs to share helpers across files, extend `benches/common.rs` ra
 
 ## Retrieval-quality probes
 
-Criterion measures speed; ranking quality is measured on BEIR datasets with [`laurus/examples/beir_multi_vector_probe.rs`](https://github.com/mosuka/laurus/blob/main/laurus/examples/beir_multi_vector_probe.rs). It reports nDCG@10 of ColBERT MaxSim rescoring for every [`MultiVector` storage kind](../concepts/indexing/vector_indexing.md#multivector-storage), `Binary` included, and is the harness later options (token pooling) are measured with.
+Criterion measures speed; ranking quality is measured on BEIR datasets with [`laurus/examples/beir_multi_vector_probe.rs`](https://github.com/mosuka/laurus/blob/main/laurus/examples/beir_multi_vector_probe.rs). It reports nDCG@10 of ColBERT MaxSim rescoring for every [`MultiVector` storage kind](../concepts/indexing/vector_indexing.md#multivector-storage) and [token-pooling factor](../concepts/indexing/vector_indexing.md#token-pooling) it is configured with, along with each configuration's segment size.
 
 ```bash
 ./scripts/fetch-beir.sh scifact          # download and MD5-check the BEIR zip into .cache/beir/

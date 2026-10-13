@@ -312,6 +312,7 @@ Every token vector of a document (for example ColBERT-style per-token embeddings
 dimension = 128
 distance = "Cosine"
 storage = "Int8"  # optional; omit for F32 (exact, default)
+pool_factor = 2   # optional; omit (or 1) to keep every token vector
 ```
 
 | Option | Type | Default | Description |
@@ -319,6 +320,7 @@ storage = "Int8"  # optional; omit for F32 (exact, default)
 | `dimension` | `integer` | `128` | Dimensionality of every token vector |
 | `distance` | `string` | `"Cosine"` | Token similarity: `"Cosine"` (vectors are L2-normalized when written) or `"DotProduct"`. Other metrics are rejected, and `"Binary"` storage requires `"Cosine"` |
 | `storage` | `string` | `"F32"` | On-disk element kind of the token vectors: `"F32"` (exact, 4 bytes/element), `"F16"` (2 bytes/element, ~2⁻¹¹ relative error/element), `"Int8"` (~1 byte/element plus a small per-vector scale, `dimension + 2` bytes/row total), or `"Binary"` (1 bit/element, `ceil(dimension / 8)` bytes/row, against a center the field learns once it holds 2,048 token vectors; segments written before that are `F16`). See [MultiVector Storage](../concepts/indexing/vector_indexing.md#multivector-storage). Changing it on an existing field requires a reindex |
+| `pool_factor` | `integer` | `1` | Token pooling: each document keeps about `1 / pool_factor` of its token vectors (the first one, then cluster means). `1` keeps them all; `0` is rejected. Turning it on for an existing field requires a reindex; changing or turning off a factor in use discards the field's data. See [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) |
 | `embedder` | `string` | -- | Name of a token-level embedder (`type = "candle_colbert"`) declared under `[embedders]`. When set, documents may give the field text, which is embedded into token vectors (see [Embedders](#embedders)) |
 
 A document's value is an array of equal-length numeric arrays, between 1 and 8,192 of them, or text when the field has an embedder. The field is not stored in the document store.

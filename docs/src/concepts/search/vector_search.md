@@ -485,7 +485,9 @@ nDCG@10. The query vectors are never compressed.
 ### Cost
 
 Rescoring takes `window_size × query vectors × document vectors` dot
-products. On native builds the candidates are scored in parallel on
+products, so a field's
+[`pool_factor`](../indexing/vector_indexing.md#token-pooling) cuts it by
+about that factor. On native builds the candidates are scored in parallel on
 [rayon][rayon-crate]'s global thread pool; on `wasm32` they are scored one
 by one. As a guide, 100 candidates of 300 vectors with 128 dimensions and a
 32-vector query (about 123 million multiply-adds) took about 2 ms per

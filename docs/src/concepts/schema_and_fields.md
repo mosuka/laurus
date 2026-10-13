@@ -178,7 +178,7 @@ let schema = Schema::builder()
 ```
 
 - **Options**: `dimension` (every token vector's length), `distance`,
-  `storage` and `embedder`. Only `Cosine` (vectors are L2-normalized when
+  `storage`, `pool_factor` and `embedder`. Only `Cosine` (vectors are L2-normalized when
   written, so the similarity is their dot product; a zero vector is kept
   as-is) and `DotProduct` are accepted for `distance`; other metrics are
   rejected when the index is created. `storage` picks the on-disk element
@@ -186,7 +186,11 @@ let schema = Schema::builder()
   `Binary` (1 bit per element; requires `Cosine`) — trading some precision
   for a smaller index; see [MultiVector
   Storage](indexing/vector_indexing.md#multivector-storage) for the size
-  and quality figures. `embedder` names a token-level embedder, such as a
+  and quality figures. `pool_factor` (default 1, no pooling) keeps about
+  `1 / pool_factor` of each document's token vectors by averaging similar
+  ones at index time; see [Token
+  pooling](indexing/vector_indexing.md#token-pooling). `embedder` names a
+  token-level embedder, such as a
   [`candle_colbert`](../laurus-cli/schema_format.md#embedders) one
   (`MultiVectorOption::new(96).embedder("colbert")`).
 - **Values**: a `DataValue::VectorArray(Vec<Vec<f32>>)` holding at least one
@@ -209,9 +213,13 @@ let schema = Schema::builder()
   stored values are decoded and re-encoded, so
   `Engine::update_field(.., UpdateFieldOptions { reindex: true, .. })`
   rebuilds the field's existing segments under the new on-disk kind
-  (precision a lossy kind already dropped does not come back). An option
-  the field's index would reject, such as `Binary` with `DotProduct`, is
-  rejected before any data is touched.
+  (precision a lossy kind already dropped does not come back). Turning
+  pooling on (`pool_factor` from 1 to more) is a Reindex change too: the
+  stored token vectors are pooled. Changing or turning off a `pool_factor`
+  already in use is destructive, because pooled token vectors cannot be
+  restored. An option the field's index would reject, such as `Binary`
+  with `DotProduct` or a `pool_factor` of 0, is rejected before any data
+  is touched.
 
 ## Document
 

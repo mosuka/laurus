@@ -164,13 +164,16 @@ let schema = Schema::builder()
 ```
 
 - **オプション**: `dimension`（各トークンベクトルの長さ）、`distance`、`storage`、
-  `embedder`。`distance` として受け付けるのは `Cosine`（書き込み時に L2 正規化
+  `pool_factor`、`embedder`。`distance` として受け付けるのは `Cosine`（書き込み時に L2 正規化
   するので、類似度は内積になる。ゼロベクトルはそのまま保存する）と `DotProduct`
   だけで、それ以外はインデックスの作成時に拒否されます。`storage` はトークン
   ベクトルのディスク上での要素形式を選びます — `F32`（デフォルト、厳密）、
   `F16`、`Int8`、`Binary`（要素あたり 1 bit。`Cosine` が必要）のいずれかで、
   精度とインデックスサイズのトレードオフです。サイズと品質の数値は [MultiVector
   ストレージ](indexing/vector_indexing.md#multivector-ストレージ)を参照してください。
+  `pool_factor`（デフォルト 1、pooling なし）は、インデックス時に似たトークン
+  ベクトルを平均して、各文書のトークンベクトルを約 `1 / pool_factor` に減らします
+  （[Token pooling](indexing/vector_indexing.md#token-pooling) を参照）。
   `embedder` には、[`candle_colbert`](../laurus-cli/schema_format.md#エンベダー)
   のようなトークン単位の Embedder の名前を指定します
   （`MultiVectorOption::new(96).embedder("colbert")`）。
@@ -190,8 +193,12 @@ let schema = Schema::builder()
   **Reindex** 扱いです。保存されている値を展開して再エンコードするため、
   `Engine::update_field(.., UpdateFieldOptions { reindex: true, .. })`
   でフィールドの既存セグメントを新しいディスク上の形式へ再構築します（非可逆な
-  形式で失われた精度は戻りません）。`DotProduct` の `Binary` のように、
-  フィールドのインデックスが拒否するオプションは、データに触れる前に拒否されます。
+  形式で失われた精度は戻りません）。pooling の有効化（`pool_factor` を 1 から
+  それより大きくする）も Reindex 扱いで、保存済みのトークンベクトルを pooling
+  します。使用中の `pool_factor` を変える、または無効にするのは破壊的な変更です。
+  pooling したトークンベクトルは元に戻せないためです。`DotProduct` の `Binary`
+  や 0 の `pool_factor` のように、フィールドのインデックスが拒否するオプション
+  は、データに触れる前に拒否されます。
 
 ## Document
 
