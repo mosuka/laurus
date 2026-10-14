@@ -448,6 +448,16 @@ impl DistanceMetric {
 /// Extra elements of the longer slice are ignored; callers pass slices of
 /// the same length.
 pub(crate) fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    dot_product_inline(a, b)
+}
+
+/// [`dot_product`], always inlined into its caller.
+///
+/// A caller whose slices have a length known at compile time (the
+/// fixed-dimension MaxSim of Issue #1442) gets the chunk loop unrolled. The
+/// sum is the same as [`dot_product`]'s, bit for bit.
+#[inline(always)]
+pub(crate) fn dot_product_inline(a: &[f32], b: &[f32]) -> f32 {
     use wide::f32x8;
 
     let mut sum = f32x8::ZERO;

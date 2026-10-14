@@ -15,10 +15,18 @@
 
 use std::sync::Arc;
 
-use crate::vector::core::distance::dot_product;
+use crate::vector::core::distance::{dot_product, dot_product_inline};
 use crate::vector::core::multi_vector::{BinaryParams, BinaryQuery, MultiVectorRows};
 
 /// MaxSim of one document.
+///
+/// Vectors of 64, 96 and 128 dimensions, the widths of common ColBERT-style
+/// models, are scored by a copy of the loop with the dimension fixed at
+/// compile time (Issue #1442). With the dimension known only at run time,
+/// setting up and finishing the loops of a pair cost about 81 instructions
+/// at 96 dimensions, more than the 74 of the dot product itself. Every copy
+/// sums a pair as [`dot_product`] does, so the score does not depend on the
+/// loop that computed it.
 ///
 /// # Arguments
 ///
@@ -33,6 +41,16 @@ use crate::vector::core::multi_vector::{BinaryParams, BinaryQuery, MultiVectorRo
 pub(crate) fn max_sim(query: &[f32], document: &[f32], dimension: usize) -> f32 {
     debug_assert!(dimension > 0 && query.len().is_multiple_of(dimension));
     debug_assert!(!document.is_empty() && document.len().is_multiple_of(dimension));
+    match dimension {
+        64 => max_sim_fixed::<64>(query, document),
+        96 => max_sim_fixed::<96>(query, document),
+        128 => max_sim_fixed::<128>(query, document),
+        _ => max_sim_dyn(query, document, dimension),
+    }
+}
+
+/// [`max_sim`] with the dimension given at run time; any dimension.
+pub(crate) fn max_sim_dyn(query: &[f32], document: &[f32], dimension: usize) -> f32 {
     query
         .chunks_exact(dimension)
         .map(|q| {
@@ -42,6 +60,54 @@ pub(crate) fn max_sim(query: &[f32], document: &[f32], dimension: usize) -> f32 
                 .fold(f32::NEG_INFINITY, f32::max)
         })
         .sum()
+}
+
+/// [`max_sim`] with the dimension `D` fixed at compile time, so that the
+/// loop over a pair's 8-lane chunks unrolls.
+fn max_sim_fixed<const D: usize>(query: &[f32], document: &[f32]) -> f32 {
+    #[cfg(test)]
+    fixed_calls::record();
+    let query = query.as_chunks::<D>().0;
+    let document = document.as_chunks::<D>().0;
+    query
+        .iter()
+        .map(|q| {
+            document
+                .iter()
+                .map(|d| dot_product_inline(q, d))
+                .fold(f32::NEG_INFINITY, f32::max)
+        })
+        .sum()
+}
+
+/// Calls into [`max_sim_fixed`], so that tests can see the dispatch, which
+/// the scores, the same through either loop, cannot show.
+#[cfg(test)]
+pub(crate) mod fixed_calls {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ANY_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static THIS_THREAD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        ANY_THREAD.fetch_add(1, Ordering::Relaxed);
+        THIS_THREAD.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    /// Calls made on the current thread.
+    pub(crate) fn on_this_thread() -> usize {
+        THIS_THREAD.with(Cell::get)
+    }
+
+    /// Calls made on any thread, for scoring that runs on rayon's pool.
+    /// Tests running at the same time add to it as well.
+    pub(crate) fn on_any_thread() -> usize {
+        ANY_THREAD.load(Ordering::Relaxed)
+    }
 }
 
 /// Query token vectors ready to score documents stored under any
@@ -169,12 +235,59 @@ mod tests {
 
     #[test]
     fn test_matches_scalar_reference_across_dimensions() {
-        for dimension in [1, 7, 8, 9, 128] {
+        for dimension in [1, 7, 8, 9, 64, 96, 128] {
             for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
                 let query = values(dimension as u64, query_rows * dimension);
                 let document = values(1000 + dimension as u64, doc_rows * dimension);
                 let expected = reference(&rows(&query, dimension), &rows(&document, dimension));
                 let actual = max_sim(&query, &document, dimension);
+                assert!(
+                    (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                    "dimension {dimension}, {query_rows}x{doc_rows}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1442: the dimensions with a fixed copy go through it and
+    /// score bit for bit as the run-time loop.
+    #[test]
+    fn test_fixed_dimensions_match_the_run_time_loop_bit_for_bit() {
+        for dimension in [64, 96, 128] {
+            for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
+                let query = values(dimension as u64, query_rows * dimension);
+                let document = values(2000 + dimension as u64, doc_rows * dimension);
+                let before = fixed_calls::on_this_thread();
+                let actual = max_sim(&query, &document, dimension);
+                assert_eq!(
+                    fixed_calls::on_this_thread(),
+                    before + 1,
+                    "dimension {dimension} should take its fixed copy"
+                );
+                assert_eq!(
+                    actual.to_bits(),
+                    max_sim_dyn(&query, &document, dimension).to_bits(),
+                    "dimension {dimension}, {query_rows}x{doc_rows}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1442: every other dimension keeps the run-time loop.
+    #[test]
+    fn test_other_dimensions_take_the_run_time_loop() {
+        for dimension in [1, 7, 8, 63, 65, 95, 97, 127, 129, 768] {
+            for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
+                let query = values(dimension as u64, query_rows * dimension);
+                let document = values(3000 + dimension as u64, doc_rows * dimension);
+                let before = fixed_calls::on_this_thread();
+                let actual = max_sim(&query, &document, dimension);
+                assert_eq!(
+                    fixed_calls::on_this_thread(),
+                    before,
+                    "dimension {dimension} has no fixed copy"
+                );
+                let expected = reference(&rows(&query, dimension), &rows(&document, dimension));
                 assert!(
                     (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
                     "dimension {dimension}, {query_rows}x{doc_rows}: {actual} vs {expected}"
