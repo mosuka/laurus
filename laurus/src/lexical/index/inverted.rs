@@ -1195,6 +1195,19 @@ impl LexicalIndex for InvertedIndex {
         Ok(())
     }
 
+    /// Rebuild `name` in every segment and publish the rebuilt segments in
+    /// one manifest write.
+    ///
+    /// # Errors
+    ///
+    /// An error means nothing was published: the manifest lists the same
+    /// segments as before and the field's option is unchanged. Once the
+    /// manifest write succeeds, the call returns `Ok` and the field's
+    /// option is the new `option`, so documents indexed afterwards use it.
+    /// Deleting the replaced segments' files after that is cleanup only: a
+    /// failure there is logged at `warn` and not returned (Issue #1436),
+    /// and the files left behind are reclaimed by the orphan sweep when the
+    /// index is next opened.
     fn rebuild_field(
         &self,
         name: &str,
@@ -1297,9 +1310,19 @@ impl LexicalIndex for InvertedIndex {
             self.release_replaced_segment_readers();
 
             // Physical cleanup only: the manifest write above already
-            // removed the sources from discovery atomically.
+            // removed the sources from discovery atomically, so a file left
+            // behind is an unreferenced orphan the next open's sweep
+            // reclaims. Returning its error would skip the option update
+            // below and report a rebuild that took effect as a failed one,
+            // so the caller would keep the old analyzer (Issue #1436).
             for info in &segments {
-                self.delete_segment_files(&info.segment_id)?;
+                if let Err(e) = self.delete_segment_files(&info.segment_id) {
+                    log::warn!(
+                        "cannot delete the files of segment {} replaced by rebuilding field \
+                         {name}: {e}; they are left for the next open's orphan sweep",
+                        info.segment_id
+                    );
+                }
             }
         }
 

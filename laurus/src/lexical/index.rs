@@ -206,6 +206,12 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// [`crate::vector::index::VectorIndex::rebuild_field`]'s contract on
     /// the vector side). Implementations also error if no field named
     /// `name` is registered, or if the rebuild itself fails.
+    ///
+    /// An error must mean that nothing changed. Once the rebuilt data is
+    /// published, implementations return `Ok` even if cleaning up the data
+    /// it replaced fails, because callers such as
+    /// [`LexicalStore::rebuild_field`](crate::lexical::store::LexicalStore::rebuild_field)
+    /// switch the field's analyzer only on `Ok`.
     fn rebuild_field(
         &self,
         _name: &str,

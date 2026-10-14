@@ -879,8 +879,14 @@ impl LexicalStore {
     /// [`Self::commit`] does. Once the flush succeeds, the writer and the
     /// cached searcher are dropped whether the rebuild succeeds or not, so
     /// the next search and `_id` lookup see the documents the flush
-    /// committed (Issue #1424). A failed rebuild leaves the per-field
-    /// analyzer unchanged.
+    /// committed (Issue #1424). A failed rebuild published nothing, so the
+    /// field's postings, option and per-field analyzer stay as they were.
+    ///
+    /// Once the rebuilt postings are published, this returns `Ok` with the
+    /// field's option and analyzer switched to the new ones, even if
+    /// deleting the replaced segments' files fails afterwards: that failure
+    /// is logged at `warn`, and the files are reclaimed when the index is
+    /// next opened (Issue #1436).
     pub fn rebuild_field(
         &self,
         name: &str,
@@ -896,11 +902,10 @@ impl LexicalStore {
         if let Some(writer) = writer_guard.as_mut() {
             writer.commit()?;
         }
-        // The committed writer has nothing left to lose, and the rebuild
-        // replaces every segment its view describes, so drop it now rather
-        // than keep that view when the rebuild fails after publishing
-        // (Issue #1424). The next writer is built from the manifest as the
-        // rebuild left it.
+        // The committed writer has nothing left to lose, and a rebuild that
+        // publishes replaces every segment its view describes, so drop it
+        // whatever the rebuild's outcome (Issue #1424). The next writer is
+        // built from the manifest as the rebuild left it.
         *writer_guard = None;
 
         let rebuilt = self.index.rebuild_field(name, option, analyzer.clone());
@@ -1297,13 +1302,13 @@ mod tests {
         assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
     }
 
-    /// Issue #1424 — a rebuild that fails after publishing the rebuilt
-    /// segments (here, deleting a source segment's files) must not leave a
-    /// writer behind whose segment view still names the replaced segments:
-    /// replacing a document through it would mark the old copy deleted in a
-    /// segment that is gone, and two copies would stay live.
+    /// Issue #1424 — a rebuild whose cleanup fails after publishing the
+    /// rebuilt segments (here, deleting a source segment's files) must not
+    /// leave a writer behind whose segment view still names the replaced
+    /// segments: replacing a document through it would mark the old copy
+    /// deleted in a segment that is gone, and two copies would stay live.
     #[test]
-    fn rebuild_failure_after_publishing_still_replaces_documents_exactly() {
+    fn rebuild_cleanup_failure_still_replaces_documents_exactly() {
         let storage = Arc::new(FailOnceStorage::new());
         let store = store_with_title_field(storage.clone());
         store.upsert_document(1, titled_doc("ida")).unwrap();
@@ -1312,11 +1317,16 @@ mod tests {
         store.upsert_document(2, titled_doc("idb")).unwrap();
 
         *storage.fail_delete.lock() = Some("segment_");
-        assert!(store.rebuild_field("title", title_option(), None).is_err());
+        // The cleanup failure is logged, not returned (Issue #1436).
+        store.rebuild_field("title", title_option(), None).unwrap();
+        assert!(
+            storage.fail_delete.lock().is_none(),
+            "the cleanup must hit the injected failure"
+        );
         let files = storage.list_files().unwrap();
         assert!(
             files.iter().any(|file| file.starts_with("merged_")),
-            "the rebuild must fail after publishing, not before: {files:?}"
+            "the rebuild must publish before the cleanup fails: {files:?}"
         );
 
         // Replace both documents, as `Engine::put_document` does.
@@ -1332,6 +1342,74 @@ mod tests {
 
         assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![3]);
         assert_eq!(store.find_doc_ids_by_term("_id", "idb").unwrap(), vec![4]);
+    }
+
+    /// Issue #1436 — once a rebuild has published its segments, a failure
+    /// deleting the replaced segments' files must not keep the field's old
+    /// option and analyzer: a document added afterwards is indexed under the
+    /// new option, and a query parsed with the new analyzer matches the
+    /// rebuilt postings.
+    #[test]
+    fn rebuild_cleanup_failure_still_switches_option_and_analyzer() {
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+        use crate::analysis::analyzer::simple::SimpleAnalyzer;
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let storage = Arc::new(FailOnceStorage::new());
+        let config = LexicalIndexConfig::builder()
+            .analyzer(Arc::new(PerFieldAnalyzer::new(Arc::new(
+                StandardAnalyzer::new().unwrap(),
+            ))))
+            .add_field(
+                "title",
+                FieldOption::Text(TextOption::default().term_vectors(false)),
+            )
+            .build();
+        let store = LexicalStore::new(storage.clone(), config).unwrap();
+        let doc = |title: &str| Document::builder().add_text("title", title).build();
+        store.upsert_document(1, doc("Rust Programming")).unwrap();
+        store.commit().unwrap();
+
+        // The new analyzer keeps case and the new option stores positions;
+        // the old ones lowercase and do not.
+        let analyzer: Arc<dyn Analyzer> =
+            Arc::new(SimpleAnalyzer::new(Arc::new(WhitespaceTokenizer::new())));
+        *storage.fail_delete.lock() = Some("segment_");
+        let rebuilt = store.rebuild_field(
+            "title",
+            FieldOption::Text(TextOption::default().term_vectors(true)),
+            Some(analyzer),
+        );
+        assert!(
+            storage.fail_delete.lock().is_none(),
+            "the cleanup must hit the injected failure"
+        );
+
+        store.upsert_document(2, doc("Quick Brown Fox")).unwrap();
+        store.commit().unwrap();
+
+        let parser = store.query_parser().unwrap();
+        let hits = |query: &str| -> Vec<u64> {
+            let query = parser.parse(query).unwrap();
+            let results = store.search(LexicalSearchRequest::new(query)).unwrap();
+            results.hits.iter().map(|hit| hit.doc_id).collect()
+        };
+        assert_eq!(
+            hits("title:Rust"),
+            vec![1],
+            "the query must be parsed with the new analyzer, which keeps case"
+        );
+        assert_eq!(
+            hits("title:\"Quick Brown\""),
+            vec![2],
+            "a document added after the rebuild must be indexed with positions"
+        );
+        assert!(
+            rebuilt.is_ok(),
+            "a cleanup failure after publishing is not an error: {rebuilt:?}"
+        );
     }
 
     /// #1016 — a document written before the writer's automatic
