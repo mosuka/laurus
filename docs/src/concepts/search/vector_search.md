@@ -493,6 +493,18 @@ by one. As a guide, 100 candidates of 300 vectors with 128 dimensions and a
 32-vector query (about 123 million multiply-adds) took about 2 ms per
 search on an Apple M4, and about 7 ms on one thread.
 
+A `Binary` field is scored straight from its bits. For each query vector,
+the search first builds one 256-entry table per byte of a row, holding the
+byte's contribution to the dot product for each of its bit patterns. A
+query vector and a document vector then cost `ceil(dimension / 8)` table
+lookups instead of a decode and `dimension` multiply-adds. The tables take
+`ceil(dimension / 8)` KiB per query vector (384 KiB for 32 vectors of 96
+dimensions) and are built once per search. A query that would need more
+than 4 MiB of tables decodes its `Binary` candidates instead. On the
+SciFact and NFCorpus token vectors of `answerai-colbert-small-v1` (96
+dimensions, Apple M4), a pair retires about 50 instructions, against about
+74 for `F32` and about 224 when the rows are decoded first.
+
 ## Distance Metrics
 
 The distance metric is configured per field in the schema (see [Vector Indexing](../indexing/vector_indexing.md)):

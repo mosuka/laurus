@@ -680,7 +680,9 @@ where `c` is the mean token vector and `w_i` the mean of `|v_i - c_i|`,
 both stored as f16. The decoded offset is projected off `c`: without
 that, the bits' spurious component along `c` acts as a query-independent
 bias in MaxSim and ranking quality collapses. Queries are not binarized:
-the stored rows are decoded and scored against the float query vectors.
+the float query vectors are scored against the stored bits directly,
+without decoding the rows (see
+[Cost](../search/vector_search.md#cost)).
 
 - **The field learns `c` and `w` once**, from the first commit or merge
   that holds at least 2,048 token vectors (a sample of at most 16,384 of
