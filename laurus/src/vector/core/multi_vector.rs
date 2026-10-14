@@ -386,8 +386,40 @@ impl BinaryQuery {
     /// * `keep` - Scratch for the per-row `keep`; cleared first.
     pub(crate) fn max_sim(&self, rows: &[u8], keep: &mut Vec<f32>) -> f32 {
         debug_assert!(!rows.is_empty() && rows.len().is_multiple_of(self.row_bytes));
+        // The row widths of 64, 96 and 128 dimensions get their own copy,
+        // in which the lookups of a pair unroll.
+        match self.row_bytes {
+            8 => self.max_sim_rows_of::<8>(rows, keep),
+            12 => self.max_sim_rows_of::<12>(rows, keep),
+            16 => self.max_sim_rows_of::<16>(rows, keep),
+            width => self.score(
+                self.tables.chunks_exact(width),
+                rows.chunks_exact(width),
+                keep,
+            ),
+        }
+    }
+
+    /// [`Self::max_sim`] for rows of exactly `N` bytes.
+    fn max_sim_rows_of<const N: usize>(&self, rows: &[u8], keep: &mut Vec<f32>) -> f32 {
+        self.score(
+            self.tables.as_chunks::<N>().0.iter().map(|t| t.as_slice()),
+            rows.as_chunks::<N>().0.iter().map(|r| r.as_slice()),
+            keep,
+        )
+    }
+
+    /// `Σ_q max_r (q · c) keep_r + Σ_j T_qj[r_j]`, with `tables` yielding
+    /// each query vector's tables and `rows` each row's bytes.
+    #[inline(always)]
+    fn score<'t, 'r>(
+        &self,
+        tables: impl Iterator<Item = &'t [[f32; 256]]>,
+        rows: impl Iterator<Item = &'r [u8]> + Clone,
+        keep: &mut Vec<f32>,
+    ) -> f32 {
         keep.clear();
-        keep.extend(rows.chunks_exact(self.row_bytes).map(|row| {
+        keep.extend(rows.clone().map(|row| {
             let along = lookup_sum(&self.keep_tables, row);
             1.0 - if self.center_norm_sq > 0.0 {
                 along / self.center_norm_sq
@@ -397,9 +429,9 @@ impl BinaryQuery {
         }));
         self.center_dots
             .iter()
-            .zip(self.tables.chunks_exact(self.row_bytes))
+            .zip(tables)
             .map(|(&center_dot, tables)| {
-                rows.chunks_exact(self.row_bytes)
+                rows.clone()
                     .zip(keep.iter())
                     .map(|(row, &keep)| center_dot * keep + lookup_sum(tables, row))
                     .fold(f32::NEG_INFINITY, f32::max)
@@ -1233,7 +1265,8 @@ mod tests {
 
     #[test]
     fn test_binary_query_matches_decode_then_max_sim() {
-        for dimension in [1, 7, 8, 9, 96, 128] {
+        // 64, 96 and 128 dimensions take the unrolled copies of the kernel.
+        for dimension in [1, 7, 8, 9, 64, 96, 128] {
             let params = test_binary_params(dimension);
             for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
                 let query = query_values(query_rows * dimension, dimension as u64);
