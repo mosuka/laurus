@@ -538,7 +538,9 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns an error if the writer commit, deletion persistence,
-    /// compaction, storage sync, or index refresh fails.
+    /// compaction, storage sync, or index refresh fails. The cached searcher
+    /// is dropped on every return, so the next search sees whatever a
+    /// failed commit had already published (Issue #1435).
     pub async fn commit(&self) -> Result<()> {
         let mut writer_guard = self.writer_cache.lock().await;
         // commit() calls finalize() then write() to persist to storage. A
@@ -574,11 +576,12 @@ impl VectorStore {
             // A no-op unless the index supports it and `auto_compaction` is
             // enabled.
             .and_then(|_| self.index.maybe_auto_compact());
-        match ladder_result {
+        let finished = match ladder_result {
             Ok(compacted) => {
                 if compacted || !self.index.retain_writer_after_commit() {
                     *writer_guard = None;
                 }
+                Ok(())
             }
             Err(e) => {
                 // A mid-ladder failure leaves the writer/disk agreement
@@ -589,17 +592,24 @@ impl VectorStore {
                 // path), instead of retrying — or resurrecting from — a
                 // stale writer.
                 *writer_guard = None;
-                return Err(e);
+                Err(e)
             }
-        }
+        };
         drop(writer_guard);
-        // Sync storage to ensure all file metadata (creation, rename, size) is
-        // flushed to disk. This is critical on Windows where directory listings
-        // and file visibility may be cached until the directory is synced.
-        self.index.storage().sync()?;
-        self.index.refresh()?;
+        let finished = finished
+            // Sync storage to ensure all file metadata (creation, rename,
+            // size) is flushed to disk. This is critical on Windows where
+            // directory listings and file visibility may be cached until the
+            // directory is synced.
+            .and_then(|()| self.index.storage().sync())
+            .and_then(|()| self.index.refresh());
+        // On the error paths too (Issue #1435): the flush above, or a
+        // compaction that failed partway, may already have changed the
+        // segment set, and a searcher fixes its segment set when it is
+        // built, so keeping it would hide those changes from every search
+        // until the next successful commit.
         *self.searcher_cache.write() = None;
-        Ok(())
+        finished
     }
 
     /// Optimize the index for improved query performance.
@@ -618,7 +628,8 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns an error if flushing the cached writer or the underlying index
-    /// optimization fails.
+    /// optimization fails. The cached searcher is dropped on every return,
+    /// as in [`Self::commit`] (Issue #1435).
     pub async fn optimize(&self) -> Result<()> {
         let mut writer_guard = self.writer_cache.lock().await;
         // Flush uncommitted mutations first. `has_pending_changes` (not
@@ -631,16 +642,26 @@ impl VectorStore {
         };
         // A failed flush keeps the writer cached (#882 review / #875): its
         // buffered mutations are the only in-process copy and their WAL
-        // records may already be inside the pending checkpoint's range.
-        flush_result?;
+        // records may already be inside the pending checkpoint's range. It
+        // drops the cached searcher, as `commit` does (Issue #1435): the
+        // multi-field writer commits the other fields after one fails, so a
+        // failed flush may still have sealed segments.
+        if let Err(e) = flush_result {
+            drop(writer_guard);
+            *self.searcher_cache.write() = None;
+            return Err(e);
+        }
         // Drop the cache on success — optimize() rewrites the index through
         // a fresh writer and clears the deletion bitmap, so a retained
         // writer would resurrect reclaimed vectors (#864).
         *writer_guard = None;
-        self.index.optimize()?;
+        let optimized = self.index.optimize();
         drop(writer_guard);
+        // Whatever the outcome (Issue #1435): the flush may have sealed new
+        // segments, and an optimization that failed partway may already have
+        // replaced some.
         *self.searcher_cache.write() = None;
-        Ok(())
+        optimized
     }
 
     /// Invalidate the searcher cache.
@@ -1494,7 +1515,10 @@ impl VectorStore {
     /// [`Self::delete_field`], a flush failure is **propagated**, not
     /// cached for a later retry — the writer's buffered state is not a
     /// safe starting point for a rebuild, the same reasoning
-    /// [`Self::optimize`] already applies.
+    /// [`Self::optimize`] already applies. The cached searcher is dropped on
+    /// every return, as in [`Self::commit`] (Issue #1435); the field's base
+    /// weight and embedder registration change only when the rebuild
+    /// succeeds.
     pub async fn rebuild_field(
         &self,
         name: &str,
@@ -1524,35 +1548,48 @@ impl VectorStore {
             Some(writer) if writer.has_pending_changes() => writer.commit(),
             _ => Ok(()),
         };
-        flush_result?;
+        // A failed flush may still have sealed other fields' segments, as in
+        // `optimize` (Issue #1435).
+        if let Err(e) = flush_result {
+            drop(writer_guard);
+            *self.searcher_cache.write() = None;
+            return Err(e);
+        }
         *writer_guard = None;
 
-        if purge {
-            self.index.remove_field(name, true)?;
-            self.index.add_field(name, new_config)?;
+        let rebuilt = if purge {
+            self.index
+                .remove_field(name, true)
+                .and_then(|()| self.index.add_field(name, new_config))
         } else {
-            self.index.rebuild_field(name, new_config)?;
-        }
+            self.index.rebuild_field(name, new_config)
+        };
 
-        self.base_weights.write().insert(
-            name.to_string(),
-            Self::sanitize_base_weight(new_option.base_weight()),
-        );
+        if rebuilt.is_ok() {
+            self.base_weights.write().insert(
+                name.to_string(),
+                Self::sanitize_base_weight(new_option.base_weight()),
+            );
 
-        match embedder {
-            FieldEmbedderChange::Keep => {}
-            FieldEmbedderChange::Register(field_embedder) => {
-                let index_embedder = self.index.embedder();
-                if let Some(pfe) = index_embedder.as_any().downcast_ref::<PerFieldEmbedder>() {
-                    pfe.add_embedder(name, field_embedder);
+            match embedder {
+                FieldEmbedderChange::Keep => {}
+                FieldEmbedderChange::Register(field_embedder) => {
+                    let index_embedder = self.index.embedder();
+                    if let Some(pfe) = index_embedder.as_any().downcast_ref::<PerFieldEmbedder>() {
+                        pfe.add_embedder(name, field_embedder);
+                    }
                 }
+                FieldEmbedderChange::Unregister => self.unregister_field_embedder(name),
             }
-            FieldEmbedderChange::Unregister => self.unregister_field_embedder(name),
         }
 
         drop(writer_guard);
+        // Whatever the outcome (Issue #1435): the flush may have sealed new
+        // segments, and a purge whose re-creation failed has already
+        // unregistered the field, which a searcher built before it would
+        // still search.
         *self.searcher_cache.write() = None;
-        Ok(())
+        rebuilt
     }
 }
 
@@ -1654,4 +1691,471 @@ mod tests {
     // (rerank/quantizer propagation) and #794 (metric-conditional
     // normalization) cases these two tests used to cover -- now lives in
     // `vector::store::config::tests`.
+
+    /// The [`VectorIndex`] call that a [`FailingIndex`] fails (Issue #1435).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IndexCall {
+        PersistDeletions,
+        MaybeAutoCompact,
+        Refresh,
+        Optimize,
+        RemoveField,
+        AddField,
+        RebuildField,
+    }
+
+    /// A [`VectorIndex`] that delegates every call to `inner`, except that
+    /// the armed call fails once without reaching `inner`, and that
+    /// [`VectorIndex::storage`] returns `storage` (Issue #1435).
+    #[derive(Debug)]
+    struct FailingIndex {
+        inner: Box<dyn VectorIndex>,
+        armed: Arc<parking_lot::Mutex<Option<IndexCall>>>,
+        storage: Arc<dyn Storage>,
+    }
+
+    impl FailingIndex {
+        fn check(&self, call: IndexCall) -> Result<()> {
+            let mut armed = self.armed.lock();
+            if *armed == Some(call) {
+                *armed = None;
+                return Err(LaurusError::internal(format!("injected {call:?} failure")));
+            }
+            Ok(())
+        }
+    }
+
+    impl VectorIndex for FailingIndex {
+        fn reader(&self) -> Result<Arc<dyn crate::vector::reader::VectorIndexReader>> {
+            self.inner.reader()
+        }
+        fn writer(&self) -> Result<Box<dyn VectorIndexWriter>> {
+            self.inner.writer()
+        }
+        fn storage(&self) -> &Arc<dyn Storage> {
+            &self.storage
+        }
+        fn close(&self) -> Result<()> {
+            self.inner.close()
+        }
+        fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+        fn stats(&self) -> Result<crate::vector::index::VectorIndexStats> {
+            self.inner.stats()
+        }
+        fn optimize(&self) -> Result<()> {
+            self.check(IndexCall::Optimize)?;
+            self.inner.optimize()
+        }
+        fn refresh(&self) -> Result<()> {
+            self.check(IndexCall::Refresh)?;
+            self.inner.refresh()
+        }
+        fn retain_writer_after_commit(&self) -> bool {
+            self.inner.retain_writer_after_commit()
+        }
+        fn searcher(&self) -> Result<Box<dyn VectorIndexSearcher>> {
+            self.inner.searcher()
+        }
+        fn embedder(&self) -> Arc<dyn Embedder> {
+            self.inner.embedder()
+        }
+        fn last_wal_seq(&self) -> u64 {
+            self.inner.last_wal_seq()
+        }
+        fn set_last_wal_seq(&self, seq: u64) -> Result<()> {
+            self.inner.set_last_wal_seq(seq)
+        }
+        fn supports_soft_delete(&self) -> bool {
+            self.inner.supports_soft_delete()
+        }
+        fn soft_delete_document(&self, doc_id: u64) -> Result<()> {
+            self.inner.soft_delete_document(doc_id)
+        }
+        fn persist_deletions(&self) -> Result<()> {
+            self.check(IndexCall::PersistDeletions)?;
+            self.inner.persist_deletions()
+        }
+        fn maybe_auto_compact(&self) -> Result<bool> {
+            self.check(IndexCall::MaybeAutoCompact)?;
+            self.inner.maybe_auto_compact()
+        }
+        fn supports_dynamic_fields(&self) -> bool {
+            self.inner.supports_dynamic_fields()
+        }
+        fn add_field(&self, name: &str, config: VectorIndexTypeConfig) -> Result<()> {
+            self.check(IndexCall::AddField)?;
+            self.inner.add_field(name, config)
+        }
+        fn remove_field(&self, name: &str, purge: bool) -> Result<()> {
+            self.check(IndexCall::RemoveField)?;
+            self.inner.remove_field(name, purge)
+        }
+        fn rebuild_field(&self, name: &str, new_config: VectorIndexTypeConfig) -> Result<()> {
+            self.check(IndexCall::RebuildField)?;
+            self.inner.rebuild_field(name, new_config)
+        }
+        fn field_dimensions(&self) -> std::collections::BTreeMap<String, usize> {
+            self.inner.field_dimensions()
+        }
+        fn multi_vector_snapshot(
+            &self,
+            field: &str,
+        ) -> Result<Option<crate::vector::index::multivector::MultiVectorSnapshot>> {
+            self.inner.multi_vector_snapshot(field)
+        }
+        fn late_interaction_fields(&self) -> std::collections::BTreeSet<String> {
+            self.inner.late_interaction_fields()
+        }
+    }
+
+    /// A [`Storage`] over `inner` that fails the next `sync`, or the next
+    /// `create_output` of a file whose name starts with the armed prefix
+    /// (Issue #1435).
+    #[derive(Debug)]
+    struct FailingStorage {
+        inner: Arc<dyn Storage>,
+        fail_sync: std::sync::atomic::AtomicBool,
+        fail_create_prefix: parking_lot::Mutex<Option<&'static str>>,
+    }
+
+    impl FailingStorage {
+        fn new(inner: Arc<dyn Storage>) -> Self {
+            Self {
+                inner,
+                fail_sync: std::sync::atomic::AtomicBool::new(false),
+                fail_create_prefix: parking_lot::Mutex::new(None),
+            }
+        }
+    }
+
+    impl Storage for FailingStorage {
+        fn open_input(&self, name: &str) -> Result<Box<dyn crate::storage::StorageInput>> {
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            let mut prefix = self.fail_create_prefix.lock();
+            if prefix.is_some_and(|prefix| name.starts_with(prefix)) {
+                *prefix = None;
+                return Err(LaurusError::storage(format!(
+                    "injected failure creating {name}"
+                )));
+            }
+            self.inner.create_output(name)
+        }
+        fn create_output_append(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(
+            &self,
+            prefix: &str,
+        ) -> Result<(String, Box<dyn crate::storage::StorageOutput>)> {
+            self.inner.create_temp_output(prefix)
+        }
+        fn sync(&self) -> Result<()> {
+            if self
+                .fail_sync
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(LaurusError::storage("injected sync failure"));
+            }
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn lock_manager(&self) -> Option<Arc<dyn crate::storage::LockManager>> {
+            self.inner.lock_manager()
+        }
+    }
+
+    /// A store from [`store_with_stale_searcher`] and the switches that make
+    /// it fail.
+    struct StaleSearcherFixture {
+        store: VectorStore,
+        /// Fails a call from the store to its index.
+        armed: Arc<parking_lot::Mutex<Option<IndexCall>>>,
+        /// The storage the index writes its files to.
+        index_storage: Arc<FailingStorage>,
+        /// The storage the store itself syncs ([`VectorIndex::storage`]).
+        /// The index syncs `index_storage` instead, for example after saving
+        /// a manifest, so failing this one fails only the store's sync.
+        store_storage: Arc<FailingStorage>,
+    }
+
+    impl StaleSearcherFixture {
+        /// Asserts that the armed failure was hit, so the operation failed
+        /// where the test meant it to.
+        fn assert_failure_hit(&self) {
+            assert!(self.armed.lock().is_none(), "the index failure was not hit");
+            assert!(
+                self.index_storage.fail_create_prefix.lock().is_none(),
+                "the create failure was not hit"
+            );
+            assert!(
+                !self
+                    .store_storage
+                    .fail_sync
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "the sync failure was not hit"
+            );
+        }
+    }
+
+    fn flat_option() -> crate::vector::core::field::FlatOption {
+        crate::vector::core::field::FlatOption {
+            dimension: 4,
+            ..Default::default()
+        }
+    }
+
+    /// Buffers `doc_id` with a vector in both fields `a` and `b`.
+    async fn put_doc(store: &VectorStore, doc_id: u64) {
+        let vector = DataValue::Vector(vec![doc_id as f32; 4]);
+        let doc = Document::builder()
+            .add_field("a", vector.clone())
+            .add_field("b", vector)
+            .build();
+        store
+            .upsert_document_by_internal_id(doc_id, doc)
+            .await
+            .unwrap();
+    }
+
+    /// The ids a search of `field` returns, in ascending order.
+    fn search_ids(store: &VectorStore, field: &str) -> Result<Vec<u64>> {
+        use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery};
+
+        let request = VectorSearchRequest {
+            query: VectorSearchQuery::Vectors(vec![QueryVector {
+                vector: Vector::new(vec![1.0; 4]),
+                weight: 1.0,
+                fields: Some(vec![field.to_string()]),
+            }]),
+            params: VectorSearchParams {
+                limit: 10,
+                ..Default::default()
+            },
+        };
+        let mut ids: Vec<u64> = store
+            .search(request)?
+            .hits
+            .iter()
+            .map(|hit| hit.doc_id)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Issue #1435 fixture: a store over two Flat fields `a` and `b` that
+    /// has committed doc 1, cached a searcher over that commit, and buffered
+    /// doc 2 in its writer. The searcher fixed its segment set when it was
+    /// built, so it cannot see doc 2 once doc 2 is committed.
+    async fn store_with_stale_searcher() -> StaleSearcherFixture {
+        let memory: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index_storage = Arc::new(FailingStorage::new(memory));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let VectorStore {
+            index,
+            writer_cache,
+            searcher_cache,
+            config,
+            base_weights,
+        } = VectorStore::new(index_storage.clone(), config).unwrap();
+        let armed = Arc::new(parking_lot::Mutex::new(None));
+        let store_storage = Arc::new(FailingStorage::new(index_storage.clone()));
+        let store = VectorStore {
+            index: Box::new(FailingIndex {
+                inner: index,
+                armed: armed.clone(),
+                storage: store_storage.clone(),
+            }),
+            writer_cache,
+            searcher_cache,
+            config,
+            base_weights,
+        };
+
+        put_doc(&store, 1).await;
+        store.commit().await.unwrap();
+        assert_eq!(search_ids(&store, "b").unwrap(), vec![1]);
+        put_doc(&store, 2).await;
+
+        StaleSearcherFixture {
+            store,
+            armed,
+            index_storage,
+            store_storage,
+        }
+    }
+
+    /// Issue #1435 — a commit whose deletion persistence fails after the
+    /// writer's commit must not keep the searcher built before that commit.
+    #[tokio::test]
+    async fn commit_failing_to_persist_deletions_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::PersistDeletions);
+        assert!(fixture.store.commit().await.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — as above, for a failed auto-compaction.
+    #[tokio::test]
+    async fn commit_failing_to_auto_compact_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::MaybeAutoCompact);
+        assert!(fixture.store.commit().await.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — as above, for a failed storage sync.
+    #[tokio::test]
+    async fn commit_failing_to_sync_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        fixture
+            .store_storage
+            .fail_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(fixture.store.commit().await.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — as above, for a failed index refresh.
+    #[tokio::test]
+    async fn commit_failing_to_refresh_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::Refresh);
+        assert!(fixture.store.commit().await.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — an optimization that fails after the writer's commit
+    /// must not keep the searcher built before that commit.
+    #[tokio::test]
+    async fn optimize_failure_after_flush_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::Optimize);
+        assert!(fixture.store.optimize().await.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — a failed flush in `optimize` must drop the cached
+    /// searcher, as `commit` does: the multi-field writer commits field `a`
+    /// even though field `b` fails, so doc 2 is published in `a`.
+    #[tokio::test]
+    async fn optimize_flush_failure_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.index_storage.fail_create_prefix.lock() = Some("b/segment_");
+        assert!(fixture.store.optimize().await.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "a").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — a rebuild (`purge: false`) that fails after the writer's
+    /// commit must not keep the searcher built before that commit.
+    #[tokio::test]
+    async fn rebuild_failure_after_flush_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::RebuildField);
+        let rebuilt = fixture
+            .store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, false)
+            .await;
+        assert!(rebuilt.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — as above, for a purge that fails to remove the field.
+    #[tokio::test]
+    async fn purge_failing_to_remove_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::RemoveField);
+        let rebuilt = fixture
+            .store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, true)
+            .await;
+        assert!(rebuilt.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1435 — a purge that removed the field but failed to re-create
+    /// it must not keep the searcher built before: besides missing doc 2,
+    /// that searcher would still search the purged field.
+    #[tokio::test]
+    async fn purge_failing_to_recreate_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::AddField);
+        let rebuilt = fixture
+            .store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, true)
+            .await;
+        assert!(rebuilt.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+        let err = search_ids(&fixture.store, "a").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown vector field 'a'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Issue #1435 — a failed flush in `rebuild_field` must drop the cached
+    /// searcher, as in `optimize_flush_failure_drops_stale_searcher`.
+    #[tokio::test]
+    async fn rebuild_flush_failure_drops_stale_searcher() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.index_storage.fail_create_prefix.lock() = Some("b/segment_");
+        let rebuilt = fixture
+            .store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, false)
+            .await;
+        assert!(rebuilt.is_err());
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "a").unwrap(), vec![1, 2]);
+    }
 }
