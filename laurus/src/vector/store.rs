@@ -489,7 +489,11 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns an error if obtaining/creating the writer fails or if the
-    /// underlying delete operation fails.
+    /// underlying delete operation fails. The cached searcher is dropped on
+    /// every return of the soft-delete path, as in [`Self::commit`] (Issue
+    /// #1435): `MultiFieldVectorIndex::soft_delete_document` keeps marking
+    /// the other fields after one fails, so a failure can still leave the
+    /// document marked deleted (Issue #1445).
     pub async fn delete_document_by_internal_id(&self, doc_id: u64) -> Result<()> {
         // Prefer logical (soft) deletion when the index supports it (Issue
         // #624): mark the deletion bitmap and invalidate the searcher cache so
@@ -498,10 +502,16 @@ impl VectorStore {
         // writer-side delete triggers, and applies equally to updates (the
         // engine deletes the old internal id, which is monotonic and never
         // reused, before adding the new version).
+        //
+        // The cache is dropped whatever the outcome (Issue #1445): a failure
+        // in one field does not undo markings already applied to others, and
+        // a field with no bitmap yet fixes it as `None` when its searcher is
+        // built, so a cached searcher would not see a deletion applied after
+        // it was built until the cache is dropped.
         if self.index.supports_soft_delete() {
-            self.index.soft_delete_document(doc_id)?;
+            let result = self.index.soft_delete_document(doc_id);
             *self.searcher_cache.write() = None;
-            return Ok(());
+            return result;
         }
 
         let mut guard = self.writer_cache.lock().await;
@@ -1692,7 +1702,8 @@ mod tests {
     // normalization) cases these two tests used to cover -- now lives in
     // `vector::store::config::tests`.
 
-    /// The [`VectorIndex`] call that a [`FailingIndex`] fails (Issue #1435).
+    /// The [`VectorIndex`] call that a [`FailingIndex`] fails (Issue #1435,
+    /// `SoftDelete` added for Issue #1445).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum IndexCall {
         PersistDeletions,
@@ -1702,6 +1713,7 @@ mod tests {
         RemoveField,
         AddField,
         RebuildField,
+        SoftDelete,
     }
 
     /// A [`VectorIndex`] that delegates every call to `inner`, except that
@@ -1771,7 +1783,13 @@ mod tests {
             self.inner.supports_soft_delete()
         }
         fn soft_delete_document(&self, doc_id: u64) -> Result<()> {
-            self.inner.soft_delete_document(doc_id)
+            // The real call first (Issue #1445): a genuine partial failure
+            // inside `MultiFieldVectorIndex::soft_delete_document`'s
+            // `try_all` still marks whichever fields succeed before
+            // reporting the first error, so the injected failure below must
+            // not undo that real effect.
+            self.inner.soft_delete_document(doc_id)?;
+            self.check(IndexCall::SoftDelete)
         }
         fn persist_deletions(&self) -> Result<()> {
             self.check(IndexCall::PersistDeletions)?;
@@ -2157,5 +2175,97 @@ mod tests {
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "a").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1445 fixture: a store over two Flat fields `a` and `b` with doc
+    /// 1 committed and a searcher already cached over that commit, like
+    /// [`store_with_stale_searcher`] -- but doc 1 is inserted through the
+    /// index's own writer directly, bypassing
+    /// [`VectorStore::upsert_document_by_internal_id`]'s delete-before-add
+    /// dance ([`write_vectors`](VectorStore::write_vectors) always calls
+    /// `writer.delete_document` first, which eagerly creates a field's
+    /// deletion bitmap even on its very first write, via
+    /// `SegmentedCore::mark_deleted`'s `create_if_missing: true`). Both
+    /// fields therefore have no deletion bitmap at all when the searcher
+    /// below is built and cached -- `SegmentedIndex::searcher` captures
+    /// `None` -- which is the condition the Issue's bug depends on: once a
+    /// field's bitmap is created later, a `Some(Arc<DeletionBitmap>)`
+    /// captured by an earlier searcher is a live, shared reference that
+    /// sees later mutations on its own, but a searcher that captured `None`
+    /// has no such reference to see the bitmap created after it.
+    async fn store_with_searcher_cached_before_any_bitmap() -> StaleSearcherFixture {
+        let memory: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index_storage = Arc::new(FailingStorage::new(memory));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let VectorStore {
+            index,
+            writer_cache,
+            searcher_cache,
+            config,
+            base_weights,
+        } = VectorStore::new(index_storage.clone(), config).unwrap();
+        let armed = Arc::new(parking_lot::Mutex::new(None));
+        let store_storage = Arc::new(FailingStorage::new(index_storage.clone()));
+        let store = VectorStore {
+            index: Box::new(FailingIndex {
+                inner: index,
+                armed: armed.clone(),
+                storage: store_storage.clone(),
+            }),
+            writer_cache,
+            searcher_cache,
+            config,
+            base_weights,
+        };
+
+        let vector = Vector::new(vec![1.0; 4]);
+        let mut writer = store.index.writer().unwrap();
+        writer
+            .add_vectors(vec![
+                (1, "a".to_string(), vector.clone()),
+                (1, "b".to_string(), vector),
+            ])
+            .unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(search_ids(&store, "b").unwrap(), vec![1]);
+
+        StaleSearcherFixture {
+            store,
+            armed,
+            index_storage,
+            store_storage,
+        }
+    }
+
+    /// Issue #1445 — `MultiFieldVectorIndex::soft_delete_document`'s
+    /// `try_all` keeps marking every field it can before returning the first
+    /// error, so a soft delete that fails still leaves doc 1 marked deleted.
+    /// Field `b` has no deletion bitmap before this call (see
+    /// [`store_with_searcher_cached_before_any_bitmap`]), so the searcher
+    /// cached before it captured `None` and will not see the mark unless
+    /// `delete_document_by_internal_id` drops the cache on this error path
+    /// too, same as `commit`/`optimize`/`rebuild_field` already do (Issue
+    /// #1435).
+    #[tokio::test]
+    async fn soft_delete_failure_drops_stale_searcher() {
+        let fixture = store_with_searcher_cached_before_any_bitmap().await;
+        *fixture.armed.lock() = Some(IndexCall::SoftDelete);
+        assert!(
+            fixture
+                .store
+                .delete_document_by_internal_id(1)
+                .await
+                .is_err()
+        );
+        fixture.assert_failure_hit();
+
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), Vec::<u64>::new());
     }
 }
