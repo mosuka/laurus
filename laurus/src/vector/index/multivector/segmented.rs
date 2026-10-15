@@ -13,7 +13,7 @@
 //! encoded the way the merged segment is.
 //!
 //! A field with a `pool_factor` above 1 pools every document's token
-//! vectors as they are buffered (see [`token_pooling`]) and marks them in
+//! vectors as they are buffered (see [`TokenPooling`]) and marks them in
 //! the segment's document table with that factor. A merge pools the
 //! documents still marked as ingested, which is how turning pooling on for
 //! an existing field (a Reindex) pools its stored vectors, and leaves
@@ -37,7 +37,7 @@ use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::multi_vector_params_error;
 use crate::vector::core::multi_vector::{BinaryParams, MultiVectorStorage, OwnedCodec};
-use crate::vector::core::token_pooling::{self, pooled_count};
+use crate::vector::core::token_pooling::{TokenPooling, pooled_count};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::MultiVectorIndexConfig;
 use crate::vector::index::multivector::LAYOUT;
@@ -186,16 +186,23 @@ impl Shared {
         }
     }
 
-    /// Pool one document's token vectors (row-major) by the field's factor,
-    /// re-normalizing the means in a `Cosine` field; `None` when pooling
-    /// leaves them unchanged.
+    /// How this field pools its documents: `None` when it does not pool
+    /// (a factor of 1).
+    fn token_pooling(&self) -> Option<TokenPooling> {
+        (self.config.pool_factor > 1).then(|| {
+            TokenPooling::new(
+                self.config.dimension,
+                self.config.pool_factor,
+                self.config.distance_metric == DistanceMetric::Cosine,
+            )
+        })
+    }
+
+    /// Pool one document's stored token vectors (row-major) by the field's
+    /// factor, re-normalizing the means in a `Cosine` field; `None` when
+    /// pooling leaves them unchanged or the field does not pool.
     fn pool_rows(&self, rows: &[f32]) -> Option<Vec<f32>> {
-        token_pooling::pool(
-            rows,
-            self.config.dimension,
-            self.config.pool_factor,
-            self.config.distance_metric == DistanceMetric::Cosine,
-        )
+        self.token_pooling()?.pool_rows(rows)
     }
 
     fn snapshot(&self) -> Result<MultiVectorSnapshot> {
@@ -621,25 +628,13 @@ impl MultiVectorWriter {
     /// Every write passes here exactly once (ingest, WAL replay, embedder
     /// output), so a document is pooled once, deterministically.
     fn buffer_documents(&mut self, docs: &mut [(u64, Vec<Vector>)]) -> Result<()> {
-        if self.shared.config.distance_metric == DistanceMetric::Cosine {
-            docs.iter_mut()
-                .flat_map(|(_, vectors)| vectors.iter_mut())
-                .for_each(Vector::normalize);
-        }
-        let (factor, dimension) = (self.shared.config.pool_factor, self.shared.config.dimension);
+        let pooling = self.shared.token_pooling();
+        let normalize = self.shared.config.distance_metric == DistanceMetric::Cosine;
         for (_, vectors) in docs.iter_mut() {
-            if pooled_count(vectors.len(), factor) == vectors.len() {
-                continue;
-            }
-            let rows: Vec<f32> = vectors
-                .iter()
-                .flat_map(|v| v.data.iter().copied())
-                .collect();
-            if let Some(pooled) = self.shared.pool_rows(&rows) {
-                *vectors = pooled
-                    .chunks_exact(dimension)
-                    .map(|row| Vector::new(row.to_vec()))
-                    .collect();
+            match pooling.and_then(|pooling| pooling.apply(vectors)) {
+                Some(pooled) => *vectors = pooled.into_vectors(),
+                None if normalize => vectors.iter_mut().for_each(Vector::normalize),
+                None => {}
             }
         }
         self.shared

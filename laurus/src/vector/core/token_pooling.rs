@@ -26,8 +26,13 @@
 //!
 //! Cost per document: `O(r²)` time and memory (an `f64` condensed distance
 //! matrix of `r (r - 1) / 2` entries).
+//!
+//! [`TokenPooling`] names everything the result depends on besides the
+//! rows, so a document can be pooled away from the writer that stores it
+//! (#1429): the writer keeps rows pooled elsewhere only when their
+//! [`TokenPooling`] equals its own.
 
-use crate::vector::core::vector::normalize_slice;
+use crate::vector::core::vector::{Vector, normalize_slice};
 
 /// Rows kept verbatim at the start of every document: the first token
 /// (`[CLS]` for a ColBERT model), as Sentence Transformers and PyLate do.
@@ -41,7 +46,7 @@ fn cluster_count(rest: usize, factor: u32) -> usize {
 /// The number of rows a document of `rows` token vectors keeps after
 /// pooling by `factor`: a pure function of the two, so a merge can write a
 /// segment's document table before pooling the rows.
-pub(crate) fn pooled_count(rows: usize, factor: u32) -> usize {
+pub fn pooled_count(rows: usize, factor: u32) -> usize {
     let protected = rows.min(PROTECTED_ROWS);
     let rest = rows - protected;
     let clusters = cluster_count(rest, factor);
@@ -105,6 +110,133 @@ pub(crate) fn pool(
         }
     }
     Some(pooled)
+}
+
+/// How a field pools its documents' token vectors: everything the pooled
+/// rows depend on besides the rows themselves. Equal rows pooled under
+/// equal `TokenPooling`s give the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenPooling {
+    dimension: usize,
+    factor: u32,
+    normalize: bool,
+}
+
+impl TokenPooling {
+    /// Create a pooling configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `dimension` - Length of every token vector.
+    /// * `factor` - Pooling factor (see [`pooled_count`]); `<= 1` pools
+    ///   nothing.
+    /// * `normalize` - Whether the field L2-normalizes its token vectors (a
+    ///   `Cosine` field): the vectors are normalized before pooling and the
+    ///   cluster means after it.
+    pub fn new(dimension: usize, factor: u32, normalize: bool) -> Self {
+        Self {
+            dimension,
+            factor,
+            normalize,
+        }
+    }
+
+    /// Length of every token vector.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// The pooling factor.
+    pub fn factor(&self) -> u32 {
+        self.factor
+    }
+
+    /// Whether token vectors are L2-normalized (see [`Self::new`]).
+    pub fn normalize(&self) -> bool {
+        self.normalize
+    }
+
+    /// Pool one document's rows as the field stores them (row-major, and
+    /// already normalized when the field normalizes), as a merge does.
+    ///
+    /// # Returns
+    ///
+    /// `None` when pooling leaves the rows unchanged; otherwise the
+    /// [`pooled_count`] pooled rows.
+    pub(crate) fn pool_rows(&self, rows: &[f32]) -> Option<Vec<f32>> {
+        pool(rows, self.dimension, self.factor, self.normalize)
+    }
+
+    /// Pool one document's token vectors as they were embedded, before the
+    /// field normalizes them: normalize a copy when the field normalizes,
+    /// with the arithmetic of [`Vector::normalize`], then pool it. Ingest
+    /// pools every document through here, inside or outside the writer.
+    ///
+    /// # Returns
+    ///
+    /// `None` when pooling leaves the document unchanged (see
+    /// [`pooled_count`]) or when a vector's length is not
+    /// [`Self::dimension`], which the writer rejects; otherwise the pooled
+    /// vectors, tagged with this configuration.
+    pub fn apply(&self, vectors: &[Vector]) -> Option<PooledTokens> {
+        let n = vectors.len();
+        if self.dimension == 0
+            || pooled_count(n, self.factor) == n
+            || vectors.iter().any(|v| v.dimension() != self.dimension)
+        {
+            return None;
+        }
+        let mut rows = Vec::with_capacity(n * self.dimension);
+        for vector in vectors {
+            let start = rows.len();
+            rows.extend_from_slice(&vector.data);
+            if self.normalize {
+                normalize_slice(&mut rows[start..]);
+            }
+        }
+        let pooled = self.pool_rows(&rows)?;
+        Some(PooledTokens {
+            pooling: *self,
+            source_len: n,
+            vectors: pooled
+                .chunks_exact(self.dimension)
+                .map(|row| Vector::new(row.to_vec()))
+                .collect(),
+        })
+    }
+}
+
+/// A document's token vectors pooled by [`TokenPooling::apply`], tagged
+/// with the configuration they were pooled under and how many vectors
+/// they were pooled from. Only `apply` creates one, so the tag always
+/// describes the vectors.
+#[derive(Clone, Debug)]
+pub struct PooledTokens {
+    pooling: TokenPooling,
+    source_len: usize,
+    vectors: Vec<Vector>,
+}
+
+impl PooledTokens {
+    /// The configuration the vectors were pooled under.
+    pub fn pooling(&self) -> TokenPooling {
+        self.pooling
+    }
+
+    /// How many token vectors were pooled.
+    pub fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    /// The pooled vectors.
+    pub fn vectors(&self) -> &[Vector] {
+        &self.vectors
+    }
+
+    /// Take the pooled vectors.
+    pub fn into_vectors(self) -> Vec<Vector> {
+        self.vectors
+    }
 }
 
 /// Index of the pair `(i, j)`, `i < j`, in a condensed distance matrix of
@@ -368,6 +500,77 @@ mod tests {
         assert_eq!(&raw[3..], &[0.5, 0.5, 0.0]);
         let unit = pool(&input, 3, 2, true).unwrap();
         assert!((norm(&unit[3..]) - 1.0).abs() < 1e-6, "{unit:?}");
+    }
+
+    fn to_vectors(values: &[f32], dimension: usize) -> Vec<Vector> {
+        values
+            .chunks_exact(dimension)
+            .map(|row| Vector::new(row.to_vec()))
+            .collect()
+    }
+
+    fn bits(vectors: &[Vector]) -> Vec<u32> {
+        vectors
+            .iter()
+            .flat_map(|v| v.data.iter().map(|x| x.to_bits()))
+            .collect()
+    }
+
+    /// `apply` gives exactly the rows the writer stored before #1429:
+    /// normalize every vector in place, then pool the rows.
+    #[test]
+    fn test_apply_matches_normalizing_in_place_then_pooling() {
+        let dimension = 5;
+        for normalize in [true, false] {
+            let pooling = TokenPooling::new(dimension, 2, normalize);
+            let mut pooled_documents = 0;
+            for n in [1, 2, 30] {
+                let raw = to_vectors(&rows(n, dimension, n as u64 + 3), dimension);
+                let mut in_place = raw.clone();
+                if normalize {
+                    in_place.iter_mut().for_each(Vector::normalize);
+                }
+                let flat: Vec<f32> = in_place
+                    .iter()
+                    .flat_map(|v| v.data.iter().copied())
+                    .collect();
+                match (pooling.apply(&raw), pool(&flat, dimension, 2, normalize)) {
+                    (None, None) => assert_eq!(pooled_count(n, 2), n),
+                    (Some(applied), Some(expected)) => {
+                        pooled_documents += 1;
+                        assert_eq!(applied.pooling(), pooling);
+                        assert_eq!(applied.source_len(), n);
+                        assert_eq!(
+                            bits(applied.vectors()),
+                            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            "{n} rows, normalize {normalize}"
+                        );
+                        assert_eq!(bits(&applied.vectors()[..1]), bits(&in_place[..1]));
+                    }
+                    (applied, expected) => panic!(
+                        "{n} rows: apply pooled {}, the reference {}",
+                        applied.is_some(),
+                        expected.is_some()
+                    ),
+                }
+            }
+            assert_eq!(pooled_documents, 1, "normalize {normalize}");
+        }
+    }
+
+    /// A vector of another length is refused rather than pooled into rows
+    /// that straddle vectors, even when the lengths still add up to whole
+    /// rows.
+    #[test]
+    fn test_apply_refuses_vectors_of_another_dimension() {
+        let pooling = TokenPooling::new(3, 2, true);
+        let mut raw = to_vectors(&rows(9, 3, 5), 3);
+        assert!(pooling.apply(&raw).is_some());
+        raw[4] = Vector::new(vec![1.0, 0.0]);
+        raw[5] = Vector::new(vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(raw.iter().map(Vector::dimension).sum::<usize>(), 27);
+        assert!(pooling.apply(&raw).is_none());
+        assert!(TokenPooling::new(0, 2, true).apply(&[]).is_none());
     }
 
     #[test]
