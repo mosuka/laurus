@@ -277,6 +277,11 @@ impl BinaryParams {
     }
 
     /// Decode one row's bits and push its `dimension` values onto `out`.
+    ///
+    /// Branchless: a clear bit flips the sign of `w_i` and `w_i c_i` by
+    /// XOR-ing their f32 sign bit, instead of selecting `±w_i` with an
+    /// `if`. `along` accumulates in the same order as the signed-add form
+    /// it replaces, so the result is bit-identical (#1439).
     fn decode_row(&self, bytes: &[u8], out: &mut Vec<f32>) {
         let start = out.len();
         let mut along = 0f32;
@@ -286,13 +291,9 @@ impl BinaryParams {
                 .zip(&*self.spread_center)
                 .enumerate()
                 .map(|(i, (w, wc))| {
-                    if bytes[i / 8] >> (i % 8) & 1 == 1 {
-                        along += wc;
-                        *w
-                    } else {
-                        along -= wc;
-                        -w
-                    }
+                    let flip = u32::from(!(bytes[i / 8] >> (i % 8)) & 1) << 31;
+                    along += f32::from_bits(wc.to_bits() ^ flip);
+                    f32::from_bits(w.to_bits() ^ flip)
                 }),
         );
         let off = if self.center_norm_sq > 0.0 {
@@ -1084,6 +1085,71 @@ mod tests {
         let params = BinaryParams::from_f16_bits(3, bits).unwrap();
         let decoded = decode(RowCodec::Binary(&params), &[0b101], 3);
         assert_eq!(decoded, [0.5, -0.25, 0.125]);
+    }
+
+    /// The pre-#1439 decode, kept here as the bit-identical oracle for
+    /// [`BinaryParams::decode_row`]'s branchless rewrite.
+    fn decode_row_branch_per_bit(params: &BinaryParams, bytes: &[u8], out: &mut Vec<f32>) {
+        let start = out.len();
+        let mut along = 0f32;
+        out.extend(
+            params
+                .spread
+                .iter()
+                .zip(&*params.spread_center)
+                .enumerate()
+                .map(|(i, (w, wc))| {
+                    if bytes[i / 8] >> (i % 8) & 1 == 1 {
+                        along += wc;
+                        *w
+                    } else {
+                        along -= wc;
+                        -w
+                    }
+                }),
+        );
+        let off = if params.center_norm_sq > 0.0 {
+            along / params.center_norm_sq
+        } else {
+            0.0
+        };
+        for (x, c) in out[start..].iter_mut().zip(&*params.center) {
+            *x += c * (1.0 - off);
+        }
+    }
+
+    #[test]
+    fn test_binary_decode_is_bit_identical_to_the_branch_per_bit_oracle() {
+        // Dimensions both multiples and non-multiples of 8, so the test
+        // exercises a row's trailing partial byte too.
+        for dimension in [5, 7, 8, 9, 16, 17] {
+            let params = test_binary_params(dimension);
+            let row_bytes = dimension.div_ceil(8);
+            for varying in 0..row_bytes {
+                // The byte under test runs over every one of its 256
+                // patterns; the other bytes are held at two baselines so
+                // their bits still interact with `along`.
+                for &baseline in &[0x00u8, 0xFFu8] {
+                    for byte in 0u16..=255 {
+                        let bytes: Vec<u8> = (0..row_bytes)
+                            .map(|j| if j == varying { byte as u8 } else { baseline })
+                            .collect();
+                        let mut expected = Vec::new();
+                        decode_row_branch_per_bit(&params, &bytes, &mut expected);
+                        let mut actual = Vec::new();
+                        params.decode_row(&bytes, &mut actual);
+                        let expected_bits: Vec<u32> =
+                            expected.iter().map(|v| v.to_bits()).collect();
+                        let actual_bits: Vec<u32> = actual.iter().map(|v| v.to_bits()).collect();
+                        assert_eq!(
+                            actual_bits, expected_bits,
+                            "dimension {dimension}, byte {varying} = {byte:#010b}, \
+                             baseline {baseline:#010b}: {actual:?} vs {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
