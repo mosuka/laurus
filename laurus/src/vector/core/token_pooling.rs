@@ -237,6 +237,18 @@ impl PooledTokens {
     pub fn into_vectors(self) -> Vec<Vector> {
         self.vectors
     }
+
+    /// `vectors`, whatever they are, tagged as pooled under `pooling` from
+    /// `source_len` vectors, so a test can tell the rows a writer kept from
+    /// rows it pooled itself.
+    #[cfg(test)]
+    pub(crate) fn tagged(pooling: TokenPooling, source_len: usize, vectors: Vec<Vector>) -> Self {
+        Self {
+            pooling,
+            source_len,
+            vectors,
+        }
+    }
 }
 
 /// Index of the pair `(i, j)`, `i < j`, in a condensed distance matrix of

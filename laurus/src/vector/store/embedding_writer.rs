@@ -11,7 +11,7 @@ use crate::embedding::embedder::{EmbedInput, Embedder};
 use crate::embedding::per_field::PerFieldEmbedder;
 use crate::error::{LaurusError, Result};
 use crate::vector::core::vector::Vector;
-use crate::vector::writer::VectorIndexWriter;
+use crate::vector::writer::{FieldVectors, VectorIndexWriter};
 
 /// A wrapper around a VectorIndexWriter that automatically handles content embedding.
 pub struct EmbeddingVectorIndexWriter {
@@ -136,6 +136,14 @@ impl VectorIndexWriter for EmbeddingVectorIndexWriter {
         fields: Vec<(String, Vec<Vector>)>,
     ) -> Result<()> {
         self.inner.add_document_vectors(doc_id, fields)
+    }
+
+    fn add_prepared_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<FieldVectors>,
+    ) -> Result<()> {
+        self.inner.add_prepared_document_vectors(doc_id, fields)
     }
 
     fn finalize(&mut self) -> Result<()> {

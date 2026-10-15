@@ -75,6 +75,7 @@ use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::storage::prefixed::PrefixedStorage;
 use crate::vector::core::distance::DistanceMetric;
+use crate::vector::core::token_pooling::TokenPooling;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::VectorIndexTypeConfig;
 use crate::vector::index::factory::VectorIndexFactory;
@@ -87,7 +88,7 @@ use crate::vector::reader::{
 use crate::vector::search::searcher::{
     VectorIndexQuery, VectorIndexQueryResults, VectorIndexSearcher,
 };
-use crate::vector::writer::VectorIndexWriter;
+use crate::vector::writer::{FieldVectors, VectorIndexWriter};
 
 /// `(doc_id, field_name, Vector)` triples bucketed by field name -- the
 /// output of [`MultiFieldWriter::group_by_field`].
@@ -504,6 +505,13 @@ impl VectorIndex for MultiFieldVectorIndex {
             .map(|(name, _)| name.clone())
             .collect()
     }
+
+    /// The field's own pooling. The `fields` lock is released before
+    /// asking, as in [`Self::multi_vector_snapshot`].
+    fn token_pooling(&self, field: &str) -> Option<TokenPooling> {
+        let index = self.fields.read().get(field)?.index.clone();
+        index.token_pooling(field)
+    }
 }
 
 /// Writer over a [`MultiFieldVectorIndex`]'s per-field sub-writers.
@@ -590,26 +598,44 @@ impl VectorIndexWriter for MultiFieldWriter {
         Ok(())
     }
 
-    /// Route each field's vectors to that field's writer, moving the name
-    /// rather than cloning it per vector. As with [`Self::add_vectors`], an
-    /// unknown field rejects the whole document before any field is routed.
+    /// Route each field's vectors to that field's writer, as
+    /// [`Self::add_prepared_document_vectors`] does with nothing pooled in
+    /// advance.
     fn add_document_vectors(
         &mut self,
         doc_id: u64,
         fields: Vec<(String, Vec<Vector>)>,
     ) -> Result<()> {
-        if let Some((field_name, _)) = fields
+        self.add_prepared_document_vectors(
+            doc_id,
+            fields
+                .into_iter()
+                .map(|(field, vectors)| FieldVectors::new(field, vectors))
+                .collect(),
+        )
+    }
+
+    /// Route each field's vectors, with any pooled in advance, to that
+    /// field's writer, moving the name rather than cloning it per vector.
+    /// As with [`Self::add_vectors`], an unknown field rejects the whole
+    /// document before any field is routed.
+    fn add_prepared_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<FieldVectors>,
+    ) -> Result<()> {
+        if let Some(field) = fields
             .iter()
-            .find(|(field_name, _)| !self.writers.contains_key(field_name))
+            .find(|field| !self.writers.contains_key(&field.field))
         {
-            return Err(Self::unknown_field(field_name));
+            return Err(Self::unknown_field(&field.field));
         }
-        for (field_name, vectors) in fields {
+        for field in fields {
             let writer = self
                 .writers
-                .get_mut(&field_name)
+                .get_mut(&field.field)
                 .expect("field name validated above");
-            writer.add_document_vectors(doc_id, vec![(field_name, vectors)])?;
+            writer.add_prepared_document_vectors(doc_id, vec![field])?;
         }
         Ok(())
     }
@@ -1354,5 +1380,99 @@ mod tests {
             "{err}"
         );
         assert!(writer.writers["a"].vectors().is_empty());
+    }
+
+    /// An index with a multi-vector field `tokens` (2 dimensions, Cosine,
+    /// pool factor 2) and a Flat field `flat`.
+    fn pooling_index() -> (
+        MultiFieldVectorIndex,
+        crate::vector::index::config::MultiVectorIndexConfig,
+    ) {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::{FlatIndexConfig, MultiVectorIndexConfig};
+
+        let tokens = MultiVectorIndexConfig {
+            dimension: 2,
+            pool_factor: 2,
+            ..MultiVectorIndexConfig::default()
+        };
+        let configs = BTreeMap::from([
+            (
+                "tokens".to_string(),
+                VectorIndexTypeConfig::MultiVector(tokens.clone()),
+            ),
+            (
+                "flat".to_string(),
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+        ]);
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index =
+            MultiFieldVectorIndex::open_or_create(storage, &configs, tokens.embedder.clone())
+                .unwrap();
+        (index, tokens)
+    }
+
+    #[test]
+    fn token_pooling_comes_from_the_fields_own_index() {
+        use crate::vector::index::config::MultiVectorIndexConfig;
+
+        let (index, tokens) = pooling_index();
+        assert_eq!(
+            index.token_pooling("tokens"),
+            Some(TokenPooling::new(2, 2, true))
+        );
+        assert_eq!(index.token_pooling("flat"), None);
+        assert_eq!(index.token_pooling("gone"), None);
+        index
+            .rebuild_field(
+                "tokens",
+                VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+                    pool_factor: 4,
+                    ..tokens
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            index.token_pooling("tokens"),
+            Some(TokenPooling::new(2, 4, true))
+        );
+    }
+
+    /// The field's writer receives the vectors pooled in advance, and keeps
+    /// them since they were pooled the way it pools.
+    #[test]
+    fn add_prepared_document_vectors_hands_pooled_vectors_to_the_fields_writer() {
+        use crate::vector::core::token_pooling::PooledTokens;
+
+        let (index, _) = pooling_index();
+        let raw: Vec<Vector> = (0..5)
+            .map(|i| Vector::new(vec![1.0 + i as f32, 0.5]))
+            .collect();
+        let kept = vec![
+            Vector::new(vec![0.25, 0.0]),
+            Vector::new(vec![0.0, 0.25]),
+            Vector::new(vec![0.125, 0.125]),
+        ];
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_prepared_document_vectors(
+                1,
+                vec![FieldVectors {
+                    pooled: Some(PooledTokens::tagged(TokenPooling::new(2, 2, true), 5, kept)),
+                    ..FieldVectors::new("tokens", raw)
+                }],
+            )
+            .unwrap();
+        writer.commit().unwrap();
+        let snapshot = index.multi_vector_snapshot("tokens").unwrap().unwrap();
+        assert_eq!(
+            snapshot.vectors(1).unwrap().unwrap().into_owned(),
+            [0.25, 0.0, 0.0, 0.25, 0.125, 0.125]
+        );
     }
 }

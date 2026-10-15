@@ -41,6 +41,7 @@ use parking_lot::RwLock;
 use crate::embedding::embedder::Embedder;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
+use crate::vector::core::token_pooling::TokenPooling;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::{
     FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, VectorIndexTypeConfig,
@@ -319,6 +320,17 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// field selectors. Defaults to empty.
     fn late_interaction_fields(&self) -> std::collections::BTreeSet<String> {
         std::collections::BTreeSet::new()
+    }
+
+    /// How the multi-vector field `field` pools its documents' token
+    /// vectors (Issue #1429), so that a caller can pool a document before
+    /// taking the writer and hand it over as
+    /// [`FieldVectors::pooled`](crate::vector::writer::FieldVectors::pooled).
+    ///
+    /// Defaults to `None`: only a multi-vector index with a pool factor
+    /// above 1 (and a multi-field index routing to one) pools.
+    fn token_pooling(&self, _field: &str) -> Option<TokenPooling> {
+        None
     }
 }
 

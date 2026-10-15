@@ -9,8 +9,44 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::vector::core::token_pooling::PooledTokens;
 use crate::vector::core::vector::Vector;
 use serde::{Deserialize, Serialize};
+
+/// One field's vectors for one document, as
+/// [`VectorIndexWriter::add_prepared_document_vectors`] takes them: the
+/// vectors as they were embedded, and, for a multi-vector field that pools,
+/// the same vectors already pooled outside the writer (Issue #1429).
+#[derive(Debug, Clone)]
+pub struct FieldVectors {
+    /// The field's name.
+    pub field: String,
+    /// The vectors as they were embedded.
+    pub vectors: Vec<Vector>,
+    /// [`Self::vectors`] pooled by
+    /// [`TokenPooling::apply`](crate::vector::core::token_pooling::TokenPooling::apply)
+    /// under the field's [`VectorIndex::token_pooling`](crate::vector::index::VectorIndex::token_pooling).
+    /// A writer stores them as they are only when they were pooled the way
+    /// it pools, and processes [`Self::vectors`] otherwise; writers that do
+    /// not pool ignore them.
+    pub pooled: Option<PooledTokens>,
+}
+
+impl FieldVectors {
+    /// A field's vectors with nothing pooled in advance.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The field's name.
+    /// * `vectors` - The vectors as they were embedded.
+    pub fn new(field: impl Into<String>, vectors: Vec<Vector>) -> Self {
+        Self {
+            field: field.into(),
+            vectors,
+            pooled: None,
+        }
+    }
+}
 
 /// Configuration for vector index writers common to all index types.
 ///
@@ -129,6 +165,38 @@ pub trait VectorIndexWriter: Send + Sync + std::fmt::Debug {
             })
             .collect();
         self.add_vectors(vectors)
+    }
+
+    /// Add one document's vectors as [`Self::add_document_vectors`] does,
+    /// taking along token vectors the caller has already pooled (Issue
+    /// #1429), so that pooling does not run while the writer is held.
+    ///
+    /// A writer that pools stores a field's [`FieldVectors::pooled`] as they
+    /// are when they were pooled the way it pools, and pools
+    /// [`FieldVectors::vectors`] itself otherwise. The default
+    /// implementation ignores `pooled` and calls
+    /// [`Self::add_document_vectors`].
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - The document the vectors belong to.
+    /// * `fields` - One entry per field.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::add_document_vectors`].
+    fn add_prepared_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<FieldVectors>,
+    ) -> Result<()> {
+        self.add_document_vectors(
+            doc_id,
+            fields
+                .into_iter()
+                .map(|field| (field.field, field.vectors))
+                .collect(),
+        )
     }
 
     /// Finalize the index construction.
