@@ -55,6 +55,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
+use rkyv::api::high::HighSerializer;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
+use rkyv::with::Inline;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +95,52 @@ pub enum LogEntry {
 pub struct LogRecord {
     pub seq: SeqNumber,
     pub entry: LogEntry,
+}
+
+/// A borrowed mirror of [`LogEntry`], field for field and variant for
+/// variant, used only to *write* a record without cloning its `Document`
+/// (Issue #1416). `document` is archived with [`Inline`], which gives the
+/// exact same archived bytes as the owned `Document` field in [`LogEntry`]
+/// (`Inline`'s `Archived` type is `Document`'s own, see `rkyv::with::Inline`),
+/// so the v3 WAL format is unchanged. References archived with `Inline`
+/// cannot be deserialized, so this type derives `Serialize` (for the
+/// v2/legacy JSON path) and rkyv's `Serialize`, but never `Deserialize`.
+#[derive(Debug, Serialize, Archive, RkyvSerialize)]
+enum LogEntryRef<'a> {
+    Upsert {
+        doc_id: u64,
+        external_id: String,
+        #[rkyv(with = Inline)]
+        document: &'a Document,
+    },
+    Delete {
+        doc_id: u64,
+        external_id: String,
+    },
+}
+
+/// A borrowed mirror of [`LogRecord`]; see [`LogEntryRef`].
+#[derive(Debug, Serialize, Archive, RkyvSerialize)]
+struct LogRecordRef<'a> {
+    seq: SeqNumber,
+    entry: LogEntryRef<'a>,
+}
+
+/// Either [`LogRecord`] (owned, used by `append_delete` and the
+/// truncate/rewrite path) or [`LogRecordRef`] (borrowed, used by
+/// [`DocumentLog::append`]) can be encoded through the same WAL-writing path
+/// (Issue #1416). The bound mirrors what `rkyv::to_bytes` itself requires
+/// (`rkyv::Serialize<S>` already has `Archive` as a supertrait).
+trait WalEncodable:
+    serde::Serialize
+    + for<'x> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'x>, rkyv::rancor::Error>>
+{
+}
+
+impl<T> WalEncodable for T where
+    T: serde::Serialize
+        + for<'x> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'x>, rkyv::rancor::Error>>
+{
 }
 
 /// Durability policy governing when WAL appends are fsync'd.
@@ -452,7 +502,12 @@ impl DocumentLog {
     /// under [`WalSyncPolicy::Group`].
     ///
     /// Returns `(doc_id, seq_number)`.
-    pub fn append(&self, external_id: &str, doc: Document) -> Result<(u64, SeqNumber)> {
+    ///
+    /// Takes `doc` by reference and serializes it borrowed (Issue #1416): a
+    /// caller that still needs `doc` after this call (the engine's put path
+    /// does, for the lexical store and stored-field filtering) no longer has
+    /// to clone it just to hand the WAL a copy to own and drop.
+    pub fn append(&self, external_id: &str, doc: &Document) -> Result<(u64, SeqNumber)> {
         // Single critical section: ensure the writer, allocate ids, and write
         // under one lock so the on-disk record order matches id/seq allocation.
         let mut writer_guard = self.wal_writer.lock();
@@ -461,9 +516,9 @@ impl DocumentLog {
         let doc_id = self.next_doc_id.fetch_add(1, Ordering::SeqCst);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
-        let record = LogRecord {
+        let record = LogRecordRef {
             seq,
-            entry: LogEntry::Upsert {
+            entry: LogEntryRef::Upsert {
                 doc_id,
                 external_id: external_id.to_string(),
                 document: doc,
@@ -487,9 +542,9 @@ impl DocumentLog {
 
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
-        let record = LogRecord {
+        let record = LogRecordRef {
             seq,
-            entry: LogEntry::Delete {
+            entry: LogEntryRef::Delete {
                 doc_id,
                 external_id: external_id.to_string(),
             },
@@ -515,7 +570,7 @@ impl DocumentLog {
     ///
     /// Returns a [`LaurusError::SerializationError`](crate::error::LaurusError::SerializationError)
     /// if rkyv (v3) or `serde_json` (v2/legacy) encoding fails.
-    fn encode_payload(record: &LogRecord, format: WalFormat) -> Result<Vec<u8>> {
+    fn encode_payload<T: WalEncodable>(record: &T, format: WalFormat) -> Result<Vec<u8>> {
         match format {
             WalFormat::V3 => rkyv::to_bytes::<rkyv::rancor::Error>(record)
                 .map(|bytes| bytes.to_vec())
@@ -566,7 +621,10 @@ impl DocumentLog {
     /// [`WalFormat`]. Durability is the caller's responsibility via
     /// [`Self::flush_writer`] — this split lets the group-commit path amortize
     /// one fsync over many appended records (#542). A no-op if no writer is open.
-    fn append_record_bytes(state: &mut Option<WalWriterState>, record: &LogRecord) -> Result<()> {
+    fn append_record_bytes<T: WalEncodable>(
+        state: &mut Option<WalWriterState>,
+        record: &T,
+    ) -> Result<()> {
         let Some(state) = state.as_mut() else {
             return Ok(());
         };
@@ -638,7 +696,11 @@ impl DocumentLog {
     /// Group policy's bounded loss window holds even mid-batch;
     /// [`Self::flush_wal`] (called at commit) forces any trailing partial
     /// batch durable.
-    fn write_record(&self, state: &mut Option<WalWriterState>, record: &LogRecord) -> Result<()> {
+    fn write_record<T: WalEncodable>(
+        &self,
+        state: &mut Option<WalWriterState>,
+        record: &T,
+    ) -> Result<()> {
         Self::append_record_bytes(state, record)?;
         let flush_now = match self.sync_policy {
             WalSyncPolicy::PerRecord => self.sync_deferral_depth.load(Ordering::Acquire) == 0,
@@ -1113,6 +1175,66 @@ mod tests {
         Arc::new(MemoryStorage::new(MemoryStorageConfig::default()))
     }
 
+    /// `LogRecordRef` (the borrowed type `append` builds, Issue #1416) must
+    /// encode to exactly the same bytes as the owned `LogRecord` holding the
+    /// same values, under every WAL framing — otherwise the WAL format would
+    /// silently change. Fails if `LogEntryRef`'s variant order, field order,
+    /// or `external_id`'s representation (e.g. switched to `&str` +
+    /// `InlineAsBox`, which archives as `ArchivedBox<str>` instead of
+    /// `ArchivedString`) drifts from `LogEntry`'s.
+    #[test]
+    fn borrowed_record_encodes_identically_to_owned() {
+        let doc = Document::builder()
+            .add_field(
+                "tokens",
+                DataValue::VectorArray(vec![vec![0.1, 0.2, 0.3], vec![1.0, 2.0, 3.0]]),
+            )
+            .add_field("title", DataValue::Text("hello".to_string()))
+            .build();
+
+        let owned = LogRecord {
+            seq: 7,
+            entry: LogEntry::Upsert {
+                doc_id: 1,
+                external_id: "ext_1".to_string(),
+                document: doc.clone(),
+            },
+        };
+        let borrowed = LogRecordRef {
+            seq: 7,
+            entry: LogEntryRef::Upsert {
+                doc_id: 1,
+                external_id: "ext_1".to_string(),
+                document: &doc,
+            },
+        };
+
+        for format in [WalFormat::V3, WalFormat::V2, WalFormat::Legacy] {
+            let owned_bytes = DocumentLog::encode_payload(&owned, format).unwrap();
+            let borrowed_bytes = DocumentLog::encode_payload(&borrowed, format).unwrap();
+            assert_eq!(
+                owned_bytes, borrowed_bytes,
+                "archived bytes must match under {format:?}"
+            );
+        }
+
+        let v3_bytes = DocumentLog::encode_payload(&borrowed, WalFormat::V3).unwrap();
+        let decoded = DocumentLog::decode_payload(&v3_bytes, WalFormat::V3).unwrap();
+        assert_eq!(decoded.seq, 7);
+        match decoded.entry {
+            LogEntry::Upsert {
+                doc_id,
+                external_id,
+                document,
+            } => {
+                assert_eq!(doc_id, 1);
+                assert_eq!(external_id, "ext_1");
+                assert_eq!(document.fields.len(), doc.fields.len());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     fn make_log() -> DocumentLog {
         let wal_storage = make_storage();
         let doc_storage = make_storage();
@@ -1151,7 +1273,7 @@ mod tests {
             .build();
 
         // Append upsert.
-        let (doc_id, seq1) = log.append("ext_1", doc.clone()).unwrap();
+        let (doc_id, seq1) = log.append("ext_1", &doc).unwrap();
         assert_eq!(doc_id, 1);
         assert_eq!(seq1, 1);
 
@@ -1197,7 +1319,7 @@ mod tests {
             .add_field("body", DataValue::Text("hello".to_string()))
             .build();
 
-        log.append("ext_1", doc).unwrap();
+        log.append("ext_1", &doc).unwrap();
         log.truncate().unwrap();
 
         let records = log.read_all().unwrap();
@@ -1207,7 +1329,7 @@ mod tests {
         let doc2 = Document::builder()
             .add_field("body", DataValue::Text("world".to_string()))
             .build();
-        let (doc_id, seq) = log.append("ext_2", doc2).unwrap();
+        let (doc_id, seq) = log.append("ext_2", &doc2).unwrap();
         assert_eq!(doc_id, 2);
         assert_eq!(seq, 2);
     }
@@ -1229,8 +1351,8 @@ mod tests {
         let doc = Document::builder()
             .add_field("body", DataValue::Text("hello".to_string()))
             .build();
-        log.append("ext_1", doc.clone()).unwrap();
-        log.append("ext_2", doc.clone()).unwrap();
+        log.append("ext_1", &doc).unwrap();
+        log.append("ext_2", &doc).unwrap();
 
         log.truncate().unwrap();
 
@@ -1244,7 +1366,7 @@ mod tests {
         assert!(log.read_all().unwrap().is_empty());
 
         // The next append re-initializes the file in v3 framing.
-        log.append("ext_3", doc).unwrap();
+        log.append("ext_3", &doc).unwrap();
         let mut header = [0u8; WAL_HEADER_LEN as usize];
         wal_storage
             .open_input("test.log")
@@ -1282,7 +1404,7 @@ mod tests {
         let doc = Document::builder()
             .add_field("body", DataValue::Text("hello".to_string()))
             .build();
-        log.append("ext_1", doc).unwrap();
+        log.append("ext_1", &doc).unwrap();
 
         assert!(
             !log.wal_writer.lock().as_ref().unwrap().dirty,
@@ -1348,7 +1470,7 @@ mod tests {
 
         let deferral = log.defer_sync();
         for i in 0..5 {
-            log.append(&format!("ext_{i}"), small_doc()).unwrap();
+            log.append(&format!("ext_{i}"), &small_doc()).unwrap();
         }
         assert!(
             log.wal_is_dirty(),
@@ -1380,12 +1502,12 @@ mod tests {
 
         {
             let _deferral = log.defer_sync();
-            log.append("ext_0", small_doc()).unwrap();
+            log.append("ext_0", &small_doc()).unwrap();
             assert!(log.wal_is_dirty());
             // Abandoned scope: no flush_wal before drop.
         }
 
-        log.append("ext_1", small_doc()).unwrap();
+        log.append("ext_1", &small_doc()).unwrap();
         assert!(
             !log.wal_is_dirty(),
             "the first append after the scope must sync itself and the leftover bytes"
@@ -1400,12 +1522,12 @@ mod tests {
         let log = make_group_log(2, usize::MAX);
 
         let _deferral = log.defer_sync();
-        log.append("ext_0", small_doc()).unwrap();
+        log.append("ext_0", &small_doc()).unwrap();
         assert!(
             log.wal_is_dirty(),
             "below the record threshold the group batch stays unsynced"
         );
-        log.append("ext_1", small_doc()).unwrap();
+        log.append("ext_1", &small_doc()).unwrap();
         assert!(
             !log.wal_is_dirty(),
             "the group record threshold must fire despite the deferral scope"
@@ -1442,8 +1564,8 @@ mod tests {
         // Flush every 3 records; effectively no byte limit.
         let log = make_group_log(3, usize::MAX);
 
-        log.append("e1", small_doc()).unwrap();
-        log.append("e2", small_doc()).unwrap();
+        log.append("e1", &small_doc()).unwrap();
+        log.append("e2", &small_doc()).unwrap();
         {
             let guard = log.wal_writer.lock();
             let state = guard.as_ref().unwrap();
@@ -1452,7 +1574,7 @@ mod tests {
             assert!(state.unsynced_bytes > 0);
         }
 
-        log.append("e3", small_doc()).unwrap();
+        log.append("e3", &small_doc()).unwrap();
         {
             let guard = log.wal_writer.lock();
             let state = guard.as_ref().unwrap();
@@ -1475,7 +1597,7 @@ mod tests {
         // 1-byte budget so any record trips the byte threshold; no count limit.
         let log = make_group_log(usize::MAX, 1);
 
-        log.append("e1", small_doc()).unwrap();
+        log.append("e1", &small_doc()).unwrap();
         let guard = log.wal_writer.lock();
         let state = guard.as_ref().unwrap();
         assert!(
@@ -1492,8 +1614,8 @@ mod tests {
     fn group_partial_batch_is_made_durable_by_flush_wal() {
         let log = make_group_log(1000, usize::MAX);
 
-        log.append("e1", small_doc()).unwrap();
-        log.append("e2", small_doc()).unwrap();
+        log.append("e1", &small_doc()).unwrap();
+        log.append("e2", &small_doc()).unwrap();
         assert!(
             log.wal_writer.lock().as_ref().unwrap().dirty,
             "a partial batch stays unsynced"
@@ -1523,8 +1645,8 @@ mod tests {
             let doc = Document::builder()
                 .add_field("body", DataValue::Text("hello".to_string()))
                 .build();
-            log.append("ext_1", doc.clone()).unwrap();
-            log.append("ext_2", doc).unwrap();
+            log.append("ext_1", &doc).unwrap();
+            log.append("ext_2", &doc).unwrap();
         }
 
         // Reopen and verify counters are restored.
@@ -1538,7 +1660,7 @@ mod tests {
             let doc = Document::builder()
                 .add_field("body", DataValue::Text("world".to_string()))
                 .build();
-            let (doc_id, seq) = log.append("ext_3", doc).unwrap();
+            let (doc_id, seq) = log.append("ext_3", &doc).unwrap();
             assert_eq!(doc_id, 3);
             assert_eq!(seq, 3);
         }
@@ -1598,7 +1720,7 @@ mod tests {
         let doc = Document::builder()
             .add_field("body", DataValue::Text("next".to_string()))
             .build();
-        let (doc_id, seq) = log.append("ext_2", doc).unwrap();
+        let (doc_id, seq) = log.append("ext_2", &doc).unwrap();
         assert_eq!(doc_id, 2);
         assert_eq!(seq, 2);
     }
@@ -1637,7 +1759,7 @@ mod tests {
         let doc = Document::builder()
             .add_field("body", DataValue::Text("hello".to_string()))
             .build();
-        log.append("ext_1", doc).unwrap();
+        log.append("ext_1", &doc).unwrap();
         log.append_delete(1, "ext_1").unwrap();
 
         // The file begins with the v2 header.
@@ -1671,8 +1793,8 @@ mod tests {
             let doc = Document::builder()
                 .add_field("body", DataValue::Text("first".to_string()))
                 .build();
-            log.append("ext_1", doc.clone()).unwrap();
-            log.append("ext_2", doc).unwrap();
+            log.append("ext_1", &doc).unwrap();
+            log.append("ext_2", &doc).unwrap();
         }
 
         // Flip the last byte (inside the 2nd record's payload) so its CRC fails.
@@ -1738,7 +1860,7 @@ mod tests {
         let doc = Document::builder()
             .add_field("body", DataValue::Text("more".to_string()))
             .build();
-        log.append("ext_2", doc).unwrap();
+        log.append("ext_2", &doc).unwrap();
 
         // The file still has no v2 header (it was not switched mid-file).
         let mut magic = [0u8; 4];
@@ -1842,7 +1964,7 @@ mod tests {
             .add_field("embedding", DataValue::Vector(vec![0.1, 0.2, 0.3, 0.4]))
             .add_field("tags", DataValue::Int64Array(vec![1, 2, 3]))
             .build();
-        log.append("ext_1", doc.clone()).unwrap();
+        log.append("ext_1", &doc).unwrap();
         log.append_delete(1, "ext_1").unwrap();
 
         let records = log.read_all().unwrap();
@@ -1890,7 +2012,7 @@ mod tests {
         let doc = Document::builder()
             .add_field("embedding", DataValue::Vector(vec![0.5; 32]))
             .build();
-        log.append("ext_2", doc).unwrap();
+        log.append("ext_2", &doc).unwrap();
 
         let mut header = [0u8; WAL_HEADER_LEN as usize];
         wal_storage
@@ -1981,7 +2103,7 @@ mod tests {
                 ..
             } = &rec.entry
             {
-                v3_log.append(external_id, document.clone()).unwrap();
+                v3_log.append(external_id, document).unwrap();
             }
         }
 
@@ -2019,7 +2141,7 @@ mod tests {
         let doc = Document::builder()
             .add_field("body", DataValue::Text("hello".to_string()))
             .build();
-        let (doc_id, _) = log.append("ext_1", doc).unwrap();
+        let (doc_id, _) = log.append("ext_1", &doc).unwrap();
         assert_eq!(doc_id, 100);
     }
 
@@ -2050,7 +2172,7 @@ mod tests {
 
     /// Append `external_id` and return the seq the WAL assigned it.
     fn append_named(log: &DocumentLog, external_id: &str) -> SeqNumber {
-        log.append(external_id, small_doc()).unwrap().1
+        log.append(external_id, &small_doc()).unwrap().1
     }
 
     /// The `external_id`s still present in the WAL, in seq order.

@@ -241,14 +241,36 @@ impl VectorStore {
     /// order. Each field name is carried once rather than once per token
     /// vector (Issue #1406).
     pub async fn embed_document(&self, doc: &Document) -> Result<Vec<(String, Vec<Vector>)>> {
+        let fields: Vec<(&str, &DataValue)> = doc
+            .fields
+            .iter()
+            .map(|(name, val)| (name.as_str(), val))
+            .collect();
+        self.embed_fields(&fields).await
+    }
+
+    /// Core of [`Self::embed_document`], taking already-borrowed
+    /// `(field_name, value)` pairs instead of a whole `Document`.
+    ///
+    /// Lets a caller that already knows which of a larger document's fields
+    /// are vector fields (the engine, via its schema) embed them without
+    /// first cloning those fields' values into a throwaway vector-only
+    /// `Document` (Issue #1416) — for a `MultiVector` field, that clone
+    /// copies every token's `Vec<f32>`.
+    pub(crate) async fn embed_fields(
+        &self,
+        fields: &[(&str, &DataValue)],
+    ) -> Result<Vec<(String, Vec<Vector>)>> {
         // Phase 1: Embed all fields OUTSIDE the lock.
         // This allows multiple concurrent upserts to perform embedding in parallel
         // rather than being serialized by the writer Mutex.
         let embedder = self.index.embedder();
         let late_interaction_fields = self.index.late_interaction_fields();
-        let mut embedded_fields: Vec<(String, Vec<Vector>)> = Vec::with_capacity(doc.fields.len());
+        let mut embedded_fields: Vec<(String, Vec<Vector>)> = Vec::with_capacity(fields.len());
 
-        for (field_name, value) in &doc.fields {
+        for (field_name, value) in fields {
+            let field_name = *field_name;
+            let value = *value;
             // A multi-vector field takes exactly a token-vector array, and
             // only a multi-vector field takes one (Issue #1177). Checked
             // here as well as in the engine's coercion: this store is public,
@@ -289,7 +311,7 @@ impl VectorStore {
                 }
                 _ => continue,
             };
-            embedded_fields.push((field_name.clone(), vectors));
+            embedded_fields.push((field_name.to_string(), vectors));
         }
 
         // Validate every resulting vector against this index's configured

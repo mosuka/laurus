@@ -20,7 +20,7 @@ use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::keyword::KeywordAnalyzer;
 use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
-use crate::data::Document;
+use crate::data::{DataValue, Document};
 use crate::embedding::cache::{EmbeddingCache, embed_batch_with_cache};
 use crate::embedding::embedder::Embedder;
 use crate::error::{LaurusError, Result};
@@ -967,17 +967,8 @@ impl Engine {
                         record.seq > lexical_last_seq && record.seq > vector_last_seq;
 
                     let vectors = if record.seq > vector_last_seq {
-                        // Filter for vector fields
-                        let mut vector_doc = Document::new();
-                        {
-                            let schema = self.schema.read();
-                            for (name, val) in &document.fields {
-                                if schema.fields.get(name).is_some_and(|fc| fc.is_vector()) {
-                                    vector_doc.fields.insert(name.clone(), val.clone());
-                                }
-                            }
-                        }
-                        match self.vector.embed_document(&vector_doc).await {
+                        let vector_fields = self.vector_field_refs(&document);
+                        match self.vector.embed_fields(&vector_fields).await {
                             Ok(vectors) => Some(vectors),
                             Err(e) if neither_checkpointed && is_quarantinable(&e) => {
                                 log::warn!(
@@ -1307,23 +1298,15 @@ impl Engine {
         // already performed under both guards above (unchanged), just later in
         // the sequence; moving it here changes only the ordering, not the lock
         // scope.
-        let mut vector_doc = Document::new();
-        {
-            let schema = self.schema.read();
-            for (name, val) in &doc.fields {
-                if schema.fields.get(name).is_some_and(|fc| fc.is_vector()) {
-                    vector_doc.fields.insert(name.clone(), val.clone());
-                }
-            }
-        }
-        let vectors = self.vector.embed_document(&vector_doc).await?;
+        let vector_fields = self.vector_field_refs(&doc);
+        let vectors = self.vector.embed_fields(&vector_fields).await?;
 
         if !as_chunk {
             self.delete_documents_internal(id).await?;
         }
 
         // 3. Write-Ahead Log: assign doc_id + persist (before any index updates)
-        let (doc_id, seq) = self.log.append(id, doc.clone())?;
+        let (doc_id, seq) = self.log.append(id, &doc)?;
 
         // 4. Store only stored fields for retrieval (WAL has full data for recovery)
         let stored_doc = self.filter_stored_fields(&doc);
@@ -2742,6 +2725,27 @@ impl Engine {
             .fields
             .get(name)
             .is_some_and(|option| option.is_multi_vector())
+    }
+
+    /// Borrowed `(field_name, value)` pairs of `doc`'s vector fields, for
+    /// [`VectorStore::embed_fields`] (Issue #1416).
+    ///
+    /// No field value is cloned: unlike building a vector-only `Document`,
+    /// this just names which of `doc.fields` are vector fields. The schema
+    /// read lock is dropped before returning, so the borrow it would
+    /// otherwise hold never crosses an `.await`.
+    fn vector_field_refs<'a>(&self, doc: &'a Document) -> Vec<(&'a str, &'a DataValue)> {
+        let schema = self.schema.read();
+        doc.fields
+            .iter()
+            .filter(|(name, _)| {
+                schema
+                    .fields
+                    .get(name.as_str())
+                    .is_some_and(|fc| fc.is_vector())
+            })
+            .map(|(name, val)| (name.as_str(), val))
+            .collect()
     }
 
     /// Filter a document to only include fields that should be stored.
@@ -4867,7 +4871,7 @@ mod tests {
             .unwrap(),
         );
 
-        log.append("doc1", Document::builder().add_text("title", "x").build())
+        log.append("doc1", &Document::builder().add_text("title", "x").build())
             .unwrap();
         assert!(
             log.wal_is_dirty(),
@@ -7073,7 +7077,7 @@ mod tests {
         // apply: append the WAL record directly (mirrors `index_internal`'s
         // step 2) without upserting it into `lexical`/`vector` (which would be
         // steps 4-5) — `applied_seq` is therefore NOT advanced for it.
-        engine.log.append("b", title_doc("bravo")).unwrap();
+        engine.log.append("b", &title_doc("bravo")).unwrap();
 
         // The commit ladder must snapshot `applied_seq` before materializing,
         // so "b" — appended but never applied — is retained by the truncate
@@ -7189,7 +7193,7 @@ mod tests {
             .add_text("title", "poison")
             .add_vector("vec", vec![1.0, 0.0])
             .build();
-        engine.log.append("poison", poison_doc).unwrap();
+        engine.log.append("poison", &poison_doc).unwrap();
 
         // Crash: drop without a commit, leaving both records WAL-only.
         drop(engine);
