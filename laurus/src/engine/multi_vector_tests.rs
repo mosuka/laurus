@@ -23,7 +23,7 @@ use crate::storage::Storage;
 use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::{FlatOption, HnswOption, MultiVectorOption};
-use crate::vector::core::late_interaction::{fixed_calls, max_sim, max_sim_dyn};
+use crate::vector::core::late_interaction::{dispatch_calls, max_sim, max_sim_dyn};
 use crate::vector::core::multi_vector::{MultiVectorStorage, binary_max_sim_tolerance};
 use crate::vector::core::vector::Vector;
 use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery, VectorSearchRequest};
@@ -957,7 +957,7 @@ async fn test_f32_rescore_at_a_fixed_width_dimension() -> Result<()> {
     let query: Vec<Vector> = (0..4)
         .map(|i| Vector::new(fixed_width_token(1_000, i)))
         .collect();
-    let before = fixed_calls::on_any_thread();
+    let before = dispatch_calls::on_any_thread(dispatch_calls::Loop::Fixed);
     let results = engine
         .search(
             SearchRequestBuilder::new()
@@ -971,7 +971,7 @@ async fn test_f32_rescore_at_a_fixed_width_dimension() -> Result<()> {
     // The rescore scores on rayon's pool; other tests may add to the count,
     // but without the dispatch nothing would.
     assert!(
-        fixed_calls::on_any_thread() >= before + 16,
+        dispatch_calls::on_any_thread(dispatch_calls::Loop::Fixed) >= before + 16,
         "the rescore should take MaxSim's fixed-width copy"
     );
 
@@ -984,6 +984,83 @@ async fn test_f32_rescore_at_a_fixed_width_dimension() -> Result<()> {
         let doc_id = internal_ids(&engine, &result.id)[0];
         let vectors = snapshot.vectors(doc_id)?.unwrap();
         let expected = max_sim_dyn(&flat, &vectors, FIXED_WIDTH_DIMENSION);
+        assert_eq!(result.score.to_bits(), expected.to_bits(), "{result:?}");
+    }
+    Ok(())
+}
+
+/// Issue #1444: dimension of the block4 `F32` rescore test, one without a
+/// fixed-width copy of MaxSim.
+const BLOCK4_DIMENSION: usize = 100;
+
+/// Token `i` of document `n` at [`BLOCK4_DIMENSION`], built like
+/// [`rescore_token`].
+fn block4_token(n: u64, i: u64) -> Vec<f32> {
+    (0..BLOCK4_DIMENSION as u64)
+        .map(|k| {
+            let x = ((n * 1_000 + i) * 128 + k).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let noise = (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+            let base = [0.6, -0.3, 0.1][(k % 3) as usize];
+            base + 0.4 * noise
+        })
+        .collect()
+}
+
+/// Issue #1444: a 100-dimension `F32` field (no fixed-width copy) is
+/// rescored through MaxSim's four-vector-per-pass loop, with the scores of
+/// the one-at-a-time run-time loop over the snapshot's vectors.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_f32_rescore_at_a_block4_dimension() -> Result<()> {
+    let schema = Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .add_field(
+            TOKENS,
+            FieldOption::MultiVector(
+                MultiVectorOption::new(BLOCK4_DIMENSION).distance(DistanceMetric::Cosine),
+            ),
+        )
+        .build();
+    let engine = Engine::new(storage(), schema).await?;
+    for n in 0..16 {
+        let tokens = (0..8).map(|i| block4_token(n, i)).collect();
+        let doc = Document::builder()
+            .add_text("title", format!("doc {n}"))
+            .add_vector_array(TOKENS, tokens)
+            .build();
+        engine.put_document(&format!("d{n}"), doc).await?;
+    }
+    engine.commit().await?;
+
+    let query: Vec<Vector> = (0..4)
+        .map(|i| Vector::new(block4_token(1_000, i)))
+        .collect();
+    let before = dispatch_calls::on_any_thread(dispatch_calls::Loop::Block4);
+    let results = engine
+        .search(
+            SearchRequestBuilder::new()
+                .query_dsl("title:doc")
+                .rescore(RescoreOptions::late_interaction(TOKENS, query.clone()).window_size(100))
+                .limit(100)
+                .build(),
+        )
+        .await?;
+    assert_eq!(results.len(), 16);
+    // The rescore scores on rayon's pool; other tests may add to the count,
+    // but without the dispatch nothing would.
+    assert!(
+        dispatch_calls::on_any_thread(dispatch_calls::Loop::Block4) >= before + 16,
+        "the rescore should take MaxSim's block4 loop"
+    );
+
+    let mut flat = Vec::new();
+    for vector in &query {
+        flat.extend_from_slice(&vector.normalized().data);
+    }
+    let snapshot = engine.vector.multi_vector_snapshot(TOKENS).unwrap();
+    for result in &results {
+        let doc_id = internal_ids(&engine, &result.id)[0];
+        let vectors = snapshot.vectors(doc_id)?.unwrap();
+        let expected = max_sim_dyn(&flat, &vectors, BLOCK4_DIMENSION);
         assert_eq!(result.score.to_bits(), expected.to_bits(), "{result:?}");
     }
     Ok(())

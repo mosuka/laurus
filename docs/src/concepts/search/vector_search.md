@@ -495,11 +495,11 @@ search on an Apple M4, and about 5.5 ms on one thread.
 
 Vectors of 64, 96 or 128 dimensions, the widths of common ColBERT-style
 models, are scored by a copy of the MaxSim loop made for that width. Other
-dimensions take a general loop that costs about twice the instructions per
-pair of a query vector and a document vector: on one thread of an Apple M4,
-a pair retired about 54, 73 and 100 instructions at 64, 96 and 128
-dimensions, and about 180 at 100 dimensions. The scores are the same
-through either loop.
+dimensions score four document vectors per pass over a query vector, which
+costs more per pair than the fixed-width copies but 31 to 36% less than
+scoring one document vector at a time: on one thread of an Apple M4, a pair
+retired about 54, 73 and 100 instructions at 64, 96 and 128 dimensions, and
+about 114 at 100 dimensions. The scores are the same through every loop.
 
 A `Binary` field is scored straight from its bits. For each query vector,
 the search first builds one 256-entry table per byte of a row, holding the

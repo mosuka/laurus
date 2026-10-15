@@ -15,18 +15,20 @@
 
 use std::sync::Arc;
 
-use crate::vector::core::distance::{dot_product, dot_product_inline};
+#[cfg(test)]
+use crate::vector::core::distance::dot_product;
+use crate::vector::core::distance::dot_product_inline;
 use crate::vector::core::multi_vector::{BinaryParams, BinaryQuery, MultiVectorRows};
 
 /// MaxSim of one document.
 ///
 /// Vectors of 64, 96 and 128 dimensions, the widths of common ColBERT-style
 /// models, are scored by a copy of the loop with the dimension fixed at
-/// compile time (Issue #1442). With the dimension known only at run time,
-/// setting up and finishing the loops of a pair cost about 81 instructions
-/// at 96 dimensions, more than the 74 of the dot product itself. Every copy
-/// sums a pair as [`dot_product`] does, so the score does not depend on the
-/// loop that computed it.
+/// compile time (Issue #1442). Every other dimension scores four document
+/// vectors per pass over a query vector ([`max_sim_block4`], Issue #1444),
+/// which cuts 31 to 36% of the instructions per pair a plain one-at-a-time
+/// run-time loop takes. Every path sums a pair as [`dot_product`](crate::vector::core::distance::dot_product) does, so
+/// the score does not depend on the loop that computed it.
 ///
 /// # Arguments
 ///
@@ -45,11 +47,15 @@ pub(crate) fn max_sim(query: &[f32], document: &[f32], dimension: usize) -> f32 
         64 => max_sim_fixed::<64>(query, document),
         96 => max_sim_fixed::<96>(query, document),
         128 => max_sim_fixed::<128>(query, document),
-        _ => max_sim_dyn(query, document, dimension),
+        _ => max_sim_block4(query, document, dimension),
     }
 }
 
-/// [`max_sim`] with the dimension given at run time; any dimension.
+/// [`max_sim`] with the dimension given at run time, one document vector
+/// per pass; any dimension. Superseded by [`max_sim_block4`] in production
+/// (Issue #1444); kept under `#[cfg(test)]` as the bit-identical reference
+/// the faster loops are checked against.
+#[cfg(test)]
 pub(crate) fn max_sim_dyn(query: &[f32], document: &[f32], dimension: usize) -> f32 {
     query
         .chunks_exact(dimension)
@@ -66,7 +72,7 @@ pub(crate) fn max_sim_dyn(query: &[f32], document: &[f32], dimension: usize) -> 
 /// loop over a pair's 8-lane chunks unrolls.
 fn max_sim_fixed<const D: usize>(query: &[f32], document: &[f32]) -> f32 {
     #[cfg(test)]
-    fixed_calls::record();
+    dispatch_calls::record(dispatch_calls::Loop::Fixed);
     let query = query.as_chunks::<D>().0;
     let document = document.as_chunks::<D>().0;
     query
@@ -80,33 +86,125 @@ fn max_sim_fixed<const D: usize>(query: &[f32], document: &[f32]) -> f32 {
         .sum()
 }
 
-/// Calls into [`max_sim_fixed`], so that tests can see the dispatch, which
-/// the scores, the same through either loop, cannot show.
+/// [`max_sim`] with the dimension given at run time, scoring four document
+/// vectors per pass over a query vector (Issue #1444). At 32, 100, 256,
+/// 384, 768 and 1,024 dimensions this retires 31 to 36% fewer instructions
+/// per pair than [`max_sim_dyn`], amortizing the loop setup and the query
+/// row's loads over four document rows instead of one. Each pair sums in
+/// the same order as [`dot_product`](crate::vector::core::distance::dot_product), so scores stay bit-identical.
+fn max_sim_block4(query: &[f32], document: &[f32], dimension: usize) -> f32 {
+    #[cfg(test)]
+    dispatch_calls::record(dispatch_calls::Loop::Block4);
+    let block = dimension * 4;
+    let full = (document.len() / block) * block;
+    let (quads, rem) = document.split_at(full);
+    query
+        .chunks_exact(dimension)
+        .map(|q| {
+            let mut best = f32::NEG_INFINITY;
+            for quad in quads.chunks_exact(block) {
+                let (d0, rest) = quad.split_at(dimension);
+                let (d1, rest) = rest.split_at(dimension);
+                let (d2, d3) = rest.split_at(dimension);
+                let (s0, s1, s2, s3) = dot4(q, d0, d1, d2, d3);
+                best = best.max(s0).max(s1).max(s2).max(s3);
+            }
+            for d in rem.chunks_exact(dimension) {
+                best = best.max(dot_product_inline(q, d));
+            }
+            best
+        })
+        .sum()
+}
+
+/// Four dot products of `a` against `b0..b3`, one pass over `a`'s 8-lane
+/// chunks. Sums in the same order as [`dot_product`](crate::vector::core::distance::dot_product).
+#[inline(always)]
+fn dot4(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> (f32, f32, f32, f32) {
+    use wide::f32x8;
+
+    let mut sum0 = f32x8::ZERO;
+    let mut sum1 = f32x8::ZERO;
+    let mut sum2 = f32x8::ZERO;
+    let mut sum3 = f32x8::ZERO;
+    let (chunks_a, rem_a) = a.as_chunks::<8>();
+    let (chunks_0, rem_0) = b0.as_chunks::<8>();
+    let (chunks_1, rem_1) = b1.as_chunks::<8>();
+    let (chunks_2, rem_2) = b2.as_chunks::<8>();
+    let (chunks_3, rem_3) = b3.as_chunks::<8>();
+    for i in 0..chunks_a.len() {
+        let va = f32x8::from(chunks_a[i]);
+        sum0 += va * f32x8::from(chunks_0[i]);
+        sum1 += va * f32x8::from(chunks_1[i]);
+        sum2 += va * f32x8::from(chunks_2[i]);
+        sum3 += va * f32x8::from(chunks_3[i]);
+    }
+    let mut r0 = sum0.reduce_add();
+    let mut r1 = sum1.reduce_add();
+    let mut r2 = sum2.reduce_add();
+    let mut r3 = sum3.reduce_add();
+    for j in 0..rem_a.len() {
+        r0 += rem_a[j] * rem_0[j];
+        r1 += rem_a[j] * rem_1[j];
+        r2 += rem_a[j] * rem_2[j];
+        r3 += rem_a[j] * rem_3[j];
+    }
+    (r0, r1, r2, r3)
+}
+
+/// Calls into [`max_sim_fixed`] and [`max_sim_block4`], so that tests can
+/// see which one `max_sim` dispatched to — the scores, the same through
+/// either loop, cannot show it.
 #[cfg(test)]
-pub(crate) mod fixed_calls {
+pub(crate) mod dispatch_calls {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static ANY_THREAD: AtomicUsize = AtomicUsize::new(0);
+    /// Which run-time loop `max_sim` dispatched to.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum Loop {
+        /// A dimension with a fixed-width copy (64, 96 or 128).
+        Fixed,
+        /// Any other dimension, [`super::max_sim_block4`].
+        Block4,
+    }
+
+    static FIXED_ANY_THREAD: AtomicUsize = AtomicUsize::new(0);
+    static BLOCK4_ANY_THREAD: AtomicUsize = AtomicUsize::new(0);
 
     thread_local! {
-        static THIS_THREAD: Cell<usize> = const { Cell::new(0) };
+        static FIXED_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
+        static BLOCK4_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(super) fn record() {
-        ANY_THREAD.fetch_add(1, Ordering::Relaxed);
-        THIS_THREAD.with(|calls| calls.set(calls.get() + 1));
+    pub(super) fn record(kind: Loop) {
+        match kind {
+            Loop::Fixed => {
+                FIXED_ANY_THREAD.fetch_add(1, Ordering::Relaxed);
+                FIXED_THIS_THREAD.with(|calls| calls.set(calls.get() + 1));
+            }
+            Loop::Block4 => {
+                BLOCK4_ANY_THREAD.fetch_add(1, Ordering::Relaxed);
+                BLOCK4_THIS_THREAD.with(|calls| calls.set(calls.get() + 1));
+            }
+        }
     }
 
-    /// Calls made on the current thread.
-    pub(crate) fn on_this_thread() -> usize {
-        THIS_THREAD.with(Cell::get)
+    /// Calls of `kind` made on the current thread.
+    pub(crate) fn on_this_thread(kind: Loop) -> usize {
+        match kind {
+            Loop::Fixed => FIXED_THIS_THREAD.with(Cell::get),
+            Loop::Block4 => BLOCK4_THIS_THREAD.with(Cell::get),
+        }
     }
 
-    /// Calls made on any thread, for scoring that runs on rayon's pool.
-    /// Tests running at the same time add to it as well.
-    pub(crate) fn on_any_thread() -> usize {
-        ANY_THREAD.load(Ordering::Relaxed)
+    /// Calls of `kind` made on any thread, for scoring that runs on
+    /// rayon's pool. Tests running at the same time add to it as well.
+    pub(crate) fn on_any_thread(kind: Loop) -> usize {
+        match kind {
+            Loop::Fixed => FIXED_ANY_THREAD.load(Ordering::Relaxed),
+            Loop::Block4 => BLOCK4_ANY_THREAD.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -257,10 +355,10 @@ mod tests {
             for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
                 let query = values(dimension as u64, query_rows * dimension);
                 let document = values(2000 + dimension as u64, doc_rows * dimension);
-                let before = fixed_calls::on_this_thread();
+                let before = dispatch_calls::on_this_thread(dispatch_calls::Loop::Fixed);
                 let actual = max_sim(&query, &document, dimension);
                 assert_eq!(
-                    fixed_calls::on_this_thread(),
+                    dispatch_calls::on_this_thread(dispatch_calls::Loop::Fixed),
                     before + 1,
                     "dimension {dimension} should take its fixed copy"
                 );
@@ -273,24 +371,48 @@ mod tests {
         }
     }
 
-    /// Issue #1442: every other dimension keeps the run-time loop.
+    /// Issue #1444: every dimension without a fixed copy takes the
+    /// four-vector-per-pass loop and scores bit for bit as the
+    /// one-at-a-time run-time loop.
     #[test]
-    fn test_other_dimensions_take_the_run_time_loop() {
+    fn test_other_dimensions_take_the_block4_loop() {
         for dimension in [1, 7, 8, 63, 65, 95, 97, 127, 129, 768] {
             for (query_rows, doc_rows) in [(1, 1), (3, 5), (32, 17)] {
                 let query = values(dimension as u64, query_rows * dimension);
                 let document = values(3000 + dimension as u64, doc_rows * dimension);
-                let before = fixed_calls::on_this_thread();
+                let before = dispatch_calls::on_this_thread(dispatch_calls::Loop::Block4);
                 let actual = max_sim(&query, &document, dimension);
                 assert_eq!(
-                    fixed_calls::on_this_thread(),
-                    before,
-                    "dimension {dimension} has no fixed copy"
+                    dispatch_calls::on_this_thread(dispatch_calls::Loop::Block4),
+                    before + 1,
+                    "dimension {dimension} should take the block4 loop"
                 );
-                let expected = reference(&rows(&query, dimension), &rows(&document, dimension));
-                assert!(
-                    (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
-                    "dimension {dimension}, {query_rows}x{doc_rows}: {actual} vs {expected}"
+                assert_eq!(
+                    actual.to_bits(),
+                    max_sim_dyn(&query, &document, dimension).to_bits(),
+                    "dimension {dimension}, {query_rows}x{doc_rows}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1444: `max_sim_block4` against `max_sim_dyn`, directly and at
+    /// document-row counts that are and are not a multiple of 4, so both
+    /// `dot4`'s tail (dimensions not a multiple of 8) and
+    /// `max_sim_block4`'s remainder block (rows not a multiple of 4) are
+    /// exercised.
+    #[test]
+    fn test_block4_matches_the_run_time_loop_bit_for_bit() {
+        for dimension in [1, 7, 20, 32, 100, 256] {
+            for (query_rows, doc_rows) in [(1, 1), (3, 4), (3, 5), (2, 8), (32, 17)] {
+                let query = values(4000 + dimension as u64, query_rows * dimension);
+                let document = values(5000 + dimension as u64, doc_rows * dimension);
+                let actual = max_sim_block4(&query, &document, dimension);
+                let expected = max_sim_dyn(&query, &document, dimension);
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "dimension {dimension}, {query_rows}x{doc_rows}"
                 );
             }
         }
