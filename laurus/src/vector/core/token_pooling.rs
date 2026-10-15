@@ -34,6 +34,7 @@
 //! a memory budget ([`POOLING_BUDGET_BYTES`]).
 
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -55,6 +56,26 @@ pub(crate) const POOLING_BUDGET_BYTES: usize = 256 << 20;
 /// rows.
 pub(crate) fn pooling_bytes(rows: usize, dimension: usize) -> usize {
     4 * rows * rows.saturating_sub(1) + 4 * rows * dimension
+}
+
+/// Split documents of the given pooling `costs` (see [`pooling_bytes`]),
+/// in order, into consecutive windows whose costs add up to at most
+/// `budget`, so that a window's documents can be pooled at the same time.
+/// A document that costs more than `budget` forms a window of its own.
+pub(crate) fn pool_windows(costs: &[usize], budget: usize) -> Vec<Range<usize>> {
+    let mut windows = Vec::new();
+    let (mut start, mut held) = (0, 0usize);
+    for (i, &cost) in costs.iter().enumerate() {
+        if i > start && held.saturating_add(cost) > budget {
+            windows.push(start..i);
+            (start, held) = (i, 0);
+        }
+        held = held.saturating_add(cost);
+    }
+    if start < costs.len() {
+        windows.push(start..costs.len());
+    }
+    windows
 }
 
 /// Bounds the documents pooled at the same time outside the writer
@@ -647,6 +668,37 @@ mod tests {
         assert_eq!(raw.iter().map(Vector::dimension).sum::<usize>(), 27);
         assert!(pooling.apply(&raw).is_none());
         assert!(TokenPooling::new(0, 2, true).apply(&[]).is_none());
+    }
+
+    #[test]
+    fn test_pool_windows_cover_the_documents_in_order_within_the_budget() {
+        // (costs, budget, each window's start and end)
+        for (costs, budget, windows) in [
+            (vec![], 6, vec![]),
+            (vec![3, 3, 3], 6, vec![(0, 2), (2, 3)]),
+            (vec![3, 3, 3], 9, vec![(0, 3)]),
+            (vec![6, 1, 5, 2], 6, vec![(0, 1), (1, 3), (3, 4)]),
+            (vec![10, 1, 1, 10], 5, vec![(0, 1), (1, 3), (3, 4)]),
+            (vec![1, 1, 1], 0, vec![(0, 1), (1, 2), (2, 3)]),
+        ] {
+            let found: Vec<(usize, usize)> = pool_windows(&costs, budget)
+                .into_iter()
+                .map(|w| (w.start, w.end))
+                .collect();
+            assert_eq!(found, windows, "{costs:?}, {budget}");
+        }
+        // Every window fits the budget unless it holds a single document,
+        // and together they cover the documents in order.
+        let costs: Vec<usize> = (0..200).map(|i| (i * 37 + 11) % 50).collect();
+        let windows = pool_windows(&costs, 120);
+        assert_eq!(windows.first().map(|w| w.start), Some(0));
+        assert_eq!(windows.last().map(|w| w.end), Some(costs.len()));
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        for window in windows {
+            assert!(window.len() == 1 || costs[window].iter().sum::<usize>() <= 120);
+        }
     }
 
     /// A document that takes the whole budget holds the next one back until

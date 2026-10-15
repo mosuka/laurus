@@ -25,7 +25,7 @@
 //! later segment with them. Segments written before that are stored as
 //! [`INTERIM_KIND`] and converted by a later merge.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,7 +37,9 @@ use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::multi_vector_params_error;
 use crate::vector::core::multi_vector::{BinaryParams, MultiVectorStorage, OwnedCodec};
-use crate::vector::core::token_pooling::{PooledTokens, TokenPooling, pooled_count};
+use crate::vector::core::token_pooling::{
+    POOLING_BUDGET_BYTES, PooledTokens, TokenPooling, pool_windows, pooled_count, pooling_bytes,
+};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::MultiVectorIndexConfig;
 use crate::vector::index::multivector::LAYOUT;
@@ -221,6 +223,15 @@ impl Shared {
     /// surviving document's payload, so memory stays proportional to the
     /// document count.
     fn merge(&self, segments: Vec<ManagedSegmentInfo>) -> Result<()> {
+        self.merge_within(segments, POOLING_BUDGET_BYTES)
+    }
+
+    /// [`Self::merge`], pooling the documents it pools in windows of at most
+    /// `pooling_budget` bytes (see [`pool_windows`]), each window's documents
+    /// at the same time (Issue #1429). Rows are still read and written in
+    /// doc-id order, and pooling is deterministic, so the merged segment is
+    /// the same whatever the windows and the threads.
+    fn merge_within(&self, segments: Vec<ManagedSegmentInfo>, pooling_budget: usize) -> Result<()> {
         let mut binary = self.binary.lock();
         let mut sources = segments.clone();
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
@@ -242,9 +253,10 @@ impl Shared {
                     continue;
                 }
                 let pool = factor > 1 && entry.pool_factor == 0;
+                let stored = entry.vector_count as usize;
                 let entry = if pool {
                     DocEntry {
-                        vector_count: pooled_count(entry.vector_count as usize, factor) as u32,
+                        vector_count: pooled_count(stored, factor) as u32,
                         pool_factor: factor,
                         ..entry
                     }
@@ -252,9 +264,11 @@ impl Shared {
                     entry
                 };
                 survivors.push(Survivor {
+                    shrinks: (entry.vector_count as usize) < stored,
                     entry,
                     source,
                     pool,
+                    stored,
                 });
             }
         }
@@ -280,6 +294,19 @@ impl Shared {
             })
         })?;
 
+        // The survivors pooling shrinks, in write order, grouped into windows
+        // whose documents are pooled at the same time; `pooled` holds the
+        // current window's rows until they are written.
+        let shrinking: Vec<usize> = (0..survivors.len())
+            .filter(|&i| survivors[i].shrinks)
+            .collect();
+        let costs: Vec<usize> = shrinking
+            .iter()
+            .map(|&i| pooling_bytes(survivors[i].stored, self.config.dimension))
+            .collect();
+        let mut windows = pool_windows(&costs, pooling_budget).into_iter();
+        let mut pooled: VecDeque<(u64, Vec<f32>)> = VecDeque::new();
+
         let merged_id = self.core.manager().generate_segment_id();
         write_segment(
             self.core.storage().as_ref(),
@@ -289,18 +316,31 @@ impl Shared {
             &entries,
             |i, sink| {
                 let survivor = &survivors[i];
-                let rows = source_rows(survivor)?;
-                if survivor.pool
-                    && let Some(pooled) = self.pool_rows(&rows.to_f32())
-                {
-                    return sink.write(&pooled);
+                if survivor.shrinks {
+                    if pooled.is_empty() {
+                        let window = windows.next().ok_or_else(|| {
+                            LaurusError::internal("a merge ran out of documents to pool")
+                        })?;
+                        pooled = self
+                            .pool_window(&readers, &survivors, &shrinking[window])?
+                            .into();
+                    }
+                    let (doc_id, rows) =
+                        pooled.pop_front().expect("a pooling window is never empty");
+                    if doc_id != survivor.entry.doc_id {
+                        return Err(LaurusError::internal(format!(
+                            "a merge pooled doc {doc_id} where doc {} belongs",
+                            survivor.entry.doc_id
+                        )));
+                    }
+                    return sink.write(&rows);
                 }
                 // Rows encoded exactly as the target encodes are copied
                 // verbatim (no re-quantization, no compounding loss across
                 // merges); others (the field's `storage` just changed) are
                 // transcoded through f32, which is also how `update_field`
                 // migrates every existing segment to the new kind.
-                sink.append(&rows)
+                sink.append(&source_rows(survivor)?)
             },
         )?;
 
@@ -326,14 +366,56 @@ impl Shared {
         }
         Ok(())
     }
+
+    /// Pool the stored rows of the survivors at `window` (indices into
+    /// `survivors`, all of which pooling shrinks), at the same time under the
+    /// `native` feature and one after another otherwise.
+    ///
+    /// # Returns
+    ///
+    /// Each survivor's doc id and pooled rows, in `window`'s order.
+    fn pool_window(
+        &self,
+        readers: &[Arc<SegmentReader>],
+        survivors: &[Survivor],
+        window: &[usize],
+    ) -> Result<Vec<(u64, Vec<f32>)>> {
+        let pooling = self
+            .token_pooling()
+            .ok_or_else(|| LaurusError::internal("a merge pooled in a field that does not pool"))?;
+        let pool_one = |&i: &usize| -> Result<(u64, Vec<f32>)> {
+            let survivor = &survivors[i];
+            let doc_id = survivor.entry.doc_id;
+            let rows = readers[survivor.source].rows(doc_id)?.ok_or_else(|| {
+                LaurusError::internal("merge source lost a document listed in its table")
+            })?;
+            let pooled = pooling
+                .pool_rows(&rows.to_f32())
+                .ok_or_else(|| LaurusError::internal("a document pooling shrinks did not pool"))?;
+            Ok((doc_id, pooled))
+        };
+        #[cfg(feature = "native")]
+        {
+            use rayon::prelude::*;
+            window.par_iter().map(pool_one).collect()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            window.iter().map(pool_one).collect()
+        }
+    }
 }
 
 /// A document a merge keeps: its entry as the merged segment records it,
-/// the reader it comes from, and whether the merge pools its rows.
+/// the reader it comes from, whether the merge pools its rows (and so
+/// marks it pooled), how many rows it has stored, and whether pooling
+/// shrinks them.
 struct Survivor {
     entry: DocEntry,
     source: usize,
     pool: bool,
+    stored: usize,
+    shrinks: bool,
 }
 
 /// Row-major token vectors to learn [`BinaryParams`] from: every
@@ -2215,6 +2297,85 @@ mod tests {
                 binary_params(&index),
                 Some(BinaryParams::train(DIM, &sample).unwrap())
             );
+            assert!(entries(&index).iter().all(|e| e.pool_factor == 2));
+        }
+
+        /// A field that, before pooling was turned on, stored documents of
+        /// several lengths (two too short to pool), a stale copy and a
+        /// deleted document, plus one document a factor-2 field pooled.
+        fn mixed_storage() -> Arc<dyn Storage> {
+            let storage = storage();
+            {
+                let index = open(&storage, MultiVectorStorage::F32, 1);
+                commit_docs(&index, &[(1, 9), (2, 2), (3, 30), (4, 5)]);
+                commit_docs(&index, &[(5, 17), (6, 1), (3, 12)]);
+                index.soft_delete_document(4).unwrap();
+                index.persist_deletions().unwrap();
+            }
+            {
+                let index = open(&storage, MultiVectorStorage::F32, 2);
+                commit_docs(&index, &[(7, 11)]);
+            }
+            storage
+        }
+
+        /// Merge every segment of [`mixed_storage`] into a factor-2 field,
+        /// pooling in windows of `budget` bytes on `threads` threads.
+        ///
+        /// # Returns
+        ///
+        /// The merged index and its one segment's bytes.
+        #[cfg(feature = "native")]
+        fn merged_bytes(budget: usize, threads: usize) -> (MultiVectorIndex, Vec<u8>) {
+            let storage = mixed_storage();
+            let index = open(&storage, MultiVectorStorage::F32, 2);
+            let segments = index.shared.core.manager().list_segments();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| index.shared.merge_within(segments, budget))
+                .unwrap();
+            let merged = index.shared.core.manager().list_segments();
+            assert_eq!(merged.len(), 1);
+            let mut bytes = Vec::new();
+            storage
+                .open_input(&Shared::file_name(&merged[0].segment_id))
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            (index, bytes)
+        }
+
+        /// Issue #1429: a merge pools window by window, each window's
+        /// documents at the same time, and writes the same segment whatever
+        /// the windows and the threads: what ingest by factor 2 stores.
+        #[cfg(feature = "native")]
+        #[test]
+        fn test_merges_write_the_same_segment_whatever_the_windows_and_threads() {
+            let (index, reference) = merged_bytes(usize::MAX, 1);
+            // Documents 1, 3 and 5 shrink; this budget groups 1 and 3.
+            let medium = pooling_bytes(9, DIM) + pooling_bytes(17, DIM);
+            for budget in [0, medium, usize::MAX] {
+                for threads in [1, 4] {
+                    assert_eq!(
+                        merged_bytes(budget, threads).1,
+                        reference,
+                        "budget {budget}, {threads} threads"
+                    );
+                }
+            }
+
+            let fresh = open(&storage(), MultiVectorStorage::F32, 2);
+            commit_docs(&fresh, &[(1, 9), (2, 2), (3, 12), (5, 17), (6, 1), (7, 11)]);
+            for doc_id in [1, 2, 3, 5, 6, 7] {
+                assert_eq!(
+                    raw_rows(&index, doc_id),
+                    raw_rows(&fresh, doc_id),
+                    "doc {doc_id}"
+                );
+            }
+            assert_eq!(vectors_of(&index, 4), None);
             assert!(entries(&index).iter().all(|e| e.pool_factor == 2));
         }
 
