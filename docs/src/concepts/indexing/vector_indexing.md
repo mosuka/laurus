@@ -728,24 +728,32 @@ let opt = MultiVectorOption::new(128)
   SciPy's clustering; a test checks it against SciPy's output. In a
   `Cosine` field the cluster means are re-normalized, which ranked better
   on BEIR than the raw means those implementations keep.
-- **Every write is pooled once.** Pooling happens as documents are
-  buffered, so fresh documents, WAL recovery and text embedded by the
-  field's embedder are all pooled; queries are not. Each stored document
-  records the factor it was pooled with, so merges never pool it again.
+- **Every write is pooled once.** A document is pooled after it is
+  embedded and before the field's writer is taken, so fresh documents, WAL
+  recovery and text embedded by the field's embedder are all pooled;
+  queries are not. Each stored document records the factor it was pooled
+  with, so merges never pool it again.
 - **Turning pooling on for an existing field is a Reindex.** Its stored
   vectors are still the original ones, so `Engine::update_field` with
   `reindex: true` pools them exactly as ingest would have (for `F32`
   storage; other kinds pool their decoded values, and a `Binary` field
-  keeps the parameters it already learned). Ingestion waits until it is
-  done.
+  keeps the parameters it already learned). The merge pools the stored
+  documents in parallel (one after another on WebAssembly), and ingestion
+  waits until it is done.
 - **Changing or turning off a factor in use is Destructive.** The original
   token vectors are gone once a document is pooled (multi-vector values
   are not kept in the document store), so the field's data is discarded
   and its documents must be put again.
 - **Cost.** Pooling a document of `n` token vectors takes `O(n²)` time and
   memory: about 3 ms for 300 vectors of 128 dimensions, and about 2 s and
-  290 MB for the 8,192-vector maximum (Apple M4, release build). It runs
-  while the field's writer is held, so it adds to ingest time.
+  290 MB for the 8,192-vector maximum (Apple M4, release build). Puts made
+  at the same time pool their documents at the same time, outside the
+  field's writer. Documents pooled at once hold at most 256 MiB together
+  (one document at the maximum, which is then pooled alone), and no more
+  of them run at once than there are cores. A Reindex pools within its own
+  256 MiB, so documents put through `VectorStore` directly while
+  `VectorStore::rebuild_field` runs can bring the total to 512 MiB;
+  `Engine::update_field` holds puts back until it is done.
 - A `Binary` field learns its parameters from the pooled vectors, and its
   2,048-vector threshold counts pooled vectors.
 

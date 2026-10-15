@@ -698,24 +698,31 @@ let opt = MultiVectorOption::new(128)
   結果になり、テストで SciPy の出力と突き合わせています。`Cosine` の
   フィールドでは、クラスタの平均を正規化し直します。これらの実装が使う
   正規化しない平均より、BEIR で良い順位になりました。
-- **どの書き込みも一度だけ pooling します。** pooling は文書をバッファーに
-  入れるときに行うので、新しい文書、WAL からの復旧、フィールドの embedder
-  が埋め込んだテキストのどれも pooling され、query はされません。保存した
-  各文書には pooling に使った factor を記録するので、merge で再び pooling
-  されることはありません。
+- **どの書き込みも一度だけ pooling します。** pooling は文書を埋め込んだ
+  後、フィールドの writer を取る前に行うので、新しい文書、WAL からの復旧、
+  フィールドの embedder が埋め込んだテキストのどれも pooling され、query は
+  されません。保存した各文書には pooling に使った factor を記録するので、
+  merge で再び pooling されることはありません。
 - **既存のフィールドで pooling を有効にするのは Reindex です。** 保存
   されているベクトルはまだ元のままなので、`Engine::update_field` を
   `reindex: true` で呼ぶと、取り込み時と同じ結果に pooling されます（`F32`
   の場合。ほかの形式では展開した値を pooling し、`Binary` のフィールドは
-  学習済みの params をそのまま使います）。終わるまで取り込みは待たされます。
+  学習済みの params をそのまま使います）。merge は保存済みの文書を並列に
+  pooling します（WebAssembly では 1 件ずつ）。終わるまで取り込みは待たされ
+  ます。
 - **使用中の factor を変える、または無効にするのは Destructive です。**
   pooling した後は元のトークンベクトルが残らない（MultiVector の値は文書
   ストアに保存されない）ので、フィールドのデータは捨てられ、文書を入れ直す
   必要があります。
 - **コスト**: `n` 本のトークンベクトルを持つ文書の pooling は、時間と
   メモリが `O(n²)` です。128 次元 300 本で約 3 ms、上限の 8,192 本で約 2 秒と
-  290 MB でした（Apple M4、release ビルド）。フィールドの writer を保持した
-  まま行うので、取り込みの時間に加わります。
+  290 MB でした（Apple M4、release ビルド）。同時に put された文書は、
+  フィールドの writer の外で同時に pooling されます。同時に pooling する文書
+  が持つメモリは合わせて 256 MiB まで（上限の長さの文書 1 件分で、その文書
+  は単独で pooling されます）で、同時に走る数はコア数までです。Reindex は
+  別に 256 MiB までを使うので、`VectorStore::rebuild_field` の実行中に
+  `VectorStore` へ直接 put すると、合計で 512 MiB になりえます。
+  `Engine::update_field` は、終わるまで put を待たせます。
 - `Binary` のフィールドは pooling 後のベクトルから params を学習し、2,048 本
   という閾値も pooling 後の本数で数えます。
 
