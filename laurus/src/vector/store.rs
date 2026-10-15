@@ -37,13 +37,14 @@ use crate::embedding::embedder::{EmbedInput, EmbedRole, Embedder};
 use crate::embedding::per_field::{PerFieldEmbedder, embed_field_tokens};
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
+use crate::vector::core::token_pooling::{PooledTokens, PoolingBudget, TokenPooling, pooled_count};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::VectorIndex;
 use crate::vector::index::config::VectorIndexTypeConfig;
 use crate::vector::index::factory::VectorIndexFactory;
 use crate::vector::search::filter_set::FilterSet;
 use crate::vector::search::searcher::{VectorIndexQuery, VectorIndexSearcher};
-use crate::vector::writer::VectorIndexWriter;
+use crate::vector::writer::{FieldVectors, VectorIndexWriter};
 
 use self::config::VectorIndexConfig;
 use self::request::{FieldSelector, QueryVector, VectorScoreMode, VectorSearchRequest};
@@ -96,6 +97,9 @@ pub struct VectorStore {
     /// [`Self::with_index_type_config`]) falls back to `1.0` in
     /// [`Self::base_weight_of`].
     base_weights: parking_lot::RwLock<HashMap<String, f32>>,
+    /// Bounds the documents pooled at the same time before the writer
+    /// lock is taken (Issue #1429; see [`Self::embed_fields`]).
+    pooling_budget: PoolingBudget,
 }
 
 impl std::fmt::Debug for VectorStore {
@@ -151,6 +155,7 @@ impl VectorStore {
             searcher_cache: parking_lot::RwLock::new(None),
             config: Some(config),
             base_weights: parking_lot::RwLock::new(base_weights),
+            pooling_budget: PoolingBudget::for_this_machine(),
         })
     }
 
@@ -178,6 +183,7 @@ impl VectorStore {
             searcher_cache: parking_lot::RwLock::new(None),
             config: None,
             base_weights: parking_lot::RwLock::new(HashMap::new()),
+            pooling_budget: PoolingBudget::for_this_machine(),
         })
     }
 
@@ -246,21 +252,34 @@ impl VectorStore {
             .iter()
             .map(|(name, val)| (name.as_str(), val))
             .collect();
-        self.embed_fields(&fields).await
+        self.embed_raw(&fields).await
     }
 
-    /// Core of [`Self::embed_document`], taking already-borrowed
-    /// `(field_name, value)` pairs instead of a whole `Document`.
+    /// [`Self::embed_document`] for already-borrowed `(field_name, value)`
+    /// pairs instead of a whole `Document`, followed by pooling every
+    /// multi-vector field that pools (Issue #1429; see [`Self::prepare`]),
+    /// so that [`Self::write_prepared`] only has to buffer the result.
     ///
     /// Lets a caller that already knows which of a larger document's fields
     /// are vector fields (the engine, via its schema) embed them without
     /// first cloning those fields' values into a throwaway vector-only
     /// `Document` (Issue #1416) — for a `MultiVector` field, that clone
     /// copies every token's `Vec<f32>`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::embed_document`]'s.
     pub(crate) async fn embed_fields(
         &self,
         fields: &[(&str, &DataValue)],
-    ) -> Result<Vec<(String, Vec<Vector>)>> {
+    ) -> Result<Vec<FieldVectors>> {
+        let embedded = self.embed_raw(fields).await?;
+        Ok(self.prepare(embedded).await)
+    }
+
+    /// Embed and validate `(field_name, value)` pairs: the body of
+    /// [`Self::embed_document`].
+    async fn embed_raw(&self, fields: &[(&str, &DataValue)]) -> Result<Vec<(String, Vec<Vector>)>> {
         // Phase 1: Embed all fields OUTSIDE the lock.
         // This allows multiple concurrent upserts to perform embedding in parallel
         // rather than being serialized by the writer Mutex.
@@ -352,10 +371,12 @@ impl VectorStore {
     /// Write already-embedded vectors for `doc_id` (Phase 2 of the former
     /// single-method `upsert_document_by_internal_id`, Issue #1326).
     ///
-    /// Acquires the writer lock, deletes any existing vectors for `doc_id`,
-    /// and adds the given ones. Callers are expected to have produced
-    /// `fields` via [`Self::embed_document`], which has already validated
-    /// them; this phase performs no further validation of its own.
+    /// Pools the token vectors of every multi-vector field that pools (see
+    /// [`Self::prepare`]), then acquires the writer lock, deletes any
+    /// existing vectors for `doc_id`, and adds the given ones. Callers are
+    /// expected to have produced `fields` via [`Self::embed_document`],
+    /// which has already validated them; this phase performs no further
+    /// validation of its own.
     ///
     /// # Arguments
     ///
@@ -372,6 +393,21 @@ impl VectorStore {
         doc_id: u64,
         fields: Vec<(String, Vec<Vector>)>,
     ) -> Result<()> {
+        let prepared = self.prepare(fields).await;
+        self.write_prepared(doc_id, prepared).await
+    }
+
+    /// [`Self::write_vectors`] for fields [`Self::embed_fields`] has already
+    /// embedded and pooled: only this step holds the writer lock.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::write_vectors`]'s.
+    pub(crate) async fn write_prepared(
+        &self,
+        doc_id: u64,
+        fields: Vec<FieldVectors>,
+    ) -> Result<()> {
         // Phase 2: Acquire lock and write pre-computed vectors (fast, sync-only).
         let mut guard = self.writer_cache.lock().await;
         if guard.is_none() {
@@ -382,9 +418,69 @@ impl VectorStore {
         // One call for the whole document, so a field the writer does not
         // know (e.g. removed concurrently by `delete_field`) rejects every
         // field rather than leaving the others buffered.
-        writer.add_document_vectors(doc_id, fields)?;
+        writer.add_prepared_document_vectors(doc_id, fields)?;
 
         Ok(())
+    }
+
+    /// Pool, before the writer lock is taken, the token vectors of every
+    /// multi-vector field whose index pools (Issue #1429), so that
+    /// concurrent puts no longer pool one after another under the lock.
+    ///
+    /// The writer keeps the pooled vectors only when the field still pools
+    /// the same way when it buffers them, and pools the embedded vectors
+    /// itself otherwise, so a field changed in between is handled exactly
+    /// as before. Pooling never fails a document: whatever goes wrong here
+    /// leaves the field without pooled vectors.
+    async fn prepare(&self, fields: Vec<(String, Vec<Vector>)>) -> Vec<FieldVectors> {
+        let mut prepared = Vec::with_capacity(fields.len());
+        for (field, vectors) in fields {
+            let pooled = match self.index.token_pooling(&field) {
+                Some(pooling) => self.pool_before_writer(pooling, &vectors).await,
+                None => None,
+            };
+            prepared.push(FieldVectors {
+                field,
+                vectors,
+                pooled,
+            });
+        }
+        prepared
+    }
+
+    /// Pool one field's token vectors within [`Self::pooling_budget`]. Under
+    /// a tokio runtime (the `native` feature), the pooling runs on the
+    /// blocking pool, so documents pooled at the same time do not hold up
+    /// the runtime's workers; elsewhere it runs inline.
+    async fn pool_before_writer(
+        &self,
+        pooling: TokenPooling,
+        vectors: &[Vector],
+    ) -> Option<PooledTokens> {
+        if pooled_count(vectors.len(), pooling.factor()) == vectors.len() {
+            return None;
+        }
+        let permit = self
+            .pooling_budget
+            .acquire(vectors.len(), pooling.dimension())
+            .await;
+        #[cfg(feature = "native")]
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Clones the rows' `Arc`s, not their values. The permit moves
+            // along, so a put cancelled while it waits still holds the
+            // budget until the pooling ends.
+            let vectors = vectors.to_vec();
+            return runtime
+                .spawn_blocking(move || {
+                    let _permit = permit;
+                    pooling.apply(&vectors)
+                })
+                .await
+                .ok()
+                .flatten();
+        }
+        let _permit = permit;
+        pooling.apply(vectors)
     }
 
     /// Embed a multi-vector field's value into token vectors with the
@@ -1848,6 +1944,10 @@ mod tests {
         fn late_interaction_fields(&self) -> std::collections::BTreeSet<String> {
             self.inner.late_interaction_fields()
         }
+
+        fn token_pooling(&self, field: &str) -> Option<TokenPooling> {
+            self.inner.token_pooling(field)
+        }
     }
 
     /// A [`Storage`] over `inner` that fails the next `sync`, or the next
@@ -2029,6 +2129,7 @@ mod tests {
             searcher_cache,
             config,
             base_weights,
+            pooling_budget,
         } = VectorStore::new(index_storage.clone(), config).unwrap();
         let armed = Arc::new(parking_lot::Mutex::new(None));
         let store_storage = Arc::new(FailingStorage::new(index_storage.clone()));
@@ -2042,6 +2143,7 @@ mod tests {
             searcher_cache,
             config,
             base_weights,
+            pooling_budget,
         };
 
         put_doc(&store, 1).await;
@@ -2231,6 +2333,7 @@ mod tests {
             searcher_cache,
             config,
             base_weights,
+            pooling_budget,
         } = VectorStore::new(index_storage.clone(), config).unwrap();
         let armed = Arc::new(parking_lot::Mutex::new(None));
         let store_storage = Arc::new(FailingStorage::new(index_storage.clone()));
@@ -2244,6 +2347,7 @@ mod tests {
             searcher_cache,
             config,
             base_weights,
+            pooling_budget,
         };
 
         let vector = Vector::new(vec![1.0; 4]);
@@ -2289,5 +2393,69 @@ mod tests {
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "b").unwrap(), Vec::<u64>::new());
+    }
+
+    /// A store with a multi-vector field `tokens` (4 dimensions, Cosine,
+    /// pool factor 2) and a Flat field `flat`.
+    fn pooling_store() -> VectorStore {
+        use crate::vector::core::field::{FieldOption, MultiVectorOption};
+
+        let config = VectorIndexConfig::builder()
+            .add_field(
+                "tokens",
+                FieldOption::MultiVector(MultiVectorOption::new(4).pool_factor(2)),
+            )
+            .unwrap()
+            .add_field("flat", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        VectorStore::new(storage, config).unwrap()
+    }
+
+    fn token_array(count: usize) -> DataValue {
+        DataValue::VectorArray(
+            (0..count)
+                .map(|i| vec![1.0 + i as f32, 0.5, -0.25 * i as f32, 0.125])
+                .collect(),
+        )
+    }
+
+    /// Issue #1429: embedding pools a pooling multi-vector field's
+    /// document before the writer is taken, exactly as
+    /// `TokenPooling::apply` does, and leaves alone other fields and
+    /// documents that pooling would not shorten.
+    #[tokio::test]
+    async fn embed_fields_pools_documents_that_pooling_shortens() {
+        let store = pooling_store();
+        let (long, short) = (token_array(9), token_array(2));
+        let flat = DataValue::Vector(vec![1.0, 0.0, 0.0, 0.0]);
+        let fields = store
+            .embed_fields(&[("tokens", &long), ("flat", &flat)])
+            .await
+            .unwrap();
+        assert_eq!(fields[0].field, "tokens");
+        let pooled = fields[0].pooled.as_ref().expect("9 vectors pool to 5");
+        let expected = TokenPooling::new(4, 2, true)
+            .apply(&fields[0].vectors)
+            .unwrap();
+        assert_eq!(pooled.pooling(), expected.pooling());
+        assert_eq!(pooled.vectors(), expected.vectors());
+        assert_eq!(fields[1].field, "flat");
+        assert!(fields[1].pooled.is_none());
+
+        let fields = store.embed_fields(&[("tokens", &short)]).await.unwrap();
+        assert!(fields[0].pooled.is_none());
+    }
+
+    /// Without a tokio runtime the pooling runs inline instead of on the
+    /// runtime's blocking pool.
+    #[test]
+    fn embed_fields_pools_without_a_tokio_runtime() {
+        let store = pooling_store();
+        let long = token_array(9);
+        let fields = futures::executor::block_on(store.embed_fields(&[("tokens", &long)])).unwrap();
+        assert!(fields[0].pooled.is_some());
     }
 }

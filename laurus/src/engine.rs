@@ -1002,7 +1002,7 @@ impl Engine {
                     }
 
                     if let Some(vectors) = vectors {
-                        self.vector.write_vectors(doc_id, vectors).await?;
+                        self.vector.write_prepared(doc_id, vectors).await?;
                     }
 
                     // Both stores succeeded — now update seq trackers.
@@ -1319,7 +1319,7 @@ impl Engine {
         // rollback on failure is kept.
         self.strip_multi_vector_fields(&mut doc);
         self.lexical.upsert_document(doc_id, doc)?;
-        if let Err(e) = self.vector.write_vectors(doc_id, vectors).await {
+        if let Err(e) = self.vector.write_prepared(doc_id, vectors).await {
             // Rollback lexical insert to maintain consistency
             let _ = self.lexical.delete_document_by_internal_id(doc_id);
             return Err(e);

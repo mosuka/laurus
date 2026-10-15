@@ -2239,7 +2239,9 @@ mod tests {
             // normalizing them again changes them, and not what the writer
             // pools from the raw vectors.
             let kept: Vec<Vector> = pooled(1, 7, 2)
-                .chunks_exact(DIM)
+                .as_chunks::<DIM>()
+                .0
+                .iter()
                 .map(|row| Vector::new(row.iter().map(|x| x * 0.5).collect()))
                 .collect();
             let renormalized: Vec<Vector> = kept.iter().map(Vector::normalized).collect();

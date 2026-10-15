@@ -30,13 +30,77 @@
 //! [`TokenPooling`] names everything the result depends on besides the
 //! rows, so a document can be pooled away from the writer that stores it
 //! (#1429): the writer keeps rows pooled elsewhere only when their
-//! [`TokenPooling`] equals its own.
+//! [`TokenPooling`] equals its own. Documents pooled at the same time share
+//! a memory budget ([`POOLING_BUDGET_BYTES`]).
+
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::vector::core::vector::{Vector, normalize_slice};
 
 /// Rows kept verbatim at the start of every document: the first token
 /// (`[CLS]` for a ColBERT model), as Sentence Transformers and PyLate do.
 pub(crate) const PROTECTED_ROWS: usize = 1;
+
+/// Memory that documents pooled at the same time may hold together, as
+/// measured by [`pooling_bytes`]: one document at the 8,192-vector maximum,
+/// which is what pooling held at most while it ran under the writer lock.
+/// A larger document is pooled alone.
+pub(crate) const POOLING_BUDGET_BYTES: usize = 256 << 20;
+
+/// Memory pooling one document of `rows` token vectors of `dimension`
+/// holds: its `f64` condensed distance matrix and an `f32` copy of its
+/// rows.
+pub(crate) fn pooling_bytes(rows: usize, dimension: usize) -> usize {
+    4 * rows * rows.saturating_sub(1) + 4 * rows * dimension
+}
+
+/// Bounds the documents pooled at the same time outside the writer
+/// (#1429): together they hold at most a budget of [`pooling_bytes`], and
+/// no more of them run at once than there are cores, however small they
+/// are. Waiters are served first come, first served.
+#[derive(Debug)]
+pub(crate) struct PoolingBudget {
+    permits: Arc<Semaphore>,
+    budget: usize,
+    min_charge: usize,
+}
+
+impl PoolingBudget {
+    /// A budget of `budget` bytes shared by at most `parallelism`
+    /// documents at once.
+    pub(crate) fn new(budget: usize, parallelism: usize) -> Self {
+        let budget = budget.clamp(1, u32::MAX as usize);
+        Self {
+            permits: Arc::new(Semaphore::new(budget)),
+            budget,
+            min_charge: budget / parallelism.max(1),
+        }
+    }
+
+    /// [`POOLING_BUDGET_BYTES`] shared by as many documents as this machine
+    /// has cores.
+    pub(crate) fn for_this_machine() -> Self {
+        Self::new(
+            POOLING_BUDGET_BYTES,
+            std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        )
+    }
+
+    /// Wait until a document of `rows` token vectors of `dimension` may be
+    /// pooled. It may be until the returned permit is dropped.
+    pub(crate) async fn acquire(&self, rows: usize, dimension: usize) -> OwnedSemaphorePermit {
+        let charge = pooling_bytes(rows, dimension)
+            .max(self.min_charge)
+            .min(self.budget);
+        Arc::clone(&self.permits)
+            .acquire_many_owned(charge as u32)
+            .await
+            .expect("the pooling budget's semaphore is never closed")
+    }
+}
 
 /// Clusters the `rest` rows after the protected ones are pooled into.
 fn cluster_count(rest: usize, factor: u32) -> usize {
@@ -583,6 +647,42 @@ mod tests {
         assert_eq!(raw.iter().map(Vector::dimension).sum::<usize>(), 27);
         assert!(pooling.apply(&raw).is_none());
         assert!(TokenPooling::new(0, 2, true).apply(&[]).is_none());
+    }
+
+    /// A document that takes the whole budget holds the next one back until
+    /// its permit is released.
+    #[test]
+    fn test_budget_holds_documents_back_until_permits_are_released() {
+        use tokio_test::{assert_pending, assert_ready, task};
+
+        let budget = PoolingBudget::new(1_000, 4);
+        assert!(pooling_bytes(100, 4) > 1_000);
+        let mut big = task::spawn(budget.acquire(100, 4));
+        let held = assert_ready!(big.poll());
+        let mut small = task::spawn(budget.acquire(2, 4));
+        assert_pending!(small.poll());
+        drop(held);
+        assert!(small.is_woken());
+        let _permit = assert_ready!(small.poll());
+    }
+
+    /// However small the documents, no more than the parallelism are
+    /// pooled at once.
+    #[test]
+    fn test_budget_pools_at_most_parallelism_documents_at_once() {
+        use tokio_test::{assert_pending, assert_ready, task};
+
+        let budget = PoolingBudget::new(1_000, 4);
+        assert!(pooling_bytes(2, 4) * 5 < 1_000);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut acquire = task::spawn(budget.acquire(2, 4));
+            held.push(assert_ready!(acquire.poll()));
+        }
+        let mut fifth = task::spawn(budget.acquire(2, 4));
+        assert_pending!(fifth.poll());
+        held.pop();
+        let _permit = assert_ready!(fifth.poll());
     }
 
     #[test]

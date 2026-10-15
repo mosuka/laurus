@@ -1246,6 +1246,41 @@ async fn test_wal_replay_pools_documents_once() -> Result<()> {
     Ok(())
 }
 
+/// Issue #1429: documents put concurrently are pooled before the writer is
+/// taken, and stored exactly as the token pooling reference pools them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_puts_store_the_reference_pooling() -> Result<()> {
+    let engine = Arc::new(Engine::new(storage(), pooled_schema(2)).await?);
+    let puts = (0..8).map(|n| {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            let tokens = (0..9).map(|i| binary_token(n, i)).collect();
+            let doc = Document::builder()
+                .add_text("title", format!("doc {n}"))
+                .add_vector_array(TOKENS, tokens)
+                .build();
+            engine.put_document(&format!("d{n}"), doc).await
+        })
+    });
+    for put in futures::future::join_all(puts).await {
+        put.expect("the put task panicked")?;
+    }
+    engine.commit().await?;
+    for n in 0..8 {
+        let rows: Vec<f32> = (0..9)
+            .flat_map(|i| Vector::new(binary_token(n, i)).normalized().data.to_vec())
+            .collect();
+        let expected = crate::vector::core::token_pooling::pool(&rows, 4, 2, true)
+            .expect("9 token vectors pool to 5");
+        assert_eq!(
+            stored_tokens(&engine, &format!("d{n}")),
+            Some(expected),
+            "d{n}"
+        );
+    }
+    Ok(())
+}
+
 /// A pool factor of 0 is rejected up front, in a dry run too, and the
 /// field's data is untouched.
 #[tokio::test(flavor = "multi_thread")]
