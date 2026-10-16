@@ -10,6 +10,7 @@
 //! [`RescorePlan::prepare`] embeds a text query outside it, so a bad
 //! request fails before any model runs.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::embedding::cache::{EmbeddingCache, embed_tokens_with_cache};
@@ -27,6 +28,35 @@ use crate::vector::store::VectorStore;
 /// Most query token vectors a late-interaction rescore accepts (ColBERT
 /// queries are typically 32 tokens).
 const MAX_QUERY_VECTORS: usize = 1024;
+
+/// Largest scratch, in bytes, that a thread keeps for its next candidate
+/// (Issue #1438): 2,730 decoded rows at 96 dimensions, 2,048 at 128. A
+/// larger scratch is dropped after its candidate, so a thread holds at most
+/// this much between searches.
+const MAX_KEPT_SCRATCH_BYTES: usize = 1 << 20;
+
+thread_local! {
+    /// This thread's scratch for [`MaxSimQuery::max_sim`]: an `F16` or
+    /// `Int8` document's decoded rows, or a `Binary` one's per-row factors.
+    ///
+    /// [`MaxSimQuery::max_sim`]: crate::vector::core::late_interaction::MaxSimQuery::max_sim
+    static SCRATCH: Cell<Vec<f32>> = const { Cell::new(Vec::new()) };
+}
+
+/// Run `f` with this thread's scratch, reused across candidates and
+/// searches instead of allocated per candidate, then keep the scratch
+/// unless it grew past [`MAX_KEPT_SCRATCH_BYTES`].
+///
+/// The scratch is taken out of the thread-local while `f` runs, so a nested
+/// call gets an empty one instead of aliasing it.
+fn with_scratch<R>(f: impl FnOnce(&mut Vec<f32>) -> R) -> R {
+    let mut scratch = SCRATCH.take();
+    let result = f(&mut scratch);
+    if scratch.capacity() * size_of::<f32>() <= MAX_KEPT_SCRATCH_BYTES {
+        SCRATCH.set(scratch);
+    }
+    result
+}
 
 /// Rescore options checked against the schema, with a text query not yet
 /// embedded.
@@ -254,7 +284,8 @@ impl PreparedRescore {
 
     /// Late-interaction score of each candidate, `None` for one without
     /// token vectors. The query is prepared for the snapshot once, then
-    /// candidates are scored in parallel on native builds.
+    /// candidates are scored in parallel on native builds, each thread
+    /// reusing its own scratch ([`with_scratch`]).
     fn score(
         &self,
         snapshot: &MultiVectorSnapshot,
@@ -262,10 +293,12 @@ impl PreparedRescore {
     ) -> Result<Vec<Option<f32>>> {
         let query = snapshot.max_sim_query(&self.query);
         let score_one = |&(doc_id, _): &(u64, f32)| -> Result<Option<f32>> {
-            let mut scratch = Vec::new();
-            Ok(snapshot
-                .rows(doc_id)?
-                .map(|document| query.max_sim(&document, &mut scratch)))
+            let Some(document) = snapshot.rows(doc_id)? else {
+                return Ok(None);
+            };
+            Ok(Some(with_scratch(|scratch| {
+                query.max_sim(&document, scratch)
+            })))
         };
         #[cfg(feature = "native")]
         {
@@ -281,4 +314,38 @@ impl PreparedRescore {
 
 fn invalid(reason: String) -> LaurusError {
     LaurusError::invalid_argument(format!("rescore: {reason}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #1438: a scratch up to the cap is handed to the next call on
+    /// the same thread, capacity included.
+    #[test]
+    fn test_with_scratch_keeps_a_scratch_up_to_the_cap() {
+        let floats = MAX_KEPT_SCRATCH_BYTES / size_of::<f32>();
+        with_scratch(|scratch| scratch.reserve_exact(floats));
+        let kept = with_scratch(|scratch| scratch.capacity());
+        assert!(kept >= floats, "kept a capacity of {kept} floats");
+    }
+
+    /// Issue #1438: a scratch grown past the cap is dropped, so the thread
+    /// does not hold it until its next rescore.
+    #[test]
+    fn test_with_scratch_drops_a_scratch_past_the_cap() {
+        let floats = MAX_KEPT_SCRATCH_BYTES / size_of::<f32>() + 1;
+        with_scratch(|scratch| scratch.reserve_exact(floats));
+        assert_eq!(with_scratch(|scratch| scratch.capacity()), 0);
+    }
+
+    /// A nested call gets an empty scratch of its own, not the outer one.
+    #[test]
+    fn test_with_scratch_nested_call_gets_an_empty_scratch() {
+        with_scratch(|outer| {
+            outer.extend([1.0, 2.0]);
+            with_scratch(|inner| assert!(inner.is_empty()));
+            assert_eq!(outer, &[1.0, 2.0]);
+        });
+    }
 }

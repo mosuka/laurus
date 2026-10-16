@@ -1066,6 +1066,78 @@ async fn test_f32_rescore_at_a_block4_dimension() -> Result<()> {
     Ok(())
 }
 
+/// Issue #1438: token counts of the decoded rescore test's documents, in
+/// document order. Each long document is followed by a shorter one, so a
+/// scratch reused without being cleared would score the shorter one over
+/// rows left by the longer one.
+const DECODED_TOKEN_COUNTS: [u64; 4] = [24, 3, 17, 1];
+
+/// Issue #1438: `F16` and `Int8` documents of different lengths, decoded one
+/// after another into the scratch the rescore reuses, score as a decode of
+/// each document into a new buffer does, bit for bit.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_decoded_rescore_of_documents_of_different_lengths_matches_a_fresh_decode()
+-> Result<()> {
+    for kind in [MultiVectorStorage::F16, MultiVectorStorage::Int8] {
+        let schema = Schema::builder()
+            .add_text_field("title", TextOption::default())
+            .add_field(
+                TOKENS,
+                FieldOption::MultiVector(
+                    MultiVectorOption::new(RESCORE_DIMENSION)
+                        .distance(DistanceMetric::Cosine)
+                        .storage(kind),
+                ),
+            )
+            .build();
+        let engine = Engine::new(storage(), schema).await?;
+        for n in 0..64u64 {
+            let count = DECODED_TOKEN_COUNTS[n as usize % DECODED_TOKEN_COUNTS.len()];
+            let tokens = (0..count).map(|i| rescore_token(n, i)).collect();
+            let doc = Document::builder()
+                .add_text("title", format!("doc {n}"))
+                .add_vector_array(TOKENS, tokens)
+                .build();
+            engine.put_document(&format!("d{n}"), doc).await?;
+        }
+        engine.commit().await?;
+
+        let query: Vec<Vector> = (0..5)
+            .map(|i| Vector::new(rescore_token(1_000, i)))
+            .collect();
+        let results = engine
+            .search(
+                SearchRequestBuilder::new()
+                    .query_dsl("title:doc")
+                    .rescore(
+                        RescoreOptions::late_interaction(TOKENS, query.clone()).window_size(100),
+                    )
+                    .limit(100)
+                    .build(),
+            )
+            .await?;
+        assert_eq!(results.len(), 64, "{kind:?}");
+
+        let mut flat = Vec::new();
+        for vector in &query {
+            flat.extend_from_slice(&vector.normalized().data);
+        }
+        let snapshot = engine.vector.multi_vector_snapshot(TOKENS).unwrap();
+        for result in &results {
+            let doc_id = internal_ids(&engine, &result.id)[0];
+            let rows = snapshot.rows(doc_id)?.unwrap();
+            assert_eq!(rows.kind(), kind, "{result:?}");
+            let expected = max_sim(&flat, &rows.to_f32(), RESCORE_DIMENSION);
+            assert_eq!(
+                result.score.to_bits(),
+                expected.to_bits(),
+                "{kind:?} {result:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Issue #1346: a Cosine field of 4-dimensional token vectors pooled by
 /// `pool_factor`, next to a text field.
 fn pooled_option(pool_factor: u32) -> FieldOption {
