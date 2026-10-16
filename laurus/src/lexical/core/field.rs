@@ -1043,6 +1043,24 @@ impl FieldOption {
             FieldOption::Bytes(opt) => opt.stored,
         }
     }
+
+    /// Whether this field accepts an array of values per document.
+    ///
+    /// Centralizes the same 8-arm match as [`Self::stored`], for callers
+    /// that need one value per document, such as result grouping (Issue
+    /// #1297).
+    pub(crate) fn multi_valued(&self) -> bool {
+        match self {
+            FieldOption::Text(opt) => opt.multi_valued,
+            FieldOption::Integer(opt) => opt.multi_valued,
+            FieldOption::Float(opt) => opt.multi_valued,
+            FieldOption::Boolean(opt) => opt.multi_valued,
+            FieldOption::DateTime(opt) => opt.multi_valued,
+            FieldOption::Geo(opt) => opt.multi_valued,
+            FieldOption::Geo3d(opt) => opt.multi_valued,
+            FieldOption::Bytes(opt) => opt.multi_valued,
+        }
+    }
 }
 
 impl Default for GeoOption {

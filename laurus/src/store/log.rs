@@ -1132,6 +1132,32 @@ impl DocumentLog {
         self.doc_store.read().get_documents_batch(doc_ids)
     }
 
+    /// The value of `field` in the stored documents of `doc_ids`, without
+    /// populating the document cache (see
+    /// [`UnifiedDocumentStore::get_field_values_batch`](crate::store::document::UnifiedDocumentStore::get_field_values_batch)).
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_ids` - Internal document IDs to look up.
+    /// * `field` - The stored field to read.
+    ///
+    /// # Returns
+    ///
+    /// A map of doc_id to the field's value, for every document found that
+    /// has the field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError`](crate::error::LaurusError) on storage I/O or
+    /// deserialization failure.
+    pub fn get_field_values_batch(
+        &self,
+        doc_ids: &[u64],
+        field: &str,
+    ) -> Result<std::collections::HashMap<u64, crate::data::DataValue>> {
+        self.doc_store.read().get_field_values_batch(doc_ids, field)
+    }
+
     /// Find internal doc_id by external ID.
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<u64>> {
         self.doc_store.read().find_by_external_id(external_id)

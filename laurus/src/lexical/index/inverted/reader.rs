@@ -37,6 +37,7 @@ use crate::lexical::index::structures::norms::NormsColumn;
 use crate::lexical::query::Query;
 use crate::lexical::reader::FieldStats;
 use crate::lexical::reader::PostingIterator;
+use crate::lexical::search::searcher::DocValueLookup;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::storage::structured::{
@@ -1336,6 +1337,26 @@ impl SegmentReader {
         })
     }
 
+    /// This segment's DocValues column of `field`, loading the segment's
+    /// DocValues on first use; `None` when the segment has no column for
+    /// `field`.
+    ///
+    /// Unlike [`Self::get_doc_value`], deletions are not applied: the column
+    /// also holds deleted documents, so the caller checks
+    /// [`Self::deletions`] (Issue #1297).
+    fn doc_values_column(
+        &self,
+        field: &str,
+    ) -> Result<Option<Arc<crate::lexical::index::structures::doc_values::FieldDocValues>>> {
+        if self.core.doc_values.read().unwrap().is_none() {
+            self.core.load_doc_values()?;
+        }
+        match self.core.doc_values.read().unwrap().as_ref() {
+            Some(reader) => reader.column(field),
+            None => Ok(None),
+        }
+    }
+
     /// Get a DocValues field value for a document.
     pub(crate) fn get_doc_value(&self, field: &str, doc_id: u64) -> Result<Option<FieldValue>> {
         // Mirror `document()`: a soft-deleted doc (e.g. the pre-upsert
@@ -2598,6 +2619,68 @@ impl InvertedIndexReader {
             }
         }
         Ok(Some(doc_ids))
+    }
+
+    /// The DocValues value of `field` for each of `doc_ids`, in the same
+    /// order (Issue #1297).
+    ///
+    /// Each segment is visited at most once: only a segment whose
+    /// `[min_doc_id, max_doc_id]` range holds a still-unanswered id is
+    /// opened, and its deletions and column are resolved once for all of
+    /// them. A deleted copy (the old copy of a re-added id) does not answer,
+    /// so the live copy in another segment does, as in
+    /// [`Self::field_length`].
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The DocValues field.
+    /// * `doc_ids` - The internal document ids to look up.
+    ///
+    /// # Returns
+    ///
+    /// One entry per id. [`Absent`](DocValueLookup::Absent) needs a segment
+    /// that has the column and is known to hold the live document; a
+    /// document whose segment has no column, or whose segment's membership
+    /// is unknown, is [`Unknown`](DocValueLookup::Unknown).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reader is closed, or if a segment's DocValues
+    /// cannot be read.
+    pub fn doc_values_batch(&self, field: &str, doc_ids: &[u64]) -> Result<Vec<DocValueLookup>> {
+        self.check_closed()?;
+        let mut answers = vec![DocValueLookup::Unknown; doc_ids.len()];
+        for (min_doc_id, max_doc_id, segment) in self.segment_ranges() {
+            let pending: Vec<usize> = (0..doc_ids.len())
+                .filter(|&i| {
+                    matches!(answers[i], DocValueLookup::Unknown)
+                        && (min_doc_id..=max_doc_id).contains(&doc_ids[i])
+                })
+                .collect();
+            if pending.is_empty() {
+                continue;
+            }
+            let segment = segment.read().unwrap();
+            let Some(column) = segment.doc_values_column(field)? else {
+                continue;
+            };
+            let deletions = segment.deletions();
+            for i in pending {
+                let doc_id = doc_ids[i];
+                if deletions
+                    .as_ref()
+                    .is_some_and(|deletions| deletions.contains(doc_id))
+                {
+                    continue;
+                }
+                if let Some(value) = column.get(doc_id) {
+                    answers[i] = DocValueLookup::Value(value.clone());
+                } else if segment.membership().holds(doc_id) == Some(true) {
+                    answers[i] = DocValueLookup::Absent;
+                }
+            }
+        }
+        Ok(answers)
     }
 
     /// Check if the reader is closed.

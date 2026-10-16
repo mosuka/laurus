@@ -484,6 +484,8 @@ mod tests {
             score: 1.0,
             document: None,
             highlights,
+            group_key: None,
+            inner_hits: Vec::new(),
         }
     }
 

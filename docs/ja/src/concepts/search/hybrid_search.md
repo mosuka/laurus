@@ -313,5 +313,6 @@ async fn main() -> laurus::Result<()> {
 ## 次のステップ
 
 - クエリ構文の完全なリファレンス: [Query DSL](../query_dsl.md)
+- chunk に分けた文書を 1 回ずつ返す: [検索結果のグループ化](result_grouping.md)
 - ID 解決の仕組み: [ID Management](../../laurus/id_management.md)
 - データの永続性: [Persistence & WAL](../../laurus/persistence.md)

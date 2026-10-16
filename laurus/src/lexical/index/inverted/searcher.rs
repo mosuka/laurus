@@ -1537,6 +1537,20 @@ impl crate::lexical::search::searcher::LexicalSearcher for InvertedIndexSearcher
         }
     }
 
+    fn doc_values_batch(
+        &self,
+        field: &str,
+        doc_ids: &[u64],
+    ) -> Result<Vec<crate::lexical::search::searcher::DocValueLookup>> {
+        match self.reader.as_any().downcast_ref::<InvertedIndexReader>() {
+            Some(reader) => reader.doc_values_batch(field, doc_ids),
+            None => Ok(vec![
+                crate::lexical::search::searcher::DocValueLookup::Unknown;
+                doc_ids.len()
+            ]),
+        }
+    }
+
     fn matching_doc_ids(&self, query: Box<dyn Query>) -> Result<Arc<roaring::RoaringTreemap>> {
         // The common case: the reader is an `InvertedIndexReader`, which owns
         // the snapshot-scoped query/filter cache (Issue #578) and serves

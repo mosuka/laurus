@@ -23,6 +23,7 @@
   - [Lexical Search](concepts/search/lexical_search.md)
   - [Vector Search](concepts/search/vector_search.md)
   - [Hybrid Search](concepts/search/hybrid_search.md)
+  - [Result Grouping](concepts/search/result_grouping.md)
 - [Query DSL](concepts/query_dsl.md)
 - [BKD-Tree](concepts/bkd_tree.md)
 - [3D Geographic Search (ECEF)](concepts/geo3d.md)

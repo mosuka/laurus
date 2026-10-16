@@ -699,6 +699,8 @@ mod tests {
             score: 1.5,
             document: None,
             highlights,
+            group_key: None,
+            inner_hits: Vec::new(),
         };
 
         let proto = result_to_proto(&result);
@@ -715,6 +717,8 @@ mod tests {
             score: 1.5,
             document: None,
             highlights: HashMap::new(),
+            group_key: None,
+            inner_hits: Vec::new(),
         };
 
         let proto = result_to_proto(&result);

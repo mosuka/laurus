@@ -6,6 +6,7 @@ use std::sync::Arc;
 use roaring::RoaringTreemap;
 
 use crate::error::Result;
+use crate::lexical::core::field::FieldValue;
 use crate::lexical::query::{LexicalSearchResults, Query};
 
 /// Sort order for search results.
@@ -230,6 +231,21 @@ impl LexicalSearchRequest {
     }
 }
 
+/// One document's answer from [`LexicalSearcher::doc_values_batch`]
+/// (Issue #1297).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocValueLookup {
+    /// The document's DocValues value.
+    Value(FieldValue),
+    /// The document's segment has a DocValues column for the field and no
+    /// value in it for the document: the document has no value.
+    Absent,
+    /// No DocValues column answers for the document: its segment predates
+    /// the column, the snapshot does not hold the document, or the searcher
+    /// keeps no DocValues. Read the stored document instead.
+    Unknown,
+}
+
 /// Trait for lexical search implementations.
 ///
 /// This trait defines the interface for executing searches against lexical indexes.
@@ -262,6 +278,25 @@ pub trait LexicalSearcher: Send + Sync + std::fmt::Debug {
     fn live_doc_ids_for_term(&self, field: &str, term: &str) -> Result<Option<Vec<u64>>> {
         let _ = (field, term);
         Ok(None)
+    }
+
+    /// The DocValues value of `field` for each of `doc_ids`, in the same
+    /// order, read from this searcher's snapshot (Issue #1297).
+    ///
+    /// The default implementation answers
+    /// [`Unknown`](DocValueLookup::Unknown) for every id.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The DocValues field.
+    /// * `doc_ids` - The internal document ids to look up.
+    ///
+    /// # Returns
+    ///
+    /// One [`DocValueLookup`] per id.
+    fn doc_values_batch(&self, field: &str, doc_ids: &[u64]) -> Result<Vec<DocValueLookup>> {
+        let _ = field;
+        Ok(vec![DocValueLookup::Unknown; doc_ids.len()])
     }
 
     /// Return the set of document ids matching `query`, ignoring score

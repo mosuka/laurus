@@ -366,6 +366,86 @@ pub enum LateInteractionQuery {
     Text(String),
 }
 
+// ── GroupBy ──────────────────────────────────────────────────────────────────
+
+/// Group the ranked hits by a field's value, like Elasticsearch's
+/// `collapse` or Qdrant's `group_by` (Issue #1297).
+///
+/// Grouping runs on the final ranking, after fusion and rescore and before
+/// pagination, so it applies to lexical, vector and hybrid searches alike.
+/// Each returned [`SearchResult`] is the best hit of one group, its
+/// [`group_key`](SearchResult::group_key) is the shared value, and its
+/// [`inner_hits`](SearchResult::inner_hits) hold the group's next best hits,
+/// up to [`group_size`](Self::group_size) hits per group in total.
+/// [`SearchRequest::limit`] and [`SearchRequest::offset`] then count groups,
+/// not hits.
+///
+/// The typical key is `_id`: chunks added with
+/// [`Engine::add_document`](super::Engine::add_document) share their
+/// document's `_id`, so grouping by it returns each document once. Any other
+/// single-valued `Text`, `Integer`, `Float`, `Boolean` or `DateTime` field
+/// that is `stored` and keeps `doc_values` works too. A hit whose document
+/// has no value for the field forms a group of its own.
+///
+/// The engine widens the first-stage candidate pool, doubling it up to
+/// [`MAX_CANDIDATES`](Self::MAX_CANDIDATES), until the pool holds
+/// `offset + limit` groups or the first stage runs out of hits. A group's
+/// further hits come from that pool, so `inner_hits` can hold fewer than
+/// `group_size - 1` hits even when the group has more matching documents.
+///
+/// # Example
+///
+/// ```
+/// use laurus::{GroupBy, SearchRequestBuilder};
+///
+/// let request = SearchRequestBuilder::new()
+///     .query_dsl("body:rust")
+///     .group_by(GroupBy::new("_id").group_size(3))
+///     .limit(10)
+///     .build();
+/// assert_eq!(request.group_by.as_ref().map(|g| g.group_size), Some(3));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupBy {
+    /// The field whose value groups the hits: `_id`, or a single-valued
+    /// `Text`, `Integer`, `Float`, `Boolean` or `DateTime` field that is
+    /// `stored` and keeps `doc_values`.
+    pub field: String,
+    /// How many hits to keep per group, `1..=100`: the group's best hit
+    /// plus up to `group_size - 1` [`inner_hits`](SearchResult::inner_hits).
+    /// Defaults to `1`.
+    pub group_size: usize,
+}
+
+impl GroupBy {
+    /// Largest accepted [`group_size`](Self::group_size).
+    pub const MAX_GROUP_SIZE: usize = 100;
+
+    /// Largest first-stage candidate pool a grouped search ranks, and the
+    /// largest `offset + limit` it accepts. The same bound as
+    /// [`RescoreOptions::MAX_WINDOW_SIZE`].
+    pub const MAX_CANDIDATES: usize = 10_000;
+
+    /// Group by `field`, keeping one hit per group.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The grouping field (see [`field`](Self::field)).
+    pub fn new(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            group_size: 1,
+        }
+    }
+
+    /// Set how many hits to keep per group (see
+    /// [`group_size`](Self::group_size)).
+    pub fn group_size(mut self, group_size: usize) -> Self {
+        self.group_size = group_size;
+        self
+    }
+}
+
 // ── SearchRequest ────────────────────────────────────────────────────────────
 
 /// Unified search request combining query specification with pagination,
@@ -413,6 +493,11 @@ pub struct SearchRequest {
     /// (see [`RescoreOptions`]). Cannot be combined with a lexical
     /// [`sort_by`](LexicalSearchOptions::sort_by).
     pub rescore: Option<RescoreOptions>,
+
+    /// Optional grouping of the ranked hits by a field's value (see
+    /// [`GroupBy`]). When set, [`limit`](Self::limit) and
+    /// [`offset`](Self::offset) count groups.
+    pub group_by: Option<GroupBy>,
 }
 
 /// Algorithm used to combine lexical and vector scores in hybrid search.
@@ -457,6 +542,7 @@ impl Default for SearchRequest {
             lexical_options: LexicalSearchOptions::default(),
             vector_options: VectorSearchOptions::default(),
             rescore: None,
+            group_by: None,
         }
     }
 }
@@ -489,6 +575,7 @@ pub struct SearchRequestBuilder {
     lexical_options: LexicalSearchOptions,
     vector_options: VectorSearchOptions,
     rescore: Option<RescoreOptions>,
+    group_by: Option<GroupBy>,
 }
 
 impl Default for SearchRequestBuilder {
@@ -511,6 +598,7 @@ impl SearchRequestBuilder {
             lexical_options: LexicalSearchOptions::default(),
             vector_options: VectorSearchOptions::default(),
             rescore: None,
+            group_by: None,
         }
     }
 
@@ -703,6 +791,14 @@ impl SearchRequestBuilder {
         self
     }
 
+    // ── Grouping ─────────────────────────────────────────────────────────
+
+    /// Group the ranked hits by a field's value (see [`GroupBy`]).
+    pub fn group_by(mut self, group_by: GroupBy) -> Self {
+        self.group_by = Some(group_by);
+        self
+    }
+
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder and return the constructed [`SearchRequest`].
@@ -734,6 +830,7 @@ impl SearchRequestBuilder {
             lexical_options: self.lexical_options,
             vector_options: self.vector_options,
             rescore: self.rescore,
+            group_by: self.group_by,
         }
     }
 }
@@ -762,6 +859,17 @@ pub struct SearchResult {
     /// field, or when nothing in it matched (unless
     /// `return_entire_field_if_no_highlight` is set).
     pub highlights: HashMap<String, Vec<String>>,
+    /// The value this result's group shares, when the request set
+    /// [`group_by`](SearchRequest::group_by). `None` for an ungrouped search,
+    /// and for a hit whose document has no value for the grouping field
+    /// (such a hit forms a group of its own).
+    pub group_key: Option<crate::data::DataValue>,
+    /// The group's next best hits after this one, in rank order, when the
+    /// request set [`group_by`](SearchRequest::group_by): at most
+    /// [`GroupBy::group_size`] `- 1` of them. Empty for an ungrouped search.
+    /// Each inner hit carries the same `group_key` and has no inner hits of
+    /// its own.
+    pub inner_hits: Vec<SearchResult>,
 }
 
 #[cfg(test)]

@@ -230,6 +230,8 @@ workloads.
 | `filter_query` | `Option<Box<dyn Query>>` | None | Filter applied to both search types |
 | `lexical_options` | `LexicalSearchOptions` | Default | Parameters controlling lexical search behavior |
 | `vector_options` | `VectorSearchOptions` | Default | Parameters controlling vector search behavior |
+| `rescore` | `Option<RescoreOptions>` | None | Second stage that reorders the top first-stage candidates ([Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)) |
+| `group_by` | `Option<GroupBy>` | None | Group the ranked hits by a field's value; when set, `limit` and `offset` count groups ([Result Grouping](../concepts/search/result_grouping.md)) |
 
 ### LexicalSearchOptions
 

@@ -594,4 +594,5 @@ async fn main() -> laurus::Result<()> {
 ## Next Steps
 
 - Combine with keyword search: [Hybrid Search](hybrid_search.md)
+- Return each chunked document once: [Result Grouping](result_grouping.md)
 - DSL syntax for vector queries: [Query DSL](../query_dsl.md)

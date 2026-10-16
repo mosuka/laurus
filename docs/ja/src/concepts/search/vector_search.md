@@ -544,4 +544,5 @@ async fn main() -> laurus::Result<()> {
 ## 次のステップ
 
 - キーワード検索と組み合わせる: [ハイブリッド検索](hybrid_search.md)
+- chunk に分けた文書を 1 回ずつ返す: [検索結果のグループ化](result_grouping.md)
 - Vector クエリの DSL 構文: [Query DSL](../query_dsl.md)

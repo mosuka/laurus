@@ -499,4 +499,5 @@ let config = LexicalIndexConfig::builder()
 
 - Semantic similarity search: [Vector Search](vector_search.md)
 - Combine lexical + vector: [Hybrid Search](hybrid_search.md)
+- Return each chunked document once: [Result Grouping](result_grouping.md)
 - Full DSL syntax reference: [Query DSL](../query_dsl.md)

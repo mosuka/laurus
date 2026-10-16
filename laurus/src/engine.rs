@@ -1,3 +1,4 @@
+mod grouping;
 pub mod json_document;
 #[cfg(test)]
 mod multi_vector_tests;
@@ -748,6 +749,35 @@ fn check_field_embedder(
             embedder.name()
         ))),
     }
+}
+
+/// The first stage of a search, built once before the search runs.
+///
+/// [`Engine::rank_round`] runs it for a given candidate count; a grouped
+/// search runs it once per pool size it tries (Issue #1297), so the query
+/// is parsed, the filter evaluated and the vectors embedded only once.
+struct FirstStage {
+    /// Whether both lists run and are fused.
+    hybrid: bool,
+    /// The lexical request, without its limit.
+    lexical: Option<crate::lexical::search::searcher::LexicalSearchRequest>,
+    /// The vector request with embedded vectors, without its limit.
+    vector: Option<crate::vector::store::request::VectorSearchRequest>,
+    /// How a hybrid search fuses the lists.
+    fusion_algorithm: FusionAlgorithm,
+    /// Which documents a hybrid search keeps.
+    hybrid_mode: self::search::HybridMode,
+}
+
+/// One run of a [`FirstStage`]: the ranking, and how many hits each list
+/// returned for what it was asked.
+struct RankedRound {
+    /// The ranked candidates as `(doc id, score)`, best first, rescored.
+    ranked: Vec<(u64, f32)>,
+    /// The lexical list's counts, if the search has one.
+    lexical: Option<self::grouping::ListCount>,
+    /// The vector list's counts, if the search has one.
+    vector: Option<self::grouping::ListCount>,
 }
 
 /// Combine lexical and vector hits into one ranking, best first.
@@ -3208,6 +3238,12 @@ impl Engine {
     /// the top `window_size` of them are reordered by the rescorer before
     /// the page is cut (see [`RescoreOptions`](self::search::RescoreOptions)).
     ///
+    /// When [`group_by`](self::search::SearchRequest::group_by) is set, the
+    /// ranked hits (after rescore) are grouped by the field's value and
+    /// `offset` and `limit` count groups; the first stage widens its
+    /// candidate pool until it holds `offset + limit` groups or runs out of
+    /// hits (see [`GroupBy`](self::search::GroupBy)).
+    ///
     /// When `lexical_options.highlight` is set, each returned hit's
     /// [`highlights`](self::search::SearchResult::highlights) is filled from
     /// its stored document using the request's lexical query (without the
@@ -3229,6 +3265,12 @@ impl Engine {
     /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
     /// multi-vector field, query vectors of the wrong dimension or count, or
     /// a lexical `sort_by` on a field.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if the `group_by` options are invalid: a `group_size` outside
+    /// `1..=GroupBy::MAX_GROUP_SIZE`, an `offset + limit` above
+    /// `GroupBy::MAX_CANDIDATES`, or a field that cannot group (see
+    /// [`GroupBy::field`](self::search::GroupBy::field)).
     ///
     /// Returns [`LaurusError::Query`](crate::error::LaurusError::Query) if
     /// the lexical query or `filter_query` runs a phrase of two or more
@@ -3255,9 +3297,16 @@ impl Engine {
             lexical_options,
             vector_options,
             rescore: request_rescore,
+            group_by: request_group_by,
         } = request;
 
         self.validate_field_boosts(&lexical_options.field_boosts)?;
+        if let Some(group_by) = &request_group_by {
+            self::grouping::validate(&self.schema.read(), group_by, request_offset, request_limit)?;
+            if request_limit == 0 {
+                return Ok(Vec::new());
+            }
+        }
 
         // Validate the rescore options, and embed a text query, before any
         // search runs. Two statements on purpose: the `parking_lot` schema
@@ -3278,11 +3327,17 @@ impl Engine {
         };
 
         // How many first-stage candidates to rank: enough for the requested
-        // page, and for the rescore window when there is one.
+        // page, and for the rescore window when there is one. A grouped
+        // search counts its page in groups, so it starts from a pool sized
+        // for them and may widen it later.
         let page_end = request_offset.saturating_add(request_limit);
+        let first_count = match &request_group_by {
+            Some(group_by) => self::grouping::first_request(page_end, group_by.group_size),
+            None => page_end,
+        };
         let fetch_count = rescore
             .as_ref()
-            .map_or(page_end, |rescore| rescore.depth(page_end));
+            .map_or(first_count, |rescore| rescore.depth(first_count));
 
         // Turn a DSL string into Lexical / Vector / Hybrid parts first. Every
         // variant is listed explicitly, so a new one fails to compile here
@@ -3368,17 +3423,11 @@ impl Engine {
             query.apply_field_boosts(&lex_req.field_boosts);
         }
 
-        // Build the lexical request; the search itself runs in parallel below.
-        let lex_req = if let Some(query) = &lexical_query_to_use {
-            let q = query.clone_box();
-            let overfetch_limit = if vector_search_request.is_some() {
-                fetch_count.saturating_mul(2)
-            } else {
-                fetch_count
-            };
-            let mut req = crate::lexical::search::searcher::LexicalSearchRequest::new(q)
-                .limit(overfetch_limit)
-                .load_documents(false);
+        // Build the lexical request; its limit is set per round below.
+        let lexical = if let Some(query) = &lexical_query_to_use {
+            let mut req =
+                crate::lexical::search::searcher::LexicalSearchRequest::new(query.clone_box())
+                    .load_documents(false);
             // Carry the caller's resolved lexical params through (#942):
             // rebuilding the request from scratch silently dropped them.
             // `limit` / `load_documents` stay engine-controlled (overfetch
@@ -3401,13 +3450,9 @@ impl Engine {
 
         // 2. Build the vector request — including the async payload embedding,
         // which must complete before the (synchronous) search runs in parallel
-        // below.
-        let vec_req = if let Some(vector_req) = &vector_search_request {
+        // below. Its limit is set per round.
+        let vector = if let Some(vector_req) = &vector_search_request {
             let mut vreq = vector_req.clone();
-            if lexical_search_request.is_some() && vreq.params.limit < fetch_count.saturating_mul(2)
-            {
-                vreq.params.limit = fetch_count.saturating_mul(2);
-            }
             if let Some(filter) = &allowed_filter {
                 vreq.params.allowed_filter = Some(filter.clone());
             }
@@ -3427,6 +3472,166 @@ impl Engine {
             None
         };
 
+        let stage = FirstStage {
+            hybrid: lexical_search_request.is_some() && vector_search_request.is_some(),
+            lexical,
+            vector,
+            fusion_algorithm: fusion_algorithm.unwrap_or(FusionAlgorithm::RRF { k: 60.0 }),
+            hybrid_mode,
+        };
+
+        let Some(group_by) = request_group_by else {
+            // 3–4. Rank and rescore once.
+            let mut scores = self::rescore::RescoreScores::default();
+            let round = self.rank_round(
+                &stage,
+                fetch_count,
+                None,
+                rescore.as_ref().map(|rescore| (rescore, &mut scores)),
+            )?;
+
+            // 5. Paginate once, then resolve ids and documents for the page only.
+            let page: Vec<(u64, f32)> = round
+                .ranked
+                .into_iter()
+                .skip(request_offset)
+                .take(request_limit)
+                .collect();
+            let mut results = self.resolve_hits(page)?;
+
+            // 6. Highlighting: after pagination, so the cost is bounded by
+            // `limit × fields` analyzer passes.
+            if let (Some(options), Some(query)) = (&lexical_options.highlight, &highlight_query) {
+                self.apply_highlights(&mut results, query.as_ref(), options)?;
+            }
+
+            return Ok(results);
+        };
+
+        // 3–4 for a grouped search (Issue #1297): rank, rescore and group
+        // a pool, widening it until it holds `offset + limit` groups or the
+        // first stage runs out. The lexical timeout bounds every round
+        // together.
+        let timer = crate::util::time::Timer::now();
+        let lexical_timeout_ms = stage
+            .lexical
+            .as_ref()
+            .and_then(|request| request.params.timeout_ms);
+        let mut scores = self::rescore::RescoreScores::default();
+        let mut keys: ahash::AHashMap<u64, Option<crate::data::DataValue>> = ahash::AHashMap::new();
+        let mut fetch_count = fetch_count;
+        let mut previous_vector = None;
+        let groups = loop {
+            let remaining_ms =
+                lexical_timeout_ms.map(|timeout| timeout.saturating_sub(timer.elapsed_ms()));
+            let round = self.rank_round(
+                &stage,
+                fetch_count,
+                remaining_ms,
+                rescore.as_ref().map(|rescore| (rescore, &mut scores)),
+            )?;
+            self.resolve_group_keys(&group_by.field, &round.ranked, &mut keys)?;
+            let groups =
+                self::grouping::group_ranked(&round.ranked, &keys, group_by.group_size, page_end);
+            if groups.len() >= page_end
+                || self::grouping::first_stage_exhausted(
+                    round.lexical,
+                    round.vector,
+                    previous_vector,
+                )
+            {
+                break groups;
+            }
+            let Some(next) = self::grouping::next_request(fetch_count) else {
+                break groups;
+            };
+            fetch_count = rescore.as_ref().map_or(next, |rescore| rescore.depth(next));
+            previous_vector = round.vector;
+        };
+
+        // 5. Paginate over groups, then resolve and highlight the page's
+        // hits in one batch, leaders and inner hits alike.
+        let page: Vec<self::grouping::Group> = groups
+            .into_iter()
+            .skip(request_offset)
+            .take(request_limit)
+            .collect();
+        let hits: Vec<(u64, f32)> = page
+            .iter()
+            .flat_map(|group| group.hits.iter().copied())
+            .collect();
+        let mut results = self.resolve_hits(hits)?;
+        if let (Some(options), Some(query)) = (&lexical_options.highlight, &highlight_query) {
+            self.apply_highlights(&mut results, query.as_ref(), options)?;
+        }
+
+        // 6. Nest each group's hits under its best one.
+        let mut results = results.into_iter();
+        let mut grouped = Vec::with_capacity(page.len());
+        for group in page {
+            let mut members = results.by_ref().take(group.hits.len()).map(|mut hit| {
+                hit.group_key = group.key.clone();
+                hit
+            });
+            let Some(mut leader) = members.next() else {
+                continue;
+            };
+            leader.inner_hits = members.collect();
+            grouped.push(leader);
+        }
+        Ok(grouped)
+    }
+
+    /// Run the first stage for `fetch_count` candidates, rank them, and
+    /// rescore the top (steps 1–4 of [`Self::search`]).
+    ///
+    /// A grouped search runs this once per pool size it tries (Issue
+    /// #1297); every other search runs it once.
+    ///
+    /// # Arguments
+    ///
+    /// * `stage` - The prepared first stage.
+    /// * `fetch_count` - How many candidates to rank. A hybrid search asks
+    ///   each list for twice as many before fusing.
+    /// * `lexical_timeout_ms` - Replaces the lexical request's timeout when
+    ///   `Some`.
+    /// * `rescore` - The rescore stage and the scores it keeps across
+    ///   rounds, if the request rescores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lexical or vector search, or the rescore,
+    /// fails.
+    fn rank_round(
+        &self,
+        stage: &FirstStage,
+        fetch_count: usize,
+        lexical_timeout_ms: Option<u64>,
+        rescore: Option<(
+            &self::rescore::PreparedRescore,
+            &mut self::rescore::RescoreScores,
+        )>,
+    ) -> Result<RankedRound> {
+        // 1–2. Each list fetches `fetch_count` candidates, or twice that
+        // when two lists are fused.
+        let list_limit = if stage.hybrid {
+            fetch_count.saturating_mul(2)
+        } else {
+            fetch_count
+        };
+        let lex_req = stage.lexical.as_ref().map(|template| {
+            let mut request = template.clone().limit(list_limit);
+            if lexical_timeout_ms.is_some() {
+                request.params.timeout_ms = lexical_timeout_ms;
+            }
+            request
+        });
+        let vec_req = stage.vector.as_ref().map(|template| {
+            let mut request = template.clone();
+            request.params.limit = list_limit;
+            request
+        });
+
         // Run the independent lexical and vector searches (#659). On native
         // builds both synchronous searches overlap via `rayon::join`, so the
         // hybrid latency drops from `lex + vec` toward `max(lex, vec)`. The
@@ -3442,49 +3647,106 @@ impl Engine {
         let (lex_res, vec_res) = (run_lexical(), run_vector());
         let lexical_hits = lex_res?.map(|r| r.hits).unwrap_or_default();
         let vector_hits = vec_res?.map(|r| r.hits).unwrap_or_default();
+        let lexical = stage.lexical.as_ref().map(|_| self::grouping::ListCount {
+            requested: list_limit,
+            returned: lexical_hits.len(),
+        });
+        let vector = stage.vector.as_ref().map(|_| self::grouping::ListCount {
+            requested: list_limit,
+            returned: vector_hits.len(),
+        });
 
         // 3. Rank: every mode reduces to one list of (doc id, score), best
         // first, before any page is cut or any document is read.
-        let ranked: Vec<(u64, f32)> =
-            if lexical_search_request.is_some() && vector_search_request.is_some() {
-                let algorithm = fusion_algorithm.unwrap_or(FusionAlgorithm::RRF { k: 60.0 });
-                let mut fused = fuse_scores(lexical_hits, vector_hits, algorithm, hybrid_mode);
-                fused.truncate(fetch_count);
-                fused
-            } else if !vector_hits.is_empty() {
-                vector_hits
-                    .into_iter()
-                    .map(|h| (h.doc_id, h.score))
-                    .collect()
-            } else {
-                // Only lexical results (or both empty).
-                lexical_hits
-                    .into_iter()
-                    .map(|h| (h.doc_id, h.score))
-                    .collect()
-            };
+        let ranked: Vec<(u64, f32)> = if stage.hybrid {
+            let mut fused = fuse_scores(
+                lexical_hits,
+                vector_hits,
+                stage.fusion_algorithm,
+                stage.hybrid_mode,
+            );
+            fused.truncate(fetch_count);
+            fused
+        } else if !vector_hits.is_empty() {
+            vector_hits
+                .into_iter()
+                .map(|h| (h.doc_id, h.score))
+                .collect()
+        } else {
+            // Only lexical results (or both empty).
+            lexical_hits
+                .into_iter()
+                .map(|h| (h.doc_id, h.score))
+                .collect()
+        };
 
         // 4. Rescore the top of the ranking.
-        let ranked = match &rescore {
-            Some(rescore) => rescore.apply(&self.vector, ranked)?,
+        let ranked = match rescore {
+            Some((rescore, scores)) => rescore.apply(&self.vector, ranked, scores)?,
             None => ranked,
         };
 
-        // 5. Paginate once, then resolve ids and documents for the page only.
-        let page: Vec<(u64, f32)> = ranked
-            .into_iter()
-            .skip(request_offset)
-            .take(request_limit)
+        Ok(RankedRound {
+            ranked,
+            lexical,
+            vector,
+        })
+    }
+
+    /// Record the group value of every hit in `ranked` that `keys` does not
+    /// hold yet (Issue #1297).
+    ///
+    /// Values come from the lexical DocValues of the search's snapshot. A
+    /// hit no DocValues column answers for (its segment predates the column,
+    /// or a commit landed between the search and this lookup) is read from
+    /// its stored document, without touching the document cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The grouping field.
+    /// * `ranked` - The ranked hits as `(doc id, score)`.
+    /// * `keys` - Each looked-up hit's value, `None` for no value; filled in
+    ///   place, so a later round only looks up new hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DocValues or the stored documents cannot be
+    /// read.
+    fn resolve_group_keys(
+        &self,
+        field: &str,
+        ranked: &[(u64, f32)],
+        keys: &mut ahash::AHashMap<u64, Option<crate::data::DataValue>>,
+    ) -> Result<()> {
+        use crate::lexical::search::searcher::DocValueLookup;
+
+        let new: Vec<u64> = ranked
+            .iter()
+            .map(|(doc_id, _)| *doc_id)
+            .filter(|doc_id| !keys.contains_key(doc_id))
             .collect();
-        let mut results = self.resolve_hits(page)?;
-
-        // 6. Highlighting: after pagination, so the cost is bounded by
-        // `limit × fields` analyzer passes.
-        if let (Some(options), Some(query)) = (&lexical_options.highlight, &highlight_query) {
-            self.apply_highlights(&mut results, query.as_ref(), options)?;
+        if new.is_empty() {
+            return Ok(());
         }
-
-        Ok(results)
+        let mut unknown = Vec::new();
+        for (doc_id, answer) in new.iter().zip(self.lexical.doc_values_batch(field, &new)?) {
+            match answer {
+                DocValueLookup::Value(value) => {
+                    keys.insert(*doc_id, Some(value));
+                }
+                DocValueLookup::Absent => {
+                    keys.insert(*doc_id, None);
+                }
+                DocValueLookup::Unknown => unknown.push(*doc_id),
+            }
+        }
+        if !unknown.is_empty() {
+            let mut stored = self.log.get_field_values_batch(&unknown, field)?;
+            for doc_id in unknown {
+                keys.insert(doc_id, stored.remove(&doc_id));
+            }
+        }
+        Ok(())
     }
 
     /// Fill [`highlights`](self::search::SearchResult::highlights) for every
@@ -3595,6 +3857,8 @@ impl Engine {
                     score,
                     document,
                     highlights: HashMap::new(),
+                    group_key: None,
+                    inner_hits: Vec::new(),
                 });
             }
         }
@@ -7225,5 +7489,178 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
+    }
+
+    fn grouping_doc(title: &str, parent: Option<&str>) -> Document {
+        let builder = Document::builder().add_text("title", title);
+        match parent {
+            Some(parent) => builder.add_text("parent", parent),
+            None => builder,
+        }
+        .build()
+    }
+
+    fn internal_id(engine: &Engine, external_id: &str) -> u64 {
+        engine
+            .log
+            .find_by_external_id(external_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Issue #1297: a DocValues lookup tells a document's value, a document
+    /// with no value (its segment has the column), and a document no column
+    /// answers for (its segment has no column, or the copy was deleted).
+    #[tokio::test]
+    async fn doc_values_batch_tells_values_absent_and_unknown_apart() {
+        use crate::lexical::search::searcher::DocValueLookup;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_text_field("title", crate::lexical::core::field::TextOption::default())
+            .add_text_field("parent", crate::lexical::core::field::TextOption::default())
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+
+        // The first segment has a `parent` column; "absent" has no value.
+        engine
+            .put_document("with", grouping_doc("one", Some("x")))
+            .await
+            .unwrap();
+        engine
+            .put_document("absent", grouping_doc("two", None))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        // No document of the second segment has `parent`: no column.
+        engine
+            .put_document("no_column", grouping_doc("three", None))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        // Re-adding "with" deletes its first copy.
+        let deleted = internal_id(&engine, "with");
+        engine
+            .put_document("with", grouping_doc("four", Some("y")))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        let doc_ids = [
+            internal_id(&engine, "with"),
+            internal_id(&engine, "absent"),
+            internal_id(&engine, "no_column"),
+            deleted,
+        ];
+        assert_ne!(doc_ids[0], deleted);
+        let answers = engine.lexical.doc_values_batch("parent", &doc_ids).unwrap();
+        assert_eq!(
+            answers,
+            vec![
+                DocValueLookup::Value(DataValue::Text("y".to_string())),
+                DocValueLookup::Absent,
+                DocValueLookup::Unknown,
+                DocValueLookup::Unknown,
+            ]
+        );
+    }
+
+    /// Issue #1297: a key no DocValues column answers for is read from the
+    /// stored document.
+    #[tokio::test]
+    async fn group_keys_fall_back_to_the_stored_document() {
+        use crate::lexical::core::field::IntegerOption;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_text_field("title", crate::lexical::core::field::TextOption::default())
+            .add_integer_field(
+                "rank",
+                IntegerOption {
+                    doc_values: false,
+                    ..Default::default()
+                },
+            )
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+        engine
+            .put_document(
+                "ranked",
+                Document::builder()
+                    .add_text("title", "one")
+                    .add_integer("rank", 7)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        engine
+            .put_document("unranked", grouping_doc("two", None))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        let (ranked, unranked) = (
+            internal_id(&engine, "ranked"),
+            internal_id(&engine, "unranked"),
+        );
+        let mut keys = ahash::AHashMap::new();
+        engine
+            .resolve_group_keys("rank", &[(ranked, 1.0), (unranked, 0.5)], &mut keys)
+            .unwrap();
+        assert_eq!(keys[&ranked], Some(DataValue::Int64(7)));
+        assert_eq!(keys[&unranked], None);
+    }
+
+    /// Issue #1297: a rescore that keeps its scores across the rounds of a
+    /// grouped search scores each candidate once.
+    #[tokio::test]
+    async fn rescore_scores_only_candidates_new_to_the_window() {
+        use crate::lexical::search::searcher::SortField;
+        use crate::vector::core::field::MultiVectorOption;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field(
+                "tokens",
+                schema::FieldOption::MultiVector(MultiVectorOption::new(2)),
+            )
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            let doc = Document::builder()
+                .add_vector_array("tokens", vec![vec![1.0, 0.0]])
+                .build();
+            engine.put_document(id, doc).await.unwrap();
+        }
+        engine.commit().await.unwrap();
+        let ranked: Vec<(u64, f32)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| (internal_id(&engine, id), 0.0))
+            .collect();
+
+        let options = self::search::RescoreOptions::late_interaction(
+            "tokens",
+            vec![Vector::new(vec![1.0, 0.0])],
+        )
+        .window_size(3);
+        let plan = self::rescore::RescorePlan::new(
+            &engine.schema.read(),
+            engine.vector.embedder(),
+            options,
+            &SortField::Score,
+        )
+        .unwrap();
+        let rescore = plan.prepare(None).await.unwrap();
+
+        let mut scores = self::rescore::RescoreScores::default();
+        rescore
+            .apply(&engine.vector, ranked[..3].to_vec(), &mut scores)
+            .unwrap();
+        assert_eq!(scores.scored, 3);
+        // The next round's window holds b, c and d: only d is new.
+        rescore
+            .apply(&engine.vector, ranked[1..].to_vec(), &mut scores)
+            .unwrap();
+        assert_eq!(scores.scored, 4);
     }
 }

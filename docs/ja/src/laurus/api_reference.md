@@ -137,6 +137,7 @@ cargo doc --open
 | `.vector_fields(Vec<FieldSelector>)` | フィールドを指定していないクエリベクトルの検索対象をこれらのフィールドに絞る（クエリベクトル自身のフィールド指定が優先） |
 | `.vector_overfetch(f32)` | フィールドごとのベクトル候補の overfetch 係数を設定（既定 `2.0`、`<= 1.0` で無効） |
 | `.rescore(RescoreOptions)` | 1段目の上位候補を late interaction で並べ替える（[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)） |
+| `.group_by(GroupBy)` | 順位付けした hit をフィールド値でグループ化する。`limit` と `offset` はグループの数を数える（[検索結果のグループ化](../concepts/search/result_grouping.md)） |
 | `.build()` | `SearchRequest` を構築 |
 
 ### VectorSearchRequestBuilder
@@ -161,6 +162,8 @@ cargo doc --open
 | `score` | `f32` | 関連度スコア（再採点した結果では late interaction のスコア） |
 | `document` | `Option<Document>` | ドキュメント内容（ロードされた場合） |
 | `highlights` | `HashMap<String, Vec<String>>` | `.highlight()` で要求したフィールドごとのハイライト済みフラグメント。未要求またはマッチなしの場合は空（[ハイライト](./highlighting.md)） |
+| `group_key` | `Option<DataValue>` | `.group_by()` を指定したとき、この結果のグループが共有する値。グループ化しない検索と、値のない hit では `None`（[検索結果のグループ化](../concepts/search/result_grouping.md)） |
+| `inner_hits` | `Vec<SearchResult>` | `.group_by()` を指定したとき、グループの 2 番目以降の hit（順位の順）。グループ化しない検索では空 |
 
 ### FusionAlgorithm
 
@@ -177,6 +180,14 @@ cargo doc --open
 | `RescoreOptions::late_interaction_text(field, text)` | 同上。クエリをテキストで渡し、フィールドのトークン単位の Embedder が埋め込む |
 | `.window_size(n)` | 再採点する1段目の上位候補の件数（デフォルト `100`、上限は `RescoreOptions::MAX_WINDOW_SIZE` = `10,000`） |
 | `Rescorer::LateInteraction { field, query }` | コンストラクタが作る再採点方法。`query` は `LateInteractionQuery::Vectors(Vec<Vector>)` か `LateInteractionQuery::Text(String)`。どちらの enum も `#[non_exhaustive]` |
+
+### GroupBy
+
+| 項目 | 説明 |
+| :--- | :--- |
+| `GroupBy::new(field)` | `field` でグループ化する。`_id` か、単一値で保存され `doc_values` が有効な `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールド（[グループ化に使えるフィールド](../concepts/search/result_grouping.md#グループ化に使えるフィールド)） |
+| `.group_size(n)` | 1 グループに残す hit の数。返る結果を含む（デフォルト `1`、上限は `GroupBy::MAX_GROUP_SIZE` = `100`） |
+| `GroupBy::MAX_CANDIDATES` | `10,000`。グループ化した検索が順位付けする候補の最大数で、受け付ける `offset + limit` の上限 |
 
 ## クエリタイプ（Lexical）
 

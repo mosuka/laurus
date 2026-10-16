@@ -337,6 +337,22 @@ impl DocValuesReader {
         Ok(Some(fdv))
     }
 
+    /// The `doc_id -> value` column of `field_name`, materialized on first
+    /// access, or `None` when this segment's `.dv` file has no column for
+    /// it.
+    ///
+    /// For callers that look up many documents of one segment (result
+    /// grouping, Issue #1297): they resolve the column once instead of
+    /// taking the cache lock per [`Self::get_value`] call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column exists but its payload cannot be read
+    /// or deserialized.
+    pub(crate) fn column(&self, field_name: &str) -> Result<Option<Arc<FieldDocValues>>> {
+        self.materialize(field_name)
+    }
+
     /// Get a value for a document and field, materializing the field's
     /// column on first access.
     ///

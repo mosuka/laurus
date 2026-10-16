@@ -228,6 +228,8 @@ Vector データを OS page cache に pre-fault します。HNSW グラフは常
 | `filter_query` | `Option<Box<dyn Query>>` | None | 両方の検索タイプに適用されるフィルタ |
 | `lexical_options` | `LexicalSearchOptions` | デフォルト | Lexical検索の動作パラメータ（ブースト、タイムアウト等） |
 | `vector_options` | `VectorSearchOptions` | デフォルト | Vector検索の動作パラメータ（スコアモード等） |
+| `rescore` | `Option<RescoreOptions>` | None | 1段目の上位候補を並べ替える再採点（[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)） |
+| `group_by` | `Option<GroupBy>` | None | 順位付けした hit のフィールド値によるグループ化。指定すると `limit` と `offset` はグループの数を数える（[検索結果のグループ化](../concepts/search/result_grouping.md)） |
 
 ### LexicalSearchOptions
 

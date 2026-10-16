@@ -137,6 +137,7 @@ A collection of named field values.
 | `.vector_fields(Vec<FieldSelector>)` | Restrict query vectors that name no field to these fields (a query vector's own fields take precedence) |
 | `.vector_overfetch(f32)` | Set the overfetch factor for per-field vector candidates (default `2.0`; `<= 1.0` disables it) |
 | `.rescore(RescoreOptions)` | Reorder the top first-stage candidates with late interaction ([Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)) |
+| `.group_by(GroupBy)` | Group the ranked hits by a field's value; `limit` and `offset` then count groups ([Result Grouping](../concepts/search/result_grouping.md)) |
 | `.build()` | Build the `SearchRequest` |
 
 ### LexicalSearchQuery
@@ -161,6 +162,8 @@ A collection of named field values.
 | `score` | `f32` | Relevance score (the late-interaction score for a rescored hit) |
 | `document` | `Option<Document>` | Document content (if loaded) |
 | `highlights` | `HashMap<String, Vec<String>>` | Highlighted fragments per field requested via `.highlight()`; empty when not requested or nothing matched ([Highlighting](./highlighting.md)) |
+| `group_key` | `Option<DataValue>` | With `.group_by()`: the value this result's group shares; `None` for an ungrouped search or a hit without a value ([Result Grouping](../concepts/search/result_grouping.md)) |
+| `inner_hits` | `Vec<SearchResult>` | With `.group_by()`: the group's next best hits, in ranking order; empty for an ungrouped search |
 
 ### FusionAlgorithm
 
@@ -177,6 +180,14 @@ A collection of named field values.
 | `RescoreOptions::late_interaction_text(field, text)` | Same, with query text that the field's token-level embedder embeds |
 | `.window_size(n)` | How many top first-stage candidates to rescore (default `100`, at most `RescoreOptions::MAX_WINDOW_SIZE` = `10,000`) |
 | `Rescorer::LateInteraction { field, query }` | The rescorer the constructors build; `query` is `LateInteractionQuery::Vectors(Vec<Vector>)` or `LateInteractionQuery::Text(String)`. Both enums are `#[non_exhaustive]` |
+
+### GroupBy
+
+| Item | Description |
+| :--- | :--- |
+| `GroupBy::new(field)` | Group by `field`: `_id`, or a single-valued, stored `Text`, `Integer`, `Float`, `Boolean` or `DateTime` field with `doc_values` ([Result Grouping](../concepts/search/result_grouping.md#grouping-fields)) |
+| `.group_size(n)` | Hits kept per group, the returned result included (default `1`, at most `GroupBy::MAX_GROUP_SIZE` = `100`) |
+| `GroupBy::MAX_CANDIDATES` | `10,000`: the largest candidate pool a grouped search ranks, and the largest `offset + limit` it accepts |
 
 ## Query Types (Lexical)
 

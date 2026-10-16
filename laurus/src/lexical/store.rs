@@ -574,6 +574,32 @@ impl LexicalStore {
         self.with_searcher(|searcher| searcher.search(request))
     }
 
+    /// The DocValues value of `field` for each of `doc_ids`, in the same
+    /// order, read through the cached searcher so it sees the same snapshot
+    /// as [`Self::search`] (Issue #1297).
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The DocValues field.
+    /// * `doc_ids` - The internal document ids to look up.
+    ///
+    /// # Returns
+    ///
+    /// One [`DocValueLookup`](crate::lexical::search::searcher::DocValueLookup)
+    /// per id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the searcher fails or a segment's
+    /// DocValues cannot be read.
+    pub(crate) fn doc_values_batch(
+        &self,
+        field: &str,
+        doc_ids: &[u64],
+    ) -> Result<Vec<crate::lexical::search::searcher::DocValueLookup>> {
+        self.with_searcher(|searcher| searcher.doc_values_batch(field, doc_ids))
+    }
+
     /// Run `f` against the cached searcher, building it first if the cache
     /// is empty.
     ///
@@ -2121,5 +2147,31 @@ mod tests {
         // Non-existent
         let not_found = engine.find_doc_ids_by_term("_id", "ext_999").unwrap();
         assert!(not_found.is_empty());
+    }
+
+    /// Issue #1297: a segment whose doc-id range spans a document it does
+    /// not hold does not answer for it, so the segment that holds it does.
+    #[test]
+    fn doc_values_batch_skips_a_segment_that_only_spans_the_id() {
+        use crate::lexical::search::searcher::DocValueLookup;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let doc = |parent: &str| Document::builder().add_text("parent", parent).build();
+        // The first segment holds 1 and 3, so its range [1, 3] spans 2.
+        store.upsert_document(1, doc("x")).unwrap();
+        store.upsert_document(3, doc("z")).unwrap();
+        store.commit().unwrap();
+        store.upsert_document(2, doc("y")).unwrap();
+        store.commit().unwrap();
+
+        assert_eq!(
+            store.doc_values_batch("parent", &[2, 1, 3]).unwrap(),
+            vec![
+                DocValueLookup::Value(crate::data::DataValue::Text("y".into())),
+                DocValueLookup::Value(crate::data::DataValue::Text("x".into())),
+                DocValueLookup::Value(crate::data::DataValue::Text("z".into())),
+            ]
+        );
     }
 }

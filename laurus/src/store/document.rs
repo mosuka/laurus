@@ -785,6 +785,73 @@ impl UnifiedDocumentStore {
         Ok(results)
     }
 
+    /// The value of `field` in the stored documents of `doc_ids`, for a
+    /// caller that needs one field of many documents rather than the
+    /// documents (result grouping, Issue #1297).
+    ///
+    /// Unlike [`get_documents_batch`](Self::get_documents_batch), documents
+    /// read from segments are not added to the document cache, and cached
+    /// documents keep their recency: a lookup over a large candidate pool
+    /// would otherwise evict the documents other searches return.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_ids` - Internal document IDs to look up.
+    /// * `field` - The stored field to read.
+    ///
+    /// # Returns
+    ///
+    /// A map of doc_id to the field's value, for every document found that
+    /// has the field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError`] on storage I/O or deserialization failure, or
+    /// if a segment holding a requested document is corrupted.
+    pub fn get_field_values_batch(
+        &self,
+        doc_ids: &[u64],
+        field: &str,
+    ) -> Result<HashMap<u64, crate::data::DataValue>> {
+        let mut results = HashMap::new();
+        let mut remaining = std::collections::HashSet::new();
+        {
+            let cache = self.doc_cache.lock();
+            for &doc_id in doc_ids {
+                match self
+                    .pending_docs
+                    .get(&doc_id)
+                    .or_else(|| cache.peek(&doc_id))
+                {
+                    Some(doc) => {
+                        if let Some(value) = doc.fields.get(field) {
+                            results.insert(doc_id, value.clone());
+                        }
+                    }
+                    None => {
+                        remaining.insert(doc_id);
+                    }
+                }
+            }
+        }
+        if remaining.is_empty() {
+            return Ok(results);
+        }
+
+        // Oldest segment first, so a newer copy overwrites an older one, as
+        // in `get_documents_batch`.
+        let mut loaded: HashMap<u64, Document> = HashMap::new();
+        for reader in &self.readers {
+            loaded.extend(reader.get_documents_batch(&remaining)?);
+        }
+        for (doc_id, mut doc) in loaded {
+            if let Some(value) = doc.fields.remove(field) {
+                results.insert(doc_id, value);
+            }
+        }
+        Ok(results)
+    }
+
     /// Finds the first internal document ID whose `_id` field matches the given external ID.
     ///
     /// Pending documents are searched first, then committed segments in reverse order.
@@ -957,6 +1024,41 @@ mod tests {
         store.commit().unwrap();
         let name = store.segments()[0].file_name();
         (store, name)
+    }
+
+    /// Issue #1297: reading one field of many documents takes it from
+    /// pending, cached and committed documents alike, and leaves the
+    /// document cache as it was.
+    #[test]
+    fn get_field_values_batch_reads_one_field_without_caching() {
+        let mut store = UnifiedDocumentStore::new(memory_storage());
+        store.add_document(doc("ext-1", "alpha")).unwrap();
+        store.add_document(doc("ext-2", "beta")).unwrap();
+        store
+            .add_document(Document::builder().add_text("_id", "ext-3").build())
+            .unwrap();
+        store.commit().unwrap();
+        store.add_document(doc("ext-4", "delta")).unwrap();
+        store
+            .get_document(1)
+            .unwrap()
+            .expect("document 1 is committed");
+        assert_eq!(store.doc_cache.lock().len(), 1);
+
+        let values = store
+            .get_field_values_batch(&[1, 2, 3, 4, 99], "title")
+            .unwrap();
+
+        let text = |value: &str| crate::data::DataValue::Text(value.to_string());
+        assert_eq!(
+            values,
+            HashMap::from([(1, text("alpha")), (2, text("beta")), (4, text("delta"))])
+        );
+        assert_eq!(
+            store.doc_cache.lock().len(),
+            1,
+            "documents read from segments are not cached"
+        );
     }
 
     /// A segment corrupted after the commit that wrote it is reported by

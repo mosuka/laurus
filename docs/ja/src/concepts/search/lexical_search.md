@@ -488,4 +488,5 @@ let config = LexicalIndexConfig::builder()
 
 - 意味的類似性検索: [Vector 検索](vector_search.md)
 - Lexical + Vector の組み合わせ: [ハイブリッド検索](hybrid_search.md)
+- chunk に分けた文書を 1 回ずつ返す: [検索結果のグループ化](result_grouping.md)
 - DSL の完全な構文リファレンス: [Query DSL](../query_dsl.md)

@@ -23,6 +23,7 @@
   - [Lexical 検索](concepts/search/lexical_search.md)
   - [Vector 検索](concepts/search/vector_search.md)
   - [ハイブリッド検索](concepts/search/hybrid_search.md)
+  - [検索結果のグループ化](concepts/search/result_grouping.md)
 - [Query DSL](concepts/query_dsl.md)
 - [BKD-Tree](concepts/bkd_tree.md)
 - [3D 地理検索 (ECEF)](concepts/geo3d.md)

@@ -337,5 +337,6 @@ async fn main() -> laurus::Result<()> {
 ## Next Steps
 
 - Full query syntax reference: [Query DSL](../query_dsl.md)
+- Return each chunked document once: [Result Grouping](result_grouping.md)
 - Understand ID resolution: [ID Management](../../laurus/id_management.md)
 - Data durability: [Persistence & WAL](../../laurus/persistence.md)

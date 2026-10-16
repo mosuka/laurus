@@ -221,6 +221,19 @@ impl RescorePlan {
     }
 }
 
+/// Late-interaction scores kept across calls of [`PreparedRescore::apply`]
+/// within one search (Issue #1297).
+#[derive(Debug, Default)]
+pub(super) struct RescoreScores {
+    /// The field's snapshot, taken on the first call that has candidates.
+    snapshot: Option<MultiVectorSnapshot>,
+    /// Each scored candidate's score; `None` for one without token vectors.
+    scores: ahash::AHashMap<u64, Option<f32>>,
+    /// How many candidates were scored over every call.
+    #[cfg(test)]
+    pub(super) scored: usize,
+}
+
 /// Validated rescore options, ready to apply.
 #[derive(Debug)]
 pub(super) struct PreparedRescore {
@@ -245,6 +258,13 @@ impl PreparedRescore {
     /// order with their first-stage score, then every candidate beyond the
     /// window, unchanged.
     ///
+    /// Scores go through `scores`: a candidate that an earlier call with the
+    /// same `scores` already scored keeps that score, and every call reads
+    /// the field's snapshot taken by the first one. A grouped search (Issue
+    /// #1297) reranks a growing candidate pool over several rounds, and its
+    /// window shifts as the first stage widens, so only candidates new to the
+    /// window are scored. Any other search passes fresh `scores`.
+    ///
     /// # Errors
     ///
     /// Returns an error when the field's segments fail to load or no longer
@@ -253,25 +273,46 @@ impl PreparedRescore {
         &self,
         store: &VectorStore,
         mut ranked: Vec<(u64, f32)>,
+        scores: &mut RescoreScores,
     ) -> Result<Vec<(u64, f32)>> {
         let tail = ranked.split_off(self.window_size.min(ranked.len()));
         if ranked.is_empty() {
             return Ok(tail);
         }
 
-        let snapshot = store.multi_vector_snapshot(&self.field)?;
-        if snapshot.dimension() != self.dimension {
-            return Err(LaurusError::InvalidOperation(format!(
-                "field '{}' changed dimension during the search",
-                self.field
-            )));
+        let snapshot = match scores.snapshot.take() {
+            Some(snapshot) => snapshot,
+            None => {
+                let taken = store.multi_vector_snapshot(&self.field)?;
+                if taken.dimension() != self.dimension {
+                    return Err(LaurusError::InvalidOperation(format!(
+                        "field '{}' changed dimension during the search",
+                        self.field
+                    )));
+                }
+                taken
+            }
+        };
+        let snapshot = &*scores.snapshot.insert(snapshot);
+        let unseen: Vec<(u64, f32)> = ranked
+            .iter()
+            .filter(|(doc_id, _)| !scores.scores.contains_key(doc_id))
+            .copied()
+            .collect();
+        if !unseen.is_empty() {
+            for ((doc_id, _), score) in unseen.iter().zip(self.score(snapshot, &unseen)?) {
+                scores.scores.insert(*doc_id, score);
+            }
         }
-        let scores = self.score(&snapshot, &ranked)?;
+        #[cfg(test)]
+        {
+            scores.scored += unseen.len();
+        }
 
         let mut rescored = Vec::with_capacity(ranked.len() + tail.len());
         let mut unscored = Vec::new();
-        for ((doc_id, first_stage), score) in ranked.into_iter().zip(scores) {
-            match score {
+        for (doc_id, first_stage) in ranked {
+            match scores.scores.get(&doc_id).copied().flatten() {
                 Some(score) => rescored.push((doc_id, score)),
                 None => unscored.push((doc_id, first_stage)),
             }
