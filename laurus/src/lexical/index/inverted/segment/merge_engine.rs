@@ -987,11 +987,9 @@ impl MergeEngine {
             analyzed.stored_fields = stored.fields.into_iter().collect();
 
             // Field lengths are read back from the segment so BM25 length
-            // normalization is preserved -- exactly for a source segment
-            // still on `.lens`/`.fstats`, or up to the `.norms` quantisation
-            // (Issue #555) once the source has already been through it; the
-            // quantisation is idempotent, so re-merging a `.norms` segment
-            // does not compound the rounding.
+            // normalization is preserved, up to the `.norms` quantisation
+            // (Issue #555); the quantisation is idempotent, so re-merging a
+            // `.norms` segment does not compound the rounding.
             let mut indexed_fields: AHashSet<String> =
                 analyzed.field_terms.keys().cloned().collect();
             indexed_fields.extend(recorded_length_fields.iter().cloned());

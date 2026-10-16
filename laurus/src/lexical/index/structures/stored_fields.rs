@@ -45,9 +45,9 @@
 //!   space it actually has to fit in once decompressed.
 //! - **Format break, no legacy reader.** A missing/mismatched magic is rejected outright
 //!   (mirroring `bkd_tree`'s "pre-release, format changes do not support older revisions"
-//!   policy) rather than keeping a second, permanently-maintained decoder for the old
-//!   uncompressed layout — which, unlike `.norms`'s `.lens`/`.fstats` migration, could not even
-//!   be made fully correct: the pre-#548 format has two independent decode bugs of its own (a
+//!   policy, which `.norms` also follows for `.lens`/`.fstats` since #1121) rather than keeping a
+//!   second, permanently-maintained decoder for the old uncompressed layout — which could not
+//!   even be made fully correct: the pre-#548 format has two independent decode bugs of its own (a
 //!   stored `Bytes` field desyncs every later field in the segment; a stored `Vector` field
 //!   always errored) that this rewrite fixes. The separate `.json`-mirror legacy fallback
 //!   (pre-#756 segments, in `SegmentReader::load_stored_documents`) is unrelated and unaffected.

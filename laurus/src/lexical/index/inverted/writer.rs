@@ -1628,9 +1628,9 @@ impl InvertedIndexWriter {
         self.write_inverted_index(&mut sink, &norms)?;
         self.write_stored_documents(&mut sink)?;
         // `.lens`/`.fstats` are no longer written (#555 Phase 5); `.norms`
-        // is the sole field-length/statistics source for new segments. Old
-        // segments that still carry `.lens`/`.fstats` remain readable via
-        // `SegmentNorms::Legacy` until their next merge.
+        // is the sole field-length/statistics source. A segment that still
+        // carries `.lens`/`.fstats` instead is refused with a rebuild error
+        // (#1121).
         self.write_norms(&mut sink, &norms)?;
         // The same sorted, deduplicated ids the `.norms` slot map records.
         self.write_doc_ids(&mut sink, norms.doc_ids())?;

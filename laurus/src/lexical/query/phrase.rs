@@ -514,11 +514,9 @@ impl Query for PhraseQuery {
         let phrase_matches =
             PhraseMatcher::find_phrase_matches(reader, &self.field, &self.positions, self.slop)?;
 
-        // Get field statistics
-        let avg_field_length = match reader.field_statistics(&self.field) {
-            Ok(field_stats) => field_stats.avg_field_length,
-            Err(_) => 10.0, // Default fallback
-        };
+        // A field with no statistics already gets a default average; an error
+        // (a corrupt or pre-`.norms` segment) must reach the caller instead.
+        let avg_field_length = reader.field_statistics(&self.field)?.avg_field_length;
 
         // Apply boost multiplier for phrase queries (phrases are generally more valuable)
         let phrase_boost = self.boost * (1.0 + 0.2 * (self.positions.len() as f32 - 1.0));

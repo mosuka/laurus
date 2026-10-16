@@ -254,26 +254,28 @@ impl GraphPhraseQuery {
 
     /// A phrase scorer over `matches`, like `PhraseQuery`'s, with the
     /// length boost of the longest path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field's statistics cannot be read, such as
+    /// from a corrupt or pre-`.norms` segment.
     fn scorer_for(
         &self,
         reader: &dyn LexicalIndexReader,
         matches: &[PhraseMatch],
-    ) -> Box<dyn Scorer> {
+    ) -> Result<Box<dyn Scorer>> {
         let total_docs = reader.doc_count();
         if total_docs == 0 {
-            return Box::new(BM25Scorer::new(0, 0, 0, 1.0, 1, self.boost));
+            return Ok(Box::new(BM25Scorer::new(0, 0, 0, 1.0, 1, self.boost)));
         }
-        let avg_field_length = reader
-            .field_statistics(&self.field)
-            .map(|stats| stats.avg_field_length)
-            .unwrap_or(10.0);
+        let avg_field_length = reader.field_statistics(&self.field)?.avg_field_length;
         let boost = self.boost * (1.0 + 0.2 * (self.longest as f32 - 1.0));
-        Box::new(PhraseScorer::new(
+        Ok(Box::new(PhraseScorer::new(
             matches,
             total_docs,
             avg_field_length,
             boost,
-        ))
+        )))
     }
 }
 
@@ -335,7 +337,7 @@ impl Query for GraphPhraseQuery {
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
         let matches = self.find_matches(reader)?;
-        Ok(self.scorer_for(reader, &matches))
+        self.scorer_for(reader, &matches)
     }
 
     fn matcher_scorer(
@@ -343,7 +345,7 @@ impl Query for GraphPhraseQuery {
         reader: &dyn LexicalIndexReader,
     ) -> Result<(Box<dyn Matcher>, Box<dyn Scorer>)> {
         let matches = self.find_matches(reader)?;
-        let scorer = self.scorer_for(reader, &matches);
+        let scorer = self.scorer_for(reader, &matches)?;
         Ok((Box::new(PhraseMatcher::from_matches(matches)), scorer))
     }
 

@@ -609,9 +609,9 @@ pub(crate) fn read_doc_ids_from<R: StorageInput>(input: R) -> Result<roaring::Ro
 impl NormsReader {
     /// Load `{segment_id}.norms` from `storage`.
     ///
-    /// `Ok(None)` means the file does not exist — a segment written before
-    /// #555 — and is not an error. Every segment written since has one,
-    /// including a segment whose documents record no field lengths at all.
+    /// `Ok(None)` means the file does not exist; the caller decides what
+    /// that means. Every segment written since #555 has one, including a
+    /// segment whose documents record no field lengths at all.
     ///
     /// # Errors
     ///
@@ -690,6 +690,20 @@ impl NormsReader {
             columns,
             column_index,
         }))
+    }
+
+    /// A reader that records no document and no field: every length and
+    /// statistic lookup answers `None`, as for a `.norms` file whose
+    /// documents record no field lengths.
+    pub(crate) fn empty() -> Self {
+        NormsReader {
+            slot_map: SlotMap::Contiguous {
+                min_doc_id: 0,
+                count: 0,
+            },
+            columns: Vec::new(),
+            column_index: AHashMap::new(),
+        }
     }
 
     /// `field`'s column, or `None` when this segment records no length for
