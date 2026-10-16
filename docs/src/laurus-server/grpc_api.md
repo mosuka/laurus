@@ -416,6 +416,9 @@ Execute a search query and stream results back one at a time.
 rpc SearchStream(SearchRequest) returns (stream SearchResult);
 ```
 
+With `group_by`, each message is one group: its best hit, with the group's
+next best hits in `inner_hits`.
+
 ### SearchRequest Fields
 
 | Field | Type | Required | Description |
@@ -430,6 +433,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `field_boosts` | `map<string, float>` | No | Per-field score boosting for the lexical part. A key must name a lexical field of the schema (or `_id`); an unknown or vector field is rejected with `INVALID_ARGUMENT` (Issue #1374). A lexical field the query does not use is accepted and has no effect |
 | `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
 | `rescore` | `RescoreParams` | No | Rescore the top first-stage results with late interaction (Issue #1351) |
+| `group_by` | `GroupByParams` | No | Group the results by a field's value; `limit` and `offset` then count groups (Issue #1297) |
 
 At least one of `query` or `query_vectors` must be provided.
 
@@ -547,6 +551,21 @@ field without a token-level embedder, or a rescore combined with
 `lexical_params.sort_by` is rejected with `INVALID_ARGUMENT`, as is a
 `RescoreParams` without `late_interaction` or a query.
 
+### GroupByParams
+
+Folds the ranked results (after fusion and rescore) that share a field's
+value into groups, ordered by each group's best result (Issue #1297). See
+[Result Grouping](../concepts/search/result_grouping.md) for the rules.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `field` | `string` | `_id`, or a single-valued, stored `Text`, `Integer`, `Float`, `Boolean` or `DateTime` field with `doc_values`. A result with no value forms a group of its own |
+| `group_size` | `optional uint32` | Results kept per group, the returned one included, 1 to 100. Unset means 1 |
+
+The engine validates the values: a field that cannot group, a `group_size`
+outside 1 to 100, or an `offset + limit` above 10,000 is rejected with
+`INVALID_ARGUMENT`.
+
 ### SearchResult
 
 | Field | Type | Description |
@@ -555,6 +574,8 @@ field without a token-level embedder, or a rescore combined with
 | `score` | `float` | Relevance score; for a rescored result, its late-interaction (MaxSim) score |
 | `document` | `Document` | Document content |
 | `highlights` | `map<string, Highlights>` | Highlighted fragments per field named in `SearchRequest.highlight.fields`. A field with no highlight is absent from this map |
+| `group_key` | `Value` | With `group_by`: the value this result's group shares. Unset for an ungrouped search and for a result without a value |
+| `inner_hits` | `repeated SearchResult` | With `group_by`: the group's next best results, in ranking order. Each carries the same `group_key` and has no `inner_hits` of its own |
 
 ### Example
 
@@ -619,6 +640,38 @@ With pre-computed query token vectors instead of text:
     "field": "body_colbert",
     "vectors": {"dimension": 2, "values": [1.0, 0.0, 0.0, 1.0]}
   }
+}
+```
+
+### Example: Grouping
+
+Documents added as chunks with `AddDocuments` share their `_id`; grouping by
+it returns each document once, with up to one more of its chunks:
+
+```json
+{
+  "query": "body:rust",
+  "limit": 10,
+  "group_by": {"field": "_id", "group_size": 2}
+}
+```
+
+Each `SearchResult` is then a group's best chunk:
+
+```json
+{
+  "id": "manual",
+  "score": 0.012571429,
+  "document": {"fields": {"body": {"text_value": "Rust ownership rules for Rust programs"}}},
+  "group_key": {"text_value": "manual"},
+  "inner_hits": [
+    {
+      "id": "manual",
+      "score": 0.012359549,
+      "document": {"fields": {"body": {"text_value": "Borrowing in Rust"}}},
+      "group_key": {"text_value": "manual"}
+    }
+  ]
 }
 ```
 

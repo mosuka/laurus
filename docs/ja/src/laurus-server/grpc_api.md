@@ -415,6 +415,9 @@ rpc Search(SearchRequest) returns (SearchResponse);
 rpc SearchStream(SearchRequest) returns (stream SearchResult);
 ```
 
+`group_by` を指定すると、各メッセージは 1 つのグループになります。グループの
+最上位の結果で、グループの 2 番目以降の結果は `inner_hits` に入ります。
+
 ### SearchRequest フィールド
 
 | フィールド | 型 | 必須 | 説明 |
@@ -429,6 +432,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `field_boosts` | `map<string, float>` | いいえ | lexical 部分のフィールドごとのスコアブースト。キーはスキーマの lexical フィールド（または `_id`）でなければならず、未知のフィールドやベクトルフィールドは `INVALID_ARGUMENT` で拒否される（Issue #1374）。クエリで使っていない lexical フィールドは受け付けられ、効果は無い |
 | `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
 | `rescore` | `RescoreParams` | いいえ | 1 段目の上位の結果を late interaction で再採点する（Issue #1351） |
+| `group_by` | `GroupByParams` | いいえ | 結果をフィールド値でグループ化する。指定すると `limit` と `offset` はグループの数を数える（Issue #1297） |
 
 `query` または `query_vectors` のいずれか 1 つ以上を指定する必要があります。
 
@@ -533,6 +537,21 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 テキスト、`lexical_params.sort_by` との併用は、`INVALID_ARGUMENT` で拒否されます。
 `late_interaction` やクエリのない `RescoreParams` も同じです。
 
+### GroupByParams
+
+順位付けした結果（融合と再採点の後）のうち、フィールド値が同じものを 1 つの
+グループにまとめ、各グループの最上位の結果の順に並べます（Issue #1297）。規則は
+[検索結果のグループ化](../concepts/search/result_grouping.md)を参照してください。
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `field` | `string` | `_id`、または単一値で保存され `doc_values` が有効な `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールド。値のない結果は単独のグループになる |
+| `group_size` | `optional uint32` | 1 グループに残す結果の数。返る結果を含めて 1〜100。未設定は 1 |
+
+値はエンジンが検査します。グループ化に使えないフィールド、1〜100 の範囲外の
+`group_size`、10,000 を超える `offset + limit` は、`INVALID_ARGUMENT` で拒否
+されます。
+
 ### SearchResult
 
 | フィールド | 型 | 説明 |
@@ -541,6 +560,8 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `score` | `float` | 関連度スコア。再採点した結果では late interaction（MaxSim）のスコア |
 | `document` | `Document` | ドキュメントの内容 |
 | `highlights` | `map<string, Highlights>` | `SearchRequest.highlight.fields` で指定したフィールドごとのハイライト済みフラグメント。ハイライトがないフィールドはこのマップに現れない |
+| `group_key` | `Value` | `group_by` を指定したとき、この結果のグループが共有する値。グループ化しない検索と、値のない結果では未設定 |
+| `inner_hits` | `repeated SearchResult` | `group_by` を指定したとき、グループの 2 番目以降の結果（順位の順）。各結果は同じ `group_key` を持ち、自身の `inner_hits` は持たない |
 
 ### 例
 
@@ -605,6 +626,38 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
     "field": "body_colbert",
     "vectors": {"dimension": 2, "values": [1.0, 0.0, 0.0, 1.0]}
   }
+}
+```
+
+### 例: グループ化
+
+`AddDocuments` で chunk として登録した文書は `_id` を共有します。`_id` で
+グループ化すると、各文書が 1 回ずつ、その chunk を最大 1 件添えて返ります。
+
+```json
+{
+  "query": "body:rust",
+  "limit": 10,
+  "group_by": {"field": "_id", "group_size": 2}
+}
+```
+
+各 `SearchResult` は、グループの最上位の chunk になります。
+
+```json
+{
+  "id": "manual",
+  "score": 0.012571429,
+  "document": {"fields": {"body": {"text_value": "Rust ownership rules for Rust programs"}}},
+  "group_key": {"text_value": "manual"},
+  "inner_hits": [
+    {
+      "id": "manual",
+      "score": 0.012359549,
+      "document": {"fields": {"body": {"text_value": "Borrowing in Rust"}}},
+      "group_key": {"text_value": "manual"}
+    }
+  ]
 }
 ```
 

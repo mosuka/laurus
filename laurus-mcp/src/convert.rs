@@ -279,10 +279,25 @@ pub fn json_to_rescore_params(json_str: &str) -> anyhow::Result<v1::RescoreParam
     laurus_server::convert::search::rescore_params_from_json(&val).map_err(anyhow::Error::msg)
 }
 
+/// Parse the `group_by` parameter of the `search` and `search_batch` tools
+/// (Issue #1297): the same shape as the HTTP gateway's `group_by`,
+/// `{"field": "_id", "group_size": 3}`.
+///
+/// # Errors
+///
+/// Returns an error if the JSON is malformed or does not have that shape;
+/// the server validates the values (field, size).
+pub fn json_to_group_by_params(json_str: &str) -> anyhow::Result<v1::GroupByParams> {
+    let val: Value = serde_json::from_str(json_str)?;
+    laurus_server::convert::search::group_by_params_from_json(&val).map_err(anyhow::Error::msg)
+}
+
 /// Convert a proto [`v1::SearchResult`] to the JSON shape every MCP search
-/// tool returns: `{"id", "score", "fields", "highlights"?}`. `"highlights"`
-/// is present only when at least one field actually highlighted, matching
-/// the HTTP gateway's `proto_search_result_to_json` (Issue #1134).
+/// tool returns: `{"id", "score", "fields", "highlights"?, "group_key"?,
+/// "inner_hits"?}`. `"highlights"` is present only when at least one field
+/// actually highlighted (Issue #1134); `"group_key"` only when set and
+/// `"inner_hits"` only when non-empty (Issue #1297), matching the HTTP
+/// gateway's `proto_search_result_to_json`.
 pub fn search_result_to_json(result: &v1::SearchResult) -> Value {
     let mut obj = json!({
         "id": result.id,
@@ -295,6 +310,18 @@ pub fn search_result_to_json(result: &v1::SearchResult) -> Value {
                 .highlights
                 .iter()
                 .map(|(field, highlights)| (field.clone(), json!(highlights.fragments)))
+                .collect(),
+        );
+    }
+    if let Some(group_key) = &result.group_key {
+        obj["group_key"] = proto_value_to_json(group_key);
+    }
+    if !result.inner_hits.is_empty() {
+        obj["inner_hits"] = Value::Array(
+            result
+                .inner_hits
+                .iter()
+                .map(search_result_to_json)
                 .collect(),
         );
     }
@@ -485,6 +512,7 @@ mod tests {
             score: 0.5,
             document: None,
             highlights,
+            ..Default::default()
         };
 
         let json = search_result_to_json(&result);
@@ -501,10 +529,51 @@ mod tests {
             score: 0.5,
             document: None,
             highlights: HashMap::new(),
+            ..Default::default()
         };
 
         let json = search_result_to_json(&result);
         assert!(json.get("highlights").is_none());
+    }
+
+    /// Issue #1297: the `group_by` parameter has the HTTP gateway's shape.
+    #[test]
+    fn test_json_to_group_by_params() {
+        let params = json_to_group_by_params(r#"{"field": "_id", "group_size": 3}"#).unwrap();
+        assert_eq!(params.field, "_id");
+        assert_eq!(params.group_size, Some(3));
+
+        assert!(json_to_group_by_params("not json").is_err());
+        let err = json_to_group_by_params(r#"{"group_size": 3}"#).unwrap_err();
+        assert!(err.to_string().contains("group_by.field"), "{err}");
+    }
+
+    /// Issue #1297: a grouped result carries its group key and its inner
+    /// hits, each in the same shape; an ungrouped one gains neither key.
+    #[test]
+    fn test_search_result_to_json_includes_groups_when_present() {
+        let hit = |id: &str| v1::SearchResult {
+            id: id.to_string(),
+            score: 0.5,
+            group_key: Some(int_value(2024)),
+            ..Default::default()
+        };
+        let leader = v1::SearchResult {
+            inner_hits: vec![hit("b")],
+            ..hit("a")
+        };
+
+        let json = search_result_to_json(&leader);
+        assert_eq!(json["group_key"], json!(2024));
+        assert_eq!(json["inner_hits"][0]["id"], json!("b"));
+        assert_eq!(json["inner_hits"][0]["group_key"], json!(2024));
+
+        let ungrouped = search_result_to_json(&v1::SearchResult {
+            id: "a".to_string(),
+            ..Default::default()
+        });
+        assert!(ungrouped.get("group_key").is_none(), "{ungrouped}");
+        assert!(ungrouped.get("inner_hits").is_none(), "{ungrouped}");
     }
 
     #[test]

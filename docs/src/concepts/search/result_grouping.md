@@ -35,6 +35,12 @@ for result in engine.search(request).await? {
 }
 ```
 
+Besides the Rust API, grouping is available over
+[gRPC](../../laurus-server/grpc_api.md#groupbyparams) and the
+[HTTP gateway](../../laurus-server/http_gateway.md#search-with-grouping), in
+the [MCP `search` and `search_batch` tools](../../laurus-mcp/tools.md#group-by-example)
+and in [`laurus search --group-by`](../../laurus-cli/commands.md#search).
+
 ## How It Works
 
 ```text

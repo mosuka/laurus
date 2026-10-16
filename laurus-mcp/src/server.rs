@@ -188,6 +188,19 @@ struct SearchParams {
     /// - `{"late_interaction": {"field": "body_colbert", "text": "how do lifetimes work"}}`
     /// - `{"window_size": 50, "late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}`
     rescore: Option<String>,
+
+    /// Group the results by a field's value, as a JSON string (Issue
+    /// #1297). Each result is then a group's best hit, its `inner_hits` hold
+    /// the group's next best hits, its `group_key` the shared value, and
+    /// `limit`/`offset` count groups. `field` is `_id` (chunks added under
+    /// one id share it) or a single-valued, stored Text, Integer, Float,
+    /// Boolean or DateTime field; `group_size` (default 1, at most 100) is
+    /// how many hits each group keeps.
+    ///
+    /// Examples:
+    /// - `{"field": "_id"}` — each document once, by its best chunk
+    /// - `{"field": "parent", "group_size": 3}`
+    group_by: Option<String>,
 }
 
 /// Parameters for the `search_batch` tool.
@@ -208,6 +221,11 @@ struct SearchBatchParams {
     /// format as the `search` tool's `highlight` parameter. Applied
     /// identically to every query in the batch (Issue #1134).
     highlight: Option<String>,
+
+    /// Group each query's results by a field's value, as a JSON string —
+    /// same format as the `search` tool's `group_by` parameter. Applied
+    /// identically to every query in the batch (Issue #1297).
+    group_by: Option<String>,
 }
 
 /// Parameters for the `add_field` tool.
@@ -898,7 +916,7 @@ impl LaurusMcpServer {
 
     /// Search documents using the laurus unified query DSL.
     #[tool(
-        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field). Returns JSON with total count and array of results (id, score, fields, highlights when requested via the highlight parameter)."
+        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Returns JSON with total count and array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped)."
     )]
     async fn search(
         &self,
@@ -913,55 +931,9 @@ impl LaurusMcpServer {
             }
         };
 
-        // Parse optional fusion algorithm
-        let fusion = if let Some(ref fusion_json) = params.fusion {
-            match convert::json_to_fusion_algorithm(fusion_json) {
-                Ok(f) => Some(f),
-                Err(e) => return Ok(Self::tool_error(format!("Invalid fusion JSON: {e}"))),
-            }
-        } else {
-            None
-        };
-
-        // Parse optional field boosts
-        let field_boosts = if let Some(ref boosts_json) = params.field_boosts {
-            match convert::json_to_field_boosts(boosts_json) {
-                Ok(b) => b,
-                Err(e) => return Ok(Self::tool_error(format!("Invalid field_boosts JSON: {e}"))),
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        // Parse optional highlight request (Issue #1134)
-        let highlight = if let Some(ref highlight_json) = params.highlight {
-            match convert::json_to_highlight_params(highlight_json) {
-                Ok(h) => Some(h),
-                Err(e) => return Ok(Self::tool_error(format!("Invalid highlight JSON: {e}"))),
-            }
-        } else {
-            None
-        };
-
-        // Parse optional rescore (Issue #1351)
-        let rescore = if let Some(ref rescore_json) = params.rescore {
-            match convert::json_to_rescore_params(rescore_json) {
-                Ok(r) => Some(r),
-                Err(e) => return Ok(Self::tool_error(format!("Invalid rescore JSON: {e}"))),
-            }
-        } else {
-            None
-        };
-
-        let request = SearchRequest {
-            query: params.query,
-            limit: params.limit.unwrap_or(10),
-            offset: params.offset.unwrap_or(0),
-            fusion,
-            field_boosts,
-            highlight,
-            rescore,
-            ..Default::default()
+        let request = match search_request(params) {
+            Ok(request) => request,
+            Err(e) => return Ok(Self::tool_error(e)),
         };
 
         match SearchServiceClient::new(channel).search(request).await {
@@ -986,7 +958,7 @@ impl LaurusMcpServer {
     }
 
     #[tool(
-        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset and highlight settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the total count and results (id, score, fields, highlights when requested) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
+        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset, highlight and group_by settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the total count and results (id, score, fields, highlights when requested, group_key and inner_hits when grouped) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
     )]
     async fn search_batch(
         &self,
@@ -1008,32 +980,10 @@ impl LaurusMcpServer {
             )]));
         }
 
-        // Parse optional highlight request (Issue #1134), applied identically
-        // to every query in the batch.
-        let highlight = if let Some(ref highlight_json) = params.highlight {
-            match convert::json_to_highlight_params(highlight_json) {
-                Ok(h) => Some(h),
-                Err(e) => return Ok(Self::tool_error(format!("Invalid highlight JSON: {e}"))),
-            }
-        } else {
-            None
+        let request = match search_batch_request(params) {
+            Ok(request) => request,
+            Err(e) => return Ok(Self::tool_error(e)),
         };
-
-        let limit = params.limit.unwrap_or(10);
-        let offset = params.offset.unwrap_or(0);
-        let queries: Vec<SearchRequest> = params
-            .queries
-            .into_iter()
-            .map(|query| SearchRequest {
-                query,
-                limit,
-                offset,
-                highlight: highlight.clone(),
-                ..Default::default()
-            })
-            .collect();
-
-        let request = SearchBatchRequest { queries };
 
         match SearchServiceClient::new(channel)
             .search_batch(request)
@@ -1065,6 +1015,102 @@ impl LaurusMcpServer {
             Err(e) => Ok(Self::tool_error(format!("Batch search failed: {e}"))),
         }
     }
+}
+
+// ── Search requests ───────────────────────────────────────────────────────────
+
+/// Parse the optional JSON-string tool parameter `name` with `parse`; the
+/// error is the tool error message.
+fn parse_json_param<T>(
+    name: &str,
+    json: Option<&String>,
+    parse: impl FnOnce(&str) -> anyhow::Result<T>,
+) -> Result<Option<T>, String> {
+    json.map(|json| parse(json).map_err(|e| format!("Invalid {name} JSON: {e}")))
+        .transpose()
+}
+
+/// Build the `search` tool's gRPC request from its parameters.
+///
+/// # Errors
+///
+/// Returns the tool error message of the first malformed JSON parameter.
+fn search_request(params: SearchParams) -> Result<SearchRequest, String> {
+    let fusion = parse_json_param(
+        "fusion",
+        params.fusion.as_ref(),
+        convert::json_to_fusion_algorithm,
+    )?;
+    let field_boosts = parse_json_param(
+        "field_boosts",
+        params.field_boosts.as_ref(),
+        convert::json_to_field_boosts,
+    )?
+    .unwrap_or_default();
+    // Issue #1134.
+    let highlight = parse_json_param(
+        "highlight",
+        params.highlight.as_ref(),
+        convert::json_to_highlight_params,
+    )?;
+    // Issue #1351.
+    let rescore = parse_json_param(
+        "rescore",
+        params.rescore.as_ref(),
+        convert::json_to_rescore_params,
+    )?;
+    // Issue #1297.
+    let group_by = parse_json_param(
+        "group_by",
+        params.group_by.as_ref(),
+        convert::json_to_group_by_params,
+    )?;
+    Ok(SearchRequest {
+        query: params.query,
+        limit: params.limit.unwrap_or(10),
+        offset: params.offset.unwrap_or(0),
+        fusion,
+        field_boosts,
+        highlight,
+        rescore,
+        group_by,
+        ..Default::default()
+    })
+}
+
+/// Build the `search_batch` tool's gRPC request from its parameters: one
+/// request per query, sharing the limit, offset, highlight (Issue #1134)
+/// and grouping (Issue #1297).
+///
+/// # Errors
+///
+/// Returns the tool error message of the first malformed JSON parameter.
+fn search_batch_request(params: SearchBatchParams) -> Result<SearchBatchRequest, String> {
+    let highlight = parse_json_param(
+        "highlight",
+        params.highlight.as_ref(),
+        convert::json_to_highlight_params,
+    )?;
+    let group_by = parse_json_param(
+        "group_by",
+        params.group_by.as_ref(),
+        convert::json_to_group_by_params,
+    )?;
+    let limit = params.limit.unwrap_or(10);
+    let offset = params.offset.unwrap_or(0);
+    let queries = params
+        .queries
+        .into_iter()
+        .map(|query| SearchRequest {
+            query,
+            limit,
+            offset,
+            highlight: highlight.clone(),
+            group_by: group_by.clone(),
+            ..Default::default()
+        })
+        .collect();
+    Ok(SearchBatchRequest { queries })
 }
 
 // ── ServerHandler impl ────────────────────────────────────────────────────────
@@ -1126,4 +1172,64 @@ pub async fn run(endpoint: Option<&str>) -> anyhow::Result<()> {
     service.waiting().await.context("MCP server error")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use laurus_server::proto::laurus::v1::GroupByParams;
+
+    use super::*;
+
+    fn search_params(group_by: Option<&str>) -> SearchParams {
+        SearchParams {
+            query: "title:rust".to_string(),
+            limit: None,
+            offset: None,
+            fusion: None,
+            field_boosts: None,
+            highlight: None,
+            rescore: None,
+            group_by: group_by.map(str::to_string),
+        }
+    }
+
+    fn by_id(group_size: Option<u32>) -> Option<GroupByParams> {
+        Some(GroupByParams {
+            field: "_id".to_string(),
+            group_size,
+        })
+    }
+
+    /// Issue #1297: the `search` tool's `group_by` reaches the gRPC
+    /// request, and a malformed one is a tool error naming the parameter.
+    #[test]
+    fn search_request_carries_group_by() {
+        let request =
+            search_request(search_params(Some(r#"{"field": "_id", "group_size": 3}"#))).unwrap();
+        assert_eq!(request.group_by, by_id(Some(3)));
+        assert_eq!((request.limit, request.offset), (10, 0));
+
+        assert_eq!(search_request(search_params(None)).unwrap().group_by, None);
+
+        let err = search_request(search_params(Some("{}"))).unwrap_err();
+        assert!(err.starts_with("Invalid group_by JSON"), "{err}");
+    }
+
+    /// Issue #1297: `search_batch` applies `group_by` to every query.
+    #[test]
+    fn search_batch_request_groups_every_query() {
+        let request = search_batch_request(SearchBatchParams {
+            queries: vec!["title:rust".to_string(), "title:go".to_string()],
+            limit: Some(5),
+            offset: None,
+            highlight: None,
+            group_by: Some(r#"{"field": "_id"}"#.to_string()),
+        })
+        .unwrap();
+        assert_eq!(request.queries.len(), 2);
+        for query in &request.queries {
+            assert_eq!(query.group_by, by_id(None));
+            assert_eq!(query.limit, 5);
+        }
+    }
 }

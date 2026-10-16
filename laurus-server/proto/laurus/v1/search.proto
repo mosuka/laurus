@@ -71,6 +71,26 @@ message SearchRequest {
   // Rescore the top first-stage candidates before the page is cut
   // (Issue #1351). Unset leaves the first-stage ranking as is.
   optional RescoreParams rescore = 10;
+
+  // Group the ranked hits by a field's value (Issue #1297). When set,
+  // `limit` and `offset` count groups, and each result is a group's best
+  // hit with the group's next best hits in `inner_hits`. Unset returns
+  // ungrouped hits.
+  optional GroupByParams group_by = 11;
+}
+
+// Fold the ranked hits (after fusion and rescore) that share `field`'s
+// value into groups, ordered by each group's best hit. Values are
+// validated by the engine: an invalid field or size is INVALID_ARGUMENT.
+message GroupByParams {
+  // `_id`, or a single-valued, stored Text, Integer, Float, Boolean or
+  // DateTime field with doc_values. A hit with no value forms a group of
+  // its own.
+  string field = 1;
+
+  // Hits kept per group, the returned result included, 1 to 100. Unset
+  // means 1.
+  optional uint32 group_size = 2;
 }
 
 // Reorder the top `window_size` first-stage candidates (lexical, vector or
@@ -269,4 +289,14 @@ message SearchResult {
   // params. A field with no highlight is absent from this map (Issue
   // #1134).
   map<string, Highlights> highlights = 4;
+
+  // With `group_by`: the value this result's group shares. Unset for an
+  // ungrouped search, and for a hit whose document has no value for the
+  // field (Issue #1297).
+  Value group_key = 5;
+
+  // With `group_by`: the group's next best hits after this one, in ranking
+  // order, at most `group_size - 1`. Each carries the same `group_key` and
+  // has no inner hits of its own. Empty for an ungrouped search.
+  repeated SearchResult inner_hits = 6;
 }

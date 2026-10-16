@@ -341,6 +341,38 @@ neither of `vectors` and `text`, unequal vector lengths) is rejected with
 [gRPC `RescoreParams`](grpc_api.md#rescoreparams) and
 [Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)).
 
+#### Search with Grouping
+
+`group_by` groups the results by a field's value (Issue #1297); `limit` and
+`offset` then count groups. Chunks added with `POST /v1/documents/:id`
+share their `_id`, so grouping by it returns each document once, by its best
+chunk, with up to `group_size - 1` more of its chunks (`group_size` defaults
+to 1, at most 100):
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "body:rust", "limit": 10, "group_by": {"field": "_id", "group_size": 2}}'
+```
+
+With three chunks added as `manual` and one as `faq`, the response is:
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total_hits":2}
+```
+
+A result gains `"group_key"` when it has a value and `"inner_hits"` when its
+group has more results, each in the same shape. Like `rescore`, a malformed
+`group_by` is rejected with 400 instead of being ignored:
+
+```json
+{"error":{"code":400,"message":"group_by.field must be a string"}}
+```
+
+So are the values the engine rejects (see
+[gRPC `GroupByParams`](grpc_api.md#groupbyparams) and
+[Result Grouping](../concepts/search/result_grouping.md)).
+
 ### Streaming Search (SSE)
 
 The `/v1/search/stream` endpoint returns results as Server-Sent Events (SSE). Each result is sent as a separate event:
@@ -357,6 +389,16 @@ The response is a stream of SSE events:
 data: {"id":"doc1","score":0.8532,"fields":{...}}
 
 data: {"id":"doc2","score":0.4210,"fields":{...}}
+```
+
+With `group_by`, each event is one group: its best result, with its
+`inner_hits` when `group_size` is above 1. For
+`"group_by": {"field": "_id"}`:
+
+```text
+data: {"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","score":0.012571428902447224}
+
+data: {"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}
 ```
 
 ## JSON Field Value Inference

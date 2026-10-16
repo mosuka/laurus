@@ -470,6 +470,7 @@ Execute a search query using the [Query DSL](../concepts/query_dsl.md).
 ```bash
 laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
               [--rescore-field <FIELD> (--rescore-text <TEXT> | --rescore-vectors <JSON>) [--rescore-window <N>]]
+              [--group-by <FIELD> [--group-size <N>]]
 ```
 
 The query string is analyzed with each field's own configured analyzer —
@@ -491,6 +492,8 @@ field is always queryable even though it does not appear in the schema.
 | `--rescore-text <TEXT>` | No | (none) | Rescore query text, embedded by the field's token-level embedder (a `candle_colbert` one) |
 | `--rescore-vectors <JSON>` | No | (none) | Rescore query token vectors as JSON, e.g. `'[[0.1, 0.2], [0.3, 0.4]]'` |
 | `--rescore-window <N>` | No | `100` | How many top results to rescore (at most 10,000) |
+| `--group-by <FIELD>` | No | (none) | Group the results by this field's value (Issue #1297): `_id`, or a single-valued, stored `Text`, `Integer`, `Float`, `Boolean` or `DateTime` field. `--limit` and `--offset` then count groups |
+| `--group-size <N>` | No | `1` | How many results each group keeps, the shown one included (at most 100). Needs `--group-by` |
 
 A rescored result's score is its late-interaction (MaxSim) score; see
 [Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore).
@@ -498,6 +501,26 @@ For example, with a `candle_colbert` embedder on `body_colbert`:
 
 ```bash
 laurus search 'body:lifetimes' --rescore-field body_colbert --rescore-text 'how do lifetimes work'
+```
+
+`--group-by _id` shows each document added in chunks (`laurus add doc`)
+once, by its best chunk; see
+[Result Grouping](../concepts/search/result_grouping.md). With
+`--group-size 2`, a group's next best chunk follows it, indented, and a
+`Group` column shows each group's value:
+
+```bash
+laurus search "body:rust" --group-by _id --group-size 2
+```
+
+```text
+╭────────────┬────────┬────────┬──────────────────────────────────────────────╮
+│ ID         │ Score  │ Group  │ Fields                                       │
+├────────────┼────────┼────────┼──────────────────────────────────────────────┤
+│ manual     │ 0.0126 │ manual │ body: Rust ownership rules for Rust programs │
+│   ↳ manual │ 0.0124 │        │ body: Borrowing in Rust                      │
+│ faq        │ 0.0109 │ faq    │ body: Why Rust has no garbage collector      │
+╰────────────┴────────┴────────┴──────────────────────────────────────────────╯
 ```
 
 **Query syntax examples:**
@@ -596,6 +619,44 @@ See [Highlighting](../laurus/highlighting.md) for the full semantics —
 field selection, per-field analyzers, and why a `filter_query` never
 highlights (not reachable from this one-shot form of `search`, but
 relevant to any client using the same underlying option).
+
+With `--group-by`, a result gains `"group_key"` (when it has a value) and
+`"inner_hits"` (when the group has more results, each in the same shape):
+
+```bash
+laurus --format json search "body:rust" --group-by _id --group-size 2
+```
+
+```json
+[
+  {
+    "fields": {
+      "body": "Rust ownership rules for Rust programs"
+    },
+    "group_key": "manual",
+    "id": "manual",
+    "inner_hits": [
+      {
+        "fields": {
+          "body": "Borrowing in Rust"
+        },
+        "group_key": "manual",
+        "id": "manual",
+        "score": 0.012359549291431904
+      }
+    ],
+    "score": 0.012571428902447224
+  },
+  {
+    "fields": {
+      "body": "Why Rust has no garbage collector"
+    },
+    "group_key": "faq",
+    "id": "faq",
+    "score": 0.010891089215874672
+  }
+]
+```
 
 ---
 

@@ -338,6 +338,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `field_boosts` | string | いいえ | フィールド毎のブースト係数（JSON） |
 | `highlight` | string | いいえ | フィールドごとのハイライト済みフラグメント（JSON、[ハイライトの例](#ハイライトの例)を参照） |
 | `rescore` | string | いいえ | 上位の結果の late interaction による再採点（JSON、[再採点の例](#再採点の例)を参照） |
+| `group_by` | string | いいえ | 結果のフィールド値によるグループ化（JSON）。指定すると `limit` と `offset` はグループの数を数える（[グループ化の例](#グループ化の例)を参照） |
 
 ### クエリ DSL の例
 
@@ -427,6 +428,22 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 
 不正な `rescore` はツールのエラーになります。`search_batch` には `rescore` パラメーターはありません。[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照してください。
 
+### グループ化の例
+
+`group_by` を指定すると、結果をフィールド値でグループ化します（Issue #1297）。各結果はグループの最上位の hit で、`inner_hits` にグループの 2 番目以降の hit が、`group_key` に共有する値が入ります。1 つの id で追加した chunk は `_id` を共有するので、`_id` でグループ化すると、各文書が 1 回ずつ、その chunk を最大 `group_size - 1` 件添えて返ります（`group_size` の既定は 1、上限は 100）。
+
+```json
+{"field": "_id", "group_size": 2}
+```
+
+`manual` として 3 つ、`faq` として 1 つの chunk を追加したとき、クエリ `body:rust` の結果は次のとおりです。
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total":2}
+```
+
+フィールドには、単一値で保存された `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールドも使えます。不正な `group_by` はツールのエラーになります。[検索結果のグループ化](../concepts/search/result_grouping.md)を参照してください。
+
 ### 結果
 
 `highlight` を要求し、少なくとも1つのフィールドが実際にハイライトされた場合、各結果に `"highlights"` オブジェクトが追加されます。
@@ -455,9 +472,9 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 ## search_batch
 
 独立した複数の検索を 1 回のラウンドトリップで実行します。すべてのクエリは
-サーバー上で並列に実行され、`limit` と `offset` はすべてのクエリに共通で
-適用されます。エージェントが 1 ターンで複数のサブクエリを発行する場合に
-有用です。
+サーバー上で並列に実行され、`limit`・`offset`・`highlight`・`group_by` は
+すべてのクエリに共通で適用されます。エージェントが 1 ターンで複数の
+サブクエリを発行する場合に有用です。
 
 ### パラメータ
 
@@ -467,6 +484,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `limit` | 整数 | いいえ | クエリごとの最大結果数（デフォルト: 10）。`offset + limit` はサーバの `max_result_window`（既定 10,000）以下にする |
 | `offset` | 整数 | いいえ | クエリごとのページネーションオフセット（デフォルト: 0） |
 | `highlight` | 文字列 | いいえ | フィールドごとのハイライト済みフラグメント（JSON）。`search` の `highlight` と同じ形式で、バッチ内のすべてのクエリに同一に適用される |
+| `group_by` | 文字列 | いいえ | 各クエリの結果のフィールド値によるグループ化（JSON）。`search` の `group_by` と同じ形式で、バッチ内のすべてのクエリに同一に適用される |
 
 ### 結果
 

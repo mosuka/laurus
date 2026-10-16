@@ -1077,6 +1077,14 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         .map(crate::convert::search::rescore_params_from_json)
         .transpose()?;
 
+    // A malformed `group_by` is rejected (400) rather than dropped: see
+    // `group_by_params_from_json`.
+    let group_by = json
+        .get("group_by")
+        .filter(|v| !v.is_null())
+        .map(crate::convert::search::group_by_params_from_json)
+        .transpose()?;
+
     Ok(v1::SearchRequest {
         query,
         query_vectors,
@@ -1088,6 +1096,7 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         field_boosts,
         highlight,
         rescore,
+        group_by,
     })
 }
 
@@ -1337,6 +1346,10 @@ fn json_to_highlight_params(json: &Value) -> Option<v1::HighlightParams> {
 /// "fields"}` — the same `"fields"` key (no `"document"` wrapper) that
 /// [`proto_document_to_json`] and laurus-cli's search output use, so a hit
 /// can be re-submitted through `put doc` / `PUT /v1/documents/:id` as-is.
+///
+/// A grouped search's result also carries `"group_key"` (when set) and
+/// `"inner_hits"` (when non-empty, each converted the same way), so an
+/// ungrouped result's shape is unchanged (Issue #1297).
 pub fn proto_search_result_to_json(result: &v1::SearchResult) -> Value {
     let mut obj = json!({
         "id": result.id,
@@ -1362,6 +1375,18 @@ pub fn proto_search_result_to_json(result: &v1::SearchResult) -> Value {
                         ),
                     )
                 })
+                .collect(),
+        );
+    }
+    if let Some(group_key) = &result.group_key {
+        obj["group_key"] = proto_value_to_json(group_key);
+    }
+    if !result.inner_hits.is_empty() {
+        obj["inner_hits"] = Value::Array(
+            result
+                .inner_hits
+                .iter()
+                .map(proto_search_result_to_json)
                 .collect(),
         );
     }
@@ -2113,6 +2138,7 @@ mod tests {
             score: 0.5,
             document: Some(doc),
             highlights: Default::default(),
+            ..Default::default()
         };
         let json = proto_search_result_to_json(&result);
         assert_eq!(json["fields"]["title"], json!("hello"));
@@ -2136,6 +2162,7 @@ mod tests {
             score: 0.5,
             document: None,
             highlights,
+            ..Default::default()
         };
 
         let json = proto_search_result_to_json(&result);
@@ -2152,6 +2179,7 @@ mod tests {
             score: 0.5,
             document: None,
             highlights: HashMap::new(),
+            ..Default::default()
         };
 
         let json = proto_search_result_to_json(&result);
@@ -2159,6 +2187,68 @@ mod tests {
             json.get("highlights").is_none(),
             "empty highlights must not add a key: {json}"
         );
+    }
+
+    /// Issue #1297: a grouped result carries its group key and its inner
+    /// hits, each in the same shape; an ungrouped one gains neither key.
+    #[test]
+    fn test_proto_search_result_to_json_includes_groups_when_present() {
+        let key = v1::Value {
+            kind: Some(v1::value::Kind::TextValue("doc".to_string())),
+        };
+        let hit = |id: &str| v1::SearchResult {
+            id: id.to_string(),
+            score: 0.5,
+            group_key: Some(key.clone()),
+            ..Default::default()
+        };
+        let leader = v1::SearchResult {
+            inner_hits: vec![hit("b"), hit("c")],
+            ..hit("a")
+        };
+
+        let json = proto_search_result_to_json(&leader);
+        assert_eq!(json["group_key"], json!("doc"));
+        assert_eq!(json["inner_hits"][0]["id"], json!("b"));
+        assert_eq!(json["inner_hits"][1]["group_key"], json!("doc"));
+        assert!(json["inner_hits"][0].get("inner_hits").is_none());
+
+        let ungrouped = proto_search_result_to_json(&v1::SearchResult {
+            id: "a".to_string(),
+            ..Default::default()
+        });
+        assert!(ungrouped.get("group_key").is_none(), "{ungrouped}");
+        assert!(ungrouped.get("inner_hits").is_none(), "{ungrouped}");
+    }
+
+    /// Issue #1297: `group_by` reaches the proto request, `null` leaves it
+    /// unset, and a malformed value is a 400 rather than dropped.
+    #[test]
+    fn test_json_to_proto_search_request_group_by() {
+        let request = json_to_proto_search_request(&json!({
+            "query": "title:rust",
+            "group_by": {"field": "_id", "group_size": 3}
+        }))
+        .unwrap();
+        assert_eq!(
+            request.group_by,
+            Some(v1::GroupByParams {
+                field: "_id".to_string(),
+                group_size: Some(3),
+            })
+        );
+
+        let request =
+            json_to_proto_search_request(&json!({"query": "title:rust", "group_by": null}))
+                .unwrap();
+        assert_eq!(request.group_by, None);
+
+        let err = json_to_proto_search_request(&json!({
+            "query": "title:rust",
+            "group_by": {"group_size": 3}
+        }))
+        .unwrap_err();
+        assert!(err.contains("group_by.field"), "{err}");
     }
 
     #[test]

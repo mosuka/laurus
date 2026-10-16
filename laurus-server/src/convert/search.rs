@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use laurus::vector::Vector;
 use laurus::vector::store::request::FieldSelector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, QueryVector, RescoreOptions, SearchRequestBuilder,
+    FusionAlgorithm, GroupBy, HighlightConfig, QueryVector, RescoreOptions, SearchRequestBuilder,
     SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
 };
 
@@ -124,7 +124,57 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
         builder = builder.rescore(rescore_from_proto(rescore)?);
     }
 
+    // Grouping (Issue #1297). The engine validates the field and the size.
+    if let Some(group_by) = &proto.group_by {
+        builder = builder.group_by(group_by_from_proto(group_by));
+    }
+
     Ok(builder.build())
+}
+
+/// Build a [`GroupBy`] from proto `GroupByParams`: an unset `group_size`
+/// keeps one hit per group.
+fn group_by_from_proto(params: &v1::GroupByParams) -> GroupBy {
+    let group_by = GroupBy::new(params.field.clone());
+    match params.group_size {
+        Some(group_size) => group_by.group_size(group_size as usize),
+        None => group_by,
+    }
+}
+
+/// Parse the JSON form of [`v1::GroupByParams`], shared by the HTTP
+/// gateway's `POST /v1/search` and the MCP search tools (Issue #1297):
+///
+/// ```json
+/// {"field": "_id", "group_size": 3}
+/// ```
+///
+/// `field` is required; `group_size` is optional. A malformed value is an
+/// error rather than ignored, as for `rescore`: dropping it would change
+/// what `limit` counts without telling the caller.
+///
+/// # Errors
+///
+/// Returns a message describing the first malformed part.
+pub fn group_by_params_from_json(json: &serde_json::Value) -> Result<v1::GroupByParams, String> {
+    use serde_json::Value;
+
+    let obj = json.as_object().ok_or("group_by must be an object")?;
+    let field = obj
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or("group_by.field must be a string")?
+        .to_string();
+    let group_size = match obj.get("group_size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or("group_by.group_size must be a non-negative integer")?,
+        ),
+    };
+    Ok(v1::GroupByParams { field, group_size })
 }
 
 /// Apply proto `VectorParams` to the builder (Issue #1342).
@@ -425,7 +475,8 @@ fn highlight_config_from_proto(
     Ok(config)
 }
 
-/// Convert a laurus SearchResult into a proto SearchResult.
+/// Convert a laurus SearchResult into a proto SearchResult, its group's
+/// inner hits included (Issue #1297).
 pub fn result_to_proto(result: &SearchResult) -> v1::SearchResult {
     v1::SearchResult {
         id: result.id.clone(),
@@ -443,6 +494,8 @@ pub fn result_to_proto(result: &SearchResult) -> v1::SearchResult {
                 )
             })
             .collect::<HashMap<_, _>>(),
+        group_key: result.group_key.as_ref().map(document::data_value_to_proto),
+        inner_hits: result.inner_hits.iter().map(result_to_proto).collect(),
     }
 }
 
@@ -973,5 +1026,113 @@ mod tests {
                 "{case}: {status:?}"
             );
         }
+    }
+
+    // ── group_by (Issue #1297) ──────────────────────────────────────────
+
+    fn grouped_request(group_by: Option<v1::GroupByParams>) -> v1::SearchRequest {
+        v1::SearchRequest {
+            query: "title:rust".to_string(),
+            group_by,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_proto_sets_group_by() {
+        let request = from_proto(&grouped_request(Some(v1::GroupByParams {
+            field: "_id".to_string(),
+            group_size: Some(3),
+        })))
+        .unwrap();
+        assert_eq!(request.group_by, Some(GroupBy::new("_id").group_size(3)));
+
+        // An unset group_size keeps one hit per group.
+        let request = from_proto(&grouped_request(Some(v1::GroupByParams {
+            field: "parent".to_string(),
+            group_size: None,
+        })))
+        .unwrap();
+        assert_eq!(request.group_by, Some(GroupBy::new("parent")));
+
+        assert_eq!(from_proto(&grouped_request(None)).unwrap().group_by, None);
+    }
+
+    #[test]
+    fn group_by_params_from_json_parses_the_documented_shape() {
+        assert_eq!(
+            group_by_params_from_json(&serde_json::json!({"field": "_id", "group_size": 3})),
+            Ok(v1::GroupByParams {
+                field: "_id".to_string(),
+                group_size: Some(3),
+            })
+        );
+        for absent in [
+            serde_json::json!({"field": "_id"}),
+            serde_json::json!({"field": "_id", "group_size": null}),
+        ] {
+            assert_eq!(
+                group_by_params_from_json(&absent),
+                Ok(v1::GroupByParams {
+                    field: "_id".to_string(),
+                    group_size: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn group_by_params_from_json_rejects_malformed_values() {
+        let cases = [
+            (serde_json::json!("_id"), "must be an object"),
+            (serde_json::json!({}), "group_by.field"),
+            (serde_json::json!({"field": 1}), "group_by.field"),
+            (
+                serde_json::json!({"field": "_id", "group_size": -1}),
+                "group_by.group_size",
+            ),
+            (
+                serde_json::json!({"field": "_id", "group_size": 2.5}),
+                "group_by.group_size",
+            ),
+            (
+                serde_json::json!({"field": "_id", "group_size": u64::from(u32::MAX) + 1}),
+                "group_by.group_size",
+            ),
+        ];
+        for (json, fragment) in cases {
+            let err = group_by_params_from_json(&json).unwrap_err();
+            assert!(err.contains(fragment), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn result_to_proto_carries_the_group_key_and_inner_hits() {
+        let hit = |id: &str| SearchResult {
+            id: id.to_string(),
+            score: 1.0,
+            document: None,
+            highlights: HashMap::new(),
+            group_key: Some(laurus::DataValue::Text("doc".to_string())),
+            inner_hits: Vec::new(),
+        };
+        let mut leader = hit("a");
+        leader.inner_hits = vec![hit("b"), hit("c")];
+
+        let proto = result_to_proto(&leader);
+        assert_eq!(
+            proto.group_key,
+            Some(document::data_value_to_proto(&laurus::DataValue::Text(
+                "doc".to_string()
+            )))
+        );
+        let inner: Vec<&str> = proto.inner_hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(inner, ["b", "c"]);
+        assert!(
+            proto
+                .inner_hits
+                .iter()
+                .all(|h| h.group_key == proto.group_key)
+        );
     }
 }

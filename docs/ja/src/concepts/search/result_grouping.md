@@ -35,6 +35,11 @@ for result in engine.search(request).await? {
 }
 ```
 
+Rust API のほか、[gRPC](../../laurus-server/grpc_api.md#groupbyparams) と
+[HTTP gateway](../../laurus-server/http_gateway.md#グループ化付き検索)、
+[MCP の `search`・`search_batch` ツール](../../laurus-mcp/tools.md#グループ化の例)、
+[`laurus search --group-by`](../../laurus-cli/commands.md#search) でも使えます。
+
 ## 仕組み
 
 ```text

@@ -351,6 +351,7 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `field_boosts` | string | No | Per-field boost factors as JSON |
 | `highlight` | string | No | Highlighted fragments per field, as JSON (see [Highlight example](#highlight-example)) |
 | `rescore` | string | No | Late-interaction rescore of the top results, as JSON (see [Rescore example](#rescore-example)) |
+| `group_by` | string | No | Group the results by a field's value, as JSON; `limit` and `offset` then count groups (see [Group by example](#group-by-example)) |
 
 ### Query DSL examples
 
@@ -449,6 +450,29 @@ or the query's token vectors:
 A malformed `rescore` is a tool error. `search_batch` has no `rescore`
 parameter. See [Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore).
 
+### Group by example
+
+`group_by` groups the results by a field's value (Issue #1297): each result
+is a group's best hit, its `inner_hits` hold the group's next best hits, and
+its `group_key` the shared value. Chunks added under one id share `_id`, so
+grouping by it returns each document once, with up to `group_size - 1` more
+of its chunks (`group_size` defaults to 1, at most 100):
+
+```json
+{"field": "_id", "group_size": 2}
+```
+
+With three chunks added as `manual` and one as `faq`, the query `body:rust`
+returns:
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total":2}
+```
+
+The field may also be a single-valued, stored `Text`, `Integer`, `Float`,
+`Boolean` or `DateTime` field. A malformed `group_by` is a tool error. See
+[Result Grouping](../concepts/search/result_grouping.md).
+
 ### Result
 
 Each result gains a `"highlights"` object when `highlight` was requested
@@ -478,8 +502,9 @@ and at least one field actually highlighted:
 ## search_batch
 
 Execute multiple independent searches in a single round trip. All queries
-run in parallel on the server; the same `limit` and `offset` apply to every
-query. Useful for agents issuing several sub-queries per turn.
+run in parallel on the server; the same `limit`, `offset`, `highlight` and
+`group_by` apply to every query. Useful for agents issuing several
+sub-queries per turn.
 
 ### Parameters
 
@@ -489,6 +514,7 @@ query. Useful for agents issuing several sub-queries per turn.
 | `limit` | integer | No | Maximum results per query (default: 10). `offset + limit` must not exceed the server's `max_result_window` (default 10,000) |
 | `offset` | integer | No | Results to skip per query for pagination (default: 0) |
 | `highlight` | string | No | Highlighted fragments per field, as JSON — same format as `search`'s `highlight`, applied identically to every query |
+| `group_by` | string | No | Group each query's results by a field's value, as JSON — same format as `search`'s `group_by`, applied identically to every query |
 
 ### Result
 

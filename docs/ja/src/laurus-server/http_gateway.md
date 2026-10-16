@@ -296,6 +296,30 @@ curl -X POST http://localhost:8080/v1/search \
 
 再採点した結果の `score` は late interaction（MaxSim）のスコアです。ほかの検索オプションと違い、不正な `rescore`（`field` がない、`vectors` と `text` の両方またはどちらもない、ベクトルの長さがそろわない）は無視されず 400 で拒否されます。エンジンが拒否する値も同じです（[gRPC の `RescoreParams`](grpc_api.md#rescoreparams) と [late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照）。
 
+#### グループ化付き検索
+
+`group_by` を指定すると、結果をフィールド値でグループ化し、`limit` と `offset` はグループの数を数えます（Issue #1297）。`POST /v1/documents/:id` で追加した chunk は `_id` を共有するので、`_id` でグループ化すると、各文書が最上位の chunk を代表として 1 回ずつ返り、その文書の chunk が最大 `group_size - 1` 件添えられます（`group_size` の既定は 1、上限は 100）。
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "body:rust", "limit": 10, "group_by": {"field": "_id", "group_size": 2}}'
+```
+
+`manual` として 3 つ、`faq` として 1 つの chunk を追加したとき、レスポンスは次のとおりです。
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total_hits":2}
+```
+
+値を持つ結果には `"group_key"` が、グループにほかの結果がある結果には `"inner_hits"`（各要素は同じ形）が付きます。`rescore` と同じく、不正な `group_by` は無視されず 400 で拒否されます。
+
+```json
+{"error":{"code":400,"message":"group_by.field must be a string"}}
+```
+
+エンジンが拒否する値も同じです（[gRPC の `GroupByParams`](grpc_api.md#groupbyparams) と[検索結果のグループ化](../concepts/search/result_grouping.md)を参照）。
+
 ### ストリーミング検索（SSE）
 
 `/v1/search/stream` エンドポイントは Server-Sent Events（SSE）として結果を返します。各結果は個別のイベントとして送信されます。
@@ -312,6 +336,14 @@ curl -N -X POST http://localhost:8080/v1/search/stream \
 data: {"id":"doc1","score":0.8532,"fields":{...}}
 
 data: {"id":"doc2","score":0.4210,"fields":{...}}
+```
+
+`group_by` を指定すると、各イベントは 1 つのグループになります。グループの最上位の結果で、`group_size` が 2 以上なら `inner_hits` が付きます。`"group_by": {"field": "_id"}` のとき:
+
+```text
+data: {"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","score":0.012571428902447224}
+
+data: {"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}
 ```
 
 ## JSON フィールド値の型推論

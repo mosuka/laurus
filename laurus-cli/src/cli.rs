@@ -443,6 +443,18 @@ pub struct SearchCommand {
     /// How many top results to rescore (default 100, at most 10,000).
     #[arg(long, value_name = "N", requires = "rescore_field")]
     pub rescore_window: Option<usize>,
+
+    /// Group the results by this field's value (Issue #1297): `_id` shows
+    /// each document once, by its best chunk; any other field must be a
+    /// single-valued, stored Text, Integer, Float, Boolean or DateTime
+    /// field. `--limit` and `--offset` then count groups.
+    #[arg(long, value_name = "FIELD")]
+    pub group_by: Option<String>,
+
+    /// How many hits each group keeps, the shown result included (default
+    /// 1, at most 100).
+    #[arg(long, value_name = "N", requires = "group_by")]
+    pub group_size: Option<usize>,
 }
 
 #[cfg(test)]
@@ -469,5 +481,29 @@ mod tests {
             Some(50_000)
         );
         assert!(serve_max_result_window(&["--max-result-window", "0"]).is_err());
+    }
+
+    fn search_group_by(args: &[&str]) -> Result<(Option<String>, Option<usize>), clap::Error> {
+        let cli = Cli::try_parse_from(["laurus", "search", "title:rust"].iter().chain(args))?;
+        match cli.command {
+            Command::Search(search) => Ok((search.group_by, search.group_size)),
+            _ => unreachable!("parsed a search command"),
+        }
+    }
+
+    /// Issue #1297: `search --group-by` takes a field, and `--group-size`
+    /// needs it.
+    #[test]
+    fn search_parses_group_by() {
+        assert_eq!(search_group_by(&[]).unwrap(), (None, None));
+        assert_eq!(
+            search_group_by(&["--group-by", "_id"]).unwrap(),
+            (Some("_id".to_string()), None)
+        );
+        assert_eq!(
+            search_group_by(&["--group-by", "parent", "--group-size", "3"]).unwrap(),
+            (Some("parent".to_string()), Some(3))
+        );
+        assert!(search_group_by(&["--group-size", "3"]).is_err());
     }
 }

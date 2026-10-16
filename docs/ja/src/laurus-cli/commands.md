@@ -465,6 +465,7 @@ laurus train pq-codebook --field embedding --from-index --sample-size 5000 --upd
 ```bash
 laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
               [--rescore-field <FIELD> (--rescore-text <TEXT> | --rescore-vectors <JSON>) [--rescore-window <N>]]
+              [--group-by <FIELD> [--group-size <N>]]
 ```
 
 クエリ文字列は、各フィールドに設定されたアナライザー自身で解析されます。例えば `schema.toml` で日本語（Lindera）アナライザーを設定したフィールドは、インデックス時と同じ方法でクエリ時にも解析されます。スキーマに宣言されていないフィールドを参照すると、そのフィールド名を含むエラーで拒否されます（typo の検出に役立ちます）。予約済みの `_id` フィールドはスキーマに現れませんが、常に検索可能です。
@@ -481,11 +482,29 @@ laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
 | `--rescore-text <TEXT>` | いいえ | （なし） | 再採点のクエリのテキスト。フィールドのトークン単位のエンベッダー（`candle_colbert`）が埋め込む |
 | `--rescore-vectors <JSON>` | いいえ | （なし） | 再採点のクエリのトークンベクトル（JSON。例: `'[[0.1, 0.2], [0.3, 0.4]]'`） |
 | `--rescore-window <N>` | いいえ | `100` | 再採点する上位の件数（最大 10,000） |
+| `--group-by <FIELD>` | いいえ | （なし） | 結果をこのフィールドの値でグループ化する（Issue #1297）。`_id`、または単一値で保存された `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールド。指定すると `--limit` と `--offset` はグループの数を数える |
+| `--group-size <N>` | いいえ | `1` | 1 グループに残す結果の数。表示される結果を含む（最大 100）。`--group-by` が必要 |
 
 再採点した結果のスコアは late interaction（MaxSim）のスコアです。[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照してください。例えば `body_colbert` に `candle_colbert` のエンベッダーがある場合:
 
 ```bash
 laurus search 'body:lifetimes' --rescore-field body_colbert --rescore-text 'how do lifetimes work'
+```
+
+`--group-by _id` を指定すると、chunk に分けて追加した文書（`laurus add doc`）が、最上位の chunk を代表として 1 回ずつ表示されます。[検索結果のグループ化](../concepts/search/result_grouping.md)を参照してください。`--group-size 2` を指定すると、グループの 2 番目の chunk が字下げした行で続き、`Group` 列に各グループの値が表示されます。
+
+```bash
+laurus search "body:rust" --group-by _id --group-size 2
+```
+
+```text
+╭────────────┬────────┬────────┬──────────────────────────────────────────────╮
+│ ID         │ Score  │ Group  │ Fields                                       │
+├────────────┼────────┼────────┼──────────────────────────────────────────────┤
+│ manual     │ 0.0126 │ manual │ body: Rust ownership rules for Rust programs │
+│   ↳ manual │ 0.0124 │        │ body: Borrowing in Rust                      │
+│ faq        │ 0.0109 │ faq    │ body: Why Rust has no garbage collector      │
+╰────────────┴────────┴────────┴──────────────────────────────────────────────╯
 ```
 
 **クエリ構文の例:**
@@ -580,6 +599,43 @@ laurus --format json search "body:rust" --limit 5
 ```
 
 完全な意味論（フィールド選択、フィールドごとのアナライザー、`filter_query` がハイライトされない理由など）は[ハイライト](../laurus/highlighting.md)を参照してください。
+
+`--group-by` を指定すると、値を持つ結果には `"group_key"` が、グループにほかの結果がある結果には `"inner_hits"`（各要素は同じ形）が追加されます。
+
+```bash
+laurus --format json search "body:rust" --group-by _id --group-size 2
+```
+
+```json
+[
+  {
+    "fields": {
+      "body": "Rust ownership rules for Rust programs"
+    },
+    "group_key": "manual",
+    "id": "manual",
+    "inner_hits": [
+      {
+        "fields": {
+          "body": "Borrowing in Rust"
+        },
+        "group_key": "manual",
+        "id": "manual",
+        "score": 0.012359549291431904
+      }
+    ],
+    "score": 0.012571428902447224
+  },
+  {
+    "fields": {
+      "body": "Why Rust has no garbage collector"
+    },
+    "group_key": "faq",
+    "id": "faq",
+    "score": 0.010891089215874672
+  }
+]
+```
 
 ---
 

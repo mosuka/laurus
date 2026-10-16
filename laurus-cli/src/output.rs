@@ -41,23 +41,25 @@ pub fn print_search_results(results: &[SearchResult], format: OutputFormat) {
                 return;
             }
 
-            let has_highlights = results.iter().any(|r| !r.highlights.is_empty());
-            let rows: Vec<SearchResultRow> = results
+            let has_highlights = results.iter().any(|r| {
+                std::iter::once(r)
+                    .chain(&r.inner_hits)
+                    .any(|hit| !hit.highlights.is_empty())
+            });
+            let grouped = results
                 .iter()
-                .map(|r| {
-                    let fields = r
-                        .document
-                        .as_ref()
-                        .map(|doc| format_fields_compact(&doc.fields))
-                        .unwrap_or_default();
-                    SearchResultRow {
-                        id: r.id.clone(),
-                        score: format!("{:.4}", r.score),
-                        fields,
-                        highlights: format_highlights_compact(&r.highlights),
-                    }
-                })
-                .collect();
+                .any(|r| r.group_key.is_some() || !r.inner_hits.is_empty());
+            let mut rows = Vec::new();
+            for result in results {
+                rows.push(search_result_row(result, false));
+                // A group's inner hits follow it, indented (Issue #1297).
+                rows.extend(
+                    result
+                        .inner_hits
+                        .iter()
+                        .map(|hit| search_result_row(hit, true)),
+                );
+            }
 
             let mut table = Table::new(&rows);
             table.with(Style::rounded());
@@ -66,16 +68,48 @@ pub fn print_search_results(results: &[SearchResult], format: OutputFormat) {
             if !has_highlights {
                 table.with(Remove::column(ByColumnName::new("Highlights")));
             }
+            // Likewise for an ungrouped search (Issue #1297).
+            if !grouped {
+                table.with(Remove::column(ByColumnName::new("Group")));
+            }
             println!("{table}");
         }
     }
 }
 
+/// One table row of [`print_search_results`]: a result, or one of a group's
+/// inner hits (`inner`), whose ID is indented under its group's result and
+/// whose `Group` cell stays empty (Issue #1297).
+fn search_result_row(result: &SearchResult, inner: bool) -> SearchResultRow {
+    let fields = result
+        .document
+        .as_ref()
+        .map(|doc| format_fields_compact(&doc.fields))
+        .unwrap_or_default();
+    SearchResultRow {
+        id: if inner {
+            format!("  ↳ {}", result.id)
+        } else {
+            result.id.clone()
+        },
+        score: format!("{:.4}", result.score),
+        group: match (&result.group_key, inner) {
+            (_, true) => String::new(),
+            (Some(key), false) => format_data_value(key),
+            (None, false) => "-".to_string(),
+        },
+        fields,
+        highlights: format_highlights_compact(&result.highlights),
+    }
+}
+
 /// Convert search results to the JSON shape [`print_search_results`] prints:
-/// `{"id", "score", "fields"?, "highlights"?}` per result. `"highlights"` is
-/// present only when at least one field actually highlighted (Issue #1134),
-/// matching the HTTP gateway's and laurus-mcp's `SearchResult` -> JSON
-/// conversions.
+/// `{"id", "score", "fields"?, "highlights"?, "group_key"?, "inner_hits"?}`
+/// per result. `"highlights"` is present only when at least one field
+/// actually highlighted (Issue #1134); `"group_key"` only when set and
+/// `"inner_hits"` only when non-empty, each inner hit in the same shape
+/// (Issue #1297). This matches the HTTP gateway's and laurus-mcp's
+/// `SearchResult` -> JSON conversions.
 fn search_results_to_json(results: &[SearchResult]) -> Vec<serde_json::Value> {
     results
         .iter()
@@ -89,6 +123,12 @@ fn search_results_to_json(results: &[SearchResult]) -> Vec<serde_json::Value> {
             }
             if !r.highlights.is_empty() {
                 obj["highlights"] = json!(r.highlights);
+            }
+            if let Some(ref group_key) = r.group_key {
+                obj["group_key"] = data_value_to_json(group_key);
+            }
+            if !r.inner_hits.is_empty() {
+                obj["inner_hits"] = serde_json::Value::Array(search_results_to_json(&r.inner_hits));
             }
             obj
         })
@@ -200,6 +240,8 @@ struct SearchResultRow {
     id: String,
     #[tabled(rename = "Score")]
     score: String,
+    #[tabled(rename = "Group")]
+    group: String,
     #[tabled(rename = "Fields")]
     fields: String,
     #[tabled(rename = "Highlights")]
@@ -547,5 +589,48 @@ mod tests {
         let with_highlights = vec![result_with_highlights("doc1", highlights)];
         print_search_results(&with_highlights, OutputFormat::Table);
         print_search_results(&with_highlights, OutputFormat::Json);
+    }
+
+    /// A grouped result: `a` with group key `doc` and inner hit `b`.
+    fn grouped_result() -> SearchResult {
+        let key = Some(DataValue::Text("doc".to_string()));
+        let mut inner = result_with_highlights("b", HashMap::new());
+        inner.group_key = key.clone();
+        let mut leader = result_with_highlights("a", HashMap::new());
+        leader.group_key = key;
+        leader.inner_hits = vec![inner];
+        leader
+    }
+
+    /// Issue #1297: JSON output carries a group's key and nests its inner
+    /// hits in the same shape; an ungrouped result gains neither key.
+    #[test]
+    fn search_results_to_json_nests_inner_hits() {
+        let json = search_results_to_json(&[grouped_result()]);
+        assert_eq!(json[0]["group_key"], json!("doc"));
+        assert_eq!(json[0]["inner_hits"][0]["id"], json!("b"));
+        assert_eq!(json[0]["inner_hits"][0]["group_key"], json!("doc"));
+
+        let ungrouped = search_results_to_json(&[result_with_highlights("c", HashMap::new())]);
+        assert!(ungrouped[0].get("group_key").is_none(), "{}", ungrouped[0]);
+        assert!(ungrouped[0].get("inner_hits").is_none(), "{}", ungrouped[0]);
+    }
+
+    /// Issue #1297: table rows show a group's key on its result and indent
+    /// its inner hits under it.
+    #[test]
+    fn search_result_rows_show_the_group_and_indent_inner_hits() {
+        let leader = grouped_result();
+        let row = search_result_row(&leader, false);
+        assert_eq!((row.id.as_str(), row.group.as_str()), ("a", "doc"));
+        let row = search_result_row(&leader.inner_hits[0], true);
+        assert_eq!((row.id.as_str(), row.group.as_str()), ("  ↳ b", ""));
+
+        let no_key = result_with_highlights("c", HashMap::new());
+        assert_eq!(search_result_row(&no_key, false).group, "-");
+
+        // Smoke: both formats print a grouped search without panicking.
+        print_search_results(&[grouped_result()], OutputFormat::Table);
+        print_search_results(&[grouped_result()], OutputFormat::Json);
     }
 }

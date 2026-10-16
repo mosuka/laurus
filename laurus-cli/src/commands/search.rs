@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use laurus::vector::Vector;
-use laurus::{RescoreOptions, SearchRequestBuilder, SearchResult};
+use laurus::{GroupBy, RescoreOptions, SearchRequestBuilder, SearchResult};
 
 use crate::cli::SearchCommand;
 use crate::context;
@@ -47,6 +47,13 @@ pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<Vec
     }
     if let Some(rescore) = rescore_options(cmd)? {
         builder = builder.rescore(rescore);
+    }
+    if let Some(field) = &cmd.group_by {
+        let group_by = GroupBy::new(field.clone());
+        builder = builder.group_by(match cmd.group_size {
+            Some(group_size) => group_by.group_size(group_size),
+            None => group_by,
+        });
     }
 
     engine
@@ -143,6 +150,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             rescore_text: None,
             rescore_vectors: None,
             rescore_window: None,
+            group_by: None,
+            group_size: None,
         }
     }
 
@@ -546,5 +555,51 @@ distance = "DotProduct"
 
         let cmd = parse(&["--rescore-field", "tokens", "--rescore-vectors", "[1, 0]"]).unwrap();
         assert!(rescore_options(&cmd).is_err(), "not an array of arrays");
+    }
+
+    /// Issue #1297: `--group-by _id` returns each chunked document once,
+    /// with up to `--group-size - 1` more of its chunks as inner hits.
+    #[tokio::test]
+    async fn search_groups_chunks_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.toml"),
+            "[fields.title.Text]\nindexed = true\nstored = true\n",
+        )
+        .unwrap();
+        let engine = context::open_index(dir.path()).await.unwrap();
+        for (id, title) in [
+            ("a", "rust rust rust"),
+            ("a", "rust rust"),
+            ("a", "rust notes"),
+            ("b", "rust intro guide"),
+        ] {
+            let doc = laurus::Document::builder().add_text("title", title).build();
+            engine.add_document(id, doc).await.unwrap();
+        }
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let mut groups: Vec<(String, usize)> = execute(
+            &SearchCommand {
+                group_by: Some("_id".to_string()),
+                group_size: Some(2),
+                ..search_command("title:rust")
+            },
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|result| {
+            assert_eq!(
+                result.group_key,
+                Some(laurus::DataValue::Text(result.id.clone()))
+            );
+            (result.id, result.inner_hits.len())
+        })
+        .collect();
+        groups.sort();
+        assert_eq!(groups, [("a".to_string(), 1), ("b".to_string(), 0)]);
     }
 }
