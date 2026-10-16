@@ -1,4 +1,10 @@
 //! PHP-facing `Index` class — the primary entry point for the laurus binding.
+//!
+//! The multi-word `groupBy` parameter of `search` and `searchBatch` (Issue
+//! #1297) is camelCase, as in `search.rs`: `#[php_impl]` exposes a
+//! parameter's Rust identifier as its PHP named-argument name. The lint is
+//! allowed for the whole module for the reason given there.
+#![allow(non_snake_case)]
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -17,8 +23,8 @@ use crate::convert::{document_to_hashtable, hashtable_to_document};
 use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::schema::PhpSchema;
 use crate::search::{
-    PhpSearchResult, build_request_from_php, parse_highlight_option, parse_rescore_option,
-    to_php_search_result,
+    PhpSearchResult, build_request_from_php, parse_group_by_option, parse_highlight_option,
+    parse_rescore_option, to_php_search_result,
 };
 
 // ---------------------------------------------------------------------------
@@ -549,6 +555,8 @@ impl PhpIndex {
     ///   `stored: true` text fields can be highlighted.
     /// * `rescore` - `LateInteractionRescore` reordering the top results by
     ///   MaxSim against a multi-vector field (Issue #1351).
+    /// * `groupBy` - `GroupBy` grouping the results by a field's value
+    ///   (Issue #1297); `$limit` and `$offset` then count groups.
     ///
     /// When `$query` is a `SearchRequest`, the other arguments are ignored
     /// in favor of the request's own values.
@@ -564,15 +572,18 @@ impl PhpIndex {
         offset: i64,
         highlight: Option<&ZendHashTable>,
         rescore: Option<&Zval>,
+        groupBy: Option<&Zval>,
     ) -> PhpResult<Vec<PhpSearchResult>> {
         let highlight = parse_highlight_option(highlight)?;
         let rescore = parse_rescore_option(rescore)?;
+        let group_by = parse_group_by_option(groupBy)?;
         let request = build_request_from_php(
             query,
             limit as usize,
             offset as usize,
             highlight.as_ref(),
             rescore.as_ref(),
+            group_by.as_ref(),
         )?;
 
         let engine = self.engine()?;
@@ -601,6 +612,8 @@ impl PhpIndex {
     /// * `highlight` - Request highlighted fragments per field, applied
     ///   identically to every query in the batch — same format as
     ///   `search`'s `$highlight` (Issue #1134).
+    /// * `groupBy` - `GroupBy` applied identically to every query in the
+    ///   batch (Issue #1297). A `SearchRequest` element uses its own.
     ///
     /// # Returns
     ///
@@ -617,8 +630,10 @@ impl PhpIndex {
         limit: i64,
         offset: i64,
         highlight: Option<&ZendHashTable>,
+        groupBy: Option<&Zval>,
     ) -> PhpResult<Vec<Vec<PhpSearchResult>>> {
         let highlight = parse_highlight_option(highlight)?;
+        let group_by = parse_group_by_option(groupBy)?;
         let arr = queries.array().ok_or_else(|| {
             PhpException::from(
                 "search_batch: expected an array of queries (DSL string, Query object, or SearchRequest)".to_string(),
@@ -637,6 +652,7 @@ impl PhpIndex {
                 offset as usize,
                 highlight.as_ref(),
                 None,
+                group_by.as_ref(),
             )?);
         }
 

@@ -38,12 +38,12 @@ class Index {
 | `deleteDocuments(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush writes and make pending changes searchable. |
 | `flushWal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, limit?, offset?, highlight?, rescore?)` | Search with a DSL string. `rescore` reorders the top results by late interaction; see [Late-interaction rescore](#late-interaction-rescore). |
+| `search(query, limit?, offset?, highlight?, rescore?, groupBy?)` | Search with a DSL string. `rescore` reorders the top results by late interaction; see [Late-interaction rescore](#late-interaction-rescore). `groupBy` groups the results by a field's value; see [Result grouping](#result-grouping). |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | Search with an exact term match. |
 | `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector. |
 | `searchVectorText(field, text, limit?, offset?)` | Search with text (auto-embedded). |
 | `searchWithRequest(request)` | Search with a `SearchRequest`. |
-| `searchBatch(queries, limit?, offset?, highlight?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` applies identically to every query. |
+| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` and `groupBy` apply identically to every query. |
 | `stats()` | Return index statistics (`documentCount`, `vectorFields`). |
 
 All document methods and search methods are async
@@ -576,6 +576,7 @@ interface SearchRequestOptions {
   offset?: number;  // default 0
   highlight?: HighlightOptions;
   rescore?: RescoreOptions;
+  groupBy?: GroupByOptions;
 }
 
 class SearchRequest {
@@ -586,9 +587,9 @@ class SearchRequest {
 Construct with primitive options first; attach polymorphic clauses with
 the per-type setters below. As with `BooleanQuery`, the binding exposes
 per-type setters because of `napi-derive`'s limitation on `Either<&T, ...>`
-arguments. `highlight` and `rescore` are plain data (not class-instance
-unions), so they live directly on `SearchRequestOptions` rather than behind a
-setter.
+arguments. `highlight`, `rescore` and `groupBy` are plain data (not
+class-instance unions), so they live directly on `SearchRequestOptions` rather
+than behind a setter.
 
 ### DSL and fusion setters
 
@@ -718,6 +719,69 @@ req.setRrfFusion(new RRF(60.0));
 const reranked = await index.searchWithRequest(req);
 ```
 
+### Result grouping
+
+`search` and `searchBatch` (their trailing `groupBy` argument) and
+`SearchRequestOptions` accept an optional `groupBy` object (Issue #1297). It
+groups the results by a field's value, so that the chunks of one document do
+not fill the page. Grouping runs on the final ranking, after fusion and
+rescore, for lexical, vector and hybrid searches alike. See
+[Result Grouping](../concepts/search/result_grouping.md) for the ordering, the
+candidate pool and why a group can hold fewer than `groupSize` hits.
+
+```typescript
+// Exported from index.d.ts as JsGroupByOptions.
+interface GroupByOptions {
+  field: string;       // "_id", or a single-valued stored field
+  groupSize?: number;  // default 1, at most 100
+}
+```
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | `string` | -- | `_id` (chunks added with `addDocument` share their document's `_id`), or a single-valued, stored Text, Integer, Float, Boolean or DateTime field with `docValues` enabled (the defaults). |
+| `groupSize` | `number` | `1` | How many hits each group keeps, the returned result included, `1` to `100`. |
+
+Each returned result is then the best hit of a group: its `groupKey` is the
+value the group shares and its `innerHits` hold up to `groupSize - 1` further
+hits of the group, in ranking order (see [SearchResult](#searchresult)).
+`limit` and `offset` count groups.
+
+An object without `field` rejects with code `InvalidArg` and the message
+``Missing field `field` ``. The engine checks the values when the search runs,
+and rejects with code `InvalidArg` and a message containing `group_by: ...`
+when `field` is unknown, of another type, multi-valued, not stored or without
+`docValues`, when `groupSize` is out of range, or when `offset + limit`
+exceeds 10,000.
+
+`searchTerm`, `searchVector` and `searchVectorText` take no `groupBy`
+argument; build a `SearchRequest` instead.
+
+```javascript
+const schema = new Schema();
+schema.addTextField("body");
+const index = await Index.create(null, schema);
+await index.addDocument("manual", { body: "Lifetimes tie a reference to its owner." });
+await index.addDocument("manual", { body: "Elided lifetimes follow three rules." });
+await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
+await index.commit();
+
+const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+  field: "_id",
+  groupSize: 2,
+});
+for (const r of results) {
+  console.log(r.groupKey, r.innerHits.map((hit) => hit.document.body));
+}
+// faq []
+// manual [ 'Elided lifetimes follow three rules.' ]
+
+// The same grouping through a SearchRequest.
+const req = new SearchRequest({ limit: 10, groupBy: { field: "_id", groupSize: 2 } });
+req.setLexicalTerm(new TermQuery("body", "lifetimes"));
+const grouped = await index.searchWithRequest(req);
+```
+
 ---
 
 ## SearchResult
@@ -730,10 +794,14 @@ interface SearchResult {
   score: number;     // Relevance score
   document: object | null; // Retrieved fields, or null if not stored
   highlights: Record<string, string[]>; // Highlighted fragments per requested field
+  groupKey?: any;    // With groupBy, the group's value
+  innerHits: SearchResult[]; // With groupBy, the group's next best hits
 }
 ```
 
 `highlights` maps each field named in `highlight.fields` to its highlighted fragments (best first); a field that did not highlight is absent from the object, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
+
+With `groupBy`, `groupKey` is the value the result's group shares (a DateTime value as an RFC 3339 string; absent for a hit without a value) and `innerHits` holds the group's next best hits in ranking order, each with the same `groupKey` and no inner hits of its own. An ungrouped search leaves `groupKey` absent and `innerHits` empty. See [Result grouping](#result-grouping).
 
 ---
 

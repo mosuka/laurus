@@ -12,8 +12,8 @@ use crate::query::{
 };
 use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, RescoreOptions,
-    SearchRequestBuilder, SearchResult,
+    FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions, LexicalSearchQuery,
+    RescoreOptions, SearchRequestBuilder, SearchResult,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -123,6 +123,33 @@ pub fn js_rescore_options_to_core(options: &JsRescoreOptions) -> Result<RescoreO
     })
 }
 
+/// Group the search results by a field's value (Issue #1297), e.g.
+/// `{ field: "_id", groupSize: 3 }`.
+///
+/// Each result is then a group's best hit: its `groupKey` is the value the
+/// group shares and its `innerHits` hold the group's next best hits, up to
+/// `groupSize` hits per group. `limit` and `offset` count groups.
+#[napi(object)]
+pub struct JsGroupByOptions {
+    /// `_id` (chunks added with `addDocument` share their document's
+    /// `_id`), or a single-valued, stored Text, Integer, Float, Boolean or
+    /// DateTime field.
+    pub field: String,
+    /// How many hits each group keeps, the returned result included
+    /// (default 1, at most 100).
+    pub group_size: Option<u32>,
+}
+
+/// Convert [`JsGroupByOptions`] into the core [`GroupBy`]. The engine
+/// checks the values when searching.
+pub fn js_group_by_options_to_core(options: &JsGroupByOptions) -> GroupBy {
+    let group_by = GroupBy::new(options.field.clone());
+    match options.group_size {
+        Some(group_size) => group_by.group_size(group_size as usize),
+        None => group_by,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fusion algorithm types
 // ---------------------------------------------------------------------------
@@ -199,6 +226,11 @@ impl JsWeightedSum {
 ///   - `highlights` (object): Highlighted fragments per field requested via
 ///     `highlight`, best fragment first. Empty when highlighting was not
 ///     requested, the field was not a stored text field, or nothing matched.
+///   - `groupKey` (any | undefined): With `groupBy`, the value this result's
+///     group shares; absent for an ungrouped search and for a hit without a
+///     value (Issue #1297).
+///   - `innerHits` (SearchResult[]): With `groupBy`, the group's next best
+///     hits, in ranking order. Empty for an ungrouped search.
 #[napi(object)]
 pub struct JsSearchResult {
     /// External document identifier.
@@ -209,6 +241,11 @@ pub struct JsSearchResult {
     pub document: Option<serde_json::Value>,
     /// Highlighted fragments per field.
     pub highlights: HashMap<String, Vec<String>>,
+    /// The value this result's group shares (Issue #1297).
+    pub group_key: Option<serde_json::Value>,
+    /// The group's next best hits, each with the same `groupKey` and no
+    /// inner hits of its own (Issue #1297).
+    pub inner_hits: Vec<JsSearchResult>,
 }
 
 /// Convert a [`SearchResult`] from the engine into a serializable [`JsSearchResult`].
@@ -233,6 +270,8 @@ pub fn to_js_search_result(r: SearchResult) -> JsSearchResult {
         score: r.score as f64,
         document,
         highlights: r.highlights,
+        group_key: r.group_key.as_ref().map(data_value_to_json),
+        inner_hits: r.inner_hits.into_iter().map(to_js_search_result).collect(),
     }
 }
 
@@ -275,6 +314,8 @@ pub struct JsSearchRequest {
     pub(crate) highlight: Option<JsHighlightOptions>,
     /// Late-interaction rescore of the top results (Issue #1351).
     pub(crate) rescore: Option<JsRescoreOptions>,
+    /// Grouping of the results by a field's value (Issue #1297).
+    pub(crate) group_by: Option<JsGroupByOptions>,
 }
 
 pub enum FusionChoice {
@@ -309,6 +350,9 @@ pub struct JsSearchRequestOptions {
     /// Late-interaction rescore of the top results (Issue #1351). Plain
     /// data, like `highlight`.
     pub rescore: Option<JsRescoreOptions>,
+    /// Grouping of the results by a field's value (Issue #1297). Plain
+    /// data, like `highlight`.
+    pub group_by: Option<JsGroupByOptions>,
 }
 
 #[napi]
@@ -339,6 +383,7 @@ impl JsSearchRequest {
             offset: None,
             highlight: None,
             rescore: None,
+            group_by: None,
         });
         Self {
             query_dsl: options.query_dsl,
@@ -350,6 +395,7 @@ impl JsSearchRequest {
             offset: options.offset.unwrap_or(0) as usize,
             highlight: options.highlight,
             rescore: options.rescore,
+            group_by: options.group_by,
         }
     }
 
@@ -599,6 +645,9 @@ impl JsSearchRequest {
         }
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(js_rescore_options_to_core(rescore)?);
+        }
+        if let Some(group_by) = &self.group_by {
+            builder = builder.group_by(js_group_by_options_to_core(group_by));
         }
 
         // DSL with a lexical / vector query (Issue #1372). A DSL is searched

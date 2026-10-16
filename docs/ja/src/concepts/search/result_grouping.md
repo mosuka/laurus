@@ -38,7 +38,13 @@ for result in engine.search(request).await? {
 Rust API のほか、[gRPC](../../laurus-server/grpc_api.md#groupbyparams) と
 [HTTP gateway](../../laurus-server/http_gateway.md#グループ化付き検索)、
 [MCP の `search`・`search_batch` ツール](../../laurus-mcp/tools.md#グループ化の例)、
-[`laurus search --group-by`](../../laurus-cli/commands.md#search) でも使えます。
+[`laurus search --group-by`](../../laurus-cli/commands.md#search)、
+[Python](../../laurus-python/api_reference.md#groupby)・
+[Node.js](../../laurus-nodejs/api_reference.md#検索結果のグループ化)・
+[Ruby](../../laurus-ruby/api_reference.md#groupby)・
+[PHP](../../laurus-php/api_reference.md#groupby)・
+[WASM](../../laurus-wasm/api_reference.md#検索結果のグループ化) のバインディングでも
+使えます。
 
 ## 仕組み
 

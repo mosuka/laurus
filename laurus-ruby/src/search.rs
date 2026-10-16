@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 
-use crate::convert::{document_to_hash, rb_token_vectors};
+use crate::convert::{data_value_to_rb, document_to_hash, rb_token_vectors};
 use crate::query::{
     extract_lexical_query, is_vector_query, rb_to_lexical_search_query, rb_to_vector_search_query,
 };
 use laurus::vector::Vector;
 use laurus::{
-    Document, FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery,
-    RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
+    DataValue, Document, FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions,
+    LexicalSearchQuery, RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
 };
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -273,6 +273,90 @@ pub fn rb_to_rescore_options(value: Value) -> Result<RescoreOptions, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// GroupBy (Issue #1297)
+// ---------------------------------------------------------------------------
+
+/// Group the search results by a field's value (`Laurus::GroupBy`, Issue
+/// #1297).
+///
+/// Each result is then a group's best hit: its `group_key` is the value the
+/// group shares and its `inner_hits` hold the group's next best hits, up to
+/// `group_size` hits per group. `limit:` and `offset:` count groups.
+/// `field` is `"_id"` — chunks added with `add_document` share their
+/// document's `_id` — or a single-valued, stored Text, Integer, Float,
+/// Boolean or DateTime field.
+///
+/// ## Example
+///
+/// ```ruby
+/// results = index.search("body:rust", group_by: Laurus::GroupBy.new("_id", group_size: 3))
+/// ```
+#[magnus::wrap(class = "Laurus::GroupBy")]
+#[derive(Clone)]
+pub struct RbGroupBy {
+    group_by: GroupBy,
+}
+
+impl RbGroupBy {
+    /// Create a grouping.
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Positional and keyword arguments:
+    ///   - `field` (String): The grouping field.
+    ///   - `group_size:` (Integer, default 1, at most 100): How many hits
+    ///     each group keeps, the returned result included. `nil` keeps the
+    ///     default. The values are checked when searching.
+    fn new(args: &[Value]) -> Result<Self, Error> {
+        let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+        let (field,) = args.required;
+        let kwargs =
+            get_kwargs::<_, (), (Option<Option<usize>>,), ()>(args.keywords, &[], &["group_size"])?;
+        let group_by = GroupBy::new(field);
+        Ok(Self {
+            group_by: match kwargs.optional.0.flatten() {
+                Some(group_size) => group_by.group_size(group_size),
+                None => group_by,
+            },
+        })
+    }
+
+    /// Return the grouping field.
+    fn field(&self) -> String {
+        self.group_by.field.clone()
+    }
+
+    /// Return how many hits each group keeps.
+    fn group_size(&self) -> usize {
+        self.group_by.group_size
+    }
+
+    fn inspect(&self) -> String {
+        format!(
+            "GroupBy(field={:?}, group_size={})",
+            self.group_by.field, self.group_by.group_size
+        )
+    }
+}
+
+/// Convert a Ruby `group_by:` value into [`GroupBy`].
+///
+/// # Errors
+///
+/// Raises `TypeError` if `value` is not a `Laurus::GroupBy`.
+pub fn rb_to_group_by(value: Value) -> Result<GroupBy, Error> {
+    <&RbGroupBy>::try_convert(value)
+        .map(|group_by| group_by.group_by.clone())
+        .map_err(|_| {
+            let ruby = Ruby::get().expect("called from Ruby thread");
+            Error::new(
+                ruby.exception_type_error(),
+                "group_by must be a Laurus::GroupBy",
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -285,6 +369,11 @@ pub fn rb_to_rescore_options(value: Value) -> Result<RescoreOptions, Error> {
 ///   - `highlights` (Hash): Highlighted fragments per field requested via
 ///     `highlight:`, best fragment first. Empty when highlighting was not
 ///     requested, the field was not a stored text field, or nothing matched.
+///   - `group_key`: With `group_by:`, the value this result's group shares;
+///     `nil` for an ungrouped search and for a hit without a value (Issue
+///     #1297).
+///   - `inner_hits` (Array of SearchResult): With `group_by:`, the group's
+///     next best hits, in ranking order. Empty for an ungrouped search.
 #[magnus::wrap(class = "Laurus::SearchResult")]
 pub struct RbSearchResult {
     pub id: String,
@@ -292,6 +381,10 @@ pub struct RbSearchResult {
     /// Stores the Rust Document to avoid Send issues with Ruby RHash values.
     pub document: Option<Document>,
     pub highlights: HashMap<String, Vec<String>>,
+    /// Stored as a Rust value, like `document`.
+    pub group_key: Option<DataValue>,
+    /// The engine's inner hits, converted when `inner_hits` is called.
+    pub inner_hits: Vec<SearchResult>,
 }
 
 impl RbSearchResult {
@@ -325,6 +418,26 @@ impl RbSearchResult {
         Ok(hash)
     }
 
+    /// Return the value this result's group shares, or nil (Issue #1297).
+    fn group_key(&self) -> Result<Value, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        match &self.group_key {
+            Some(key) => data_value_to_rb(&ruby, key),
+            None => Ok(ruby.qnil().as_value()),
+        }
+    }
+
+    /// Return the group's next best hits as an Array of `SearchResult`
+    /// (Issue #1297).
+    fn inner_hits(&self) -> Result<RArray, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let arr = ruby.ary_new_capa(self.inner_hits.len());
+        for hit in &self.inner_hits {
+            arr.push(ruby.into_value(to_rb_search_result(hit.clone())))?;
+        }
+        Ok(arr)
+    }
+
     fn inspect(&self) -> String {
         format!("SearchResult(id='{}', score={:.4})", self.id, self.score)
     }
@@ -345,6 +458,8 @@ pub fn to_rb_search_result(r: SearchResult) -> RbSearchResult {
         score: r.score,
         document: r.document,
         highlights: r.highlights,
+        group_key: r.group_key,
+        inner_hits: r.inner_hits,
     }
 }
 
@@ -384,6 +499,8 @@ pub struct RbSearchRequest {
     highlight: Option<HighlightOptions>,
     /// Late-interaction rescore of the top results (Issue #1351).
     rescore: Option<RescoreOptions>,
+    /// Grouping of the results by a field's value (Issue #1297).
+    group_by: Option<GroupBy>,
 }
 
 impl RbSearchRequest {
@@ -408,10 +525,19 @@ impl RbSearchRequest {
     ///     search-result highlighting (Issue #1134).
     ///   - `rescore:` - `LateInteractionRescore` reordering the top results
     ///     (Issue #1351).
+    ///   - `group_by:` - `GroupBy` grouping the results by a field's value
+    ///     (Issue #1297).
     fn new(args: &[Value]) -> Result<Self, Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        // `ScanArgsOpt` stops at 9 elements, which this list now fills.
+        // `ScanArgsOpt` stops at 9 elements, which the list below fills, so
+        // `group_by:` (Issue #1297) is taken out of the keyword hash first.
+        let group_by = args
+            .keywords
+            .delete::<_, Option<Value>>(ruby.to_symbol("group_by"))?
+            .filter(|value| !value.is_nil())
+            .map(rb_to_group_by)
+            .transpose()?;
         let kwargs = get_kwargs::<
             _,
             (),
@@ -511,6 +637,7 @@ impl RbSearchRequest {
             offset: offset.unwrap_or(0),
             highlight,
             rescore,
+            group_by,
         })
     }
 
@@ -548,6 +675,9 @@ impl RbSearchRequest {
         }
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(rescore.clone());
+        }
+        if let Some(group_by) = &self.group_by {
+            builder = builder.group_by(group_by.clone());
         }
 
         // `query` with `lexical_query` / `vector_query` (Issue #1372). A DSL
@@ -636,9 +766,10 @@ impl RbSearchRequest {
 /// - Any lexical query class
 /// - `VectorQuery` or `VectorTextQuery`
 ///
-/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`
-/// are used as-is from the request without overriding — same precedent as
-/// `limit`/`offset` already had here before highlighting existed.
+/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`/
+/// `group_by` are used as-is from the request without overriding — same
+/// precedent as `limit`/`offset` already had here before highlighting
+/// existed.
 ///
 /// # Arguments
 ///
@@ -647,6 +778,7 @@ impl RbSearchRequest {
 /// * `offset` - Pagination offset.
 /// * `highlight` - Already-parsed highlight options, if `highlight:` was given.
 /// * `rescore` - Already-parsed rescore, if `rescore:` was given.
+/// * `group_by` - Already-parsed grouping, if `group_by:` was given.
 ///
 /// # Returns
 ///
@@ -657,6 +789,7 @@ pub fn build_request_from_rb(
     offset: usize,
     highlight: Option<&HighlightOptions>,
     rescore: Option<&RescoreOptions>,
+    group_by: Option<&GroupBy>,
 ) -> Result<laurus::SearchRequest, Error> {
     // Full SearchRequest object
     if let Ok(req) = <&RbSearchRequest>::try_convert(query) {
@@ -672,6 +805,9 @@ pub fn build_request_from_rb(
     }
     if let Some(rescore) = rescore {
         builder = builder.rescore(rescore.clone());
+    }
+    if let Some(group_by) = group_by {
+        builder = builder.group_by(group_by.clone());
     }
 
     // DSL string
@@ -730,12 +866,22 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
         magnus::method!(RbLateInteractionRescore::inspect, 0),
     )?;
 
+    // GroupBy (Issue #1297)
+    let gb = module.define_class("GroupBy", ruby.class_object())?;
+    gb.define_singleton_method("new", magnus::function!(RbGroupBy::new, -1))?;
+    gb.define_method("field", magnus::method!(RbGroupBy::field, 0))?;
+    gb.define_method("group_size", magnus::method!(RbGroupBy::group_size, 0))?;
+    gb.define_method("inspect", magnus::method!(RbGroupBy::inspect, 0))?;
+    gb.define_method("to_s", magnus::method!(RbGroupBy::inspect, 0))?;
+
     // SearchResult
     let sr = module.define_class("SearchResult", ruby.class_object())?;
     sr.define_method("id", magnus::method!(RbSearchResult::id, 0))?;
     sr.define_method("score", magnus::method!(RbSearchResult::score, 0))?;
     sr.define_method("document", magnus::method!(RbSearchResult::document, 0))?;
     sr.define_method("highlights", magnus::method!(RbSearchResult::highlights, 0))?;
+    sr.define_method("group_key", magnus::method!(RbSearchResult::group_key, 0))?;
+    sr.define_method("inner_hits", magnus::method!(RbSearchResult::inner_hits, 0))?;
     sr.define_method("inspect", magnus::method!(RbSearchResult::inspect, 0))?;
     sr.define_method("to_s", magnus::method!(RbSearchResult::inspect, 0))?;
 

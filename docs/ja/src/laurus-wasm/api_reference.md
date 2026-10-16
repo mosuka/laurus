@@ -117,7 +117,7 @@ OPFS で永続化されたインデックスを開くか、新規作成します
 
 - **戻り値:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?, rescore?)`
+#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?)`
 
 DSL 文字列クエリで検索します。
 
@@ -125,8 +125,9 @@ DSL 文字列クエリで検索します。
   - `query` (string) -- クエリ DSL（例: `"title:hello"`）
   - `limit` (number, デフォルト 10)
   - `offset` (number, デフォルト 0)
-  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照。`rescore` だけを使う場合は `undefined` を渡す
+  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照。`rescore` か `groupBy` だけを使う場合は `undefined` を渡す
   - `rescore` (`RescoreOptions`, 省略可) -- 上位の結果を、MultiVector フィールドに対する late interaction で並べ替える（Issue #1351）。詳細は下記の [Late interaction による再採点](#late-interaction-による再採点)を参照
+  - `groupBy` (`GroupByOptions`, 省略可) -- 結果をフィールドの値でグループ化する（Issue #1297）。詳細は下記の[検索結果のグループ化](#検索結果のグループ化)を参照
 - **戻り値:** `Promise<SearchResult[]>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
@@ -177,7 +178,7 @@ const results = await index.search("body:rust", 10, 0, {
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language"] }
 ```
 
-#### `searchVector(field, vector, limit?, offset?, rescore?)`
+#### `searchVector(field, vector, limit?, offset?, rescore?, groupBy?)`
 
 ベクトル類似度で検索します。
 
@@ -186,9 +187,10 @@ const results = await index.search("body:rust", 10, 0, {
   - `vector` (number[]) -- クエリ埋め込みベクトル
   - `limit`, `offset` (number, 省略可)
   - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
+  - `groupBy` (`GroupByOptions`, 省略可) -- `search` の `groupBy` 引数と同じ
 - **戻り値:** `Promise<SearchResult[]>`
 
-#### `searchVectorText(field, text, limit?, offset?, rescore?)`
+#### `searchVectorText(field, text, limit?, offset?, rescore?, groupBy?)`
 
 テキストで検索します（登録された埋め込み器で変換）。
 
@@ -197,6 +199,7 @@ const results = await index.search("body:rust", 10, 0, {
   - `text` (string) -- 埋め込み対象テキスト
   - `limit`, `offset` (number, 省略可)
   - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
+  - `groupBy` (`GroupByOptions`, 省略可) -- `search` の `groupBy` 引数と同じ
 - **戻り値:** `Promise<SearchResult[]>`
 
 #### Late interaction による再採点
@@ -236,6 +239,41 @@ const reranked = await index.searchVectorText("embedding", "how do lifetimes wor
   text: "how do lifetimes work",
   windowSize: 50,
 });
+```
+
+#### 検索結果のグループ化
+
+`search`、`searchVector`、`searchVectorText` は、末尾に省略可能な `groupBy` 引数を受け付けます（Issue #1297）。結果をフィールドの値でグループ化し、1 つの文書の chunk がページを埋めないようにします。グループ化は、融合と再採点の後の最終的な順位に対して行い、lexical・vector・ハイブリッドのどの検索でも同じように動きます。ほかの検索メソッドには `groupBy` 引数はありません。引数は以下の形の単純なオブジェクトです。
+
+```typescript
+interface GroupByOptions {
+  field: string;
+  groupSize?: number;
+}
+```
+
+| キー | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | string | -- | `_id`（`addDocument` で登録した chunk は元の文書の `_id` を共有する）、または単一値で、stored で、`docValues` が有効（いずれも既定値）な Text・Integer・Float・Boolean・DateTime のフィールド |
+| `groupSize` | number | `1` | 各グループに残す hit の数。返す結果自身を含み、`1`〜`100` |
+
+このとき、返る各結果はグループの最上位の hit です。`groupKey` はグループが共有する値で、`innerHits` にはグループの残りの hit が順位順に最大 `groupSize - 1` 件入ります（[SearchResult](#searchresult) を参照）。`limit` と `offset` はグループの数を数えます。並び順、候補の数、グループの hit が `groupSize` 件に満たないことがある理由は、[検索結果のグループ化](../concepts/search/result_grouping.md) を参照してください。
+
+`field` のないオブジェクトや、型の合わない値は `Invalid groupBy options: ...` で例外になり、未知のキーは無視されます。それ以外の値はエンジンが検索の実行時に検査し、`field` が未知のフィールド、対象外の型、複数値、stored でない、または `docValues` がない場合、`groupSize` が範囲外の場合、`offset + limit` が 10,000 を超える場合に、`group_by: ...` を含むエラーになります。
+
+```js
+// 同じ id で登録した chunk は、その id でまとまる。
+await index.addDocument("manual", { body: "Lifetimes tie a reference to its owner." });
+await index.addDocument("manual", { body: "Elided lifetimes follow three rules." });
+await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
+await index.commit();
+
+const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+  field: "_id",
+  groupSize: 2,
+});
+results.map((r) => [r.groupKey, r.innerHits.map((hit) => hit.document.body)]);
+// => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
 ```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
@@ -771,10 +809,14 @@ interface SearchResult {
   score: number;
   document: object | null;
   highlights: Record<string, string[]>;
+  groupKey: string | number | boolean | null;
+  innerHits: SearchResult[];
 }
 ```
 
 `highlights` はリクエストの `highlight.fields` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドはオブジェクトに現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
+
+`groupBy` を指定した場合、`groupKey` は結果のグループが共有する値です（DateTime の値は RFC 3339 の文字列。値を持たない hit では `null`）。`innerHits` にはグループの残りの hit が順位順に入り、それぞれ同じ `groupKey` を持ち、自身の inner hits は持ちません。グループ化しない検索では、`groupKey` は `null`、`innerHits` は空です。詳細は[検索結果のグループ化](#検索結果のグループ化)を参照してください。
 
 ## Analysis
 

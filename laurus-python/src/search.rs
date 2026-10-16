@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 
-use crate::convert::{document_to_dict, py_token_vectors};
+use crate::convert::{data_value_to_py, document_to_dict, py_token_vectors};
 use crate::query::{
     extract_lexical_query, is_vector_query, py_to_lexical_search_query, py_to_vector_search_query,
 };
 use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, RescoreOptions,
-    SearchRequestBuilder, SearchResult,
+    FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions, LexicalSearchQuery,
+    RescoreOptions, SearchRequestBuilder, SearchResult,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -210,6 +210,67 @@ impl PyLateInteractionRescore {
 }
 
 // ---------------------------------------------------------------------------
+// GroupBy (Issue #1297)
+// ---------------------------------------------------------------------------
+
+/// Group the search results by a field's value (Issue #1297).
+///
+/// Each result is then a group's best hit: its ``group_key`` is the value
+/// the group shares and its ``inner_hits`` hold the group's next best hits,
+/// up to ``group_size`` hits per group. ``limit`` and ``offset`` count
+/// groups. ``field`` is ``"_id"`` — chunks added with ``add_document``
+/// share their document's ``_id`` — or a single-valued, stored ``Text``,
+/// ``Integer``, ``Float``, ``Boolean`` or ``DateTime`` field.
+///
+/// ## Example
+///
+/// ```python
+/// results = index.search("body:rust", group_by=laurus.GroupBy("_id", group_size=3))
+/// for result in results:
+///     print(result.id, [hit.score for hit in result.inner_hits])
+/// ```
+#[pyclass(name = "GroupBy", from_py_object)]
+#[derive(Clone)]
+pub struct PyGroupBy {
+    group_by: GroupBy,
+}
+
+#[pymethods]
+impl PyGroupBy {
+    /// Args:
+    ///     field: The grouping field.
+    ///     group_size: How many hits each group keeps, the returned result
+    ///         included (default 1, at most 100). The values are checked
+    ///         when searching.
+    #[new]
+    #[pyo3(signature = (field, *, group_size=1))]
+    pub fn new(field: String, group_size: usize) -> Self {
+        Self {
+            group_by: GroupBy::new(field).group_size(group_size),
+        }
+    }
+
+    /// The grouping field.
+    #[getter]
+    fn field(&self) -> &str {
+        &self.group_by.field
+    }
+
+    /// How many hits each group keeps.
+    #[getter]
+    fn group_size(&self) -> usize {
+        self.group_by.group_size
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GroupBy(field={:?}, group_size={})",
+            self.group_by.field, self.group_by.group_size
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -223,6 +284,12 @@ impl PyLateInteractionRescore {
 ///         requested via `highlight=`, best fragment first. Empty when
 ///         highlighting was not requested, the field was not a stored text
 ///         field, or nothing in it matched.
+///     group_key: With `group_by=`, the value this result's group shares;
+///         `None` for an ungrouped search and for a hit without a value
+///         (Issue #1297).
+///     inner_hits (list[SearchResult]): With `group_by=`, the group's next
+///         best hits, in ranking order. Each carries the same `group_key`
+///         and has no inner hits of its own. Empty for an ungrouped search.
 #[pyclass(name = "SearchResult")]
 pub struct PySearchResult {
     #[pyo3(get)]
@@ -232,6 +299,8 @@ pub struct PySearchResult {
     #[pyo3(get)]
     pub highlights: HashMap<String, Vec<String>>,
     document: Option<Py<PyAny>>,
+    group_key: Option<Py<PyAny>>,
+    inner_hits: Vec<Py<PySearchResult>>,
 }
 
 #[pymethods]
@@ -243,23 +312,53 @@ impl PySearchResult {
             None => py.None(),
         }
     }
+
+    #[getter]
+    pub fn group_key(&self, py: Python) -> Py<PyAny> {
+        match &self.group_key {
+            Some(key) => key.clone_ref(py),
+            None => py.None(),
+        }
+    }
+
+    #[getter]
+    pub fn inner_hits(&self, py: Python) -> Vec<Py<PySearchResult>> {
+        self.inner_hits
+            .iter()
+            .map(|hit| hit.clone_ref(py))
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!("SearchResult(id='{}', score={:.4})", self.id, self.score)
     }
 }
 
-/// Convert a [`SearchResult`] from the engine into a [`PySearchResult`].
+/// Convert a [`SearchResult`] from the engine into a [`PySearchResult`],
+/// its group's inner hits included (Issue #1297).
 pub fn to_py_search_result(py: Python, r: SearchResult) -> PyResult<PySearchResult> {
     let document = r
         .document
         .as_ref()
         .map(|doc| document_to_dict(py, doc))
         .transpose()?;
+    let group_key = r
+        .group_key
+        .as_ref()
+        .map(|key| data_value_to_py(py, key))
+        .transpose()?;
+    let inner_hits = r
+        .inner_hits
+        .into_iter()
+        .map(|hit| Py::new(py, to_py_search_result(py, hit)?))
+        .collect::<PyResult<_>>()?;
     Ok(PySearchResult {
         id: r.id,
         score: r.score,
         highlights: r.highlights,
         document,
+        group_key,
+        inner_hits,
     })
 }
 
@@ -307,6 +406,8 @@ pub struct PySearchRequest {
     pub highlight: Option<Py<PyAny>>,
     /// Late-interaction rescore of the top results (Issue #1351).
     pub rescore: Option<PyLateInteractionRescore>,
+    /// Grouping of the results by a field's value (Issue #1297).
+    pub group_by: Option<PyGroupBy>,
 }
 
 #[pymethods]
@@ -322,7 +423,8 @@ impl PySearchRequest {
         limit=10,
         offset=0,
         highlight=None,
-        rescore=None
+        rescore=None,
+        group_by=None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -335,6 +437,7 @@ impl PySearchRequest {
         offset: usize,
         highlight: Option<Py<PyAny>>,
         rescore: Option<PyLateInteractionRescore>,
+        group_by: Option<PyGroupBy>,
     ) -> Self {
         Self {
             query,
@@ -346,6 +449,7 @@ impl PySearchRequest {
             offset,
             highlight,
             rescore,
+            group_by,
         }
     }
 
@@ -399,6 +503,12 @@ impl PySearchRequest {
         // Also before the branches below, for the same reason.
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(rescore.options.clone());
+        }
+
+        // ── Grouping (Issue #1297) ──────────────────────────────────────────
+        // Likewise.
+        if let Some(group_by) = &self.group_by {
+            builder = builder.group_by(group_by.group_by.clone());
         }
 
         // ── `query` with `lexical_query` / `vector_query` (Issue #1372) ───
@@ -495,9 +605,9 @@ impl PySearchRequest {
 /// - A `PyRRF` / `PyWeightedSum` are not valid here
 ///
 /// When `query` is a `PySearchRequest`, `limit`/`offset`/`highlight`/
-/// `rescore` are used as-is from the request without overriding — same
-/// precedent as `limit`/`offset` already had here before highlighting
-/// existed.
+/// `rescore`/`group_by` are used as-is from the request without
+/// overriding — same precedent as `limit`/`offset` already had here before
+/// highlighting existed.
 pub fn build_request_from_py(
     py: Python,
     query: &Bound<PyAny>,
@@ -505,6 +615,7 @@ pub fn build_request_from_py(
     offset: usize,
     highlight: Option<&Bound<PyAny>>,
     rescore: Option<&PyLateInteractionRescore>,
+    group_by: Option<&PyGroupBy>,
 ) -> PyResult<laurus::SearchRequest> {
     // Full SearchRequest object — use limit/offset as-is without overriding.
     if let Ok(req) = query.extract::<PyRef<PySearchRequest>>() {
@@ -521,6 +632,9 @@ pub fn build_request_from_py(
     }
     if let Some(rescore) = rescore {
         builder = builder.rescore(rescore.options.clone());
+    }
+    if let Some(group_by) = group_by {
+        builder = builder.group_by(group_by.group_by.clone());
     }
 
     // DSL string

@@ -11,8 +11,8 @@ use crate::query::{
 };
 use crate::schema::WasmSchema;
 use crate::search::{
-    build_dsl_request, build_lexical_request, build_vector_request, parse_highlight_options,
-    parse_rescore_options,
+    build_dsl_request, build_lexical_request, build_vector_request, parse_group_by_options,
+    parse_highlight_options, parse_rescore_options,
 };
 use crate::storage::OpfsPersistence;
 use crate::wal::WasmWalSyncPolicy;
@@ -28,30 +28,39 @@ use wasm_bindgen::prelude::*;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Convert one search result, and its group's inner hits (Issue #1297),
+/// into the JSON shape `search_results_to_js` returns.
+fn search_result_to_json(r: laurus::SearchResult) -> serde_json::Value {
+    let document = r.document.map(|doc| {
+        let mut map = serde_json::Map::new();
+        for (field, value) in doc.fields {
+            map.insert(field, data_value_to_json(&value));
+        }
+        serde_json::Value::Object(map)
+    });
+    let inner_hits: Vec<serde_json::Value> = r
+        .inner_hits
+        .into_iter()
+        .map(search_result_to_json)
+        .collect();
+    serde_json::json!({
+        "id": r.id,
+        "score": r.score,
+        "document": document,
+        "highlights": r.highlights,
+        "groupKey": r.group_key.as_ref().map(data_value_to_json),
+        "innerHits": inner_hits,
+    })
+}
+
 /// Serialize search results to JS via JSON.parse(JSON string).
 ///
 /// This avoids issues with `serde_wasm_bindgen` not correctly handling
 /// nested `serde_json::Value` types. Instead, we serialize the entire
 /// result to a JSON string and then parse it in JS.
 fn search_results_to_js(results: Vec<laurus::SearchResult>) -> Result<JsValue, JsValue> {
-    let json_results: Vec<serde_json::Value> = results
-        .into_iter()
-        .map(|r| {
-            let document = r.document.map(|doc| {
-                let mut map = serde_json::Map::new();
-                for (field, value) in doc.fields {
-                    map.insert(field, data_value_to_json(&value));
-                }
-                serde_json::Value::Object(map)
-            });
-            serde_json::json!({
-                "id": r.id,
-                "score": r.score,
-                "document": document,
-                "highlights": r.highlights,
-            })
-        })
-        .collect();
+    let json_results: Vec<serde_json::Value> =
+        results.into_iter().map(search_result_to_json).collect();
 
     let json_str = serde_json::to_string(&json_results)
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))?;
@@ -525,10 +534,22 @@ impl WasmIndex {
     ///   exactly one of `vectors` (`number[][]`) and `text`. The top
     ///   `windowSize` results (default 100) are reordered by MaxSim against
     ///   the multi-vector `field`.
+    /// * `group_by` - Optional grouping of the results by a field's value
+    ///   (Issue #1297): `{ field, groupSize? }`. `field` is `_id` (chunks
+    ///   added with `addDocument` share their document's `_id`) or a
+    ///   single-valued, stored Text, Integer, Float, Boolean or DateTime
+    ///   field; `groupSize` (default 1, at most 100) is how many hits each
+    ///   group keeps. Each result is then a group's best hit; `limit` and
+    ///   `offset` count groups.
     ///
     /// # Returns
     ///
-    /// A JS array of SearchResult objects `{ id, score, document, highlights }`.
+    /// A JS array of SearchResult objects
+    /// `{ id, score, document, highlights, groupKey, innerHits }`. With
+    /// `group_by`, `groupKey` is the value the result's group shares (`null`
+    /// for a hit without a value) and `innerHits` holds the group's next
+    /// best hits in ranking order; otherwise `groupKey` is `null` and
+    /// `innerHits` is empty.
     #[wasm_bindgen]
     pub async fn search(
         &self,
@@ -537,6 +558,7 @@ impl WasmIndex {
         offset: Option<u32>,
         highlight: Option<js_sys::Object>,
         rescore: Option<js_sys::Object>,
+        group_by: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let mut request = build_dsl_request(
             query,
@@ -545,6 +567,7 @@ impl WasmIndex {
         );
         request.lexical_options.highlight = parse_highlight_options(highlight)?;
         request.rescore = parse_rescore_options(rescore)?;
+        request.group_by = parse_group_by_options(group_by)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -748,6 +771,8 @@ impl WasmIndex {
     /// * `offset` - Pagination offset (default 0).
     /// * `rescore` - Optional late-interaction rescore; same shape as
     ///   `search`'s `rescore` argument (Issue #1351).
+    /// * `group_by` - Optional grouping of the results; same shape as
+    ///   `search`'s `group_by` argument (Issue #1297).
     #[wasm_bindgen(js_name = "searchVector")]
     pub async fn search_vector(
         &self,
@@ -756,6 +781,7 @@ impl WasmIndex {
         limit: Option<u32>,
         offset: Option<u32>,
         rescore: Option<js_sys::Object>,
+        group_by: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let query = JsVectorQuery::VectorQuery(JsVectorQueryInner {
             field,
@@ -767,6 +793,7 @@ impl WasmIndex {
             offset.unwrap_or(0) as usize,
         );
         request.rescore = parse_rescore_options(rescore)?;
+        request.group_by = parse_group_by_options(group_by)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -781,6 +808,8 @@ impl WasmIndex {
     /// * `offset` - Pagination offset (default 0).
     /// * `rescore` - Optional late-interaction rescore; same shape as
     ///   `search`'s `rescore` argument (Issue #1351).
+    /// * `group_by` - Optional grouping of the results; same shape as
+    ///   `search`'s `group_by` argument (Issue #1297).
     #[wasm_bindgen(js_name = "searchVectorText")]
     pub async fn search_vector_text(
         &self,
@@ -789,6 +818,7 @@ impl WasmIndex {
         limit: Option<u32>,
         offset: Option<u32>,
         rescore: Option<js_sys::Object>,
+        group_by: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         let query = JsVectorQuery::VectorTextQuery(JsVectorTextQuery { field, text });
         let mut request = build_vector_request(
@@ -797,6 +827,7 @@ impl WasmIndex {
             offset.unwrap_or(0) as usize,
         );
         request.rescore = parse_rescore_options(rescore)?;
+        request.group_by = parse_group_by_options(group_by)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -941,7 +972,14 @@ mod tests {
         let highlight = highlight_object(serde_json::json!({ "fields": ["body"] }));
 
         let js_results = index
-            .search("body:rust".to_string(), None, None, Some(highlight), None)
+            .search(
+                "body:rust".to_string(),
+                None,
+                None,
+                Some(highlight),
+                None,
+                None,
+            )
             .await
             .expect("search must succeed");
         let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
@@ -960,7 +998,7 @@ mod tests {
         let index = text_index().await;
 
         let js_results = index
-            .search("body:rust".to_string(), None, None, None, None)
+            .search("body:rust".to_string(), None, None, None, None, None)
             .await
             .expect("search must succeed");
         let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
@@ -1045,14 +1083,14 @@ mod tests {
 
         // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
         let title_hits = index
-            .search("title:ell".to_string(), None, None, None, None)
+            .search("title:ell".to_string(), None, None, None, None, None)
             .await
             .expect("search must succeed");
         let title_hits: serde_json::Value = serde_wasm_bindgen::from_value(title_hits).unwrap();
         assert_eq!(title_hits.as_array().unwrap().len(), 1);
 
         let plain_hits = index
-            .search("plain:ell".to_string(), None, None, None, None)
+            .search("plain:ell".to_string(), None, None, None, None, None)
             .await
             .expect("search must succeed");
         let plain_hits: serde_json::Value = serde_wasm_bindgen::from_value(plain_hits).unwrap();
@@ -1102,7 +1140,7 @@ mod tests {
         index.commit().await.expect("commit must succeed");
 
         let hits = index
-            .search("title:ell".to_string(), None, None, None, None)
+            .search("title:ell".to_string(), None, None, None, None, None)
             .await
             .expect("search must succeed");
         let hits: serde_json::Value = serde_wasm_bindgen::from_value(hits).unwrap();
@@ -1412,7 +1450,7 @@ mod tests {
     async fn search_is_reordered_by_late_interaction() {
         let index = rescore_index(None).await;
         let baseline = index
-            .search("title:rust".to_string(), None, None, None, None)
+            .search("title:rust".to_string(), None, None, None, None, None)
             .await
             .unwrap();
         assert_ne!(ids(baseline), EXPECTED);
@@ -1424,6 +1462,7 @@ mod tests {
                 None,
                 None,
                 Some(vectors_rescore()),
+                None,
             )
             .await
             .unwrap();
@@ -1457,6 +1496,7 @@ mod tests {
                 None,
                 None,
                 Some(vectors_rescore()),
+                None,
             )
             .await
             .unwrap();
@@ -1472,7 +1512,14 @@ mod tests {
                 "text": "how fast is rust"
             }));
             let results = index
-                .search("title:rust".to_string(), None, None, None, Some(rescore))
+                .search(
+                    "title:rust".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(rescore),
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(ids(results), EXPECTED, "{wrap}");
@@ -1576,6 +1623,7 @@ mod tests {
                     None,
                     None,
                     Some(highlight_object(rescore)),
+                    None,
                 )
                 .await
             else {
@@ -1649,6 +1697,205 @@ mod tests {
                 )
                 .unwrap_or_else(|err| panic!("storage={storage} must be accepted: {err:?}"));
             assert_eq!(schema.field_names(), vec!["tokens".to_string()]);
+        }
+    }
+
+    // ── Result grouping (Issue #1297) ──────────────────────────────────────
+    //
+    // Uses the corpus of `laurus-server/tests/grpc_group_by_test.rs`: three
+    // documents added as chunks sharing their `_id`, with Flat vectors so the
+    // vector ranking against [1, 0] — and with it the groups — is exact.
+
+    /// `(id, title, vec)` of each chunk.
+    const GROUP_CHUNKS: [(&str, &str, [f64; 2]); 6] = [
+        ("a", "rust rust rust guide", [1.0, 0.0]),
+        ("a", "rust rust intro", [0.9, 0.1]),
+        ("a", "rust appendix notes", [0.3, 0.7]),
+        ("b", "rust rust book chapter", [0.8, 0.2]),
+        ("b", "rust history of programming", [0.2, 0.8]),
+        ("c", "rust", [0.6, 0.4]),
+    ];
+
+    /// Each group as `(id, titles of its hits, best first)` with groupSize 2.
+    const GROUP_EXPECTED: [(&str, &[&str]); 3] = [
+        ("a", &["rust rust rust guide", "rust rust intro"]),
+        (
+            "b",
+            &["rust rust book chapter", "rust history of programming"],
+        ),
+        ("c", &["rust"]),
+    ];
+
+    async fn group_index() -> WasmIndex {
+        let index = WasmIndex::create(Some(rescore_schema(None)), None, None)
+            .await
+            .expect("index creation must succeed");
+        for (id, title, vec) in GROUP_CHUNKS {
+            let value = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "title": title, "vec": vec
+            }))
+            .unwrap();
+            index
+                .add_document(id.to_string(), value)
+                .await
+                .expect("add_document must succeed");
+        }
+        index.commit().await.expect("commit must succeed");
+        index
+    }
+
+    async fn search_vector_grouped(
+        index: &WasmIndex,
+        group_by: Option<serde_json::Value>,
+    ) -> JsValue {
+        index
+            .search_vector(
+                "vec".to_string(),
+                vec![1.0, 0.0],
+                None,
+                None,
+                None,
+                group_by.map(highlight_object),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The groups as `(id, titles of its hits)`, after checking that every
+    /// hit carries its group's key and only the leader has inner hits.
+    fn groups(js_results: JsValue) -> Vec<(String, Vec<String>)> {
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                assert_eq!(r["groupKey"], r["id"]);
+                let inner_hits = r["innerHits"].as_array().unwrap();
+                for hit in inner_hits {
+                    assert_eq!(hit["groupKey"], r["groupKey"]);
+                    assert_eq!(hit["innerHits"], serde_json::json!([]));
+                }
+                let titles = std::iter::once(r)
+                    .chain(inner_hits)
+                    .map(|h| h["document"]["title"].as_str().unwrap().to_string())
+                    .collect();
+                (r["id"].as_str().unwrap().to_string(), titles)
+            })
+            .collect()
+    }
+
+    fn expected_groups() -> Vec<(String, Vec<String>)> {
+        GROUP_EXPECTED
+            .iter()
+            .map(|(id, titles)| {
+                (
+                    id.to_string(),
+                    titles.iter().map(|t| t.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[wasm_bindgen_test]
+    async fn vector_search_groups_chunks_by_id() {
+        let index = group_index().await;
+        let results = search_vector_grouped(
+            &index,
+            Some(serde_json::json!({ "field": "_id", "groupSize": 2 })),
+        )
+        .await;
+        assert_eq!(groups(results), expected_groups());
+
+        let one_each =
+            search_vector_grouped(&index, Some(serde_json::json!({ "field": "_id" }))).await;
+        let one_each = groups(one_each);
+        assert_eq!(
+            one_each
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert!(one_each.iter().all(|(_, titles)| titles.len() == 1));
+    }
+
+    #[wasm_bindgen_test]
+    async fn dsl_search_groups_chunks_by_id() {
+        let index = group_index().await;
+        let results = index
+            .search(
+                "title:rust".to_string(),
+                None,
+                None,
+                None,
+                None,
+                Some(highlight_object(
+                    serde_json::json!({ "field": "_id", "groupSize": 2 }),
+                )),
+            )
+            .await
+            .unwrap();
+        // BM25 decides the order here; check the groups' shape and sizes.
+        let mut sizes: Vec<(String, usize)> = groups(results)
+            .into_iter()
+            .map(|(id, titles)| (id, titles.len()))
+            .collect();
+        sizes.sort();
+        assert_eq!(
+            sizes,
+            [
+                ("a".to_string(), 2),
+                ("b".to_string(), 2),
+                ("c".to_string(), 1)
+            ]
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn ungrouped_results_have_no_group() {
+        let index = group_index().await;
+        let results: serde_json::Value =
+            serde_wasm_bindgen::from_value(search_vector_grouped(&index, None).await).unwrap();
+        let results = results.as_array().unwrap();
+        assert_eq!(results.len(), GROUP_CHUNKS.len());
+        for r in results {
+            assert_eq!(r["groupKey"], serde_json::Value::Null);
+            assert_eq!(r["innerHits"], serde_json::json!([]));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn invalid_group_by_is_rejected() {
+        let index = group_index().await;
+        let cases = [
+            (
+                serde_json::json!({ "groupSize": 2 }),
+                "Invalid groupBy options",
+            ),
+            (serde_json::json!({ "field": "missing" }), "group_by"),
+            (serde_json::json!({ "field": "vec" }), "group_by"),
+            (
+                serde_json::json!({ "field": "_id", "groupSize": 0 }),
+                "group_by",
+            ),
+        ];
+        for (group_by, message) in cases {
+            let Err(err) = index
+                .search_vector(
+                    "vec".to_string(),
+                    vec![1.0, 0.0],
+                    None,
+                    None,
+                    None,
+                    Some(highlight_object(group_by)),
+                )
+                .await
+            else {
+                panic!("an invalid groupBy must be rejected: {message}");
+            };
+            let error = err.as_string().unwrap();
+            assert!(error.contains(message), "{error}");
         }
     }
 }

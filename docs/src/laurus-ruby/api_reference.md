@@ -31,8 +31,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records and returns `nil`. Useful when running under a group-commit policy (see below). |
-| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil) -> Array<SearchResult>` | Execute a search query. `rescore:` takes a `LateInteractionRescore` that reorders the top results (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). |
-| `search_batch(queries, limit: 10, offset: 0, highlight: nil) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight:` applies identically to every query in the batch. There is no `rescore:` keyword; a `SearchRequest` element is rescored by its own `rescore:`. |
+| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil, group_by: nil) -> Array<SearchResult>` | Execute a search query. `rescore:` takes a `LateInteractionRescore` that reorders the top results (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). `group_by:` takes a `GroupBy` that groups the results by a field's value (Issue #1297); `limit:` and `offset:` then count groups. Any other value raises `TypeError`. See [GroupBy](#groupby). |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil, group_by: nil) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight:` and `group_by:` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore:` keyword; a `SearchRequest` element is rescored by its own `rescore:`. |
 | `stats -> Hash` | Return index statistics (`"document_count"`, `"vector_fields"`). |
 
 ### `search` query argument
@@ -44,7 +44,7 @@ The `query` parameter accepts any of the following:
 - A **vector query object** (`VectorQuery`, `VectorTextQuery`)
 - A **`SearchRequest`** for full control
 
-When `query` is a `SearchRequest`, its own `limit:`, `offset:`, `highlight:` and `rescore:` are used and the keyword arguments of `search` are ignored.
+When `query` is a `SearchRequest`, its own `limit:`, `offset:`, `highlight:`, `rescore:` and `group_by:` are used and the keyword arguments of `search` are ignored.
 
 The same value kinds are accepted as the elements of `search_batch`'s `queries` Array — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
 
@@ -482,6 +482,7 @@ Laurus::SearchRequest.new(
   offset: 0,
   highlight: nil,
   rescore: nil,
+  group_by: nil,
 )
 ```
 
@@ -496,6 +497,7 @@ Laurus::SearchRequest.new(
 | `offset:` | Pagination offset (default 0). |
 | `highlight:` | Same Array-or-Hash shape as `Index#search`'s `highlight:` (Issue #1134). See [Highlighting](#highlighting). |
 | `rescore:` | A `LateInteractionRescore` that reorders the top results of the request — lexical, vector, or hybrid (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). |
+| `group_by:` | A `GroupBy` that groups the results of the request (Issue #1297); any other value raises `TypeError`. See [GroupBy](#groupby). |
 
 ---
 
@@ -542,6 +544,46 @@ rescore = Laurus::LateInteractionRescore.new("body_colbert", "how do lifetimes w
 
 ---
 
+## GroupBy
+
+Groups the search results by a field's value (Issue #1297), so that the chunks of one document do not fill the page. Pass it as `group_by:` to `Index#search`, `Index#search_batch` or `SearchRequest.new`.
+
+```ruby
+Laurus::GroupBy.new(field, group_size: 1)
+```
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | `String` | -- | `_id` (chunks added with `add_document` share their document's `_id`), or a single-valued, stored text, integer, float, boolean or datetime field with `doc_values` enabled (the defaults). |
+| `group_size:` | `Integer` | `1` | How many hits each group keeps, the returned result included, `1..=100`. |
+
+| Method | Description |
+| :--- | :--- |
+| `field -> String` | Return the grouping field. |
+| `group_size -> Integer` | Return how many hits each group keeps. |
+| `inspect -> String` | Return a summary such as `GroupBy(field="_id", group_size=2)`. |
+
+Each returned `SearchResult` is then the best hit of a group: its `group_key` is the value the group shares and its `inner_hits` hold up to `group_size - 1` further hits of the group, in ranking order. `limit:` and `offset:` count groups. Grouping runs on the final ranking, after fusion and rescore, for lexical, vector and hybrid searches alike. See [Result Grouping](../concepts/search/result_grouping.md) for the ordering, the candidate pool and why a group can hold fewer than `group_size` hits.
+
+**Errors**: the constructor raises `RangeError` for a negative `group_size:`. The other values are checked by the engine when searching, before any search runs, which raises `ArgumentError` with a message containing `group_by: ...` when the field is unknown, of another type, multi-valued, not stored or without `doc_values`, when `group_size` is not between 1 and 100, or when `offset + limit` exceeds 10,000.
+
+```ruby
+schema = Laurus::Schema.new
+schema.add_text_field("body")
+
+index = Laurus::Index.new(schema: schema)
+index.add_document("manual", { "body" => "Lifetimes tie a reference to its owner." })
+index.add_document("manual", { "body" => "Elided lifetimes follow three rules." })
+index.add_document("faq", { "body" => "Why do lifetimes appear in signatures?" })
+index.commit
+
+results = index.search("body:lifetimes", group_by: Laurus::GroupBy.new("_id", group_size: 2))
+results.map { |r| [r.group_key, r.inner_hits.map { |hit| hit.document["body"] }] }
+# => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
+```
+
+---
+
 ## SearchResult
 
 Returned by `Index#search`.
@@ -551,9 +593,13 @@ result.id         # => String   -- External document identifier
 result.score      # => Float    -- Relevance score
 result.document   # => Hash|nil -- Retrieved field values, or nil if deleted
 result.highlights # => Hash     -- Highlighted fragments per requested field
+result.group_key  # => Object   -- With group_by:, the group's value
+result.inner_hits # => Array    -- With group_by:, the group's next best hits
 ```
 
 `highlights` maps each field named in `highlight:` to its highlighted fragments (best first); a field that did not highlight is absent from the Hash, and `highlights` is `{}` when `highlight:` was not requested. See [Highlighting](#highlighting).
+
+With `group_by:`, `group_key` is the value the result's group shares (a String, Integer, Float, `true`/`false`, or a datetime as an RFC 3339 String; `nil` for a hit without a value) and `inner_hits` is an Array of the group's next best `SearchResult`s in ranking order, each with the same `group_key` and no inner hits of its own. An ungrouped search returns `nil` and `[]`. See [GroupBy](#groupby).
 
 ---
 

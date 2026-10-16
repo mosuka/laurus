@@ -120,7 +120,7 @@ durable persistence.
 
 - **Returns:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?, rescore?)`
+#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?)`
 
 Search using a DSL string query.
 
@@ -128,8 +128,9 @@ Search using a DSL string query.
   - `query` (string) -- Query DSL (e.g. `"title:hello"`).
   - `limit` (number, default 10)
   - `offset` (number, default 0)
-  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below. Pass `undefined` to skip it when you only need `rescore`.
+  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below. Pass `undefined` to skip it when you only need `rescore` or `groupBy`.
   - `rescore` (`RescoreOptions`, optional) -- Reorder the top results by late interaction against a multi-vector field (Issue #1351). See [Late-interaction rescore](#late-interaction-rescore) below.
+  - `groupBy` (`GroupByOptions`, optional) -- Group the results by a field's value (Issue #1297). See [Result grouping](#result-grouping) below.
 - **Returns:** `Promise<SearchResult[]>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
@@ -180,7 +181,7 @@ const results = await index.search("body:rust", 10, 0, {
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language"] }
 ```
 
-#### `searchVector(field, vector, limit?, offset?, rescore?)`
+#### `searchVector(field, vector, limit?, offset?, rescore?, groupBy?)`
 
 Search by vector similarity.
 
@@ -189,9 +190,10 @@ Search by vector similarity.
   - `vector` (number[]) -- Query embedding.
   - `limit`, `offset` (number, optional)
   - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
+  - `groupBy` (`GroupByOptions`, optional) -- Same as `search`'s `groupBy` argument.
 - **Returns:** `Promise<SearchResult[]>`
 
-#### `searchVectorText(field, text, limit?, offset?, rescore?)`
+#### `searchVectorText(field, text, limit?, offset?, rescore?, groupBy?)`
 
 Search by text (embedded by the registered embedder).
 
@@ -200,6 +202,7 @@ Search by text (embedded by the registered embedder).
   - `text` (string) -- Text to embed.
   - `limit`, `offset` (number, optional)
   - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
+  - `groupBy` (`GroupByOptions`, optional) -- Same as `search`'s `groupBy` argument.
 - **Returns:** `Promise<SearchResult[]>`
 
 #### Late-interaction rescore
@@ -239,6 +242,41 @@ const reranked = await index.searchVectorText("embedding", "how do lifetimes wor
   text: "how do lifetimes work",
   windowSize: 50,
 });
+```
+
+#### Result grouping
+
+`search`, `searchVector` and `searchVectorText` accept an optional trailing `groupBy` argument (Issue #1297). It groups the results by a field's value, so that the chunks of one document do not fill the page. Grouping runs on the final ranking, after fusion and rescore, for lexical, vector and hybrid searches alike. The other search methods have no `groupBy` argument. The argument is a plain object shaped like:
+
+```typescript
+interface GroupByOptions {
+  field: string;
+  groupSize?: number;
+}
+```
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | string | -- | `_id` (chunks added with `addDocument` share their document's `_id`), or a single-valued, stored Text, Integer, Float, Boolean or DateTime field with `docValues` enabled (the defaults). |
+| `groupSize` | number | `1` | How many hits each group keeps, the returned result included, `1`–`100`. |
+
+Each returned result is then the best hit of a group: its `groupKey` is the value the group shares and its `innerHits` hold up to `groupSize - 1` further hits of the group, in ranking order (see [SearchResult](#searchresult)). `limit` and `offset` count groups. See [Result Grouping](../concepts/search/result_grouping.md) for the ordering, the candidate pool and why a group can hold fewer than `groupSize` hits.
+
+An object without `field`, or with a value of the wrong type, throws `Invalid groupBy options: ...`, while unknown keys are ignored. The engine checks the values when the search runs and throws an error containing `group_by: ...` when `field` is unknown, of another type, multi-valued, not stored or without `docValues`, when `groupSize` is out of range, or when `offset + limit` exceeds 10,000.
+
+```js
+// Chunks added under one id are grouped by that id.
+await index.addDocument("manual", { body: "Lifetimes tie a reference to its owner." });
+await index.addDocument("manual", { body: "Elided lifetimes follow three rules." });
+await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
+await index.commit();
+
+const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+  field: "_id",
+  groupSize: 2,
+});
+results.map((r) => [r.groupKey, r.innerHits.map((hit) => hit.document.body)]);
+// => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
 ```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
@@ -796,10 +834,14 @@ interface SearchResult {
   score: number;
   document: object | null;
   highlights: Record<string, string[]>;
+  groupKey: string | number | boolean | null;
+  innerHits: SearchResult[];
 }
 ```
 
 `highlights` maps each field named in the request's `highlight.fields` to its highlighted fragments (best first); a field that did not highlight is absent from the object, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
+
+With `groupBy`, `groupKey` is the value the result's group shares (a DateTime value as an RFC 3339 string; `null` for a hit without a value) and `innerHits` holds the group's next best hits in ranking order, each with the same `groupKey` and no inner hits of its own. An ungrouped search returns `groupKey: null` and an empty `innerHits`. See [Result grouping](#result-grouping).
 
 ## Analysis
 

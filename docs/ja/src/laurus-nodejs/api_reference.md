@@ -38,12 +38,12 @@ class Index {
 | `deleteDocuments(id)` | 指定 ID の全バージョンを削除。 |
 | `commit()` | 書き込みをフラッシュし変更を検索可能にする。 |
 | `flushWal()` | WAL の永続性バリアを強制する。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照。 |
-| `search(query, limit?, offset?, highlight?, rescore?)` | DSL 文字列で検索。`rescore` は上位の結果を late interaction で並べ替えます。[Late interaction による再採点（Rescore）](#late-interaction-による再採点rescore)を参照。 |
+| `search(query, limit?, offset?, highlight?, rescore?, groupBy?)` | DSL 文字列で検索。`rescore` は上位の結果を late interaction で並べ替えます。[Late interaction による再採点（Rescore）](#late-interaction-による再採点rescore)を参照。`groupBy` は結果をフィールドの値でグループ化します。[検索結果のグループ化](#検索結果のグループ化)を参照。 |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | 完全一致 Term 検索。 |
 | `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。 |
 | `searchVectorText(field, text, limit?, offset?)` | テキストを自動埋め込みして検索。 |
 | `searchWithRequest(request)` | `SearchRequest` で検索。 |
-| `searchBatch(queries, limit?, offset?, highlight?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` はすべてのクエリに同一に適用されます。 |
+| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` と `groupBy` はすべてのクエリに同一に適用されます。 |
 | `stats()` | インデックス統計（`documentCount`、`vectorFields`）を返す。 |
 
 ドキュメント操作と検索メソッドはすべて非同期で Promise を返します。
@@ -569,6 +569,7 @@ interface SearchRequestOptions {
   offset?: number;  // デフォルト 0
   highlight?: HighlightOptions;
   rescore?: RescoreOptions;
+  groupBy?: GroupByOptions;
 }
 
 class SearchRequest {
@@ -579,8 +580,8 @@ class SearchRequest {
 コンストラクタにはプリミティブな options を渡し、多態クエリ句は下記の
 per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` の
 `Either<&T, ...>` バリデーション制限を回避するため per-type 化されています。
-`highlight` と `rescore` はプレーンなデータ（クラスインスタンスのユニオンではない）
-なので、セッターを介さず `SearchRequestOptions` に直接持たせています。
+`highlight`、`rescore`、`groupBy` はプレーンなデータ（クラスインスタンスのユニオンでは
+ない）なので、セッターを介さず `SearchRequestOptions` に直接持たせています。
 
 ### DSL とフュージョンセッター
 
@@ -709,6 +710,69 @@ req.setRrfFusion(new RRF(60.0));
 const reranked = await index.searchWithRequest(req);
 ```
 
+### 検索結果のグループ化
+
+`search` と `searchBatch`（末尾の `groupBy` 引数）、`SearchRequestOptions` は
+省略可能な `groupBy` オブジェクトを受け付けます（Issue #1297）。結果をフィールドの
+値でグループ化し、1 つの文書の chunk がページを埋めないようにします。グループ化は、
+融合と再採点の後の最終的な順位に対して行い、lexical・vector・ハイブリッドのどの
+検索でも同じように動きます。並び順、候補の数、グループの hit が `groupSize` 件に
+満たないことがある理由は、[検索結果のグループ化](../concepts/search/result_grouping.md)
+を参照してください。
+
+```typescript
+// index.d.ts では JsGroupByOptions としてエクスポートされます。
+interface GroupByOptions {
+  field: string;       // "_id"、または単一値の stored なフィールド
+  groupSize?: number;  // デフォルト 1、最大 100
+}
+```
+
+| フィールド | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | `string` | -- | `_id`（`addDocument` で登録した chunk は元の文書の `_id` を共有します）、または単一値で、stored で、`docValues` が有効（いずれも既定値）な Text・Integer・Float・Boolean・DateTime のフィールド。 |
+| `groupSize` | `number` | `1` | 各グループに残す hit の数。返す結果自身を含み、`1`〜`100`。 |
+
+このとき、返る各結果はグループの最上位の hit です。`groupKey` はグループが共有する
+値で、`innerHits` にはグループの残りの hit が順位順に最大 `groupSize - 1` 件
+入ります（[SearchResult](#searchresult) を参照）。`limit` と `offset` はグループの
+数を数えます。
+
+`field` のないオブジェクトは、code `InvalidArg`、メッセージ
+``Missing field `field` `` で reject されます。それ以外の値はエンジンが検索時に
+検証し、`field` が未知のフィールド、対象外の型、複数値、stored でない、または
+`docValues` がない場合、`groupSize` が範囲外の場合、`offset + limit` が 10,000 を
+超える場合に、code `InvalidArg`、`group_by: ...` を含むメッセージで reject
+されます。
+
+`searchTerm`、`searchVector`、`searchVectorText` は `groupBy` 引数を取りません。
+代わりに `SearchRequest` を組み立ててください。
+
+```javascript
+const schema = new Schema();
+schema.addTextField("body");
+const index = await Index.create(null, schema);
+await index.addDocument("manual", { body: "Lifetimes tie a reference to its owner." });
+await index.addDocument("manual", { body: "Elided lifetimes follow three rules." });
+await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
+await index.commit();
+
+const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+  field: "_id",
+  groupSize: 2,
+});
+for (const r of results) {
+  console.log(r.groupKey, r.innerHits.map((hit) => hit.document.body));
+}
+// faq []
+// manual [ 'Elided lifetimes follow three rules.' ]
+
+// 同じグループ化を SearchRequest で指定します。
+const req = new SearchRequest({ limit: 10, groupBy: { field: "_id", groupSize: 2 } });
+req.setLexicalTerm(new TermQuery("body", "lifetimes"));
+const grouped = await index.searchWithRequest(req);
+```
+
 ---
 
 ## SearchResult
@@ -721,10 +785,14 @@ interface SearchResult {
   score: number;     // 関連度スコア
   document: object | null; // 取得フィールド、stored=false の場合は null
   highlights: Record<string, string[]>; // 要求したフィールドごとのハイライト済みフラグメント
+  groupKey?: any;    // groupBy を指定した場合、グループの値
+  innerHits: SearchResult[]; // groupBy を指定した場合、グループの残りの hit
 }
 ```
 
 `highlights` は `highlight.fields` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドはオブジェクトに現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
+
+`groupBy` を指定した場合、`groupKey` は結果のグループが共有する値です（DateTime の値は RFC 3339 の文字列。値を持たない hit では省略されます）。`innerHits` にはグループの残りの hit が順位順に入り、それぞれ同じ `groupKey` を持ち、自身の inner hits は持ちません。グループ化しない検索では、`groupKey` は省略され、`innerHits` は空です。詳細は[検索結果のグループ化](#検索結果のグループ化)を参照してください。
 
 ---
 

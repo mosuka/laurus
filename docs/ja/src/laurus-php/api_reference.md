@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
 | `commit(): void` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flushWal(): void` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore` を使い、他の引数は無視されます。 |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` はバッチ内のすべてのクエリに同一に適用されます。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。 |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$groupBy` は結果をフィールドの値でグループ化し（Issue #1297）、このとき `$limit`/`$offset` はグループの数を数えます。[GroupBy](#groupby) を参照。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` を使い、他の引数は無視されます。 |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` と `$groupBy` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。 |
 | `stats(): array` | インデックス統計（`"documentCount"`、`"vectorFields"`）を返します。 |
 
 ### `search` の query 引数
@@ -495,6 +495,7 @@ new \Laurus\SearchRequest(
     int $offset = 0,
     ?array $highlight = null,
     ?LateInteractionRescore $rescore = null,
+    ?GroupBy $groupBy = null,
 )
 ```
 
@@ -509,8 +510,9 @@ new \Laurus\SearchRequest(
 | `$offset` | ページネーションオフセット（デフォルト 0）。 |
 | `$highlight` | `Index->search()` の `$highlight` と同じリストまたは連想配列の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。`$limit`/`$offset` 以外は PHP レベルのデフォルトを持たないため、`$highlight` を名前付き引数で渡す場合もそれ以前の引数はすべて位置または名前で渡す必要があります。 |
 | `$rescore` | 上位の結果を並べ替える `LateInteractionRescore`（Issue #1351）。それ以外のオブジェクトは `\TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
+| `$groupBy` | 結果をグループ化する `GroupBy`（Issue #1297）。それ以外の値は `\TypeError` になります。[GroupBy](#groupby) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
 
-`SearchRequest` を `Index->search()` に渡すと、リクエスト自身の `$limit`・`$offset`・`$highlight`・`$rescore` が使われ、`search` の他の引数は無視されます。
+`SearchRequest` を `Index->search()` に渡すと、リクエスト自身の `$limit`・`$offset`・`$highlight`・`$rescore`・`$groupBy` が使われ、`search` の他の引数は無視されます。
 
 ---
 
@@ -571,6 +573,58 @@ $rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes w
 
 ---
 
+## GroupBy
+
+検索結果をフィールドの値でグループ化し（Issue #1297）、1 つの文書の chunk がページを埋めないようにします。`Index->search()` か `Index->searchBatch()` の `$groupBy` 引数、または `SearchRequest` の `$groupBy` に渡します。
+
+```php
+new \Laurus\GroupBy(string $field, ?int $groupSize = null)
+```
+
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `$field` | `string` | -- | `_id`（`addDocument` で登録した chunk は元の文書の `_id` を共有します）、または単一値で、stored で、`docValues` が有効（いずれも既定値）なテキスト・整数・浮動小数点数・真偽値・日時のフィールド。 |
+| `$groupSize` | `int\|null` | `null`（1） | 各グループに残す hit の数。返す結果自身を含み、`1..=100`。 |
+
+### メソッド
+
+| メソッド | 説明 |
+| :--- | :--- |
+| `getField(): string` | グループ化に使うフィールドを返します。 |
+| `getGroupSize(): int` | 各グループに残す hit の数を返します（`$groupSize` を指定しなければ `1`）。 |
+| `__toString(): string` | `GroupBy(field="_id", group_size=2)` のような文字列表現を返します。 |
+
+### 結果とエラー
+
+このとき、返る各 `SearchResult` はグループの最上位の hit です。`getGroupKey()` はグループが共有する値で、`getInnerHits()` にはグループの残りの hit が順位順に最大 `$groupSize - 1` 件入ります。`$limit` と `$offset` はグループの数を数えます。グループ化は、融合と再採点の後の最終的な順位に対して行い、lexical・vector・ハイブリッドのどの検索でも同じように動きます。並び順、候補の数、グループの hit が `$groupSize` 件に満たないことがある理由は、[検索結果のグループ化](../concepts/search/result_grouping.md) を参照してください。
+
+- `Index->search()`、`Index->searchBatch()`、`SearchRequest` は、`$groupBy` にそれ以外の値を渡すと `\TypeError`（`groupBy must be a Laurus\GroupBy`）を投げます。
+- それ以外の値は検索時、検索を始める前にエンジンがチェックし、`group_by: ...` を含むメッセージの `\ValueError` を投げます。フィールドが存在しない、対象外の型、複数値、stored でない、または `docValues` がない場合、`$groupSize` が `1..=100` の範囲外の場合（負の値は 0 として報告されます）、`$offset + $limit` が 10,000 を超える場合です。
+
+### 例
+
+```php
+$schema = new Laurus\Schema();
+$schema->addTextField("body");
+
+$index = new Laurus\Index(null, $schema);
+$index->addDocument("manual", ["body" => "Lifetimes tie a reference to its owner."]);
+$index->addDocument("manual", ["body" => "Elided lifetimes follow three rules."]);
+$index->addDocument("faq", ["body" => "Why do lifetimes appear in signatures?"]);
+$index->commit();
+
+$results = $index->search("body:lifetimes", groupBy: new Laurus\GroupBy("_id", groupSize: 2));
+$results[0]->getGroupKey();                            // "faq"
+$results[1]->getGroupKey();                            // "manual"
+$results[1]->getInnerHits()[0]->getDocument()["body"]; // "Elided lifetimes follow three rules."
+
+// SearchRequest で同じグループ化を行う（10 番目の引数）
+$request = new Laurus\SearchRequest("body:lifetimes", null, null, null, null, 10, 0, null, null, new Laurus\GroupBy("_id", groupSize: 2));
+$results = $index->search($request);
+```
+
+---
+
 ## SearchResult
 
 `Index->search()` が返すクラスです。
@@ -580,9 +634,13 @@ $result->getId()          // string   -- 外部ドキュメント識別子
 $result->getScore()       // float    -- 関連性スコア
 $result->getDocument()    // array|null -- 取得されたフィールド値。stored=false の場合は null
 $result->getHighlights()  // array    -- 要求したフィールドごとのハイライト済みフラグメント
+$result->getGroupKey()    // mixed    -- $groupBy を指定した場合、グループの値
+$result->getInnerHits()   // array    -- $groupBy を指定した場合、グループの残りの hit
 ```
 
 `getHighlights()` は `$highlight` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドは配列に現れず、`$highlight` を要求しなかった場合は `[]` を返します。詳細は[ハイライト](#ハイライト)を参照してください。
+
+`$groupBy` を指定した場合、`getGroupKey()` は結果のグループが共有する値を返します（`string`、`int`、`float`、`bool`、または日時を表す RFC 3339 の `string`。値を持たない hit では `null`）。`getInnerHits()` はグループの残りの `SearchResult` を順位順に返し、それぞれ同じグループの値を持ち、自身の inner hits は持ちません。グループ化しない検索では、`null` と `[]` を返します。詳細は [GroupBy](#groupby) を参照してください。
 
 ---
 

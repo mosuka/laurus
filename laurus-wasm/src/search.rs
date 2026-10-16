@@ -6,8 +6,8 @@ use crate::query::{
 };
 use laurus::vector::Vector;
 use laurus::{
-    FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery, RescoreOptions,
-    SearchRequestBuilder,
+    FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions, LexicalSearchQuery,
+    RescoreOptions, SearchRequestBuilder,
 };
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
@@ -113,6 +113,40 @@ pub fn parse_rescore_options(
     Ok(Some(match parsed.window_size {
         Some(window_size) => rescore.window_size(window_size as usize),
         None => rescore,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Grouping (Issue #1297)
+// ---------------------------------------------------------------------------
+
+/// JS-facing shape of [`GroupBy`], deserialized via `serde_wasm_bindgen`
+/// from a plain JS object, e.g. `{ field: "_id", groupSize: 3 }`.
+///
+/// Each result is then a group's best hit: its `groupKey` is the value the
+/// group shares and its `innerHits` hold the group's next best hits, up to
+/// `groupSize` hits per group. `limit` and `offset` count groups.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmGroupByOptions {
+    field: String,
+    group_size: Option<u32>,
+}
+
+/// Parse an optional grouping JS object into [`GroupBy`]. Only the shape is
+/// checked here; the engine checks the values when searching. `None` (no
+/// object passed) means "don't group" and returns `Ok(None)`.
+pub fn parse_group_by_options(options: Option<js_sys::Object>) -> Result<Option<GroupBy>, JsValue> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let parsed: WasmGroupByOptions = serde_wasm_bindgen::from_value(options.into())
+        .map_err(|e| JsValue::from_str(&format!("Invalid groupBy options: {e}")))?;
+
+    let group_by = GroupBy::new(parsed.field);
+    Ok(Some(match parsed.group_size {
+        Some(group_size) => group_by.group_size(group_size as usize),
+        None => group_by,
     }))
 }
 

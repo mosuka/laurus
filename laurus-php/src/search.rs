@@ -18,11 +18,13 @@ use ext_php_rs::types::{ZendClassObject, ZendHashTable, Zval};
 use ext_php_rs::zend::ce;
 use laurus::vector::Vector;
 use laurus::{
-    Document, FusionAlgorithm, HighlightConfig, HighlightOptions, LexicalSearchQuery,
-    RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
+    DataValue, Document, FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions,
+    LexicalSearchQuery, RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
 };
 
-use crate::convert::{document_to_hashtable, is_token_vector_list, php_token_vectors};
+use crate::convert::{
+    data_value_to_zval, document_to_hashtable, is_token_vector_list, php_token_vectors,
+};
 use crate::query::{
     extract_lexical_query, is_vector_query, zval_to_lexical_search_query,
     zval_to_vector_search_query,
@@ -306,6 +308,92 @@ pub fn parse_rescore_option(rescore: Option<&Zval>) -> PhpResult<Option<RescoreO
 }
 
 // ---------------------------------------------------------------------------
+// GroupBy (Issue #1297)
+// ---------------------------------------------------------------------------
+
+/// Group the search results by a field's value (`Laurus\GroupBy`, Issue
+/// #1297).
+///
+/// Each result is then a group's best hit: `getGroupKey()` returns the value
+/// the group shares and `getInnerHits()` the group's next best hits, up to
+/// `groupSize` hits per group. `$limit` and `$offset` count groups. `field`
+/// is `"_id"` — chunks added with `addDocument` share their document's
+/// `_id` — or a single-valued, stored Text, Integer, Float, Boolean or
+/// DateTime field.
+///
+/// ## Example
+///
+/// ```php
+/// $results = $index->search("body:rust", groupBy: new Laurus\GroupBy("_id", groupSize: 3));
+/// ```
+#[php_class]
+#[php(name = "Laurus\\GroupBy")]
+#[derive(Clone)]
+pub struct PhpGroupBy {
+    group_by: GroupBy,
+}
+
+#[php_impl]
+impl PhpGroupBy {
+    /// Create a grouping.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The grouping field.
+    /// * `groupSize` - How many hits each group keeps, the returned result
+    ///   included (default 1, at most 100). The values are checked when
+    ///   searching.
+    pub fn __construct(field: String, groupSize: Option<i64>) -> Self {
+        let group_by = GroupBy::new(field);
+        Self {
+            group_by: match groupSize {
+                // A negative size is rejected by the engine like 0.
+                Some(size) => group_by.group_size(usize::try_from(size).unwrap_or(0)),
+                None => group_by,
+            },
+        }
+    }
+
+    /// Return the grouping field.
+    pub fn get_field(&self) -> String {
+        self.group_by.field.clone()
+    }
+
+    /// Return how many hits each group keeps.
+    pub fn get_group_size(&self) -> i64 {
+        self.group_by.group_size as i64
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        format!(
+            "GroupBy(field={:?}, group_size={})",
+            self.group_by.field, self.group_by.group_size
+        )
+    }
+}
+
+/// Convert a PHP `$groupBy` argument into [`GroupBy`].
+///
+/// # Errors
+///
+/// Throws `\TypeError` if `group_by` is not a `Laurus\GroupBy`.
+pub fn parse_group_by_option(group_by: Option<&Zval>) -> PhpResult<Option<GroupBy>> {
+    let Some(group_by) = group_by.filter(|zv| !zv.is_null()) else {
+        return Ok(None);
+    };
+    <&ZendClassObject<PhpGroupBy>>::from_zval(group_by)
+        .map(|obj| Some(obj.group_by.clone()))
+        .ok_or_else(|| {
+            PhpException::new(
+                "groupBy must be a Laurus\\GroupBy".to_string(),
+                0,
+                ce::type_error(),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -318,6 +406,11 @@ pub fn parse_rescore_option(rescore: Option<&Zval>) -> PhpResult<Option<RescoreO
 ///   - `highlights` (array): Highlighted fragments per field requested via
 ///     `$highlight`, best fragment first. Empty when highlighting was not
 ///     requested, the field was not a stored text field, or nothing matched.
+///   - `groupKey`: With `$groupBy`, the value this result's group shares;
+///     null for an ungrouped search and for a hit without a value (Issue
+///     #1297).
+///   - `innerHits` (array of SearchResult): With `$groupBy`, the group's
+///     next best hits, in ranking order. Empty for an ungrouped search.
 #[php_class]
 #[php(name = "Laurus\\SearchResult")]
 pub struct PhpSearchResult {
@@ -326,6 +419,10 @@ pub struct PhpSearchResult {
     /// Stores the Rust Document to avoid serialization issues.
     document: Option<Document>,
     highlights: HashMap<String, Vec<String>>,
+    /// Stored as a Rust value, like `document`.
+    group_key: Option<DataValue>,
+    /// The engine's inner hits, converted when `getInnerHits` is called.
+    inner_hits: Vec<SearchResult>,
 }
 
 #[php_impl]
@@ -363,6 +460,28 @@ impl PhpSearchResult {
         Ok(self.highlights.clone())
     }
 
+    /// Return the value this result's group shares, or null (Issue #1297).
+    pub fn get_group_key(&self) -> PhpResult<Zval> {
+        match &self.group_key {
+            Some(key) => data_value_to_zval(key),
+            None => {
+                let mut zv = Zval::new();
+                zv.set_null();
+                Ok(zv)
+            }
+        }
+    }
+
+    /// Return the group's next best hits as an array of `SearchResult`
+    /// (Issue #1297).
+    pub fn get_inner_hits(&self) -> Vec<PhpSearchResult> {
+        self.inner_hits
+            .iter()
+            .cloned()
+            .map(to_php_search_result)
+            .collect()
+    }
+
     /// Return a string representation.
     pub fn __to_string(&self) -> String {
         format!("SearchResult(id='{}', score={:.4})", self.id, self.score)
@@ -384,6 +503,8 @@ pub fn to_php_search_result(r: SearchResult) -> PhpSearchResult {
         score: r.score,
         document: r.document,
         highlights: r.highlights,
+        group_key: r.group_key,
+        inner_hits: r.inner_hits,
     }
 }
 
@@ -424,6 +545,8 @@ pub struct PhpSearchRequest {
     highlight: Option<HighlightOptions>,
     /// Late-interaction rescore of the top results (Issue #1351).
     rescore: Option<RescoreOptions>,
+    /// Grouping of the results by a field's value (Issue #1297).
+    group_by: Option<GroupBy>,
 }
 
 #[php_impl]
@@ -448,6 +571,8 @@ impl PhpSearchRequest {
     ///   highlighting (Issue #1134).
     /// * `rescore` - `LateInteractionRescore` reordering the top results
     ///   (Issue #1351).
+    /// * `groupBy` - `GroupBy` grouping the results by a field's value
+    ///   (Issue #1297).
     #[php(defaults(limit = 10, offset = 0))]
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
@@ -460,6 +585,7 @@ impl PhpSearchRequest {
         offset: i64,
         highlight: Option<&ZendHashTable>,
         rescore: Option<&Zval>,
+        groupBy: Option<&Zval>,
     ) -> PhpResult<Self> {
         // Convert fusion
         let fusion_alg = if !fusion.is_null() {
@@ -515,6 +641,7 @@ impl PhpSearchRequest {
 
         let highlight = parse_highlight_option(highlight)?;
         let rescore = parse_rescore_option(rescore)?;
+        let group_by = parse_group_by_option(groupBy)?;
 
         Ok(Self {
             query: q,
@@ -526,6 +653,7 @@ impl PhpSearchRequest {
             offset: offset as usize,
             highlight,
             rescore,
+            group_by,
         })
     }
 
@@ -564,6 +692,9 @@ impl PhpSearchRequest {
         }
         if let Some(rescore) = &self.rescore {
             builder = builder.rescore(rescore.clone());
+        }
+        if let Some(group_by) = &self.group_by {
+            builder = builder.group_by(group_by.clone());
         }
 
         // `query` with `lexical_query` / `vector_query` (Issue #1372). A DSL
@@ -653,9 +784,10 @@ impl PhpSearchRequest {
 /// - Any lexical query class
 /// - `VectorQuery` or `VectorTextQuery`
 ///
-/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`
-/// are used as-is from the request without overriding — same precedent as
-/// `limit`/`offset` already had here before highlighting existed.
+/// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`/
+/// `groupBy` are used as-is from the request without overriding — same
+/// precedent as `limit`/`offset` already had here before highlighting
+/// existed.
 ///
 /// # Arguments
 ///
@@ -664,6 +796,7 @@ impl PhpSearchRequest {
 /// * `offset` - Pagination offset.
 /// * `highlight` - Already-parsed highlight options, if `$highlight` was given.
 /// * `rescore` - Already-parsed rescore, if `$rescore` was given.
+/// * `group_by` - Already-parsed grouping, if `$groupBy` was given.
 ///
 /// # Returns
 ///
@@ -674,6 +807,7 @@ pub fn build_request_from_php(
     offset: usize,
     highlight: Option<&HighlightOptions>,
     rescore: Option<&RescoreOptions>,
+    group_by: Option<&GroupBy>,
 ) -> PhpResult<laurus::SearchRequest> {
     // Full SearchRequest object
     if let Some(req_obj) = <&ZendClassObject<PhpSearchRequest>>::from_zval(query) {
@@ -690,6 +824,9 @@ pub fn build_request_from_php(
     }
     if let Some(rescore) = rescore {
         builder = builder.rescore(rescore.clone());
+    }
+    if let Some(group_by) = group_by {
+        builder = builder.group_by(group_by.clone());
     }
 
     // DSL string

@@ -39,6 +39,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<search::PhpSearchRequest>()
         // Rescore (Issue #1351)
         .class::<search::PhpLateInteractionRescore>()
+        // Grouping (Issue #1297)
+        .class::<search::PhpGroupBy>()
         // Query types
         .class::<query::PhpTermQuery>()
         .class::<query::PhpPhraseQuery>()

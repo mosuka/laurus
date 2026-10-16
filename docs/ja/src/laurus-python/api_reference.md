@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit()` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal()` | WAL の永続性バリアを強制します。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。 |
-| `search(query, *, limit=10, offset=0, highlight=None, rescore=None) -> list[SearchResult]` | 検索クエリを実行します。`rescore` には、MultiVector フィールドに対する late interaction で上位の結果を並べ替える [`LateInteractionRescore`](#lateinteractionrescore) を渡します（Issue #1351）。`query` が `SearchRequest` の場合はリクエスト自身の `rescore` を使い、このキーワードは無視されます。 |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` はバッチ内のすべてのクエリに同一に適用されます。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。 |
+| `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None) -> list[SearchResult]` | 検索クエリを実行します。`rescore` には、MultiVector フィールドに対する late interaction で上位の結果を並べ替える [`LateInteractionRescore`](#lateinteractionrescore) を渡します（Issue #1351）。`group_by` には、結果をフィールドの値でグループ化する [`GroupBy`](#groupby) を渡します（Issue #1297）。このとき `limit` と `offset` はグループの数を数えます。`query` が `SearchRequest` の場合はリクエスト自身の `rescore` と `group_by` を使い、これらのキーワードは無視されます。 |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` と `group_by` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。 |
 | `stats() -> dict` | インデックス統計（`document_count`、`vector_fields`）を返します。 |
 
 ### `search` の query 引数
@@ -549,6 +549,7 @@ class SearchRequest:
         offset: int = 0,
         highlight=None,
         rescore: LateInteractionRescore | None = None,
+        group_by: GroupBy | None = None,
     ) -> None: ...
 ```
 
@@ -563,6 +564,7 @@ class SearchRequest:
 | `offset` | ページネーションオフセット（デフォルト 0）。 |
 | `highlight` | `Index.search` の `highlight` パラメータと同じリストまたは辞書の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
 | `rescore` | このリクエストの上位の結果に適用する [`LateInteractionRescore`](#lateinteractionrescore)（Issue #1351）。どのクエリの形を指定した場合でも適用されます。`SearchRequest` を渡すと `Index.search` の `rescore` キーワードは無視され、こちらが使われます。 |
+| `group_by` | このリクエストの結果をグループ化する [`GroupBy`](#groupby)（Issue #1297）。`SearchRequest` を渡すと `Index.search` と `Index.search_batch` の `group_by` キーワードは無視され、こちらが使われます。 |
 
 ---
 
@@ -623,6 +625,52 @@ results = index.search(request)
 
 ---
 
+## GroupBy
+
+検索結果をフィールドの値でグループ化し（Issue #1297）、1 つの文書の chunk がページを埋めないようにします。`Index.search`、`Index.search_batch`、`SearchRequest` の `group_by=` に渡します。
+
+```python
+class GroupBy:
+    def __init__(self, field: str, *, group_size: int = 1) -> None: ...
+
+    @property
+    def field(self) -> str: ...
+    @property
+    def group_size(self) -> int: ...
+```
+
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `field` | `str` | -- | `_id`（`add_document` で登録した chunk は元の文書の `_id` を共有します）、または単一値で、stored で、`doc_values` が有効（いずれも既定値）なテキスト・整数・浮動小数点数・真偽値・日時のフィールド。 |
+| `group_size` | `int` | `1` | 各グループに残す hit の数。返す結果自身を含み、`1..=100`。キーワード専用引数です。 |
+
+このとき、返る各 `SearchResult` はグループの最上位の hit です。`group_key` はグループが共有する値で、`inner_hits` にはグループの残りの hit が順位順に最大 `group_size - 1` 件入ります。`limit` と `offset` はグループの数を数えます。グループ化は、融合と再採点の後の最終的な順位に対して行い、lexical・vector・ハイブリッドのどの検索でも同じように動きます。並び順、候補の数、グループの hit が `group_size` 件に満たないことがある理由は、[検索結果のグループ化](../concepts/search/result_grouping.md) を参照してください。
+
+**エラー**:
+
+- `group_by` が `GroupBy` でない場合、`Index.search`、`Index.search_batch`、`SearchRequest` は `TypeError` を送出します。`group_size` が負の場合は、構築時に `OverflowError` を送出します。
+- `Index.search` と `Index.search_batch` は、検索を始める前に次の値を検査し、`ValueError`（`Invalid argument: group_by: ...`）を送出します。対象は、`field` が未知のフィールド、対象外の型、複数値、stored でない、または `doc_values` がない場合、`group_size` が `1..=100` の範囲外の場合、`offset + limit` が 10,000 を超える場合です。
+
+```python
+import laurus
+
+schema = laurus.Schema()
+schema.add_text_field("body")
+
+index = laurus.Index(schema=schema)
+index.add_document("manual", {"body": "Lifetimes tie a reference to its owner."})
+index.add_document("manual", {"body": "Elided lifetimes follow three rules."})
+index.add_document("faq", {"body": "Why do lifetimes appear in signatures?"})
+index.commit()
+
+for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", group_size=2)):
+    print(result.group_key, [hit.document["body"] for hit in result.inner_hits])
+# faq []
+# manual ['Elided lifetimes follow three rules.']
+```
+
+---
+
 ## SearchResult
 
 `Index.search()` が返すクラスです。
@@ -633,11 +681,15 @@ class SearchResult:
     score: float     # 関連性スコア
     document: dict | None  # 取得されたフィールド値。stored=False の場合は None
     highlights: dict[str, list[str]]  # 要求したフィールドごとのハイライト済みフラグメント
+    group_key: str | int | float | bool | None  # group_by を指定した場合、グループの値
+    inner_hits: list[SearchResult]  # group_by を指定した場合、グループの残りの hit
 ```
 
 `highlights` は `highlight` で指定した各フィールドをハイライト済みフラグメント（最も良いものが先頭）にマッピングします。ハイライトされなかったフィールドは辞書に現れず、`highlight` を要求しなかった場合 `highlights` は `{}` になります。詳細は[ハイライト](#ハイライト)を参照してください。
 
 `rescore` を指定した場合、再採点した結果の `score` は MaxSim の値になり、再採点の window の外の結果は 1 段目のスコアのままです。詳細は [LateInteractionRescore](#lateinteractionrescore) を参照してください。
+
+`group_by` を指定した場合、`group_key` は結果のグループが共有する値です（日時の値は RFC 3339 の文字列、値を持たない hit では `None`）。`inner_hits` にはグループの残りの hit が順位順に入り、それぞれ同じ `group_key` を持ち、自身の inner hits は持ちません。グループ化しない検索では、`group_key` は `None`、`inner_hits` は空です。詳細は [GroupBy](#groupby) を参照してください。
 
 ---
 

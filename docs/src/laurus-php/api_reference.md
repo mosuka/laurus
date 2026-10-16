@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | Delete all versions for the given ID. |
 | `commit(): void` | Flush buffered writes and make all pending changes searchable. |
 | `flushWal(): void` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records. Useful when running under a group-commit policy (see below). |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null): array` | Execute a search query. Returns an array of `SearchResult`. `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore` are used and the other arguments are ignored. |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` applies identically to every query in the batch. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | Execute a search query. Returns an array of `SearchResult`. `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. `$groupBy` groups the results by a field's value (Issue #1297), and `$limit`/`$offset` then count groups; see [GroupBy](#groupby). When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` are used and the other arguments are ignored. |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` and `$groupBy` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. |
 | `stats(): array` | Return index statistics (`"documentCount"`, `"vectorFields"`). |
 
 ### `search` query argument
@@ -499,6 +499,7 @@ new \Laurus\SearchRequest(
     int $offset = 0,
     ?array $highlight = null,
     ?LateInteractionRescore $rescore = null,
+    ?GroupBy $groupBy = null,
 )
 ```
 
@@ -513,8 +514,9 @@ new \Laurus\SearchRequest(
 | `$offset` | Pagination offset (default 0). |
 | `$highlight` | Same list-or-associative-array shape as `Index->search()`'s `$highlight` (Issue #1134). See [Highlighting](#highlighting). Only `$limit`/`$offset` have PHP-level defaults today, so a call that names `$highlight` must still pass every earlier parameter positionally or by name. |
 | `$rescore` | A `LateInteractionRescore` that reorders the top results (Issue #1351); any other object throws `\TypeError`. See [LateInteractionRescore](#lateinteractionrescore). As with `$highlight`, pass every earlier parameter too. |
+| `$groupBy` | A `GroupBy` that groups the results (Issue #1297); any other value throws `\TypeError`. See [GroupBy](#groupby). As with `$highlight`, pass every earlier parameter too. |
 
-When a `SearchRequest` is passed to `Index->search()`, its own `$limit`, `$offset`, `$highlight` and `$rescore` are used; `search`'s other arguments are ignored.
+When a `SearchRequest` is passed to `Index->search()`, its own `$limit`, `$offset`, `$highlight`, `$rescore` and `$groupBy` are used; `search`'s other arguments are ignored.
 
 ---
 
@@ -575,6 +577,58 @@ $rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes w
 
 ---
 
+## GroupBy
+
+Groups the search results by a field's value (Issue #1297), so that the chunks of one document do not fill the page. Pass it as the `$groupBy` argument of `Index->search()` or `Index->searchBatch()`, or as `SearchRequest`'s `$groupBy`.
+
+```php
+new \Laurus\GroupBy(string $field, ?int $groupSize = null)
+```
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `$field` | `string` | -- | `_id` (chunks added with `addDocument` share their document's `_id`), or a single-valued, stored text, integer, float, boolean or datetime field with `docValues` enabled (the defaults). |
+| `$groupSize` | `int\|null` | `null` (1) | How many hits each group keeps, the returned result included, `1..=100`. |
+
+### Methods
+
+| Method | Description |
+| :--- | :--- |
+| `getField(): string` | Return the grouping field. |
+| `getGroupSize(): int` | Return how many hits each group keeps (`1` unless `$groupSize` was given). |
+| `__toString(): string` | Return a representation such as `GroupBy(field="_id", group_size=2)`. |
+
+### Results and errors
+
+Each returned `SearchResult` is then the best hit of a group: its `getGroupKey()` is the value the group shares and its `getInnerHits()` hold up to `$groupSize - 1` further hits of the group, in ranking order. `$limit` and `$offset` count groups. Grouping runs on the final ranking, after fusion and rescore, for lexical, vector and hybrid searches alike. See [Result Grouping](../concepts/search/result_grouping.md) for the ordering, the candidate pool and why a group can hold fewer than `$groupSize` hits.
+
+- `Index->search()`, `Index->searchBatch()` and `SearchRequest` throw `\TypeError` (`groupBy must be a Laurus\GroupBy`) for any other `$groupBy` value.
+- Everything else is checked by the engine when searching, before any search runs, and throws `\ValueError` with a message containing `group_by: ...`: the field is unknown, of another type, multi-valued, not stored or without `docValues`, `$groupSize` is outside `1..=100` (a negative size is reported as 0), or `$offset + $limit` exceeds 10,000.
+
+### Example
+
+```php
+$schema = new Laurus\Schema();
+$schema->addTextField("body");
+
+$index = new Laurus\Index(null, $schema);
+$index->addDocument("manual", ["body" => "Lifetimes tie a reference to its owner."]);
+$index->addDocument("manual", ["body" => "Elided lifetimes follow three rules."]);
+$index->addDocument("faq", ["body" => "Why do lifetimes appear in signatures?"]);
+$index->commit();
+
+$results = $index->search("body:lifetimes", groupBy: new Laurus\GroupBy("_id", groupSize: 2));
+$results[0]->getGroupKey();                            // "faq"
+$results[1]->getGroupKey();                            // "manual"
+$results[1]->getInnerHits()[0]->getDocument()["body"]; // "Elided lifetimes follow three rules."
+
+// The same grouping through a SearchRequest (10th argument)
+$request = new Laurus\SearchRequest("body:lifetimes", null, null, null, null, 10, 0, null, null, new Laurus\GroupBy("_id", groupSize: 2));
+$results = $index->search($request);
+```
+
+---
+
 ## SearchResult
 
 Returned by `Index->search()`.
@@ -584,9 +638,13 @@ $result->getId()          // string   -- External document identifier
 $result->getScore()       // float    -- Relevance score
 $result->getDocument()    // array|null -- Retrieved field values, or null if not stored
 $result->getHighlights()  // array    -- Highlighted fragments per requested field
+$result->getGroupKey()    // mixed    -- With $groupBy, the group's value
+$result->getInnerHits()   // array    -- With $groupBy, the group's next best hits
 ```
 
 `getHighlights()` maps each field named in `$highlight` to its highlighted fragments (best first); a field that did not highlight is absent from the array, and it returns `[]` when `$highlight` was not requested. See [Highlighting](#highlighting).
+
+With `$groupBy`, `getGroupKey()` returns the value the result's group shares (a `string`, `int`, `float` or `bool`, or a datetime as an RFC 3339 `string`; `null` for a hit without a value) and `getInnerHits()` returns the group's next best `SearchResult`s in ranking order, each with the same group key and no inner hits of its own. An ungrouped search returns `null` and `[]`. See [GroupBy](#groupby).
 
 ---
 

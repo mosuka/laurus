@@ -7,7 +7,7 @@ use crate::convert::{dict_to_document, document_to_dict};
 use crate::errors::{closed_err, index_dir_err, laurus_err, reload_requires_path_err};
 use crate::schema::PySchema;
 use crate::search::{
-    PyLateInteractionRescore, PySearchResult, build_request_from_py, to_py_search_result,
+    PyGroupBy, PyLateInteractionRescore, PySearchResult, build_request_from_py, to_py_search_result,
 };
 use laurus::index_dir::CreateRollback;
 use laurus::{
@@ -728,11 +728,16 @@ impl PyIndex {
     ///         results by late interaction over a multi-vector field
     ///         (Issue #1351). Ignored when `query` is a `SearchRequest`,
     ///         which carries its own.
+    ///     group_by: A `GroupBy` that groups the results by a field's value
+    ///         (Issue #1297); `limit` and `offset` then count groups.
+    ///         Ignored when `query` is a `SearchRequest`, which carries its
+    ///         own.
     ///
     /// Returns:
     ///     A list of [`SearchResult`] objects with `.id`, `.score`,
-    ///     `.document`, `.highlights`.
-    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None, rescore=None))]
+    ///     `.document`, `.highlights`, `.group_key`, `.inner_hits`.
+    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
         py: Python,
@@ -741,8 +746,17 @@ impl PyIndex {
         offset: usize,
         highlight: Option<&Bound<PyAny>>,
         rescore: Option<PyLateInteractionRescore>,
+        group_by: Option<PyGroupBy>,
     ) -> PyResult<Vec<PySearchResult>> {
-        let request = build_request_from_py(py, query, limit, offset, highlight, rescore.as_ref())?;
+        let request = build_request_from_py(
+            py,
+            query,
+            limit,
+            offset,
+            highlight,
+            rescore.as_ref(),
+            group_by.as_ref(),
+        )?;
 
         let engine = self.engine()?;
         let results = py
@@ -773,6 +787,8 @@ impl PyIndex {
     ///     highlight: Request highlighted fragments per field, applied
     ///         identically to every query in the batch — same format as
     ///         `search`'s `highlight` parameter (Issue #1134).
+    ///     group_by: A `GroupBy` applied identically to every query in the
+    ///         batch (Issue #1297). A `SearchRequest` entry uses its own.
     ///
     /// Returns:
     ///     A list of lists: `results[i]` is the result list for
@@ -781,7 +797,7 @@ impl PyIndex {
     ///
     /// Issue [#717](https://github.com/mosuka/laurus/issues/717)
     /// Phase 3b of [#648](https://github.com/mosuka/laurus/issues/648).
-    #[pyo3(signature = (queries, *, limit=10, offset=0, highlight=None))]
+    #[pyo3(signature = (queries, *, limit=10, offset=0, highlight=None, group_by=None))]
     pub fn search_batch(
         &self,
         py: Python,
@@ -789,6 +805,7 @@ impl PyIndex {
         limit: usize,
         offset: usize,
         highlight: Option<&Bound<PyAny>>,
+        group_by: Option<PyGroupBy>,
     ) -> PyResult<Vec<Vec<PySearchResult>>> {
         let queries_seq = queries.try_iter().map_err(|_| {
             PyRuntimeError::new_err(
@@ -800,7 +817,13 @@ impl PyIndex {
         for item in queries_seq {
             let item = item?;
             requests.push(build_request_from_py(
-                py, &item, limit, offset, highlight, None,
+                py,
+                &item,
+                limit,
+                offset,
+                highlight,
+                None,
+                group_by.as_ref(),
             )?);
         }
 

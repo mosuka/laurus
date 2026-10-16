@@ -2529,4 +2529,144 @@ class LaurusTest extends TestCase
             }
         }
     }
+
+    // ── Result grouping (Issue #1297) ─────────────────────────────────────
+    //
+    // Uses the corpus of `laurus-server/tests/grpc_group_by_test.rs`: three
+    // documents added as chunks sharing their `_id`, with Flat vectors so the
+    // vector ranking against [1, 0] — and with it the groups — is exact.
+
+    private const GROUP_CHUNKS = [
+        ["a", "rust rust rust guide", [1.0, 0.0]],
+        ["a", "rust rust intro", [0.9, 0.1]],
+        ["a", "rust appendix notes", [0.3, 0.7]],
+        ["b", "rust rust book chapter", [0.8, 0.2]],
+        ["b", "rust history of programming", [0.2, 0.8]],
+        ["c", "rust", [0.6, 0.4]],
+    ];
+
+    /** Each group as [id, titles of its hits, best first] with groupSize 2. */
+    private const GROUP_EXPECTED = [
+        ["a", ["rust rust rust guide", "rust rust intro"]],
+        ["b", ["rust rust book chapter", "rust history of programming"]],
+        ["c", ["rust"]],
+    ];
+
+    private function createGroupIndex(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addFlatField("vec", 2);
+        $idx = new Laurus\Index(null, $schema);
+        foreach (self::GROUP_CHUNKS as [$id, $title, $vec]) {
+            $idx->addDocument($id, ["title" => $title, "vec" => $vec]);
+        }
+        $idx->commit();
+        return $idx;
+    }
+
+    private static function groupVectorQuery(): Laurus\VectorQuery
+    {
+        return new Laurus\VectorQuery("vec", [1.0, 0.0]);
+    }
+
+    private function groupsOf(array $results): array
+    {
+        $groups = [];
+        foreach ($results as $r) {
+            $this->assertSame($r->getId(), $r->getGroupKey());
+            foreach ($r->getInnerHits() as $hit) {
+                $this->assertSame($r->getGroupKey(), $hit->getGroupKey());
+                $this->assertSame([], $hit->getInnerHits());
+            }
+            $titles = array_map(fn ($h) => $h->getDocument()["title"], [$r, ...$r->getInnerHits()]);
+            $groups[] = [$r->getId(), $titles];
+        }
+        return $groups;
+    }
+
+    public function testSearchGroupsChunksById(): void
+    {
+        $idx = $this->createGroupIndex();
+        $results = $idx->search(self::groupVectorQuery(), groupBy: new Laurus\GroupBy("_id", groupSize: 2));
+        $this->assertSame(self::GROUP_EXPECTED, $this->groupsOf($results));
+
+        $oneEach = $idx->search(self::groupVectorQuery(), groupBy: new Laurus\GroupBy("_id"));
+        $this->assertSame(["a", "b", "c"], self::rankedIds($oneEach));
+        foreach ($oneEach as $r) {
+            $this->assertSame([], $r->getInnerHits());
+        }
+    }
+
+    public function testUngroupedResultsHaveNoGroup(): void
+    {
+        $results = $this->createGroupIndex()->search(self::groupVectorQuery());
+        $this->assertCount(count(self::GROUP_CHUNKS), $results);
+        foreach ($results as $r) {
+            $this->assertNull($r->getGroupKey());
+            $this->assertSame([], $r->getInnerHits());
+        }
+    }
+
+    public function testSearchRequestCarriesItsOwnGroupBy(): void
+    {
+        $request = new Laurus\SearchRequest(
+            null, // query
+            null, // lexicalQuery
+            self::groupVectorQuery(), // vectorQuery
+            null, // filterQuery
+            null, // fusion
+            10, // limit
+            0, // offset
+            null, // highlight
+            null, // rescore
+            new Laurus\GroupBy("_id", groupSize: 2), // groupBy
+        );
+        $this->assertSame(self::GROUP_EXPECTED, $this->groupsOf($this->createGroupIndex()->search($request)));
+    }
+
+    public function testSearchBatchGroupsEveryQuery(): void
+    {
+        $batch = $this->createGroupIndex()->searchBatch(
+            [self::groupVectorQuery(), self::groupVectorQuery()],
+            groupBy: new Laurus\GroupBy("_id", groupSize: 2),
+        );
+        $this->assertSame(
+            [self::GROUP_EXPECTED, self::GROUP_EXPECTED],
+            array_map(fn ($results) => $this->groupsOf($results), $batch)
+        );
+    }
+
+    public function testGroupByAccessorsAndString(): void
+    {
+        $groupBy = new Laurus\GroupBy(field: "parent", groupSize: 3);
+        $this->assertSame(["parent", 3], [$groupBy->getField(), $groupBy->getGroupSize()]);
+        $this->assertSame('GroupBy(field="parent", group_size=3)', (string)$groupBy);
+        $this->assertSame(1, (new Laurus\GroupBy("parent"))->getGroupSize());
+    }
+
+    public function testGroupByMustBeAGroupBy(): void
+    {
+        $this->expectException(\TypeError::class);
+        $this->expectExceptionMessage("groupBy must be a Laurus\\GroupBy");
+        $this->createGroupIndex()->search(self::groupVectorQuery(), groupBy: "_id");
+    }
+
+    public function testInvalidGroupByIsRejected(): void
+    {
+        $idx = $this->createGroupIndex();
+        $cases = [
+            new Laurus\GroupBy("missing"),
+            new Laurus\GroupBy("vec"),
+            new Laurus\GroupBy("_id", groupSize: 0),
+        ];
+        foreach ($cases as $groupBy) {
+            try {
+                $idx->search(self::groupVectorQuery(), groupBy: $groupBy);
+                $this->fail("accepted an invalid grouping: $groupBy");
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString("group_by", $e->getMessage());
+            }
+        }
+    }
 }

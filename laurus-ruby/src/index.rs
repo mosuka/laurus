@@ -9,7 +9,8 @@ use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::gvl::without_gvl;
 use crate::schema::RbSchema;
 use crate::search::{
-    build_request_from_rb, rb_to_highlight_options, rb_to_rescore_options, to_rb_search_result,
+    build_request_from_rb, rb_to_group_by, rb_to_highlight_options, rb_to_rescore_options,
+    to_rb_search_result,
 };
 use crate::wal::RbWalSyncPolicy;
 use laurus::index_dir::CreateRollback;
@@ -366,6 +367,8 @@ impl RbIndex {
     ///     highlighted.
     ///   - `rescore:` - `LateInteractionRescore` reordering the top results
     ///     by MaxSim against a multi-vector field (Issue #1351).
+    ///   - `group_by:` - `GroupBy` grouping the results by a field's value
+    ///     (Issue #1297); `limit:` and `offset:` then count groups.
     ///
     /// When `query` is a `SearchRequest`, the keyword arguments are ignored
     /// in favor of the request's own values.
@@ -377,22 +380,39 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (query,) = args.required;
-        let kwargs =
-            get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<Value>, Option<Value>), ()>(
-                args.keywords,
-                &[],
-                &["limit", "offset", "highlight", "rescore"],
-            )?;
-        let (limit, offset, highlight, rescore) = kwargs.optional;
+        let kwargs = get_kwargs::<
+            _,
+            (),
+            (
+                Option<usize>,
+                Option<usize>,
+                Option<Value>,
+                Option<Value>,
+                Option<Value>,
+            ),
+            (),
+        >(
+            args.keywords,
+            &[],
+            &["limit", "offset", "highlight", "rescore", "group_by"],
+        )?;
+        let (limit, offset, highlight, rescore, group_by) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
         let highlight = highlight
             .map(|v| rb_to_highlight_options(&ruby, v))
             .transpose()?;
         let rescore = rescore.map(rb_to_rescore_options).transpose()?;
+        let group_by = group_by.map(rb_to_group_by).transpose()?;
 
-        let request =
-            build_request_from_rb(query, limit, offset, highlight.as_ref(), rescore.as_ref())?;
+        let request = build_request_from_rb(
+            query,
+            limit,
+            offset,
+            highlight.as_ref(),
+            rescore.as_ref(),
+            group_by.as_ref(),
+        )?;
 
         let engine = self.engine()?;
         let results =
@@ -424,6 +444,8 @@ impl RbIndex {
     ///   - `highlight:` - Request highlighted fragments per field, applied
     ///     identically to every query in the batch — same format as
     ///     `search`'s `highlight:` (Issue #1134).
+    ///   - `group_by:` - `GroupBy` applied identically to every query in the
+    ///     batch (Issue #1297). A `SearchRequest` entry uses its own.
     ///
     /// # Returns
     ///
@@ -437,17 +459,19 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (queries,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<Value>), ()>(
-            args.keywords,
-            &[],
-            &["limit", "offset", "highlight"],
-        )?;
-        let (limit, offset, highlight) = kwargs.optional;
+        let kwargs =
+            get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<Value>, Option<Value>), ()>(
+                args.keywords,
+                &[],
+                &["limit", "offset", "highlight", "group_by"],
+            )?;
+        let (limit, offset, highlight, group_by) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
         let highlight = highlight
             .map(|v| rb_to_highlight_options(&ruby, v))
             .transpose()?;
+        let group_by = group_by.map(rb_to_group_by).transpose()?;
 
         let queries_array: RArray = TryConvert::try_convert(queries).map_err(|_| {
             Error::new(
@@ -468,6 +492,7 @@ impl RbIndex {
                 offset,
                 highlight.as_ref(),
                 None,
+                group_by.as_ref(),
             )?);
         }
 

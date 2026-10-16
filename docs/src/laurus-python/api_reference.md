@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, *, limit=10, offset=0, highlight=None, rescore=None) -> list[SearchResult]` | Execute a search query. `rescore` takes a [`LateInteractionRescore`](#lateinteractionrescore) that reorders the top results by late interaction over a multi-vector field (Issue #1351). When `query` is a `SearchRequest`, the request's own `rescore` is used and this keyword is ignored. |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` applies identically to every query in the batch. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. |
+| `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None) -> list[SearchResult]` | Execute a search query. `rescore` takes a [`LateInteractionRescore`](#lateinteractionrescore) that reorders the top results by late interaction over a multi-vector field (Issue #1351). `group_by` takes a [`GroupBy`](#groupby) that groups the results by a field's value (Issue #1297); `limit` and `offset` then count groups. When `query` is a `SearchRequest`, the request's own `rescore` and `group_by` are used and these keywords are ignored. |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` and `group_by` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. |
 | `stats() -> dict` | Return index statistics (`document_count`, `vector_fields`). |
 
 ### `search` query argument
@@ -551,6 +551,7 @@ class SearchRequest:
         offset: int = 0,
         highlight=None,
         rescore: LateInteractionRescore | None = None,
+        group_by: GroupBy | None = None,
     ) -> None: ...
 ```
 
@@ -565,6 +566,7 @@ class SearchRequest:
 | `offset` | Pagination offset (default 0). |
 | `highlight` | Same list-or-dict shape as `Index.search`'s `highlight` parameter (Issue #1134). See [Highlighting](#highlighting). |
 | `rescore` | A [`LateInteractionRescore`](#lateinteractionrescore) applied to the top results of this request, whichever query shape is set (Issue #1351). It takes the place of `Index.search`'s `rescore` keyword, which is ignored when a `SearchRequest` is passed. |
+| `group_by` | A [`GroupBy`](#groupby) grouping the results of this request (Issue #1297). It takes the place of the `group_by` keyword of `Index.search` and `Index.search_batch`, which is ignored when a `SearchRequest` is passed. |
 
 ---
 
@@ -625,6 +627,52 @@ With a `"candle_colbert"` embedder on the field, documents can give the field te
 
 ---
 
+## GroupBy
+
+Groups the search results by a field's value (Issue #1297), so that the chunks of one document do not fill the page. Pass it as `group_by=` to `Index.search`, `Index.search_batch` or `SearchRequest`.
+
+```python
+class GroupBy:
+    def __init__(self, field: str, *, group_size: int = 1) -> None: ...
+
+    @property
+    def field(self) -> str: ...
+    @property
+    def group_size(self) -> int: ...
+```
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `field` | `str` | -- | `_id` (chunks added with `add_document` share their document's `_id`), or a single-valued, stored text, integer, float, boolean or datetime field with `doc_values` enabled (the defaults). |
+| `group_size` | `int` | `1` | How many hits each group keeps, the returned result included, `1..=100`. Keyword-only. |
+
+Each returned `SearchResult` is then the best hit of a group: its `group_key` is the value the group shares and its `inner_hits` hold up to `group_size - 1` further hits of the group, in ranking order. `limit` and `offset` count groups. Grouping runs on the final ranking, after fusion and rescore, for lexical, vector and hybrid searches alike. See [Result Grouping](../concepts/search/result_grouping.md) for the ordering, the candidate pool and why a group can hold fewer than `group_size` hits.
+
+**Errors**:
+
+- `TypeError` from `Index.search`, `Index.search_batch` and `SearchRequest` when `group_by` is not a `GroupBy`, and `OverflowError` at construction for a negative `group_size`.
+- `ValueError` (`Invalid argument: group_by: ...`) from `Index.search` and `Index.search_batch`, checked before the search runs: `field` is unknown, of another type, multi-valued, not stored or without `doc_values`, `group_size` is outside `1..=100`, or `offset + limit` exceeds 10,000.
+
+```python
+import laurus
+
+schema = laurus.Schema()
+schema.add_text_field("body")
+
+index = laurus.Index(schema=schema)
+index.add_document("manual", {"body": "Lifetimes tie a reference to its owner."})
+index.add_document("manual", {"body": "Elided lifetimes follow three rules."})
+index.add_document("faq", {"body": "Why do lifetimes appear in signatures?"})
+index.commit()
+
+for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", group_size=2)):
+    print(result.group_key, [hit.document["body"] for hit in result.inner_hits])
+# faq []
+# manual ['Elided lifetimes follow three rules.']
+```
+
+---
+
 ## SearchResult
 
 Returned by `Index.search()`.
@@ -635,11 +683,15 @@ class SearchResult:
     score: float     # Relevance score
     document: dict | None  # Retrieved field values, or None if not stored
     highlights: dict[str, list[str]]  # Highlighted fragments per requested field
+    group_key: str | int | float | bool | None  # With group_by, the group's value
+    inner_hits: list[SearchResult]  # With group_by, the group's next best hits
 ```
 
 `highlights` maps each field named in `highlight` to its highlighted fragments (best first); a field that did not highlight is absent from the dict, and `highlights` is `{}` when `highlight` was not requested. See [Highlighting](#highlighting).
 
 With `rescore`, a rescored result's `score` is its MaxSim, while results outside the rescore window keep their first-stage score. See [LateInteractionRescore](#lateinteractionrescore).
+
+With `group_by`, `group_key` is the value the result's group shares (a datetime value as an RFC 3339 string; `None` for a hit without a value) and `inner_hits` holds the group's next best hits in ranking order, each with the same `group_key` and no inner hits of its own. An ungrouped search leaves `group_key` as `None` and `inner_hits` empty. See [GroupBy](#groupby).
 
 ---
 
