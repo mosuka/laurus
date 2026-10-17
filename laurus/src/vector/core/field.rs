@@ -638,6 +638,40 @@ impl FlatOption {
 
 // Builder pattern for HnswOption
 impl HnswOption {
+    /// Check that the configured quantizer supports the selected metric.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when PQ is paired with a
+    /// metric other than Euclidean or Cosine.
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        let uses_product_quantization = match self.quantizer {
+            quantization::QuantizationMethod::ProductQuantization { .. } => true,
+            #[cfg(feature = "pq-fastscan")]
+            quantization::QuantizationMethod::ProductQuantizationFastScan { .. } => true,
+            quantization::QuantizationMethod::Scalar8Bit => false,
+        };
+
+        if uses_product_quantization
+            && !matches!(
+                self.distance,
+                DistanceMetric::Euclidean | DistanceMetric::Cosine
+            )
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': quantizer {:?} does not support distance metric {:?}; \
+                 supported metrics are Euclidean and Cosine",
+                self.quantizer, self.distance
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn new(dimension: usize) -> Self {
         Self {
             dimension,

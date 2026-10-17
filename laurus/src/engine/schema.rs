@@ -110,8 +110,7 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Check that `option` describes a usable field named `name`: today, that
-/// a `MultiVector` option passes [`MultiVectorOption::validate`].
+/// Check that `option` describes a usable field named `name`.
 ///
 /// Called by [`Schema::validate_for_create`] and before
 /// `Engine::add_field` / `Engine::update_field` touch any data, so an
@@ -122,8 +121,10 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
 /// Returns [`crate::error::LaurusError::invalid_argument`] when the option
 /// is rejected.
 pub(crate) fn validate_field_option(name: &str, option: &FieldOption) -> crate::error::Result<()> {
-    if let FieldOption::MultiVector(opt) = option {
-        opt.validate(name)?;
+    match option {
+        FieldOption::Hnsw(opt) => opt.validate(name)?,
+        FieldOption::MultiVector(opt) => opt.validate(name)?,
+        _ => {}
     }
     Ok(())
 }
@@ -226,6 +227,8 @@ impl Schema {
     /// - A [`FieldOption::MultiVector`] field has a zero dimension or a
     ///   distance other than `Cosine` / `DotProduct` (see
     ///   [`MultiVectorOption::validate`]).
+    /// - An HNSW field using Product Quantization (including FastScan) has a
+    ///   distance other than `Euclidean` / `Cosine`.
     ///
     /// [`validate_analyzer_name`]: crate::analysis::analyzer::registry::validate_analyzer_name
     pub fn validate_for_create(&self) -> crate::error::Result<()> {
