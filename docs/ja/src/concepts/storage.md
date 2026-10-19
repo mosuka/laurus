@@ -71,30 +71,25 @@ let storage: Arc<dyn Storage> = Arc::new(FileStorage::new("/tmp/laurus-data", co
 ビットパック済みブロックを `bitpacking::decompress*` に直接渡します
 （`Read` 経由の `Vec<u8>` 確保とコピーを省略）。
 
-**デフォルトはプラットフォーム依存:**
+**デフォルトはすべてのプラットフォームで `true`:** Unix (Linux /
+macOS / *BSD) は Issue #504 以降、Windows は Issue #508 以降です。
+デバッグセッションや mmap が機能しないホストでバッファード I/O に
+切り替えるには、`FileStorageConfig::new` 呼び出し時に
+`LAURUS_NO_MMAP=1` 環境変数を設定します。
 
-- **Unix (Linux / macOS / *BSD): `true`** (Issue #504 以降)。デバッグ
-  セッションや mmap が機能しないホストでバッファード I/O に切り替える
-  には、`FileStorageConfig::new` 呼び出し時に `LAURUS_NO_MMAP=1`
-  環境変数を設定します。
-- **Windows: `false`** (Issue #508 以降)。Windows はメモリマップ
-  ドファイルに排他ロックを持ち (`ERROR_USER_MAPPED_FILE`、os
-  error 1224)、reader が mmap を保持したまま writer がセグメント
-  ファイルを truncate / delete することを許可しません。現状の
-  segment file lifecycle はこのロックと整合しません。コミット頻度
-  が低い read-only / read-mostly ワークロードでは
-  `LAURUS_USE_MMAP=1` でオプトイン可能です。Windows mmap の完全
-  サポートは
-  [Issue #508](https://github.com/mosuka/laurus/issues/508) で
-  追跡しています。
+Windows はメモリマップドファイルに排他ロックを持ち
+(`ERROR_USER_MAPPED_FILE`、os error 1224)、マップされている
+ファイルの truncate や削除を許可しません。そのため `FileStorage` は、
+ファイルを truncate・削除・リネームする前に、そのファイルについて
+自身がキャッシュしているマップを破棄します。
 
 ```rust
 use std::sync::Arc;
 use laurus::Storage;
 use laurus::storage::file::{FileStorage, FileStorageConfig};
 
-// Unix では mmap がデフォルトで有効、Windows では LAURUS_USE_MMAP=1
-// を設定しない限り無効。
+// mmap はすべてのプラットフォームでデフォルトで有効。LAURUS_NO_MMAP=1
+// を設定したときだけ無効。
 let config = FileStorageConfig::new("/tmp/laurus-data");
 let storage: Arc<dyn Storage> = Arc::new(FileStorage::new("/tmp/laurus-data", config)?);
 
@@ -102,7 +97,7 @@ let storage: Arc<dyn Storage> = Arc::new(FileStorage::new("/tmp/laurus-data", co
 let mut buffered_config = FileStorageConfig::new("/tmp/laurus-data");
 buffered_config.use_mmap = false;
 
-// 明示的にオプトイン（Windows でも有効、OS 不問）。
+// 明示的にオプトイン。LAURUS_NO_MMAP=1 を設定していても有効（OS 不問）。
 let mut mmap_config = FileStorageConfig::new("/tmp/laurus-data");
 mmap_config.use_mmap = true;
 ```

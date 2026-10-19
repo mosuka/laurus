@@ -600,7 +600,7 @@ pub(crate) fn load_rerank_sidecar(
         )));
     }
     // Transient rehydration for the pool's String-shaped assignment input
-    // (eager-only path; nothing retained).
+    // (load time only; nothing retained).
     let assignment: Vec<(u64, String)> = vector_ids
         .iter()
         .map(|&(id, fid)| (id, field_dict[fid as usize].to_string()))

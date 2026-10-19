@@ -331,11 +331,12 @@ offset  size  field
 
 Vectors are written in the same `(doc_id, field_name)` order as the
 matching LVS1 segment, so a (sidecar position) → (LVS1 position)
-mapping is the identity. The HNSW reader loads the sidecar into a
-`RerankStoragePool` at init time when the storage loading mode is
-Eager; Lazy mode skips the sidecar to honor its memory-savings
-promise (Stage 2 segments opened in Lazy mode silently degrade to
-Stage 1).
+mapping is the identity. The reader (HNSW, Flat or IVF) loads the
+sidecar into a `RerankStoragePool` when it opens the segment, in both
+loading modes. Under `Lazy` (the mmap-backed `FileStorage`) the vector
+rows stay mapped, but the sidecar is read into memory, so enabling
+`rerank_storage` costs `vector_count * dim * 4` bytes of RAM per
+segment in either mode.
 
 The sidecar is enabled per field by `rerank_storage` in the schema's
 HNSW options, and that setting is honored on every write path: direct

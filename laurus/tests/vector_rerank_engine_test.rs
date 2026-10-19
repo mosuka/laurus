@@ -16,7 +16,7 @@ use laurus::Engine;
 use laurus::SearchRequestBuilder;
 use laurus::storage::file::FileStorageConfig;
 use laurus::storage::prefixed::PrefixedStorage;
-use laurus::storage::{Storage, StorageConfig, StorageFactory};
+use laurus::storage::{LoadingMode, Storage, StorageConfig, StorageFactory};
 use laurus::vector::HnswOption;
 use laurus::vector::Vector;
 use laurus::vector::core::distance::DistanceMetric as VectorDistanceMetric;
@@ -52,8 +52,12 @@ fn vector_request(query: &[f32], rerank_factor: Option<usize>) -> laurus::Search
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_search_with_rerank_factor_succeeds_on_stage2_field() -> laurus::Result<()> {
     let temp_dir = TempDir::new().unwrap();
-    let storage =
-        StorageFactory::create(StorageConfig::File(FileStorageConfig::new(temp_dir.path())))?;
+    // mmap on explicitly, not through the platform default that
+    // `LAURUS_NO_MMAP=1` turns off, so the segment reopens under `Lazy`
+    // below: the reader must load the sidecar in that mode too (#1482).
+    let mut config = FileStorageConfig::new(temp_dir.path());
+    config.use_mmap = true;
+    let storage = StorageFactory::create(StorageConfig::File(config))?;
 
     let hnsw_opt = HnswOption {
         dimension: 4,
@@ -99,14 +103,20 @@ async fn engine_search_with_rerank_factor_succeeds_on_stage2_field() -> laurus::
     // Stronger, deterministic guard: reopen the committed segment the
     // way the vector store does (behind `PrefixedStorage("vector", ..)`,
     // first sealed segment `segment_000000`, #882) and assert the sidecar
-    // actually loads into the rerank pool. A fresh `PrefixedStorage`
-    // reports Eager loading (the trait default), so the pool is populated
-    // on load — this proves "the f32 pool exists and is populated",
-    // independent of the score comparison below.
+    // actually loads into the rerank pool. `PrefixedStorage` reports the
+    // mmap-backed `FileStorage`'s `Lazy` mode (#554), so this also pins
+    // that the sidecar loads under `Lazy` — it proves "the f32 pool
+    // exists and is populated", independent of the score comparison
+    // below.
     let vector_storage: Arc<dyn Storage> =
         Arc::new(PrefixedStorage::new("vector", storage.clone()));
     let field_storage: Arc<dyn Storage> =
         Arc::new(PrefixedStorage::new("embedding", vector_storage));
+    assert_eq!(
+        field_storage.loading_mode(),
+        LoadingMode::Lazy,
+        "the reopened segment must see the mmap-backed storage's Lazy mode (#554)"
+    );
     let reader = HnswIndexReader::load(
         field_storage,
         "segment_000000",

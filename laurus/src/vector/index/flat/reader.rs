@@ -36,8 +36,8 @@ pub struct FlatVectorIndexReader {
     /// slice without re-cloning `vector_ids`. #405.
     vector_ids_by_field: std::collections::HashMap<String, Arc<[u64]>>,
     /// Stage 2 rerank sidecar pool (Issue #481, extended to Flat by
-    /// #650 PR-2 / #932). `Some` only when the `.f32` sidecar exists and
-    /// the loading mode is Eager; absence keeps Stage 1 behavior.
+    /// #650 PR-2 / #932). `Some` whenever the `.f32` sidecar exists, in
+    /// either loading mode; absence keeps Stage 1 behavior.
     rerank_storage: Option<Arc<crate::vector::index::rerank_storage::RerankStoragePool>>,
 }
 
@@ -255,10 +255,10 @@ impl FlatVectorIndexReader {
         let vector_ids_by_field = build_vector_ids_by_field(&vector_ids, &field_dict);
 
         // Stage 2 rerank sidecar (Issue #481, extended to Flat by #650
-        // PR-2 / #932): loaded eagerly when present, mirroring HNSW. The
-        // pool's positions pair with `vector_ids` (the record order the
-        // writer also used for the sidecar payload) — an identity mapping.
-        // Lazy mode skips the sidecar to honor its memory-savings promise.
+        // PR-2 / #932): read into memory whenever present, in either
+        // loading mode, mirroring HNSW. The pool's positions pair with
+        // `vector_ids` (the record order the writer also used for the
+        // sidecar payload) — an identity mapping.
         let rerank_storage = crate::vector::index::rerank_sidecar::load_rerank_sidecar(
             storage.as_ref(),
             &file_name,

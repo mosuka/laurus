@@ -91,12 +91,11 @@ pub struct HnswIndexReader {
 
     /// Optional Stage 2 rerank storage pool (Issue #481).
     ///
-    /// `Some(_)` only when (a) the LRS1 sidecar exists alongside the
-    /// main `.hnsw` file and (b) the storage loading mode is Eager.
-    /// Lazy mode silently skips the sidecar so the on-disk read pattern
-    /// stays small; Stage 1 segments without a sidecar always yield
-    /// `None`. The HNSW searcher reads this to decide whether to
-    /// activate the two-stage rerank flow.
+    /// `Some(_)` whenever the LRS1 sidecar exists alongside the main
+    /// `.hnsw` file, in either storage loading mode (the sidecar is read
+    /// into memory even under Lazy); Stage 1 segments without a sidecar
+    /// always yield `None`. The HNSW searcher reads this to decide
+    /// whether to activate the two-stage rerank flow.
     pub rerank_storage: Option<Arc<RerankStoragePool>>,
 }
 
@@ -1060,10 +1059,10 @@ impl HnswIndexReader {
 
     /// Borrow the optional Stage 2 rerank storage pool.
     ///
-    /// Returns `Some(_)` only when this reader was loaded against a
-    /// segment whose LRS1 sidecar was present and the storage loading
-    /// mode allowed eager sidecar load. The HNSW searcher consults
-    /// this to decide whether the two-stage rerank flow is available.
+    /// Returns `Some(_)` when this reader was loaded against a segment
+    /// whose LRS1 sidecar was present, in either storage loading mode.
+    /// The HNSW searcher consults this to decide whether the two-stage
+    /// rerank flow is available.
     pub fn rerank_storage(&self) -> Option<&Arc<RerankStoragePool>> {
         self.rerank_storage.as_ref()
     }

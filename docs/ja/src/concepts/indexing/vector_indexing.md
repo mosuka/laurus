@@ -330,11 +330,12 @@ offset  size  field
 
 ベクトルは LVS1 セグメントと同じ `(doc_id, field_name)` 順で書かれる
 ので、(sidecar position) → (LVS1 position) のマッピングは恒等関数に
-なります。HNSW reader は storage の loading mode が Eager のとき初期化
-時に sidecar を `RerankStoragePool` にロードします。Lazy mode では
-memory savings の前提を尊重するため sidecar 読み込みをスキップします
-（Lazy mode で開いた Stage 2 セグメントは silent に Stage 1 へ
-degrade します）。
+なります。reader（HNSW、Flat、IVF）は、どちらの loading mode でも、
+セグメントを開くときに sidecar を `RerankStoragePool` にロードします。
+`Lazy`（mmap を使う `FileStorage`）ではベクトルの行はマップしたまま
+ですが、sidecar はメモリに読み込むので、`rerank_storage` を有効に
+すると、どちらのモードでもセグメントごとに
+`vector_count * dim * 4` バイトのメモリを使います。
 
 sidecar はスキーマの HNSW オプションの `rerank_storage` でフィールド
 ごとに有効化され、その設定はすべての書き込み経路で尊重されます。直接

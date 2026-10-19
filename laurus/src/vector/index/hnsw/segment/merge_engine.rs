@@ -92,9 +92,9 @@ impl MergeEngine {
             // sidecar (lossless) over the int8-dequantized iterator value,
             // so a merge does not bake one round of quantization error into
             // the merged sidecar. The pool is already loaded by the reader
-            // (Eager mode, zero extra I/O); when absent (no sidecar, or Lazy
-            // mode) we keep the int8-dequantized vector — the best available
-            // source.
+            // (in either loading mode, zero extra I/O); when the segment has
+            // no sidecar we keep the int8-dequantized vector — the best
+            // available source.
             let rerank_pool = reader.rerank_storage().cloned();
 
             let mut iterator = reader.vector_iterator()?;

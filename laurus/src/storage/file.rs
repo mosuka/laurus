@@ -145,8 +145,8 @@ impl FileStorageConfig {
     ///
     /// - `use_mmap`: **`true` on every platform** (Linux / macOS /
     ///   other Unix per Issue #504; Windows per Issue #508 once the
-    ///   cache eviction in [`Self::create_output`] /
-    ///   [`Self::delete_file`] landed). mmap-backed reads are the
+    ///   cache eviction in [`FileStorage::create_output`] /
+    ///   [`FileStorage::delete_file`] landed). mmap-backed reads are the
     ///   default so the lexical posting decoder can take the
     ///   zero-copy path through `StorageInput::as_slice`. Set the
     ///   `LAURUS_NO_MMAP=1` environment variable to opt out (debug /
@@ -158,8 +158,8 @@ impl FileStorageConfig {
     /// - `mmap_enable_prefault`: false
     /// - `mmap_enable_hugepages`: false
     pub fn new<P: AsRef<std::path::Path>>(path: P) -> Self {
-        // The mmap default is platform-specific (Unix on / Windows
-        // off, Issue #504, #508); the per-OS policy lives in
+        // mmap is on unless `LAURUS_NO_MMAP=1` on every platform
+        // (Issue #504, #508); the per-OS policy lives in
         // `super::platform` so this call site stays platform-agnostic.
         FileStorageConfig {
             path: path.as_ref().to_path_buf(),
