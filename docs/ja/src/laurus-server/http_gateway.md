@@ -91,6 +91,26 @@ MultiVector フィールドには、トークン単位のエンベッダーも�
 
 MultiVector フィールドには `storage`（Issue #1346）も指定でき、トークンベクトルのディスク上の要素形式を選べます。`"f32"`（デフォルト、誤差なし）、`"f16"`（`"f32"` の半分のサイズ、要素あたり相対誤差 ~2⁻¹¹）、`"int8"`（典型的な次元数で `"f32"` の約 1/4 のサイズ、ベクトルごとのスケールを使用）、`"binary"`（`"f32"` の 1/32 のサイズ、要素あたり 1 bit。`"distance": "cosine"` が必要）のいずれかです。整数の `pool_factor` も指定でき、各文書のトークンベクトルを約 `1 / pool_factor` に減らします（デフォルトの `1` はすべて保存。`0` はエンジンが拒否し、0 以上の整数でない値は 400 になります）。`1` のとき、このキーはレスポンスから省略されます。値は小文字の文字列で、入力時は大文字小文字を区別せずに受け付けます。例: `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`。認識できない値は拒否されます。`storage` がデフォルトの `"f32"` の場合、このキーはレスポンスから省略されます。
 
+`hnsw`・`flat`・`ivf` フィールドには `quantizer` を指定でき、ベクトルの保存形式を選べます。例: `"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "product_quantization", "subvector_count": 48}}}`。`method` は gRPC の `QuantizationMethod` の名前から接頭辞 `QUANTIZATION_METHOD_` を除いて小文字にしたもので、入力時は大文字小文字を区別せずに受け付けます。
+
+| `method` | インデックスの種類 | 備考 |
+| :--- | :--- | :--- |
+| `"scalar_8bit"` | HNSW, Flat, IVF | `quantizer` を省略したとき、または `null` のときのデフォルト |
+| `"float16"` | HNSW, Flat, IVF | IEEE 754 半精度（Issue #623） |
+| `"product_quantization"` | HNSW | `subvector_count` は `dimension` を割り切る値にする |
+| `"product_quantization_fastscan"` | HNSW | 実験的。サーバーを `pq-fastscan` feature 付きでビルドする必要がある |
+
+`subvector_count` を読むのは、2 つの直積量子化（product quantization）の方式のときだけです。ほかの `method`（`"none"` を含む。量子化なしの保存は Issue #481 で廃止）、文字列の `method` を持たない quantizer、`pq-fastscan` なしでビルドしたサーバーへの `"product_quantization_fastscan"` は 400 で拒否され（Issue #1459）、何も書き込まれません。
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "pq", "subvector_count": 48}}}}}}'
+# => {"error":{"code":400,"message":"field \"embedding\": unknown quantizer method \"pq\" (expected \"scalar_8bit\", \"product_quantization\", \"product_quantization_fastscan\", or \"float16\")"}}
+```
+
+レスポンスには常に `quantizer` が含まれます。`subvector_count` を使わない方式では、その値は `0` です（例: `"quantizer": {"method": "scalar_8bit", "subvector_count": 0}`）。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:

@@ -123,9 +123,9 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
-**Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index only — `CreateIndex`, `AddField` and `UpdateField` reject it on a Flat / IVF field as `INVALID_ARGUMENT`, Issue #1457), `FLOAT16` (Issue #623; IEEE 754 half precision, 2 bytes per dimension, nothing to train; supported by HNSW, Flat and IVF — see [Float16](../concepts/indexing/vector_indexing.md#float16-issue-623)). A server that predates `FLOAT16` stores the field as `SCALAR_8BIT` without an error (Issue #1459), so check the returned schema when talking to an older server.
+**Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index only — `CreateIndex`, `AddField` and `UpdateField` reject it on a Flat / IVF field as `INVALID_ARGUMENT`, Issue #1457), `FLOAT16` (Issue #623; IEEE 754 half precision, 2 bytes per dimension, nothing to train; supported by HNSW, Flat and IVF — see [Float16](../concepts/indexing/vector_indexing.md#float16-issue-623)), `PRODUCT_QUANTIZATION_FASTSCAN` (Issue #695; experimental, HNSW only, and only on a server built with the `pq-fastscan` feature). `CreateIndex`, `AddField` and `UpdateField` reject a value the server does not know, and `PRODUCT_QUANTIZATION_FASTSCAN` on a server built without `pq-fastscan`, as `INVALID_ARGUMENT` instead of storing the field as `SCALAR_8BIT` (Issue #1459). A server that predates `FLOAT16` predates this check as well and stores such a field as `SCALAR_8BIT` without an error, so check the returned schema when talking to an older server.
 
-`NONE` (no quantization) was removed in Issue #481 Stage 1. The proto enum value `0` (`QUANTIZATION_METHOD_NONE`) is kept as a wire-compat reservation; if the server receives it, it falls back to `SCALAR_8BIT` via `Default::default()`.
+`NONE` (no quantization) was removed in Issue #481 Stage 1. The proto enum value `0` (`QUANTIZATION_METHOD_NONE`) is what a client that leaves `method` unset sends, so it is kept: the server stores the field as `SCALAR_8BIT`, the default.
 
 **Rerank storage:** the optional `rerank_storage` field (enum `RerankStorageKind`: `UNSPECIFIED` = no sidecar, `F32`) enables the Stage-2 rerank sidecar (Issue #481 / #793). When set to `F32` on an HNSW field, commit writes an extra full-precision `.hnsw.f32` sidecar so searches that set `rerank_factor` rescore int8 candidates against the original vectors. Omitting the field (or `UNSPECIFIED`) keeps Stage-1 int8-only ranking. Since #932 the sidecar is emitted and consumed by all three vector index types (HNSW / Flat / IVF), including a field-less query when the segment holds only one field (Issue #1388).
 
@@ -137,8 +137,8 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `method` | `QuantizationMethod` | Quantization method (`QUANTIZATION_METHOD_SCALAR_8BIT`, `QUANTIZATION_METHOD_PRODUCT_QUANTIZATION` or `QUANTIZATION_METHOD_FLOAT16` = `4`). The reserved value `0` (`NONE`) is silently coerced to `SCALAR_8BIT`. |
-| `subvector_count` | `uint32` | Number of subvectors (only used when `method` is `PRODUCT_QUANTIZATION`; must evenly divide `dimension`; ignored for `SCALAR_8BIT` and `FLOAT16`) |
+| `method` | `QuantizationMethod` | Quantization method (`QUANTIZATION_METHOD_SCALAR_8BIT`, `QUANTIZATION_METHOD_PRODUCT_QUANTIZATION`, `QUANTIZATION_METHOD_PRODUCT_QUANTIZATION_FASTSCAN` = `3` or `QUANTIZATION_METHOD_FLOAT16` = `4`). `0` (`NONE`, an unset `method`) means `SCALAR_8BIT`; any other value is rejected as `INVALID_ARGUMENT`. |
+| `subvector_count` | `uint32` | Number of subvectors (only used when `method` is `PRODUCT_QUANTIZATION` or `PRODUCT_QUANTIZATION_FASTSCAN`; must evenly divide `dimension`; ignored for `SCALAR_8BIT` and `FLOAT16`) |
 
 **Example:**
 

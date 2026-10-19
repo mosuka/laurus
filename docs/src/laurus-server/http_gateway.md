@@ -95,6 +95,26 @@ A multi-vector field may also name a token-level embedder (Issue #1349), declare
 
 A multi-vector field may also set `storage` (Issue #1346) to pick the on-disk element kind of its token vectors: `"f32"` (default, exact), `"f16"` (2x smaller than `"f32"`, ~2⁻¹¹ relative error per element), `"int8"` (~4x smaller than `"f32"` at typical dimensions, using a per-vector scale), or `"binary"` (32x smaller, 1 bit per element; requires `"distance": "cosine"`). It may also set `pool_factor`, an integer: each document keeps about `1 / pool_factor` of its token vectors (`1`, the default, keeps them all; `0` is rejected by the engine, and a value that is not a non-negative integer is a 400). The key is omitted from the response when it is `1`. The value is a lowercase string, accepted case-insensitively on input, e.g. `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`; an unrecognized value is rejected. The key is omitted from the response when `storage` is `"f32"`, the default.
 
+An `hnsw`, `flat` or `ivf` field may set `quantizer` to pick how its vectors are stored, e.g. `"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "product_quantization", "subvector_count": 48}}}`. `method` is the gRPC `QuantizationMethod` name without its `QUANTIZATION_METHOD_` prefix, in lower case, and is accepted case-insensitively:
+
+| `method` | Index types | Notes |
+| :--- | :--- | :--- |
+| `"scalar_8bit"` | HNSW, Flat, IVF | The default when `quantizer` is omitted or `null` |
+| `"float16"` | HNSW, Flat, IVF | IEEE 754 half precision (Issue #623) |
+| `"product_quantization"` | HNSW | `subvector_count` must divide `dimension` |
+| `"product_quantization_fastscan"` | HNSW | Experimental; the server must be built with the `pq-fastscan` feature |
+
+`subvector_count` is read only for the two product quantization methods. Any other `method`, including `"none"` (unquantized storage was removed in Issue #481), a quantizer without a string `method`, and `"product_quantization_fastscan"` on a server built without `pq-fastscan` are rejected with 400 (Issue #1459), and nothing is written:
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "pq", "subvector_count": 48}}}}}}'
+# => {"error":{"code":400,"message":"field \"embedding\": unknown quantizer method \"pq\" (expected \"scalar_8bit\", \"product_quantization\", \"product_quantization_fastscan\", or \"float16\")"}}
+```
+
+The response always includes `quantizer`, with `subvector_count` `0` for a method that does not use it (e.g. `"quantizer": {"method": "scalar_8bit", "subvector_count": 0}`).
+
 ### Add a Field (Dynamic Schema)
 
 Adds a new field to the running index. The request body uses the same `FieldOption` JSON shape as `POST /v1/index`:

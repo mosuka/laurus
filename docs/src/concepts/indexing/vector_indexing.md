@@ -721,8 +721,10 @@ ingested again.
 > `unknown vector segment quant_kind = 4`, or with an unknown-variant
 > error when they parse the schema. A server that predates
 > `QUANTIZATION_METHOD_FLOAT16` stores the field as `Scalar8Bit`
-> without an error (Issue #1459), so check the returned schema when you
-> talk to an older server.
+> without an error, so check the returned schema when you talk to an
+> older server. Servers that know Float16 reject a quantization method
+> they do not know as `INVALID_ARGUMENT` (HTTP 400) instead
+> (Issue #1459).
 
 #### Measurements
 

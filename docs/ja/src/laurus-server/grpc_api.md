@@ -123,9 +123,9 @@ message AnalyzerDefinition {
 
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
-**量子化手法:** `SCALAR_8BIT`（デフォルト）, `PRODUCT_QUANTIZATION`（Issue #481 Stage 3。HNSW インデックスだけがサポート — Flat / IVF のフィールドに指定すると、`CreateIndex`・`AddField`・`UpdateField` が `INVALID_ARGUMENT` で拒否。Issue #1457）, `FLOAT16`（Issue #623。IEEE 754 半精度で 1 次元あたり 2 バイト、学習は不要。HNSW / Flat / IVF がサポート — [Float16](../concepts/indexing/vector_indexing.md#float16issue-623) を参照）。`FLOAT16` を知らない古いサーバーは、エラーにせずそのフィールドを `SCALAR_8BIT` として保存する（Issue #1459）ので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
+**量子化手法:** `SCALAR_8BIT`（デフォルト）, `PRODUCT_QUANTIZATION`（Issue #481 Stage 3。HNSW インデックスだけがサポート — Flat / IVF のフィールドに指定すると、`CreateIndex`・`AddField`・`UpdateField` が `INVALID_ARGUMENT` で拒否。Issue #1457）, `FLOAT16`（Issue #623。IEEE 754 半精度で 1 次元あたり 2 バイト、学習は不要。HNSW / Flat / IVF がサポート — [Float16](../concepts/indexing/vector_indexing.md#float16issue-623) を参照）, `PRODUCT_QUANTIZATION_FASTSCAN`（Issue #695。実験的で HNSW だけがサポート。`pq-fastscan` feature 付きでビルドしたサーバーだけが受け付ける）。`CreateIndex`・`AddField`・`UpdateField` は、サーバーが知らない値と、`pq-fastscan` なしでビルドしたサーバーへの `PRODUCT_QUANTIZATION_FASTSCAN` を、フィールドを `SCALAR_8BIT` として保存せずに `INVALID_ARGUMENT` で拒否します（Issue #1459）。`FLOAT16` を知らない古いサーバーはこの検査も持たず、そうしたフィールドをエラーにせず `SCALAR_8BIT` として保存するので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
 
-`NONE`（量子化なし）は Issue #481 Stage 1 で廃止されました。proto enum 値 0（`QUANTIZATION_METHOD_NONE`）は wire 互換のため予約されていますが、サーバ側で受信すると `Default::default()`（`SCALAR_8BIT`）にフォールバックします。
+`NONE`（量子化なし）は Issue #481 Stage 1 で廃止されました。proto enum 値 0（`QUANTIZATION_METHOD_NONE`）は、`method` を設定しないクライアントが送る値なので残してあり、サーバーはそのフィールドをデフォルトの `SCALAR_8BIT` として保存します。
 
 **Rerank storage:** オプションの `rerank_storage` フィールド（enum `RerankStorageKind`: `UNSPECIFIED` = サイドカーなし、`F32`）は Stage-2 rerank サイドカー（Issue #481 / #793）を有効化します。HNSW フィールドで `F32` を設定すると、commit 時に完全精度の `.hnsw.f32` サイドカーを追加で書き出し、`rerank_factor` を指定した検索が int8 候補を元のベクトルで再スコアします。フィールドを省略（または `UNSPECIFIED`）すると Stage-1 の int8 のみのランキングになります。#932 以降、サイドカーは 3 つのベクトルインデックスタイプ（HNSW / Flat / IVF）すべてで出力・利用されます。セグメントが単一フィールドしか持たない場合はフィールド指定なしのクエリでも再スコアされます（Issue #1388）。
 
@@ -137,8 +137,8 @@ message AnalyzerDefinition {
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `method` | `QuantizationMethod` | 量子化手法（`QUANTIZATION_METHOD_SCALAR_8BIT`、`QUANTIZATION_METHOD_PRODUCT_QUANTIZATION`、`QUANTIZATION_METHOD_FLOAT16` = `4` のいずれか）。0（`NONE`）は予約、サーバ側で `SCALAR_8BIT` にフォールバック。 |
-| `subvector_count` | `uint32` | サブベクトルの数（`method` が `PRODUCT_QUANTIZATION` の場合のみ使用。`dimension` を均等に割り切れる値を指定。`SCALAR_8BIT` と `FLOAT16` では無視）。 |
+| `method` | `QuantizationMethod` | 量子化手法（`QUANTIZATION_METHOD_SCALAR_8BIT`、`QUANTIZATION_METHOD_PRODUCT_QUANTIZATION`、`QUANTIZATION_METHOD_PRODUCT_QUANTIZATION_FASTSCAN` = `3`、`QUANTIZATION_METHOD_FLOAT16` = `4` のいずれか）。0（`NONE`、`method` が未設定）は `SCALAR_8BIT` として扱い、ほかの値は `INVALID_ARGUMENT` で拒否。 |
+| `subvector_count` | `uint32` | サブベクトルの数（`method` が `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` の場合のみ使用。`dimension` を均等に割り切れる値を指定。`SCALAR_8BIT` と `FLOAT16` では無視）。 |
 
 **例:**
 

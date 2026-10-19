@@ -728,27 +728,62 @@ fn distance_metric_to_string(val: i32) -> &'static str {
     }
 }
 
-fn json_to_quantizer(json: &Value) -> Option<v1::QuantizationConfig> {
-    let obj = json.as_object()?;
-    let method_str = obj.get("method")?.as_str()?;
-    let method = match method_str.to_lowercase().as_str() {
-        "scalar_8bit" => v1::QuantizationMethod::Scalar8bit as i32,
-        "product_quantization" => v1::QuantizationMethod::ProductQuantization as i32,
-        "product_quantization_fastscan" => {
-            v1::QuantizationMethod::ProductQuantizationFastscan as i32
+/// The `method` strings [`json_to_quantizer`] accepts, as quoted in its
+/// error message.
+const QUANTIZER_METHODS: &str =
+    "\"scalar_8bit\", \"product_quantization\", \"product_quantization_fastscan\", or \"float16\"";
+
+/// Parse a vector option's JSON `quantizer` object
+/// (`{ "method": "product_quantization", "subvector_count": 4 }`) into the
+/// proto message.
+///
+/// Returns `Ok(None)` when `quantizer` is absent or `null`, so the server
+/// default (`Scalar8Bit`) applies. `method` is matched case-insensitively.
+///
+/// # Arguments
+///
+/// * `json` - The vector option object that may carry `quantizer`.
+///
+/// # Errors
+///
+/// Returns an error when `quantizer` is not an object, has no string
+/// `method`, or names a method other than `scalar_8bit`,
+/// `product_quantization`, `product_quantization_fastscan` or `float16`,
+/// so a typo is a 400 instead of int8 storage (Issue #1459). `none` is
+/// rejected too: unquantized storage was removed in Issue #481 Stage 1.
+fn json_to_quantizer(json: &Value) -> Result<Option<v1::QuantizationConfig>, String> {
+    let obj = match json.get("quantizer") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(obj)) => obj,
+        Some(other) => {
+            return Err(format!(
+                "quantizer must be an object with a \"method\" of {QUANTIZER_METHODS}, got {other}"
+            ));
         }
+    };
+    let method_str = obj.get("method").and_then(|v| v.as_str()).ok_or_else(|| {
+        format!("quantizer \"method\" must be a string, one of {QUANTIZER_METHODS}")
+    })?;
+    let method = match method_str.to_lowercase().as_str() {
+        "scalar_8bit" => v1::QuantizationMethod::Scalar8bit,
+        "product_quantization" => v1::QuantizationMethod::ProductQuantization,
+        "product_quantization_fastscan" => v1::QuantizationMethod::ProductQuantizationFastscan,
         // Issue #623: IEEE 754 half precision (HNSW / Flat / IVF).
-        "float16" => v1::QuantizationMethod::Float16 as i32,
-        _ => v1::QuantizationMethod::None as i32,
+        "float16" => v1::QuantizationMethod::Float16,
+        _ => {
+            return Err(format!(
+                "unknown quantizer method \"{method_str}\" (expected {QUANTIZER_METHODS})"
+            ));
+        }
     };
     let subvector_count = obj
         .get("subvector_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    Some(v1::QuantizationConfig {
-        method,
+    Ok(Some(v1::QuantizationConfig {
+        method: method as i32,
         subvector_count,
-    })
+    }))
 }
 
 fn quantizer_to_json(q: &v1::QuantizationConfig) -> Value {
@@ -807,7 +842,7 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
             .get("base_weight")
             .and_then(|v| v.as_f64())
             .map(|v| v as f32),
-        quantizer: json.get("quantizer").and_then(json_to_quantizer),
+        quantizer: json_to_quantizer(json)?,
         embedder: json
             .get("embedder")
             .and_then(|v| v.as_str())
@@ -844,7 +879,7 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
             .get("base_weight")
             .and_then(|v| v.as_f64())
             .map(|v| v as f32),
-        quantizer: json.get("quantizer").and_then(json_to_quantizer),
+        quantizer: json_to_quantizer(json)?,
         embedder: json
             .get("embedder")
             .and_then(|v| v.as_str())
@@ -930,7 +965,7 @@ fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
             .get("base_weight")
             .and_then(|v| v.as_f64())
             .map(|v| v as f32),
-        quantizer: json.get("quantizer").and_then(json_to_quantizer),
+        quantizer: json_to_quantizer(json)?,
         embedder: json
             .get("embedder")
             .and_then(|v| v.as_str())
@@ -2327,8 +2362,8 @@ mod tests {
 
     /// Issue #623: a `{ "method": "float16" }` quantizer survives the HTTP
     /// gateway's JSON -> proto -> JSON round-trip for HNSW and Flat fields,
-    /// mapping to `QUANTIZATION_METHOD_FLOAT16` rather than the `NONE`
-    /// fallback for an unrecognized method string.
+    /// mapping to `QUANTIZATION_METHOD_FLOAT16` rather than being rejected
+    /// as an unrecognized method string (Issue #1459).
     #[test]
     fn test_float16_quantizer_round_trips_through_json() {
         let json = json!({ "dimension": 32, "quantizer": { "method": "float16" } });
@@ -2410,6 +2445,65 @@ mod tests {
                     back[kind]["quantizer"], quantizer,
                     "{kind}/{name} upper case"
                 );
+            }
+        }
+    }
+
+    /// Issue #1459: a `quantizer` the gateway cannot map to a method is a
+    /// 400 instead of `NONE`, which the server would store as int8, for each
+    /// vector field kind; the schema conversion names the field. `none` is
+    /// rejected too: unquantized storage was removed in Issue #481.
+    #[test]
+    fn test_unknown_quantizer_is_rejected() {
+        let cases = [
+            (json!({ "method": "pq" }), "unknown quantizer method \"pq\""),
+            (
+                json!({ "method": "none" }),
+                "unknown quantizer method \"none\"",
+            ),
+            (
+                json!({ "subvector_count": 4 }),
+                "quantizer \"method\" must be a string",
+            ),
+            (
+                json!({ "method": 2 }),
+                "quantizer \"method\" must be a string",
+            ),
+            (json!("float16"), "quantizer must be an object"),
+        ];
+        for kind in ["hnsw", "flat", "ivf"] {
+            for (quantizer, expected) in &cases {
+                let option = json!({ kind: { "dimension": 32, "quantizer": quantizer } });
+                let err = json_to_proto_field_option(&option).unwrap_err();
+                assert!(err.starts_with(expected), "{kind}/{quantizer}: {err}");
+
+                let schema = json!({ "fields": { "vec": option } });
+                let err = json_to_proto_schema(&schema).unwrap_err();
+                assert!(
+                    err.starts_with(&format!("field \"vec\": {expected}")),
+                    "{kind}/{quantizer}: {err}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1459: an absent or `null` quantizer is left unset, so the
+    /// server default (`Scalar8Bit`) applies.
+    #[test]
+    fn test_absent_or_null_quantizer_is_left_unset() {
+        for kind in ["hnsw", "flat", "ivf"] {
+            for option in [
+                json!({ kind: { "dimension": 32 } }),
+                json!({ kind: { "dimension": 32, "quantizer": null } }),
+            ] {
+                let proto = json_to_proto_field_option(&option).unwrap();
+                let quantizer = match &proto.option {
+                    Some(v1::field_option::Option::Hnsw(o)) => o.quantizer.as_ref(),
+                    Some(v1::field_option::Option::Flat(o)) => o.quantizer.as_ref(),
+                    Some(v1::field_option::Option::Ivf(o)) => o.quantizer.as_ref(),
+                    other => panic!("{kind}: unexpected option {other:?}"),
+                };
+                assert_eq!(quantizer, None, "{option}");
             }
         }
     }

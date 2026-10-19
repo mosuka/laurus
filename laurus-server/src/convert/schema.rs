@@ -48,8 +48,7 @@ pub fn to_proto(schema: &Schema) -> v1::Schema {
 pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
     let mut fields = BTreeMap::new();
     for (name, fo) in &proto.fields {
-        let option = field_option_from_proto(fo)
-            .ok_or_else(|| format!("Field '{name}' has no option set"))?;
+        let option = field_option_from_proto(fo).map_err(|e| format!("Field '{name}': {e}"))?;
         fields.insert(name.clone(), option);
     }
     let mut analyzers = BTreeMap::new();
@@ -214,15 +213,19 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
 
 /// Convert a proto `FieldOption` into a laurus `FieldOption`.
 ///
-/// Returns `None` if the proto message has no option variant set.
-///
 /// # Arguments
 ///
 /// * `fo` - The proto field option to convert.
-pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
+///
+/// # Errors
+///
+/// Returns an error if the proto message has no option variant set, or if
+/// a vector option's quantizer is unknown or unsupported by this build
+/// (see [`quantization_from_proto`]).
+pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, String> {
     use v1::field_option::Option as Opt;
-    match &fo.option {
-        Some(Opt::Text(o)) => Some(FieldOption::Text(TextOption {
+    let option = match &fo.option {
+        Some(Opt::Text(o)) => FieldOption::Text(TextOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
@@ -237,50 +240,50 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             // Same tri-state treatment for the same reason (#1047).
             doc_values: o.doc_values.unwrap_or(true),
             analyzer: o.analyzer.as_ref().and_then(analyzer_spec_from_proto),
-        })),
-        Some(Opt::Integer(o)) => Some(FieldOption::Integer(IntegerOption {
+        }),
+        Some(Opt::Integer(o)) => FieldOption::Integer(IntegerOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
-        })),
-        Some(Opt::Float(o)) => Some(FieldOption::Float(FloatOption {
+        }),
+        Some(Opt::Float(o)) => FieldOption::Float(FloatOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
-        })),
-        Some(Opt::Boolean(o)) => Some(FieldOption::Boolean(BooleanOption {
+        }),
+        Some(Opt::Boolean(o)) => FieldOption::Boolean(BooleanOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
-        })),
-        Some(Opt::DateTime(o)) => Some(FieldOption::DateTime(DateTimeOption {
+        }),
+        Some(Opt::DateTime(o)) => FieldOption::DateTime(DateTimeOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
-        })),
-        Some(Opt::Geo(o)) => Some(FieldOption::Geo(GeoOption {
+        }),
+        Some(Opt::Geo(o)) => FieldOption::Geo(GeoOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
             doc_values: o.doc_values.unwrap_or(true),
-        })),
-        Some(Opt::Geo3d(o)) => Some(FieldOption::Geo3d(Geo3dOption {
+        }),
+        Some(Opt::Geo3d(o)) => FieldOption::Geo3d(Geo3dOption {
             indexed: o.indexed,
             stored: o.stored,
             multi_valued: o.multi_valued,
             // Same tri-state treatment as every other lexical option; this
             // arm used to hardcode `true` and drop an explicit `false`.
             doc_values: o.doc_values.unwrap_or(true),
-        })),
-        Some(Opt::Bytes(o)) => Some(FieldOption::Bytes(BytesOption {
+        }),
+        Some(Opt::Bytes(o)) => FieldOption::Bytes(BytesOption {
             stored: o.stored,
             multi_valued: o.multi_valued,
-        })),
-        Some(Opt::Hnsw(o)) => Some(FieldOption::Hnsw(HnswOption {
+        }),
+        Some(Opt::Hnsw(o)) => FieldOption::Hnsw(HnswOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
             m: o.m as usize,
@@ -292,6 +295,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
                 .quantizer
                 .as_ref()
                 .map(quantization_from_proto)
+                .transpose()?
                 .unwrap_or_default(),
             rerank_storage: o.rerank_storage.and_then(rerank_storage_from_proto),
             embedder: if o.embedder.is_empty() {
@@ -303,8 +307,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             // never exist; normalize to "unset" (same defensive convention
             // as `embedder` above).
             pq_codebook_path: o.pq_codebook_path.clone().filter(|p| !p.is_empty()),
-        })),
-        Some(Opt::Flat(o)) => Some(FieldOption::Flat(FlatOption {
+        }),
+        Some(Opt::Flat(o)) => FieldOption::Flat(FlatOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
             // Unset means "use the engine's default" (#1084).
@@ -313,6 +317,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
                 .quantizer
                 .as_ref()
                 .map(quantization_from_proto)
+                .transpose()?
                 .unwrap_or_default(),
             rerank_storage: o.rerank_storage.and_then(rerank_storage_from_proto),
             embedder: if o.embedder.is_empty() {
@@ -320,8 +325,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             } else {
                 Some(o.embedder.clone())
             },
-        })),
-        Some(Opt::Ivf(o)) => Some(FieldOption::Ivf(IvfOption {
+        }),
+        Some(Opt::Ivf(o)) => FieldOption::Ivf(IvfOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
             n_clusters: o.n_clusters as usize,
@@ -332,6 +337,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
                 .quantizer
                 .as_ref()
                 .map(quantization_from_proto)
+                .transpose()?
                 .unwrap_or_default(),
             rerank_storage: o.rerank_storage.and_then(rerank_storage_from_proto),
             embedder: if o.embedder.is_empty() {
@@ -339,8 +345,8 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             } else {
                 Some(o.embedder.clone())
             },
-        })),
-        Some(Opt::MultiVector(o)) => Some(FieldOption::MultiVector(MultiVectorOption {
+        }),
+        Some(Opt::MultiVector(o)) => FieldOption::MultiVector(MultiVectorOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance),
             embedder: if o.embedder.is_empty() {
@@ -351,9 +357,10 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Option<FieldOption> {
             storage: multi_vector_storage_from_proto(o.storage),
             // Unset (an older client) means no pooling.
             pool_factor: o.pool_factor.unwrap_or(1),
-        })),
-        None => None,
-    }
+        }),
+        None => return Err("field_option has no option set".to_string()),
+    };
+    Ok(option)
 }
 
 fn distance_to_proto(d: &DistanceMetric) -> v1::DistanceMetric {
@@ -401,34 +408,42 @@ fn quantization_to_proto(q: &QuantizationMethod) -> v1::QuantizationConfig {
     }
 }
 
-fn quantization_from_proto(q: &v1::QuantizationConfig) -> QuantizationMethod {
-    // Issue #481 Stage 1 removed the unquantized variant from the Rust enum.
-    // The proto wire format still carries `None = 0` for backward compatibility,
-    // but it is silently mapped to `Scalar8Bit` (the new default) to preserve
-    // forward compatibility for older clients that omit the quantizer field.
+/// Convert a proto `QuantizationConfig` into a laurus [`QuantizationMethod`].
+///
+/// `NONE` (the value a client that leaves `method` unset sends) maps to
+/// [`QuantizationMethod::Scalar8Bit`], the default. Issue #481 Stage 1
+/// removed unquantized storage, so `NONE` cannot mean anything else.
+///
+/// # Errors
+///
+/// Returns an error, rather than falling back to `Scalar8Bit`, for a value
+/// this server does not know (for example a method added by a newer
+/// client) and for `PRODUCT_QUANTIZATION_FASTSCAN` on a server built
+/// without the `pq-fastscan` feature (Issue #1459).
+fn quantization_from_proto(q: &v1::QuantizationConfig) -> Result<QuantizationMethod, String> {
     match v1::QuantizationMethod::try_from(q.method) {
-        Ok(v1::QuantizationMethod::Scalar8bit) | Ok(v1::QuantizationMethod::None) | Err(_) => {
-            QuantizationMethod::Scalar8Bit
+        Ok(v1::QuantizationMethod::Scalar8bit) | Ok(v1::QuantizationMethod::None) => {
+            Ok(QuantizationMethod::Scalar8Bit)
         }
         Ok(v1::QuantizationMethod::ProductQuantization) => {
-            QuantizationMethod::ProductQuantization {
+            Ok(QuantizationMethod::ProductQuantization {
                 subvector_count: q.subvector_count as usize,
-            }
+            })
         }
         #[cfg(feature = "pq-fastscan")]
         Ok(v1::QuantizationMethod::ProductQuantizationFastscan) => {
-            QuantizationMethod::ProductQuantizationFastScan {
+            Ok(QuantizationMethod::ProductQuantizationFastScan {
                 subvector_count: q.subvector_count as usize,
-            }
+            })
         }
-        // Feature off: a client that sends FastScan over gRPC will be
-        // silently downgraded to scalar quantization. Returning an
-        // error here would require changing the function signature
-        // across many call sites; we accept the lossy mapping for
-        // Phase 1 and revisit when FastScan exits experimental.
         #[cfg(not(feature = "pq-fastscan"))]
-        Ok(v1::QuantizationMethod::ProductQuantizationFastscan) => QuantizationMethod::Scalar8Bit,
-        Ok(v1::QuantizationMethod::Float16) => QuantizationMethod::Float16,
+        Ok(v1::QuantizationMethod::ProductQuantizationFastscan) => Err(
+            "quantization method QUANTIZATION_METHOD_PRODUCT_QUANTIZATION_FASTSCAN \
+             requires a server built with the `pq-fastscan` feature"
+                .to_string(),
+        ),
+        Ok(v1::QuantizationMethod::Float16) => Ok(QuantizationMethod::Float16),
+        Err(_) => Err(format!("unknown quantization method {}", q.method)),
     }
 }
 
@@ -1301,8 +1316,8 @@ mod tests {
     }
 
     /// Issue #623: `QuantizationMethod::Float16` maps to its own proto
-    /// value (`QUANTIZATION_METHOD_FLOAT16`, not the `Scalar8Bit`
-    /// fallback) and survives the round-trip, both through the
+    /// value (`QUANTIZATION_METHOD_FLOAT16`, not `SCALAR_8BIT`) and
+    /// survives the round-trip, both through the
     /// quantizer conversion itself and through a schema that uses it on
     /// every index kind that supports it (HNSW, Flat, IVF).
     #[test]
@@ -1310,7 +1325,10 @@ mod tests {
         let proto = quantization_to_proto(&QuantizationMethod::Float16);
         assert_eq!(proto.method, v1::QuantizationMethod::Float16 as i32);
         assert_eq!(proto.subvector_count, 0);
-        assert_eq!(quantization_from_proto(&proto), QuantizationMethod::Float16);
+        assert_eq!(
+            quantization_from_proto(&proto),
+            Ok(QuantizationMethod::Float16)
+        );
 
         let schema = Schema::builder()
             .add_field(
@@ -1352,6 +1370,123 @@ mod tests {
             Some(FieldOption::Ivf(i)) => assert_eq!(i.quantizer, QuantizationMethod::Float16),
             other => panic!("expected FieldOption::Ivf, got {other:?}"),
         }
+    }
+
+    /// The proto options of an HNSW, a Flat and an IVF field whose quantizer
+    /// carries the raw `method` value, which may be one this build does not
+    /// know (Issue #1459).
+    fn vector_options_with_quantizer_method(method: i32) -> [v1::FieldOption; 3] {
+        let mut options = [
+            field_option_to_proto(&FieldOption::Hnsw(HnswOption {
+                dimension: 8,
+                ..Default::default()
+            })),
+            field_option_to_proto(&FieldOption::Flat(FlatOption {
+                dimension: 8,
+                ..Default::default()
+            })),
+            field_option_to_proto(&FieldOption::Ivf(IvfOption {
+                dimension: 8,
+                ..Default::default()
+            })),
+        ];
+        for option in &mut options {
+            let quantizer = Some(v1::QuantizationConfig {
+                method,
+                subvector_count: 4,
+            });
+            match &mut option.option {
+                Some(v1::field_option::Option::Hnsw(o)) => o.quantizer = quantizer,
+                Some(v1::field_option::Option::Flat(o)) => o.quantizer = quantizer,
+                Some(v1::field_option::Option::Ivf(o)) => o.quantizer = quantizer,
+                other => unreachable!("not a vector option: {other:?}"),
+            }
+        }
+        options
+    }
+
+    /// Issue #1459: `NONE` (what a client that leaves `method` unset sends)
+    /// still means the default `Scalar8Bit`, but a value this server does
+    /// not know, such as one a newer client sends, is an error instead of
+    /// `Scalar8Bit` on every vector option that carries a quantizer.
+    /// `from_proto` (CreateIndex) names the field.
+    #[test]
+    fn unknown_quantization_method_is_rejected() {
+        for option in vector_options_with_quantizer_method(v1::QuantizationMethod::None as i32) {
+            let quantizer = match field_option_from_proto(&option) {
+                Ok(FieldOption::Hnsw(o)) => o.quantizer,
+                Ok(FieldOption::Flat(o)) => o.quantizer,
+                Ok(FieldOption::Ivf(o)) => o.quantizer,
+                other => panic!("expected a vector option, got {other:?}"),
+            };
+            assert_eq!(quantizer, QuantizationMethod::Scalar8Bit);
+        }
+
+        for option in vector_options_with_quantizer_method(99) {
+            assert_eq!(
+                field_option_from_proto(&option).unwrap_err(),
+                "unknown quantization method 99",
+                "{option:?}"
+            );
+        }
+
+        let [hnsw, _, _] = vector_options_with_quantizer_method(99);
+        let schema = v1::Schema {
+            fields: HashMap::from([("embedding".to_string(), hnsw)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_proto(&schema).unwrap_err(),
+            "Field 'embedding': unknown quantization method 99"
+        );
+    }
+
+    /// Issue #1459: a server built without `pq-fastscan` rejects a FastScan
+    /// quantizer, as the proto comment says, instead of storing the field
+    /// as `Scalar8Bit`.
+    #[cfg(not(feature = "pq-fastscan"))]
+    #[test]
+    fn fastscan_quantizer_is_rejected_without_the_feature() {
+        let method = v1::QuantizationMethod::ProductQuantizationFastscan as i32;
+        for option in vector_options_with_quantizer_method(method) {
+            let err = field_option_from_proto(&option).unwrap_err();
+            assert!(err.contains("`pq-fastscan` feature"), "{err}");
+        }
+    }
+
+    /// The other half of the pair above: with `pq-fastscan`, the same
+    /// request maps to a FastScan quantizer.
+    #[cfg(feature = "pq-fastscan")]
+    #[test]
+    fn fastscan_quantizer_is_accepted_with_the_feature() {
+        let method = v1::QuantizationMethod::ProductQuantizationFastscan as i32;
+        let [hnsw, _, _] = vector_options_with_quantizer_method(method);
+        match field_option_from_proto(&hnsw) {
+            Ok(FieldOption::Hnsw(o)) => assert_eq!(
+                o.quantizer,
+                QuantizationMethod::ProductQuantizationFastScan { subvector_count: 4 }
+            ),
+            other => panic!("expected FieldOption::Hnsw, got {other:?}"),
+        }
+    }
+
+    /// A field option with no variant set is an error, and `from_proto`
+    /// (CreateIndex) names the field.
+    #[test]
+    fn field_option_without_a_variant_is_rejected() {
+        let empty = v1::FieldOption { option: None };
+        assert_eq!(
+            field_option_from_proto(&empty).unwrap_err(),
+            "field_option has no option set"
+        );
+        let schema = v1::Schema {
+            fields: HashMap::from([("body".to_string(), empty)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_proto(&schema).unwrap_err(),
+            "Field 'body': field_option has no option set"
+        );
     }
 
     /// `FieldOption::Geo3d` round-trips through the proto `Geo3dOption`
@@ -1487,7 +1622,7 @@ mod tests {
         }
         assert!(matches!(
             field_option_from_proto(&field),
-            Some(FieldOption::MultiVector(o)) if o.pool_factor == 1
+            Ok(FieldOption::MultiVector(o)) if o.pool_factor == 1
         ));
     }
 
@@ -1606,7 +1741,7 @@ mod tests {
             })),
         };
         match field_option_from_proto(&proto) {
-            Some(FieldOption::Text(o)) => assert_eq!(
+            Ok(FieldOption::Text(o)) => assert_eq!(
                 o.position_increment_gap,
                 laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP
             ),

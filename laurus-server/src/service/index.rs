@@ -125,7 +125,7 @@ impl IndexServiceTrait for IndexService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("field_option is required"))?;
         let field_option = schema_convert::field_option_from_proto(proto_field_option)
-            .ok_or_else(|| Status::invalid_argument("field_option has no option set"))?;
+            .map_err(Status::invalid_argument)?;
 
         let guard = self.engine.read().await;
         let engine = guard
@@ -185,7 +185,7 @@ impl IndexServiceTrait for IndexService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("field_option is required"))?;
         let field_option = schema_convert::field_option_from_proto(proto_field_option)
-            .ok_or_else(|| Status::invalid_argument("field_option has no option set"))?;
+            .map_err(Status::invalid_argument)?;
 
         let guard = self.engine.read().await;
         let engine = guard
@@ -220,8 +220,57 @@ impl IndexServiceTrait for IndexService {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::proto::laurus::v1;
     use laurus::Schema;
+
+    /// An `IndexService` over a fresh index created from `schema_toml`. The
+    /// returned directory must outlive the service.
+    async fn service_with_index(schema_toml: &str) -> (tempfile::TempDir, IndexService) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: dir.path().join("data"),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        };
+        let schema = Schema::from_toml(schema_toml).unwrap();
+        service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema_convert::to_proto(&schema)),
+            }))
+            .await
+            .unwrap();
+        (dir, service)
+    }
+
+    /// The schema `GetSchema` returns, which is read back from disk.
+    async fn schema_of(service: &IndexService) -> v1::Schema {
+        service
+            .get_schema(Request::new(GetSchemaRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .schema
+            .unwrap()
+    }
+
+    /// The proto option of an HNSW field whose quantizer carries the raw
+    /// `method` value, which may be one this build does not know.
+    fn hnsw_with_quantizer_method(method: i32) -> v1::FieldOption {
+        v1::FieldOption {
+            option: Some(v1::field_option::Option::Hnsw(v1::HnswOption {
+                dimension: 8,
+                quantizer: Some(v1::QuantizationConfig {
+                    method,
+                    subvector_count: 4,
+                }),
+                ..Default::default()
+            })),
+        }
+    }
 
     /// Issue #1310: CreateIndex rejects an `[analyzers.*]` entry named after
     /// a built-in analyzer as InvalidArgument, and writes nothing.
@@ -343,5 +392,124 @@ mod tests {
         );
         assert!(!data_dir.exists(), "a rejected create must write nothing");
         assert!(service.engine.read().await.is_none());
+    }
+
+    /// Issue #1459: CreateIndex rejects a quantizer method this server does
+    /// not know as InvalidArgument, instead of storing the field as
+    /// Scalar8Bit, and writes nothing.
+    #[tokio::test]
+    async fn create_index_rejects_unknown_quantization_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: data_dir.clone(),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        };
+
+        let status = service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(v1::Schema {
+                    fields: HashMap::from([("vec".to_string(), hnsw_with_quantizer_method(99))]),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "Field 'vec': unknown quantization method 99"
+        );
+        assert!(!data_dir.exists(), "a rejected create must write nothing");
+        assert!(service.engine.read().await.is_none());
+    }
+
+    /// Issue #1459: AddField rejects a quantizer method this server does not
+    /// know as InvalidArgument and leaves the schema as it was.
+    #[tokio::test]
+    async fn add_field_rejects_unknown_quantization_method() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.body.Text]
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        let status = service
+            .add_field(Request::new(AddFieldRequest {
+                name: "vec".to_string(),
+                field_option: Some(hnsw_with_quantizer_method(99)),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "unknown quantization method 99");
+        assert_eq!(schema_of(&service).await, before);
+    }
+
+    /// Issue #1459: UpdateField rejects a quantizer method this server does
+    /// not know as InvalidArgument and leaves the field as it was.
+    #[tokio::test]
+    async fn update_field_rejects_unknown_quantization_method() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.vec.Hnsw]
+            dimension = 8
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        let status = service
+            .update_field(Request::new(UpdateFieldRequest {
+                name: "vec".to_string(),
+                field_option: Some(hnsw_with_quantizer_method(99)),
+                reindex: true,
+                dry_run: false,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "unknown quantization method 99");
+        assert_eq!(schema_of(&service).await, before);
+    }
+
+    /// Issue #1459: a server built without `pq-fastscan` rejects a FastScan
+    /// quantizer as InvalidArgument, as the proto comment says, instead of
+    /// adding the field as Scalar8Bit.
+    #[cfg(not(feature = "pq-fastscan"))]
+    #[tokio::test]
+    async fn add_field_rejects_fastscan_without_the_feature() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.body.Text]
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        let status = service
+            .add_field(Request::new(AddFieldRequest {
+                name: "vec".to_string(),
+                field_option: Some(hnsw_with_quantizer_method(
+                    v1::QuantizationMethod::ProductQuantizationFastscan as i32,
+                )),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("`pq-fastscan` feature"),
+            "got: {}",
+            status.message()
+        );
+        assert_eq!(schema_of(&service).await, before);
     }
 }

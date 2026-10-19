@@ -676,8 +676,9 @@ f32 sidecar を持たない `Scalar8Bit` フィールドは int8 のコードし
 
 > **互換性:** Float16 に対応する前の laurus は、Float16 のセグメントを含むインデックスを開けません。
 > `unknown vector segment quant_kind = 4`、またはスキーマを解析するときの unknown variant エラーで失敗します。
-> `QUANTIZATION_METHOD_FLOAT16` を知らない古いサーバーは、エラーにせず、そのフィールドを `Scalar8Bit` として保存します（Issue #1459）。
+> `QUANTIZATION_METHOD_FLOAT16` を知らない古いサーバーは、エラーにせず、そのフィールドを `Scalar8Bit` として保存します。
 > 古いサーバーを相手にするときは、返ってきたスキーマを確かめてください。
+> Float16 を知るサーバーは、知らない量子化方式を `INVALID_ARGUMENT`（HTTP では 400）で拒否します（Issue #1459）。
 
 #### 計測結果
 
