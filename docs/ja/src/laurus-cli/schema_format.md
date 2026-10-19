@@ -234,10 +234,10 @@ base_weight = 1.0
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `dimension` | `integer` | `128` | ベクトルの次元数（Embedding モデルの出力と一致させる必要あり） |
+| `dimension` | `integer` | `128` | ベクトルの次元数（Embedding モデルの出力と一致させる必要あり）。1 以上 |
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
-| `m` | `integer` | `16` | ノードあたりの最大双方向接続数。大きいほど再現率が向上するがメモリ使用量が増加 |
-| `ef_construction` | `integer` | `200` | インデックス構築時の探索幅。大きいほど品質が向上するが構築が遅くなる |
+| `m` | `integer` | `16` | ノードあたりの最大双方向接続数。大きいほど再現率が向上するがメモリ使用量が増加。2 以上 |
+| `ef_construction` | `integer` | `200` | インデックス構築時の探索幅。大きいほど品質が向上するが構築が遅くなる。1 以上 |
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式。`"Scalar8Bit"`、`"Float16"`、または `ProductQuantization` テーブル（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできるようにする。省略すると Stage 1 int8-only の挙動を維持。 |
@@ -263,7 +263,7 @@ base_weight = 1.0
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `dimension` | `integer` | `128` | ベクトルの次元数 |
+| `dimension` | `integer` | `128` | ベクトルの次元数。1 以上 |
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式。`"Scalar8Bit"` または `"Float16"`（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
@@ -285,16 +285,18 @@ base_weight = 1.0
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `dimension` | `integer` | *（必須）* | ベクトルの次元数 |
+| `dimension` | `integer` | *（必須）* | ベクトルの次元数。1 以上 |
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
-| `n_clusters` | `integer` | `100` | クラスタ数。多いほど細かい分割が可能 |
-| `n_probe` | `integer` | `1` | クエリ時に検索するクラスタ数。大きいほど再現率が向上するが遅くなる |
+| `n_clusters` | `integer` | `100` | クラスタ数。多いほど細かい分割が可能。1 以上 |
+| `n_probe` | `integer` | `1` | クエリ時に検索するクラスタ数。大きいほど再現率が向上するが遅くなる。1 以上 |
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
 | `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式。`"Scalar8Bit"` または `"Float16"`（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
 | `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。[Hnsw](#hnsw) を参照 |
 
 > **注意:** Hnsw および Flat とは異なり、Ivf の `dimension` フィールドは**必須**であり、デフォルト値はありません。
+>
+> **注意:** インデックスの作成、`laurus add field`、`laurus update field` は、Hnsw・Flat・Ivf で上の表の下限を下回る値を拒否します（Issue #1479）。`m` が 2 未満だとすべてのドキュメントの書き込みが失敗し、`n_probe` が 0 だとすべての検索が 0 件になっていました。この検査の前にそうした値で作ったインデックスも、ログに警告を出して開けます。フィールドは `laurus update field` で直してください。
 
 **チューニングガイドライン:**
 

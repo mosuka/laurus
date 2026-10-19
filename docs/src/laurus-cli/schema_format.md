@@ -236,10 +236,10 @@ base_weight = 1.0
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `dimension` | `integer` | `128` | Vector dimensionality (must match your embedding model) |
+| `dimension` | `integer` | `128` | Vector dimensionality (must match your embedding model). At least 1 |
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
-| `m` | `integer` | `16` | Max bi-directional connections per node. Higher = better recall, more memory |
-| `ef_construction` | `integer` | `200` | Search width during index construction. Higher = better quality, slower build |
+| `m` | `integer` | `16` | Max bi-directional connections per node. Higher = better recall, more memory. At least 2 |
+| `ef_construction` | `integer` | `200` | Search width during index construction. Higher = better quality, slower build. At least 1 |
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method: `"Scalar8Bit"`, `"Float16"`, or a `ProductQuantization` table (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)). `"F32"` enables a per-field f32 sidecar so search can rescore int8 candidates against the original vectors. Omit to keep Stage 1 int8-only behavior. |
@@ -265,7 +265,7 @@ base_weight = 1.0
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `dimension` | `integer` | `128` | Vector dimensionality |
+| `dimension` | `integer` | `128` | Vector dimensionality. At least 1 |
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method: `"Scalar8Bit"` or `"Float16"` (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
@@ -287,16 +287,18 @@ base_weight = 1.0
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `dimension` | `integer` | *(required)* | Vector dimensionality |
+| `dimension` | `integer` | *(required)* | Vector dimensionality. At least 1 |
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
-| `n_clusters` | `integer` | `100` | Number of clusters. More clusters = finer partitioning |
-| `n_probe` | `integer` | `1` | Number of clusters to search at query time. Higher = better recall, slower |
+| `n_clusters` | `integer` | `100` | Number of clusters. More clusters = finer partitioning. At least 1 |
+| `n_probe` | `integer` | `1` | Number of clusters to search at query time. Higher = better recall, slower. At least 1 |
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
 | `quantizer` | `object` | `"Scalar8Bit"` | Quantization method: `"Scalar8Bit"` or `"Float16"` (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
 | `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders); see [Hnsw](#hnsw) |
 
 > **Note:** Unlike Hnsw and Flat, the `dimension` field in Ivf is **required** and has no default value.
+>
+> **Note:** Creating an index, `laurus add field` and `laurus update field` reject a value below the minimum in the tables above for Hnsw, Flat and Ivf (Issue #1479): with `m` below 2 every document write failed, and with `n_probe` 0 every search returned no hits. An index created with such a value before the check still opens, with a warning in the log; fix the field with `laurus update field`.
 
 **Tuning guidelines:**
 

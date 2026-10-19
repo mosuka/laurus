@@ -120,6 +120,17 @@ curl -X POST http://localhost:8080/v1/index \
 
 レスポンスには常に `quantizer` が含まれます。`subvector_count` を使わない方式では、その値は `0` です（例: `"quantizer": {"method": "scalar_8bit", "subvector_count": 0}`）。
 
+`hnsw` フィールドには `m` と `ef_construction`、`ivf` フィールドには `n_clusters` と `n_probe` を整数で指定できます（Issue #1479）。省略するか `null` にするとエンジンのデフォルト（`m` は `16`、`ef_construction` は `200`、`n_clusters` は `100`、`n_probe` は `1`）が使われ、TOML のスキーマで省略したときと同じになります。レスポンスには使われた値が出ます。`dimension` にはデフォルトがなく、どの vector フィールドでも指定が必要です。`0` から `4294967295` までの整数でない値（`16.0` や `"16"` など）は 400 で拒否されます。`2` 未満の `m`、`0` の `ef_construction`・`n_clusters`・`n_probe`、`0` の `dimension` も同じく 400 で拒否され、何も書き込まれません。
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "m": 1}}}}}'
+# => {"error":{"code":400,"message":"Invalid argument: field 'embedding': HNSW m must be at least 2, got 1"}}
+```
+
+この変更より古いサーバーは、省略した値を `0` として読みます。`m` が `0` だとすべてのドキュメントの書き込みが失敗し、`n_probe` が `0` だとすべての検索が 0 件になるので、古いサーバーを相手にするときはこれらを明示してください。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出ます。フィールドの直し方は [gRPC API のグラフとクラスタのパラメータ](grpc_api.md)を参照してください。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:

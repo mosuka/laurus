@@ -126,6 +126,17 @@ curl -X POST http://localhost:8080/v1/index \
 
 The response always includes `quantizer`, with `subvector_count` `0` for a method that does not use it (e.g. `"quantizer": {"method": "scalar_8bit", "subvector_count": 0}`).
 
+An `hnsw` field may set `m` and `ef_construction`, and an `ivf` field `n_clusters` and `n_probe`, all integers (Issue #1479). Omitting one or setting it to `null` gets the engine's default (`m` `16`, `ef_construction` `200`, `n_clusters` `100`, `n_probe` `1`), the same as a TOML schema, and the response shows the value used. `dimension` has no default and must be set on every vector field. A value that is not an integer between `0` and `4294967295` (such as `16.0` or `"16"`) is rejected with 400, and so are an `m` below `2`, an `ef_construction`, `n_clusters` or `n_probe` of `0`, and a `dimension` of `0`; nothing is written:
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "m": 1}}}}}'
+# => {"error":{"code":400,"message":"Invalid argument: field 'embedding': HNSW m must be at least 2, got 1"}}
+```
+
+A server older than this change reads an omitted value as `0`, with which every document write fails (`m`) or every search returns no hits (`n_probe`), so set these explicitly when talking to an older server. An index such a server created still opens, with a warning in the server log; see [gRPC API → Graph and cluster parameters](grpc_api.md) for how to repair the field.
+
 ### Add a Field (Dynamic Schema)
 
 Adds a new field to the running index. The request body uses the same `FieldOption` JSON shape as `POST /v1/index`:
