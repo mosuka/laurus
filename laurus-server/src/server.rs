@@ -230,7 +230,10 @@ impl ShutdownSignals {
 }
 
 /// Waits for a shutdown signal and commits pending changes before exiting.
-async fn shutdown_signal(engine: Arc<RwLock<Option<laurus::Engine>>>, mut signals: ShutdownSignals) {
+async fn shutdown_signal(
+    engine: Arc<RwLock<Option<laurus::Engine>>>,
+    mut signals: ShutdownSignals,
+) {
     let signal_name = signals.wait().await;
 
     tracing::info!("{signal_name} received, committing pending changes...");
@@ -318,11 +321,10 @@ mod tests {
         // `store/engine.lock` behind.
         std::fs::write(data_dir.join("store").join("engine.lock"), b"").unwrap();
 
-        let err =
-            open_index_at_startup(&data_dir, WalSyncPolicy::default(), CommitPolicy::Manual)
-                .await
-                .map(|_engine| ())
-                .unwrap_err();
+        let err = open_index_at_startup(&data_dir, WalSyncPolicy::default(), CommitPolicy::Manual)
+            .await
+            .map(|_engine| ())
+            .unwrap_err();
 
         let message = format!("{err:#}");
         assert!(message.contains("already locked"), "got: {message}");
