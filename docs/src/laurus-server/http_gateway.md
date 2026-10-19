@@ -135,7 +135,7 @@ curl -X POST http://localhost:8080/v1/index \
 # => {"error":{"code":400,"message":"Invalid argument: field 'embedding': HNSW m must be at least 2, got 1"}}
 ```
 
-A server older than this change reads an omitted value as `0`, with which every document write fails (`m`) or every search returns no hits (`n_probe`), so set these explicitly when talking to an older server. An index such a server created still opens, with a warning in the server log; see [gRPC API → Graph and cluster parameters](grpc_api.md) for how to repair the field.
+`PATCH /v1/schema/fields/{name}` (`UpdateField`) replaces the whole option, so a key omitted there also gets the default, not the field's current value: an `hnsw` field with `"m": 32` patched with `{"field_option": {"hnsw": {"dimension": 2}}, "reindex": true}` is rebuilt with `m` `16`. A server older than this change reads an omitted value as `0`, with which every document write fails (`m`) or every search returns no hits (`n_probe`), so set these explicitly when talking to an older server. An index such a server created still opens, with a warning in the server log; see [gRPC API → Graph and cluster parameters](grpc_api.md) for how to repair the field.
 
 ### Add a Field (Dynamic Schema)
 
