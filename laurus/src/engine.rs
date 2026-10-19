@@ -4139,16 +4139,19 @@ impl EngineBuilder {
         // lexical/vector/document `PrefixedStorage` namespaces below and
         // before it's moved into `DocumentLog::with_sync_policy` further
         // down.
+        const LOCK_NAME: &str = "engine";
         let storage_lock = match self.storage.lock_manager() {
-            Some(lock_manager) => match lock_manager.try_acquire_lock("engine")? {
+            Some(lock_manager) => match lock_manager.try_acquire_lock(LOCK_NAME)? {
                 Some(lock) => Some(lock),
                 None => {
-                    return Err(crate::error::LaurusError::storage(
+                    return Err(crate::error::LaurusError::storage(format!(
                         "Index directory is already locked by another Engine \
                          instance (in this process or another process). If \
                          the previous session did not shut down cleanly, \
-                         remove the stale lock file manually.",
-                    ));
+                         remove the stale `{LOCK_NAME}.lock` file under the \
+                         storage directory manually, once you have \
+                         confirmed no Engine is still using it."
+                    )));
                 }
             },
             None => None, // This storage backend doesn't support locking.

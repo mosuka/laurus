@@ -56,6 +56,12 @@ tempfile = { workspace = true }
 # bench to serve the gRPC service on an ephemeral port (#727).
 tokio-stream = { workspace = true, features = ["net"] }
 
+# Used by the SIGTERM shutdown test (Issue #1480) to raise the signal
+# against this process via `libc::raise`. Unix-only, mirroring the
+# per-target dev-dependency table in `laurus/Cargo.toml`.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.189"
+
 [[bench]]
 name = "search_batch_grpc_bench"
 harness = false

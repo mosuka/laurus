@@ -106,6 +106,15 @@ pub async fn create_index(
     }
 }
 
+/// Returns `true` when `data_dir` holds an index, i.e. `schema.toml` exists.
+///
+/// Lets a caller distinguish "no index here" from "an index exists but
+/// failed to open" without inspecting the error [`open_index`] returns for
+/// the latter (Issue #1480).
+pub fn index_exists(data_dir: &Path) -> bool {
+    data_dir.join(SCHEMA_FILE).exists()
+}
+
 /// Open an existing index from the given data directory.
 ///
 /// Reads the persisted `schema.toml`, opens the file-based storage, and
