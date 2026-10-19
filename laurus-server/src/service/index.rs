@@ -663,4 +663,222 @@ mod tests {
             assert_eq!(schema_of(&service).await, before, "{message}");
         }
     }
+
+    /// Proto field options that each set one parameter to a value the
+    /// engine cannot work with (Issue #1479), paired with the reason it
+    /// gives. `m`, `ef_construction`, `n_clusters` and `n_probe` are set
+    /// explicitly (unset, they get the engine's defaults); `dimension` has
+    /// no default, so an unset one is 0.
+    fn options_with_unusable_parameters() -> [(v1::FieldOption, &'static str); 7] {
+        use v1::field_option::Option as Opt;
+        [
+            (
+                Opt::Hnsw(v1::HnswOption {
+                    dimension: 8,
+                    m: Some(1),
+                    ..Default::default()
+                }),
+                "HNSW m must be at least 2, got 1",
+            ),
+            (
+                Opt::Hnsw(v1::HnswOption {
+                    dimension: 8,
+                    ef_construction: Some(0),
+                    ..Default::default()
+                }),
+                "HNSW ef_construction must be at least 1",
+            ),
+            (
+                Opt::Hnsw(v1::HnswOption::default()),
+                "HNSW dimension must be greater than 0",
+            ),
+            (
+                Opt::Ivf(v1::IvfOption {
+                    dimension: 8,
+                    n_clusters: Some(0),
+                    ..Default::default()
+                }),
+                "IVF n_clusters must be at least 1",
+            ),
+            (
+                Opt::Ivf(v1::IvfOption {
+                    dimension: 8,
+                    n_probe: Some(0),
+                    ..Default::default()
+                }),
+                "IVF n_probe must be at least 1",
+            ),
+            (
+                Opt::Ivf(v1::IvfOption::default()),
+                "IVF dimension must be greater than 0",
+            ),
+            (
+                Opt::Flat(v1::FlatOption::default()),
+                "Flat dimension must be greater than 0",
+            ),
+        ]
+        .map(|(option, reason)| {
+            (
+                v1::FieldOption {
+                    option: Some(option),
+                },
+                reason,
+            )
+        })
+    }
+
+    /// Issue #1479: CreateIndex rejects each unusable parameter as
+    /// InvalidArgument, instead of creating a field every write or search
+    /// then fails on, and writes nothing.
+    #[tokio::test]
+    async fn create_index_rejects_unusable_vector_parameters() {
+        for (option, reason) in options_with_unusable_parameters() {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().join("data");
+            let service = IndexService {
+                engine: Arc::new(RwLock::new(None)),
+                data_dir: data_dir.clone(),
+                wal_policy: WalSyncPolicy::PerRecord,
+                commit_policy: CommitPolicy::Manual,
+            };
+
+            let status = service
+                .create_index(Request::new(CreateIndexRequest {
+                    schema: Some(v1::Schema {
+                        fields: HashMap::from([("vec".to_string(), option)]),
+                        ..Default::default()
+                    }),
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{reason}");
+            assert_eq!(
+                status.message(),
+                format!("Invalid argument: field 'vec': {reason}")
+            );
+            assert!(
+                !data_dir.exists(),
+                "a rejected create must write nothing: {reason}"
+            );
+            assert!(service.engine.read().await.is_none(), "{reason}");
+        }
+    }
+
+    /// Issue #1479: AddField rejects each unusable parameter as
+    /// InvalidArgument and leaves the schema as it was.
+    #[tokio::test]
+    async fn add_field_rejects_unusable_vector_parameters() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.body.Text]
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        for (option, reason) in options_with_unusable_parameters() {
+            let status = service
+                .add_field(Request::new(AddFieldRequest {
+                    name: "vec".to_string(),
+                    field_option: Some(option),
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{reason}");
+            assert_eq!(
+                status.message(),
+                format!("Invalid argument: field 'vec': {reason}")
+            );
+            assert_eq!(schema_of(&service).await, before, "{reason}");
+        }
+    }
+
+    /// Issue #1479: UpdateField rejects each unusable parameter as
+    /// InvalidArgument and leaves the field as it was.
+    #[tokio::test]
+    async fn update_field_rejects_unusable_vector_parameters() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.vec.Hnsw]
+            dimension = 8
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        for (option, reason) in options_with_unusable_parameters() {
+            let status = service
+                .update_field(Request::new(UpdateFieldRequest {
+                    name: "vec".to_string(),
+                    field_option: Some(option),
+                    reindex: true,
+                    dry_run: false,
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{reason}");
+            assert_eq!(
+                status.message(),
+                format!("Invalid argument: field 'vec': {reason}")
+            );
+            assert_eq!(schema_of(&service).await, before, "{reason}");
+        }
+    }
+
+    /// Issue #1479: an HNSW or IVF field created over gRPC without `m`,
+    /// `ef_construction`, `n_clusters` or `n_probe` gets the engine's
+    /// defaults, as through a TOML schema, instead of 0, and GetSchema
+    /// reports them.
+    #[tokio::test]
+    async fn create_index_gives_unset_vector_parameters_the_engine_defaults() {
+        use v1::field_option::Option as Opt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let service = IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: dir.path().join("data"),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        };
+        let field = |option| v1::FieldOption {
+            option: Some(option),
+        };
+        service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(v1::Schema {
+                    fields: HashMap::from([
+                        (
+                            "hnsw".to_string(),
+                            field(Opt::Hnsw(v1::HnswOption {
+                                dimension: 8,
+                                ..Default::default()
+                            })),
+                        ),
+                        (
+                            "ivf".to_string(),
+                            field(Opt::Ivf(v1::IvfOption {
+                                dimension: 8,
+                                ..Default::default()
+                            })),
+                        ),
+                    ]),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap();
+
+        let schema = schema_of(&service).await;
+        match &schema.fields["hnsw"].option {
+            Some(Opt::Hnsw(o)) => assert_eq!((o.m, o.ef_construction), (Some(16), Some(200))),
+            other => panic!("unexpected option: {other:?}"),
+        }
+        match &schema.fields["ivf"].option {
+            Some(Opt::Ivf(o)) => assert_eq!((o.n_clusters, o.n_probe), (Some(100), Some(1))),
+            other => panic!("unexpected option: {other:?}"),
+        }
+    }
 }

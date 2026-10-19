@@ -322,10 +322,19 @@ enum RerankStorageKind {
 }
 
 message HnswOption {
+  // Required: 0 (also what an omitted value reads as) is rejected with
+  // INVALID_ARGUMENT.
   uint32 dimension = 1;
   DistanceMetric distance = 2;
-  uint32 m = 3;
-  uint32 ef_construction = 4;
+  // Graph degree. Unset means "use the engine's default" (currently 16);
+  // `optional` because a plain `uint32` read an omitted value as 0, with
+  // which every document write failed (issue #1479). A value below 2 is
+  // rejected with INVALID_ARGUMENT.
+  optional uint32 m = 3;
+  // Candidate-list size while building the graph. Unset means "use the
+  // engine's default" (currently 200), for the same reason as `m`. 0 is
+  // rejected with INVALID_ARGUMENT.
+  optional uint32 ef_construction = 4;
   // Relative priority of this field's similarity scores when multiple
   // vector fields are searched together (issue #1084). Unset means "use
   // the engine's default" (currently `1.0`) rather than an explicit
@@ -356,6 +365,7 @@ message HnswOption {
 }
 
 message FlatOption {
+  // See `HnswOption.dimension`.
   uint32 dimension = 1;
   DistanceMetric distance = 2;
   // See `HnswOption.base_weight`.
@@ -370,10 +380,18 @@ message FlatOption {
 }
 
 message IvfOption {
+  // See `HnswOption.dimension`.
   uint32 dimension = 1;
   DistanceMetric distance = 2;
-  uint32 n_clusters = 3;
-  uint32 n_probe = 4;
+  // Number of clusters. Unset means "use the engine's default" (currently
+  // 100), for the same reason as `HnswOption.m`. 0 is rejected with
+  // INVALID_ARGUMENT.
+  optional uint32 n_clusters = 3;
+  // Number of clusters a search probes. Unset means "use the engine's
+  // default" (currently 1); a plain `uint32` read an omitted value as 0,
+  // with which every search returned no hits (issue #1479). 0 is rejected
+  // with INVALID_ARGUMENT.
+  optional uint32 n_probe = 4;
   // See `HnswOption.base_weight`.
   optional float base_weight = 5;
   optional QuantizationConfig quantizer = 6;
@@ -407,6 +425,7 @@ enum MultiVectorStorage {
 }
 
 message MultiVectorOption {
+  // See `HnswOption.dimension`.
   uint32 dimension = 1;
   // Only COSINE (vectors are L2-normalized) and DOT_PRODUCT are accepted;
   // BINARY storage requires COSINE.

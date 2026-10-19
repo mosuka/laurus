@@ -6,6 +6,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use laurus::vector::core::field::{
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
+};
 use laurus::vector::core::rerank::RerankStorageKind;
 use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
@@ -187,8 +190,8 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::Hnsw(o) => Some(Opt::Hnsw(v1::HnswOption {
             dimension: o.dimension as u32,
             distance: distance_to_proto(&o.distance) as i32,
-            m: o.m as u32,
-            ef_construction: o.ef_construction as u32,
+            m: Some(o.m as u32),
+            ef_construction: Some(o.ef_construction as u32),
             base_weight: Some(o.base_weight),
             quantizer: Some(quantization_to_proto(&o.quantizer)),
             embedder: o.embedder.clone().unwrap_or_default(),
@@ -207,8 +210,8 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
         FieldOption::Ivf(o) => Some(Opt::Ivf(v1::IvfOption {
             dimension: o.dimension as u32,
             distance: distance_to_proto(&o.distance) as i32,
-            n_clusters: o.n_clusters as u32,
-            n_probe: o.n_probe as u32,
+            n_clusters: Some(o.n_clusters as u32),
+            n_probe: Some(o.n_probe as u32),
             base_weight: Some(o.base_weight),
             quantizer: Some(quantization_to_proto(&o.quantizer)),
             embedder: o.embedder.clone().unwrap_or_default(),
@@ -302,8 +305,12 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
         Some(Opt::Hnsw(o)) => FieldOption::Hnsw(HnswOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance)?,
-            m: o.m as usize,
-            ef_construction: o.ef_construction as usize,
+            // Unset means "use the engine's default" (#1479), as for a TOML
+            // schema; an explicit 0 is kept so the engine rejects it.
+            m: o.m.map_or(DEFAULT_HNSW_M, |m| m as usize),
+            ef_construction: o
+                .ef_construction
+                .map_or(DEFAULT_HNSW_EF_CONSTRUCTION, |ef| ef as usize),
             default_ef_search: o.default_ef_search.map(|v| v as usize),
             // Unset means "use the engine's default" (#1084).
             base_weight: o.base_weight.unwrap_or(1.0),
@@ -345,8 +352,9 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
         Some(Opt::Ivf(o)) => FieldOption::Ivf(IvfOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance)?,
-            n_clusters: o.n_clusters as usize,
-            n_probe: o.n_probe as usize,
+            // Same as `m` above (#1479).
+            n_clusters: o.n_clusters.map_or(DEFAULT_IVF_N_CLUSTERS, |n| n as usize),
+            n_probe: o.n_probe.map_or(DEFAULT_IVF_N_PROBE, |n| n as usize),
             // Unset means "use the engine's default" (#1084).
             base_weight: o.base_weight.unwrap_or(1.0),
             quantizer: o

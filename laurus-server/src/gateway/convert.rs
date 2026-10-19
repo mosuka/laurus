@@ -877,19 +877,25 @@ fn rerank_storage_to_json(value: i32) -> Option<&'static str> {
     }
 }
 
+/// An HNSW field option.
+///
+/// An omitted or `null` `m` / `ef_construction` stays unset, which the
+/// server reads as the engine's default (Issue #1479). An omitted
+/// `dimension` is 0, which the engine rejects: it has no default.
+///
+/// # Errors
+///
+/// Returns an error when `dimension`, `m` or `ef_construction` is present
+/// and not an integer that fits `u32` (see [`json_optional_u32`]), or when
+/// `distance`, `quantizer` or `rerank_storage` is invalid.
 fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
     Ok(v1::HnswOption {
-        dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
         distance: json_to_distance(json)?,
-        m: json.get("m").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        ef_construction: json
-            .get("ef_construction")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32,
+        m: json_optional_u32(json, "m")?,
+        ef_construction: json_optional_u32(json, "ef_construction")?,
         // Unset (omitted by the client) means "use the engine's default"
-        // (#1084), unlike `dimension`/`m`/`ef_construction` above, which
-        // have no such tri-state and are left as their existing
-        // `unwrap_or(0)` behavior.
+        // (#1084).
         base_weight: json
             .get("base_weight")
             .and_then(|v| v.as_f64())
@@ -918,9 +924,17 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
     })
 }
 
+/// A Flat field option. An omitted `dimension` is 0, which the engine
+/// rejects (Issue #1479).
+///
+/// # Errors
+///
+/// Returns an error when `dimension` is present and not an integer that
+/// fits `u32` (see [`json_optional_u32`]), or when `distance`, `quantizer`
+/// or `rerank_storage` is invalid.
 fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
     Ok(v1::FlatOption {
-        dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
         distance: json_to_distance(json)?,
         // Unset means "use the engine's default" (#1084).
         base_weight: json
@@ -948,9 +962,10 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 /// `"f32"` / `"f16"` / `"int8"` / `"binary"` (case-insensitive), so a typo
 /// or a non-string value 400s instead of silently defaulting to f32
 /// (Issues #1346, #1473), and when `distance` is invalid (see
-/// [`json_to_distance`]) or `pool_factor` is present but not a non-negative
-/// integer that fits in `u32` (Issue #1346). A `pool_factor` of 0 passes
-/// here and is rejected by the engine.
+/// [`json_to_distance`]) or `dimension` or `pool_factor` is present but not
+/// a non-negative integer that fits in `u32` (Issues #1346, #1479; see
+/// [`json_optional_u32`]). A `dimension` or `pool_factor` of 0 passes here
+/// and is rejected by the engine.
 fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
     let storage = match json.get("storage") {
         None | Some(Value::Null) => v1::MultiVectorStorage::F32 as i32,
@@ -974,18 +989,8 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
             ));
         }
     };
-    let pool_factor = match json.get("pool_factor") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(
-            v.as_u64()
-                .and_then(|f| u32::try_from(f).ok())
-                .ok_or_else(|| {
-                    format!("multi_vector pool_factor must be an integer >= 1, got {v}")
-                })?,
-        ),
-    };
     Ok(v1::MultiVectorOption {
-        dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
         distance: json_to_distance(json)?,
         embedder: json
             .get("embedder")
@@ -993,7 +998,7 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
             .unwrap_or("")
             .to_string(),
         storage: Some(storage),
-        pool_factor,
+        pool_factor: json_optional_u32(json, "pool_factor")?,
     })
 }
 
@@ -1010,12 +1015,23 @@ fn multi_vector_storage_to_json(value: Option<i32>) -> Option<&'static str> {
     }
 }
 
+/// An IVF field option.
+///
+/// An omitted or `null` `n_clusters` / `n_probe` stays unset, which the
+/// server reads as the engine's default (Issue #1479). An omitted
+/// `dimension` is 0, which the engine rejects: it has no default.
+///
+/// # Errors
+///
+/// Returns an error when `dimension`, `n_clusters` or `n_probe` is present
+/// and not an integer that fits `u32` (see [`json_optional_u32`]), or when
+/// `distance`, `quantizer` or `rerank_storage` is invalid.
 fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
     Ok(v1::IvfOption {
-        dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
         distance: json_to_distance(json)?,
-        n_clusters: json.get("n_clusters").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        n_probe: json.get("n_probe").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        n_clusters: json_optional_u32(json, "n_clusters")?,
+        n_probe: json_optional_u32(json, "n_probe")?,
         // Unset means "use the engine's default" (#1084).
         base_weight: json
             .get("base_weight")
@@ -1036,9 +1052,15 @@ fn hnsw_option_to_json(opt: &v1::HnswOption) -> Value {
     let mut obj = json!({
         "dimension": opt.dimension,
         "distance": distance_metric_to_string(opt.distance),
-        "m": opt.m,
-        "ef_construction": opt.ef_construction,
     });
+    // Present whenever the server sends them (Issue #1479); an unset value
+    // is left out rather than rendered as `null`.
+    if let Some(m) = opt.m {
+        obj["m"] = json!(m);
+    }
+    if let Some(ef_construction) = opt.ef_construction {
+        obj["ef_construction"] = json!(ef_construction);
+    }
     // Surfaced only when explicitly set (#1084): an absent `base_weight`
     // means "use the engine's default", same as `analyzer`/`term_vectors`
     // elsewhere, rather than a `null` standing in for `0.0`.
@@ -1085,9 +1107,14 @@ fn ivf_option_to_json(opt: &v1::IvfOption) -> Value {
     let mut obj = json!({
         "dimension": opt.dimension,
         "distance": distance_metric_to_string(opt.distance),
-        "n_clusters": opt.n_clusters,
-        "n_probe": opt.n_probe,
     });
+    // See `hnsw_option_to_json` (Issue #1479).
+    if let Some(n_clusters) = opt.n_clusters {
+        obj["n_clusters"] = json!(n_clusters);
+    }
+    if let Some(n_probe) = opt.n_probe {
+        obj["n_probe"] = json!(n_probe);
+    }
     // Unset means "use the engine's default" (#1084).
     if let Some(base_weight) = opt.base_weight {
         obj["base_weight"] = json!(base_weight);
@@ -1302,6 +1329,23 @@ fn json_to_u32(value: &Value, key: &str) -> Result<u32, String> {
         .as_u64()
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u32::MAX))
+}
+
+/// Read the optional integer `key` of `json`, which must fit `u32` when
+/// present.
+///
+/// A missing key and `null` are `None`, so the caller can leave the value
+/// unset for the engine's default (Issue #1479) instead of reading it as 0.
+///
+/// # Errors
+///
+/// Returns an error when the value is present and not `null` but fails
+/// [`json_to_u32`] (`16.0`, `"16"`, `-1`, `4294967296`).
+fn json_optional_u32(json: &Value, key: &str) -> Result<Option<u32>, String> {
+    match json.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => json_to_u32(value, key).map(Some),
+    }
 }
 
 /// Converts a JSON `vector_params` object to proto `VectorParams`.
@@ -2155,6 +2199,82 @@ mod tests {
             let json = json!({ "multi_vector": {"dimension": 32, "pool_factor": bad} });
             let err = json_to_proto_field_option(&json).unwrap_err();
             assert!(err.contains("pool_factor"), "{err}");
+        }
+    }
+
+    /// Issue #1479: an omitted or `null` HNSW `m` / `ef_construction` or
+    /// IVF `n_clusters` / `n_probe` stays unset, which the server reads as
+    /// the engine's default; an explicit value, 0 included, is passed on
+    /// for the engine to check. A set value renders back, an unset one is
+    /// left out.
+    #[test]
+    fn test_vector_option_parameters_omitted_null_and_explicit() {
+        for json in [
+            json!({"dimension": 4}),
+            json!({"dimension": 4, "m": null, "ef_construction": null}),
+        ] {
+            let opt = json_to_hnsw_option(&json).unwrap();
+            assert_eq!((opt.m, opt.ef_construction), (None, None), "{json}");
+            let back = hnsw_option_to_json(&opt);
+            assert!(back.get("m").is_none(), "{back}");
+            assert!(back.get("ef_construction").is_none(), "{back}");
+        }
+        let opt =
+            json_to_hnsw_option(&json!({"dimension": 4, "m": 0, "ef_construction": 32})).unwrap();
+        assert_eq!((opt.m, opt.ef_construction), (Some(0), Some(32)));
+        let back = hnsw_option_to_json(&opt);
+        assert_eq!(back["m"], json!(0));
+        assert_eq!(back["ef_construction"], json!(32));
+
+        for json in [
+            json!({"dimension": 4}),
+            json!({"dimension": 4, "n_clusters": null, "n_probe": null}),
+        ] {
+            let opt = json_to_ivf_option(&json).unwrap();
+            assert_eq!((opt.n_clusters, opt.n_probe), (None, None), "{json}");
+            let back = ivf_option_to_json(&opt);
+            assert!(back.get("n_clusters").is_none(), "{back}");
+            assert!(back.get("n_probe").is_none(), "{back}");
+        }
+        let opt =
+            json_to_ivf_option(&json!({"dimension": 4, "n_clusters": 8, "n_probe": 0})).unwrap();
+        assert_eq!((opt.n_clusters, opt.n_probe), (Some(8), Some(0)));
+        let back = ivf_option_to_json(&opt);
+        assert_eq!(back["n_clusters"], json!(8));
+        assert_eq!(back["n_probe"], json!(0));
+
+        // `dimension` has no default: omitted, it is 0 for the engine to
+        // reject.
+        assert_eq!(json_to_hnsw_option(&json!({})).unwrap().dimension, 0);
+    }
+
+    /// Issue #1479: a vector option's integer parameter that is present
+    /// must be an integer that fits `u32`; it used to read as 0 (or be
+    /// truncated) instead.
+    #[test]
+    fn test_vector_option_parameters_reject_non_integers() {
+        let keys = [
+            ("hnsw", "dimension"),
+            ("hnsw", "m"),
+            ("hnsw", "ef_construction"),
+            ("flat", "dimension"),
+            ("ivf", "dimension"),
+            ("ivf", "n_clusters"),
+            ("ivf", "n_probe"),
+            ("multi_vector", "dimension"),
+        ];
+        for (kind, key) in keys {
+            for bad in [json!(16.0), json!("16"), json!(-1), json!(4_294_967_296u64)] {
+                let mut option = json!({"dimension": 4});
+                option[key] = bad.clone();
+                let err = json_to_proto_field_option(&json!({ kind: option })).unwrap_err();
+                assert!(
+                    err.contains(&format!(
+                        "{key} must be an integer between 0 and 4294967295"
+                    )),
+                    "{kind}.{key} = {bad}: {err}"
+                );
+            }
         }
     }
 
