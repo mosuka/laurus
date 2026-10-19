@@ -7,6 +7,9 @@
 //! - Index optimization and maintenance
 
 pub mod config;
+pub mod f16_storage;
+#[cfg(test)]
+mod f16_tests;
 pub mod factory;
 pub mod field;
 pub mod flat;

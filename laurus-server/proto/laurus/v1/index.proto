@@ -278,11 +278,16 @@ enum QuantizationMethod {
   // `pq-fastscan` cargo feature; otherwise the conversion path rejects
   // the value with an explicit error.
   QUANTIZATION_METHOD_PRODUCT_QUANTIZATION_FASTSCAN = 3;
+  // IEEE 754 half precision (Issue #623): 2 bytes per dimension, half of
+  // f32 and twice SCALAR_8BIT. Nothing to train. Supported by HNSW, Flat
+  // and IVF fields.
+  QUANTIZATION_METHOD_FLOAT16 = 4;
 }
 
 message QuantizationConfig {
   QuantizationMethod method = 1;
-  // Only used when method is PRODUCT_QUANTIZATION.
+  // Only used when method is PRODUCT_QUANTIZATION or
+  // PRODUCT_QUANTIZATION_FASTSCAN; ignored for SCALAR_8BIT and FLOAT16.
   uint32 subvector_count = 2;
 }
 

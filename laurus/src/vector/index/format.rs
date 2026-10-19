@@ -15,7 +15,8 @@
 //!      0     4  magic         ASCII "LVS1"
 //!      4     2  version       u16 LE  (1..=3; see the feature ladder
 //!                                       on CURRENT_VERSION)
-//!      6     2  quant_kind    u16 LE  (1 = Scalar8Bit, 2 = PQ;
+//!      6     2  quant_kind    u16 LE  (1 = Scalar8Bit, 2 = PQ,
+//!                                       3 = PQ FastScan, 4 = Float16;
 //!                                       0 reserved for "no quant")
 //!      8     8  reserved      zero-padded
 //!     16     -  quantization metadata (variant-specific, see below)
@@ -51,6 +52,17 @@
 //!                              row-major: codebook[m][k][sub_dim])
 //!      :     -  vector data (per-vector: m bytes of u8 codes)
 //! ```
+//!
+//! For `quant_kind = 4` (Float16, Issue #623) there is no metadata, and
+//! the kind is only valid with [`VERSION_FIELD_DICT`] or later, whose
+//! fixed-size record prefix lets a reader address every row directly:
+//!
+//! ```text
+//!     16     -  field dictionary, then vector data (per-vector:
+//!                 dim × 2 bytes, IEEE 754 binary16)
+//! ```
+//!
+//! Rows are not aligned to any boundary; readers use unaligned loads.
 //!
 //! Endianness is **little-endian** for all multi-byte integers and
 //! IEEE-754 floats.
@@ -142,6 +154,10 @@ pub mod quant_kind {
     /// with the `pq-fastscan` cargo feature.
     #[cfg(feature = "pq-fastscan")]
     pub const PRODUCT_QUANTIZATION_FASTSCAN: u16 = 3;
+    /// IEEE 754 half precision, `dim × 2` bytes per record and no
+    /// metadata (Issue #623). Only valid with
+    /// [`super::VERSION_FIELD_DICT`] or later.
+    pub const FLOAT16: u16 = 4;
 }
 
 /// Size in bytes of the fixed portion of the segment header (the part
@@ -223,6 +239,9 @@ pub enum QuantHeader {
         /// always `m * 16 * sub_dim` floats.
         codebook: Vec<f32>,
     },
+    /// `quant_kind = 4` — IEEE 754 half precision (Issue #623). No
+    /// metadata: each record stores `dim × 2` bytes of binary16 values.
+    Float16,
 }
 
 impl QuantHeader {
@@ -233,6 +252,7 @@ impl QuantHeader {
             Self::ProductQuantization { .. } => quant_kind::PRODUCT_QUANTIZATION,
             #[cfg(feature = "pq-fastscan")]
             Self::ProductQuantizationFastScan { .. } => quant_kind::PRODUCT_QUANTIZATION_FASTSCAN,
+            Self::Float16 => quant_kind::FLOAT16,
         }
     }
 
@@ -248,6 +268,7 @@ impl QuantHeader {
             Self::ProductQuantizationFastScan { params, .. } => {
                 PQ_FIXED_METADATA_SIZE + params.codebook_byte_size()
             }
+            Self::Float16 => 0,
         }
     }
 }
@@ -288,6 +309,18 @@ impl VectorSegmentHeader {
         Self {
             version: CURRENT_VERSION,
             quant: QuantHeader::ProductQuantizationFastScan { params, codebook },
+            field_dict: Vec::new(),
+        }
+    }
+
+    /// Build a Float16 header (Issue #623).
+    ///
+    /// The kind is only valid with [`VERSION_FIELD_DICT`] or later, so the
+    /// header starts at that version (the reader rejects older ones).
+    pub fn float16() -> Self {
+        Self {
+            version: VERSION_FIELD_DICT,
+            quant: QuantHeader::Float16,
             field_dict: Vec::new(),
         }
     }
@@ -393,6 +426,15 @@ impl VectorSegmentHeader {
                     writer.write_all(&f.to_le_bytes())?;
                 }
             }
+            QuantHeader::Float16 => {
+                if self.version < VERSION_FIELD_DICT {
+                    return Err(LaurusError::InvalidOperation(format!(
+                        "Float16 vector segments require header version {VERSION_FIELD_DICT} \
+                         or later, got {}",
+                        self.version
+                    )));
+                }
+            }
         }
         if self.version >= VERSION_FIELD_DICT {
             if self.field_dict.len() > u16::MAX as usize {
@@ -445,8 +487,9 @@ impl VectorSegmentHeader {
     ///   by a pre-quantization (f32-only) build of laurus and must be
     ///   rebuilt — Issue #481 Stage 1 is a deliberate format break.
     /// * [`LaurusError::IncompatibleFormat`] if the version is outside
-    ///   the supported `CURRENT_VERSION..=MAX_SUPPORTED_VERSION` range
-    ///   or if `quant_kind` is the reserved value 0.
+    ///   the supported `CURRENT_VERSION..=MAX_SUPPORTED_VERSION` range,
+    ///   if `quant_kind` is the reserved value 0 or unknown, or if it is
+    ///   Float16 below [`VERSION_FIELD_DICT`].
     /// * [`LaurusError::Index`] if a PQ / PQ FastScan codebook declares
     ///   more entries than `available` bytes can physically hold — the
     ///   segment is corrupted (Issue #921).
@@ -558,6 +601,20 @@ impl VectorSegmentHeader {
                     codebook.push(f32::from_le_bytes(fbuf));
                 }
                 QuantHeader::ProductQuantizationFastScan { params, codebook }
+            }
+            quant_kind::FLOAT16 => {
+                // Below v3 a record's field name is inline and variable
+                // length, so rows could not be addressed directly; no
+                // writer produces that combination.
+                if version < VERSION_FIELD_DICT {
+                    return Err(LaurusError::IncompatibleFormat(format!(
+                        "vector segment reports quant_kind = {} (Float16) with header \
+                         version {version}; Float16 requires version {VERSION_FIELD_DICT} \
+                         or later",
+                        quant_kind::FLOAT16
+                    )));
+                }
+                QuantHeader::Float16
             }
             quant_kind::NONE => {
                 return Err(LaurusError::IncompatibleFormat(
@@ -1339,5 +1396,50 @@ mod tests {
         let h = QuantHeader::Scalar8Bit(sample_params());
         assert_eq!(h.kind_code(), quant_kind::SCALAR_8BIT);
         assert_eq!(h.metadata_size(), SCALAR_8BIT_METADATA_SIZE);
+        assert_eq!(QuantHeader::Float16.kind_code(), quant_kind::FLOAT16);
+        assert_eq!(QuantHeader::Float16.metadata_size(), 0);
+    }
+
+    /// Issue #623: a Float16 header carries no metadata, round-trips with
+    /// its field dictionary, and is written at `VERSION_FIELD_DICT`.
+    #[test]
+    fn roundtrip_float16_header() {
+        let h = VectorSegmentHeader::float16()
+            .with_field_dict(vec!["embedding".to_string(), "b".to_string()]);
+        assert_eq!(h.version, VERSION_FIELD_DICT);
+        let mut buf = Vec::new();
+        h.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), h.serialized_size());
+        assert_eq!(&buf[6..8], &quant_kind::FLOAT16.to_le_bytes());
+        // Fixed header, then the dictionary straight away.
+        assert_eq!(&buf[16..18], &2u16.to_le_bytes());
+
+        let back =
+            VectorSegmentHeader::read_from(&mut Cursor::new(&buf), buf.len() as u64).unwrap();
+        assert_eq!(back, h);
+    }
+
+    /// Below v3 a record's field name is inline and variable length, so
+    /// Float16 rows could not be addressed directly: both directions
+    /// refuse the combination.
+    #[test]
+    fn float16_is_rejected_below_the_field_dictionary_version() {
+        for version in [CURRENT_VERSION, VERSION_ORDINAL_GRAPH] {
+            let header = VectorSegmentHeader::float16().with_version(version);
+            let err = header.write_to(&mut Vec::new()).unwrap_err();
+            assert!(err.to_string().contains("Float16"), "{err}");
+
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"LVS1");
+            buf.extend_from_slice(&version.to_le_bytes());
+            buf.extend_from_slice(&quant_kind::FLOAT16.to_le_bytes());
+            buf.extend_from_slice(&[0u8; 8]);
+            let err = VectorSegmentHeader::read_from(&mut Cursor::new(&buf), buf.len() as u64)
+                .unwrap_err();
+            match err {
+                LaurusError::IncompatibleFormat(msg) => assert!(msg.contains("Float16"), "{msg}"),
+                other => panic!("expected IncompatibleFormat, got {other:?}"),
+            }
+        }
     }
 }

@@ -617,7 +617,7 @@ fn prompt_hnsw_option() -> Result<FieldOption> {
     }))
 }
 
-/// Prompt for the quantization method.
+/// Prompt for an HNSW field's quantization method.
 ///
 /// Default = Scalar8Bit (Stage 1, 4x compression, recall ~0.95).
 /// Optional Product Quantization (Stage 3, Issue #481) requires the
@@ -627,6 +627,11 @@ fn prompt_hnsw_option() -> Result<FieldOption> {
 /// across segments via `pq_codebook_path` / `laurus train
 /// pq-codebook` (Issue #631). PQ delivers 8-19x compression at the
 /// cost of recall — usually paired with rerank storage to compensate.
+/// Float16 (Issue #623) stores IEEE 754 half precision values: 2 bytes
+/// per dimension (half of f32, twice Scalar8Bit) with nothing to train.
+///
+/// Each menu index has its own match arm, so a new entry cannot fall
+/// through to the Product Quantization follow-up prompt.
 fn prompt_quantization_method(
     dimension: usize,
 ) -> Result<laurus::vector::core::quantization::QuantizationMethod> {
@@ -634,6 +639,7 @@ fn prompt_quantization_method(
     let kinds = [
         "Scalar8Bit (Stage 1, 4x)",
         "ProductQuantization (Stage 3, 8-32x)",
+        "Float16 (2 bytes/dim, near-lossless)",
     ];
     let idx = Select::new()
         .with_prompt("Quantization method")
@@ -642,7 +648,7 @@ fn prompt_quantization_method(
         .interact()?;
     match idx {
         0 => Ok(QuantizationMethod::Scalar8Bit),
-        _ => {
+        1 => {
             // Default M = max divisor of dim in {32, 16, 8} so the
             // codebook is well-formed and the codes-to-dim ratio is
             // sensible (sub_dim ≥ 2 to keep ADC meaningful).
@@ -659,6 +665,30 @@ fn prompt_quantization_method(
             }
             Ok(QuantizationMethod::ProductQuantization { subvector_count })
         }
+        2 => Ok(QuantizationMethod::Float16),
+        _ => unreachable!("Select returns an index into `kinds`"),
+    }
+}
+
+/// Prompt for a Flat or IVF field's quantization method.
+///
+/// Default = Scalar8Bit (4x compression). Float16 (Issue #623) keeps
+/// IEEE 754 half precision values at 2 bytes per dimension. Product
+/// Quantization is not offered: it is HNSW-only, and the Flat and IVF
+/// writers store a PQ field as Scalar8Bit (Issue #1457).
+fn prompt_flat_ivf_quantization_method()
+-> Result<laurus::vector::core::quantization::QuantizationMethod> {
+    use laurus::vector::core::quantization::QuantizationMethod;
+    let kinds = ["Scalar8Bit (4x)", "Float16 (2 bytes/dim, near-lossless)"];
+    let idx = Select::new()
+        .with_prompt("Quantization method")
+        .items(kinds.as_slice())
+        .default(0)
+        .interact()?;
+    match idx {
+        0 => Ok(QuantizationMethod::Scalar8Bit),
+        1 => Ok(QuantizationMethod::Float16),
+        _ => unreachable!("Select returns an index into `kinds`"),
     }
 }
 
@@ -709,13 +739,14 @@ fn prompt_rerank_storage() -> Result<Option<RerankStorageKind>> {
 fn prompt_flat_option() -> Result<FieldOption> {
     let dimension = prompt_usize("Dimension", 128)?;
     let distance = prompt_distance_metric()?;
+    let quantizer = prompt_flat_ivf_quantization_method()?;
     let base_weight = prompt_base_weight()?;
 
     Ok(FieldOption::Flat(FlatOption {
         dimension,
         distance,
         base_weight,
-        quantizer: Default::default(),
+        quantizer,
         rerank_storage: None,
         embedder: None,
     }))
@@ -777,6 +808,7 @@ fn prompt_ivf_option() -> Result<FieldOption> {
     let distance = prompt_distance_metric()?;
     let n_clusters = prompt_usize("Number of clusters", 100)?;
     let n_probe = prompt_usize("Number of probes", 1)?;
+    let quantizer = prompt_flat_ivf_quantization_method()?;
     let base_weight = prompt_base_weight()?;
 
     Ok(FieldOption::Ivf(IvfOption {
@@ -785,7 +817,7 @@ fn prompt_ivf_option() -> Result<FieldOption> {
         n_clusters,
         n_probe,
         base_weight,
-        quantizer: Default::default(),
+        quantizer,
         rerank_storage: None,
         embedder: None,
     }))

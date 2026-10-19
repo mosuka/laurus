@@ -9,6 +9,8 @@
 // * `quantizer: "product_quantization"` forwards `subvectorCount` to the
 //   core's PQ training, which rejects a count that does not divide the
 //   field dimension.
+// * `quantizer: "float16"` (Issue #623) separates two vectors that the
+//   default int8 quantizer stores as the same code.
 
 import { describe, it, expect } from "vitest";
 import { mkdtempSync, readdirSync } from "node:fs";
@@ -135,5 +137,46 @@ describe("HNSW quantizer / rerankStorage options (#797)", () => {
         "embedding", 4, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "bogus",
       ),
     ).toThrow();
+  });
+
+  it("rejects product_quantization for a Flat field", () => {
+    const schema = new Schema();
+    // `addFlatField` is positional: (name, dimension, distance, embedder,
+    // baseWeight, quantizer)
+    expect(() =>
+      schema.addFlatField("embedding", 4, undefined, undefined, undefined, "product_quantization"),
+    ).toThrow(/only supported by HNSW/);
+  });
+});
+
+// `low` / `high` stretch the segment's int8 range to [-100, 100] (step
+// ~0.78), so `a` and `b` share one int8 code and tie under the default
+// quantizer; Float16 keeps them apart, so the exact match `b` must rank
+// first.
+async function expectFloat16RanksExactMatchFirst(schema) {
+  const index = await Index.create(null, schema);
+  await index.putDocument("low", { embedding: [-100.0, -100.0] });
+  await index.putDocument("high", { embedding: [100.0, 100.0] });
+  await index.putDocument("a", { embedding: [0.2, 0.0] });
+  await index.putDocument("b", { embedding: [0.25, 0.0] });
+  await index.commit();
+
+  const results = await index.searchVector("embedding", [0.25, 0.0], 2);
+  expect(results.map((r) => r.id)).toEqual(["b", "a"]);
+}
+
+describe("Float16 quantizer (#623)", () => {
+  it("an HNSW field ranks the nearest document first", async () => {
+    const schema = new Schema();
+    schema.addHnswField(
+      "embedding", 2, "euclidean", undefined, undefined, undefined, undefined, "float16",
+    );
+    await expectFloat16RanksExactMatchFirst(schema);
+  });
+
+  it("a Flat field ranks the nearest document first", async () => {
+    const schema = new Schema();
+    schema.addFlatField("embedding", 2, "euclidean", undefined, undefined, "float16");
+    await expectFloat16RanksExactMatchFirst(schema);
   });
 });

@@ -519,26 +519,29 @@ HNSW ベクトルインデックスフィールドを追加します。
 - `m`: 分岐係数（デフォルト 16）
 - `efConstruction`: 構築時の探索幅（デフォルト 200）
 - `defaultEfSearch`: クエリ時の `ef_search`（候補リストサイズ）のスキーマレベルデフォルト。省略時は内部フォールバックの 50 を使用します
-- `quantizer`: `"scalar_8bit"`（デフォルト）または `"product_quantization"`（`subvectorCount` が必須）
+- `quantizer`: `"scalar_8bit"`（デフォルト）、`"float16"`、または `"product_quantization"`（`subvectorCount` が必須）
 - `subvectorCount`: PQ サブベクトル数。`dimension` を割り切れる値を指定します
 - `rerankStorage`: 省略（デフォルト）するか、`"f32"` を指定して完全精度のリランクサイドカーを保存します
 - `pqCodebookPath`: 省略（デフォルト）するか、segment 間で再利用する共有 PQ codebook のストレージ相対ファイル名（Issue #631）を指定します（segment ごとの学習の代替）
 - `baseWeight`: 他の vector フィールドと同時に検索されたときの、このフィールドの相対的なスコアリング優先度（デフォルト `1.0`、Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照してください
 
-#### `addFlatField(name, dimension, distance?, embedder?, baseWeight?)`
+#### `addFlatField(name, dimension, distance?, embedder?, baseWeight?, quantizer?)`
 
 全探索ベクトルインデックスフィールドを追加します。
 
-#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)`
+- `quantizer`: `"scalar_8bit"`（デフォルト）または `"float16"`。`"product_quantization"` は HNSW 専用で、指定すると例外を投げます
+
+#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?, quantizer?)`
 
 IVF ベクトルインデックスフィールドを追加します。
 
 - `nClusters`: パーティショニングクラスタ数（デフォルト 100）
 - `nProbe`: 検索時にプローブするクラスタ数（デフォルト 1）
+- `quantizer`: `"scalar_8bit"`（デフォルト）または `"float16"`。`"product_quantization"` は HNSW 専用で、指定すると例外を投げます
 
-**ベクトル量子化とリランクストレージ**（HNSW フィールド）:
+**ベクトル量子化とリランクストレージ**（HNSW フィールド。`quantizer` は Flat・IVF フィールドでも指定可）:
 
-- `quantizer` — `"scalar_8bit"`（デフォルト、4 倍圧縮）または高圧縮率の `"product_quantization"`。Product quantization では `subvectorCount`（`dimension` を割り切れる値）が必須です。
+- `quantizer` — `"scalar_8bit"`（デフォルト、4 倍圧縮）、`"float16"`（IEEE 754 半精度、2 倍圧縮、学習不要。Issue #623）、または高圧縮率の `"product_quantization"`。Product quantization では `subvectorCount`（`dimension` を割り切れる値）が必須で、HNSW 専用です。
 - `rerankStorage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
 - `pqCodebookPath` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`quantizer: "product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
 

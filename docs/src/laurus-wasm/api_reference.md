@@ -526,8 +526,8 @@ Add an HNSW vector index field.
 - `efConstruction`: Build-time expansion (default 200)
 - `defaultEfSearch`: Schema-level default for the query-time `ef_search`
   candidate-list size; omit to use the internal fallback of 50
-- `quantizer`: `"scalar_8bit"` (default) or `"product_quantization"`
-  (requires `subvectorCount`)
+- `quantizer`: `"scalar_8bit"` (default), `"float16"` or
+  `"product_quantization"` (requires `subvectorCount`)
 - `subvectorCount`: number of PQ sub-vectors; must divide `dimension`
 - `rerankStorage`: omit (default) or `"f32"` to store a full-precision
   rerank sidecar
@@ -538,20 +538,25 @@ Add an HNSW vector index field.
   alongside other vector fields (default `1.0`, Issue #1084); see
   [Vector Search → Weights](../concepts/search/vector_search.md#weights)
 
-#### `addFlatField(name, dimension, distance?, embedder?, baseWeight?)`
+#### `addFlatField(name, dimension, distance?, embedder?, baseWeight?, quantizer?)`
 
 Add a brute-force vector index field.
 
-#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)`
+- `quantizer`: `"scalar_8bit"` (default) or `"float16"`;
+  `"product_quantization"` is HNSW-only and throws
+
+#### `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?, quantizer?)`
 
 Add an IVF vector index field.
 
 - `nClusters`: Number of partitioning clusters (default 100)
 - `nProbe`: Number of clusters to probe at query time (default 1)
+- `quantizer`: `"scalar_8bit"` (default) or `"float16"`;
+  `"product_quantization"` is HNSW-only and throws
 
-**Vector quantization & rerank storage** (HNSW fields):
+**Vector quantization & rerank storage** (HNSW fields; `quantizer` also on Flat and IVF fields):
 
-- `quantizer` — `"scalar_8bit"` (default, 4× compression) or `"product_quantization"` for higher compression. Product quantization requires `subvectorCount` (must divide `dimension`).
+- `quantizer` — `"scalar_8bit"` (default, 4× compression), `"float16"` (IEEE 754 half precision, 2× compression, nothing to train; Issue #623) or `"product_quantization"` for higher compression. Product quantization requires `subvectorCount` (must divide `dimension`) and is HNSW-only.
 - `rerankStorage` — set to `"f32"` to write a full-precision `*.hnsw.f32` sidecar enabling exact Stage-2 rerank; omit to keep the int8-only segment.
 - `pqCodebookPath` — storage-relative file name of a shared PQ codebook (Issue #631), trained once via the `laurus train pq-codebook` CLI command. Only meaningful with `quantizer: "product_quantization"`; commits then encode against the pre-trained codebook instead of re-training k-means per segment. Omit to keep per-segment training.
 

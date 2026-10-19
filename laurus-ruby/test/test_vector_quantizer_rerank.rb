@@ -14,6 +14,8 @@ require "tmpdir"
 # * +quantizer: "product_quantization"+ forwards +subvector_count+ to the
 #   core's PQ training, which rejects a count that does not divide the
 #   field dimension.
+# * +quantizer: "float16"+ (Issue #623) separates two vectors that the
+#   default int8 quantizer stores as the same code.
 class TestVectorQuantizerRerank < Minitest::Test
   # Stable two-cluster corpus mirroring the core's
   # +test_hnsw_pq_search_returns_corpus_neighbour+ (issue #730).
@@ -114,5 +116,43 @@ class TestVectorQuantizerRerank < Minitest::Test
   def test_unknown_rerank_storage_rejected
     schema = Laurus::Schema.new
     assert_raises(ArgumentError) { schema.add_hnsw_field("embedding", 4, rerank_storage: "bogus") }
+  end
+
+  def test_pq_rejected_for_flat_field
+    schema = Laurus::Schema.new
+    error = assert_raises(ArgumentError) do
+      schema.add_flat_field("embedding", 4, quantizer: "product_quantization")
+    end
+    assert_match(/only supported by HNSW/, error.message)
+  end
+
+  def test_float16_hnsw_field_ranks_nearest_first
+    schema = Laurus::Schema.new
+    schema.add_hnsw_field("embedding", 2, distance: "euclidean", quantizer: "float16")
+    assert_float16_ranks_exact_match_first(schema)
+  end
+
+  def test_float16_flat_field_ranks_nearest_first
+    schema = Laurus::Schema.new
+    schema.add_flat_field("embedding", 2, distance: "euclidean", quantizer: "float16")
+    assert_float16_ranks_exact_match_first(schema)
+  end
+
+  private
+
+  # +low+ / +high+ stretch the segment's int8 range to [-100, 100] (step
+  # ~0.78), so +a+ and +b+ share one int8 code and tie under the default
+  # quantizer; Float16 keeps them apart, so the exact match +b+ must rank
+  # first.
+  def assert_float16_ranks_exact_match_first(schema)
+    idx = Laurus::Index.new(schema: schema)
+    idx.put_document("low", { "embedding" => [-100.0, -100.0] })
+    idx.put_document("high", { "embedding" => [100.0, 100.0] })
+    idx.put_document("a", { "embedding" => [0.2, 0.0] })
+    idx.put_document("b", { "embedding" => [0.25, 0.0] })
+    idx.commit
+
+    results = idx.search(Laurus::VectorQuery.new("embedding", [0.25, 0.0]), limit: 2)
+    assert_equal %w[b a], results.map(&:id)
   end
 end

@@ -9,8 +9,10 @@ use rayon::prelude::*;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::util::alloc_bounds::checked_capacity;
+use crate::vector::core::quantization::QuantizationMethod;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::FlatIndexConfig;
+use crate::vector::index::f16_storage::{f16_row_size, write_f16_row};
 use crate::vector::index::field::LegacyVectorFieldWriter;
 use crate::vector::index::format::{
     QuantHeader, VERSION_FIELD_DICT, VectorSegmentHeader, build_field_dict, record_prefix_size,
@@ -138,8 +140,10 @@ impl FlatIndexWriter {
         let header_available =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
         let header = VectorSegmentHeader::read_from(&mut input, header_available)?;
+        // `None` = Float16 (Issue #623), which has no params.
         let params = match &header.quant {
-            QuantHeader::Scalar8Bit(p) => *p,
+            QuantHeader::Scalar8Bit(p) => Some(*p),
+            QuantHeader::Float16 => None,
             QuantHeader::ProductQuantization { .. } => {
                 return Err(crate::error::LaurusError::NotImplemented(
                     "Product quantization (Issue #481 Stage 3) is HNSW-only; \
@@ -165,8 +169,11 @@ impl FlatIndexWriter {
         // quantized payload (dim int8 + 8 meta).
         let records_remaining =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
-        let record_stride =
-            record_prefix_size(header.version) + quantized_record_payload_size(dimension) as u64;
+        let payload_size = match params {
+            Some(_) => quantized_record_payload_size(dimension),
+            None => crate::vector::index::f16_storage::f16_row_size(dimension),
+        };
+        let record_stride = record_prefix_size(header.version) + payload_size as u64;
         checked_capacity(
             num_vectors,
             record_stride,
@@ -183,8 +190,11 @@ impl FlatIndexWriter {
             let field_name =
                 header.read_record_field(&mut input, records_remaining, "flat field_name_len")?;
 
-            // Read quantized payload + dequantize.
-            let values = read_dequantized_vector(&mut input, dimension, &params)?;
+            // Read the payload and decode it to f32.
+            let values = match &params {
+                Some(params) => read_dequantized_vector(&mut input, dimension, params)?,
+                None => crate::vector::index::f16_storage::read_f16_row(&mut input, dimension)?,
+            };
 
             vectors.push((doc_id, field_name, Vector::new(values)));
         }
@@ -457,36 +467,52 @@ impl VectorIndexWriter for FlatIndexWriter {
         output.write_all(&vector_count.to_le_bytes())?;
         output.write_all(&(self.index_config.dimension as u32).to_le_bytes())?;
 
-        // Issue #481 Stage 1, Step 7: train per-segment SQ params on
-        // the f32 vectors and emit the LVS1 quantized format. Empty
-        // segments fall back to neutral (0.0, 1.0) params so the
-        // header is still emitted (test_put_document_* exercise this
-        // path).
-        //
-        // Issue #1151: quantizes and writes each record immediately as
-        // the segment is walked, instead of collecting a
-        // `Vec<QuantizedRecord>` (one heap allocation per vector) up
-        // front just to zip it back with this same iteration order.
-        let params =
-            train_quant_params_or_neutral(self.vectors.iter().map(|(_, _, v)| v.data.as_slice()))?;
         // Per-segment field-name dictionary (Issue #633): ids assigned in
         // first-appearance order over the exact emission order below.
         let (field_dict, field_ids) =
             build_field_dict(self.vectors.iter().map(|(_, f, _)| f.as_str()))?;
-        VectorSegmentHeader::scalar_8bit(params)
-            .with_version(VERSION_FIELD_DICT)
-            .with_field_dict(field_dict)
-            .write_to(&mut output)?;
+        let dimension = self.index_config.dimension;
 
-        // Write vectors with dictionary field ids and quantized records.
-        let mut scratch = Vec::with_capacity(self.index_config.dimension);
-        for (doc_id, field_name, v) in &self.vectors {
-            output.write_all(&doc_id.to_le_bytes())?;
-            output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
+        if self.index_config.quantization_method == QuantizationMethod::Float16 {
+            // Issue #623: nothing to train; each record is the binary16 row.
+            VectorSegmentHeader::float16()
+                .with_field_dict(field_dict)
+                .write_to(&mut output)?;
+            let mut scratch = Vec::with_capacity(f16_row_size(dimension));
+            for (doc_id, field_name, v) in &self.vectors {
+                output.write_all(&doc_id.to_le_bytes())?;
+                output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
+                write_f16_row(&mut output, dimension, &v.data, &mut scratch)?;
+            }
+        } else {
+            // Issue #481 Stage 1, Step 7: train per-segment SQ params on
+            // the f32 vectors and emit the LVS1 quantized format. Empty
+            // segments fall back to neutral (0.0, 1.0) params so the
+            // header is still emitted (test_put_document_* exercise this
+            // path). A PQ quantizer is also written as SQ8 here (#1457).
+            //
+            // Issue #1151: quantizes and writes each record immediately as
+            // the segment is walked, instead of collecting a
+            // `Vec<QuantizedRecord>` (one heap allocation per vector) up
+            // front just to zip it back with this same iteration order.
+            let params = train_quant_params_or_neutral(
+                self.vectors.iter().map(|(_, _, v)| v.data.as_slice()),
+            )?;
+            VectorSegmentHeader::scalar_8bit(params)
+                .with_version(VERSION_FIELD_DICT)
+                .with_field_dict(field_dict)
+                .write_to(&mut output)?;
 
-            // Write quantized payload (dim int8 + sum_q + norm_q).
-            let meta = quantize_into(&params, self.index_config.dimension, &v.data, &mut scratch)?;
-            write_quantized_record(&mut output, &scratch, meta)?;
+            // Write vectors with dictionary field ids and quantized records.
+            let mut scratch = Vec::with_capacity(dimension);
+            for (doc_id, field_name, v) in &self.vectors {
+                output.write_all(&doc_id.to_le_bytes())?;
+                output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
+
+                // Write quantized payload (dim int8 + sum_q + norm_q).
+                let meta = quantize_into(&params, dimension, &v.data, &mut scratch)?;
+                write_quantized_record(&mut output, &scratch, meta)?;
+            }
         }
 
         // Close with an fsync BEFORE the rename (mirrors HNSW's #882 review

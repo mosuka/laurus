@@ -394,6 +394,10 @@ fn quantization_to_proto(q: &QuantizationMethod) -> v1::QuantizationConfig {
                 subvector_count: *subvector_count as u32,
             }
         }
+        QuantizationMethod::Float16 => v1::QuantizationConfig {
+            method: v1::QuantizationMethod::Float16 as i32,
+            subvector_count: 0,
+        },
     }
 }
 
@@ -424,6 +428,7 @@ fn quantization_from_proto(q: &v1::QuantizationConfig) -> QuantizationMethod {
         // Phase 1 and revisit when FastScan exits experimental.
         #[cfg(not(feature = "pq-fastscan"))]
         Ok(v1::QuantizationMethod::ProductQuantizationFastscan) => QuantizationMethod::Scalar8Bit,
+        Ok(v1::QuantizationMethod::Float16) => QuantizationMethod::Float16,
     }
 }
 
@@ -1291,6 +1296,60 @@ mod tests {
             Some(FieldOption::Ivf(i)) => {
                 assert_eq!(i.rerank_storage, None);
             }
+            other => panic!("expected FieldOption::Ivf, got {other:?}"),
+        }
+    }
+
+    /// Issue #623: `QuantizationMethod::Float16` maps to its own proto
+    /// value (`QUANTIZATION_METHOD_FLOAT16`, not the `Scalar8Bit`
+    /// fallback) and survives the round-trip, both through the
+    /// quantizer conversion itself and through a schema that uses it on
+    /// every index kind that supports it (HNSW, Flat, IVF).
+    #[test]
+    fn float16_quantizer_round_trips_through_proto() {
+        let proto = quantization_to_proto(&QuantizationMethod::Float16);
+        assert_eq!(proto.method, v1::QuantizationMethod::Float16 as i32);
+        assert_eq!(proto.subvector_count, 0);
+        assert_eq!(quantization_from_proto(&proto), QuantizationMethod::Float16);
+
+        let schema = Schema::builder()
+            .add_field(
+                "hnsw_vec",
+                FieldOption::Hnsw(HnswOption {
+                    dimension: 8,
+                    quantizer: QuantizationMethod::Float16,
+                    ..Default::default()
+                }),
+            )
+            .add_field(
+                "flat_vec",
+                FieldOption::Flat(FlatOption {
+                    dimension: 8,
+                    quantizer: QuantizationMethod::Float16,
+                    ..Default::default()
+                }),
+            )
+            .add_field(
+                "ivf_vec",
+                FieldOption::Ivf(IvfOption {
+                    dimension: 8,
+                    quantizer: QuantizationMethod::Float16,
+                    ..Default::default()
+                }),
+            )
+            .build();
+
+        let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+        match back.fields.get("hnsw_vec") {
+            Some(FieldOption::Hnsw(h)) => assert_eq!(h.quantizer, QuantizationMethod::Float16),
+            other => panic!("expected FieldOption::Hnsw, got {other:?}"),
+        }
+        match back.fields.get("flat_vec") {
+            Some(FieldOption::Flat(f)) => assert_eq!(f.quantizer, QuantizationMethod::Float16),
+            other => panic!("expected FieldOption::Flat, got {other:?}"),
+        }
+        match back.fields.get("ivf_vec") {
+            Some(FieldOption::Ivf(i)) => assert_eq!(i.quantizer, QuantizationMethod::Float16),
             other => panic!("expected FieldOption::Ivf, got {other:?}"),
         }
     }

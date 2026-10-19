@@ -76,7 +76,8 @@ fn base_weight_from_splat(splat: RHash) -> Result<f32, Error> {
 /// [`QuantizationMethod`].
 ///
 /// Accepts `"scalar_8bit"` / `"scalar"` (the default when `name` is
-/// `None`) and `"product_quantization"` / `"pq"`. Product quantization
+/// `None`), `"float16"` (IEEE half precision, Issue #623) and
+/// `"product_quantization"` / `"pq"`. Product quantization
 /// requires a `subvector_count` (which must divide the field dimension —
 /// validated by the core at index-build time); supplying it for any other
 /// quantizer is rejected so an incoherent configuration cannot silently
@@ -86,15 +87,24 @@ fn parse_quantizer(
     subvector_count: Option<usize>,
 ) -> Result<QuantizationMethod, Error> {
     let ruby = Ruby::get().expect("called from Ruby thread");
+    let reject_subvector_count = || {
+        Error::new(
+            ruby.exception_arg_error(),
+            "subvector_count is only valid with quantizer: 'product_quantization'",
+        )
+    };
     match name.map(|s| s.to_lowercase()).as_deref() {
         None | Some("scalar_8bit") | Some("scalar") => {
             if subvector_count.is_some() {
-                return Err(Error::new(
-                    ruby.exception_arg_error(),
-                    "subvector_count is only valid with quantizer: 'product_quantization'",
-                ));
+                return Err(reject_subvector_count());
             }
             Ok(QuantizationMethod::Scalar8Bit)
+        }
+        Some("float16") => {
+            if subvector_count.is_some() {
+                return Err(reject_subvector_count());
+            }
+            Ok(QuantizationMethod::Float16)
         }
         Some("product_quantization") | Some("pq") => {
             let subvector_count = subvector_count.ok_or_else(|| {
@@ -108,8 +118,29 @@ fn parse_quantizer(
         }
         Some(other) => Err(Error::new(
             ruby.exception_arg_error(),
-            format!("Unknown quantizer: '{other}'. Valid: scalar_8bit, product_quantization"),
+            format!(
+                "Unknown quantizer: '{other}'. Valid: scalar_8bit, float16, product_quantization"
+            ),
         )),
+    }
+}
+
+/// Parse the `quantizer:` of a Flat or IVF field.
+///
+/// Accepts the same names as [`parse_quantizer`] except product
+/// quantization, which only HNSW fields support (Issue #1457); Flat and
+/// IVF take no `subvector_count:`.
+fn parse_flat_ivf_quantizer(name: Option<&str>) -> Result<QuantizationMethod, Error> {
+    match name.map(|s| s.to_lowercase()).as_deref() {
+        Some("product_quantization") | Some("pq") => {
+            let ruby = Ruby::get().expect("called from Ruby thread");
+            Err(Error::new(
+                ruby.exception_arg_error(),
+                "quantizer: 'product_quantization' is only supported by HNSW fields \
+                 (add_hnsw_field); use scalar_8bit or float16",
+            ))
+        }
+        _ => parse_quantizer(name, None),
     }
 }
 
@@ -680,7 +711,8 @@ impl RbSchema {
     ///     overrides via the search request still take precedence.
     ///   - `embedder:` (String, optional): Embedder name registered via `add_embedder`.
     ///   - `quantizer:` (String, optional): Vector quantizer — "scalar_8bit"
-    ///     (default) or "product_quantization" (requires `subvector_count`).
+    ///     (default), "float16" (IEEE half precision, 2 bytes per dimension)
+    ///     or "product_quantization" (requires `subvector_count`).
     ///   - `subvector_count:` (usize, optional): Number of PQ sub-vectors.
     ///     Required when `quantizer:` is "product_quantization" and must
     ///     divide `dimension`; rejected for other quantizers.
@@ -775,6 +807,9 @@ impl RbSchema {
     ///   - `dimension` (usize): Vector dimensionality.
     ///   - `distance:` (String, default "cosine"): Distance metric.
     ///   - `embedder:` (String, optional): Embedder name registered via `add_embedder`.
+    ///   - `quantizer:` (String, optional): Vector quantizer — "scalar_8bit"
+    ///     (default) or "float16" (IEEE half precision, 2 bytes per dimension).
+    ///     "product_quantization" is HNSW-only and raises here.
     ///   - `base_weight:` (Float, default 1.0): This field's relative
     ///     scoring priority when searched alongside other vector fields
     ///     (Issue #1084). See `add_hnsw_field` for the full contract.
@@ -782,21 +817,32 @@ impl RbSchema {
     /// # Errors
     ///
     /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
-    /// which is reserved for system fields, or if `distance:` is not a known
-    /// metric.
+    /// which is reserved for system fields, if `distance:` or `quantizer:`
+    /// is not a known value, or if `quantizer:` is "product_quantization".
     fn add_flat_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<String>, Option<Option<String>>, Option<f64>), ()>(
+        let kwargs = get_kwargs::<
+            _,
+            (),
+            (
+                Option<String>,
+                Option<Option<String>>,
+                Option<String>,
+                Option<f64>,
+            ),
+            (),
+        >(
             args.keywords,
             &[],
-            &["distance", "embedder", "base_weight"],
+            &["distance", "embedder", "quantizer", "base_weight"],
         )?;
-        let (distance, embedder, base_weight) = kwargs.optional;
+        let (distance, embedder, quantizer, base_weight) = kwargs.optional;
         let distance_str = distance.as_deref().unwrap_or("cosine");
         let opt = laurus::FlatOption {
             dimension,
             distance: parse_distance(distance_str)?,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder: embedder.flatten(),
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
@@ -815,6 +861,9 @@ impl RbSchema {
     ///   - `n_clusters:` (usize, default 100): Number of Voronoi clusters.
     ///   - `n_probe:` (usize, default 1): Number of clusters to probe at search time.
     ///   - `embedder:` (String, optional): Embedder name registered via `add_embedder`.
+    ///   - `quantizer:` (String, optional): Vector quantizer — "scalar_8bit"
+    ///     (default) or "float16" (IEEE half precision, 2 bytes per dimension).
+    ///     "product_quantization" is HNSW-only and raises here.
     ///   - `base_weight:` (Float, default 1.0): This field's relative
     ///     scoring priority when searched alongside other vector fields
     ///     (Issue #1084). See `add_hnsw_field` for the full contract.
@@ -822,8 +871,8 @@ impl RbSchema {
     /// # Errors
     ///
     /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
-    /// which is reserved for system fields, or if `distance:` is not a known
-    /// metric.
+    /// which is reserved for system fields, if `distance:` or `quantizer:`
+    /// is not a known value, or if `quantizer:` is "product_quantization".
     fn add_ivf_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
@@ -835,6 +884,7 @@ impl RbSchema {
                 Option<usize>,
                 Option<usize>,
                 Option<Option<String>>,
+                Option<String>,
                 Option<f64>,
             ),
             (),
@@ -846,16 +896,18 @@ impl RbSchema {
                 "n_clusters",
                 "n_probe",
                 "embedder",
+                "quantizer",
                 "base_weight",
             ],
         )?;
-        let (distance, n_clusters, n_probe, embedder, base_weight) = kwargs.optional;
+        let (distance, n_clusters, n_probe, embedder, quantizer, base_weight) = kwargs.optional;
         let distance_str = distance.as_deref().unwrap_or("cosine");
         let opt = IvfOption {
             dimension,
             distance: parse_distance(distance_str)?,
             n_clusters: n_clusters.unwrap_or(100),
             n_probe: n_probe.unwrap_or(1),
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder: embedder.flatten(),
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()

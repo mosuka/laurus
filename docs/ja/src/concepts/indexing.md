@@ -20,4 +20,4 @@
 - インデックスタイプ: Flat、HNSW、IVF
 - パラメータチューニング（m、ef_construction、n_clusters、n_probe）
 - 距離メトリクス（Cosine、Euclidean、DotProduct）
-- 量子化（Quantization）: SQ8、PQ
+- 量子化（Quantization）: SQ8、PQ、Float16

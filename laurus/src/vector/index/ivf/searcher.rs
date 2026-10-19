@@ -249,6 +249,9 @@ impl VectorIndexSearcher for IvfSearcher {
                 &pool.params,
             )
         });
+        // Issue #623: Float16 rows are scored in place against the f32
+        // query (`prepared_query` above).
+        let f16_pool = ivf_reader.and_then(|r| r.vectors().f16_pool().cloned());
 
         // Filter-aware allow-set honoured inline (Issue #740). Borrowed once
         // before the scan; `&AHashSet` is `Send + Sync`, so it composes with
@@ -277,6 +280,24 @@ impl VectorIndexSearcher for IvfSearcher {
                     let similarity = metric.distance_to_similarity(distance);
                     let vector = if request.params.include_vectors {
                         pool.dequantize_to_vector(*doc_id, field_name)
+                            .unwrap_or_else(|| Vector::new(Vec::new()))
+                    } else {
+                        Vector::new(Vec::new())
+                    };
+                    return Ok(Some((*doc_id, *fid, similarity, distance, vector)));
+                }
+                if let Some(pool) = &f16_pool
+                    && let Some(row) = pool.get_row(*doc_id, field_name)
+                    && !ivf_reader.is_some_and(|r| r.is_deleted(*doc_id))
+                {
+                    let distance = crate::vector::core::distance_f16::distance_f16(
+                        metric,
+                        &prepared_query,
+                        row,
+                    );
+                    let similarity = metric.distance_to_similarity(distance);
+                    let vector = if request.params.include_vectors {
+                        pool.decode_to_vector(*doc_id, field_name)
                             .unwrap_or_else(|| Vector::new(Vec::new()))
                     } else {
                         Vector::new(Vec::new())

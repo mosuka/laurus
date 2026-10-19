@@ -210,6 +210,11 @@ name = "beir_multi_vector_probe"
 required-features = ["embeddings-candle"]
 test = true
 
+# BEIR nDCG@10 per dense vector storage kind (Issue #623).
+[[example]]
+name = "beir_dense_probe"
+required-features = ["embeddings-candle"]
+
 [[bench]]
 name = "distance_bench"
 harness = false

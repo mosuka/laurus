@@ -1690,6 +1690,54 @@ class LaurusTest extends TestCase
         $schema->addHnswField("embedding", 4, null, 16, 200, null, null, null, null, "bogus");
     }
 
+    // addFlatField is positional:
+    //   (name, dimension, distance, embedder, baseWeight, quantizer)
+
+    public function testPqRejectedForFlatField(): void
+    {
+        $schema = new Laurus\Schema();
+        $this->expectException(\Throwable::class);
+        $this->expectExceptionMessageMatches('/only supported by HNSW/');
+        $schema->addFlatField("embedding", 4, null, null, 1.0, "product_quantization");
+    }
+
+    // ── Float16 quantizer (#623) ──────────────────────────────────────────
+
+    /**
+     * Index a corpus whose two closest documents share one int8 code and
+     * assert that the exact match ranks first.
+     *
+     * `low` / `high` stretch the segment's int8 range to [-100, 100] (step
+     * ~0.78), so `a` and `b` tie under the default quantizer; Float16 keeps
+     * them apart, so the exact match `b` must rank first.
+     */
+    private function assertFloat16RanksExactMatchFirst(Laurus\Schema $schema): void
+    {
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("low", ["embedding" => [-100.0, -100.0]]);
+        $idx->putDocument("high", ["embedding" => [100.0, 100.0]]);
+        $idx->putDocument("a", ["embedding" => [0.2, 0.0]]);
+        $idx->putDocument("b", ["embedding" => [0.25, 0.0]]);
+        $idx->commit();
+
+        $results = $idx->search(new Laurus\VectorQuery("embedding", [0.25, 0.0]), 2);
+        $this->assertSame(["b", "a"], array_map(fn ($r) => $r->getId(), $results));
+    }
+
+    public function testFloat16HnswFieldRanksNearestFirst(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addHnswField("embedding", 2, "euclidean", 16, 200, null, null, "float16");
+        $this->assertFloat16RanksExactMatchFirst($schema);
+    }
+
+    public function testFloat16FlatFieldRanksNearestFirst(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addFlatField("embedding", 2, "euclidean", null, 1.0, "float16");
+        $this->assertFloat16RanksExactMatchFirst($schema);
+    }
+
     // ── WAL group-commit / WalSyncPolicy (#820) ───────────────────────────
 
     public function testIndexWithGroupCommitWalPolicy(): void

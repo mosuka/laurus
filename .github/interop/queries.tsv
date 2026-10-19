@@ -8,3 +8,5 @@ vector_music	vector	4	summary:"classical music history and composers"
 vector_space	vector	4	summary:"space exploration and rockets"
 vector_ocean	vector	4	summary:"marine biology and ocean life"
 vector_baking_boosted	vector	4	summary:"French pastry baking techniques"^1.5
+vector_music_f16	vector	4	summary_f16:"classical music history and composers"
+vector_space_f16	vector	4	summary_f16:"space exploration and rockets"

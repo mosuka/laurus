@@ -29,3 +29,11 @@ stored = true
 dimension = 384
 distance = "Cosine"
 embedder = "bert_embedder"
+
+# Float16 rows (Issue #623): written with the macOS (NEON) kernels and
+# searched with the Linux (x86 F16C) ones.
+[fields.summary_f16.Hnsw]
+dimension = 384
+distance = "Cosine"
+embedder = "bert_embedder"
+quantizer = "Float16"

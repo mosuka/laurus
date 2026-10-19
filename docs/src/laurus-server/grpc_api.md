@@ -123,7 +123,7 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
-**Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index — Flat / IVF reject it at write time).
+**Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index — Flat / IVF reject it at write time), `FLOAT16` (Issue #623; IEEE 754 half precision, 2 bytes per dimension, nothing to train; supported by HNSW, Flat and IVF — see [Float16](../concepts/indexing/vector_indexing.md#float16-issue-623)). A server that predates `FLOAT16` stores the field as `SCALAR_8BIT` without an error (Issue #1459), so check the returned schema when talking to an older server.
 
 `NONE` (no quantization) was removed in Issue #481 Stage 1. The proto enum value `0` (`QUANTIZATION_METHOD_NONE`) is kept as a wire-compat reservation; if the server receives it, it falls back to `SCALAR_8BIT` via `Default::default()`.
 
@@ -137,8 +137,8 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `method` | `QuantizationMethod` | Quantization method (`QUANTIZATION_METHOD_SCALAR_8BIT` or `QUANTIZATION_METHOD_PRODUCT_QUANTIZATION`). The reserved value `0` (`NONE`) is silently coerced to `SCALAR_8BIT`. |
-| `subvector_count` | `uint32` | Number of subvectors (only used when `method` is `PRODUCT_QUANTIZATION`; must evenly divide `dimension`) |
+| `method` | `QuantizationMethod` | Quantization method (`QUANTIZATION_METHOD_SCALAR_8BIT`, `QUANTIZATION_METHOD_PRODUCT_QUANTIZATION` or `QUANTIZATION_METHOD_FLOAT16` = `4`). The reserved value `0` (`NONE`) is silently coerced to `SCALAR_8BIT`. |
+| `subvector_count` | `uint32` | Number of subvectors (only used when `method` is `PRODUCT_QUANTIZATION`; must evenly divide `dimension`; ignored for `SCALAR_8BIT` and `FLOAT16`) |
 
 **Example:**
 

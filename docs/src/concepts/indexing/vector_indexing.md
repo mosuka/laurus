@@ -200,9 +200,9 @@ let metric = DistanceMetric::Angular;      // Angular distance
 
 ## Quantization
 
-Vectors are stored on disk as **8-bit scalar-quantized integers**
-(Issue #481 Stage 1). Compared to the previous 32-bit float storage
-this is **~4x smaller** with negligible recall loss in practice
+By default, vectors are stored on disk as **8-bit scalar-quantized
+integers** (Issue #481 Stage 1). Compared to the previous 32-bit float
+storage this is **~4x smaller** with negligible recall loss in practice
 (Recall@10 remains ≥ 0.95 against the f32 ground truth — see the
 recall test at `laurus/tests/vector_recall_test.rs`).
 
@@ -210,6 +210,7 @@ recall test at `laurus/tests/vector_recall_test.rs`).
 | :--- | :--- | :--- | :--- |
 | **Scalar 8-bit** *(default)* | `Scalar8Bit` | Per-segment global affine quantization to `u8` | ~4x |
 | **Product Quantization** | `ProductQuantization { subvector_count }` | Stage 3 of #481 — codebook of `M × 256` centroids (trained per segment, or [trained once and shared](#shared-pq-codebook-issue-631) via `pq_codebook_path`), each vector stored as `M` bytes | ~16-64x (HNSW-only) |
+| **Float16** | `Float16` | Issue #623 — IEEE 754 half precision, 2 bytes per dimension; nothing to train (see [Float16](#float16-issue-623)) | ~2x (HNSW, Flat, IVF) |
 
 ```rust
 use laurus::vector::HnswOption;
@@ -626,6 +627,120 @@ The `score_basis` contract (Issue #927) is unaffected either way:
 the pipeline still ends in the exact f32 stage, so multi-segment
 fan-out keeps treating those scores as the exact, cross-segment-
 comparable basis regardless of whether an SQ stage ran ahead of it.
+
+### Float16 (Issue #623)
+
+`Float16` stores each value as an IEEE 754 half-precision number:
+2 bytes per dimension, half of f32 and twice `Scalar8Bit`. It is
+supported by HNSW, Flat and IVF fields (unlike Product Quantization,
+which is HNSW-only) and by all five distance metrics.
+
+```rust
+use laurus::vector::FlatOption;
+use laurus::vector::core::quantization::QuantizationMethod;
+
+let opt = FlatOption {
+    dimension: 384,
+    quantizer: QuantizationMethod::Float16,
+    ..Default::default()
+};
+```
+
+In a schema TOML file the same choice is `quantizer = "Float16"` (see
+[Schema Format → Quantization](../../laurus-cli/schema_format.md#float16)).
+
+#### Encoding
+
+- Each value is rounded to the nearest half-precision value. Values
+  beyond ±65504 (the largest finite half-precision value) saturate to
+  ±65504 instead of becoming infinite. This is the same conversion as
+  the `F16` kind of [MultiVector storage](#multivector-storage).
+- There is nothing to train and no per-segment parameter. The segment
+  uses the `LVS1` header with `quant_kind = 4` and no metadata block;
+  each record stores `dim × 2` bytes.
+- A merge decodes the rows and encodes them again. Re-encoding a value
+  that is already half precision is exact, so merges do not degrade the
+  vectors. The tests rewrite a segment ten times and no component
+  moves, including Cosine fields, whose rows are re-normalized on every
+  write.
+
+#### Search
+
+- The query stays f32. The distance kernels widen the stored values to
+  f32 as they read them, so the routed search paths never decode a row
+  into a buffer. The kernel is chosen per target: NEON on aarch64,
+  F16C + AVX2 + FMA on x86_64 (detected at run time), and a portable
+  kernel elsewhere, including wasm32. The kernels sum in different
+  orders, so their results agree to within f32 rounding, not bit for
+  bit.
+- Where the rows live depends on the loading mode. With the default
+  mmap-backed `FileStorage` (`Lazy`), the rows are read in place from
+  the mapped segment file: they are not copied onto the heap, and the OS
+  page cache keeps the hot part resident. With `Eager` loading
+  (`MemoryStorage`, or `FileStorage` with `LAURUS_NO_MMAP=1`), the rows
+  are copied into memory when the segment is loaded. On Windows, a
+  mapped segment file that a merge deletes stays on disk until its
+  reader is dropped; leftover files are removed on the next open.
+- Two paths are slower because they decode each candidate through
+  `get_vector` instead of scoring the row in place: a Flat search
+  without a field name over a segment that holds several fields, and
+  the HNSW linear-scan fallback. A search with a field name, or over a
+  segment that holds a single field, takes the in-place kernels.
+- An f32 [rerank sidecar](#two-stage-rerank-issue-481-stage-2)
+  (`rerank_storage`) is still allowed, but it adds little: in the
+  measurements below, Float16 already reproduces the f32 top 10.
+
+#### Changing an existing field to Float16
+
+Changing `quantizer` is a
+[Reindex change](../schema_and_fields.md#changing-a-field):
+`Engine::update_field` with `reindex: true` rebuilds the field's
+segments as Float16 from the values they store. A `Scalar8Bit` field
+without an f32 sidecar stores only int8 codes, so the rebuild produces
+Float16 copies of the dequantized int8 values, not the original
+precision. To get full precision, the field needs the f32 sidecar
+(`rerank_storage = "F32"`) before the change, or the documents must be
+ingested again.
+
+> **Compatibility:** laurus builds that predate Float16 cannot open an
+> index that contains Float16 segments. They fail with
+> `unknown vector segment quant_kind = 4`, or with an unknown-variant
+> error when they parse the schema. A server that predates
+> `QUANTIZATION_METHOD_FLOAT16` stores the field as `Scalar8Bit`
+> without an error (Issue #1459), so check the returned schema when you
+> talk to an older server.
+
+#### Measurements
+
+Quality and size through the engine, BEIR SciFact (5,183 documents,
+300 queries) and NFCorpus (3,633 documents, 323 queries) with
+`all-MiniLM-L6-v2` (384 dimensions), Cosine, a commit every 500
+documents, measured with `laurus/examples/beir_dense_probe.rs`.
+"Recall@10 vs f32" is the overlap with exact f32 search; nDCG@10 for
+exact f32 is 0.6451 (SciFact) and 0.3159 (NFCorpus):
+
+| Field | nDCG@10 SciFact / NFCorpus | Recall@10 vs f32 | Bytes per vector (Flat) |
+| :--- | :--- | :--- | :--- |
+| `Scalar8Bit` (Flat and HNSW) | 0.6460 / 0.3165 | 0.9933 / 0.9935 | 402 |
+| `Scalar8Bit` + f32 sidecar, `rerank_factor = 4` (Flat) | 0.6451 / 0.3159 | 1.0000 / 1.0000 | 402 + 1,536 |
+| `Float16` (Flat and HNSW) | 0.6451 / 0.3159 | 1.0000 / 1.0000 | 778 |
+
+The `Scalar8Bit` nDCG@10 differences from f32 have 95% confidence
+intervals that contain 0. The results are the same with `MemoryStorage`
+(`Eager`) and the mmap-backed `FileStorage` (`Lazy`).
+
+Search cost, instructions per query on Apple Silicon (SciFact, one
+segment, top 10, one rayon thread, median of five rounds):
+
+| Index | `Scalar8Bit` `Eager` | `Scalar8Bit` `Lazy` | `Float16` `Eager` | `Float16` `Lazy` |
+| :--- | :--- | :--- | :--- | :--- |
+| Flat | 7.29 M | 22.46 M | 8.94 M | 9.05 M |
+| HNSW | 0.47 M | 2.88 M | 0.75 M | 0.77 M |
+
+With rows on the heap the int8 kernels are cheaper. With the default
+mmap-backed storage, `Scalar8Bit` decodes every candidate into a new
+buffer (Issue #1463), so `Float16` takes 60% (Flat) and 73% (HNSW)
+fewer instructions per query. The x86 F16C kernel was not measured.
 
 ### MultiVector Storage
 

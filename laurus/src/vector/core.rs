@@ -5,8 +5,11 @@
 //! distance metrics, and quantization methods.
 
 pub mod distance;
+pub mod distance_f16;
 pub mod distance_pq_fastscan;
 pub mod distance_quantized;
+pub mod f16_avx2;
+pub mod f16_neon;
 pub mod field;
 pub(crate) mod late_interaction;
 pub mod multi_vector;

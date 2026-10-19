@@ -66,7 +66,8 @@ fn parse_multi_vector_storage(s: &str) -> Result<MultiVectorStorage, JsValue> {
 /// [`QuantizationMethod`].
 ///
 /// Accepts `"scalar_8bit"` / `"scalar"` (the default when `name` is
-/// `None`) and `"product_quantization"` / `"pq"`. Product quantization
+/// `None`), `"float16"` (IEEE half precision, Issue #623) and
+/// `"product_quantization"` / `"pq"`. Product quantization
 /// requires a `subvector_count` (which must divide the field dimension —
 /// validated by the core at index-build time); supplying it for any other
 /// quantizer is rejected so an incoherent configuration cannot silently
@@ -75,14 +76,20 @@ fn parse_quantizer(
     name: Option<&str>,
     subvector_count: Option<usize>,
 ) -> Result<QuantizationMethod, JsValue> {
+    let reject_subvector_count =
+        || JsValue::from_str("subvectorCount is only valid with quantizer='product_quantization'");
     match name.map(|s| s.to_lowercase()).as_deref() {
         None | Some("scalar_8bit") | Some("scalar") => {
             if subvector_count.is_some() {
-                return Err(JsValue::from_str(
-                    "subvectorCount is only valid with quantizer='product_quantization'",
-                ));
+                return Err(reject_subvector_count());
             }
             Ok(QuantizationMethod::Scalar8Bit)
+        }
+        Some("float16") => {
+            if subvector_count.is_some() {
+                return Err(reject_subvector_count());
+            }
+            Ok(QuantizationMethod::Float16)
         }
         Some("product_quantization") | Some("pq") => {
             let subvector_count = subvector_count.ok_or_else(|| {
@@ -94,8 +101,23 @@ fn parse_quantizer(
             Ok(QuantizationMethod::ProductQuantization { subvector_count })
         }
         Some(other) => Err(JsValue::from_str(&format!(
-            "Unknown quantizer: '{other}'. Valid: scalar_8bit, product_quantization"
+            "Unknown quantizer: '{other}'. Valid: scalar_8bit, float16, product_quantization"
         ))),
+    }
+}
+
+/// Parse the `quantizer` of a Flat or IVF field.
+///
+/// Accepts the same names as [`parse_quantizer`] except product
+/// quantization, which only HNSW fields support (Issue #1457); Flat and
+/// IVF take no `subvectorCount`.
+fn parse_flat_ivf_quantizer(name: Option<&str>) -> Result<QuantizationMethod, JsValue> {
+    match name.map(|s| s.to_lowercase()).as_deref() {
+        Some("product_quantization") | Some("pq") => Err(JsValue::from_str(
+            "quantizer='product_quantization' is only supported by HNSW fields \
+             (addHnswField); use scalar_8bit or float16",
+        )),
+        _ => parse_quantizer(name, None),
     }
 }
 
@@ -462,7 +484,8 @@ impl WasmSchema {
     ///   searcher uses an internal fallback of 50. Per-query overrides
     ///   via the search request still take precedence.
     /// * `embedder` - Optional embedder name registered via `addEmbedder`.
-    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
+    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default),
+    ///   "float16" (IEEE half precision, 2 bytes per dimension) or
     ///   "product_quantization" (requires `subvectorCount`).
     /// * `subvectorCount` - Number of PQ sub-vectors. Required when
     ///   `quantizer` is "product_quantization" and must divide `dimension`;
@@ -528,11 +551,15 @@ impl WasmSchema {
     /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `addHnswField` for the full contract.
+    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
+    ///   "float16" (IEEE half precision, 2 bytes per dimension).
+    ///   "product_quantization" is HNSW-only and throws here.
     ///
     /// # Errors
     ///
     /// Throws if `name` starts with `_` (other than `_id`), which is
-    /// reserved for system fields, or if `distance` is not a known metric.
+    /// reserved for system fields, if `distance` or `quantizer` is not a
+    /// known name, or if `quantizer` is "product_quantization".
     #[wasm_bindgen(js_name = "addFlatField")]
     pub fn add_flat_field(
         &mut self,
@@ -541,10 +568,12 @@ impl WasmSchema {
         distance: Option<String>,
         embedder: Option<String>,
         base_weight: Option<f32>,
+        quantizer: Option<String>,
     ) -> Result<(), JsValue> {
         let opt = FlatOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight: base_weight.unwrap_or(1.0),
             ..Default::default()
@@ -559,11 +588,15 @@ impl WasmSchema {
     /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `addHnswField` for the full contract.
+    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
+    ///   "float16" (IEEE half precision, 2 bytes per dimension).
+    ///   "product_quantization" is HNSW-only and throws here.
     ///
     /// # Errors
     ///
     /// Throws if `name` starts with `_` (other than `_id`), which is
-    /// reserved for system fields, or if `distance` is not a known metric.
+    /// reserved for system fields, if `distance` or `quantizer` is not a
+    /// known name, or if `quantizer` is "product_quantization".
     #[wasm_bindgen(js_name = "addIvfField")]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -575,12 +608,14 @@ impl WasmSchema {
         n_probe: Option<u32>,
         embedder: Option<String>,
         base_weight: Option<f32>,
+        quantizer: Option<String>,
     ) -> Result<(), JsValue> {
         let opt = IvfOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
             n_clusters: n_clusters.unwrap_or(100) as usize,
             n_probe: n_probe.unwrap_or(1) as usize,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight: base_weight.unwrap_or(1.0),
             ..Default::default()

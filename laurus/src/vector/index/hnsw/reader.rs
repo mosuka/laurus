@@ -818,6 +818,61 @@ impl HnswIndexReader {
                     interner.into_dict(),
                 )
             }
+            (QuantHeader::Float16, loading_mode) => {
+                // Issue #623: `Eager` copies the rows to the heap; `Lazy`
+                // keeps a clone of the input and reads rows in place. The
+                // clone is taken from `input` (the checksum wrapper), whose
+                // `clone_input` returns the bare input at position 0 — the
+                // wrapper itself exposes no slice.
+                let record_stride = record_prefix_size(header.version)
+                    + crate::vector::index::f16_storage::f16_row_size(dimension) as u64;
+                checked_capacity(
+                    num_vectors,
+                    record_stride,
+                    records_remaining,
+                    "hnsw num_vectors",
+                )?;
+                let mut builder = match loading_mode {
+                    crate::storage::LoadingMode::Eager => {
+                        crate::vector::index::f16_storage::F16PoolBuilder::heap(
+                            dimension,
+                            num_vectors,
+                        )
+                    }
+                    crate::storage::LoadingMode::Lazy => {
+                        crate::vector::index::f16_storage::F16PoolBuilder::mapped(
+                            dimension,
+                            num_vectors,
+                            crate::storage::StorageInput::clone_input(&input)?,
+                            record_stride,
+                        )?
+                    }
+                };
+                let mut vector_ids = Vec::with_capacity(num_vectors);
+                for _ in 0..num_vectors {
+                    let mut doc_id_buf = [0u8; 8];
+                    input.read_exact(&mut doc_id_buf)?;
+                    let doc_id = u64::from_le_bytes(doc_id_buf);
+
+                    let fid = interner.read_record_field_id(
+                        &header,
+                        &mut input,
+                        records_remaining,
+                        "hnsw field_name_len",
+                    )?;
+                    builder.push(doc_id, fid, &mut input)?;
+                    vector_ids.push((doc_id, fid));
+                }
+                let graph = read_graph(&mut input, &vector_ids)?;
+                let field_dict = interner.into_dict();
+                let pool = builder.build(&field_dict);
+                (
+                    VectorStorage::Float16(Arc::new(pool)),
+                    vector_ids,
+                    graph,
+                    field_dict,
+                )
+            }
         };
 
         // Finalize the folded CRC verification (Issue #789). On the Eager path
@@ -892,6 +947,9 @@ impl HnswIndexReader {
                 // nothing on top of the natural sequential access.
                 HashMap::new()
             }
+            // Like OwnedQuantized, the ordinal path computes Float16
+            // prefetch addresses from the pool's base and stride.
+            VectorStorage::Float16(_) => HashMap::new(),
             VectorStorage::OnDemand { .. } => HashMap::new(),
         };
 
@@ -912,16 +970,9 @@ impl HnswIndexReader {
             if identity {
                 HashMap::new()
             } else {
-                let pos_index_for = |field: &str| match &vectors {
-                    VectorStorage::OwnedQuantized(pool) => pool.field_position_index(field),
-                    VectorStorage::OwnedPq(pool) => pool.field_position_index(field),
-                    #[cfg(feature = "pq-fastscan")]
-                    VectorStorage::OwnedPqFastScan(pool) => pool.field_position_index(field),
-                    _ => None,
-                };
                 let mut tables = HashMap::new();
                 for field in vector_ids_by_field.keys() {
-                    if let Some(pos_map) = pos_index_for(field) {
+                    if let Some(pos_map) = vectors.field_position_index(field) {
                         let table: Vec<u32> = unique
                             .iter()
                             .map(|id| pos_map.get(id).copied().unwrap_or(u32::MAX))
@@ -1186,6 +1237,7 @@ impl VectorIndexReader for HnswIndexReader {
             VectorStorage::OwnedPq(pool) => pool.data.len() + pool.codebook.len() * 4,
             #[cfg(feature = "pq-fastscan")]
             VectorStorage::OwnedPqFastScan(pool) => pool.packed.len() + pool.codebook.len() * 4,
+            VectorStorage::Float16(pool) => pool.heap_size(),
             VectorStorage::OnDemand { offsets, .. } => {
                 // Estimate memory for offsets map + ID list
                 offsets.len() * (8 + 32 + 8) // Key + Valid + Offset roughly
@@ -1356,6 +1408,20 @@ impl VectorIndexReader for HnswIndexReader {
                     "OwnedPqFastScan mode: dimension / NaN checks skipped (4-bit codes \
                      index into the trained K=16 codebook which is bounded by construction)"
                         .to_string(),
+                );
+            }
+            VectorStorage::Float16(pool) => {
+                for &(id, fid) in &self.vector_ids {
+                    let field = &self.field_dict[fid as usize];
+                    if !pool.contains(id, field) {
+                        errors.push(format!(
+                            "Vector {}:{} found in keys but missing in Float16 pool",
+                            id, field
+                        ));
+                    }
+                }
+                warnings.push(
+                    "Float16 mode: NaN checks skipped (rows are validated at ingest)".to_string(),
                 );
             }
             VectorStorage::OnDemand { offsets, .. } => {

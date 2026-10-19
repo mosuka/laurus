@@ -118,8 +118,10 @@ impl FlatVectorIndexReader {
         let header_available =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
         let header = VectorSegmentHeader::read_from(&mut input, header_available)?;
+        // `None` = Float16 (Issue #623), which has no params.
         let params = match &header.quant {
-            QuantHeader::Scalar8Bit(p) => *p,
+            QuantHeader::Scalar8Bit(p) => Some(*p),
+            QuantHeader::Float16 => None,
             QuantHeader::ProductQuantization { .. } => {
                 return Err(crate::error::LaurusError::NotImplemented(
                     "Product quantization (Issue #481 Stage 3) is HNSW-only; \
@@ -144,15 +146,65 @@ impl FlatVectorIndexReader {
         // per-record `dimension`-sized int8 read.
         let records_remaining =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
-        let record_stride =
-            record_prefix_size(header.version) + quantized_record_payload_size(dimension) as u64;
+        let payload_size = match params {
+            Some(_) => quantized_record_payload_size(dimension),
+            None => crate::vector::index::f16_storage::f16_row_size(dimension),
+        };
+        let record_stride = record_prefix_size(header.version) + payload_size as u64;
 
         // Interned field ids (Issue #633 PR-B): one shared dictionary per
         // segment instead of one heap `String` per record.
         let mut interner = FieldInterner::from_header(&header);
 
-        let (vectors, vector_ids, field_dict) = match storage.loading_mode() {
-            crate::storage::LoadingMode::Eager => {
+        let (vectors, vector_ids, field_dict) = match (params, storage.loading_mode()) {
+            (None, loading_mode) => {
+                // Float16 (Issue #623): `Eager` copies the rows to the heap,
+                // `Lazy` reads them in place from a clone of the input.
+                checked_capacity(
+                    num_vectors,
+                    record_stride,
+                    records_remaining,
+                    "flat num_vectors",
+                )?;
+                let mut builder = match loading_mode {
+                    crate::storage::LoadingMode::Eager => {
+                        crate::vector::index::f16_storage::F16PoolBuilder::heap(
+                            dimension,
+                            num_vectors,
+                        )
+                    }
+                    crate::storage::LoadingMode::Lazy => {
+                        crate::vector::index::f16_storage::F16PoolBuilder::mapped(
+                            dimension,
+                            num_vectors,
+                            input.clone_input()?,
+                            record_stride,
+                        )?
+                    }
+                };
+                let mut vector_ids = Vec::with_capacity(num_vectors);
+                for _ in 0..num_vectors {
+                    let mut doc_id_buf = [0u8; 8];
+                    input.read_exact(&mut doc_id_buf)?;
+                    let doc_id = u64::from_le_bytes(doc_id_buf);
+                    let fid = interner.read_record_field_id(
+                        &header,
+                        &mut input,
+                        records_remaining,
+                        "flat field_name_len",
+                    )?;
+                    builder.push(doc_id, fid, &mut input)?;
+                    vector_ids.push((doc_id, fid));
+                }
+                let field_dict = interner.into_dict();
+                let pool = builder.build(&field_dict);
+                (
+                    VectorStorage::Float16(Arc::new(pool)),
+                    vector_ids,
+                    field_dict,
+                )
+            }
+            (Some(params), crate::storage::LoadingMode::Eager) => {
                 // Step 7 of #481 Stage 1: load vectors as int8 + meta
                 // directly into a QuantizedVectorPool.
                 checked_capacity(
@@ -204,7 +256,7 @@ impl FlatVectorIndexReader {
                     interner.into_dict(),
                 )
             }
-            crate::storage::LoadingMode::Lazy => {
+            (Some(params), crate::storage::LoadingMode::Lazy) => {
                 checked_capacity(
                     num_vectors,
                     record_stride,
@@ -421,6 +473,7 @@ impl VectorIndexReader for FlatVectorIndexReader {
             VectorStorage::OwnedPqFastScan(_) => {
                 unreachable!("Flat reader rejects PQ FastScan at the segment header (HNSW-only)")
             }
+            VectorStorage::Float16(pool) => pool.heap_size(),
             VectorStorage::OnDemand { offsets, .. } => {
                 // Estimate memory for offsets map + ID list
                 offsets.len() * (8 + 32 + 8) // Key + Valid + Offset roughly
@@ -580,6 +633,20 @@ impl VectorIndexReader for FlatVectorIndexReader {
             #[cfg(feature = "pq-fastscan")]
             VectorStorage::OwnedPqFastScan(_) => {
                 unreachable!("Flat reader rejects PQ FastScan at the segment header (HNSW-only)")
+            }
+            VectorStorage::Float16(pool) => {
+                for &(id, fid) in &self.vector_ids {
+                    let field = &self.field_dict[fid as usize];
+                    if !pool.contains(id, field) {
+                        errors.push(format!(
+                            "Vector {}:{} found in keys but missing in Float16 pool",
+                            id, field
+                        ));
+                    }
+                }
+                warnings.push(
+                    "Float16 mode: NaN checks skipped (rows are validated at ingest)".to_string(),
+                );
             }
             VectorStorage::OnDemand { offsets, .. } => {
                 for &(id, fid) in &self.vector_ids {

@@ -149,8 +149,8 @@ if (Laurus\peek_commit_generation($path) !== $before) {
 | `addGeo3dField(name, stored, indexed, multiValued, docValues)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル） |
 | `addBytesField(name, stored)` | バイナリデータフィールド |
 | `addHnswField(name, dimension, distance, m, efConstruction, defaultEfSearch, embedder, quantizer, subvectorCount, rerankStorage, pqCodebookPath, baseWeight)` | HNSW ベクトルインデックスフィールド |
-| `addFlatField(name, dimension, distance, embedder, baseWeight)` | Flat（総当たり）ベクトルインデックスフィールド |
-| `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight)` | IVF ベクトルインデックスフィールド |
+| `addFlatField(name, dimension, distance, embedder, baseWeight, quantizer)` | Flat（総当たり）ベクトルインデックスフィールド |
+| `addIvfField(name, dimension, distance, nClusters, nProbe, embedder, baseWeight, quantizer)` | IVF ベクトルインデックスフィールド |
 | `addMultiVectorField(name, dimension, distance, embedder, storage, poolFactor)` | late interaction による再採点に使う、文書ごとのトークンベクトル（`distance` は `cosine` または `dot_product`、`storage` は `f32`・`f16`・`int8`・`binary`、`poolFactor` は各文書のトークンベクトルを約 `1 / poolFactor` に減らす） |
 | `addEmbedder(name, config)` | 名前付きエンベダーの登録 |
 | `addAnalyzer(name, tokenizer, charFilters, tokenFilters)` | 名前付きカスタムアナライザーの登録 |

@@ -9,8 +9,10 @@ use rayon::prelude::*;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::util::alloc_bounds::checked_capacity;
+use crate::vector::core::quantization::QuantizationMethod;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::IvfIndexConfig;
+use crate::vector::index::f16_storage::{f16_row_size, write_f16_row};
 use crate::vector::index::field::LegacyVectorFieldWriter;
 use crate::vector::index::format::{
     QuantHeader, VERSION_FIELD_DICT, VectorSegmentHeader, build_field_dict, record_prefix_size,
@@ -251,8 +253,10 @@ impl IvfIndexWriter {
         let header_available =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
         let header = VectorSegmentHeader::read_from(&mut input, header_available)?;
+        // `None` = Float16 (Issue #623), which has no params.
         let params = match &header.quant {
-            QuantHeader::Scalar8Bit(p) => *p,
+            QuantHeader::Scalar8Bit(p) => Some(*p),
+            QuantHeader::Float16 => None,
             QuantHeader::ProductQuantization { .. } => {
                 return Err(crate::error::LaurusError::NotImplemented(
                     "Product quantization (Issue #481 Stage 3) is HNSW-only; \
@@ -278,8 +282,11 @@ impl IvfIndexWriter {
         // list_size (4 bytes).
         let lists_remaining =
             file_size.saturating_sub(input.stream_position().map_err(LaurusError::Io)?);
-        let record_stride =
-            record_prefix_size(header.version) + quantized_record_payload_size(dimension) as u64;
+        let payload_size = match params {
+            Some(_) => quantized_record_payload_size(dimension),
+            None => crate::vector::index::f16_storage::f16_row_size(dimension),
+        };
+        let record_stride = record_prefix_size(header.version) + payload_size as u64;
         checked_capacity(n_clusters, 4, lists_remaining, "ivf cluster lists")?;
         // `num_vectors` is a separate header field and is still unverified,
         // so bound it against the same record section before reserving
@@ -312,8 +319,11 @@ impl IvfIndexWriter {
                 let field_name =
                     header.read_record_field(&mut input, lists_remaining, "ivf field_name_len")?;
 
-                // Read quantized payload + dequantize.
-                let values = read_dequantized_vector(&mut input, dimension, &params)?;
+                // Read the payload and decode it to f32.
+                let values = match &params {
+                    Some(params) => read_dequantized_vector(&mut input, dimension, params)?,
+                    None => crate::vector::index::f16_storage::read_f16_row(&mut input, dimension)?,
+                };
 
                 vectors.push((doc_id, field_name, Vector::new(values)));
             }
@@ -1339,39 +1349,46 @@ impl VectorIndexWriter for IvfIndexWriter {
             "CSR order must cover every buffered vector exactly once"
         );
 
-        // Issue #481 Stage 1, Step 7: train per-segment SQ params on
-        // ALL vectors across ALL inverted lists (segment-wide single
-        // (offset, scale) pair) and emit the LVS1 header before the
-        // inverted-list data. `self.inverted_lists.order` is already in
-        // cluster-grouped emission order (Issue #629).
-        //
-        // Issue #1151: quantizes and writes each record immediately as
-        // `order` is walked a second time below, instead of collecting
-        // a `Vec<QuantizedRecord>` (one heap allocation per vector) up
-        // front just to zip it back with that same order.
-        let params = train_quant_params_or_neutral(
-            self.inverted_lists
-                .order
-                .iter()
-                .map(|&idx| self.vectors[idx as usize].2.data.as_slice()),
-        )?;
         // Per-segment field-name dictionary (Issue #633): ids assigned in
         // first-appearance order over the cluster-grouped emission order
-        // below (the same order training above walked).
+        // below.
         let (field_dict, field_ids) = build_field_dict(
             self.inverted_lists
                 .order
                 .iter()
                 .map(|&idx| self.vectors[idx as usize].1.as_str()),
         )?;
-        VectorSegmentHeader::scalar_8bit(params)
-            .with_version(VERSION_FIELD_DICT)
-            .with_field_dict(field_dict)
-            .write_to(&mut output)?;
+        let dimension = self.index_config.dimension;
+        let float16 = self.index_config.quantization_method == QuantizationMethod::Float16;
 
-        // Write inverted lists with quantized records, quantizing each
-        // one in place as its cluster window is walked.
-        let mut scratch = Vec::with_capacity(self.index_config.dimension);
+        // Issue #623: Float16 has nothing to train. Otherwise (Issue #481
+        // Stage 1, Step 7) train per-segment SQ params on ALL vectors
+        // across ALL inverted lists (segment-wide single (offset, scale)
+        // pair); a PQ quantizer is also written as SQ8 here (#1457).
+        // `self.inverted_lists.order` is already in cluster-grouped
+        // emission order (Issue #629).
+        let params = if float16 {
+            VectorSegmentHeader::float16()
+                .with_field_dict(field_dict)
+                .write_to(&mut output)?;
+            None
+        } else {
+            let params = train_quant_params_or_neutral(
+                self.inverted_lists
+                    .order
+                    .iter()
+                    .map(|&idx| self.vectors[idx as usize].2.data.as_slice()),
+            )?;
+            VectorSegmentHeader::scalar_8bit(params)
+                .with_version(VERSION_FIELD_DICT)
+                .with_field_dict(field_dict)
+                .write_to(&mut output)?;
+            Some(params)
+        };
+
+        // Write the inverted lists, encoding each record in place as its
+        // cluster window is walked (Issue #1151: no per-record allocation).
+        let mut scratch = Vec::with_capacity(f16_row_size(dimension));
         for i in 0..self.inverted_lists.cluster_count() {
             let window = self.inverted_lists.cluster(i);
             output.write_all(&(window.len() as u32).to_le_bytes())?;
@@ -1379,11 +1396,14 @@ impl VectorIndexWriter for IvfIndexWriter {
                 let (doc_id, field_name, v) = &self.vectors[idx as usize];
                 output.write_all(&doc_id.to_le_bytes())?;
                 output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
-
-                // Write quantized payload (dim int8 + sum_q + norm_q).
-                let meta =
-                    quantize_into(&params, self.index_config.dimension, &v.data, &mut scratch)?;
-                write_quantized_record(&mut output, &scratch, meta)?;
+                match &params {
+                    // Quantized payload (dim int8 + sum_q + norm_q).
+                    Some(params) => {
+                        let meta = quantize_into(params, dimension, &v.data, &mut scratch)?;
+                        write_quantized_record(&mut output, &scratch, meta)?;
+                    }
+                    None => write_f16_row(&mut output, dimension, &v.data, &mut scratch)?,
+                }
             }
         }
 

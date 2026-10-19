@@ -200,16 +200,17 @@ let metric = DistanceMetric::Angular;      // Angular distance
 
 ## 量子化（Quantization）
 
-ベクトルはディスク上で **8 ビットスカラー量子化された整数** として保存
-されます（Issue #481 Stage 1）。以前の 32 ビット浮動小数点形式と比較
-して **約 4 倍小さく**、recall 損失は実用上ほぼ無視できる範囲（f32
-ground truth に対して Recall@10 ≥ 0.95 — recall テスト
+デフォルトでは、ベクトルはディスク上で **8 ビットスカラー量子化された
+整数** として保存されます（Issue #481 Stage 1）。以前の 32 ビット浮動
+小数点形式と比較して **約 4 倍小さく**、recall 損失は実用上ほぼ無視
+できる範囲（f32 ground truth に対して Recall@10 ≥ 0.95 — recall テスト
 `laurus/tests/vector_recall_test.rs` 参照）です。
 
 | 方式 | Enum バリアント | 説明 | メモリ削減率 |
 | :--- | :--- | :--- | :--- |
 | **スカラー 8 ビット** *(デフォルト)* | `Scalar8Bit` | per-segment global affine による `u8` 量子化 | 約 4 倍 |
 | **プロダクト量子化** | `ProductQuantization { subvector_count }` | Issue #481 Stage 3 — `M × 256` centroid の codebook（segment ごとに学習、または `pq_codebook_path` で[一度だけ学習して共有](#共有-pq-codebookissue-631)）、各ベクトルを `M` バイトで保存 | 約 16-64 倍（HNSW のみ） |
+| **Float16** | `Float16` | Issue #623 — IEEE 754 半精度、1 次元あたり 2 バイト。学習は不要（[Float16](#float16issue-623) を参照） | 約 2 倍（HNSW、Flat、IVF） |
 
 ```rust
 use laurus::vector::HnswOption;
@@ -600,6 +601,97 @@ Stage 3 の rerank は PQ ADC の候補集合を `top_k * rerank_factor` まで
 — パイプラインは常に exact な f32 段で終わるため、SQ 段が事前に
 走ったかどうかに関わらず、マルチセグメント fan-out はそのスコアを
 引き続き exact でセグメント間比較可能な basis として扱います。
+
+### Float16（Issue #623）
+
+`Float16` は各値を IEEE 754 の半精度浮動小数点数として保存します。
+1 次元あたり 2 バイトで、f32 の半分、`Scalar8Bit` の 2 倍です。
+HNSW・Flat・IVF のフィールドで使え（HNSW 専用の Product Quantization とは異なります）、5 つの距離メトリクスすべてに対応します。
+
+```rust
+use laurus::vector::FlatOption;
+use laurus::vector::core::quantization::QuantizationMethod;
+
+let opt = FlatOption {
+    dimension: 384,
+    quantizer: QuantizationMethod::Float16,
+    ..Default::default()
+};
+```
+
+スキーマの TOML ファイルでは `quantizer = "Float16"` と書きます（[スキーマ形式 → 量子化](../../laurus-cli/schema_format.md#float16) を参照）。
+
+#### エンコード
+
+- 各値は、最も近い半精度の値に丸められます。
+  ±65504（半精度で表せる最大の有限値）を超える値は、無限大にならず ±65504 に飽和します。
+  これは [MultiVector ストレージ](#multivector-ストレージ) の `F16` と同じ変換です。
+- 学習するものはなく、セグメントごとのパラメータもありません。
+  セグメントは `quant_kind = 4` の `LVS1` ヘッダーを使い、メタデータブロックを持ちません。
+  各レコードは `dim × 2` バイトです。
+- merge は行をデコードしてから、エンコードし直します。
+  すでに半精度になっている値をエンコードし直しても値は変わらないため、merge でベクトルが劣化することはありません。
+  テストではセグメントを 10 回書き直しても、どの成分も変化しませんでした。
+  書き込みのたびに行を正規化し直す Cosine フィールドでも同じです。
+
+#### 検索
+
+- クエリは f32 のままです。
+  距離カーネルは保存された値を読みながら f32 に広げるため、ルーティングされた検索経路で行をバッファにデコードすることはありません。
+  カーネルはターゲットごとに選ばれます。
+  aarch64 では NEON、x86_64 では F16C + AVX2 + FMA（実行時に検出）、それ以外（wasm32 を含む）ではポータブルなカーネルを使います。
+  カーネルごとに加算の順序が違うため、結果は f32 の丸め誤差の範囲で一致しますが、ビット単位では一致しません。
+- 行の置き場所はロードモードで決まります。
+  デフォルトの mmap ベースの `FileStorage`（`Lazy`）では、行はマップしたセグメントファイルからその場で読まれます。
+  ヒープにはコピーされず、よく使う部分は OS のページキャッシュに残ります。
+  `Eager` ロード（`MemoryStorage`、または `LAURUS_NO_MMAP=1` を指定した `FileStorage`）では、セグメントのロード時に行をメモリにコピーします。
+  Windows では、merge が削除したマップ中のセグメントファイルは、その reader が破棄されるまでディスクに残ります。
+  残ったファイルは次回のオープン時に削除されます。
+- 次の 2 つの経路は、行をその場で採点せず、候補ごとに `get_vector` でデコードするため遅くなります。
+  複数のフィールドを持つセグメントに対するフィールド名なしの Flat 検索と、HNSW の線形スキャンへのフォールバックです。
+  フィールド名を指定した検索と、単一のフィールドしか持たないセグメントへの検索は、その場で採点するカーネルを使います。
+- f32 の [rerank sidecar](#two-stage-rerankissue-481-stage-2)（`rerank_storage`）も併用できますが、効果は小さいです。
+  下の計測では、Float16 だけで f32 の上位 10 件を再現しています。
+
+#### 既存フィールドを Float16 に変更する
+
+`quantizer` の変更は [Reindex 変更](../schema_and_fields.md#フィールドの変更) です。
+`Engine::update_field` を `reindex: true` で呼ぶと、フィールドのセグメントを、保存されている値から Float16 で再構築します。
+f32 sidecar を持たない `Scalar8Bit` フィールドは int8 のコードしか保存していないため、再構築の結果は元の精度ではなく、int8 から復元した値の Float16 コピーになります。
+完全な精度を得るには、変更の前にフィールドが f32 sidecar（`rerank_storage = "F32"`）を持っているか、文書を取り込み直す必要があります。
+
+> **互換性:** Float16 に対応する前の laurus は、Float16 のセグメントを含むインデックスを開けません。
+> `unknown vector segment quant_kind = 4`、またはスキーマを解析するときの unknown variant エラーで失敗します。
+> `QUANTIZATION_METHOD_FLOAT16` を知らない古いサーバーは、エラーにせず、そのフィールドを `Scalar8Bit` として保存します（Issue #1459）。
+> 古いサーバーを相手にするときは、返ってきたスキーマを確かめてください。
+
+#### 計測結果
+
+エンジンを通した品質と容量です。
+BEIR SciFact（5,183 文書、300 クエリ）と NFCorpus（3,633 文書、323 クエリ）を `all-MiniLM-L6-v2`（384 次元）で埋め込み、Cosine で 500 文書ごとに commit して、`laurus/examples/beir_dense_probe.rs` で計測しました。
+「f32 に対する Recall@10」は、f32 の厳密な検索の上位 10 件との一致率です。
+f32 の厳密な検索の nDCG@10 は 0.6451（SciFact）と 0.3159（NFCorpus）です。
+
+| フィールド | nDCG@10 SciFact / NFCorpus | f32 に対する Recall@10 | 1 ベクトルあたりのバイト数（Flat） |
+| :--- | :--- | :--- | :--- |
+| `Scalar8Bit`（Flat と HNSW） | 0.6460 / 0.3165 | 0.9933 / 0.9935 | 402 |
+| `Scalar8Bit` + f32 sidecar、`rerank_factor = 4`（Flat） | 0.6451 / 0.3159 | 1.0000 / 1.0000 | 402 + 1,536 |
+| `Float16`（Flat と HNSW） | 0.6451 / 0.3159 | 1.0000 / 1.0000 | 778 |
+
+`Scalar8Bit` の nDCG@10 の f32 との差は、95% 信頼区間が 0 を含みます。
+`MemoryStorage`（`Eager`）でも mmap の `FileStorage`（`Lazy`）でも結果は同じです。
+
+検索のコストです。
+Apple Silicon 上での 1 クエリあたりの命令数で、SciFact、1 セグメント、上位 10 件、rayon 1 スレッド、5 回の中央値です。
+
+| インデックス | `Scalar8Bit` `Eager` | `Scalar8Bit` `Lazy` | `Float16` `Eager` | `Float16` `Lazy` |
+| :--- | :--- | :--- | :--- | :--- |
+| Flat | 7.29 M | 22.46 M | 8.94 M | 9.05 M |
+| HNSW | 0.47 M | 2.88 M | 0.75 M | 0.77 M |
+
+行がヒープにある場合は、int8 カーネルのほうが安くなります。
+既定の mmap のストレージでは、`Scalar8Bit` は候補ごとに新しいバッファへデコードするため（Issue #1463）、`Float16` は 1 クエリあたりの命令数が 60%（Flat）と 73%（HNSW）少なくなります。
+x86 の F16C カーネルは計測していません。
 
 ### MultiVector ストレージ
 

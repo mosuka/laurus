@@ -241,7 +241,7 @@ base_weight = 1.0
 | `m` | `integer` | `16` | Max bi-directional connections per node. Higher = better recall, more memory |
 | `ef_construction` | `integer` | `200` | Search width during index construction. Higher = better quality, slower build |
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
-| `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
+| `quantizer` | `object` | `"Scalar8Bit"` | Quantization method: `"Scalar8Bit"`, `"Float16"`, or a `ProductQuantization` table (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)). `"F32"` enables a per-field f32 sidecar so search can rescore int8 candidates against the original vectors. Omit to keep Stage 1 int8-only behavior. |
 | `pq_codebook_path` | `string` | *(omit)* | Storage-relative file name of a shared PQ codebook (Issue #631); only meaningful with a `ProductQuantization` quantizer. Train it with `laurus train pq-codebook`; commits then encode against it instead of re-training k-means per segment. When set but not yet trained, commits fail loudly (no silent fallback). Omit to train per segment. |
 | `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders). Text (or image) values given for this field are then embedded with that model, both when indexing and when searching. Omit to supply precomputed vectors only |
@@ -268,7 +268,7 @@ base_weight = 1.0
 | `dimension` | `integer` | `128` | Vector dimensionality |
 | `distance` | `string` | `"Cosine"` | Distance metric (see [Distance Metrics](#distance-metrics)) |
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
-| `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
+| `quantizer` | `object` | `"Scalar8Bit"` | Quantization method: `"Scalar8Bit"` or `"Float16"` (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
 | `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders); see [Hnsw](#hnsw) |
 
@@ -292,7 +292,7 @@ base_weight = 1.0
 | `n_clusters` | `integer` | `100` | Number of clusters. More clusters = finer partitioning |
 | `n_probe` | `integer` | `1` | Number of clusters to search at query time. Higher = better recall, slower |
 | `base_weight` | `float` | `1.0` | Relative priority vs. other vector fields searched together; no effect on lexical-vs-vector fusion balance (see [Vector Search → Weights](../concepts/search/vector_search.md#weights)) |
-| `quantizer` | `object` | `"Scalar8Bit"` | Quantization method (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
+| `quantizer` | `object` | `"Scalar8Bit"` | Quantization method: `"Scalar8Bit"` or `"Float16"` (see [Quantization](#quantization)). Mandatory; default keeps the int8 format introduced in Issue #481 Stage 1. |
 | `rerank_storage` | `string` | *(omit)* | Optional Stage 2 rerank sidecar (see [Rerank Storage](#rerank-storage)); supported by all three vector index types since #932. `"F32"` enables the per-field f32 sidecar so search can rescore int8 candidates against the original vectors. |
 | `embedder` | `string` | *(omit)* | Name of an entry in [`[embedders.*]`](#embedders); see [Hnsw](#hnsw) |
 
@@ -341,10 +341,11 @@ For most embedding models (BERT, Sentence Transformers, OpenAI, etc.), `"Cosine"
 
 ## Quantization
 
-Vector fields are stored on disk as **8-bit scalar-quantized integers**
-(Issue #481 Stage 1). Quantization is mandatory; the previous "no
-quantization" mode no longer exists. The `quantizer` option defaults to
-`Scalar8Bit` and can be omitted from TOML.
+By default, vector fields are stored on disk as **8-bit
+scalar-quantized integers** (Issue #481 Stage 1). Quantization is
+mandatory; the previous "no quantization" mode no longer exists. The
+`quantizer` option defaults to `Scalar8Bit` and can be omitted from
+TOML.
 
 ### Scalar 8-bit (default)
 
@@ -392,6 +393,28 @@ stay on PQ — but a commit before the codebook has been trained fails
 with an error naming the `laurus train pq-codebook` command to run
 (never a silent fallback to per-segment training). See the
 [`train` command](commands.md#train) for the training workflow.
+
+### Float16
+
+Issue #623. Stores each component as an IEEE 754 half-precision value:
+2 bytes per dimension, half of f32 and twice `Scalar8Bit`. There is
+nothing to train. Supported by the HNSW, Flat and IVF indexes, with
+every distance metric.
+
+```toml
+[fields.embedding.Flat]
+dimension = 384
+distance = "Cosine"
+quantizer = "Float16"
+```
+
+Changing `quantizer` on an existing field requires a reindex. A
+`Scalar8Bit` field without `rerank_storage = "F32"` is rebuilt from its
+int8 values, so re-ingest the documents to get full precision. laurus
+builds that predate Float16 cannot open an index that contains Float16
+segments. See
+[Float16](../concepts/indexing/vector_indexing.md#float16-issue-623)
+for the encoding, the loading modes and the measurements.
 
 > **Breaking change (Issue #481 Stage 1):** schemas that explicitly
 > set `quantizer` to a "none" value are no longer valid. Existing

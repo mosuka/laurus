@@ -27,6 +27,9 @@
 //!   k-means++ initialisation, then encodes every vector as `M` bytes.
 //!   The distance kernel is wired up separately in
 //!   [`crate::vector::core::distance_quantized`].
+//! - [`QuantizationMethod::Float16`]: no quantization step here; the
+//!   codec and kernels live in [`crate::vector::core::distance_f16`]
+//!   (Issue #623).
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +80,17 @@ pub enum QuantizationMethod {
         /// block-transposed packing.
         subvector_count: usize,
     },
+    /// IEEE 754 half precision (Issue
+    /// [#623](https://github.com/mosuka/laurus/issues/623)): 2 bytes per
+    /// dimension, half of f32 and twice [`Self::Scalar8Bit`].
+    ///
+    /// Each value is rounded to the nearest f16 (values beyond ±65504
+    /// saturate). There is nothing to train and no per-segment parameter,
+    /// so a merge re-encodes the same values instead of re-quantizing
+    /// them. Supported by HNSW, Flat and IVF; the query stays f32 and the
+    /// distance kernels in [`crate::vector::core::distance_f16`] widen the
+    /// stored values as they go.
+    Float16,
 }
 
 /// Segment-level scalar quantization parameters.
@@ -722,18 +736,26 @@ enum QuantizerState {
         params: PqParams,
         codebook: Vec<f32>,
     },
+    /// Float16 (Issue #623): nothing to train.
+    Float16,
 }
 
 impl VectorQuantizer {
-    /// Create an untrained quantizer for `dimension`-d vectors.
+    /// Create a quantizer for `dimension`-d vectors.
     ///
-    /// Calling [`quantize`](Self::quantize) before [`train`](Self::train)
-    /// returns [`LaurusError::InvalidOperation`].
+    /// Methods that learn per-segment state start untrained: calling
+    /// [`quantize`](Self::quantize) before [`train`](Self::train) returns
+    /// [`LaurusError::InvalidOperation`]. [`QuantizationMethod::Float16`]
+    /// has nothing to learn and is ready immediately.
     pub fn new(method: QuantizationMethod, dimension: usize) -> Self {
+        let state = match method {
+            QuantizationMethod::Float16 => QuantizerState::Float16,
+            _ => QuantizerState::Untrained,
+        };
         Self {
             method,
             dimension,
-            state: QuantizerState::Untrained,
+            state,
         }
     }
 
@@ -744,7 +766,9 @@ impl VectorQuantizer {
     ///
     /// Returns [`LaurusError::InvalidOperation`] if `method` is
     /// [`QuantizationMethod::ProductQuantization`] — use
-    /// [`Self::from_pq_codebook`] instead.
+    /// [`Self::from_pq_codebook`] instead — or
+    /// [`QuantizationMethod::Float16`], which has no params (use
+    /// [`Self::new`]).
     pub fn from_params(
         method: QuantizationMethod,
         dimension: usize,
@@ -769,6 +793,11 @@ impl VectorQuantizer {
                         .to_string(),
                 ))
             }
+            QuantizationMethod::Float16 => Err(LaurusError::InvalidOperation(
+                "Float16 has no quantization params; use VectorQuantizer::new; \
+                 from_params is Scalar8Bit-only"
+                    .to_string(),
+            )),
         }
     }
 
@@ -840,6 +869,10 @@ impl VectorQuantizer {
                 self.state = QuantizerState::ProductQuantization { params, codebook };
                 Ok(())
             }
+            QuantizationMethod::Float16 => {
+                self.state = QuantizerState::Float16;
+                Ok(())
+            }
         }
     }
 
@@ -849,6 +882,8 @@ impl VectorQuantizer {
     /// For Product Quantization the result is `(m bytes, empty meta)` —
     /// PQ does not use the `sum_q` / `norm_q` correction terms (the
     /// ADC distance kernel is fed the LUT, not the meta block).
+    /// For Float16 the result is `(2 × dim bytes, empty meta)`, the
+    /// little-endian binary16 row a segment stores.
     ///
     /// # Errors
     ///
@@ -877,6 +912,17 @@ impl VectorQuantizer {
                 let codes = pq_encode(&vector.data, *params, codebook);
                 Ok((
                     codes,
+                    QuantizedVectorMeta {
+                        sum_q: 0,
+                        norm_q: 0.0,
+                    },
+                ))
+            }
+            QuantizerState::Float16 => {
+                let mut row = Vec::new();
+                crate::vector::core::distance_f16::encode_f16_row(&vector.data, &mut row);
+                Ok((
+                    row,
                     QuantizedVectorMeta {
                         sum_q: 0,
                         norm_q: 0.0,
@@ -951,6 +997,7 @@ impl VectorQuantizer {
                     (self.dimension * 4) as f32 / (subvector_count as f32 / 2.0)
                 }
             }
+            QuantizationMethod::Float16 => 2.0,
         }
     }
 }

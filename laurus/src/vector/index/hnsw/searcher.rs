@@ -4,12 +4,14 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::vector::core::distance::{DistanceMetric, PreparedQuery};
+use crate::vector::core::distance_f16::distance_f16;
 #[cfg(feature = "pq-fastscan")]
 use crate::vector::core::distance_pq_fastscan::PqFastScanQuery;
 use crate::vector::core::distance_quantized::{
     PqQuery, QuantizedQuery, distance_pq_adc, distance_quantized,
 };
 use crate::vector::core::vector::Vector;
+use crate::vector::index::f16_storage::F16VectorPool;
 use crate::vector::index::hnsw::graph::OrdinalHnswGraph;
 use crate::vector::index::hnsw::reader::HnswIndexReader;
 #[cfg(feature = "pq-fastscan")]
@@ -102,6 +104,21 @@ enum QuantizedSearchCtx {
         /// Distance metric, cached for the hot loop.
         metric: DistanceMetric,
     },
+    /// Float16 hot path (Issue #623): the f32 query against the stored
+    /// binary16 rows, read in place by
+    /// [`crate::vector::core::distance_f16::distance_f16`].
+    Float16 {
+        /// The query values (shared with the request, not copied).
+        query: Arc<Vec<f32>>,
+        /// `‖query‖²` for Cosine / Angular, `0.0` otherwise.
+        norm_sq: f32,
+        /// The reader's Float16 pool (heap or mapped rows).
+        pool: Arc<F16VectorPool>,
+        /// Per-field doc_id -> row position.
+        field_idx: Arc<HashMap<u64, u32>>,
+        /// Distance metric, cached for the hot loop.
+        metric: DistanceMetric,
+    },
 }
 
 impl QuantizedSearchCtx {
@@ -154,6 +171,19 @@ impl QuantizedSearchCtx {
                 let distances = distance_pq_fastscan_block(*metric, prepared, packed_block);
                 distances[in_block]
             }
+            Self::Float16 {
+                query,
+                norm_sq,
+                pool,
+                metric,
+                ..
+            } => {
+                let prepared = PreparedQuery {
+                    data: query.as_slice(),
+                    norm_sq: *norm_sq,
+                };
+                distance_f16(*metric, &prepared, pool.row_at(pos))
+            }
         }
     }
 
@@ -199,6 +229,7 @@ impl QuantizedSearchCtx {
             Self::Pq { field_idx, .. } => field_idx,
             #[cfg(feature = "pq-fastscan")]
             Self::PqFastScan { field_idx, .. } => field_idx,
+            Self::Float16 { field_idx, .. } => field_idx,
         };
         match field_idx.get(&doc_id) {
             Some(&pos) => self.distance_at(pos),
@@ -209,18 +240,24 @@ impl QuantizedSearchCtx {
     /// Base address and record stride for direct-address software
     /// prefetch (Issue #686), when this ctx's pool layout supports it.
     ///
-    /// Only the int8 SQ pool benefits: PQ records are 8–32 bytes (the
-    /// LUT is the important cache occupant) and FastScan streams whole
-    /// blocks sequentially, so both return `None` — matching the
-    /// pre-#686 behaviour where their prefetch maps were never built.
+    /// The int8 SQ and Float16 pools benefit: PQ records are 8–32 bytes
+    /// (the LUT is the important cache occupant) and FastScan streams
+    /// whole blocks sequentially, so both return `None` — matching the
+    /// pre-#686 behaviour where their prefetch maps were never built. A
+    /// Float16 pool whose mapped rows span several runs has no single
+    /// stride and also returns `None`.
     ///
     /// # Returns
     ///
-    /// `Some((base_address, stride_bytes))` for the SQ pool, else `None`.
+    /// `Some((base_address, stride_bytes))` for the SQ and Float16 pools,
+    /// else `None`.
     fn prefetch_base_stride(&self) -> Option<(usize, usize)> {
         match self {
             Self::Scalar8Bit { pool, .. } => Some((pool.int8_data.as_ptr() as usize, pool.pad_dim)),
-            _ => None,
+            Self::Float16 { pool, .. } => pool.prefetch_base_stride(),
+            Self::Pq { .. } => None,
+            #[cfg(feature = "pq-fastscan")]
+            Self::PqFastScan { .. } => None,
         }
     }
 }
@@ -478,6 +515,14 @@ impl VectorIndexSearcher for HnswSearcher {
         let Some(reader) = self.index_reader.as_any().downcast_ref::<HnswIndexReader>() else {
             return Ok(());
         };
+        // Float16 rows read in place from the mapped file (Issue #623):
+        // touch one byte per page of every row.
+        if let Some(pool) = reader.vectors().f16_pool() {
+            if pool.is_mapped() {
+                std::hint::black_box(crate::vector::index::f16_storage::touch_rows(pool));
+            }
+            return Ok(());
+        }
         if !matches!(
             reader.vectors(),
             crate::vector::index::storage::VectorStorage::OnDemand { .. }
@@ -599,6 +644,17 @@ impl HnswSearcher {
                         metric,
                     }
                 })
+            } else if let Some(pool) = reader.vectors().f16_pool() {
+                pool.field_position_index(field_name).map(|field_idx| {
+                    let norm_sq = metric.prepare_query(&query.data).norm_sq;
+                    QuantizedSearchCtx::Float16 {
+                        query: query.data.clone(),
+                        norm_sq,
+                        pool: pool.clone(),
+                        field_idx,
+                        metric,
+                    }
+                })
             } else {
                 #[cfg(feature = "pq-fastscan")]
                 {
@@ -650,8 +706,9 @@ impl HnswSearcher {
             None
         };
         let prefetch_n_bytes = match &sq_prefetch {
-            // The padded int8 record; its meta lives in separate SoA
-            // arrays, so the int8 stride alone is what the loop streams.
+            // The padded int8 record (its meta lives in separate SoA
+            // arrays) or the Float16 record, so the stride alone is what
+            // the loop streams.
             Some((_, stride)) => *stride,
             None => reader.dimension() * std::mem::size_of::<f32>(),
         };

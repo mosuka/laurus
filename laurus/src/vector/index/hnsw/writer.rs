@@ -852,6 +852,9 @@ impl HnswIndexWriter {
             QuantHeader::ProductQuantization { params, .. } => params.m as u64,
             #[cfg(feature = "pq-fastscan")]
             QuantHeader::ProductQuantizationFastScan { .. } => 1,
+            QuantHeader::Float16 => {
+                crate::vector::index::f16_storage::f16_row_size(dimension) as u64
+            }
         };
         let record_stride = record_prefix_size(header.version) + min_payload;
         checked_capacity(
@@ -886,6 +889,9 @@ impl HnswIndexWriter {
                     crate::vector::index::pq_fastscan_io::read_dequantized_pq_fastscan_vector(
                         &mut input, *params, codebook,
                     )?
+                }
+                QuantHeader::Float16 => {
+                    crate::vector::index::f16_storage::read_f16_row(&mut input, dimension)?
                 }
             };
 
@@ -2294,6 +2300,26 @@ impl VectorIndexWriter for HnswIndexWriter {
                             codes_i,
                         )?;
                     }
+                }
+            }
+            crate::vector::core::quantization::QuantizationMethod::Float16 => {
+                // Issue #623: nothing to train; each record is the
+                // binary16 row, streamed as `sorted_vectors` is walked.
+                VectorSegmentHeader::float16()
+                    .with_field_dict(field_dict.clone())
+                    .write_to(&mut output)?;
+                let mut scratch = Vec::with_capacity(
+                    crate::vector::index::f16_storage::f16_row_size(self.index_config.dimension),
+                );
+                for (doc_id, field_name, v) in &sorted_vectors {
+                    output.write_all(&doc_id.to_le_bytes())?;
+                    output.write_all(&field_ids[field_name.as_str()].to_le_bytes())?;
+                    crate::vector::index::f16_storage::write_f16_row(
+                        &mut output,
+                        self.index_config.dimension,
+                        &v.data,
+                        &mut scratch,
+                    )?;
                 }
             }
         }

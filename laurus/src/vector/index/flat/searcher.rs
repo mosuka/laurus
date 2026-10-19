@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::vector::core::distance_f16::distance_f16;
 use crate::vector::core::distance_quantized::{QuantizedQuery, distance_quantized};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::flat::reader::FlatVectorIndexReader;
@@ -62,6 +63,9 @@ impl VectorIndexSearcher for FlatVectorSearcher {
             .as_any()
             .downcast_ref::<FlatVectorIndexReader>();
         let quant_pool = flat_reader.and_then(|r| r.vectors().quantized_pool().cloned());
+        // Issue #623: Float16 rows are scored in place against the f32
+        // query (`prepared_query` above).
+        let f16_pool = flat_reader.and_then(|r| r.vectors().f16_pool().cloned());
 
         // Filter-aware allow-set honoured inline (Issue #740). Borrowed once
         // before the scan; `&FilterSet` is `Send + Sync`, so it composes with
@@ -97,6 +101,9 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                     (prepared, pool.clone(), idx)
                 })
             });
+            let f16_ctx = f16_pool
+                .as_ref()
+                .and_then(|pool| pool.field_position_index(field_name).map(|idx| (pool, idx)));
 
             // Distance scan, parallelised across candidates above
             // PARALLEL_SCAN_THRESHOLD (#662). The quantized hot path and the
@@ -122,6 +129,20 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                         // dequantize lazily only when requested.
                         let vector = if request.params.include_vectors {
                             pool.dequantize_to_vector(doc_id, field_name)
+                                .unwrap_or_else(|| Vector::new(Vec::new()))
+                        } else {
+                            Vector::new(Vec::new())
+                        };
+                        return Ok(Some((doc_id, similarity, distance, vector)));
+                    }
+                    if let Some((pool, idx)) = &f16_ctx
+                        && let Some(&pos) = idx.get(&doc_id)
+                        && !flat_reader.is_some_and(|r| r.is_deleted(doc_id))
+                    {
+                        let distance = distance_f16(metric, &prepared_query, pool.row_at(pos));
+                        let similarity = metric.distance_to_similarity(distance);
+                        let vector = if request.params.include_vectors {
+                            pool.decode_to_vector(doc_id, field_name)
                                 .unwrap_or_else(|| Vector::new(Vec::new()))
                         } else {
                             Vector::new(Vec::new())

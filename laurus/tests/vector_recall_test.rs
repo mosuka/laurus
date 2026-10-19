@@ -48,8 +48,11 @@ use laurus::storage::StorageConfig;
 use laurus::storage::StorageFactory;
 use laurus::storage::memory::MemoryStorageConfig;
 use laurus::vector::core::distance::DistanceMetric;
+use laurus::vector::core::distance_f16::distance_f16;
 use laurus::vector::core::distance_quantized::{QuantizedQuery, distance_quantized};
-use laurus::vector::core::quantization::{QuantizedVectorMeta, ScalarQuantParams};
+use laurus::vector::core::quantization::{
+    QuantizationMethod, QuantizedVectorMeta, ScalarQuantParams,
+};
 use laurus::vector::core::rerank::RerankStorageKind;
 use laurus::vector::core::vector::Vector;
 use laurus::vector::index::VectorIndex;
@@ -231,6 +234,16 @@ fn recall_at_k(exact: &HashSet<u64>, approx: &HashSet<u64>, k: usize) -> f32 {
 /// quantized format, and the Eager-mode reader populates
 /// `VectorStorage::OwnedQuantized`).
 fn measure_recall(corpus: Vec<Vec<f32>>, queries: &[Vec<f32>], ef_search: usize) -> f32 {
+    measure_recall_with_method(corpus, queries, ef_search, QuantizationMethod::Scalar8Bit)
+}
+
+/// [`measure_recall`] for any storage kind (Issue #623 adds Float16).
+fn measure_recall_with_method(
+    corpus: Vec<Vec<f32>>,
+    queries: &[Vec<f32>],
+    ef_search: usize,
+    method: QuantizationMethod,
+) -> f32 {
     let storage = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))
         .expect("memory storage");
     let config = HnswIndexConfig {
@@ -238,6 +251,7 @@ fn measure_recall(corpus: Vec<Vec<f32>>, queries: &[Vec<f32>], ef_search: usize)
         m: 16,
         ef_construction: 200,
         distance_metric: DistanceMetric::Cosine,
+        quantization_method: method,
         ..Default::default()
     };
     let index = HnswIndex::create(storage, "recall_index", config).expect("create index");
@@ -458,11 +472,43 @@ fn brute_force_quantized_recall_with_rerank(
     total / queries.len() as f32
 }
 
+/// Brute-force `distance_f16` over the whole corpus and report Recall@K
+/// against exact f32 (Issue #623). Isolates the Float16 codec and kernel
+/// from HNSW graph behaviour.
+fn brute_force_f16_recall(corpus: &[Vec<f32>], queries: &[Vec<f32>]) -> f32 {
+    use laurus::vector::core::quantization::VectorQuantizer;
+    let quantizer = VectorQuantizer::new(QuantizationMethod::Float16, DIM);
+    let rows: Vec<Vec<u8>> = corpus
+        .iter()
+        .map(|v| {
+            quantizer
+                .quantize(&Vector::new(v.clone()))
+                .expect("encode")
+                .0
+        })
+        .collect();
+    let metric = DistanceMetric::Cosine;
+    let mut total = 0.0_f32;
+    for query in queries {
+        let exact = exact_top_k(corpus, query, TOP_K);
+        let prepared = metric.prepare_query(query);
+        let mut scored: Vec<(u64, f32)> = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| (idx as u64, distance_f16(metric, &prepared, row)))
+            .collect();
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let approx: HashSet<u64> = scored.into_iter().take(TOP_K).map(|(id, _)| id).collect();
+        total += recall_at_k(&exact, &approx, TOP_K);
+    }
+    total / queries.len() as f32
+}
+
 /// Diagnostic helper: brute-force `distance_quantized` over the
 /// whole corpus and report Recall@K. Isolates the quantized distance
 /// kernel from HNSW graph behaviour.
 fn brute_force_quantized_recall(corpus: &[Vec<f32>], queries: &[Vec<f32>]) -> f32 {
-    use laurus::vector::core::quantization::{QuantizationMethod, VectorQuantizer};
+    use laurus::vector::core::quantization::VectorQuantizer;
     let mut quantizer = VectorQuantizer::new(QuantizationMethod::Scalar8Bit, DIM);
     let training: Vec<Vector> = corpus.iter().cloned().map(Vector::new).collect();
     quantizer.train(&training).expect("train");
@@ -539,6 +585,49 @@ fn hnsw_quantized_recall_at_10_meets_stage1_recall_gate() {
          (1) graph build regression (HnswIndexWriter), \
          (2) searcher hot-path change (HnswSearcher), \
          (3) HNSW config (m / ef_construction) drifted from defaults."
+    );
+}
+
+/// Issue #623 Float16 gates, on the Stage 1 default fixture:
+///
+/// - [`F16_KERNEL_RECALL_THRESHOLD`]: brute-force Float16 vs exact f32.
+///   Measured 1.0000 (deterministic); the margin covers near-ties that a
+///   different summation order (x86 F16C / portable kernels) may swap.
+/// - [`F16_HNSW_RECALL_THRESHOLD`]: HNSW over Float16 rows vs exact f32.
+///   Ten local runs gave 0.981–0.984 (the int8 path gives about 0.977 on
+///   the same fixture); the gate sits below the minimum of those runs.
+const F16_KERNEL_RECALL_THRESHOLD: f32 = 0.995;
+const F16_HNSW_RECALL_THRESHOLD: f32 = 0.97;
+
+/// Issue #623 Float16 recall gates (same default fixture as the Stage 1
+/// gate above): the brute-force Float16 kernel against exact f32, and HNSW
+/// over Float16 rows against exact f32.
+#[test]
+fn hnsw_float16_recall_at_10_meets_float16_recall_gates() {
+    let n_corpus = 5_000;
+    let corpus: Vec<Vec<f32>> = (0..n_corpus)
+        .map(|i| pseudo_random_unit_norm(0xCAFE_0000 + i as u32, DIM))
+        .collect();
+    let queries: Vec<Vec<f32>> = (0..N_QUERIES)
+        .map(|i| pseudo_random_unit_norm(0xBEEF_0000 + i as u32, DIM))
+        .collect();
+
+    let bf_recall = brute_force_f16_recall(&corpus, &queries);
+    eprintln!("Brute-force Float16 Recall@{TOP_K} = {bf_recall:.4}");
+    let recall = measure_recall_with_method(corpus, &queries, 200, QuantizationMethod::Float16);
+    eprintln!("HNSW Float16 Recall@{TOP_K}        = {recall:.4} (ef_search = 200)");
+
+    assert!(
+        bf_recall >= F16_KERNEL_RECALL_THRESHOLD,
+        "Brute-force Float16 Recall@{TOP_K} = {bf_recall:.4} < {F16_KERNEL_RECALL_THRESHOLD}: \
+         the Float16 codec or distance kernel no longer reproduces f32 ranking \
+         (distance_f16 / encode_f16_row)."
+    );
+    assert!(
+        recall >= F16_HNSW_RECALL_THRESHOLD,
+        "HNSW Float16 Recall@{TOP_K} = {recall:.4} < {F16_HNSW_RECALL_THRESHOLD} \
+         (brute force = {bf_recall:.4}): a regression in the HNSW Float16 search \
+         path (QuantizedSearchCtx::Float16, F16VectorPool) or the graph build."
     );
 }
 

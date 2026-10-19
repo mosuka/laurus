@@ -153,7 +153,8 @@ fn parse_multi_vector_storage(s: &str) -> PyResult<MultiVectorStorage> {
 /// [`QuantizationMethod`].
 ///
 /// Accepts `"scalar_8bit"` / `"scalar"` (the default when `name` is
-/// `None`) and `"product_quantization"` / `"pq"`. Product quantization
+/// `None`), `"float16"` (IEEE half precision, Issue #623) and
+/// `"product_quantization"` / `"pq"`. Product quantization
 /// requires a `subvector_count` (which must divide the field dimension —
 /// the divisibility itself is validated by the core at index-build time);
 /// supplying `subvector_count` for any other quantizer is rejected so an
@@ -162,14 +163,21 @@ fn parse_quantizer(
     name: Option<&str>,
     subvector_count: Option<usize>,
 ) -> PyResult<QuantizationMethod> {
+    let reject_subvector_count = || {
+        PyValueError::new_err("subvector_count is only valid with quantizer='product_quantization'")
+    };
     match name.map(|s| s.to_lowercase()).as_deref() {
         None | Some("scalar_8bit") | Some("scalar") => {
             if subvector_count.is_some() {
-                return Err(PyValueError::new_err(
-                    "subvector_count is only valid with quantizer='product_quantization'",
-                ));
+                return Err(reject_subvector_count());
             }
             Ok(QuantizationMethod::Scalar8Bit)
+        }
+        Some("float16") => {
+            if subvector_count.is_some() {
+                return Err(reject_subvector_count());
+            }
+            Ok(QuantizationMethod::Float16)
         }
         Some("product_quantization") | Some("pq") => {
             let subvector_count = subvector_count.ok_or_else(|| {
@@ -181,8 +189,23 @@ fn parse_quantizer(
             Ok(QuantizationMethod::ProductQuantization { subvector_count })
         }
         Some(other) => Err(PyValueError::new_err(format!(
-            "Unknown quantizer: '{other}'. Valid: scalar_8bit, product_quantization"
+            "Unknown quantizer: '{other}'. Valid: scalar_8bit, float16, product_quantization"
         ))),
+    }
+}
+
+/// Parse the `quantizer` of a Flat or IVF field.
+///
+/// Accepts the same names as [`parse_quantizer`] except product
+/// quantization, which only HNSW fields support (Issue #1457); Flat and
+/// IVF take no `subvector_count`.
+fn parse_flat_ivf_quantizer(name: Option<&str>) -> PyResult<QuantizationMethod> {
+    match name.map(|s| s.to_lowercase()).as_deref() {
+        Some("product_quantization") | Some("pq") => Err(PyValueError::new_err(
+            "quantizer='product_quantization' is only supported by HNSW fields \
+             (add_hnsw_field); use scalar_8bit or float16",
+        )),
+        _ => parse_quantizer(name, None),
     }
 }
 
@@ -543,7 +566,8 @@ impl PySchema {
     ///         `ef_search` candidate-list size (Issue #644). When unset,
     ///         the searcher uses an internal fallback of 50. Per-query
     ///         overrides via the search request still take precedence.
-    ///     quantizer: Vector quantizer — "scalar_8bit" (default) or
+    ///     quantizer: Vector quantizer — "scalar_8bit" (default),
+    ///         "float16" (IEEE half precision, 2 bytes per dimension) or
     ///         "product_quantization". Product quantization requires
     ///         `subvector_count`.
     ///     subvector_count: Number of PQ sub-vectors. Required when
@@ -611,6 +635,9 @@ impl PySchema {
     ///     name: Field name.
     ///     dimension: Vector dimensionality.
     ///     distance: Distance metric — "cosine" (default), "euclidean", "dot_product".
+    ///     quantizer: Vector quantizer — "scalar_8bit" (default) or
+    ///         "float16" (IEEE half precision, 2 bytes per dimension).
+    ///         "product_quantization" is HNSW-only and raises here.
     ///     embedder: Optional embedder name registered via `add_embedder`.
     ///         When set, text payloads are automatically embedded by the Rust engine.
     ///     base_weight: This field's relative scoring priority when
@@ -619,20 +646,23 @@ impl PySchema {
     ///
     /// Raises:
     ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
-    ///         which is reserved for system fields, or if ``distance`` is
-    ///         not a recognized metric.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", embedder=None, base_weight=1.0))]
+    ///         which is reserved for system fields, or if ``distance`` or
+    ///         ``quantizer`` is not a recognized name, or if ``quantizer`` is
+    ///         ``"product_quantization"``.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", quantizer=None, embedder=None, base_weight=1.0))]
     pub fn add_flat_field(
         &mut self,
         name: &str,
         dimension: usize,
         distance: &str,
+        quantizer: Option<String>,
         embedder: Option<String>,
         base_weight: f32,
     ) -> PyResult<()> {
         let opt = FlatOption {
             dimension,
             distance: parse_distance(distance)?,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight,
             ..Default::default()
@@ -695,6 +725,9 @@ impl PySchema {
     ///     distance: Distance metric — "cosine" (default), "euclidean", "dot_product".
     ///     n_clusters: Number of Voronoi clusters (default 100).
     ///     n_probe: Number of clusters to probe at search time (default 1).
+    ///     quantizer: Vector quantizer — "scalar_8bit" (default) or
+    ///         "float16" (IEEE half precision, 2 bytes per dimension).
+    ///         "product_quantization" is HNSW-only and raises here.
     ///     embedder: Optional embedder name registered via `add_embedder`.
     ///         When set, text payloads are automatically embedded by the Rust engine.
     ///     base_weight: This field's relative scoring priority when
@@ -703,9 +736,10 @@ impl PySchema {
     ///
     /// Raises:
     ///     ValueError: if ``name`` starts with ``_`` (other than ``_id``),
-    ///         which is reserved for system fields, or if ``distance`` is
-    ///         not a recognized metric.
-    #[pyo3(signature = (name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, embedder=None, base_weight=1.0))]
+    ///         which is reserved for system fields, or if ``distance`` or
+    ///         ``quantizer`` is not a recognized name, or if ``quantizer`` is
+    ///         ``"product_quantization"``.
+    #[pyo3(signature = (name, dimension, *, distance="cosine", n_clusters=100, n_probe=1, quantizer=None, embedder=None, base_weight=1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
         &mut self,
@@ -714,6 +748,7 @@ impl PySchema {
         distance: &str,
         n_clusters: usize,
         n_probe: usize,
+        quantizer: Option<String>,
         embedder: Option<String>,
         base_weight: f32,
     ) -> PyResult<()> {
@@ -722,6 +757,7 @@ impl PySchema {
             distance: parse_distance(distance)?,
             n_clusters,
             n_probe,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight,
             ..Default::default()

@@ -205,8 +205,8 @@ class Schema {
 | `addGeo3dField(name, stored?, indexed?, multiValued?, docValues?)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multiValued: true` で `{ x, y, z }` オブジェクトの配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`docValues` は上記を参照。 |
 | `addDatetimeField(name, stored?, indexed?, multiValued?, docValues?)` | UTC 日時フィールド。`multiValued: true` で RFC 3339 文字列の配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`docValues` は上記を参照。 |
 | `addHnswField(name, dimension, distance?, m?, efConstruction?, defaultEfSearch?, embedder?, quantizer?, subvectorCount?, rerankStorage?, pqCodebookPath?, baseWeight?)` | HNSW ベクトルフィールド。`baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
-| `addFlatField(name, dimension, distance?, embedder?, baseWeight?)` | Flat（全探索）ベクトルフィールド。 |
-| `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?)` | IVF ベクトルフィールド。 |
+| `addFlatField(name, dimension, distance?, embedder?, baseWeight?, quantizer?)` | Flat（全探索）ベクトルフィールド。 |
+| `addIvfField(name, dimension, distance?, nClusters?, nProbe?, embedder?, baseWeight?, quantizer?)` | IVF ベクトルフィールド。 |
 | `addMultiVectorField(name, dimension, distance?, embedder?, storage?, poolFactor?)` | 文書ごとに可変個のトークンベクトルを保持する MultiVector フィールド。[late interaction による再採点](#late-interaction-による再採点rescore)に使います（Issue #1351）。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。`dimension` は各トークンベクトルの次元で、0 より大きくなければなりません。`distance` は `"cosine"`（デフォルト）または `"dot_product"` です。どちらもフィールド追加時に検証され、不正なら code `InvalidArg` の例外を投げます。`storage` はトークンベクトルのディスク上の要素種別を指定します（Issue #1346）— `"f32"`（デフォルト、正確）、`"f16"`（2倍小さい）、`"int8"`（約4倍小さい）、`"binary"`（32倍小さい、要素あたり 1 bit。`"cosine"` が必要）のいずれかで、認識できない値や `"dot_product"` との `"binary"` も例外を投げます。`poolFactor` は、インデックス時に似たトークンベクトルを平均して、各文書のトークンベクトルを約 `1 / poolFactor` に減らします（デフォルト `1` はすべて保存、`0` は `InvalidArg` の例外）。[Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) を参照。`embedder` にはトークン単位の Embedder（`"candle_colbert"`）の名前を指定し、テキスト値と再採点のクエリテキストを埋め込みます。このフィールド単体では検索できず、トークンベクトルは保存されないため、`getDocuments` や検索結果には含まれません。 |
 | `addEmbedder(name, config)` | 名前付き Embedder を登録。[Embedder](#embedder)を参照。 |
 | `addAnalyzer(name, tokenizer, charFilters?, tokenFilters?)` | カスタムアナライザ定義を登録します。`tokenizer` は必須、`charFilters`/`tokenFilters` は省略可能なオブジェクトの配列です。各オブジェクトはスキーマ TOML/JSON 形式と同じ `{ type: "...", ... }` 形式で、キーは snake_case のままです（下記参照）。組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は例外になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）で新しいインデックスを `Index.create` する場合も同じです。正規表現の妥当性など意味的な検証は、このメソッド呼び出し時点ではなく `Index` 構築時に行われます。 |
@@ -221,9 +221,9 @@ class Schema {
 | `fieldNames()` | 全フィールド名を返す。 |
 | `toString()` | スキーマの文字列表現（`"Schema(fields=[...])"` 形式）を返す。 |
 
-**ベクトル量子化とリランクストレージ**（HNSW フィールド）:
+**ベクトル量子化とリランクストレージ**（HNSW フィールド。`quantizer` は Flat・IVF フィールドでも指定可）:
 
-- `quantizer` — `"scalar_8bit"`（デフォルト、4 倍圧縮）または高圧縮率の `"product_quantization"`。Product quantization では `subvectorCount`（`dimension` を割り切れる値）が必須です。
+- `quantizer` — `"scalar_8bit"`（デフォルト、4 倍圧縮）、`"float16"`（IEEE 754 半精度、2 倍圧縮、学習不要。Issue #623）、または高圧縮率の `"product_quantization"`。Product quantization では `subvectorCount`（`dimension` を割り切れる値）が必須です。`addFlatField` と `addIvfField` は `quantizer` を最後の引数に取り、`"scalar_8bit"` と `"float16"` を受け付けます。`"product_quantization"` は HNSW 専用で、これらのメソッドでは例外を投げます。
 - `rerankStorage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
 - `pqCodebookPath` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`quantizer: "product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
 

@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LaurusError, Result};
 use crate::vector::core::distance::dot_product;
+use crate::vector::core::distance_f16::f16_saturating;
 
 /// On-disk element kind of a `MultiVector` field's token vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -614,17 +615,6 @@ impl OwnedCodec {
             Self::Binary(params) => RowCodec::Binary(params),
         }
     }
-}
-
-/// Convert to f16, saturating instead of overflowing to infinity. `half`'s
-/// plain `f16::from_f32` follows IEEE-754 round-to-nearest and produces
-/// `inf` past `f16::MAX` (65504), which would poison a `DotProduct`
-/// field's MaxSim with a non-finite score; NaN passes through unchanged.
-fn f16_saturating(v: f32) -> f16 {
-    if v.is_nan() {
-        return f16::from_f32(v);
-    }
-    f16::from_f32(v.clamp(f16::MIN.to_f32(), f16::MAX.to_f32()))
 }
 
 /// Encode one int8 row: `dimension` signed codes, then a trailing f16

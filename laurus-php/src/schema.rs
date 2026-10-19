@@ -43,7 +43,8 @@ fn parse_distance(s: &str) -> PhpResult<DistanceMetric> {
 /// [`QuantizationMethod`].
 ///
 /// Accepts `"scalar_8bit"` / `"scalar"` (the default when `name` is
-/// `None`) and `"product_quantization"` / `"pq"`. Product quantization
+/// `None`), `"float16"` (IEEE half precision, Issue #623) and
+/// `"product_quantization"` / `"pq"`. Product quantization
 /// requires a `subvector_count` (which must divide the field dimension —
 /// validated by the core at index-build time); supplying it for any other
 /// quantizer is rejected so an incoherent configuration cannot silently
@@ -52,14 +53,20 @@ fn parse_quantizer(
     name: Option<&str>,
     subvector_count: Option<usize>,
 ) -> PhpResult<QuantizationMethod> {
+    const REJECT_SUBVECTOR_COUNT: &str =
+        "subvector_count is only valid with quantizer 'product_quantization'";
     match name.map(|s| s.to_lowercase()).as_deref() {
         None | Some("scalar_8bit") | Some("scalar") => {
             if subvector_count.is_some() {
-                return Err(
-                    "subvector_count is only valid with quantizer 'product_quantization'".into(),
-                );
+                return Err(REJECT_SUBVECTOR_COUNT.into());
             }
             Ok(QuantizationMethod::Scalar8Bit)
+        }
+        Some("float16") => {
+            if subvector_count.is_some() {
+                return Err(REJECT_SUBVECTOR_COUNT.into());
+            }
+            Ok(QuantizationMethod::Float16)
         }
         Some("product_quantization") | Some("pq") => match subvector_count {
             Some(subvector_count) => {
@@ -70,9 +77,25 @@ fn parse_quantizer(
                 .into()),
         },
         Some(other) => Err(format!(
-            "Unknown quantizer: '{other}'. Valid: scalar_8bit, product_quantization"
+            "Unknown quantizer: '{other}'. Valid: scalar_8bit, float16, product_quantization"
         )
         .into()),
+    }
+}
+
+/// Parse the `quantizer` of a Flat or IVF field.
+///
+/// Accepts the same names as [`parse_quantizer`] except product
+/// quantization, which only HNSW fields support (Issue #1457); Flat and
+/// IVF take no `subvector_count`.
+fn parse_flat_ivf_quantizer(name: Option<&str>) -> PhpResult<QuantizationMethod> {
+    match name.map(|s| s.to_lowercase()).as_deref() {
+        Some("product_quantization") | Some("pq") => Err(
+            "quantizer 'product_quantization' is only supported by HNSW fields \
+                 (addHnswField); use scalar_8bit or float16"
+                .into(),
+        ),
+        _ => parse_quantizer(name, None),
     }
 }
 
@@ -508,7 +531,8 @@ impl PhpSchema {
     ///   searcher uses an internal fallback of 50. Per-query overrides
     ///   via the search request still take precedence.
     /// * `embedder` - Embedder name registered via `addEmbedder` (default: "" for none).
-    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
+    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default),
+    ///   "float16" (IEEE half precision, 2 bytes per dimension) or
     ///   "product_quantization" (requires `subvector_count`).
     /// * `subvector_count` - Number of PQ sub-vectors. Required when
     ///   `quantizer` is "product_quantization" and must divide `dimension`;
@@ -579,12 +603,16 @@ impl PhpSchema {
     /// * `base_weight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `add_hnsw_field` for the full contract.
+    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
+    ///   "float16" (IEEE half precision, 2 bytes per dimension).
+    ///   "product_quantization" is HNSW-only and throws here.
     ///
     /// # Errors
     ///
-    /// Throws `\Exception` if `distance` is not a known metric, or
-    /// `\ValueError` if `name` starts with `_` (other than `_id`), which is
-    /// reserved for system fields.
+    /// Throws `\Exception` if `distance` or `quantizer` is not a known
+    /// name or `quantizer` is `"product_quantization"`, or `\ValueError`
+    /// if `name` starts with `_` (other than `_id`), which is reserved for
+    /// system fields.
     #[php(defaults(base_weight = 1.0))]
     pub fn add_flat_field(
         &self,
@@ -593,11 +621,13 @@ impl PhpSchema {
         distance: Option<String>,
         embedder: Option<String>,
         base_weight: f64,
+        quantizer: Option<String>,
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = laurus::FlatOption {
             dimension: dimension as usize,
             distance: parse_distance(&dist_str)?,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight: base_weight as f32,
             ..Default::default()
@@ -618,12 +648,16 @@ impl PhpSchema {
     /// * `base_weight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `add_hnsw_field` for the full contract.
+    /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
+    ///   "float16" (IEEE half precision, 2 bytes per dimension).
+    ///   "product_quantization" is HNSW-only and throws here.
     ///
     /// # Errors
     ///
-    /// Throws `\Exception` if `distance` is not a known metric, or
-    /// `\ValueError` if `name` starts with `_` (other than `_id`), which is
-    /// reserved for system fields.
+    /// Throws `\Exception` if `distance` or `quantizer` is not a known
+    /// name or `quantizer` is `"product_quantization"`, or `\ValueError`
+    /// if `name` starts with `_` (other than `_id`), which is reserved for
+    /// system fields.
     #[php(defaults(n_clusters = 100, n_probe = 1, base_weight = 1.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -635,6 +669,7 @@ impl PhpSchema {
         n_probe: i64,
         embedder: Option<String>,
         base_weight: f64,
+        quantizer: Option<String>,
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = IvfOption {
@@ -642,6 +677,7 @@ impl PhpSchema {
             distance: parse_distance(&dist_str)?,
             n_clusters: n_clusters as usize,
             n_probe: n_probe as usize,
+            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight: base_weight as f32,
             ..Default::default()

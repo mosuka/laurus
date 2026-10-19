@@ -10,6 +10,8 @@ succeeds:
 * ``quantizer="product_quantization"`` forwards ``subvector_count`` to the
   core's PQ training, which rejects a count that does not divide the field
   dimension.
+* ``quantizer="float16"`` (Issue #623) separates two vectors that the
+  default int8 quantizer stores as the same code.
 """
 
 import pytest
@@ -102,8 +104,55 @@ def test_pq_subvector_count_must_divide_dimension():
 
 
 # ---------------------------------------------------------------------------
+# quantizer="float16" reaches the core (Issue #623)
+# ---------------------------------------------------------------------------
+
+
+def _assert_float16_ranks_exact_match_first(add_field):
+    """``low`` / ``high`` stretch the segment's int8 range to [-100, 100]
+    (step ~0.78), so ``a`` and ``b`` share one int8 code and tie under the
+    default quantizer; Float16 keeps them apart, so the exact match ``b``
+    must rank first."""
+    schema = laurus.Schema()
+    add_field(schema)
+    idx = laurus.Index(schema=schema)
+    idx.put_document("low", {"embedding": [-100.0, -100.0]})
+    idx.put_document("high", {"embedding": [100.0, 100.0]})
+    idx.put_document("a", {"embedding": [0.2, 0.0]})
+    idx.put_document("b", {"embedding": [0.25, 0.0]})
+    idx.commit()
+
+    results = idx.search(laurus.VectorQuery("embedding", [0.25, 0.0]), limit=2)
+    assert [r.id for r in results] == ["b", "a"]
+
+
+def test_float16_hnsw_field_ranks_nearest_first():
+    _assert_float16_ranks_exact_match_first(
+        lambda s: s.add_hnsw_field(
+            "embedding", dimension=2, distance="euclidean", quantizer="float16"
+        )
+    )
+
+
+def test_float16_flat_field_ranks_nearest_first():
+    _assert_float16_ranks_exact_match_first(
+        lambda s: s.add_flat_field(
+            "embedding", dimension=2, distance="euclidean", quantizer="float16"
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Builder-level validation (incoherent configs are rejected up front)
 # ---------------------------------------------------------------------------
+
+
+def test_pq_rejected_for_flat_field():
+    schema = laurus.Schema()
+    with pytest.raises(ValueError, match="only supported by HNSW"):
+        schema.add_flat_field(
+            "embedding", dimension=4, quantizer="product_quantization"
+        )
 
 
 def test_unknown_quantizer_rejected():

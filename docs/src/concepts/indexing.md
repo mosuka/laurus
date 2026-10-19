@@ -20,4 +20,4 @@ How vector fields are indexed for approximate nearest neighbor search. Covers:
 - Index types: Flat, HNSW, IVF
 - Parameter tuning (m, ef_construction, n_clusters, n_probe)
 - Distance metrics (Cosine, Euclidean, DotProduct)
-- Quantization (SQ8, PQ)
+- Quantization (SQ8, PQ, Float16)

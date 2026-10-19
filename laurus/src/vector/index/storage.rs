@@ -6,6 +6,7 @@ use crate::error::{LaurusError, Result};
 use crate::storage::{Storage, StorageInput};
 use crate::vector::core::quantization::{QuantizedVectorMeta, ScalarQuantParams};
 use crate::vector::core::vector::Vector;
+use crate::vector::index::f16_storage::F16VectorPool;
 #[cfg(feature = "pq-fastscan")]
 use crate::vector::index::pq_fastscan_storage::PqFastScanPool;
 use crate::vector::index::pq_storage::PqVectorPool;
@@ -48,6 +49,12 @@ pub enum VectorStorage {
     /// when the crate is built with the `pq-fastscan` cargo feature.
     #[cfg(feature = "pq-fastscan")]
     OwnedPqFastScan(Arc<PqFastScanPool>),
+    /// Float16 rows (Issue #623), on the heap or read in place from the
+    /// mapped segment depending on the loading mode. The search hot loop
+    /// reads rows through [`Self::f16_pool`] and
+    /// [`crate::vector::core::distance_f16::distance_f16`]; [`Self::get`]
+    /// decodes to f32.
+    Float16(Arc<F16VectorPool>),
     /// Vectors are read from disk on demand.
     ///
     /// Each [`get`](Self::get) call opens a fresh [`StorageInput`](crate::storage::StorageInput)
@@ -130,6 +137,30 @@ impl VectorStorage {
         }
     }
 
+    /// If this storage holds Float16 rows (Issue #623), return the
+    /// underlying [`F16VectorPool`] so the search hot loop can score rows
+    /// in place.
+    pub fn f16_pool(&self) -> Option<&Arc<F16VectorPool>> {
+        match self {
+            VectorStorage::Float16(pool) => Some(pool),
+            _ => None,
+        }
+    }
+
+    /// The per-field `doc_id -> position` map of an in-memory pool, used by
+    /// readers to build the HNSW ordinal tables. `None` for
+    /// [`Self::OnDemand`] and the legacy [`Self::Owned`].
+    pub fn field_position_index(&self, field: &str) -> Option<Arc<HashMap<u64, u32>>> {
+        match self {
+            VectorStorage::OwnedQuantized(pool) => pool.field_position_index(field),
+            VectorStorage::OwnedPq(pool) => pool.field_position_index(field),
+            #[cfg(feature = "pq-fastscan")]
+            VectorStorage::OwnedPqFastScan(pool) => pool.field_position_index(field),
+            VectorStorage::Float16(pool) => pool.field_position_index(field),
+            VectorStorage::Owned(_) | VectorStorage::OnDemand { .. } => None,
+        }
+    }
+
     /// Returns all keys stored in this vector storage.
     pub fn keys(&self) -> Vec<(u64, String)> {
         match self {
@@ -138,6 +169,7 @@ impl VectorStorage {
             VectorStorage::OwnedPq(pool) => pool.keys(),
             #[cfg(feature = "pq-fastscan")]
             VectorStorage::OwnedPqFastScan(pool) => pool.keys(),
+            VectorStorage::Float16(pool) => pool.keys(),
             VectorStorage::OnDemand {
                 offsets,
                 field_dict,
@@ -157,6 +189,7 @@ impl VectorStorage {
             VectorStorage::OwnedPq(pool) => pool.vector_count,
             #[cfg(feature = "pq-fastscan")]
             VectorStorage::OwnedPqFastScan(pool) => pool.vector_count(),
+            VectorStorage::Float16(pool) => pool.vector_count(),
             VectorStorage::OnDemand { offsets, .. } => offsets.len(),
         }
     }
@@ -183,6 +216,7 @@ impl VectorStorage {
             VectorStorage::OwnedPq(pool) => pool.contains(doc_id, field_name),
             #[cfg(feature = "pq-fastscan")]
             VectorStorage::OwnedPqFastScan(pool) => pool.contains(doc_id, field_name),
+            VectorStorage::Float16(pool) => pool.contains(doc_id, field_name),
             VectorStorage::OnDemand {
                 offsets,
                 field_dict,
@@ -230,6 +264,7 @@ impl VectorStorage {
             VectorStorage::OwnedPqFastScan(pool) => {
                 Ok(pool.dequantize_to_vector(doc_id, field_name))
             }
+            VectorStorage::Float16(pool) => Ok(pool.decode_to_vector(doc_id, field_name)),
             VectorStorage::OnDemand {
                 storage,
                 file_name,

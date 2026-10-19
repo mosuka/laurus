@@ -189,6 +189,13 @@ impl QuantizedSegmentVectors {
                         .to_string(),
                 ));
             }
+            QuantHeader::Float16 => {
+                return Err(crate::error::LaurusError::NotImplemented(
+                    "QuantizedSegmentVectors (Stage 1) cannot read Float16 segments; \
+                     the HNSW / Flat / IVF readers load them into an F16VectorPool"
+                        .to_string(),
+                ));
+            }
         };
 
         let mut dim_bytes = [0u8; 4];

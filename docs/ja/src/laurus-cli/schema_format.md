@@ -239,7 +239,7 @@ base_weight = 1.0
 | `m` | `integer` | `16` | ノードあたりの最大双方向接続数。大きいほど再現率が向上するがメモリ使用量が増加 |
 | `ef_construction` | `integer` | `200` | インデックス構築時の探索幅。大きいほど品質が向上するが構築が遅くなる |
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
-| `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
+| `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式。`"Scalar8Bit"`、`"Float16"`、または `ProductQuantization` テーブル（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできるようにする。省略すると Stage 1 int8-only の挙動を維持。 |
 | `pq_codebook_path` | `string` | *（省略）* | 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`ProductQuantization` quantizer との組み合わせでのみ意味を持つ。`laurus train pq-codebook` で学習すると、以後の commit は segment ごとの k-means 再学習の代わりにこの codebook で encode する。設定済みで未学習の場合、commit は明示的にエラーになる（無言のフォールバック無し）。省略すると segment ごとに学習。 |
 | `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。指定すると、このフィールドに与えたテキスト（または画像）をそのモデルでベクトルに変換する。インデックス時と検索時の両方で変換する。省略すると計算済みのベクトルだけを受け付ける |
@@ -266,7 +266,7 @@ base_weight = 1.0
 | `dimension` | `integer` | `128` | ベクトルの次元数 |
 | `distance` | `string` | `"Cosine"` | 距離メトリクス（[距離メトリクス](#距離メトリクス)を参照） |
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
-| `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
+| `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式。`"Scalar8Bit"` または `"Float16"`（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
 | `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。[Hnsw](#hnsw) を参照 |
 
@@ -290,7 +290,7 @@ base_weight = 1.0
 | `n_clusters` | `integer` | `100` | クラスタ数。多いほど細かい分割が可能 |
 | `n_probe` | `integer` | `1` | クエリ時に検索するクラスタ数。大きいほど再現率が向上するが遅くなる |
 | `base_weight` | `float` | `1.0` | 同時に検索する他の vector フィールドに対する相対的な優先度。ハイブリッド検索の lexical-vs-vector 融合のバランスには影響しない（[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照） |
-| `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
+| `quantizer` | `object` | `"Scalar8Bit"` | 量子化方式。`"Scalar8Bit"` または `"Float16"`（[量子化](#量子化)を参照）。必須。デフォルトは Issue #481 Stage 1 で導入された int8 形式を保つ。 |
 | `rerank_storage` | `string` | *（省略）* | Stage 2 rerank sidecar（[Rerank Storage](#rerank-storage)）。#932 以降、3 つのベクトルインデックスタイプすべてでサポート。`"F32"` でフィールド単位の f32 sidecar を有効化し、検索時に int8 候補を元のベクトルで再スコアできる。 |
 | `embedder` | `string` | *（省略）* | [`[embedders.*]`](#エンベダー) のエントリ名。[Hnsw](#hnsw) を参照 |
 
@@ -339,9 +339,9 @@ Vector フィールドの `distance` オプションは以下の値を受け付�
 
 ## 量子化
 
-Vector フィールドはディスク上で **8 ビットスカラー量子化された整数**
-として保存されます（Issue #481 Stage 1）。量子化は必須となり、以前
-の「量子化なし」モードは廃止されました。`quantizer` オプションは
+デフォルトでは、Vector フィールドはディスク上で **8 ビットスカラー
+量子化された整数** として保存されます（Issue #481 Stage 1）。量子化は
+必須となり、以前の「量子化なし」モードは廃止されました。`quantizer` オプションは
 `Scalar8Bit` がデフォルトで、TOML から省略可能です。
 
 ### Scalar 8-bit（デフォルト）
@@ -391,6 +391,25 @@ commit は大幅に高速化し、小さな per-commit segment も PQ を維持
 （per-segment 学習への無言のフォールバックはありません）。学習
 ワークフローは [`train` コマンド](commands.md#train) を参照して
 ください。
+
+### Float16
+
+Issue #623。各コンポーネントを IEEE 754 の半精度の値として保存します。
+1 次元あたり 2 バイトで、f32 の半分、`Scalar8Bit` の 2 倍です。
+学習するものはありません。
+HNSW・Flat・IVF のインデックスで使え、すべての距離メトリクスに対応します。
+
+```toml
+[fields.embedding.Flat]
+dimension = 384
+distance = "Cosine"
+quantizer = "Float16"
+```
+
+既存のフィールドで `quantizer` を変更すると reindex が必要です。
+`rerank_storage = "F32"` を持たない `Scalar8Bit` フィールドは int8 の値から再構築されるため、完全な精度が必要なら文書を取り込み直してください。
+Float16 に対応する前の laurus は、Float16 のセグメントを含むインデックスを開けません。
+エンコード、ロードモード、計測結果は [Float16](../concepts/indexing/vector_indexing.md#float16issue-623) を参照してください。
 
 > **破壊的変更（Issue #481 Stage 1）:** `quantizer` を「なし」に
 > 設定するスキーマはもはや有効ではありません。Stage 1 より前の

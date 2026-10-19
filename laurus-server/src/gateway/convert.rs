@@ -737,6 +737,8 @@ fn json_to_quantizer(json: &Value) -> Option<v1::QuantizationConfig> {
         "product_quantization_fastscan" => {
             v1::QuantizationMethod::ProductQuantizationFastscan as i32
         }
+        // Issue #623: IEEE 754 half precision (HNSW / Flat / IVF).
+        "float16" => v1::QuantizationMethod::Float16 as i32,
         _ => v1::QuantizationMethod::None as i32,
     };
     let subvector_count = obj
@@ -755,6 +757,7 @@ fn quantizer_to_json(q: &v1::QuantizationConfig) -> Value {
         Ok(v1::QuantizationMethod::Scalar8bit) => "scalar_8bit",
         Ok(v1::QuantizationMethod::ProductQuantization) => "product_quantization",
         Ok(v1::QuantizationMethod::ProductQuantizationFastscan) => "product_quantization_fastscan",
+        Ok(v1::QuantizationMethod::Float16) => "float16",
         Err(_) => "none",
     };
     json!({
@@ -2221,6 +2224,35 @@ mod tests {
         let empty =
             json_to_hnsw_option(&json!({ "dimension": 32, "pq_codebook_path": "" })).unwrap();
         assert_eq!(empty.pq_codebook_path, None, "empty must normalize to None");
+    }
+
+    /// Issue #623: a `{ "method": "float16" }` quantizer survives the HTTP
+    /// gateway's JSON -> proto -> JSON round-trip for HNSW and Flat fields,
+    /// mapping to `QUANTIZATION_METHOD_FLOAT16` rather than the `NONE`
+    /// fallback for an unrecognized method string.
+    #[test]
+    fn test_float16_quantizer_round_trips_through_json() {
+        let json = json!({ "dimension": 32, "quantizer": { "method": "float16" } });
+
+        let hnsw = json_to_hnsw_option(&json).unwrap();
+        assert_eq!(
+            hnsw.quantizer.as_ref().map(|q| q.method),
+            Some(v1::QuantizationMethod::Float16 as i32)
+        );
+        assert_eq!(
+            hnsw_option_to_json(&hnsw)["quantizer"]["method"].as_str(),
+            Some("float16")
+        );
+
+        let flat = json_to_flat_option(&json).unwrap();
+        assert_eq!(
+            flat.quantizer.as_ref().map(|q| q.method),
+            Some(v1::QuantizationMethod::Float16 as i32)
+        );
+        assert_eq!(
+            flat_option_to_json(&flat)["quantizer"]["method"].as_str(),
+            Some("float16")
+        );
     }
 
     /// Issue #1084: `base_weight` survives the HTTP gateway's
