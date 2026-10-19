@@ -7,33 +7,27 @@
 //!
 //! - **Heap** (`Eager`, or a backend that cannot expose its bytes): the
 //!   rows are copied into one contiguous buffer at load.
-//! - **Mapped** (`Lazy`): the pool keeps a clone of the segment's input
-//!   and slices rows out of [`StorageInput::as_slice`] in place, so a
-//!   segment costs no heap beyond the lookup tables and the page cache
-//!   decides what stays resident. The input is held until the pool is
-//!   dropped, which keeps the file mapped; on Windows a segment deleted
-//!   by a merge stays on disk until the reader is dropped (the next open
-//!   removes leftover files).
+//! - **Mapped** (`Lazy`): the rows are read in place from the segment's
+//!   input through `MappedRows` (see the crate-internal `row_pool` module
+//!   for the run table and the mapping's lifetime).
 //!
 //! # On-disk record
 //!
 //! ```text
 //! [ doc_id u64 LE ][ field_id u16 LE ][ dim × binary16 LE ]
 //! ```
-//!
-//! The rows of one segment form runs of equally spaced records: HNSW and
-//! Flat write a single run, IVF one run per non-empty inverted list (each
-//! list is preceded by its 4-byte length). The pool stores one
-//! `(first position, byte offset)` pair per run.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::StorageInput;
 use crate::vector::core::distance_f16::{F16_BYTES, decode_f16_row, encode_f16_row};
 use crate::vector::core::vector::Vector;
+use crate::vector::index::row_pool::{
+    FieldPositions, MappedRows, MappedRowsBuilder, MappedRowsView,
+};
 
 /// Bytes of one stored Float16 row.
 #[inline]
@@ -89,30 +83,86 @@ enum Rows {
     /// order.
     Heap(Vec<u8>),
     /// Rows read in place from the segment's input.
-    Mapped {
-        /// A clone of the segment's input, positioned at 0 and never
-        /// moved, so `as_slice()` spans the whole file.
-        input: Box<dyn StorageInput>,
-        /// First pool position of each run of equally spaced records.
-        run_starts: Vec<u32>,
-        /// Byte offset of the first row of each run.
-        run_offsets: Vec<u64>,
-        /// Bytes from one record's row to the next within a run.
-        stride: u64,
-    },
+    Mapped(MappedRows),
 }
 
 impl std::fmt::Debug for Rows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Rows::Heap(data) => f.debug_tuple("Heap").field(&data.len()).finish(),
-            Rows::Mapped {
-                run_starts, stride, ..
-            } => f
-                .debug_struct("Mapped")
-                .field("runs", &run_starts.len())
-                .field("stride", stride)
-                .finish(),
+            Rows::Mapped(rows) => f.debug_tuple("Mapped").field(rows).finish(),
+        }
+    }
+}
+
+/// The rows of a heap pool, borrowed for one search
+/// ([`F16VectorPool::rows`]).
+#[derive(Clone, Copy)]
+pub(crate) struct F16HeapRows<'a> {
+    data: &'a [u8],
+    row_size: usize,
+}
+
+impl<'a> F16HeapRows<'a> {
+    /// The row at `pos`.
+    ///
+    /// # Panics
+    ///
+    /// If `pos` is not a position of the pool.
+    #[inline]
+    pub(crate) fn row_at(&self, pos: u32) -> &'a [u8] {
+        let start = pos as usize * self.row_size;
+        &self.data[start..start + self.row_size]
+    }
+
+    /// Base address and stride of the rows, for direct-address software
+    /// prefetch.
+    pub(crate) fn base_stride(&self) -> (usize, usize) {
+        (self.data.as_ptr() as usize, self.row_size)
+    }
+}
+
+/// The rows of a mapped pool, borrowed for one search
+/// ([`F16VectorPool::rows`]).
+#[derive(Clone, Copy)]
+pub(crate) struct F16MappedRows<'a> {
+    rows: MappedRowsView<'a>,
+    row_size: usize,
+}
+
+impl<'a> F16MappedRows<'a> {
+    /// The row at `pos`.
+    ///
+    /// # Panics
+    ///
+    /// If `pos` is not a position of the pool.
+    #[inline]
+    pub(crate) fn row_at(&self, pos: u32) -> &'a [u8] {
+        self.rows.row(pos, self.row_size)
+    }
+
+    /// Base address and stride for direct-address software prefetch, when
+    /// the rows form one run.
+    pub(crate) fn base_stride(&self) -> Option<(usize, usize)> {
+        self.rows.base_stride()
+    }
+}
+
+/// A pool's rows borrowed for one search: [`F16HeapRows`] or
+/// [`F16MappedRows`].
+#[derive(Clone, Copy)]
+pub(crate) enum F16Rows<'a> {
+    Heap(F16HeapRows<'a>),
+    Mapped(F16MappedRows<'a>),
+}
+
+impl<'a> F16Rows<'a> {
+    /// The row at `pos` (see [`F16VectorPool::row_at`]).
+    #[inline]
+    pub(crate) fn row_at(&self, pos: u32) -> &'a [u8] {
+        match self {
+            F16Rows::Heap(rows) => rows.row_at(pos),
+            F16Rows::Mapped(rows) => rows.row_at(pos),
         }
     }
 }
@@ -162,36 +212,37 @@ impl F16VectorPool {
     /// lookup tables).
     #[inline]
     pub fn row_at(&self, pos: u32) -> &[u8] {
+        self.rows().row_at(pos)
+    }
+
+    /// The rows borrowed for one search. A hot loop takes this once and
+    /// reads every candidate through it: the storage kind is resolved up
+    /// front, and a mapped pool resolves its file slice once instead of
+    /// per candidate.
+    #[inline]
+    pub(crate) fn rows(&self) -> F16Rows<'_> {
         match &self.rows {
-            Rows::Heap(data) => {
-                let start = pos as usize * self.row_size;
-                &data[start..start + self.row_size]
-            }
-            Rows::Mapped {
-                input,
-                run_starts,
-                run_offsets,
-                stride,
-            } => {
-                let run = if run_starts.len() == 1 {
-                    0
-                } else {
-                    run_starts.partition_point(|&s| s <= pos) - 1
-                };
-                let start = (run_offsets[run] + (pos - run_starts[run]) as u64 * stride) as usize;
-                let bytes = input
-                    .as_slice()
-                    .expect("mapped pools are only built over inputs that expose a slice");
-                &bytes[start..start + self.row_size]
-            }
+            Rows::Heap(data) => F16Rows::Heap(F16HeapRows {
+                data,
+                row_size: self.row_size,
+            }),
+            Rows::Mapped(rows) => F16Rows::Mapped(F16MappedRows {
+                rows: rows.view(),
+                row_size: self.row_size,
+            }),
         }
     }
 
     /// The stored row for `(doc_id, field)`, if present.
     #[inline]
     pub fn get_row(&self, doc_id: u64, field: &str) -> Option<&[u8]> {
-        let pos = self.field_index.get(field)?.get(&doc_id).copied()?;
-        Some(self.row_at(pos))
+        Some(self.row_at(self.position(doc_id, field)?))
+    }
+
+    /// The position of `(doc_id, field)` in this pool, if present.
+    #[inline]
+    pub fn position(&self, doc_id: u64, field: &str) -> Option<u32> {
+        self.field_index.get(field)?.get(&doc_id).copied()
     }
 
     /// The per-field `doc_id -> position` map, shared so the search loop
@@ -236,11 +287,7 @@ impl F16VectorPool {
     pub fn heap_size(&self) -> usize {
         match &self.rows {
             Rows::Heap(data) => data.len(),
-            Rows::Mapped {
-                run_starts,
-                run_offsets,
-                ..
-            } => run_starts.len() * 4 + run_offsets.len() * 8,
+            Rows::Mapped(rows) => rows.heap_size(),
         }
     }
 
@@ -248,42 +295,26 @@ impl F16VectorPool {
     /// every row lies at a fixed stride (one heap buffer or one mapped
     /// run). The address is only used as a prefetch hint.
     pub fn prefetch_base_stride(&self) -> Option<(usize, usize)> {
-        match &self.rows {
-            Rows::Heap(data) => Some((data.as_ptr() as usize, self.row_size)),
-            Rows::Mapped {
-                input,
-                run_offsets,
-                stride,
-                ..
-            } if run_offsets.len() == 1 => {
-                let base = input.as_slice()?.as_ptr() as usize + run_offsets[0] as usize;
-                Some((base, *stride as usize))
-            }
-            Rows::Mapped { .. } => None,
+        match self.rows() {
+            F16Rows::Heap(rows) => Some(rows.base_stride()),
+            F16Rows::Mapped(rows) => rows.base_stride(),
         }
     }
-}
 
-/// Read one byte from every page of every row, so a mapped pool's pages
-/// are faulted in before the first query (searcher warmup, Issue #677).
-///
-/// # Returns
-///
-/// A checksum of the touched bytes, for the caller to keep alive with
-/// `std::hint::black_box`.
-pub(crate) fn touch_rows(pool: &F16VectorPool) -> u64 {
-    const PAGE: usize = 4096;
-    let mut acc = 0u64;
-    for pos in 0..pool.vector_count() as u32 {
-        let row = pool.row_at(pos);
-        for b in row.iter().step_by(PAGE) {
-            acc = acc.wrapping_add(*b as u64);
-        }
-        if let Some(last) = row.last() {
-            acc = acc.wrapping_add(*last as u64);
+    /// Read one byte from every page of every mapped row, so the pages are
+    /// faulted in before the first query (searcher warmup, Issue #677).
+    ///
+    /// # Returns
+    ///
+    /// A checksum of the touched bytes, for the caller to keep alive with
+    /// `std::hint::black_box`; `None` for a heap pool, which needs no
+    /// warming.
+    pub(crate) fn touch_mapped_rows(&self) -> Option<u64> {
+        match &self.rows {
+            Rows::Heap(_) => None,
+            Rows::Mapped(rows) => Some(rows.touch(self.vector_count as u32, self.row_size)),
         }
     }
-    acc
 }
 
 /// Builds an [`F16VectorPool`] while a reader parses a segment's records.
@@ -296,22 +327,13 @@ pub(crate) struct F16PoolBuilder {
     dim: usize,
     row_size: usize,
     mode: BuilderMode,
-    /// Positions per field id, in field-dictionary order.
-    by_field: Vec<HashMap<u64, u32>>,
+    positions: FieldPositions,
     count: u32,
 }
 
 enum BuilderMode {
     Heap(Vec<u8>),
-    Mapped {
-        input: Box<dyn StorageInput>,
-        file_len: u64,
-        run_starts: Vec<u32>,
-        run_offsets: Vec<u64>,
-        stride: u64,
-        /// Where the next row would start if it continued the current run.
-        next: Option<u64>,
-    },
+    Mapped(MappedRowsBuilder),
 }
 
 impl F16PoolBuilder {
@@ -328,22 +350,20 @@ impl F16PoolBuilder {
             dim,
             row_size,
             mode: BuilderMode::Heap(Vec::with_capacity(capacity * row_size)),
-            by_field: Vec::new(),
+            positions: FieldPositions::default(),
             count: 0,
         }
     }
 
     /// A builder that reads rows in place from `input`, or a heap builder
-    /// when `input` cannot expose its bytes as one slice.
+    /// when there is no input or it cannot expose its bytes as one slice.
     ///
     /// # Arguments
     ///
     /// * `dim` - The field dimension.
     /// * `capacity` - Expected number of rows, for the heap fallback.
-    /// * `input` - A fresh clone of the segment's input (position 0); it is
-    ///   never moved, so its slice covers the whole file.
-    /// * `record_stride` - Bytes from one record's row to the next
-    ///   (record prefix + row).
+    /// * `input` - A fresh clone of the segment's input (position 0), or
+    ///   `None` when the input could not be cloned.
     ///
     /// # Errors
     ///
@@ -351,28 +371,21 @@ impl F16PoolBuilder {
     pub(crate) fn mapped(
         dim: usize,
         capacity: usize,
-        input: Box<dyn StorageInput>,
-        record_stride: u64,
+        input: Option<Box<dyn StorageInput>>,
     ) -> Result<Self> {
-        let file_len = input.size()?;
-        let whole_file = input
-            .as_slice()
-            .is_some_and(|bytes| bytes.len() as u64 == file_len);
-        if !whole_file {
+        let row_size = f16_row_size(dim);
+        let Some(rows) = input
+            .map(|input| MappedRowsBuilder::new(input, row_size))
+            .transpose()?
+            .flatten()
+        else {
             return Ok(Self::heap(dim, capacity));
-        }
+        };
         Ok(Self {
             dim,
-            row_size: f16_row_size(dim),
-            mode: BuilderMode::Mapped {
-                input,
-                file_len,
-                run_starts: Vec::new(),
-                run_offsets: Vec::new(),
-                stride: record_stride,
-                next: None,
-            },
-            by_field: Vec::new(),
+            row_size,
+            mode: BuilderMode::Mapped(rows),
+            positions: FieldPositions::default(),
             count: 0,
         })
     }
@@ -408,36 +421,9 @@ impl F16PoolBuilder {
                 data.resize(start + self.row_size, 0);
                 reader.read_exact(&mut data[start..])?;
             }
-            BuilderMode::Mapped {
-                file_len,
-                run_starts,
-                run_offsets,
-                stride,
-                next,
-                ..
-            } => {
-                let offset = reader.stream_position().map_err(LaurusError::Io)?;
-                if offset + self.row_size as u64 > *file_len {
-                    return Err(LaurusError::index(format!(
-                        "vector segment corrupt: Float16 row at byte {offset} runs past \
-                         the end of the file ({file_len} bytes)"
-                    )));
-                }
-                if *next != Some(offset) {
-                    run_starts.push(self.count);
-                    run_offsets.push(offset);
-                }
-                *next = Some(offset + *stride);
-                reader
-                    .seek(SeekFrom::Current(self.row_size as i64))
-                    .map_err(LaurusError::Io)?;
-            }
+            BuilderMode::Mapped(rows) => rows.push(self.count, reader)?,
         }
-        let fid = field_id as usize;
-        if self.by_field.len() <= fid {
-            self.by_field.resize_with(fid + 1, HashMap::new);
-        }
-        self.by_field[fid].insert(doc_id, self.count);
+        self.positions.insert(field_id, doc_id, self.count);
         self.count += 1;
         Ok(())
     }
@@ -451,38 +437,16 @@ impl F16PoolBuilder {
     pub(crate) fn build(self, field_dict: &[Arc<str>]) -> F16VectorPool {
         let rows = match self.mode {
             BuilderMode::Heap(data) => Rows::Heap(data),
-            BuilderMode::Mapped {
-                input,
-                run_starts,
-                run_offsets,
-                stride,
-                ..
-            } => {
-                if run_starts.is_empty() {
-                    // No rows: nothing to map.
-                    Rows::Heap(Vec::new())
-                } else {
-                    Rows::Mapped {
-                        input,
-                        run_starts,
-                        run_offsets,
-                        stride,
-                    }
-                }
-            }
+            // No rows: nothing to map.
+            BuilderMode::Mapped(rows) => rows
+                .build()
+                .map_or_else(|| Rows::Heap(Vec::new()), Rows::Mapped),
         };
-        let field_index = self
-            .by_field
-            .into_iter()
-            .enumerate()
-            .filter(|(_, map)| !map.is_empty())
-            .map(|(fid, map)| (field_dict[fid].to_string(), Arc::new(map)))
-            .collect();
         F16VectorPool {
             dim: self.dim,
             row_size: self.row_size,
             rows,
-            field_index,
+            field_index: self.positions.into_index(field_dict),
             vector_count: self.count as usize,
         }
     }
@@ -581,8 +545,7 @@ mod tests {
     #[test]
     fn mapped_pool_returns_the_same_rows_across_runs() {
         let (bytes, records) = segment();
-        let record_stride = 10 + f16_row_size(DIM) as u64;
-        let builder = F16PoolBuilder::mapped(DIM, 4, mapped_input(&bytes), record_stride).unwrap();
+        let builder = F16PoolBuilder::mapped(DIM, 4, Some(mapped_input(&bytes))).unwrap();
         let pool = parse(builder, &bytes);
         assert!(pool.is_mapped(), "MemoryStorage inputs expose a slice");
         check(&pool, &records);
@@ -590,18 +553,27 @@ mod tests {
         for pos in 0..4 {
             assert_eq!(pool.row_at(pos), heap.row_at(pos), "position {pos}");
         }
-        // Two runs: the second list's length breaks the stride.
-        assert_eq!(pool.heap_size(), 2 * 4 + 2 * 8);
+        // Two runs: the second list's length breaks the stride. Each run
+        // keeps a start, an offset and a stride.
+        assert_eq!(pool.heap_size(), 2 * (4 + 8 + 8));
         assert!(pool.prefetch_base_stride().is_none());
+        assert!(pool.touch_mapped_rows().is_some());
+        assert!(heap.touch_mapped_rows().is_none());
+    }
+
+    #[test]
+    fn mapped_builder_without_an_input_copies_the_rows() {
+        let (bytes, records) = segment();
+        let pool = parse(F16PoolBuilder::mapped(DIM, 4, None).unwrap(), &bytes);
+        assert!(!pool.is_mapped());
+        check(&pool, &records);
     }
 
     #[test]
     fn mapped_builder_rejects_rows_past_the_end() {
         let (bytes, _) = segment();
         let truncated = &bytes[..bytes.len() - 1];
-        let record_stride = 10 + f16_row_size(DIM) as u64;
-        let mut builder =
-            F16PoolBuilder::mapped(DIM, 4, mapped_input(truncated), record_stride).unwrap();
+        let mut builder = F16PoolBuilder::mapped(DIM, 4, Some(mapped_input(truncated))).unwrap();
         let mut cursor = Cursor::new(truncated);
         cursor.set_position(truncated.len() as u64 - f16_row_size(DIM) as u64 + 1);
         let err = builder.push(1, 0, &mut cursor).unwrap_err();

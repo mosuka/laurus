@@ -7,20 +7,19 @@ use std::sync::atomic::Ordering;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
-use crate::vector::core::quantization::QuantizedVectorMeta;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::format::{
     FieldInterner, QuantHeader, VERSION_ORDINAL_GRAPH, VectorSegmentHeader, record_prefix_size,
 };
 use crate::vector::index::hnsw::graph::OrdinalHnswGraph;
 use crate::vector::index::quantized_io::quantized_record_payload_size;
-use crate::vector::index::quantized_storage::QuantizedVectorPool;
+use crate::vector::index::quantized_storage::QuantizedPoolBuilder;
 use crate::vector::index::rerank_storage::RerankStoragePool;
 use crate::vector::reader::{ValidationReport, VectorIndexMetadata, VectorStats};
 use crate::vector::reader::{VectorIndexReader, VectorIterator};
 
 use crate::maintenance::deletion::DeletionBitmap;
-/// Storage for vectors (in-memory or on-demand).
+/// Storage for vectors (heap or mapped rows).
 use crate::vector::index::storage::VectorStorage;
 
 /// Build a `field_name → Arc<[u64]>` lookup from a flat `Vec<(u64, String)>`.
@@ -71,8 +70,9 @@ pub struct HnswIndexReader {
     ord_to_pos: HashMap<String, Arc<[u32]>>,
     /// Pre-built lookup table: `field_name → (doc_id → Vec<f32> base address as usize)`.
     ///
-    /// Populated at load time for in-memory (`Owned`) storage; empty for
-    /// on-demand (disk-backed) storage.  Enables zero-allocation, O(1) software
+    /// Populated at load time for the legacy f32 (`Owned`) storage; empty for
+    /// the pool-backed kinds, whose ordinal path computes addresses from the
+    /// pool's base and stride.  Enables zero-allocation, O(1) software
     /// prefetch hints on the HNSW search hot-path without the per-call
     /// `String` allocation that a direct `HashMap<(u64, String), _>` lookup
     /// would require.
@@ -154,10 +154,11 @@ impl HnswIndexReader {
     /// Verify that the `content_len` bytes from offset 0 hash to `expected`, in
     /// an independent sequential pass, then rewind to 0.
     ///
-    /// Used on the Lazy / OnDemand load path (Issue #789): that parse seeks over
-    /// the vector payload and so cannot fold the checksum into its structural
-    /// pass the way the Eager path does, so the integrity guarantee from
-    /// Issue #786 is preserved here with a dedicated pass.
+    /// Used on the Lazy load path (Issue #789): that parse seeks over the
+    /// vector rows (the mapped pools record their offsets and skip them) and
+    /// so cannot fold the checksum into its structural pass the way the Eager
+    /// path does, so the integrity guarantee from Issue #786 is preserved
+    /// here with a dedicated pass.
     ///
     /// # Arguments
     ///
@@ -465,7 +466,9 @@ impl HnswIndexReader {
     ///
     /// # Arguments
     ///
-    /// * `storage` - Shared storage backend (cloned into `OnDemand` for concurrent reads).
+    /// * `storage` - Shared storage backend. Its loading mode decides whether
+    ///   the vector rows are copied to the heap (`Eager`) or read in place
+    ///   from the mapped file (`Lazy`).
     /// * `path` - Base path/name for the index file (`.hnsw` extension is appended).
     /// * `distance_metric` - Distance metric used for similarity computations.
     ///
@@ -503,9 +506,9 @@ impl HnswIndexReader {
         // Fold the integrity check into the single Eager structural pass
         // (Issue #789): that pass reads the whole content sequentially, so a CRC
         // accumulated *during* it verifies the footer with no extra read. The
-        // Lazy / OnDemand parse seeks over the vector payload and so cannot
-        // fold; verify it up front with a dedicated pass instead (the #786
-        // behavior). Footer-less legacy segments have nothing to verify.
+        // Lazy parse seeks over the vector rows and so cannot fold; verify it
+        // up front with a dedicated pass instead (the #786 behavior).
+        // Footer-less legacy segments have nothing to verify.
         let eager = matches!(storage.loading_mode(), crate::storage::LoadingMode::Eager);
         let fold = eager && stored_crc.is_some();
         if !fold && let Some(expected) = stored_crc {
@@ -542,11 +545,9 @@ impl HnswIndexReader {
         let ef_construction = u32::from_le_bytes(ef_construction_buf) as usize;
 
         // Read the Issue #481 vector segment header (LVS1). Pre-Stage-1
-        // segments are rejected with IncompatibleFormat. Both Scalar8Bit
-        // (Stage 1) and ProductQuantization (Stage 3) variants are
-        // handled here; Lazy mode silently degrades PQ to "not
-        // supported" because the OnDemand path's offsets table only
-        // carries Scalar8Bit params today.
+        // segments are rejected with IncompatibleFormat. Scalar8Bit
+        // (Stage 1), ProductQuantization (Stage 3) and Float16 (#623) are
+        // handled here; PQ codes load onto the heap in both loading modes.
         // Issue #921: pass the bytes physically left in the file so the
         // header's PQ codebook allocation is bounded before it reserves.
         let header_available =
@@ -581,17 +582,18 @@ impl HnswIndexReader {
 
         let (vectors, vector_ids, graph, field_dict) = match (&header.quant, storage.loading_mode())
         {
-            (QuantHeader::Scalar8Bit(params), crate::storage::LoadingMode::Eager) => {
-                // Step 6 of #481 Stage 1: load vectors as int8 + meta
-                // directly into a QuantizedVectorPool so the search
-                // hot loop can use distance_quantized without per-call
-                // dequantization. The legacy
-                // VectorIndexReader::get_vector API still works via
-                // VectorStorage::OwnedQuantized's dequantize-on-get.
-                // Each record is at least doc_id (8) + field_name_len (4) +
-                // the fixed quantized payload (dim int8 + 8 meta). Bounding
-                // `num_vectors` by that stride also bounds the per-record
-                // `dimension`-sized int8 read (Issue #806).
+            (QuantHeader::Scalar8Bit(params), loading_mode) => {
+                // int8 rows + meta go into a QuantizedVectorPool, so the
+                // search hot loop runs distance_quantized with no per-call
+                // dequantization (#481 Stage 1). `Eager` copies the rows to
+                // the heap; `Lazy` keeps a clone of the input and reads them
+                // in place (Issue #1463). The clone is taken from `input`
+                // (the checksum wrapper), whose `clone_input` returns the
+                // bare input at position 0 — the wrapper itself exposes no
+                // slice. Each record is at least the version-dependent
+                // prefix + the fixed quantized payload (dim int8 + 8 meta);
+                // bounding `num_vectors` by that stride also bounds the
+                // per-record reads (Issue #806).
                 let record_stride = record_prefix_size(header.version)
                     + quantized_record_payload_size(dimension) as u64;
                 checked_capacity(
@@ -600,10 +602,18 @@ impl HnswIndexReader {
                     records_remaining,
                     "hnsw num_vectors",
                 )?;
+                let mut builder = match loading_mode {
+                    crate::storage::LoadingMode::Eager => {
+                        QuantizedPoolBuilder::heap(*params, dimension, num_vectors)
+                    }
+                    crate::storage::LoadingMode::Lazy => QuantizedPoolBuilder::mapped(
+                        *params,
+                        dimension,
+                        num_vectors,
+                        crate::storage::StorageInput::clone_input(&input).ok(),
+                    )?,
+                };
                 let mut vector_ids = Vec::with_capacity(num_vectors);
-                let mut records: Vec<(u64, String, Vec<u8>, QuantizedVectorMeta)> =
-                    Vec::with_capacity(num_vectors);
-
                 for _ in 0..num_vectors {
                     let mut doc_id_buf = [0u8; 8];
                     input.read_exact(&mut doc_id_buf)?;
@@ -615,91 +625,14 @@ impl HnswIndexReader {
                         records_remaining,
                         "hnsw field_name_len",
                     )?;
-
-                    let mut int8 = vec![0u8; dimension];
-                    input.read_exact(&mut int8)?;
-                    let mut sum_q_buf = [0u8; 4];
-                    let mut norm_q_buf = [0u8; 4];
-                    input.read_exact(&mut sum_q_buf)?;
-                    input.read_exact(&mut norm_q_buf)?;
-                    let meta = QuantizedVectorMeta {
-                        sum_q: u32::from_le_bytes(sum_q_buf),
-                        norm_q: f32::from_le_bytes(norm_q_buf),
-                    };
-
+                    builder.push(doc_id, fid, &mut input)?;
                     vector_ids.push((doc_id, fid));
-                    // Transient clone for the pool's String-shaped build
-                    // input; the pool retains only per-field keys.
-                    records.push((doc_id, interner.name(fid).to_string(), int8, meta));
                 }
                 let graph = read_graph(&mut input, &vector_ids)?;
-                let pool = QuantizedVectorPool::build(*params, dimension, records);
+                let field_dict = interner.into_dict();
+                let pool = builder.build(&field_dict);
                 (
                     VectorStorage::OwnedQuantized(Arc::new(pool)),
-                    vector_ids,
-                    graph,
-                    interner.into_dict(),
-                )
-            }
-            (QuantHeader::Scalar8Bit(params), crate::storage::LoadingMode::Lazy) => {
-                let record_stride = record_prefix_size(header.version)
-                    + quantized_record_payload_size(dimension) as u64;
-                checked_capacity(
-                    num_vectors,
-                    record_stride,
-                    records_remaining,
-                    "hnsw num_vectors",
-                )?;
-                let mut offsets = HashMap::with_capacity(num_vectors);
-                let mut vector_ids = Vec::with_capacity(num_vectors);
-
-                // Seek to the start of the per-vector entries: HNSW preamble
-                // (count u64 + dim u32 + m u32 + ef u32 = 20 bytes) followed
-                // by the parsed header's real size (which includes the v3
-                // field dictionary, Issue #633 — reconstructing a fresh
-                // header here would omit it).
-                let start_pos = 20u64 + header.serialized_size() as u64;
-                input
-                    .seek(std::io::SeekFrom::Start(start_pos))
-                    .map_err(LaurusError::Io)?;
-
-                let quant_payload_size = quantized_record_payload_size(dimension) as i64;
-
-                for _ in 0..num_vectors {
-                    let mut doc_id_buf = [0u8; 8];
-                    input.read_exact(&mut doc_id_buf)?;
-                    let doc_id = u64::from_le_bytes(doc_id_buf);
-
-                    let fid = interner.read_record_field_id(
-                        &header,
-                        &mut input,
-                        records_remaining,
-                        "hnsw field_name_len",
-                    )?;
-
-                    // Offsets point at the payload start (right after the
-                    // record prefix), so `VectorStorage::get` seeks straight
-                    // to the int8 data (Issue #633).
-                    let payload_offset = input.stream_position().map_err(LaurusError::Io)?;
-                    offsets.insert((doc_id, fid), payload_offset);
-                    vector_ids.push((doc_id, fid));
-
-                    input
-                        .seek(std::io::SeekFrom::Current(quant_payload_size))
-                        .map_err(LaurusError::Io)?;
-                }
-                let graph = read_graph(&mut input, &vector_ids)?;
-
-                let field_dict = interner.into_dict();
-                (
-                    VectorStorage::OnDemand {
-                        storage: storage.clone(),
-                        file_name: file_name.clone(),
-                        offsets: Arc::new(offsets),
-                        field_dict: field_dict.clone(),
-                        quant_params: Some(*params),
-                        cached_input: Arc::new(std::sync::RwLock::new(None)),
-                    },
                     vector_ids,
                     graph,
                     field_dict,
@@ -713,10 +646,8 @@ impl HnswIndexReader {
                 _loading_mode,
             ) => {
                 // Stage 3 (#481): read M-byte codes per vector into a
-                // PqVectorPool. Lazy mode is not yet supported for PQ
-                // segments (the OnDemand path's offsets table only
-                // carries Scalar8Bit params), so we eagerly load the
-                // codes regardless of `loading_mode`.
+                // PqVectorPool. There is no mapped PQ pool, so the codes
+                // load eagerly regardless of `loading_mode`.
                 let codes_size = pq_params.m as usize;
                 // Each PQ record is at least the version-dependent prefix
                 // (doc_id + field reference, Issue #633) + `codes_size`
@@ -843,8 +774,7 @@ impl HnswIndexReader {
                         crate::vector::index::f16_storage::F16PoolBuilder::mapped(
                             dimension,
                             num_vectors,
-                            crate::storage::StorageInput::clone_input(&input)?,
-                            record_stride,
+                            crate::storage::StorageInput::clone_input(&input).ok(),
                         )?
                     }
                 };
@@ -886,8 +816,8 @@ impl HnswIndexReader {
         // backward, but if that ever changes the wrapper degrades gracefully to
         // a dedicated verification pass so the #786 guarantee can never silently
         // weaken. `fold` is only set in Eager mode with a footer present, so
-        // Lazy/OnDemand and footer-less legacy segments skip this block (they
-        // were verified up front or have nothing to verify).
+        // Lazy and footer-less legacy segments skip this block (they were
+        // verified up front or have nothing to verify).
         if fold && let Some(expected) = stored_crc {
             if input.is_sequential() {
                 input.absorb_to(content_len).map_err(LaurusError::Io)?;
@@ -901,12 +831,10 @@ impl HnswIndexReader {
             }
         }
 
-        // Build zero-allocation prefetch lookup. For OwnedQuantized
-        // (Step 6+), the address points to the int8 record start
-        // inside the contiguous AoS buffer; the int8 payload + 8 bytes
-        // of meta will be prefetched per neighbour. For Owned (legacy
-        // f32, kept for symmetry), the address points to the Vec<f32>
-        // data. Empty for OnDemand where CPU cache hints don't apply.
+        // Build zero-allocation prefetch lookup. Only the legacy f32 `Owned`
+        // storage (kept for symmetry) needs a doc_id-keyed address map; the
+        // pool-backed kinds either compute addresses from the pool's base and
+        // stride on the ordinal path or never prefetch.
         //
         // On targets with no software-prefetch intrinsic (e.g. wasm32,
         // Issue #657) this map's only consumer (`HnswSearcher::prefetch_addr`)
@@ -928,7 +856,7 @@ impl HnswIndexReader {
             VectorStorage::OwnedQuantized(_) => {
                 // The ordinal search path (Issue #686) computes int8
                 // prefetch addresses directly from the pool as
-                // `base + pos * pad_dim` — a doc_id-keyed address map
+                // `base + pos * stride` — a doc_id-keyed address map
                 // would only add a hash probe back to the hot loop, so
                 // none is built.
                 HashMap::new()
@@ -950,7 +878,6 @@ impl HnswIndexReader {
             // Like OwnedQuantized, the ordinal path computes Float16
             // prefetch addresses from the pool's base and stride.
             VectorStorage::Float16(_) => HashMap::new(),
-            VectorStorage::OnDemand { .. } => HashMap::new(),
         };
 
         // Per-field doc-id lookup (#405). Built from `vector_ids` so it
@@ -1111,8 +1038,7 @@ impl HnswIndexReader {
     /// without the `String` allocation that a direct `HashMap<(u64, String), _>`
     /// lookup would require.
     ///
-    /// Returns `None` for on-demand (disk-backed) storage where prefetching is
-    /// not applicable.
+    /// Returns `None` for the pool-backed storages, which have no such map.
     ///
     /// # Arguments
     ///
@@ -1130,24 +1056,6 @@ impl HnswIndexReader {
     /// Step 6).
     pub fn vectors(&self) -> &crate::vector::index::storage::VectorStorage {
         &self.vectors
-    }
-
-    /// Iterate the interned `(doc_id, field_name)` records without
-    /// materializing a `String` per record (Issue #672).
-    ///
-    /// The trait-level [`VectorIndexReader::vector_ids`] must rehydrate
-    /// owned `String`s at every call (its signature predates the #633
-    /// interning); callers that already hold a concrete
-    /// `HnswIndexReader` — e.g. the warmup page-fault pass — can borrow
-    /// the dictionary-backed names instead.
-    ///
-    /// # Returns
-    ///
-    /// An iterator over `(doc_id, &field_name)` in record order.
-    pub(crate) fn interned_vector_ids(&self) -> impl Iterator<Item = (u64, &str)> {
-        self.vector_ids
-            .iter()
-            .map(|&(id, fid)| (id, &*self.field_dict[fid as usize]))
     }
 
     /// Borrow the optional Stage 2 rerank storage pool.
@@ -1238,10 +1146,6 @@ impl VectorIndexReader for HnswIndexReader {
             #[cfg(feature = "pq-fastscan")]
             VectorStorage::OwnedPqFastScan(pool) => pool.packed.len() + pool.codebook.len() * 4,
             VectorStorage::Float16(pool) => pool.heap_size(),
-            VectorStorage::OnDemand { offsets, .. } => {
-                // Estimate memory for offsets map + ID list
-                offsets.len() * (8 + 32 + 8) // Key + Valid + Offset roughly
-            }
         };
 
         VectorStats {
@@ -1423,18 +1327,6 @@ impl VectorIndexReader for HnswIndexReader {
                 warnings.push(
                     "Float16 mode: NaN checks skipped (rows are validated at ingest)".to_string(),
                 );
-            }
-            VectorStorage::OnDemand { offsets, .. } => {
-                for &(id, fid) in &self.vector_ids {
-                    let field = &self.field_dict[fid as usize];
-                    if !offsets.contains_key(&(id, fid)) {
-                        errors.push(format!(
-                            "Vector {}:{} in ids but missing in storage",
-                            id, field
-                        ));
-                    }
-                }
-                warnings.push("OnDemand mode: Deep vector validation skipped".to_string());
             }
         }
 
@@ -1932,6 +1824,111 @@ mod ordinal_migration_tests {
             results.results[0].doc_id, 10,
             "nearest neighbour of doc 10's own vector must rank first"
         );
+    }
+
+    /// A mmap-backed (`Lazy`) storage holding one file with `bytes`.
+    fn mmap_storage_with(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> Arc<dyn Storage> {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+        let mut config = crate::storage::file::FileStorageConfig::new(dir.path());
+        config.use_mmap = true;
+        crate::storage::StorageFactory::create(crate::storage::StorageConfig::File(config)).unwrap()
+    }
+
+    /// Load `bytes` as segment `name` both from mmap (`Lazy`) and from
+    /// memory (`Eager`), and assert that the `Lazy` rows are read in place
+    /// and that both readers return bit-identical vectors and searches for
+    /// every field in `fields`.
+    ///
+    /// # Returns
+    ///
+    /// The `Lazy` reader, for further checks.
+    fn load_both_and_compare(name: &str, bytes: Vec<u8>, fields: &[&str]) -> Arc<HnswIndexReader> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = format!("{name}.hnsw");
+        let mut lazy_reader = None;
+        for metric in [DistanceMetric::Cosine, DistanceMetric::Euclidean] {
+            let lazy = Arc::new(
+                HnswIndexReader::load(mmap_storage_with(&dir, &file, &bytes), name, metric)
+                    .unwrap(),
+            );
+            let eager = Arc::new(
+                HnswIndexReader::load(storage_with(&file, bytes.clone()), name, metric).unwrap(),
+            );
+            assert!(lazy.vectors().quantized_pool().unwrap().is_mapped());
+            assert!(!eager.vectors().quantized_pool().unwrap().is_mapped());
+            for &field in fields {
+                for doc_id in [10, 20, 30] {
+                    assert_eq!(
+                        lazy.get_vector(doc_id, field).unwrap().unwrap().data,
+                        eager.get_vector(doc_id, field).unwrap().unwrap().data,
+                        "doc {doc_id} field {field}"
+                    );
+                }
+            }
+            let (lazy_searcher, eager_searcher) = (
+                HnswSearcher::new(lazy.clone()).unwrap(),
+                HnswSearcher::new(eager).unwrap(),
+            );
+            for &field in fields {
+                for query in [
+                    [100.0, 1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0, 90.0],
+                    [3.5, 7.25, 0.5, 2.0],
+                ] {
+                    let request = VectorIndexQuery::new(Vector::new(query.to_vec()))
+                        .top_k(3)
+                        .field_name(field.to_string());
+                    let l = lazy_searcher.search(&request).unwrap().results;
+                    let e = eager_searcher.search(&request).unwrap().results;
+                    assert!(!l.is_empty(), "{metric:?} field {field}");
+                    let key = |r: &crate::vector::search::searcher::VectorIndexQueryResult| {
+                        (r.doc_id, r.distance.to_bits())
+                    };
+                    assert_eq!(
+                        l.iter().map(key).collect::<Vec<_>>(),
+                        e.iter().map(key).collect::<Vec<_>>(),
+                        "{metric:?} field {field} query {query:?}"
+                    );
+                }
+            }
+            lazy_reader = Some(lazy);
+        }
+        lazy_reader.unwrap()
+    }
+
+    /// Issue #1463: a v1 record carries its field name inline, so its rows
+    /// are further apart than the v3 record stride. The mapped pool takes
+    /// the stride from the rows and still keeps one run.
+    #[test]
+    fn v1_inline_names_read_in_place_as_one_run() {
+        let reader = load_both_and_compare("v1_mapped", v1_fixture_bytes(), &["f"]);
+        let pool = reader.vectors().quantized_pool().unwrap();
+        assert_eq!(pool.heap_size(), 4 + 8 + 8, "one run");
+        assert!(pool.prefetch_base_stride().is_some());
+    }
+
+    /// Issue #1463: records sorted by doc id interleave the fields, so with
+    /// names of different lengths the gap between rows alternates and the
+    /// mapped pool splits into several runs. Every row must still resolve,
+    /// through the ordinal tables of a multi-field segment.
+    #[test]
+    fn v1_fields_with_names_of_different_lengths_read_in_place() {
+        let mut bytes = preamble(6);
+        bytes.extend_from_slice(&header_bytes(CURRENT_VERSION));
+        for (doc_id, f, g) in [
+            (10, [100, 1, 1, 1], [1, 1, 1, 90]),
+            (20, [1, 100, 1, 1], [1, 1, 90, 1]),
+            (30, [1, 1, 100, 1], [1, 90, 1, 1]),
+        ] {
+            bytes.extend_from_slice(&sq_record(doc_id, "f", f));
+            bytes.extend_from_slice(&sq_record(doc_id, "ggggg", g));
+        }
+        bytes.extend_from_slice(&v1_graph_block());
+
+        let reader = load_both_and_compare("v1_two_names", bytes, &["f", "ggggg"]);
+        let pool = reader.vectors().quantized_pool().unwrap();
+        assert!(pool.heap_size() > 4 + 8 + 8, "several runs");
+        assert!(reader.field_ord_to_pos("f").is_some());
     }
 
     #[test]

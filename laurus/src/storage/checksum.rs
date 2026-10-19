@@ -126,7 +126,8 @@ impl<R: Read> Read for CrcReader<R> {
 /// (Issue #789).
 ///
 /// Tracking is only meaningful while reads stay sequential: any real seek
-/// (Lazy / OnDemand parsing) clears [`Self::is_sequential`], after which
+/// (the Lazy parse, which skips the vector rows) clears
+/// [`Self::is_sequential`], after which
 /// [`Self::checksum`] must not be trusted. A no-op `Seek(Current(0))` (used by
 /// [`std::io::Seek::stream_position`]) is served from the byte counter and does
 /// **not** break tracking. Pass `track = false` to skip hashing entirely on
@@ -234,8 +235,9 @@ impl StorageInput for ChecksumTrackingInput {
 
     fn clone_input(&self) -> Result<Box<dyn StorageInput>> {
         // Return an unwrapped clone of the inner input: clones are used by the
-        // OnDemand (Lazy) read path, which does not participate in the folded
-        // CRC and must not inherit this wrapper's running-checksum state.
+        // Lazy read path (the mapped row pools), which does not participate in
+        // the folded CRC and must not inherit this wrapper's running-checksum
+        // state.
         self.inner.clone_input()
     }
 
@@ -442,7 +444,7 @@ mod tests {
     #[test]
     fn tracking_input_clone_input_unwraps_inner() {
         // `clone_input` must return a plain inner stream, not another
-        // `ChecksumTrackingInput`: the OnDemand (Lazy) path uses clones and must
+        // `ChecksumTrackingInput`: the Lazy path uses clones and must
         // not inherit this wrapper's running-checksum state (Issue #789).
         let data = b"clone returns a plain unwrapped inner stream".to_vec();
         let mut input = ChecksumTrackingInput::new(Box::new(TestInput::new(data.clone())), true);

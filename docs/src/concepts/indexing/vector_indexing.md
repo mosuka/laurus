@@ -260,6 +260,17 @@ let opt = HnswOption {
   v3 = per-segment field-name dictionary) and, from v3 on, the
   dictionary itself — records then reference field names by a 16-bit
   id instead of repeating the full name inline.
+- Where the rows live depends on the loading mode, and both modes run
+  the same int8 kernels and return the same scores. With the default
+  mmap-backed `FileStorage` (`Lazy`), the int8 rows and their metadata
+  are read in place from the mapped segment file (Issue #1463): they
+  are not copied onto the heap, and a search allocates nothing per
+  candidate. With `Eager` loading (`MemoryStorage`, or `FileStorage`
+  with `LAURUS_NO_MMAP=1`), the rows are copied into memory when the
+  segment is loaded, each padded to a multiple of 32 bytes. On
+  Windows, a mapped segment file that a merge deletes stays on disk
+  until its reader is dropped; leftover files are removed on the next
+  open.
 
 ### Two-stage rerank (Issue #481 Stage 2)
 
@@ -744,17 +755,23 @@ intervals that contain 0. The results are the same with `MemoryStorage`
 (`Eager`) and the mmap-backed `FileStorage` (`Lazy`).
 
 Search cost, instructions per query on Apple Silicon (SciFact, one
-segment, top 10, one rayon thread, median of five rounds):
+segment, top 10, one rayon thread, median of five rounds; IVF with 64
+lists, 8 of them probed):
 
 | Index | `Scalar8Bit` `Eager` | `Scalar8Bit` `Lazy` | `Float16` `Eager` | `Float16` `Lazy` |
 | :--- | :--- | :--- | :--- | :--- |
-| Flat | 7.29 M | 22.46 M | 8.94 M | 9.05 M |
-| HNSW | 0.47 M | 2.88 M | 0.75 M | 0.77 M |
+| Flat | 5.14 M | 5.21 M | 6.69 M | 6.76 M |
+| IVF | 0.83 M | 0.89 M | 1.05 M | 1.11 M |
+| HNSW | 0.47 M | 0.49 M | 0.73 M | 0.75 M |
 
-With rows on the heap the int8 kernels are cheaper. With the default
-mmap-backed storage, `Scalar8Bit` decodes every candidate into a new
-buffer (Issue #1463), so `Float16` takes 60% (Flat) and 73% (HNSW)
-fewer instructions per query. The x86 F16C kernel was not measured.
+Both loading modes run the same kernels on the same rows. Reading the
+rows in place costs 1–7% more instructions than reading them from the
+heap; IVF pays the most, since its rows form one run per list.
+`Scalar8Bit` takes 19% (IVF) to 35% (HNSW) fewer instructions per query
+than `Float16`. Before Issue #1463, `Scalar8Bit` with the default
+mmap-backed storage decoded every candidate into new buffers and took
+three to six times the instructions of `Eager`. The x86 F16C kernel
+was not measured.
 
 ### MultiVector Storage
 

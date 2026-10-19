@@ -242,16 +242,20 @@ impl VectorIndexSearcher for IvfSearcher {
         // Issue #481 Stage 1, Step 7: try the int8 hot path when the
         // reader holds an OwnedQuantized pool. Build per-search
         // QuantizedQuery once before the candidate loop.
+        // The pools' rows are borrowed once, so the storage kind (heap or
+        // mapped, Issue #1463) is resolved before the scan.
         let quant_pool = ivf_reader.and_then(|r| r.vectors().quantized_pool().cloned());
-        let prepared_quantized = quant_pool.as_ref().map(|pool| {
-            crate::vector::core::distance_quantized::QuantizedQuery::prepare(
+        let quant_ctx = quant_pool.as_ref().map(|pool| {
+            let prepared = crate::vector::core::distance_quantized::QuantizedQuery::prepare(
                 &request.query.data,
                 &pool.params,
-            )
+            );
+            (prepared, pool, pool.records())
         });
         // Issue #623: Float16 rows are scored in place against the f32
         // query (`prepared_query` above).
         let f16_pool = ivf_reader.and_then(|r| r.vectors().f16_pool().cloned());
+        let f16_ctx = f16_pool.as_ref().map(|pool| (pool, pool.rows()));
 
         // Filter-aware allow-set honoured inline (Issue #740). Borrowed once
         // before the scan; `&AHashSet` is `Send + Sync`, so it composes with
@@ -261,7 +265,10 @@ impl VectorIndexSearcher for IvfSearcher {
         // Distance scan over the probed clusters, parallelised across
         // candidates above PARALLEL_SCAN_THRESHOLD (#662). The quantized hot
         // path and the f32 fallback both run inside the per-candidate closure.
-        let mut candidates: Vec<(u64, u16, f32, f32, Vector)> =
+        // The pool paths decode a vector only when `include_vectors` asks
+        // for it, so a plain search allocates nothing per candidate (Issue
+        // #1463).
+        let mut candidates: Vec<(u64, u16, f32, f32, Option<Vector>)> =
             crate::vector::search::searcher::parallel_scan(&vector_ids[..], |(doc_id, fid)| {
                 let field_name: &str = &field_dict[*fid as usize];
                 // Skip non-matching candidates before the distance kernel.
@@ -270,44 +277,44 @@ impl VectorIndexSearcher for IvfSearcher {
                 {
                     return Ok(None);
                 }
-                if let (Some(pool), Some(prepared)) = (&quant_pool, &prepared_quantized)
-                    && let Some((int8, meta)) = pool.get_record(*doc_id, field_name)
+                if let Some((prepared, pool, rows)) = &quant_ctx
+                    && let Some(pos) = pool.position(*doc_id, field_name)
                     && !ivf_reader.is_some_and(|r| r.is_deleted(*doc_id))
                 {
+                    let (int8, meta) = rows.record_at(pos);
                     let distance = crate::vector::core::distance_quantized::distance_quantized(
                         metric, prepared, int8, meta,
                     );
                     let similarity = metric.distance_to_similarity(distance);
-                    let vector = if request.params.include_vectors {
-                        pool.dequantize_to_vector(*doc_id, field_name)
-                            .unwrap_or_else(|| Vector::new(Vec::new()))
-                    } else {
-                        Vector::new(Vec::new())
-                    };
+                    let vector = request
+                        .params
+                        .include_vectors
+                        .then(|| pool.dequantize_to_vector(*doc_id, field_name))
+                        .flatten();
                     return Ok(Some((*doc_id, *fid, similarity, distance, vector)));
                 }
-                if let Some(pool) = &f16_pool
-                    && let Some(row) = pool.get_row(*doc_id, field_name)
+                if let Some((pool, rows)) = &f16_ctx
+                    && let Some(pos) = pool.position(*doc_id, field_name)
                     && !ivf_reader.is_some_and(|r| r.is_deleted(*doc_id))
                 {
+                    let row = rows.row_at(pos);
                     let distance = crate::vector::core::distance_f16::distance_f16(
                         metric,
                         &prepared_query,
                         row,
                     );
                     let similarity = metric.distance_to_similarity(distance);
-                    let vector = if request.params.include_vectors {
-                        pool.decode_to_vector(*doc_id, field_name)
-                            .unwrap_or_else(|| Vector::new(Vec::new()))
-                    } else {
-                        Vector::new(Vec::new())
-                    };
+                    let vector = request
+                        .params
+                        .include_vectors
+                        .then(|| pool.decode_to_vector(*doc_id, field_name))
+                        .flatten();
                     return Ok(Some((*doc_id, *fid, similarity, distance, vector)));
                 }
                 if let Ok(Some(vector)) = self.index_reader.get_vector(*doc_id, field_name) {
                     let distance = metric.distance_with_prepared(&prepared_query, &vector.data)?;
                     let similarity = metric.distance_to_similarity(distance);
-                    return Ok(Some((*doc_id, *fid, similarity, distance, vector)));
+                    return Ok(Some((*doc_id, *fid, similarity, distance, Some(vector))));
                 }
                 Ok(None)
             })?;
@@ -366,7 +373,7 @@ impl VectorIndexSearcher for IvfSearcher {
                             fid,
                             metric.distance_to_similarity(distance),
                             distance,
-                            Vector::new(Vec::new()),
+                            None,
                         )
                     })
                     .collect();
@@ -386,11 +393,11 @@ impl VectorIndexSearcher for IvfSearcher {
 
             let vector_output = if request.params.include_vectors {
                 if rerank_applied {
-                    // The rescored tuple carries a placeholder; fetch the
-                    // real vector only for the final results.
+                    // The rescored tuple carries no vector; fetch the real
+                    // vector only for the final results.
                     self.index_reader.get_vector(doc_id, &field_name)?
                 } else {
-                    Some(vector)
+                    vector
                 }
             } else {
                 None

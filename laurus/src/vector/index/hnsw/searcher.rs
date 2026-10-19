@@ -11,7 +11,7 @@ use crate::vector::core::distance_quantized::{
     PqQuery, QuantizedQuery, distance_pq_adc, distance_quantized,
 };
 use crate::vector::core::vector::Vector;
-use crate::vector::index::f16_storage::F16VectorPool;
+use crate::vector::index::f16_storage::{F16HeapRows, F16MappedRows, F16Rows, F16VectorPool};
 use crate::vector::index::hnsw::graph::OrdinalHnswGraph;
 use crate::vector::index::hnsw::reader::HnswIndexReader;
 #[cfg(feature = "pq-fastscan")]
@@ -19,7 +19,9 @@ use crate::vector::index::pq_fastscan_avx2::distance_pq_fastscan_block;
 #[cfg(feature = "pq-fastscan")]
 use crate::vector::index::pq_fastscan_storage::{BLOCK_SIZE, PqFastScanPool};
 use crate::vector::index::pq_storage::PqVectorPool;
-use crate::vector::index::quantized_storage::QuantizedVectorPool;
+use crate::vector::index::quantized_storage::{
+    HeapRecords, MappedRecords, QuantizedVectorPool, Records,
+};
 use crate::vector::reader::VectorIndexReader;
 use crate::vector::search::searcher::VectorIndexSearcher;
 use crate::vector::search::searcher::{
@@ -43,29 +45,45 @@ const MAX_VISIT_FACTOR: usize = 16;
 /// Per-search state for the quantized hot path (Issue #481 Stage 1 +
 /// Stage 3).
 ///
-/// Built once at the start of `search_graph` when the reader exposes
-/// either a [`QuantizedVectorPool`] (Stage 1, int8) or a
-/// [`PqVectorPool`] (Stage 3, PQ codes + codebook). Threaded through
-/// `calc_dist` so each per-candidate call is one O(1)
+/// Built once at the start of `search_graph` when the reader exposes a
+/// pool: a [`QuantizedVectorPool`] (Stage 1, int8), a [`PqVectorPool`]
+/// (Stage 3, PQ codes + codebook) or an [`F16VectorPool`] (#623).
+/// Threaded through `calc_dist` so each per-candidate call is one O(1)
 /// `field_idx.get` plus a quantized distance kernel call — no per-call
 /// allocation, no `String` clone.
-enum QuantizedSearchCtx {
-    /// Stage 1: int8 hot path.
-    Scalar8Bit {
+///
+/// The int8 and Float16 rows are borrowed from the reader's pool for the
+/// search (`'a`), and whether they sit on the heap or in the mapped file
+/// is resolved here, once, as separate variants (Issue #1463): a
+/// candidate lookup then takes no second branch on the storage kind, and
+/// the mapped variants hold the file slice instead of fetching it per
+/// candidate.
+enum QuantizedSearchCtx<'a> {
+    /// Stage 1: int8 rows on the heap (`Eager` loading).
+    Scalar8BitHeap {
         /// Quantized query (int8 + cached norm + offset/scale),
         /// prepared once per search via [`QuantizedQuery::prepare`].
         prepared: QuantizedQuery,
-        /// The reader's in-memory int8 storage. Cloned `Arc` so the
-        /// pool stays alive even if the reader is dropped mid-search
-        /// (it isn't, but the borrow checker needs the lifetime
-        /// extension).
-        pool: Arc<QuantizedVectorPool>,
-        /// Per-field doc_id -> vector position in `pool.data`. Cached
+        /// The pool's padded rows and meta arrays.
+        rows: HeapRecords<'a>,
+        /// Per-field doc_id -> vector position in the pool. Cached
         /// so the hot loop is a HashMap probe, not a per-field-name
         /// indirection.
         field_idx: Arc<HashMap<u64, u32>>,
         /// Distance metric, cached so the hot loop skips the
         /// `reader.distance_metric()` indirection.
+        metric: DistanceMetric,
+    },
+    /// Stage 1: int8 rows read in place from the mapped segment (`Lazy`
+    /// loading, Issue #1463).
+    Scalar8BitMapped {
+        /// See [`Self::Scalar8BitHeap`].
+        prepared: QuantizedQuery,
+        /// The pool's stored records in the mapped file.
+        rows: MappedRecords<'a>,
+        /// See [`Self::Scalar8BitHeap`].
+        field_idx: Arc<HashMap<u64, u32>>,
+        /// See [`Self::Scalar8BitHeap`].
         metric: DistanceMetric,
     },
     /// Stage 3: PQ ADC hot path.
@@ -105,23 +123,86 @@ enum QuantizedSearchCtx {
         metric: DistanceMetric,
     },
     /// Float16 hot path (Issue #623): the f32 query against the stored
-    /// binary16 rows, read in place by
+    /// binary16 rows on the heap (`Eager` loading), read in place by
     /// [`crate::vector::core::distance_f16::distance_f16`].
-    Float16 {
+    Float16Heap {
         /// The query values (shared with the request, not copied).
         query: Arc<Vec<f32>>,
         /// `‖query‖²` for Cosine / Angular, `0.0` otherwise.
         norm_sq: f32,
-        /// The reader's Float16 pool (heap or mapped rows).
-        pool: Arc<F16VectorPool>,
+        /// The pool's rows.
+        rows: F16HeapRows<'a>,
         /// Per-field doc_id -> row position.
         field_idx: Arc<HashMap<u64, u32>>,
         /// Distance metric, cached for the hot loop.
         metric: DistanceMetric,
     },
+    /// Float16 rows read in place from the mapped segment (`Lazy`
+    /// loading).
+    Float16Mapped {
+        /// See [`Self::Float16Heap`].
+        query: Arc<Vec<f32>>,
+        /// See [`Self::Float16Heap`].
+        norm_sq: f32,
+        /// The pool's rows in the mapped file.
+        rows: F16MappedRows<'a>,
+        /// See [`Self::Float16Heap`].
+        field_idx: Arc<HashMap<u64, u32>>,
+        /// See [`Self::Float16Heap`].
+        metric: DistanceMetric,
+    },
 }
 
-impl QuantizedSearchCtx {
+impl<'a> QuantizedSearchCtx<'a> {
+    /// The int8 context for `pool`, with the storage kind resolved.
+    fn scalar_8bit(
+        pool: &'a QuantizedVectorPool,
+        prepared: QuantizedQuery,
+        field_idx: Arc<HashMap<u64, u32>>,
+        metric: DistanceMetric,
+    ) -> Self {
+        match pool.records() {
+            Records::Heap(rows) => Self::Scalar8BitHeap {
+                prepared,
+                rows,
+                field_idx,
+                metric,
+            },
+            Records::Mapped(rows) => Self::Scalar8BitMapped {
+                prepared,
+                rows,
+                field_idx,
+                metric,
+            },
+        }
+    }
+
+    /// The Float16 context for `pool`, with the storage kind resolved.
+    fn float16(
+        pool: &'a F16VectorPool,
+        query: Arc<Vec<f32>>,
+        norm_sq: f32,
+        field_idx: Arc<HashMap<u64, u32>>,
+        metric: DistanceMetric,
+    ) -> Self {
+        match pool.rows() {
+            F16Rows::Heap(rows) => Self::Float16Heap {
+                query,
+                norm_sq,
+                rows,
+                field_idx,
+                metric,
+            },
+            F16Rows::Mapped(rows) => Self::Float16Mapped {
+                query,
+                norm_sq,
+                rows,
+                field_idx,
+                metric,
+            },
+        }
+    }
+
     /// Compute distance from the prepared query to the candidate at
     /// pool position `pos` (Issue #686 ordinal hot path — no hash
     /// probe; the caller has already translated ordinal → position).
@@ -137,13 +218,22 @@ impl QuantizedSearchCtx {
     #[inline]
     fn distance_at(&self, pos: u32) -> f32 {
         match self {
-            Self::Scalar8Bit {
+            Self::Scalar8BitHeap {
                 prepared,
-                pool,
+                rows,
                 metric,
                 ..
             } => {
-                let (int8, meta) = pool.record_at(pos);
+                let (int8, meta) = rows.record_at(pos);
+                distance_quantized(*metric, prepared, int8, meta)
+            }
+            Self::Scalar8BitMapped {
+                prepared,
+                rows,
+                metric,
+                ..
+            } => {
+                let (int8, meta) = rows.record_at(pos);
                 distance_quantized(*metric, prepared, int8, meta)
             }
             Self::Pq {
@@ -171,10 +261,10 @@ impl QuantizedSearchCtx {
                 let distances = distance_pq_fastscan_block(*metric, prepared, packed_block);
                 distances[in_block]
             }
-            Self::Float16 {
+            Self::Float16Heap {
                 query,
                 norm_sq,
-                pool,
+                rows,
                 metric,
                 ..
             } => {
@@ -182,7 +272,20 @@ impl QuantizedSearchCtx {
                     data: query.as_slice(),
                     norm_sq: *norm_sq,
                 };
-                distance_f16(*metric, &prepared, pool.row_at(pos))
+                distance_f16(*metric, &prepared, rows.row_at(pos))
+            }
+            Self::Float16Mapped {
+                query,
+                norm_sq,
+                rows,
+                metric,
+                ..
+            } => {
+                let prepared = PreparedQuery {
+                    data: query.as_slice(),
+                    norm_sq: *norm_sq,
+                };
+                distance_f16(*metric, &prepared, rows.row_at(pos))
             }
         }
     }
@@ -225,11 +328,13 @@ impl QuantizedSearchCtx {
     #[inline]
     fn distance_doc(&self, doc_id: u64) -> f32 {
         let field_idx = match self {
-            Self::Scalar8Bit { field_idx, .. } => field_idx,
-            Self::Pq { field_idx, .. } => field_idx,
+            Self::Scalar8BitHeap { field_idx, .. }
+            | Self::Scalar8BitMapped { field_idx, .. }
+            | Self::Pq { field_idx, .. }
+            | Self::Float16Heap { field_idx, .. }
+            | Self::Float16Mapped { field_idx, .. } => field_idx,
             #[cfg(feature = "pq-fastscan")]
             Self::PqFastScan { field_idx, .. } => field_idx,
-            Self::Float16 { field_idx, .. } => field_idx,
         };
         match field_idx.get(&doc_id) {
             Some(&pos) => self.distance_at(pos),
@@ -244,8 +349,8 @@ impl QuantizedSearchCtx {
     /// (the LUT is the important cache occupant) and FastScan streams
     /// whole blocks sequentially, so both return `None` — matching the
     /// pre-#686 behaviour where their prefetch maps were never built. A
-    /// Float16 pool whose mapped rows span several runs has no single
-    /// stride and also returns `None`.
+    /// pool whose mapped rows span several runs has no single stride and
+    /// also returns `None`.
     ///
     /// # Returns
     ///
@@ -253,8 +358,10 @@ impl QuantizedSearchCtx {
     /// else `None`.
     fn prefetch_base_stride(&self) -> Option<(usize, usize)> {
         match self {
-            Self::Scalar8Bit { pool, .. } => Some((pool.int8_data.as_ptr() as usize, pool.pad_dim)),
-            Self::Float16 { pool, .. } => pool.prefetch_base_stride(),
+            Self::Scalar8BitHeap { rows, .. } => Some(rows.base_stride()),
+            Self::Scalar8BitMapped { rows, .. } => rows.base_stride(),
+            Self::Float16Heap { rows, .. } => Some(rows.base_stride()),
+            Self::Float16Mapped { rows, .. } => rows.base_stride(),
             Self::Pq { .. } => None,
             #[cfg(feature = "pq-fastscan")]
             Self::PqFastScan { .. } => None,
@@ -499,49 +606,28 @@ impl VectorIndexSearcher for HnswSearcher {
 
     /// Pre-fault the on-disk vector data into the OS page cache (Issue #677).
     ///
-    /// Only the [`OnDemand`](crate::vector::index::storage::VectorStorage::OnDemand)
-    /// (`Mmap` / lazy) storage benefits: without warming, the first query pays
-    /// a page fault for every candidate vector it reads. Touching each stored
-    /// vector once moves that cost to startup. The `Owned*` variants are
-    /// already heap-resident after the reader load that
-    /// [`VectorStore::warmup`](crate::vector::VectorStore::warmup) forces, so
-    /// this is a no-op for them. The HNSW graph is always loaded into memory
-    /// eagerly, so only the vector data needs warming.
-    ///
-    /// Individual read failures are skipped rather than aborting startup —
-    /// warming is a best-effort optimisation, and a genuinely unreadable vector
-    /// would surface on the real query regardless.
+    /// Only pools that read their rows in place from the mapped file (`Lazy`
+    /// loading: `Scalar8Bit` since Issue #1463, `Float16` since Issue #623)
+    /// benefit: without warming, the first query pays a page fault for every
+    /// candidate row it reads. Touching one byte per page of every row moves
+    /// that cost to startup. Heap pools are already resident after the
+    /// reader load that [`VectorStore::warmup`](crate::vector::VectorStore::warmup)
+    /// forces, so this is a no-op for them. The HNSW graph is always loaded
+    /// into memory eagerly, so only the vector data needs warming.
     fn warmup(&mut self) -> Result<()> {
         let Some(reader) = self.index_reader.as_any().downcast_ref::<HnswIndexReader>() else {
             return Ok(());
         };
-        // Float16 rows read in place from the mapped file (Issue #623):
-        // touch one byte per page of every row.
-        if let Some(pool) = reader.vectors().f16_pool() {
-            if pool.is_mapped() {
-                std::hint::black_box(crate::vector::index::f16_storage::touch_rows(pool));
-            }
-            return Ok(());
-        }
-        if !matches!(
-            reader.vectors(),
-            crate::vector::index::storage::VectorStorage::OnDemand { .. }
-        ) {
-            return Ok(());
-        }
-        // Read every stored vector so its backing page is faulted in. The
-        // accumulator (kept live via `black_box`) stops the loop from being
-        // optimised away as dead code. The interned iterator (#672) avoids
-        // materializing one `String` per record just to name the field.
-        let mut acc = 0u64;
-        for (doc_id, field) in reader.interned_vector_ids() {
-            if let Ok(Some(vector)) = reader.get_vector(doc_id, field)
-                && let Some(first) = vector.data.first()
-            {
-                acc = acc.wrapping_add(first.to_bits() as u64);
-            }
-        }
-        std::hint::black_box(acc);
+        let vectors = reader.vectors();
+        let touched = if let Some(pool) = vectors.quantized_pool() {
+            pool.touch_mapped_rows()
+        } else if let Some(pool) = vectors.f16_pool() {
+            pool.touch_mapped_rows()
+        } else {
+            None
+        };
+        // Kept live so the page-touching loop is not optimised away.
+        std::hint::black_box(touched);
         Ok(())
     }
 }
@@ -616,67 +702,58 @@ impl HnswSearcher {
 
         // Prepare the quantized hot path according to the segment's
         // storage kind:
-        // * Stage 1 (`OwnedQuantized`): int8 SIMD via
+        // * Stage 1 (`OwnedQuantized`, heap or mapped rows): int8 SIMD via
         //   [`distance_quantized`].
         // * Stage 3 (`OwnedPq`, Issue #481 PQ): ADC LUT via
         //   [`distance_pq_adc`].
-        // Other storage kinds (`OnDemand`, `Owned`) fall through to
-        // the f32 reference path in `calc_dist`.
+        // * `Float16` (Issue #623): [`distance_f16`] over the stored rows.
+        // The legacy `Owned` storage falls through to the f32 reference
+        // path in `calc_dist`.
         let metric = reader.distance_metric();
-        let quant_ctx: Option<QuantizedSearchCtx> =
-            if let Some(pool) = reader.vectors().quantized_pool() {
-                pool.field_position_index(field_name).map(|field_idx| {
-                    let prepared = QuantizedQuery::prepare(&query.data, &pool.params);
-                    QuantizedSearchCtx::Scalar8Bit {
-                        prepared,
-                        pool: pool.clone(),
-                        field_idx,
-                        metric,
-                    }
-                })
-            } else if let Some(pool) = reader.vectors().pq_pool() {
-                pool.field_position_index(field_name).map(|field_idx| {
-                    let prepared = PqQuery::prepare(&query.data, pool.params, &pool.codebook);
-                    QuantizedSearchCtx::Pq {
-                        prepared,
-                        pool: pool.clone(),
-                        field_idx,
-                        metric,
-                    }
-                })
-            } else if let Some(pool) = reader.vectors().f16_pool() {
-                pool.field_position_index(field_name).map(|field_idx| {
-                    let norm_sq = metric.prepare_query(&query.data).norm_sq;
-                    QuantizedSearchCtx::Float16 {
-                        query: query.data.clone(),
-                        norm_sq,
-                        pool: pool.clone(),
-                        field_idx,
-                        metric,
-                    }
-                })
-            } else {
-                #[cfg(feature = "pq-fastscan")]
-                {
-                    if let Some(pool) = reader.vectors().pq_fastscan_pool() {
-                        let field_idx = pool.field_position_index(field_name);
-                        let prepared =
-                            PqFastScanQuery::prepare(&query.data, pool.params, &pool.codebook)?;
-                        field_idx.map(|field_idx| QuantizedSearchCtx::PqFastScan {
-                            prepared,
-                            pool: pool.clone(),
-                            field_idx,
-                            metric,
-                        })
-                    } else {
-                        None
-                    }
+        let quant_ctx: Option<QuantizedSearchCtx> = if let Some(pool) =
+            reader.vectors().quantized_pool()
+        {
+            pool.field_position_index(field_name).map(|field_idx| {
+                let prepared = QuantizedQuery::prepare(&query.data, &pool.params);
+                QuantizedSearchCtx::scalar_8bit(pool, prepared, field_idx, metric)
+            })
+        } else if let Some(pool) = reader.vectors().pq_pool() {
+            pool.field_position_index(field_name).map(|field_idx| {
+                let prepared = PqQuery::prepare(&query.data, pool.params, &pool.codebook);
+                QuantizedSearchCtx::Pq {
+                    prepared,
+                    pool: pool.clone(),
+                    field_idx,
+                    metric,
                 }
-                #[cfg(not(feature = "pq-fastscan"))]
-                {
+            })
+        } else if let Some(pool) = reader.vectors().f16_pool() {
+            pool.field_position_index(field_name).map(|field_idx| {
+                let norm_sq = metric.prepare_query(&query.data).norm_sq;
+                QuantizedSearchCtx::float16(pool, query.data.clone(), norm_sq, field_idx, metric)
+            })
+        } else {
+            #[cfg(feature = "pq-fastscan")]
+            {
+                if let Some(pool) = reader.vectors().pq_fastscan_pool() {
+                    let field_idx = pool.field_position_index(field_name);
+                    let prepared =
+                        PqFastScanQuery::prepare(&query.data, pool.params, &pool.codebook)?;
+                    field_idx.map(|field_idx| QuantizedSearchCtx::PqFastScan {
+                        prepared,
+                        pool: pool.clone(),
+                        field_idx,
+                        metric,
+                    })
+                } else {
                     None
                 }
-            };
+            }
+            #[cfg(not(feature = "pq-fastscan"))]
+            {
+                None
+            }
+        };
 
         // f32 reference path (no quantized context): cache the query norm once
         // so `calc_dist` uses `distance_with_prepared` (candidate-norm-only
@@ -706,9 +783,9 @@ impl HnswSearcher {
             None
         };
         let prefetch_n_bytes = match &sq_prefetch {
-            // The padded int8 record (its meta lives in separate SoA
-            // arrays) or the Float16 record, so the stride alone is what
-            // the loop streams.
+            // The padded int8 row of a heap pool (its meta lives in
+            // separate SoA arrays), or the record of a mapped / Float16
+            // pool, so the stride alone is what the loop streams.
             Some((_, stride)) => *stride,
             None => reader.dimension() * std::mem::size_of::<f32>(),
         };
@@ -717,8 +794,8 @@ impl HnswSearcher {
         // plain stack closure so both traversal branches share one body
         // without perturbing their codegen (#645 discipline).
         // Whether any prefetch source exists at all. Hoisted so the
-        // no-prefetch storages (OnDemand / PQ / FastScan) skip the
-        // pass-1 loops entirely, exactly like the pre-#686 structure
+        // no-prefetch storages (PQ / FastScan / multi-run mapped pools)
+        // skip the pass-1 loops entirely, exactly like the pre-#686 structure
         // (`if let Some(idx) = field_prefetch` around the loop).
         let prefetch_enabled = sq_prefetch.is_some() || field_prefetch.is_some();
         let prefetch_ord = |ord: u32| {
@@ -729,10 +806,11 @@ impl HnswSearcher {
                 };
                 if pos != u32::MAX {
                     // SAFETY (address computation only): `base` was taken
-                    // from the SQ pool's `int8_data`, which the ctx's Arc
-                    // keeps alive for this search; `pos` is a validated
-                    // pool position, so the address stays in-bounds.
-                    // Prefetch is a pure hint and never dereferences.
+                    // from the pool's row buffer or mapped file, which the
+                    // ctx's Arc keeps alive for this search; `pos` is a
+                    // validated pool position, so the address stays
+                    // in-bounds. Prefetch is a pure hint and never
+                    // dereferences.
                     Self::prefetch_addr(base + pos as usize * stride, prefetch_n_bytes);
                 }
             } else if let Some(idx) = field_prefetch {
@@ -1333,7 +1411,7 @@ impl HnswSearcher {
         &self,
         reader: &HnswIndexReader,
         query: &Vector,
-        quant_ctx: Option<&QuantizedSearchCtx>,
+        quant_ctx: Option<&QuantizedSearchCtx<'_>>,
         prepared: Option<&PreparedQuery<'_>>,
         ord_to_pos: Option<&[u32]>,
         graph: &OrdinalHnswGraph,
@@ -1357,15 +1435,14 @@ impl HnswSearcher {
         &self,
         reader: &HnswIndexReader,
         query: &Vector,
-        quant_ctx: Option<&QuantizedSearchCtx>,
+        quant_ctx: Option<&QuantizedSearchCtx<'_>>,
         prepared: Option<&PreparedQuery<'_>>,
         doc_id: u64,
         field_name: &str,
     ) -> Result<f32> {
-        // Issue #481 Stage 1, Step 6: prefer the int8 hot path when
-        // the reader exposes a QuantizedVectorPool. The fallback
-        // remains f32 for backward compatibility (OnDemand mode and
-        // legacy f32 Owned).
+        // Issue #481 Stage 1, Step 6: prefer the quantized hot path when
+        // the reader exposes a pool. The f32 fallback serves the legacy
+        // `Owned` storage and a field the segment's pool does not hold.
         if let Some(ctx) = quant_ctx {
             return Ok(ctx.distance_doc(doc_id));
         }

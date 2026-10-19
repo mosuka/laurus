@@ -152,6 +152,12 @@ impl QuantizedQuery {
 /// carries the per-vector `sum_q` (cosine cross-term) and `norm_q`
 /// (cosine denominator).
 ///
+/// `cand` is either the zero-padded row of a heap pool (`pad_dim` bytes,
+/// so the kernels run whole 32-byte blocks) or the unpadded row of a
+/// mapped pool (`dim` bytes, Issue #1463). The query is scored over the
+/// same number of bytes; its padding is zero, so both lengths give the
+/// same integer sums and the same distance.
+///
 /// # Returns
 ///
 /// Distance in the metric's natural scale, matching the convention of
@@ -161,20 +167,28 @@ impl QuantizedQuery {
 ///
 /// # Panics
 ///
-/// In debug mode, panics if `cand.len() != query.pad_dim`. The candidate
-/// is the zero-padded int8 slice from the pool (length `pad_dim`), and
-/// the query is padded to the same length, so the kernels see matching
-/// multiple-of-32 operands. The caller guarantees this in release mode.
+/// If `cand` is longer than `query.pad_dim`; in debug builds, also if
+/// `cand.len()` is neither `query.dim` nor `query.pad_dim`.
 pub fn distance_quantized(
     metric: DistanceMetric,
     query: &QuantizedQuery,
     cand: &[u8],
     cand_meta: QuantizedVectorMeta,
 ) -> f32 {
-    debug_assert_eq!(cand.len(), query.pad_dim);
+    debug_assert!(
+        cand.len() == query.pad_dim || cand.len() == query.dim,
+        "candidate row of {} bytes for a {}-dimensional query",
+        cand.len(),
+        query.dim
+    );
+    // Slicing the query to the row's length is what makes the kernel calls
+    // below sound: both operands then have `cand.len()` bytes.
+    let q = &query.q_data[..cand.len()];
     match metric {
         DistanceMetric::Cosine => {
-            let approx_dot = approx_dot_product(query, cand, cand_meta.sum_q);
+            // SAFETY: `q.len() == cand.len()` (sliced above).
+            let dot_q = unsafe { dot_same_len(q, cand) };
+            let approx_dot = approx_dot_product(query, dot_q, cand_meta.sum_q);
             let denom = cand_meta.norm_q * query.norm_query;
             if denom == 0.0 {
                 1.0
@@ -184,7 +198,9 @@ pub fn distance_quantized(
             }
         }
         DistanceMetric::Angular => {
-            let approx_dot = approx_dot_product(query, cand, cand_meta.sum_q);
+            // SAFETY: `q.len() == cand.len()` (sliced above).
+            let dot_q = unsafe { dot_same_len(q, cand) };
+            let approx_dot = approx_dot_product(query, dot_q, cand_meta.sum_q);
             let denom = cand_meta.norm_q * query.norm_query;
             if denom == 0.0 {
                 std::f32::consts::PI
@@ -196,27 +212,33 @@ pub fn distance_quantized(
         DistanceMetric::Euclidean => {
             // (a - b)² with affine offset cancellation: the offset term
             // disappears, leaving scale² as the per-pair multiplier.
-            let sq_diff = sq_diff_u8_to_i32(&query.q_data, cand);
+            // SAFETY: `q.len() == cand.len()` (sliced above).
+            let sq_diff = unsafe { sq_diff_same_len(q, cand) };
             (query.scale * query.scale * sq_diff as f32).sqrt()
         }
         DistanceMetric::Manhattan => {
             // |a - b| with the same offset cancellation; the per-pair
             // multiplier is just scale (no square).
-            let abs_diff = abs_diff_u8_to_i32(&query.q_data, cand);
+            // SAFETY: `q.len() == cand.len()` (sliced above).
+            let abs_diff = unsafe { abs_diff_same_len(q, cand) };
             query.scale * abs_diff as f32
         }
-        DistanceMetric::DotProduct => -approx_dot_product(query, cand, cand_meta.sum_q),
+        DistanceMetric::DotProduct => {
+            // SAFETY: `q.len() == cand.len()` (sliced above).
+            let dot_q = unsafe { dot_same_len(q, cand) };
+            -approx_dot_product(query, dot_q, cand_meta.sum_q)
+        }
     }
 }
 
 /// Reconstruct an approximate f32 dot product from quantized data.
 ///
 /// Implements `a·b ≈ N·offset² + scale·offset·(sum_q_a + sum_q_b)
-/// + scale²·Σ(aq · bq)`. Only the last term is per-pair; the other
-/// three collapse into a constant once `cand_sum_q` is loaded.
+/// + scale²·Σ(aq · bq)`. Only the last term is per-pair (`dot_q`, the
+/// int8 dot product); the other three collapse into a constant once
+/// `cand_sum_q` is loaded.
 #[inline]
-fn approx_dot_product(query: &QuantizedQuery, cand: &[u8], cand_sum_q: u32) -> f32 {
-    let dot_q = dot_u8_to_i32(&query.q_data, cand);
+fn approx_dot_product(query: &QuantizedQuery, dot_q: i32, cand_sum_q: u32) -> f32 {
     let n = query.dim as f32;
     let off = query.offset;
     let scale = query.scale;
@@ -237,8 +259,27 @@ fn approx_dot_product(query: &QuantizedQuery, cand: &[u8], cand_sum_q: u32) -> f
 /// `u8 * u8 ≤ 65025` fits in i32. Accumulating up to `i32::MAX / 65025
 /// ≈ 33,000` per-pair products fits without overflow, comfortably
 /// covering all realistic vector dimensions.
+///
+/// # Panics
+///
+/// If `a.len() != b.len()`. The SIMD kernels read both inputs up to
+/// `a.len()`, so the check also runs in release builds.
 #[inline]
 pub fn dot_u8_to_i32(a: &[u8], b: &[u8]) -> i32 {
+    assert_eq!(a.len(), b.len(), "int8 kernel inputs differ in length");
+    // SAFETY: the lengths were checked above.
+    unsafe { dot_same_len(a, b) }
+}
+
+/// [`dot_u8_to_i32`] without the length check, for callers that sliced
+/// both inputs to the same length themselves ([`distance_quantized`]).
+///
+/// # Safety
+///
+/// `a.len() == b.len()`: the SIMD kernels read both inputs up to
+/// `a.len()`.
+#[inline]
+unsafe fn dot_same_len(a: &[u8], b: &[u8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if crate::vector::core::sq_int8_avx2::is_avx2_supported() {
@@ -307,8 +348,24 @@ pub fn dot_u8_to_i32_scalar(a: &[u8], b: &[u8]) -> i32 {
 /// exactly like [`dot_u8_to_i32`]. Per-pair squared diff is at most
 /// `255² = 65025`, identical to the dot-product kernel's per-pair
 /// bound, so the same overflow analysis applies.
+///
+/// # Panics
+///
+/// If `a.len() != b.len()`, like [`dot_u8_to_i32`].
 #[inline]
 pub fn sq_diff_u8_to_i32(a: &[u8], b: &[u8]) -> i32 {
+    assert_eq!(a.len(), b.len(), "int8 kernel inputs differ in length");
+    // SAFETY: the lengths were checked above.
+    unsafe { sq_diff_same_len(a, b) }
+}
+
+/// [`sq_diff_u8_to_i32`] without the length check (see [`dot_same_len`]).
+///
+/// # Safety
+///
+/// `a.len() == b.len()`.
+#[inline]
+unsafe fn sq_diff_same_len(a: &[u8], b: &[u8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if crate::vector::core::sq_int8_avx2::is_avx2_supported() {
@@ -371,8 +428,24 @@ pub fn sq_diff_u8_to_i32_scalar(a: &[u8], b: &[u8]) -> i32 {
 /// Dispatches at runtime to AVX2 / NEON / [`abs_diff_u8_to_i32_scalar`]
 /// exactly like [`dot_u8_to_i32`]. Per-pair magnitude is at most
 /// `255`, so accumulation safety is the same as the other kernels.
+///
+/// # Panics
+///
+/// If `a.len() != b.len()`, like [`dot_u8_to_i32`].
 #[inline]
 pub fn abs_diff_u8_to_i32(a: &[u8], b: &[u8]) -> i32 {
+    assert_eq!(a.len(), b.len(), "int8 kernel inputs differ in length");
+    // SAFETY: the lengths were checked above.
+    unsafe { abs_diff_same_len(a, b) }
+}
+
+/// [`abs_diff_u8_to_i32`] without the length check (see [`dot_same_len`]).
+///
+/// # Safety
+///
+/// `a.len() == b.len()`.
+#[inline]
+unsafe fn abs_diff_same_len(a: &[u8], b: &[u8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if crate::vector::core::sq_int8_avx2::is_avx2_supported() {
@@ -921,6 +994,63 @@ mod tests {
         // so summing the whole padded buffer yields the same value.
         let expected_sum: u32 = prepared.q_data.iter().map(|&x| x as u32).sum();
         assert_eq!(prepared.sum_q, expected_sum);
+    }
+
+    /// Issue #1463: a mapped pool hands the kernel the stored row as is
+    /// (`dim` bytes), a heap pool the zero-padded row (`pad_dim` bytes).
+    /// Both must give bit-identical distances for every metric, including
+    /// dimensions where the SIMD kernels run a tail.
+    #[test]
+    fn unpadded_rows_score_exactly_like_padded_rows() {
+        let metrics = [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::Manhattan,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Angular,
+        ];
+        for &dim in &[1usize, 31, 32, 33, 100, 384] {
+            let a = pseudo_random_f32(61 + dim as u32, dim, -1.0, 1.0);
+            let b = pseudo_random_f32(62 + dim as u32, dim, -0.7, 1.3);
+            let params =
+                ScalarQuantParams::train(&[Vector::new(a.clone()), Vector::new(b.clone())])
+                    .unwrap();
+            let row = params.quantize_slice(&a);
+            let meta = QuantizedVectorMeta::from_quantized(&row, &params);
+            let mut padded = row.clone();
+            padded.resize(padded_dim(dim), 0);
+            let prepared = QuantizedQuery::prepare(&b, &params);
+            for metric in metrics {
+                let unpadded_d = distance_quantized(metric, &prepared, &row, meta);
+                let padded_d = distance_quantized(metric, &prepared, &padded, meta);
+                assert_eq!(
+                    unpadded_d.to_bits(),
+                    padded_d.to_bits(),
+                    "dim {dim} {metric:?}: {unpadded_d} vs {padded_d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "candidate row of 31 bytes")]
+    fn distance_quantized_rejects_a_row_of_another_length() {
+        let params = ScalarQuantParams {
+            offset: 0.0,
+            scale: 1.0,
+        };
+        let prepared = QuantizedQuery::prepare(&[0.5; 30], &params);
+        let meta = QuantizedVectorMeta {
+            sum_q: 0,
+            norm_q: 0.0,
+        };
+        distance_quantized(DistanceMetric::Euclidean, &prepared, &[0; 31], meta);
+    }
+
+    #[test]
+    #[should_panic(expected = "differ in length")]
+    fn int8_kernels_reject_inputs_of_different_lengths() {
+        dot_u8_to_i32(&[1; 64], &[1; 33]);
     }
 
     // ------------------------------------------------------------------

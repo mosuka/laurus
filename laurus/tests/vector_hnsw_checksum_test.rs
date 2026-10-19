@@ -252,7 +252,7 @@ async fn legacy_hnsw_without_footer_still_loads_lazy_mmap() {
     use laurus::storage::file::FileStorageConfig;
     use laurus::storage::{StorageConfig, StorageFactory};
 
-    // Mirror of the Eager legacy test for the Lazy (mmap) / OnDemand path: a
+    // Mirror of the Eager legacy test for the Lazy (mmap) path: a
     // footer-less segment yields stored_crc = None, so verification is skipped
     // up front and the segment loads unchanged (Issue #789 back-compat).
     let dir = tempfile::tempdir().unwrap();

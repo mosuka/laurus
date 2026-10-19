@@ -94,23 +94,28 @@ impl VectorIndexSearcher for FlatVectorSearcher {
             results.candidates_examined = ids.len();
 
             // Step-7 hot path: prepare quantized query once and look
-            // up per-field doc_id -> position once per search.
+            // up per-field doc_id -> position once per search. The pools'
+            // rows are borrowed once too, so the storage kind (heap or
+            // mapped, Issue #1463) is resolved before the scan.
             let quant_ctx = quant_pool.as_ref().and_then(|pool| {
                 pool.field_position_index(field_name).map(|idx| {
                     let prepared = QuantizedQuery::prepare(&request.query.data, &pool.params);
-                    (prepared, pool.clone(), idx)
+                    (prepared, pool, pool.records(), idx)
                 })
             });
-            let f16_ctx = f16_pool
-                .as_ref()
-                .and_then(|pool| pool.field_position_index(field_name).map(|idx| (pool, idx)));
+            let f16_ctx = f16_pool.as_ref().and_then(|pool| {
+                pool.field_position_index(field_name)
+                    .map(|idx| (pool, pool.rows(), idx))
+            });
 
             // Distance scan, parallelised across candidates above
             // PARALLEL_SCAN_THRESHOLD (#662). The quantized hot path and the
             // f32 fallback both run inside the per-candidate closure; a
             // missing vector yields `Ok(None)` (skipped) and a dimension
-            // mismatch propagates as `Err`.
-            let mut candidates: Vec<(u64, f32, f32, Vector)> =
+            // mismatch propagates as `Err`. The pool paths decode a vector
+            // only when `include_vectors` asks for it, so a plain search
+            // allocates nothing per candidate (Issue #1463).
+            let mut candidates: Vec<(u64, f32, f32, Option<Vector>)> =
                 crate::vector::search::searcher::parallel_scan(&ids[..], |&doc_id| {
                     // Skip non-matching candidates before the distance kernel.
                     if let Some(allowed) = filter
@@ -118,42 +123,38 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                     {
                         return Ok(None);
                     }
-                    if let Some((prepared, pool, idx)) = &quant_ctx
+                    if let Some((prepared, pool, rows, idx)) = &quant_ctx
                         && let Some(&pos) = idx.get(&doc_id)
                         && !flat_reader.is_some_and(|r| r.is_deleted(doc_id))
                     {
-                        let (int8, meta) = pool.record_at(pos);
+                        let (int8, meta) = rows.record_at(pos);
                         let distance = distance_quantized(metric, prepared, int8, meta);
                         let similarity = metric.distance_to_similarity(distance);
-                        // include_vectors path still needs the f32 vector;
-                        // dequantize lazily only when requested.
-                        let vector = if request.params.include_vectors {
-                            pool.dequantize_to_vector(doc_id, field_name)
-                                .unwrap_or_else(|| Vector::new(Vec::new()))
-                        } else {
-                            Vector::new(Vec::new())
-                        };
+                        let vector = request
+                            .params
+                            .include_vectors
+                            .then(|| pool.dequantize_to_vector(doc_id, field_name))
+                            .flatten();
                         return Ok(Some((doc_id, similarity, distance, vector)));
                     }
-                    if let Some((pool, idx)) = &f16_ctx
+                    if let Some((pool, rows, idx)) = &f16_ctx
                         && let Some(&pos) = idx.get(&doc_id)
                         && !flat_reader.is_some_and(|r| r.is_deleted(doc_id))
                     {
-                        let distance = distance_f16(metric, &prepared_query, pool.row_at(pos));
+                        let distance = distance_f16(metric, &prepared_query, rows.row_at(pos));
                         let similarity = metric.distance_to_similarity(distance);
-                        let vector = if request.params.include_vectors {
-                            pool.decode_to_vector(doc_id, field_name)
-                                .unwrap_or_else(|| Vector::new(Vec::new()))
-                        } else {
-                            Vector::new(Vec::new())
-                        };
+                        let vector = request
+                            .params
+                            .include_vectors
+                            .then(|| pool.decode_to_vector(doc_id, field_name))
+                            .flatten();
                         return Ok(Some((doc_id, similarity, distance, vector)));
                     }
                     if let Ok(Some(vector)) = self.index_reader.get_vector(doc_id, field_name) {
                         let distance =
                             metric.distance_with_prepared(&prepared_query, &vector.data)?;
                         let similarity = metric.distance_to_similarity(distance);
-                        return Ok(Some((doc_id, similarity, distance, vector)));
+                        return Ok(Some((doc_id, similarity, distance, Some(vector))));
                     }
                     Ok(None)
                 })?;
@@ -208,7 +209,7 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                                 doc_id,
                                 metric.distance_to_similarity(distance),
                                 distance,
-                                Vector::new(Vec::new()),
+                                None,
                             )
                         })
                         .collect();
@@ -223,11 +224,11 @@ impl VectorIndexSearcher for FlatVectorSearcher {
 
                 let vector_output = if request.params.include_vectors {
                     if rerank_applied {
-                        // The rescored tuple carries a placeholder; fetch
-                        // the real vector only for the final results.
+                        // The rescored tuple carries no vector; fetch the
+                        // real vector only for the final results.
                         self.index_reader.get_vector(doc_id, field_name)?
                     } else {
-                        Some(vector)
+                        vector
                     }
                 } else {
                     None

@@ -1,23 +1,21 @@
 //! Flat vector index reader implementation.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
-use crate::vector::core::quantization::QuantizedVectorMeta;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::format::{
     FieldInterner, QuantHeader, VectorSegmentHeader, record_prefix_size,
 };
 use crate::vector::index::quantized_io::quantized_record_payload_size;
-use crate::vector::index::quantized_storage::QuantizedVectorPool;
+use crate::vector::index::quantized_storage::QuantizedPoolBuilder;
 use crate::vector::reader::{ValidationReport, VectorIndexMetadata, VectorStats};
 use crate::vector::reader::{VectorIndexReader, VectorIterator};
 
 use crate::maintenance::deletion::DeletionBitmap;
-/// Storage for vectors (in-memory or on-demand).
+/// Storage for vectors (heap or mapped rows).
 use crate::vector::index::storage::VectorStorage;
 
 /// Reader for flat (brute-force) vector indexes.
@@ -71,7 +69,9 @@ impl FlatVectorIndexReader {
     ///
     /// # Arguments
     ///
-    /// * `storage` - Shared storage backend (cloned into `OnDemand` for concurrent reads).
+    /// * `storage` - Shared storage backend. Its loading mode decides whether
+    ///   the vector rows are copied to the heap (`Eager`) or read in place
+    ///   from the mapped file (`Lazy`).
     /// * `path` - Base path/name for the index file (`.flat` extension is appended).
     /// * `distance_metric` - Distance metric used for similarity computations.
     ///
@@ -177,8 +177,7 @@ impl FlatVectorIndexReader {
                         crate::vector::index::f16_storage::F16PoolBuilder::mapped(
                             dimension,
                             num_vectors,
-                            input.clone_input()?,
-                            record_stride,
+                            input.clone_input().ok(),
                         )?
                     }
                 };
@@ -204,19 +203,29 @@ impl FlatVectorIndexReader {
                     field_dict,
                 )
             }
-            (Some(params), crate::storage::LoadingMode::Eager) => {
-                // Step 7 of #481 Stage 1: load vectors as int8 + meta
-                // directly into a QuantizedVectorPool.
+            (Some(params), loading_mode) => {
+                // int8 rows + meta go into a QuantizedVectorPool (#481
+                // Stage 1, Step 7): `Eager` copies them to the heap, `Lazy`
+                // reads them in place from a clone of the input (Issue
+                // #1463).
                 checked_capacity(
                     num_vectors,
                     record_stride,
                     records_remaining,
                     "flat num_vectors",
                 )?;
+                let mut builder = match loading_mode {
+                    crate::storage::LoadingMode::Eager => {
+                        QuantizedPoolBuilder::heap(params, dimension, num_vectors)
+                    }
+                    crate::storage::LoadingMode::Lazy => QuantizedPoolBuilder::mapped(
+                        params,
+                        dimension,
+                        num_vectors,
+                        input.clone_input().ok(),
+                    )?,
+                };
                 let mut vector_ids = Vec::with_capacity(num_vectors);
-                let mut records: Vec<(u64, String, Vec<u8>, QuantizedVectorMeta)> =
-                    Vec::with_capacity(num_vectors);
-
                 for _ in 0..num_vectors {
                     let mut doc_id_buf = [0u8; 8];
                     input.read_exact(&mut doc_id_buf)?;
@@ -230,88 +239,13 @@ impl FlatVectorIndexReader {
                         records_remaining,
                         "flat field_name_len",
                     )?;
-
-                    // Read int8 + meta directly (no dequantize).
-                    let mut int8 = vec![0u8; dimension];
-                    input.read_exact(&mut int8)?;
-                    let mut sum_q_buf = [0u8; 4];
-                    let mut norm_q_buf = [0u8; 4];
-                    input.read_exact(&mut sum_q_buf)?;
-                    input.read_exact(&mut norm_q_buf)?;
-                    let meta = QuantizedVectorMeta {
-                        sum_q: u32::from_le_bytes(sum_q_buf),
-                        norm_q: f32::from_le_bytes(norm_q_buf),
-                    };
-
+                    builder.push(doc_id, fid, &mut input)?;
                     vector_ids.push((doc_id, fid));
-                    // The pool's build input keeps the String shape; this
-                    // clone is transient (the pool retains only per-field
-                    // grouping keys), so nothing per-record is kept.
-                    records.push((doc_id, interner.name(fid).to_string(), int8, meta));
                 }
-                let pool = QuantizedVectorPool::build(params, dimension, records);
+                let field_dict = interner.into_dict();
+                let pool = builder.build(&field_dict);
                 (
                     VectorStorage::OwnedQuantized(Arc::new(pool)),
-                    vector_ids,
-                    interner.into_dict(),
-                )
-            }
-            (Some(params), crate::storage::LoadingMode::Lazy) => {
-                checked_capacity(
-                    num_vectors,
-                    record_stride,
-                    records_remaining,
-                    "flat num_vectors",
-                )?;
-                let mut offsets = HashMap::with_capacity(num_vectors);
-                let mut vector_ids = Vec::with_capacity(num_vectors);
-
-                // Seek to the start of the per-vector entries: Flat preamble
-                // (count u32 + dim u32 = 8 bytes) + the parsed header's real
-                // size (which includes the v3 field dictionary, Issue #633 —
-                // reconstructing a fresh header here would omit it).
-                let start_pos = 8u64 + header.serialized_size() as u64;
-                input
-                    .seek(std::io::SeekFrom::Start(start_pos))
-                    .map_err(LaurusError::Io)?;
-
-                let quant_payload_size = quantized_record_payload_size(dimension) as i64;
-
-                for _ in 0..num_vectors {
-                    let mut doc_id_buf = [0u8; 8];
-                    input.read_exact(&mut doc_id_buf)?;
-                    let doc_id = u64::from_le_bytes(doc_id_buf);
-
-                    let fid = interner.read_record_field_id(
-                        &header,
-                        &mut input,
-                        records_remaining,
-                        "flat field_name_len",
-                    )?;
-
-                    // Offsets point at the payload start (right after the
-                    // record prefix), so `VectorStorage::get` seeks straight
-                    // to the int8 data without re-parsing the prefix.
-                    let payload_offset = input.stream_position().map_err(LaurusError::Io)?;
-                    offsets.insert((doc_id, fid), payload_offset);
-                    vector_ids.push((doc_id, fid));
-
-                    // Skip int8 payload + per-vector meta.
-                    input
-                        .seek(std::io::SeekFrom::Current(quant_payload_size))
-                        .map_err(LaurusError::Io)?;
-                }
-
-                let field_dict = interner.into_dict();
-                (
-                    VectorStorage::OnDemand {
-                        storage: storage.clone(),
-                        file_name: file_name.clone(),
-                        offsets: Arc::new(offsets),
-                        field_dict: field_dict.clone(),
-                        quant_params: Some(params),
-                        cached_input: Arc::new(std::sync::RwLock::new(None)),
-                    },
                     vector_ids,
                     field_dict,
                 )
@@ -474,10 +408,6 @@ impl VectorIndexReader for FlatVectorIndexReader {
                 unreachable!("Flat reader rejects PQ FastScan at the segment header (HNSW-only)")
             }
             VectorStorage::Float16(pool) => pool.heap_size(),
-            VectorStorage::OnDemand { offsets, .. } => {
-                // Estimate memory for offsets map + ID list
-                offsets.len() * (8 + 32 + 8) // Key + Valid + Offset roughly
-            }
         };
         VectorStats {
             vector_count: self.vectors.len(),
@@ -647,19 +577,6 @@ impl VectorIndexReader for FlatVectorIndexReader {
                 warnings.push(
                     "Float16 mode: NaN checks skipped (rows are validated at ingest)".to_string(),
                 );
-            }
-            VectorStorage::OnDemand { offsets, .. } => {
-                for &(id, fid) in &self.vector_ids {
-                    let field = &self.field_dict[fid as usize];
-                    let id = &id;
-                    if !offsets.contains_key(&(*id, fid)) {
-                        errors.push(format!(
-                            "Vector {}:{} in ids but missing in storage",
-                            id, field
-                        ));
-                    }
-                }
-                warnings.push("OnDemand mode: Deep vector validation skipped".to_string());
             }
         }
 

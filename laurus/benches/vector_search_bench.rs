@@ -314,9 +314,10 @@ fn open_cached_reader(
 ) -> laurus::Result<Arc<dyn VectorIndexReader>> {
     let mut file_config = FileStorageConfig::new(dir);
     // `use_mmap = false` forces `LoadingMode::Eager`, so scalar-quantized
-    // segments load as `VectorStorage::OwnedQuantized` and the search hot loop
-    // dispatches to the int8 `distance_quantized` kernel; mmap (the default)
-    // yields `LoadingMode::Lazy` -> `OnDemand` dequantize-on-get (f32 path).
+    // rows are copied to the heap; mmap (the default) yields
+    // `LoadingMode::Lazy`, which reads the same rows in place from the
+    // mapped file (Issue #1463). Both dispatch to the int8
+    // `distance_quantized` kernel.
     file_config.use_mmap = use_mmap;
     let storage = StorageFactory::create(StorageConfig::File(file_config))?;
     let distance = config.distance_metric();
@@ -409,9 +410,9 @@ fn cached_vector_reader(
 /// loading mode.
 ///
 /// `use_mmap = false` forces `LoadingMode::Eager`, so scalar-quantized
-/// segments load as `VectorStorage::OwnedQuantized` and the search hot
-/// loop dispatches to the int8 `distance_quantized` kernel. `use_mmap =
-/// true` yields the mmap `Lazy` / `OnDemand` dequantize-on-get f32 path.
+/// rows are copied to the heap. `use_mmap = true` yields `Lazy`, which
+/// reads the same rows in place from the mapped file (Issue #1463). Both
+/// dispatch to the int8 `distance_quantized` kernel.
 fn cached_vector_reader_with_loading(
     slot: &str,
     config: VectorIndexTypeConfig,
@@ -1909,16 +1910,14 @@ fn run_pq_fastscan_real_data_bench(c: &mut Criterion, params: PqFastScanRealData
     group.finish();
 }
 
-/// HNSW graph search with prefetch actually enabled (Issue #656).
+/// HNSW graph search over heap rows with prefetch (Issue #656).
 ///
 /// Every other HNSW graph-search bench in this file uses the default
-/// `use_mmap = true` (`cached_vector_reader`), which loads segments as
-/// `VectorStorage::OnDemand` — the storage mode `search_graph`'s
-/// `prefetch_enabled` gate is *always false* for (no `sq_prefetch`, and
-/// `field_prefetch_index` returns an empty map unconditionally), so none
-/// of the other benches exercise the one-hop OR the new two-hop lookahead
-/// prefetch code at all. This bench forces eager loading
-/// (`cached_vector_reader_with_loading(..., false, ...)`), matching
+/// `use_mmap = true` (`cached_vector_reader`), whose int8 rows are read in
+/// place from the mapped segment file (Issue #1463; before it, that mode
+/// decoded every candidate and never prefetched). This bench forces eager
+/// loading (`cached_vector_reader_with_loading(..., false, ...)`), so the
+/// rows sit in the padded heap layout, matching
 /// `bench_hnsw_graph_search_sparse_ids`'s int8-kernel setup but sweeping
 /// `hnsw_corpus_sizes()` (up to 100k with `LAURUS_BENCH_LARGE=1`) instead
 /// of a single fixed 10k count, since the two-hop lookahead's benefit (if

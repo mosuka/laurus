@@ -1,11 +1,12 @@
 //! Integration tests for searcher warmup (Issue #677).
 //!
 //! `VectorStore::warmup` eagerly builds the cached searcher and invokes the
-//! searcher's `warmup`, which for HNSW pre-faults on-disk (`Mmap` / `OnDemand`)
-//! vector data into the OS page cache. Warmup must be transparent (results
-//! unchanged), idempotent, and must exercise the HNSW `OnDemand` path without
-//! error. Cold-start *timing* is environment-dependent and intentionally not
-//! asserted.
+//! searcher's `warmup`. Warmup must be transparent (results unchanged),
+//! idempotent, and must not fail on an mmap-backed (`Lazy`) store, whose
+//! vector rows are read in place from the mapped segment files. The
+//! page-touching pass of `HnswSearcher::warmup` itself is tested in the
+//! crate's `sq8_mapped_tests`. Cold-start *timing* is environment-dependent
+//! and intentionally not asserted.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -103,14 +104,14 @@ async fn warmup_is_transparent_and_idempotent() {
     assert_eq!(after, before, "warmup must not change search results");
 }
 
-/// Warmup exercises the HNSW `OnDemand` (Mmap) page-fault loop without error
-/// and leaves search working. `use_mmap` is forced on so the storage is `Lazy`
-/// on every platform (the default is platform-specific).
+/// Warmup on an mmap-backed HNSW store succeeds and leaves search working.
+/// `use_mmap` is forced on so the storage is `Lazy` on every platform
+/// (`LAURUS_NO_MMAP=1` would otherwise turn it off).
 #[tokio::test(flavor = "multi_thread")]
 async fn warmup_on_demand_hnsw_pre_faults() {
     let dir = tempfile::tempdir().unwrap();
     let mut file_config = FileStorageConfig::new(dir.path());
-    file_config.use_mmap = true; // force Lazy / OnDemand on all platforms
+    file_config.use_mmap = true; // force Lazy (mapped rows) on all platforms
     let storage = StorageFactory::create(StorageConfig::File(file_config)).unwrap();
     let store = VectorStore::new(storage, config(3)).unwrap();
     add_docs(
@@ -123,13 +124,13 @@ async fn warmup_on_demand_hnsw_pre_faults() {
     )
     .await;
 
-    // Warmup before any query: builds the cached searcher and runs the
-    // OnDemand page-fault pass.
+    // Warmup before any query: builds the cached searcher and runs its
+    // warmup.
     store.warmup().unwrap();
 
     let hits = search_ids(&store, vec![1.0, 0.1, 0.0]);
     assert!(
         !hits.is_empty(),
-        "search after warmup on an OnDemand store must return hits"
+        "search after warmup on an mmap-backed store must return hits"
     );
 }
