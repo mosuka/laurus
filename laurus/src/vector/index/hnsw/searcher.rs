@@ -626,9 +626,35 @@ impl VectorIndexSearcher for HnswSearcher {
         } else {
             None
         };
+        #[cfg(test)]
+        if touched.is_some() {
+            warmup_calls::record();
+        }
         // Kept live so the page-touching loop is not optimised away.
         std::hint::black_box(touched);
         Ok(())
+    }
+}
+
+/// Mapped pools touched by [`HnswSearcher::warmup`], so that tests can see
+/// that a warmup reached a segment's rows — the search results, the same
+/// with or without warming, cannot show it (Issue #1483).
+#[cfg(test)]
+pub(crate) mod warmup_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TOUCHED_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        TOUCHED_THIS_THREAD.with(|touched| touched.set(touched.get() + 1));
+    }
+
+    /// Mapped pools touched on the current thread. Warmup runs on the
+    /// calling thread, so tests running at the same time do not add to it.
+    pub(crate) fn on_this_thread() -> usize {
+        TOUCHED_THIS_THREAD.with(Cell::get)
     }
 }
 

@@ -5,8 +5,10 @@
 //! idempotent, and must not fail on an mmap-backed (`Lazy`) store, whose
 //! vector rows are read in place from the mapped segment files. The
 //! page-touching pass of `HnswSearcher::warmup` itself is tested in the
-//! crate's `sq8_mapped_tests`. Cold-start *timing* is environment-dependent
-//! and intentionally not asserted.
+//! crate's `sq8_mapped_tests`, and that `Engine::warmup` runs it for every
+//! segment of every field in the crate's engine tests (Issue #1483).
+//! Cold-start *timing* is environment-dependent and intentionally not
+//! asserted.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

@@ -356,8 +356,9 @@ fn hnsw_lazy_multi_field_segment_scores_exactly_like_eager() -> Result<()> {
     Ok(())
 }
 
-/// Warmup touches the mapped rows of a `Lazy` HNSW segment (the engine's
-/// fan-out searcher does not forward `warmup`, so this calls it directly).
+/// Warmup touches the mapped rows of a `Lazy` HNSW segment. That the engine
+/// runs this pass for every segment is tested in the engine's tests
+/// (Issue #1483).
 #[test]
 fn hnsw_warmup_touches_mapped_rows() -> Result<()> {
     let dim = 64;

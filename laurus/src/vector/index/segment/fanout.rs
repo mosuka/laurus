@@ -301,8 +301,8 @@ impl std::fmt::Debug for SegmentFanoutSearcher {
 impl SegmentFanoutSearcher {
     /// Build a fan-out searcher over `readers` (newest generation first).
     ///
-    /// `make_searcher` is invoked once per segment per `search`/`count` call
-    /// to build that segment's concrete searcher.
+    /// `make_searcher` is invoked once per segment per `search`/`warmup`
+    /// call to build that segment's concrete searcher.
     pub fn new(
         readers: Vec<Arc<dyn VectorIndexReader>>,
         bitmap: Option<Arc<DeletionBitmap>>,
@@ -576,5 +576,21 @@ impl VectorIndexSearcher for SegmentFanoutSearcher {
             }
         }
         Ok(count)
+    }
+
+    /// Warm every segment (Issue #1483): build each segment's concrete
+    /// searcher and run its `warmup`.
+    ///
+    /// The per-segment searchers are not kept (`search` builds them per
+    /// probe), so this builds them here. That is enough for the warming to
+    /// last: `HnswSearcher::warmup` pre-faults the segment's mapped rows into
+    /// the OS page cache, which outlives the searcher. Segments are warmed one
+    /// after another — a one-time startup pass whose per-segment touch is
+    /// sequential — and the first error is returned.
+    fn warmup(&mut self) -> Result<()> {
+        for reader in &self.readers {
+            (self.make_searcher)(reader.clone())?.warmup()?;
+        }
+        Ok(())
     }
 }

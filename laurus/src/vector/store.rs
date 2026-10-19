@@ -834,9 +834,10 @@ impl VectorStore {
     /// (file → memory for `InMemory`, the offset table for `Mmap`) — and then
     /// invokes the searcher's
     /// [`warmup`](crate::vector::search::searcher::VectorIndexSearcher::warmup),
-    /// which pre-faults on-disk vector data into the OS page cache where
-    /// applicable (HNSW `Mmap` mode). This moves the searcher-construction and
-    /// page-fault latency off the first query.
+    /// which pre-faults the vector rows read in place from every segment's
+    /// mapped file into the OS page cache where applicable (HNSW `Scalar8Bit`
+    /// and `Float16` fields in `Mmap` mode). This moves the
+    /// searcher-construction and page-fault latency off the first query.
     ///
     /// Safe to call multiple times and from any index type (a no-op
     /// `warmup` for searchers that do not override it). Typically called once

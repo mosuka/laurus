@@ -3053,8 +3053,10 @@ impl Engine {
     ///
     /// Delegates to [`VectorStore::warmup`](crate::vector::VectorStore::warmup):
     /// it eagerly builds the cached searcher (loading the reader) and pre-faults
-    /// on-disk vector data into the OS page cache where applicable (HNSW `Mmap`
-    /// mode). Call once after building the engine, before serving traffic.
+    /// the vector rows read in place from every segment's mapped file into the
+    /// OS page cache where applicable (HNSW `Scalar8Bit` and `Float16` fields
+    /// in `Mmap` mode). Call once after building the engine, before serving
+    /// traffic.
     /// Safe to call multiple times; lexical search needs no warming.
     ///
     /// # Errors
@@ -7726,5 +7728,76 @@ mod tests {
             .apply(&engine.vector, ranked[1..].to_vec(), &mut scores)
             .unwrap();
         assert_eq!(scores.scored, 4);
+    }
+
+    /// Issue #1483: `warmup` pre-faults the mapped rows of every segment of
+    /// every HNSW field. Each field's searcher fans out over its sealed
+    /// segments, and the fan-out used to keep the trait's no-op `warmup`, so
+    /// `HnswSearcher::warmup` never ran behind the engine. Both kinds of HNSW
+    /// rows read in place from `Lazy` segments are covered (`Scalar8Bit`,
+    /// `Float16`); three commits seal three segments per field, below the
+    /// default `merge_factor` of 10.
+    #[tokio::test]
+    async fn warmup_touches_the_mapped_rows_of_every_segment() {
+        use crate::storage::file::FileStorageConfig;
+        use crate::storage::{StorageConfig, StorageFactory};
+        use crate::vector::core::field::HnswOption;
+        use crate::vector::core::quantization::QuantizationMethod;
+        use crate::vector::index::hnsw::searcher::warmup_calls;
+        use crate::vector::store::request::QueryVector;
+
+        const SEGMENTS: usize = 3;
+        // Declared before the engine, so the mapped files are dropped first.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut file_config = FileStorageConfig::new(dir.path());
+        file_config.use_mmap = true; // `Lazy` on every platform
+        let storage = StorageFactory::create(StorageConfig::File(file_config)).unwrap();
+        let schema = Schema::builder()
+            .add_hnsw_field(
+                "sq8",
+                HnswOption::new(4).quantizer(QuantizationMethod::Scalar8Bit),
+            )
+            .add_hnsw_field(
+                "f16",
+                HnswOption::new(4).quantizer(QuantizationMethod::Float16),
+            )
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+        for segment in 0..SEGMENTS {
+            for i in 0..4 {
+                let vector = vec![1.0 + i as f32, segment as f32, 0.5, -(i as f32)];
+                let document = Document::builder()
+                    .add_vector("sq8", vector.clone())
+                    .add_vector("f16", vector)
+                    .build();
+                engine
+                    .put_document(&format!("{segment}-{i}"), document)
+                    .await
+                    .unwrap();
+            }
+            engine.commit().await.unwrap();
+        }
+
+        // `Engine::warmup` runs on this thread, so the thread-local count
+        // sees only this engine's pools.
+        let before = warmup_calls::on_this_thread();
+        engine.warmup().unwrap();
+        assert_eq!(
+            warmup_calls::on_this_thread() - before,
+            2 * SEGMENTS,
+            "warmup must touch the mapped rows of every segment of each field"
+        );
+
+        let request = self::search::SearchRequestBuilder::new()
+            .vector_query(self::search::VectorSearchQuery::Vectors(vec![
+                QueryVector {
+                    vector: Vector::new(vec![1.0, 0.0, 0.5, 0.0]),
+                    weight: 1.0,
+                    fields: None,
+                },
+            ]))
+            .limit(3)
+            .build();
+        assert_eq!(engine.search(request).await.unwrap().len(), 3);
     }
 }

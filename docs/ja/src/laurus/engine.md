@@ -212,8 +212,10 @@ engine.warmup()?;   // オプション: 初回クエリの latency を起動時�
 ```
 
 Vector searcher を先行構築・キャッシュし（reader をロード — `InMemory` は
-ファイル→メモリ、`Mmap` は参照表のみで、ベクトルの行はマップしたファイルからその場で読む）、HNSW の `Mmap` モードではディスク上の
-Vector データを OS page cache に pre-fault します。HNSW グラフは常に eager に
+ファイル→メモリ、`Mmap` は参照表のみで、ベクトルの行はマップしたファイルからその場で読む）、
+HNSW フィールドの `Mmap` モードでは、全セグメントの、その場で読む行（既定の
+`Scalar8Bit` と `Float16`。PQ の符号はメモリに読み込まれる）を OS page cache に
+pre-fault します。Flat と IVF の行は pre-fault しません。HNSW グラフは常に eager に
 ロードされるため、warming が必要なのは Vector データのみです。`warmup()` は
 複数回呼んでも安全で、lexical のみのワークロードでは no-op です。
 
