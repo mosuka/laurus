@@ -328,6 +328,22 @@ pub fn search_result_to_json(result: &v1::SearchResult) -> Value {
     obj
 }
 
+/// Convert a proto [`v1::SearchResponse`] to the JSON the `search` tool
+/// returns, and `search_batch` returns per query: `{"results": [...]}`, each
+/// result converted by [`search_result_to_json`].
+///
+/// There is no `"total"`: it held only the number of returned results, as
+/// the server's `total_hits` did, and was removed (Issue #1455).
+pub fn search_response_to_json(response: &v1::SearchResponse) -> Value {
+    json!({
+        "results": response
+            .results
+            .iter()
+            .map(search_result_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +590,31 @@ mod tests {
         });
         assert!(ungrouped.get("group_key").is_none(), "{ungrouped}");
         assert!(ungrouped.get("inner_hits").is_none(), "{ungrouped}");
+    }
+
+    /// Issue #1455: a search's JSON is `{"results": [...]}` and nothing
+    /// else. `"total"` held only the number of returned results, so no total
+    /// comes back under any key.
+    #[test]
+    fn test_search_response_to_json_has_only_results() {
+        let hit = |id: &str| v1::SearchResult {
+            id: id.to_string(),
+            score: 0.5,
+            ..Default::default()
+        };
+        let response = v1::SearchResponse {
+            results: vec![hit("a"), hit("b")],
+        };
+
+        assert_eq!(
+            search_response_to_json(&response),
+            json!({
+                "results": [
+                    search_result_to_json(&hit("a")),
+                    search_result_to_json(&hit("b")),
+                ]
+            })
+        );
     }
 
     #[test]

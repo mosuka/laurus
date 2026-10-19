@@ -276,8 +276,12 @@ message Highlights {
 
 message SearchResponse {
   repeated SearchResult results = 1;
-  // Total number of matching results (before limit/offset).
-  uint64 total_hits = 2;
+
+  // Field 2 was `total_hits`. It was documented as the number of matches
+  // before limit/offset but held the number of returned results, so it was
+  // removed (Issue #1455). The response carries no total.
+  reserved 2;
+  reserved "total_hits";
 }
 
 message SearchResult {

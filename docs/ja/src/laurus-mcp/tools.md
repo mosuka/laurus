@@ -439,7 +439,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 `manual` として 3 つ、`faq` として 1 つの chunk を追加したとき、クエリ `body:rust` の結果は次のとおりです。
 
 ```json
-{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total":2}
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}]}
 ```
 
 フィールドには、単一値で保存された `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールドも使えます。不正な `group_by` はツールのエラーになります。[検索結果のグループ化](../concepts/search/result_grouping.md)を参照してください。
@@ -450,7 +450,6 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 
 ```json
 {
-  "total": 2,
   "results": [
     {
       "id": "doc-1",
@@ -494,13 +493,11 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 {
   "batch": [
     {
-      "total": 1,
       "results": [
         { "id": "doc-1", "score": 3.14, "fields": { "title": "Hello World" } }
       ]
     },
     {
-      "total": 1,
       "results": [
         { "id": "doc-2", "score": 2.71, "fields": { "title": "Vector Search" } }
       ]

@@ -406,7 +406,10 @@ rpc Search(SearchRequest) returns (SearchResponse);
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `results` | `repeated SearchResult` | Search results ordered by relevance |
-| `total_hits` | `uint64` | Total number of matching documents (before `limit`/`offset`) |
+
+The response carries no total hit count. Field `2` (`total_hits`) held the
+number of returned results rather than the number of matches its description
+promised, and was removed (Issue #1455).
 
 ### `SearchStream`
 

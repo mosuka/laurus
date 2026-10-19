@@ -916,7 +916,7 @@ impl LaurusMcpServer {
 
     /// Search documents using the laurus unified query DSL.
     #[tool(
-        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Returns JSON with total count and array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped)."
+        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: ~\"text\" syntax for semantic similarity (content:~\"cute kitten\", ~\"text\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:~\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Returns JSON with the array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped)."
     )]
     async fn search(
         &self,
@@ -938,17 +938,7 @@ impl LaurusMcpServer {
 
         match SearchServiceClient::new(channel).search(request).await {
             Ok(resp) => {
-                let r = resp.into_inner();
-                let json_results: Vec<Value> = r
-                    .results
-                    .iter()
-                    .map(convert::search_result_to_json)
-                    .collect();
-
-                let output = json!({
-                    "total": r.total_hits,
-                    "results": json_results,
-                });
+                let output = convert::search_response_to_json(&resp.into_inner());
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     output.to_string(),
                 )]))
@@ -958,7 +948,7 @@ impl LaurusMcpServer {
     }
 
     #[tool(
-        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset, highlight and group_by settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the total count and results (id, score, fields, highlights when requested, group_key and inner_hits when grouped) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
+        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset, highlight and group_by settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the results (id, score, fields, highlights when requested, group_key and inner_hits when grouped) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
     )]
     async fn search_batch(
         &self,
@@ -990,21 +980,11 @@ impl LaurusMcpServer {
             .await
         {
             Ok(resp) => {
-                let r = resp.into_inner();
-                let batch: Vec<Value> = r
+                let batch: Vec<Value> = resp
+                    .into_inner()
                     .results
                     .iter()
-                    .map(|per_query| {
-                        let json_results: Vec<Value> = per_query
-                            .results
-                            .iter()
-                            .map(convert::search_result_to_json)
-                            .collect();
-                        json!({
-                            "total": per_query.total_hits,
-                            "results": json_results,
-                        })
-                    })
+                    .map(convert::search_response_to_json)
                     .collect();
 
                 let output = json!({ "batch": batch });

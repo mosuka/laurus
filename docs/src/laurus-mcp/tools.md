@@ -466,7 +466,7 @@ With three chunks added as `manual` and one as `faq`, the query `body:rust`
 returns:
 
 ```json
-{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total":2}
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}]}
 ```
 
 The field may also be a single-valued, stored `Text`, `Integer`, `Float`,
@@ -480,7 +480,6 @@ and at least one field actually highlighted:
 
 ```json
 {
-  "total": 2,
   "results": [
     {
       "id": "doc-1",
@@ -525,13 +524,11 @@ The `batch` array preserves input order: `batch[i]` is the result set for
 {
   "batch": [
     {
-      "total": 1,
       "results": [
         { "id": "doc-1", "score": 3.14, "fields": { "title": "Hello World" } }
       ]
     },
     {
-      "total": 1,
       "results": [
         { "id": "doc-2", "score": 2.71, "fields": { "title": "Vector Search" } }
       ]

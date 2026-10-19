@@ -405,7 +405,8 @@ rpc Search(SearchRequest) returns (SearchResponse);
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `results` | `repeated SearchResult` | 関連度順の検索結果 |
-| `total_hits` | `uint64` | マッチするドキュメントの総数（`limit`/`offset` 適用前） |
+
+レスポンスはヒットの総数を持ちません。フィールド番号 `2`（`total_hits`）は、説明にあった一致件数ではなく返した結果の件数を入れていたため、削除しました（Issue #1455）。
 
 ### `SearchStream`
 

@@ -69,16 +69,12 @@ impl SearchServiceTrait for SearchService {
             .search(search_request)
             .await
             .map_err(error::to_status)?;
-        let total_hits = results.len() as u64;
         let results: Vec<SearchResult> = results
             .iter()
             .map(search_convert::result_to_proto)
             .collect();
 
-        Ok(Response::new(SearchResponse {
-            results,
-            total_hits,
-        }))
+        Ok(Response::new(SearchResponse { results }))
     }
 
     type SearchStreamStream = ReceiverStream<Result<SearchResult, Status>>;
@@ -159,16 +155,11 @@ impl SearchServiceTrait for SearchService {
 
         let results: Vec<SearchResponse> = batch_results
             .into_iter()
-            .map(|per_query_results| {
-                let total_hits = per_query_results.len() as u64;
-                let proto_results: Vec<SearchResult> = per_query_results
+            .map(|per_query_results| SearchResponse {
+                results: per_query_results
                     .iter()
                     .map(search_convert::result_to_proto)
-                    .collect();
-                SearchResponse {
-                    results: proto_results,
-                    total_hits,
-                }
+                    .collect(),
             })
             .collect();
 

@@ -1396,6 +1396,22 @@ pub fn proto_search_result_to_json(result: &v1::SearchResult) -> Value {
     obj
 }
 
+/// Converts a proto `SearchResponse` to the JSON body of `POST /v1/search`
+/// and of each entry of `POST /v1/search/batch`: `{"results": [...]}`, each
+/// result converted by [`proto_search_result_to_json`].
+///
+/// The body carries no total: `total_hits` held only the number of returned
+/// results and was removed (Issue #1455).
+pub fn proto_search_response_to_json(response: &v1::SearchResponse) -> Value {
+    json!({
+        "results": response
+            .results
+            .iter()
+            .map(proto_search_result_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Analyzer definition conversion
 // ---------------------------------------------------------------------------
@@ -2222,6 +2238,31 @@ mod tests {
         });
         assert!(ungrouped.get("group_key").is_none(), "{ungrouped}");
         assert!(ungrouped.get("inner_hits").is_none(), "{ungrouped}");
+    }
+
+    /// Issue #1455: the search body is `{"results": [...]}` and nothing
+    /// else. `total_hits` held only the number of returned results, so no
+    /// total comes back under any key.
+    #[test]
+    fn test_proto_search_response_to_json_has_only_results() {
+        let hit = |id: &str| v1::SearchResult {
+            id: id.to_string(),
+            score: 0.5,
+            ..Default::default()
+        };
+        let response = v1::SearchResponse {
+            results: vec![hit("a"), hit("b")],
+        };
+
+        assert_eq!(
+            proto_search_response_to_json(&response),
+            json!({
+                "results": [
+                    proto_search_result_to_json(&hit("a")),
+                    proto_search_result_to_json(&hit("b")),
+                ]
+            })
+        );
     }
 
     /// Issue #1297: `group_by` reaches the proto request, `null` leaves it

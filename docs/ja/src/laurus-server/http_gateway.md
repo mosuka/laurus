@@ -309,7 +309,7 @@ curl -X POST http://localhost:8080/v1/search \
 `manual` として 3 つ、`faq` として 1 つの chunk を追加したとき、レスポンスは次のとおりです。
 
 ```json
-{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}],"total_hits":2}
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","inner_hits":[{"fields":{"body":"Borrowing in Rust"},"group_key":"manual","id":"manual","score":0.012359549291431904}],"score":0.012571428902447224},{"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}]}
 ```
 
 値を持つ結果には `"group_key"` が、グループにほかの結果がある結果には `"inner_hits"`（各要素は同じ形）が付きます。`rescore` と同じく、不正な `group_by` は無視されず 400 で拒否されます。

@@ -28,17 +28,9 @@ pub async fn search(
         .await
         .map_err(|s| GatewayError(s).into_response())?;
 
-    let inner = response.into_inner();
-    let results: Vec<Value> = inner
-        .results
-        .iter()
-        .map(convert::proto_search_result_to_json)
-        .collect();
-
-    Ok(Json(json!({
-        "total_hits": inner.total_hits,
-        "results": results,
-    })))
+    Ok(Json(convert::proto_search_response_to_json(
+        &response.into_inner(),
+    )))
 }
 
 /// `POST /v1/search/stream` — Executes a search and returns results incrementally via SSE.
@@ -113,21 +105,11 @@ pub async fn search_batch(
         .await
         .map_err(|s| GatewayError(s).into_response())?;
 
-    let inner = response.into_inner();
-    let results: Vec<Value> = inner
+    let results: Vec<Value> = response
+        .into_inner()
         .results
         .iter()
-        .map(|search_response| {
-            let per_query_results: Vec<Value> = search_response
-                .results
-                .iter()
-                .map(convert::proto_search_result_to_json)
-                .collect();
-            json!({
-                "total_hits": search_response.total_hits,
-                "results": per_query_results,
-            })
-        })
+        .map(convert::proto_search_response_to_json)
         .collect();
 
     Ok(Json(json!({ "results": results })))
