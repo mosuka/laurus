@@ -410,10 +410,7 @@ impl VectorStore {
     ) -> Result<()> {
         // Phase 2: Acquire lock and write pre-computed vectors (fast, sync-only).
         let mut guard = self.writer_cache.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.index.writer()?);
-        }
-        let writer = guard.as_mut().unwrap();
+        let writer = self.cached_writer(&mut guard)?;
         writer.delete_document(doc_id)?;
         // One call for the whole document, so a field the writer does not
         // know (e.g. removed concurrently by `delete_field`) rejects every
@@ -421,6 +418,42 @@ impl VectorStore {
         writer.add_prepared_document_vectors(doc_id, fields)?;
 
         Ok(())
+    }
+
+    /// Create the cached writer if there is none (Issue #1479).
+    ///
+    /// `Engine::index_internal` calls this before it deletes a document's
+    /// previous version and appends the document's WAL record. Creating the
+    /// writer is where a field the index cannot build with fails (an HNSW
+    /// `m` below 2, which a schema persisted before the field checks can
+    /// hold); failing there after the WAL append left a record that every
+    /// later open replayed into the same error. A commit may still drop
+    /// the writer before the document is written, and
+    /// [`Self::write_prepared`] then creates it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer fails.
+    pub(crate) async fn ensure_writer(&self) -> Result<()> {
+        let mut guard = self.writer_cache.lock().await;
+        self.cached_writer(&mut guard)?;
+        Ok(())
+    }
+
+    /// The writer cached in `slot` (the content of [`Self::writer_cache`]),
+    /// created first if there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer fails.
+    fn cached_writer<'a>(
+        &self,
+        slot: &'a mut Option<Box<dyn VectorIndexWriter>>,
+    ) -> Result<&'a mut dyn VectorIndexWriter> {
+        if slot.is_none() {
+            *slot = Some(self.index.writer()?);
+        }
+        Ok(slot.as_deref_mut().expect("the writer was created above"))
     }
 
     /// Pool, before the writer lock is taken, the token vectors of every
@@ -633,10 +666,7 @@ impl VectorStore {
         }
 
         let mut guard = self.writer_cache.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.index.writer()?);
-        }
-        let writer = guard.as_mut().unwrap();
+        let writer = self.cached_writer(&mut guard)?;
 
         writer.delete_document(doc_id)?;
 

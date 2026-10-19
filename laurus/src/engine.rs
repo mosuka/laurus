@@ -1102,21 +1102,22 @@ impl Engine {
 
     /// Put (upsert) a document.
     ///
-    /// The new document's vector fields are embedded and validated first
-    /// (Issue #1326): only once that succeeds are a document with the same
-    /// external ID's chunks deleted and the new document indexed. A
-    /// rejection (e.g. an unsupported input type, the wrong dimension) thus
-    /// leaves the previous version in place and never reaches the WAL. A
-    /// `_id` field is automatically inserted into the document with the
-    /// provided `id` value. A WAL entry is written before any index
-    /// mutation, to ensure durability.
+    /// The new document's vector fields are embedded and validated, and the
+    /// vector writer created, first (Issues #1326, #1479): only once that
+    /// succeeds are a document with the same external ID's chunks deleted
+    /// and the new document indexed. A rejection (e.g. an unsupported input
+    /// type, the wrong dimension, a vector field the index cannot build
+    /// with) thus leaves the previous version in place and never reaches
+    /// the WAL. A `_id` field is automatically inserted into the document
+    /// with the provided `id` value. A WAL entry is written before any
+    /// index mutation, to ensure durability.
     ///
     /// The document fields are routed to the appropriate underlying stores
     /// (lexical or vector) based on the schema field configuration. If
     /// writing the already-validated vectors fails after the lexical store
-    /// has already been updated (e.g. an I/O error obtaining the vector
-    /// writer), the lexical insert is rolled back to maintain cross-store
-    /// consistency.
+    /// has already been updated (e.g. an I/O error re-creating a vector
+    /// writer a concurrent commit dropped), the lexical insert is rolled
+    /// back to maintain cross-store consistency.
     ///
     /// # Parameters
     ///
@@ -1149,8 +1150,9 @@ impl Engine {
     ///
     /// A `_id` field is automatically inserted into the document with the
     /// provided `id` value. The chunk's vector fields are embedded and
-    /// validated first (Issue #1326); a WAL entry is written only once that
-    /// succeeds, before any index mutation, to ensure durability.
+    /// validated, and the vector writer created, first (Issues #1326,
+    /// #1479); a WAL entry is written only once that succeeds, before any
+    /// index mutation, to ensure durability.
     ///
     /// # Parameters
     ///
@@ -1206,8 +1208,9 @@ impl Engine {
     /// searchable immediately, durable at the next commit, and replayed on
     /// crash recovery — so retrying the batch (or its suffix from
     /// `failed_index`) is idempotent. The failing document inherits the
-    /// singular-put semantics: a rejection during embedding/validation
-    /// (Issue #1326) never reaches the WAL, so there is nothing to replay or
+    /// singular-put semantics: a rejection during embedding/validation or
+    /// while creating the vector writer (Issues #1326, #1479) never reaches
+    /// the WAL, so there is nothing to replay or
     /// discard for it and its previous version, if any, is untouched; any
     /// other failure after its WAL record was written is retried by crash
     /// recovery exactly as for a singular put.
@@ -1333,6 +1336,13 @@ impl Engine {
         // scope.
         let vector_fields = self.vector_field_refs(&doc);
         let vectors = self.vector.embed_fields(&vector_fields).await?;
+        // Create the vector writer here too, for the same reason (Issue
+        // #1479): creating it fails for a field the index cannot build with
+        // (an HNSW `m` below 2 in a schema persisted before the field
+        // checks), even for a document without vectors. Failing after the
+        // WAL append deleted the previous version and left a record that
+        // every later open replayed into the same error.
+        self.vector.ensure_writer().await?;
 
         if !as_chunk {
             self.delete_documents_internal(id).await?;
@@ -1347,9 +1357,10 @@ impl Engine {
 
         // 5. Index into Lexical and Vector stores. The vector side can no
         // longer fail here on a rejection it already had the chance to raise
-        // at step 2 (see `VectorStore::write_vectors`'s doc comment); it can
-        // still fail on e.g. a writer-creation I/O error, so the lexical
-        // rollback on failure is kept.
+        // at step 2 (see `VectorStore::write_vectors`'s doc comment), where
+        // its writer was also created; it can still fail on e.g. an I/O
+        // error re-creating a writer a concurrent commit dropped, so the
+        // lexical rollback on failure is kept.
         self.strip_multi_vector_fields(&mut doc);
         self.lexical.upsert_document(doc_id, doc)?;
         if let Err(e) = self.vector.write_prepared(doc_id, vectors).await {
@@ -7572,6 +7583,74 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
+    }
+
+    /// Issue #1479: a `put` whose vector writer cannot be created must fail
+    /// before anything durable or destructive happens: no WAL record, the
+    /// previous version kept, and the index still opens. The writer fails
+    /// here for an HNSW field with `m` 0, which a schema an older server
+    /// persisted for an omitted `m` can hold, and it fails even for a
+    /// document without vectors. The `put` used to delete the previous
+    /// version and leave a WAL record whose replay failed every later open
+    /// with the same error.
+    #[tokio::test]
+    async fn put_failing_to_create_the_vector_writer_leaves_no_trace() {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+        use crate::lexical::search::searcher::LexicalSearchQuery;
+        use crate::vector::core::field::HnswOption;
+
+        async fn alpha_hits(engine: &Engine) -> usize {
+            let request = crate::engine::search::SearchRequestBuilder::new()
+                .lexical_query(LexicalSearchQuery::from("title:alpha"))
+                .limit(10)
+                .build();
+            engine.search(request).await.unwrap().len()
+        }
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let text_only = Schema::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .build();
+        let engine = Engine::new(storage.clone(), text_only.clone())
+            .await
+            .unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        // Not checked by `validate_for_create`, like the persisted schema.
+        let mut broken = text_only;
+        broken.fields.insert(
+            "vec".to_string(),
+            FieldOption::Hnsw(HnswOption::new(2).m(0)),
+        );
+        let engine = Engine::new(storage.clone(), broken.clone()).await.unwrap();
+
+        let err = engine
+            .put_document("a", title_doc("bravo"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("HNSW parameter m must be >= 2"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            wal_bytes(&storage),
+            0,
+            "a put rejected while creating the vector writer must not reach the WAL"
+        );
+        assert_eq!(
+            alpha_hits(&engine).await,
+            1,
+            "the previous version must stay"
+        );
+        drop(engine);
+
+        let reopened = Engine::new(storage.clone(), broken)
+            .await
+            .expect("the index must still open");
+        assert_eq!(alpha_hits(&reopened).await, 1);
     }
 
     fn grouping_doc(title: &str, parent: Option<&str>) -> Document {
