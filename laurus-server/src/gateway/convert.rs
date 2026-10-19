@@ -2282,22 +2282,31 @@ mod tests {
 
     /// Issue #631: `pq_codebook_path` survives the HTTP gateway's
     /// JSON -> proto -> JSON round-trip, and an absent key stays absent.
+    /// The PQ quantizer it is meant for round-trips with it (Issue #1460).
     #[test]
     fn test_hnsw_pq_codebook_path_round_trips_through_json() {
         let json = json!({
             "dimension": 32,
             "distance": "euclidean",
-            "quantizer": { "product_quantization": { "subvector_count": 4 } },
+            "quantizer": { "method": "product_quantization", "subvector_count": 4 },
             "pq_codebook_path": "embedding.pqcb"
         });
         let opt = json_to_hnsw_option(&json).unwrap();
         assert_eq!(opt.pq_codebook_path.as_deref(), Some("embedding.pqcb"));
+        assert_eq!(
+            opt.quantizer,
+            Some(v1::QuantizationConfig {
+                method: v1::QuantizationMethod::ProductQuantization as i32,
+                subvector_count: 4,
+            })
+        );
 
         let back = hnsw_option_to_json(&opt);
         assert_eq!(
             back.get("pq_codebook_path").and_then(|v| v.as_str()),
             Some("embedding.pqcb")
         );
+        assert_eq!(back["quantizer"], json["quantizer"]);
 
         // Absent in JSON -> absent in proto -> no key in the JSON view.
         let plain = json_to_hnsw_option(&json!({ "dimension": 32 })).unwrap();
@@ -2343,6 +2352,66 @@ mod tests {
             flat_option_to_json(&flat)["quantizer"]["method"].as_str(),
             Some("float16")
         );
+    }
+
+    /// Issue #1460: every `method` string the gateway accepts maps to its
+    /// proto `QuantizationMethod` and back, with its `subvector_count`, for
+    /// each vector field kind that carries a quantizer. The gateway does not
+    /// check a method against the field kind or the build's features (see
+    /// #1457, #1459), so every pair passes through unchanged. The method is
+    /// matched case-insensitively and written back in lower case.
+    #[test]
+    fn test_quantizer_methods_round_trip_through_json() {
+        let methods = [
+            ("scalar_8bit", v1::QuantizationMethod::Scalar8bit, 0),
+            (
+                "product_quantization",
+                v1::QuantizationMethod::ProductQuantization,
+                8,
+            ),
+            (
+                "product_quantization_fastscan",
+                v1::QuantizationMethod::ProductQuantizationFastscan,
+                8,
+            ),
+            ("float16", v1::QuantizationMethod::Float16, 0),
+        ];
+        for kind in ["hnsw", "flat", "ivf"] {
+            for (name, method, subvector_count) in methods {
+                let quantizer = json!({ "method": name, "subvector_count": subvector_count });
+                let json = json!({ kind: { "dimension": 32, "quantizer": quantizer.clone() } });
+                let proto = json_to_proto_field_option(&json).unwrap();
+                let parsed = match &proto.option {
+                    Some(v1::field_option::Option::Hnsw(o)) => o.quantizer.as_ref(),
+                    Some(v1::field_option::Option::Flat(o)) => o.quantizer.as_ref(),
+                    Some(v1::field_option::Option::Ivf(o)) => o.quantizer.as_ref(),
+                    other => panic!("{kind}: unexpected option {other:?}"),
+                };
+                assert_eq!(
+                    parsed,
+                    Some(&v1::QuantizationConfig {
+                        method: method as i32,
+                        subvector_count,
+                    }),
+                    "{kind}/{name}"
+                );
+                assert_eq!(
+                    proto_field_option_to_json(&proto)[kind]["quantizer"],
+                    quantizer,
+                    "{kind}/{name}"
+                );
+
+                let upper = json!({ kind: {
+                    "dimension": 32,
+                    "quantizer": { "method": name.to_uppercase(), "subvector_count": subvector_count }
+                } });
+                let back = proto_field_option_to_json(&json_to_proto_field_option(&upper).unwrap());
+                assert_eq!(
+                    back[kind]["quantizer"], quantizer,
+                    "{kind}/{name} upper case"
+                );
+            }
+        }
     }
 
     /// Issue #1084: `base_weight` survives the HTTP gateway's
