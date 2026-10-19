@@ -855,8 +855,10 @@ fn fuse_scores(
     }
 
     let mut fused: Vec<(u64, f32)> = fused_scores.into_iter().collect();
-    // Sort by fused score descending
-    fused.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Sort by fused score descending, breaking ties by ascending doc id
+    // (Issue #1456) so identical requests return the same order on every
+    // run -- the `HashMap` above iterates in a per-process random order.
+    fused.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     fused
 }
 
@@ -4230,6 +4232,43 @@ mod tests {
     use crate::embedding::per_field::PerFieldEmbedder;
     use crate::embedding::precomputed::PrecomputedEmbedder;
     use crate::storage::memory::MemoryStorage;
+
+    /// Issue #1456: ties (identical fused score) must be ordered by
+    /// ascending doc id, like the vector store's multi-query path and the
+    /// late-interaction rescore. Before the fix, ties kept the `HashMap`'s
+    /// iteration order, which is unrelated to doc id. Every lexical hit
+    /// gets the same raw score, so `WeightedSum`'s min-max normalization
+    /// collapses them all to a guaranteed tie regardless of score magnitude.
+    #[test]
+    fn fuse_scores_breaks_ties_by_ascending_doc_id() {
+        use crate::lexical::query::SearchHit;
+        use crate::vector::store::response::VectorHit;
+
+        let doc_ids: Vec<u64> = vec![17, 3, 42, 9, 25, 1, 38, 12, 30, 6];
+        let lexical_hits: Vec<SearchHit> = doc_ids
+            .iter()
+            .map(|&doc_id| SearchHit {
+                doc_id,
+                score: 1.0,
+                document: None,
+            })
+            .collect();
+
+        let fused = fuse_scores(
+            lexical_hits,
+            Vec::<VectorHit>::new(),
+            FusionAlgorithm::WeightedSum {
+                lexical_weight: 1.0,
+                vector_weight: 0.0,
+            },
+            search::HybridMode::Union,
+        );
+
+        let mut expected: Vec<u64> = doc_ids;
+        expected.sort_unstable();
+        let actual: Vec<u64> = fused.iter().map(|&(doc_id, _)| doc_id).collect();
+        assert_eq!(actual, expected);
+    }
 
     /// Issue #1342: every `VectorSearchOptions` field reaches the vector
     /// search parameters; `fields` and `overfetch` used to be hard-coded.

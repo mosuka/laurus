@@ -1006,6 +1006,27 @@ impl VectorStore {
         Vec::new()
     }
 
+    /// Select the top `limit` hits by descending score, breaking ties by
+    /// ascending doc id so that identical requests return the same order on
+    /// every run (Issue #1456) -- matching the multi-query path and the
+    /// late-interaction rescore, which already tiebreak this way.
+    fn select_top_k_by_score(mut hits: Vec<VectorHit>, limit: usize) -> Vec<VectorHit> {
+        let cmp = |a: &VectorHit, b: &VectorHit| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        };
+        let limit = limit.min(hits.len());
+        if limit > 0 && limit < hits.len() {
+            hits.select_nth_unstable_by(limit - 1, cmp);
+            hits.truncate(limit);
+            hits.sort_unstable_by(cmp);
+        } else if !hits.is_empty() {
+            hits.sort_unstable_by(cmp);
+        }
+        hits
+    }
+
     /// Common implementation for [`Self::search`] and
     /// [`Self::search_with_threshold`].
     ///
@@ -1176,14 +1197,7 @@ impl VectorStore {
 
             // Use partial sort for top-K selection when the result set is larger
             // than the requested limit.
-            let limit = request.params.limit.min(hits.len());
-            if limit > 0 && limit < hits.len() {
-                hits.select_nth_unstable_by(limit - 1, |a, b| b.score.total_cmp(&a.score));
-                hits.truncate(limit);
-                hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-            } else if !hits.is_empty() {
-                hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-            }
+            let hits = Self::select_top_k_by_score(hits, request.params.limit);
 
             return Ok(VectorSearchResults { hits });
         }
@@ -1725,6 +1739,39 @@ impl VectorStore {
 mod tests {
     use super::*;
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+    /// Issue #1456: ties (identical score) must be ordered by ascending
+    /// doc id on every call, matching the multi-query path and the
+    /// late-interaction rescore, which already tiebreak this way. Exercises
+    /// both the partial-sort branch (`limit < hits.len()`) and the full-sort
+    /// branch.
+    #[test]
+    fn select_top_k_by_score_breaks_ties_by_ascending_doc_id() {
+        let doc_ids: Vec<u64> = vec![
+            17, 3, 42, 9, 25, 1, 38, 12, 30, 6, 44, 2, 19, 27, 33, 5, 21, 8, 36, 14,
+        ];
+        let hits: Vec<VectorHit> = doc_ids
+            .iter()
+            .map(|&doc_id| VectorHit {
+                doc_id,
+                score: 1.0,
+                field_hits: vec![],
+            })
+            .collect();
+
+        let top = VectorStore::select_top_k_by_score(hits.clone(), 7);
+        let mut expected: Vec<u64> = doc_ids.clone();
+        expected.sort_unstable();
+        expected.truncate(7);
+        let actual: Vec<u64> = top.iter().map(|h| h.doc_id).collect();
+        assert_eq!(actual, expected);
+
+        let all = VectorStore::select_top_k_by_score(hits, doc_ids.len());
+        let mut expected_all = doc_ids;
+        expected_all.sort_unstable();
+        let actual_all: Vec<u64> = all.iter().map(|h| h.doc_id).collect();
+        assert_eq!(actual_all, expected_all);
+    }
 
     #[test]
     fn test_vectorstore_creation() {
