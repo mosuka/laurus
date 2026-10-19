@@ -16,20 +16,37 @@ fn default_dimension() -> usize {
     128
 }
 
+/// [`HnswOption::m`] when a schema omits it.
+///
+/// Public so a front end that builds options from its own wire format (the
+/// gRPC server, Issue #1479) gives an omitted value the same default a TOML
+/// schema gets.
+pub const DEFAULT_HNSW_M: usize = 16;
+
+/// [`HnswOption::ef_construction`] when a schema omits it. See
+/// [`DEFAULT_HNSW_M`].
+pub const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 200;
+
+/// [`IvfOption::n_clusters`] when a schema omits it. See [`DEFAULT_HNSW_M`].
+pub const DEFAULT_IVF_N_CLUSTERS: usize = 100;
+
+/// [`IvfOption::n_probe`] when a schema omits it. See [`DEFAULT_HNSW_M`].
+pub const DEFAULT_IVF_N_PROBE: usize = 1;
+
 fn default_getting_m() -> usize {
-    16
+    DEFAULT_HNSW_M
 }
 
 fn default_getting_ef_construction() -> usize {
-    200
+    DEFAULT_HNSW_EF_CONSTRUCTION
 }
 
 fn default_getting_n_clusters() -> usize {
-    100
+    DEFAULT_IVF_N_CLUSTERS
 }
 
 fn default_getting_n_probe() -> usize {
-    1
+    DEFAULT_IVF_N_PROBE
 }
 
 /// Options for vector fields.
@@ -111,6 +128,57 @@ impl FieldOption {
     /// late-interaction rescoring instead of one searchable vector.
     pub fn is_multi_vector(&self) -> bool {
         matches!(self, FieldOption::MultiVector(_))
+    }
+
+    /// Check that the options describe a usable field, with the check of
+    /// the field's own kind ([`FlatOption::validate`],
+    /// [`HnswOption::validate`], [`IvfOption::validate`] or
+    /// [`MultiVectorOption::validate`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::invalid_argument`] when the kind's check
+    /// rejects the options.
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        match self {
+            FieldOption::Flat(opt) => opt.validate(field_name),
+            FieldOption::Hnsw(opt) => opt.validate(field_name),
+            FieldOption::Ivf(opt) => opt.validate(field_name),
+            FieldOption::MultiVector(opt) => opt.validate(field_name),
+        }
+    }
+
+    /// Why the field's index cannot work with these parameters, if it
+    /// cannot: the part of [`Self::validate`] that does not look at the
+    /// quantizer.
+    ///
+    /// Opening an index uses this to warn about a field persisted before
+    /// the checks existed (Issue #1479) instead of refusing to open it, so
+    /// the field can still be repaired with `Engine::update_field`.
+    pub(crate) fn params_error(&self) -> Option<String> {
+        match self {
+            FieldOption::Flat(opt) => opt.params_error(),
+            FieldOption::Hnsw(opt) => opt.params_error(),
+            FieldOption::Ivf(opt) => opt.params_error(),
+            FieldOption::MultiVector(opt) => {
+                multi_vector_params_error(opt.dimension, opt.distance, opt.storage, opt.pool_factor)
+            }
+        }
+    }
+}
+
+/// Turn the reason a field's options are unusable into the error the
+/// `validate` methods return.
+fn reject_field(field_name: &str, reason: Option<String>) -> Result<()> {
+    match reason {
+        Some(reason) => Err(LaurusError::invalid_argument(format!(
+            "field '{field_name}': {reason}"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -474,17 +542,15 @@ impl MultiVectorOption {
     /// `Binary` and the distance is not `Cosine` (see
     /// [`multi_vector_params_error`]).
     pub fn validate(&self, field_name: &str) -> Result<()> {
-        match multi_vector_params_error(
-            self.dimension,
-            self.distance,
-            self.storage,
-            self.pool_factor,
-        ) {
-            Some(reason) => Err(LaurusError::invalid_argument(format!(
-                "field '{field_name}': {reason}"
-            ))),
-            None => Ok(()),
-        }
+        reject_field(
+            field_name,
+            multi_vector_params_error(
+                self.dimension,
+                self.distance,
+                self.storage,
+                self.pool_factor,
+            ),
+        )
     }
 
     /// Check one document's token vectors against this field.
@@ -686,16 +752,21 @@ impl FlatOption {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::invalid_argument`] when [`Self::quantizer`] is
-    /// a product quantizer, which Flat does not implement (see
-    /// [`quantizer_support_error`]).
+    /// Returns [`LaurusError::invalid_argument`] when [`Self::dimension`] is
+    /// `0` (Issue #1479), which every non-empty vector would then fail, or
+    /// when [`Self::quantizer`] is a product quantizer, which Flat does not
+    /// implement (see [`quantizer_support_error`]).
     pub fn validate(&self, field_name: &str) -> Result<()> {
-        match quantizer_support_error(VectorIndexKind::Flat, self.quantizer) {
-            Some(reason) => Err(LaurusError::invalid_argument(format!(
-                "field '{field_name}': {reason}"
-            ))),
-            None => Ok(()),
-        }
+        reject_field(
+            field_name,
+            self.params_error()
+                .or_else(|| quantizer_support_error(VectorIndexKind::Flat, self.quantizer)),
+        )
+    }
+
+    /// The part of [`Self::validate`] that does not look at the quantizer.
+    fn params_error(&self) -> Option<String> {
+        (self.dimension == 0).then(|| "Flat dimension must be greater than 0".to_string())
     }
 }
 
@@ -759,6 +830,40 @@ impl HnswOption {
         self.rerank_storage = Some(kind);
         self
     }
+
+    /// Check that the options describe a usable HNSW field (Issue #1479).
+    ///
+    /// HNSW implements every quantizer, so only the graph parameters are
+    /// checked.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::invalid_argument`] when [`Self::dimension`] is
+    /// `0`, which every non-empty vector would then fail, when [`Self::m`]
+    /// is below `2`, which the HNSW writer refuses to build a graph with,
+    /// or when [`Self::ef_construction`] is `0`, which would link each
+    /// inserted node to a single neighbor per layer.
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        reject_field(field_name, self.params_error())
+    }
+
+    /// The checks of [`Self::validate`].
+    fn params_error(&self) -> Option<String> {
+        if self.dimension == 0 {
+            return Some("HNSW dimension must be greater than 0".to_string());
+        }
+        if self.m < 2 {
+            return Some(format!("HNSW m must be at least 2, got {}", self.m));
+        }
+        if self.ef_construction == 0 {
+            return Some("HNSW ef_construction must be at least 1".to_string());
+        }
+        None
+    }
 }
 
 // Builder pattern for IvfOption
@@ -819,16 +924,32 @@ impl IvfOption {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::invalid_argument`] when [`Self::quantizer`] is
-    /// a product quantizer, which IVF does not implement (see
-    /// [`quantizer_support_error`]).
+    /// Returns [`LaurusError::invalid_argument`] when [`Self::dimension`] is
+    /// `0`, which every non-empty vector would then fail, when
+    /// [`Self::n_clusters`] is `0`, when [`Self::n_probe`] is `0`, which
+    /// would make every search probe no cluster (Issue #1479), or when
+    /// [`Self::quantizer`] is a product quantizer, which IVF does not
+    /// implement (see [`quantizer_support_error`]).
     pub fn validate(&self, field_name: &str) -> Result<()> {
-        match quantizer_support_error(VectorIndexKind::Ivf, self.quantizer) {
-            Some(reason) => Err(LaurusError::invalid_argument(format!(
-                "field '{field_name}': {reason}"
-            ))),
-            None => Ok(()),
+        reject_field(
+            field_name,
+            self.params_error()
+                .or_else(|| quantizer_support_error(VectorIndexKind::Ivf, self.quantizer)),
+        )
+    }
+
+    /// The part of [`Self::validate`] that does not look at the quantizer.
+    fn params_error(&self) -> Option<String> {
+        if self.dimension == 0 {
+            return Some("IVF dimension must be greater than 0".to_string());
         }
+        if self.n_clusters == 0 {
+            return Some("IVF n_clusters must be at least 1".to_string());
+        }
+        if self.n_probe == 0 {
+            return Some("IVF n_probe must be at least 1".to_string());
+        }
+        None
     }
 }
 
@@ -1048,6 +1169,98 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    /// Issue #1479: each graph and cluster parameter is rejected at the
+    /// first value the index cannot work with, and accepted at the next.
+    #[test]
+    fn validate_rejects_unusable_parameters_at_their_boundaries() {
+        let cases: Vec<(FieldOption, FieldOption, &str)> = vec![
+            (
+                HnswOption::new(8).m(1).into(),
+                HnswOption::new(8).m(2).into(),
+                "HNSW m must be at least 2, got 1",
+            ),
+            (
+                HnswOption::new(8).ef_construction(0).into(),
+                HnswOption::new(8).ef_construction(1).into(),
+                "HNSW ef_construction must be at least 1",
+            ),
+            (
+                HnswOption::new(0).into(),
+                HnswOption::new(1).into(),
+                "HNSW dimension must be greater than 0",
+            ),
+            (
+                IvfOption::new(8).n_clusters(0).into(),
+                IvfOption::new(8).n_clusters(1).into(),
+                "IVF n_clusters must be at least 1",
+            ),
+            (
+                IvfOption::new(8).n_probe(0).into(),
+                IvfOption::new(8).n_probe(1).into(),
+                "IVF n_probe must be at least 1",
+            ),
+            (
+                IvfOption::new(0).into(),
+                IvfOption::new(1).into(),
+                "IVF dimension must be greater than 0",
+            ),
+            (
+                FlatOption::new(0).into(),
+                FlatOption::new(1).into(),
+                "Flat dimension must be greater than 0",
+            ),
+        ];
+        for (rejected, accepted, reason) in cases {
+            let err = rejected.validate("vec").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("Invalid argument: field 'vec': {reason}")
+            );
+            assert_eq!(rejected.params_error().as_deref(), Some(reason));
+            assert!(accepted.validate("vec").is_ok(), "{accepted:?}");
+            assert_eq!(accepted.params_error(), None, "{accepted:?}");
+        }
+    }
+
+    /// The defaults a schema gets for an omitted key pass the checks.
+    #[test]
+    fn default_options_validate() {
+        for option in [
+            FieldOption::Hnsw(HnswOption::default()),
+            FieldOption::Ivf(IvfOption::default()),
+            FieldOption::Flat(FlatOption::default()),
+            FieldOption::MultiVector(MultiVectorOption::default()),
+        ] {
+            assert!(option.validate("vec").is_ok(), "{option:?}");
+        }
+        let hnsw: HnswOption = serde_json::from_str(r#"{"dimension": 8}"#).unwrap();
+        assert_eq!(hnsw.m, DEFAULT_HNSW_M);
+        assert_eq!(hnsw.ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
+        let ivf: IvfOption = serde_json::from_str(r#"{"dimension": 8}"#).unwrap();
+        assert_eq!(ivf.n_clusters, DEFAULT_IVF_N_CLUSTERS);
+        assert_eq!(ivf.n_probe, DEFAULT_IVF_N_PROBE);
+    }
+
+    /// `params_error` is the part of `validate` that opening an index only
+    /// warns about, so it must not report the quantizer, which opening
+    /// still rejects (Issue #1457).
+    #[test]
+    fn params_error_ignores_the_quantizer() {
+        let pq = quantization::QuantizationMethod::ProductQuantization { subvector_count: 4 };
+        for option in [
+            FieldOption::Flat(FlatOption::new(8).quantizer(pq)),
+            FieldOption::Ivf(IvfOption::new(8).quantizer(pq)),
+        ] {
+            assert!(option.validate("vec").is_err(), "{option:?}");
+            assert_eq!(option.params_error(), None, "{option:?}");
+        }
+        let multi_vector = FieldOption::MultiVector(MultiVectorOption::new(0));
+        assert_eq!(
+            multi_vector.params_error().as_deref(),
+            Some("MultiVector dimension must be greater than 0")
+        );
     }
 
     /// HNSW implements every quantizer, and a MultiVector field has none.

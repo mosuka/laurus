@@ -30,6 +30,7 @@ use crate::lexical::store::config::LexicalIndexConfig;
 use crate::storage::Storage;
 use crate::storage::prefixed::PrefixedStorage;
 use crate::store::log::{DocumentLog, LogEntry, WalSyncPolicy};
+use crate::vector::core::field::{VectorIndexKind, quantizer_support_error};
 use crate::vector::core::vector::Vector;
 use crate::vector::store::config::VectorIndexConfig;
 use crate::vector::store::{FieldEmbedderChange, VectorStore};
@@ -2919,20 +2920,41 @@ impl Engine {
         // schema that says PQ. Builds before the check wrote that field
         // exactly as `Scalar8Bit`, so the error says how to reopen as is.
         for (name, field_option) in &schema.fields {
-            let checked = match field_option {
-                schema::FieldOption::Flat(opt) => opt.validate(name),
-                schema::FieldOption::Ivf(opt) => opt.validate(name),
-                _ => Ok(()),
-            };
-            match checked {
-                Err(crate::error::LaurusError::InvalidArgument(reason)) => {
-                    return Err(crate::error::LaurusError::invalid_argument(format!(
-                        "{reason}; an index that already holds this field stored it as \
-                         Scalar8Bit, so set its quantizer to Scalar8Bit in schema.toml to \
-                         reopen it unchanged"
-                    )));
+            let unsupported = match field_option {
+                schema::FieldOption::Flat(opt) => {
+                    quantizer_support_error(VectorIndexKind::Flat, opt.quantizer)
                 }
-                other => other?,
+                schema::FieldOption::Ivf(opt) => {
+                    quantizer_support_error(VectorIndexKind::Ivf, opt.quantizer)
+                }
+                _ => None,
+            };
+            if let Some(reason) = unsupported {
+                return Err(crate::error::LaurusError::invalid_argument(format!(
+                    "field '{name}': {reason}; an index that already holds this field stored \
+                     it as Scalar8Bit, so set its quantizer to Scalar8Bit in schema.toml to \
+                     reopen it unchanged"
+                )));
+            }
+        }
+
+        // A vector field whose parameters `validate_for_create` rejects
+        // (Issue #1479: e.g. HNSW `m` 0, IVF `n_probe` 0, which gRPC and
+        // HTTP used to persist for an omitted key) opens with a warning
+        // instead: refusing to open would leave no way to repair it with
+        // `update_field`.
+        for (name, field_option) in &schema.fields {
+            if let Some(reason) = field_option
+                .to_vector()
+                .and_then(|vector_option| vector_option.params_error())
+            {
+                log::warn!(
+                    "schema.fields entry '{name}' is not usable as persisted: {reason}; \
+                     fix it with update_field (a new m, ef_construction or n_clusters \
+                     rebuilds the field, a new n_probe applies once the index is reopened, \
+                     a new dimension discards the field's vectors), or in schema.toml \
+                     while the index is closed"
+                );
             }
         }
 

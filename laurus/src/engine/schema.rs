@@ -110,9 +110,9 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Check that `option` describes a usable field named `name`: a `Flat`,
-/// `Ivf` or `MultiVector` option must pass [`FlatOption::validate`],
-/// [`IvfOption::validate`] or [`MultiVectorOption::validate`].
+/// Check that `option` describes a usable field named `name`: a vector
+/// option must pass [`crate::vector::core::field::FieldOption::validate`]
+/// (the check of its kind, e.g. [`HnswOption::validate`]).
 ///
 /// Called by [`Schema::validate_for_create`] and before
 /// `Engine::add_field` / `Engine::update_field` touch any data, so an
@@ -123,11 +123,9 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
 /// Returns [`crate::error::LaurusError::invalid_argument`] when the option
 /// is rejected.
 pub(crate) fn validate_field_option(name: &str, option: &FieldOption) -> crate::error::Result<()> {
-    match option {
-        FieldOption::Flat(opt) => opt.validate(name),
-        FieldOption::Ivf(opt) => opt.validate(name),
-        FieldOption::MultiVector(opt) => opt.validate(name),
-        _ => Ok(()),
+    match option.to_vector() {
+        Some(vector_option) => vector_option.validate(name),
+        None => Ok(()),
     }
 }
 
@@ -230,6 +228,13 @@ impl Schema {
     /// - A [`FieldOption::MultiVector`] field has a zero dimension or a
     ///   distance other than `Cosine` / `DotProduct` (see
     ///   [`MultiVectorOption::validate`]).
+    /// - A [`FieldOption::Hnsw`], [`FieldOption::Flat`] or
+    ///   [`FieldOption::Ivf`] field has a zero dimension, an HNSW `m` below
+    ///   2 or `ef_construction` of 0, or an IVF `n_clusters` or `n_probe` of
+    ///   0 (see [`HnswOption::validate`], [`FlatOption::validate`] and
+    ///   [`IvfOption::validate`], Issue #1479). When the index is reopened,
+    ///   a persisted field that breaks one of these only logs a warning, so
+    ///   it can still be repaired with `Engine::update_field`.
     /// - A [`FieldOption::Flat`] or [`FieldOption::Ivf`] field uses a
     ///   product quantizer, which only HNSW implements (see
     ///   [`FlatOption::validate`] / [`IvfOption::validate`]). Unlike the

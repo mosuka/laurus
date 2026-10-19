@@ -1681,12 +1681,7 @@ impl VectorStore {
 
         // `purge` discards the field's data before re-creating it, so an
         // option the new index would reject must fail before that.
-        match new_option {
-            crate::vector::core::field::FieldOption::Flat(opt) => opt.validate(name)?,
-            crate::vector::core::field::FieldOption::Ivf(opt) => opt.validate(name)?,
-            crate::vector::core::field::FieldOption::MultiVector(opt) => opt.validate(name)?,
-            crate::vector::core::field::FieldOption::Hnsw(_) => {}
-        }
+        new_option.validate(name)?;
 
         let mut writer_guard = self.writer_cache.lock().await;
         let flush_result = match writer_guard.as_mut() {
@@ -2394,6 +2389,49 @@ mod tests {
                 "unexpected error: {err:?}"
             );
             assert_eq!(search_ids(&store, "a").unwrap(), vec![1], "{kind}");
+        }
+    }
+
+    /// Issue #1479 — a purge to an option whose parameters the new index
+    /// cannot work with (HNSW included, which has no quantizer rule) is
+    /// rejected before the field's data is discarded.
+    #[tokio::test]
+    async fn rebuild_rejects_unusable_parameters_before_purging() {
+        use crate::vector::core::field::{FieldOption, HnswOption};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = VectorStore::new(storage, config).unwrap();
+        put_doc(&store, 1).await;
+        store.commit().await.unwrap();
+
+        let options = [
+            (
+                FieldOption::Hnsw(HnswOption::new(4).m(1)),
+                "field 'a': HNSW m must be at least 2, got 1",
+            ),
+            (
+                FieldOption::Flat(flat_option().dimension(0)),
+                "field 'a': Flat dimension must be greater than 0",
+            ),
+        ];
+        for (option, expected) in options {
+            let err = store
+                .rebuild_field("a", &option, FieldEmbedderChange::Keep, true)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, LaurusError::InvalidArgument(m) if m == expected),
+                "unexpected error: {err:?}"
+            );
+            assert_eq!(search_ids(&store, "a").unwrap(), vec![1], "{expected}");
         }
     }
 
