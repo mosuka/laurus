@@ -8,7 +8,7 @@ The `laurus-server` crate provides a gRPC server with an optional HTTP/JSON gate
 - **Full gRPC API** -- Index management, document CRUD, commit, and search (unary + streaming)
 - **HTTP Gateway** -- Optional HTTP/JSON gateway alongside gRPC for REST-style access
 - **Health checking** -- Standard health check endpoint for load balancers and orchestrators
-- **Graceful shutdown** -- Pending changes are committed automatically on Ctrl+C / SIGINT
+- **Graceful shutdown** -- Pending changes are committed automatically on Ctrl+C / SIGINT, or SIGTERM on Unix
 - **TOML configuration** -- Optional config file with CLI and environment variable overrides
 
 ## Architecture

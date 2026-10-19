@@ -11,7 +11,7 @@ gRPC server with HTTP/JSON gateway for the [Laurus](https://github.com/mosuka/la
 - **Full gRPC API** -- Index management, document CRUD, commit, and search (unary + streaming)
 - **HTTP Gateway** -- Optional HTTP/JSON gateway alongside gRPC for REST-style access
 - **Health checking** -- Standard health check endpoint for load balancers and orchestrators
-- **Graceful shutdown** -- Pending changes are committed automatically on Ctrl+C / SIGINT
+- **Graceful shutdown** -- Pending changes are committed automatically on Ctrl+C / SIGINT, or SIGTERM on Unix
 - **TOML configuration** -- Optional config file with CLI and environment variable overrides
 
 ## Quick Start

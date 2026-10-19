@@ -36,7 +36,11 @@ laurus serve
 
 ### Startup Behavior
 
-On startup, the server attempts to open an existing index at the configured data directory. If no index exists, the server starts without one -- you can create an index later via the `CreateIndex` RPC.
+On startup, the server attempts to open an existing index at the configured data directory:
+
+- No index at that directory (no `schema.toml`) -- the server starts without one; you can create an index later via the `CreateIndex` RPC.
+- An index exists and opens successfully -- the server serves it immediately.
+- An index exists but fails to open (a stale lock left by an unclean shutdown, a corrupt `schema.toml`, a failed WAL replay, ...) -- the server logs the cause at error level and exits with a non-zero status instead of starting as if the directory were empty. See [Recovering from an Unclean Shutdown](#recovering-from-an-unclean-shutdown).
 
 ## Configuration
 
@@ -56,11 +60,37 @@ laurus serve --http-port 8080
 
 ## Graceful Shutdown
 
-When the server receives a shutdown signal (Ctrl+C / SIGINT), it automatically:
+When the server receives a shutdown signal -- Ctrl+C / SIGINT, or SIGTERM
+(the signal `docker stop`, Kubernetes and systemd send) on Unix -- it
+automatically:
 
 1. Stops accepting new connections
 2. Commits any pending changes to the index
-3. Exits cleanly
+3. Releases the index lock
+4. Exits cleanly
+
+On non-Unix platforms, only Ctrl+C / SIGINT triggers this sequence.
+
+### Recovering from an Unclean Shutdown
+
+A running server holds an exclusive lock on its data directory,
+`<data-dir>/store/engine.lock`. The lock is released as part of the
+graceful shutdown above, so a normal `docker stop`, `systemctl stop`, or
+Ctrl+C never leaves it behind.
+
+If the process is killed outright -- `kill -9`, a container OOM-kill, a
+host crash -- the lock file can survive the process. The next start then
+fails to open the index (see [Startup Behavior](#startup-behavior) above)
+with an error naming the lock file. To recover:
+
+1. Confirm no `laurus serve` process is still using the data directory
+   (e.g. `ps aux | grep laurus` and check its index directory, or confirm
+   the host that held it has in fact restarted).
+2. Delete `<data-dir>/store/engine.lock`.
+3. Start the server again.
+
+Removing the lock does not touch the index data itself; it only stops the
+engine from refusing to reopen a directory it believes is already in use.
 
 ## Connecting via gRPC
 
