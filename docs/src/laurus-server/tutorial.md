@@ -55,7 +55,7 @@ curl -X POST http://localhost:8080/v1/index \
         "title": {"text": {"indexed": true, "stored": true, "term_vectors": true, "analyzer": "standard"}},
         "body": {"text": {"indexed": true, "stored": true, "term_vectors": true, "analyzer": "body_analyzer"}},
         "category": {"text": {"indexed": true, "stored": true, "term_vectors": false, "analyzer": "keyword"}},
-        "embedding": {"hnsw": {"dimension": 4, "distance": "DISTANCE_METRIC_COSINE", "m": 16, "ef_construction": 200, "embedder": "my_embedder"}}
+        "embedding": {"hnsw": {"dimension": 4, "distance": "cosine", "m": 16, "ef_construction": 200, "embedder": "my_embedder"}}
       },
       "default_fields": ["title", "body"]
     }
@@ -427,7 +427,7 @@ curl -X POST http://localhost:8080/v1/index \
       "fields": {
         "title": {"text": {"indexed": true, "stored": true, "analyzer": "standard"}},
         "body": {"text": {"indexed": true, "stored": true, "analyzer": "standard"}},
-        "embedding": {"hnsw": {"dimension": 384, "distance": "DISTANCE_METRIC_COSINE", "m": 16, "ef_construction": 200, "embedder": "bert"}}
+        "embedding": {"hnsw": {"dimension": 384, "distance": "cosine", "m": 16, "ef_construction": 200, "embedder": "bert"}}
       },
       "default_fields": ["title", "body"]
     }
@@ -506,7 +506,7 @@ curl -X POST http://localhost:8080/v1/index \
       },
       "fields": {
         "title": {"text": {"indexed": true, "stored": true}},
-        "embedding": {"hnsw": {"dimension": 1536, "distance": "DISTANCE_METRIC_COSINE", "embedder": "openai"}}
+        "embedding": {"hnsw": {"dimension": 1536, "distance": "cosine", "embedder": "openai"}}
       },
       "default_fields": ["title"]
     }

@@ -69,7 +69,7 @@ curl -X POST http://localhost:8080/v1/index \
   }'
 ```
 
-`dynamic_field_policy` は省略可能なキーで、スキーマに宣言されていないフィールドの扱いを制御します。指定できる値は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"` の 3 種類です。詳細および `"dynamic"` での情報損失に関する警告は [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
+`dynamic_field_policy` は省略可能なキーで、スキーマに宣言されていないフィールドの扱いを制御します。指定できる値は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"` の 3 種類です。`null` はキーの省略と同じで、ほかの値（文字列でない値を含む）は 400 で拒否されます（Issue #1473）。詳細および `"dynamic"` での情報損失に関する警告は [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
 
 ### インデックス統計情報の取得
 
@@ -89,7 +89,16 @@ MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector"
 
 MultiVector フィールドには、トークン単位のエンベッダーも指定できます（Issue #1349）。エンベッダーはスキーマの `embedders` で宣言し、数値のオプションは JSON の数値で書きます。例: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` と `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`。こうすると、文書はこのフィールドにテキスト（`"body_colbert": "how lifetimes work in rust"`）を与えられ、テキストはトークンベクトルに埋め込まれます。エンベッダーのパラメータのうち数値と真偽値は文字列として渡され、配列とオブジェクトは拒否されます。
 
-MultiVector フィールドには `storage`（Issue #1346）も指定でき、トークンベクトルのディスク上の要素形式を選べます。`"f32"`（デフォルト、誤差なし）、`"f16"`（`"f32"` の半分のサイズ、要素あたり相対誤差 ~2⁻¹¹）、`"int8"`（典型的な次元数で `"f32"` の約 1/4 のサイズ、ベクトルごとのスケールを使用）、`"binary"`（`"f32"` の 1/32 のサイズ、要素あたり 1 bit。`"distance": "cosine"` が必要）のいずれかです。整数の `pool_factor` も指定でき、各文書のトークンベクトルを約 `1 / pool_factor` に減らします（デフォルトの `1` はすべて保存。`0` はエンジンが拒否し、0 以上の整数でない値は 400 になります）。`1` のとき、このキーはレスポンスから省略されます。値は小文字の文字列で、入力時は大文字小文字を区別せずに受け付けます。例: `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`。認識できない値は拒否されます。`storage` がデフォルトの `"f32"` の場合、このキーはレスポンスから省略されます。
+MultiVector フィールドには `storage`（Issue #1346）も指定でき、トークンベクトルのディスク上の要素形式を選べます。`"f32"`（デフォルト、誤差なし）、`"f16"`（`"f32"` の半分のサイズ、要素あたり相対誤差 ~2⁻¹¹）、`"int8"`（典型的な次元数で `"f32"` の約 1/4 のサイズ、ベクトルごとのスケールを使用）、`"binary"`（`"f32"` の 1/32 のサイズ、要素あたり 1 bit。`"distance": "cosine"` が必要）のいずれかです。整数の `pool_factor` も指定でき、各文書のトークンベクトルを約 `1 / pool_factor` に減らします（デフォルトの `1` はすべて保存。`0` はエンジンが拒否し、0 以上の整数でない値は 400 になります）。`1` のとき、このキーはレスポンスから省略されます。値は小文字の文字列で、入力時は大文字小文字を区別せずに受け付けます。例: `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`。認識できない値と文字列でない値は 400 で拒否され（Issue #1473）、`null` はキーの省略と同じです。`storage` がデフォルトの `"f32"` の場合、このキーはレスポンスから省略されます。
+
+`hnsw`・`flat`・`ivf` フィールドには、`distance` として `"cosine"`・`"euclidean"`・`"manhattan"`・`"dot_product"`・`"angular"` のいずれか（MultiVector フィールドも同じ文字列を受け付けます）を、`rerank_storage` として `"F32"` を指定できます。`"F32"` を指定すると、`rerank_factor` を指定したクエリが再スコアに使う完全精度のベクトルの写しを保存します（[Two-stage rerank](../concepts/indexing/vector_indexing.md#two-stage-rerankissue-481-stage-2) を参照）。どちらも入力時は大文字小文字を区別せずに受け付けます。`distance` を省略するか `null` にすると `"cosine"` になり、`rerank_storage` を省略するか `null` にすると写しを保存しません。レスポンスの `rerank_storage` は、`"F32"` のときだけ含まれます。ほかの値（文字列でない値を含む）は 400 で拒否され（Issue #1473）、何も書き込まれません。
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "distance": "euclidian"}}}}}'
+# => {"error":{"code":400,"message":"field \"embedding\": unknown distance \"euclidian\" (expected \"cosine\", \"euclidean\", \"manhattan\", \"dot_product\", or \"angular\")"}}
+```
 
 `hnsw`・`flat`・`ivf` フィールドには `quantizer` を指定でき、ベクトルの保存形式を選べます。例: `"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "product_quantization", "subvector_count": 48}}}`。`method` は gRPC の `QuantizationMethod` の名前から接頭辞 `QUANTIZATION_METHOD_` を除いて小文字にしたもので、入力時は大文字小文字を区別せずに受け付けます。
 

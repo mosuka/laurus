@@ -71,7 +71,9 @@ curl -X POST http://localhost:8080/v1/index \
 
 The `dynamic_field_policy` key is optional. It controls how fields absent
 from the schema are handled at ingest time. Accepted values: `"strict"`,
-`"dynamic"` (default), `"ignore"`. See
+`"dynamic"` (default), `"ignore"`. `null` is the same as omitting the key;
+any other value, including one that is not a string, is rejected with 400
+(Issue #1473). See
 [Schema & Fields](../concepts/schema_and_fields.md#dynamic-schema) for the
 full semantics and the warning about silent truncation under `"dynamic"`.
 
@@ -93,7 +95,16 @@ A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vecto
 
 A multi-vector field may also name a token-level embedder (Issue #1349), declared in the schema's `embedders` with its numeric options as JSON numbers: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` and `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`. A document can then give the field text (`"body_colbert": "how lifetimes work in rust"`), which is embedded into token vectors. Embedder parameters that are numbers or booleans are passed on as strings, and arrays or objects are rejected.
 
-A multi-vector field may also set `storage` (Issue #1346) to pick the on-disk element kind of its token vectors: `"f32"` (default, exact), `"f16"` (2x smaller than `"f32"`, ~2⁻¹¹ relative error per element), `"int8"` (~4x smaller than `"f32"` at typical dimensions, using a per-vector scale), or `"binary"` (32x smaller, 1 bit per element; requires `"distance": "cosine"`). It may also set `pool_factor`, an integer: each document keeps about `1 / pool_factor` of its token vectors (`1`, the default, keeps them all; `0` is rejected by the engine, and a value that is not a non-negative integer is a 400). The key is omitted from the response when it is `1`. The value is a lowercase string, accepted case-insensitively on input, e.g. `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`; an unrecognized value is rejected. The key is omitted from the response when `storage` is `"f32"`, the default.
+A multi-vector field may also set `storage` (Issue #1346) to pick the on-disk element kind of its token vectors: `"f32"` (default, exact), `"f16"` (2x smaller than `"f32"`, ~2⁻¹¹ relative error per element), `"int8"` (~4x smaller than `"f32"` at typical dimensions, using a per-vector scale), or `"binary"` (32x smaller, 1 bit per element; requires `"distance": "cosine"`). It may also set `pool_factor`, an integer: each document keeps about `1 / pool_factor` of its token vectors (`1`, the default, keeps them all; `0` is rejected by the engine, and a value that is not a non-negative integer is a 400). The key is omitted from the response when it is `1`. The value is a lowercase string, accepted case-insensitively on input, e.g. `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`; an unrecognized value, or one that is not a string, is rejected with 400 (Issue #1473), and `null` is the same as omitting the key. The key is omitted from the response when `storage` is `"f32"`, the default.
+
+An `hnsw`, `flat` or `ivf` field may set `distance` to `"cosine"`, `"euclidean"`, `"manhattan"`, `"dot_product"` or `"angular"` (a multi-vector field takes the same strings), and `rerank_storage` to `"F32"` to keep a full-precision copy of the vectors that a query with `rerank_factor` rescores against (see [Two-stage rerank](../concepts/indexing/vector_indexing.md#two-stage-rerank-issue-481-stage-2)). Both are accepted case-insensitively. Omitting `distance` or setting it to `null` means `"cosine"`, and omitting `rerank_storage` or setting it to `null` keeps no copy; in the response, `rerank_storage` appears only when it is `"F32"`. Any other value, including one that is not a string, is rejected with 400 (Issue #1473), and nothing is written:
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "distance": "euclidian"}}}}}'
+# => {"error":{"code":400,"message":"field \"embedding\": unknown distance \"euclidian\" (expected \"cosine\", \"euclidean\", \"manhattan\", \"dot_product\", or \"angular\")"}}
+```
 
 An `hnsw`, `flat` or `ivf` field may set `quantizer` to pick how its vectors are stored, e.g. `"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "product_quantization", "subvector_count": 48}}}`. `method` is the gRPC `QuantizationMethod` name without its `QUANTIZATION_METHOD_` prefix, in lower case, and is accepted case-insensitively:
 

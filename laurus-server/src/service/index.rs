@@ -512,4 +512,155 @@ mod tests {
         );
         assert_eq!(schema_of(&service).await, before);
     }
+
+    /// Proto field options that each carry a value this build does not know
+    /// in one field-level enum (Issue #1473), paired with the error they get:
+    /// a distance and a rerank storage kind on an HNSW field, and a storage
+    /// on a multi-vector field.
+    fn options_with_unknown_enum_values() -> [(v1::FieldOption, &'static str); 3] {
+        use v1::field_option::Option as Opt;
+        [
+            (
+                Opt::Hnsw(v1::HnswOption {
+                    dimension: 8,
+                    distance: 99,
+                    ..Default::default()
+                }),
+                "unknown distance metric 99",
+            ),
+            (
+                Opt::Hnsw(v1::HnswOption {
+                    dimension: 8,
+                    rerank_storage: Some(99),
+                    ..Default::default()
+                }),
+                "unknown rerank storage kind 99",
+            ),
+            (
+                Opt::MultiVector(v1::MultiVectorOption {
+                    dimension: 8,
+                    storage: Some(99),
+                    ..Default::default()
+                }),
+                "unknown multi-vector storage 99",
+            ),
+        ]
+        .map(|(option, message)| {
+            (
+                v1::FieldOption {
+                    option: Some(option),
+                },
+                message,
+            )
+        })
+    }
+
+    /// Issue #1473: CreateIndex rejects a distance, rerank storage kind,
+    /// multi-vector storage or dynamic field policy this server does not
+    /// know as InvalidArgument, instead of using the default, and writes
+    /// nothing.
+    #[tokio::test]
+    async fn create_index_rejects_unknown_enum_values() {
+        let mut cases: Vec<(v1::Schema, String)> = options_with_unknown_enum_values()
+            .into_iter()
+            .map(|(option, message)| {
+                (
+                    v1::Schema {
+                        fields: HashMap::from([("vec".to_string(), option)]),
+                        ..Default::default()
+                    },
+                    format!("Field 'vec': {message}"),
+                )
+            })
+            .collect();
+        let mut schema =
+            schema_convert::to_proto(&Schema::from_toml("[fields.body.Text]").unwrap());
+        schema.dynamic_field_policy = 99;
+        cases.push((schema, "unknown dynamic field policy 99".to_string()));
+
+        for (schema, message) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().join("data");
+            let service = IndexService {
+                engine: Arc::new(RwLock::new(None)),
+                data_dir: data_dir.clone(),
+                wal_policy: WalSyncPolicy::PerRecord,
+                commit_policy: CommitPolicy::Manual,
+            };
+
+            let status = service
+                .create_index(Request::new(CreateIndexRequest {
+                    schema: Some(schema),
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{message}");
+            assert_eq!(status.message(), message);
+            assert!(
+                !data_dir.exists(),
+                "a rejected create must write nothing: {message}"
+            );
+            assert!(service.engine.read().await.is_none(), "{message}");
+        }
+    }
+
+    /// Issue #1473: AddField rejects a distance, rerank storage kind or
+    /// multi-vector storage this server does not know as InvalidArgument and
+    /// leaves the schema as it was.
+    #[tokio::test]
+    async fn add_field_rejects_unknown_enum_values() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.body.Text]
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        for (option, message) in options_with_unknown_enum_values() {
+            let status = service
+                .add_field(Request::new(AddFieldRequest {
+                    name: "vec".to_string(),
+                    field_option: Some(option),
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{message}");
+            assert_eq!(status.message(), message);
+            assert_eq!(schema_of(&service).await, before, "{message}");
+        }
+    }
+
+    /// Issue #1473: UpdateField rejects a distance, rerank storage kind or
+    /// multi-vector storage this server does not know as InvalidArgument and
+    /// leaves the field as it was.
+    #[tokio::test]
+    async fn update_field_rejects_unknown_enum_values() {
+        let (_dir, service) = service_with_index(
+            r#"
+            [fields.vec.Hnsw]
+            dimension = 8
+            "#,
+        )
+        .await;
+        let before = schema_of(&service).await;
+
+        for (option, message) in options_with_unknown_enum_values() {
+            let status = service
+                .update_field(Request::new(UpdateFieldRequest {
+                    name: "vec".to_string(),
+                    field_option: Some(option),
+                    reindex: true,
+                    dry_run: false,
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{message}");
+            assert_eq!(status.message(), message);
+            assert_eq!(schema_of(&service).await, before, "{message}");
+        }
+    }
 }

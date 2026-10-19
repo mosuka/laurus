@@ -45,6 +45,13 @@ pub fn to_proto(schema: &Schema) -> v1::Schema {
 }
 
 /// Convert a proto Schema into a laurus Schema.
+///
+/// # Errors
+///
+/// Returns an error if a field option cannot be converted (see
+/// [`field_option_from_proto`]; the message names the field), if an
+/// analyzer or embedder definition is invalid, or if `dynamic_field_policy`
+/// is a value this server does not know (Issue #1473).
 pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
     let mut fields = BTreeMap::new();
     for (name, fo) in &proto.fields {
@@ -64,7 +71,7 @@ pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
         embedders,
         fields,
         default_fields: proto.default_fields.clone(),
-        dynamic_field_policy: dynamic_field_policy_from_proto(proto.dynamic_field_policy),
+        dynamic_field_policy: dynamic_field_policy_from_proto(proto.dynamic_field_policy)?,
         pending_reindex: proto.pending_reindex.iter().cloned().collect(),
     })
 }
@@ -84,18 +91,25 @@ fn dynamic_field_policy_to_proto(policy: &DynamicFieldPolicy) -> v1::DynamicFiel
 
 /// Convert a proto `DynamicFieldPolicy` value into a laurus `DynamicFieldPolicy`.
 ///
-/// The proto value `UNSPECIFIED` (zero) and any unrecognised value are mapped to
-/// [`DynamicFieldPolicy::Dynamic`], matching the laurus default.
+/// `UNSPECIFIED` (zero, what a client that leaves the field unset sends)
+/// maps to [`DynamicFieldPolicy::Dynamic`], the laurus default.
 ///
 /// # Arguments
 ///
 /// * `value` - The proto enum value (i32).
-fn dynamic_field_policy_from_proto(value: i32) -> DynamicFieldPolicy {
+///
+/// # Errors
+///
+/// Returns an error, rather than falling back to the default, for a value
+/// this server does not know, such as one a newer client sends
+/// (Issue #1473).
+fn dynamic_field_policy_from_proto(value: i32) -> Result<DynamicFieldPolicy, String> {
     match v1::DynamicFieldPolicy::try_from(value) {
-        Ok(v1::DynamicFieldPolicy::Strict) => DynamicFieldPolicy::Strict,
-        Ok(v1::DynamicFieldPolicy::Dynamic) => DynamicFieldPolicy::Dynamic,
-        Ok(v1::DynamicFieldPolicy::Ignore) => DynamicFieldPolicy::Ignore,
-        Ok(v1::DynamicFieldPolicy::Unspecified) | Err(_) => DynamicFieldPolicy::default(),
+        Ok(v1::DynamicFieldPolicy::Strict) => Ok(DynamicFieldPolicy::Strict),
+        Ok(v1::DynamicFieldPolicy::Dynamic) => Ok(DynamicFieldPolicy::Dynamic),
+        Ok(v1::DynamicFieldPolicy::Ignore) => Ok(DynamicFieldPolicy::Ignore),
+        Ok(v1::DynamicFieldPolicy::Unspecified) => Ok(DynamicFieldPolicy::default()),
+        Err(_) => Err(format!("unknown dynamic field policy {value}")),
     }
 }
 
@@ -219,9 +233,11 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
 ///
 /// # Errors
 ///
-/// Returns an error if the proto message has no option variant set, or if
-/// a vector option's quantizer is unknown or unsupported by this build
-/// (see [`quantization_from_proto`]).
+/// Returns an error if the proto message has no option variant set, if a
+/// vector option's quantizer is unknown or unsupported by this build (see
+/// [`quantization_from_proto`]), or if a vector option's distance, rerank
+/// storage or multi-vector storage is a value this server does not know
+/// (Issue #1473).
 pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, String> {
     use v1::field_option::Option as Opt;
     let option = match &fo.option {
@@ -285,7 +301,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
         }),
         Some(Opt::Hnsw(o)) => FieldOption::Hnsw(HnswOption {
             dimension: o.dimension as usize,
-            distance: distance_from_proto(o.distance),
+            distance: distance_from_proto(o.distance)?,
             m: o.m as usize,
             ef_construction: o.ef_construction as usize,
             default_ef_search: o.default_ef_search.map(|v| v as usize),
@@ -297,7 +313,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
                 .map(quantization_from_proto)
                 .transpose()?
                 .unwrap_or_default(),
-            rerank_storage: o.rerank_storage.and_then(rerank_storage_from_proto),
+            rerank_storage: rerank_storage_from_proto(o.rerank_storage)?,
             embedder: if o.embedder.is_empty() {
                 None
             } else {
@@ -310,7 +326,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
         }),
         Some(Opt::Flat(o)) => FieldOption::Flat(FlatOption {
             dimension: o.dimension as usize,
-            distance: distance_from_proto(o.distance),
+            distance: distance_from_proto(o.distance)?,
             // Unset means "use the engine's default" (#1084).
             base_weight: o.base_weight.unwrap_or(1.0),
             quantizer: o
@@ -319,7 +335,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
                 .map(quantization_from_proto)
                 .transpose()?
                 .unwrap_or_default(),
-            rerank_storage: o.rerank_storage.and_then(rerank_storage_from_proto),
+            rerank_storage: rerank_storage_from_proto(o.rerank_storage)?,
             embedder: if o.embedder.is_empty() {
                 None
             } else {
@@ -328,7 +344,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
         }),
         Some(Opt::Ivf(o)) => FieldOption::Ivf(IvfOption {
             dimension: o.dimension as usize,
-            distance: distance_from_proto(o.distance),
+            distance: distance_from_proto(o.distance)?,
             n_clusters: o.n_clusters as usize,
             n_probe: o.n_probe as usize,
             // Unset means "use the engine's default" (#1084).
@@ -339,7 +355,7 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
                 .map(quantization_from_proto)
                 .transpose()?
                 .unwrap_or_default(),
-            rerank_storage: o.rerank_storage.and_then(rerank_storage_from_proto),
+            rerank_storage: rerank_storage_from_proto(o.rerank_storage)?,
             embedder: if o.embedder.is_empty() {
                 None
             } else {
@@ -348,13 +364,13 @@ pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, Stri
         }),
         Some(Opt::MultiVector(o)) => FieldOption::MultiVector(MultiVectorOption {
             dimension: o.dimension as usize,
-            distance: distance_from_proto(o.distance),
+            distance: distance_from_proto(o.distance)?,
             embedder: if o.embedder.is_empty() {
                 None
             } else {
                 Some(o.embedder.clone())
             },
-            storage: multi_vector_storage_from_proto(o.storage),
+            storage: multi_vector_storage_from_proto(o.storage)?,
             // Unset (an older client) means no pooling.
             pool_factor: o.pool_factor.unwrap_or(1),
         }),
@@ -373,14 +389,23 @@ fn distance_to_proto(d: &DistanceMetric) -> v1::DistanceMetric {
     }
 }
 
-fn distance_from_proto(d: i32) -> DistanceMetric {
+/// Convert a proto `DistanceMetric` value into a laurus [`DistanceMetric`].
+///
+/// `COSINE` is the zero value, so a client that leaves `distance` unset
+/// gets cosine, the default.
+///
+/// # Errors
+///
+/// Returns an error, rather than falling back to cosine, for a value this
+/// server does not know, such as one a newer client sends (Issue #1473).
+fn distance_from_proto(d: i32) -> Result<DistanceMetric, String> {
     match v1::DistanceMetric::try_from(d) {
-        Ok(v1::DistanceMetric::Cosine) => DistanceMetric::Cosine,
-        Ok(v1::DistanceMetric::Euclidean) => DistanceMetric::Euclidean,
-        Ok(v1::DistanceMetric::Manhattan) => DistanceMetric::Manhattan,
-        Ok(v1::DistanceMetric::DotProduct) => DistanceMetric::DotProduct,
-        Ok(v1::DistanceMetric::Angular) => DistanceMetric::Angular,
-        Err(_) => DistanceMetric::Cosine,
+        Ok(v1::DistanceMetric::Cosine) => Ok(DistanceMetric::Cosine),
+        Ok(v1::DistanceMetric::Euclidean) => Ok(DistanceMetric::Euclidean),
+        Ok(v1::DistanceMetric::Manhattan) => Ok(DistanceMetric::Manhattan),
+        Ok(v1::DistanceMetric::DotProduct) => Ok(DistanceMetric::DotProduct),
+        Ok(v1::DistanceMetric::Angular) => Ok(DistanceMetric::Angular),
+        Err(_) => Err(format!("unknown distance metric {d}")),
     }
 }
 
@@ -454,15 +479,24 @@ fn rerank_storage_to_proto(kind: RerankStorageKind) -> v1::RerankStorageKind {
     }
 }
 
-/// Convert a proto `rerank_storage` enum value into an optional laurus
-/// [`RerankStorageKind`] (Issue #793).
+/// Convert an optional proto `rerank_storage` enum value into an optional
+/// laurus [`RerankStorageKind`] (Issue #793).
 ///
-/// `UNSPECIFIED` and any unknown value map to `None` (Stage-1, no
-/// sidecar), so an absent or zero field keeps the historical behavior.
-fn rerank_storage_from_proto(value: i32) -> Option<RerankStorageKind> {
+/// An absent field and `UNSPECIFIED` map to `None` (Stage-1, no sidecar),
+/// so a client that leaves the field unset keeps the historical behavior.
+///
+/// # Errors
+///
+/// Returns an error, rather than `None`, for a value this server does not
+/// know, such as one a newer client sends (Issue #1473).
+fn rerank_storage_from_proto(value: Option<i32>) -> Result<Option<RerankStorageKind>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
     match v1::RerankStorageKind::try_from(value) {
-        Ok(v1::RerankStorageKind::F32) => Some(RerankStorageKind::F32),
-        Ok(v1::RerankStorageKind::Unspecified) | Err(_) => None,
+        Ok(v1::RerankStorageKind::F32) => Ok(Some(RerankStorageKind::F32)),
+        Ok(v1::RerankStorageKind::Unspecified) => Ok(None),
+        Err(_) => Err(format!("unknown rerank storage kind {value}")),
     }
 }
 
@@ -478,16 +512,25 @@ fn multi_vector_storage_to_proto(storage: MultiVectorStorage) -> v1::MultiVector
 }
 
 /// Convert an optional proto `storage` enum value into a laurus
-/// [`MultiVectorStorage`]. `UNSPECIFIED`, absent, and any unknown value
-/// all map to [`MultiVectorStorage::F32`], the default.
-fn multi_vector_storage_from_proto(value: Option<i32>) -> MultiVectorStorage {
-    match value.and_then(|v| v1::MultiVectorStorage::try_from(v).ok()) {
-        Some(v1::MultiVectorStorage::F16) => MultiVectorStorage::F16,
-        Some(v1::MultiVectorStorage::Int8) => MultiVectorStorage::Int8,
-        Some(v1::MultiVectorStorage::Binary) => MultiVectorStorage::Binary,
-        Some(v1::MultiVectorStorage::F32 | v1::MultiVectorStorage::Unspecified) | None => {
-            MultiVectorStorage::F32
+/// [`MultiVectorStorage`]. An absent field and `UNSPECIFIED` map to
+/// [`MultiVectorStorage::F32`], the default.
+///
+/// # Errors
+///
+/// Returns an error, rather than falling back to `F32`, for a value this
+/// server does not know, such as one a newer client sends (Issue #1473).
+fn multi_vector_storage_from_proto(value: Option<i32>) -> Result<MultiVectorStorage, String> {
+    let Some(value) = value else {
+        return Ok(MultiVectorStorage::F32);
+    };
+    match v1::MultiVectorStorage::try_from(value) {
+        Ok(v1::MultiVectorStorage::F16) => Ok(MultiVectorStorage::F16),
+        Ok(v1::MultiVectorStorage::Int8) => Ok(MultiVectorStorage::Int8),
+        Ok(v1::MultiVectorStorage::Binary) => Ok(MultiVectorStorage::Binary),
+        Ok(v1::MultiVectorStorage::F32 | v1::MultiVectorStorage::Unspecified) => {
+            Ok(MultiVectorStorage::F32)
         }
+        Err(_) => Err(format!("unknown multi-vector storage {value}")),
     }
 }
 
@@ -972,7 +1015,7 @@ mod tests {
         ] {
             let proto_value = dynamic_field_policy_to_proto(&policy) as i32;
             let back = dynamic_field_policy_from_proto(proto_value);
-            assert_eq!(policy, back, "round-trip mismatch for {policy:?}");
+            assert_eq!(Ok(policy), back, "round-trip mismatch for {policy:?}");
         }
     }
 
@@ -983,19 +1026,27 @@ mod tests {
         let unspecified = v1::DynamicFieldPolicy::Unspecified as i32;
         assert_eq!(
             dynamic_field_policy_from_proto(unspecified),
-            DynamicFieldPolicy::default()
+            Ok(DynamicFieldPolicy::default())
         );
         assert_eq!(DynamicFieldPolicy::default(), DynamicFieldPolicy::Dynamic);
     }
 
-    /// Unknown i32 values coming from a newer client fall back to the
-    /// laurus default (`Dynamic`), matching the forward-compatibility
-    /// contract for proto3 enums.
+    /// Issue #1473: a policy value this server does not know, such as one a
+    /// newer client sends, is an error instead of the default `Dynamic`,
+    /// and `from_proto` (CreateIndex) rejects the schema.
     #[test]
-    fn dynamic_field_policy_unknown_value_maps_to_default() {
+    fn dynamic_field_policy_unknown_value_is_rejected() {
         assert_eq!(
             dynamic_field_policy_from_proto(9999),
-            DynamicFieldPolicy::default()
+            Err("unknown dynamic field policy 9999".to_string())
+        );
+        let schema = v1::Schema {
+            dynamic_field_policy: 9999,
+            ..Default::default()
+        };
+        assert_eq!(
+            from_proto(&schema).unwrap_err(),
+            "unknown dynamic field policy 9999"
         );
     }
 
@@ -1489,6 +1540,144 @@ mod tests {
         );
     }
 
+    /// The proto options of an HNSW, a Flat, an IVF and a multi-vector field
+    /// whose `distance` is the raw value `distance`, which may be one this
+    /// build does not know (Issue #1473).
+    fn vector_options_with_distance(distance: i32) -> [v1::FieldOption; 4] {
+        use v1::field_option::Option as Opt;
+        [
+            Opt::Hnsw(v1::HnswOption {
+                dimension: 8,
+                distance,
+                ..Default::default()
+            }),
+            Opt::Flat(v1::FlatOption {
+                dimension: 8,
+                distance,
+                ..Default::default()
+            }),
+            Opt::Ivf(v1::IvfOption {
+                dimension: 8,
+                distance,
+                ..Default::default()
+            }),
+            Opt::MultiVector(v1::MultiVectorOption {
+                dimension: 8,
+                distance,
+                ..Default::default()
+            }),
+        ]
+        .map(|option| v1::FieldOption {
+            option: Some(option),
+        })
+    }
+
+    /// The distance of a converted vector field option.
+    fn distance_of(option: &FieldOption) -> DistanceMetric {
+        match option {
+            FieldOption::Hnsw(o) => o.distance,
+            FieldOption::Flat(o) => o.distance,
+            FieldOption::Ivf(o) => o.distance,
+            FieldOption::MultiVector(o) => o.distance,
+            other => panic!("not a vector option: {other:?}"),
+        }
+    }
+
+    /// Issue #1473: `COSINE` (the zero value, what a client that leaves
+    /// `distance` unset sends) is cosine, but a distance this server does
+    /// not know, such as one a newer client sends, is an error instead of
+    /// cosine on every vector option. `from_proto` (CreateIndex) names the
+    /// field.
+    #[test]
+    fn unknown_distance_metric_is_rejected() {
+        for option in vector_options_with_distance(v1::DistanceMetric::Cosine as i32) {
+            let converted = field_option_from_proto(&option).unwrap();
+            assert_eq!(distance_of(&converted), DistanceMetric::Cosine);
+        }
+
+        for option in vector_options_with_distance(99) {
+            assert_eq!(
+                field_option_from_proto(&option).unwrap_err(),
+                "unknown distance metric 99",
+                "{option:?}"
+            );
+        }
+
+        let [hnsw, _, _, _] = vector_options_with_distance(99);
+        let schema = v1::Schema {
+            fields: HashMap::from([("embedding".to_string(), hnsw)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_proto(&schema).unwrap_err(),
+            "Field 'embedding': unknown distance metric 99"
+        );
+    }
+
+    /// The proto options of an HNSW, a Flat and an IVF field whose
+    /// `rerank_storage` is the raw value `rerank_storage`, which may be one
+    /// this build does not know (Issue #1473).
+    fn vector_options_with_rerank_storage(rerank_storage: Option<i32>) -> [v1::FieldOption; 3] {
+        use v1::field_option::Option as Opt;
+        [
+            Opt::Hnsw(v1::HnswOption {
+                dimension: 8,
+                rerank_storage,
+                ..Default::default()
+            }),
+            Opt::Flat(v1::FlatOption {
+                dimension: 8,
+                rerank_storage,
+                ..Default::default()
+            }),
+            Opt::Ivf(v1::IvfOption {
+                dimension: 8,
+                rerank_storage,
+                ..Default::default()
+            }),
+        ]
+        .map(|option| v1::FieldOption {
+            option: Some(option),
+        })
+    }
+
+    /// Issue #1473: an absent `rerank_storage` and `UNSPECIFIED` mean no
+    /// sidecar, but a value this server does not know, such as one a newer
+    /// client sends, is an error instead of no sidecar on every vector
+    /// option that carries it. `from_proto` (CreateIndex) names the field.
+    #[test]
+    fn unknown_rerank_storage_kind_is_rejected() {
+        for value in [None, Some(v1::RerankStorageKind::Unspecified as i32)] {
+            for option in vector_options_with_rerank_storage(value) {
+                let rerank_storage = match field_option_from_proto(&option) {
+                    Ok(FieldOption::Hnsw(o)) => o.rerank_storage,
+                    Ok(FieldOption::Flat(o)) => o.rerank_storage,
+                    Ok(FieldOption::Ivf(o)) => o.rerank_storage,
+                    other => panic!("expected a vector option, got {other:?}"),
+                };
+                assert_eq!(rerank_storage, None, "{value:?}");
+            }
+        }
+
+        for option in vector_options_with_rerank_storage(Some(99)) {
+            assert_eq!(
+                field_option_from_proto(&option).unwrap_err(),
+                "unknown rerank storage kind 99",
+                "{option:?}"
+            );
+        }
+
+        let [hnsw, _, _] = vector_options_with_rerank_storage(Some(99));
+        let schema = v1::Schema {
+            fields: HashMap::from([("embedding".to_string(), hnsw)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_proto(&schema).unwrap_err(),
+            "Field 'embedding': unknown rerank storage kind 99"
+        );
+    }
+
     /// `FieldOption::Geo3d` round-trips through the proto `Geo3dOption`
     /// variant added in #305 (it used to be silently dropped to `None`
     /// before the proto representation existed).
@@ -1633,11 +1822,36 @@ mod tests {
     fn schema_field_option_multi_vector_storage_absent_or_unspecified_defaults_to_f32() {
         assert_eq!(
             multi_vector_storage_from_proto(None),
-            MultiVectorStorage::F32
+            Ok(MultiVectorStorage::F32)
         );
         assert_eq!(
             multi_vector_storage_from_proto(Some(v1::MultiVectorStorage::Unspecified as i32)),
-            MultiVectorStorage::F32
+            Ok(MultiVectorStorage::F32)
+        );
+    }
+
+    /// Issue #1473: a multi-vector storage value this server does not know,
+    /// such as one a newer client sends, is an error instead of `F32`, and
+    /// `from_proto` (CreateIndex) names the field.
+    #[test]
+    fn unknown_multi_vector_storage_is_rejected() {
+        let mut option =
+            field_option_to_proto(&FieldOption::MultiVector(MultiVectorOption::new(96)));
+        match &mut option.option {
+            Some(v1::field_option::Option::MultiVector(o)) => o.storage = Some(99),
+            other => unreachable!("not a multi-vector option: {other:?}"),
+        }
+        assert_eq!(
+            field_option_from_proto(&option).unwrap_err(),
+            "unknown multi-vector storage 99"
+        );
+        let schema = v1::Schema {
+            fields: HashMap::from([("tokens".to_string(), option)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_proto(&schema).unwrap_err(),
+            "Field 'tokens': unknown multi-vector storage 99"
         );
     }
 

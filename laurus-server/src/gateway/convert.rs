@@ -241,19 +241,25 @@ pub fn json_to_proto_schema(json: &Value) -> Result<v1::Schema, String> {
         .transpose()?
         .unwrap_or_default();
 
-    let dynamic_field_policy = json
-        .get("dynamic_field_policy")
-        .and_then(|v| v.as_str())
-        .map(json_to_proto_dynamic_field_policy)
-        .transpose()?
-        .unwrap_or(v1::DynamicFieldPolicy::Unspecified) as i32;
+    // Absent or `null` means the server default; a non-string value is a
+    // 400 like an unknown name, not the default (Issue #1473).
+    let dynamic_field_policy = match json.get("dynamic_field_policy") {
+        None | Some(Value::Null) => v1::DynamicFieldPolicy::Unspecified,
+        Some(Value::String(s)) => json_to_proto_dynamic_field_policy(s)?,
+        Some(other) => {
+            return Err(format!(
+                "dynamic_field_policy must be a string, one of \"strict\", \"dynamic\", \
+                 or \"ignore\", got {other}"
+            ));
+        }
+    };
 
     Ok(v1::Schema {
         fields,
         default_fields,
         analyzers,
         embedders,
-        dynamic_field_policy,
+        dynamic_field_policy: dynamic_field_policy as i32,
         // Not user-supplied at schema-creation time: only `UpdateField`
         // populates this (Issue #1079).
         pending_reindex: Vec::new(),
@@ -706,15 +712,48 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
 // Vector field option conversion
 // ---------------------------------------------------------------------------
 
-fn parse_distance_metric(s: &str) -> i32 {
-    match s.to_lowercase().as_str() {
-        "cosine" => v1::DistanceMetric::Cosine as i32,
-        "euclidean" => v1::DistanceMetric::Euclidean as i32,
-        "manhattan" => v1::DistanceMetric::Manhattan as i32,
-        "dot_product" => v1::DistanceMetric::DotProduct as i32,
-        "angular" => v1::DistanceMetric::Angular as i32,
-        _ => v1::DistanceMetric::Cosine as i32,
-    }
+/// The `distance` strings [`json_to_distance`] accepts, as quoted in its
+/// error message.
+const DISTANCE_METRICS: &str =
+    "\"cosine\", \"euclidean\", \"manhattan\", \"dot_product\", or \"angular\"";
+
+/// Parse a vector option's JSON `distance` string into the proto enum value.
+///
+/// Returns `COSINE`, the default, when `distance` is absent or `null`. The
+/// string is matched case-insensitively.
+///
+/// # Arguments
+///
+/// * `json` - The vector option object that may carry `distance`.
+///
+/// # Errors
+///
+/// Returns an error when `distance` is not a string or names a metric
+/// other than `cosine`, `euclidean`, `manhattan`, `dot_product` or
+/// `angular`, so a typo is a 400 instead of a cosine index (Issue #1473).
+fn json_to_distance(json: &Value) -> Result<i32, String> {
+    let name = match json.get("distance") {
+        None | Some(Value::Null) => return Ok(v1::DistanceMetric::Cosine as i32),
+        Some(Value::String(name)) => name,
+        Some(other) => {
+            return Err(format!(
+                "distance must be a string, one of {DISTANCE_METRICS}, got {other}"
+            ));
+        }
+    };
+    let metric = match name.to_lowercase().as_str() {
+        "cosine" => v1::DistanceMetric::Cosine,
+        "euclidean" => v1::DistanceMetric::Euclidean,
+        "manhattan" => v1::DistanceMetric::Manhattan,
+        "dot_product" => v1::DistanceMetric::DotProduct,
+        "angular" => v1::DistanceMetric::Angular,
+        _ => {
+            return Err(format!(
+                "unknown distance \"{name}\" (expected {DISTANCE_METRICS})"
+            ));
+        }
+    };
+    Ok(metric as i32)
 }
 
 fn distance_metric_to_string(val: i32) -> &'static str {
@@ -801,13 +840,30 @@ fn quantizer_to_json(q: &v1::QuantizationConfig) -> Value {
     })
 }
 
-/// Parse the JSON `rerank_storage` field (string, e.g. `"F32"`) into the
-/// proto enum value (Issue #793). Returns `None` (no sidecar) when the
-/// field is absent or unrecognized.
-fn json_to_rerank_storage(json: &Value) -> Option<i32> {
-    match json.get("rerank_storage").and_then(|v| v.as_str()) {
-        Some(s) if s.eq_ignore_ascii_case("f32") => Some(v1::RerankStorageKind::F32 as i32),
-        _ => None,
+/// Parse a vector option's JSON `rerank_storage` string (`"F32"`, matched
+/// case-insensitively) into the proto enum value (Issue #793).
+///
+/// Returns `None` (no sidecar) when `rerank_storage` is absent or `null`.
+///
+/// # Arguments
+///
+/// * `json` - The vector option object that may carry `rerank_storage`.
+///
+/// # Errors
+///
+/// Returns an error when `rerank_storage` is not a string or is a string
+/// other than `"F32"`, so a typo is a 400 instead of no sidecar
+/// (Issue #1473).
+fn json_to_rerank_storage(json: &Value) -> Result<Option<i32>, String> {
+    match json.get("rerank_storage") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("f32") => {
+            Ok(Some(v1::RerankStorageKind::F32 as i32))
+        }
+        Some(Value::String(s)) => Err(format!("unknown rerank_storage \"{s}\" (expected \"F32\")")),
+        Some(other) => Err(format!(
+            "rerank_storage must be the string \"F32\", got {other}"
+        )),
     }
 }
 
@@ -824,11 +880,7 @@ fn rerank_storage_to_json(value: i32) -> Option<&'static str> {
 fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
     Ok(v1::HnswOption {
         dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        distance: json
-            .get("distance")
-            .and_then(|v| v.as_str())
-            .map(parse_distance_metric)
-            .unwrap_or(v1::DistanceMetric::Cosine as i32),
+        distance: json_to_distance(json)?,
         m: json.get("m").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         ef_construction: json
             .get("ef_construction")
@@ -854,7 +906,7 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32),
         // Issue #793: optional Stage-2 rerank sidecar storage.
-        rerank_storage: json_to_rerank_storage(json),
+        rerank_storage: json_to_rerank_storage(json)?,
         // Issue #631: optional shared PQ codebook file name. An explicitly
         // empty string would configure a codebook that can never exist;
         // treat it as unset.
@@ -869,11 +921,7 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
 fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
     Ok(v1::FlatOption {
         dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        distance: json
-            .get("distance")
-            .and_then(|v| v.as_str())
-            .map(parse_distance_metric)
-            .unwrap_or(v1::DistanceMetric::Cosine as i32),
+        distance: json_to_distance(json)?,
         // Unset means "use the engine's default" (#1084).
         base_weight: json
             .get("base_weight")
@@ -886,7 +934,7 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
             .unwrap_or("")
             .to_string(),
         // Issue #793: optional Stage-2 rerank sidecar storage.
-        rerank_storage: json_to_rerank_storage(json),
+        rerank_storage: json_to_rerank_storage(json)?,
     })
 }
 
@@ -896,19 +944,35 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 ///
 /// # Errors
 ///
-/// Returns an error when `storage` is present but not one of
+/// Returns an error when `storage` is present and not `null` but not one of
 /// `"f32"` / `"f16"` / `"int8"` / `"binary"` (case-insensitive), so a typo
-/// 400s instead of silently defaulting to f32, and when `pool_factor` is
-/// present but not a non-negative integer that fits in `u32` (Issue #1346).
-/// A `pool_factor` of 0 passes here and is rejected by the engine.
+/// or a non-string value 400s instead of silently defaulting to f32
+/// (Issues #1346, #1473), and when `distance` is invalid (see
+/// [`json_to_distance`]) or `pool_factor` is present but not a non-negative
+/// integer that fits in `u32` (Issue #1346). A `pool_factor` of 0 passes
+/// here and is rejected by the engine.
 fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
-    let storage = match json.get("storage").and_then(|v| v.as_str()) {
-        None => v1::MultiVectorStorage::F32 as i32,
-        Some(s) if s.eq_ignore_ascii_case("f32") => v1::MultiVectorStorage::F32 as i32,
-        Some(s) if s.eq_ignore_ascii_case("f16") => v1::MultiVectorStorage::F16 as i32,
-        Some(s) if s.eq_ignore_ascii_case("int8") => v1::MultiVectorStorage::Int8 as i32,
-        Some(s) if s.eq_ignore_ascii_case("binary") => v1::MultiVectorStorage::Binary as i32,
-        Some(s) => return Err(format!("unknown multi_vector storage '{s}'")),
+    let storage = match json.get("storage") {
+        None | Some(Value::Null) => v1::MultiVectorStorage::F32 as i32,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("f32") => {
+            v1::MultiVectorStorage::F32 as i32
+        }
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("f16") => {
+            v1::MultiVectorStorage::F16 as i32
+        }
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("int8") => {
+            v1::MultiVectorStorage::Int8 as i32
+        }
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("binary") => {
+            v1::MultiVectorStorage::Binary as i32
+        }
+        Some(Value::String(s)) => return Err(format!("unknown multi_vector storage '{s}'")),
+        Some(other) => {
+            return Err(format!(
+                "multi_vector storage must be a string, one of \"f32\", \"f16\", \"int8\", \
+                 or \"binary\", got {other}"
+            ));
+        }
     };
     let pool_factor = match json.get("pool_factor") {
         None | Some(Value::Null) => None,
@@ -922,11 +986,7 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
     };
     Ok(v1::MultiVectorOption {
         dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        distance: json
-            .get("distance")
-            .and_then(|v| v.as_str())
-            .map(parse_distance_metric)
-            .unwrap_or(v1::DistanceMetric::Cosine as i32),
+        distance: json_to_distance(json)?,
         embedder: json
             .get("embedder")
             .and_then(|v| v.as_str())
@@ -953,11 +1013,7 @@ fn multi_vector_storage_to_json(value: Option<i32>) -> Option<&'static str> {
 fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
     Ok(v1::IvfOption {
         dimension: json.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        distance: json
-            .get("distance")
-            .and_then(|v| v.as_str())
-            .map(parse_distance_metric)
-            .unwrap_or(v1::DistanceMetric::Cosine as i32),
+        distance: json_to_distance(json)?,
         n_clusters: json.get("n_clusters").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         n_probe: json.get("n_probe").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         // Unset means "use the engine's default" (#1084).
@@ -972,7 +1028,7 @@ fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
             .unwrap_or("")
             .to_string(),
         // Issue #793: optional Stage-2 rerank sidecar storage.
-        rerank_storage: json_to_rerank_storage(json),
+        rerank_storage: json_to_rerank_storage(json)?,
     })
 }
 
@@ -2546,6 +2602,202 @@ mod tests {
                 };
                 assert_eq!(quantizer, None, "{option}");
             }
+        }
+    }
+
+    /// The `distance` of a converted vector field option.
+    fn proto_distance_of(option: &v1::FieldOption) -> i32 {
+        match &option.option {
+            Some(v1::field_option::Option::Hnsw(o)) => o.distance,
+            Some(v1::field_option::Option::Flat(o)) => o.distance,
+            Some(v1::field_option::Option::Ivf(o)) => o.distance,
+            Some(v1::field_option::Option::MultiVector(o)) => o.distance,
+            other => panic!("not a vector option: {other:?}"),
+        }
+    }
+
+    /// Issue #1473: `distance` is matched case-insensitively, and an absent
+    /// or `null` distance is cosine, the default, on every vector field
+    /// kind.
+    #[test]
+    fn test_distance_parses_or_defaults_to_cosine() {
+        for kind in ["hnsw", "flat", "ivf", "multi_vector"] {
+            for (distance, expected) in [
+                (json!("cosine"), v1::DistanceMetric::Cosine),
+                (json!("Euclidean"), v1::DistanceMetric::Euclidean),
+                (json!("manhattan"), v1::DistanceMetric::Manhattan),
+                (json!("DOT_PRODUCT"), v1::DistanceMetric::DotProduct),
+                (json!("angular"), v1::DistanceMetric::Angular),
+                (Value::Null, v1::DistanceMetric::Cosine),
+            ] {
+                let option = json!({ kind: { "dimension": 32, "distance": distance } });
+                let proto = json_to_proto_field_option(&option).unwrap();
+                assert_eq!(proto_distance_of(&proto), expected as i32, "{option}");
+            }
+            let option = json!({ kind: { "dimension": 32 } });
+            let proto = json_to_proto_field_option(&option).unwrap();
+            assert_eq!(
+                proto_distance_of(&proto),
+                v1::DistanceMetric::Cosine as i32,
+                "{option}"
+            );
+        }
+    }
+
+    /// Issue #1473: a `distance` the gateway cannot map to a metric is a 400
+    /// instead of cosine, for each vector field kind; the schema conversion
+    /// names the field.
+    #[test]
+    fn test_unknown_distance_is_rejected() {
+        let cases = [
+            (json!("euclidian"), "unknown distance \"euclidian\""),
+            (json!("l2"), "unknown distance \"l2\""),
+            (json!(1), "distance must be a string"),
+            (json!({ "metric": "cosine" }), "distance must be a string"),
+        ];
+        for kind in ["hnsw", "flat", "ivf", "multi_vector"] {
+            for (distance, expected) in &cases {
+                let option = json!({ kind: { "dimension": 32, "distance": distance } });
+                let err = json_to_proto_field_option(&option).unwrap_err();
+                assert!(err.starts_with(expected), "{kind}/{distance}: {err}");
+
+                let schema = json!({ "fields": { "vec": option } });
+                let err = json_to_proto_schema(&schema).unwrap_err();
+                assert!(
+                    err.starts_with(&format!("field \"vec\": {expected}")),
+                    "{kind}/{distance}: {err}"
+                );
+            }
+        }
+
+        let option = json!({ "hnsw": { "dimension": 32, "distance": "euclidian" } });
+        assert_eq!(
+            json_to_proto_field_option(&option).unwrap_err(),
+            "unknown distance \"euclidian\" (expected \"cosine\", \"euclidean\", \
+             \"manhattan\", \"dot_product\", or \"angular\")"
+        );
+    }
+
+    /// The `rerank_storage` of a converted HNSW, Flat or IVF field option.
+    fn proto_rerank_storage_of(option: &v1::FieldOption) -> Option<i32> {
+        match &option.option {
+            Some(v1::field_option::Option::Hnsw(o)) => o.rerank_storage,
+            Some(v1::field_option::Option::Flat(o)) => o.rerank_storage,
+            Some(v1::field_option::Option::Ivf(o)) => o.rerank_storage,
+            other => panic!("not an HNSW, Flat or IVF option: {other:?}"),
+        }
+    }
+
+    /// Issue #1473: `rerank_storage` is matched case-insensitively, and an
+    /// absent or `null` value is left unset (no sidecar).
+    #[test]
+    fn test_rerank_storage_parses_or_is_left_unset() {
+        let f32 = Some(v1::RerankStorageKind::F32 as i32);
+        for kind in ["hnsw", "flat", "ivf"] {
+            for (rerank_storage, expected) in [
+                (json!("F32"), f32),
+                (json!("f32"), f32),
+                (Value::Null, None),
+            ] {
+                let option = json!({ kind: { "dimension": 32, "rerank_storage": rerank_storage } });
+                let proto = json_to_proto_field_option(&option).unwrap();
+                assert_eq!(proto_rerank_storage_of(&proto), expected, "{option}");
+            }
+            let option = json!({ kind: { "dimension": 32 } });
+            let proto = json_to_proto_field_option(&option).unwrap();
+            assert_eq!(proto_rerank_storage_of(&proto), None, "{option}");
+        }
+    }
+
+    /// Issue #1473: a `rerank_storage` other than `"F32"` is a 400 instead of
+    /// no sidecar, for each vector field kind that carries it; the schema
+    /// conversion names the field.
+    #[test]
+    fn test_unknown_rerank_storage_is_rejected() {
+        let cases = [
+            (
+                json!("f16"),
+                "unknown rerank_storage \"f16\" (expected \"F32\")",
+            ),
+            (
+                json!("none"),
+                "unknown rerank_storage \"none\" (expected \"F32\")",
+            ),
+            (json!(1), "rerank_storage must be the string \"F32\", got 1"),
+            (
+                json!(true),
+                "rerank_storage must be the string \"F32\", got true",
+            ),
+        ];
+        for kind in ["hnsw", "flat", "ivf"] {
+            for (rerank_storage, expected) in &cases {
+                let option = json!({ kind: { "dimension": 32, "rerank_storage": rerank_storage } });
+                let err = json_to_proto_field_option(&option).unwrap_err();
+                assert_eq!(&err, expected, "{kind}/{rerank_storage}");
+
+                let schema = json!({ "fields": { "vec": option } });
+                let err = json_to_proto_schema(&schema).unwrap_err();
+                assert_eq!(
+                    err,
+                    format!("field \"vec\": {expected}"),
+                    "{kind}/{rerank_storage}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1473: a multi-vector `storage` that is not a string is a 400
+    /// instead of `f32`, like an unknown name; `null` keeps the default.
+    #[test]
+    fn test_non_string_multi_vector_storage_is_rejected() {
+        for storage in [json!(3), json!(["int8"])] {
+            let option = json!({ "multi_vector": { "dimension": 32, "storage": storage } });
+            let err = json_to_proto_field_option(&option).unwrap_err();
+            assert!(
+                err.starts_with("multi_vector storage must be a string"),
+                "{storage}: {err}"
+            );
+        }
+
+        let option = json!({ "multi_vector": { "dimension": 32, "storage": null } });
+        match json_to_proto_field_option(&option).unwrap().option {
+            Some(v1::field_option::Option::MultiVector(o)) => {
+                assert_eq!(o.storage, Some(v1::MultiVectorStorage::F32 as i32));
+            }
+            other => panic!("expected a multi-vector option, got {other:?}"),
+        }
+    }
+
+    /// Issue #1473: the schema's `dynamic_field_policy` parses its three
+    /// names, an absent or `null` value is left `UNSPECIFIED` (the server
+    /// default, dynamic), and an unknown name or a value that is not a
+    /// string is a 400 instead of the default.
+    #[test]
+    fn test_dynamic_field_policy_parses_or_is_rejected() {
+        for (policy, expected) in [
+            (json!("strict"), v1::DynamicFieldPolicy::Strict),
+            (json!("dynamic"), v1::DynamicFieldPolicy::Dynamic),
+            (json!("ignore"), v1::DynamicFieldPolicy::Ignore),
+            (Value::Null, v1::DynamicFieldPolicy::Unspecified),
+        ] {
+            let schema = json!({ "fields": {}, "dynamic_field_policy": policy });
+            let proto = json_to_proto_schema(&schema).unwrap();
+            assert_eq!(proto.dynamic_field_policy, expected as i32, "{policy}");
+        }
+        let proto = json_to_proto_schema(&json!({ "fields": {} })).unwrap();
+        assert_eq!(
+            proto.dynamic_field_policy,
+            v1::DynamicFieldPolicy::Unspecified as i32
+        );
+
+        for (policy, expected) in [
+            (json!("lenient"), "unknown dynamic_field_policy \"lenient\""),
+            (json!(1), "dynamic_field_policy must be a string"),
+            (json!(false), "dynamic_field_policy must be a string"),
+        ] {
+            let schema = json!({ "fields": {}, "dynamic_field_policy": policy });
+            let err = json_to_proto_schema(&schema).unwrap_err();
+            assert!(err.starts_with(expected), "{policy}: {err}");
         }
     }
 

@@ -70,7 +70,7 @@ enum DynamicFieldPolicy {
 - **`default_fields`** — クエリでフィールドを指定しない場合のデフォルト検索対象フィールド名。
 - **`analyzers`** — 名前をキーとしたカスタムアナライザーパイプライン。`TextOption.analyzer` で参照。
 - **`embedders`** — 名前をキーとしたエンベッダー設定。ベクトルフィールドオプション（`HnswOption.embedder` など）で参照。
-- **`dynamic_field_policy`** — 投入されたドキュメントに含まれるが `fields` に**宣言されていない**フィールドの扱い。`UNSPECIFIED`（値 0）は後方互換のため `DYNAMIC` として解釈されます。挙動マトリクスおよび `DYNAMIC` での情報損失警告は [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
+- **`dynamic_field_policy`** — 投入されたドキュメントに含まれるが `fields` に**宣言されていない**フィールドの扱い。`UNSPECIFIED`（値 0）は後方互換のため `DYNAMIC` として解釈されます。サーバーが知らない値は、`DYNAMIC` として扱わずに `CreateIndex` が `INVALID_ARGUMENT` で拒否します（Issue #1473）。挙動マトリクスおよび `DYNAMIC` での情報損失警告は [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
 
 **AnalyzerDefinition:**
 
@@ -117,17 +117,17 @@ message AnalyzerDefinition {
 
 **MultiVector フィールド:** `MultiVectorOption`（`FieldOption` のフィールド番号 `12`、Issue #1177）は、文書ごとのトークンベクトル（ColBERT 型のトークンごとの埋め込みなど）を late interaction の再採点のために保持するフィールドを宣言します。ANN 索引は持たず、ベクトル検索の対象にはなりません。`query_vectors` でこのフィールドを指定すると拒否されます。`distance` は `COSINE`（書き込み時に L2 正規化する）か `DOT_PRODUCT` でなければなりません。値は `VectorArrayValue`（下の `Value` の表を参照）です。このフィールドは保存されないため、サーバーが返す文書には含まれません。`embedder`（フィールド番号 `3`、Issue #1349）には、`Schema.embedders` で宣言したトークン単位のエンベッダー（`"candle_colbert"`）の名前を指定します。指定すると、文書はこのフィールドに `text_value` を与えられ、テキストはトークンベクトルに埋め込まれます。MultiVector フィールドに置けるのは `"candle_colbert"` か `"precomputed"` のエンベッダーだけで、他のベクトルフィールドには `"candle_colbert"` を置けません。
 
-**MultiVector のストレージ:** オプションの `storage` フィールド（フィールド番号 `4`、enum `MultiVectorStorage`、Issue #1346）は、トークンベクトルのディスク上の要素形式を選びます。`UNSPECIFIED` は `F32` と同じ、`F32`（デフォルト。4 バイト/要素、誤差なし）、`F16`（2 バイト/要素、要素あたり相対誤差 ~2⁻¹¹）、`INT8`（約 1 バイト/要素に加えてベクトルごとの小さなスケールのオーバーヘッド — 1 行あたり `dimension + 2` バイト — ベクトルごとのスケール `max(abs(vector)) / 127` を使用し、セグメント単位やコーパス全体で学習するものではありません）、`BINARY`（1 bit/要素 — 1 行あたり `ceil(dimension / 8)` バイト — フィールドが一度だけ学習する中心に対して符号化。`distance` は `COSINE` が必要）のいずれかです。300 トークン × 128 次元（`F32` で約 150 KB/文書）の場合、`F16` は約 75 KB/文書、`INT8` は約 38 KB/文書、`BINARY` は約 4.7 KB/文書になります。未設定時は `F32` のままです。その値を知らない古いサーバーは、エラーにせず `F32` として扱うので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
+**MultiVector のストレージ:** オプションの `storage` フィールド（フィールド番号 `4`、enum `MultiVectorStorage`、Issue #1346）は、トークンベクトルのディスク上の要素形式を選びます。`UNSPECIFIED` は `F32` と同じ、`F32`（デフォルト。4 バイト/要素、誤差なし）、`F16`（2 バイト/要素、要素あたり相対誤差 ~2⁻¹¹）、`INT8`（約 1 バイト/要素に加えてベクトルごとの小さなスケールのオーバーヘッド — 1 行あたり `dimension + 2` バイト — ベクトルごとのスケール `max(abs(vector)) / 127` を使用し、セグメント単位やコーパス全体で学習するものではありません）、`BINARY`（1 bit/要素 — 1 行あたり `ceil(dimension / 8)` バイト — フィールドが一度だけ学習する中心に対して符号化。`distance` は `COSINE` が必要）のいずれかです。300 トークン × 128 次元（`F32` で約 150 KB/文書）の場合、`F16` は約 75 KB/文書、`INT8` は約 38 KB/文書、`BINARY` は約 4.7 KB/文書になります。未設定時は `F32` のままです。`CreateIndex`・`AddField`・`UpdateField` は、サーバーが知らない値を、フィールドを `F32` として保存せずに `INVALID_ARGUMENT` で拒否します（Issue #1473）。この検査より古いサーバーは、そうしたフィールドをエラーにせず `F32` として保存するので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
 
 **MultiVector の Token pooling:** オプションの `pool_factor` フィールド（フィールド番号 `5`、`uint32`、Issue #1346）は、各文書のトークンベクトルを約 `1 / pool_factor` に減らします（先頭の 1 本と、ほかを Ward でまとめたクラスタの平均）。未設定は `1`（pooling なし）で、`0` は拒否されます。既存のフィールドで有効にするのは reindex、使用中の factor を変える、または無効にするのは破壊的な変更です。詳細は [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) を参照してください。
 
-**距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
+**距離メトリクス:** `COSINE`（ゼロ値なので、`distance` が未設定のときのデフォルト）, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`。`CreateIndex`・`AddField`・`UpdateField` は、サーバーが知らない値を、フィールドを `COSINE` で作らずに `INVALID_ARGUMENT` で拒否します（Issue #1473）。この検査より古いサーバーは、エラーにせず `COSINE` を使います。
 
 **量子化手法:** `SCALAR_8BIT`（デフォルト）, `PRODUCT_QUANTIZATION`（Issue #481 Stage 3。HNSW インデックスだけがサポート — Flat / IVF のフィールドに指定すると、`CreateIndex`・`AddField`・`UpdateField` が `INVALID_ARGUMENT` で拒否。Issue #1457）, `FLOAT16`（Issue #623。IEEE 754 半精度で 1 次元あたり 2 バイト、学習は不要。HNSW / Flat / IVF がサポート — [Float16](../concepts/indexing/vector_indexing.md#float16issue-623) を参照）, `PRODUCT_QUANTIZATION_FASTSCAN`（Issue #695。実験的で HNSW だけがサポート。`pq-fastscan` feature 付きでビルドしたサーバーだけが受け付ける）。`CreateIndex`・`AddField`・`UpdateField` は、サーバーが知らない値と、`pq-fastscan` なしでビルドしたサーバーへの `PRODUCT_QUANTIZATION_FASTSCAN` を、フィールドを `SCALAR_8BIT` として保存せずに `INVALID_ARGUMENT` で拒否します（Issue #1459）。`FLOAT16` を知らない古いサーバーはこの検査も持たず、そうしたフィールドをエラーにせず `SCALAR_8BIT` として保存するので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
 
 `NONE`（量子化なし）は Issue #481 Stage 1 で廃止されました。proto enum 値 0（`QUANTIZATION_METHOD_NONE`）は、`method` を設定しないクライアントが送る値なので残してあり、サーバーはそのフィールドをデフォルトの `SCALAR_8BIT` として保存します。
 
-**Rerank storage:** オプションの `rerank_storage` フィールド（enum `RerankStorageKind`: `UNSPECIFIED` = サイドカーなし、`F32`）は Stage-2 rerank サイドカー（Issue #481 / #793）を有効化します。HNSW フィールドで `F32` を設定すると、commit 時に完全精度の `.hnsw.f32` サイドカーを追加で書き出し、`rerank_factor` を指定した検索が int8 候補を元のベクトルで再スコアします。フィールドを省略（または `UNSPECIFIED`）すると Stage-1 の int8 のみのランキングになります。#932 以降、サイドカーは 3 つのベクトルインデックスタイプ（HNSW / Flat / IVF）すべてで出力・利用されます。セグメントが単一フィールドしか持たない場合はフィールド指定なしのクエリでも再スコアされます（Issue #1388）。
+**Rerank storage:** オプションの `rerank_storage` フィールド（enum `RerankStorageKind`: `UNSPECIFIED` = サイドカーなし、`F32`）は Stage-2 rerank サイドカー（Issue #481 / #793）を有効化します。HNSW フィールドで `F32` を設定すると、commit 時に完全精度の `.hnsw.f32` サイドカーを追加で書き出し、`rerank_factor` を指定した検索が int8 候補を元のベクトルで再スコアします。フィールドを省略（または `UNSPECIFIED`）すると Stage-1 の int8 のみのランキングになります。サーバーが知らない値は、サイドカーなしとして扱わずに `CreateIndex`・`AddField`・`UpdateField` が `INVALID_ARGUMENT` で拒否します（Issue #1473）。#932 以降、サイドカーは 3 つのベクトルインデックスタイプ（HNSW / Flat / IVF）すべてで出力・利用されます。セグメントが単一フィールドしか持たない場合はフィールド指定なしのクエリでも再スコアされます（Issue #1388）。
 
 **共有 PQ codebook:** `HnswOption` のオプションフィールド `pq_codebook_path`（Issue #631）は、`laurus train pq-codebook` CLI コマンドで一度だけ学習するストレージ相対の共有 PQ codebook ファイルを指定します。設定すると segment は commit / merge のたびに k-means を再学習する代わりに、学習済み codebook で encode されます。`PRODUCT_QUANTIZATION` quantizer との組み合わせでのみ意味を持ち、設定済みで未学習の場合、commit は学習コマンドを示すエラーで失敗します（per-segment 学習への無言のフォールバック無し）。未設定なら per-segment 学習のままです。
 

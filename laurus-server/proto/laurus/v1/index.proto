@@ -57,7 +57,9 @@ enum FieldChangeKind {
   FIELD_CHANGE_KIND_DESTRUCTIVE = 3;
 }
 
-// Policy for handling undeclared fields during document ingestion.
+// Policy for handling undeclared fields during document ingestion. A value
+// the server does not know (for example one added by a newer client) is
+// rejected as INVALID_ARGUMENT rather than treated as DYNAMIC (Issue #1473).
 enum DynamicFieldPolicy {
   // Treated as DYNAMIC for backward compatibility.
   DYNAMIC_FIELD_POLICY_UNSPECIFIED = 0;
@@ -261,6 +263,10 @@ message BytesOption {
 
 // Vector field options.
 
+// COSINE is the zero value, so a client that leaves `distance` unset gets
+// cosine. A value the server does not know (for example one added by a
+// newer client) is rejected as INVALID_ARGUMENT rather than treated as
+// COSINE (Issue #1473).
 enum DistanceMetric {
   DISTANCE_METRIC_COSINE = 0;
   DISTANCE_METRIC_EUCLIDEAN = 1;
@@ -304,7 +310,10 @@ message QuantizationConfig {
 // laurus::vector::core::rerank::RerankStorageKind. Selecting a kind on
 // an HNSW field makes the writer emit an extra full-precision sidecar
 // (`<segment>.hnsw.f32`) so the searcher can rescore int8 candidates
-// against the original vectors when a query sets `rerank_factor`.
+// against the original vectors when a query sets `rerank_factor`. A value
+// the server does not know (for example one added by a newer client) is
+// rejected as INVALID_ARGUMENT rather than treated as UNSPECIFIED
+// (Issue #1473).
 enum RerankStorageKind {
   // No rerank sidecar (Stage 1, int8-only). Same as omitting the field.
   RERANK_STORAGE_KIND_UNSPECIFIED = 0;
@@ -379,7 +388,9 @@ message IvfOption {
 // A multi-vector field (Issue #1177): each document's token vectors (e.g.
 // the per-token embeddings of a ColBERT-style model) with no ANN index,
 // read by late-interaction rescoring. Values are `VectorArrayValue`s.
-// On-disk element kind of a MultiVector field's token vectors (#1346).
+// On-disk element kind of a MultiVector field's token vectors (#1346). A
+// value the server does not know (for example one added by a newer client)
+// is rejected as INVALID_ARGUMENT rather than treated as F32 (Issue #1473).
 enum MultiVectorStorage {
   // Unset on the wire; treated the same as F32.
   MULTI_VECTOR_STORAGE_UNSPECIFIED = 0;
