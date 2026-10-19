@@ -1826,31 +1826,35 @@ mod ordinal_migration_tests {
         );
     }
 
-    /// A mmap-backed (`Lazy`) storage holding one file with `bytes`.
-    fn mmap_storage_with(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> Arc<dyn Storage> {
-        std::fs::write(dir.path().join(name), bytes).unwrap();
-        let mut config = crate::storage::file::FileStorageConfig::new(dir.path());
-        config.use_mmap = true;
-        crate::storage::StorageFactory::create(crate::storage::StorageConfig::File(config)).unwrap()
-    }
-
-    /// Load `bytes` as segment `name` both from mmap (`Lazy`) and from
-    /// memory (`Eager`), and assert that the `Lazy` rows are read in place
-    /// and that both readers return bit-identical vectors and searches for
-    /// every field in `fields`.
+    /// Load `bytes` as segment `name` both from mmap (`Lazy`, a file in
+    /// `dir`) and from memory (`Eager`), and assert that the `Lazy` rows are
+    /// read in place and that both readers return bit-identical vectors and
+    /// searches for every field in `fields`.
+    ///
+    /// The file is written once, before any reader maps it: Windows refuses
+    /// to write a file that is mapped. The caller owns `dir` so that the
+    /// returned reader is dropped before the directory is removed.
     ///
     /// # Returns
     ///
     /// The `Lazy` reader, for further checks.
-    fn load_both_and_compare(name: &str, bytes: Vec<u8>, fields: &[&str]) -> Arc<HnswIndexReader> {
-        let dir = tempfile::TempDir::new().unwrap();
+    fn load_both_and_compare(
+        dir: &tempfile::TempDir,
+        name: &str,
+        bytes: Vec<u8>,
+        fields: &[&str],
+    ) -> Arc<HnswIndexReader> {
         let file = format!("{name}.hnsw");
+        std::fs::write(dir.path().join(&file), &bytes).unwrap();
+        let mut config = crate::storage::file::FileStorageConfig::new(dir.path());
+        config.use_mmap = true;
+        let mmap_storage =
+            crate::storage::StorageFactory::create(crate::storage::StorageConfig::File(config))
+                .unwrap();
         let mut lazy_reader = None;
         for metric in [DistanceMetric::Cosine, DistanceMetric::Euclidean] {
-            let lazy = Arc::new(
-                HnswIndexReader::load(mmap_storage_with(&dir, &file, &bytes), name, metric)
-                    .unwrap(),
-            );
+            let lazy =
+                Arc::new(HnswIndexReader::load(Arc::clone(&mmap_storage), name, metric).unwrap());
             let eager = Arc::new(
                 HnswIndexReader::load(storage_with(&file, bytes.clone()), name, metric).unwrap(),
             );
@@ -1901,7 +1905,8 @@ mod ordinal_migration_tests {
     /// the stride from the rows and still keeps one run.
     #[test]
     fn v1_inline_names_read_in_place_as_one_run() {
-        let reader = load_both_and_compare("v1_mapped", v1_fixture_bytes(), &["f"]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let reader = load_both_and_compare(&dir, "v1_mapped", v1_fixture_bytes(), &["f"]);
         let pool = reader.vectors().quantized_pool().unwrap();
         assert_eq!(pool.heap_size(), 4 + 8 + 8, "one run");
         assert!(pool.prefetch_base_stride().is_some());
@@ -1925,7 +1930,8 @@ mod ordinal_migration_tests {
         }
         bytes.extend_from_slice(&v1_graph_block());
 
-        let reader = load_both_and_compare("v1_two_names", bytes, &["f", "ggggg"]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let reader = load_both_and_compare(&dir, "v1_two_names", bytes, &["f", "ggggg"]);
         let pool = reader.vectors().quantized_pool().unwrap();
         assert!(pool.heap_size() > 4 + 8 + 8, "several runs");
         assert!(reader.field_ord_to_pos("f").is_some());
