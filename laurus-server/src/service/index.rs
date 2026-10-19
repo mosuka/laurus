@@ -302,4 +302,46 @@ mod tests {
         assert!(!data_dir.exists(), "a rejected create must write nothing");
         assert!(service.engine.read().await.is_none());
     }
+
+    /// Issue #1457: CreateIndex rejects a Flat field with a product
+    /// quantizer as InvalidArgument, and writes nothing.
+    #[tokio::test]
+    async fn create_index_rejects_product_quantization_on_flat() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: data_dir.clone(),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        };
+        let schema = Schema::from_toml(
+            r#"
+            [fields.vec.Flat]
+            dimension = 8
+
+            [fields.vec.Flat.quantizer.ProductQuantization]
+            subvector_count = 4
+            "#,
+        )
+        .unwrap();
+
+        let status = service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema_convert::to_proto(&schema)),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("field 'vec': Flat does not support quantizer ProductQuantization"),
+            "got: {}",
+            status.message()
+        );
+        assert!(!data_dir.exists(), "a rejected create must write nothing");
+        assert!(service.engine.read().await.is_none());
+    }
 }

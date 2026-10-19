@@ -361,8 +361,12 @@ distance = "Cosine"
 
 Issue #481 Stage 3。各ベクトルを、sub-vector ごとに 256 centroid を
 持つ codebook への 1 バイトの centroid index × `subvector_count` 個
-として保存します（約 16-64 倍の圧縮）。HNSW index がサポートし、
-Flat / IVF は書き込み時に拒否します。recall 回復のため
+として保存します（約 16-64 倍の圧縮）。HNSW index だけがサポートし
+ます。Flat / IVF のフィールドに指定すると、インデックスの作成時と
+フィールドの追加・更新時に拒否し、`schema.toml` に既にそのフィールド
+があるインデックスは開けません（Issue #1457）。そのフィールドは
+`Scalar8Bit` で保存されているので、quantizer を `Scalar8Bit` に
+書き換えれば、そのまま開けます。recall 回復のため
 [Rerank Storage](#rerank-storage) との併用を推奨します。
 
 ```toml

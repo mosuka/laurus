@@ -1681,8 +1681,11 @@ impl VectorStore {
 
         // `purge` discards the field's data before re-creating it, so an
         // option the new index would reject must fail before that.
-        if let crate::vector::core::field::FieldOption::MultiVector(opt) = new_option {
-            opt.validate(name)?;
+        match new_option {
+            crate::vector::core::field::FieldOption::Flat(opt) => opt.validate(name)?,
+            crate::vector::core::field::FieldOption::Ivf(opt) => opt.validate(name)?,
+            crate::vector::core::field::FieldOption::MultiVector(opt) => opt.validate(name)?,
+            crate::vector::core::field::FieldOption::Hnsw(_) => {}
         }
 
         let mut writer_guard = self.writer_cache.lock().await;
@@ -2346,6 +2349,52 @@ mod tests {
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "a").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1457 — a purge to a Flat or IVF option with a product
+    /// quantizer is rejected before the field's data is discarded.
+    #[tokio::test]
+    async fn rebuild_rejects_product_quantization_on_flat_and_ivf_before_purging() {
+        use crate::vector::core::field::{FieldOption, IvfOption};
+        use crate::vector::core::quantization::QuantizationMethod;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = VectorStore::new(storage, config).unwrap();
+        put_doc(&store, 1).await;
+        store.commit().await.unwrap();
+
+        let pq = QuantizationMethod::ProductQuantization { subvector_count: 2 };
+        let options = [
+            ("Flat", FieldOption::Flat(flat_option().quantizer(pq))),
+            (
+                "IVF",
+                FieldOption::Ivf(IvfOption {
+                    dimension: 4,
+                    quantizer: pq,
+                    ..Default::default()
+                }),
+            ),
+        ];
+        for (kind, option) in options {
+            let err = store
+                .rebuild_field("a", &option, FieldEmbedderChange::Keep, true)
+                .await
+                .unwrap_err();
+            let expected = format!("field 'a': {kind} does not support quantizer");
+            assert!(
+                matches!(&err, LaurusError::InvalidArgument(m) if m.contains(&expected)),
+                "unexpected error: {err:?}"
+            );
+            assert_eq!(search_ids(&store, "a").unwrap(), vec![1], "{kind}");
+        }
     }
 
     /// Issue #1445 fixture: a store over two Flat fields `a` and `b` with doc

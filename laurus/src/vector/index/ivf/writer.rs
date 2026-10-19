@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::util::alloc_bounds::checked_capacity;
+use crate::vector::core::field::{VectorIndexKind, quantizer_support_error};
 use crate::vector::core::quantization::QuantizationMethod;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::IvfIndexConfig;
@@ -1295,6 +1296,13 @@ impl VectorIndexWriter for IvfIndexWriter {
                 "Index must be finalized before writing".to_string(),
             ));
         }
+        // Field definitions reject this (Issue #1457); refuse here as well so
+        // a config built directly cannot store int8 under a PQ quantizer.
+        if let Some(reason) =
+            quantizer_support_error(VectorIndexKind::Ivf, self.index_config.quantization_method)
+        {
+            return Err(LaurusError::InvalidOperation(reason));
+        }
 
         let storage = self
             .storage
@@ -1364,7 +1372,7 @@ impl VectorIndexWriter for IvfIndexWriter {
         // Issue #623: Float16 has nothing to train. Otherwise (Issue #481
         // Stage 1, Step 7) train per-segment SQ params on ALL vectors
         // across ALL inverted lists (segment-wide single (offset, scale)
-        // pair); a PQ quantizer is also written as SQ8 here (#1457).
+        // pair). PQ never gets here: it was refused above.
         // `self.inverted_lists.order` is already in cluster-grouped
         // emission order (Issue #629).
         let params = if float16 {
@@ -1562,6 +1570,41 @@ mod tests {
                 (i as u64, "f".to_string(), Vector::new(data))
             })
             .collect()
+    }
+
+    /// Issue #1457: a PQ config is refused instead of being written as
+    /// Scalar8Bit, and nothing is left in storage.
+    #[test]
+    fn write_refuses_product_quantization() {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = IvfIndexConfig {
+            dimension: 4,
+            n_clusters: 2,
+            n_probe: 2,
+            quantization_method: QuantizationMethod::ProductQuantization { subvector_count: 2 },
+            ..Default::default()
+        };
+        let mut writer = IvfIndexWriter::with_storage(
+            config,
+            VectorIndexWriterConfig::default(),
+            "test",
+            storage.clone(),
+        )
+        .unwrap();
+        writer.add_vectors(lcg_vectors(8, 4)).unwrap();
+        writer.finalize().unwrap();
+
+        let err = writer.write().unwrap_err();
+        assert!(
+            matches!(&err, LaurusError::InvalidOperation(m)
+                if m.starts_with("IVF does not support quantizer ProductQuantization")),
+            "unexpected error: {err:?}"
+        );
+        assert!(!storage.file_exists("test.ivf"));
+        assert!(!storage.file_exists("test.ivf.tmp"));
     }
 
     /// Issue #847: with the seeded k-means RNG, two trainings over the

@@ -20,6 +20,16 @@
 //!
 //! # Variants
 //!
+//! | Variant | HNSW | Flat | IVF |
+//! | --- | --- | --- | --- |
+//! | [`QuantizationMethod::Scalar8Bit`] | yes | yes | yes |
+//! | [`QuantizationMethod::ProductQuantization`] | yes | no | no |
+//! | `QuantizationMethod::ProductQuantizationFastScan` (`pq-fastscan`) | yes | no | no |
+//! | [`QuantizationMethod::Float16`] | yes | yes | yes |
+//!
+//! A Flat or IVF field with an unsupported variant is rejected (see
+//! [`crate::vector::core::field::FlatOption::validate`]).
+//!
 //! - [`QuantizationMethod::Scalar8Bit`]: implemented here. Default.
 //! - [`QuantizationMethod::ProductQuantization`]: implemented here.
 //!   Stage 3 of Issue #481. Trains a per-segment codebook of `M`
@@ -53,11 +63,13 @@ pub enum QuantizationMethod {
     #[default]
     Scalar8Bit,
     /// Product quantization (Stage 3 of Issue #481). Supported by the
-    /// HNSW index; Flat / IVF return [`LaurusError::NotImplemented`]
-    /// at write time. The codebook (`subvector_count × 256` centroids)
-    /// is trained per segment by default, or trained once and shared
-    /// across segments via `HnswOption::pq_codebook_path` /
-    /// `Engine::train_pq_codebook` (Issue #631).
+    /// HNSW index only: a Flat or IVF field with it is rejected with
+    /// [`LaurusError::InvalidArgument`] when the field is defined, and an
+    /// index whose persisted schema holds one fails to open (Issue #1457).
+    /// The codebook (`subvector_count × 256` centroids) is trained per
+    /// segment by default, or trained once and shared across segments via
+    /// `HnswOption::pq_codebook_path` / `Engine::train_pq_codebook`
+    /// (Issue #631).
     ProductQuantization {
         /// Number of sub-vectors; must evenly divide the vector
         /// dimension. Derives the codebook layout.
@@ -65,9 +77,11 @@ pub enum QuantizationMethod {
     },
     /// FastScan product quantization (K=16 4-bit codes + SIMD LUT
     /// distance). Experimental, only available with the `pq-fastscan`
-    /// cargo feature and only supported by HNSW indexes today
+    /// cargo feature and only supported by HNSW indexes
     /// (Issue [#695](https://github.com/mosuka/laurus/issues/695) /
-    /// part D of [#651](https://github.com/mosuka/laurus/issues/651)).
+    /// part D of [#651](https://github.com/mosuka/laurus/issues/651)); a
+    /// Flat or IVF field with it is rejected like
+    /// [`Self::ProductQuantization`].
     ///
     /// Use this when the HNSW search latency is dominated by the PQ
     /// ADC kernel and the corpus fits the FAISS-style block layout

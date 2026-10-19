@@ -123,7 +123,7 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Distance metrics:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
-**Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index — Flat / IVF reject it at write time), `FLOAT16` (Issue #623; IEEE 754 half precision, 2 bytes per dimension, nothing to train; supported by HNSW, Flat and IVF — see [Float16](../concepts/indexing/vector_indexing.md#float16-issue-623)). A server that predates `FLOAT16` stores the field as `SCALAR_8BIT` without an error (Issue #1459), so check the returned schema when talking to an older server.
+**Quantization methods:** `SCALAR_8BIT` (default), `PRODUCT_QUANTIZATION` (Issue #481 Stage 3; supported by the HNSW index only — `CreateIndex`, `AddField` and `UpdateField` reject it on a Flat / IVF field as `INVALID_ARGUMENT`, Issue #1457), `FLOAT16` (Issue #623; IEEE 754 half precision, 2 bytes per dimension, nothing to train; supported by HNSW, Flat and IVF — see [Float16](../concepts/indexing/vector_indexing.md#float16-issue-623)). A server that predates `FLOAT16` stores the field as `SCALAR_8BIT` without an error (Issue #1459), so check the returned schema when talking to an older server.
 
 `NONE` (no quantization) was removed in Issue #481 Stage 1. The proto enum value `0` (`QUANTIZATION_METHOD_NONE`) is kept as a wire-compat reservation; if the server receives it, it falls back to `SCALAR_8BIT` via `Default::default()`.
 

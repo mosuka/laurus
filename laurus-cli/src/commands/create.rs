@@ -674,8 +674,8 @@ fn prompt_quantization_method(
 ///
 /// Default = Scalar8Bit (4x compression). Float16 (Issue #623) keeps
 /// IEEE 754 half precision values at 2 bytes per dimension. Product
-/// Quantization is not offered: it is HNSW-only, and the Flat and IVF
-/// writers store a PQ field as Scalar8Bit (Issue #1457).
+/// Quantization is not offered: it is HNSW-only, and a Flat or IVF field
+/// with it is rejected (Issue #1457).
 fn prompt_flat_ivf_quantization_method()
 -> Result<laurus::vector::core::quantization::QuantizationMethod> {
     use laurus::vector::core::quantization::QuantizationMethod;

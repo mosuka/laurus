@@ -133,6 +133,12 @@ pub struct FlatOption {
     /// Defaults to [`quantization::QuantizationMethod::Scalar8Bit`]
     /// (Issue #481 Stage 1: int8 SQ is mandatory; the previous
     /// `Option::None` "no quantization" path no longer exists).
+    ///
+    /// Flat supports only [`Scalar8Bit`](quantization::QuantizationMethod::Scalar8Bit)
+    /// and [`Float16`](quantization::QuantizationMethod::Float16);
+    /// `ProductQuantization` (and, with the `pq-fastscan` feature,
+    /// `ProductQuantizationFastScan`) are HNSW-only and are rejected by
+    /// [`Self::validate`] (Issue #1457).
     #[serde(default)]
     pub quantizer: quantization::QuantizationMethod,
     /// Two-stage rerank storage backend (Issue #481 Stage 2).
@@ -301,6 +307,12 @@ pub struct IvfOption {
     /// Defaults to [`quantization::QuantizationMethod::Scalar8Bit`]
     /// (Issue #481 Stage 1: int8 SQ is mandatory; the previous
     /// `Option::None` "no quantization" path no longer exists).
+    ///
+    /// IVF supports only [`Scalar8Bit`](quantization::QuantizationMethod::Scalar8Bit)
+    /// and [`Float16`](quantization::QuantizationMethod::Float16);
+    /// `ProductQuantization` (and, with the `pq-fastscan` feature,
+    /// `ProductQuantizationFastScan`) are HNSW-only and are rejected by
+    /// [`Self::validate`] (Issue #1457).
     #[serde(default)]
     pub quantizer: quantization::QuantizationMethod,
     /// Two-stage rerank storage backend (Issue #481 Stage 2).
@@ -555,6 +567,37 @@ pub(crate) fn multi_vector_params_error(
     }
 }
 
+/// Why an index of kind `index_kind` cannot store vectors with
+/// `quantizer`, if it cannot.
+///
+/// Product quantization is implemented only by HNSW. Flat and IVF store
+/// `Scalar8Bit` and `Float16`; their writers used to take a PQ quantizer
+/// down the `Scalar8Bit` path without an error (Issue #1457).
+pub(crate) fn quantizer_support_error(
+    index_kind: VectorIndexKind,
+    quantizer: quantization::QuantizationMethod,
+) -> Option<String> {
+    use quantization::QuantizationMethod;
+
+    let kind = match index_kind {
+        VectorIndexKind::Flat => "Flat",
+        VectorIndexKind::Ivf => "IVF",
+        VectorIndexKind::Hnsw | VectorIndexKind::MultiVector => return None,
+    };
+    let supported = match quantizer {
+        QuantizationMethod::Scalar8Bit | QuantizationMethod::Float16 => true,
+        QuantizationMethod::ProductQuantization { .. } => false,
+        #[cfg(feature = "pq-fastscan")]
+        QuantizationMethod::ProductQuantizationFastScan { .. } => false,
+    };
+    (!supported).then(|| {
+        format!(
+            "{kind} does not support quantizer {quantizer:?}: product quantization is \
+             HNSW-only; use Scalar8Bit or Float16"
+        )
+    })
+}
+
 /// The type of vector index to use.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -633,6 +676,26 @@ impl FlatOption {
     pub fn rerank_storage(mut self, kind: RerankStorageKind) -> Self {
         self.rerank_storage = Some(kind);
         self
+    }
+
+    /// Check that the options describe a usable Flat field.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::invalid_argument`] when [`Self::quantizer`] is
+    /// a product quantizer, which Flat does not implement (see
+    /// [`quantizer_support_error`]).
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        match quantizer_support_error(VectorIndexKind::Flat, self.quantizer) {
+            Some(reason) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': {reason}"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -746,6 +809,26 @@ impl IvfOption {
     pub fn rerank_storage(mut self, kind: RerankStorageKind) -> Self {
         self.rerank_storage = Some(kind);
         self
+    }
+
+    /// Check that the options describe a usable IVF field.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name, used in the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::invalid_argument`] when [`Self::quantizer`] is
+    /// a product quantizer, which IVF does not implement (see
+    /// [`quantizer_support_error`]).
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        match quantizer_support_error(VectorIndexKind::Ivf, self.quantizer) {
+            Some(reason) => Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': {reason}"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -898,5 +981,80 @@ mod tests {
             assert!(msg.starts_with("Invalid argument: field 't': "), "{msg}");
             assert!(msg.contains(expected), "{msg}");
         }
+    }
+
+    /// Issue #1457: Flat and IVF accept only the quantizers they implement.
+    #[test]
+    fn flat_and_ivf_validate_accept_scalar8bit_and_float16() {
+        use quantization::QuantizationMethod;
+
+        for quantizer in [QuantizationMethod::Scalar8Bit, QuantizationMethod::Float16] {
+            assert!(
+                FlatOption::new(8)
+                    .quantizer(quantizer)
+                    .validate("vec")
+                    .is_ok()
+            );
+            assert!(
+                IvfOption::new(8)
+                    .quantizer(quantizer)
+                    .validate("vec")
+                    .is_ok()
+            );
+        }
+    }
+
+    /// Issue #1457: a product quantizer on a Flat or IVF field is rejected
+    /// with an error that names the field and the quantizer.
+    #[test]
+    fn flat_and_ivf_validate_reject_product_quantization() {
+        use quantization::QuantizationMethod;
+
+        let pq = QuantizationMethod::ProductQuantization { subvector_count: 4 };
+        let flat = FlatOption::new(8)
+            .quantizer(pq)
+            .validate("vec")
+            .unwrap_err();
+        assert_eq!(
+            flat.to_string(),
+            "Invalid argument: field 'vec': Flat does not support quantizer \
+             ProductQuantization { subvector_count: 4 }: product quantization is HNSW-only; \
+             use Scalar8Bit or Float16"
+        );
+        let ivf = IvfOption::new(8).quantizer(pq).validate("vec").unwrap_err();
+        assert!(
+            ivf.to_string().starts_with(
+                "Invalid argument: field 'vec': IVF does not support quantizer \
+                 ProductQuantization { subvector_count: 4 }"
+            ),
+            "{ivf}"
+        );
+    }
+
+    /// Issue #1457: the FastScan variant is rejected the same way.
+    #[cfg(feature = "pq-fastscan")]
+    #[test]
+    fn flat_and_ivf_validate_reject_product_quantization_fastscan() {
+        use quantization::QuantizationMethod;
+
+        let fastscan = QuantizationMethod::ProductQuantizationFastScan { subvector_count: 4 };
+        for err in [
+            FlatOption::new(8).quantizer(fastscan).validate("vec"),
+            IvfOption::new(8).quantizer(fastscan).validate("vec"),
+        ] {
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.contains("field 'vec'") && msg.contains("ProductQuantizationFastScan"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// HNSW implements every quantizer, and a MultiVector field has none.
+    #[test]
+    fn quantizer_support_error_ignores_hnsw_and_multi_vector() {
+        let pq = quantization::QuantizationMethod::ProductQuantization { subvector_count: 4 };
+        assert!(quantizer_support_error(VectorIndexKind::Hnsw, pq).is_none());
+        assert!(quantizer_support_error(VectorIndexKind::MultiVector, pq).is_none());
     }
 }

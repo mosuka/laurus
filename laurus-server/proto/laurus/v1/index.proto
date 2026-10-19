@@ -272,11 +272,14 @@ enum DistanceMetric {
 enum QuantizationMethod {
   QUANTIZATION_METHOD_NONE = 0;
   QUANTIZATION_METHOD_SCALAR_8BIT = 1;
+  // Product quantization (Issue #481 Stage 3). HNSW fields only; a Flat or
+  // IVF field with it is rejected as INVALID_ARGUMENT (Issue #1457).
   QUANTIZATION_METHOD_PRODUCT_QUANTIZATION = 2;
   // PQ FastScan (K=16 4-bit codes + SIMD LUT distance). Issue #695 /
   // part D of #651. Requires the server to be built with the
   // `pq-fastscan` cargo feature; otherwise the conversion path rejects
-  // the value with an explicit error.
+  // the value with an explicit error. HNSW fields only, like
+  // PRODUCT_QUANTIZATION.
   QUANTIZATION_METHOD_PRODUCT_QUANTIZATION_FASTSCAN = 3;
   // IEEE 754 half precision (Issue #623): 2 bytes per dimension, half of
   // f32 and twice SCALAR_8BIT. Nothing to train. Supported by HNSW, Flat

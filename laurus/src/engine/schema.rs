@@ -110,8 +110,9 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Check that `option` describes a usable field named `name`: today, that
-/// a `MultiVector` option passes [`MultiVectorOption::validate`].
+/// Check that `option` describes a usable field named `name`: a `Flat`,
+/// `Ivf` or `MultiVector` option must pass [`FlatOption::validate`],
+/// [`IvfOption::validate`] or [`MultiVectorOption::validate`].
 ///
 /// Called by [`Schema::validate_for_create`] and before
 /// `Engine::add_field` / `Engine::update_field` touch any data, so an
@@ -122,10 +123,12 @@ pub fn validate_field_name(name: &str) -> crate::error::Result<()> {
 /// Returns [`crate::error::LaurusError::invalid_argument`] when the option
 /// is rejected.
 pub(crate) fn validate_field_option(name: &str, option: &FieldOption) -> crate::error::Result<()> {
-    if let FieldOption::MultiVector(opt) = option {
-        opt.validate(name)?;
+    match option {
+        FieldOption::Flat(opt) => opt.validate(name),
+        FieldOption::Ivf(opt) => opt.validate(name),
+        FieldOption::MultiVector(opt) => opt.validate(name),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Schema for the unified engine.
@@ -210,8 +213,9 @@ impl Schema {
     /// Check a schema that is about to create a new index.
     ///
     /// Call this before the schema is persisted for a new index. A schema
-    /// persisted earlier is not re-checked when its index is reopened, so
-    /// a rule added here never stops an existing index from opening.
+    /// persisted earlier is not re-checked as a whole when its index is
+    /// reopened, so a rule added here does not stop an existing index from
+    /// opening unless `Engine` checks it again (see the last rule below).
     ///
     /// # Errors
     ///
@@ -226,6 +230,11 @@ impl Schema {
     /// - A [`FieldOption::MultiVector`] field has a zero dimension or a
     ///   distance other than `Cosine` / `DotProduct` (see
     ///   [`MultiVectorOption::validate`]).
+    /// - A [`FieldOption::Flat`] or [`FieldOption::Ivf`] field uses a
+    ///   product quantizer, which only HNSW implements (see
+    ///   [`FlatOption::validate`] / [`IvfOption::validate`]). Unlike the
+    ///   rules above, this one is also checked when the index is reopened
+    ///   (Issue #1457).
     ///
     /// [`validate_analyzer_name`]: crate::analysis::analyzer::registry::validate_analyzer_name
     pub fn validate_for_create(&self) -> crate::error::Result<()> {
@@ -978,13 +987,14 @@ impl SchemaBuilder {
         self
     }
 
-    /// Build the schema, validating reserved field and analyzer names.
+    /// Build the schema, checking it with [`Schema::validate_for_create`].
     ///
     /// # Errors
     ///
-    /// Returns an error if any field name starts with `_` and is not in the
-    /// reserved allow-list, or if a custom analyzer uses a name reserved for
-    /// a built-in analyzer (see [`Schema::validate_for_create`]).
+    /// Returns an error for any schema [`Schema::validate_for_create`]
+    /// rejects: a reserved field or analyzer name, or a field option its
+    /// index cannot use (such as a product quantizer on a Flat or IVF
+    /// field).
     pub fn try_build(self) -> crate::error::Result<Schema> {
         let schema = Schema {
             analyzers: self.analyzers,
@@ -1002,8 +1012,8 @@ impl SchemaBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if a field or custom analyzer name collides with a reserved
-    /// name. Use [`try_build`](Self::try_build) for a fallible variant.
+    /// Panics for any schema [`try_build`](Self::try_build) rejects. Use
+    /// `try_build` for a fallible variant.
     pub fn build(self) -> Schema {
         self.try_build()
             .expect("SchemaBuilder::build: schema validation failed")
@@ -1093,6 +1103,35 @@ mod tests {
         schema.fields.insert(
             RESERVED_ID_FIELD.to_string(),
             FieldOption::Text(TextOption::default()),
+        );
+        assert!(schema.validate_for_create().is_ok());
+    }
+
+    /// Issue #1457: a new index cannot declare a Flat or IVF field with a
+    /// product quantizer.
+    #[test]
+    fn validate_for_create_rejects_product_quantization_on_flat_and_ivf() {
+        use crate::vector::core::quantization::QuantizationMethod;
+
+        let pq = QuantizationMethod::ProductQuantization { subvector_count: 4 };
+        let cases = [
+            ("Flat", FieldOption::Flat(FlatOption::new(8).quantizer(pq))),
+            ("IVF", FieldOption::Ivf(IvfOption::new(8).quantizer(pq))),
+        ];
+        for (kind, option) in cases {
+            let mut schema = Schema::new();
+            schema.fields.insert("vec".to_string(), option);
+            let msg = schema.validate_for_create().unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!("field 'vec': {kind} does not support quantizer")),
+                "got: {msg}"
+            );
+        }
+
+        let mut schema = Schema::new();
+        schema.fields.insert(
+            "vec".to_string(),
+            FieldOption::Flat(FlatOption::new(8).quantizer(QuantizationMethod::Float16)),
         );
         assert!(schema.validate_for_create().is_ok());
     }
@@ -1780,7 +1819,7 @@ mod tests {
                 "flat: quantizer change requires reindex",
                 flat(|o| o),
                 flat(|mut o| {
-                    o.quantizer = QuantizationMethod::ProductQuantization { subvector_count: 8 };
+                    o.quantizer = QuantizationMethod::Float16;
                     o
                 }),
                 Reindex,
@@ -1835,7 +1874,7 @@ mod tests {
                 "ivf: quantizer change requires reindex",
                 ivf(|o| o),
                 ivf(|mut o| {
-                    o.quantizer = QuantizationMethod::ProductQuantization { subvector_count: 8 };
+                    o.quantizer = QuantizationMethod::Float16;
                     o
                 }),
                 Reindex,

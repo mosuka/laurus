@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::util::alloc_bounds::checked_capacity;
+use crate::vector::core::field::{VectorIndexKind, quantizer_support_error};
 use crate::vector::core::quantization::QuantizationMethod;
 use crate::vector::core::vector::Vector;
 use crate::vector::index::FlatIndexConfig;
@@ -443,6 +444,13 @@ impl VectorIndexWriter for FlatIndexWriter {
                 "Index must be finalized before writing".to_string(),
             ));
         }
+        // Field definitions reject this (Issue #1457); refuse here as well so
+        // a config built directly cannot store int8 under a PQ quantizer.
+        if let Some(reason) =
+            quantizer_support_error(VectorIndexKind::Flat, self.index_config.quantization_method)
+        {
+            return Err(LaurusError::InvalidOperation(reason));
+        }
 
         let storage = self
             .storage
@@ -489,7 +497,7 @@ impl VectorIndexWriter for FlatIndexWriter {
             // the f32 vectors and emit the LVS1 quantized format. Empty
             // segments fall back to neutral (0.0, 1.0) params so the
             // header is still emitted (test_put_document_* exercise this
-            // path). A PQ quantizer is also written as SQ8 here (#1457).
+            // path). Only Scalar8Bit reaches here: PQ was refused above.
             //
             // Issue #1151: quantizes and writes each record immediately as
             // the segment is walked, instead of collecting a
@@ -654,6 +662,38 @@ mod tests {
     fn assert_ids_in_step(writer: &FlatIndexWriter) {
         let expected: HashSet<u64> = writer.vectors.iter().map(|(id, _, _)| *id).collect();
         assert_eq!(writer.buffered_ids, expected);
+    }
+
+    /// Issue #1457: a PQ config is refused instead of being written as
+    /// Scalar8Bit, and nothing is left in storage.
+    #[test]
+    fn write_refuses_product_quantization() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = FlatIndexConfig {
+            quantization_method: QuantizationMethod::ProductQuantization { subvector_count: 1 },
+            ..config()
+        };
+        let mut writer = FlatIndexWriter::with_storage(
+            config,
+            VectorIndexWriterConfig::default(),
+            "test",
+            storage.clone(),
+        )
+        .unwrap();
+        writer
+            .add_vectors(vec![vector(1, 1.0), vector(2, 2.0)])
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let err = writer.write().unwrap_err();
+        assert!(
+            matches!(&err, LaurusError::InvalidOperation(m)
+                if m.starts_with("Flat does not support quantizer ProductQuantization")),
+            "unexpected error: {err:?}"
+        );
+        assert!(!storage.file_exists("test.flat"));
+        assert!(!storage.file_exists("test.flat.tmp"));
     }
 
     #[test]

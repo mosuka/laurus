@@ -206,11 +206,25 @@ storage this is **~4x smaller** with negligible recall loss in practice
 (Recall@10 remains ≥ 0.95 against the f32 ground truth — see the
 recall test at `laurus/tests/vector_recall_test.rs`).
 
-| Method | Enum Variant | Description | Memory Reduction |
-| :--- | :--- | :--- | :--- |
-| **Scalar 8-bit** *(default)* | `Scalar8Bit` | Per-segment global affine quantization to `u8` | ~4x |
-| **Product Quantization** | `ProductQuantization { subvector_count }` | Stage 3 of #481 — codebook of `M × 256` centroids (trained per segment, or [trained once and shared](#shared-pq-codebook-issue-631) via `pq_codebook_path`), each vector stored as `M` bytes | ~16-64x (HNSW-only) |
-| **Float16** | `Float16` | Issue #623 — IEEE 754 half precision, 2 bytes per dimension; nothing to train (see [Float16](#float16-issue-623)) | ~2x (HNSW, Flat, IVF) |
+| Method | Enum Variant | Description | Memory Reduction | Index Types |
+| :--- | :--- | :--- | :--- | :--- |
+| **Scalar 8-bit** *(default)* | `Scalar8Bit` | Per-segment global affine quantization to `u8` | ~4x | HNSW, Flat, IVF |
+| **Product Quantization** | `ProductQuantization { subvector_count }` | Stage 3 of #481 — codebook of `M × 256` centroids (trained per segment, or [trained once and shared](#shared-pq-codebook-issue-631) via `pq_codebook_path`), each vector stored as `M` bytes | ~16-64x | HNSW |
+| **PQ FastScan** *(experimental)* | `ProductQuantizationFastScan { subvector_count }` | Issue #695 — `M × 16` centroids, each vector stored as `M` 4-bit codes; needs the `pq-fastscan` cargo feature | ~32-128x | HNSW |
+| **Float16** | `Float16` | Issue #623 — IEEE 754 half precision, 2 bytes per dimension; nothing to train (see [Float16](#float16-issue-623)) | ~2x | HNSW, Flat, IVF |
+
+A Flat or IVF field with a quantizer its index type does not support is
+rejected when the index is created or the field is added or updated
+(Issue #1457).
+
+> **Breaking change (Issue #1457):** a Flat or IVF field with
+> `ProductQuantization` (or `ProductQuantizationFastScan`) used to be
+> accepted and stored as `Scalar8Bit` without an error. It is now
+> rejected, and an index whose `schema.toml` already holds such a field
+> fails to open. Its segments are already `Scalar8Bit`, so setting that
+> field's quantizer to `Scalar8Bit` in `schema.toml` reopens the index
+> unchanged; to move to `Float16`, reopen it first and then change the
+> quantizer with `update_field` (a reindex).
 
 ```rust
 use laurus::vector::HnswOption;
@@ -744,8 +758,8 @@ fewer instructions per query. The x86 F16C kernel was not measured.
 
 ### MultiVector Storage
 
-The quantization methods above apply to the ANN index types (Flat, HNSW,
-IVF). A [`MultiVector` field](../schema_and_fields.md#multi-vector-fields)
+The quantization methods above apply to the ANN index types listed for
+each in the [Quantization](#quantization) table. A [`MultiVector` field](../schema_and_fields.md#multi-vector-fields)
 has no ANN index, so `quantizer` does not apply to it — instead its own
 `storage` option (Issue #1346) picks the on-disk element kind of its token
 vectors:

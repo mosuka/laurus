@@ -123,7 +123,7 @@ message AnalyzerDefinition {
 
 **距離メトリクス:** `COSINE`, `EUCLIDEAN`, `MANHATTAN`, `DOT_PRODUCT`, `ANGULAR`
 
-**量子化手法:** `SCALAR_8BIT`（デフォルト）, `PRODUCT_QUANTIZATION`（Issue #481 Stage 3。HNSW インデックスがサポート — Flat / IVF は書き込み時に拒否）, `FLOAT16`（Issue #623。IEEE 754 半精度で 1 次元あたり 2 バイト、学習は不要。HNSW / Flat / IVF がサポート — [Float16](../concepts/indexing/vector_indexing.md#float16issue-623) を参照）。`FLOAT16` を知らない古いサーバーは、エラーにせずそのフィールドを `SCALAR_8BIT` として保存する（Issue #1459）ので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
+**量子化手法:** `SCALAR_8BIT`（デフォルト）, `PRODUCT_QUANTIZATION`（Issue #481 Stage 3。HNSW インデックスだけがサポート — Flat / IVF のフィールドに指定すると、`CreateIndex`・`AddField`・`UpdateField` が `INVALID_ARGUMENT` で拒否。Issue #1457）, `FLOAT16`（Issue #623。IEEE 754 半精度で 1 次元あたり 2 バイト、学習は不要。HNSW / Flat / IVF がサポート — [Float16](../concepts/indexing/vector_indexing.md#float16issue-623) を参照）。`FLOAT16` を知らない古いサーバーは、エラーにせずそのフィールドを `SCALAR_8BIT` として保存する（Issue #1459）ので、古いサーバーを相手にするときは返ってきたスキーマを確かめてください。
 
 `NONE`（量子化なし）は Issue #481 Stage 1 で廃止されました。proto enum 値 0（`QUANTIZATION_METHOD_NONE`）は wire 互換のため予約されていますが、サーバ側で受信すると `Default::default()`（`SCALAR_8BIT`）にフォールバックします。
 

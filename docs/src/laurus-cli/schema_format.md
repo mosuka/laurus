@@ -364,8 +364,12 @@ distance = "Cosine"
 
 Issue #481 Stage 3. Stores each vector as `subvector_count` one-byte
 centroid indexes against a codebook of 256 centroids per sub-vector
-(~16-64x compression). Supported by the HNSW index; Flat / IVF reject
-it at write time. Usually paired with
+(~16-64x compression). Supported by the HNSW index only: a Flat or IVF
+field with it is rejected when the index is created or the field is
+added or updated, and an index whose `schema.toml` already holds one
+fails to open (Issue #1457). Such a field was stored as `Scalar8Bit`, so
+setting its quantizer to `Scalar8Bit` reopens the index unchanged.
+Usually paired with
 [Rerank Storage](#rerank-storage) to recover recall.
 
 ```toml

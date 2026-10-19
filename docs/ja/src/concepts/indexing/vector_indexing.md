@@ -206,11 +206,25 @@ let metric = DistanceMetric::Angular;      // Angular distance
 できる範囲（f32 ground truth に対して Recall@10 ≥ 0.95 — recall テスト
 `laurus/tests/vector_recall_test.rs` 参照）です。
 
-| 方式 | Enum バリアント | 説明 | メモリ削減率 |
-| :--- | :--- | :--- | :--- |
-| **スカラー 8 ビット** *(デフォルト)* | `Scalar8Bit` | per-segment global affine による `u8` 量子化 | 約 4 倍 |
-| **プロダクト量子化** | `ProductQuantization { subvector_count }` | Issue #481 Stage 3 — `M × 256` centroid の codebook（segment ごとに学習、または `pq_codebook_path` で[一度だけ学習して共有](#共有-pq-codebookissue-631)）、各ベクトルを `M` バイトで保存 | 約 16-64 倍（HNSW のみ） |
-| **Float16** | `Float16` | Issue #623 — IEEE 754 半精度、1 次元あたり 2 バイト。学習は不要（[Float16](#float16issue-623) を参照） | 約 2 倍（HNSW、Flat、IVF） |
+| 方式 | Enum バリアント | 説明 | メモリ削減率 | 対応インデックス |
+| :--- | :--- | :--- | :--- | :--- |
+| **スカラー 8 ビット** *(デフォルト)* | `Scalar8Bit` | per-segment global affine による `u8` 量子化 | 約 4 倍 | HNSW、Flat、IVF |
+| **プロダクト量子化** | `ProductQuantization { subvector_count }` | Issue #481 Stage 3 — `M × 256` centroid の codebook（segment ごとに学習、または `pq_codebook_path` で[一度だけ学習して共有](#共有-pq-codebookissue-631)）、各ベクトルを `M` バイトで保存 | 約 16-64 倍 | HNSW |
+| **PQ FastScan** *(実験的)* | `ProductQuantizationFastScan { subvector_count }` | Issue #695 — `M × 16` centroid、各ベクトルを `M` 個の 4 ビットコードで保存。cargo feature `pq-fastscan` が必要 | 約 32-128 倍 | HNSW |
+| **Float16** | `Float16` | Issue #623 — IEEE 754 半精度、1 次元あたり 2 バイト。学習は不要（[Float16](#float16issue-623) を参照） | 約 2 倍 | HNSW、Flat、IVF |
+
+インデックス型が対応していない quantizer を Flat / IVF のフィールドに
+指定すると、インデックスの作成時とフィールドの追加・更新時に拒否します
+（Issue #1457）。
+
+> **破壊的変更（Issue #1457）:** Flat / IVF のフィールドに
+> `ProductQuantization`（または `ProductQuantizationFastScan`）を
+> 指定すると、以前はエラーにならず `Scalar8Bit` で保存されていました。
+> 今は拒否し、`schema.toml` に既にそのフィールドがあるインデックスは
+> 開けません。セグメントは既に `Scalar8Bit` なので、`schema.toml` の
+> そのフィールドの quantizer を `Scalar8Bit` に書き換えれば、そのまま
+> 開けます。`Float16` に移すときは、まず開いてから `update_field` で
+> quantizer を変えてください（reindex になります）。
 
 ```rust
 use laurus::vector::HnswOption;
@@ -695,8 +709,8 @@ x86 の F16C カーネルは計測していません。
 
 ### MultiVector ストレージ
 
-上記の量子化方式は ANN インデックスタイプ（Flat、HNSW、IVF）に適用され
-ます。[`MultiVector` フィールド](../schema_and_fields.md#multivector-フィールド)
+上記の量子化方式は、[量子化](#量子化quantization)の表でそれぞれに示した
+ANN インデックスタイプに適用されます。[`MultiVector` フィールド](../schema_and_fields.md#multivector-フィールド)
 は ANN 索引を持たないため `quantizer` は適用されません。代わりに独自の
 `storage` オプション（Issue #1346）で、トークンベクトルのディスク上で
 の要素形式を選びます。

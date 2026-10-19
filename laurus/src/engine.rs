@@ -2914,6 +2914,28 @@ impl Engine {
             );
         }
 
+        // No such tolerance for a Flat / IVF field with a product quantizer
+        // (Issue #1457): opening would keep storing int8 vectors under a
+        // schema that says PQ. Builds before the check wrote that field
+        // exactly as `Scalar8Bit`, so the error says how to reopen as is.
+        for (name, field_option) in &schema.fields {
+            let checked = match field_option {
+                schema::FieldOption::Flat(opt) => opt.validate(name),
+                schema::FieldOption::Ivf(opt) => opt.validate(name),
+                _ => Ok(()),
+            };
+            match checked {
+                Err(crate::error::LaurusError::InvalidArgument(reason)) => {
+                    return Err(crate::error::LaurusError::invalid_argument(format!(
+                        "{reason}; an index that already holds this field stored it as \
+                         Scalar8Bit, so set its quantizer to Scalar8Bit in schema.toml to \
+                         reopen it unchanged"
+                    )));
+                }
+                other => other?,
+            }
+        }
+
         // Register per-field analyzers declared in the schema.
         // Resolution order: parameterized built-in → runtime registration →
         // built-in name → custom definition in schema.analyzers.
