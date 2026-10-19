@@ -213,7 +213,8 @@ engine.warmup()?;   // optional: move first-query latency to startup
 ```
 
 It eagerly builds and caches the vector searcher — loading the reader (file →
-memory for `InMemory`, the offset table for `Mmap`) — and, for HNSW indexes in
+memory for `InMemory`; for `Mmap`, the lookup tables, while the vector rows are
+read in place from the mapped file) — and, for HNSW indexes in
 `Mmap` mode, pre-faults the on-disk vector data into the OS page cache. The HNSW
 graph is always loaded eagerly, so only the vector data needs warming.
 `warmup()` is safe to call multiple times and is a no-op for lexical-only
