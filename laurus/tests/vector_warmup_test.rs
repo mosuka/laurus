@@ -6,7 +6,8 @@
 //! vector rows are read in place from the mapped segment files. The
 //! page-touching pass of `HnswSearcher::warmup` itself is tested in the
 //! crate's `sq8_mapped_tests`, and that `Engine::warmup` runs it for every
-//! segment of every field in the crate's engine tests (Issue #1483).
+//! segment of every HNSW, Flat and IVF field in the crate's engine tests
+//! (Issues #1483 and #1485).
 //! Cold-start *timing* is environment-dependent and intentionally not
 //! asserted.
 

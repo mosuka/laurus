@@ -98,6 +98,35 @@ impl VectorStorage {
         }
     }
 
+    /// Read one byte from every page of every row that is read in place
+    /// from the mapped segment file, so the pages are faulted in before the
+    /// first query (searcher warmup, Issues #677 and #1485).
+    ///
+    /// Only the `Scalar8Bit` and `Float16` pools read their rows in place
+    /// (`Lazy` loading, Issues #1463 and #623); the PQ codes and the legacy
+    /// f32 map are always on the heap. The HNSW, Flat and IVF searchers'
+    /// `warmup` all call this.
+    ///
+    /// # Returns
+    ///
+    /// A checksum of the touched bytes, for the caller to keep alive with
+    /// `std::hint::black_box`; `None` when the rows are on the heap, which
+    /// needs no warming.
+    pub(crate) fn touch_mapped_rows(&self) -> Option<u64> {
+        let touched = match self {
+            VectorStorage::OwnedQuantized(pool) => pool.touch_mapped_rows(),
+            VectorStorage::Float16(pool) => pool.touch_mapped_rows(),
+            VectorStorage::Owned(_) | VectorStorage::OwnedPq(_) => None,
+            #[cfg(feature = "pq-fastscan")]
+            VectorStorage::OwnedPqFastScan(_) => None,
+        };
+        #[cfg(test)]
+        if touched.is_some() {
+            warmup_calls::record();
+        }
+        touched
+    }
+
     /// The per-field `doc_id -> position` map of a pool, used by readers
     /// to build the HNSW ordinal tables. `None` for the legacy
     /// [`Self::Owned`].
@@ -194,5 +223,28 @@ impl VectorStorage {
             }
             VectorStorage::Float16(pool) => Ok(pool.decode_to_vector(doc_id, field_name)),
         }
+    }
+}
+
+/// Mapped pools touched by [`VectorStorage::touch_mapped_rows`], so that
+/// tests can see that a searcher's warmup reached a segment's rows — the
+/// search results, the same with or without warming, cannot show it
+/// (Issues #1483 and #1485).
+#[cfg(test)]
+pub(crate) mod warmup_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TOUCHED_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        TOUCHED_THIS_THREAD.with(|touched| touched.set(touched.get() + 1));
+    }
+
+    /// Mapped pools touched on the current thread. Warmup runs on the
+    /// calling thread, so tests running at the same time do not add to it.
+    pub(crate) fn on_this_thread() -> usize {
+        TOUCHED_THIS_THREAD.with(Cell::get)
     }
 }

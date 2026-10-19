@@ -835,9 +835,10 @@ impl VectorStore {
     /// invokes the searcher's
     /// [`warmup`](crate::vector::search::searcher::VectorIndexSearcher::warmup),
     /// which pre-faults the vector rows read in place from every segment's
-    /// mapped file into the OS page cache where applicable (HNSW `Scalar8Bit`
-    /// and `Float16` fields in `Mmap` mode). This moves the
-    /// searcher-construction and page-fault latency off the first query.
+    /// mapped file into the OS page cache where applicable (`Scalar8Bit` and
+    /// `Float16` rows of HNSW, Flat and IVF fields in `Mmap` mode). This
+    /// moves the searcher-construction and page-fault latency off the first
+    /// query.
     ///
     /// Safe to call multiple times and from any index type (a no-op
     /// `warmup` for searchers that do not override it). Typically called once

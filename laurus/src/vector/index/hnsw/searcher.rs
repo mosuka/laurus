@@ -613,48 +613,16 @@ impl VectorIndexSearcher for HnswSearcher {
     /// that cost to startup. Heap pools are already resident after the
     /// reader load that [`VectorStore::warmup`](crate::vector::VectorStore::warmup)
     /// forces, so this is a no-op for them. The HNSW graph is always loaded
-    /// into memory eagerly, so only the vector data needs warming.
+    /// into memory eagerly, so only the vector data needs warming. The touch
+    /// is `VectorStorage::touch_mapped_rows`, shared with the Flat and IVF
+    /// searchers (Issue #1485).
     fn warmup(&mut self) -> Result<()> {
         let Some(reader) = self.index_reader.as_any().downcast_ref::<HnswIndexReader>() else {
             return Ok(());
         };
-        let vectors = reader.vectors();
-        let touched = if let Some(pool) = vectors.quantized_pool() {
-            pool.touch_mapped_rows()
-        } else if let Some(pool) = vectors.f16_pool() {
-            pool.touch_mapped_rows()
-        } else {
-            None
-        };
-        #[cfg(test)]
-        if touched.is_some() {
-            warmup_calls::record();
-        }
         // Kept live so the page-touching loop is not optimised away.
-        std::hint::black_box(touched);
+        std::hint::black_box(reader.vectors().touch_mapped_rows());
         Ok(())
-    }
-}
-
-/// Mapped pools touched by [`HnswSearcher::warmup`], so that tests can see
-/// that a warmup reached a segment's rows — the search results, the same
-/// with or without warming, cannot show it (Issue #1483).
-#[cfg(test)]
-pub(crate) mod warmup_calls {
-    use std::cell::Cell;
-
-    thread_local! {
-        static TOUCHED_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(super) fn record() {
-        TOUCHED_THIS_THREAD.with(|touched| touched.set(touched.get() + 1));
-    }
-
-    /// Mapped pools touched on the current thread. Warmup runs on the
-    /// calling thread, so tests running at the same time do not add to it.
-    pub(crate) fn on_this_thread() -> usize {
-        TOUCHED_THIS_THREAD.with(Cell::get)
     }
 }
 

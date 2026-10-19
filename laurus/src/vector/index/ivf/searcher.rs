@@ -441,6 +441,26 @@ impl VectorIndexSearcher for IvfSearcher {
             Ok(self.index_reader.vector_count() as u64)
         }
     }
+
+    /// Pre-fault the segment's mapped rows into the OS page cache
+    /// (Issue #1485), as `HnswSearcher::warmup` does.
+    ///
+    /// `Scalar8Bit` and `Float16` rows of a `Lazy` (mmap) segment are read
+    /// in place from the mapped file (Issues #1463 and #623), so without
+    /// warming the first query pays a page fault for every row page of the
+    /// probed clusters. Touching one byte per page of every row moves that
+    /// cost to startup. Heap pools (`Eager` loading) are already resident,
+    /// so this is a no-op for them. The centroids are always on the heap.
+    fn warmup(&mut self) -> Result<()> {
+        use super::reader::IvfIndexReader;
+
+        let Some(reader) = self.index_reader.as_any().downcast_ref::<IvfIndexReader>() else {
+            return Ok(());
+        };
+        // Kept live so the page-touching loop is not optimised away.
+        std::hint::black_box(reader.vectors().touch_mapped_rows());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

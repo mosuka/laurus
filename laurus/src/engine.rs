@@ -3054,9 +3054,9 @@ impl Engine {
     /// Delegates to [`VectorStore::warmup`](crate::vector::VectorStore::warmup):
     /// it eagerly builds the cached searcher (loading the reader) and pre-faults
     /// the vector rows read in place from every segment's mapped file into the
-    /// OS page cache where applicable (HNSW `Scalar8Bit` and `Float16` fields
-    /// in `Mmap` mode). Call once after building the engine, before serving
-    /// traffic.
+    /// OS page cache where applicable (`Scalar8Bit` and `Float16` rows of
+    /// HNSW, Flat and IVF fields in `Mmap` mode). Call once after building the
+    /// engine, before serving traffic.
     /// Safe to call multiple times; lexical search needs no warming.
     ///
     /// # Errors
@@ -7730,74 +7730,81 @@ mod tests {
         assert_eq!(scores.scored, 4);
     }
 
-    /// Issue #1483: `warmup` pre-faults the mapped rows of every segment of
-    /// every HNSW field. Each field's searcher fans out over its sealed
-    /// segments, and the fan-out used to keep the trait's no-op `warmup`, so
-    /// `HnswSearcher::warmup` never ran behind the engine. Both kinds of HNSW
-    /// rows read in place from `Lazy` segments are covered (`Scalar8Bit`,
-    /// `Float16`); three commits seal three segments per field, below the
-    /// default `merge_factor` of 10.
+    /// Issues #1483 and #1485: `warmup` pre-faults the mapped rows of every
+    /// segment of every HNSW, Flat and IVF field, and touches nothing when the
+    /// rows are on the heap. Each field's searcher fans out over its sealed
+    /// segments; the fan-out used to keep the trait's no-op `warmup` (#1483),
+    /// and so did the Flat and IVF searchers (#1485). Both kinds of rows read
+    /// in place from `Lazy` segments are covered for each index type
+    /// (`Scalar8Bit`, `Float16`); three commits seal three segments per
+    /// field, below the default `merge_factor` of 10.
     #[tokio::test]
     async fn warmup_touches_the_mapped_rows_of_every_segment() {
         use crate::storage::file::FileStorageConfig;
         use crate::storage::{StorageConfig, StorageFactory};
-        use crate::vector::core::field::HnswOption;
-        use crate::vector::core::quantization::QuantizationMethod;
-        use crate::vector::index::hnsw::searcher::warmup_calls;
+        use crate::vector::core::field::{FlatOption, HnswOption, IvfOption};
+        use crate::vector::core::quantization::QuantizationMethod::{Float16, Scalar8Bit};
+        use crate::vector::index::storage::warmup_calls;
         use crate::vector::store::request::QueryVector;
 
         const SEGMENTS: usize = 3;
-        // Declared before the engine, so the mapped files are dropped first.
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut file_config = FileStorageConfig::new(dir.path());
-        file_config.use_mmap = true; // `Lazy` on every platform
-        let storage = StorageFactory::create(StorageConfig::File(file_config)).unwrap();
-        let schema = Schema::builder()
-            .add_hnsw_field(
-                "sq8",
-                HnswOption::new(4).quantizer(QuantizationMethod::Scalar8Bit),
-            )
-            .add_hnsw_field(
-                "f16",
-                HnswOption::new(4).quantizer(QuantizationMethod::Float16),
-            )
-            .build();
-        let engine = Engine::new(storage, schema).await.unwrap();
-        for segment in 0..SEGMENTS {
-            for i in 0..4 {
-                let vector = vec![1.0 + i as f32, segment as f32, 0.5, -(i as f32)];
-                let document = Document::builder()
-                    .add_vector("sq8", vector.clone())
-                    .add_vector("f16", vector)
-                    .build();
-                engine
-                    .put_document(&format!("{segment}-{i}"), document)
-                    .await
-                    .unwrap();
+        const FIELDS: [&str; 6] = [
+            "hnsw_sq8", "hnsw_f16", "flat_sq8", "flat_f16", "ivf_sq8", "ivf_f16",
+        ];
+        // `Lazy` (mmap) segments read their rows in place, so every pool of
+        // every segment is touched; `Eager` segments copy them to the heap.
+        for (use_mmap, expected) in [(true, FIELDS.len() * SEGMENTS), (false, 0)] {
+            // Declared before the engine, so the mapped files are dropped first.
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut file_config = FileStorageConfig::new(dir.path());
+            file_config.use_mmap = use_mmap; // the same on every platform
+            let storage = StorageFactory::create(StorageConfig::File(file_config)).unwrap();
+            let schema = Schema::builder()
+                .add_hnsw_field("hnsw_sq8", HnswOption::new(4).quantizer(Scalar8Bit))
+                .add_hnsw_field("hnsw_f16", HnswOption::new(4).quantizer(Float16))
+                .add_flat_field("flat_sq8", FlatOption::new(4).quantizer(Scalar8Bit))
+                .add_flat_field("flat_f16", FlatOption::new(4).quantizer(Float16))
+                .add_ivf_field("ivf_sq8", IvfOption::new(4).quantizer(Scalar8Bit))
+                .add_ivf_field("ivf_f16", IvfOption::new(4).quantizer(Float16))
+                .build();
+            let engine = Engine::new(storage, schema).await.unwrap();
+            for segment in 0..SEGMENTS {
+                for i in 0..4 {
+                    let vector = vec![1.0 + i as f32, segment as f32, 0.5, -(i as f32)];
+                    let mut document = Document::builder();
+                    for field in FIELDS {
+                        document = document.add_vector(field, vector.clone());
+                    }
+                    engine
+                        .put_document(&format!("{segment}-{i}"), document.build())
+                        .await
+                        .unwrap();
+                }
+                engine.commit().await.unwrap();
             }
-            engine.commit().await.unwrap();
+
+            // `Engine::warmup` runs on this thread, so the thread-local count
+            // sees only this engine's pools.
+            let before = warmup_calls::on_this_thread();
+            engine.warmup().unwrap();
+            assert_eq!(
+                warmup_calls::on_this_thread() - before,
+                expected,
+                "use_mmap = {use_mmap}: warmup must touch the mapped rows of \
+                 every segment of each field, and nothing on the heap"
+            );
+
+            let request = self::search::SearchRequestBuilder::new()
+                .vector_query(self::search::VectorSearchQuery::Vectors(vec![
+                    QueryVector {
+                        vector: Vector::new(vec![1.0, 0.0, 0.5, 0.0]),
+                        weight: 1.0,
+                        fields: None,
+                    },
+                ]))
+                .limit(3)
+                .build();
+            assert_eq!(engine.search(request).await.unwrap().len(), 3);
         }
-
-        // `Engine::warmup` runs on this thread, so the thread-local count
-        // sees only this engine's pools.
-        let before = warmup_calls::on_this_thread();
-        engine.warmup().unwrap();
-        assert_eq!(
-            warmup_calls::on_this_thread() - before,
-            2 * SEGMENTS,
-            "warmup must touch the mapped rows of every segment of each field"
-        );
-
-        let request = self::search::SearchRequestBuilder::new()
-            .vector_query(self::search::VectorSearchQuery::Vectors(vec![
-                QueryVector {
-                    vector: Vector::new(vec![1.0, 0.0, 0.5, 0.0]),
-                    weight: 1.0,
-                    fields: None,
-                },
-            ]))
-            .limit(3)
-            .build();
-        assert_eq!(engine.search(request).await.unwrap().len(), 3);
     }
 }

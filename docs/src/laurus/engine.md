@@ -214,12 +214,12 @@ engine.warmup()?;   // optional: move first-query latency to startup
 
 It eagerly builds and caches the vector searcher — loading the reader (file →
 memory for `InMemory`; for `Mmap`, the lookup tables, while the vector rows are
-read in place from the mapped file) — and, for HNSW fields in `Mmap` mode,
-pre-faults the rows that are read in place (`Scalar8Bit`, the default, and
-`Float16`; PQ codes are loaded into memory) of every segment into the OS page
-cache. Flat and IVF rows are not pre-faulted. The HNSW graph is always loaded
-eagerly, so only the vector data needs warming. `warmup()` is safe to call
-multiple times and is a no-op for lexical-only workloads.
+read in place from the mapped file) — and, for HNSW, Flat and IVF fields in
+`Mmap` mode, pre-faults the rows that are read in place (`Scalar8Bit`, the
+default, and `Float16`; the PQ codes of HNSW are loaded into memory) of every
+segment into the OS page cache. The HNSW graph and the IVF centroids are always
+loaded eagerly, so only the vector rows need warming. `warmup()` is safe to
+call multiple times and is a no-op for lexical-only workloads.
 
 ## SearchRequest
 

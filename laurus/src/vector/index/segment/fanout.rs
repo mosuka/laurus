@@ -583,10 +583,11 @@ impl VectorIndexSearcher for SegmentFanoutSearcher {
     ///
     /// The per-segment searchers are not kept (`search` builds them per
     /// probe), so this builds them here. That is enough for the warming to
-    /// last: `HnswSearcher::warmup` pre-faults the segment's mapped rows into
-    /// the OS page cache, which outlives the searcher. Segments are warmed one
-    /// after another — a one-time startup pass whose per-segment touch is
-    /// sequential — and the first error is returned.
+    /// last: the HNSW, Flat and IVF searchers' `warmup` pre-faults the
+    /// segment's mapped rows into the OS page cache (Issue #1485), which
+    /// outlives the searcher. Segments are warmed one after another — a
+    /// one-time startup pass whose per-segment touch is sequential — and the
+    /// first error is returned.
     fn warmup(&mut self) -> Result<()> {
         for reader in &self.readers {
             (self.make_searcher)(reader.clone())?.warmup()?;
