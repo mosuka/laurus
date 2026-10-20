@@ -1,3 +1,4 @@
+mod applied_seqs;
 mod grouping;
 pub mod json_document;
 #[cfg(test)]
@@ -35,6 +36,7 @@ use crate::vector::core::vector::Vector;
 use crate::vector::store::config::VectorIndexConfig;
 use crate::vector::store::{FieldEmbedderChange, VectorStore};
 
+use self::applied_seqs::AppliedSeqs;
 use self::schema::Schema;
 
 /// Callback invoked to persist a [`Schema`] snapshot outside the engine's own
@@ -260,10 +262,11 @@ impl Drop for WalFlushTimer {
 /// in #892).
 ///
 /// The fixed order makes a crash at any step recoverable: `flush_wal` (the hard
-/// barrier) → `lexical.commit` (persists `last_wal_seq`) → `vector.commit` →
-/// `commit_documents` → `truncate`. Both [`Engine::commit`] and the background
-/// [`CommitTimer`] call this, so the timer needs only the `Arc` sub-parts — not
-/// the whole `Engine` (which would be a reference cycle).
+/// barrier) → `lexical.commit_through` (persists `last_wal_seq`) →
+/// `vector.commit_through` → `commit_documents` → `truncate`. Both
+/// [`Engine::commit`] and the background [`CommitTimer`] call this, so the
+/// timer needs only the `Arc` sub-parts — not the whole `Engine` (which would
+/// be a reference cycle).
 ///
 /// # Errors
 ///
@@ -277,22 +280,22 @@ async fn run_commit_ladder(
     vector: &VectorStore,
     log: &DocumentLog,
     docs_since_commit: &AtomicU64,
-    applied_seq: &AtomicU64,
+    applied: &AppliedSeqs,
     commit_generation: &CommitGenerationTracker,
     write_stop: &WriteStop,
 ) -> Result<()> {
     write_stop.check()?;
-    // Snapshot the ingest high-water mark BEFORE any store materializes
-    // (Issue #876). `applied_seq` is advanced only after a document has landed
-    // in BOTH stores' NRT buffers, so every record at or below this snapshot is
-    // guaranteed to be materialized by the `lexical.commit()` below — the store
-    // commits hold the same writer lock those upserts take, so a document that
-    // finished before this point cannot be excluded from the commit. Anything
-    // appended (or applied) afterwards must survive the truncate. (Not when
-    // mutations of different ids finish out of order: `applied_seq` is a
-    // high-water mark, so it can pass a record still being applied, Issue
-    // #1499.)
-    let applied_before = applied_seq.load(Ordering::Acquire);
+    // Snapshot the watermark BEFORE any store materializes (Issues #876,
+    // #1499): every mutation at or below it has landed in BOTH stores' NRT
+    // buffers, while mutations of other ids may still be applying above it.
+    // Each store commit below takes its writer lock after this point, so it
+    // includes everything at or below the snapshot, and records the snapshot
+    // as its checkpoint under that same lock. A mutation above it may be
+    // partly included too, but its record survives the truncate and the
+    // checkpoint does not cover it, so recovery replays it (idempotently).
+    let applied_before = applied.watermark();
+    // Whether anything finished at all, for the commit generation below.
+    let progress_before = applied.progress();
     // Hard durability barrier: force the WAL durable before any store
     // materializes its state, so the WAL is never less durable than the
     // committed lexical/vector indexes. A near-no-op under the per-record
@@ -300,17 +303,17 @@ async fn run_commit_ladder(
     // fsync); the load-bearing step once group commit defers per-append
     // fsync (#542 Phase 3).
     log.flush_wal()?;
-    lexical.commit()?;
-    vector.commit().await?;
+    lexical.commit_through(applied_before)?;
+    vector.commit_through(applied_before).await?;
     log.commit_documents()?;
-    // Truncate the log, but RETAIN every record this commit did not materialize
-    // (Issue #876). The ladder is not serialized against ingestion, so a
-    // mutation can append its WAL record while the commit runs — wiping the
-    // whole file would destroy that record while its data lives only in the
-    // fresh in-memory writer, losing an acknowledged write on the next crash.
-    // Retaining from the pre-commit snapshot is conservative: a record that was
-    // in fact materialized is merely replayed again on recovery, which is
-    // idempotent.
+    // Truncate the log, but RETAIN every record above the snapshot (Issue
+    // #876). The ladder is not serialized against ingestion, so a mutation
+    // can append its WAL record while the commit runs — wiping the whole
+    // file would destroy that record while its data lives only in the fresh
+    // in-memory writer, losing an acknowledged write on the next crash.
+    // Retaining from the pre-commit snapshot is conservative: a record that
+    // was in fact materialized is merely replayed again on recovery, which
+    // is idempotent.
     log.truncate_retaining_after(applied_before)?;
     // Reset the auto-commit counter so a manual commit and an `EveryDocs`
     // auto-commit keep the same cadence going forward (#890).
@@ -318,17 +321,16 @@ async fn run_commit_ladder(
 
     // Issue #1088: advance (and persist) the commit generation ONLY when
     // something was actually applied (put/add/delete) since the previous
-    // commit -- `applied_before` is the ingest high-water mark snapshotted
-    // above, and every mutation path (`index_internal`,
-    // `delete_documents_internal`, and `recover()`'s replay) advances
-    // `applied_seq` via `fetch_max` before this ladder runs. Comparing
-    // against the last commit's snapshot is what keeps an idle
-    // `CommitPolicy::Interval` tick (which runs this same ladder
-    // unconditionally on a timer) from making external readers see a
-    // false "something changed" signal on every tick. After a reopen over an
-    // empty WAL, `recover()` starts both `applied_seq` and that snapshot at
-    // the stores' highest checkpoint (Issue #1502), not at 0.
-    commit_generation.advance_if_changed(applied_before)?;
+    // commit. `progress_before` grows with every mutation that finished
+    // before the snapshot, also one that finished above a slower one, which
+    // this commit makes visible while the watermark stays below both (Issue
+    // #1499). Comparing against the last commit's value is what keeps an
+    // idle `CommitPolicy::Interval` tick (which runs this same ladder
+    // unconditionally on a timer) from making external readers see a false
+    // "something changed" signal on every tick. After a reopen over an empty
+    // WAL, `recover()` marks the progress of raising the watermark to the
+    // stores' highest checkpoint (Issue #1502) as committed.
+    commit_generation.advance_if_changed(progress_before)?;
 
     Ok(())
 }
@@ -353,7 +355,8 @@ pub(crate) struct CommitGenerationFile {
 /// Tracks and persists the cross-process commit generation counter (Issue
 /// #1088), grouped into one struct so it can be threaded through
 /// [`run_commit_ladder`]/[`CommitTimer::spawn`] as a single parameter
-/// instead of three (storage root, counter, last-seen `applied_seq`).
+/// instead of three (storage root, counter, last-seen progress of the
+/// applied WAL records).
 #[derive(Clone)]
 struct CommitGenerationTracker {
     /// Bare root storage (outside any `PrefixedStorage` namespace) that
@@ -363,9 +366,9 @@ struct CommitGenerationTracker {
     /// `commit_generation.json` at build time; read back by
     /// [`Engine::stats`].
     generation: Arc<AtomicU64>,
-    /// Snapshot of `applied_seq` as of the last commit, purely in-memory.
+    /// [`AppliedSeqs::progress`] as of the last commit, purely in-memory.
     /// See [`Self::advance_if_changed`].
-    last_applied_seq: Arc<AtomicU64>,
+    last_progress: Arc<AtomicU64>,
 }
 
 impl CommitGenerationTracker {
@@ -382,17 +385,17 @@ impl CommitGenerationTracker {
         Ok(Self {
             root_storage,
             generation: Arc::new(AtomicU64::new(generation)),
-            last_applied_seq: Arc::new(AtomicU64::new(0)),
+            last_progress: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Advance and persist the generation IF `applied_before` (the
-    /// commit ladder's ingest high-water mark snapshot) shows something
-    /// was applied since the last commit; a no-op (no I/O at all)
-    /// otherwise -- the gate that keeps an idle `CommitPolicy::Interval`
-    /// tick from advancing it for no reason.
-    fn advance_if_changed(&self, applied_before: u64) -> Result<()> {
-        if applied_before > self.last_applied_seq.load(Ordering::Acquire) {
+    /// Advance and persist the generation IF `progress_before` (the commit
+    /// ladder's snapshot of [`AppliedSeqs::progress`]) shows something was
+    /// applied since the last commit; a no-op (no I/O at all) otherwise --
+    /// the gate that keeps an idle `CommitPolicy::Interval` tick from
+    /// advancing it for no reason.
+    fn advance_if_changed(&self, progress_before: u64) -> Result<()> {
+        if progress_before > self.last_progress.load(Ordering::Acquire) {
             let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             crate::storage::manifest::save_checksummed_json(
                 self.root_storage.as_ref(),
@@ -402,23 +405,24 @@ impl CommitGenerationTracker {
                     generation: new_generation,
                 },
             )?;
-            self.last_applied_seq
-                .store(applied_before, Ordering::Release);
+            // `fetch_max`: a concurrent ladder with an older snapshot must
+            // not lower it, or the next commit would advance it again.
+            self.last_progress
+                .fetch_max(progress_before, Ordering::AcqRel);
         }
         Ok(())
     }
 
-    /// Record that everything at or below `applied_seq` is already covered
-    /// by the persisted generation, so a later commit with nothing newer to
-    /// apply leaves the generation alone.
+    /// Record that everything up to `progress` (an
+    /// [`AppliedSeqs::progress`]) is already covered by the persisted
+    /// generation, so a later commit with nothing newer to apply leaves the
+    /// generation alone.
     ///
-    /// For a reopen over an empty WAL (Issue #1502): `applied_seq` then
-    /// starts at the stores' highest checkpoint instead of `0`, and without
-    /// this the first idle commit would see it above the in-memory `0` and
-    /// advance the generation for nothing.
-    fn mark_committed(&self, applied_seq: u64) {
-        self.last_applied_seq
-            .fetch_max(applied_seq, Ordering::AcqRel);
+    /// For a reopen over an empty WAL (Issue #1502): raising the watermark
+    /// to the stores' highest checkpoint counts as progress, and without
+    /// this the first idle commit would advance the generation for nothing.
+    fn mark_committed(&self, progress: u64) {
+        self.last_progress.fetch_max(progress, Ordering::AcqRel);
     }
 
     /// The current generation, for [`Engine::stats`].
@@ -457,7 +461,7 @@ struct CommitParts {
     vector: Arc<VectorStore>,
     log: Arc<DocumentLog>,
     docs_since_commit: Arc<AtomicU64>,
-    applied_seq: Arc<AtomicU64>,
+    applied: Arc<AppliedSeqs>,
     commit_generation: CommitGenerationTracker,
     /// While writes are stopped (Issue #1492) a tick runs no commit and
     /// logs nothing more.
@@ -486,7 +490,7 @@ impl CommitTimer {
             vector,
             log,
             docs_since_commit,
-            applied_seq,
+            applied,
             commit_generation,
             write_stop,
         } = parts;
@@ -530,7 +534,7 @@ impl CommitTimer {
                             &vector,
                             &log,
                             &docs_since_commit,
-                            &applied_seq,
+                            &applied,
                             &commit_generation,
                             &write_stop,
                         ))
@@ -570,7 +574,9 @@ const ID_LOCK_SHARDS: usize = 64;
 
 /// Whether the engine stopped accepting writes, and why (Issue #1492).
 ///
-/// Recorded when a mutation fails at or after its first WAL append. From
+/// Recorded when a mutation fails at or after its first WAL append, or is
+/// cancelled or panics after it, before it finished applying to both stores
+/// (Issue #1499; see [`Applying`]). From
 /// then on the in-memory stores may disagree with the WAL: a commit could
 /// persist the disagreement and truncate the record, and a later write
 /// could build on it (a put that cannot see a failed put's version of the
@@ -610,6 +616,60 @@ impl WriteStop {
     /// The recorded reason, if writes stopped.
     fn reason(&self) -> Option<&str> {
         self.reason.get().map(String::as_str)
+    }
+}
+
+/// A WAL record from its append until its mutation finished applying to both
+/// stores (Issue #1499).
+///
+/// [`Self::finish`] marks the record finished, which lets commits truncate
+/// the WAL and checkpoint the stores past it. Every other way out stops
+/// writes (Issue #1492): the stores may then hold the mutation only in part,
+/// and the [watermark](AppliedSeqs::watermark) can never pass its record, so
+/// only reopening the index, which replays it, settles it. [`Self::fail`]
+/// records the error that ended the mutation; dropping the guard with
+/// neither records a cancellation: the mutation's future was dropped (for
+/// example by laurus-server when a client disconnects while a put waits for
+/// the vector writer), or it panicked.
+#[must_use = "a record dropped without `finish` or `fail` stops writes"]
+struct Applying<'a> {
+    applied: &'a AppliedSeqs,
+    write_stop: &'a WriteStop,
+    /// The record's sequence number.
+    seq: u64,
+    /// Whether `finish` or `fail` ran.
+    settled: bool,
+}
+
+impl Applying<'_> {
+    /// The mutation finished applying to both stores.
+    fn finish(mut self) {
+        self.settled = true;
+        self.applied.finish(self.seq);
+    }
+
+    /// The mutation failed with `err`: stop writes with it as the reason,
+    /// and return it unchanged for the failing call to report.
+    fn fail(mut self, err: LaurusError) -> LaurusError {
+        self.settled = true;
+        self.write_stop.record(err)
+    }
+}
+
+impl Drop for Applying<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let how = if std::thread::panicking() {
+            "panicked"
+        } else {
+            "was cancelled"
+        };
+        self.write_stop.record(LaurusError::cancelled(format!(
+            "the write of WAL record {} {how} before it finished applying",
+            self.seq
+        )));
     }
 }
 
@@ -656,21 +716,25 @@ pub struct Engine {
     /// [`CommitTimer`] shares the same counter and resets it on each timed
     /// commit.
     docs_since_commit: Arc<AtomicU64>,
-    /// Highest WAL sequence number whose mutation has been applied to **both**
-    /// stores' NRT buffers (Issue #876).
+    /// The WAL records whose mutation has been applied to **both** stores'
+    /// NRT buffers (Issues #876, #1499).
     ///
-    /// Advanced in [`Self::index_internal`] / the delete path only after both
-    /// stores accepted the mutation, so a commit can snapshot it up front and
-    /// know that everything at or below it will be materialized by that commit.
-    /// [`run_commit_ladder`] uses the snapshot as the WAL retain point, so a
-    /// record appended by a mutation racing the commit is preserved instead of
-    /// being wiped by the truncate. `Arc` so the [`CommitTimer`] shares it.
+    /// A mutation marks its record finished only after both stores accepted
+    /// it (see [`Applying`]), so a commit can snapshot the
+    /// [watermark](AppliedSeqs::watermark) up front and know that everything
+    /// at or below it will be materialized by that commit, even while
+    /// mutations of other ids are still applying below records that already
+    /// finished. [`run_commit_ladder`] uses the snapshot as the WAL retain
+    /// point and as both stores' checkpoint, so a record appended by a
+    /// mutation racing the commit is preserved instead of being wiped by the
+    /// truncate. `Arc` so the [`CommitTimer`] shares it.
     ///
     /// Sequence numbers continue across opens (Issue #1502), so
-    /// [`Self::recover`] raises this to the stores' highest checkpoint once
-    /// every WAL record is replayed or covered: everything at or below it is
-    /// then in both stores.
-    applied_seq: Arc<AtomicU64>,
+    /// [`Self::recover`] raises the watermark to the log's last sequence
+    /// number (at least the stores' highest checkpoint) once every WAL record
+    /// is replayed or covered: everything at or below it is then in both
+    /// stores.
+    applied: Arc<AppliedSeqs>,
     /// Per-external-id serialization for the delete-then-add upsert (#1049).
     ///
     /// [`Self::index_internal`] deletes any existing versions of an id and
@@ -735,17 +799,25 @@ pub struct Engine {
 }
 
 impl Drop for Engine {
+    /// While writes are accepted, record the watermark as the cached lexical
+    /// writer's checkpoint, which the commit it runs when dropped persists
+    /// (Issue #1499). No mutation is in flight while the engine is dropped,
+    /// so every record up to the watermark is in that writer or already
+    /// committed, and the next open replays the uncommitted records to the
+    /// vector store only, as when mutations still set the checkpoint
+    /// themselves.
+    ///
     /// While writes are stopped (Issue #1492), discard the cached lexical
-    /// writer without the commit it would run when dropped. Its buffer can
-    /// hold a mutation that failed halfway, and a checkpoint that a
-    /// concurrent mutation finishing after the stop moved past the failed
-    /// record, which the replay would then skip. No commit ran after the
-    /// stop, so the WAL still holds every record since the last one, and
-    /// the next open replays them all. The commit timer is stopped first,
-    /// since it shares the lexical store. Nothing changes while writes are
-    /// accepted.
+    /// writer without that commit instead: its buffer can hold a mutation
+    /// that failed halfway, and only the replay decides what the index
+    /// holds. No commit ran after the stop, so the WAL still holds every
+    /// record since the last one, and the next open replays them all. The
+    /// commit timer is stopped first, since it shares the lexical store.
     fn drop(&mut self) {
         if self.write_stop.reason().is_none() {
+            // A failure only leaves the checkpoint where the last commit put
+            // it, so the next open replays more.
+            let _ = self.lexical.set_pending_wal_seq(self.applied.watermark());
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1039,6 +1111,13 @@ impl Engine {
     /// always replayed after a crash. Must run before anything else commits:
     /// [`EngineBuilder::build`] starts the [`CommitTimer`] only afterwards.
     ///
+    /// The replay sets no checkpoint. Once every record is applied, discarded
+    /// or covered, the [watermark](AppliedSeqs::watermark) is raised to the
+    /// log's last sequence number, and the commit that ends the recovery
+    /// records it as both stores' checkpoint (Issue #1499). A recovery that
+    /// fails partway leaves the checkpoints where the last commit put them,
+    /// so the next open replays those records again.
+    ///
     /// A record whose re-application fails is normally a fatal error for
     /// recovery (and therefore for [`EngineBuilder::build`]), since retrying
     /// a deterministic rejection would just fail the same way on every
@@ -1084,13 +1163,16 @@ impl Engine {
         if records.is_empty() {
             // Nothing to replay: every record at or below the floor was
             // truncated by a commit that completed in both stores. Start
-            // `applied_seq` there, or the next commit's
-            // `truncate_retaining_after` would see `last_seq()` above its
-            // retain point and rewrite the empty WAL instead of taking its
-            // fast path. And record it as committed, or that same commit
-            // would advance the generation with nothing applied (#1088).
-            self.applied_seq.fetch_max(seq_floor, Ordering::AcqRel);
-            self.commit_generation.mark_committed(seq_floor);
+            // the watermark there: the next append gets the number after
+            // it, which could never finish into a watermark left at 0, and
+            // the next commit's `truncate_retaining_after` would see
+            // `last_seq()` above its retain point and rewrite the empty WAL
+            // instead of taking its fast path (Issue #1499). And record it
+            // as committed, or that same commit would advance the generation
+            // with nothing applied (#1088).
+            self.applied.raise_to(seq_floor);
+            self.commit_generation
+                .mark_committed(self.applied.progress());
             return Ok(());
         }
 
@@ -1136,12 +1218,6 @@ impl Engine {
                     // exactly as a full replay would have.
                     applied = true;
                 }
-                // Publish the high-water mark for skipped records too:
-                // without it a skip-everything recovery leaves `applied_seq`
-                // at its build-time 0, and the next commit's
-                // `truncate_retaining_after(0)` re-retains the whole dead
-                // WAL — breaking the post-commit empty-WAL invariant.
-                self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
                 continue;
             }
             applied = true;
@@ -1181,7 +1257,6 @@ impl Engine {
                                     "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
                                     record.seq
                                 );
-                                self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
                                 continue;
                             }
                             Err(e) => return Err(e),
@@ -1190,7 +1265,6 @@ impl Engine {
                         None
                     };
 
-                    // Update seq only after BOTH stores succeed to maintain atomicity.
                     if record.seq > lexical_last_seq
                         && let Err(e) = self
                             .lexical
@@ -1201,7 +1275,6 @@ impl Engine {
                                 "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
                                 record.seq
                             );
-                            self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
                             continue;
                         }
                         return Err(e);
@@ -1210,26 +1283,6 @@ impl Engine {
                     if let Some(vectors) = vectors {
                         self.vector.write_prepared(doc_id, vectors).await?;
                     }
-
-                    // Both stores succeeded — now update seq trackers.
-                    // `vector.set_last_wal_seq` propagates `record.seq` to
-                    // EVERY field's sub-index identically (Issue #948); see
-                    // `vector_last_seq`'s comment above for why the store's
-                    // own `last_wal_seq()` aggregate is a `min`, not a `max`.
-                    if record.seq > lexical_last_seq {
-                        self.lexical.set_last_wal_seq(record.seq)?;
-                    }
-                    if record.seq > vector_last_seq {
-                        self.vector.set_last_wal_seq(record.seq);
-                    }
-                    // Publish the high-water mark exactly as `index_internal`
-                    // does (Issue #876): by this point both stores are at or
-                    // above `record.seq`, whether just applied here or already
-                    // covered by an earlier partial commit. Without this, the
-                    // `self.commit()` below would snapshot `applied_seq` at its
-                    // stale build-time 0 and its own truncate would wrongly
-                    // retain every record it just durably committed.
-                    self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
                 }
                 LogEntry::Delete {
                     doc_id,
@@ -1241,31 +1294,22 @@ impl Engine {
                     if record.seq > vector_last_seq {
                         self.vector.delete_document_by_internal_id(doc_id).await?;
                     }
-
-                    // Both stores succeeded — now update seq trackers (see
-                    // the `Upsert` arm above for the `MultiFieldVectorIndex`
-                    // min-aggregate rationale, Issue #948).
-                    if record.seq > lexical_last_seq {
-                        self.lexical.set_last_wal_seq(record.seq)?;
-                    }
-                    if record.seq > vector_last_seq {
-                        self.vector.set_last_wal_seq(record.seq);
-                    }
-                    // See the matching comment in the `Upsert` arm above.
-                    self.applied_seq.fetch_max(record.seq, Ordering::AcqRel);
                 }
             }
         }
 
         // Every record is now applied, discarded or covered by both
-        // checkpoints, so everything at or below the floor is in both stores
-        // (Issue #1502, see the empty-WAL case above). Raised only now, so no
-        // commit can take the floor as its retain point while a store still
-        // lacks a record at or below it. The generation's baseline stays at
-        // 0: the commit below advances the generation for a replay, and a
-        // WAL holding only covered `Delete`s (no commit here) advances it at
-        // the next commit, as the session that wrote them never got to.
-        self.applied_seq.fetch_max(seq_floor, Ordering::AcqRel);
+        // checkpoints, so everything at or below the log's last sequence
+        // number (at least the floor, Issue #1502) is in both stores. Raised
+        // only now, so no commit can take it as its retain point or
+        // checkpoint while a store still lacks a record at or below it. The
+        // replay sets no checkpoint itself: the commit below records this
+        // watermark as both stores' (Issue #1499). The generation's baseline
+        // stays at 0: the commit below advances the generation for a replay,
+        // and a WAL holding only covered `Delete`s (no commit here) advances
+        // it at the next commit, as the session that wrote them never got
+        // to.
+        self.applied.raise_to(self.log.last_seq());
 
         // Persist the replayed state right away (Issue #875). Deletion
         // persistence is deferred to commit, so without this a freshly
@@ -1307,7 +1351,11 @@ impl Engine {
     /// stops accepting writes: every later write, commit and schema change
     /// fails with [`LaurusError::WritesStopped`] until the index is
     /// reopened (see [`Self::write_stop_reason`]). Reopening replays the
-    /// WAL, which applies this put, replacing the previous version.
+    /// WAL, which applies this put, replacing the previous version. Writes
+    /// stop the same way when the call is cancelled (its future dropped) or
+    /// panics after that point but before the put finished applying to both
+    /// stores (Issue #1499): the stores may then hold it in part, and no
+    /// commit may truncate its record.
     ///
     /// # Parameters
     ///
@@ -1571,9 +1619,13 @@ impl Engine {
             .log
             .append(id, &doc)
             .map_err(|e| self.write_stop.record(e))?;
-        self.apply_upsert(doc_id, seq, &doc, lexical, vectors)
-            .await
-            .map_err(|e| self.write_stop.record(e))?;
+        // Until both stores hold the document, the guard keeps commits from
+        // truncating or checkpointing past its record (Issue #1499).
+        let applying = self.applying(seq);
+        match self.apply_upsert(doc_id, &doc, lexical, vectors).await {
+            Ok(()) => applying.finish(),
+            Err(e) => return Err(applying.fail(e)),
+        }
 
         // 7. Count the applied document toward the auto-commit threshold. The
         // trigger itself lives at the API boundary (see `maybe_auto_commit`),
@@ -1584,24 +1636,22 @@ impl Engine {
         Ok(doc_id)
     }
 
-    /// Steps 4 to 6 of [`Self::index_internal`]: everything after the
+    /// Steps 4 and 5 of [`Self::index_internal`]: everything after the
     /// document's WAL append, which the caller turns into a stop of writes
     /// on failure (Issue #1492).
     ///
     /// # Arguments
     ///
-    /// * `doc_id` / `seq` - What the WAL append assigned to the document.
+    /// * `doc_id` - What the WAL append assigned to the document.
     /// * `doc` - The document as appended.
     /// * `lexical` / `vectors` - What the prepare step analyzed and embedded.
     ///
     /// # Errors
     ///
-    /// Returns an error if buffering the document in either store, or
-    /// recording `seq` as the lexical store's checkpoint, fails.
+    /// Returns an error if buffering the document in either store fails.
     async fn apply_upsert(
         &self,
         doc_id: u64,
-        seq: u64,
         doc: &Document,
         lexical: crate::lexical::store::PreparedLexicalDocument,
         vectors: Vec<crate::vector::writer::FieldVectors>,
@@ -1623,20 +1673,9 @@ impl Engine {
             let _ = self.lexical.delete_document_by_internal_id(doc_id);
             return Err(e);
         }
-
-        // 6. Update sub-stores sequence tracker AFTER both stores succeed.
-        // This ensures failed index operations are retried on recovery.
-        // `vector.set_last_wal_seq` fans `seq` out to every field's
-        // sub-index identically (Issue #948); see `recover()`'s comment on
-        // `vector_last_seq` for why the store's own `last_wal_seq()`
-        // aggregate is a `min` across fields, not a `max`.
-        self.lexical.set_last_wal_seq(seq)?;
-        self.vector.set_last_wal_seq(seq);
-        // Publish the ingest high-water mark only now that BOTH stores hold the
-        // mutation, so a concurrent commit can safely treat everything at or
-        // below it as materializable (Issue #876). `fetch_max` keeps it
-        // monotonic under concurrent writers.
-        self.applied_seq.fetch_max(seq, Ordering::AcqRel);
+        // The stores' checkpoints are not set here: the commit records its
+        // watermark as both (Issue #1499), once the caller marked this
+        // record finished.
         Ok(())
     }
 
@@ -1838,9 +1877,10 @@ impl Engine {
     /// If no documents match the given ID, the operation completes
     /// successfully without error (non-existent IDs are silently ignored).
     ///
-    /// A failure once a document's WAL delete record is written stops
+    /// A failure once a document's WAL delete record is written, or a
+    /// cancellation or panic before the delete finished applying, stops
     /// writes until the index is reopened, and the reopen applies the
-    /// delete (Issue #1492; see [`Self::put_document`]).
+    /// delete (Issues #1492, #1499; see [`Self::put_document`]).
     ///
     /// # Parameters
     ///
@@ -1906,9 +1946,7 @@ impl Engine {
     async fn delete_documents_internal(&self, id: &str) -> Result<()> {
         let doc_ids = self.lexical.find_doc_ids_by_term("_id", id)?;
         for doc_id in doc_ids {
-            self.delete_by_internal_id(doc_id, id)
-                .await
-                .map_err(|e| self.write_stop.record(e))?;
+            self.delete_by_internal_id(doc_id, id).await?;
         }
         Ok(())
     }
@@ -1916,28 +1954,44 @@ impl Engine {
     /// Delete one document of [`Self::delete_documents_internal`]: append
     /// its WAL record, then delete it from both stores.
     ///
+    /// Any failure, from the WAL append on, stops writes (Issue #1492).
+    ///
     /// # Errors
     ///
     /// Returns an error if the WAL write, the lexical deletion or the
     /// vector deletion fails.
     async fn delete_by_internal_id(&self, doc_id: u64, id: &str) -> Result<()> {
         // 1. Write to log
-        let seq = self.log.append_delete(doc_id, id)?;
-        // 2. Delete from Lexical
-        self.lexical.delete_document_by_internal_id(doc_id)?;
-        // 3. Delete from Vector
-        self.vector.delete_document_by_internal_id(doc_id).await?;
-        // 4. Update trackers AFTER both deletes succeed.
-        // This ensures failed deletes are retried on recovery. See
-        // `index_internal`'s comment on `vector.set_last_wal_seq`
-        // (Issue #948: fans out to every field identically; the
-        // store's own `last_wal_seq()` is a min across fields).
-        self.lexical.set_last_wal_seq(seq)?;
-        self.vector.set_last_wal_seq(seq);
-        // Publish the high-water mark only once both stores hold the delete
-        // (Issue #876) — see `index_internal` for the rationale.
-        self.applied_seq.fetch_max(seq, Ordering::AcqRel);
-        Ok(())
+        let seq = self
+            .log
+            .append_delete(doc_id, id)
+            .map_err(|e| self.write_stop.record(e))?;
+        // Until both stores hold the delete, the guard keeps commits from
+        // truncating or checkpointing past its record (Issue #1499).
+        let applying = self.applying(seq);
+        // 2. Delete from Lexical, 3. Delete from Vector
+        let deleted = match self.lexical.delete_document_by_internal_id(doc_id) {
+            Ok(()) => self.vector.delete_document_by_internal_id(doc_id).await,
+            Err(e) => Err(e),
+        };
+        match deleted {
+            Ok(()) => {
+                applying.finish();
+                Ok(())
+            }
+            Err(e) => Err(applying.fail(e)),
+        }
+    }
+
+    /// Guard WAL record `seq` from its append until its mutation finished
+    /// applying to both stores (Issue #1499); see [`Applying`].
+    fn applying(&self, seq: u64) -> Applying<'_> {
+        Applying {
+            applied: &self.applied,
+            write_stop: &self.write_stop,
+            seq,
+            settled: false,
+        }
     }
 
     /// Commit changes to both stores and truncate the WAL.
@@ -1946,14 +2000,22 @@ impl Engine {
     /// makes a crash at any step recoverable (Issue #821):
     ///
     /// 1. `flush_wal()` — force the WAL durable (the hard barrier).
-    /// 2. `lexical.commit()` — materialize + fsync the lexical store. This is
-    ///    where the lexical `last_wal_seq` checkpoint is persisted.
-    /// 3. `vector.commit()` — materialize + fsync the vector store.
+    /// 2. `lexical.commit_through(watermark)` — materialize + fsync the
+    ///    lexical store, persisting the watermark as its `last_wal_seq`
+    ///    checkpoint.
+    /// 3. `vector.commit_through(watermark)` — materialize + fsync the vector
+    ///    store, publishing the watermark as each field's checkpoint.
     /// 4. `commit_documents()` — materialize + fsync the document store.
-    /// 5. `truncate_retaining_after(applied_before)` — discard everything this
-    ///    commit covered; **retain** anything appended (or still being applied)
-    ///    concurrently (Issue #876).
+    /// 5. `truncate_retaining_after(watermark)` — discard everything this
+    ///    commit covered; **retain** everything above the watermark, which
+    ///    includes anything appended (or still being applied) concurrently
+    ///    (Issues #876, #1499).
     ///
+    /// The watermark is snapshotted before step 1: the highest WAL sequence
+    /// number at or below which every put, add and delete has finished
+    /// applying to both stores. Mutations of different ids finish in any
+    /// order, so it can stay below a record that already finished above an
+    /// unfinished one.
     /// This order upholds two invariants. First, `last_wal_seq` is persisted
     /// only in step 2+, always *after* the step-1 barrier, so a committed index
     /// can never reference a WAL record that is not yet durable. Second, every
@@ -1966,9 +2028,10 @@ impl Engine {
     /// `put`/`add`/`delete` calls. After a successful commit with no concurrent
     /// mutation, the WAL is empty and all data is durable, exactly as before
     /// Issue #876. Under a mutation that raced this commit, the WAL is **not**
-    /// necessarily empty afterward: it retains that mutation's record so the
-    /// next crash can still recover it. `CommitPolicy::Interval`'s background
-    /// timer runs this same ladder, so the same caveat applies to auto-commits.
+    /// necessarily empty afterward: it retains that mutation's record, and no
+    /// checkpoint covers it, so the next crash can still recover it.
+    /// `CommitPolicy::Interval`'s background timer runs this same ladder, so
+    /// the same caveat applies to auto-commits.
     ///
     /// # Errors
     ///
@@ -1983,7 +2046,7 @@ impl Engine {
             &self.vector,
             &self.log,
             &self.docs_since_commit,
-            &self.applied_seq,
+            &self.applied,
             &self.commit_generation,
             &self.write_stop,
         )
@@ -1994,10 +2057,11 @@ impl Engine {
     /// them (Issue #1492).
     ///
     /// Writes stop when a put, add or delete fails after its write-ahead-log
-    /// record was written: from then on every write, commit and schema
-    /// change returns [`LaurusError::WritesStopped`] until the index is
-    /// reopened, and reopening replays the WAL, which applies that write.
-    /// The failing call itself returned its original error.
+    /// record was written, or its call is cancelled (its future dropped) or
+    /// panics before the write finished applying: from then on every write,
+    /// commit and schema change returns [`LaurusError::WritesStopped`] until
+    /// the index is reopened, and reopening replays the WAL, which applies
+    /// that write. A failing call itself returned its original error.
     pub fn write_stop_reason(&self) -> Option<&str> {
         self.write_stop.reason()
     }
@@ -2279,6 +2343,10 @@ impl Engine {
             let lexical_opt = option
                 .to_lexical()
                 .expect("is_lexical() was true but to_lexical() returned None");
+            // The store commits its cached writer here; nothing is in flight
+            // under the schema write lock, so it may persist the watermark
+            // as its checkpoint (Issue #1499).
+            self.lexical.set_pending_wal_seq(self.applied.watermark())?;
             self.lexical.add_field(name, lexical_opt, field_analyzer)?;
         }
 
@@ -2365,6 +2433,10 @@ impl Engine {
 
         // 2. Remove from the appropriate store.
         if option.is_lexical() {
+            // The store commits its cached writer here; nothing is in flight
+            // under the schema write lock, so it may persist the watermark
+            // as its checkpoint (Issue #1499).
+            self.lexical.set_pending_wal_seq(self.applied.watermark())?;
             self.lexical.delete_field(name)?;
         }
 
@@ -2607,6 +2679,8 @@ impl Engine {
                         )
                     };
 
+                    // As in `add_field` (Issue #1499).
+                    self.lexical.set_pending_wal_seq(self.applied.watermark())?;
                     self.lexical
                         .rebuild_field(name, lexical_opt, field_analyzer)?;
                 }
@@ -4561,7 +4635,7 @@ impl EngineBuilder {
         let lexical = Arc::new(LexicalStore::new(lexical_storage, lexical_config)?);
         let vector = Arc::new(VectorStore::new(vector_storage, vector_config)?);
         let docs_since_commit = Arc::new(AtomicU64::new(0));
-        let applied_seq = Arc::new(AtomicU64::new(0));
+        let applied = Arc::new(AppliedSeqs::default());
         let write_stop = Arc::new(WriteStop::default());
 
         let log = Arc::new(DocumentLog::with_sync_policy(
@@ -4597,7 +4671,7 @@ impl EngineBuilder {
             embedding_cache,
             commit_policy: self.commit_policy,
             docs_since_commit,
-            applied_seq,
+            applied,
             id_locks: Arc::new(
                 (0..ID_LOCK_SHARDS)
                     .map(|_| tokio::sync::Mutex::new(()))
@@ -4619,8 +4693,8 @@ impl EngineBuilder {
         // Start the auto-commit timer for `CommitPolicy::Interval` only now
         // that recovery is done (Issue #1502). A tick during recovery would
         // run the commit ladder against a WAL that is not replayed yet: on
-        // an index no commit has checkpointed, `last_seq()` and
-        // `applied_seq` are both still 0 before `read_all`, so
+        // an index no commit has checkpointed, `last_seq()` and the
+        // watermark are both still 0 before `read_all`, so
         // `truncate_retaining_after` takes its fast path and empties the WAL
         // a crash left behind before it is read. `recover` also sets the
         // commit generation's baseline, which a tick must not see unset.
@@ -4638,7 +4712,7 @@ impl EngineBuilder {
                     vector: Arc::clone(&engine.vector),
                     log: Arc::clone(&engine.log),
                     docs_since_commit: Arc::clone(&engine.docs_since_commit),
-                    applied_seq: Arc::clone(&engine.applied_seq),
+                    applied: Arc::clone(&engine.applied),
                     commit_generation: engine.commit_generation.clone(),
                     write_stop: Arc::clone(&engine.write_stop),
                 },
@@ -7858,7 +7932,7 @@ mod tests {
     /// appends "b"'s WAL record directly via `log.append`, exactly as
     /// `index_internal` does, but — like a mutation caught mid-flight — does
     /// NOT apply it to the stores before `commit()` runs. `commit()` must
-    /// snapshot `applied_seq` (covering only "a", already applied) BEFORE
+    /// snapshot the watermark (covering only "a", already applied) BEFORE
     /// materializing, so "b"'s un-applied record is retained by the truncate
     /// and replayed on the next recovery.
     #[tokio::test]
@@ -7872,10 +7946,11 @@ mod tests {
         // "b" simulates a mutation caught between its WAL append and its store
         // apply: append the WAL record directly (mirrors `index_internal`'s
         // step 2) without upserting it into `lexical`/`vector` (which would be
-        // steps 4-5) — `applied_seq` is therefore NOT advanced for it.
+        // steps 4-5) — its record never finishes, holding the watermark
+        // below it.
         engine.log.append("b", &title_doc("bravo")).unwrap();
 
-        // The commit ladder must snapshot `applied_seq` before materializing,
+        // The commit ladder must snapshot the watermark before materializing,
         // so "b" — appended but never applied — is retained by the truncate
         // rather than wiped with the rest of the (now-covered) WAL.
         engine.commit().await.unwrap();
@@ -7920,12 +7995,11 @@ mod tests {
     /// WAL, not just replay the records into the stores.
     ///
     /// `recover()` mutates the stores directly rather than through
-    /// `index_internal`, so it must publish `applied_seq` itself; otherwise the
-    /// `commit()` it calls at the end snapshots the stale build-time `0`,
+    /// `index_internal`, so it must raise the watermark itself; otherwise
+    /// the `commit()` it calls at the end snapshots the stale build-time `0`,
     /// `truncate_retaining_after` takes the slow path unconditionally, and
     /// re-retains every record it just durably committed — the WAL never
-    /// shrinks until an unrelated future mutation happens to raise
-    /// `applied_seq` past it.
+    /// shrinks.
     #[tokio::test]
     async fn recover_commit_empties_the_wal() {
         let (engine, storage) = commit_policy_engine(CommitPolicy::Manual).await;
@@ -8207,9 +8281,10 @@ mod tests {
 
     /// Issue #1502: when the stores' highest checkpoint is above every record
     /// recovery replays, recovery's own commit must still empty the WAL, and
-    /// the idle commits after it must keep it empty. `applied_seq` is raised
-    /// to the floor after the replay; left at the last replayed record, every
-    /// commit until a write passes the floor would rewrite the WAL.
+    /// the idle commits after it must keep it empty. The watermark is raised
+    /// to the log's last sequence number, at least the floor, after the
+    /// replay; left at the last replayed record, every commit would rewrite
+    /// the WAL.
     #[tokio::test]
     async fn recovery_below_the_floor_leaves_an_empty_wal() {
         let storage = unlocked_memory_storage();
@@ -8275,7 +8350,7 @@ mod tests {
 
     /// Issue #1502: after a clean reopen over an empty WAL, a commit with
     /// nothing new to apply must stay a no-op, as before the sequence
-    /// continued across opens: `applied_seq` starts at the floor, so the
+    /// continued across opens: the watermark starts at the floor, so the
     /// truncate takes its fast path and leaves the WAL at 0 bytes, and the
     /// commit generation's baseline starts there too, so the generation does
     /// not move (#1088). A real write after that still advances it.
@@ -8375,8 +8450,9 @@ mod tests {
         engine.delete_documents("a").await.unwrap();
         let delete_seq = engine.log.last_seq();
         // The store commits of a commit that crashes before its truncate.
-        engine.lexical.commit().unwrap();
-        engine.vector.commit().await.unwrap();
+        let watermark = engine.applied.watermark();
+        engine.lexical.commit_through(watermark).unwrap();
+        engine.vector.commit_through(watermark).await.unwrap();
         assert!(engine.lexical.last_wal_seq() >= delete_seq);
         assert!(engine.vector.last_wal_seq() >= delete_seq);
         engine
@@ -8403,6 +8479,376 @@ mod tests {
         assert_eq!(nearest_id(&reopened, [0.0, 0.0, 1.0]).await, vec!["d"]);
         assert!(reopened.get_documents("a").await.unwrap().is_empty());
         assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
+    }
+
+    /// A put caught between its WAL append and its apply to the stores, as
+    /// a mutation of another id that is still applying (Issue #1499).
+    struct UnappliedPut<'a> {
+        applying: Applying<'a>,
+        doc_id: u64,
+        doc: Document,
+        lexical: crate::lexical::store::PreparedLexicalDocument,
+        vectors: Vec<crate::vector::writer::FieldVectors>,
+    }
+
+    impl UnappliedPut<'_> {
+        /// The record's sequence number.
+        fn seq(&self) -> u64 {
+            self.applying.seq
+        }
+
+        /// Apply the put to both stores and mark its record finished, the
+        /// rest of `index_internal`.
+        async fn finish(self, engine: &Engine) {
+            engine
+                .apply_upsert(self.doc_id, &self.doc, self.lexical, self.vectors)
+                .await
+                .unwrap();
+            self.applying.finish();
+        }
+
+        /// Fail the put before it applied anything, as its vector write
+        /// would after its append.
+        fn fail(self, err: LaurusError) -> LaurusError {
+            self.applying.fail(err)
+        }
+    }
+
+    /// Run `index_internal`'s steps for a put of a new `id` up to and
+    /// including its WAL append, and stop there.
+    async fn append_unapplied_put<'a>(
+        engine: &'a Engine,
+        id: &str,
+        mut doc: Document,
+    ) -> UnappliedPut<'a> {
+        doc.fields
+            .insert("_id".to_string(), DataValue::Text(id.to_string()));
+        let vectors = engine
+            .vector
+            .embed_fields(&engine.vector_field_refs(&doc))
+            .await
+            .unwrap();
+        engine.vector.ensure_writer().await.unwrap();
+        let lexical = {
+            let schema = engine.schema.read();
+            engine
+                .lexical
+                .prepare_upsert(&mut Engine::lexical_fields(&schema, &doc))
+                .unwrap()
+        };
+        let (doc_id, seq) = engine.log.append(id, &doc).unwrap();
+        UnappliedPut {
+            applying: engine.applying(seq),
+            doc_id,
+            doc,
+            lexical,
+            vectors,
+        }
+    }
+
+    /// Issue #1499: a commit that runs while a put is still applying, after
+    /// a put of another id appended later already finished, keeps the
+    /// earlier put's record. Both survive a crash after the earlier put
+    /// finished in the fresh writers. Commits used to truncate the WAL
+    /// through the highest finished sequence number, which lost it.
+    #[tokio::test]
+    async fn puts_finishing_out_of_order_around_a_commit_survive_a_crash() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+
+        let a =
+            append_unapplied_put(&engine, "a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0])).await;
+        engine
+            .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        a.finish(&engine).await;
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+        assert_eq!(nearest_id(&reopened, [1.0, 0.0, 0.0]).await, vec!["a"]);
+        assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
+        assert_eq!(nearest_id(&reopened, [0.0, 1.0, 0.0]).await, vec!["b"]);
+    }
+
+    /// Issue #1499: neither store's persisted checkpoint covers a mutation
+    /// that had not finished when the commit ran, for a put and for a
+    /// delete, and a crash after both finished loses neither.
+    #[tokio::test]
+    async fn a_commit_checkpoints_no_store_past_an_unfinished_mutation() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("x", vector_doc("xray", "vec", [0.0, 0.0, 1.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        // A put still applying while a later put finishes.
+        let a =
+            append_unapplied_put(&engine, "a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0])).await;
+        engine
+            .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        assert!(
+            engine.lexical.last_wal_seq() < a.seq(),
+            "the lexical checkpoint covers the unfinished put"
+        );
+        assert!(
+            engine.vector.last_wal_seq() < a.seq(),
+            "the vector checkpoint covers the unfinished put"
+        );
+        a.finish(&engine).await;
+        engine.commit().await.unwrap();
+        assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
+        assert_eq!(engine.vector.last_wal_seq(), engine.log.last_seq());
+
+        // A delete still applying while a later put finishes.
+        let x = engine.lexical.find_doc_ids_by_term("_id", "x").unwrap()[0];
+        let delete_seq = engine.log.append_delete(x, "x").unwrap();
+        let deleting = engine.applying(delete_seq);
+        engine
+            .put_document("c", vector_doc("charlie", "vec", [1.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        assert!(
+            engine.lexical.last_wal_seq() < delete_seq,
+            "the lexical checkpoint covers the unfinished delete"
+        );
+        assert!(
+            engine.vector.last_wal_seq() < delete_seq,
+            "the vector checkpoint covers the unfinished delete"
+        );
+        engine.lexical.delete_document_by_internal_id(x).unwrap();
+        engine
+            .vector
+            .delete_document_by_internal_id(x)
+            .await
+            .unwrap();
+        deleting.finish();
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert!(title_hits(&reopened, "xray").await.is_empty());
+        assert!(reopened.get_documents("x").await.unwrap().is_empty());
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+        assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
+        assert_eq!(title_hits(&reopened, "charlie").await, vec!["c"]);
+    }
+
+    /// Issue #1499: a commit that makes a put visible advances the commit
+    /// generation even while an earlier put is still applying, which holds
+    /// the watermark below both.
+    #[tokio::test]
+    async fn a_commit_advances_the_generation_past_an_unfinished_put() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+        let engine = Engine::new(storage, schema).await.unwrap();
+        let before = engine.commit_generation.current();
+
+        let a = append_unapplied_put(&engine, "a", title_doc("alpha")).await;
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(title_hits(&engine, "beta").await, vec!["b"]);
+        assert_eq!(
+            engine.commit_generation.current(),
+            before + 1,
+            "the commit made \"b\" visible"
+        );
+
+        a.finish(&engine).await;
+        engine.commit().await.unwrap();
+        assert_eq!(engine.commit_generation.current(), before + 2);
+        engine.commit().await.unwrap();
+        assert_eq!(
+            engine.commit_generation.current(),
+            before + 2,
+            "an idle commit leaves it"
+        );
+    }
+
+    /// Issue #1499 (the window #1492 left): a put that fails after its WAL
+    /// append, while a commit that started before the failure runs, keeps
+    /// its record. Writes stop, and the reopen applies the put.
+    #[tokio::test]
+    async fn a_put_failing_after_a_running_commit_is_applied_on_reopen() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+
+        let a =
+            append_unapplied_put(&engine, "a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0])).await;
+        engine
+            .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        // A commit runs while "a" is unfinished, as one that was already
+        // past its stop check when "a" failed would.
+        engine.commit().await.unwrap();
+        a.fail(LaurusError::storage("injected vector write failure"));
+        assert!(engine.write_stop_reason().is_some());
+        drop(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+        assert_eq!(nearest_id(&reopened, [1.0, 0.0, 0.0]).await, vec!["a"]);
+        assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
+    }
+
+    /// Issue #1499: the guard between a record's append and its finish.
+    /// `finish` advances the watermark; `fail` stops writes with its error;
+    /// dropping it with neither, as when the mutation's future is dropped,
+    /// stops writes as a cancellation and holds the watermark below it.
+    #[tokio::test]
+    async fn a_record_dropped_before_it_finished_stops_writes() {
+        let (engine, _storage) = commit_policy_engine(CommitPolicy::Manual).await;
+        let (_, seq) = engine.log.append("a", &title_doc("alpha")).unwrap();
+        engine.applying(seq).finish();
+        assert_eq!(engine.applied.watermark(), seq);
+        assert!(engine.write_stop_reason().is_none());
+
+        let (_, seq) = engine.log.append("b", &title_doc("bravo")).unwrap();
+        let err = engine.applying(seq).fail(LaurusError::storage("disk full"));
+        assert!(err.to_string().contains("disk full"));
+        let reason = engine.write_stop_reason().expect("fail stops writes");
+        assert!(reason.contains("disk full"), "{reason}");
+        assert_eq!(engine.applied.watermark(), seq - 1);
+
+        let (engine, _storage) = commit_policy_engine(CommitPolicy::Manual).await;
+        let (_, seq) = engine.log.append("c", &title_doc("charlie")).unwrap();
+        drop(engine.applying(seq));
+        let reason = engine
+            .write_stop_reason()
+            .expect("a record dropped unfinished stops writes");
+        assert!(
+            reason.contains("was cancelled before it finished"),
+            "{reason}"
+        );
+        assert_eq!(engine.applied.watermark(), seq - 1);
+        assert!(matches!(
+            engine.put_document("d", title_doc("delta")).await,
+            Err(LaurusError::WritesStopped(_))
+        ));
+    }
+
+    /// Issue #1499: mutations no longer set the checkpoints, so an engine
+    /// dropped without a commit records the watermark for the commit its
+    /// lexical writer runs when dropped. The lexical checkpoint is then
+    /// persisted as before, and the next open replays the put to the vector
+    /// store only.
+    #[tokio::test]
+    async fn an_engine_dropped_without_a_commit_persists_its_lexical_checkpoint() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+        let engine = Engine::new(storage.clone(), schema).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        let seq = engine.log.last_seq();
+        drop(engine);
+
+        let lexical = LexicalStore::new(
+            Arc::new(PrefixedStorage::new("lexical", storage)),
+            LexicalIndexConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(lexical.last_wal_seq(), seq);
+    }
+
+    /// Issue #1499: a schema change commits the lexical writer outside the
+    /// commit ladder, with no mutation in flight, and persists the
+    /// watermark as the lexical checkpoint.
+    #[tokio::test]
+    async fn a_lexical_schema_change_persists_the_lexical_checkpoint() {
+        use crate::lexical::core::field::TextOption;
+        let (engine, _storage) = commit_policy_engine(CommitPolicy::Manual).await;
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine
+            .add_field("body", schema::FieldOption::Text(TextOption::default()))
+            .await
+            .unwrap();
+        assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
+
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        engine.delete_field("body").await.unwrap();
+        assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
+
+        // A lexical rebuild by `update_field`.
+        engine.put_document("c", title_doc("gamma")).await.unwrap();
+        engine
+            .update_field(
+                "title",
+                schema::FieldOption::Text(TextOption::default().analyzer("keyword")),
+                UpdateFieldOptions {
+                    reindex: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
+    }
+
+    /// Issue #1499: a put whose future is dropped after its WAL append,
+    /// while it waits for the vector writer that a commit holds, stops
+    /// writes, and the reopen applies it. The vector writer lock is fair:
+    /// the test holds it, the put queues for it in `ensure_writer` (before
+    /// its append), and a request queued behind the put takes it as soon as
+    /// that releases it, so the put waits again in `write_prepared`, after
+    /// its append.
+    #[tokio::test]
+    async fn a_put_cancelled_after_its_wal_append_stops_writes() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        let seq_before = engine.log.last_seq();
+
+        let held = engine.vector.lock_writer_for_tests().await;
+        let mut put =
+            Box::pin(engine.put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0])));
+        assert!(futures::poll!(put.as_mut()).is_pending());
+        assert_eq!(
+            engine.log.last_seq(),
+            seq_before,
+            "the put waits before its append"
+        );
+        let mut queued = Box::pin(engine.vector.lock_writer_for_tests());
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        drop(held);
+        assert!(futures::poll!(put.as_mut()).is_pending());
+        assert_eq!(
+            engine.log.last_seq(),
+            seq_before + 1,
+            "the put waits after its append"
+        );
+        assert!(engine.write_stop_reason().is_none());
+
+        // The client goes away while the put waits.
+        drop(put);
+        let reason = engine
+            .write_stop_reason()
+            .expect("a put cancelled after its append stops writes");
+        assert!(
+            reason.contains("was cancelled before it finished"),
+            "{reason}"
+        );
+        drop(queued);
+        assert!(matches!(
+            engine
+                .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+                .await,
+            Err(LaurusError::WritesStopped(_))
+        ));
+        drop(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+        assert_eq!(nearest_id(&reopened, [1.0, 0.0, 0.0]).await, vec!["a"]);
     }
 
     /// Delays the first `file_exists` of the WAL (`engine.wal`), the first
@@ -8464,8 +8910,8 @@ mod tests {
 
     /// Issue #1502: the `CommitPolicy::Interval` timer starts only after
     /// recovery. It used to run alongside `recover`: on an index no commit
-    /// had checkpointed, a tick before `read_all` saw `last_seq()` and
-    /// `applied_seq` both at 0, took `truncate_retaining_after`'s fast path
+    /// had checkpointed, a tick before `read_all` saw `last_seq()` and its
+    /// retain point both at 0, took `truncate_retaining_after`'s fast path
     /// and emptied the WAL a crash had left before it was replayed.
     #[tokio::test]
     async fn interval_timer_does_not_commit_before_recovery_reads_the_wal() {
@@ -9191,13 +9637,13 @@ mod tests {
     }
 
     /// Issue #1492: an engine dropped while writes are stopped discards its
-    /// lexical writer instead of committing it on drop. A mutation that
-    /// passed the stop check before the stop and finished after it moves
-    /// the lexical checkpoint past the failed put's record; this test sets
-    /// that checkpoint directly, as such a mutation would. The drop-time
-    /// commit used to persist it, the replay then skipped the failed put in
-    /// the lexical store while applying it in the vector store, and the
-    /// document was left without its lexical side.
+    /// lexical writer instead of committing it on drop. This test sets the
+    /// writer's checkpoint past the failed put's record directly, as a
+    /// mutation that finished after the stop did before Issue #1499 (now
+    /// only commits set it). The drop-time commit used to persist it, the
+    /// replay then skipped the failed put in the lexical store while
+    /// applying it in the vector store, and the document was left without
+    /// its lexical side.
     #[tokio::test]
     async fn an_engine_dropped_while_stopped_does_not_commit_its_lexical_writer() {
         let (engine, storage) = engine_with_a_failing_vector_write().await;

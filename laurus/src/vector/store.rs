@@ -420,6 +420,18 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Request the writer lock, for crate-internal tests that hold it as a
+    /// running commit does, or queue for it: the lock is fair, so it is
+    /// handed to waiters in the order they requested it.
+    #[cfg(test)]
+    pub(crate) fn lock_writer_for_tests(
+        &self,
+    ) -> impl std::future::Future<
+        Output = tokio::sync::MutexGuard<'_, Option<Box<dyn VectorIndexWriter>>>,
+    > + '_ {
+        self.writer_cache.lock()
+    }
+
     /// Create the cached writer if there is none (Issue #1479).
     ///
     /// `Engine::index_internal` calls this before it deletes a document's
@@ -701,7 +713,39 @@ impl VectorStore {
     /// is dropped on every return, so the next search sees whatever a
     /// failed commit had already published (Issue #1435).
     pub async fn commit(&self) -> Result<()> {
+        self.commit_with_checkpoint(None).await
+    }
+
+    /// [`Self::commit`], publishing `wal_seq` as the WAL checkpoint (Issue
+    /// #1499).
+    ///
+    /// The engine's commit ladder passes its watermark: every WAL record at
+    /// or below it was applied to this store before this call. It is
+    /// recorded as the pending checkpoint inside the writer lock, before the
+    /// flush, so it is published by this commit's own deletion persistence
+    /// and never by a concurrent commit that already wrote its deletion
+    /// bitmap: a soft delete takes no writer lock, and a checkpoint raised
+    /// between another commit's bitmap write and its publish could cover a
+    /// delete that bitmap does not hold.
+    ///
+    /// # Arguments
+    ///
+    /// * `wal_seq` - The WAL sequence number at or below which every record
+    ///   is in this store.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::commit`]'s, and an error recording the checkpoint.
+    pub(crate) async fn commit_through(&self, wal_seq: u64) -> Result<()> {
+        self.commit_with_checkpoint(Some(wal_seq)).await
+    }
+
+    /// The body of [`Self::commit`] and [`Self::commit_through`].
+    async fn commit_with_checkpoint(&self, wal_seq: Option<u64>) -> Result<()> {
         let mut writer_guard = self.writer_cache.lock().await;
+        if let Some(wal_seq) = wal_seq {
+            self.index.set_last_wal_seq(wal_seq)?;
+        }
         // commit() calls finalize() then write() to persist to storage. A
         // retained writer with no pending changes is skipped — its state was
         // already captured by the previous finalize+write, so re-committing
@@ -1514,6 +1558,10 @@ impl VectorStore {
 
     /// Set the last processed WAL sequence number.
     ///
+    /// A segmented field records it as pending; the next commit publishes
+    /// it. The engine records its checkpoint through [`Self::commit_through`]
+    /// instead, under the writer lock (Issue #1499).
+    ///
     /// Note: This method doesn't return Result for Engine compatibility.
     /// Errors are silently ignored.
     pub fn set_last_wal_seq(&self, seq: u64) {
@@ -1862,6 +1910,40 @@ mod tests {
         }
         store.commit().await.unwrap();
         store
+    }
+
+    /// Issue #1499: `commit_through` records its checkpoint inside the
+    /// writer lock. A commit that holds the lock publishes the pending
+    /// checkpoint after it wrote its deletion bitmap, and a soft delete takes
+    /// no writer lock, so a checkpoint raised by a waiting commit could cover
+    /// a delete that bitmap does not hold.
+    #[tokio::test]
+    async fn commit_through_records_its_checkpoint_inside_the_writer_lock() {
+        let store = store_with_committed_vectors("embedding", &[1, 2]).await;
+        store.commit_through(1).await.unwrap();
+        assert_eq!(store.last_wal_seq(), 1);
+
+        // Hold the writer lock as a running commit does.
+        let writer_guard = store.writer_cache.lock().await;
+        let waiting = store.commit_through(5);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "commit_through must wait for the writer lock"
+        );
+        // The running commit's last step publishes the pending checkpoint.
+        store.index.persist_deletions().unwrap();
+        assert_eq!(
+            store.last_wal_seq(),
+            1,
+            "the running commit published the waiting commit's checkpoint"
+        );
+
+        drop(writer_guard);
+        waiting.await.unwrap();
+        assert_eq!(store.last_wal_seq(), 5);
     }
 
     /// Issue #920: `sample_field_vectors` must return committed vectors

@@ -358,6 +358,57 @@ impl LexicalStore {
     /// engine.commit().unwrap();
     /// ```
     pub fn commit(&self) -> Result<()> {
+        self.commit_with_checkpoint(None)
+    }
+
+    /// [`Self::commit`], persisting `wal_seq` as the WAL checkpoint (Issue
+    /// #1499).
+    ///
+    /// The engine's commit ladder passes its watermark: every WAL record at
+    /// or below it was applied to the cached writer (or committed) before
+    /// this call. The checkpoint is recorded under the same lock acquisition
+    /// as the commit, so no other writer can be committed in between. Without
+    /// a cached writer nothing is buffered, and the checkpoint stays where
+    /// the last commit put it: a checkpoint behind the WAL only means more
+    /// replay, while persisting it here would rewrite `metadata.json` on
+    /// every idle commit.
+    ///
+    /// # Arguments
+    ///
+    /// * `wal_seq` - The WAL sequence number at or below which every record
+    ///   is in this store.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::commit`]'s.
+    pub(crate) fn commit_through(&self, wal_seq: u64) -> Result<()> {
+        self.commit_with_checkpoint(Some(wal_seq))
+    }
+
+    /// Record `wal_seq` as the WAL checkpoint the cached writer's next commit
+    /// persists, if a writer is cached; persists nothing (Issue #1499).
+    ///
+    /// For a commit the engine does not run through its ladder (a schema
+    /// change, the writer's own commit when it is dropped) while no mutation
+    /// is in flight, so that it keeps the checkpoint up to date.
+    ///
+    /// # Arguments
+    ///
+    /// * `wal_seq` - The WAL sequence number at or below which every record
+    ///   is in this store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer rejects the checkpoint.
+    pub(crate) fn set_pending_wal_seq(&self, wal_seq: u64) -> Result<()> {
+        match self.writer_cache.lock().as_mut() {
+            Some(writer) => writer.set_last_wal_seq(wal_seq),
+            None => Ok(()),
+        }
+    }
+
+    /// The body of [`Self::commit`] and [`Self::commit_through`].
+    fn commit_with_checkpoint(&self, wal_seq: Option<u64>) -> Result<()> {
         // Hold the writer-cache lock across the whole ladder (Issue #864): a
         // writer constructed concurrently while `maybe_merge` replaces
         // segments would seed its segment-range cache from a racing,
@@ -374,6 +425,9 @@ impl LexicalStore {
         // any crash. Keeping the writer cached preserves everything for the
         // retry the WAL contract assumes.
         if let Some(writer) = writer_guard.as_mut() {
+            if let Some(wal_seq) = wal_seq {
+                writer.set_last_wal_seq(wal_seq)?;
+            }
             writer.commit()?;
         }
         *writer_guard = None;
@@ -874,7 +928,9 @@ impl LexicalStore {
     /// Set the last processed WAL sequence number.
     ///
     /// If a writer is cached, it sets the sequence on the writer.
-    /// Otherwise, it sets it on the underlying index.
+    /// Otherwise, it sets it on the underlying index, which persists it at
+    /// once. The engine records its checkpoint through
+    /// [`Self::commit_through`] instead (Issue #1499).
     pub fn set_last_wal_seq(&self, seq: u64) -> Result<()> {
         if let Some(writer) = self.writer_cache.lock().as_mut() {
             writer.set_last_wal_seq(seq)?;
