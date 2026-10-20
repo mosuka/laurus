@@ -103,7 +103,7 @@ impl PhpWalSyncPolicy {
     ///   When provided, the engine runs a background timer that forces the WAL
     ///   durable at least this often so a trailing partial batch under a low
     ///   ingest rate is not left unsynced indefinitely. Null disables the
-    ///   timer.
+    ///   timer. `0` runs no timer either, but flushes on every append.
     ///
     /// # Returns
     ///
@@ -230,8 +230,8 @@ impl PhpCommitPolicy {
     ///
     /// # Arguments
     ///
-    /// * `ms` - Commit at least this often, in milliseconds. Negative values are
-    ///   clamped to `0`.
+    /// * `ms` - Commit at least this often, in milliseconds. `0` disables
+    ///   auto-commit, and negative values are clamped to `0`.
     ///
     /// # Returns
     ///

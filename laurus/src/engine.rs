@@ -132,7 +132,12 @@ pub enum CommitPolicy {
     /// concurrent in-flight write may leave that write durable only at the next
     /// commit). **Native targets only** — on `wasm32` there are no background
     /// threads, so `Interval` is a no-op (the timer is never started), just like
-    /// [`WalSyncPolicy::Group`]'s `max_interval`.
+    /// a non-zero [`WalSyncPolicy::Group`] `max_interval`.
+    ///
+    /// `Interval(Duration::ZERO)` disables auto-commit (equivalent to
+    /// [`CommitPolicy::Manual`]): no timer is started (Issue #1504). A timer
+    /// with a zero interval would never wait, and would run the ladder back to
+    /// back for the engine's whole lifetime.
     Interval(Duration),
 }
 
@@ -189,9 +194,10 @@ pub struct PqCodebookInfo {
 /// — a no-op when nothing is pending, thanks to the dirty guard — so a trailing
 /// partial batch under a low ingest rate is not left unsynced indefinitely (the
 /// record/byte thresholds may never be reached). Dropping the timer wakes the
-/// thread immediately and joins it. Native targets only; on `wasm32` (no
-/// background threads) the timer is never constructed and the interval is
-/// ignored.
+/// thread immediately and joins it. Never started for a zero `max_interval`
+/// ([`WalSyncPolicy::flush_interval`] reports none), which syncs every append
+/// instead (Issue #1504). Native targets only; on `wasm32` (no background
+/// threads) the timer is never constructed and a non-zero interval is ignored.
 #[cfg(not(target_arch = "wasm32"))]
 struct WalFlushTimer {
     /// Sending on (or dropping) this channel signals the thread to stop.
@@ -431,8 +437,10 @@ impl CommitGenerationTracker {
 /// the lexical + vector stores, so the thread owns a private single-threaded
 /// tokio runtime and `block_on`s [`run_commit_ladder`] each tick. It holds only
 /// the `Arc` sub-parts the ladder needs — never the `Engine` — so there is no
-/// reference cycle and dropping the engine cleanly stops the timer. Native
-/// targets only; on `wasm32` (no background threads) `Interval` is a no-op.
+/// reference cycle and dropping the engine cleanly stops the timer. Never
+/// started for `Interval(Duration::ZERO)`, which disables auto-commit (Issue
+/// #1504). Native targets only; on `wasm32` (no background threads) `Interval`
+/// is a no-op.
 #[cfg(not(target_arch = "wasm32"))]
 struct CommitTimer {
     /// Sending on (or dropping) this channel signals the thread to stop.
@@ -636,7 +644,8 @@ pub struct Engine {
     /// `Payloads` path and the DSL path hit the same cache.
     embedding_cache: Option<Arc<EmbeddingCache>>,
     /// Auto-commit policy (Issue #890). `Manual` by default; a non-`Manual`
-    /// policy runs the commit ladder automatically during ingestion.
+    /// policy runs the commit ladder automatically during ingestion, except
+    /// `EveryDocs(0)` and `Interval(Duration::ZERO)`, which disable it.
     commit_policy: CommitPolicy,
     /// Documents applied since the last commit, tracking progress toward the
     /// [`CommitPolicy::EveryDocs`] threshold. Incremented once per applied
@@ -693,13 +702,15 @@ pub struct Engine {
     /// #1492); see [`WriteStop`]. `Arc` so the [`CommitTimer`] shares it.
     write_stop: Arc<WriteStop>,
     /// Background WAL flush timer for a [`WalSyncPolicy::Group`] configured with
-    /// a `max_interval`. `None` when no interval is set. Held only to keep the
+    /// a `max_interval`. `None` when no interval is set, or when it is zero
+    /// (Issue #1504; every append syncs instead). Held only to keep the
     /// timer thread alive for the engine's lifetime; dropping the engine stops
     /// it. Absent on `wasm32` (no background threads — the interval is ignored).
     #[cfg(not(target_arch = "wasm32"))]
     _wal_flush_timer: Option<WalFlushTimer>,
     /// Background auto-commit timer for [`CommitPolicy::Interval`] (Issue #892).
-    /// `None` under any other policy. Held only to keep the timer thread alive
+    /// `None` under any other policy, and under `Interval(Duration::ZERO)`
+    /// (Issue #1504). Held only to keep the timer thread alive
     /// for the engine's lifetime; dropping the engine stops and joins it.
     /// Absent on `wasm32` (no background threads — `Interval` is a no-op).
     #[cfg(not(target_arch = "wasm32"))]
@@ -4471,14 +4482,16 @@ impl EngineBuilder {
     /// caller invokes [`Engine::commit`]. Use [`CommitPolicy::EveryDocs`] to
     /// run the commit ladder automatically every `n` applied documents (across
     /// the singular and batch ingest APIs, and every `n` documents *within* a
-    /// batch). Orthogonal to [`Self::wal_sync_policy`]: an auto-commit works
-    /// under any WAL sync policy because [`Engine::commit`] always begins with
-    /// a WAL flush.
+    /// batch), or [`CommitPolicy::Interval`] to run it from a background timer
+    /// at least every interval (native targets only). Orthogonal to
+    /// [`Self::wal_sync_policy`]: an auto-commit works under any WAL sync
+    /// policy because [`Engine::commit`] always begins with a WAL flush.
     ///
     /// # Arguments
     ///
-    /// * `policy` - The auto-commit policy. `EveryDocs(0)` disables auto-commit
-    ///   (equivalent to `Manual`).
+    /// * `policy` - The auto-commit policy. `EveryDocs(0)` and
+    ///   `Interval(Duration::ZERO)` disable auto-commit (equivalent to
+    ///   `Manual`).
     pub fn commit_policy(mut self, policy: CommitPolicy) -> Self {
         self.commit_policy = policy;
         self
@@ -4564,7 +4577,8 @@ impl EngineBuilder {
             .map(|cap| Arc::new(EmbeddingCache::new(cap)));
 
         // Start the periodic WAL flush timer when the policy is a group commit
-        // with an interval. Native only; on wasm32 the interval is ignored.
+        // with a non-zero interval (`flush_interval` reports a zero one as
+        // none, Issue #1504). Native only; on wasm32 the interval is ignored.
         #[cfg(not(target_arch = "wasm32"))]
         let wal_flush_timer = match self.wal_sync_policy.flush_interval() {
             Some(interval) => Some(WalFlushTimer::spawn(Arc::clone(&log), interval)?),
@@ -4610,10 +4624,14 @@ impl EngineBuilder {
         // `truncate_retaining_after` takes its fast path and empties the WAL
         // a crash left behind before it is read. `recover` also sets the
         // commit generation's baseline, which a tick must not see unset.
-        // Native only; on wasm32 `Interval` is a no-op (no background
-        // threads).
+        // `Interval(Duration::ZERO)` starts no timer (Issue #1504): it means
+        // no auto-commit, and a zero `recv_timeout` never waits, so the
+        // ladder would run back to back. Native only; on wasm32 `Interval` is
+        // a no-op (no background threads).
         #[cfg(not(target_arch = "wasm32"))]
-        if let CommitPolicy::Interval(interval) = engine.commit_policy {
+        if let CommitPolicy::Interval(interval) = engine.commit_policy
+            && !interval.is_zero()
+        {
             engine._commit_timer = Some(CommitTimer::spawn(
                 CommitParts {
                     lexical: Arc::clone(&engine.lexical),
@@ -5641,6 +5659,47 @@ mod tests {
 
         // Dropping the engine must stop the background timer without hanging.
         drop(engine);
+    }
+
+    /// Issue #1504: a zero `Group` `max_interval` starts no WAL flush timer,
+    /// which would never wait between flushes. Every append syncs instead,
+    /// although neither batch threshold is reached.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn group_zero_max_interval_starts_no_flush_timer() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field(
+                "title",
+                schema::FieldOption::Text(crate::lexical::core::field::TextOption::default()),
+            )
+            .build();
+
+        let engine = Engine::builder(storage, schema)
+            .wal_sync_policy(WalSyncPolicy::Group {
+                max_records: usize::MAX,
+                max_bytes: usize::MAX,
+                max_interval: Some(Duration::ZERO),
+            })
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            engine._wal_flush_timer.is_none(),
+            "a zero max_interval must start no WAL flush timer"
+        );
+
+        engine
+            .add_document(
+                "doc1",
+                Document::builder().add_text("title", "zero").build(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !engine.log.wal_is_dirty(),
+            "a zero max_interval must sync the append at once"
+        );
     }
 
     #[tokio::test]
@@ -7756,6 +7815,34 @@ mod tests {
             engine.search(request).await.unwrap().len(),
             1,
             "an Interval-committed doc must be searchable without an explicit commit"
+        );
+    }
+
+    /// Issue #1504: `Interval(Duration::ZERO)` disables auto-commit, like
+    /// `EveryDocs(0)`, and starts no timer. A timer with a zero interval never
+    /// waits, so it would run the ladder back to back and empty the WAL right
+    /// after the put.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interval_zero_starts_no_commit_timer() {
+        let (engine, storage) = commit_policy_engine(CommitPolicy::Interval(Duration::ZERO)).await;
+        engine.put_document("d1", title_doc("zero")).await.unwrap();
+        // A zero-interval timer would commit within microseconds.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            wal_bytes(&storage) > 0,
+            "Interval(Duration::ZERO) must not auto-commit"
+        );
+        assert!(
+            engine._commit_timer.is_none(),
+            "Interval(Duration::ZERO) must start no commit timer"
+        );
+
+        engine.commit().await.unwrap();
+        assert_eq!(
+            wal_bytes(&storage),
+            0,
+            "an explicit commit still truncates the WAL"
         );
     }
 

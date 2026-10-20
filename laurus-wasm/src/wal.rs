@@ -76,8 +76,11 @@ impl WasmWalSyncPolicy {
     /// * `max_bytes` - Flush after this many buffered bytes. Defaults to
     ///   [`DEFAULT_GROUP_MAX_BYTES`] (1 MiB) when omitted.
     /// * `max_interval_ms` - Optional time-based flush interval in
-    ///   milliseconds. **No-op under WebAssembly** (the background timer is
-    ///   native-only in the core); the thresholds above still apply.
+    ///   milliseconds. A non-zero value is a **no-op under WebAssembly** (the
+    ///   background timer is native-only in the core); the thresholds above
+    ///   still apply. `0` needs no timer, so it applies here too and flushes
+    ///   on every append. The value is truncated to whole milliseconds, so
+    ///   anything below `1` (and a negative value or `NaN`) counts as `0`.
     ///
     /// # Returns
     ///

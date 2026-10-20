@@ -46,12 +46,12 @@ data_dir = "./laurus_data"
 sync_policy = "group"          # "per_record"（デフォルト） | "group"
 group_max_records = 1024       # オプション; デフォルト 1024
 group_max_bytes = 1048576      # オプション; デフォルト 1 MiB
-group_max_interval_ms = 1000   # オプション; 未設定時は background timer なし（native のみ）
+group_max_interval_ms = 1000   # オプション; 未設定時は timer なし、0 は append ごとに sync（native のみ）
 
 [index.commit]
 policy = "every_docs"          # "manual"（デフォルト） | "every_docs" | "interval"
 every_docs = 1000              # オプション; N 件ごとに commit（0/未設定で無効）
-interval_ms = 1000             # "interval" のみ; 最低 N ミリ秒ごとに commit（native のみ）
+interval_ms = 1000             # "interval" のみ; 最低 N ミリ秒ごとに commit（0/未設定で無効、native のみ）
 ```
 
 ログの詳細度は設定ファイルではなく、`RUST_LOG` 環境変数で制御します（デフォルト: `info`）。
@@ -87,7 +87,7 @@ WAL は **per-record** fsync を使用します（各書き込みは返る前に
 | `sync_policy` | String | `"per_record"` | 耐久性ポリシー: `"per_record"`（書き込みごとに fsync）または `"group"`（fsync をバッチ化） |
 | `group_max_records` | Integer | `1024` | グループコミットのみ。前回 sync 以降にこの件数のレコードが蓄積したら flush |
 | `group_max_bytes` | Integer | `1048576` | グループコミットのみ。前回 sync 以降にこのバイト数が蓄積したら flush（デフォルト 1 MiB） |
-| `group_max_interval_ms` | Integer | -- | グループコミットのみ。定期 background flush の間隔（ミリ秒）。未設定時は timer なし。**native ターゲットのみ** — `wasm32` では無視される |
+| `group_max_interval_ms` | Integer | -- | グループコミットのみ。定期 background flush の間隔（ミリ秒）。未設定時は timer なし。`0` でも timer は動かないが、`group_max_records = 0` と同じく append ごとに sync する。**native ターゲットのみ** — `wasm32` では 0 以外の値は無視される |
 
 `sync_policy = "group"` の場合、WAL は前回 sync 以降に **`group_max_records` 件**または
 **`group_max_bytes` バイト**のいずれか（先に到達した方）が蓄積した時点、および commit 時に
@@ -110,7 +110,7 @@ WebAssembly では background thread がないため no-op になります。
 | :--- | :--- | :--- | :--- |
 | `policy` | String | `"manual"` | 自動コミットポリシー: `"manual"`（呼び出し側が commit を駆動）、`"every_docs"`（`every_docs` 件ごとに commit）、または `"interval"`（最低 `interval_ms` ミリ秒ごとに commit） |
 | `every_docs` | Integer | -- | `every_docs` ポリシーのみ。適用ドキュメント数がこの値に達するごとに commit。未設定（または `0`）で自動コミット無効（`"manual"` と同等） |
-| `interval_ms` | Integer | -- | `interval` ポリシーのみ。background timer により最低この間隔（ミリ秒）ごとに自動コミットするため、インジェストがアイドルでも末尾の部分バッチが commit されます — `every_docs` の時間ベース版。**native ターゲットのみ** — `wasm32` では no-op として扱われます（background thread なし） |
+| `interval_ms` | Integer | -- | `interval` ポリシーのみ。background timer により最低この間隔（ミリ秒）ごとに自動コミットするため、インジェストがアイドルでも末尾の部分バッチが commit されます — `every_docs` の時間ベース版。未設定（または `0`）で自動コミット無効（`"manual"` と同等）。**native ターゲットのみ** — `wasm32` では no-op として扱われます（background thread なし） |
 
 `CommitPolicy` は `[index.wal]` と直交します。WAL セクションは *append がいつ fsync
 されるか* を、このセクションは *ストアがいつ materialize するか* を制御します。commit は

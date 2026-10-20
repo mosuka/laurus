@@ -156,7 +156,7 @@ engine.put_documents(one_thousand_docs).await?;
 | :--- | :--- |
 | `Manual` (default) | Never auto-commits; you drive every `commit()`. Identical to the historical behavior. |
 | `EveryDocs(n)` | Runs the commit ladder after every `n` applied documents, across the singular and batch APIs. `EveryDocs(0)` disables auto-commit (same as `Manual`). |
-| `Interval(Duration)` | Runs the commit ladder at least every `Duration` via a background timer, so a trailing partial batch is committed even while ingestion is idle. **Native targets only** — a no-op on `wasm32` (no background threads), like `WalSyncPolicy::Group`'s `max_interval`. |
+| `Interval(Duration)` | Runs the commit ladder at least every `Duration` via a background timer, so a trailing partial batch is committed even while ingestion is idle. `Interval(Duration::ZERO)` disables auto-commit (same as `Manual`) and starts no timer. **Native targets only** — a no-op on `wasm32` (no background threads), like a non-zero `WalSyncPolicy::Group` `max_interval`. |
 
 Key semantics:
 
@@ -216,9 +216,9 @@ let engine = Engine::builder(storage, schema)
 
 ### Periodic Flush Timer
 
-`Group.max_interval` adds a time bound to the size-based thresholds. When set, the engine runs a background timer that forces the WAL durable at least that often, so a trailing partial batch under a **low ingest rate** — where the record/byte thresholds may never be reached — is not left unsynced indefinitely. The flush is a no-op when nothing is pending, so an idle timer costs nothing. `None` disables the timer.
+`Group.max_interval` adds a time bound to the size-based thresholds. When set, the engine runs a background timer that forces the WAL durable at least that often, so a trailing partial batch under a **low ingest rate** — where the record/byte thresholds may never be reached — is not left unsynced indefinitely. The flush is a no-op when nothing is pending, so an idle timer costs nothing. `None` disables the timer. `Some(Duration::ZERO)` allows no unsynced time at all: no timer is started and every append syncs, the same as a zero `max_records` or `max_bytes`.
 
-> **WASM note:** the timer is honored on native targets only. On `wasm32` there are no background threads, so `max_interval` is ignored; durability there relies on the record/byte thresholds, `commit()`, and `flush_wal()`.
+> **WASM note:** the timer is honored on native targets only. On `wasm32` there are no background threads, so a non-zero `max_interval` is ignored; durability there relies on the record/byte thresholds, `commit()`, and `flush_wal()`. A zero `max_interval` needs no timer, so it syncs every append on `wasm32` too.
 
 ### Durability Guarantees
 

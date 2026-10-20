@@ -117,7 +117,9 @@ pub struct WalConfig {
     #[serde(default)]
     pub group_max_bytes: Option<usize>,
     /// Periodic flush interval in milliseconds (group policy only). When unset
-    /// no background timer runs. Honored on native targets only.
+    /// no background timer runs, and durability is left to the thresholds.
+    /// `0` runs no timer either, but syncs every append (Issue #1504). A
+    /// non-zero interval is honored on native targets only.
     #[serde(default)]
     pub group_max_interval_ms: Option<u64>,
 }
@@ -157,7 +159,8 @@ pub enum CommitPolicyKind {
     /// [`CommitPolicy::EveryDocs`].
     EveryDocs,
     /// Auto-commit at least every `interval_ms` milliseconds via a background
-    /// timer; maps to [`CommitPolicy::Interval`] (Issue #892). Native-only: on
+    /// timer; maps to [`CommitPolicy::Interval`] (Issue #892). An unset or `0`
+    /// `interval_ms` disables auto-commit (Issue #1504). Native-only: on
     /// `wasm32` the engine never starts the timer, so this is a no-op there.
     Interval,
 }
@@ -196,7 +199,8 @@ impl CommitConfig {
     /// [`CommitPolicy::EveryDocs`] with the configured threshold (`0` when
     /// unset, which the engine treats as disabled) when `policy` is
     /// `every_docs`, or [`CommitPolicy::Interval`] with the configured
-    /// millisecond interval (`0` when unset) when `policy` is `interval`.
+    /// millisecond interval (`0` when unset, which the engine treats as
+    /// disabled) when `policy` is `interval`.
     pub fn to_policy(&self) -> CommitPolicy {
         match self.policy {
             CommitPolicyKind::Manual => CommitPolicy::Manual,
@@ -345,6 +349,34 @@ mod tests {
             config.index.commit.to_policy(),
             CommitPolicy::Interval(Duration::from_millis(500))
         );
+    }
+
+    #[test]
+    fn interval_policy_defaults_interval_to_zero_when_omitted() {
+        // policy = "interval" without interval_ms maps to Interval(0), which
+        // the engine treats as disabled (Issue #1504).
+        let toml = r#"
+            [index.commit]
+            policy = "interval"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.index.commit.to_policy(),
+            CommitPolicy::Interval(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn group_zero_max_interval_ms_starts_no_timer() {
+        // group_max_interval_ms = 0 runs no flush timer; the engine syncs
+        // every append instead (Issue #1504).
+        let toml = r#"
+            [index.wal]
+            sync_policy = "group"
+            group_max_interval_ms = 0
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.index.wal.to_policy().flush_interval(), None);
     }
 
     #[test]

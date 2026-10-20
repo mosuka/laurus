@@ -88,7 +88,7 @@ class WalSyncPolicy {
 | :--- | :--- | :--- |
 | `maxRecords` | `1024` | Flush once this many records have accumulated. |
 | `maxBytes` | `1048576` (1 MiB) | Flush once this many unsynced bytes have accumulated. |
-| `maxIntervalMs` | none | Optional periodic flush timer (milliseconds). Omit to disable the timer. |
+| `maxIntervalMs` | none | Optional periodic flush timer (milliseconds). Omit to disable the timer. `0` (or any value below `1`) runs no timer but syncs every append. |
 
 With group commit the WAL is flushed when **either** `maxRecords` or
 `maxBytes` is reached, and always at `commit()`. A crash can lose up to the
@@ -139,7 +139,7 @@ class CommitPolicy {
 | :--- | :--- |
 | `CommitPolicy.manual()` | Default. No auto-commit; the caller drives every `commit()`. |
 | `CommitPolicy.everyDocs(n)` | Auto-commit after every `n` applied documents. |
-| `CommitPolicy.intervalMs(ms)` | Auto-commit at least every `ms` milliseconds via a background timer (default: none). **Native-only**; a no-op on wasm (no background threads). |
+| `CommitPolicy.intervalMs(ms)` | Auto-commit at least every `ms` milliseconds via a background timer (default: none). `0` disables auto-commit. **Native-only**; a no-op on wasm (no background threads). |
 
 With `everyDocs(n)` the engine commits after every `n` applied documents,
 counted across both singular and batch ingest — including every `n`

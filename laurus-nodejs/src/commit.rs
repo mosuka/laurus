@@ -94,7 +94,8 @@ impl JsCommitPolicy {
     ///
     /// # Arguments
     ///
-    /// * `ms` - Commit at least this often, in milliseconds.
+    /// * `ms` - Commit at least this often, in milliseconds. `0` disables
+    ///   auto-commit.
     ///
     /// # Returns
     ///

@@ -285,4 +285,61 @@ mod tests {
         assert!(!data_dir.join(SCHEMA_FILE).exists());
         assert!(!data_dir.join(STORE_DIR).exists());
     }
+
+    /// Issue #1504: `policy = "interval"` without `interval_ms` disables
+    /// auto-commit, as the config docs say, on the path the server takes:
+    /// the config file, `to_policy`, then `create_index`. The engine used to
+    /// start a zero-interval timer that committed back to back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interval_policy_without_interval_ms_never_auto_commits() {
+        use laurus::{Document, TextOption};
+
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [index.commit]
+            policy = "interval"
+        "#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("idx");
+        // Declare the field, so the put does not add it dynamically (which
+        // commits the stores).
+        let schema = Schema::builder()
+            .add_text_field("title", TextOption::default())
+            .build();
+        let engine = create_index(
+            &data_dir,
+            &schema,
+            config.index.wal.to_policy(),
+            config.index.commit.to_policy(),
+        )
+        .await
+        .unwrap();
+
+        engine
+            .put_document("d1", Document::builder().add_text("title", "zero").build())
+            .await
+            .unwrap();
+        // A zero-interval timer would commit within microseconds.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let wal = data_dir.join(STORE_DIR).join("engine.wal");
+        assert_eq!(
+            engine.stats().unwrap().commit_generation,
+            0,
+            "an unset interval_ms must not auto-commit"
+        );
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the put stays in the WAL until a commit"
+        );
+
+        engine.commit().await.unwrap();
+        assert_eq!(engine.stats().unwrap().commit_generation, 1);
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            0,
+            "an explicit commit still truncates the WAL"
+        );
+    }
 }

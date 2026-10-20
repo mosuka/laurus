@@ -351,7 +351,7 @@ class WalSyncPolicy {
 | :--- | :--- | :--- |
 | `maxRecords` | `1024` | Flush once this many records have accumulated. |
 | `maxBytes` | `1048576` (1 MiB) | Flush once this many unsynced bytes have accumulated. |
-| `maxIntervalMs` | none | Periodic flush timer (milliseconds). **No-op on wasm** (see caveats). |
+| `maxIntervalMs` | none | Periodic flush timer (milliseconds). A non-zero value is a **no-op on wasm** (see caveats); `0` (or any value below `1`) syncs every append. |
 
 With group commit the engine WAL is flushed when **either** `maxRecords` or
 `maxBytes` is reached, and always at `commit()`. A crash can lose up to the
@@ -368,9 +368,11 @@ last unsynced batch — the same trade-off as SQLite's `synchronous = NORMAL`.
 WebAssembly has no background threads or direct filesystem, so two behaviours
 differ from the native bindings:
 
-- **`maxIntervalMs` is a no-op.** The periodic flush timer requires a
-  background thread, which is unavailable on wasm. Group commit still flushes
-  on the `maxRecords` / `maxBytes` thresholds and at `commit()`.
+- **A non-zero `maxIntervalMs` is a no-op.** The periodic flush timer requires
+  a background thread, which is unavailable on wasm. Group commit still flushes
+  on the `maxRecords` / `maxBytes` thresholds and at `commit()`. A zero
+  `maxIntervalMs` needs no timer, so it applies on wasm too and syncs every
+  append.
 - **`flushWal()` flushes the in-memory engine WAL only.** OPFS persistence
   still happens at `commit()`. For durable persistence on wasm, call
   `commit()`.

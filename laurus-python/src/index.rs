@@ -95,7 +95,8 @@ impl PyWalSyncPolicy {
     ///     max_interval_ms: Optional time-based flush interval in milliseconds.
     ///         When set, a background timer flushes the WAL at least this often
     ///         even if the size thresholds have not been reached. When `None`
-    ///         (the default) no time-based flushing occurs.
+    ///         (the default) no time-based flushing occurs. `0` runs no timer
+    ///         but flushes on every append.
     ///
     /// Returns:
     ///     A `WalSyncPolicy` wrapping `WalSyncPolicy::Group { .. }`.
@@ -216,7 +217,8 @@ impl PyCommitPolicy {
     ///     there (the value still constructs).
     ///
     /// Args:
-    ///     ms: Commit at least this often, in milliseconds.
+    ///     ms: Commit at least this often, in milliseconds. `0` disables
+    ///         auto-commit.
     ///
     /// Returns:
     ///     A `CommitPolicy` wrapping `CommitPolicy::Interval(Duration)`.

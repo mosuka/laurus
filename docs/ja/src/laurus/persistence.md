@@ -177,7 +177,7 @@ engine.put_documents(one_thousand_docs).await?;
 | :--- | :--- |
 | `Manual`（既定） | 自動コミットしない。すべての `commit()` を自分で駆動する。従来と同一の挙動。 |
 | `EveryDocs(n)` | 単数・バッチ両 API を通じて、適用ドキュメント `n` 件ごとにコミットラダーを実行。`EveryDocs(0)` は自動コミット無効（`Manual` と同じ）。 |
-| `Interval(Duration)` | 背景タイマーで少なくとも `Duration` ごとにコミットラダーを実行。インジェストが idle でも末尾の端数がコミットされる。**native ターゲットのみ** — `wasm32`（背景スレッドなし）では no-op（`WalSyncPolicy::Group` の `max_interval` と同様）。 |
+| `Interval(Duration)` | 背景タイマーで少なくとも `Duration` ごとにコミットラダーを実行。インジェストが idle でも末尾の端数がコミットされる。`Interval(Duration::ZERO)` は自動コミット無効（`Manual` と同じ）で、タイマーを起動しない。**native ターゲットのみ** — `wasm32`（背景スレッドなし）では no-op（0 以外の `WalSyncPolicy::Group` の `max_interval` と同様）。 |
 
 主なセマンティクス:
 
@@ -237,9 +237,9 @@ let engine = Engine::builder(storage, schema)
 
 ### 定期 flush タイマー
 
-`Group.max_interval` はサイズベースの閾値に時間上限を加えます。設定すると、エンジンは少なくともその間隔ごとに WAL を強制 durable 化する background timer を起動します。これにより、**低い取り込みレート**（record/byte 閾値に到達しない場合）でも末尾の partial batch が無期限に未 sync のまま残ることを防ぎます。保留中のものが無ければ flush は no-op なので、アイドルな timer のコストはゼロです。`None` で timer を無効化します。
+`Group.max_interval` はサイズベースの閾値に時間上限を加えます。設定すると、エンジンは少なくともその間隔ごとに WAL を強制 durable 化する background timer を起動します。これにより、**低い取り込みレート**（record/byte 閾値に到達しない場合）でも末尾の partial batch が無期限に未 sync のまま残ることを防ぎます。保留中のものが無ければ flush は no-op なので、アイドルな timer のコストはゼロです。`None` で timer を無効化します。`Some(Duration::ZERO)` は未 sync の時間をまったく許しません。timer は起動せず、0 の `max_records`・`max_bytes` と同じく append ごとに sync します。
 
-> **WASM 注意:** timer は native ターゲットのみで有効です。`wasm32` には background thread が無いため `max_interval` は無視され、耐久性は record/byte 閾値・`commit()`・`flush_wal()` に依存します。
+> **WASM 注意:** timer は native ターゲットのみで有効です。`wasm32` には background thread が無いため 0 以外の `max_interval` は無視され、耐久性は record/byte 閾値・`commit()`・`flush_wal()` に依存します。0 の `max_interval` は timer を必要としないので、`wasm32` でも append ごとに sync します。
 
 ### 耐久性の保証
 

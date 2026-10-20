@@ -89,7 +89,7 @@ Laurus::WalSyncPolicy.group(
 | Constructor | Description |
 | :--- | :--- |
 | `WalSyncPolicy.per_record` | Default. Every record is `fsync`ed before the write returns — fully durable per write. |
-| `WalSyncPolicy.group(max_records:, max_bytes:, max_interval_ms:)` | Batch `fsync`s. With no arguments uses the defaults (`max_records: 1024`, `max_bytes: 1 MiB`, no timer). The WAL is flushed when **either** `max_records` **or** `max_bytes` accumulate, and on every `commit`. Pass `max_interval_ms:` to also flush on a periodic timer. |
+| `WalSyncPolicy.group(max_records:, max_bytes:, max_interval_ms:)` | Batch `fsync`s. With no arguments uses the defaults (`max_records: 1024`, `max_bytes: 1 MiB`, no timer). The WAL is flushed when **either** `max_records` **or** `max_bytes` accumulate, and on every `commit`. Pass `max_interval_ms:` to also flush on a periodic timer; `0` runs no timer but syncs every append. |
 
 Group commit is analogous to SQLite's `synchronous = NORMAL`: a crash can lose
 at most the last unsynced batch of records, but the index never corrupts.
@@ -140,7 +140,7 @@ Laurus::CommitPolicy.interval_ms(5000)
 | :--- | :--- |
 | `CommitPolicy.manual` | Default. No auto-commit — the caller drives every `commit`. |
 | `CommitPolicy.every_docs(n)` | Auto-commit after every `n` applied documents. Counted across both singular and batch ingest, including every `n` documents **within** a single batch. |
-| `CommitPolicy.interval_ms(ms)` | Auto-commit at least every `ms` milliseconds via a background timer, so a trailing partial batch is committed even while ingestion is idle. The time-based counterpart of `every_docs`. Default: none. **Native only** — under WebAssembly (`wasm32`) there are no background threads, so the engine treats it as a no-op (the value still constructs, but no timed commit happens). |
+| `CommitPolicy.interval_ms(ms)` | Auto-commit at least every `ms` milliseconds via a background timer, so a trailing partial batch is committed even while ingestion is idle. The time-based counterpart of `every_docs`. Default: none. `0` disables auto-commit. **Native only** — under WebAssembly (`wasm32`) there are no background threads, so the engine treats it as a no-op (the value still constructs, but no timed commit happens). |
 
 `every_docs(0)` is valid and disables auto-commit, making it equivalent to
 `manual`.

@@ -46,12 +46,12 @@ data_dir = "./laurus_data"
 sync_policy = "group"          # "per_record" (default) | "group"
 group_max_records = 1024       # optional; default 1024
 group_max_bytes = 1048576      # optional; default 1 MiB
-group_max_interval_ms = 1000   # optional; no background timer when unset (native only)
+group_max_interval_ms = 1000   # optional; no timer when unset, 0 syncs every append (native only)
 
 [index.commit]
 policy = "every_docs"          # "manual" (default) | "every_docs" | "interval"
 every_docs = 1000              # optional; commit every N docs (0/unset disables)
-interval_ms = 1000             # "interval" only; commit at least every N ms (native only)
+interval_ms = 1000             # "interval" only; commit at least every N ms (0/unset disables, native only)
 ```
 
 Log verbosity is controlled by the `RUST_LOG` environment variable (default: `info`), not through the config file.
@@ -87,7 +87,7 @@ for the durability trade-off.
 | `sync_policy` | String | `"per_record"` | Durability policy: `"per_record"` (fsync every write) or `"group"` (batch fsyncs) |
 | `group_max_records` | Integer | `1024` | Group commit only. Flush once this many records accumulate since the last sync |
 | `group_max_bytes` | Integer | `1048576` | Group commit only. Flush once this many bytes accumulate since the last sync (default 1 MiB) |
-| `group_max_interval_ms` | Integer | -- | Group commit only. Periodic background flush interval in milliseconds. No timer runs when unset. **Native targets only** — ignored on `wasm32` |
+| `group_max_interval_ms` | Integer | -- | Group commit only. Periodic background flush interval in milliseconds. No timer runs when unset. `0` runs no timer either, but syncs every append, like `group_max_records = 0`. **Native targets only** — a non-zero interval is ignored on `wasm32` |
 
 Under `sync_policy = "group"`, the WAL flushes when **either** `group_max_records`
 records **or** `group_max_bytes` bytes have accumulated since the last sync
@@ -110,7 +110,7 @@ background threads.
 | :--- | :--- | :--- | :--- |
 | `policy` | String | `"manual"` | Auto-commit policy: `"manual"` (caller-driven commits), `"every_docs"` (commit every `every_docs` applied documents), or `"interval"` (commit at least every `interval_ms` milliseconds) |
 | `every_docs` | Integer | -- | `every_docs` policy only. Commit after this many applied documents. Unset (or `0`) disables auto-commit, equivalent to `"manual"` |
-| `interval_ms` | Integer | -- | `interval` policy only. Auto-commit at least this often (milliseconds) via a background timer, so a trailing partial batch commits even while ingestion is idle — the time-based counterpart of `every_docs`. **Native targets only** — treated as a no-op on `wasm32` (no background threads) |
+| `interval_ms` | Integer | -- | `interval` policy only. Auto-commit at least this often (milliseconds) via a background timer, so a trailing partial batch commits even while ingestion is idle — the time-based counterpart of `every_docs`. Unset (or `0`) disables auto-commit, equivalent to `"manual"`. **Native targets only** — treated as a no-op on `wasm32` (no background threads) |
 
 `CommitPolicy` is orthogonal to `[index.wal]`: the WAL section governs *when
 appends are fsync'd*, while this section governs *when the stores materialize*.

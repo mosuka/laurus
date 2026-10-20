@@ -90,7 +90,7 @@ Laurus::WalSyncPolicy.group(
 | コンストラクタ | 説明 |
 | :--- | :--- |
 | `WalSyncPolicy.per_record` | デフォルト。すべてのレコードは書き込みが返る前に `fsync` されます。書き込みごとに完全に耐久的です。 |
-| `WalSyncPolicy.group(max_records:, max_bytes:, max_interval_ms:)` | `fsync` をまとめます。引数なしの場合はデフォルト（`max_records: 1024`、`max_bytes: 1 MiB`、タイマーなし）を使用します。WAL は `max_records` **または** `max_bytes` のいずれかが蓄積したとき、および毎回の `commit` 時にフラッシュされます。`max_interval_ms:` を指定すると、定期タイマーでもフラッシュします。 |
+| `WalSyncPolicy.group(max_records:, max_bytes:, max_interval_ms:)` | `fsync` をまとめます。引数なしの場合はデフォルト（`max_records: 1024`、`max_bytes: 1 MiB`、タイマーなし）を使用します。WAL は `max_records` **または** `max_bytes` のいずれかが蓄積したとき、および毎回の `commit` 時にフラッシュされます。`max_interval_ms:` を指定すると、定期タイマーでもフラッシュします。`0` はタイマーを動かさず、append ごとに sync します。 |
 
 Group commit は SQLite の `synchronous = NORMAL` に相当します。クラッシュ時に
 失われるのは最後の未同期バッチのレコードまでで、インデックスが破損する
@@ -142,7 +142,7 @@ Laurus::CommitPolicy.interval_ms(5000)
 | :--- | :--- |
 | `CommitPolicy.manual` | デフォルト。自動コミットなし。すべての `commit` は呼び出し側が駆動します。 |
 | `CommitPolicy.every_docs(n)` | `n` ドキュメント適用ごとに自動コミットします。単発・バッチ両方の取り込みを通してカウントされ、単一バッチ **内** でも `n` ドキュメントごとにコミットされます。 |
-| `CommitPolicy.interval_ms(ms)` | バックグラウンドタイマーで少なくとも `ms` ミリ秒ごとに自動コミットします。取り込みがアイドル状態でも、末尾の部分バッチがコミットされます。`every_docs` の時間ベース版です。デフォルト: なし。**ネイティブのみ** — WebAssembly（`wasm32`）ではバックグラウンドスレッドが存在しないため、エンジンはこれを no-op として扱います（値は構築されますが、タイマーによるコミットは発生しません）。 |
+| `CommitPolicy.interval_ms(ms)` | バックグラウンドタイマーで少なくとも `ms` ミリ秒ごとに自動コミットします。取り込みがアイドル状態でも、末尾の部分バッチがコミットされます。`every_docs` の時間ベース版です。デフォルト: なし。`0` で自動コミット無効。**ネイティブのみ** — WebAssembly（`wasm32`）ではバックグラウンドスレッドが存在しないため、エンジンはこれを no-op として扱います（値は構築されますが、タイマーによるコミットは発生しません）。 |
 
 `every_docs(0)` は有効で、自動コミットを無効化します（`manual` と等価）。
 

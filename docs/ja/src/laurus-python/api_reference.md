@@ -99,7 +99,7 @@ class WalSyncPolicy:
 | :--- | :--- | :--- |
 | `max_records` | `1024` | この件数のレコードが蓄積されたらフラッシュします。 |
 | `max_bytes` | `1048576`（1 MiB） | この量の未同期バイトが蓄積されたらフラッシュします。 |
-| `max_interval_ms` | `None` | 任意の定期フラッシュタイマー（ミリ秒）。`None` でタイマー無効。 |
+| `max_interval_ms` | `None` | 任意の定期フラッシュタイマー（ミリ秒）。`None` でタイマー無効。`0` はタイマーを動かさず、append ごとに sync します。 |
 
 グループコミットでは、`max_records` または `max_bytes` の**いずれか**に達した
 時点で WAL がフラッシュされ、`commit()` 時にも必ずフラッシュされます。
@@ -154,7 +154,7 @@ class CommitPolicy:
 | :--- | :--- |
 | `CommitPolicy.manual()` | デフォルト。自動コミットなし。呼び出し側がすべての `commit()` を実行します。 |
 | `CommitPolicy.every_docs(n)` | `n` 件のドキュメントを適用するごとに自動コミットします。 |
-| `CommitPolicy.interval_ms(ms)` | バックグラウンドタイマーにより、少なくとも `ms` ミリ秒ごとに自動コミットします（デフォルト: なし）。ネイティブ専用で、wasm では no-op です。 |
+| `CommitPolicy.interval_ms(ms)` | バックグラウンドタイマーにより、少なくとも `ms` ミリ秒ごとに自動コミットします（デフォルト: なし）。`0` で自動コミット無効。ネイティブ専用で、wasm では no-op です。 |
 
 `every_docs(n)` は、単体（`put_document`、`add_document`）とバッチ
 （`put_documents`、`add_documents`）の両方の取り込みにまたがって適用済み

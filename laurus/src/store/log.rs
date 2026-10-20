@@ -178,8 +178,13 @@ pub enum WalSyncPolicy {
         /// [`commit`](crate::Engine::commit), and
         /// [`flush_wal`](crate::Engine::flush_wal).
         ///
-        /// Honored on native targets only; on `wasm32` (no background threads)
-        /// the interval is ignored.
+        /// `Some(Duration::ZERO)` allows no unsynced time at all: no timer is
+        /// started and every append syncs, the same as a zero `max_records`
+        /// or `max_bytes` (Issue #1504).
+        ///
+        /// A non-zero interval is honored on native targets only; on `wasm32`
+        /// (no background threads) it is ignored. A zero interval needs no
+        /// timer, so it applies on every target.
         max_interval: Option<Duration>,
     },
 }
@@ -220,6 +225,7 @@ impl WalSyncPolicy {
     /// # Arguments
     ///
     /// * `interval` - Maximum time a partial batch may remain unsynced.
+    ///   `Duration::ZERO` starts no timer and syncs every append instead.
     pub fn group_with_interval(interval: Duration) -> Self {
         Self::Group {
             max_records: DEFAULT_GROUP_MAX_RECORDS,
@@ -231,10 +237,12 @@ impl WalSyncPolicy {
     /// The periodic flush interval for this policy, if any.
     ///
     /// Returns the `max_interval` of a [`WalSyncPolicy::Group`], or `None` for
-    /// [`WalSyncPolicy::PerRecord`] or a `Group` without a timer.
+    /// [`WalSyncPolicy::PerRecord`] or a `Group` without a timer. A zero
+    /// `max_interval` also reports `None`: it syncs every append instead of
+    /// running a timer (Issue #1504).
     pub fn flush_interval(&self) -> Option<Duration> {
         match self {
-            Self::Group { max_interval, .. } => *max_interval,
+            Self::Group { max_interval, .. } => max_interval.filter(|d| !d.is_zero()),
             Self::PerRecord => None,
         }
     }
@@ -737,9 +745,10 @@ impl DocumentLog {
     /// case the fsync is left to the scope owner's batch-end
     /// [`Self::flush_wal`]. Under [`WalSyncPolicy::Group`] the fsync is
     /// deferred and only happens once the batch reaches `max_records` records
-    /// or `max_bytes` bytes since the last sync, amortizing one fsync over the
-    /// batch — deferral scopes do not suppress these threshold flushes, so the
-    /// Group policy's bounded loss window holds even mid-batch;
+    /// or `max_bytes` bytes since the last sync (on every append under a zero
+    /// `max_interval`), amortizing one fsync over the batch — deferral scopes
+    /// do not suppress these threshold flushes, so the Group policy's bounded
+    /// loss window holds even mid-batch;
     /// [`Self::flush_wal`] (called at commit) forces any trailing partial
     /// batch durable.
     ///
@@ -766,18 +775,22 @@ impl DocumentLog {
     /// Whether the pending (unsynced) batch should be flushed now under `policy`.
     ///
     /// Always `true` for [`WalSyncPolicy::PerRecord`]; for
-    /// [`WalSyncPolicy::Group`] it is `true` once either batch threshold is met.
-    /// `false` when no writer is open.
+    /// [`WalSyncPolicy::Group`] it is `true` once either batch threshold is
+    /// met, or always under a zero `max_interval`, which allows no unsynced
+    /// time (Issue #1504). `false` when no writer is open.
     fn batch_ready(state: &Option<WalWriterState>, policy: WalSyncPolicy) -> bool {
         match policy {
             WalSyncPolicy::PerRecord => true,
             WalSyncPolicy::Group {
                 max_records,
                 max_bytes,
-                // The timer is driven by the engine, not the per-append path.
-                max_interval: _,
+                // A non-zero interval is a timer, driven by the engine rather
+                // than the per-append path.
+                max_interval,
             } => state.as_ref().is_some_and(|s| {
-                s.unsynced_records >= max_records.max(1) || s.unsynced_bytes >= max_bytes.max(1)
+                max_interval.is_some_and(|d| d.is_zero())
+                    || s.unsynced_records >= max_records.max(1)
+                    || s.unsynced_bytes >= max_bytes.max(1)
             }),
         }
     }
@@ -1734,6 +1747,12 @@ mod tests {
             WalSyncPolicy::group_with_interval(Duration::from_millis(50)).flush_interval(),
             Some(Duration::from_millis(50))
         );
+        // A zero interval runs no timer; it syncs every append instead (Issue
+        // #1504).
+        assert_eq!(
+            WalSyncPolicy::group_with_interval(Duration::ZERO).flush_interval(),
+            None
+        );
     }
 
     /// Under `Group`, appends below the record threshold buffer their bytes
@@ -1786,6 +1805,40 @@ mod tests {
             "a record past the byte threshold flushes immediately"
         );
         assert_eq!(state.unsynced_bytes, 0);
+    }
+
+    /// Under `Group`, a zero `max_interval` allows no unsynced time: every
+    /// append syncs, inside a deferral scope too, although neither threshold
+    /// is reached (Issue #1504).
+    #[test]
+    fn group_zero_max_interval_syncs_every_append() {
+        let log = DocumentLog::with_sync_policy(
+            make_storage(),
+            "test.log",
+            make_storage(),
+            WalSyncPolicy::Group {
+                max_records: usize::MAX,
+                max_bytes: usize::MAX,
+                max_interval: Some(Duration::ZERO),
+            },
+        )
+        .unwrap();
+
+        log.append("e1", &small_doc()).unwrap();
+        assert!(
+            !log.wal_is_dirty(),
+            "a zero max_interval syncs the append at once"
+        );
+        {
+            let _deferral = log.defer_sync();
+            log.append("e2", &small_doc()).unwrap();
+            assert!(
+                !log.wal_is_dirty(),
+                "a deferral scope does not hold back the sync"
+            );
+        }
+        assert_eq!(log.wal_sync_count(), 2, "one fsync per append");
+        assert_eq!(log.read_all().unwrap().len(), 2);
     }
 
     /// Under `Group`, a trailing partial batch (below both thresholds) is left

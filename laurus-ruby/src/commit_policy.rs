@@ -97,7 +97,8 @@ impl RbCommitPolicy {
     ///
     /// # Arguments
     ///
-    /// * `ms` (Integer): The auto-commit interval in milliseconds.
+    /// * `ms` (Integer): The auto-commit interval in milliseconds. `0`
+    ///   disables auto-commit.
     ///
     /// # Returns
     ///

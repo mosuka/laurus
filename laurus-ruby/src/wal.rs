@@ -90,7 +90,8 @@ impl RbWalSyncPolicy {
     ///   - `max_interval_ms:` (Integer): Maximum time, in milliseconds, that an
     ///     append may stay un-fsync'd before a background timer flushes it.
     ///     When omitted, no time-based flush timer is installed and the policy
-    ///     relies solely on the record-count and byte thresholds.
+    ///     relies solely on the record-count and byte thresholds. `0` installs
+    ///     no timer either, but flushes on every append.
     ///
     /// Calling `group` with no arguments yields the default group-commit
     /// thresholds with no flush timer.

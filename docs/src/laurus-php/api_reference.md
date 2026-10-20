@@ -87,7 +87,7 @@ flushed. Pass it to the `Index` constructor's `$wal_sync_policy` argument.
 | Constructor | Description |
 | :--- | :--- |
 | `WalSyncPolicy::perRecord()` | Default. Every record is `fsync`ed before the write returns — fully durable per write. |
-| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | Batch `fsync`s. With all arguments `null` uses the defaults (`max_records = 1024`, `max_bytes = 1 MiB`, no timer). The WAL is flushed when **either** `$max_records` **or** `$max_bytes` accumulate, and on every `commit()`. Pass `$max_interval_ms` to also flush on a periodic timer. |
+| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | Batch `fsync`s. With all arguments `null` uses the defaults (`max_records = 1024`, `max_bytes = 1 MiB`, no timer). The WAL is flushed when **either** `$max_records` **or** `$max_bytes` accumulate, and on every `commit()`. Pass `$max_interval_ms` to also flush on a periodic timer; `0` runs no timer but syncs every append. |
 
 Group commit is analogous to SQLite's `synchronous = NORMAL`: a crash can lose
 at most the last unsynced batch of records, but the index never corrupts.
@@ -142,7 +142,7 @@ commits. Pass it to the `Index` constructor's `$commit_policy` argument.
 | :--- | :--- |
 | `CommitPolicy::manual()` | Default. The engine never commits on its own; the caller drives every `commit()`. |
 | `CommitPolicy::everyDocs($n)` | Auto-commit after every `$n` applied documents. Counting spans both singular and batch ingest, and triggers every `$n` documents **within** a batch. |
-| `CommitPolicy::intervalMs($ms)` | Auto-commit at least every `$ms` milliseconds via a background timer, so a trailing partial batch is committed even while ingestion is idle. The time-based counterpart of `everyDocs`. Default: none. **Native only** — a no-op on wasm (WebAssembly has no background threads); the value still constructs, but no timed commit happens. |
+| `CommitPolicy::intervalMs($ms)` | Auto-commit at least every `$ms` milliseconds via a background timer, so a trailing partial batch is committed even while ingestion is idle. The time-based counterpart of `everyDocs`. Default: none. `0` (or a negative value) disables auto-commit. **Native only** — a no-op on wasm (WebAssembly has no background threads); the value still constructs, but no timed commit happens. |
 
 `CommitPolicy::everyDocs(0)` is valid and disables auto-commit — it is
 equivalent to `CommitPolicy::manual()`.

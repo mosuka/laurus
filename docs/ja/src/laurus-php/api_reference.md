@@ -88,7 +88,7 @@ $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems pro
 | コンストラクタ | 説明 |
 | :--- | :--- |
 | `WalSyncPolicy::perRecord()` | デフォルト。すべてのレコードは書き込みが返る前に `fsync` されます。書き込みごとに完全に耐久的です。 |
-| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | `fsync` をまとめます。すべての引数が `null` の場合はデフォルト（`max_records = 1024`、`max_bytes = 1 MiB`、タイマーなし）を使用します。WAL は `$max_records` **または** `$max_bytes` のいずれかが蓄積したとき、および毎回の `commit()` 時にフラッシュされます。`$max_interval_ms` を指定すると、定期タイマーでもフラッシュします。 |
+| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | `fsync` をまとめます。すべての引数が `null` の場合はデフォルト（`max_records = 1024`、`max_bytes = 1 MiB`、タイマーなし）を使用します。WAL は `$max_records` **または** `$max_bytes` のいずれかが蓄積したとき、および毎回の `commit()` 時にフラッシュされます。`$max_interval_ms` を指定すると、定期タイマーでもフラッシュします。`0` はタイマーを動かさず、append ごとに sync します。 |
 
 Group commit は SQLite の `synchronous = NORMAL` に相当します。クラッシュ時に
 失われるのは最後の未同期バッチのレコードまでで、インデックスが破損する
@@ -144,7 +144,7 @@ Laurus が自動でコミットすることはなく、呼び出し側がすべ�
 | :--- | :--- |
 | `CommitPolicy::manual()` | デフォルト。エンジンは自動でコミットせず、呼び出し側がすべての `commit()` を駆動します。 |
 | `CommitPolicy::everyDocs($n)` | 適用したドキュメント `$n` 件ごとに自動コミットします。カウントは単一 ingest とバッチ ingest の両方にまたがり、バッチ **内** でも `$n` 件ごとにトリガーされます。 |
-| `CommitPolicy::intervalMs($ms)` | バックグラウンドタイマーにより、少なくとも `$ms` ミリ秒ごとに自動コミットします。ingest がアイドル状態でも、末尾の部分バッチがコミットされます。`everyDocs` の時間ベース版です。デフォルト: なし。**ネイティブ専用** — wasm では no-op です（WebAssembly にはバックグラウンドスレッドがありません）。値は構築されますが、タイマーによるコミットは発生しません。 |
+| `CommitPolicy::intervalMs($ms)` | バックグラウンドタイマーにより、少なくとも `$ms` ミリ秒ごとに自動コミットします。ingest がアイドル状態でも、末尾の部分バッチがコミットされます。`everyDocs` の時間ベース版です。デフォルト: なし。`0`（または負の値）で自動コミット無効。**ネイティブ専用** — wasm では no-op です（WebAssembly にはバックグラウンドスレッドがありません）。値は構築されますが、タイマーによるコミットは発生しません。 |
 
 `CommitPolicy::everyDocs(0)` は有効で、自動コミットを無効化します。
 `CommitPolicy::manual()` と等価です。

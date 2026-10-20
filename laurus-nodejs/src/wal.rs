@@ -92,8 +92,10 @@ impl JsWalSyncPolicy {
     ///   (1 MiB).
     /// * `max_interval_ms` - Optional periodic flush interval in milliseconds.
     ///   When omitted, no background timer runs and durability is left to the
-    ///   thresholds, `commit()`, and `flushWal()`. Honored on native targets
-    ///   only.
+    ///   thresholds, `commit()`, and `flushWal()`. `0` runs no timer but
+    ///   flushes on every append; the value is truncated to whole
+    ///   milliseconds, so anything below `1` (and a negative value or `NaN`)
+    ///   counts as `0`. A non-zero interval is honored on native targets only.
     ///
     /// # Returns
     ///

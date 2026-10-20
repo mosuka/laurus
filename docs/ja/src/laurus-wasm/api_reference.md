@@ -348,7 +348,7 @@ class WalSyncPolicy {
 | :--- | :--- | :--- |
 | `maxRecords` | `1024` | この件数のレコードが蓄積されたらフラッシュします。 |
 | `maxBytes` | `1048576`（1 MiB） | この量の未同期バイトが蓄積されたらフラッシュします。 |
-| `maxIntervalMs` | なし | 定期フラッシュタイマー（ミリ秒）。**wasm では no-op**（注意点を参照）。 |
+| `maxIntervalMs` | なし | 定期フラッシュタイマー（ミリ秒）。0 以外の値は **wasm では no-op**（注意点を参照）。`0`（または `1` 未満の値）は append ごとに sync します。 |
 
 グループコミットでは、`maxRecords` または `maxBytes` の**いずれか**に達した
 時点でエンジン WAL がフラッシュされ、`commit()` 時にも必ずフラッシュされます。
@@ -366,10 +366,11 @@ SQLite の `synchronous = NORMAL` と同じトレードオフです。
 WebAssembly にはバックグラウンドスレッドや直接のファイルシステムがないため、
 ネイティブバインディングとは 2 点で動作が異なります:
 
-- **`maxIntervalMs` は no-op です。** 定期フラッシュタイマーには
+- **0 以外の `maxIntervalMs` は no-op です。** 定期フラッシュタイマーには
   バックグラウンドスレッドが必要ですが、wasm では利用できません。
   グループコミットは `maxRecords` / `maxBytes` のしきい値到達時と
-  `commit()` 時にはフラッシュされます。
+  `commit()` 時にはフラッシュされます。0 の `maxIntervalMs` はタイマーを
+  必要としないので wasm でも効き、append ごとに sync します。
 - **`flushWal()` はインメモリエンジンの WAL のみをフラッシュします。**
   OPFS への永続化は引き続き `commit()` で行われます。wasm で永続的に
   永続化するには `commit()` を呼び出してください。
