@@ -169,14 +169,21 @@ pq-fastscan = []
 [[example]]
 name = "quickstart"
 
+# `test = true` runs the test in each of these examples, which calls its
+# `main()` on in-memory storage, under `cargo test` (Issue #1495). Without
+# it `cargo test` only compiles an example, so a query DSL change that breaks
+# one goes unnoticed.
 [[example]]
 name = "lexical_search"
+test = true
 
 [[example]]
 name = "vector_search"
+test = true
 
 [[example]]
 name = "hybrid_search"
+test = true
 
 [[example]]
 name = "geo3d_search"

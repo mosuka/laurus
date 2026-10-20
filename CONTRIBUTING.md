@@ -183,6 +183,7 @@ Public API is re-exported in `lib.rs`.
 
 - Unit tests: `#[cfg(test)]` module at the bottom of each file
 - Integration tests: `laurus/tests/` directory
+- Example tests: an example in `laurus/examples/` with a `#[cfg(test)]` module needs `test = true` on its `[[example]]` entry in `laurus/Cargo.toml`; without it `cargo test` only compiles the example
 - Sync tests: `#[test]`
 - Async tests: `#[tokio::test]`
 - Test naming: `test_<what_is_being_tested>` (e.g., `test_error_construction`)
