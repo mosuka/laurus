@@ -26,6 +26,7 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `ResourceExhausted` | Resource limits exceeded | Out of memory, too many open files |
 | `SerializationError` | Binary serialization errors | Corrupt data on disk |
 | `OperationCancelled` | Operation was cancelled | Timeout, user cancellation |
+| `WritesStopped` | The engine stopped accepting writes | An earlier write failed after its WAL record was written (an I/O error, disk full); reopen the index |
 | `NotImplemented` | Feature not available | Unimplemented operation |
 | `Other` | Generic errors | Timeout, invalid config, not found |
 
@@ -142,6 +143,26 @@ match StorageFactory::open(StorageConfig::File {
 }
 ```
 
+### Writes Stopped
+
+A write that fails after its WAL record was written (for example on an I/O error) returns its own error and stops the engine from accepting writes: every later write, commit and schema change fails with `WritesStopped` until the index is reopened, which replays the WAL and applies the failed write (see [Failed Writes](persistence.md#failed-writes)). Searches keep working meanwhile.
+
+```rust
+match engine.put_document("doc-1", doc).await {
+    Ok(()) => {}
+    Err(LaurusError::WritesStopped(reason)) => {
+        // An earlier write stopped writes: fix the cause, then reopen the index.
+        eprintln!("Writes stopped: {reason}");
+    }
+    Err(e) => match engine.write_stop_reason() {
+        // This write reached the WAL; reopening the index applies it.
+        Some(reason) => eprintln!("Write failed after its WAL append: {reason}"),
+        // This write changed nothing.
+        None => eprintln!("Write rejected: {e}"),
+    },
+}
+```
+
 ## Convenience Constructors
 
 `LaurusError` provides factory methods for creating errors in custom implementations:
@@ -157,6 +178,7 @@ match StorageFactory::open(StorageConfig::File {
 | `LaurusError::other(msg)` | `Other` variant |
 | `LaurusError::cancelled(msg)` | `OperationCancelled` variant |
 | `LaurusError::invalid_argument(msg)` | `InvalidArgument` variant |
+| `LaurusError::writes_stopped(msg)` | `WritesStopped` variant |
 | `LaurusError::invalid_config(msg)` | `Other` with "Invalid configuration" prefix |
 | `LaurusError::not_found(msg)` | `Other` with "Not found" prefix |
 | `LaurusError::timeout(msg)` | `Other` with "Timeout" prefix |

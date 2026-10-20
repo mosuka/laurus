@@ -227,6 +227,12 @@ already-applied entries are not rolled back (they become durable at the next
 commit), and the error names the failing position, so retrying the batch or
 its suffix is idempotent.
 
+A write that fails after its write-ahead-log record was written (an I/O
+error, a full disk) stops writes instead: every later write, commit and field
+change returns `412 Precondition Failed` until the server is restarted, which
+replays the log and applies that write (see
+[Failed Writes](../laurus/persistence.md#failed-writes)).
+
 ### Get Documents
 
 ```bash

@@ -26,6 +26,7 @@ Laurusのすべての操作は `Result<T>` を返します。これは `std::res
 | `ResourceExhausted` | リソース制限超過 | メモリ不足、オープンファイル数超過 |
 | `SerializationError` | バイナリシリアライズエラー | ディスク上のデータ破損 |
 | `OperationCancelled` | 操作がキャンセルされた | タイムアウト、ユーザーによるキャンセル |
+| `WritesStopped` | エンジンが書き込みの受け付けを止めた | それ以前の書き込みが WAL レコードを書いた後に失敗した（I/O エラー、ディスク容量不足）。索引を開き直す |
 | `NotImplemented` | 機能が利用不可 | 未実装の操作 |
 | `Other` | 汎用エラー | タイムアウト、無効な設定、見つからない |
 
@@ -142,6 +143,26 @@ match StorageFactory::open(StorageConfig::File {
 }
 ```
 
+### 書き込みの停止
+
+WAL レコードを書いた後に失敗した書き込み（I/O エラーなど）は、自身のエラーを返し、エンジンに書き込みの受け付けを止めさせます。以後の書き込み・コミット・スキーマ変更は、索引を開き直すまで `WritesStopped` で失敗します。開き直すと WAL が再生され、失敗した書き込みが適用されます（[失敗した書き込み](persistence.md#失敗した書き込み)を参照）。その間も検索は動きます。
+
+```rust
+match engine.put_document("doc-1", doc).await {
+    Ok(()) => {}
+    Err(LaurusError::WritesStopped(reason)) => {
+        // それ以前の書き込みが書き込みを止めた。原因を取り除いてから索引を開き直す。
+        eprintln!("Writes stopped: {reason}");
+    }
+    Err(e) => match engine.write_stop_reason() {
+        // この書き込みは WAL に届いている。索引を開き直すと適用される。
+        Some(reason) => eprintln!("Write failed after its WAL append: {reason}"),
+        // この書き込みは何も変えていない。
+        None => eprintln!("Write rejected: {e}"),
+    },
+}
+```
+
 ## 便利なコンストラクタ
 
 `LaurusError` はカスタム実装でエラーを作成するためのファクトリメソッドを提供しています。
@@ -157,6 +178,7 @@ match StorageFactory::open(StorageConfig::File {
 | `LaurusError::other(msg)` | `Other` バリアント |
 | `LaurusError::cancelled(msg)` | `OperationCancelled` バリアント |
 | `LaurusError::invalid_argument(msg)` | `InvalidArgument` バリアント |
+| `LaurusError::writes_stopped(msg)` | `WritesStopped` バリアント |
 | `LaurusError::invalid_config(msg)` | "Invalid configuration" プレフィックス付き `Other` |
 | `LaurusError::not_found(msg)` | "Not found" プレフィックス付き `Other` |
 | `LaurusError::timeout(msg)` | "Timeout" プレフィックス付き `Other` |

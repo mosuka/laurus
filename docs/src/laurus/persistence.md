@@ -26,7 +26,7 @@ sequenceDiagram
 
 ### Key Principles
 
-1. **WAL-first**: Every write (add or delete) is appended to the WAL before updating in-memory structures
+1. **WAL-first**: Every write (add or delete) is appended to the WAL before updating in-memory structures. Everything that can reject a write runs before that append (embedding and validating its vector fields, creating the writers, analyzing its lexical fields, flushing a full lexical buffer), and a failure after it stops writes until the index is reopened (see [Failed Writes](#failed-writes))
 2. **Buffered writes**: In-memory buffers accumulate changes until `commit()` is called
 3. **Atomic commit**: `commit()` flushes all buffered changes to segment files and truncates the WAL
 4. **Commit-scoped visibility**: a lexical segment is written as soon as the writer's buffer fills, which can happen long before `commit()`, so the segment files existing on storage is not what makes its documents searchable. Publication is a manifest entry that only `commit()` adds, and segment discovery reads only the manifest — so "documents become searchable only after `commit()`" holds regardless of when a searcher happens to be built. Deletions are published in the same step, after their bitmaps are durable, so a reader that can see a segment can always filter it
@@ -83,7 +83,27 @@ graph TD
 
 Recovery is transparent — you do not need to handle it manually. Note that a post-crash open therefore does commit-scale work (segment flush, index writes), and `Engine::build` returns an error if that commit fails (e.g. the disk is full); reopening after the condition clears is safe, since replay is idempotent and the WAL is only truncated after the commit succeeds.
 
-A `put`/`add` call rejected for a caller-input reason — an unsupported input type for a field's embedder, a vector of the wrong dimension, an unconfigured field — never reaches the WAL (the document's vector fields are embedded and validated before anything is written or deleted), so it leaves no replayable record for a later recovery to retry. An index that an older build already left with such a record still in its WAL replays it once more: recovery logs a warning and discards the record instead of failing to open, since the call that originally wrote it already returned that same error to its caller. A record rejected for any other reason (e.g. a remote embedder temporarily unreachable) still fails recovery and is retried on the next open, as before.
+A `put`/`add` call rejected for a caller-input reason — an unsupported input type for a field's embedder, a vector of the wrong dimension, an unconfigured field — never reaches the WAL (the document's vector fields are embedded and validated before anything is written or deleted), so it leaves no replayable record for a later recovery to retry. The same holds for a document the lexical analyzer rejects and for a flush of a full lexical buffer that fails: both run before the append too. An index that an older build already left with a caller-input record still in its WAL replays it once more: recovery logs a warning and discards the record instead of failing to open, since the call that originally wrote it already returned that same error to its caller. A record rejected for any other reason (e.g. a remote embedder temporarily unreachable, or an analyzer error, which can also be transient) still fails recovery and is retried on the next open, as before.
+
+## Failed Writes
+
+A write that fails returns its error, and what it changed depends on where it failed:
+
+| Where it fails | For example | Outcome |
+| :--- | :--- | :--- |
+| Before its WAL append | A rejected embedding, an analyzer error, a writer that cannot be created, a failed flush of a full lexical buffer | Nothing changed: no WAL record is written, and a `put` keeps the previous version. The engine keeps accepting writes. |
+| At or after its first WAL append | An I/O error writing the WAL record, loading a deletion bitmap, or recording the lexical checkpoint | The engine **stops accepting writes**, and reopening the index applies the write. |
+
+The first WAL append of a `put` is the previous version's delete record, or the document's own record when there is no previous version. From that point the in-memory index may disagree with the WAL, and going on would let a commit persist the disagreement or a later write build on it. Once writes stopped:
+
+- Every `put`, `add`, delete, `commit()` (also from `CommitPolicy::EveryDocs` and `Interval`, which skip their commits instead) and schema change (`add_field`, `delete_field`, `update_field`) fails with `LaurusError::WritesStopped`, whose message names the original failure. `Engine::write_stop_reason()` returns it.
+- Searches and lookups keep working. They may show the failed write half applied, for example a `put`'s previous version already gone from vector results.
+- No commit runs, so the WAL keeps every record since the last commit, and an engine dropped while stopped discards its lexical writer instead of committing it.
+- Reopening the index (for `laurus serve`, restarting it) replays the WAL. The failed write is applied, so a failed `put` replaces its previous version, together with every write acknowledged since the last commit. Fix the cause first (e.g. free disk space): if the replay fails again, the open fails and can be retried.
+
+An append that failed partway through writing its record also makes every later append fail, because recovery stops at the first incomplete record and would lose any record written after it.
+
+With concurrent writers there is one window left: a commit that was already running when a write failed can still truncate that write's record, because commits and checkpoints follow the highest sequence number applied, not the highest below which every record finished ([#1499](https://github.com/mosuka/laurus/issues/1499)). It cannot happen with a single writer, or to anything that starts after the stop.
 
 ## The Commit Lifecycle
 
@@ -156,7 +176,7 @@ engine.commit().await?;            // one commit publishes the whole batch
 Semantics to be aware of:
 
 - **Ordering**: duplicate external IDs within one `put_documents` batch dedup exactly like the same puts issued sequentially — the last occurrence wins. Repeating an ID in `add_documents` legitimately appends multiple chunks.
-- **Fail-fast, no rollback**: the batch stops at the first document that cannot be applied and returns `LaurusError::BatchIngest { failed_index, failed_id, applied, .. }`. The `applied` documents before the failure are **not** rolled back — they stay in the WAL and NRT buffers (resolvable by `_id` immediately, searchable after the next `commit()`, durable at that commit, replayed on crash recovery), and the batch-end WAL flush runs on the error path too. Retrying the batch, or its suffix starting at `failed_index`, is idempotent under put semantics.
+- **Fail-fast, no rollback**: the batch stops at the first document that cannot be applied and returns `LaurusError::BatchIngest { failed_index, failed_id, applied, .. }`. The `applied` documents before the failure are **not** rolled back — they stay in the WAL and NRT buffers (resolvable by `_id` immediately, searchable after the next `commit()`, durable at that commit, replayed on crash recovery), and the batch-end WAL flush runs on the error path too. Retrying the batch, or its suffix starting at `failed_index`, is idempotent under put semantics. The failing document follows the [single-write rules](#failed-writes): rejected before its WAL append, it changed nothing; failing after it, it stopped writes, and `source` holds its own error. Once writes stopped, a batch fails at its first document with `WritesStopped` as `source`.
 - **Durability**: when the call returns `Ok`, every document in the batch is exactly as durable as a successful singular put. A crash mid-call loses at most the un-fsync'd tail; recovery replays the fsync'd prefix per document, and a torn trailing record is dropped by the CRC framing as usual.
 - **Sizing**: the engine clones each document into the WAL as it goes, so batch memory is dominated by the caller's `Vec`. Batches of 1,000-10,000 documents per call are a good default; chunk larger corpora into multiple calls (and commit periodically to bound segment sizes).
 - **Under `Group` policy**: the group thresholds keep firing mid-batch, so that policy's bounded loss window is preserved; the batch-end flush still runs.
