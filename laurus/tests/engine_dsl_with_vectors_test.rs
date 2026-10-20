@@ -1,6 +1,9 @@
 //! Issue #1366: a DSL query set together with a vector query keeps both.
 //! The vectors are added to the DSL's vector part (a lexical-only DSL
 //! becomes a hybrid search) instead of being silently dropped.
+//!
+//! Issue #1495: a DSL vector clause that uses the removed `~` marker fails
+//! with an error that names the marker.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -158,4 +161,22 @@ async fn empty_extra_vectors_match_the_dsl_alone() {
     .await;
     assert_eq!(alone, ["lex_only"]);
     assert_eq!(with_empty, alone);
+}
+
+/// The removed `~` marker on a vector field is an `InvalidArgument` that
+/// names it, not a lexical parse error (Issue #1495).
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_vector_marker_fails_with_an_error_that_names_it() {
+    let engine = engine().await;
+    for dsl in [r#"vec:~"go""#, r#"title:rust vec:~"go""#] {
+        let err = engine
+            .search(SearchRequestBuilder::new().query_dsl(dsl).build())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LaurusError::InvalidArgument(_)),
+            "{dsl}: got {err:?}"
+        );
+        assert!(err.to_string().contains("'~' marker"), "{dsl}: got {err}");
+    }
 }

@@ -41,7 +41,7 @@ use crate::engine::search::{FusionAlgorithm, HybridMode, SearchQuery, SearchRequ
 use crate::error::{LaurusError, Result};
 use crate::lexical::query::parser::LexicalQueryParser;
 use crate::lexical::search::searcher::LexicalSearchQuery;
-use crate::vector::query::parser::VectorQueryParser;
+use crate::vector::query::parser::{VectorQueryParser, removed_marker_error};
 
 /// A character that cannot be part of a DSL field name: both query grammars
 /// define a field name as `[A-Za-z_][A-Za-z0-9_.]*`.
@@ -173,6 +173,10 @@ impl UnifiedQueryParser {
     ///
     /// Returns [`LaurusError::InvalidArgument`] if, after splitting, no valid
     /// lexical or vector clause could be parsed from the input.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if a vector field clause uses
+    /// the removed `~` marker (`content:~"cute kitten"`) or lexical-only
+    /// syntax (proximity/fuzzy `~`, range queries).
     pub async fn parse(&self, query_str: &str) -> Result<SearchRequest> {
         let query_str = query_str.trim();
         if query_str.is_empty() {
@@ -251,8 +255,9 @@ impl UnifiedQueryParser {
     ///
     /// # Errors
     ///
-    /// Returns an error if a vector field clause uses lexical-only syntax
-    /// such as proximity/fuzzy modifiers (`~`) or range queries (`[`/`{`).
+    /// Returns an error if a vector field clause uses the removed `~` marker
+    /// (`content:~"text"`), or lexical-only syntax such as proximity/fuzzy
+    /// modifiers (`~`) or range queries (`[`/`{`).
     ///
     /// # Returns
     ///
@@ -402,9 +407,26 @@ impl UnifiedQueryParser {
     /// descriptive error if found.
     ///
     /// Detects:
+    /// - The removed `~` vector marker: `content:~"text"`, `content:~word`
     /// - Proximity/fuzzy modifiers: `content:"text"~2`, `content:word~`
     /// - Range queries: `content:[A TO Z]`, `content:{100 TO 500}`
     fn check_unsupported_vector_syntax(&self, input: &str, fields_pattern: &str) -> Result<()> {
+        // Removed vector marker: vector_field:~value (Issue #1495). The vector
+        // clause pattern takes no `~` value, so without this check the clause
+        // reaches the lexical parser and fails with an error that does not
+        // name the marker. Most queries have no `:~`, so they skip the regex.
+        if input.contains(":~") {
+            let marker_pattern = format!(
+                r#"(?:^|{boundary})((?:{fields}):~(?:"[^"]*"|[^\s"]*))"#,
+                boundary = NON_FIELD_NAME_CHAR,
+                fields = fields_pattern,
+            );
+            let marker_re = Regex::new(&marker_pattern).unwrap();
+            if let Some(caps) = marker_re.captures(input) {
+                return Err(removed_marker_error(caps.get(1).unwrap().as_str()));
+            }
+        }
+
         // Proximity/fuzzy: vector_field:value~[digits]
         let tilde_pattern = format!(
             r#"(?:^|{boundary})((?:{fields})(?::(?:"[^"]*"|[^\s"^~]+)(?:\^[\d]+(?:\.[\d]+)?)?))(~[\d]*)"#,
@@ -876,6 +898,46 @@ mod tests {
         let vecs = get_vectors(vq);
         assert_eq!(vecs.len(), 1);
         assert_eq!(vecs[0].fields.as_ref().unwrap()[0], "content");
+    }
+
+    // -- Tests for the removed `~` vector marker (Issue #1495) --
+
+    /// `vector_field:~"text"` used to reach the lexical parser and fail with
+    /// `expected field_value`; now the error names the removed marker and the
+    /// clause.
+    #[tokio::test]
+    async fn test_vector_field_with_removed_marker_error() {
+        let parser = make_parser();
+        for query in [
+            r#"content:~"cute kitten""#,
+            "content:~kitten",
+            r#"title:hello +content:~"cute kitten"^0.8"#,
+        ] {
+            let Err(err) = parser.parse(query).await else {
+                panic!("{query}: the removed marker must be rejected");
+            };
+            assert!(
+                matches!(err, LaurusError::InvalidArgument(_)),
+                "{query}: got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("'~' marker"), "{query}: got {msg}");
+            assert!(msg.contains("'content:~"), "{query}: got {msg}");
+        }
+    }
+
+    /// A `~` after whitespace is the lexical fuzzy modifier of the term
+    /// before it, and a quoted vector value may start with `~`: neither is
+    /// the removed marker.
+    #[tokio::test]
+    async fn test_tilde_that_is_not_the_removed_marker_still_parses() {
+        let parser = make_parser();
+        let request = parser.parse("title:rust ~2").await.unwrap();
+        assert_lexical_only(&request);
+
+        let request = parser.parse(r#"content:"~kitten""#).await.unwrap();
+        let vq = assert_vector_only(&request);
+        assert_eq!(get_vectors(vq).len(), 1);
     }
 
     // -- Tests for HybridMode (AND/OR semantics) --

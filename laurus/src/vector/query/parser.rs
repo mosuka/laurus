@@ -102,6 +102,12 @@ impl VectorQueryParser {
     /// Text payloads are embedded into vectors at parse time using the
     /// configured embedder. The resulting `VectorSearchRequest` contains
     /// a `VectorSearchQuery::Vectors` query (not `Payloads`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when the string does not
+    /// parse, when a clause has no field and no default field is set, or when
+    /// a clause uses the removed `~` marker (`content:~"cute kitten"`).
     pub async fn parse(&self, query_str: &str) -> Result<VectorSearchRequest> {
         let pairs = VectorQueryStringParser::parse(Rule::query, query_str).map_err(|e| {
             LaurusError::invalid_argument(format!("Failed to parse vector query: {}", e))
@@ -165,6 +171,7 @@ impl VectorQueryParser {
 
     /// Parse a single vector clause (e.g., `content:"cute kitten"^0.8` or `content:python`).
     fn parse_vector_clause(&self, pair: pest::iterators::Pair<Rule>) -> Result<QueryPayload> {
+        let clause = pair.as_str();
         let mut field_name: Option<String> = None;
         let mut text: Option<String> = None;
         let mut weight: f32 = 1.0;
@@ -188,7 +195,14 @@ impl VectorQueryParser {
                     }
                 }
                 Rule::plain_text => {
-                    text = Some(inner.as_str().to_string());
+                    let value = inner.as_str();
+                    // The grammar reads the removed marker of `field:~"text"`
+                    // as an unquoted value `~`, so reject it here instead of
+                    // embedding it (Issue #1495).
+                    if value.starts_with('~') {
+                        return Err(removed_marker_error(clause));
+                    }
+                    text = Some(value.to_string());
                 }
                 Rule::boost => {
                     // Extract weight from boost → float_value
@@ -229,6 +243,22 @@ impl VectorQueryParser {
             weight,
         ))
     }
+}
+
+/// Build the error for a vector clause that uses the `~` marker
+/// (`content:~"cute kitten"`), which the vector query syntax no longer has
+/// (Issue #1495).
+///
+/// [`VectorQueryParser`] and the unified query parser both return it, so the
+/// old syntax fails with an error that names the marker instead of being read
+/// as different clauses or as a lexical query.
+pub(crate) fn removed_marker_error(clause: &str) -> LaurusError {
+    LaurusError::invalid_argument(format!(
+        "Vector clause '{clause}' uses the '~' marker, which was removed from the \
+         vector query syntax. Write the text right after the field (e.g. \
+         content:\"cute kitten\", not content:~\"cute kitten\"), and quote text \
+         that starts with '~' (e.g. content:\"~text\")."
+    ))
 }
 
 #[cfg(test)]
@@ -430,5 +460,41 @@ mod tests {
 
         let vecs = get_vectors(&request);
         assert_eq!(qv_field(&vecs[0]), "nested.field");
+    }
+
+    /// Assert that `query` fails with the removed `~` marker error.
+    async fn assert_removed_marker_error(parser: &VectorQueryParser, query: &str) {
+        let err = parser.parse(query).await.unwrap_err();
+        assert!(
+            matches!(err, LaurusError::InvalidArgument(_)),
+            "got: {err:?}"
+        );
+        assert!(err.to_string().contains("'~' marker"), "got: {err}");
+    }
+
+    /// `field:~"text"` is the syntax #275 removed. The parser used to fail
+    /// on it with a missing-field error, or, with a default field, embed `~`
+    /// and the text as two clauses (Issue #1495).
+    #[tokio::test]
+    async fn test_removed_tilde_marker_is_rejected() {
+        let parser = VectorQueryParser::new(mock_embedder());
+        assert_removed_marker_error(&parser, r#"text_vec:~"memory safety""#).await;
+
+        let parser = VectorQueryParser::new(mock_embedder()).with_default_field("text_vec");
+        assert_removed_marker_error(&parser, r#"text_vec:~"memory safety""#).await;
+        assert_removed_marker_error(&parser, "content:~python").await;
+        assert_removed_marker_error(&parser, r#"~"memory safety""#).await;
+        assert_removed_marker_error(&parser, r#"content:"cats" image:~"dogs"^0.5"#).await;
+    }
+
+    /// Quoted text may start with `~`: only an unquoted value is the marker.
+    #[tokio::test]
+    async fn test_quoted_text_starting_with_tilde() {
+        let parser = VectorQueryParser::new(mock_embedder());
+        let request = parser.parse(r#"content:"~python""#).await.unwrap();
+
+        let vecs = get_vectors(&request);
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(qv_field(&vecs[0]), "content");
     }
 }
