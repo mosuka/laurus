@@ -8924,7 +8924,6 @@ mod tests {
     /// so it wrote no delete for it, and after a crash the replay of both
     /// records left the id with two versions.
     #[tokio::test]
-    #[ignore = "the reopen restarts WAL sequence numbers at 1, so the replay skips the failed put (#1502)"]
     async fn a_put_failing_after_its_wal_append_stops_writes_until_reopened() {
         use crate::engine::schema::FieldOption;
         use crate::lexical::core::field::TextOption;
@@ -9010,7 +9009,6 @@ mod tests {
     /// the lexical store while applying it in the vector store, and the
     /// document was left without its lexical side.
     #[tokio::test]
-    #[ignore = "the reopen restarts WAL sequence numbers at 1, so the replay skips the failed put (#1502)"]
     async fn an_engine_dropped_while_stopped_does_not_commit_its_lexical_writer() {
         let (engine, storage) = engine_with_a_failing_vector_write().await;
         engine
