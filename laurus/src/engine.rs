@@ -602,10 +602,12 @@ pub struct Engine {
     /// [`LexicalStore::find_doc_ids_by_term`] maintains.
     id_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Guards ingestion against a concurrent [`Self::update_field`] (Issue
-    /// #1079). Ingestion (`index_internal`, `delete_documents`) takes a
-    /// read lock — any number of writers can ingest concurrently — while
-    /// `update_field` takes a write lock, so a schema change never races a
-    /// document that assumes the old field option.
+    /// #1079), [`Self::add_field`] or [`Self::delete_field`] (Issue #1492).
+    /// Ingestion (`index_internal`, `delete_documents`) takes a read lock —
+    /// any number of writers can ingest concurrently — while the schema
+    /// changes take a write lock, so a schema change never races a document
+    /// that assumes the old fields. `add_field` is also called from
+    /// ingestion (`apply_dynamic_schema`), before the read lock is taken.
     ///
     /// A `tokio::sync::RwLock` because the guard must be held across
     /// `await` points (a `parking_lot::RwLock` guard is not `Send` across
@@ -1973,6 +1975,11 @@ impl Engine {
     /// and searches can target it. Existing documents are unaffected (they
     /// simply do not have a value for the new field).
     ///
+    /// Like [`Self::update_field`], this waits for in-flight ingestion and
+    /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
+    /// `schema_change_lock`), so a document is never written against fields
+    /// that changed after it was embedded and analyzed.
+    ///
     /// # Arguments
     ///
     /// * `name` - The field name. Must not collide with an existing field.
@@ -2000,6 +2007,15 @@ impl Engine {
         // and options the field's index would reject.
         schema::validate_field_name(name)?;
         schema::validate_field_option(name, &option)?;
+
+        // Wait for in-flight ingestion and block new ingestion while the
+        // field is registered (Issue #1492), as `update_field` does: a put
+        // holds the read lock from its embedding and analysis to its
+        // writes, and registering the field drops the cached writers it
+        // prepared against. Taken before the duplicate check, so two
+        // `DynamicFieldPolicy::Dynamic` puts adding the same field cannot
+        // both pass it.
+        let _schema_guard = self.schema_change_lock.write().await;
 
         // 1. Check for duplicates.
         {
@@ -2073,6 +2089,11 @@ impl Engine {
     /// If the deleted field appears in [`Schema::default_fields`], it is removed
     /// from that list as well.
     ///
+    /// Like [`Self::update_field`], this waits for in-flight ingestion and
+    /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
+    /// `schema_change_lock`). A put between its embedding and its vector
+    /// write used to find the field gone and fail after its WAL append.
+    ///
     /// # Arguments
     ///
     /// * `name` - The name of the field to delete
@@ -2092,6 +2113,12 @@ impl Engine {
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
     pub async fn delete_field(&self, name: &str) -> Result<Schema> {
+        // Wait for in-flight ingestion and block new ingestion while the
+        // field is removed (Issue #1492), as `update_field` does: a put
+        // between its embedding and its vector write used to find the field
+        // unregistered, and failed after its WAL append.
+        let _schema_guard = self.schema_change_lock.write().await;
+
         // 1. Check that the field exists.
         let option = {
             let schema = self.schema.read();
@@ -8470,6 +8497,101 @@ mod tests {
             FILL as u64 + 1,
             "every buffered document must survive the failed flush"
         );
+    }
+
+    /// An embedder that signals `entered` and then waits for `release`
+    /// before it returns a 2-d vector, so a test can act while a put is
+    /// between its embedding and its writes (Issue #1492).
+    #[derive(Debug, Default)]
+    struct BlockingEmbedder {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for BlockingEmbedder {
+        async fn embed(
+            &self,
+            _input: &crate::embedding::embedder::EmbedInput<'_>,
+        ) -> Result<crate::vector::core::vector::Vector> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(crate::vector::core::vector::Vector::new(vec![1.0, 0.0]))
+        }
+
+        fn supported_input_types(&self) -> Vec<crate::embedding::embedder::EmbedInputType> {
+            vec![crate::embedding::embedder::EmbedInputType::Text]
+        }
+
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #1492: `add_field` and `delete_field` wait for a put that is
+    /// between its embedding and its writes, as `update_field` does (Issue
+    /// #1079), and the put succeeds. Neither took the schema lock, so
+    /// `delete_field` could unregister a vector field in that window: the
+    /// put then failed in `write_prepared` with "unknown vector field",
+    /// after its WAL append and with its previous version deleted.
+    #[tokio::test]
+    async fn schema_changes_wait_for_a_put_between_its_embedding_and_its_writes() {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+        use crate::vector::core::field::FlatOption;
+
+        for change in ["delete_field", "add_field"] {
+            let embedder = Arc::new(BlockingEmbedder::default());
+            let schema = Schema::builder()
+                .add_field("title", FieldOption::Text(TextOption::default()))
+                .add_field("vec", FieldOption::Flat(FlatOption::default().dimension(2)))
+                .build();
+            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+            let engine = Arc::new(
+                Engine::builder(storage, schema)
+                    .embedder(embedder.clone())
+                    .build()
+                    .await
+                    .unwrap(),
+            );
+
+            let doc = Document::builder()
+                .add_text("title", "alpha")
+                .add_text("vec", "alpha")
+                .build();
+            let put = tokio::spawn({
+                let engine = engine.clone();
+                async move { engine.put_document("a", doc).await }
+            });
+            embedder.entered.notified().await;
+
+            let schema_change = tokio::spawn({
+                let engine = engine.clone();
+                async move {
+                    match change {
+                        "delete_field" => engine.delete_field("vec").await,
+                        _ => {
+                            engine
+                                .add_field("body", FieldOption::Text(TextOption::default()))
+                                .await
+                        }
+                    }
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let waited = !schema_change.is_finished();
+
+            embedder.release.notify_one();
+            let put = put.await.unwrap();
+            schema_change.await.unwrap().unwrap();
+            put.unwrap_or_else(|err| panic!("the put must succeed ({change}): {err}"));
+            assert!(waited, "{change} must wait for the put");
+            assert_eq!(titles(&engine, "a").await, ["alpha"], "{change}");
+        }
     }
 
     fn grouping_doc(title: &str, parent: Option<&str>) -> Document {
