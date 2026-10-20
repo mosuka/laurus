@@ -1028,8 +1028,8 @@ impl InvertedIndexWriter {
     /// Flush the buffer to an unpublished segment if it has reached
     /// `max_buffered_docs` or `max_buffer_memory`.
     ///
-    /// A failed flush keeps the documents buffered (see
-    /// [`Self::flush_segment`]), so a later call or the commit flushes them.
+    /// A failed flush keeps the documents buffered (see `flush_segment`), so
+    /// a later call or the commit flushes them.
     ///
     /// # Errors
     ///
@@ -1040,6 +1040,19 @@ impl InvertedIndexWriter {
             self.flush_segment()?;
         }
         Ok(())
+    }
+
+    /// Close the writer without committing it and without any I/O (Issue
+    /// #1492).
+    ///
+    /// Everything since the last commit is discarded: the buffer, the
+    /// deletions, and the segments an automatic flush wrote, whose files no
+    /// manifest lists and the next open sweeps. Dropping the writer then
+    /// commits nothing. The engine abandons its writer when it is dropped
+    /// after it stopped accepting writes, so that the replay of the WAL,
+    /// not this writer's state, decides what the index holds.
+    pub fn abandon(&mut self) {
+        self.closed = true;
     }
 
     /// Add an already analyzed document to the index with a specific document ID.
@@ -2962,6 +2975,10 @@ impl LexicalIndexWriter for InvertedIndexWriter {
 
     fn buffer_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()> {
         InvertedIndexWriter::buffer_analyzed_document(self, doc_id, doc)
+    }
+
+    fn abandon(&mut self) {
+        InvertedIndexWriter::abandon(self)
     }
 
     fn upsert_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()> {

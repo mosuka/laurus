@@ -202,6 +202,18 @@ impl LexicalStore {
             .buffer_analyzed_document(internal_id, doc.0)
     }
 
+    /// Discard the cached writer without committing it (Issue #1492).
+    ///
+    /// Everything buffered since the last commit is dropped, and the
+    /// writer's drop-time commit does not run. The engine calls this when it
+    /// is dropped after it stopped accepting writes, so that only the replay
+    /// of its WAL decides what the index holds.
+    pub(crate) fn abandon_writer(&self) {
+        if let Some(mut writer) = self.writer_cache.lock().take() {
+            writer.abandon();
+        }
+    }
+
     /// Delete a document by internal ID.
     ///
     /// Note: You must call `commit()` to persist the changes.

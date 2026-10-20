@@ -100,12 +100,25 @@ pub enum LaurusError {
     #[error("Incompatible format: {0}")]
     IncompatibleFormat(String),
 
+    /// The engine stopped accepting writes because an earlier write failed
+    /// after its write-ahead-log record was written (Issue #1492).
+    ///
+    /// From that point the in-memory index may disagree with the WAL, so
+    /// every later write, commit and schema change is refused with this
+    /// error until the index is reopened. Reopening replays the WAL, which
+    /// applies the failed write together with every write acknowledged
+    /// since the last commit. Searches and lookups keep working meanwhile.
+    /// The message names the original failure.
+    #[error("Writes stopped: {0}")]
+    WritesStopped(String),
+
     /// A batch ingestion call failed partway through (fail-fast semantics).
     ///
     /// Batch ingestion applies documents sequentially and stops at the first
     /// failure. The `applied` documents that preceded the failure remain in
-    /// the WAL and NRT buffers — they are searchable, become durable at the
-    /// next commit, and are replayed on crash recovery. There is no batch
+    /// the WAL and NRT buffers — they resolve by `_id` at once, are
+    /// searchable and durable after the next commit, and are replayed on
+    /// crash recovery. There is no batch
     /// rollback; retrying the batch (or its suffix starting at
     /// `failed_index`) is idempotent under put semantics. With fail-fast
     /// sequential processing `applied == failed_index` always holds; both are
@@ -197,6 +210,16 @@ impl LaurusError {
     /// - `msg` - A descriptive message about the storage error.
     pub fn storage<S: Into<String>>(msg: S) -> Self {
         LaurusError::Storage(msg.into())
+    }
+
+    /// Creates a [`WritesStopped`](Self::WritesStopped) variant with the
+    /// given message.
+    ///
+    /// # Parameters
+    ///
+    /// - `msg` - Why the engine stopped accepting writes.
+    pub fn writes_stopped<S: Into<String>>(msg: S) -> Self {
+        LaurusError::WritesStopped(msg.into())
     }
 
     /// Creates a [`Field`](Self::Field) variant with the given message.

@@ -51,7 +51,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
@@ -338,6 +338,14 @@ pub struct DocumentLog {
     /// whole batch via [`Self::flush_wal`]. [`WalSyncPolicy::Group`] thresholds
     /// are unaffected (its loss-window contract is preserved mid-batch).
     sync_deferral_depth: AtomicUsize,
+    /// Set when writing an appended record to the WAL file failed partway
+    /// (Issue #1492). The file may then end in a partial frame, and
+    /// [`Self::read_all`] stops at the first bad record, so a record
+    /// appended after it would be lost on the next open although its append
+    /// returned `Ok`. Once set, every append fails, until the log is opened
+    /// again. Set under the WAL writer lock, so no append can slip in
+    /// between the failure and the flag.
+    torn: AtomicBool,
 }
 
 impl DocumentLog {
@@ -420,6 +428,7 @@ impl DocumentLog {
             doc_store: RwLock::new(doc_store),
             sync_policy,
             sync_deferral_depth: AtomicUsize::new(0),
+            torn: AtomicBool::new(false),
         })
     }
 
@@ -460,7 +469,18 @@ impl DocumentLog {
     /// header; an existing file keeps whatever framing it already has (v3/v2 by
     /// header version, else legacy) so the formats are never mixed within one
     /// file.
+    ///
+    /// Only the append paths call this, before they assign an id and a
+    /// sequence number, so it is also where an append is refused once an
+    /// earlier one left a partial frame (see [`Self::torn`]).
     fn ensure_writer(&self, writer_guard: &mut Option<WalWriterState>) -> Result<()> {
+        if self.torn.load(Ordering::Acquire) {
+            return Err(crate::error::LaurusError::storage(format!(
+                "WAL '{}' may end in a partially written record, so nothing more can be \
+                 appended to it until it is opened again",
+                self.wal_path
+            )));
+        }
         if writer_guard.is_some() {
             return Ok(());
         }
@@ -531,7 +551,7 @@ impl DocumentLog {
             },
         };
 
-        self.write_record(&mut writer_guard, &record)?;
+        self.write_record(&mut writer_guard, &record, Some(&self.torn))?;
 
         Ok((doc_id, seq))
     }
@@ -556,7 +576,7 @@ impl DocumentLog {
             },
         };
 
-        self.write_record(&mut writer_guard, &record)?;
+        self.write_record(&mut writer_guard, &record, Some(&self.torn))?;
 
         Ok(seq)
     }
@@ -627,9 +647,14 @@ impl DocumentLog {
     /// [`WalFormat`]. Durability is the caller's responsibility via
     /// [`Self::flush_writer`] — this split lets the group-commit path amortize
     /// one fsync over many appended records (#542). A no-op if no writer is open.
+    ///
+    /// `torn`, when given, is set if writing the frame fails after it may
+    /// have written part of it (see [`Self::torn`]); a failure to encode the
+    /// record writes nothing and leaves it unset.
     fn append_record_bytes<T: WalEncodable>(
         state: &mut Option<WalWriterState>,
         record: &T,
+        torn: Option<&AtomicBool>,
     ) -> Result<()> {
         let Some(state) = state.as_mut() else {
             return Ok(());
@@ -646,16 +671,25 @@ impl DocumentLog {
 
         // Frame size: length prefix (+ CRC for v2/v3) + payload.
         let mut frame_len = len_bytes.len() + bytes.len();
-        state.out.write_all(&len_bytes)?;
-        if state.format.has_crc() {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&len_bytes);
-            hasher.update(&bytes);
-            let crc = hasher.finalize().to_le_bytes();
-            state.out.write_all(&crc)?;
-            frame_len += crc.len();
+        let written = (|| -> Result<()> {
+            state.out.write_all(&len_bytes)?;
+            if state.format.has_crc() {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&len_bytes);
+                hasher.update(&bytes);
+                let crc = hasher.finalize().to_le_bytes();
+                state.out.write_all(&crc)?;
+                frame_len += crc.len();
+            }
+            state.out.write_all(&bytes)?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            if let Some(torn) = torn {
+                torn.store(true, Ordering::Release);
+            }
+            return Err(e);
         }
-        state.out.write_all(&bytes)?;
         // Bytes are now buffered/written but not yet fsynced. Track how much
         // is pending so a Group policy can flush once its batch threshold is
         // reached.
@@ -702,12 +736,17 @@ impl DocumentLog {
     /// Group policy's bounded loss window holds even mid-batch;
     /// [`Self::flush_wal`] (called at commit) forces any trailing partial
     /// batch durable.
+    ///
+    /// `torn` is passed to [`Self::append_record_bytes`]: the append paths
+    /// pass [`Self::torn`], so a partial frame in the live WAL stops further
+    /// appends.
     fn write_record<T: WalEncodable>(
         &self,
         state: &mut Option<WalWriterState>,
         record: &T,
+        torn: Option<&AtomicBool>,
     ) -> Result<()> {
-        Self::append_record_bytes(state, record)?;
+        Self::append_record_bytes(state, record, torn)?;
         let flush_now = match self.sync_policy {
             WalSyncPolicy::PerRecord => self.sync_deferral_depth.load(Ordering::Acquire) == 0,
             group @ WalSyncPolicy::Group { .. } => Self::batch_ready(state, group),
@@ -1066,8 +1105,9 @@ impl DocumentLog {
         // sync once after the whole tail is written instead.
         {
             let _deferral = self.defer_sync();
+            // No `torn` flag: a failure here leaves the live WAL untouched.
             for record in &retained {
-                self.write_record(&mut tmp_state, record)?;
+                self.write_record(&mut tmp_state, record, None)?;
             }
         }
         if let Some(state) = tmp_state.as_mut() {
@@ -1490,7 +1530,7 @@ mod tests {
         {
             let mut guard = log.wal_writer.lock();
             log.ensure_writer(&mut guard).unwrap();
-            DocumentLog::append_record_bytes(&mut guard, &record).unwrap();
+            DocumentLog::append_record_bytes(&mut guard, &record, None).unwrap();
             assert!(
                 guard.as_ref().unwrap().dirty,
                 "appended-but-unsynced bytes mark the writer dirty"
@@ -2407,6 +2447,97 @@ mod tests {
         assert_eq!(
             log.get_document(1).unwrap().unwrap().fields.get("body"),
             Some(&DataValue::Text("after".to_string()))
+        );
+    }
+
+    /// An output that writes only the first `budget` bytes of the next
+    /// `write` and fails it, then passes every later write through: one
+    /// append torn partway (Issue #1492).
+    #[derive(Debug)]
+    struct TornOutput {
+        inner: Box<dyn crate::storage::StorageOutput>,
+        budget: Option<usize>,
+    }
+
+    impl std::io::Write for TornOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.budget.take() {
+                Some(budget) => {
+                    self.inner.write_all(&buf[..budget.min(buf.len())])?;
+                    Err(std::io::Error::other("injected torn write"))
+                }
+                None => self.inner.write(buf),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl std::io::Seek for TornOutput {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl crate::storage::StorageOutput for TornOutput {
+        fn flush_and_sync(&mut self) -> Result<()> {
+            self.inner.flush_and_sync()
+        }
+
+        fn position(&self) -> Result<u64> {
+            self.inner.position()
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
+        }
+    }
+
+    /// Issue #1492: an append that wrote only part of its frame makes every
+    /// later append fail. `read_all` stops at the first bad record, so a
+    /// record appended after the partial frame used to be lost on the next
+    /// open although its append returned `Ok`.
+    #[test]
+    fn a_partially_written_record_refuses_later_appends() {
+        let wal_storage = make_storage();
+        let doc_storage = make_storage();
+        let log = DocumentLog::new(wal_storage.clone(), "test.log", doc_storage.clone()).unwrap();
+        let doc = |text: &str| {
+            Document::builder()
+                .add_field("body", DataValue::Text(text.to_string()))
+                .build()
+        };
+        log.append("first", &doc("first")).unwrap();
+
+        // Tear the next append two bytes into its length prefix.
+        {
+            let mut guard = log.wal_writer.lock();
+            let state = guard.as_mut().unwrap();
+            let scratch = wal_storage.create_output("scratch").unwrap();
+            let inner = std::mem::replace(&mut state.out, scratch);
+            state.out = Box::new(TornOutput {
+                inner,
+                budget: Some(2),
+            });
+        }
+        let err = log.append("second", &doc("second")).unwrap_err();
+        assert!(err.to_string().contains("injected torn write"), "{err}");
+
+        // The output works again; the log must refuse anyway.
+        let err = log.append("third", &doc("third")).unwrap_err();
+        assert!(err.to_string().contains("partially written"), "{err}");
+        let err = log.append_delete(1, "first").unwrap_err();
+        assert!(err.to_string().contains("partially written"), "{err}");
+
+        drop(log);
+        let reopened = DocumentLog::new(wal_storage, "test.log", doc_storage).unwrap();
+        let records = reopened.read_all().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "only the record before the partial frame is in the WAL"
         );
     }
 }

@@ -133,6 +133,14 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
     /// of `doc_id` deleted fails.
     fn buffer_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()>;
 
+    /// Close the writer without committing and without touching storage
+    /// (Issue #1492).
+    ///
+    /// Every change since the last commit is discarded, and dropping the
+    /// writer afterwards commits nothing. There is no default: a writer that
+    /// commits on drop must not silently keep doing so.
+    fn abandon(&mut self);
+
     /// Delete a document by ID.
     ///
     /// Removes the document from the in-memory buffer if it is still pending.

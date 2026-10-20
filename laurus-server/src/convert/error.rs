@@ -1,8 +1,8 @@
 //! Error-to-[`tonic::Status`] conversion utilities.
 //!
 //! Maps [`LaurusError`] variants to appropriate gRPC status codes (e.g.
-//! `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `INTERNAL`) and provides a catch-all
-//! converter for [`anyhow::Error`].
+//! `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `UNIMPLEMENTED`, `INTERNAL`)
+//! and provides a catch-all converter for [`anyhow::Error`].
 
 use laurus::LaurusError;
 use tonic::Status;
@@ -28,6 +28,8 @@ fn code_for(err: &LaurusError) -> tonic::Code {
         | LaurusError::SerializationError(_)
         | LaurusError::Json(_) => tonic::Code::InvalidArgument,
         LaurusError::NotImplemented(_) => tonic::Code::Unimplemented,
+        // Retrying cannot succeed until the index is reopened (Issue #1492).
+        LaurusError::WritesStopped(_) => tonic::Code::FailedPrecondition,
         LaurusError::BatchIngest { source, .. } => code_for(source),
         _ => tonic::Code::Internal,
     }
@@ -84,5 +86,27 @@ mod tests {
             source: Box::new(LaurusError::invalid_argument("bad value")),
         };
         assert_eq!(to_status(batch).code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Issue #1492: once the engine stopped accepting writes, a write is
+    /// refused until the index is reopened, directly and inside a batch, so
+    /// it is `FAILED_PRECONDITION` rather than a retryable `INTERNAL`.
+    #[test]
+    fn writes_stopped_is_a_failed_precondition() {
+        let stopped = || LaurusError::writes_stopped("a write failed after reaching the WAL");
+        let status = to_status(stopped());
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "Writes stopped: a write failed after reaching the WAL"
+        );
+
+        let batch = LaurusError::BatchIngest {
+            failed_index: 2,
+            failed_id: "x".into(),
+            applied: 2,
+            source: Box::new(stopped()),
+        };
+        assert_eq!(to_status(batch).code(), tonic::Code::FailedPrecondition);
     }
 }

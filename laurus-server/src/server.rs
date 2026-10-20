@@ -240,7 +240,13 @@ async fn shutdown_signal(
 
     let guard = engine.read().await;
     if let Some(engine) = guard.as_ref() {
-        if let Err(e) = engine.commit().await {
+        if let Some(reason) = engine.write_stop_reason() {
+            // The engine refuses commits once writes stopped (Issue #1492);
+            // its write-ahead log keeps every pending change for the replay.
+            tracing::warn!(
+                "Not committing on shutdown, writes are stopped: {reason}. The write-ahead log is replayed on the next start."
+            );
+        } else if let Err(e) = engine.commit().await {
             tracing::error!("Failed to commit on shutdown: {e}");
         } else {
             tracing::info!("Committed successfully");
