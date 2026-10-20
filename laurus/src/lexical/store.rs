@@ -7,7 +7,9 @@ pub mod config;
 use std::sync::Arc;
 
 use crate::analysis::analyzer::analyzer::Analyzer;
+use crate::data::DataValue;
 use crate::error::Result;
+use crate::lexical::core::analyzed::AnalyzedDocument;
 use crate::lexical::core::document::Document;
 use crate::lexical::index::LexicalIndex;
 use crate::lexical::index::factory::LexicalIndexFactory;
@@ -79,6 +81,10 @@ pub struct LexicalStore {
     searcher_cache: RwLock<Option<Box<dyn LexicalSearcher>>>,
 }
 
+/// A document [`LexicalStore::prepare_upsert`] analyzed, to be buffered by
+/// [`LexicalStore::apply_prepared_upsert`] (Issue #1492).
+pub(crate) struct PreparedLexicalDocument(AnalyzedDocument);
+
 impl std::fmt::Debug for LexicalStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LexicalStore")
@@ -145,10 +151,55 @@ impl LexicalStore {
     /// Changes are not persisted until you call `commit()`.
     pub fn upsert_document(&self, internal_id: u64, doc: Document) -> Result<()> {
         let mut guard = self.writer_cache.lock();
-        if guard.is_none() {
-            *guard = Some(self.index.writer()?);
-        }
-        guard.as_mut().unwrap().upsert_document(internal_id, doc)
+        self.cached_writer(&mut guard)?
+            .upsert_document(internal_id, doc)
+    }
+
+    /// The first half of [`Self::upsert_document`], for a document whose
+    /// internal ID is not assigned yet (Issue #1492).
+    ///
+    /// Analyzes `fields`, the document's `(field name, value)` pairs, then
+    /// flushes the writer's buffer if it is already full, so that neither the
+    /// analyzer nor the flush can fail once the engine has written the
+    /// document's WAL record. Analysis runs first: a document the analyzer
+    /// rejects causes no flush. Buffers nothing; pass the result to
+    /// [`Self::apply_prepared_upsert`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer, analyzing the document, or
+    /// flushing the buffer fails. A failed flush keeps the documents
+    /// buffered.
+    pub(crate) fn prepare_upsert(
+        &self,
+        fields: &[(&str, &DataValue)],
+    ) -> Result<PreparedLexicalDocument> {
+        let mut guard = self.writer_cache.lock();
+        let writer = self.cached_writer(&mut guard)?;
+        let analyzed = writer.analyze_fields(fields)?;
+        writer.flush_if_full()?;
+        Ok(PreparedLexicalDocument(analyzed))
+    }
+
+    /// The second half of [`Self::upsert_document`]: buffer a document
+    /// [`Self::prepare_upsert`] analyzed under `internal_id`, replacing any
+    /// version of that ID, without flushing (Issue #1492).
+    ///
+    /// A commit between the two halves may have dropped the writer; it is
+    /// created again here, which fails only when the index is closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer or buffering the document
+    /// fails.
+    pub(crate) fn apply_prepared_upsert(
+        &self,
+        internal_id: u64,
+        doc: PreparedLexicalDocument,
+    ) -> Result<()> {
+        let mut guard = self.writer_cache.lock();
+        self.cached_writer(&mut guard)?
+            .buffer_analyzed_document(internal_id, doc.0)
     }
 
     /// Delete a document by internal ID.
@@ -164,10 +215,23 @@ impl LexicalStore {
         // Assuming no delete in doc store for now (compaction handles it).
 
         let mut guard = self.writer_cache.lock();
-        if guard.is_none() {
-            *guard = Some(self.index.writer()?);
+        self.cached_writer(&mut guard)?.delete_document(internal_id)
+    }
+
+    /// The writer cached in `slot` (the content of [`Self::writer_cache`]),
+    /// created first if there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer fails.
+    fn cached_writer<'a>(
+        &self,
+        slot: &'a mut Option<Box<dyn LexicalIndexWriter>>,
+    ) -> Result<&'a mut dyn LexicalIndexWriter> {
+        if slot.is_none() {
+            *slot = Some(self.index.writer()?);
         }
-        guard.as_mut().unwrap().delete_document(internal_id)
+        Ok(slot.as_deref_mut().expect("the writer was created above"))
     }
 
     /// Find all internal document IDs for a given term (field:value).

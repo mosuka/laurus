@@ -1401,6 +1401,14 @@ impl Engine {
         // WAL append deleted the previous version and left a record that
         // every later open replayed into the same error.
         self.vector.ensure_writer().await?;
+        // Analyze the lexical fields here as well, and flush the lexical
+        // writer's buffer if it is full (Issue #1492): an analyzer error or
+        // a failed flush after the WAL append likewise deleted the previous
+        // version, and the record replayed into the same analyzer error on
+        // every later open. Only buffering is left for after the append.
+        let lexical = self
+            .lexical
+            .prepare_upsert(&self.lexical_field_refs(&doc))?;
 
         if !as_chunk {
             self.delete_documents_internal(id).await?;
@@ -1413,14 +1421,13 @@ impl Engine {
         let stored_doc = self.filter_stored_fields(&doc);
         self.log.store_document(doc_id, stored_doc);
 
-        // 5. Index into Lexical and Vector stores. The vector side can no
-        // longer fail here on a rejection it already had the chance to raise
+        // 5. Index into Lexical and Vector stores. Neither side can fail
+        // here any more on a rejection it already had the chance to raise
         // at step 2 (see `VectorStore::write_vectors`'s doc comment), where
-        // its writer was also created; it can still fail on e.g. an I/O
-        // error re-creating a writer a concurrent commit dropped, so the
-        // lexical rollback on failure is kept.
-        self.strip_multi_vector_fields(&mut doc);
-        self.lexical.upsert_document(doc_id, doc)?;
+        // both writers were also created and the lexical document analyzed;
+        // the vector side can still fail on e.g. an I/O error loading a
+        // deletion bitmap, so the lexical rollback on failure is kept.
+        self.lexical.apply_prepared_upsert(doc_id, lexical)?;
         if let Err(e) = self.vector.write_prepared(doc_id, vectors).await {
             // Rollback lexical insert to maintain consistency
             let _ = self.lexical.delete_document_by_internal_id(doc_id);
@@ -2796,21 +2803,25 @@ impl Engine {
         }
     }
 
-    /// Remove multi-vector fields from a document bound for the lexical
-    /// store (Issue #1177).
+    /// Borrowed `(field_name, value)` pairs of `doc`'s fields for the
+    /// lexical store, without its multi-vector fields (Issues #1177,
+    /// #1492). The counterpart of [`Self::vector_field_refs`].
     ///
     /// The lexical store ignores fields it does not know, except when its
     /// field list is empty: it then stores every field, which would copy
     /// each document's token vectors into its stored fields.
-    fn strip_multi_vector_fields(&self, doc: &mut Document) {
+    fn lexical_field_refs<'a>(&self, doc: &'a Document) -> Vec<(&'a str, &'a DataValue)> {
         let schema = self.schema.read();
         doc.fields
-            .retain(|name, _| !Self::is_multi_vector_field(&schema, name));
+            .iter()
+            .filter(|(name, _)| !Self::is_multi_vector_field(&schema, name))
+            .map(|(name, val)| (name.as_str(), val))
+            .collect()
     }
 
     /// A copy of `doc` without its multi-vector fields, for the lexical
-    /// store (see [`Self::strip_multi_vector_fields`]); the token vectors
-    /// are never cloned.
+    /// store (see [`Self::lexical_field_refs`]); the token vectors are
+    /// never cloned.
     fn without_multi_vector_fields(&self, doc: &Document) -> Document {
         let schema = self.schema.read();
         let mut copy = Document::new();
@@ -8161,6 +8172,304 @@ mod tests {
             .await
             .expect("the index must still open");
         assert_eq!(alpha_hits(&reopened).await, 1);
+    }
+
+    /// Which file names a [`FaultStorage`] fails, and on which calls.
+    type FaultRule = fn(&str) -> bool;
+
+    /// A [`Storage`] over `inner` that, while armed, fails `open_input` or
+    /// file creation (`create_output`, `create_temp_output`) for the file
+    /// names a rule accepts, and counts the failures (Issue #1492).
+    ///
+    /// It has no lock manager, so a test can open the index over it again
+    /// after `std::mem::forget`ting the engine. That is how these tests
+    /// crash an engine: forgetting it runs no drop-time commit.
+    #[derive(Debug)]
+    struct FaultStorage {
+        inner: Arc<dyn Storage>,
+        fail_open: parking_lot::Mutex<Option<FaultRule>>,
+        fail_create: parking_lot::Mutex<Option<FaultRule>>,
+        fired: AtomicU64,
+    }
+
+    impl FaultStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(MemoryStorage::new(Default::default())),
+                fail_open: parking_lot::Mutex::new(None),
+                fail_create: parking_lot::Mutex::new(None),
+                fired: AtomicU64::new(0),
+            })
+        }
+
+        /// Fail every file creation of a name `rule` accepts until disarmed.
+        fn fail_create(&self, rule: FaultRule) {
+            *self.fail_create.lock() = Some(rule);
+        }
+
+        fn disarm(&self) {
+            *self.fail_open.lock() = None;
+            *self.fail_create.lock() = None;
+        }
+
+        /// How many calls were failed so far.
+        fn fired(&self) -> u64 {
+            self.fired.load(Ordering::SeqCst)
+        }
+
+        fn check(&self, rule: &parking_lot::Mutex<Option<FaultRule>>, name: &str) -> Result<()> {
+            if rule.lock().is_some_and(|rule| rule(name)) {
+                self.fired.fetch_add(1, Ordering::SeqCst);
+                return Err(LaurusError::storage(format!("injected failure on {name}")));
+            }
+            Ok(())
+        }
+    }
+
+    impl Storage for FaultStorage {
+        fn loading_mode(&self) -> crate::storage::LoadingMode {
+            self.inner.loading_mode()
+        }
+        fn open_input(&self, name: &str) -> Result<Box<dyn crate::storage::StorageInput>> {
+            self.check(&self.fail_open, name)?;
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.check(&self.fail_create, name)?;
+            self.inner.create_output(name)
+        }
+        fn create_output_append(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(
+            &self,
+            prefix: &str,
+        ) -> Result<(String, Box<dyn crate::storage::StorageOutput>)> {
+            self.check(&self.fail_create, prefix)?;
+            self.inner.create_temp_output(prefix)
+        }
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An analyzer that fails on any text containing "boom" and analyzes
+    /// everything else like [`StandardAnalyzer`] (Issue #1492).
+    ///
+    /// It fails with [`LaurusError::Analysis`], the error the Lindera
+    /// tokenizer returns, rather than `InvalidArgument`, which recovery
+    /// would quarantine instead of failing the open.
+    #[derive(Debug)]
+    struct BoomAnalyzer(StandardAnalyzer);
+
+    impl Analyzer for BoomAnalyzer {
+        fn analyze(&self, text: &str) -> Result<crate::analysis::token::TokenStream> {
+            if text.contains("boom") {
+                return Err(LaurusError::analysis(format!("cannot analyze '{text}'")));
+            }
+            self.0.analyze(text)
+        }
+
+        fn name(&self) -> &str {
+            "boom"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An engine over `storage` with one text field, `title`, analyzed by
+    /// [`BoomAnalyzer`].
+    async fn boom_engine(storage: Arc<FaultStorage>) -> Result<Engine> {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+
+        let schema = Schema::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .build();
+        Engine::builder(storage, schema)
+            .analyzer(Arc::new(BoomAnalyzer(StandardAnalyzer::new()?)))
+            .build()
+            .await
+    }
+
+    /// The `title` of every live version of `id`, sorted.
+    async fn titles(engine: &Engine, id: &str) -> Vec<String> {
+        let mut titles: Vec<String> = engine
+            .get_documents(id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|doc| match doc.fields.get("title") {
+                Some(DataValue::Text(title)) => Some(title.clone()),
+                _ => None,
+            })
+            .collect();
+        titles.sort();
+        titles
+    }
+
+    /// Issue #1492: a put whose lexical analysis fails must fail before
+    /// anything durable or destructive happens, as an embedding rejection
+    /// does (Issue #1326): the previous version stays, the WAL gets no
+    /// record, and the index still opens. Analysis used to run only after
+    /// the WAL append, so the put deleted the previous version and left a
+    /// record whose replay failed every later open with the same error.
+    #[tokio::test]
+    async fn put_failing_lexical_analysis_leaves_no_trace() {
+        for commit_first in [true, false] {
+            let storage = FaultStorage::new();
+            let dyn_storage: Arc<dyn Storage> = storage.clone();
+            let engine = boom_engine(storage.clone()).await.unwrap();
+            engine.put_document("a", title_doc("alpha")).await.unwrap();
+            if commit_first {
+                engine.commit().await.unwrap();
+            }
+            let wal_before = wal_bytes(&dyn_storage);
+
+            let err = engine
+                .put_document("a", title_doc("boom"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LaurusError::Analysis(_)), "put: {err}");
+            let err = engine
+                .add_document("a", title_doc("boom"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LaurusError::Analysis(_)), "add: {err}");
+            let err = engine
+                .put_documents(vec![("a".to_string(), title_doc("boom"))])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    LaurusError::BatchIngest { source, .. }
+                        if matches!(**source, LaurusError::Analysis(_))
+                ),
+                "put_documents: {err}"
+            );
+
+            assert_eq!(
+                wal_bytes(&dyn_storage),
+                wal_before,
+                "a document the analyzer rejects must not reach the WAL (commit first: {commit_first})"
+            );
+            assert_eq!(
+                titles(&engine, "a").await,
+                ["alpha"],
+                "the previous version must stay (commit first: {commit_first})"
+            );
+
+            std::mem::forget(engine);
+            let reopened = boom_engine(storage.clone())
+                .await
+                .expect("the index must still open");
+            assert_eq!(titles(&reopened, "a").await, ["alpha"]);
+        }
+    }
+
+    /// Issue #1492: the lexical writer flushes a full buffer before a
+    /// document's WAL record is written, not after the document entered
+    /// the buffer. A failed flush then fails the put before anything
+    /// durable or destructive happens, and keeps the documents buffered, so
+    /// the next put flushes them. The flush used to run
+    /// after the append and after the document was buffered: the put
+    /// failed with its previous version deleted, and the document stayed
+    /// buffered, without its vectors, and in the WAL.
+    #[tokio::test]
+    async fn put_failing_to_flush_the_lexical_buffer_leaves_no_trace() {
+        // One below the writer's default `max_buffered_docs`, which the
+        // engine does not expose.
+        const FILL: usize = crate::lexical::index::inverted::writer::DEFAULT_MAX_BUFFERED_DOCS - 1;
+
+        let storage = FaultStorage::new();
+        let dyn_storage: Arc<dyn Storage> = storage.clone();
+        let engine = boom_engine(storage.clone()).await.unwrap();
+        engine
+            .put_document("keep", title_doc("alpha"))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine
+            .put_documents(
+                (0..FILL)
+                    .map(|i| (format!("fill-{i}"), title_doc("fill")))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        storage.fail_create(|name| name.starts_with("lexical/segment_"));
+        let mut kept = "alpha";
+        let mut failed = None;
+        for title in ["bravo", "charlie", "delta"] {
+            let wal_before = wal_bytes(&dyn_storage);
+            match engine.put_document("keep", title_doc(title)).await {
+                Ok(()) => kept = title,
+                Err(err) => {
+                    failed = Some((title, err, wal_before));
+                    break;
+                }
+            }
+        }
+        let (failed, err, wal_before) = failed.expect("a put must hit the failing flush");
+        assert!(storage.fired() > 0, "the injected failure must fire");
+        assert!(
+            err.to_string().contains("injected failure"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            wal_bytes(&dyn_storage),
+            wal_before,
+            "the put of '{failed}' must not reach the WAL"
+        );
+        assert_eq!(
+            titles(&engine, "keep").await,
+            [kept],
+            "the version before '{failed}' must stay"
+        );
+
+        storage.disarm();
+        engine
+            .put_document("keep", title_doc("echo"))
+            .await
+            .expect("the writer must still accept documents and flush them");
+        assert_eq!(titles(&engine, "keep").await, ["echo"]);
+
+        std::mem::forget(engine);
+        let reopened = boom_engine(storage.clone()).await.unwrap();
+        assert_eq!(titles(&reopened, "keep").await, ["echo"]);
+        assert_eq!(
+            reopened.stats().unwrap().document_count,
+            FILL as u64 + 1,
+            "every buffered document must survive the failed flush"
+        );
     }
 
     fn grouping_doc(title: &str, parent: Option<&str>) -> Document {

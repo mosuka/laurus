@@ -3,6 +3,7 @@
 //! This module defines the `LexicalIndexWriter` trait which all lexical index writer
 //! implementations must follow. The primary implementation is `InvertedIndexWriter`.
 
+use crate::data::DataValue;
 use crate::error::Result;
 use crate::lexical::core::analyzed::AnalyzedDocument;
 use crate::lexical::core::document::Document;
@@ -93,6 +94,44 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Returns an error if the writer is closed.
     fn upsert_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()>;
+
+    /// Analyze a document given as its `(field name, value)` pairs the way
+    /// [`upsert_document()`](Self::upsert_document) would, without buffering
+    /// it (Issue #1492).
+    ///
+    /// Together with [`flush_if_full()`](Self::flush_if_full) and
+    /// [`buffer_analyzed_document()`](Self::buffer_analyzed_document) this
+    /// splits an upsert so that everything that can reject the document runs
+    /// before the caller makes the write durable elsewhere (the engine's
+    /// WAL), and only buffering runs after.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if analyzing a field's value fails.
+    fn analyze_fields(&self, fields: &[(&str, &DataValue)]) -> Result<AnalyzedDocument>;
+
+    /// Flush the in-memory buffer to an unpublished segment if it has reached
+    /// the writer's size or memory threshold, as an upsert does after
+    /// buffering a document (Issue #1492). A failed flush keeps the documents
+    /// buffered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the segment fails.
+    fn flush_if_full(&mut self) -> Result<()>;
+
+    /// Buffer an already analyzed document under `doc_id`, replacing any
+    /// version of `doc_id`, without ever flushing (Issue #1492).
+    ///
+    /// [`upsert_document()`](Self::upsert_document) is
+    /// [`analyze_fields()`](Self::analyze_fields), this method, and
+    /// [`flush_if_full()`](Self::flush_if_full), in that order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer is closed, or if marking a flushed copy
+    /// of `doc_id` deleted fails.
+    fn buffer_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()>;
 
     /// Delete a document by ID.
     ///

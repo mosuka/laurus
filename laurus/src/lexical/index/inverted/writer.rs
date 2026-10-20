@@ -990,15 +990,56 @@ impl InvertedIndexWriter {
         // Analyze the document
         let analyzed_doc = self.analyze_document(doc)?;
 
+        self.buffer_analyzed_document(doc_id, analyzed_doc)?;
+        self.flush_if_full()
+    }
+
+    /// Buffer an already analyzed document under `doc_id`, replacing any
+    /// version of `doc_id` this writer buffered or a flushed segment holds,
+    /// and never flush (Issue #1492).
+    ///
+    /// [`Self::upsert_document`] is this plus the analysis before it and the
+    /// automatic flush after it. Split out so that a caller can analyze and
+    /// flush before it writes the document's WAL record
+    /// ([`Self::analyze_fields`], [`Self::flush_if_full`]) and buffer it
+    /// afterwards, when no rejection may happen any more.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer is closed, or if marking a flushed
+    /// copy of `doc_id` deleted fails.
+    pub fn buffer_analyzed_document(
+        &mut self,
+        doc_id: u64,
+        analyzed_doc: AnalyzedDocument,
+    ) -> Result<()> {
+        self.check_closed()?;
+
         // Upsert: remove any pending document with the same ID before adding.
         // The removed version's postings stay until purged, and
-        // `upsert_analyzed_document` purges them before re-adding this id.
+        // `buffer_analyzed` purges them before re-adding this id.
         self.remove_pending_document(doc_id)?;
         // Upsert: mark persisted occurrences as deleted (flushed segments)
         self.mark_persisted_doc_deleted(doc_id)?;
 
-        // Add the analyzed document with the specified ID
-        self.upsert_analyzed_document(doc_id, analyzed_doc)
+        self.buffer_analyzed(doc_id, analyzed_doc)
+    }
+
+    /// Flush the buffer to an unpublished segment if it has reached
+    /// `max_buffered_docs` or `max_buffer_memory`.
+    ///
+    /// A failed flush keeps the documents buffered (see
+    /// [`Self::flush_segment`]), so a later call or the commit flushes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the segment or opening a reader over it
+    /// fails.
+    pub fn flush_if_full(&mut self) -> Result<()> {
+        if self.should_flush() {
+            self.flush_segment()?;
+        }
+        Ok(())
     }
 
     /// Add an already analyzed document to the index with a specific document ID.
@@ -1007,6 +1048,15 @@ impl InvertedIndexWriter {
         doc_id: u64,
         analyzed_doc: AnalyzedDocument,
     ) -> Result<()> {
+        self.buffer_analyzed(doc_id, analyzed_doc)?;
+        self.flush_if_full()
+    }
+
+    /// Buffer an already analyzed document under `doc_id` without
+    /// replacing anything and without flushing: the body of
+    /// [`Self::upsert_analyzed_document`] and
+    /// [`Self::buffer_analyzed_document`].
+    fn buffer_analyzed(&mut self, doc_id: u64, analyzed_doc: AnalyzedDocument) -> Result<()> {
         self.check_closed()?;
 
         // Checked before anything changes, so a writer that has buffered
@@ -1068,11 +1118,6 @@ impl InvertedIndexWriter {
         self.buffered_docs.push((doc_id, buffered));
         self.buffered_doc_ids.insert(doc_id);
         self.stats.docs_added += 1;
-
-        // Check if we need to flush
-        if self.should_flush() {
-            self.flush_segment()?;
-        }
 
         Ok(())
     }
@@ -1241,13 +1286,37 @@ impl InvertedIndexWriter {
     }
 
     /// Analyze a document into terms.
-    fn analyze_document(&mut self, doc: Document) -> Result<AnalyzedDocument> {
+    fn analyze_document(&self, doc: Document) -> Result<AnalyzedDocument> {
+        self.analyze_fields(
+            doc.fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value)),
+        )
+    }
+
+    /// Analyze a document given as its `(field name, value)` pairs into
+    /// terms, exactly as [`Self::upsert_document`] does, buffering nothing
+    /// (Issue #1492).
+    ///
+    /// Reads only the writer's configuration, so the engine runs it before
+    /// it writes a document's WAL record, and a document the analyzer
+    /// rejects never reaches the WAL. Field names and stored values are
+    /// copied into the result as [`Self::upsert_document`] always did, so
+    /// borrowing the fields costs no extra allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the analyzer fails on a field's value.
+    pub fn analyze_fields<'a>(
+        &self,
+        fields: impl IntoIterator<Item = (&'a str, &'a DataValue)>,
+    ) -> Result<AnalyzedDocument> {
         let mut field_terms = AHashMap::new();
         let mut stored_fields = AHashMap::new();
         let mut point_values = AHashMap::new();
 
         // Process each field in the document
-        for (field_name, val) in &doc.fields {
+        for (field_name, val) in fields {
             // 1. Get field option (Schema-aware)
             // If the field is not in schema, we check if it starts with "_" (internal)
             // Internal fields are indexed/stored by default unless explicitly disabled?
@@ -1282,16 +1351,16 @@ impl InvertedIndexWriter {
                     position_increment_gap_for(option),
                 )?;
                 if !terms.is_empty() {
-                    field_terms.insert(field_name.clone(), terms);
+                    field_terms.insert(field_name.to_string(), terms);
                 }
                 if !points.is_empty() {
-                    point_values.insert(field_name.clone(), points);
+                    point_values.insert(field_name.to_string(), points);
                 }
             }
 
             // Store the field if enabled
             if should_store {
-                stored_fields.insert(field_name.clone(), val.clone());
+                stored_fields.insert(field_name.to_string(), val.clone());
             }
         }
 
@@ -1523,6 +1592,12 @@ impl InvertedIndexWriter {
     }
 
     /// Flush the current segment to disk.
+    ///
+    /// On failure the documents stay buffered (Issue #1492): the buffer is
+    /// reset only once the segment is written and a reader over it opened,
+    /// so a later flush or the commit writes the same documents again under
+    /// a new segment name. The failed attempt's files, which nothing
+    /// publishes, are swept by the next open.
     fn flush_segment(&mut self) -> Result<()> {
         if self.buffered_docs.is_empty() {
             return Ok(());
@@ -2875,6 +2950,18 @@ impl LexicalIndexWriter for InvertedIndexWriter {
 
     fn add_analyzed_document(&mut self, doc: AnalyzedDocument) -> Result<u64> {
         InvertedIndexWriter::add_analyzed_document(self, doc)
+    }
+
+    fn analyze_fields(&self, fields: &[(&str, &DataValue)]) -> Result<AnalyzedDocument> {
+        InvertedIndexWriter::analyze_fields(self, fields.iter().copied())
+    }
+
+    fn flush_if_full(&mut self) -> Result<()> {
+        InvertedIndexWriter::flush_if_full(self)
+    }
+
+    fn buffer_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()> {
+        InvertedIndexWriter::buffer_analyzed_document(self, doc_id, doc)
     }
 
     fn upsert_analyzed_document(&mut self, doc_id: u64, doc: AnalyzedDocument) -> Result<()> {
