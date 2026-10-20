@@ -52,7 +52,7 @@ use pyo3::types::PyDict;
 ///
 /// index = laurus.Index(wal_sync_policy=policy)
 /// ```
-#[pyclass(name = "WalSyncPolicy", skip_from_py_object)]
+#[pyclass(name = "WalSyncPolicy")]
 #[derive(Clone)]
 pub struct PyWalSyncPolicy {
     /// The wrapped Rust durability policy.
@@ -161,7 +161,7 @@ impl PyWalSyncPolicy {
 ///
 /// index = laurus.Index(commit_policy=policy)
 /// ```
-#[pyclass(name = "CommitPolicy", skip_from_py_object)]
+#[pyclass(name = "CommitPolicy")]
 #[derive(Clone)]
 pub struct PyCommitPolicy {
     /// The wrapped Rust auto-commit policy.
