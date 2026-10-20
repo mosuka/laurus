@@ -47,7 +47,10 @@
 //! fails to deserialize. Such a torn trailing record (e.g. from a crash
 //! mid-append) is dropped along with everything after it, and the valid prefix
 //! is recovered so the engine can still open. Recovery never skips a bad record
-//! to continue, which keeps the recovered sequence gap-free and consistent.
+//! to continue, which keeps the recovered sequence gap-free and consistent. It
+//! also cuts the file back to the end of the last valid record, so a record
+//! appended after the open is not written behind the bad one, where the next
+//! recovery would stop before reaching it (Issue #1503).
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -343,7 +346,8 @@ pub struct DocumentLog {
     /// [`Self::read_all`] stops at the first bad record, so a record
     /// appended after it would be lost on the next open although its append
     /// returned `Ok`. Once set, every append fails, until the log is opened
-    /// again. Set under the WAL writer lock, so no append can slip in
+    /// again (its [`Self::read_all`] cuts the partial frame off, Issue
+    /// #1503). Set under the WAL writer lock, so no append can slip in
     /// between the failure and the flag.
     torn: AtomicBool,
 }
@@ -359,7 +363,8 @@ impl DocumentLog {
     /// duplicate document IDs. `read_all` only raises `next_seq` above the
     /// records it finds, so a caller whose stores keep WAL checkpoints must
     /// also call [`advance_seq_past`](Self::advance_seq_past) with the
-    /// highest of them.
+    /// highest of them. `read_all` also cuts a partially written record off
+    /// the end of the WAL, so it must run before the first append.
     ///
     /// Equivalent to [`with_sync_policy`](Self::with_sync_policy) with the
     /// default [`WalSyncPolicy::PerRecord`], where every append is fsync'd before
@@ -398,7 +403,8 @@ impl DocumentLog {
     /// duplicate document IDs. `read_all` only raises `next_seq` above the
     /// records it finds, so a caller whose stores keep WAL checkpoints must
     /// also call [`advance_seq_past`](Self::advance_seq_past) with the
-    /// highest of them.
+    /// highest of them. `read_all` also cuts a partially written record off
+    /// the end of the WAL, so it must run before the first append.
     ///
     /// # Arguments
     ///
@@ -875,12 +881,57 @@ impl DocumentLog {
     /// `next_doc_id` with the committed document store segments. An empty
     /// or missing WAL leaves `next_seq` where it is: raising it above the
     /// stores' checkpoints is [`Self::advance_seq_past`]'s job.
+    ///
+    /// Reading stops at the first record that is incomplete or does not
+    /// verify, as a crash partway through an append leaves it. The file is
+    /// then cut back to the end of the last complete record (Issue #1503),
+    /// so the next append follows that record: appended behind the bytes
+    /// that stopped the reading, a record would be lost on the next open,
+    /// since reading would stop before it again. The cut copies the bytes
+    /// it keeps into a temporary file and renames it over the WAL. It is
+    /// skipped while an append handle is open, since the handle would go on
+    /// writing to the replaced file (under [`WalSyncPolicy::Group`] a
+    /// buffered writer can leave part of a record in the file and the rest
+    /// in its buffer), and for a header naming a version this build does
+    /// not know, whose records a newer build may still read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the WAL, or cutting it back, fails.
     pub fn read_all(&self) -> Result<Vec<LogRecord>> {
+        // Held across the read and the cut, so that no append opens the
+        // file in between.
+        let writer_guard = self.wal_writer.lock();
+        let (records, cut_at) = self.read_wal()?;
+        if let Some(valid_len) = cut_at
+            && writer_guard.is_none()
+        {
+            ::log::warn!(
+                "WAL recovery: cutting '{}' back to {valid_len} bytes, the end of its last \
+                 complete record",
+                self.wal_path
+            );
+            self.cut_wal(valid_len)?;
+        }
+        Ok(records)
+    }
+
+    /// Read every record of the WAL up to the first one that is incomplete
+    /// or does not verify, and update the counters as [`Self::read_all`]
+    /// describes, without cutting the file.
+    ///
+    /// # Returns
+    ///
+    /// The records, and the length to cut the file back to: the end of the
+    /// last complete record (or of the header, or 0 without a complete
+    /// header) when bytes that do not form a complete record follow it and
+    /// the header names a known version, else `None`.
+    fn read_wal(&self) -> Result<(Vec<LogRecord>, Option<u64>)> {
         if !self.wal_storage.file_exists(&self.wal_path) {
             // Even with an empty WAL, sync next_doc_id with doc_store.
             let store_next = self.doc_store.read().next_doc_id();
             self.set_next_doc_id(store_next);
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let size = self.wal_storage.open_input(&self.wal_path)?.size()?;
@@ -899,13 +950,18 @@ impl DocumentLog {
 
         // Skip the file header (magic + version) so the loop starts at the first
         // record; legacy files have no header.
-        let mut position = if has_header {
+        let (mut position, known_version) = if has_header {
             let mut header = [0u8; WAL_HEADER_LEN as usize];
             reader.read_exact(&mut header)?;
-            WAL_HEADER_LEN
+            (
+                WAL_HEADER_LEN,
+                matches!(header[4], WAL_VERSION | WAL_VERSION_V2),
+            )
         } else {
-            0
+            (0, true)
         };
+        // Where the last complete record (or the header) ends.
+        let mut valid_len = position;
 
         while position < size {
             if position + 4 > size {
@@ -985,6 +1041,7 @@ impl DocumentLog {
                 max_doc_id = *doc_id;
             }
             records.push(record);
+            valid_len = position;
         }
 
         // Update counters to continue from the highest values found.
@@ -1001,7 +1058,40 @@ impl DocumentLog {
         let store_next = self.doc_store.read().next_doc_id();
         self.set_next_doc_id(store_next);
 
-        Ok(records)
+        let cut_at = (valid_len < size && known_version).then_some(valid_len);
+        Ok((records, cut_at))
+    }
+
+    /// Cut the WAL back to its first `valid_len` bytes, the end of its last
+    /// complete record (Issue #1503).
+    ///
+    /// Copies those bytes unchanged into a temporary file, so the file
+    /// keeps its framing, and renames it over the WAL, as
+    /// [`Self::truncate_retaining_after`] does: a crash leaves either the
+    /// whole old file or the cut one. Only [`Self::read_all`] calls this,
+    /// holding the writer lock with no append handle open, so the file
+    /// cannot change during the copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the WAL, writing the temporary file, or
+    /// renaming it fails.
+    fn cut_wal(&self, valid_len: u64) -> Result<()> {
+        let (tmp_name, mut tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
+        {
+            // Dropped before the rename: on Windows, a mapping of the file
+            // that is still open (an mmap `FileStorage` input) fails it.
+            let mut input = self.wal_storage.open_input(&self.wal_path)?;
+            std::io::copy(&mut (&mut input).take(valid_len), &mut tmp_out)?;
+        }
+        tmp_out.flush_and_sync()?;
+        tmp_out.close()?;
+
+        self.wal_storage.rename_file(&tmp_name, &self.wal_path)?;
+        // Make the rename durable before an append lands on the cut file.
+        self.wal_storage.sync()?;
+
+        Ok(())
     }
 
     /// Truncate (clear) the WAL.
@@ -1069,10 +1159,13 @@ impl DocumentLog {
         }
 
         // Slow path: a mutation raced this commit. The writer is closed, so the
-        // file is complete. `read_all` only ever advances the id/seq counters
-        // (never regresses them), so replaying it here is safe.
+        // file is complete. `read_wal` only ever advances the id/seq counters
+        // (never regresses them), so replaying it here is safe. Not
+        // `read_all`, which takes the writer lock held here: there is
+        // nothing to cut first, since the rename below replaces the file.
         let retained: Vec<LogRecord> = self
-            .read_all()?
+            .read_wal()?
+            .0
             .into_iter()
             .filter(|record| record.seq > retain_after_seq)
             .collect();
@@ -2539,5 +2632,163 @@ mod tests {
             1,
             "only the record before the partial frame is in the WAL"
         );
+    }
+
+    /// A log over the WAL `test.log` in `wal_storage`, as an open after a
+    /// crash sees it, with a fresh document store.
+    fn reopen(wal_storage: &Arc<dyn Storage>) -> DocumentLog {
+        DocumentLog::new(wal_storage.clone(), "test.log", make_storage()).unwrap()
+    }
+
+    /// The bytes of the WAL `test.log`.
+    fn wal_file(wal_storage: &Arc<dyn Storage>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        wal_storage
+            .open_input("test.log")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// Replace the WAL `test.log` with `bytes`.
+    fn write_wal_file(wal_storage: &Arc<dyn Storage>, bytes: &[u8]) {
+        let mut out = wal_storage.create_output("test.log").unwrap();
+        out.write_all(bytes).unwrap();
+        out.flush_and_sync().unwrap();
+        out.close().unwrap();
+    }
+
+    /// Drop the last 3 bytes of the WAL `test.log`, as a crash partway
+    /// through writing its last record would.
+    fn tear_last_record(wal_storage: &Arc<dyn Storage>) {
+        let bytes = wal_file(wal_storage);
+        write_wal_file(wal_storage, &bytes[..bytes.len() - 3]);
+    }
+
+    /// Issue #1503: `read_all` cuts a WAL that ends in a partially written
+    /// record back to its last complete record, so a record appended after
+    /// it survives the next open. Appended behind the partial frame, it was
+    /// lost: the next `read_all` stopped at the partial frame again.
+    #[test]
+    fn an_append_after_a_partial_frame_survives_a_reopen() {
+        let wal_storage = make_storage();
+        let log = reopen(&wal_storage);
+        append_named(&log, "a");
+        let complete_len = wal_storage.file_size("test.log").unwrap();
+        append_named(&log, "b");
+        drop(log);
+        tear_last_record(&wal_storage);
+
+        let log = reopen(&wal_storage);
+        assert_eq!(surviving_ids(&log), vec!["a"]);
+        assert_eq!(
+            wal_storage.file_size("test.log").unwrap(),
+            complete_len,
+            "the WAL ends where the record of `a` ends"
+        );
+        append_named(&log, "c");
+        drop(log);
+
+        assert_eq!(surviving_ids(&reopen(&wal_storage)), vec!["a", "c"]);
+    }
+
+    /// Issue #1503: the same with no complete record before the partial
+    /// one, as a crash during the first append after a commit emptied the
+    /// WAL leaves it: `read_all` keeps only the header.
+    #[test]
+    fn an_append_after_a_lone_partial_frame_survives_a_reopen() {
+        let wal_storage = make_storage();
+        let log = reopen(&wal_storage);
+        append_named(&log, "a");
+        drop(log);
+        tear_last_record(&wal_storage);
+
+        let log = reopen(&wal_storage);
+        assert!(surviving_ids(&log).is_empty());
+        assert_eq!(
+            wal_file(&wal_storage),
+            [&WAL_MAGIC[..], &[WAL_VERSION]].concat()
+        );
+        append_named(&log, "b");
+        drop(log);
+
+        assert_eq!(surviving_ids(&reopen(&wal_storage)), vec!["b"]);
+    }
+
+    /// Issue #1503: a crash while the first append after a commit wrote the
+    /// file header leaves only part of it. `read_all` empties the file, so
+    /// the next append writes a whole header first. Kept, the partial
+    /// header made the file read as a header-less legacy WAL that the
+    /// append's record could not be read back from.
+    #[test]
+    fn an_append_after_a_partial_header_survives_a_reopen() {
+        let wal_storage = make_storage();
+        write_wal_file(&wal_storage, &WAL_MAGIC[..3]);
+
+        let log = reopen(&wal_storage);
+        assert!(surviving_ids(&log).is_empty());
+        assert_eq!(wal_storage.file_size("test.log").unwrap(), 0);
+        append_named(&log, "a");
+        drop(log);
+
+        assert_eq!(surviving_ids(&reopen(&wal_storage)), vec!["a"]);
+    }
+
+    /// Issue #1503: a WAL whose header names a version this build does not
+    /// know may hold records a newer build can read, so `read_all` leaves
+    /// it as it is instead of cutting every record it cannot read.
+    #[test]
+    fn read_all_leaves_a_wal_of_an_unknown_version_as_it_is() {
+        let wal_storage = make_storage();
+        let mut bytes = WAL_MAGIC.to_vec();
+        bytes.push(WAL_VERSION + 1);
+        bytes.extend_from_slice(&frame_v2(b"a record this build cannot decode"));
+        write_wal_file(&wal_storage, &bytes);
+
+        assert!(reopen(&wal_storage).read_all().unwrap().is_empty());
+        assert_eq!(wal_file(&wal_storage), bytes);
+    }
+
+    /// Issue #1503: `read_all` does not cut the WAL while an append handle
+    /// is open. Under [`WalSyncPolicy::Group`], a `FileStorage` writer
+    /// writes its buffer out when the buffer fills, which can be partway
+    /// through a record, so the file ends in a partial frame whose rest is
+    /// still in the buffer. A cut would replace the file under the handle,
+    /// and the rest of that record would go to the replaced file.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn read_all_does_not_cut_a_record_an_open_writer_is_still_writing() {
+        use crate::storage::file::{FileStorage, FileStorageConfig};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = FileStorageConfig::new(dir.path());
+        config.buffer_size = 64 * 1024;
+        let wal_storage: Arc<dyn Storage> = Arc::new(FileStorage::new(dir.path(), config).unwrap());
+        let log = DocumentLog::with_sync_policy(
+            wal_storage.clone(),
+            "test.log",
+            make_storage(),
+            WalSyncPolicy::group_with_defaults(),
+        )
+        .unwrap();
+        // 40 KiB each: the second record does not fit in the buffer after
+        // the first, so the writer writes the buffer out after its length
+        // prefix and CRC, and keeps its payload.
+        let big = Document::builder()
+            .add_field("body", DataValue::Text("x".repeat(40 * 1024)))
+            .build();
+        log.append("a", &big).unwrap();
+        log.append("b", &big).unwrap();
+        assert_eq!(
+            log.read_all().unwrap().len(),
+            1,
+            "precondition: the file ends partway through the record of `b`"
+        );
+        log.flush_wal().unwrap();
+        drop(log);
+
+        let reopened = DocumentLog::new(wal_storage, "test.log", make_storage()).unwrap();
+        assert_eq!(surviving_ids(&reopened), vec!["a", "b"]);
     }
 }

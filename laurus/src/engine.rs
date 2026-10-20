@@ -1064,6 +1064,10 @@ impl Engine {
         self.log.advance_seq_past(seq_floor);
 
         // read_all() internally syncs next_doc_id with doc_store segments.
+        // It also cuts a partially written record off the end of the WAL
+        // (Issue #1503), so the next append follows the last complete
+        // record even when nothing below is applied and no commit rewrites
+        // the WAL.
         let records = self.log.read_all()?;
 
         if records.is_empty() {
@@ -8213,6 +8217,105 @@ mod tests {
         reopened.commit().await.unwrap();
         assert_eq!(reopened.stats().unwrap().commit_generation, 2);
         assert_eq!(wal_bytes(&storage), 0);
+    }
+
+    /// Drops the last 3 bytes of the WAL, as a crash partway through
+    /// writing its last record would.
+    fn tear_last_wal_record(storage: &Arc<dyn Storage>) {
+        use std::io::{Read as _, Write as _};
+        let mut wal = Vec::new();
+        storage
+            .open_input("engine.wal")
+            .unwrap()
+            .read_to_end(&mut wal)
+            .unwrap();
+        let mut out = storage.create_output("engine.wal").unwrap();
+        out.write_all(&wal[..wal.len() - 3]).unwrap();
+        out.flush_and_sync().unwrap();
+        out.close().unwrap();
+    }
+
+    /// Issue #1503: a put made after reopening over a WAL that holds only a
+    /// partially written record must survive a crash. Recovery found no
+    /// complete record, so it did not commit, and the put was appended
+    /// behind the partial frame, where the next recovery stopped before
+    /// reaching it.
+    #[tokio::test]
+    async fn put_after_reopening_over_a_lone_partial_record_survives_a_crash() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.commit().await.unwrap();
+        // The first record after the commit emptied the WAL.
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        // Crash partway through writing it.
+        std::mem::forget(engine);
+        tear_last_wal_record(&storage);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        assert!(title_hits(&engine, "beta").await.is_empty());
+        engine.put_document("c", title_doc("gamma")).await.unwrap();
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(reopened.get_documents("c").await.unwrap().len(), 1);
+        assert_eq!(title_hits(&reopened, "gamma").await, vec!["c"]);
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+    }
+
+    /// Issue #1503: the same when every complete record before the partial
+    /// one is a `Delete` both stores' checkpoints cover, which recovery
+    /// skips without committing. A crash between a commit's store commits
+    /// and its WAL truncate leaves such records. A vector field is needed:
+    /// without one, the vector checkpoint stays 0 and covers nothing.
+    #[tokio::test]
+    async fn put_after_reopening_over_covered_deletes_and_a_partial_record_survives_a_crash() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine
+            .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine.delete_documents("a").await.unwrap();
+        let delete_seq = engine.log.last_seq();
+        // The store commits of a commit that crashes before its truncate.
+        engine.lexical.commit().unwrap();
+        engine.vector.commit().await.unwrap();
+        assert!(engine.lexical.last_wal_seq() >= delete_seq);
+        assert!(engine.vector.last_wal_seq() >= delete_seq);
+        engine
+            .put_document("c", vector_doc("gamma", "vec", [0.0, 0.0, 1.0]))
+            .await
+            .unwrap();
+        // Crash partway through writing the record of "c".
+        std::mem::forget(engine);
+        tear_last_wal_record(&storage);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        assert!(
+            wal_bytes(&storage) > 0,
+            "precondition: recovery did not commit, so the delete is still in the WAL"
+        );
+        engine
+            .put_document("d", vector_doc("delta", "vec", [0.0, 0.0, 1.0]))
+            .await
+            .unwrap();
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(title_hits(&reopened, "delta").await, vec!["d"]);
+        assert_eq!(nearest_id(&reopened, [0.0, 0.0, 1.0]).await, vec!["d"]);
+        assert!(reopened.get_documents("a").await.unwrap().is_empty());
+        assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
     }
 
     /// Delays the first `file_exists` of the WAL (`engine.wal`), the first

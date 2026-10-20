@@ -83,6 +83,8 @@ graph TD
 
 Recovery is transparent — you do not need to handle it manually. Note that a post-crash open therefore does commit-scale work (segment flush, index writes), and `Engine::build` returns an error if that commit fails (e.g. the disk is full); reopening after the condition clears is safe, since replay is idempotent and the WAL is only truncated after the commit succeeds.
 
+A crash in the middle of an append can leave the WAL ending in an incomplete record. Recovery replays the records before it and, before anything new is appended, cuts the file back to the end of the last complete record: a write made after the reopen is then not stored behind the incomplete record, where the next recovery would stop before reaching it. Recovery stops at the first record it cannot read in full or whose CRC does not match, and never skips a bad record to replay the ones after it, so the cut drops everything from that record on.
+
 A `put`/`add` call rejected for a caller-input reason — an unsupported input type for a field's embedder, a vector of the wrong dimension, an unconfigured field — never reaches the WAL (the document's vector fields are embedded and validated before anything is written or deleted), so it leaves no replayable record for a later recovery to retry. The same holds for a document the lexical analyzer rejects and for a flush of a full lexical buffer that fails: both run before the append too. An index that an older build already left with a caller-input record still in its WAL replays it once more: recovery logs a warning and discards the record instead of failing to open, since the call that originally wrote it already returned that same error to its caller. A record rejected for any other reason (e.g. a remote embedder temporarily unreachable, or an analyzer error, which can also be transient) still fails recovery and is retried on the next open, as before.
 
 ## Failed Writes
@@ -101,7 +103,7 @@ The first WAL append of a `put` is the previous version's delete record, or the 
 - No commit runs, so the WAL keeps every record since the last commit, and an engine dropped while stopped discards its lexical writer instead of committing it.
 - Reopening the index (for `laurus serve`, restarting it) replays the WAL. The failed write is applied, so a failed `put` replaces its previous version, together with every write acknowledged since the last commit. Fix the cause first (e.g. free disk space): if the replay fails again, the open fails and can be retried.
 
-An append that failed partway through writing its record also makes every later append fail, because recovery stops at the first incomplete record and would lose any record written after it.
+An append that failed partway through writing its record also makes every later append fail, because recovery stops at the first incomplete record and would lose any record written after it. Reopening the index cuts the incomplete record off (see [Recovery](#recovery)), and appends work again.
 
 With concurrent writers there is one window left: a commit that was already running when a write failed can still truncate that write's record, because commits and checkpoints follow the highest sequence number applied, not the highest below which every record finished ([#1499](https://github.com/mosuka/laurus/issues/1499)). It cannot happen with a single writer, or to anything that starts after the stop.
 
