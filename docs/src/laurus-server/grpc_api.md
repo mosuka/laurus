@@ -7,7 +7,7 @@ All services are defined under the `laurus.v1` protobuf package.
 | Service | RPCs | Description |
 | :--- | :--- | :--- |
 | `HealthService` | `Check` | Health checking |
-| `IndexService` | `CreateIndex`, `GetIndex`, `GetSchema`, `AddField`, `DeleteField` | Index lifecycle and schema |
+| `IndexService` | `CreateIndex`, `GetIndex`, `GetSchema`, `AddField`, `DeleteField`, `UpdateField` | Index lifecycle and schema |
 | `DocumentService` | `PutDocument`, `AddDocument`, `PutDocuments`, `AddDocuments`, `GetDocuments`, `DeleteDocuments`, `Commit`, `FlushWal` | Document CRUD, bulk ingestion, commit, and WAL flush |
 | `SearchService` | `Search`, `SearchStream` | Unary and streaming search |
 
@@ -222,6 +222,42 @@ Existing indexed data for the field remains in storage but becomes
 inaccessible. Per-field analyzers and embedders are unregistered.
 
 **HTTP gateway:** `DELETE /v1/schema/fields/{name}`
+
+### `UpdateField`
+
+Change an existing field's type or options on the running index.
+
+```protobuf
+rpc UpdateField(UpdateFieldRequest) returns (UpdateFieldResponse);
+```
+
+**Request fields:**
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `name` | `string` | The field to change; it must already exist |
+| `field_option` | `FieldOption` | The field's new configuration. It replaces the whole option: a value left unset is not taken from the field's current option (see **Graph and cluster parameters** under [`CreateIndex`](#createindex) for what an unset value becomes) |
+| `reindex` | `bool` | Must be `true` to apply a `REINDEX` or `DESTRUCTIVE` change; ignored for a `METADATA_ONLY` change |
+| `dry_run` | `bool` | When `true`, classify the change and return the classification without applying anything |
+
+**Response fields:**
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `classification` | `FieldChangeKind` | How the change was classified |
+| `schema` | `Schema` | The schema after the change; unchanged when `dry_run` is `true` |
+
+`FieldChangeKind` is one of:
+
+| Value | Meaning |
+| :--- | :--- |
+| `FIELD_CHANGE_KIND_METADATA_ONLY` | No existing data is affected, and the change is always applied (e.g. an HNSW field's `default_ef_search`) |
+| `FIELD_CHANGE_KIND_REINDEX` | The field is rebuilt from the data already in the index (e.g. an HNSW field's `m` or `ef_construction`) |
+| `FIELD_CHANGE_KIND_DESTRUCTIVE` | The field's existing data is discarded (e.g. a vector field's `dimension`, `distance` or `embedder`), and the field is added to `Schema.pending_reindex` |
+
+See [Changing a Field](../concepts/schema_and_fields.md#changing-a-field) for the full rules. A `REINDEX` or `DESTRUCTIVE` change sent without `reindex` is rejected as `INVALID_ARGUMENT`, and nothing is applied. The error message names `UpdateFieldOptions`, the library's option that `reindex` sets.
+
+**HTTP gateway:** `PATCH /v1/schema/fields/{name}`
 
 ### `GetSchema`
 

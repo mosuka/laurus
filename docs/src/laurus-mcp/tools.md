@@ -106,7 +106,10 @@ Add a new field to the index.
 }
 ```
 
-Result: `Field 'category' added successfully.`
+Result: `{"fields":["title","category","embedding"],"message":"Field 'category' added successfully."}`
+
+`fields` lists the field names of the schema after the change, in no
+particular order.
 
 ---
 
@@ -130,7 +133,61 @@ unregistered.
 }
 ```
 
-Result: `Field 'category' deleted successfully.`
+Result: `{"fields":["embedding","title"],"message":"Field 'category' deleted successfully."}`
+
+---
+
+## update_field
+
+Change an existing field's type or options. The change is classified as
+`metadata_only` (no existing data is affected; always applied), `reindex`
+(the field is rebuilt from the data already in the index) or `destructive`
+(the field's existing data is discarded); see
+[Changing a Field](../concepts/schema_and_fields.md#changing-a-field) for the
+rules. A `reindex` or `destructive` change is rejected unless `reindex` is
+`true`.
+
+### Parameters
+
+| Name | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `name` | string | Yes | The field to change; it must already exist |
+| `field_option_json` | string | Yes | The field's new configuration as JSON, in the same format as `add_field` |
+| `reindex` | boolean | No | Apply a `reindex` or `destructive` change (default: `false`) |
+| `dry_run` | boolean | No | Classify the change without applying anything (default: `false`) |
+
+`field_option_json` replaces the field's whole option: a key left out gets
+its default value, not the field's current one. For an `Hnsw`, `Flat` or
+`MultiVector` field this includes `dimension`, which defaults to `128`.
+
+### Example
+
+For an `embedding` field created as `{"Hnsw": {"dimension": 384}}`:
+
+```json
+{
+  "name": "embedding",
+  "field_option_json": "{\"Hnsw\": {\"dimension\": 384, \"m\": 32}}",
+  "dry_run": true
+}
+```
+
+Result: `{"classification":"reindex","fields":["title","embedding"],"message":"Dry run: change to field 'embedding' classified."}`
+
+The same call without `dry_run` is a tool error, because the change needs
+`reindex`:
+
+```text
+Failed to update field: code: 'Client specified an invalid argument', message: "Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"
+```
+
+With `"reindex": true` in place of `"dry_run": true`, the change is applied:
+
+Result: `{"classification":"reindex","fields":["title","embedding"],"message":"Field 'embedding' updated successfully."}`
+
+The result lists the field names, not the schema; call `get_schema` to see
+the field's new option. The error message names `UpdateFieldOptions`, the
+library's option that the `reindex` parameter sets.
 
 ---
 

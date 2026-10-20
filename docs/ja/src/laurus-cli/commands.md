@@ -285,6 +285,20 @@ laurus add docs --file <JSONL> [--batch-size 1000] [--commit-every 0]
 
 繰り返した ID はチャンクとして蓄積されます。途中で失敗した場合、エラーは該当行を示し、適用済みの prefix はコミットされるため、残りの行から再実行してインジェストを継続できます。
 
+### `add field`
+
+既存のインデックスにフィールドを動的に追加します。
+
+```bash
+laurus --index-dir ./my_index add field \
+    --name category \
+    --field-option '{"Text": {"indexed": true, "stored": true}}'
+# Field 'category' added successfully.
+```
+
+`--field-option` 引数はスキーマファイルと同じ外部タグ付き JSON 形式を受け付けます。
+フィールド追加後、スキーマは自動的に永続化されます。
+
 ---
 
 ## `put` — リソースの上書き（Upsert）
@@ -336,21 +350,6 @@ laurus put docs --file docs.jsonl
 
 ---
 
-### `add field`
-
-既存のインデックスにフィールドを動的に追加します。
-
-```bash
-laurus add field --index-dir ./data \
-    --name category \
-    --field-option '{"Text": {"indexed": true, "stored": true}}'
-```
-
-`--field-option` 引数はスキーマファイルと同じ外部タグ付き JSON 形式を受け付けます。
-フィールド追加後、スキーマは自動的に永続化されます。
-
----
-
 ## `delete` — リソースの削除
 
 ### `delete field`
@@ -364,8 +363,8 @@ laurus delete field --name <FIELD_NAME>
 **例:**
 
 ```bash
-laurus delete field --name category
-# Field 'category' deleted.
+laurus --index-dir ./my_index delete field --name category
+# Field 'category' deleted successfully.
 ```
 
 ### `delete docs`
@@ -382,6 +381,74 @@ laurus delete docs --id <ID>
 laurus delete docs --id doc1
 # Documents 'doc1' deleted. Run 'commit' to persist changes.
 ```
+
+---
+
+## `update` — リソースの変更
+
+### `update field`
+
+既存のフィールドの型やオプションを変更します。変更を適用すると、スキーマは自動的に永続化されます。
+
+```bash
+laurus update field --name <NAME> --field-option <JSON> [--reindex] [--dry-run]
+```
+
+**引数:**
+
+| フラグ | 必須 | 説明 |
+| :--- | :--- | :--- |
+| `--name <NAME>` | はい | 変更するフィールド。既に存在している必要があります |
+| `--field-option <JSON>` | はい | フィールドの新しい設定。`add field` と同じ外部タグ付き形式の JSON 文字列 |
+| `--reindex` | いいえ | `Reindex` か `Destructive` の変更を適用します。`MetadataOnly` の変更では無視されます |
+| `--dry-run` | いいえ | 何も適用せずに、変更の分類だけを表示します |
+
+変更は、インデックスに既にあるデータへの影響で分類されます（規則の全体は[フィールドの変更](../concepts/schema_and_fields.md#フィールドの変更)を参照してください）。
+
+| 分類 | フィールドのデータ | 例 | 適用 |
+| :--- | :--- | :--- | :--- |
+| `MetadataOnly` | 変わらない | Hnsw フィールドの `default_ef_search` | 常に適用 |
+| `Reindex` | インデックスにあるデータから作り直す | Hnsw フィールドの `m`・`ef_construction`、Text フィールドの `analyzer` | `--reindex` を付けたときだけ |
+| `Destructive` | 捨てる | ベクトルフィールドの `dimension`・`distance`・`embedder` | `--reindex` を付けたときだけ |
+
+`Destructive` の変更を適用すると、そのフィールドはスキーマの `pending_reindex` にも載ります。`laurus get schema` で表示されるので、ドキュメントを入れ直す必要のあるフィールドを見つけられます。
+
+`--field-option` はフィールドのオプション全体を置き換えます。省略したキーは、フィールドの今の値ではなくデフォルト値になります。Hnsw・Flat・MultiVector のフィールドでは `dimension` も同じで、デフォルトは `128` です。384 次元のフィールドで `dimension` を省略すると `Destructive` の変更になります。
+
+このコマンドは `--format` にかかわらず 1 行だけを出力し、スキーマは出力しません。結果は `laurus get schema` で確認してください。
+
+**例:**
+
+`embedding` フィールドを `{"Hnsw": {"dimension": 384}}` で作ったインデックスの場合:
+
+```bash
+# m を大きくする変更の分類を、適用せずに確かめる
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32}}' --dry-run
+# Dry run: change to field 'embedding' classified as Reindex. Nothing was applied.
+
+# Reindex の変更は --reindex なしでは拒否される
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32}}'
+# Error: Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed
+
+# 適用する。フィールドのグラフは保存されているベクトルから作り直される
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32}}' --reindex
+# Field 'embedding' updated successfully (classified as Reindex).
+
+# MetadataOnly の変更には --reindex が要らない（m を 32 のまま保つため、m も指定する）
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32, "default_ef_search": 100}}'
+# Field 'embedding' updated successfully (classified as MetadataOnly).
+
+# dimension を省略すると 128 に変わる
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"m": 32}}' --dry-run
+# Dry run: change to field 'embedding' classified as Destructive. Nothing was applied.
+```
+
+エラーメッセージはライブラリのオプション `UpdateFieldOptions` を挙げますが、コマンドラインでは `--reindex` を付けてください。
 
 ---
 

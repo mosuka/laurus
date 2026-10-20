@@ -7,7 +7,7 @@
 | サービス | RPC | 説明 |
 | :--- | :--- | :--- |
 | `HealthService` | `Check` | ヘルスチェック |
-| `IndexService` | `CreateIndex`, `GetIndex`, `GetSchema`, `AddField`, `DeleteField` | インデックスのライフサイクルとスキーマ |
+| `IndexService` | `CreateIndex`, `GetIndex`, `GetSchema`, `AddField`, `DeleteField`, `UpdateField` | インデックスのライフサイクルとスキーマ |
 | `DocumentService` | `PutDocument`, `AddDocument`, `PutDocuments`, `AddDocuments`, `GetDocuments`, `DeleteDocuments`, `Commit`, `FlushWal` | ドキュメント CRUD・バルクインジェスト・コミット・WAL flush |
 | `SearchService` | `Search`, `SearchStream` | 単発検索とストリーミング検索 |
 
@@ -212,7 +212,7 @@ rpc AddField(AddFieldRequest) returns (AddFieldResponse);
 
 **HTTP ゲートウェイ:** `POST /v1/schema/fields`
 
-### DeleteField
+### `DeleteField`
 
 稼働中のインデックスからフィールドを動的に削除します。既にインデックスされたデータは残りますが、削除されたフィールドにはアクセスできなくなります。
 
@@ -235,6 +235,42 @@ message DeleteFieldResponse {
 | `name` | `string` | はい | 削除するフィールド名 |
 
 **レスポンス:** 更新後の `Schema` を返します。
+
+### `UpdateField`
+
+稼働中のインデックスで、既存のフィールドの型やオプションを変更します。
+
+```protobuf
+rpc UpdateField(UpdateFieldRequest) returns (UpdateFieldResponse);
+```
+
+**リクエストフィールド:**
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `name` | `string` | 変更するフィールド。既に存在している必要があります |
+| `field_option` | `FieldOption` | フィールドの新しい設定。オプション全体を置き換えるので、設定しなかった値はフィールドの今のオプションから引き継がれません（設定しなかった値がどうなるかは、[`CreateIndex`](#createindex) の「グラフとクラスタのパラメータ」を参照） |
+| `reindex` | `bool` | `REINDEX` か `DESTRUCTIVE` の変更を適用するには `true` が必要。`METADATA_ONLY` の変更では無視されます |
+| `dry_run` | `bool` | `true` のときは、何も適用せずに変更の分類だけを返します |
+
+**レスポンスフィールド:**
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `classification` | `FieldChangeKind` | 変更の分類 |
+| `schema` | `Schema` | 変更後のスキーマ。`dry_run` が `true` のときは変更前のまま |
+
+`FieldChangeKind` の値:
+
+| 値 | 意味 |
+| :--- | :--- |
+| `FIELD_CHANGE_KIND_METADATA_ONLY` | 既存のデータに影響せず、常に適用されます（例: HNSW フィールドの `default_ef_search`） |
+| `FIELD_CHANGE_KIND_REINDEX` | フィールドを、インデックスにあるデータから作り直します（例: HNSW フィールドの `m`・`ef_construction`） |
+| `FIELD_CHANGE_KIND_DESTRUCTIVE` | フィールドの既存のデータを捨て（例: ベクトルフィールドの `dimension`・`distance`・`embedder`）、フィールドを `Schema.pending_reindex` に載せます |
+
+規則の全体は[フィールドの変更](../concepts/schema_and_fields.md#フィールドの変更)を参照してください。`reindex` なしで送った `REINDEX` か `DESTRUCTIVE` の変更は `INVALID_ARGUMENT` で拒否され、何も適用されません。エラーメッセージが挙げる `UpdateFieldOptions` は、`reindex` が設定するライブラリのオプションです。
+
+**HTTP ゲートウェイ:** `PATCH /v1/schema/fields/{name}`
 
 ---
 

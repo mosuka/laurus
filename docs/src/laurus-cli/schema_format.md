@@ -298,7 +298,7 @@ base_weight = 1.0
 
 > **Note:** Unlike Hnsw and Flat, the `dimension` field in Ivf is **required** and has no default value.
 >
-> **Note:** Creating an index, `laurus add field` and `laurus update field` reject a value below the minimum in the tables above for Hnsw, Flat and Ivf (Issue #1479): with `m` below 2 every document write failed, and with `n_probe` 0 every search returned no hits. An index created with such a value before the check still opens, with a warning in the log; fix the field with `laurus update field`.
+> **Note:** Creating an index, `laurus add field` and [`laurus update field`](commands.md#update-field) reject a value below the minimum in the tables above for Hnsw, Flat and Ivf (Issue #1479): with `m` below 2 every document write failed, and with `n_probe` 0 every search returned no hits. An index created with such a value before the check still opens, with a warning in the log; fix the field with `laurus update field`.
 
 **Tuning guidelines:**
 
@@ -391,7 +391,7 @@ subvector_count = 48
 | :--- | :--- | :--- |
 | `subvector_count` | `integer` | Number of subvectors. Must be at least 1 and evenly divide `dimension`. |
 
-Creating an index, `laurus add field` and `laurus update field` reject a
+Creating an index, `laurus add field` and [`laurus update field`](commands.md#update-field) reject a
 `subvector_count` of 0 or one that does not divide `dimension`
 (Issue #1491); before that check, such a field was accepted and a later
 commit failed. An index created with one still opens, with a warning in the log,
@@ -613,7 +613,7 @@ model = "..."  # required for every type except "precomputed"
 
 Hugging Face models are downloaded on first use. `candle_bert` and `candle_clip` cache them under `$HF_HOME` (default `~/.cache/huggingface`); `candle_colbert` uses the Hugging Face default cache, `$HF_HOME/hub` (default `~/.cache/huggingface/hub`), which Python tools share. The vector field's `dimension` must equal the model's output dimension; for `candle_colbert` this is checked when the engine starts.
 
-An embedder must fit the field that names it: a MultiVector field accepts only `"candle_colbert"` or `"precomputed"`, and an Hnsw, Flat or Ivf field does not accept `"candle_colbert"`. Any other combination is rejected by `create index`, `add field` and `update field`.
+An embedder must fit the field that names it: a MultiVector field accepts only `"candle_colbert"` or `"precomputed"`, and an Hnsw, Flat or Ivf field does not accept `"candle_colbert"`. Any other combination is rejected by `create index`, `add field` and [`update field`](commands.md#update-field).
 
 > **Note:** The prebuilt release binaries are built with `--features embeddings-all`. A `laurus` binary installed with `cargo install laurus-cli` or built from source enables none of the embedding features unless you pass them (for example `cargo install laurus-cli --features embeddings-candle`), so only `"precomputed"` works. See [Installation](installation.md) and [Feature Flags](../development/feature_flags.md). A schema that names a type whose feature is missing still parses, but `create index` fails:
 >
@@ -621,7 +621,7 @@ An embedder must fit the field that names it: a MultiVector field accepts only `
 > Error: Not implemented: candle_bert embedder requires the 'embeddings-candle' feature to be enabled
 > ```
 
-A vector field's `embedder` must name an `[embedders.*]` entry. An undeclared name is rejected by `create index`, `add field`, and `update field`, and an existing index whose `schema.toml` holds one fails to open:
+A vector field's `embedder` must name an `[embedders.*]` entry. An undeclared name is rejected by `create index`, `add field`, and [`update field`](commands.md#update-field), and an existing index whose `schema.toml` holds one fails to open:
 
 ```text
 Error: Invalid argument: Unknown embedder 'missing' for field 'vec': not defined in schema.embedders

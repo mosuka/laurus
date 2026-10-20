@@ -296,7 +296,7 @@ base_weight = 1.0
 
 > **注意:** Hnsw および Flat とは異なり、Ivf の `dimension` フィールドは**必須**であり、デフォルト値はありません。
 >
-> **注意:** インデックスの作成、`laurus add field`、`laurus update field` は、Hnsw・Flat・Ivf で上の表の下限を下回る値を拒否します（Issue #1479）。`m` が 2 未満だとすべてのドキュメントの書き込みが失敗し、`n_probe` が 0 だとすべての検索が 0 件になっていました。この検査の前にそうした値で作ったインデックスも、ログに警告を出して開けます。フィールドは `laurus update field` で直してください。
+> **注意:** インデックスの作成、`laurus add field`、[`laurus update field`](commands.md#update-field) は、Hnsw・Flat・Ivf で上の表の下限を下回る値を拒否します（Issue #1479）。`m` が 2 未満だとすべてのドキュメントの書き込みが失敗し、`n_probe` が 0 だとすべての検索が 0 件になっていました。この検査の前にそうした値で作ったインデックスも、ログに警告を出して開けます。フィールドは `laurus update field` で直してください。
 
 **チューニングガイドライン:**
 
@@ -388,7 +388,7 @@ subvector_count = 48
 | :--- | :--- | :--- |
 | `subvector_count` | `integer` | サブベクトルの数。1 以上で、`dimension` を均等に割り切れる必要があります。 |
 
-インデックスの作成、`laurus add field`、`laurus update field` は、
+インデックスの作成、`laurus add field`、[`laurus update field`](commands.md#update-field) は、
 `subvector_count` が 0 のものと `dimension` を割り切らないものを拒否
 します（Issue #1491）。この検査の前は、そうしたフィールドが受け付け
 られ、後の commit が失敗していました。そうした値で作られたインデックス
@@ -609,7 +609,7 @@ model = "..."  # "precomputed" 以外のすべての型で必須
 
 Hugging Face のモデルは初回の使用時にダウンロードされます。`candle_bert` と `candle_clip` は `$HF_HOME`（デフォルトは `~/.cache/huggingface`）にキャッシュします。`candle_colbert` は Hugging Face の標準のキャッシュ `$HF_HOME/hub`（デフォルトは `~/.cache/huggingface/hub`）を使うため、Python のツールとキャッシュを共有できます。ベクトルフィールドの `dimension` は、モデルの出力次元と一致させる必要があります。`candle_colbert` では、エンジンの起動時にこれを検査します。
 
-エンベダーは、それを指定したフィールドに合っている必要があります。MultiVector フィールドに置けるのは `"candle_colbert"` か `"precomputed"` だけで、Hnsw、Flat、Ivf のフィールドには `"candle_colbert"` を置けません。それ以外の組み合わせは、`create index`、`add field`、`update field` で拒否されます。
+エンベダーは、それを指定したフィールドに合っている必要があります。MultiVector フィールドに置けるのは `"candle_colbert"` か `"precomputed"` だけで、Hnsw、Flat、Ivf のフィールドには `"candle_colbert"` を置けません。それ以外の組み合わせは、`create index`、`add field`、[`update field`](commands.md#update-field) で拒否されます。
 
 > **注意:** リリースで配布しているビルド済みバイナリは `--features embeddings-all` 付きでビルドされています。一方、`cargo install laurus-cli` やソースからのビルドでは、feature を指定しない限り（例: `cargo install laurus-cli --features embeddings-candle`）埋め込みの feature がどれも有効にならず、使えるのは `"precomputed"` だけです。[インストール](installation.md) と [Feature Flags](../development/feature_flags.md) を参照してください。feature が無効な型を書いたスキーマも解析は通りますが、`create index` が次のエラーで失敗します:
 >
@@ -617,7 +617,7 @@ Hugging Face のモデルは初回の使用時にダウンロードされます�
 > Error: Not implemented: candle_bert embedder requires the 'embeddings-candle' feature to be enabled
 > ```
 
-ベクトルフィールドの `embedder` には、`[embedders.*]` のエントリの名前を書く必要があります。宣言していない名前は `create index`、`add field`、`update field` で拒否されます。`schema.toml` にそうした名前を含む既存のインデックスは開けません:
+ベクトルフィールドの `embedder` には、`[embedders.*]` のエントリの名前を書く必要があります。宣言していない名前は `create index`、`add field`、[`update field`](commands.md#update-field) で拒否されます。`schema.toml` にそうした名前を含む既存のインデックスは開けません:
 
 ```text
 Error: Invalid argument: Unknown embedder 'missing' for field 'vec': not defined in schema.embedders

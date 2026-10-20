@@ -34,6 +34,7 @@ If `http_port` is not set, only the gRPC server starts.
 | GET | `/v1/schema` | `IndexService/GetSchema` | Get the index schema |
 | POST | `/v1/schema/fields` | `IndexService/AddField` | Dynamically add a field |
 | DELETE | `/v1/schema/fields/{name}` | `IndexService/DeleteField` | Remove a field from the schema |
+| PATCH | `/v1/schema/fields/{name}` | `IndexService/UpdateField` | Change a field's type or options |
 | PUT | `/v1/documents/{id}` | `DocumentService/PutDocument` | Upsert a document |
 | POST | `/v1/documents/{id}` | `DocumentService/AddDocument` | Add a document (chunk) |
 | GET | `/v1/documents/{id}` | `DocumentService/GetDocuments` | Get documents by ID |
@@ -172,6 +173,42 @@ curl -X DELETE http://localhost:8080/v1/schema/fields/category
 ```
 
 Existing indexed data for the field remains in storage but becomes inaccessible. Per-field analyzers and embedders are unregistered.
+
+### Change a Field
+
+Changes an existing field's type or options. The field name is supplied in the path, and the body holds the new option and two flags:
+
+| Key | Required | Description |
+| :--- | :--- | :--- |
+| `field_option` | Yes | The field's new configuration, in the same `FieldOption` JSON shape as `POST /v1/schema/fields`. It replaces the whole option: a key left out is not taken from the field's current option but gets its default (see [Get Schema](#get-schema)), and `dimension`, which has no default, must be given again |
+| `reindex` | No | `true` to apply a `reindex` or `destructive` change (default `false`) |
+| `dry_run` | No | `true` to classify the change without applying anything (default `false`) |
+
+`reindex` and `dry_run` must be JSON booleans. Any other value, such as the string `"true"`, is currently read as `false` without an error, so `"dry_run": "true"` applies the change (Issue #1511).
+
+The response holds the `classification` (`metadata_only`, `reindex` or `destructive`; see [Changing a Field](../concepts/schema_and_fields.md#changing-a-field)) and the schema after the change, which a dry run leaves unchanged. A `destructive` change also adds the field to the schema's `pending_reindex`. For an index whose only field is `embedding`, created as `{"hnsw": {"dimension": 384}}`:
+
+```bash
+# See how a larger m would be classified, without applying it
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "dry_run": true}'
+# => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":16,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
+
+# A reindex change is rejected without "reindex": true
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}}'
+# => {"error":{"code":400,"message":"Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"}}
+
+# Apply it
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "reindex": true}'
+# => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":32,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
+```
+
+The error message names `UpdateFieldOptions`, the library's option that `reindex` sets.
 
 ### Upsert a Document (PUT)
 

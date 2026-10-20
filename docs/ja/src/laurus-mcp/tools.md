@@ -300,6 +300,10 @@ documents: [
 }
 ```
 
+結果: `{"fields":["title","category","embedding"],"message":"Field 'category' added successfully."}`
+
+`fields` は変更後のスキーマのフィールド名で、順序は決まっていません。
+
 ---
 
 ## delete_field
@@ -319,7 +323,50 @@ Tool: delete_field
 name: "category"
 ```
 
-結果: `Field 'category' deleted.`
+結果: `{"fields":["embedding","title"],"message":"Field 'category' deleted successfully."}`
+
+---
+
+## update_field
+
+既存のフィールドの型やオプションを変更します。変更は `metadata_only`（既存のデータに影響せず、常に適用）、`reindex`（フィールドをインデックスにあるデータから作り直す）、`destructive`（フィールドの既存のデータを捨てる）のいずれかに分類されます。規則は[フィールドの変更](../concepts/schema_and_fields.md#フィールドの変更)を参照してください。`reindex` と `destructive` の変更は、`reindex` が `true` でなければ拒否されます。
+
+### パラメーター
+
+| 名前 | 型 | 必須 | 説明 |
+| :--- | :--- | :--- | :--- |
+| `name` | string | はい | 変更するフィールド。既に存在している必要があります |
+| `field_option_json` | string | はい | JSON 形式のフィールドの新しい設定。`add_field` と同じ形式 |
+| `reindex` | boolean | いいえ | `reindex` か `destructive` の変更を適用します（デフォルト: `false`） |
+| `dry_run` | boolean | いいえ | 何も適用せずに変更を分類します（デフォルト: `false`） |
+
+`field_option_json` はフィールドのオプション全体を置き換えます。省略したキーは、フィールドの今の値ではなくデフォルト値になります。`Hnsw`・`Flat`・`MultiVector` のフィールドでは `dimension` も同じで、デフォルトは `128` です。
+
+### 例
+
+`embedding` フィールドを `{"Hnsw": {"dimension": 384}}` で作った場合:
+
+```json
+{
+  "name": "embedding",
+  "field_option_json": "{\"Hnsw\": {\"dimension\": 384, \"m\": 32}}",
+  "dry_run": true
+}
+```
+
+結果: `{"classification":"reindex","fields":["title","embedding"],"message":"Dry run: change to field 'embedding' classified."}`
+
+同じ呼び出しから `dry_run` を除くと、変更に `reindex` が要るため、ツールエラーになります:
+
+```text
+Failed to update field: code: 'Client specified an invalid argument', message: "Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"
+```
+
+`"dry_run": true` の代わりに `"reindex": true` を指定すると、変更が適用されます:
+
+結果: `{"classification":"reindex","fields":["title","embedding"],"message":"Field 'embedding' updated successfully."}`
+
+結果に含まれるのはフィールド名で、スキーマではありません。フィールドの新しいオプションは `get_schema` で確認してください。エラーメッセージが挙げる `UpdateFieldOptions` は、`reindex` パラメーターが設定するライブラリのオプションです。
 
 ---
 

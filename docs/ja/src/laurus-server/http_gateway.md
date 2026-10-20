@@ -34,6 +34,7 @@ laurus serve --config config.toml
 | GET | `/v1/schema` | `IndexService/GetSchema` | インデックスのスキーマを取得 |
 | POST | `/v1/schema/fields` | `IndexService/AddField` | フィールドを動的に追加 |
 | DELETE | `/v1/schema/fields/{name}` | `IndexService/DeleteField` | スキーマからフィールドを削除 |
+| PATCH | `/v1/schema/fields/{name}` | `IndexService/UpdateField` | フィールドの型やオプションを変更 |
 | PUT | `/v1/documents/{id}` | `DocumentService/PutDocument` | ドキュメントの Upsert |
 | POST | `/v1/documents/{id}` | `DocumentService/AddDocument` | ドキュメントの追加（チャンク） |
 | GET | `/v1/documents/{id}` | `DocumentService/GetDocuments` | ID でドキュメントを取得 |
@@ -166,6 +167,42 @@ curl -X DELETE http://localhost:8080/v1/schema/fields/category
 ```
 
 既にインデックスされたデータはストレージに残りますが、アクセスできなくなります。フィールド固有のアナライザとエンベッダーは解除されます。
+
+### フィールドの変更
+
+既存のフィールドの型やオプションを変更します。フィールド名はパスで指定し、本文には新しいオプションと 2 つのフラグを書きます:
+
+| キー | 必須 | 説明 |
+| :--- | :--- | :--- |
+| `field_option` | はい | フィールドの新しい設定。`POST /v1/schema/fields` と同じ `FieldOption` の JSON 形式。オプション全体を置き換えるので、省略したキーはフィールドの今のオプションから引き継がれず、デフォルトになります（[スキーマの取得](#スキーマの取得)を参照）。`dimension` にはデフォルトがないので、改めて指定する必要があります |
+| `reindex` | いいえ | `true` にすると `reindex` か `destructive` の変更を適用します（デフォルト `false`） |
+| `dry_run` | いいえ | `true` にすると、何も適用せずに変更を分類します（デフォルト `false`） |
+
+`reindex` と `dry_run` は JSON の真偽値で指定してください。文字列の `"true"` などそれ以外の値は、今はエラーにならずに `false` として読まれるため、`"dry_run": "true"` は変更を適用してしまいます（Issue #1511）。
+
+レスポンスには、`classification`（`metadata_only`・`reindex`・`destructive` のいずれか。[フィールドの変更](../concepts/schema_and_fields.md#フィールドの変更)を参照）と、変更後のスキーマが入ります。dry run ではスキーマは変わりません。`destructive` の変更では、フィールドがスキーマの `pending_reindex` にも載ります。`embedding` だけを `{"hnsw": {"dimension": 384}}` で作ったインデックスの場合:
+
+```bash
+# m を大きくする変更の分類を、適用せずに確かめる
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "dry_run": true}'
+# => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":16,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
+
+# reindex の変更は "reindex": true なしでは拒否される
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}}'
+# => {"error":{"code":400,"message":"Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"}}
+
+# 適用する
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "reindex": true}'
+# => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":32,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
+```
+
+エラーメッセージが挙げる `UpdateFieldOptions` は、`reindex` が設定するライブラリのオプションです。
 
 ### ドキュメントの Upsert（PUT）
 

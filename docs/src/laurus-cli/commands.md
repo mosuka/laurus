@@ -286,6 +286,21 @@ laurus add docs --file <JSONL> [--batch-size 1000] [--commit-every 0]
 
 Repeated IDs accumulate as chunks. On a mid-file failure the error names the offending line, the applied prefix is committed, and re-running the remaining lines continues the ingest.
 
+### `add field`
+
+Dynamically add a new field to an existing index.
+
+```bash
+laurus --index-dir ./my_index add field \
+    --name category \
+    --field-option '{"Text": {"indexed": true, "stored": true}}'
+# Field 'category' added successfully.
+```
+
+The `--field-option` argument accepts a JSON string using the same
+externally-tagged format as the schema file. The schema is automatically
+persisted after the field is added.
+
 ---
 
 ## `put` — Put (Upsert) a Resource
@@ -337,22 +352,6 @@ laurus put docs --file docs.jsonl
 
 ---
 
-### `add field`
-
-Dynamically add a new field to an existing index.
-
-```bash
-laurus add field --index-dir ./data \
-    --name category \
-    --field-option '{"Text": {"indexed": true, "stored": true}}'
-```
-
-The `--field-option` argument accepts a JSON string using the same
-externally-tagged format as the schema file. The schema is automatically
-persisted after the field is added.
-
----
-
 ## `delete` — Delete a Resource
 
 ### `delete docs`
@@ -381,12 +380,90 @@ laurus delete field --name <FIELD_NAME>
 **Example:**
 
 ```bash
-laurus delete field --name category
-# Field 'category' deleted.
+laurus --index-dir ./my_index delete field --name category
+# Field 'category' deleted successfully.
 ```
 
 Existing indexed data for the field remains in storage but becomes
 inaccessible. Per-field analyzers and embedders are unregistered.
+
+---
+
+## `update` — Update a Resource
+
+### `update field`
+
+Change an existing field's type or options. The schema is automatically
+persisted after the change is applied.
+
+```bash
+laurus update field --name <NAME> --field-option <JSON> [--reindex] [--dry-run]
+```
+
+**Arguments:**
+
+| Flag | Required | Description |
+| :--- | :--- | :--- |
+| `--name <NAME>` | Yes | The field to change; it must already exist |
+| `--field-option <JSON>` | Yes | The field's new configuration, as a JSON string in the same externally-tagged format as `add field` |
+| `--reindex` | No | Apply a `Reindex` or `Destructive` change; ignored for a `MetadataOnly` change |
+| `--dry-run` | No | Print how the change is classified without applying anything |
+
+The change is classified by what it does to the data already in the index
+(see [Changing a Field](../concepts/schema_and_fields.md#changing-a-field)
+for the full rules):
+
+| Classification | What happens to the field's data | Example | Applied |
+| :--- | :--- | :--- | :--- |
+| `MetadataOnly` | Nothing | An Hnsw field's `default_ef_search` | Always |
+| `Reindex` | Rebuilt from the data already in the index | An Hnsw field's `m` or `ef_construction`, a Text field's `analyzer` | Only with `--reindex` |
+| `Destructive` | Discarded | A vector field's `dimension`, `distance` or `embedder` | Only with `--reindex` |
+
+Applying a `Destructive` change also adds the field to the schema's
+`pending_reindex` list, which `laurus get schema` shows, so you can find the
+fields whose documents need to be indexed again.
+
+`--field-option` replaces the field's whole option: a key you leave out gets
+its default value, not the field's current one. For an Hnsw, Flat or
+MultiVector field this includes `dimension`, which defaults to `128`, so
+leaving it out on a 384-dimensional field is a `Destructive` change.
+
+The command prints one line whatever `--format` is, and does not print the
+schema. Run `laurus get schema` to see the result.
+
+**Examples:**
+
+For an index whose `embedding` field was created as `{"Hnsw": {"dimension": 384}}`:
+
+```bash
+# See how a larger m would be classified, without applying it
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32}}' --dry-run
+# Dry run: change to field 'embedding' classified as Reindex. Nothing was applied.
+
+# A Reindex change is rejected without --reindex
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32}}'
+# Error: Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed
+
+# Apply it; the field's graph is rebuilt from its stored vectors
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32}}' --reindex
+# Field 'embedding' updated successfully (classified as Reindex).
+
+# A MetadataOnly change needs no --reindex (m is given again to keep 32)
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"dimension": 384, "m": 32, "default_ef_search": 100}}'
+# Field 'embedding' updated successfully (classified as MetadataOnly).
+
+# Leaving out dimension would change it to 128
+laurus --index-dir ./my_index update field --name embedding \
+    --field-option '{"Hnsw": {"m": 32}}' --dry-run
+# Dry run: change to field 'embedding' classified as Destructive. Nothing was applied.
+```
+
+The error message names `UpdateFieldOptions`, the library's option; on the
+command line, pass `--reindex`.
 
 ---
 
