@@ -175,12 +175,12 @@ async fn main() -> Result<()> {
     // [D] Vector Search via DSL
     // =====================================================================
     println!("\n{}", "=".repeat(60));
-    println!("[D] Vector DSL: text_vec:~\"memory safety\"");
+    println!("[D] Vector DSL: text_vec:\"memory safety\"");
     println!("{}", "=".repeat(60));
 
     let vector_parser = VectorQueryParser::new(per_field_embedder.clone());
 
-    let parsed = vector_parser.parse("text_vec:~\"memory safety\"").await?;
+    let parsed = vector_parser.parse("text_vec:\"memory safety\"").await?;
     let results = engine
         .search(
             SearchRequestBuilder::new()

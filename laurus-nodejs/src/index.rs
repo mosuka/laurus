@@ -322,7 +322,7 @@ impl JsIndex {
     ///
     /// # Arguments
     ///
-    /// * `query` - The query DSL string (e.g. `"title:hello"`, `"~\"memory safety\""`).
+    /// * `query` - The query DSL string (e.g. `"title:hello"`, `"text_vec:\"memory safety\""`).
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
     /// * `highlight` - Request highlighted fragments per field (Issue

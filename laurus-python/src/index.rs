@@ -708,7 +708,7 @@ impl PyIndex {
     /// Search the index and return a list of [`SearchResult`] objects.
     ///
     /// `query` may be:
-    ///   - A **DSL string** (e.g. `"title:hello"`, `"~\"memory safety\""`)
+    ///   - A **DSL string** (e.g. `"title:hello"`, `"text_vec:\"memory safety\""`)
     ///   - A **lexical query** object (`TermQuery`, `BooleanQuery`, `GeoDistanceQuery`, …)
     ///   - A **vector query** object (`VectorQuery`, `VectorTextQuery`)
     ///   - A **[`SearchRequest`]** for full control (hybrid, filter, fusion)

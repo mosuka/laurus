@@ -107,7 +107,7 @@ The sum runs over each result list the document appears in. The `k` parameter (d
 use laurus::{FusionAlgorithm, SearchRequestBuilder};
 
 let request = SearchRequestBuilder::new()
-    .query_dsl("title:rust ~\"systems programming\"")
+    .query_dsl("title:rust text_vec:\"systems programming\"")
     .fusion_algorithm(FusionAlgorithm::Rrf { k: 60.0 })
     .build();
 ```
@@ -126,7 +126,7 @@ final(doc)   = lexical_weight * norm(lexical_score(doc))
 use laurus::{FusionAlgorithm, SearchRequestBuilder};
 
 let request = SearchRequestBuilder::new()
-    .query_dsl("title:rust ~\"systems programming\"")
+    .query_dsl("title:rust text_vec:\"systems programming\"")
     .fusion_algorithm(FusionAlgorithm::WeightedSum {
         lexical_weight: 0.6,
         vector_weight: 0.4,
