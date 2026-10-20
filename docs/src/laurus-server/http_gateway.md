@@ -89,7 +89,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, `geo3d`, and `bytes` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}` or `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response. A `bytes` option has no `indexed` or `doc_values` key: a `Bytes` value is never indexed or written to DocValues regardless of `multi_valued` (Issue #1176).
+The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, `geo3d`, and `bytes` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}` or `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response. It must be an integer between `0` and `4294967295`, and `null` is the same as omitting it; anything else, such as `"0"`, `-1` or `4294967296`, is rejected with 400 instead of being read as omitted (Issue #1490). A `bytes` option has no `indexed` or `doc_values` key: a `Bytes` value is never indexed or written to DocValues regardless of `multi_valued` (Issue #1176).
 
 A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` (`distance` is `"cosine"` or `"dot_product"`, defaulting to `"cosine"`). Its value in a document is an array of equal-length numeric arrays, one per token vector (`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`). The field holds token vectors for late-interaction rescoring: it is not a vector-search target and is not returned with documents.
 
@@ -115,7 +115,7 @@ An `hnsw`, `flat` or `ivf` field may set `quantizer` to pick how its vectors are
 | `"product_quantization"` | HNSW | `subvector_count` must be at least `1` and divide `dimension` |
 | `"product_quantization_fastscan"` | HNSW | Experimental; the server must be built with the `pq-fastscan` feature. `subvector_count` must be at least `1` and divide `dimension` |
 
-`subvector_count` is read only for the two product quantization methods. Any other `method`, including `"none"` (unquantized storage was removed in Issue #481), a quantizer without a string `method`, and `"product_quantization_fastscan"` on a server built without `pq-fastscan` are rejected with 400 (Issue #1459), and nothing is written:
+`subvector_count` is used only by the two product quantization methods, but with any method it must be an integer between `0` and `4294967295`, and `null` is the same as omitting it: a value such as `"48"`, `48.0` or `-1` is rejected with 400 instead of being read as `0`, and one above `4294967295` instead of wrapping around (Issue #1490). Any other `method`, including `"none"` (unquantized storage was removed in Issue #481), a quantizer without a string `method`, and `"product_quantization_fastscan"` on a server built without `pq-fastscan` are rejected with 400 (Issue #1459), and nothing is written:
 
 ```bash
 curl -X POST http://localhost:8080/v1/index \
@@ -147,6 +147,8 @@ curl -X POST http://localhost:8080/v1/index \
 ```
 
 `PATCH /v1/schema/fields/{name}` (`UpdateField`) replaces the whole option, so a key omitted there also gets the default, not the field's current value: an `hnsw` field with `"m": 32` patched with `{"field_option": {"hnsw": {"dimension": 2}}, "reindex": true}` is rebuilt with `m` `16`. A server older than this change reads an omitted value as `0`, with which every document write fails (`m`) or every search returns no hits (`n_probe`), so set these explicitly when talking to an older server. An index such a server created still opens, with a warning in the server log; see [gRPC API → Graph and cluster parameters](grpc_api.md) for how to repair the field.
+
+An `hnsw` field may also set `default_ef_search`, the size of the candidate list a search of the field uses when the request does not set `vector_params.ef_search` (Issue #644; see [Schema and Fields → `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-the-search-time-recall-knob)). Like `m`, it must be an integer between `0` and `4294967295`, and anything else, such as `"64"`, `64.0` or `-1`, is rejected with 400 and nothing is written (Issue #1490). Omitting it or setting it to `null` leaves it unset, and the response shows it only when it is set. A server older than this fix read such a value as unset, wrapped one above `4294967295` (`4294967360` became `64`), and left `default_ef_search` out of the schema in its responses. Because `PATCH /v1/schema/fields/{name}` replaces the whole option, a field copied from such a response into a PATCH loses its `default_ef_search` unless the copy sets it again.
 
 ### Add a Field (Dynamic Schema)
 
@@ -274,6 +276,13 @@ back to the default or wrap around. A search whose `offset + limit` exceeds
 the server's [`max_result_window`](configuration.md) (default 10,000) is
 rejected with `400 Bad Request` as well.
 
+`lexical_params` takes the keys of the gRPC
+[`LexicalParams`](grpc_api.md#lexicalparams) message in snake_case. Its
+`timeout_ms` must be an integer between `0` and `18446744073709551615`;
+omitting it, `null` and `0` mean no timeout. Anything else, such as `"500"`,
+`500.0` or `-1`, is rejected with `400 Bad Request` instead of searching
+without a timeout (Issue #1490).
+
 #### Search with Field Boosts
 
 ```bash
@@ -355,6 +364,14 @@ curl -X POST http://localhost:8080/v1/search \
     "highlight": {"fields": ["body"], "max_fragments": 2, "tag": "em"}
   }'
 ```
+
+`max_fragments` and `fragment_size` must be integers between `0` and
+`4294967295`, and `max_analyzed_chars` one between `0` and
+`18446744073709551615`; `null` is the same as omitting the key, which keeps
+the default. Anything else, such as `"2"`, `2.0` or `-1`, is rejected with
+`400 Bad Request` instead of falling back to the default or wrapping around,
+even when `fields` is empty (Issue #1490). As over gRPC, a `max_fragments`
+or `fragment_size` of `0` is rejected too.
 
 Each result gains a `"highlights"` object, present only when at least one
 field actually highlighted:

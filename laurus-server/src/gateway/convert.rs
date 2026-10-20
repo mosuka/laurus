@@ -483,11 +483,9 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             // Tri-state like `term_vectors` (#1175): an omitted gap means the
-            // engine default, never 0.
-            position_increment_gap: v
-                .get("position_increment_gap")
-                .and_then(|v| v.as_u64())
-                .and_then(|g| u32::try_from(g).ok()),
+            // engine default, never 0. Anything but an integer that fits
+            // `u32` is rejected rather than read as omitted (#1490).
+            position_increment_gap: json_optional_u32(v, "position_increment_gap")?,
         })
     } else if let Some(v) = obj.get("integer") {
         Opt::Integer(v1::IntegerOption {
@@ -790,6 +788,8 @@ const QUANTIZER_METHODS: &str =
 /// `product_quantization`, `product_quantization_fastscan` or `float16`,
 /// so a typo is a 400 instead of int8 storage (Issue #1459). `none` is
 /// rejected too: unquantized storage was removed in Issue #481 Stage 1.
+/// Also returns an error when `subvector_count` is present and not an
+/// integer that fits `u32` (Issue #1490; see [`json_optional_u32`]).
 fn json_to_quantizer(json: &Value) -> Result<Option<v1::QuantizationConfig>, String> {
     let obj = match json.get("quantizer") {
         None | Some(Value::Null) => return Ok(None),
@@ -815,10 +815,12 @@ fn json_to_quantizer(json: &Value) -> Result<Option<v1::QuantizationConfig>, Str
             ));
         }
     };
-    let subvector_count = obj
-        .get("subvector_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    // Absent or `null` is 0, which the engine rejects for the two product
+    // quantization methods (Issue #1491); anything else must be an integer
+    // that fits `u32` rather than read as 0 or wrapped (Issue #1490).
+    let subvector_count = json_optional_u32(&json["quantizer"], "subvector_count")
+        .map_err(|e| format!("quantizer: {e}"))?
+        .unwrap_or(0);
     Ok(Some(v1::QuantizationConfig {
         method: method as i32,
         subvector_count,
@@ -880,14 +882,16 @@ fn rerank_storage_to_json(value: i32) -> Option<&'static str> {
 /// An HNSW field option.
 ///
 /// An omitted or `null` `m` / `ef_construction` stays unset, which the
-/// server reads as the engine's default (Issue #1479). An omitted
-/// `dimension` is 0, which the engine rejects: it has no default.
+/// server reads as the engine's default (Issue #1479), and so does
+/// `default_ef_search`. An omitted `dimension` is 0, which the engine
+/// rejects: it has no default.
 ///
 /// # Errors
 ///
-/// Returns an error when `dimension`, `m` or `ef_construction` is present
-/// and not an integer that fits `u32` (see [`json_optional_u32`]), or when
-/// `distance`, `quantizer` or `rerank_storage` is invalid.
+/// Returns an error when `dimension`, `m`, `ef_construction` or
+/// `default_ef_search` is present and not an integer that fits `u32` (see
+/// [`json_optional_u32`]; Issues #1479, #1490), or when `distance`,
+/// `quantizer` or `rerank_storage` is invalid.
 fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
     Ok(v1::HnswOption {
         dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
@@ -907,10 +911,7 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
             .unwrap_or("")
             .to_string(),
         // Issue #644: optional schema-level `ef_search` default.
-        default_ef_search: json
-            .get("default_ef_search")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
+        default_ef_search: json_optional_u32(json, "default_ef_search")?,
         // Issue #793: optional Stage-2 rerank sidecar storage.
         rerank_storage: json_to_rerank_storage(json)?,
         // Issue #631: optional shared PQ codebook file name. An explicitly
@@ -1073,6 +1074,12 @@ fn hnsw_option_to_json(opt: &v1::HnswOption) -> Value {
     if !opt.embedder.is_empty() {
         obj["embedder"] = json!(opt.embedder);
     }
+    // Written like `m` (Issue #1490): gRPC GetSchema keeps it, and a client
+    // that copies a field from this response into `PATCH
+    // /v1/schema/fields/:name` would otherwise clear it.
+    if let Some(default_ef_search) = opt.default_ef_search {
+        obj["default_ef_search"] = json!(default_ef_search);
+    }
     if let Some(s) = opt.rerank_storage.and_then(rerank_storage_to_json) {
         obj["rerank_storage"] = json!(s);
     }
@@ -1169,7 +1176,14 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
     let offset = page_value("offset", 0)?;
 
     let fusion = json.get("fusion").and_then(json_to_fusion_algorithm);
-    let lexical_params = json.get("lexical_params").and_then(json_to_lexical_params);
+    // A malformed integer in `lexical_params` or `highlight` is rejected
+    // (400) rather than dropped: see `json_to_lexical_params` and
+    // `json_to_highlight_params` (Issue #1490).
+    let lexical_params = json
+        .get("lexical_params")
+        .map(json_to_lexical_params)
+        .transpose()?
+        .flatten();
     // A malformed `vector_params` is rejected (400) rather than dropped:
     // see `json_to_vector_params`.
     let vector_params = json
@@ -1188,7 +1202,11 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         })
         .unwrap_or_default();
 
-    let highlight = json.get("highlight").and_then(json_to_highlight_params);
+    let highlight = json
+        .get("highlight")
+        .map(json_to_highlight_params)
+        .transpose()?
+        .flatten();
 
     // A malformed `rescore` is rejected (400) rather than dropped: see
     // `rescore_params_from_json`.
@@ -1301,11 +1319,24 @@ fn json_to_fusion_algorithm(json: &Value) -> Option<v1::FusionAlgorithm> {
     }
 }
 
-fn json_to_lexical_params(json: &Value) -> Option<v1::LexicalParams> {
-    let obj = json.as_object()?;
-    Some(v1::LexicalParams {
+/// Converts a JSON `lexical_params` object to proto `LexicalParams`.
+///
+/// Returns `Ok(None)` when `json` is not an object, which
+/// [`json_to_proto_search_request`] treats like an absent `lexical_params`.
+///
+/// # Errors
+///
+/// Returns an error when `timeout_ms` is present and not `null` but not an
+/// integer that fits `u64`, instead of searching without a timeout (Issue
+/// #1490; see [`json_optional_u64`]).
+fn json_to_lexical_params(json: &Value) -> Result<Option<v1::LexicalParams>, String> {
+    let Some(obj) = json.as_object() else {
+        return Ok(None);
+    };
+    Ok(Some(v1::LexicalParams {
         min_score: obj.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        timeout_ms: obj.get("timeout_ms").and_then(|v| v.as_u64()),
+        timeout_ms: json_optional_u64(json, "timeout_ms")
+            .map_err(|e| format!("lexical_params: {e}"))?,
         parallel: obj
             .get("parallel")
             .and_then(|v| v.as_bool())
@@ -1318,7 +1349,7 @@ fn json_to_lexical_params(json: &Value) -> Option<v1::LexicalParams> {
             };
             Some(v1::SortSpec { field, order })
         }),
-    })
+    }))
 }
 
 /// Parse a JSON integer that must fit `u32`, naming `key` in the error, so
@@ -1345,6 +1376,29 @@ fn json_optional_u32(json: &Value, key: &str) -> Result<Option<u32>, String> {
     match json.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => json_to_u32(value, key).map(Some),
+    }
+}
+
+/// Parse a JSON integer that must fit `u64`, naming `key` in the error, the
+/// `uint64` counterpart of [`json_to_u32`] (Issue #1490).
+fn json_to_u64(value: &Value, key: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u64::MAX))
+}
+
+/// Read the optional integer `key` of `json`, which must fit `u64` when
+/// present; the `uint64` counterpart of [`json_optional_u32`] (Issue
+/// #1490).
+///
+/// # Errors
+///
+/// Returns an error when the value is present and not `null` but fails
+/// [`json_to_u64`] (`500.0`, `"500"`, `-1`, `18446744073709551616`).
+fn json_optional_u64(json: &Value, key: &str) -> Result<Option<u64>, String> {
+    match json.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => json_to_u64(value, key).map(Some),
     }
 }
 
@@ -1423,28 +1477,42 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
 /// #1134). Accepts either the array shorthand (just a field list) —
 /// `["title", "body"]` — or the full object form —
 /// `{"fields": ["body"], "max_fragments": 2, "tag": "em", ...}`. Returns
-/// `None` for anything else (including an object with no usable `fields`),
-/// which `json_to_proto_search_request` treats the same as an absent
-/// `highlight` key; `from_proto` rejects an explicitly empty field list, but
-/// a malformed shorthand silently requesting nothing is not worth a hard
-/// gateway-level error.
-fn json_to_highlight_params(json: &Value) -> Option<v1::HighlightParams> {
+/// `Ok(None)` for anything else (including an object with no usable
+/// `fields`), which `json_to_proto_search_request` treats the same as an
+/// absent `highlight` key; `from_proto` rejects an explicitly empty field
+/// list, but a malformed shorthand silently requesting nothing is not worth
+/// a hard gateway-level error.
+///
+/// # Errors
+///
+/// Returns an error when `max_fragments` or `fragment_size` is present and
+/// not `null` but not an integer that fits `u32`, or `max_analyzed_chars`
+/// one that fits `u64`, instead of using the default or wrapping (Issue
+/// #1490; see [`json_optional_u32`] and [`json_optional_u64`]). They are
+/// checked even when the object has no usable `fields`.
+fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>, String> {
     if let Some(arr) = json.as_array() {
         let fields: Vec<String> = arr
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        return if fields.is_empty() {
+        return Ok(if fields.is_empty() {
             None
         } else {
             Some(v1::HighlightParams {
                 fields,
                 ..Default::default()
             })
-        };
+        });
     }
 
-    let obj = json.as_object()?;
+    let Some(obj) = json.as_object() else {
+        return Ok(None);
+    };
+    let error = |message: String| format!("highlight: {message}");
+    let max_fragments = json_optional_u32(json, "max_fragments").map_err(error)?;
+    let fragment_size = json_optional_u32(json, "fragment_size").map_err(error)?;
+    let max_analyzed_chars = json_optional_u64(json, "max_analyzed_chars").map_err(error)?;
     let fields: Vec<String> = obj
         .get("fields")
         .and_then(|v| v.as_array())
@@ -1455,29 +1523,23 @@ fn json_to_highlight_params(json: &Value) -> Option<v1::HighlightParams> {
         })
         .unwrap_or_default();
     if fields.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(v1::HighlightParams {
+    Ok(Some(v1::HighlightParams {
         fields,
-        max_fragments: obj
-            .get("max_fragments")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
-        fragment_size: obj
-            .get("fragment_size")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
+        max_fragments,
+        fragment_size,
         tag: obj.get("tag").and_then(|v| v.as_str()).map(str::to_string),
         css_class: obj
             .get("css_class")
             .and_then(|v| v.as_str())
             .map(str::to_string),
         require_field_match: obj.get("require_field_match").and_then(|v| v.as_bool()),
-        max_analyzed_chars: obj.get("max_analyzed_chars").and_then(|v| v.as_u64()),
+        max_analyzed_chars,
         return_entire_field_if_no_highlight: obj
             .get("return_entire_field_if_no_highlight")
             .and_then(|v| v.as_bool()),
-    })
+    }))
 }
 
 /// Converts a proto `SearchResult` to a JSON value: `{"id", "score",
@@ -2276,6 +2338,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #1490: `text.position_increment_gap`, `hnsw.default_ef_search`
+    /// and a quantizer's `subvector_count` must be integers that fit `u32`.
+    /// They used to be dropped (or read as 0), or wrapped (`4294967296`
+    /// became 0).
+    #[test]
+    fn test_field_option_integer_keys_reject_non_integers() {
+        // Builds a field option with the key set to a value.
+        type WithKey = fn(Value) -> Value;
+        // Each key as the error names it, and its field option.
+        let keys: [(&str, WithKey); 3] = [
+            (
+                "position_increment_gap",
+                |value| json!({"text": {"indexed": true, "position_increment_gap": value}}),
+            ),
+            (
+                "default_ef_search",
+                |value| json!({"hnsw": {"dimension": 8, "default_ef_search": value}}),
+            ),
+            ("quantizer: subvector_count", |value| {
+                json!({"hnsw": {"dimension": 8, "quantizer": {
+                    "method": "product_quantization", "subvector_count": value,
+                }}})
+            }),
+        ];
+        // Every value that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (key, option) in keys {
+            let expected = format!("{key} must be an integer between 0 and 4294967295");
+            for bad in [json!("16"), json!(16.0), json!(-1), json!(4_294_967_296u64)] {
+                let error = json_to_proto_field_option(&option(bad.clone())).err();
+                if error.as_deref() != Some(expected.as_str()) {
+                    wrong.push(format!("{key} = {bad}: {error:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Issue #1490: an omitted or `null` key keeps the value it had before
+    /// the keys were made strict (unset, or 0 for `subvector_count`), and an
+    /// integer is passed on as is.
+    #[test]
+    fn test_field_option_integer_keys_omitted_null_and_explicit() {
+        let gap = |text: Value| match json_to_proto_field_option(&json!({ "text": text }))
+            .unwrap()
+            .option
+        {
+            Some(v1::field_option::Option::Text(text)) => text.position_increment_gap,
+            other => panic!("expected a text option, got {other:?}"),
+        };
+        assert_eq!(gap(json!({"indexed": true})), None);
+        assert_eq!(
+            gap(json!({"indexed": true, "position_increment_gap": null})),
+            None
+        );
+        assert_eq!(
+            gap(json!({"indexed": true, "position_increment_gap": 4})),
+            Some(4)
+        );
+
+        let ef = |hnsw: Value| json_to_hnsw_option(&hnsw).unwrap().default_ef_search;
+        assert_eq!(ef(json!({"dimension": 8})), None);
+        assert_eq!(ef(json!({"dimension": 8, "default_ef_search": null})), None);
+        assert_eq!(ef(json!({"dimension": 8, "default_ef_search": 4})), Some(4));
+
+        let count = |quantizer: Value| {
+            json_to_hnsw_option(&json!({"dimension": 8, "quantizer": quantizer}))
+                .unwrap()
+                .quantizer
+                .unwrap()
+                .subvector_count
+        };
+        let pq = "product_quantization";
+        assert_eq!(count(json!({"method": pq})), 0);
+        assert_eq!(count(json!({"method": pq, "subvector_count": null})), 0);
+        assert_eq!(count(json!({"method": pq, "subvector_count": 4})), 4);
+    }
+
+    /// Issue #1490: `default_ef_search` renders back like `m`, so a field
+    /// copied from `GET /v1/schema` keeps it, and an unset one is left out.
+    #[test]
+    fn test_hnsw_default_ef_search_round_trips_through_json() {
+        let opt = json_to_hnsw_option(&json!({"dimension": 8, "default_ef_search": 64})).unwrap();
+        assert_eq!(opt.default_ef_search, Some(64));
+        let back = hnsw_option_to_json(&opt);
+        assert_eq!(back["default_ef_search"], json!(64));
+        assert_eq!(json_to_hnsw_option(&back).unwrap(), opt);
+
+        let opt = json_to_hnsw_option(&json!({"dimension": 8})).unwrap();
+        let back = hnsw_option_to_json(&opt);
+        assert!(back.get("default_ef_search").is_none(), "{back}");
     }
 
     /// #1349: numeric and boolean embedder parameters reach the proto as
@@ -3237,6 +3393,110 @@ mod tests {
                 json_to_proto_search_request(&json!({"query": "q", key: value})).expect_err(key);
             assert!(err.contains(key), "{key} = {value}: {err}");
         }
+    }
+
+    /// Issue #1490: `lexical_params.timeout_ms` and the highlight numbers
+    /// must be integers in the range of their proto type. They used to be
+    /// dropped (no timeout, or the highlight default), and `max_fragments`
+    /// and `fragment_size` wrapped (`4294967298` became 2).
+    #[test]
+    fn test_json_to_proto_search_request_rejects_malformed_integer_keys() {
+        // Above `u64::MAX`: `serde_json` parses it as a float, as it does
+        // in a request body.
+        let above_u64: Value = serde_json::from_str("18446744073709551616").unwrap();
+        let uint32 = [json!("2"), json!(2.0), json!(-1), json!(4_294_967_296u64)];
+        let uint64 = [json!("500"), json!(500.0), json!(-1), above_u64];
+        let cases = [
+            ("lexical_params", "timeout_ms", u64::MAX, &uint64),
+            ("highlight", "max_fragments", u32::MAX.into(), &uint32),
+            ("highlight", "fragment_size", u32::MAX.into(), &uint32),
+            ("highlight", "max_analyzed_chars", u64::MAX, &uint64),
+        ];
+        // Every value that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (object, key, max, bad_values) in cases {
+            let expected = format!("{object}: {key} must be an integer between 0 and {max}");
+            for bad in bad_values {
+                let mut params = match object {
+                    "highlight" => json!({"fields": ["body"]}),
+                    _ => json!({}),
+                };
+                params[key] = bad.clone();
+                let request = json!({"query": "body:rust", object: params});
+                let error = json_to_proto_search_request(&request).err();
+                if error.as_deref() != Some(expected.as_str()) {
+                    wrong.push(format!("{object}.{key} = {bad}: {error:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+
+        // Checked even when the highlight is dropped for lack of fields.
+        let err = json_to_proto_search_request(&json!({
+            "query": "body:rust",
+            "highlight": {"fields": [], "max_fragments": "2"}
+        }))
+        .expect_err("highlight without fields");
+        assert!(err.contains("highlight: max_fragments"), "{err}");
+    }
+
+    /// Issue #1490: an omitted or `null` `lexical_params.timeout_ms` or
+    /// highlight number stays unset, and an integer in range is passed on,
+    /// up to `u64` for `timeout_ms` and `max_analyzed_chars`.
+    #[test]
+    fn test_json_to_proto_search_request_integer_keys_omitted_null_and_explicit() {
+        for (lexical_params, highlight) in [
+            (json!({}), json!({"fields": ["body"]})),
+            (
+                json!({"timeout_ms": null}),
+                json!({
+                    "fields": ["body"],
+                    "max_fragments": null,
+                    "fragment_size": null,
+                    "max_analyzed_chars": null
+                }),
+            ),
+        ] {
+            let req = json_to_proto_search_request(&json!({
+                "query": "body:rust",
+                "lexical_params": lexical_params,
+                "highlight": highlight
+            }))
+            .unwrap();
+            assert_eq!(req.lexical_params.unwrap().timeout_ms, None);
+            let highlight = req.highlight.unwrap();
+            assert_eq!(
+                (
+                    highlight.max_fragments,
+                    highlight.fragment_size,
+                    highlight.max_analyzed_chars
+                ),
+                (None, None, None)
+            );
+        }
+
+        let req = json_to_proto_search_request(&json!({
+            "query": "body:rust",
+            "lexical_params": {"timeout_ms": 4_294_967_296u64},
+            "highlight": {
+                "fields": ["body"],
+                "max_fragments": 2,
+                "fragment_size": 80,
+                "max_analyzed_chars": 4_294_967_296u64
+            }
+        }))
+        .unwrap();
+        assert_eq!(req.lexical_params.unwrap().timeout_ms, Some(4_294_967_296));
+        let highlight = req.highlight.unwrap();
+        assert_eq!(
+            (
+                highlight.max_fragments,
+                highlight.fragment_size,
+                highlight.max_analyzed_chars
+            ),
+            (Some(2), Some(80), Some(4_294_967_296))
+        );
     }
 
     /// Issue #1342: a malformed `vector_params` value is rejected (400)

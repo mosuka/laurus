@@ -83,7 +83,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
+レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。値は `0` から `4294967295` までの整数で、`null` は省略と同じです。`"0"`・`-1`・`4294967296` などそれ以外の値は、省略として読まれるのではなく 400 で拒否されます（Issue #1490）。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
 
 MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` のように宣言します（`distance` は `"cosine"` または `"dot_product"`、省略時は `"cosine"`）。文書での値は、トークンベクトルごとの同じ長さの数値配列の配列です（`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`）。このフィールドは late interaction の再採点のためにトークンベクトルを保持するもので、ベクトル検索の対象にはならず、文書とともに返されることもありません。
 
@@ -109,7 +109,7 @@ curl -X POST http://localhost:8080/v1/index \
 | `"product_quantization"` | HNSW | `subvector_count` は `1` 以上で `dimension` を割り切る値にする |
 | `"product_quantization_fastscan"` | HNSW | 実験的。サーバーを `pq-fastscan` feature 付きでビルドする必要がある。`subvector_count` は `1` 以上で `dimension` を割り切る値にする |
 
-`subvector_count` を読むのは、2 つの直積量子化（product quantization）の方式のときだけです。ほかの `method`（`"none"` を含む。量子化なしの保存は Issue #481 で廃止）、文字列の `method` を持たない quantizer、`pq-fastscan` なしでビルドしたサーバーへの `"product_quantization_fastscan"` は 400 で拒否され（Issue #1459）、何も書き込まれません。
+`subvector_count` を使うのは、2 つの直積量子化（product quantization）の方式のときだけです。ただし、どの方式でも値は `0` から `4294967295` までの整数で、`null` は省略と同じです。`"48"`・`48.0`・`-1` などの値は `0` として読まれるのではなく、`4294967295` を超える値は折り返されるのではなく、400 で拒否されます（Issue #1490）。ほかの `method`（`"none"` を含む。量子化なしの保存は Issue #481 で廃止）、文字列の `method` を持たない quantizer、`pq-fastscan` なしでビルドしたサーバーへの `"product_quantization_fastscan"` は 400 で拒否され（Issue #1459）、何も書き込まれません。
 
 ```bash
 curl -X POST http://localhost:8080/v1/index \
@@ -141,6 +141,8 @@ curl -X POST http://localhost:8080/v1/index \
 ```
 
 `PATCH /v1/schema/fields/{name}`（`UpdateField`）はオプション全体を置き換えるので、そこで省略したキーも、フィールドの今の値ではなくデフォルトになります。たとえば `"m": 32` の `hnsw` フィールドに `{"field_option": {"hnsw": {"dimension": 2}}, "reindex": true}` を PATCH すると、`m` は `16` で作り直されます。この変更より古いサーバーは、省略した値を `0` として読みます。`m` が `0` だとすべてのドキュメントの書き込みが失敗し、`n_probe` が `0` だとすべての検索が 0 件になるので、古いサーバーを相手にするときはこれらを明示してください。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出ます。フィールドの直し方は [gRPC API のグラフとクラスタのパラメータ](grpc_api.md)を参照してください。
+
+`hnsw` フィールドには `default_ef_search` も指定できます。検索が `vector_params.ef_search` を指定しないときに、そのフィールドの検索で使う候補リストの大きさです（Issue #644。[スキーマとフィールドの `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-検索時の-recall-調整パラメータ) を参照）。`m` と同じく `0` から `4294967295` までの整数で、`"64"`・`64.0`・`-1` などそれ以外の値は 400 で拒否され、何も書き込まれません（Issue #1490）。省略するか `null` にすると未設定のままで、レスポンスには設定したときだけ出ます。この修正より古いサーバーは、そうした値を未設定として読み、`4294967295` を超える値を折り返し（`4294967360` は `64` になる）、レスポンスのスキーマに `default_ef_search` を出しませんでした。`PATCH /v1/schema/fields/{name}` はオプション全体を置き換えるので、そうしたレスポンスからコピーしたフィールドで PATCH すると、コピーに設定し直さない限り `default_ef_search` は消えます。
 
 ### フィールドの動的追加
 
@@ -253,6 +255,8 @@ curl -X POST http://localhost:8080/v1/search \
 
 `limit` と `offset` は、省略または `null` のとき既定値（10 と 0）になります。Issue #1367 以降、0 以上の整数でない値や、32 ビット符号なし整数に収まらない値は `400 Bad Request` で拒否されます（以前は既定値に置き換わるか、折り返していました）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索も `400 Bad Request` で拒否されます。
 
+`lexical_params` には、gRPC の [`LexicalParams`](grpc_api.md#lexicalparams) メッセージのキーを snake_case で指定します。`timeout_ms` は `0` から `18446744073709551615` までの整数で、省略・`null`・`0` はタイムアウトなしを意味します。`"500"`・`500.0`・`-1` などそれ以外の値は、タイムアウトなしで検索するのではなく `400 Bad Request` で拒否されます（Issue #1490）。
+
 #### フィールドブースト付き検索
 
 ```bash
@@ -317,6 +321,8 @@ curl -X POST http://localhost:8080/v1/search \
     "highlight": {"fields": ["body"], "max_fragments": 2, "tag": "em"}
   }'
 ```
+
+`max_fragments` と `fragment_size` は `0` から `4294967295` までの整数、`max_analyzed_chars` は `0` から `18446744073709551615` までの整数で、`null` はキーの省略と同じく既定値になります。`"2"`・`2.0`・`-1` などそれ以外の値は、既定値に置き換わったり折り返したりするのではなく、`fields` が空のときも含めて `400 Bad Request` で拒否されます（Issue #1490）。gRPC と同じく、`0` の `max_fragments`・`fragment_size` も拒否されます。
 
 各結果には、少なくとも1つのフィールドが実際にハイライトされた場合にのみ `"highlights"` オブジェクトが追加されます。
 

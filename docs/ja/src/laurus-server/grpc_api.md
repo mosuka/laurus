@@ -100,7 +100,7 @@ message AnalyzerDefinition {
 
 | Lexical フィールド | Vector フィールド |
 | :--- | :--- |
-| `TextOption` (`indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`, `pq_codebook_path`) |
+| `TextOption` (`indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`) | `HnswOption` (`dimension`, `distance`, `m`, `ef_construction`, `base_weight`, `quantizer`, `embedder`, `default_ef_search`, `rerank_storage`, `pq_codebook_path`) |
 | `IntegerOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `FlatOption` (`dimension`, `distance`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `FloatOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `IvfOption` (`dimension`, `distance`, `n_clusters`, `n_probe`, `base_weight`, `quantizer`, `embedder`, `rerank_storage`) |
 | `BooleanOption` (`indexed`, `stored`, `multi_valued`, `doc_values`) | `MultiVectorOption` (`dimension`, `distance`, `embedder`, `storage`) |
@@ -134,6 +134,8 @@ message AnalyzerDefinition {
 **Base weight:** `HnswOption`/`FlatOption`/`IvfOption` の `base_weight` は `optional float`（Issue #1084）です。クライアントが省略するとエンジンのデフォルト（`1.0`）が使われ、これは明示的な `0.0` とは区別されます。他の vector フィールドと同時にクエリ対象になったときの、そのフィールドの相対的なスコアリング優先度を設定します。何に効いて何に効かないかは[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照してください。
 
 **グラフとクラスタのパラメータ:** `HnswOption` の `m`・`ef_construction` と、`IvfOption` の `n_clusters`・`n_probe` は `optional uint32` です（Issue #1479）。クライアントが省略するとエンジンのデフォルト（`m` は `16`、`ef_construction` は `200`、`n_clusters` は `100`、`n_probe` は `1`）が使われ、TOML のスキーマで省略したときと同じになります。`CreateIndex`・`AddField`・`UpdateField` は、`2` 未満の `m`、`0` の `ef_construction`・`n_clusters`・`n_probe`、どの vector オプションでも `0` の `dimension` を `INVALID_ARGUMENT` で拒否します。gRPC では `dimension` にデフォルトはありません。plain な `uint32` なので、省略すると `0` になって拒否されます。`UpdateField` はオプション全体を置き換えるので、そこで省略したキーも、フィールドの今の値ではなくデフォルトになります。この変更より古いサーバーは、省略した値を `0` として読みます。`m` が `0` だとすべてのドキュメントの書き込みが失敗し、`n_probe` が `0` だとすべての検索が 0 件になるので、古いサーバーを相手にするときはこれらを明示してください。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出ます。フィールドは `UpdateField` で直します（新しい `m`・`ef_construction`・`n_clusters` には `reindex` が要り、新しい `n_probe` はインデックスを開き直した後、`laurus serve` ではサーバーを再起動した後に効きます）。ドキュメントの書き込みが失敗したためにインデックスが開けない場合、その書き込みは write-ahead log に残っています。インデックスの `schema.toml` に有効な `m` を書いてサーバーを起動し直すと、その書き込みが適用されます。
+
+**`ef_search` のデフォルト:** `HnswOption` の `default_ef_search`（フィールド番号 `8`、`optional uint32`、Issue #644）は、リクエストが `VectorParams.ef_search` を指定しないときに、そのフィールドの検索で使う候補リストの大きさです。未設定のときはエンジンが決めます。[スキーマとフィールドの `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-検索時の-recall-調整パラメータ) を参照してください。`GetSchema` は、設定されているときに返します。HTTP gateway は `0` から `4294967295` までの JSON の整数として受け取ってそれ以外を 400 で拒否し、設定されているときはスキーマのレスポンスに出します。Issue #1490 より古い gateway は、不正な値を未設定として読み、そのレスポンスにキーを出しませんでした（[HTTP Gateway](http_gateway.md) を参照）。
 
 **直積量子化の `subvector_count`:** `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` のとき、`CreateIndex`・`AddField`・`UpdateField` は、`0` の `subvector_count`（クライアントが省略したときに送られる値）、`dimension` を割り切らない値、`subvector_count` か `dimension / subvector_count` が `65535` を超える値を `INVALID_ARGUMENT` で拒否します（Issue #1491）。この検査より古いサーバーはそうしたフィールドを受け付け、後の commit が `INTERNAL` で失敗します。`dimension` を割り切らない値では、そのフィールドのベクトルを含む最初の commit で、`0` では、フィールドのセグメントが 256 件（FastScan は 16 件）に達した時点で失敗し、以後の commit もすべて失敗します。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出て、フィールドを直すまではすべてのドキュメントの書き込みが、適用されずに失敗します。フィールドは `UpdateField` で有効な `subvector_count` を指定して直します（`reindex` が要り、フィールドはそのセグメントから作り直されます）。フィールドのドキュメントを多く削除する前に直してください。直すまでは、フィールドの compaction が commit を失敗させます。commit が失敗したためにインデックスが開けない場合は、インデックスの `schema.toml` に有効な `subvector_count` を書いてサーバーを起動し直してください。
 
@@ -471,7 +473,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `min_score` | `float` | 最小スコア閾値 |
-| `timeout_ms` | `uint64` | 検索タイムアウト（ミリ秒） |
+| `timeout_ms` | `optional uint64` | 検索タイムアウト（ミリ秒）。未設定または `0` はタイムアウトなし |
 | `parallel` | `bool` | 並列検索を有効化 |
 | `sort_by` | `SortSpec` | スコアの代わりにフィールドでソート |
 

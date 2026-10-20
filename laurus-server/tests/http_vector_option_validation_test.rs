@@ -1,5 +1,7 @@
 //! The HTTP gateway answers 400 when the engine rejects a vector field's
-//! options on CreateIndex, AddField and UpdateField (Issues #1479, #1491).
+//! options on CreateIndex, AddField and UpdateField (Issues #1479, #1491),
+//! or when the gateway cannot parse one of its integer keys (Issue #1490),
+//! and its schema responses keep `default_ef_search` (Issue #1490).
 //!
 //! The gateway forwards each call to the gRPC service and maps the status
 //! it returns, so these requests go through both, over a gRPC connection
@@ -130,4 +132,68 @@ async fn add_and_update_field_answer_400_and_leave_the_schema() {
         let (_, after) = send(&router, "GET", "/v1/schema", json!({})).await;
         assert_eq!(after, before, "{reason}");
     }
+}
+
+/// Issue #1490: a `default_ef_search` that is not an integer that fits
+/// `u32` is a 400 from the gateway itself, instead of a field without one,
+/// and nothing is written.
+#[tokio::test]
+async fn create_index_answers_400_for_a_malformed_default_ef_search() {
+    for bad in [json!("64"), json!(64.0), json!(-1), json!(4_294_967_360u64)] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let router = gateway(data_dir.clone()).await;
+
+        let option = json!({"hnsw": {"dimension": 8, "default_ef_search": bad}});
+        let schema = json!({"schema": {"fields": {"vec": option}}});
+        let (status, body) = send(&router, "POST", "/v1/index", schema).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert_eq!(
+            body["error"]["message"],
+            "field \"vec\": default_ef_search must be an integer between 0 and 4294967295",
+            "{bad}"
+        );
+        assert!(!data_dir.exists(), "{bad}");
+    }
+}
+
+/// Issue #1490: `GET /v1/schema` shows an HNSW field's `default_ef_search`,
+/// so a `PATCH /v1/schema/fields/:name` with the field copied from it, to
+/// change another key, keeps the value instead of clearing it.
+#[tokio::test]
+async fn schema_responses_keep_default_ef_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    let option = json!({"hnsw": {"dimension": 8, "default_ef_search": 64}});
+    let schema = json!({"schema": {"fields": {"vec": option}}});
+    let (status, body) = send(&router, "POST", "/v1/index", schema).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(&router, "GET", "/v1/schema", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut option = body["schema"]["fields"]["vec"].clone();
+    assert_eq!(option["hnsw"]["default_ef_search"], json!(64), "{body}");
+
+    option["hnsw"]["m"] = json!(24);
+    let update = json!({"field_option": option, "reindex": true});
+    let (status, body) = send(&router, "PATCH", "/v1/schema/fields/vec", update).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = send(&router, "GET", "/v1/schema", json!({})).await;
+    let hnsw = &body["schema"]["fields"]["vec"]["hnsw"];
+    assert_eq!(hnsw["m"], json!(24), "{body}");
+    assert_eq!(hnsw["default_ef_search"], json!(64), "{body}");
+
+    // UpdateField replaces the whole option, so a copy without the key, as
+    // a server before this fix rendered it, clears the value.
+    option["hnsw"]
+        .as_object_mut()
+        .unwrap()
+        .remove("default_ef_search");
+    let update = json!({"field_option": option});
+    let (status, body) = send(&router, "PATCH", "/v1/schema/fields/vec", update).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = send(&router, "GET", "/v1/schema", json!({})).await;
+    let hnsw = &body["schema"]["fields"]["vec"]["hnsw"];
+    assert!(hnsw.get("default_ef_search").is_none(), "{body}");
 }
