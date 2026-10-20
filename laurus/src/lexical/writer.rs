@@ -108,7 +108,10 @@ pub trait LexicalIndexWriter: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if analyzing a field's value fails.
-    fn analyze_fields(&self, fields: &[(&str, &DataValue)]) -> Result<AnalyzedDocument>;
+    fn analyze_fields<'a>(
+        &self,
+        fields: &mut dyn Iterator<Item = (&'a str, &'a DataValue)>,
+    ) -> Result<AnalyzedDocument>;
 
     /// Flush the in-memory buffer to an unpublished segment if it has reached
     /// the writer's size or memory threshold, as an upsert does after

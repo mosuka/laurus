@@ -2965,8 +2965,11 @@ impl LexicalIndexWriter for InvertedIndexWriter {
         InvertedIndexWriter::add_analyzed_document(self, doc)
     }
 
-    fn analyze_fields(&self, fields: &[(&str, &DataValue)]) -> Result<AnalyzedDocument> {
-        InvertedIndexWriter::analyze_fields(self, fields.iter().copied())
+    fn analyze_fields<'a>(
+        &self,
+        fields: &mut dyn Iterator<Item = (&'a str, &'a DataValue)>,
+    ) -> Result<AnalyzedDocument> {
+        InvertedIndexWriter::analyze_fields(self, fields)
     }
 
     fn flush_if_full(&mut self) -> Result<()> {

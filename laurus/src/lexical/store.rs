@@ -170,9 +170,9 @@ impl LexicalStore {
     /// Returns an error if creating the writer, analyzing the document, or
     /// flushing the buffer fails. A failed flush keeps the documents
     /// buffered.
-    pub(crate) fn prepare_upsert(
+    pub(crate) fn prepare_upsert<'a>(
         &self,
-        fields: &[(&str, &DataValue)],
+        fields: &mut dyn Iterator<Item = (&'a str, &'a DataValue)>,
     ) -> Result<PreparedLexicalDocument> {
         let mut guard = self.writer_cache.lock();
         let writer = self.cached_writer(&mut guard)?;

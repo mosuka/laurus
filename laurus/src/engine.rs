@@ -1532,9 +1532,13 @@ impl Engine {
         // a failed flush after the WAL append likewise deleted the previous
         // version, and the record replayed into the same analyzer error on
         // every later open. Only buffering is left for after the append.
-        let lexical = self
-            .lexical
-            .prepare_upsert(&self.lexical_field_refs(&doc))?;
+        let lexical = {
+            // The schema cannot change under `_schema_guard`, so holding its
+            // read lock through the analysis blocks nothing.
+            let schema = self.schema.read();
+            self.lexical
+                .prepare_upsert(&mut Self::lexical_fields(&schema, &doc))?
+        };
         // Writes may have stopped while this put embedded and analyzed its
         // document; nothing durable has happened yet (Issue #1492).
         self.write_stop.check()?;
@@ -3051,22 +3055,24 @@ impl Engine {
 
     /// Borrowed `(field_name, value)` pairs of `doc`'s fields for the
     /// lexical store, without its multi-vector fields (Issues #1177,
-    /// #1492). The counterpart of [`Self::vector_field_refs`].
+    /// #1492). The counterpart of [`Self::vector_field_refs`], as an
+    /// iterator so that a put allocates nothing for it.
     ///
     /// The lexical store ignores fields it does not know, except when its
     /// field list is empty: it then stores every field, which would copy
     /// each document's token vectors into its stored fields.
-    fn lexical_field_refs<'a>(&self, doc: &'a Document) -> Vec<(&'a str, &'a DataValue)> {
-        let schema = self.schema.read();
+    fn lexical_fields<'a>(
+        schema: &'a Schema,
+        doc: &'a Document,
+    ) -> impl Iterator<Item = (&'a str, &'a DataValue)> + 'a {
         doc.fields
             .iter()
-            .filter(|(name, _)| !Self::is_multi_vector_field(&schema, name))
+            .filter(|(name, _)| !Self::is_multi_vector_field(schema, name))
             .map(|(name, val)| (name.as_str(), val))
-            .collect()
     }
 
     /// A copy of `doc` without its multi-vector fields, for the lexical
-    /// store (see [`Self::lexical_field_refs`]); the token vectors are
+    /// store (see [`Self::lexical_fields`]); the token vectors are
     /// never cloned.
     fn without_multi_vector_fields(&self, doc: &Document) -> Document {
         let schema = self.schema.read();
