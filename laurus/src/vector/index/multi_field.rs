@@ -364,6 +364,21 @@ impl VectorIndex for MultiFieldVectorIndex {
         Self::min_wal_seq(&self.fields.read())
     }
 
+    fn highest_wal_seq(&self) -> u64 {
+        // The MAXIMUM across fields: the bound a WAL must assign sequence
+        // numbers above after a reopen (Issue #1502). The minimum is not
+        // enough: a record at or below a field that is ahead of the others
+        // is replayed only while a lagging field holds `last_wal_seq()`
+        // down, and is skipped for the vector store once that field is
+        // gone from the schema.
+        self.fields
+            .read()
+            .values()
+            .map(|f| f.index.highest_wal_seq())
+            .max()
+            .unwrap_or(0)
+    }
+
     fn set_last_wal_seq(&self, seq: u64) -> Result<()> {
         try_all(self.fields.read().values(), |f| {
             f.index.set_last_wal_seq(seq)

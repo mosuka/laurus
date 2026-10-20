@@ -1502,6 +1502,16 @@ impl VectorStore {
         self.index.last_wal_seq()
     }
 
+    /// The highest WAL checkpoint any vector field has persisted.
+    ///
+    /// [`Self::last_wal_seq`] is the minimum across fields, the replay
+    /// checkpoint; this is the maximum, the bound the WAL assigns its
+    /// sequence numbers above after a reopen (see
+    /// [`VectorIndex::highest_wal_seq`]). `0` without vector fields.
+    pub fn highest_wal_seq(&self) -> u64 {
+        self.index.highest_wal_seq()
+    }
+
     /// Set the last processed WAL sequence number.
     ///
     /// Note: This method doesn't return Result for Engine compatibility.
@@ -1971,6 +1981,9 @@ mod tests {
         }
         fn last_wal_seq(&self) -> u64 {
             self.inner.last_wal_seq()
+        }
+        fn highest_wal_seq(&self) -> u64 {
+            self.inner.highest_wal_seq()
         }
         fn set_last_wal_seq(&self, seq: u64) -> Result<()> {
             self.inner.set_last_wal_seq(seq)

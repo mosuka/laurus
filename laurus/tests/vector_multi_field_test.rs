@@ -752,3 +752,40 @@ fn add_field_seeds_wal_seq_from_current_minimum() {
             .is_err()
     );
 }
+
+/// Issue #1502: `highest_wal_seq()` is the maximum across fields, the bound
+/// the engine's WAL assigns sequence numbers above after a reopen, while
+/// `last_wal_seq()` stays the minimum (the replay checkpoint).
+#[test]
+fn highest_wal_seq_is_the_maximum_across_fields() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "title_vec".to_string(),
+        hnsw_config(3, DistanceMetric::Cosine),
+    );
+    fields.insert(
+        "body_vec".to_string(),
+        hnsw_config(3, DistanceMetric::Cosine),
+    );
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+    assert_eq!(index.highest_wal_seq(), 0);
+
+    index.set_last_wal_seq(42).unwrap();
+    index.persist_deletions().unwrap();
+    assert_eq!(index.last_wal_seq(), 42);
+    assert_eq!(index.highest_wal_seq(), 42);
+
+    // Run `title_vec` ahead: unregister `body_vec` (its data stays), publish
+    // a higher checkpoint for the remaining field, then register `body_vec`
+    // again. It reopens with its published 42; the checkpoint `add_field`
+    // seeds stays pending until the next `persist_deletions()`.
+    index.remove_field("body_vec", false).unwrap();
+    index.set_last_wal_seq(50).unwrap();
+    index.persist_deletions().unwrap();
+    index
+        .add_field("body_vec", hnsw_config(3, DistanceMetric::Cosine))
+        .unwrap();
+    assert_eq!(index.last_wal_seq(), 42);
+    assert_eq!(index.highest_wal_seq(), 50);
+}

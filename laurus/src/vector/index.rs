@@ -150,6 +150,19 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
         0
     }
 
+    /// The highest WAL checkpoint any part of this index has persisted.
+    ///
+    /// [`Self::last_wal_seq`] is the replay checkpoint, so an index made of
+    /// independently checkpointed parts reports the lowest of them. This
+    /// reports the highest, which is what a WAL must assign its sequence
+    /// numbers above after a reopen (Issue #1502): a record at or below
+    /// some part's checkpoint would be skipped for that part once the
+    /// lower parts no longer hold the replay checkpoint down. An index with
+    /// a single checkpoint returns [`Self::last_wal_seq`].
+    fn highest_wal_seq(&self) -> u64 {
+        self.last_wal_seq()
+    }
+
     /// Set the last processed WAL sequence number.
     fn set_last_wal_seq(&self, _seq: u64) -> Result<()> {
         Ok(())

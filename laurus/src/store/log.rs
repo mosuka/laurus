@@ -348,7 +348,10 @@ impl DocumentLog {
     /// Callers must invoke [`read_all`](Self::read_all) after construction to
     /// replay the WAL and synchronize both the `next_doc_id` and `next_seq`
     /// counters with the persisted state. Failing to do so may cause
-    /// duplicate document IDs.
+    /// duplicate document IDs. `read_all` only raises `next_seq` above the
+    /// records it finds, so a caller whose stores keep WAL checkpoints must
+    /// also call [`advance_seq_past`](Self::advance_seq_past) with the
+    /// highest of them.
     ///
     /// Equivalent to [`with_sync_policy`](Self::with_sync_policy) with the
     /// default [`WalSyncPolicy::PerRecord`], where every append is fsync'd before
@@ -384,7 +387,10 @@ impl DocumentLog {
     /// Callers must invoke [`read_all`](Self::read_all) after construction to
     /// replay the WAL and synchronize both the `next_doc_id` and `next_seq`
     /// counters with the persisted state. Failing to do so may cause
-    /// duplicate document IDs.
+    /// duplicate document IDs. `read_all` only raises `next_seq` above the
+    /// records it finds, so a caller whose stores keep WAL checkpoints must
+    /// also call [`advance_seq_past`](Self::advance_seq_past) with the
+    /// highest of them.
     ///
     /// # Arguments
     ///
@@ -827,7 +833,9 @@ impl DocumentLog {
     ///
     /// Also updates internal counters (`next_seq`, `next_doc_id`) to be
     /// greater than the maximum values found in the log, and syncs
-    /// `next_doc_id` with the committed document store segments.
+    /// `next_doc_id` with the committed document store segments. An empty
+    /// or missing WAL leaves `next_seq` where it is: raising it above the
+    /// stores' checkpoints is [`Self::advance_seq_past`]'s job.
     pub fn read_all(&self) -> Result<Vec<LogRecord>> {
         if !self.wal_storage.file_exists(&self.wal_path) {
             // Even with an empty WAL, sync next_doc_id with doc_store.
@@ -1078,6 +1086,20 @@ impl DocumentLog {
     /// Get the last used sequence number.
     pub fn last_seq(&self) -> SeqNumber {
         self.next_seq.load(Ordering::SeqCst).saturating_sub(1)
+    }
+
+    /// Make every sequence number assigned from now on greater than `seq`.
+    ///
+    /// A WAL that a commit emptied gives [`Self::read_all`] nothing to
+    /// continue from, so on its own the next append would get sequence
+    /// number 1 again. The engine calls this with the highest checkpoint
+    /// its stores persisted before reading the WAL (Issue #1502): a record
+    /// at or below a store's checkpoint is skipped for that store on
+    /// recovery, so a write appended after a reopen must land above all of
+    /// them. Never lowers the counter.
+    pub fn advance_seq_past(&self, seq: SeqNumber) {
+        self.next_seq
+            .fetch_max(seq.saturating_add(1), Ordering::SeqCst);
     }
 
     /// Get the current next_doc_id value.

@@ -312,9 +312,27 @@ store's `last_wal_seq`. Replay is **idempotent** — it re-applies each record
 under its originally recorded `doc_id`, so re-running it overwrites rather than
 duplicates. Because each store keeps its own checkpoint, a commit that fails
 partway leaves the stores at different `last_wal_seq` values and recovery simply
-re-applies what each store is missing. (The vector store currently keeps its
-checkpoint at `0`, so it replays the full retained WAL on every recovery —
-correct and idempotent, just not yet optimized.)
+re-applies what each store is missing. The vector store's checkpoint is the
+lowest of its fields' (each field publishes its own at the end of the vector
+commit), so a field that lags behind gets its records replayed; a field on a
+monolithic (non-segmented) vector index keeps its checkpoint at `0`, which
+replays the full retained WAL into the vector store on every recovery — correct
+and idempotent, just not optimized.
+
+Sequence numbers continue across opens. A commit empties the WAL, so before
+reading it `build()` raises the WAL's sequence counter above the highest
+checkpoint any store persisted: the lexical one and every vector field's. A
+write made after a reopen therefore always lands above every checkpoint, and a
+crash before the next commit replays it (Issue #1502).
+
+> **Note:** Before Issue #1502 was fixed, the sequence restarted at 1 on every
+> open over an empty WAL, at or below the checkpoints. A write such a build
+> made after a reopen, left only in the WAL by a crash before the next commit
+> and numbered at or below a checkpoint, is skipped by recovery in any build:
+> a new document is missing, an overwrite reverts to the previous version, and
+> a delete is undone. Nothing recovers these writes; re-ingest what was written
+> since that reopen. It cannot happen again once a build with the fix has
+> opened the index.
 
 The table below shows the outcome of a crash at each step (identical for
 `PerRecord` and `Group`, because the step-1 barrier has already run):

@@ -311,7 +311,9 @@ async fn run_commit_ladder(
     // against the last commit's snapshot is what keeps an idle
     // `CommitPolicy::Interval` tick (which runs this same ladder
     // unconditionally on a timer) from making external readers see a
-    // false "something changed" signal on every tick.
+    // false "something changed" signal on every tick. After a reopen over an
+    // empty WAL, `recover()` starts both `applied_seq` and that snapshot at
+    // the stores' highest checkpoint (Issue #1502), not at 0.
     commit_generation.advance_if_changed(applied_before)?;
 
     Ok(())
@@ -390,6 +392,19 @@ impl CommitGenerationTracker {
                 .store(applied_before, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Record that everything at or below `applied_seq` is already covered
+    /// by the persisted generation, so a later commit with nothing newer to
+    /// apply leaves the generation alone.
+    ///
+    /// For a reopen over an empty WAL (Issue #1502): `applied_seq` then
+    /// starts at the stores' highest checkpoint instead of `0`, and without
+    /// this the first idle commit would see it above the in-memory `0` and
+    /// advance the generation for nothing.
+    fn mark_committed(&self, applied_seq: u64) {
+        self.last_applied_seq
+            .fetch_max(applied_seq, Ordering::AcqRel);
     }
 
     /// The current generation, for [`Engine::stats`].
@@ -566,6 +581,11 @@ pub struct Engine {
     /// [`run_commit_ladder`] uses the snapshot as the WAL retain point, so a
     /// record appended by a mutation racing the commit is preserved instead of
     /// being wiped by the truncate. `Arc` so the [`CommitTimer`] shares it.
+    ///
+    /// Sequence numbers continue across opens (Issue #1502), so
+    /// [`Self::recover`] raises this to the stores' highest checkpoint once
+    /// every WAL record is replayed or covered: everything at or below it is
+    /// then in both stores.
     applied_seq: Arc<AtomicU64>,
     /// Per-external-id serialization for the delete-then-add upsert (#1049).
     ///
@@ -902,6 +922,12 @@ impl Engine {
     /// store re-applies only what it is missing. See [`Self::commit`] for the
     /// ordering guarantees that make this safe (Issue #821).
     ///
+    /// Before reading the WAL, the log's sequence counter is raised above
+    /// the highest checkpoint any store persisted (Issue #1502), so a record
+    /// appended after this open is never at or below a checkpoint and is
+    /// always replayed after a crash. Must run before anything else commits:
+    /// [`EngineBuilder::build`] starts the [`CommitTimer`] only afterwards.
+    ///
     /// A record whose re-application fails is normally a fatal error for
     /// recovery (and therefore for [`EngineBuilder::build`]), since retrying
     /// a deterministic rejection would just fail the same way on every
@@ -914,10 +940,32 @@ impl Engine {
     /// an [`InvalidArgument`](crate::error::LaurusError::InvalidArgument),
     /// meaning the input itself, not a transient condition, was the problem.
     async fn recover(&self) -> Result<()> {
+        // Sequence numbers continue across opens (Issue #1502). A commit
+        // empties the WAL, so `read_all` alone would let the next append
+        // restart at 1, at or below the checkpoints the stores persisted,
+        // and the replay below would skip that write after a crash. Assign
+        // every new sequence number above the HIGHEST checkpoint: the
+        // lexical one and every vector field's, not the vector store's
+        // `last_wal_seq()` (a minimum, see `VectorStore::highest_wal_seq`).
+        let seq_floor = self
+            .lexical
+            .last_wal_seq()
+            .max(self.vector.highest_wal_seq());
+        self.log.advance_seq_past(seq_floor);
+
         // read_all() internally syncs next_doc_id with doc_store segments.
         let records = self.log.read_all()?;
 
         if records.is_empty() {
+            // Nothing to replay: every record at or below the floor was
+            // truncated by a commit that completed in both stores. Start
+            // `applied_seq` there, or the next commit's
+            // `truncate_retaining_after` would see `last_seq()` above its
+            // retain point and rewrite the empty WAL instead of taking its
+            // fast path. And record it as committed, or that same commit
+            // would advance the generation with nothing applied (#1088).
+            self.applied_seq.fetch_max(seq_floor, Ordering::AcqRel);
+            self.commit_generation.mark_committed(seq_floor);
             return Ok(());
         }
 
@@ -1083,6 +1131,16 @@ impl Engine {
                 }
             }
         }
+
+        // Every record is now applied, discarded or covered by both
+        // checkpoints, so everything at or below the floor is in both stores
+        // (Issue #1502, see the empty-WAL case above). Raised only now, so no
+        // commit can take the floor as its retain point while a store still
+        // lacks a record at or below it. The generation's baseline stays at
+        // 0: the commit below advances the generation for a replay, and a
+        // WAL holding only covered `Delete`s (no commit here) advances it at
+        // the next commit, as the session that wrote them never got to.
+        self.applied_seq.fetch_max(seq_floor, Ordering::AcqRel);
 
         // Persist the replayed state right away (Issue #875). Deletion
         // persistence is deferred to commit, so without this a freshly
@@ -4245,23 +4303,10 @@ impl EngineBuilder {
             None => None,
         };
 
-        // Start the auto-commit timer for `CommitPolicy::Interval`. Native
-        // only; on wasm32 `Interval` is a no-op (no background threads).
-        #[cfg(not(target_arch = "wasm32"))]
-        let commit_timer = match self.commit_policy {
-            CommitPolicy::Interval(interval) => Some(CommitTimer::spawn(
-                Arc::clone(&lexical),
-                Arc::clone(&vector),
-                Arc::clone(&log),
-                Arc::clone(&docs_since_commit),
-                Arc::clone(&applied_seq),
-                commit_generation.clone(),
-                interval,
-            )?),
-            _ => None,
-        };
-
-        let engine = Engine {
+        // Only the commit timer below needs `engine` mutable, and it does not
+        // exist on wasm32.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut engine = Engine {
             schema: RwLock::new(self.schema),
             lexical,
             vector,
@@ -4280,13 +4325,36 @@ impl EngineBuilder {
             #[cfg(not(target_arch = "wasm32"))]
             _wal_flush_timer: wal_flush_timer,
             #[cfg(not(target_arch = "wasm32"))]
-            _commit_timer: commit_timer,
+            _commit_timer: None,
             schema_persist_hook: self.schema_persist_hook,
             _storage_lock: storage_lock,
             commit_generation,
         };
 
         engine.recover().await?;
+
+        // Start the auto-commit timer for `CommitPolicy::Interval` only now
+        // that recovery is done (Issue #1502). A tick during recovery would
+        // run the commit ladder against a WAL that is not replayed yet: on
+        // an index no commit has checkpointed, `last_seq()` and
+        // `applied_seq` are both still 0 before `read_all`, so
+        // `truncate_retaining_after` takes its fast path and empties the WAL
+        // a crash left behind before it is read. `recover` also sets the
+        // commit generation's baseline, which a tick must not see unset.
+        // Native only; on wasm32 `Interval` is a no-op (no background
+        // threads).
+        #[cfg(not(target_arch = "wasm32"))]
+        if let CommitPolicy::Interval(interval) = engine.commit_policy {
+            engine._commit_timer = Some(CommitTimer::spawn(
+                Arc::clone(&engine.lexical),
+                Arc::clone(&engine.vector),
+                Arc::clone(&engine.log),
+                Arc::clone(&engine.docs_since_commit),
+                Arc::clone(&engine.applied_seq),
+                engine.commit_generation.clone(),
+                interval,
+            )?);
+        }
 
         Ok(engine)
     }
@@ -7530,6 +7598,437 @@ mod tests {
         // not repeat a read-back/rewrite of the same stale tail forever.
         reopened.commit().await.unwrap();
         assert_eq!(wal_bytes(&storage), 0);
+    }
+
+    /// An in-memory storage without a lock manager, so that a test can
+    /// `std::mem::forget` an engine to stand for a crash (no drop-time
+    /// writer close, no commit) and still build a new engine over the same
+    /// storage.
+    fn unlocked_memory_storage() -> Arc<dyn Storage> {
+        Arc::new(PrefixedStorage::new(
+            "index",
+            Arc::new(MemoryStorage::new(Default::default())),
+        ))
+    }
+
+    /// The external ids of a search's hits, in rank order.
+    async fn hit_ids(engine: &Engine, request: search::SearchRequest) -> Vec<String> {
+        engine
+            .search(request)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect()
+    }
+
+    /// The external ids a lexical query on `title` returns.
+    async fn title_hits(engine: &Engine, term: &str) -> Vec<String> {
+        use crate::lexical::search::searcher::LexicalSearchQuery;
+        let request = search::SearchRequestBuilder::new()
+            .lexical_query(LexicalSearchQuery::from(format!("title:{term}").as_str()))
+            .limit(10)
+            .build();
+        hit_ids(engine, request).await
+    }
+
+    /// A schema with one text field, `title`, and a 3-dimensional `Flat`
+    /// vector field per name in `vector_fields`.
+    fn title_schema(vector_fields: &[&str]) -> Schema {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+        use crate::vector::core::field::FlatOption;
+        let mut builder =
+            Schema::builder().add_field("title", FieldOption::Text(TextOption::default()));
+        for &name in vector_fields {
+            builder =
+                builder.add_field(name, FieldOption::Flat(FlatOption::default().dimension(3)));
+        }
+        builder.build()
+    }
+
+    /// A document with a `title` and one 3-dimensional vector in `field`.
+    fn vector_doc(title: &str, field: &str, vector: [f32; 3]) -> Document {
+        Document::builder()
+            .add_text("title", title)
+            .add_vector(field, vector.to_vec())
+            .build()
+    }
+
+    /// The external id of the document nearest to `vector`, over every
+    /// vector field.
+    async fn nearest_id(engine: &Engine, vector: [f32; 3]) -> Vec<String> {
+        use crate::vector::store::request::QueryVector;
+        let request = search::SearchRequestBuilder::new()
+            .vector_query(search::VectorSearchQuery::Vectors(vec![QueryVector {
+                vector: Vector::new(vector.to_vec()),
+                weight: 1.0,
+                fields: None,
+            }]))
+            .limit(1)
+            .build();
+        hit_ids(engine, request).await
+    }
+
+    /// Issue #1502: a put made after a commit and a clean reopen must survive
+    /// a crash before the next commit. The WAL's sequence numbers used to
+    /// restart at 1 on every open, at or below the checkpoint the last commit
+    /// persisted, so recovery skipped the record for the lexical store and the
+    /// acknowledged put was gone from the index.
+    #[tokio::test]
+    async fn put_after_a_clean_reopen_survives_a_crash() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("c", title_doc("gamma")).await.unwrap();
+        // Crash: no drop-time writer close and no commit, so "c" is in the
+        // WAL only.
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(reopened.get_documents("c").await.unwrap().len(), 1);
+        assert_eq!(title_hits(&reopened, "gamma").await, vec!["c"]);
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+    }
+
+    /// Issue #1502, with a vector field: the put made after a clean reopen
+    /// must come back in both stores after a crash, not in neither (both
+    /// checkpoints covered the restarted sequence number).
+    #[tokio::test]
+    async fn put_after_a_clean_reopen_survives_a_crash_with_a_vector_field() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine
+            .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("c", vector_doc("gamma", "vec", [0.0, 0.0, 1.0]))
+            .await
+            .unwrap();
+        // Crash, as in the text-only test above.
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(reopened.get_documents("c").await.unwrap().len(), 1);
+        assert_eq!(title_hits(&reopened, "gamma").await, vec!["c"]);
+        assert_eq!(nearest_id(&reopened, [0.0, 0.0, 1.0]).await, vec!["c"]);
+    }
+
+    /// Issue #1502: an overwrite and a delete made after a clean reopen must
+    /// survive a crash too. A put of an existing id logs a `Delete` of the
+    /// previous version before its `Upsert`; with sequence numbers restarted
+    /// at or below the checkpoint, recovery skipped all three records, so the
+    /// old version of `a` and the deleted `b` were back.
+    #[tokio::test]
+    async fn overwrite_and_delete_after_a_clean_reopen_survive_a_crash() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        engine.put_document("c", title_doc("gamma")).await.unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("delta")).await.unwrap();
+        engine.delete_documents("b").await.unwrap();
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(reopened.get_documents("a").await.unwrap().len(), 1);
+        assert_eq!(title_hits(&reopened, "delta").await, vec!["a"]);
+        assert!(title_hits(&reopened, "alpha").await.is_empty());
+        assert!(reopened.get_documents("b").await.unwrap().is_empty());
+        assert!(title_hits(&reopened, "beta").await.is_empty());
+    }
+
+    /// Issue #1502: every open continues the sequence from the checkpoints
+    /// the previous session's commit left, not only the first reopen.
+    #[tokio::test]
+    async fn put_after_two_clean_reopens_survives_a_crash() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("c", title_doc("gamma")).await.unwrap();
+        let seq_of_c = engine.log.last_seq();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("d", title_doc("delta")).await.unwrap();
+        assert!(
+            engine.log.last_seq() > seq_of_c,
+            "a put after the second reopen must get a sequence number above \
+             the one the first reopen's put got"
+        );
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(title_hits(&reopened, "delta").await, vec!["d"]);
+        assert_eq!(title_hits(&reopened, "gamma").await, vec!["c"]);
+    }
+
+    /// Issue #1502: dropping an engine without a commit commits the lexical
+    /// store (its writer commits when closed on drop) but not the vector
+    /// store, so the next open must replay the put to the vector store only.
+    /// With the sequence restarted at or below both checkpoints, the put was
+    /// skipped for both and kept its text but lost its vector.
+    #[tokio::test]
+    async fn put_after_a_reopen_keeps_its_vector_when_dropped_without_a_commit() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("c", vector_doc("gamma", "vec", [0.0, 0.0, 1.0]))
+            .await
+            .unwrap();
+        drop(engine);
+
+        let reopened = Engine::new(storage, schema).await.unwrap();
+        assert_eq!(title_hits(&reopened, "gamma").await, vec!["c"]);
+        assert_eq!(nearest_id(&reopened, [0.0, 0.0, 1.0]).await, vec!["c"]);
+    }
+
+    /// Puts the committed `a_vec` checkpoint of an engine over
+    /// `title_schema(&["a_vec", "b_vec"])` at 50, ahead of `b_vec` and of the
+    /// lexical store: unregisters `b_vec`, publishes 50 for the remaining
+    /// field, and registers `b_vec` again. It reopens with its published
+    /// checkpoint; the one `add_field` seeds stays pending, since nothing
+    /// commits it.
+    async fn run_a_vec_ahead(engine: &Engine, schema: &Schema) {
+        engine.vector.delete_field("b_vec").await.unwrap();
+        engine.vector.set_last_wal_seq(50);
+        engine.vector.commit().await.unwrap();
+        let b_vec = schema.fields["b_vec"].to_vector().unwrap();
+        engine
+            .vector
+            .add_field("b_vec", &b_vec, None)
+            .await
+            .unwrap();
+        assert!(engine.lexical.last_wal_seq() < 50);
+        assert!(engine.vector.last_wal_seq() < 50);
+        assert_eq!(engine.vector.highest_wal_seq(), 50);
+    }
+
+    /// Issue #1502: when the stores' highest checkpoint is above every record
+    /// recovery replays, recovery's own commit must still empty the WAL, and
+    /// the idle commits after it must keep it empty. `applied_seq` is raised
+    /// to the floor after the replay; left at the last replayed record, every
+    /// commit until a write passes the floor would rewrite the WAL.
+    #[tokio::test]
+    async fn recovery_below_the_floor_leaves_an_empty_wal() {
+        let storage = unlocked_memory_storage();
+        let both = title_schema(&["a_vec", "b_vec"]);
+
+        let engine = Engine::new(storage.clone(), both.clone()).await.unwrap();
+        engine
+            .put_document("x", vector_doc("xi", "a_vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        run_a_vec_ahead(&engine, &both).await;
+        // Below `a_vec`'s checkpoint, above the lexical one and `b_vec`'s.
+        engine
+            .put_document("y", vector_doc("ypsilon", "a_vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        assert!(engine.log.last_seq() < 50);
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage.clone(), both).await.unwrap();
+        assert_eq!(title_hits(&reopened, "ypsilon").await, vec!["y"]);
+        assert_eq!(wal_bytes(&storage), 0, "recovery's commit rewrote the WAL");
+        reopened.commit().await.unwrap();
+        assert_eq!(wal_bytes(&storage), 0, "an idle commit rewrote the WAL");
+    }
+
+    /// Issue #1502, acceptance criterion 2: the floor is the highest
+    /// checkpoint of every vector field, not the vector store's
+    /// `last_wal_seq()` (the minimum). Here `a_vec` is ahead of `b_vec` and
+    /// of the lexical store. A put after the reopen at or below `a_vec`'s
+    /// checkpoint would be replayed only while `b_vec` holds the minimum
+    /// down: opened without `b_vec`, the minimum rises to `a_vec`'s
+    /// checkpoint and recovery skips the put for the vector store.
+    #[tokio::test]
+    async fn put_after_a_reopen_lands_above_every_vector_fields_checkpoint() {
+        let storage = unlocked_memory_storage();
+        let both = title_schema(&["a_vec", "b_vec"]);
+
+        let engine = Engine::new(storage.clone(), both.clone()).await.unwrap();
+        engine
+            .put_document("x", vector_doc("xi", "a_vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        run_a_vec_ahead(&engine, &both).await;
+        drop(engine);
+
+        let engine = Engine::new(storage.clone(), both).await.unwrap();
+        engine
+            .put_document("c", vector_doc("gamma", "a_vec", [0.0, 0.0, 1.0]))
+            .await
+            .unwrap();
+        assert!(engine.log.last_seq() > 50);
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, title_schema(&["a_vec"]))
+            .await
+            .unwrap();
+        assert_eq!(title_hits(&reopened, "gamma").await, vec!["c"]);
+        assert_eq!(nearest_id(&reopened, [0.0, 0.0, 1.0]).await, vec!["c"]);
+    }
+
+    /// Issue #1502: after a clean reopen over an empty WAL, a commit with
+    /// nothing new to apply must stay a no-op, as before the sequence
+    /// continued across opens: `applied_seq` starts at the floor, so the
+    /// truncate takes its fast path and leaves the WAL at 0 bytes, and the
+    /// commit generation's baseline starts there too, so the generation does
+    /// not move (#1088). A real write after that still advances it.
+    #[tokio::test]
+    async fn idle_commit_after_a_clean_reopen_is_a_no_op() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(engine.stats().unwrap().commit_generation, 1);
+        drop(engine);
+
+        let reopened = Engine::new(storage.clone(), schema).await.unwrap();
+        reopened.commit().await.unwrap();
+        reopened.commit().await.unwrap();
+        assert_eq!(wal_bytes(&storage), 0, "an idle commit rewrote the WAL");
+        assert_eq!(
+            reopened.stats().unwrap().commit_generation,
+            1,
+            "an idle commit after a reopen must not advance the generation"
+        );
+
+        reopened.put_document("b", title_doc("beta")).await.unwrap();
+        reopened.commit().await.unwrap();
+        assert_eq!(reopened.stats().unwrap().commit_generation, 2);
+        assert_eq!(wal_bytes(&storage), 0);
+    }
+
+    /// Delays the first `file_exists` of the WAL (`engine.wal`), the first
+    /// thing recovery does with it, so that a timer running alongside
+    /// recovery gets many ticks before the WAL is read.
+    #[derive(Debug)]
+    struct SlowWalStorage {
+        inner: Arc<dyn Storage>,
+        delay: std::sync::atomic::AtomicBool,
+    }
+
+    impl Storage for SlowWalStorage {
+        fn open_input(&self, name: &str) -> Result<Box<dyn crate::storage::StorageInput>> {
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output(name)
+        }
+        fn create_output_append(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            if name == "engine.wal" && self.delay.swap(false, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(
+            &self,
+            prefix: &str,
+        ) -> Result<(String, Box<dyn crate::storage::StorageOutput>)> {
+            self.inner.create_temp_output(prefix)
+        }
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #1502: the `CommitPolicy::Interval` timer starts only after
+    /// recovery. It used to run alongside `recover`: on an index no commit
+    /// had checkpointed, a tick before `read_all` saw `last_seq()` and
+    /// `applied_seq` both at 0, took `truncate_retaining_after`'s fast path
+    /// and emptied the WAL a crash had left before it was replayed.
+    #[tokio::test]
+    async fn interval_timer_does_not_commit_before_recovery_reads_the_wal() {
+        let inner = unlocked_memory_storage();
+        let schema = title_schema(&[]);
+
+        let engine = Engine::new(inner.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        // Crash before any commit: no store has a checkpoint yet.
+        std::mem::forget(engine);
+
+        let storage: Arc<dyn Storage> = Arc::new(SlowWalStorage {
+            inner,
+            delay: std::sync::atomic::AtomicBool::new(true),
+        });
+        let reopened = Engine::builder(storage, schema)
+            .commit_policy(CommitPolicy::Interval(Duration::from_millis(1)))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
     }
 
     /// Issue #1326: an index a build predating the fix already left with a
