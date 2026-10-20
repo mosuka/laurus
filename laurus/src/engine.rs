@@ -2951,9 +2951,14 @@ impl Engine {
 
         // A vector field whose parameters `validate_for_create` rejects
         // (Issue #1479: e.g. HNSW `m` 0, IVF `n_probe` 0, which gRPC and
-        // HTTP used to persist for an omitted key) opens with a warning
-        // instead: refusing to open would leave no way to repair it with
-        // `update_field`.
+        // HTTP used to persist for an omitted key; Issue #1491: an HNSW
+        // product quantizer's `subvector_count` 0 or one not dividing the
+        // dimension) opens with a warning instead: refusing to open would
+        // leave no way to repair it with `update_field`. Until then a put
+        // fails before its WAL append wherever creating the field's writer
+        // does (HNSW `m`, `subvector_count`). The warning is logged before
+        // `recover`, so it also explains a WAL replay that fails on the
+        // field.
         for (name, field_option) in &schema.fields {
             if let Some(reason) = field_option
                 .to_vector()
@@ -2961,10 +2966,11 @@ impl Engine {
             {
                 log::warn!(
                     "schema.fields entry '{name}' is not usable as persisted: {reason}; \
-                     fix it with update_field (a new m, ef_construction or n_clusters \
-                     rebuilds the field, a new n_probe applies once the index is reopened, \
-                     a new dimension discards the field's vectors), or in schema.toml \
-                     while the index is closed"
+                     fix it with update_field (a new m, ef_construction, n_clusters or \
+                     quantizer rebuilds the field, a new n_probe applies once the index is \
+                     reopened, a new dimension discards the field's vectors), or in \
+                     schema.toml while the index is closed, which is the only way when a \
+                     pending write keeps the index from opening"
                 );
             }
         }

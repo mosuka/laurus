@@ -303,6 +303,9 @@ message QuantizationConfig {
   QuantizationMethod method = 1;
   // Only used when method is PRODUCT_QUANTIZATION or
   // PRODUCT_QUANTIZATION_FASTSCAN; ignored for SCALAR_8BIT and FLOAT16.
+  // Must be at least 1 and divide the field's dimension: CreateIndex,
+  // AddField and UpdateField reject an unset (0) or non-dividing value as
+  // INVALID_ARGUMENT (Issue #1491).
   uint32 subvector_count = 2;
 }
 

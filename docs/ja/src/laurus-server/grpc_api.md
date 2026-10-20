@@ -135,12 +135,14 @@ message AnalyzerDefinition {
 
 **グラフとクラスタのパラメータ:** `HnswOption` の `m`・`ef_construction` と、`IvfOption` の `n_clusters`・`n_probe` は `optional uint32` です（Issue #1479）。クライアントが省略するとエンジンのデフォルト（`m` は `16`、`ef_construction` は `200`、`n_clusters` は `100`、`n_probe` は `1`）が使われ、TOML のスキーマで省略したときと同じになります。`CreateIndex`・`AddField`・`UpdateField` は、`2` 未満の `m`、`0` の `ef_construction`・`n_clusters`・`n_probe`、どの vector オプションでも `0` の `dimension` を `INVALID_ARGUMENT` で拒否します。gRPC では `dimension` にデフォルトはありません。plain な `uint32` なので、省略すると `0` になって拒否されます。`UpdateField` はオプション全体を置き換えるので、そこで省略したキーも、フィールドの今の値ではなくデフォルトになります。この変更より古いサーバーは、省略した値を `0` として読みます。`m` が `0` だとすべてのドキュメントの書き込みが失敗し、`n_probe` が `0` だとすべての検索が 0 件になるので、古いサーバーを相手にするときはこれらを明示してください。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出ます。フィールドは `UpdateField` で直します（新しい `m`・`ef_construction`・`n_clusters` には `reindex` が要り、新しい `n_probe` はインデックスを開き直した後、`laurus serve` ではサーバーを再起動した後に効きます）。ドキュメントの書き込みが失敗したためにインデックスが開けない場合、その書き込みは write-ahead log に残っています。インデックスの `schema.toml` に有効な `m` を書いてサーバーを起動し直すと、その書き込みが適用されます。
 
+**直積量子化の `subvector_count`:** `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` のとき、`CreateIndex`・`AddField`・`UpdateField` は、`0` の `subvector_count`（クライアントが省略したときに送られる値）、`dimension` を割り切らない値、`subvector_count` か `dimension / subvector_count` が `65535` を超える値を `INVALID_ARGUMENT` で拒否します（Issue #1491）。この検査より古いサーバーはそうしたフィールドを受け付け、後の commit が `INTERNAL` で失敗します。`dimension` を割り切らない値では、そのフィールドのベクトルを含む最初の commit で、`0` では、フィールドのセグメントが 256 件（FastScan は 16 件）に達した時点で失敗し、以後の commit もすべて失敗します。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出て、フィールドを直すまではすべてのドキュメントの書き込みが、適用されずに失敗します。フィールドは `UpdateField` で有効な `subvector_count` を指定して直します（`reindex` が要り、フィールドはそのセグメントから作り直されます）。フィールドのドキュメントを多く削除する前に直してください。直すまでは、フィールドの compaction が commit を失敗させます。commit が失敗したためにインデックスが開けない場合は、インデックスの `schema.toml` に有効な `subvector_count` を書いてサーバーを起動し直してください。
+
 **QuantizationConfig 構造:**
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `method` | `QuantizationMethod` | 量子化手法（`QUANTIZATION_METHOD_SCALAR_8BIT`、`QUANTIZATION_METHOD_PRODUCT_QUANTIZATION`、`QUANTIZATION_METHOD_PRODUCT_QUANTIZATION_FASTSCAN` = `3`、`QUANTIZATION_METHOD_FLOAT16` = `4` のいずれか）。0（`NONE`、`method` が未設定）は `SCALAR_8BIT` として扱い、ほかの値は `INVALID_ARGUMENT` で拒否。 |
-| `subvector_count` | `uint32` | サブベクトルの数（`method` が `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` の場合のみ使用。`dimension` を均等に割り切れる値を指定。`SCALAR_8BIT` と `FLOAT16` では無視）。 |
+| `subvector_count` | `uint32` | サブベクトルの数（`method` が `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` の場合のみ使用。`1` 以上で `dimension` を均等に割り切れる値を指定し、そうでなければフィールドを `INVALID_ARGUMENT` で拒否。`SCALAR_8BIT` と `FLOAT16` では無視）。 |
 
 **例:**
 

@@ -7,6 +7,10 @@
 //! no hits. Defining such a field now fails, while an index whose
 //! persisted schema already holds one still opens, so the field can be
 //! repaired with `update_field`.
+//!
+//! Issue #1491 adds an HNSW product quantizer's `subvector_count` of 0 or
+//! one that does not divide the dimension, which used to fail a commit
+//! long after the field was defined.
 
 use std::sync::Arc;
 
@@ -18,7 +22,8 @@ use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::vector::Vector;
 use laurus::{
     Document, Engine, FieldChangeKind, FieldOption, FlatOption, HnswOption, IvfOption, LaurusError,
-    QueryVector, Schema, SearchRequestBuilder, UpdateFieldOptions, VectorSearchQuery,
+    QuantizationMethod, QueryVector, Schema, SearchRequestBuilder, UpdateFieldOptions,
+    VectorSearchQuery,
 };
 
 const DIM: usize = 8;
@@ -30,6 +35,13 @@ const REINDEX: UpdateFieldOptions = UpdateFieldOptions {
 
 fn ivf() -> IvfOption {
     IvfOption::new(DIM).n_clusters(2).n_probe(2)
+}
+
+/// An HNSW field with a product quantizer of `subvector_count` sub-vectors.
+fn hnsw_pq(subvector_count: usize) -> FieldOption {
+    FieldOption::Hnsw(
+        HnswOption::new(DIM).quantizer(QuantizationMethod::ProductQuantization { subvector_count }),
+    )
 }
 
 /// A schema with `option` as field `vec`, built without
@@ -114,6 +126,16 @@ async fn defining_a_field_with_unusable_parameters_fails() {
             FieldOption::Hnsw(HnswOption::new(0)),
             FieldOption::Hnsw(HnswOption::new(DIM)),
             "HNSW dimension must be greater than 0",
+        ),
+        (
+            hnsw_pq(0),
+            hnsw_pq(2),
+            "HNSW product quantization subvector_count must be at least 1",
+        ),
+        (
+            hnsw_pq(3),
+            hnsw_pq(4),
+            "HNSW product quantization subvector_count 3 must divide dimension 8 (got 8 % 3 = 2)",
         ),
         (
             FieldOption::Ivf(ivf().n_clusters(0)),
@@ -204,6 +226,107 @@ async fn index_persisted_with_hnsw_m_0_opens_and_update_field_repairs_it() {
 
     let reopened = Engine::new(open_storage(&dir), repaired).await.unwrap();
     assert_eq!(search_ids(&reopened).await.len(), 4);
+}
+
+/// Issue #1491: an index whose persisted schema gives an HNSW product
+/// quantizer an unusable `subvector_count` opens and still finds its
+/// documents. A put fails when it creates the vector writer, before its
+/// WAL append: the previous version stays and the index reopens, where a
+/// leftover WAL record would fail the replay. `update_field` with a valid
+/// count then rebuilds the field, which takes documents and reopens.
+///
+/// An older build wrote a field persisted with 0 below 256 vectors per
+/// segment as Scalar8Bit, which is what a valid count writes here too.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_persisted_with_an_unusable_subvector_count_opens_and_update_field_repairs_it() {
+    let cases = [
+        (0, "subvector_count must be at least 1"),
+        (
+            3,
+            "subvector_count 3 must divide dimension 8 (got 8 % 3 = 2)",
+        ),
+    ];
+    for (subvector_count, reason) in cases {
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
+            .await
+            .unwrap();
+        put_four(&engine).await;
+        drop(engine);
+
+        let persisted =
+            Schema::from_toml(&schema_with(hnsw_pq(subvector_count)).to_toml().unwrap()).unwrap();
+        let engine = Engine::new(open_storage(&dir), persisted.clone())
+            .await
+            .unwrap();
+        assert_eq!(search_ids(&engine).await.len(), 4, "{reason}");
+
+        for id in ["d0", "d9"] {
+            let doc = Document::builder().add_field("vec", vector(9)).build();
+            let err = engine.put_document(id, doc).await.unwrap_err();
+            let expected = format!("HNSW product quantization {reason}");
+            assert!(
+                matches!(&err, LaurusError::InvalidOperation(m) if m == &expected),
+                "expected InvalidOperation({expected:?}), got {err:?}"
+            );
+        }
+        engine.commit().await.unwrap();
+        let mut found = search_ids(&engine).await;
+        found.sort();
+        assert_eq!(found, ["d0", "d1", "d2", "d3"], "{reason}");
+        drop(engine);
+
+        let engine = Engine::new(open_storage(&dir), persisted).await.unwrap();
+        let outcome = engine
+            .update_field("vec", hnsw_pq(2), REINDEX)
+            .await
+            .unwrap();
+        assert_eq!(outcome.classification, FieldChangeKind::Reindex, "{reason}");
+        let doc = Document::builder().add_field("vec", vector(9)).build();
+        engine.put_document("d9", doc).await.unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(search_ids(&engine).await.len(), 5, "{reason}");
+        let repaired = engine.schema();
+        drop(engine);
+
+        let reopened = Engine::new(open_storage(&dir), repaired).await.unwrap();
+        assert_eq!(search_ids(&reopened).await.len(), 5, "{reason}");
+    }
+}
+
+/// Issue #1491: writes to such a field that an older build accepted but
+/// never committed (its commit failed) are still in the WAL. Opening with
+/// the unusable count fails on them rather than discarding them, and
+/// opening with a valid count in the schema applies them.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_writes_survive_until_the_subvector_count_is_fixed() {
+    let dir = TempDir::new().unwrap();
+    let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
+        .await
+        .unwrap();
+    for i in 0..4 {
+        let doc = Document::builder().add_field("vec", vector(i)).build();
+        engine.put_document(&format!("d{i}"), doc).await.unwrap();
+    }
+    // No commit: the four writes exist only in the WAL.
+    drop(engine);
+
+    let broken = Schema::from_toml(&schema_with(hnsw_pq(0)).to_toml().unwrap()).unwrap();
+    match Engine::new(open_storage(&dir), broken).await {
+        Ok(_) => panic!("the index opened, so the pending writes were not replayed"),
+        Err(err) => {
+            let expected = "HNSW product quantization subvector_count must be at least 1";
+            assert!(
+                matches!(&err, LaurusError::InvalidOperation(m) if m == expected),
+                "expected InvalidOperation({expected:?}), got {err:?}"
+            );
+        }
+    }
+
+    let engine = Engine::new(open_storage(&dir), schema_with(hnsw_pq(2)))
+        .await
+        .unwrap();
+    assert_eq!(search_ids(&engine).await.len(), 4);
 }
 
 /// An index created with IVF `n_probe` 0 holds documents no search finds.

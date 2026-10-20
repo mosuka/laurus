@@ -389,7 +389,16 @@ subvector_count = 48
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| `subvector_count` | `integer` | Number of subvectors. Must evenly divide `dimension`. |
+| `subvector_count` | `integer` | Number of subvectors. Must be at least 1 and evenly divide `dimension`. |
+
+Creating an index, `laurus add field` and `laurus update field` reject a
+`subvector_count` of 0 or one that does not divide `dimension`
+(Issue #1491); before that check, such a field was accepted and a later
+commit failed. An index created with one still opens, with a warning in the log,
+and every document write to it fails until the field is repaired with
+`laurus update field` and a valid `subvector_count` (with `--reindex`).
+If the index does not open because a commit failed on it, set a valid
+`subvector_count` in its `schema.toml` while it is closed.
 
 By default the codebook is trained per segment (segments with fewer
 than 256 vectors fall back to `Scalar8Bit`). With `pq_codebook_path`

@@ -7,8 +7,8 @@
 //   sidecar on disk (mirrors the server-side guard in #793/#800); the
 //   default writes no sidecar.
 // * `quantizer: "product_quantization"` forwards `subvectorCount` to the
-//   core's PQ training, which rejects a count that does not divide the
-//   field dimension.
+//   core, which rejects a count that does not divide the field dimension
+//   when the index is built (Issue #1491).
 // * `quantizer: "float16"` (Issue #623) separates two vectors that the
 //   default int8 quantizer stores as the same code.
 
@@ -98,9 +98,9 @@ describe("HNSW quantizer / rerankStorage options (#797)", () => {
     schema.addHnswField(
       "embedding", 4, undefined, undefined, undefined, undefined, undefined, "product_quantization", 3, undefined,
     );
-    const index = await Index.create(null, schema);
-    await index.putDocument("doc1", { embedding: [0.1, 0.2, 0.3, 0.4] });
-    await expect(index.commit()).rejects.toThrow();
+    await expect(Index.create(null, schema)).rejects.toThrow(
+      /subvector_count 3 must divide dimension 4/,
+    );
   });
 
   it("rejects an unknown quantizer", () => {

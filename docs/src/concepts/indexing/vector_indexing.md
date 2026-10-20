@@ -492,7 +492,9 @@ let opt = HnswOption {
 };
 ```
 
-`subvector_count` must divide `dimension`. Common choices for
+`subvector_count` must be at least 1 and divide `dimension`; defining
+the field (creating the index, `add_field`, `update_field`) rejects any
+other value (Issue #1491). Common choices for
 `dim = 128`: `M ∈ {8, 16, 32}` (sub_dim 16 / 8 / 4). Larger `M`
 trades on-disk compression for higher recall — Issue #481 Stage 3
 ships only the 8-bit (K = 256) variant; the on-disk format reserves
@@ -504,8 +506,8 @@ meaningful codebook. Such segments are written as **Scalar8Bit**
 instead (the `LVS1` header is self-describing, so readers dispatch on
 the stored kind transparently); once the segment grows — or is merged
 into a larger one — the next write trains PQ as configured. The
-`subvector_count`-divides-`dimension` validation still applies
-regardless of segment size. Neither the fallback nor the minimum
+`subvector_count` check still applies regardless of segment size,
+including to a `subvector_count` of 0. Neither the fallback nor the minimum
 applies when a [shared codebook](#shared-pq-codebook-issue-631) is
 configured: nothing is trained per segment in that case, so even tiny
 per-commit segments stay on PQ.

@@ -230,8 +230,10 @@ impl Schema {
     ///   [`MultiVectorOption::validate`]).
     /// - A [`FieldOption::Hnsw`], [`FieldOption::Flat`] or
     ///   [`FieldOption::Ivf`] field has a zero dimension, an HNSW `m` below
-    ///   2 or `ef_construction` of 0, or an IVF `n_clusters` or `n_probe` of
-    ///   0 (see [`HnswOption::validate`], [`FlatOption::validate`] and
+    ///   2 or `ef_construction` of 0, an HNSW product quantizer whose
+    ///   `subvector_count` is 0 or does not divide the dimension (Issue
+    ///   #1491), or an IVF `n_clusters` or `n_probe` of 0 (see
+    ///   [`HnswOption::validate`], [`FlatOption::validate`] and
     ///   [`IvfOption::validate`], Issue #1479). When the index is reopened,
     ///   a persisted field that breaks one of these only logs a warning, so
     ///   it can still be repaired with `Engine::update_field`.

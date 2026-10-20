@@ -55,6 +55,9 @@ tempfile = { workspace = true }
 # `net` feature provides `TcpListenerStream`, used by the client-server
 # bench to serve the gRPC service on an ephemeral port (#727).
 tokio-stream = { workspace = true, features = ["net"] }
+# `ServiceExt::oneshot` sends a request to the HTTP gateway's router
+# without binding a port (Issue #1491). axum already depends on it.
+tower = { version = "0.5.3", features = ["util"] }
 
 # Used by the SIGTERM shutdown test (Issue #1480) to raise the signal
 # against this process via `libc::raise`. Unix-only, mirroring the

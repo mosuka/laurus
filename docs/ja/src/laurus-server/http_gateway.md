@@ -106,8 +106,8 @@ curl -X POST http://localhost:8080/v1/index \
 | :--- | :--- | :--- |
 | `"scalar_8bit"` | HNSW, Flat, IVF | `quantizer` を省略したとき、または `null` のときのデフォルト |
 | `"float16"` | HNSW, Flat, IVF | IEEE 754 半精度（Issue #623） |
-| `"product_quantization"` | HNSW | `subvector_count` は `dimension` を割り切る値にする |
-| `"product_quantization_fastscan"` | HNSW | 実験的。サーバーを `pq-fastscan` feature 付きでビルドする必要がある |
+| `"product_quantization"` | HNSW | `subvector_count` は `1` 以上で `dimension` を割り切る値にする |
+| `"product_quantization_fastscan"` | HNSW | 実験的。サーバーを `pq-fastscan` feature 付きでビルドする必要がある。`subvector_count` は `1` 以上で `dimension` を割り切る値にする |
 
 `subvector_count` を読むのは、2 つの直積量子化（product quantization）の方式のときだけです。ほかの `method`（`"none"` を含む。量子化なしの保存は Issue #481 で廃止）、文字列の `method` を持たない quantizer、`pq-fastscan` なしでビルドしたサーバーへの `"product_quantization_fastscan"` は 400 で拒否され（Issue #1459）、何も書き込まれません。
 
@@ -117,6 +117,17 @@ curl -X POST http://localhost:8080/v1/index \
   -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "pq", "subvector_count": 48}}}}}}'
 # => {"error":{"code":400,"message":"field \"embedding\": unknown quantizer method \"pq\" (expected \"scalar_8bit\", \"product_quantization\", \"product_quantization_fastscan\", or \"float16\")"}}
 ```
+
+2 つの直積量子化の方式では、`POST /v1/index`・`POST /v1/schema/fields`・`PATCH /v1/schema/fields/{name}` は、`0` の `subvector_count`（`subvector_count` を省略したときの値）と `dimension` を割り切らない値を 400 で拒否し（Issue #1491）、何も書き込みません。
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "product_quantization", "subvector_count": 5}}}}}}'
+# => {"error":{"code":400,"message":"Invalid argument: field 'embedding': HNSW product quantization subvector_count 5 must divide dimension 384 (got 384 % 5 = 4)"}}
+```
+
+この検査より古いサーバーはそうしたフィールドを受け付け、後の commit が 500 で失敗します。そのサーバーが作ったインデックスも開けますが、サーバーのログに警告が出ます。フィールドの直し方は [gRPC API → 直積量子化の `subvector_count`](grpc_api.md) を参照してください。
 
 レスポンスには常に `quantizer` が含まれます。`subvector_count` を使わない方式では、その値は `0` です（例: `"quantizer": {"method": "scalar_8bit", "subvector_count": 0}`）。
 

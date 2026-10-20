@@ -71,8 +71,9 @@ pub enum QuantizationMethod {
     /// `HnswOption::pq_codebook_path` / `Engine::train_pq_codebook`
     /// (Issue #631).
     ProductQuantization {
-        /// Number of sub-vectors; must evenly divide the vector
-        /// dimension. Derives the codebook layout.
+        /// Number of sub-vectors; must be at least 1 and evenly divide the
+        /// vector dimension, which defining the field checks (Issue
+        /// #1491). Derives the codebook layout.
         subvector_count: usize,
     },
     /// FastScan product quantization (K=16 4-bit codes + SIMD LUT
@@ -105,6 +106,35 @@ pub enum QuantizationMethod {
     /// distance kernels in [`crate::vector::core::distance_f16`] widen the
     /// stored values as they go.
     Float16,
+}
+
+impl QuantizationMethod {
+    /// Why this quantizer cannot encode `dimension`-dimensional vectors, if
+    /// it cannot (Issue #1491).
+    ///
+    /// Only a product quantizer has such a parameter: its
+    /// `subvector_count` must pass [`PqParams::subvector_count_error`].
+    /// Whether an index kind implements the quantizer at all is a separate
+    /// check (`quantizer_support_error` in
+    /// [`crate::vector::core::field`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `dimension` - The vector dimension of the field.
+    ///
+    /// # Returns
+    ///
+    /// The reason, starting with "product quantization", or `None`.
+    pub(crate) fn dimension_error(&self, dimension: usize) -> Option<String> {
+        let subvector_count = match *self {
+            QuantizationMethod::ProductQuantization { subvector_count } => subvector_count,
+            #[cfg(feature = "pq-fastscan")]
+            QuantizationMethod::ProductQuantizationFastScan { subvector_count } => subvector_count,
+            QuantizationMethod::Scalar8Bit | QuantizationMethod::Float16 => return None,
+        };
+        PqParams::subvector_count_error(dimension, subvector_count)
+            .map(|reason| format!("product quantization {reason}"))
+    }
 }
 
 /// Segment-level scalar quantization parameters.
@@ -613,36 +643,62 @@ impl PqParams {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError::InvalidOperation`] if `m == 0`,
-    /// `dim % m != 0`, or `k` is not one of `{16, 256}` (via
-    /// [`Self::new`]'s validation).
+    /// Returns [`LaurusError::InvalidOperation`] if `m` is `0`, does not
+    /// divide `dim`, or `m` or `dim / m` exceeds `u16::MAX`, or if `k` is
+    /// not one of `{16, 256}` or `dim` is `0` (via [`Self::new`]'s
+    /// validation).
     pub fn from_dim_and_m_k(dim: usize, m: usize, k: u16) -> Result<Self> {
-        if m == 0 {
-            return Err(LaurusError::InvalidOperation(
-                "Product quantization subvector_count must be > 0".to_string(),
-            ));
-        }
-        if !dim.is_multiple_of(m) {
+        if let Some(reason) = Self::subvector_count_error(dim, m) {
             return Err(LaurusError::InvalidOperation(format!(
-                "Product quantization subvector_count {m} must divide vector \
-                 dimension {dim} (got {dim} % {m} = {})",
-                dim % m
+                "Product quantization {reason}"
             )));
         }
+        // `subvector_count_error` has checked that both fit in a `u16`.
+        Self::new(m as u16, k, (dim / m) as u16)
+    }
+
+    /// Why `m` sub-vectors cannot split a `dim`-dimensional vector into
+    /// product quantizer codes, if they cannot: the checks of
+    /// [`Self::from_dim_and_m_k`] that do not depend on `k`, so they hold
+    /// for the 8-bit and the FastScan variants alike.
+    ///
+    /// A field definition runs them through
+    /// [`QuantizationMethod::dimension_error`] (Issue #1491), so a count the
+    /// writer cannot encode with is rejected when the field is defined
+    /// rather than at a later commit.
+    ///
+    /// # Arguments
+    ///
+    /// * `dim` - The vector dimension.
+    /// * `m` - The configured `subvector_count`.
+    ///
+    /// # Returns
+    ///
+    /// The reason, worded to follow "product quantization", when `m` is
+    /// `0`, does not divide `dim`, or `m` or `dim / m` exceeds `u16::MAX`
+    /// (the header stores both as `u16`); `None` otherwise.
+    pub(crate) fn subvector_count_error(dim: usize, m: usize) -> Option<String> {
+        if m == 0 {
+            return Some("subvector_count must be at least 1".to_string());
+        }
+        if !dim.is_multiple_of(m) {
+            return Some(format!(
+                "subvector_count {m} must divide dimension {dim} (got {dim} % {m} = {})",
+                dim % m
+            ));
+        }
+        let max = u16::MAX;
+        if m > usize::from(max) {
+            return Some(format!("subvector_count {m} exceeds {max}"));
+        }
         let sub_dim = dim / m;
-        Self::new(
-            u16::try_from(m).map_err(|_| {
-                LaurusError::InvalidOperation(format!(
-                    "Product quantization subvector_count {m} exceeds u16::MAX"
-                ))
-            })?,
-            k,
-            u16::try_from(sub_dim).map_err(|_| {
-                LaurusError::InvalidOperation(format!(
-                    "Product quantization sub_dim {sub_dim} exceeds u16::MAX"
-                ))
-            })?,
-        )
+        if sub_dim > usize::from(max) {
+            return Some(format!(
+                "sub-vector dimension {sub_dim} (dimension {dim} / subvector_count {m}) \
+                 exceeds {max}"
+            ));
+        }
+        None
     }
 
     /// Total number of f32 entries in the codebook
@@ -1267,6 +1323,93 @@ mod tests {
         let ok = PqParams::from_dim_and_m(12, 3).unwrap();
         assert_eq!(ok.original_dim(), 12);
         assert_eq!(ok.sub_dim, 4);
+    }
+
+    /// Issue #1491: `subvector_count_error` rejects a count at each
+    /// boundary, and `from_dim_and_m_k` rejects exactly the same counts,
+    /// for both centroid counts, with the same reason.
+    #[test]
+    fn subvector_count_error_matches_from_dim_and_m_k_at_the_boundaries() {
+        let cases: [(usize, usize, Option<&str>); 11] = [
+            (8, 0, Some("subvector_count must be at least 1")),
+            (8, 1, None),
+            (
+                8,
+                3,
+                Some("subvector_count 3 must divide dimension 8 (got 8 % 3 = 2)"),
+            ),
+            (8, 4, None),
+            (8, 8, None),
+            (
+                8,
+                9,
+                Some("subvector_count 9 must divide dimension 8 (got 8 % 9 = 8)"),
+            ),
+            (
+                131_072,
+                1,
+                Some(
+                    "sub-vector dimension 131072 (dimension 131072 / subvector_count 1) \
+                     exceeds 65535",
+                ),
+            ),
+            (
+                131_072,
+                2,
+                Some(
+                    "sub-vector dimension 65536 (dimension 131072 / subvector_count 2) \
+                     exceeds 65535",
+                ),
+            ),
+            (131_072, 4, None),
+            (65_536, 65_536, Some("subvector_count 65536 exceeds 65535")),
+            (65_535, 65_535, None),
+        ];
+        for (dim, m, reason) in cases {
+            assert_eq!(
+                PqParams::subvector_count_error(dim, m).as_deref(),
+                reason,
+                "dim {dim}, m {m}"
+            );
+            for k in [16, 256] {
+                match (PqParams::from_dim_and_m_k(dim, m, k), reason) {
+                    (Ok(params), None) => {
+                        assert_eq!(usize::from(params.m), m);
+                        assert_eq!(params.original_dim(), dim);
+                    }
+                    (Err(LaurusError::InvalidOperation(msg)), Some(reason)) => {
+                        assert_eq!(msg, format!("Product quantization {reason}"));
+                    }
+                    (other, _) => panic!("dim {dim}, m {m}, k {k}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Issue #1491: only a product quantizer has a parameter that depends
+    /// on the dimension.
+    #[test]
+    fn dimension_error_reports_only_product_quantizers() {
+        assert_eq!(QuantizationMethod::Scalar8Bit.dimension_error(8), None);
+        assert_eq!(QuantizationMethod::Float16.dimension_error(8), None);
+        let product_quantizers: &[fn(usize) -> QuantizationMethod] = &[
+            |subvector_count| QuantizationMethod::ProductQuantization { subvector_count },
+            #[cfg(feature = "pq-fastscan")]
+            |subvector_count| QuantizationMethod::ProductQuantizationFastScan { subvector_count },
+        ];
+        for quantizer in product_quantizers {
+            assert_eq!(quantizer(4).dimension_error(8), None, "{:?}", quantizer(4));
+            assert_eq!(
+                quantizer(0).dimension_error(8).as_deref(),
+                Some("product quantization subvector_count must be at least 1")
+            );
+            assert_eq!(
+                quantizer(3).dimension_error(8).as_deref(),
+                Some(
+                    "product quantization subvector_count 3 must divide dimension 8 (got 8 % 3 = 2)"
+                )
+            );
+        }
     }
 
     #[test]

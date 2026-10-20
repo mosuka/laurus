@@ -12,8 +12,8 @@ require "tmpdir"
 #   sidecar on disk (mirrors the server-side guard in #793/#800); the
 #   default writes no sidecar.
 # * +quantizer: "product_quantization"+ forwards +subvector_count+ to the
-#   core's PQ training, which rejects a count that does not divide the
-#   field dimension.
+#   core, which rejects a count that does not divide the field dimension
+#   when the index is built (Issue #1491).
 # * +quantizer: "float16"+ (Issue #623) separates two vectors that the
 #   default int8 quantizer stores as the same code.
 class TestVectorQuantizerRerank < Minitest::Test
@@ -91,9 +91,8 @@ class TestVectorQuantizerRerank < Minitest::Test
     schema.add_hnsw_field(
       "embedding", 4, quantizer: "product_quantization", subvector_count: 3
     )
-    idx = Laurus::Index.new(schema: schema)
-    idx.put_document("doc1", { "embedding" => [0.1, 0.2, 0.3, 0.4] })
-    assert_raises { idx.commit }
+    error = assert_raises { Laurus::Index.new(schema: schema) }
+    assert_match(/subvector_count 3 must divide dimension 4/, error.message)
   end
 
   def test_unknown_quantizer_rejected

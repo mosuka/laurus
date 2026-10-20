@@ -471,13 +471,15 @@ codebook を学習できません。そのようなセグメントは **Scalar8B
 書き出されます（`LVS1` ヘッダは自己記述型のため、reader は保存された
 種別で透過的にディスパッチします）。セグメントが成長するか、より大きな
 セグメントへマージされれば、次の書き込みで設定どおり PQ が学習されます。
-`subvector_count` が `dimension` を割り切る検証はセグメントサイズに
+`subvector_count` の検証は、0 の場合も含め、セグメントサイズに
 かかわらず常に適用されます。なお、
 [共有 codebook](#共有-pq-codebookissue-631) を設定した場合はこの
 フォールバックも最小サイズも適用されません — セグメントごとの学習が
 発生しないため、小さな per-commit セグメントもそのまま PQ を維持します。
 
-`subvector_count` は `dimension` を割り切る値を選択。 `dim = 128`
+`subvector_count` は 1 以上で `dimension` を割り切る値を選択。
+フィールドの定義（インデックスの作成、`add_field`、`update_field`）
+はそれ以外の値を拒否します（Issue #1491）。 `dim = 128`
 での候補: `M ∈ {8, 16, 32}`（sub_dim 16 / 8 / 4）。 `M` を大きく
 すると compression は下がるが recall は上がります。 Issue #481
 Stage 3 は 8 bit（K = 256）のみを ship、 on-disk format は

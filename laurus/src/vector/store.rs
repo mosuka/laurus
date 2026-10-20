@@ -425,10 +425,11 @@ impl VectorStore {
     /// `Engine::index_internal` calls this before it deletes a document's
     /// previous version and appends the document's WAL record. Creating the
     /// writer is where a field the index cannot build with fails (an HNSW
-    /// `m` below 2, which a schema persisted before the field checks can
-    /// hold); failing there after the WAL append left a record that every
-    /// later open replayed into the same error. A commit may still drop
-    /// the writer before the document is written, and
+    /// `m` below 2, or a product quantizer `subvector_count` that does not
+    /// fit the dimension, Issue #1491, which a schema persisted before the
+    /// field checks can hold); failing there after the WAL append left a
+    /// record that every later open replayed into the same error. A commit
+    /// may still drop the writer before the document is written, and
     /// [`Self::write_prepared`] then creates it again.
     ///
     /// # Errors

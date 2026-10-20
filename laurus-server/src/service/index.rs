@@ -665,13 +665,33 @@ mod tests {
     }
 
     /// Proto field options that each set one parameter to a value the
-    /// engine cannot work with (Issue #1479), paired with the reason it
-    /// gives. `m`, `ef_construction`, `n_clusters` and `n_probe` are set
-    /// explicitly (unset, they get the engine's defaults); `dimension` has
-    /// no default, so an unset one is 0.
-    fn options_with_unusable_parameters() -> [(v1::FieldOption, &'static str); 7] {
+    /// engine cannot work with (Issues #1479, #1491), paired with the
+    /// reason it gives. `m`, `ef_construction`, `n_clusters` and `n_probe`
+    /// are set explicitly (unset, they get the engine's defaults);
+    /// `dimension` and a product quantizer's `subvector_count` have no
+    /// default, so an unset one is 0.
+    fn options_with_unusable_parameters() -> [(v1::FieldOption, &'static str); 9] {
         use v1::field_option::Option as Opt;
+        let product_quantization = |subvector_count| {
+            Opt::Hnsw(v1::HnswOption {
+                dimension: 8,
+                quantizer: Some(v1::QuantizationConfig {
+                    method: v1::QuantizationMethod::ProductQuantization as i32,
+                    subvector_count,
+                }),
+                ..Default::default()
+            })
+        };
         [
+            (
+                product_quantization(0),
+                "HNSW product quantization subvector_count must be at least 1",
+            ),
+            (
+                product_quantization(3),
+                "HNSW product quantization subvector_count 3 must divide dimension 8 \
+                 (got 8 % 3 = 2)",
+            ),
             (
                 Opt::Hnsw(v1::HnswOption {
                     dimension: 8,
@@ -727,9 +747,9 @@ mod tests {
         })
     }
 
-    /// Issue #1479: CreateIndex rejects each unusable parameter as
-    /// InvalidArgument, instead of creating a field every write or search
-    /// then fails on, and writes nothing.
+    /// Issues #1479, #1491: CreateIndex rejects each unusable parameter as
+    /// InvalidArgument, instead of creating a field every write, commit or
+    /// search then fails on, and writes nothing.
     #[tokio::test]
     async fn create_index_rejects_unusable_vector_parameters() {
         for (option, reason) in options_with_unusable_parameters() {
@@ -765,7 +785,7 @@ mod tests {
         }
     }
 
-    /// Issue #1479: AddField rejects each unusable parameter as
+    /// Issues #1479, #1491: AddField rejects each unusable parameter as
     /// InvalidArgument and leaves the schema as it was.
     #[tokio::test]
     async fn add_field_rejects_unusable_vector_parameters() {
@@ -795,7 +815,7 @@ mod tests {
         }
     }
 
-    /// Issue #1479: UpdateField rejects each unusable parameter as
+    /// Issues #1479, #1491: UpdateField rejects each unusable parameter as
     /// InvalidArgument and leaves the field as it was.
     #[tokio::test]
     async fn update_field_rejects_unusable_vector_parameters() {

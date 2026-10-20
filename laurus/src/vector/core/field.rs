@@ -153,8 +153,11 @@ impl FieldOption {
     }
 
     /// Why the field's index cannot work with these parameters, if it
-    /// cannot: the part of [`Self::validate`] that does not look at the
-    /// quantizer.
+    /// cannot: everything [`Self::validate`] checks except whether the
+    /// index kind implements the quantizer ([`quantizer_support_error`]),
+    /// which opening an index still refuses (Issue #1457). A product
+    /// quantizer's `subvector_count` that does not fit the dimension is a
+    /// parameter error (Issue #1491), reported here.
     ///
     /// Opening an index uses this to warn about a field persisted before
     /// the checks existed (Issue #1479) instead of refusing to open it, so
@@ -831,10 +834,11 @@ impl HnswOption {
         self
     }
 
-    /// Check that the options describe a usable HNSW field (Issue #1479).
+    /// Check that the options describe a usable HNSW field (Issues #1479,
+    /// #1491).
     ///
-    /// HNSW implements every quantizer, so only the graph parameters are
-    /// checked.
+    /// HNSW implements every quantizer, so a product quantizer is checked
+    /// only for whether its `subvector_count` fits [`Self::dimension`].
     ///
     /// # Arguments
     ///
@@ -845,8 +849,12 @@ impl HnswOption {
     /// Returns [`LaurusError::invalid_argument`] when [`Self::dimension`] is
     /// `0`, which every non-empty vector would then fail, when [`Self::m`]
     /// is below `2`, which the HNSW writer refuses to build a graph with,
-    /// or when [`Self::ef_construction`] is `0`, which would link each
-    /// inserted node to a single neighbor per layer.
+    /// when [`Self::ef_construction`] is `0`, which would link each
+    /// inserted node to a single neighbor per layer, or when
+    /// [`Self::quantizer`] is a product quantizer whose `subvector_count`
+    /// is `0`, does not divide the dimension, or leaves it or the
+    /// sub-vector dimension above `u16::MAX`, which the writer cannot
+    /// encode with.
     pub fn validate(&self, field_name: &str) -> Result<()> {
         reject_field(field_name, self.params_error())
     }
@@ -862,7 +870,9 @@ impl HnswOption {
         if self.ef_construction == 0 {
             return Some("HNSW ef_construction must be at least 1".to_string());
         }
-        None
+        self.quantizer
+            .dimension_error(self.dimension)
+            .map(|reason| format!("HNSW {reason}"))
     }
 }
 
@@ -1243,11 +1253,68 @@ mod tests {
         assert_eq!(ivf.n_probe, DEFAULT_IVF_N_PROBE);
     }
 
-    /// `params_error` is the part of `validate` that opening an index only
-    /// warns about, so it must not report the quantizer, which opening
-    /// still rejects (Issue #1457).
+    /// Issue #1491: an HNSW product quantizer's `subvector_count` is
+    /// rejected at the first value the writer cannot encode with, and
+    /// accepted at the next, for both product quantizers. `params_error`
+    /// reports it, so opening an index that holds one only warns.
     #[test]
-    fn params_error_ignores_the_quantizer() {
+    fn validate_rejects_a_subvector_count_that_does_not_fit_the_dimension() {
+        let product_quantizers: &[fn(usize) -> quantization::QuantizationMethod] = &[
+            |subvector_count| quantization::QuantizationMethod::ProductQuantization {
+                subvector_count,
+            },
+            #[cfg(feature = "pq-fastscan")]
+            |subvector_count| quantization::QuantizationMethod::ProductQuantizationFastScan {
+                subvector_count,
+            },
+        ];
+        // (dimension, rejected count, accepted count, reason)
+        let cases = [
+            (8, 0, 1, "subvector_count must be at least 1"),
+            (
+                8,
+                3,
+                4,
+                "subvector_count 3 must divide dimension 8 (got 8 % 3 = 2)",
+            ),
+            (
+                8,
+                9,
+                8,
+                "subvector_count 9 must divide dimension 8 (got 8 % 9 = 8)",
+            ),
+            (
+                131_072,
+                2,
+                4,
+                "sub-vector dimension 65536 (dimension 131072 / subvector_count 2) exceeds 65535",
+            ),
+            (65_536, 65_536, 2, "subvector_count 65536 exceeds 65535"),
+        ];
+        for quantizer in product_quantizers {
+            for (dimension, rejected, accepted, reason) in cases {
+                let reason = format!("HNSW product quantization {reason}");
+                let rejected =
+                    FieldOption::Hnsw(HnswOption::new(dimension).quantizer(quantizer(rejected)));
+                let err = rejected.validate("vec").unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("Invalid argument: field 'vec': {reason}")
+                );
+                assert_eq!(rejected.params_error(), Some(reason));
+                let accepted =
+                    FieldOption::Hnsw(HnswOption::new(dimension).quantizer(quantizer(accepted)));
+                assert!(accepted.validate("vec").is_ok(), "{accepted:?}");
+                assert_eq!(accepted.params_error(), None, "{accepted:?}");
+            }
+        }
+    }
+
+    /// `params_error` is the part of `validate` that opening an index only
+    /// warns about, so it must not report whether the index kind implements
+    /// the quantizer, which opening still rejects (Issue #1457).
+    #[test]
+    fn params_error_ignores_quantizer_support() {
         let pq = quantization::QuantizationMethod::ProductQuantization { subvector_count: 4 };
         for option in [
             FieldOption::Flat(FlatOption::new(8).quantizer(pq)),

@@ -515,17 +515,46 @@ thread_local! {
 type ParsedGraphBlock = (Option<u64>, usize, HashMap<u64, Vec<Vec<u64>>>);
 
 impl HnswIndexWriter {
+    /// Reject a config the writer cannot build a graph or encode vectors
+    /// with: an `m` below 2, or a product quantizer whose `subvector_count`
+    /// does not fit the dimension (Issue #1491).
+    ///
+    /// Every constructor calls this. A field persisted before
+    /// `HnswOption::validate` checked these thus fails when its writer is
+    /// created, which `Engine::index_internal` does before the WAL append
+    /// (Issue #1479), instead of at a later commit, whose failure would
+    /// keep every later commit failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidOperation`] naming the parameter.
+    fn check_config(index_config: &HnswIndexConfig) -> Result<()> {
+        if index_config.m < 2 {
+            return Err(LaurusError::InvalidOperation(
+                "HNSW parameter m must be >= 2".to_string(),
+            ));
+        }
+        if let Some(reason) = index_config
+            .quantization_method
+            .dimension_error(index_config.dimension)
+        {
+            return Err(LaurusError::InvalidOperation(format!("HNSW {reason}")));
+        }
+        Ok(())
+    }
+
     /// Create a new HNSW index builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `index_config.m` is below 2, or if its product
+    /// quantizer's `subvector_count` does not fit the dimension.
     pub fn new(
         index_config: HnswIndexConfig,
         writer_config: VectorIndexWriterConfig,
         path: impl Into<String>,
     ) -> Result<Self> {
-        if index_config.m < 2 {
-            return Err(crate::error::LaurusError::InvalidOperation(
-                "HNSW parameter m must be >= 2".to_string(),
-            ));
-        }
+        Self::check_config(&index_config)?;
         let max_level = Self::calculate_max_level(index_config.m, index_config.ef_construction);
         let _ml = 1.0 / (index_config.m as f64).ln();
 
@@ -551,6 +580,12 @@ impl HnswIndexWriter {
     /// If an existing index file is found on disk, its vectors are loaded
     /// into the writer so that the next commit preserves them. This
     /// prevents data loss across multiple commit cycles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `index_config.m` is below 2, if its product
+    /// quantizer's `subvector_count` does not fit the dimension,
+    /// or if loading the existing index file fails.
     pub fn with_storage(
         index_config: HnswIndexConfig,
         writer_config: VectorIndexWriterConfig,
@@ -563,11 +598,7 @@ impl HnswIndexWriter {
             return Self::load(index_config, writer_config, storage, &path);
         }
 
-        if index_config.m < 2 {
-            return Err(crate::error::LaurusError::InvalidOperation(
-                "HNSW parameter m must be >= 2".to_string(),
-            ));
-        }
+        Self::check_config(&index_config)?;
         let max_level = Self::calculate_max_level(index_config.m, index_config.ef_construction);
         let _ml = 1.0 / (index_config.m as f64).ln();
 
@@ -779,6 +810,12 @@ impl HnswIndexWriter {
     }
 
     /// Load an existing HNSW index from storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index file cannot be read or is malformed,
+    /// or if `index_config.m` is below 2 or its product quantizer's
+    /// `subvector_count` does not fit the dimension.
     pub fn load(
         index_config: HnswIndexConfig,
         writer_config: VectorIndexWriterConfig,
@@ -954,11 +991,7 @@ impl HnswIndexWriter {
         let max_id = vectors.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
         let next_vec_id = if num_vectors > 0 { max_id + 1 } else { 0 };
 
-        if index_config.m < 2 {
-            return Err(LaurusError::InvalidOperation(
-                "HNSW parameter m must be >= 2".to_string(),
-            ));
-        }
+        Self::check_config(&index_config)?;
         let max_level = Self::calculate_max_level(index_config.m, index_config.ef_construction);
         let _ml = 1.0 / (index_config.m as f64).ln();
 
@@ -2110,13 +2143,13 @@ impl VectorIndexWriter for HnswIndexWriter {
                     if n > 0 && n < PQ_MIN_TRAIN_VECTORS && !has_shared_pq_codebook =>
                 {
                     // The fallback must not skip config validation: an
-                    // invalid PQ geometry (subvector_count not dividing the
-                    // dimension) is rejected here exactly as the training
-                    // path would, so acceptance never depends on corpus
-                    // size.
+                    // invalid PQ geometry (a subvector_count of 0 or one not
+                    // dividing the dimension, Issue #1491) is rejected here
+                    // exactly as the training path would, so acceptance
+                    // never depends on corpus size.
                     crate::vector::core::quantization::PqParams::from_dim_and_m(
                         self.index_config.dimension,
-                        subvector_count.max(1),
+                        subvector_count,
                     )?;
                     Qm::Scalar8Bit
                 }
@@ -2130,9 +2163,10 @@ impl VectorIndexWriter for HnswIndexWriter {
                     // small flushes stay FastScan, and a configured-but-
                     // untrained path must reach the loud error in the
                     // FastScan arm below instead of degrading silently.
-                    crate::vector::core::quantization::PqParams::from_dim_and_m(
+                    crate::vector::core::quantization::PqParams::from_dim_and_m_k(
                         self.index_config.dimension,
-                        subvector_count.max(1),
+                        subvector_count,
+                        16,
                     )?;
                     Qm::Scalar8Bit
                 }
@@ -2180,13 +2214,13 @@ impl VectorIndexWriter for HnswIndexWriter {
                 if f32_vectors.is_empty() {
                     // An empty segment still needs a well-formed LVS1
                     // header so the reader can dispatch on quant_kind.
-                    // We pick a minimal (m=1, sub_dim=dim) codebook of
-                    // a single zero centroid per sub-vector — readers
-                    // will never index into it because there are no
-                    // codes after it.
+                    // It carries the configured geometry, validated like
+                    // a trained segment's (Issue #1491), with an all-zero
+                    // codebook — readers will never index into it because
+                    // there are no codes after it.
                     let params = crate::vector::core::quantization::PqParams::from_dim_and_m(
                         self.index_config.dimension,
-                        subvector_count.max(1),
+                        subvector_count,
                     )?;
                     let codebook = vec![0.0_f32; params.codebook_len()];
                     VectorSegmentHeader::product_quantization(params, codebook)
@@ -2248,15 +2282,14 @@ impl VectorIndexWriter for HnswIndexWriter {
                 let f32_vectors: Vec<Vector> =
                     sorted_vectors.iter().map(|(_, _, v)| (*v).clone()).collect();
                 if f32_vectors.is_empty() {
-                    // Empty segment: emit a well-formed LVS1 header with a
-                    // minimal zero-centroid K=16 codebook so the reader can
-                    // dispatch on quant_kind. Mirrors the PQ-256 empty path.
-                    let m = subvector_count.max(1);
-                    let sub_dim = self.index_config.dimension / m;
-                    let params = crate::vector::core::quantization::PqParams::new(
-                        m as u16,
+                    // Empty segment: emit a well-formed LVS1 header with an
+                    // all-zero K=16 codebook so the reader can dispatch on
+                    // quant_kind. Mirrors the PQ-256 empty path, including
+                    // its geometry validation (Issue #1491).
+                    let params = crate::vector::core::quantization::PqParams::from_dim_and_m_k(
+                        self.index_config.dimension,
+                        subvector_count,
                         16,
-                        sub_dim as u16,
                     )?;
                     let codebook = vec![0.0_f32; params.codebook_len()];
                     VectorSegmentHeader::product_quantization_fastscan(params, codebook)
@@ -3223,5 +3256,150 @@ mod buffer_tests {
         writer.delete_document(1).unwrap();
         assert!(writer.vectors.is_empty());
         assert_map_in_step(&writer);
+    }
+}
+
+/// Issue #1491: the writer refuses a product quantizer whose
+/// `subvector_count` does not fit the dimension when it is created, and
+/// when it writes a segment of any size, including the ones written as
+/// Scalar8Bit below the training threshold and the empty ones.
+#[cfg(test)]
+mod subvector_count_tests {
+    use super::*;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+    use crate::vector::core::distance::DistanceMetric;
+    use crate::vector::core::quantization::QuantizationMethod;
+    use crate::vector::index::HnswIndexConfig;
+
+    const DIM: usize = 4;
+
+    fn config(quantization_method: QuantizationMethod) -> HnswIndexConfig {
+        HnswIndexConfig {
+            dimension: DIM,
+            m: 4,
+            ef_construction: 8,
+            normalize_vectors: false,
+            distance_metric: DistanceMetric::Euclidean,
+            quantization_method,
+            ..Default::default()
+        }
+    }
+
+    fn storage() -> Arc<dyn Storage> {
+        Arc::new(MemoryStorage::new(MemoryStorageConfig::default()))
+    }
+
+    /// Product quantizers the writer cannot encode `DIM`-dimensional
+    /// vectors with, each with the reason `dimension_error` gives.
+    fn unusable() -> Vec<(QuantizationMethod, &'static str)> {
+        [
+            (
+                QuantizationMethod::ProductQuantization { subvector_count: 0 },
+                "subvector_count must be at least 1",
+            ),
+            (
+                QuantizationMethod::ProductQuantization { subvector_count: 3 },
+                "subvector_count 3 must divide dimension 4 (got 4 % 3 = 1)",
+            ),
+            #[cfg(feature = "pq-fastscan")]
+            (
+                QuantizationMethod::ProductQuantizationFastScan { subvector_count: 0 },
+                "subvector_count must be at least 1",
+            ),
+            #[cfg(feature = "pq-fastscan")]
+            (
+                QuantizationMethod::ProductQuantizationFastScan { subvector_count: 3 },
+                "subvector_count 3 must divide dimension 4 (got 4 % 3 = 1)",
+            ),
+        ]
+        .to_vec()
+    }
+
+    fn vector(doc_id: u64) -> (u64, String, Vector) {
+        (
+            doc_id,
+            "v".to_string(),
+            Vector::new(vec![1.0, 2.0, 3.0, 4.0]),
+        )
+    }
+
+    /// The error of a constructor that must fail.
+    fn construction_error(result: Result<HnswIndexWriter>) -> LaurusError {
+        match result {
+            Ok(_) => panic!("the writer was created"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn every_constructor_rejects_an_unusable_subvector_count() {
+        // A segment on disk for `load` to read.
+        let storage = storage();
+        let mut writer = HnswIndexWriter::with_storage(
+            config(QuantizationMethod::Scalar8Bit),
+            VectorIndexWriterConfig::default(),
+            "seg",
+            storage.clone(),
+        )
+        .unwrap();
+        writer.add_vectors(vec![vector(1)]).unwrap();
+        writer.finalize().unwrap();
+        writer.write().unwrap();
+
+        for (method, reason) in unusable() {
+            let expected = format!("Invalid operation: HNSW product quantization {reason}");
+            let new = HnswIndexWriter::new(config(method), Default::default(), "new");
+            assert_eq!(construction_error(new).to_string(), expected, "{method:?}");
+            let fresh = HnswIndexWriter::with_storage(
+                config(method),
+                Default::default(),
+                "fresh",
+                self::storage(),
+            );
+            assert_eq!(
+                construction_error(fresh).to_string(),
+                expected,
+                "{method:?}"
+            );
+            let load =
+                HnswIndexWriter::load(config(method), Default::default(), storage.clone(), "seg");
+            assert_eq!(construction_error(load).to_string(), expected, "{method:?}");
+        }
+
+        for subvector_count in [1, 2, 4] {
+            let method = QuantizationMethod::ProductQuantization { subvector_count };
+            assert!(HnswIndexWriter::new(config(method), Default::default(), "new").is_ok());
+        }
+    }
+
+    /// `write` checks the count itself, so a writer whose config changed
+    /// after it was created (only possible here) still cannot write a
+    /// segment with it: not one below the training threshold, which is
+    /// written as Scalar8Bit, and not an empty one.
+    #[test]
+    fn write_rejects_an_unusable_subvector_count_at_any_segment_size() {
+        for (method, reason) in unusable() {
+            for vectors in [vec![], vec![vector(1), vector(2)]] {
+                let count = vectors.len();
+                let mut writer = HnswIndexWriter::with_storage(
+                    config(QuantizationMethod::Scalar8Bit),
+                    VectorIndexWriterConfig::default(),
+                    "seg",
+                    storage(),
+                )
+                .unwrap();
+                writer.index_config.quantization_method = method;
+                writer.add_vectors(vectors).unwrap();
+                writer.finalize().unwrap();
+                let Err(err) = writer.write() else {
+                    panic!("{method:?} with {count} vectors was written");
+                };
+                assert_eq!(
+                    err.to_string(),
+                    format!("Invalid operation: Product quantization {reason}"),
+                    "{method:?} with {count} vectors"
+                );
+            }
+        }
     }
 }

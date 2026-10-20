@@ -386,7 +386,17 @@ subvector_count = 48
 
 | オプション | 型 | 説明 |
 | :--- | :--- | :--- |
-| `subvector_count` | `integer` | サブベクトルの数。`dimension` を均等に割り切れる必要があります。 |
+| `subvector_count` | `integer` | サブベクトルの数。1 以上で、`dimension` を均等に割り切れる必要があります。 |
+
+インデックスの作成、`laurus add field`、`laurus update field` は、
+`subvector_count` が 0 のものと `dimension` を割り切らないものを拒否
+します（Issue #1491）。この検査の前は、そうしたフィールドが受け付け
+られ、後の commit が失敗していました。そうした値で作られたインデックス
+も開けますが、ログに警告が出て、フィールドを直すまではすべての
+ドキュメントの書き込みが失敗します。フィールドは `laurus update field`
+で有効な `subvector_count` を指定して直します（`--reindex` が要りま
+す）。commit が失敗したためにインデックスが開けない場合は、閉じた状態
+で `schema.toml` に有効な `subvector_count` を書いてください。
 
 デフォルトでは codebook は segment ごとに学習されます（256 ベクトル
 未満の segment は `Scalar8Bit` にフォールバック）。`pq_codebook_path`

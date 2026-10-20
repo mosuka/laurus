@@ -8,8 +8,8 @@ succeeds:
   sidecar on disk (mirrors the server-side guard in #793/#800); the default
   writes no sidecar.
 * ``quantizer="product_quantization"`` forwards ``subvector_count`` to the
-  core's PQ training, which rejects a count that does not divide the field
-  dimension.
+  core, which rejects a count that does not divide the field dimension when
+  the index is built (Issue #1491).
 * ``quantizer="float16"`` (Issue #623) separates two vectors that the
   default int8 quantizer stores as the same code.
 """
@@ -91,16 +91,14 @@ def test_product_quantization_builds_and_searches():
 
 
 def test_pq_subvector_count_must_divide_dimension():
-    """subvector_count=3 does not divide dimension=4, so the core's PQ
-    training must reject it at commit — proving the value reached the core."""
+    """subvector_count=3 does not divide dimension=4, so the core must reject
+    the field when the index is built — proving the value reached the core."""
     schema = laurus.Schema()
     schema.add_hnsw_field(
         "embedding", dimension=4, quantizer="product_quantization", subvector_count=3
     )
-    idx = laurus.Index(schema=schema)
-    idx.put_document("doc1", {"embedding": [0.1, 0.2, 0.3, 0.4]})
-    with pytest.raises(Exception):
-        idx.commit()
+    with pytest.raises(Exception, match="subvector_count 3 must divide dimension 4"):
+        laurus.Index(schema=schema)
 
 
 # ---------------------------------------------------------------------------

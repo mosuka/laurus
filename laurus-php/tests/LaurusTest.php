@@ -1656,10 +1656,10 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addHnswField("embedding", 4, null, 16, 200, null, null, "product_quantization", 3, null);
-        $idx = new Laurus\Index(null, $schema);
-        $idx->putDocument("doc1", ["embedding" => [0.1, 0.2, 0.3, 0.4]]);
+        // The core rejects the field when the index is built (Issue #1491).
         $this->expectException(\Throwable::class);
-        $idx->commit();
+        $this->expectExceptionMessageMatches('/subvector_count 3 must divide dimension 4/');
+        new Laurus\Index(null, $schema);
     }
 
     public function testUnknownQuantizerRejected(): void

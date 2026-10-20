@@ -112,8 +112,8 @@ An `hnsw`, `flat` or `ivf` field may set `quantizer` to pick how its vectors are
 | :--- | :--- | :--- |
 | `"scalar_8bit"` | HNSW, Flat, IVF | The default when `quantizer` is omitted or `null` |
 | `"float16"` | HNSW, Flat, IVF | IEEE 754 half precision (Issue #623) |
-| `"product_quantization"` | HNSW | `subvector_count` must divide `dimension` |
-| `"product_quantization_fastscan"` | HNSW | Experimental; the server must be built with the `pq-fastscan` feature |
+| `"product_quantization"` | HNSW | `subvector_count` must be at least `1` and divide `dimension` |
+| `"product_quantization_fastscan"` | HNSW | Experimental; the server must be built with the `pq-fastscan` feature. `subvector_count` must be at least `1` and divide `dimension` |
 
 `subvector_count` is read only for the two product quantization methods. Any other `method`, including `"none"` (unquantized storage was removed in Issue #481), a quantizer without a string `method`, and `"product_quantization_fastscan"` on a server built without `pq-fastscan` are rejected with 400 (Issue #1459), and nothing is written:
 
@@ -123,6 +123,17 @@ curl -X POST http://localhost:8080/v1/index \
   -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "pq", "subvector_count": 48}}}}}}'
 # => {"error":{"code":400,"message":"field \"embedding\": unknown quantizer method \"pq\" (expected \"scalar_8bit\", \"product_quantization\", \"product_quantization_fastscan\", or \"float16\")"}}
 ```
+
+For both product quantization methods, `POST /v1/index`, `POST /v1/schema/fields` and `PATCH /v1/schema/fields/{name}` reject with 400 a `subvector_count` of `0` (what an omitted `subvector_count` becomes) or one that does not divide `dimension` (Issue #1491), and nothing is written:
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384, "quantizer": {"method": "product_quantization", "subvector_count": 5}}}}}}'
+# => {"error":{"code":400,"message":"Invalid argument: field 'embedding': HNSW product quantization subvector_count 5 must divide dimension 384 (got 384 % 5 = 4)"}}
+```
+
+A server older than this check accepts such a field and fails a later commit with 500. An index it created still opens, with a warning in the server log; see [gRPC API → Product quantization `subvector_count`](grpc_api.md) for how to repair the field.
 
 The response always includes `quantizer`, with `subvector_count` `0` for a method that does not use it (e.g. `"quantizer": {"method": "scalar_8bit", "subvector_count": 0}`).
 
