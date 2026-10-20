@@ -714,7 +714,7 @@ gRPC エラーは標準の `Status` コードとして返されます。
 | :--- | :--- | :--- |
 | Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ、クエリ内の不明なフィールド、`offset + limit` が `max_result_window` を超える検索 |
 | インデックス未オープン | `FAILED_PRECONDITION` | `CreateIndex` の前に RPC が呼び出された場合 |
-| 書き込みの停止 | `FAILED_PRECONDITION` | それ以前の書き込みが write-ahead log への追記の後に失敗した後の、書き込み・コミット・フィールド変更。サーバーを再起動するとログが再生され、その書き込みが適用されます（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照） |
+| 書き込みの停止 | `FAILED_PRECONDITION` | それ以前の書き込みが write-ahead log への追記の後に失敗した後、または終わる前にキャンセルされた（その間にクライアントがキャンセルした、期限が切れた、または切断した）後の、書き込み・コミット・フィールド変更。サーバーを再起動するとログが再生され、その書き込みが適用されます（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照） |
 | インデックスが既に存在 | `ALREADY_EXISTS` | `CreateIndex` が 2 回呼び出された場合 |
 | 未実装 | `UNIMPLEMENTED` | まだサポートされていない機能 |
 | 内部エラー | `INTERNAL` | I/O、ストレージ、または予期しないエラー |

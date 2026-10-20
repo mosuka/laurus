@@ -26,7 +26,7 @@ cargo doc --open
 | `engine.delete_field(name).await?` | 稼働中のエンジンからフィールドを動的に削除 |
 | `engine.schema()` | 現在のスキーマへの参照を取得 |
 | `engine.stats()?` | インデックス統計の取得 |
-| `engine.write_stop_reason()` | WAL への追記の後に書き込みが失敗して、エンジンが書き込みの受け付けを止めた理由。止まっていなければ `None`（[失敗した書き込み](persistence.md#失敗した書き込み)を参照） |
+| `engine.write_stop_reason()` | WAL への追記の後に書き込みが失敗した（またはキャンセルされた）ために、エンジンが書き込みの受け付けを止めた理由。止まっていなければ `None`（[失敗した書き込み](persistence.md#失敗した書き込み)を参照） |
 
 > **`put_document` と `add_document` の違い:** `put_document` はUpsertを実行します。同じ外部IDのドキュメントが既に存在する場合、削除して置き換えます。`add_document` は常に追加し、複数のドキュメントチャンクが同じ外部IDを共有できます。詳細は [Schema & Fields -- ドキュメントのインデキシング](../concepts/schema_and_fields.md#indexing-documents) を参照してください。
 >

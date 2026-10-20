@@ -26,7 +26,7 @@ sequenceDiagram
 
 ### Key Principles
 
-1. **WAL-first**: Every write (add or delete) is appended to the WAL before updating in-memory structures. Everything that can reject a write runs before that append (embedding and validating its vector fields, creating the writers, analyzing its lexical fields, flushing a full lexical buffer), and a failure after it stops writes until the index is reopened (see [Failed Writes](#failed-writes))
+1. **WAL-first**: Every write (add or delete) is appended to the WAL before updating in-memory structures. Everything that can reject a write runs before that append (embedding and validating its vector fields, creating the writers, analyzing its lexical fields, flushing a full lexical buffer), and a failure after it, or a cancelled call, stops writes until the index is reopened (see [Failed Writes](#failed-writes))
 2. **Buffered writes**: In-memory buffers accumulate changes until `commit()` is called
 3. **Atomic commit**: `commit()` flushes all buffered changes to segment files and truncates the WAL
 4. **Commit-scoped visibility**: a lexical segment is written as soon as the writer's buffer fills, which can happen long before `commit()`, so the segment files existing on storage is not what makes its documents searchable. Publication is a manifest entry that only `commit()` adds, and segment discovery reads only the manifest — so "documents become searchable only after `commit()`" holds regardless of when a searcher happens to be built. Deletions are published in the same step, after their bitmaps are durable, so a reader that can see a segment can always filter it
@@ -94,7 +94,7 @@ A write that fails returns its error, and what it changed depends on where it fa
 | Where it fails | For example | Outcome |
 | :--- | :--- | :--- |
 | Before its WAL append | A rejected embedding, an analyzer error, a writer that cannot be created, a failed flush of a full lexical buffer | Nothing changed: no WAL record is written, and a `put` keeps the previous version. The engine keeps accepting writes. |
-| At or after its first WAL append | An I/O error writing the WAL record, loading a deletion bitmap, or recording the lexical checkpoint | The engine **stops accepting writes**, and reopening the index applies the write. |
+| At or after its first WAL append | An I/O error writing the WAL record or loading a deletion bitmap; the call cancelled (its future dropped, as when a `laurus serve` client's request is cancelled, its deadline expires or the client disconnects while a put waits for the vector writer) or panicking before the write finished applying | The engine **stops accepting writes**, and reopening the index applies the write. |
 
 The first WAL append of a `put` is the previous version's delete record, or the document's own record when there is no previous version. From that point the in-memory index may disagree with the WAL, and going on would let a commit persist the disagreement or a later write build on it. Once writes stopped:
 
@@ -105,7 +105,7 @@ The first WAL append of a `put` is the previous version's delete record, or the 
 
 An append that failed partway through writing its record also makes every later append fail, because recovery stops at the first incomplete record and would lose any record written after it. Reopening the index cuts the incomplete record off (see [Recovery](#recovery)), and appends work again.
 
-With concurrent writers there is one window left: a commit that was already running when a write failed can still truncate that write's record, because commits and checkpoints follow the highest sequence number applied, not the highest below which every record finished ([#1499](https://github.com/mosuka/laurus/issues/1499)). It cannot happen with a single writer, or to anything that starts after the stop.
+The WAL keeps the failed write's record with concurrent writers too, even against a commit that was already running when the write failed: a commit truncates the WAL, and records the stores' checkpoints, only up to the highest sequence number at or below which every write had finished applying when the commit started. A write that never finishes holds that number below its record until the index is reopened ([#1499](https://github.com/mosuka/laurus/issues/1499); see the [commit ladder](#commit-durability-ladder--crash-safety)).
 
 ## The Commit Lifecycle
 
@@ -163,7 +163,7 @@ Key semantics:
 - **Group-commit preserved.** Each auto-commit is one WAL flush plus one materialization ladder — never one commit per document. Within a single `put_documents` / `add_documents` call the auto-commit fires **every `n` documents** (chunked), so a large batch materializes incrementally rather than in one final ladder; the trailing `< n` remainder stays WAL-durable until the next boundary or an explicit `commit()`.
 - **Orthogonal to `WalSyncPolicy`.** `CommitPolicy` decides *when the stores materialize*; `WalSyncPolicy` decides *WAL fsync durability*. Auto-commit works under any WAL policy because `commit()` always begins with a WAL flush.
 - **Crash semantics unchanged.** An auto-commit is a normal commit; a crash replays the uncommitted tail exactly as it would under manual commits.
-- **Concurrency.** The exact cadence and the usual "acknowledged write is durable" guarantee hold for **single-writer ingestion** (the model the engine's write path — and the CLI/bindings — are built around). Under concurrent writers on a shared engine, auto-commit is best-effort: because the commit ladder is not atomic with respect to another thread's in-flight write, a write acknowledged while a concurrent auto-commit runs may only become durable at the following commit, and the cadence may drift. (A concurrent manual `commit()` races the same way — auto-commit merely triggers it from the ingest path.) The `Interval` timer runs the ladder on its own thread, so the same best-effort caveat applies to it. Use explicit commits, or a single ingest task, if you need these guarantees under concurrency.
+- **Concurrency.** The exact cadence holds for **single-writer ingestion** (the model the engine's write path — and the CLI/bindings — are built around). Under concurrent writers on a shared engine, the cadence is best-effort and may drift, and a commit does not wait for writes still applying: a write that finishes while an auto-commit (or a concurrent manual `commit()`, which races the same way) runs keeps its WAL record and reaches the stores' committed state at the following commit. An acknowledged write is never lost to such a race: no commit truncates the record of a write that has not finished applying, or records a checkpoint that covers it (Issue #1499; see the [commit ladder](#commit-durability-ladder--crash-safety)). The `Interval` timer runs the ladder on its own thread, with the same behavior.
 
 ## Batch Ingestion
 
@@ -238,9 +238,11 @@ let engine = Engine::builder(storage, schema)
 
 `commit()` persists state in a fixed order, and the order is what makes a crash
 at any point recoverable. Each lexical/vector store tracks its own `last_wal_seq`
-checkpoint — the sequence number of the last WAL record it has materialized — so
-recovery can skip already-applied records. The persisted `last_wal_seq` lives in
-the store's on-disk metadata and is written **only** during the store's commit.
+checkpoint — a sequence number at or below which the store has materialized
+every WAL record — so recovery can skip already-applied records. The persisted
+`last_wal_seq` lives in the store's on-disk metadata and is written **only**
+during the store's commit, which records the watermark the commit ladder
+snapshots (below); writes do not move it.
 
 The lexical control file (`metadata.json`) has a **single authority**: the
 in-memory copy owned by the index. The writer the store commits through holds a
@@ -302,13 +304,16 @@ The commit ladder is:
 
 1. **`flush_wal()`** — force the WAL durable (the hard barrier). Under `Group`
    this fsyncs any deferred batch; under `PerRecord` it is a no-op.
-2. **`lexical.commit()`** — write the lexical segment and metadata (including
-   `last_wal_seq`), then `sync()`.
-3. **`vector.commit()`** — write the vector segment, then `sync()`.
+2. **`lexical.commit()`** — record the watermark as `last_wal_seq`, write the
+   lexical segment and metadata, then `sync()`.
+3. **`vector.commit()`** — record the watermark as each field's checkpoint,
+   write the vector segment and deletion bitmaps, publish the checkpoint, then
+   `sync()`.
 4. **`commit_documents()`** — write the document store segment, then `sync()`.
-5. **`truncate_retaining_after(applied_before)`** — discard every WAL record
-   this commit covered; **retain** any record whose mutation had not finished
-   applying to both stores when the commit started (Issue #876).
+5. **`truncate_retaining_after(watermark)`** — discard every WAL record this
+   commit covered; **retain** every record above the watermark, which includes
+   every record whose mutation had not finished applying to both stores when
+   the commit started (Issues #876, #1499).
 
 This order guarantees two invariants:
 
@@ -321,13 +326,21 @@ This order guarantees two invariants:
 
 `commit()` is **not** serialized against concurrent `put`/`add`/`delete` calls
 (nor against `CommitPolicy::Interval`'s background timer, which runs this same
-ladder). Step 5 accounts for this: it snapshots the engine's ingest high-water
-mark *before* step 1 runs, and retains every WAL record past that snapshot
-instead of unconditionally emptying the file. A mutation racing the commit
-therefore keeps its WAL record — and is replayed on the next recovery — even
-though it was not included in this commit's materialization. When nothing
-races the commit (the common case), the snapshot covers the whole WAL and step
-5 empties the file exactly as before.
+ladder). It accounts for this with a **watermark** it snapshots *before* step 1
+runs: the highest sequence number at or below which every write has finished
+applying to both stores. Writes of different ids finish in any order, so a
+write appended later can finish first; the watermark stays below the earlier
+one until it finishes. Steps 2 and 3 record the snapshot as the stores'
+checkpoints, each under the lock its own commit holds (a lexical store with
+nothing buffered keeps its previous checkpoint, which only means more replay),
+and step 5 retains every WAL record past it instead of unconditionally emptying
+the file. A write racing
+the commit therefore keeps its WAL record — and is replayed on the next
+recovery — even if this commit materialized part of it, and no checkpoint
+covers it. A write that never finishes (it failed, was cancelled, or panicked,
+which also stops writes) holds the watermark below its record until the index
+is reopened (Issue #1499). When nothing races the commit (the common case), the
+snapshot covers the whole WAL and step 5 empties the file exactly as before.
 
 Recovery replays the WAL on the next `build()`, skipping records at or below each
 store's `last_wal_seq`. Replay is **idempotent** — it re-applies each record
@@ -364,7 +377,7 @@ The table below shows the outcome of a crash at each step (identical for
 | After step 1, before step 2 | WAL only | Replay all pending records into both stores |
 | After step 2, before step 3 | WAL + lexical (`last_wal_seq = N`) | Lexical skips ≤ N; vector replays from WAL |
 | After step 3, before step 4 | WAL + lexical + vector | Both stores skip; documents restored from WAL |
-| After step 4, before step 5 | WAL + all stores | WAL still present; both stores skip, no duplicates |
+| After step 4, before step 5 | WAL + all stores | WAL still present; both stores skip records up to the watermark, and replay any above it idempotently, so no duplicates |
 | After step 5 | All stores; WAL empty unless a mutation raced this commit | Nothing to replay (or just the racing mutation's record) |
 
 No interleaving lets a committed index reference a lost WAL record, so group

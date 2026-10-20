@@ -26,7 +26,7 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `ResourceExhausted` | Resource limits exceeded | Out of memory, too many open files |
 | `SerializationError` | Binary serialization errors | Corrupt data on disk |
 | `OperationCancelled` | Operation was cancelled | Timeout, user cancellation |
-| `WritesStopped` | The engine stopped accepting writes | An earlier write failed after its WAL record was written (an I/O error, disk full); reopen the index |
+| `WritesStopped` | The engine stopped accepting writes | An earlier write failed after its WAL record was written (an I/O error, disk full), or its call was cancelled before the write finished; reopen the index |
 | `NotImplemented` | Feature not available | Unimplemented operation |
 | `Other` | Generic errors | Timeout, invalid config, not found |
 
@@ -145,7 +145,7 @@ match StorageFactory::open(StorageConfig::File {
 
 ### Writes Stopped
 
-A write that fails after its WAL record was written (for example on an I/O error) returns its own error and stops the engine from accepting writes: every later write, commit and schema change fails with `WritesStopped` until the index is reopened, which replays the WAL and applies the failed write (see [Failed Writes](persistence.md#failed-writes)). Searches keep working meanwhile.
+A write that fails after its WAL record was written (for example on an I/O error) returns its own error and stops the engine from accepting writes, and so does a call that is cancelled (its future dropped) or panics before its write finished applying: every later write, commit and schema change fails with `WritesStopped` until the index is reopened, which replays the WAL and applies the failed write (see [Failed Writes](persistence.md#failed-writes)). Searches keep working meanwhile.
 
 ```rust
 match engine.put_document("doc-1", doc).await {

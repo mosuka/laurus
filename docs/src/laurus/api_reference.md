@@ -26,7 +26,7 @@ The central coordinator for all indexing and search operations.
 | `engine.delete_field(name).await?` | Remove a field from the schema at runtime |
 | `engine.schema()` | Return the current `Schema` |
 | `engine.stats()?` | Get index statistics |
-| `engine.write_stop_reason()` | Why the engine stopped accepting writes after a write failed past its WAL append, or `None` (see [Failed Writes](persistence.md#failed-writes)) |
+| `engine.write_stop_reason()` | Why the engine stopped accepting writes after a write failed, or was cancelled, past its WAL append, or `None` (see [Failed Writes](persistence.md#failed-writes)) |
 
 > **`put_document` vs `add_document`:** `put_document` performs an upsert — if a document with the same external ID already exists, it is deleted and replaced. `add_document` always appends, allowing multiple document chunks to share the same external ID. See [Schema & Fields — Indexing Documents](../concepts/schema_and_fields.md#indexing-documents) for details.
 >
