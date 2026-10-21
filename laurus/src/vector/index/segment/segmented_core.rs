@@ -6,9 +6,10 @@
 //! pending/published WAL checkpoint, and the publish step of a merge. Flat,
 //! HNSW, IVF and MultiVector all build on it.
 //!
-//! This type never touches segment readers. MultiVector consults
-//! [`SegmentedCore::is_deleted`] at lookup time. Flat, HNSW and IVF attach
-//! the bitmap to each cached segment reader instead, through
+//! This type never touches segment readers. MultiVector hands
+//! [`SegmentedCore::bitmap`] to each snapshot, which consults it at lookup
+//! time. Flat, HNSW and IVF attach the bitmap to each cached segment reader
+//! instead, through
 //! [`SegmentedReaderCache::sealed_readers_newest_first`], which uses
 //! [`SegmentedCore::bitmap_epoch`] to drop readers loaded before the bitmap
 //! was created.
@@ -42,9 +43,10 @@ pub(crate) struct SegmentedCore {
     /// no deletions"; it is loaded lazily from `{name}.delmap`.
     deletion: RwLock<Option<Arc<DeletionBitmap>>>,
 
-    /// Number of times a new, empty bitmap was created. Bumped under the
-    /// `deletion` write lock, so a caller that reads the epoch and then the
-    /// bitmap sees a bitmap at least as new as the epoch.
+    /// Number of times a new, empty bitmap was created or the bitmap was
+    /// replaced. Bumped under the `deletion` write lock, so a caller that
+    /// reads the epoch and then the bitmap sees a bitmap at least as new as
+    /// the epoch.
     bitmap_epoch: AtomicU64,
 
     /// Highest WAL sequence number applied to this index but not yet
@@ -80,6 +82,34 @@ impl SegmentedCore {
         format!("{}.delmap", self.name)
     }
 
+    /// Fill an empty `slot` (the content of `deletion`, write-locked by the
+    /// caller) from `{name}.delmap`, or with a new, empty bitmap when
+    /// `create_if_missing` is set and there is no file.
+    fn load_into(
+        &self,
+        slot: &mut Option<Arc<DeletionBitmap>>,
+        create_if_missing: bool,
+    ) -> Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+
+        let file = self.delmap_file_name();
+        if self.storage.file_exists(&file) {
+            let input = self.storage.open_input(&file)?;
+            let mut reader = StructReader::new(input)?;
+            *slot = Some(Arc::new(DeletionBitmap::read_from_storage(&mut reader)?));
+        } else if create_if_missing {
+            *slot = Some(Arc::new(DeletionBitmap::new(
+                self.name.clone(),
+                0,
+                u64::MAX - 1,
+            )));
+            self.bitmap_epoch.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// Load the deletion bitmap, creating an empty one when
     /// `create_if_missing` is set and none exists yet.
     fn load_or_get_bitmap(&self, create_if_missing: bool) -> Result<Option<Arc<DeletionBitmap>>> {
@@ -88,27 +118,37 @@ impl SegmentedCore {
         }
 
         let mut guard = self.deletion.write();
-        if let Some(bitmap) = guard.as_ref() {
-            return Ok(Some(bitmap.clone()));
+        self.load_into(&mut guard, create_if_missing)?;
+        Ok(guard.clone())
+    }
+
+    /// Apply `change` to the deletion bitmap while holding the `deletion`
+    /// lock, loading the bitmap first, or creating it when
+    /// `create_if_missing` is set (Issue #1518).
+    ///
+    /// [`Self::forget_deletions`] replaces the bitmap under the write lock.
+    /// A change made through a clone of the old `Arc` after the lock was
+    /// released would land on the replaced bitmap and be lost.
+    ///
+    /// # Returns
+    ///
+    /// `None`, without calling `change`, when there is no bitmap and
+    /// `create_if_missing` is not set.
+    fn change_bitmap<T>(
+        &self,
+        create_if_missing: bool,
+        change: impl FnOnce(&DeletionBitmap) -> Result<T>,
+    ) -> Result<Option<T>> {
+        {
+            let guard = self.deletion.read();
+            if let Some(bitmap) = guard.as_ref() {
+                return change(bitmap).map(Some);
+            }
         }
 
-        let file = self.delmap_file_name();
-        if self.storage.file_exists(&file) {
-            let input = self.storage.open_input(&file)?;
-            let mut reader = StructReader::new(input)?;
-            let bitmap = Arc::new(DeletionBitmap::read_from_storage(&mut reader)?);
-            *guard = Some(bitmap.clone());
-            return Ok(Some(bitmap));
-        }
-
-        if create_if_missing {
-            let bitmap = Arc::new(DeletionBitmap::new(self.name.clone(), 0, u64::MAX - 1));
-            *guard = Some(bitmap.clone());
-            self.bitmap_epoch.fetch_add(1, Ordering::Release);
-            return Ok(Some(bitmap));
-        }
-
-        Ok(None)
+        let mut guard = self.deletion.write();
+        self.load_into(&mut guard, create_if_missing)?;
+        guard.as_deref().map(change).transpose()
     }
 
     /// The current deletion bitmap, if any document was ever deleted.
@@ -116,19 +156,22 @@ impl SegmentedCore {
         self.load_or_get_bitmap(false)
     }
 
-    /// How many times a new, empty deletion bitmap has been created.
+    /// How many times a new, empty deletion bitmap has been created or the
+    /// bitmap has been replaced.
     ///
     /// A reader that attached [`Self::bitmap`] while it was `None` misses
-    /// every later deletion; comparing epochs tells its cache to drop it.
-    /// Loading `{name}.delmap` does not bump the epoch: a reader build reads
-    /// the bitmap first, so no reader is cached without a bitmap that is
-    /// already on storage. [`Self::clear_deletions`] resets the bitmap, so
-    /// the epoch moves again on the next creation.
+    /// every later deletion, and one that attached a bitmap
+    /// [`Self::forget_deletions`] has since replaced misses every deletion
+    /// made after that; comparing epochs tells its cache to drop it. Loading
+    /// `{name}.delmap` does not bump the epoch: a reader build reads the
+    /// bitmap first, so no reader is cached without a bitmap that is already
+    /// on storage.
     pub(crate) fn bitmap_epoch(&self) -> u64 {
         self.bitmap_epoch.load(Ordering::Acquire)
     }
 
     /// Whether `doc_id` is logically deleted.
+    #[cfg(test)]
     pub(crate) fn is_deleted(&self, doc_id: u64) -> Result<bool> {
         Ok(self
             .bitmap()?
@@ -145,10 +188,8 @@ impl SegmentedCore {
     ///
     /// `true` when the document was not already marked deleted.
     pub(crate) fn mark_deleted(&self, doc_id: u64) -> Result<bool> {
-        let bitmap = self
-            .load_or_get_bitmap(true)?
-            .ok_or_else(|| LaurusError::internal("deletion bitmap unexpectedly missing"))?;
-        bitmap.delete_document(doc_id)
+        self.change_bitmap(true, |bitmap| bitmap.delete_document(doc_id))?
+            .ok_or_else(|| LaurusError::internal("deletion bitmap unexpectedly missing"))
     }
 
     /// Clear the deletion marks of re-added documents.
@@ -158,11 +199,12 @@ impl SegmentedCore {
     /// delete once its segment seals. Stale copies in older segments are
     /// masked by newest-segment-wins lookups and collapsed by merges.
     pub(crate) fn unmark_deleted(&self, doc_ids: impl IntoIterator<Item = u64>) -> Result<()> {
-        if let Some(bitmap) = self.bitmap()? {
+        self.change_bitmap(false, |bitmap| {
             for doc_id in doc_ids {
                 bitmap.undelete_document(doc_id)?;
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -173,12 +215,70 @@ impl SegmentedCore {
             .map_or(0, |bitmap| bitmap.deleted_count.load(Ordering::Relaxed)))
     }
 
-    /// Drop the deletion state after a merge physically removed every
-    /// deleted document.
-    pub(crate) fn clear_deletions(&self) -> Result<()> {
-        *self.deletion.write() = None;
+    /// A frozen copy of the deletion bitmap, for a merge to filter with
+    /// (Issue #1518); `None` when there is no bitmap.
+    ///
+    /// A soft delete takes no writer lock, so it can mark a document while a
+    /// merge runs. With the copy, the documents the merge drops are exactly
+    /// the ones the copy marks, which [`Self::forget_deletions`] can then
+    /// forget after a full merge. A document deleted while the merge runs is
+    /// kept, and stays marked.
+    pub(crate) fn deletion_snapshot(&self) -> Result<Option<Arc<DeletionBitmap>>> {
+        Ok(self.bitmap()?.map(|bitmap| Arc::new(bitmap.snapshot())))
+    }
+
+    /// Forget the deletions a full merge physically removed (Issue #1518).
+    ///
+    /// `reclaimed` is the [`Self::deletion_snapshot`] the merge filtered
+    /// with. Once the merged segment has replaced every segment, no copy of a
+    /// document it marks is left. Under the `deletion` write lock, the bitmap
+    /// is replaced by one with only the marks made since, or by `None` when
+    /// there are none, and `{name}.delmap` is rewritten or removed to match
+    /// before the lock is released, so neither a reopen nor a lazy load
+    /// brings the reclaimed marks back. The WAL checkpoint is not published.
+    ///
+    /// The bitmap is replaced rather than edited: readers and searchers built
+    /// before the merge hold it, and their source segments still hold the
+    /// reclaimed documents. The replacement moves [`Self::bitmap_epoch`], so
+    /// the reader cache drops readers that hold the old bitmap.
+    ///
+    /// The caller must not seal a segment or re-add a document while the
+    /// merge runs, or a copy of a reclaimed document could outlive it.
+    /// `VectorStore` holds its writer lock across both.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing or removing `{name}.delmap` fails; the
+    /// bitmap is then left as it was.
+    pub(crate) fn forget_deletions(&self, reclaimed: Option<&DeletionBitmap>) -> Result<()> {
+        let Some(reclaimed) = reclaimed else {
+            return Ok(());
+        };
+        let mut guard = self.deletion.write();
+        let remaining = match guard.as_ref() {
+            Some(bitmap) => bitmap.difference(reclaimed),
+            None => return Ok(()),
+        };
+        self.write_delmap(&remaining)?;
+        *guard = (remaining.deleted_count.load(Ordering::Relaxed) > 0).then(|| Arc::new(remaining));
+        self.bitmap_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Write `bitmap` to `{name}.delmap`, or remove the file when `bitmap`
+    /// marks nothing.
+    fn write_delmap(&self, bitmap: &DeletionBitmap) -> Result<()> {
         let file = self.delmap_file_name();
-        if self.storage.file_exists(&file) {
+        if bitmap.deleted_count.load(Ordering::Relaxed) > 0 {
+            let tmp = format!("{file}.tmp");
+            let output = self.storage.create_output(&tmp)?;
+            let mut writer = StructWriter::new(output);
+            bitmap.write_to_storage(&mut writer)?;
+            writer.close()?;
+            self.storage.rename_file(&tmp, &file)?;
+        } else if self.storage.file_exists(&file) {
+            // An upsert can clear every mark; a stale delmap would then
+            // hide the committed re-add on reopen.
             self.storage.delete_file(&file)?;
         }
         Ok(())
@@ -193,19 +293,7 @@ impl SegmentedCore {
     pub(crate) fn persist_deletions(&self) -> Result<()> {
         let guard = self.deletion.read();
         if let Some(bitmap) = guard.as_ref() {
-            let file = self.delmap_file_name();
-            if bitmap.deleted_count.load(Ordering::Relaxed) > 0 {
-                let tmp = format!("{file}.tmp");
-                let output = self.storage.create_output(&tmp)?;
-                let mut writer = StructWriter::new(output);
-                bitmap.write_to_storage(&mut writer)?;
-                writer.close()?;
-                self.storage.rename_file(&tmp, &file)?;
-            } else if self.storage.file_exists(&file) {
-                // An upsert can clear every mark; a stale delmap would then
-                // hide the committed re-add on reopen.
-                self.storage.delete_file(&file)?;
-            }
+            self.write_delmap(bitmap)?;
         }
         drop(guard);
 
@@ -267,10 +355,10 @@ impl SegmentedCore {
 
     /// Merge `segments` into one new segment and publish it in the manifest.
     ///
-    /// `merge` receives the current deletion bitmap, the source segments and
-    /// a freshly allocated segment id, writes the merged segment, and
-    /// returns its info. The source segments are then replaced by it and
-    /// their files deleted.
+    /// `merge` receives `deletions` (the [`Self::deletion_snapshot`] the
+    /// merge filters with), the source segments and a freshly allocated
+    /// segment id, writes the merged segment, and returns its info. The
+    /// source segments are then replaced by it and their files deleted.
     ///
     /// # Returns
     ///
@@ -279,15 +367,15 @@ impl SegmentedCore {
     pub(crate) fn merge_segments(
         &self,
         segments: Vec<ManagedSegmentInfo>,
+        deletions: Option<Arc<DeletionBitmap>>,
         merge: impl FnOnce(
             Option<Arc<DeletionBitmap>>,
             Vec<ManagedSegmentInfo>,
             String,
         ) -> Result<ManagedSegmentInfo>,
     ) -> Result<Vec<String>> {
-        let bitmap = self.bitmap()?;
         let new_segment_id = self.manager.generate_segment_id();
-        let merged = merge(bitmap, segments.clone(), new_segment_id)?;
+        let merged = merge(deletions, segments.clone(), new_segment_id)?;
 
         let source_ids = segments.iter().map(|s| s.segment_id.clone()).collect();
         let candidate = MergeCandidate {
@@ -384,17 +472,56 @@ mod tests {
         assert_eq!(core.last_wal_seq(), 4);
     }
 
+    /// Issue #1518: forgetting a snapshot replaces the bitmap with one that
+    /// keeps the marks made since, rewrites the delmap to match, and leaves
+    /// the old bitmap, which readers built before the merge hold, alone.
     #[test]
-    fn test_clear_deletions_drops_state_and_file() {
+    fn test_forget_deletions_keeps_marks_made_after_the_snapshot() {
         let storage = memory_storage();
         let core = open(&storage);
         core.mark_deleted(2).unwrap();
         core.persist_deletions().unwrap();
+        let held = core.bitmap().unwrap().unwrap();
+        let snapshot = core.deletion_snapshot().unwrap();
+        core.mark_deleted(3).unwrap();
+        let epoch = core.bitmap_epoch();
 
-        core.clear_deletions().unwrap();
+        core.forget_deletions(snapshot.as_deref()).unwrap();
+        assert!(!core.is_deleted(2).unwrap(), "the snapshot's mark is gone");
+        assert!(core.is_deleted(3).unwrap(), "a later mark is kept");
+        assert_eq!(core.deleted_count().unwrap(), 1);
+        assert!(core.bitmap_epoch() > epoch, "the bitmap was replaced");
+        assert!(
+            held.is_deleted(2) && held.is_deleted(3),
+            "the bitmap readers already hold is not edited"
+        );
+        let reopened = open(&storage);
+        assert!(!reopened.is_deleted(2).unwrap());
+        assert!(reopened.is_deleted(3).unwrap());
+
+        // A mark made after the replacement reaches the new bitmap.
+        core.mark_deleted(4).unwrap();
+        assert!(core.is_deleted(4).unwrap());
+        assert!(!held.is_deleted(4));
+    }
+
+    /// Issue #1518: forgetting every mark drops the bitmap and the delmap,
+    /// so the next delete creates a new bitmap, as before the fix.
+    #[test]
+    fn test_forgetting_every_mark_drops_the_bitmap_and_the_delmap() {
+        let storage = memory_storage();
+        let core = open(&storage);
+        core.mark_deleted(2).unwrap();
+        core.persist_deletions().unwrap();
+        let snapshot = core.deletion_snapshot().unwrap();
+
+        core.forget_deletions(snapshot.as_deref()).unwrap();
         assert!(!storage.file_exists("index.delmap"));
-        assert!(!core.is_deleted(2).unwrap());
+        assert!(core.bitmap().unwrap().is_none());
         assert_eq!(core.deleted_count().unwrap(), 0);
+
+        core.forget_deletions(None).unwrap();
+        assert!(core.bitmap().unwrap().is_none(), "nothing to forget");
     }
 
     #[test]
@@ -458,13 +585,14 @@ mod tests {
             "loading the delmap is not a creation"
         );
 
-        core.clear_deletions().unwrap();
-        assert_eq!(core.bitmap_epoch(), 1);
+        let snapshot = core.deletion_snapshot().unwrap();
+        core.forget_deletions(snapshot.as_deref()).unwrap();
+        assert_eq!(core.bitmap_epoch(), 2, "forgetting replaces the bitmap");
         core.mark_deleted(4).unwrap();
         assert_eq!(
             core.bitmap_epoch(),
-            2,
-            "a delete after clear_deletions creates a new bitmap"
+            3,
+            "a delete after forgetting every mark creates a new bitmap"
         );
     }
 
@@ -506,6 +634,7 @@ mod tests {
         let replaced = core
             .merge_segments(
                 vec![first.clone(), second.clone()],
+                core.deletion_snapshot().unwrap(),
                 |bitmap, segments, id| {
                     storage
                         .create_output(&format!("{id}.test"))
@@ -533,7 +662,7 @@ mod tests {
         let core = open(&storage);
         let first = add_segment(&core, 3);
 
-        let result = core.merge_segments(vec![first.clone()], |_, _, _| {
+        let result = core.merge_segments(vec![first.clone()], None, |_, _, _| {
             Err(LaurusError::internal("merge failed"))
         });
         assert!(result.is_err());

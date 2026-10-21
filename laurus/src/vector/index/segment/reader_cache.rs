@@ -157,10 +157,10 @@ impl<R> SegmentedReaderCache<R> {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // A bitmap created while this build ran is missing from the
-            // readers loaded under the `None` snapshot, which may already be
-            // cached: drop them and rebuild. Creation happens at most once
-            // between `clear_deletions` calls, so the loop rarely repeats.
+            // A bitmap created or replaced while this build ran is missing
+            // from the readers loaded before, which may already be cached:
+            // drop them and rebuild. That happens only on the first delete
+            // and at the end of a full merge, so the loop rarely repeats.
             if core.bitmap_epoch() == epoch {
                 return Ok(readers);
             }
@@ -367,27 +367,33 @@ mod tests {
             assert_eq!(loads.load(Ordering::SeqCst), 4, "rebuilt exactly once");
         }
 
+        /// A full merge forgets the marks it reclaimed by replacing the
+        /// bitmap (Issue #1518); a reader left with the old one would miss
+        /// every later delete.
         #[test]
-        fn a_bitmap_recreated_after_clear_deletions_rebuilds_again() {
+        fn readers_are_rebuilt_with_the_bitmap_that_replaced_theirs() {
             let (core, _) = core_with_segments(1);
-            let cache = SegmentedReaderCache::new();
-            let loads = AtomicUsize::new(0);
+            let cache: SegmentedReaderCache<Option<Arc<DeletionBitmap>>> =
+                SegmentedReaderCache::new();
+            let attached = || {
+                let readers = cache
+                    .sealed_readers_newest_first(&core, |_, bitmap| Ok(bitmap))
+                    .unwrap();
+                readers[0].as_ref().clone().unwrap()
+            };
             core.mark_deleted(1).unwrap();
-            assert_eq!(build(&cache, &core, &loads), vec![true]);
+            assert!(attached().is_deleted(1));
 
-            // Optimize drops the bitmap; until the next delete, the readers
-            // keep the old one (nothing they hold is still deleted).
-            core.clear_deletions().unwrap();
-            assert_eq!(build(&cache, &core, &loads), vec![true]);
-            assert_eq!(loads.load(Ordering::SeqCst), 1);
-
+            let reclaimed = core.deletion_snapshot().unwrap();
             core.mark_deleted(2).unwrap();
-            build(&cache, &core, &loads);
-            assert_eq!(
-                loads.load(Ordering::SeqCst),
-                2,
-                "the new bitmap must reach the readers"
+            core.forget_deletions(reclaimed.as_deref()).unwrap();
+            core.mark_deleted(3).unwrap();
+            let bitmap = attached();
+            assert!(
+                !bitmap.is_deleted(1),
+                "the reader still holds the replaced bitmap"
             );
+            assert!(bitmap.is_deleted(2) && bitmap.is_deleted(3));
         }
 
         #[test]

@@ -84,7 +84,7 @@ graph LR
 2. Rebuilds the inverted index and/or vector index without deleted entries
 3. Writes new, clean segment files
 4. Removes the old segment files
-5. Resets the deletion bitmap
+5. Clears the deletion marks of the documents it removed. A document deleted while compaction runs stays deleted: its mark is kept
 
 ### Cost and Frequency
 
@@ -107,9 +107,11 @@ For the HNSW vector index, compaction can run automatically. When
 `DeletionConfig::auto_compaction` is enabled (the default), `commit()` checks
 the deletion ratio (deleted nodes / total committed nodes) and triggers
 compaction once it reaches `DeletionConfig::compaction_threshold` (default
-`0.3`). Compaction resets the ratio to zero, so it does not re-fire until
-deletions accumulate again — bounding tombstone growth without a manual
-`optimize()`. Set `auto_compaction` to `false` to manage compaction yourself.
+`0.3`). Compaction clears the marks of the deletions it reclaimed, which
+drops the ratio to the deletes made while it ran (usually none), so it does
+not re-fire until deletions accumulate again — bounding tombstone growth
+without a manual `optimize()`. Set `auto_compaction` to `false` to manage
+compaction yourself.
 
 ## Deletion Bitmap
 

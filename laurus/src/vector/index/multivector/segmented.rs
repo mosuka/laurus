@@ -33,6 +33,7 @@ use parking_lot::Mutex;
 
 use crate::embedding::embedder::Embedder;
 use crate::error::{LaurusError, Result};
+use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::multi_vector_params_error;
@@ -219,11 +220,16 @@ impl Shared {
     /// Merge `segments` into one new segment and publish it.
     ///
     /// Pass 1 reads only the document tables, newest generation first,
-    /// dropping deleted documents and stale copies. Pass 2 copies each
-    /// surviving document's payload, so memory stays proportional to the
-    /// document count.
-    fn merge(&self, segments: Vec<ManagedSegmentInfo>) -> Result<()> {
-        self.merge_within(segments, POOLING_BUDGET_BYTES)
+    /// dropping the documents `deletions` (a
+    /// [`SegmentedCore::deletion_snapshot`]) marks and stale copies. Pass 2
+    /// copies each surviving document's payload, so memory stays
+    /// proportional to the document count.
+    fn merge(
+        &self,
+        segments: Vec<ManagedSegmentInfo>,
+        deletions: Option<&DeletionBitmap>,
+    ) -> Result<()> {
+        self.merge_within(segments, deletions, POOLING_BUDGET_BYTES)
     }
 
     /// [`Self::merge`], pooling the documents it pools in windows of at most
@@ -231,7 +237,12 @@ impl Shared {
     /// at the same time (Issue #1429). Rows are still read and written in
     /// doc-id order, and pooling is deterministic, so the merged segment is
     /// the same whatever the windows and the threads.
-    fn merge_within(&self, segments: Vec<ManagedSegmentInfo>, pooling_budget: usize) -> Result<()> {
+    fn merge_within(
+        &self,
+        segments: Vec<ManagedSegmentInfo>,
+        deletions: Option<&DeletionBitmap>,
+        pooling_budget: usize,
+    ) -> Result<()> {
         let mut binary = self.binary.lock();
         let mut sources = segments.clone();
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
@@ -249,7 +260,9 @@ impl Shared {
         let mut survivors: Vec<Survivor> = Vec::new();
         for (source, reader) in readers.iter().enumerate() {
             for entry in reader.entries() {
-                if self.core.is_deleted(entry.doc_id)? || !seen.insert(entry.doc_id) {
+                if deletions.is_some_and(|deletions| deletions.is_deleted(entry.doc_id))
+                    || !seen.insert(entry.doc_id)
+                {
                     continue;
                 }
                 let pool = factor > 1 && entry.pool_factor == 0;
@@ -539,7 +552,9 @@ impl MultiVectorIndex {
         else {
             return Ok(false);
         };
-        self.shared.merge(candidate.segments)?;
+        let deletions = self.shared.core.deletion_snapshot()?;
+        self.shared
+            .merge(candidate.segments, deletions.as_deref())?;
         Ok(true)
     }
 }
@@ -594,9 +609,13 @@ impl VectorIndex for MultiVectorIndex {
         if segments.is_empty() {
             return Ok(());
         }
-        self.shared.merge(segments)?;
-        // Every logically deleted document was dropped by the merge.
-        self.shared.core.clear_deletions()
+        // Filter with a frozen copy of the deletions: a soft delete takes no
+        // writer lock and can land while the merge runs (Issue #1518).
+        let deletions = self.shared.core.deletion_snapshot()?;
+        self.shared.merge(segments, deletions.as_deref())?;
+        // Every document the copy marks was dropped by the merge; a delete
+        // marked since stays marked.
+        self.shared.core.forget_deletions(deletions.as_deref())
     }
 
     fn searcher(&self) -> Result<Box<dyn VectorIndexSearcher>> {
@@ -2330,11 +2349,16 @@ mod tests {
             let storage = mixed_storage();
             let index = open(&storage, MultiVectorStorage::F32, 2);
             let segments = index.shared.core.manager().list_segments();
+            let deletions = index.shared.core.deletion_snapshot().unwrap();
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap()
-                .install(|| index.shared.merge_within(segments, budget))
+                .install(|| {
+                    index
+                        .shared
+                        .merge_within(segments, deletions.as_deref(), budget)
+                })
                 .unwrap();
             let merged = index.shared.core.manager().list_segments();
             assert_eq!(merged.len(), 1);

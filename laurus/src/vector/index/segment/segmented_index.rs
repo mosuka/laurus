@@ -182,19 +182,28 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
             .collect())
     }
 
-    /// Merge `segments` into one new segment and drop their cached readers.
-    fn merge(&self, config: &B::Config, segments: Vec<ManagedSegmentInfo>) -> Result<()> {
-        let source_ids =
-            self.core
-                .merge_segments(segments, |bitmap, segments, new_segment_id| {
-                    B::merge_segments(
-                        config,
-                        self.core.storage(),
-                        bitmap,
-                        segments,
-                        new_segment_id,
-                    )
-                })?;
+    /// Merge `segments` into one new segment, dropping the documents
+    /// `deletions` (a [`SegmentedCore::deletion_snapshot`]) marks, and drop
+    /// their cached readers.
+    fn merge(
+        &self,
+        config: &B::Config,
+        segments: Vec<ManagedSegmentInfo>,
+        deletions: Option<Arc<DeletionBitmap>>,
+    ) -> Result<()> {
+        let source_ids = self.core.merge_segments(
+            segments,
+            deletions,
+            |deletions, segments, new_segment_id| {
+                B::merge_segments(
+                    config,
+                    self.core.storage(),
+                    deletions,
+                    segments,
+                    new_segment_id,
+                )
+            },
+        )?;
         for id in &source_ids {
             self.reader_cache.invalidate(id);
         }
@@ -315,7 +324,9 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
         else {
             return Ok(false);
         };
-        self.shared.merge(&self.config, candidate.segments)?;
+        let deletions = self.shared.core.deletion_snapshot()?;
+        self.shared
+            .merge(&self.config, candidate.segments, deletions)?;
         Ok(true)
     }
 }
@@ -403,11 +414,16 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         if segments.is_empty() {
             return Ok(());
         }
-        // Force-merge everything into one segment.
-        self.shared.merge(&self.config, segments)?;
+        // Force-merge everything into one segment, filtering with a frozen
+        // copy of the deletions: a soft delete takes no writer lock and can
+        // land while the merge runs (Issue #1518).
+        let deletions = self.shared.core.deletion_snapshot()?;
+        self.shared
+            .merge(&self.config, segments, deletions.clone())?;
 
-        // Every logically deleted doc was physically dropped by the merge.
-        self.shared.core.clear_deletions()
+        // Every document the copy marks was physically dropped by the merge;
+        // a delete marked since stays marked.
+        self.shared.core.forget_deletions(deletions.as_deref())
     }
 
     // `refresh` keeps its trait default (no-op), like the monolithic index:

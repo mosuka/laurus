@@ -166,6 +166,48 @@ impl DeletionBitmap {
         Ok(was_deleted)
     }
 
+    /// A copy of this bitmap as it is now (Issue #1518).
+    ///
+    /// Later changes to either bitmap do not reach the other. A merge filters
+    /// with such a copy, so the documents it drops are exactly the ones the
+    /// copy marks, whatever is deleted while it runs.
+    pub fn snapshot(&self) -> Self {
+        let docs = self.deleted_docs.read().unwrap();
+        DeletionBitmap {
+            segment_id: self.segment_id.clone(),
+            deleted_count: AtomicU64::new(docs.len()),
+            deleted_docs: RwLock::new(docs.clone()),
+            total_docs: AtomicU64::new(self.total_docs.load(Ordering::SeqCst)),
+            min_doc_id: self.min_doc_id,
+            max_doc_id: self.max_doc_id,
+            last_modified: AtomicU64::new(self.last_modified.load(Ordering::SeqCst)),
+            version: AtomicU64::new(self.version.load(Ordering::SeqCst)),
+        }
+    }
+
+    /// A new bitmap that marks what this one marks and `other` does not
+    /// (Issue #1518).
+    ///
+    /// Its `deleted_count` is the size of the resulting set, so it is exact
+    /// even when this bitmap's count has drifted from its set: a bitmap
+    /// written while a document was being deleted can store a count that
+    /// misses it.
+    pub fn difference(&self, other: &DeletionBitmap) -> Self {
+        // One lock at a time, so `other` may be `self`.
+        let mut docs = self.deleted_docs.read().unwrap().clone();
+        docs -= &*other.deleted_docs.read().unwrap();
+        DeletionBitmap {
+            segment_id: self.segment_id.clone(),
+            deleted_count: AtomicU64::new(docs.len()),
+            deleted_docs: RwLock::new(docs),
+            total_docs: AtomicU64::new(self.total_docs.load(Ordering::SeqCst)),
+            min_doc_id: self.min_doc_id,
+            max_doc_id: self.max_doc_id,
+            last_modified: AtomicU64::new(crate::util::time::now_secs()),
+            version: AtomicU64::new(self.version.load(Ordering::SeqCst) + 1),
+        }
+    }
+
     /// Resize the bitmap to accommodate more documents.
     pub fn resize(&self, new_size: u64) {
         self.total_docs.store(new_size, Ordering::SeqCst);
@@ -846,6 +888,32 @@ mod tests {
         // Try to delete same document again
         assert!(!bitmap.delete_document(5).unwrap());
         assert_eq!(bitmap.deleted_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// Issue #1518: a snapshot does not follow later deletes, and a
+    /// difference keeps only the marks the other bitmap lacks, counted from
+    /// its set.
+    #[test]
+    fn test_snapshot_and_difference() {
+        let bitmap = DeletionBitmap::new("index".to_string(), 0, 99);
+        bitmap.delete_document(1).unwrap();
+        bitmap.delete_document(2).unwrap();
+        let snapshot = bitmap.snapshot();
+        bitmap.delete_document(3).unwrap();
+        assert_eq!(snapshot.get_deleted_docs(), vec![1, 2]);
+        assert_eq!(snapshot.deleted_count.load(Ordering::SeqCst), 2);
+
+        // A count that drifted from the set is not carried over.
+        bitmap.deleted_count.store(5, Ordering::SeqCst);
+        let remaining = bitmap.difference(&snapshot);
+        assert_eq!(remaining.get_deleted_docs(), vec![3]);
+        assert_eq!(remaining.deleted_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bitmap.get_deleted_docs(),
+            vec![1, 2, 3],
+            "self is unchanged"
+        );
+        assert!(bitmap.difference(&bitmap).get_deleted_docs().is_empty());
     }
 
     #[test]
