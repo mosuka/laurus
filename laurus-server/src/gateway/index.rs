@@ -153,14 +153,15 @@ pub async fn update_field(
         .map_err(|e| BadRequest(e).into_response())?;
 
     // Both default to `false`, matching `UpdateFieldOptions::default()`.
-    let reindex = body
-        .get("reindex")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let dry_run = body
-        .get("dry_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // Anything but `true`, `false` or `null` is a 400 rather than `false`,
+    // so `"dry_run": "true"` cannot apply the change (Issue #1511).
+    let flag = |key: &str| {
+        convert::json_optional_bool(&body, key)
+            .map(Option::unwrap_or_default)
+            .map_err(|e| BadRequest(e).into_response())
+    };
+    let reindex = flag("reindex")?;
+    let dry_run = flag("dry_run")?;
 
     let response = state
         .index_client

@@ -366,19 +366,6 @@ pub fn proto_schema_to_json(schema: &v1::Schema) -> Value {
 // FieldOption conversion
 // ---------------------------------------------------------------------------
 
-/// Converts a JSON object to a proto `FieldOption`.
-///
-/// The JSON object must contain exactly one key identifying the field type
-/// (e.g. `"text"`, `"integer"`, `"hnsw"`) with its configuration as the value.
-///
-/// # Arguments
-///
-/// * `json` - The JSON value representing a single field option.
-///
-/// # Errors
-///
-/// Returns an error string if the JSON is not an object or contains an
-/// unknown field option type.
 /// Convert a JSON analyzer reference into the proto wire form.
 ///
 /// Accepts either a bare string (`"standard"`) or a structured object
@@ -459,6 +446,23 @@ fn analyzer_spec_to_json(spec: &v1::AnalyzerSpec) -> Option<Value> {
     }
 }
 
+/// Converts a JSON object to a proto `FieldOption`.
+///
+/// The JSON object must contain exactly one key identifying the field type
+/// (e.g. `"text"`, `"integer"`, `"hnsw"`) with its configuration as the value.
+///
+/// # Arguments
+///
+/// * `json` - The JSON value representing a single field option.
+///
+/// # Errors
+///
+/// Returns an error string if the JSON is not an object or contains an
+/// unknown field option type, or when a key of the option is invalid: a
+/// boolean key (`indexed`, `stored`, `multi_valued`, `term_vectors`,
+/// `doc_values`) that is present and not `null` but not `true` or `false`
+/// (Issue #1511; see [`json_optional_bool`]), or an integer, `analyzer` or
+/// vector option key that cannot be read.
 pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, String> {
     let obj = json
         .as_object()
@@ -468,20 +472,17 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
 
     let option = if let Some(v) = obj.get("text") {
         Opt::Text(v1::TextOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
             // Unset (omitted by the client) is distinct from an explicit
             // `false`: it means "use the engine's default" (#1083), unlike
             // `indexed`/`stored` above, which have no such tri-state and
-            // are left as their existing `unwrap_or(false)` behavior.
-            term_vectors: v.get("term_vectors").and_then(|v| v.as_bool()),
+            // are `false` when omitted.
+            term_vectors: json_optional_bool(v, "term_vectors")?,
             // Same tri-state treatment for the same reason (#1047).
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            doc_values: json_optional_bool(v, "doc_values")?,
             analyzer: v.get("analyzer").map(json_to_analyzer_spec).transpose()?,
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
             // Tri-state like `term_vectors` (#1175): an omitted gap means the
             // engine default, never 0. Anything but an integer that fits
             // `u32` is rejected rather than read as omitted (#1490).
@@ -489,71 +490,50 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         })
     } else if let Some(v) = obj.get("integer") {
         Opt::Integer(v1::IntegerOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            doc_values: json_optional_bool(v, "doc_values")?,
         })
     } else if let Some(v) = obj.get("float") {
         Opt::Float(v1::FloatOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            doc_values: json_optional_bool(v, "doc_values")?,
         })
     } else if let Some(v) = obj.get("boolean") {
         Opt::Boolean(v1::BooleanOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            doc_values: json_optional_bool(v, "doc_values")?,
         })
     } else if let Some(v) = obj.get("date_time") {
         Opt::DateTime(v1::DateTimeOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            doc_values: json_optional_bool(v, "doc_values")?,
         })
     } else if let Some(v) = obj.get("geo") {
         Opt::Geo(v1::GeoOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            doc_values: json_optional_bool(v, "doc_values")?,
         })
     } else if let Some(v) = obj.get("geo3d") {
         Opt::Geo3d(v1::Geo3dOption {
-            indexed: v.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            doc_values: v.get("doc_values").and_then(|v| v.as_bool()),
+            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            doc_values: json_optional_bool(v, "doc_values")?,
         })
     } else if let Some(v) = obj.get("bytes") {
         Opt::Bytes(v1::BytesOption {
-            stored: v.get("stored").and_then(|v| v.as_bool()).unwrap_or(false),
-            multi_valued: v
-                .get("multi_valued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
         })
     } else if let Some(v) = obj.get("hnsw") {
         Opt::Hnsw(json_to_hnsw_option(v)?)
@@ -1176,9 +1156,9 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
     let offset = page_value("offset", 0)?;
 
     let fusion = json.get("fusion").and_then(json_to_fusion_algorithm);
-    // A malformed integer in `lexical_params` or `highlight` is rejected
-    // (400) rather than dropped: see `json_to_lexical_params` and
-    // `json_to_highlight_params` (Issue #1490).
+    // A malformed integer or boolean in `lexical_params` or `highlight` is
+    // rejected (400) rather than dropped: see `json_to_lexical_params` and
+    // `json_to_highlight_params` (Issues #1490, #1511).
     let lexical_params = json
         .get("lexical_params")
         .map(json_to_lexical_params)
@@ -1328,18 +1308,19 @@ fn json_to_fusion_algorithm(json: &Value) -> Option<v1::FusionAlgorithm> {
 ///
 /// Returns an error when `timeout_ms` is present and not `null` but not an
 /// integer that fits `u64`, instead of searching without a timeout (Issue
-/// #1490; see [`json_optional_u64`]).
+/// #1490; see [`json_optional_u64`]), or when `parallel` is present and not
+/// `null` but not `true` or `false`, instead of searching serially (Issue
+/// #1511; see [`json_optional_bool`]).
 fn json_to_lexical_params(json: &Value) -> Result<Option<v1::LexicalParams>, String> {
     let Some(obj) = json.as_object() else {
         return Ok(None);
     };
+    let error = |message: String| format!("lexical_params: {message}");
     Ok(Some(v1::LexicalParams {
         min_score: obj.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        timeout_ms: json_optional_u64(json, "timeout_ms")
-            .map_err(|e| format!("lexical_params: {e}"))?,
-        parallel: obj
-            .get("parallel")
-            .and_then(|v| v.as_bool())
+        timeout_ms: json_optional_u64(json, "timeout_ms").map_err(error)?,
+        parallel: json_optional_bool(json, "parallel")
+            .map_err(error)?
             .unwrap_or(false),
         sort_by: obj.get("sort_by").and_then(|v| {
             let field = v.get("field")?.as_str()?.to_string();
@@ -1399,6 +1380,26 @@ fn json_optional_u64(json: &Value, key: &str) -> Result<Option<u64>, String> {
     match json.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => json_to_u64(value, key).map(Some),
+    }
+}
+
+/// Read the optional boolean `key` of `json`, the boolean counterpart of
+/// [`json_optional_u32`] (Issue #1511).
+///
+/// A missing key and `null` are `None`, so the caller decides what an
+/// omitted key means: `false` for a plain proto `bool`, or the engine's
+/// default for an `optional bool`.
+///
+/// # Errors
+///
+/// Returns an error naming `key` when the value is present and not `null`
+/// but not `true` or `false` (`"true"`, `1`), instead of reading it as
+/// omitted, which made `"dry_run": "true"` apply a field change.
+pub fn json_optional_bool(json: &Value, key: &str) -> Result<Option<bool>, String> {
+    match json.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!("{key} must be true or false")),
     }
 }
 
@@ -1488,8 +1489,11 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
 /// Returns an error when `max_fragments` or `fragment_size` is present and
 /// not `null` but not an integer that fits `u32`, or `max_analyzed_chars`
 /// one that fits `u64`, instead of using the default or wrapping (Issue
-/// #1490; see [`json_optional_u32`] and [`json_optional_u64`]). They are
-/// checked even when the object has no usable `fields`.
+/// #1490; see [`json_optional_u32`] and [`json_optional_u64`]), or when
+/// `require_field_match` or `return_entire_field_if_no_highlight` is
+/// present and not `null` but not `true` or `false`, instead of using the
+/// default (Issue #1511; see [`json_optional_bool`]). They are checked even
+/// when the object has no usable `fields`.
 fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>, String> {
     if let Some(arr) = json.as_array() {
         let fields: Vec<String> = arr
@@ -1513,6 +1517,9 @@ fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>,
     let max_fragments = json_optional_u32(json, "max_fragments").map_err(error)?;
     let fragment_size = json_optional_u32(json, "fragment_size").map_err(error)?;
     let max_analyzed_chars = json_optional_u64(json, "max_analyzed_chars").map_err(error)?;
+    let require_field_match = json_optional_bool(json, "require_field_match").map_err(error)?;
+    let return_entire_field_if_no_highlight =
+        json_optional_bool(json, "return_entire_field_if_no_highlight").map_err(error)?;
     let fields: Vec<String> = obj
         .get("fields")
         .and_then(|v| v.as_array())
@@ -1534,11 +1541,9 @@ fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>,
             .get("css_class")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        require_field_match: obj.get("require_field_match").and_then(|v| v.as_bool()),
+        require_field_match,
         max_analyzed_chars,
-        return_entire_field_if_no_highlight: obj
-            .get("return_entire_field_if_no_highlight")
-            .and_then(|v| v.as_bool()),
+        return_entire_field_if_no_highlight,
     }))
 }
 
@@ -2432,6 +2437,91 @@ mod tests {
         let opt = json_to_hnsw_option(&json!({"dimension": 8})).unwrap();
         let back = hnsw_option_to_json(&opt);
         assert!(back.get("default_ef_search").is_none(), "{back}");
+    }
+
+    /// Every non-vector field option with the boolean keys it reads. The
+    /// vector options have none.
+    const FIELD_OPTION_BOOLEAN_KEYS: [(&str, &[&str]); 8] = [
+        (
+            "text",
+            &[
+                "indexed",
+                "stored",
+                "multi_valued",
+                "term_vectors",
+                "doc_values",
+            ],
+        ),
+        (
+            "integer",
+            &["indexed", "stored", "multi_valued", "doc_values"],
+        ),
+        (
+            "float",
+            &["indexed", "stored", "multi_valued", "doc_values"],
+        ),
+        (
+            "boolean",
+            &["indexed", "stored", "multi_valued", "doc_values"],
+        ),
+        (
+            "date_time",
+            &["indexed", "stored", "multi_valued", "doc_values"],
+        ),
+        ("geo", &["indexed", "stored", "multi_valued", "doc_values"]),
+        (
+            "geo3d",
+            &["indexed", "stored", "multi_valued", "doc_values"],
+        ),
+        ("bytes", &["stored", "multi_valued"]),
+    ];
+
+    /// Issue #1511: a boolean key of a field option must be `true`, `false`
+    /// or `null`. Anything else used to be read as omitted (`false`, or
+    /// unset for `term_vectors` and `doc_values`), so
+    /// `{"text": {"indexed": "true"}}` created a field that is not indexed.
+    #[test]
+    fn test_field_option_boolean_keys_reject_non_booleans() {
+        // Every value that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (kind, keys) in FIELD_OPTION_BOOLEAN_KEYS {
+            for &key in keys {
+                let expected = format!("{key} must be true or false");
+                for bad in [json!("true"), json!("false"), json!(1), json!(0)] {
+                    let option = json!({ kind: { key: bad } });
+                    let error = json_to_proto_field_option(&option).err();
+                    if error.as_deref() != Some(expected.as_str()) {
+                        wrong.push(format!("{kind}.{key} = {bad}: {error:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Issue #1511: `null` is the same as omitting a boolean key of a field
+    /// option, and `true` and `false` are passed on as is.
+    #[test]
+    fn test_field_option_boolean_keys_omitted_null_and_explicit() {
+        let mut wrong = Vec::new();
+        for (kind, keys) in FIELD_OPTION_BOOLEAN_KEYS {
+            let omitted = json_to_proto_field_option(&json!({ kind: {} })).unwrap();
+            for &key in keys {
+                let null = json_to_proto_field_option(&json!({ kind: { key: null } }));
+                if null.as_ref() != Ok(&omitted) {
+                    wrong.push(format!("{kind}.{key} = null: {null:?}"));
+                }
+                for value in [true, false] {
+                    let option = json_to_proto_field_option(&json!({ kind: { key: value } }));
+                    let back = option.as_ref().map(proto_field_option_to_json);
+                    if back.as_ref().map(|back| &back[kind][key]) != Ok(&json!(value)) {
+                        wrong.push(format!("{kind}.{key} = {value}: {back:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 
     /// #1349: numeric and boolean embedder parameters reach the proto as
@@ -3497,6 +3587,102 @@ mod tests {
             ),
             (Some(2), Some(80), Some(4_294_967_296))
         );
+    }
+
+    /// Issue #1511: `lexical_params.parallel` and the highlight booleans
+    /// must be `true`, `false` or `null`. Anything else used to be read as
+    /// omitted (a serial search, or the highlight default).
+    #[test]
+    fn test_json_to_proto_search_request_rejects_malformed_boolean_keys() {
+        // Each key with the object that holds it, the highlight both with
+        // and without fields: a highlight without fields is dropped, but its
+        // keys are checked first.
+        let cases = [
+            ("lexical_params", "parallel", json!({})),
+            (
+                "highlight",
+                "require_field_match",
+                json!({"fields": ["body"]}),
+            ),
+            ("highlight", "require_field_match", json!({"fields": []})),
+            (
+                "highlight",
+                "return_entire_field_if_no_highlight",
+                json!({"fields": ["body"]}),
+            ),
+            (
+                "highlight",
+                "return_entire_field_if_no_highlight",
+                json!({"fields": []}),
+            ),
+        ];
+        // Every value that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (object, key, params) in cases {
+            let expected = format!("{object}: {key} must be true or false");
+            for bad in [json!("true"), json!("false"), json!(1), json!(0)] {
+                let mut params = params.clone();
+                params[key] = bad.clone();
+                let request = json!({"query": "body:rust", object: params});
+                let error = json_to_proto_search_request(&request).err();
+                if error.as_deref() != Some(expected.as_str()) {
+                    wrong.push(format!("{object}.{key} = {bad} in {params}: {error:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Issue #1511: an omitted or `null` `lexical_params.parallel` is
+    /// `false` and an omitted or `null` highlight boolean stays unset, and
+    /// `true` and `false` are passed on as is.
+    #[test]
+    fn test_json_to_proto_search_request_boolean_keys_omitted_null_and_explicit() {
+        // `parallel`, `require_field_match` and
+        // `return_entire_field_if_no_highlight` of the converted request.
+        let flags = |lexical_params: Value, highlight: Value| {
+            let req = json_to_proto_search_request(&json!({
+                "query": "body:rust",
+                "lexical_params": lexical_params,
+                "highlight": highlight
+            }))
+            .unwrap();
+            let highlight = req.highlight.unwrap();
+            (
+                req.lexical_params.unwrap().parallel,
+                highlight.require_field_match,
+                highlight.return_entire_field_if_no_highlight,
+            )
+        };
+        assert_eq!(
+            flags(json!({}), json!({"fields": ["body"]})),
+            (false, None, None)
+        );
+        assert_eq!(
+            flags(
+                json!({"parallel": null}),
+                json!({
+                    "fields": ["body"],
+                    "require_field_match": null,
+                    "return_entire_field_if_no_highlight": null
+                })
+            ),
+            (false, None, None)
+        );
+        for value in [true, false] {
+            assert_eq!(
+                flags(
+                    json!({"parallel": value}),
+                    json!({
+                        "fields": ["body"],
+                        "require_field_match": value,
+                        "return_entire_field_if_no_highlight": value
+                    })
+                ),
+                (value, Some(value), Some(value))
+            );
+        }
     }
 
     /// Issue #1342: a malformed `vector_params` value is rejected (400)

@@ -90,7 +90,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, `geo3d`, and `bytes` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}` or `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response. It must be an integer between `0` and `4294967295`, and `null` is the same as omitting it; anything else, such as `"0"`, `-1` or `4294967296`, is rejected with 400 instead of being read as omitted (Issue #1490). A `bytes` option has no `indexed` or `doc_values` key: a `Bytes` value is never indexed or written to DocValues regardless of `multi_valued` (Issue #1176).
+The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, `geo3d`, and `bytes` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}` or `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. Their boolean keys (`indexed`, `stored`, `multi_valued`, `doc_values` and `term_vectors`) must be `true` or `false`, and `null` is the same as omitting the key, which means `false` for `indexed`, `stored` and `multi_valued` and the engine default for `doc_values` and `term_vectors`. Anything else, such as `"true"` or `1`, is rejected with 400 and nothing is written, instead of being read as omitted (Issue #1511). A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response. It must be an integer between `0` and `4294967295`, and `null` is the same as omitting it; anything else, such as `"0"`, `-1` or `4294967296`, is rejected with 400 instead of being read as omitted (Issue #1490). A `bytes` option has no `indexed` or `doc_values` key: a `Bytes` value is never indexed or written to DocValues regardless of `multi_valued` (Issue #1176).
 
 A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` (`distance` is `"cosine"` or `"dot_product"`, defaulting to `"cosine"`). Its value in a document is an array of equal-length numeric arrays, one per token vector (`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`). The field holds token vectors for late-interaction rescoring: it is not a vector-search target and is not returned with documents.
 
@@ -186,7 +186,7 @@ Changes an existing field's type or options. The field name is supplied in the p
 | `reindex` | No | `true` to apply a `reindex` or `destructive` change (default `false`) |
 | `dry_run` | No | `true` to classify the change without applying anything (default `false`) |
 
-`reindex` and `dry_run` must be JSON booleans. Any other value, such as the string `"true"`, is currently read as `false` without an error, so `"dry_run": "true"` applies the change (Issue #1511).
+`reindex` and `dry_run` must be `true` or `false`, and `null` is the same as omitting them. Anything else, such as the string `"true"`, is rejected with 400, and nothing is classified or applied (Issue #1511). A server older than this fix read such a value as `false`, so `"dry_run": "true"` applied the change.
 
 The response holds the `classification` (`metadata_only`, `reindex` or `destructive`; see [Changing a Field](../concepts/schema_and_fields.md#changing-a-field)) and the schema after the change, which a dry run leaves unchanged. A `destructive` change also adds the field to the schema's `pending_reindex`. For an index whose only field is `embedding`, created as `{"hnsw": {"dimension": 384}}`:
 
@@ -196,6 +196,12 @@ curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
   -H 'Content-Type: application/json' \
   -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "dry_run": true}'
 # => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":16,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
+
+# A flag that is not a boolean is rejected, and nothing is applied
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "reindex": true, "dry_run": "true"}'
+# => {"error":{"code":400,"message":"dry_run must be true or false"}}
 
 # A reindex change is rejected without "reindex": true
 curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
@@ -319,7 +325,10 @@ rejected with `400 Bad Request` as well.
 `timeout_ms` must be an integer between `0` and `18446744073709551615`;
 omitting it, `null` and `0` mean no timeout. Anything else, such as `"500"`,
 `500.0` or `-1`, is rejected with `400 Bad Request` instead of searching
-without a timeout (Issue #1490).
+without a timeout (Issue #1490). Its `parallel` must be `true` or `false`;
+omitting it and `null` mean `false`. Anything else, such as `"true"` or `1`,
+is rejected with `400 Bad Request` instead of being read as `false`
+(Issue #1511).
 
 #### Search with Field Boosts
 
@@ -410,6 +419,12 @@ the default. Anything else, such as `"2"`, `2.0` or `-1`, is rejected with
 `400 Bad Request` instead of falling back to the default or wrapping around,
 even when `fields` is empty (Issue #1490). As over gRPC, a `max_fragments`
 or `fragment_size` of `0` is rejected too.
+
+`require_field_match` and `return_entire_field_if_no_highlight` must be
+`true` or `false`, and `null` is the same as omitting the key, which keeps
+the default. Anything else, such as `"true"` or `1`, is rejected with
+`400 Bad Request` instead of falling back to the default, even when `fields`
+is empty (Issue #1511).
 
 Each result gains a `"highlights"` object, present only when at least one
 field actually highlighted:
@@ -583,3 +598,5 @@ See [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic
 ## Request/Response Format
 
 All request and response bodies use JSON. The JSON structure mirrors the gRPC protobuf messages. See [gRPC API Reference](grpc_api.md) for the full message definitions.
+
+A key that takes a boolean accepts only `true`, `false` and `null`, which is the same as omitting the key. Anything else, such as the string `"true"` or the number `1`, is rejected with `400 Bad Request`, and nothing is written or searched (Issue #1511).

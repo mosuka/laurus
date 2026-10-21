@@ -84,7 +84,7 @@ curl http://localhost:8080/v1/index
 curl http://localhost:8080/v1/schema
 ```
 
-レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。値は `0` から `4294967295` までの整数で、`null` は省略と同じです。`"0"`・`-1`・`4294967296` などそれ以外の値は、省略として読まれるのではなく 400 で拒否されます（Issue #1490）。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
+レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。これらのオプションの真偽値のキー（`indexed`・`stored`・`multi_valued`・`doc_values`・`term_vectors`）は `true` か `false` で、`null` はキーの省略と同じです。省略すると、`indexed`・`stored`・`multi_valued` は `false`、`doc_values` と `term_vectors` はエンジンのデフォルトになります。`"true"`・`1` などそれ以外の値は、省略として読まれるのではなく 400 で拒否され、何も書き込まれません（Issue #1511）。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。値は `0` から `4294967295` までの整数で、`null` は省略と同じです。`"0"`・`-1`・`4294967296` などそれ以外の値は、省略として読まれるのではなく 400 で拒否されます（Issue #1490）。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
 
 MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` のように宣言します（`distance` は `"cosine"` または `"dot_product"`、省略時は `"cosine"`）。文書での値は、トークンベクトルごとの同じ長さの数値配列の配列です（`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`）。このフィールドは late interaction の再採点のためにトークンベクトルを保持するもので、ベクトル検索の対象にはならず、文書とともに返されることもありません。
 
@@ -180,7 +180,7 @@ curl -X DELETE http://localhost:8080/v1/schema/fields/category
 | `reindex` | いいえ | `true` にすると `reindex` か `destructive` の変更を適用します（デフォルト `false`） |
 | `dry_run` | いいえ | `true` にすると、何も適用せずに変更を分類します（デフォルト `false`） |
 
-`reindex` と `dry_run` は JSON の真偽値で指定してください。文字列の `"true"` などそれ以外の値は、今はエラーにならずに `false` として読まれるため、`"dry_run": "true"` は変更を適用してしまいます（Issue #1511）。
+`reindex` と `dry_run` は `true` か `false` で、`null` は省略と同じです。文字列の `"true"` などそれ以外の値は 400 で拒否され、変更の分類も適用も行われません（Issue #1511）。この修正より古いサーバーはそうした値を `false` として読むため、`"dry_run": "true"` は変更を適用してしまいます。
 
 レスポンスには、`classification`（`metadata_only`・`reindex`・`destructive` のいずれか。[フィールドの変更](../concepts/schema_and_fields.md#フィールドの変更)を参照）と、変更後のスキーマが入ります。dry run ではスキーマは変わりません。`destructive` の変更では、フィールドがスキーマの `pending_reindex` にも載ります。`embedding` だけを `{"hnsw": {"dimension": 384}}` で作ったインデックスの場合:
 
@@ -190,6 +190,12 @@ curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
   -H 'Content-Type: application/json' \
   -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "dry_run": true}'
 # => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":16,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
+
+# 真偽値でないフラグは拒否され、何も適用されない
+curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "reindex": true, "dry_run": "true"}'
+# => {"error":{"code":400,"message":"dry_run must be true or false"}}
 
 # reindex の変更は "reindex": true なしでは拒否される
 curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
@@ -292,7 +298,7 @@ curl -X POST http://localhost:8080/v1/search \
 
 `limit` と `offset` は、省略または `null` のとき既定値（10 と 0）になります。Issue #1367 以降、0 以上の整数でない値や、32 ビット符号なし整数に収まらない値は `400 Bad Request` で拒否されます（以前は既定値に置き換わるか、折り返していました）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索も `400 Bad Request` で拒否されます。
 
-`lexical_params` には、gRPC の [`LexicalParams`](grpc_api.md#lexicalparams) メッセージのキーを snake_case で指定します。`timeout_ms` は `0` から `18446744073709551615` までの整数で、省略・`null`・`0` はタイムアウトなしを意味します。`"500"`・`500.0`・`-1` などそれ以外の値は、タイムアウトなしで検索するのではなく `400 Bad Request` で拒否されます（Issue #1490）。
+`lexical_params` には、gRPC の [`LexicalParams`](grpc_api.md#lexicalparams) メッセージのキーを snake_case で指定します。`timeout_ms` は `0` から `18446744073709551615` までの整数で、省略・`null`・`0` はタイムアウトなしを意味します。`"500"`・`500.0`・`-1` などそれ以外の値は、タイムアウトなしで検索するのではなく `400 Bad Request` で拒否されます（Issue #1490）。`parallel` は `true` か `false` で、省略と `null` は `false` を意味します。`"true"`・`1` などそれ以外の値は、`false` として読まれるのではなく `400 Bad Request` で拒否されます（Issue #1511）。
 
 #### フィールドブースト付き検索
 
@@ -360,6 +366,8 @@ curl -X POST http://localhost:8080/v1/search \
 ```
 
 `max_fragments` と `fragment_size` は `0` から `4294967295` までの整数、`max_analyzed_chars` は `0` から `18446744073709551615` までの整数で、`null` はキーの省略と同じく既定値になります。`"2"`・`2.0`・`-1` などそれ以外の値は、既定値に置き換わったり折り返したりするのではなく、`fields` が空のときも含めて `400 Bad Request` で拒否されます（Issue #1490）。gRPC と同じく、`0` の `max_fragments`・`fragment_size` も拒否されます。
+
+`require_field_match` と `return_entire_field_if_no_highlight` は `true` か `false` で、`null` はキーの省略と同じく既定値になります。`"true"`・`1` などそれ以外の値は、既定値に置き換わるのではなく、`fields` が空のときも含めて `400 Bad Request` で拒否されます（Issue #1511）。
 
 各結果には、少なくとも1つのフィールドが実際にハイライトされた場合にのみ `"highlights"` オブジェクトが追加されます。
 
@@ -508,3 +516,5 @@ curl -X POST http://localhost:8080/v1/search \
 ## リクエスト/レスポンス形式
 
 すべてのリクエストおよびレスポンスボディは JSON を使用します。JSON の構造は gRPC の protobuf メッセージに対応しています。メッセージ定義の詳細は [gRPC API リファレンス](grpc_api.md)を参照してください。
+
+真偽値を取るキーは、`true`・`false`・`null` だけを受け付けます。`null` はキーの省略と同じです。文字列の `"true"` や数値の `1` などそれ以外の値は `400 Bad Request` で拒否され、何も書き込まれず、検索も行われません（Issue #1511）。
