@@ -56,8 +56,8 @@ fn entry(i: usize) -> (String, Document) {
 /// Write past the automatic flush boundary **without committing**, and prove
 /// the flush actually fired.
 ///
-/// `add_documents` is deliberate: `Engine::index_internal` skips
-/// `delete_documents_internal` for chunked adds, so nothing warms the
+/// `add_documents` is deliberate: `Engine::index_internal` skips the
+/// lookup of previous versions for chunked adds, so nothing warms the
 /// searcher cache during ingest. That leaves the cache cold, which is the
 /// state the following tests vary.
 async fn engine_past_auto_flush() -> laurus::Result<(Engine, Arc<dyn Storage>)> {

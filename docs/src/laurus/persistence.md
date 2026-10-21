@@ -26,7 +26,7 @@ sequenceDiagram
 
 ### Key Principles
 
-1. **WAL-first**: Every write (add or delete) is appended to the WAL before updating in-memory structures. Everything that can reject a write runs before that append (embedding and validating its vector fields, creating the writers, analyzing its lexical fields, flushing a full lexical buffer), and a failure after it, or a cancelled call, stops writes until the index is reopened (see [Failed Writes](#failed-writes))
+1. **WAL-first**: Every write (add or delete) is appended to the WAL before updating in-memory structures. Everything that can reject a write runs before that append (embedding and validating its vector fields, creating the writers, analyzing its lexical fields, flushing a full lexical buffer), and a failure after it stops writes until the index is reopened. From that append to its finish a write runs without an `.await`, so cancelling its call cannot leave it half applied (see [Failed Writes](#failed-writes))
 2. **Buffered writes**: In-memory buffers accumulate changes until `commit()` is called
 3. **Atomic commit**: `commit()` flushes all buffered changes to segment files and truncates the WAL
 4. **Commit-scoped visibility**: a lexical segment is written as soon as the writer's buffer fills, which can happen long before `commit()`, so the segment files existing on storage is not what makes its documents searchable. Publication is a manifest entry that only `commit()` adds, and segment discovery reads only the manifest — so "documents become searchable only after `commit()`" holds regardless of when a searcher happens to be built. Deletions are published in the same step, after their bitmaps are durable, so a reader that can see a segment can always filter it
@@ -93,8 +93,10 @@ A write that fails returns its error, and what it changed depends on where it fa
 
 | Where it fails | For example | Outcome |
 | :--- | :--- | :--- |
-| Before its WAL append | A rejected embedding, an analyzer error, a writer that cannot be created, a failed flush of a full lexical buffer | Nothing changed: no WAL record is written, and a `put` keeps the previous version. The engine keeps accepting writes. |
-| At or after its first WAL append | An I/O error writing the WAL record or loading a deletion bitmap; the call cancelled (its future dropped, as when a `laurus serve` client's request is cancelled, its deadline expires or the client disconnects while a put waits for the vector writer) or panicking before the write finished applying | The engine **stops accepting writes**, and reopening the index applies the write. |
+| Before its WAL append | A rejected embedding, an analyzer error, a writer that cannot be created, a failed flush of a full lexical buffer; the call cancelled (its future dropped, as when a `laurus serve` client's request is cancelled, its deadline expires or the client disconnects), for example while it waits for the vector writer that a commit holds | Nothing changed: no WAL record is written, and a `put` keeps the previous version. The engine keeps accepting writes. |
+| At or after its first WAL append | An I/O error writing the WAL record or loading a deletion bitmap; a panic before the write finished applying | The engine **stops accepting writes**, and reopening the index applies the write. |
+
+A write takes everything it waits for, such as the vector writer, before its first WAL append, and from that append to its finish it runs without an `.await` ([#1517](https://github.com/mosuka/laurus/issues/1517)). Cancelling its call therefore takes effect either before that append, which leaves nothing behind, or after the write finished, which leaves it applied even though the caller never sees the result. Retrying a cancelled `put` of the same id is safe either way, while retrying a cancelled `add` can add the chunk twice. A cancelled `put_documents` or `add_documents` keeps the documents it applied before the cancellation; they become durable at the WAL's next fsync rather than at the one the batch runs when it ends.
 
 The first WAL append of a `put` is the previous version's delete record, or the document's own record when there is no previous version. From that point the in-memory index may disagree with the WAL, and going on would let a commit persist the disagreement or a later write build on it. Once writes stopped:
 
@@ -337,8 +339,8 @@ and step 5 retains every WAL record past it instead of unconditionally emptying
 the file. A write racing
 the commit therefore keeps its WAL record — and is replayed on the next
 recovery — even if this commit materialized part of it, and no checkpoint
-covers it. A write that never finishes (it failed, was cancelled, or panicked,
-which also stops writes) holds the watermark below its record until the index
+covers it. A write that never finishes (it failed or panicked, which also
+stops writes) holds the watermark below its record until the index
 is reopened (Issue #1499). When nothing races the commit (the common case), the
 snapshot covers the whole WAL and step 5 empties the file exactly as before.
 

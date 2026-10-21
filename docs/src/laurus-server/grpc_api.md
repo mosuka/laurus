@@ -730,7 +730,7 @@ gRPC errors are returned as standard `Status` codes:
 | :--- | :--- | :--- |
 | Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query, a search whose `offset + limit` exceeds `max_result_window` |
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
-| Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed past its write-ahead-log append, or was cancelled before it finished (its client cancelled it, its deadline expired or the client disconnected meanwhile); restart the server to replay the log, which applies that write (see [Failed Writes](../laurus/persistence.md#failed-writes)) |
+| Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed past its write-ahead-log append; restart the server to replay the log, which applies that write (see [Failed Writes](../laurus/persistence.md#failed-writes)). A write whose call is cancelled, whose deadline expires or whose client disconnects does not stop writes: each of its documents is either applied in full or not written at all |
 | Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |
 | Internal errors | `INTERNAL` | I/O, storage, or unexpected errors |

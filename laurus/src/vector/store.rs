@@ -11,8 +11,11 @@
 //!   so that only searcher *creation* (on cache miss) holds an exclusive lock; the actual
 //!   search executes under a shared read lock, allowing concurrent queries.
 //! - **Writer cache** is protected by a `tokio::sync::Mutex`. Embedding (potentially slow
-//!   network I/O) is performed *outside* the lock; only the final `delete + add_vectors`
-//!   step runs while the lock is held, keeping the critical section short.
+//!   network I/O) and pooling are performed *outside* the lock. The engine takes the lock
+//!   right before a put's first WAL append and holds it until the put finished applying
+//!   (Issue #1517), so the critical section is the WAL append, the lexical and
+//!   document-store writes and the `delete + add_vectors` step, all synchronous; a delete
+//!   takes it only when the index cannot delete softly.
 //!
 //! # Module Structure
 //!
@@ -30,7 +33,7 @@ pub mod response;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::data::{DataValue, Document};
 use crate::embedding::embedder::{EmbedInput, EmbedRole, Embedder};
@@ -409,15 +412,7 @@ impl VectorStore {
         fields: Vec<FieldVectors>,
     ) -> Result<()> {
         // Phase 2: Acquire lock and write pre-computed vectors (fast, sync-only).
-        let mut guard = self.writer_cache.lock().await;
-        let writer = self.cached_writer(&mut guard)?;
-        writer.delete_document(doc_id)?;
-        // One call for the whole document, so a field the writer does not
-        // know (e.g. removed concurrently by `delete_field`) rejects every
-        // field rather than leaving the others buffered.
-        writer.add_prepared_document_vectors(doc_id, fields)?;
-
-        Ok(())
+        self.lock_writer().await?.write_prepared(doc_id, fields)
     }
 
     /// Request the writer lock, for crate-internal tests that hold it as a
@@ -432,25 +427,78 @@ impl VectorStore {
         self.writer_cache.lock()
     }
 
-    /// Create the cached writer if there is none (Issue #1479).
+    /// Whether the writer lock is free, for crate-internal tests: takes it
+    /// and releases it at once if so.
+    #[cfg(test)]
+    pub(crate) fn writer_lock_is_free_for_tests(&self) -> bool {
+        self.writer_cache.try_lock().is_ok()
+    }
+
+    /// Hold the cached searcher for reading, as a running search does, for
+    /// crate-internal tests.
+    #[cfg(test)]
+    pub(crate) fn read_searcher_cache_for_tests(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, Option<Box<dyn VectorIndexSearcher>>> {
+        self.searcher_cache.read()
+    }
+
+    /// Lock the writer for a put, creating it if there is none (Issues
+    /// #1479, #1517).
     ///
-    /// `Engine::index_internal` calls this before it deletes a document's
-    /// previous version and appends the document's WAL record. Creating the
-    /// writer is where a field the index cannot build with fails (an HNSW
-    /// `m` below 2, or a product quantizer `subvector_count` that does not
-    /// fit the dimension, Issue #1491, which a schema persisted before the
-    /// field checks can hold); failing there after the WAL append left a
-    /// record that every later open replayed into the same error. A commit
-    /// may still drop the writer before the document is written, and
-    /// [`Self::write_prepared`] then creates it again.
+    /// `Engine::index_internal` takes it before the put's first WAL append
+    /// (its previous version's delete record, or its own record) and holds
+    /// it until the put finished applying, so nothing after that append
+    /// waits: a put cancelled while it waits here has written nothing.
+    /// Creating the writer is where a field the index cannot build with
+    /// fails (an HNSW `m` below 2, or a product quantizer `subvector_count`
+    /// that does not fit the dimension, Issue #1491, which a schema
+    /// persisted before the field checks can hold); failing after the WAL
+    /// append left a record that every later open replayed into the same
+    /// error.
     ///
     /// # Errors
     ///
     /// Returns an error if creating the writer fails.
-    pub(crate) async fn ensure_writer(&self) -> Result<()> {
-        let mut guard = self.writer_cache.lock().await;
-        self.cached_writer(&mut guard)?;
-        Ok(())
+    pub(crate) async fn lock_writer(&self) -> Result<VectorWriteLock<'_>> {
+        let mut writer = self.writer_cache.lock().await;
+        self.cached_writer(&mut writer)?;
+        Ok(VectorWriteLock {
+            store: self,
+            soft_delete: self.index.supports_soft_delete(),
+            writer: Some(writer),
+            searcher_stale: false,
+        })
+    }
+
+    /// Lock what deleting documents needs (Issue #1517): nothing when the
+    /// index supports soft deletion (Issue #624), which takes no writer
+    /// lock and so does not wait for a commit, and otherwise the writer,
+    /// created if there is none.
+    ///
+    /// `Engine::delete_documents` takes it before the first delete's WAL
+    /// append, as [`Self::lock_writer`] is taken for a put.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer fails.
+    pub(crate) async fn lock_writer_for_delete(&self) -> Result<VectorWriteLock<'_>> {
+        if self.index.supports_soft_delete() {
+            return Ok(VectorWriteLock {
+                store: self,
+                soft_delete: true,
+                writer: None,
+                searcher_stale: false,
+            });
+        }
+        let mut writer = self.writer_cache.lock().await;
+        self.cached_writer(&mut writer)?;
+        Ok(VectorWriteLock {
+            store: self,
+            soft_delete: false,
+            writer: Some(writer),
+            searcher_stale: false,
+        })
     }
 
     /// The writer cached in `slot` (the content of [`Self::writer_cache`]),
@@ -643,8 +691,10 @@ impl VectorStore {
 
     /// Delete a document by its internal ID.
     ///
-    /// Obtains (or creates) the cached writer and removes all vectors
-    /// associated with the given `doc_id` from the index buffer.
+    /// Marks it deleted when the index supports soft deletion, and drops
+    /// the cached searcher, and otherwise obtains (or creates) the cached
+    /// writer and removes all vectors associated with the given `doc_id`
+    /// from the index buffer.
     ///
     /// # Arguments
     ///
@@ -653,37 +703,11 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns an error if obtaining/creating the writer fails or if the
-    /// underlying delete operation fails. The cached searcher is dropped on
-    /// every return of the soft-delete path, as in [`Self::commit`] (Issue
-    /// #1435): `MultiFieldVectorIndex::soft_delete_document` keeps marking
-    /// the other fields after one fails, so a failure can still leave the
-    /// document marked deleted (Issue #1445).
+    /// underlying delete operation fails.
     pub async fn delete_document_by_internal_id(&self, doc_id: u64) -> Result<()> {
-        // Prefer logical (soft) deletion when the index supports it (Issue
-        // #624): mark the deletion bitmap and invalidate the searcher cache so
-        // the next search filters the document out via the deletion-aware
-        // traversal (Issue #665). This avoids the full graph rebuild that the
-        // writer-side delete triggers, and applies equally to updates (the
-        // engine deletes the old internal id, which is monotonic and never
-        // reused, before adding the new version).
-        //
-        // The cache is dropped whatever the outcome (Issue #1445): a failure
-        // in one field does not undo markings already applied to others, and
-        // a field with no bitmap yet fixes it as `None` when its searcher is
-        // built, so a cached searcher would not see a deletion applied after
-        // it was built until the cache is dropped.
-        if self.index.supports_soft_delete() {
-            let result = self.index.soft_delete_document(doc_id);
-            *self.searcher_cache.write() = None;
-            return result;
-        }
-
-        let mut guard = self.writer_cache.lock().await;
-        let writer = self.cached_writer(&mut guard)?;
-
-        writer.delete_document(doc_id)?;
-
-        Ok(())
+        self.lock_writer_for_delete()
+            .await?
+            .delete_document_by_internal_id(doc_id)
     }
 
     /// Commit any pending changes to the index.
@@ -1821,6 +1845,114 @@ impl VectorStore {
         // still search.
         *self.searcher_cache.write() = None;
         rebuilt
+    }
+}
+
+/// What a put or delete holds of a [`VectorStore`] from before its first
+/// WAL append until it finished (Issue #1517): the writer, locked and
+/// created, unless the mutation only deletes and the index deletes softly,
+/// which needs no writer.
+///
+/// Taken with [`VectorStore::lock_writer`] or
+/// [`VectorStore::lock_writer_for_delete`], the last steps of a mutation
+/// that can wait. Its methods are synchronous, so the engine runs a
+/// mutation from its first WAL append to its finish without an await, and
+/// dropping the mutation's future cannot interrupt it there.
+///
+/// Dropping it releases the writer, then drops the cached searcher if a
+/// soft deletion marked it stale. Dropping the searcher waits for the
+/// searches running on it, so a put that soft-deletes its previous version
+/// waits for them after other puts and commits can take the writer, not
+/// before.
+pub(crate) struct VectorWriteLock<'a> {
+    store: &'a VectorStore,
+    /// Whether deletes mark the index's deletion bitmap (Issue #624).
+    /// Decided when the lock is taken and not asked again, so a lock taken
+    /// for soft deletion never needs the writer it does not hold.
+    soft_delete: bool,
+    /// The writer lock, with the writer created. `None` only for a lock
+    /// taken for soft deletion.
+    writer: Option<MutexGuard<'a, Option<Box<dyn VectorIndexWriter>>>>,
+    /// Whether a soft deletion ran, so the cached searcher must be dropped
+    /// when this is.
+    searcher_stale: bool,
+}
+
+impl VectorWriteLock<'_> {
+    /// Delete any existing vectors for `doc_id` and add `fields`, which
+    /// [`VectorStore::embed_fields`] has already embedded, validated and
+    /// pooled (Issue #1326).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deleting the existing document or adding the new
+    /// vectors fails, or on a lock taken for soft deletion, which holds no
+    /// writer.
+    pub(crate) fn write_prepared(&mut self, doc_id: u64, fields: Vec<FieldVectors>) -> Result<()> {
+        let writer = self.writer()?;
+        writer.delete_document(doc_id)?;
+        // One call for the whole document, so a field the writer does not
+        // know (e.g. removed concurrently by `delete_field`) rejects every
+        // field rather than leaving the others buffered.
+        writer.add_prepared_document_vectors(doc_id, fields)
+    }
+
+    /// Delete a document by its internal ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying delete operation fails. After the
+    /// soft-delete path, the cached searcher is dropped whatever the
+    /// outcome, when this lock is, as in [`VectorStore::commit`] (Issue
+    /// #1435): `MultiFieldVectorIndex::soft_delete_document` keeps marking
+    /// the other fields after one fails, so a failure can still leave the
+    /// document marked deleted (Issue #1445).
+    pub(crate) fn delete_document_by_internal_id(&mut self, doc_id: u64) -> Result<()> {
+        // Prefer logical (soft) deletion when the index supports it (Issue
+        // #624): mark the deletion bitmap and invalidate the searcher cache so
+        // the next search filters the document out via the deletion-aware
+        // traversal (Issue #665). This avoids the full graph rebuild that the
+        // writer-side delete triggers, and applies equally to updates (the
+        // engine deletes the old internal id, which is monotonic and never
+        // reused, before adding the new version).
+        //
+        // The cache is dropped whatever the outcome (Issue #1445): a failure
+        // in one field does not undo markings already applied to others, and
+        // a field with no bitmap yet fixes it as `None` when its searcher is
+        // built, so a cached searcher would not see a deletion applied after
+        // it was built until the cache is dropped. `Drop` drops it once the
+        // writer is released (Issue #1517).
+        if self.soft_delete {
+            self.searcher_stale = true;
+            return self.store.index.soft_delete_document(doc_id);
+        }
+        self.writer()?.delete_document(doc_id)
+    }
+
+    /// The locked writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a lock taken for soft deletion, which holds no
+    /// writer.
+    fn writer(&mut self) -> Result<&mut dyn VectorIndexWriter> {
+        let slot = self.writer.as_mut().ok_or_else(|| {
+            LaurusError::internal("the vector writer is not locked: the lock was taken for deletes")
+        })?;
+        // The writer was created when the lock was taken, and nothing else
+        // can drop it while the lock is held.
+        self.store.cached_writer(slot)
+    }
+}
+
+impl Drop for VectorWriteLock<'_> {
+    fn drop(&mut self) {
+        // Release the writer before waiting for the searches on the cached
+        // searcher (see the type's doc comment).
+        drop(self.writer.take());
+        if self.searcher_stale {
+            *self.store.searcher_cache.write() = None;
+        }
     }
 }
 

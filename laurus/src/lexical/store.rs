@@ -1585,9 +1585,9 @@ mod tests {
         // Past `max_buffered_docs` (10_000) so the writer auto-flushes.
         //
         // Resolve before every write, exactly as the ingest path does —
-        // `Engine::index_internal` runs `delete_documents_internal`, and so
-        // `find_doc_ids_by_term`, on every put (engine.rs:787). That warms
-        // the searcher cache well before the flush, which is the state the
+        // `Engine::index_internal` runs `find_doc_ids_by_term` on every put
+        // to find the previous versions. That warms the searcher cache well
+        // before the flush, which is the state the
         // bug actually occurs in; a test that only resolves at the end gets
         // a cold cache and a freshly built searcher, and would pass without
         // the fix.
