@@ -617,9 +617,14 @@ Stage 3 の rerank は PQ ADC の候補集合を `top_k * rerank_factor` まで
 - クエリに `rerank_factor` が指定されている
 - `effective_ef_search > top_k * rerank_factor` — つまりグラフ探索が
   実際に exact 段単体が消費する量より多くの候補を計算している場合。
-  そうでない場合（`ef_search` をデフォルトのままにしている一般的な
-  ケース）、SQ 段は何も絞り込まないため skip され、クエリはこれまでと
-  同一の2段（PQ → f32）経路をたどります。
+  `ef_search` をエンジンの既定のままにしている場合（既定の
+  `ef_construction`（`200`）では `400`。
+  [`default_ef_search`](../schema_and_fields.md#default_ef_search-検索時の-recall-調整パラメータ)
+  を参照）、`10 * 10` のように `top_k * rerank_factor` が `400` 未満なら
+  この条件を満たします。満たさない場合（たとえばクエリが
+  `top_k * rerank_factor` 以下の `ef_search` を指定した場合）、SQ 段は
+  何も絞り込まないため skip され、クエリはこれまでと同一の2段
+  （PQ → f32）経路をたどります。
 
 `score_basis` の契約（Issue #927）はどちらの場合でも影響を受けません
 — パイプラインは常に exact な f32 段で終わるため、SQ 段が事前に

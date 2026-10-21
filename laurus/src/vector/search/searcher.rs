@@ -182,8 +182,9 @@ impl VectorIndexQuery {
     /// graph search. Higher values explore more graph neighbours and
     /// give higher recall, at the cost of latency. When unset, the
     /// searcher uses the schema-level
-    /// [`crate::vector::core::field::HnswOption::default_ef_search`]
-    /// (or its internal fallback of `50` when neither is set).
+    /// [`crate::vector::core::field::HnswOption::default_ef_search`],
+    /// or, when that is unset too, the layout's fallback described at
+    /// [`crate::vector::index::config::HnswIndexConfig::default_ef_search`].
     ///
     /// The effective `ef_search` is always lifted to at least
     /// `top_k * rerank_factor.unwrap_or(1)` so the candidate heap is
@@ -231,8 +232,10 @@ pub struct VectorIndexQueryParams {
     ///
     /// When `None` (the default), the searcher uses the schema-level
     /// [`crate::vector::core::field::HnswOption::default_ef_search`]
-    /// or its internal fallback (`50`). When `Some(ef)`, this value
-    /// takes precedence over the schema default.
+    /// or, when that is unset too, the layout's fallback described at
+    /// [`crate::vector::index::config::HnswIndexConfig::default_ef_search`].
+    /// When `Some(ef)`, this value takes precedence over the schema
+    /// default.
     ///
     /// The effective `ef_search` used by the searcher is always lifted
     /// to at least `max(top_k, top_k * rerank_factor.unwrap_or(1))` so
@@ -540,7 +543,8 @@ pub struct VectorSearchParams {
     ///
     /// When `None` (the default), the searcher uses the schema-level
     /// [`crate::vector::core::field::HnswOption::default_ef_search`]
-    /// or its internal fallback (`50`). Ignored by non-HNSW index
+    /// or, when that is unset too, `ef_construction.max(50) * 2` (`400`
+    /// with the default `ef_construction`). Ignored by non-HNSW index
     /// types.
     #[serde(default)]
     pub ef_search: Option<usize>,

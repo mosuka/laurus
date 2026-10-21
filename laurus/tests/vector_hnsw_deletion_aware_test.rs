@@ -217,19 +217,18 @@ async fn deleting_nearest_keeps_full_page() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deletion_with_filter() {
     let store = setup_store().await;
-    // Allow-set larger than ef_search (default 50) so the graph path runs
-    // (not the brute-force tiny-allowset path). Half of it is deleted.
+    // Allow-set larger than ef_search so the graph path runs (not the
+    // brute-force tiny-allowset path). This store's default ef_search is
+    // the segmented fallback `ef_construction.max(50) * 2 = 200`, which an
+    // allow-set of 100 does not exceed, so the query sets 50 (Issue #1519).
+    // Half of the allow-set is deleted.
     let allowed: HashSet<u64> = (0..100).collect();
     let deleted: HashSet<u64> = (0..50).collect();
     delete_and_commit(&store, &deleted.iter().copied().collect::<Vec<_>>()).await;
 
-    let ids: HashSet<u64> = hit_ids(
-        &store
-            .search(request(10, Some(allowed.iter().copied().collect())))
-            .unwrap(),
-    )
-    .into_iter()
-    .collect();
+    let mut req = request(10, Some(allowed.iter().copied().collect()));
+    req.params.ef_search = Some(50);
+    let ids: HashSet<u64> = hit_ids(&store.search(req).unwrap()).into_iter().collect();
 
     assert!(
         ids.is_subset(&allowed),

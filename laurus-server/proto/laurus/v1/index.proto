@@ -350,8 +350,9 @@ message HnswOption {
   string embedder = 7;
   // Schema-level default for the `ef_search` candidate-list size used
   // during search. Per-query overrides via the search request still
-  // take precedence. When unset, the searcher uses an internal
-  // fallback (`50`). Issue #644.
+  // take precedence. When unset, the searcher uses
+  // `ef_construction.max(50) * 2` (`400` with the default
+  // `ef_construction` of `200`). Issue #644.
   optional uint32 default_ef_search = 8;
   // Stage-2 rerank sidecar storage (Issue #481 / #793). When set to
   // `F32`, commit emits the `.hnsw.f32` sidecar so searches with

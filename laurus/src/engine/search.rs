@@ -207,7 +207,8 @@ pub struct VectorSearchOptions {
     ///
     /// When `None` (the default), the searcher uses the schema-level
     /// [`HnswOption::default_ef_search`](crate::vector::core::field::HnswOption::default_ef_search)
-    /// or its internal fallback (`50`). Ignored by non-HNSW index types.
+    /// or, when that is unset too, `ef_construction.max(50) * 2` (`400`
+    /// with the default `ef_construction`). Ignored by non-HNSW index types.
     /// The effective `ef_search` is always lifted to at least `top_k`
     /// (and `top_k * rerank_factor` when both are set) so the candidate
     /// heap is never undersized for the requested `top_k`.
@@ -763,7 +764,8 @@ impl SearchRequestBuilder {
     ///
     /// When unset, the searcher uses the schema-level
     /// [`HnswOption::default_ef_search`](crate::vector::core::field::HnswOption::default_ef_search)
-    /// or its internal fallback (`50`). Per-query overrides always
+    /// or, when that is unset too, `ef_construction.max(50) * 2` (`400`
+    /// with the default `ef_construction`). Per-query overrides always
     /// take precedence. Ignored by non-HNSW index types.
     pub fn vector_ef_search(mut self, ef: usize) -> Self {
         self.vector_options.ef_search = Some(ef);

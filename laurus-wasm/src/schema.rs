@@ -481,8 +481,9 @@ impl WasmSchema {
     /// * `ef_construction` - Build-time expansion factor (default 200).
     /// * `defaultEfSearch` - Schema-level default for the search-time
     ///   `ef_search` candidate-list size (Issue #644). When omitted, the
-    ///   searcher uses an internal fallback of 50. Per-query overrides
-    ///   via the search request still take precedence.
+    ///   searcher uses twice the larger of `ef_construction` and 50 (400
+    ///   with the default of 200). Per-query overrides via the search
+    ///   request still take precedence.
     /// * `embedder` - Optional embedder name registered via `addEmbedder`.
     /// * `quantizer` - Vector quantizer — "scalar_8bit" (default),
     ///   "float16" (IEEE half precision, 2 bytes per dimension) or

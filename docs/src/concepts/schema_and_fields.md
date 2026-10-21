@@ -139,8 +139,12 @@ values explore more graph neighbours and yield higher recall at the cost of
 latency.
 
 - **Schema-level default**: set `HnswOption.default_ef_search = Some(ef)` to
-  raise the per-field default. When `None`, the searcher falls back to its
-  built-in `50`.
+  set the per-field default. When `None`, a search of the field uses
+  `ef_construction.max(50) * 2`, which is `400` with the default
+  `ef_construction` of `200`. The engine stores an HNSW field in segments,
+  each with its own graph, and searches every segment with this wider list
+  to keep the recall of the whole field stable. A smaller value, such as
+  the `Some(100)` above, narrows the search.
 - **Per-query override**: search requests honour
   [`SearchRequestBuilder::vector_ef_search`](../laurus.md). The per-query
   value takes precedence over the schema default.

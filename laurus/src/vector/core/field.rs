@@ -268,10 +268,16 @@ pub struct HnswOption {
     /// Controls the recall / latency trade-off at query time. Higher values
     /// explore more graph neighbours, improving recall at the cost of latency.
     ///
-    /// When `None` (the default), the searcher uses an internal fallback of
-    /// `50` so existing schemas behave unchanged. Per-query
-    /// [`VectorIndexQueryParams::ef_search`] always takes precedence over this
-    /// schema-level default.
+    /// When `None` (the default), the engine searches the field with
+    /// `ef_construction.max(50) * 2`, `400` with the default
+    /// `ef_construction` of `200`, so a smaller value narrows the search.
+    /// The engine opens every HNSW field in the segmented layout, which
+    /// searches each segment's graph with this wider list to keep
+    /// multi-segment recall stable (#644, #880); only a monolithic index
+    /// ([`HnswIndexConfig::segmented`](crate::vector::index::config::HnswIndexConfig::segmented)
+    /// `= false`) falls back to `50`. Per-query
+    /// [`VectorIndexQueryParams::ef_search`](crate::vector::search::searcher::VectorIndexQueryParams::ef_search)
+    /// always takes precedence over this schema-level default.
     ///
     /// Regardless of which source is used, the effective `ef_search` is also
     /// lifted to `max(ef_search, top_k * rerank_factor.unwrap_or(1), top_k)`
@@ -806,8 +812,9 @@ impl HnswOption {
     ///
     /// Per-query [`crate::vector::search::searcher::VectorIndexQueryParams::ef_search`]
     /// still takes precedence. When this builder method is not called, the
-    /// searcher falls back to its internal default (`50`). See
-    /// [`HnswOption::default_ef_search`] for the full precedence rules.
+    /// engine searches with `ef_construction.max(50) * 2` (`400` with the
+    /// default `ef_construction`). See [`HnswOption::default_ef_search`] for
+    /// the full precedence rules.
     pub fn default_ef_search(mut self, ef: usize) -> Self {
         self.default_ef_search = Some(ef);
         self

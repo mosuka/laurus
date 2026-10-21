@@ -852,6 +852,95 @@ fn factory_rejects_segmented_directory_with_flag_off() {
     );
 }
 
+/// Number of documents [`examined_with_allow_set`] commits.
+const FALLBACK_PROBE_DOCS: u64 = 20;
+
+/// Build an HNSW index through the production factory from a schema-level
+/// `HnswOption` with `default_ef_search` unset, commit
+/// [`FALLBACK_PROBE_DOCS`] vectors as one segment, and return the
+/// `candidates_examined` of a search whose allow-set holds the ids
+/// `0..allowed`.
+///
+/// `VectorIndexSearcher` does not report the `ef_search` it falls back to,
+/// so this probe makes it observable through the #738 cardinality switch:
+/// an allow-set of at most `ef_search` ids is scored directly and reported
+/// in full, and a larger one takes the graph walk, which visits at most the
+/// segment's nodes. Since nearly all of the allowed ids are absent from the
+/// segment, allow-sets of `ef_search` and `ef_search + 1` ids tell the two
+/// apart whatever the randomized graph looks like (Issue #1519).
+fn examined_with_allow_set(segmented: bool, allowed: u64) -> u64 {
+    use laurus::vector::HnswOption;
+    use laurus::vector::index::config::VectorIndexTypeConfig;
+    use laurus::vector::index::factory::VectorIndexFactory;
+    use laurus::vector::search::filter_set::FilterSet;
+
+    // The conversion `VectorStore` applies to a schema's HNSW field.
+    let schema_config = HnswIndexConfig::from_hnsw_option(&HnswOption {
+        dimension: 16,
+        ..Default::default()
+    });
+    assert_eq!(schema_config.ef_construction, 200, "precondition");
+    assert_eq!(schema_config.default_ef_search, None, "precondition");
+    assert!(schema_config.segmented, "the engine's layout");
+
+    let index = VectorIndexFactory::create(
+        storage() as Arc<dyn Storage>,
+        "vector_index",
+        VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+            segmented,
+            ..schema_config
+        }),
+    )
+    .unwrap();
+    commit_batch(index.as_ref(), 0..FALLBACK_PROBE_DOCS);
+
+    let ids: Vec<u64> = (0..allowed).collect();
+    let mut request = query(0, 10);
+    request.filter = Some(Arc::new(FilterSet::from_doc_ids(&ids)));
+    index
+        .searcher()
+        .unwrap()
+        .search(&request)
+        .unwrap()
+        .candidates_examined as u64
+}
+
+/// #1519: with `default_ef_search` unset, the segmented layout, in which the
+/// engine opens every HNSW field, searches with `ef_construction.max(50) * 2`,
+/// `400` for the default `ef_construction` of `200`, not the monolithic
+/// fallback of `50`.
+#[test]
+fn unset_default_ef_search_is_twice_ef_construction_when_segmented() {
+    assert_eq!(
+        examined_with_allow_set(true, 400),
+        400,
+        "an allow-set of 400 ids must be scored directly, so ef_search >= 400"
+    );
+    let walked = examined_with_allow_set(true, 401);
+    assert!(
+        walked <= FALLBACK_PROBE_DOCS,
+        "an allow-set of 401 ids must take the graph walk, so ef_search < 401, \
+         got {walked} candidates examined"
+    );
+}
+
+/// #1519: with `default_ef_search` unset, the monolithic layout
+/// (`segmented: false`) searches with `HNSW_DEFAULT_EF_SEARCH`, `50`.
+#[test]
+fn unset_default_ef_search_is_50_when_monolithic() {
+    assert_eq!(
+        examined_with_allow_set(false, 50),
+        50,
+        "an allow-set of 50 ids must be scored directly, so ef_search >= 50"
+    );
+    let walked = examined_with_allow_set(false, 51);
+    assert!(
+        walked <= FALLBACK_PROBE_DOCS,
+        "an allow-set of 51 ids must take the graph walk, so ef_search < 51, \
+         got {walked} candidates examined"
+    );
+}
+
 /// #882: pure-append workloads must not grow the segment count unboundedly
 /// — `maybe_auto_compact` merges a policy window once the manager's
 /// threshold is exceeded (tiered policy lands with #883).

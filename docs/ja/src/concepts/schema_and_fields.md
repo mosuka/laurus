@@ -133,7 +133,7 @@ let opt = HnswOption {
 
 `ef_search` はクエリ時の動的候補リストのサイズを制御するパラメータです（`ef_construction` がインデックス**ビルド時**にだけ影響するのとは別物です）。値を大きくするほどグラフ近傍の探索範囲が広がり、レイテンシと引き換えに recall が上がります。
 
-- **スキーマレベルのデフォルト**: `HnswOption.default_ef_search = Some(ef)` でフィールドごとのデフォルトを引き上げられます。`None` の場合、サーチャは内部 fallback (`50`) を使用します。
+- **スキーマレベルのデフォルト**: `HnswOption.default_ef_search = Some(ef)` でフィールドごとのデフォルトを設定できます。`None` の場合、そのフィールドの検索は `ef_construction.max(50) * 2` を使います。既定の `ef_construction`（`200`）では `400` です。エンジンは HNSW フィールドをセグメントに分けて保存し、セグメントごとにグラフを持つため、フィールド全体の recall を保てるよう、この広めの候補リストで各セグメントを検索します。上の例の `Some(100)` のように、これより小さい値を指定すると探索の幅は狭くなります。
 - **クエリごとのオーバーライド**: 検索リクエスト側で [`SearchRequestBuilder::vector_ef_search`](../laurus.md) を指定すると、スキーマデフォルトより優先されます。
 - **自動引き上げ**: いずれの経路で `ef_search` を指定した場合でも、サーチャは少なくとも `top_k`（`rerank_factor` 併用時は `top_k * rerank_factor`）まで持ち上げるため、`top_k` 要求に対して候補ヒープが不足することはありません。
 - Issue [#644](https://github.com/mosuka/laurus/issues/644) で対応。

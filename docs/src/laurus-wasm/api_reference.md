@@ -565,7 +565,10 @@ Add an HNSW vector index field.
 - `m`: Branching factor (default 16)
 - `efConstruction`: Build-time expansion (default 200)
 - `defaultEfSearch`: Schema-level default for the query-time `ef_search`
-  candidate-list size; omit to use the internal fallback of 50
+  candidate-list size; when omitted, a search uses twice the larger of
+  `efConstruction` and 50, which is 400 with the default `efConstruction`
+  of 200 (see
+  [Schema and Fields](../concepts/schema_and_fields.md#default_ef_search-the-search-time-recall-knob))
 - `quantizer`: `"scalar_8bit"` (default), `"float16"` or
   `"product_quantization"` (requires `subvectorCount`)
 - `subvectorCount`: number of PQ sub-vectors; must divide `dimension`

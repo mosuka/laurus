@@ -707,8 +707,9 @@ impl RbSchema {
     ///   - `ef_construction:` (usize, default 200): Build-time expansion factor.
     ///   - `default_ef_search:` (usize, optional): Schema-level default for the
     ///     search-time `ef_search` candidate-list size (Issue #644). When
-    ///     omitted, the searcher uses an internal fallback of 50. Per-query
-    ///     overrides via the search request still take precedence.
+    ///     omitted, the searcher uses twice the larger of `ef_construction:`
+    ///     and 50 (400 with the default of 200). Per-query overrides via
+    ///     the search request still take precedence.
     ///   - `embedder:` (String, optional): Embedder name registered via `add_embedder`.
     ///   - `quantizer:` (String, optional): Vector quantizer — "scalar_8bit"
     ///     (default), "float16" (IEEE half precision, 2 bytes per dimension)

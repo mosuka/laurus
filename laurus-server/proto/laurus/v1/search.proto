@@ -218,7 +218,9 @@ message VectorParams {
 
   // Per-query override for the HNSW `ef_search` candidate-list size
   // (Issue #644). When unset, the searcher uses the schema-level
-  // `HnswOption.default_ef_search` or an internal fallback (`50`).
+  // `HnswOption.default_ef_search` or, when that is unset too,
+  // `ef_construction.max(50) * 2` (`400` with the default
+  // `ef_construction`).
   // The effective ef is always lifted to `max(top_k, top_k * rerank_factor)`
   // so the candidate heap is never undersized for the requested
   // `top_k`. `0` is rejected with INVALID_ARGUMENT. Ignored by non-HNSW

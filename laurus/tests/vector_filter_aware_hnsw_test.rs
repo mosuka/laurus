@@ -225,7 +225,8 @@ async fn empty_filter_returns_empty() {
 
 // --- Issue #738: cardinality-driven brute-force mode ---
 //
-// When the allow-set is smaller than `ef_search` (default 50) the searcher
+// When the allow-set is no larger than `ef_search` (200 for this store: the
+// segmented fallback `ef_construction.max(50) * 2`, Issue #1519) the searcher
 // scores the allowed documents directly instead of walking the graph. That
 // path is *exact* and does not depend on the (randomised) graph structure, so
 // unlike the approximate graph traversal it yields a deterministic, exactly

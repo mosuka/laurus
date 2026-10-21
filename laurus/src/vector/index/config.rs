@@ -571,9 +571,12 @@ pub struct HnswIndexConfig {
     /// Default size of the dynamic candidate list during search
     /// (`ef_search`).
     ///
-    /// When `None` (the default), the searcher uses an internal
-    /// fallback of `50` so existing schemas keep their previous
-    /// behaviour. Per-query
+    /// When `None` (the default), the fallback depends on
+    /// [`Self::segmented`]: the segmented layout (the default, and the
+    /// only layout the engine uses) searches each segment with
+    /// `ef_construction.max(50) * 2`, `400` with the default
+    /// `ef_construction` of `200`, to keep multi-segment recall stable
+    /// (#644, #880), and the monolithic layout uses `50`. Per-query
     /// [`crate::vector::search::searcher::VectorIndexQueryParams::ef_search`]
     /// always takes precedence over this schema-level default.
     ///

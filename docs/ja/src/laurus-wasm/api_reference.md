@@ -557,7 +557,7 @@ HNSW ベクトルインデックスフィールドを追加します。
 - `distance`: `"cosine"`（デフォルト）、`"euclidean"`、`"dot_product"`、`"manhattan"`、`"angular"`
 - `m`: 分岐係数（デフォルト 16）
 - `efConstruction`: 構築時の探索幅（デフォルト 200）
-- `defaultEfSearch`: クエリ時の `ef_search`（候補リストサイズ）のスキーマレベルデフォルト。省略時は内部フォールバックの 50 を使用します
+- `defaultEfSearch`: クエリ時の `ef_search`（候補リストサイズ）のスキーマレベルデフォルト。省略時は `efConstruction` と 50 の大きいほうの 2 倍を使い、既定の `efConstruction`（200）では 400 です（[スキーマとフィールド](../concepts/schema_and_fields.md#default_ef_search-検索時の-recall-調整パラメータ)を参照）
 - `quantizer`: `"scalar_8bit"`（デフォルト）、`"float16"`、または `"product_quantization"`（`subvectorCount` が必須）
 - `subvectorCount`: PQ サブベクトル数。`dimension` を割り切れる値を指定します
 - `rerankStorage`: 省略（デフォルト）するか、`"f32"` を指定して完全精度のリランクサイドカーを保存します

@@ -38,8 +38,10 @@ use std::collections::{BinaryHeap, HashMap};
 /// when the filter is selective the result heap fills slowly and the search
 /// would otherwise walk most of the graph chasing matches. This cap bounds
 /// that worst case, trading recall for a latency ceiling; the unfiltered
-/// path is unaffected (it uses no cap). The chosen factor of `16` lets a
-/// default `ef_search = 50` visit ~800 nodes before giving up.
+/// path is unaffected (it uses no cap). The chosen factor of `16` lets the
+/// monolithic fallback `ef_search = 50` visit ~800 nodes before giving up,
+/// and the segmented layout's default of `400` (with the default
+/// `ef_construction`) ~6,400.
 const MAX_VISIT_FACTOR: usize = 16;
 
 /// Per-search state for the quantized hot path (Issue #481 Stage 1 +
@@ -369,9 +371,14 @@ impl<'a> QuantizedSearchCtx<'a> {
     }
 }
 
-/// Fallback `ef_search` used when neither the per-query
-/// [`VectorIndexQueryParams::ef_search`] nor the schema-level
-/// [`crate::vector::core::field::HnswOption::default_ef_search`] is set.
+/// Fallback `ef_search` of an [`HnswSearcher`] built without a default.
+///
+/// The monolithic [`crate::vector::index::hnsw::HnswIndex`] uses it when
+/// neither the per-query [`VectorIndexQueryParams::ef_search`] nor the
+/// schema-level [`crate::vector::core::field::HnswOption::default_ef_search`]
+/// is set. The segmented layout, which the engine uses, passes its own
+/// default of `ef_construction.max(50) * 2` instead (see
+/// [`crate::vector::index::config::HnswIndexConfig::default_ef_search`]).
 ///
 /// Issue [#644](https://github.com/mosuka/laurus/issues/644).
 pub(crate) const HNSW_DEFAULT_EF_SEARCH: usize = 50;

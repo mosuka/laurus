@@ -564,7 +564,8 @@ impl PySchema {
     ///     ef_construction: Build-time expansion factor (default 200).
     ///     default_ef_search: Schema-level default for the search-time
     ///         `ef_search` candidate-list size (Issue #644). When unset,
-    ///         the searcher uses an internal fallback of 50. Per-query
+    ///         the searcher uses twice the larger of ef_construction and
+    ///         50 (400 with the default ef_construction of 200). Per-query
     ///         overrides via the search request still take precedence.
     ///     quantizer: Vector quantizer — "scalar_8bit" (default),
     ///         "float16" (IEEE half precision, 2 bytes per dimension) or

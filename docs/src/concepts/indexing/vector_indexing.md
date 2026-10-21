@@ -646,10 +646,14 @@ hold:
 - `rerank_factor` is set on the query; and
 - `effective_ef_search > top_k * rerank_factor` — i.e. the graph
   traversal actually computed more candidates than the exact stage
-  alone would consume. When it doesn't (the common case where
-  `ef_search` is left at its default), the SQ stage would narrow
-  nothing and is skipped, so the query takes the identical two-stage
-  (PQ → f32) path it always has.
+  alone would consume. With `ef_search` left at the engine's default
+  (`400` for the default `ef_construction` of `200`, see
+  [`default_ef_search`](../schema_and_fields.md#default_ef_search-the-search-time-recall-knob)),
+  this holds whenever `top_k * rerank_factor` is below `400`, such as
+  `10 * 10`. When it doesn't, for example because the query sets an
+  `ef_search` no larger than `top_k * rerank_factor`, the SQ stage
+  would narrow nothing and is skipped, so the query takes the
+  identical two-stage (PQ → f32) path it always has.
 
 The `score_basis` contract (Issue #927) is unaffected either way:
 the pipeline still ends in the exact f32 stage, so multi-segment
