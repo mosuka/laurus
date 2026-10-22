@@ -50,7 +50,10 @@ message SearchRequest {
   // Number of results to skip.
   uint32 offset = 4;
 
-  // Fusion algorithm for combining lexical and vector scores.
+  // Fusion algorithm for combining lexical and vector scores. Unset uses RRF
+  // with k = 60. An out-of-range parameter is rejected with
+  // INVALID_ARGUMENT, even when the request has no hybrid part (Issue
+  // #1540).
   optional FusionAlgorithm fusion = 5;
 
   // Lexical search parameters.
@@ -59,7 +62,10 @@ message SearchRequest {
   // Vector search parameters.
   optional VectorParams vector_params = 7;
 
-  // Per-field boost factors for lexical scoring.
+  // Per-field boost factors for lexical scoring. Each key must name a
+  // lexical field, and each boost must be finite and at least 0 (-0 is
+  // rejected); 0 keeps a match with a lexical score of 0. Other values are
+  // rejected with INVALID_ARGUMENT, also without a `query` (Issue #1540).
   map<string, float> field_boosts = 8;
 
   // Request highlighted fragments for these fields (Issue #1134). Unset (or
@@ -142,16 +148,24 @@ message FusionAlgorithm {
   }
 }
 
+// Reciprocal Rank Fusion: each list adds 1 / (k + rank), rank starting at 1.
 message RRF {
+  // Finite and at least 0. proto3 sends an unset k as 0, not 60: set it
+  // explicitly (60 is the usual value), or leave `fusion` unset for k = 60.
   double k = 1;
 }
 
+// Min-max normalized scores, each multiplied by its weight and added. Each
+// weight must be in [0, 1] and at least one greater than 0; an unset weight
+// is 0, so an empty WeightedSum is rejected.
 message WeightedSum {
   float lexical_weight = 1;
   float vector_weight = 2;
 }
 
 message LexicalParams {
+  // Minimum lexical score; must be finite. 0 (also unset) sets no threshold,
+  // and lexical scores are never negative, so a negative value is the same.
   float min_score = 1;
   optional uint64 timeout_ms = 2;
   bool parallel = 3;

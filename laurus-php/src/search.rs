@@ -154,7 +154,8 @@ impl PhpRRF {
     ///
     /// # Arguments
     ///
-    /// * `k` - RRF constant (default: 60.0).
+    /// * `k` - RRF constant (default: 60.0). Must be finite and at least 0;
+    ///   the search throws `ValueError` otherwise.
     #[php(defaults(k = 60.0))]
     pub fn __construct(k: f64) -> Self {
         Self { k }
@@ -184,6 +185,9 @@ impl PhpWeightedSum {
     ///
     /// * `lexicalWeight` - Weight for lexical scores (default: 0.5).
     /// * `vectorWeight` - Weight for vector scores (default: 0.5).
+    ///
+    /// Each weight must be in `[0.0, 1.0]`, and at least one greater than 0;
+    /// the search throws `ValueError` otherwise (weights are not clamped).
     #[php(defaults(lexicalWeight = 0.5, vectorWeight = 0.5))]
     pub fn __construct(lexicalWeight: f64, vectorWeight: f64) -> Self {
         Self {

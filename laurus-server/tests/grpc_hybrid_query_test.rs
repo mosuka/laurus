@@ -152,3 +152,110 @@ async fn test_field_boost_on_a_non_lexical_field_is_rejected() {
         assert!(status.message().contains(key), "{key}: {status:?}");
     }
 }
+
+/// Issue #1540: a `NaN` boost, lexical `min_score`, RRF `k` or weight (which
+/// only gRPC can send) and an empty `WeightedSum`, whose weights proto3
+/// sends as 0 and 0, are `INVALID_ARGUMENT` naming the value. A `NaN` boost
+/// is rejected without a `query` too, and so is a boost on the vector field
+/// (Issue #1374), now that the boosts reach the engine without a `query`.
+/// An empty `Rrf` (`k = 0`) is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_out_of_range_search_parameters_are_rejected() {
+    use v1::fusion_algorithm::Algorithm;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let service = search_service(&dir).await;
+    let fusion = |algorithm| {
+        Some(v1::FusionAlgorithm {
+            algorithm: Some(algorithm),
+        })
+    };
+    let boost = |field: &str, boost: f32| -> std::collections::HashMap<String, f32> {
+        [(field.to_string(), boost)].into_iter().collect()
+    };
+    let cases = [
+        (
+            "NaN boost",
+            v1::SearchRequest {
+                field_boosts: boost("title", f32::NAN),
+                ..hybrid_request("title:rust")
+            },
+            "field_boosts: boost for field \"title\" must be finite and at least 0, got NaN",
+        ),
+        (
+            "NaN boost without a query",
+            v1::SearchRequest {
+                field_boosts: boost("title", f32::NAN),
+                ..hybrid_request("")
+            },
+            "field_boosts: boost for field \"title\" must be finite and at least 0, got NaN",
+        ),
+        (
+            "vector field boost without a query",
+            v1::SearchRequest {
+                field_boosts: boost("vec", 2.0),
+                ..hybrid_request("")
+            },
+            "field_boosts names field(s) that are not a lexical field: vec",
+        ),
+        (
+            "NaN min_score",
+            v1::SearchRequest {
+                lexical_params: Some(v1::LexicalParams {
+                    min_score: f32::NAN,
+                    ..Default::default()
+                }),
+                ..hybrid_request("title:rust")
+            },
+            "lexical min_score must be finite, got NaN",
+        ),
+        (
+            "NaN k",
+            v1::SearchRequest {
+                fusion: fusion(Algorithm::Rrf(v1::Rrf { k: f64::NAN })),
+                ..hybrid_request("title:rust")
+            },
+            "fusion: rrf: k must be finite and at least 0, got NaN",
+        ),
+        (
+            "NaN weight",
+            v1::SearchRequest {
+                fusion: fusion(Algorithm::WeightedSum(v1::WeightedSum {
+                    lexical_weight: 0.5,
+                    vector_weight: f32::NAN,
+                })),
+                ..hybrid_request("title:rust")
+            },
+            "fusion: weighted_sum: vector_weight must be between 0 and 1, got NaN",
+        ),
+        (
+            "empty weighted_sum",
+            v1::SearchRequest {
+                fusion: fusion(Algorithm::WeightedSum(v1::WeightedSum::default())),
+                ..hybrid_request("title:rust")
+            },
+            "fusion: weighted_sum: lexical_weight or vector_weight must be greater than 0",
+        ),
+    ];
+    // Every request that is not rejected as expected, so a failure lists all
+    // of them rather than the first.
+    let mut wrong = Vec::new();
+    for (case, request, expected) in cases {
+        match service.search(Request::new(request)).await {
+            Err(status)
+                if status.code() == Code::InvalidArgument
+                    && status.message().contains(expected) => {}
+            other => wrong.push(format!(
+                "{case}: {:?}",
+                other.map(|response| response.into_inner().results.len())
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let empty_rrf = v1::SearchRequest {
+        fusion: fusion(Algorithm::Rrf(v1::Rrf::default())),
+        ..hybrid_request("title:rust")
+    };
+    assert_eq!(ids(&service, empty_rrf).await, ["lexical", "vector"]);
+}

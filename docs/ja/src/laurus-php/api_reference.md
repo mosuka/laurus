@@ -652,7 +652,7 @@ $result->getInnerHits()   // array    -- $groupBy を指定した場合、グル
 new \Laurus\RRF(float $k = 60.0)
 ```
 
-逆順位フュージョン（Reciprocal Rank Fusion）。Lexical と Vector の結果リストを順位位置によってマージします。`$k` は平滑化定数で、値が大きいほど上位ランクの影響が小さくなります。
+逆順位フュージョン（Reciprocal Rank Fusion）。Lexical と Vector の結果リストを順位位置によってマージします。`$k` は平滑化定数で、値が大きいほど上位ランクの影響が小さくなります。`$k` は有限で 0 以上でなければならず、それ以外の値では検索が `\ValueError` を投げます（Issue #1540）。
 
 ### WeightedSum
 
@@ -660,7 +660,7 @@ new \Laurus\RRF(float $k = 60.0)
 new \Laurus\WeightedSum(float $lexicalWeight = 0.5, float $vectorWeight = 0.5)
 ```
 
-両スコアリストをそれぞれ正規化した後、`$lexicalWeight * lexical_score + $vectorWeight * vector_score` として結合します。
+両スコアリストをそれぞれ正規化した後、`$lexicalWeight * lexical_score + $vectorWeight * vector_score` として結合します。各重みは `[0.0, 1.0]` の範囲で、少なくとも一方が 0 より大きくなければなりません。それ以外の重みは丸めずに、検索が `\ValueError` を投げます（Issue #1540）。
 
 ---
 

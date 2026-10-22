@@ -41,6 +41,8 @@ let request = SearchRequestBuilder::new()
 
 The boost is multiplied into the BM25 score contribution of matches in that field. A boost of `1.0` is a no-op; boosts apply only to fields named in the query (or in the schema's default-search fields). The exception is a `CombinedFields` [multi-field query](#multi-field-queries), where a boost is a BM25F weight inside the score instead.
 
+A boost must be finite and at least `0` (`-0.0` is rejected, as in Lucene); `Engine::search` rejects any other boost with `InvalidArgument` (Issue #1540). A negative boost used to make the score negative, so the hit disappeared. A boost of `0` keeps the match with a lexical score of `0`, except in a `CombinedFields` multi-field query, which still rejects a boost of `0`. In a hybrid search such a hit still takes part in [fusion](#hybrid-search-fusion): RRF ranks it, and `WeightedSum` normalizes a list whose scores are all equal to `1.0`.
+
 Over gRPC and HTTP, the same setting is exposed as `SearchRequest.field_boosts` (`map<string, float>`). See [gRPC API → SearchRequest](../laurus-server/grpc_api.md#searchrequest-fields).
 
 ### Multi-field Queries
@@ -101,14 +103,14 @@ RRF avoids score normalisation entirely by combining **ranks** instead of raw sc
 rrf_score(doc) = Σ 1 / (k + rank_i(doc))
 ```
 
-The sum runs over each result list the document appears in. The `k` parameter (default **60.0**) smooths the distribution — higher `k` flattens the contribution of top-ranked results.
+The sum runs over each result list the document appears in, with `rank_i` starting at 1. The `k` parameter (default **60.0**) smooths the distribution — higher `k` flattens the contribution of top-ranked results. `k` must be finite and at least `0`, so that every term is in `(0, 1]`; `Engine::search` rejects any other `k` with `InvalidArgument` (Issue #1540).
 
 ```rust
 use laurus::{FusionAlgorithm, SearchRequestBuilder};
 
 let request = SearchRequestBuilder::new()
     .query_dsl("title:rust text_vec:\"systems programming\"")
-    .fusion_algorithm(FusionAlgorithm::Rrf { k: 60.0 })
+    .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
     .build();
 ```
 
@@ -134,7 +136,7 @@ let request = SearchRequestBuilder::new()
     .build();
 ```
 
-Both weights are clamped to `[0.0, 1.0]`. Use RRF when you do not have a calibrated reason to pick specific weights — it is parameter-light and robust to scale differences between lists.
+A list whose scores are all equal normalizes to `1.0`, and the weighted scores are added as they are, not divided by the sum of the weights. Each weight must be in `[0.0, 1.0]`, and at least one greater than `0`; `Engine::search` rejects any other weights with `InvalidArgument` (Issue #1540). They used to be clamped into `[0.0, 1.0]`. Only the ratio of the weights changes the ranking, so the range can express every ratio. Use RRF when you do not have a calibrated reason to pick specific weights — it is parameter-light and robust to scale differences between lists.
 
 ## See Also
 

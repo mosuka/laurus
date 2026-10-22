@@ -472,10 +472,10 @@ next best hits in `inner_hits`.
 | `query_vectors` | `repeated QueryVector` | No | Pre-embedded query vectors. Sent with `query`, they are added to its vector part; a `query` with only lexical clauses becomes a hybrid search (Issue #1366) |
 | `limit` | `uint32` | No | Maximum number of results (`0` means the engine default, 10). `offset + limit` must not exceed the server's [`max_result_window`](configuration.md) (default 10,000), or the search is rejected with `INVALID_ARGUMENT` (Issue #1367) |
 | `offset` | `uint32` | No | Number of results to skip; counts toward `max_result_window` with `limit` |
-| `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search |
+| `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search. Unset uses RRF with `k` 60. An out-of-range parameter (see [FusionAlgorithm](#fusionalgorithm)) is rejected with `INVALID_ARGUMENT`, even when the request has no hybrid part (Issue #1540) |
 | `lexical_params` | `LexicalParams` | No | Lexical search parameters |
 | `vector_params` | `VectorParams` | No | Vector search parameters |
-| `field_boosts` | `map<string, float>` | No | Per-field score boosting for the lexical part. A key must name a lexical field of the schema (or `_id`); an unknown or vector field is rejected with `INVALID_ARGUMENT` (Issue #1374). A lexical field the query does not use is accepted and has no effect |
+| `field_boosts` | `map<string, float>` | No | Per-field score boosting for the lexical part. A key must name a lexical field of the schema (or `_id`); an unknown or vector field is rejected with `INVALID_ARGUMENT` (Issue #1374). A lexical field the query does not use is accepted and has no effect. Each boost multiplies the field's scores and must be finite and at least `0` (`-0` is rejected); `0` keeps a match with a lexical score of `0`. Any other boost is rejected with `INVALID_ARGUMENT`. Both the field and the boost are checked on a request without a `query` too (Issue #1540) |
 | `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
 | `rescore` | `RescoreParams` | No | Rescore the top first-stage results with late interaction (Issue #1351) |
 | `group_by` | `GroupByParams` | No | Group the results by a field's value; `limit` and `offset` then count groups (Issue #1297) |
@@ -504,14 +504,16 @@ At least one of `query` or `query_vectors` must be provided.
 
 A `oneof` with two options:
 
-- **RRF** (Reciprocal Rank Fusion): `k` parameter (default: 60)
-- **WeightedSum**: `lexical_weight` and `vector_weight`
+- **RRF** (Reciprocal Rank Fusion): each result list adds `1 / (k + rank)`, `rank` starting at 1. `k` must be finite and at least `0`. proto3 sends an unset `k` as `0`, not 60: set it explicitly (60 is the usual value), or leave `fusion` unset for `k` 60.
+- **WeightedSum**: the min-max normalized lexical and vector scores, multiplied by `lexical_weight` and `vector_weight` and added. Each weight must be in `[0, 1]`, and at least one greater than `0`. An unset weight is `0`, so an empty `WeightedSum` is rejected.
+
+Any other value is rejected with `INVALID_ARGUMENT` (Issue #1540); weights used to be clamped to `[0, 1]`.
 
 ### LexicalParams
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `min_score` | `float` | Minimum score threshold |
+| `min_score` | `float` | Minimum lexical score. `0` (unset) means no threshold; lexical scores are never negative, so a negative value is the same. A non-finite value is rejected with `INVALID_ARGUMENT`, also on a request without a `query` (Issue #1540) |
 | `timeout_ms` | `optional uint64` | Search timeout in milliseconds. Unset or `0` means no timeout |
 | `parallel` | `bool` | Enable parallel search |
 | `sort_by` | `SortSpec` | Sort by a field instead of score |

@@ -607,7 +607,7 @@ result.inner_hits # => Array    -- group_by: を指定した場合、グルー�
 Laurus::RRF.new(k: 60.0)
 ```
 
-逆順位フュージョン（Reciprocal Rank Fusion）。Lexical と Vector の結果リストを順位位置によってマージします。`k` は平滑化定数で、値が大きいほど上位ランクの影響が小さくなります。
+逆順位フュージョン（Reciprocal Rank Fusion）。Lexical と Vector の結果リストを順位位置によってマージします。`k` は平滑化定数で、値が大きいほど上位ランクの影響が小さくなります。`k` は有限で 0 以上でなければならず、それ以外の値では検索が `ArgumentError` を送出します（Issue #1540）。
 
 ### WeightedSum
 
@@ -615,7 +615,7 @@ Laurus::RRF.new(k: 60.0)
 Laurus::WeightedSum.new(lexical_weight: 0.5, vector_weight: 0.5)
 ```
 
-両スコアリストをそれぞれ正規化した後、`lexical_weight * lexical_score + vector_weight * vector_score` として結合します。
+両スコアリストをそれぞれ正規化した後、`lexical_weight * lexical_score + vector_weight * vector_score` として結合します。各重みは `[0.0, 1.0]` の範囲で、少なくとも一方が 0 より大きくなければなりません。それ以外の重みは丸めずに、検索が `ArgumentError` を送出します（Issue #1540）。
 
 ---
 

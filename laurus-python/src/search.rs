@@ -77,6 +77,9 @@ fn py_to_highlight_options(obj: &Bound<PyAny>) -> PyResult<HighlightOptions> {
 
 /// Reciprocal Rank Fusion — rank-based result merging for hybrid search.
 ///
+/// Each result list adds `1 / (k + rank)`, `rank` starting at 1. `k` must be
+/// finite and at least 0; the search raises `ValueError` otherwise.
+///
 /// ## Example
 ///
 /// ```python
@@ -101,6 +104,9 @@ impl PyRRF {
 }
 
 /// Weighted sum fusion — normalises lexical and vector scores then combines them.
+///
+/// Each weight must be in `[0.0, 1.0]`, and at least one greater than 0;
+/// the search raises `ValueError` otherwise (weights are not clamped).
 ///
 /// ## Example
 ///

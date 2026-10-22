@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::error::{LaurusError, Result};
 use crate::lexical::query::Query;
 use crate::lexical::search::features::highlight::HighlightConfig;
 use crate::lexical::search::searcher::{LexicalSearchQuery, SortField};
@@ -137,10 +138,22 @@ pub struct LexicalSearchOptions {
     ///
     /// Example: `{"title": 2.0, "body": 1.0}` gives title matches twice
     /// the weight of body matches.
+    ///
+    /// A boost multiplies the score, so each must be finite and at least
+    /// `0` (`-0.0` is rejected, as in Lucene); [`Engine::search`](super::Engine::search)
+    /// rejects any other value with `InvalidArgument` (Issue #1540). A
+    /// boost of `0` keeps a match with a lexical score of `0`, except on a
+    /// `CombinedFields` [`MultiFieldQuery`](crate::lexical::query::advanced_query::MultiFieldQuery),
+    /// whose BM25F weights must be greater than `0`.
     pub field_boosts: HashMap<String, f32>,
 
     /// Minimum score threshold. Results below this score are discarded.
-    /// Defaults to `0.0` (no threshold).
+    /// Defaults to `0.0` (no threshold). Must be finite;
+    /// [`Engine::search`](super::Engine::search) rejects `NaN` and the
+    /// infinities with `InvalidArgument` (Issue #1540). With non-negative
+    /// boosts (the only kind a DSL query or `field_boosts` can carry),
+    /// lexical scores are never negative, so a negative threshold is the
+    /// same as `0.0`.
     pub min_score: f32,
 
     /// Timeout for the search operation in milliseconds.
@@ -170,6 +183,26 @@ impl Default for LexicalSearchOptions {
             sort_by: SortField::Score,
             highlight: None,
         }
+    }
+}
+
+impl LexicalSearchOptions {
+    /// Reject a [`min_score`](Self::min_score) that is not finite (Issue
+    /// #1540): `NaN` would keep every hit and an infinity would drop them
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when `min_score` is `NaN` or
+    /// infinite.
+    pub(crate) fn validate_min_score(&self) -> Result<()> {
+        if !self.min_score.is_finite() {
+            return Err(LaurusError::invalid_argument(format!(
+                "lexical min_score must be finite, got {}",
+                self.min_score
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -505,6 +538,10 @@ pub struct SearchRequest {
 ///
 /// The default fusion algorithm (when none is specified in a
 /// [`SearchRequest`]) is [`RRF`](Self::RRF) with `k = 60.0`.
+///
+/// [`Engine::search`](super::Engine::search) rejects parameters outside the
+/// ranges below with `InvalidArgument`, even when the request has no
+/// hybrid part to fuse (Issue #1540).
 #[derive(Debug, Clone, Copy)]
 pub enum FusionAlgorithm {
     /// Reciprocal Rank Fusion (RRF).
@@ -512,10 +549,12 @@ pub enum FusionAlgorithm {
     /// Combines results based on rank position rather than raw scores,
     /// making it effective when score magnitudes are not comparable
     /// (e.g. BM25 vs cosine similarity). The score for each document is
-    /// `sum(1 / (k + rank))` across the result lists.
+    /// `sum(1 / (k + rank))` across the result lists, with `rank` starting
+    /// at 1.
     RRF {
-        /// Smoothing constant `k`. Higher values reduce the influence of
-        /// top-ranked documents. Typical default is `60.0`.
+        /// Smoothing constant `k`, finite and at least `0`. Higher values
+        /// reduce the influence of top-ranked documents. Typical default is
+        /// `60.0`.
         k: f64,
     },
 
@@ -523,13 +562,64 @@ pub enum FusionAlgorithm {
     ///
     /// Before weighting, the engine independently normalizes lexical and
     /// vector scores to the `[0.0, 1.0]` range using min-max normalization
-    /// over their respective result sets.
+    /// over their respective result sets; a set whose scores are all equal
+    /// normalizes to `1.0`. The weighted scores are added as they are, not
+    /// divided by the sum of the weights.
     WeightedSum {
-        /// Weight for the normalized lexical score (clamped to `0.0..=1.0`).
+        /// Weight for the normalized lexical score, in `0.0..=1.0`.
         lexical_weight: f32,
-        /// Weight for the normalized vector score (clamped to `0.0..=1.0`).
+        /// Weight for the normalized vector score, in `0.0..=1.0`. At least
+        /// one of the two weights must be greater than `0`.
         vector_weight: f32,
     },
+}
+
+impl FusionAlgorithm {
+    /// Reject parameters the fusion cannot use (Issue #1540). An RRF `k` of
+    /// at least `0` keeps every term `1 / (k + rank)` in `(0, 1]`, while a
+    /// negative one makes a term infinite (`k = -rank`) or negative
+    /// (`k < -rank`). A `WeightedSum` with both weights `0` scores every hit
+    /// `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] for an RRF `k` that is not a
+    /// finite number of at least `0`, a `WeightedSum` weight outside
+    /// `0.0..=1.0`, or two `WeightedSum` weights of `0`.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let invalid = |reason: String| LaurusError::invalid_argument(format!("fusion: {reason}"));
+        match *self {
+            FusionAlgorithm::RRF { k } => {
+                if !(k.is_finite() && k >= 0.0) {
+                    return Err(invalid(format!(
+                        "rrf: k must be finite and at least 0, got {k}"
+                    )));
+                }
+            }
+            FusionAlgorithm::WeightedSum {
+                lexical_weight,
+                vector_weight,
+            } => {
+                for (name, weight) in [
+                    ("lexical_weight", lexical_weight),
+                    ("vector_weight", vector_weight),
+                ] {
+                    if !(0.0..=1.0).contains(&weight) {
+                        return Err(invalid(format!(
+                            "weighted_sum: {name} must be between 0 and 1, got {weight}"
+                        )));
+                    }
+                }
+                if lexical_weight == 0.0 && vector_weight == 0.0 {
+                    return Err(invalid(
+                        "weighted_sum: lexical_weight or vector_weight must be greater than 0"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for SearchRequest {
@@ -650,19 +740,11 @@ impl SearchRequestBuilder {
 
     /// Set the fusion algorithm for hybrid search.
     ///
-    /// For [`FusionAlgorithm::WeightedSum`], the weights are clamped to
-    /// `0.0..=1.0` to prevent NaN/Inf propagation.
+    /// The parameters are kept as given: [`Engine::search`](super::Engine::search)
+    /// rejects an out-of-range RRF `k` or `WeightedSum` weight with
+    /// `InvalidArgument` (see [`FusionAlgorithm`]). Weights used to be
+    /// clamped to `0.0..=1.0` here (Issue #1540).
     pub fn fusion_algorithm(mut self, fusion: FusionAlgorithm) -> Self {
-        let fusion = match fusion {
-            FusionAlgorithm::WeightedSum {
-                lexical_weight,
-                vector_weight,
-            } => FusionAlgorithm::WeightedSum {
-                lexical_weight: lexical_weight.clamp(0.0, 1.0),
-                vector_weight: vector_weight.clamp(0.0, 1.0),
-            },
-            other => other,
-        };
         self.fusion_algorithm = Some(fusion);
         self
     }
@@ -677,7 +759,8 @@ impl SearchRequestBuilder {
 
     // ── Lexical options ──────────────────────────────────────────────────
 
-    /// Add a field-level boost for lexical search.
+    /// Add a field-level boost for lexical search. The boost must be finite
+    /// and at least `0` (see [`LexicalSearchOptions::field_boosts`]).
     pub fn add_field_boost(mut self, field: impl Into<String>, boost: f32) -> Self {
         self.lexical_options
             .field_boosts
@@ -685,7 +768,8 @@ impl SearchRequestBuilder {
         self
     }
 
-    /// Set the minimum score threshold for lexical search.
+    /// Set the minimum score threshold for lexical search. The threshold
+    /// must be finite (see [`LexicalSearchOptions::min_score`]).
     pub fn lexical_min_score(mut self, min_score: f32) -> Self {
         self.lexical_options.min_score = min_score;
         self
@@ -932,6 +1016,26 @@ mod tests {
             assert_eq!(options.fields, ["body"]);
             assert_eq!(options.config.tag, "em");
             assert_eq!(options.config.css_class.as_deref(), Some("hl"));
+        }
+    }
+
+    /// Issue #1540: the builder keeps the weights as given, so that
+    /// `Engine::search` can reject an out-of-range one instead of the
+    /// builder clamping it into range first.
+    #[test]
+    fn builder_fusion_algorithm_keeps_weights_as_given() {
+        let request = SearchRequestBuilder::new()
+            .fusion_algorithm(FusionAlgorithm::WeightedSum {
+                lexical_weight: 2.0,
+                vector_weight: -1.0,
+            })
+            .build();
+        match request.fusion_algorithm {
+            Some(FusionAlgorithm::WeightedSum {
+                lexical_weight,
+                vector_weight,
+            }) => assert_eq!((lexical_weight, vector_weight), (2.0, -1.0)),
+            other => panic!("unexpected fusion {other:?}"),
         }
     }
 

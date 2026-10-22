@@ -153,7 +153,10 @@ struct SearchParams {
     offset: Option<u32>,
 
     /// Fusion algorithm for hybrid search as a JSON string. Only used when
-    /// the query contains both lexical and vector clauses.
+    /// the query contains both lexical and vector clauses, but an
+    /// out-of-range value is an error either way: `k` must be at least `0`,
+    /// and each weight between `0` and `1` with at least one greater than
+    /// `0` (Issue #1540).
     ///
     /// Examples:
     /// - `{"rrf": {"k": 60.0}}` — Reciprocal Rank Fusion (default)
@@ -161,7 +164,8 @@ struct SearchParams {
     fusion: Option<String>,
 
     /// Per-field boost factors as a JSON string. Boosts the relevance score
-    /// of matches in specific fields for lexical search.
+    /// of matches in specific fields for lexical search. Each boost must be
+    /// at least `0` (Issue #1540).
     ///
     /// Example: `{"title": 2.0, "body": 1.0}`
     field_boosts: Option<String>,

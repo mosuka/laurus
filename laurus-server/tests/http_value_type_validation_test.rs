@@ -5,6 +5,11 @@
 //! neither indexed nor stored, and `"query": 5` turned a hybrid search into
 //! a vector-only one. A missing key and `null` keep their defaults.
 //!
+//! A number of the right type that the engine cannot use is a 400 too
+//! (Issue #1540): a field boost, a lexical `min_score`, an RRF `k` or a
+//! `weighted_sum` weight out of range, including a number too large for the
+//! 32-bit float it is converted to.
+//!
 //! The gateway forwards each call to the gRPC services and maps the status
 //! they return, so these requests go through both, over a gRPC connection
 //! to the services on an ephemeral port.
@@ -354,6 +359,95 @@ async fn search_answers_400_for_a_value_of_the_wrong_type() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Issue #1540: the requests of the issue, which used to give a `null`
+/// score, hide a hit or be clamped, are a 400 naming the value, from each
+/// search endpoint; so are weights of 0 and 0, and a boost sent without a
+/// `query`. The boundaries still search.
+#[tokio::test]
+async fn search_answers_400_for_a_number_out_of_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    create_index(&router, search_fields()).await;
+
+    let vectors = json!([{"vector": [1.0, 0.0]}]);
+    let hybrid = |key: &str, value: Value| json!({"query": "body:rust", "query_vectors": vectors.clone(), key: value});
+    let boost = |got: &str| {
+        format!("field_boosts: boost for field \"title\" must be finite and at least 0, got {got}")
+    };
+    let weight = |name: &str, got: &str| {
+        format!("fusion: weighted_sum: {name} must be between 0 and 1, got {got}")
+    };
+    let cases = [
+        (hybrid("field_boosts", json!({"title": 1e39})), boost("inf")),
+        (hybrid("field_boosts", json!({"title": -1})), boost("-1")),
+        (
+            json!({"query_vectors": vectors.clone(), "field_boosts": {"title": -1}}),
+            boost("-1"),
+        ),
+        (
+            hybrid("fusion", json!({"rrf": {"k": -1}})),
+            "fusion: rrf: k must be finite and at least 0, got -1".to_string(),
+        ),
+        (
+            hybrid(
+                "fusion",
+                json!({"weighted_sum": {"lexical_weight": 2, "vector_weight": 0}}),
+            ),
+            weight("lexical_weight", "2"),
+        ),
+        (
+            hybrid(
+                "fusion",
+                json!({"weighted_sum": {"lexical_weight": 1e39, "vector_weight": -1}}),
+            ),
+            weight("lexical_weight", "inf"),
+        ),
+        (
+            hybrid(
+                "fusion",
+                json!({"weighted_sum": {"lexical_weight": 0, "vector_weight": 0}}),
+            ),
+            "fusion: weighted_sum: lexical_weight or vector_weight must be greater than 0"
+                .to_string(),
+        ),
+        (
+            hybrid("lexical_params", json!({"min_score": 1e39})),
+            "lexical min_score must be finite, got inf".to_string(),
+        ),
+    ];
+    // Every request that is not rejected as expected, so a failure lists all
+    // of them rather than the first.
+    let mut wrong = Vec::new();
+    for (search, expected) in cases {
+        for (uri, request) in [
+            ("/v1/search", search.clone()),
+            ("/v1/search/stream", search.clone()),
+            ("/v1/search/batch", json!({"queries": [search.clone()]})),
+        ] {
+            let (status, body) = send(&router, "POST", uri, request.clone()).await;
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            if status != StatusCode::BAD_REQUEST || !message.contains(&expected) {
+                wrong.push(format!("{uri} {request}: {status} {body}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    for (key, value) in [
+        ("fusion", json!({"rrf": {"k": 0}})),
+        (
+            "fusion",
+            json!({"weighted_sum": {"lexical_weight": 1, "vector_weight": 0}}),
+        ),
+        ("field_boosts", json!({"title": 0})),
+        ("lexical_params", json!({"min_score": -1})),
+    ] {
+        let search = hybrid(key, value.clone());
+        let (status, body) = send(&router, "POST", "/v1/search", search).await;
+        assert_eq!(status, StatusCode::OK, "{key} {value}: {body}");
+    }
 }
 
 /// The case in #1476 and in the Issue: `sort_by.order` is matched

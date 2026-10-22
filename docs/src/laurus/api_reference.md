@@ -121,11 +121,11 @@ A collection of named field values.
 | `.lexical_query(query)` | Set the lexical search query (`LexicalSearchQuery`) |
 | `.vector_query(query)` | Set the vector search query (`VectorSearchQuery`) |
 | `.filter_query(query)` | Set a pre-filter query |
-| `.fusion_algorithm(algo)` | Set the fusion algorithm (default: RRF) |
+| `.fusion_algorithm(algo)` | Set the fusion algorithm (default: RRF). Its parameters are kept as given; the search fails with `InvalidArgument` if one is out of range (see [FusionAlgorithm](#fusionalgorithm)) |
 | `.limit(n)` | Maximum results (default: 10) |
 | `.offset(n)` | Skip N results (default: 0) |
-| `.add_field_boost(field, boost)` | Add a field-level boost for lexical search. The search fails with `InvalidArgument` if `field` is not a lexical field of the schema (or `_id`) |
-| `.lexical_min_score(f32)` | Set minimum score threshold for lexical search |
+| `.add_field_boost(field, boost)` | Add a field-level boost for lexical search. The search fails with `InvalidArgument` if `field` is not a lexical field of the schema (or `_id`), or if `boost` is not finite or is below `0` (`-0.0` included) |
+| `.lexical_min_score(f32)` | Set minimum score threshold for lexical search. The search fails with `InvalidArgument` if it is not finite |
 | `.lexical_timeout_ms(u64)` | Set lexical search timeout in milliseconds |
 | `.lexical_parallel(bool)` | Enable parallel lexical search |
 | `.sort_by(SortField)` | Set sort order for lexical search results |
@@ -170,8 +170,10 @@ A collection of named field values.
 
 | Variant | Description |
 | :--- | :--- |
-| `RRF { k: f64 }` | Reciprocal Rank Fusion (default k=60.0) |
-| `WeightedSum { lexical_weight, vector_weight }` | Linear combination of scores |
+| `RRF { k: f64 }` | Reciprocal Rank Fusion (default k=60.0). `k` must be finite and at least `0` |
+| `WeightedSum { lexical_weight, vector_weight }` | Linear combination of min-max normalized scores. Each weight must be in `0.0..=1.0`, and at least one greater than `0` |
+
+`Engine::search` rejects any other value with `InvalidArgument`, even when the request has no hybrid part (Issue #1540). The weights used to be clamped into `0.0..=1.0`.
 
 ### RescoreOptions
 

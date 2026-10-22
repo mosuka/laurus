@@ -462,11 +462,18 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 {"weighted_sum": {"lexical_weight": 0.7, "vector_weight": 0.3}}
 ```
 
+`k` must be at least `0`, and each weight between `0` and `1` with at least
+one greater than `0`. The server rejects any other value, and the tool
+returns its error (Issue #1540).
+
 ### Field boosts example
 
 ```json
 {"title": 2.0, "body": 1.0}
 ```
+
+Each boost must be at least `0` (`-0` is rejected). The server rejects any
+other boost, and the tool returns its error (Issue #1540).
 
 ### Highlight example
 

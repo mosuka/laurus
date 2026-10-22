@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tempfile::TempDir;
 
 use laurus::Document;
@@ -5,10 +7,11 @@ use laurus::Engine;
 use laurus::lexical::TermQuery;
 use laurus::lexical::TextOption;
 use laurus::storage::file::FileStorageConfig;
+use laurus::storage::memory::MemoryStorage;
 use laurus::storage::{StorageConfig, StorageFactory};
-use laurus::vector::HnswOption;
 use laurus::vector::Vector;
-use laurus::{FieldOption, Schema};
+use laurus::vector::{FlatOption, HnswOption};
+use laurus::{FieldOption, GroupBy, LaurusError, Schema};
 use laurus::{
     FusionAlgorithm, LexicalSearchQuery, QueryVector, SearchRequestBuilder, VectorSearchQuery,
 };
@@ -337,4 +340,180 @@ async fn test_base_weight_affects_vector_only_query_through_the_engine() -> laur
     );
 
     Ok(())
+}
+
+/// Two documents that both match `title:rust` and both have a vector: doc1
+/// ranks first on the lexical side (the shorter title) and doc2 on the
+/// vector side, so min-max normalization maps each side to exactly `1.0`
+/// and `0.0` (Issue #1540).
+async fn two_sided_engine() -> Engine {
+    let schema = Schema::builder()
+        .add_field("title", FieldOption::Text(TextOption::default()))
+        .add_field("vec", FieldOption::Flat(FlatOption::default().dimension(2)))
+        .build();
+    let engine = Engine::new(Arc::new(MemoryStorage::new(Default::default())), schema)
+        .await
+        .unwrap();
+    for (id, title, vector) in [
+        ("doc1", "rust", vec![0.6, 0.8]),
+        ("doc2", "rust go programming language", vec![1.0, 0.0]),
+    ] {
+        engine
+            .put_document(
+                id,
+                Document::builder()
+                    .add_field("title", title)
+                    .add_field("vec", vector)
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+    engine.commit().await.unwrap();
+    engine
+}
+
+fn hybrid(fusion: FusionAlgorithm) -> SearchRequestBuilder {
+    SearchRequestBuilder::new()
+        .query_dsl("title:rust")
+        .vector_query(VectorSearchQuery::Vectors(vec![QueryVector {
+            vector: Vector::new(vec![1.0, 0.0]),
+            weight: 1.0,
+            fields: Some(vec!["vec".into()]),
+        }]))
+        .fusion_algorithm(fusion)
+}
+
+/// Issue #1540: an RRF `k` that is not a finite number of at least `0`, a
+/// `WeightedSum` weight outside `0.0..=1.0` and two weights of `0` are
+/// rejected with a message naming the value, also where the fusion has no
+/// effect (a lexical-only search) and on a grouped request with `limit 0`,
+/// which returns before searching.
+#[tokio::test(flavor = "multi_thread")]
+async fn out_of_range_fusion_parameters_are_rejected() {
+    let engine = two_sided_engine().await;
+    let weighted = |lexical_weight, vector_weight| FusionAlgorithm::WeightedSum {
+        lexical_weight,
+        vector_weight,
+    };
+    let mut cases: Vec<(FusionAlgorithm, String)> = [-1.0, -0.5, f64::NAN, f64::INFINITY]
+        .into_iter()
+        .map(|k| {
+            (
+                FusionAlgorithm::RRF { k },
+                format!("fusion: rrf: k must be finite and at least 0, got {k}"),
+            )
+        })
+        .collect();
+    for (lexical_weight, vector_weight, name, bad) in [
+        (2.0, 0.0, "lexical_weight", 2.0),
+        (-0.1, 1.0, "lexical_weight", -0.1),
+        (f32::NAN, 1.0, "lexical_weight", f32::NAN),
+        (1.0, f32::INFINITY, "vector_weight", f32::INFINITY),
+    ] {
+        cases.push((
+            weighted(lexical_weight, vector_weight),
+            format!("fusion: weighted_sum: {name} must be between 0 and 1, got {bad}"),
+        ));
+    }
+    cases.push((
+        weighted(0.0, 0.0),
+        "fusion: weighted_sum: lexical_weight or vector_weight must be greater than 0".to_string(),
+    ));
+
+    // Every request that is not rejected as expected, so a failure lists all
+    // of them rather than the first.
+    let mut wrong = Vec::new();
+    for (fusion, expected) in cases {
+        for (shape, request) in [
+            ("hybrid", hybrid(fusion).build()),
+            (
+                "lexical-only",
+                SearchRequestBuilder::new()
+                    .query_dsl("title:rust")
+                    .fusion_algorithm(fusion)
+                    .build(),
+            ),
+            (
+                "grouped limit 0",
+                hybrid(fusion)
+                    .group_by(GroupBy::new("_id"))
+                    .limit(0)
+                    .build(),
+            ),
+        ] {
+            let result = engine.search(request).await;
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!("{shape} {fusion:?}: {:?}", result.map(|r| r.len())));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Issue #1540: the boundaries are accepted. `k = 0` gives finite scores
+/// (`1 / rank`), weights of `1` and `0` either way round are a one-sided
+/// ranking, and in-range weights are applied as given: not clamped and not
+/// divided by their sum.
+#[tokio::test(flavor = "multi_thread")]
+async fn boundary_fusion_parameters_are_accepted() {
+    let engine = two_sided_engine().await;
+    let scores = |results: Vec<laurus::SearchResult>| -> Vec<(String, f32)> {
+        results.into_iter().map(|r| (r.id, r.score)).collect()
+    };
+
+    // doc1 is 1st lexically and 2nd by vector, doc2 the other way round.
+    let rrf = scores(
+        engine
+            .search(hybrid(FusionAlgorithm::RRF { k: 0.0 }).build())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        rrf,
+        [("doc1".to_string(), 1.5), ("doc2".to_string(), 1.5)],
+        "{rrf:?}"
+    );
+
+    for (lexical_weight, vector_weight, expected) in [
+        (1.0, 0.0, [("doc1", 1.0), ("doc2", 0.0)]),
+        (0.0, 1.0, [("doc2", 1.0), ("doc1", 0.0)]),
+    ] {
+        let one_sided = scores(
+            engine
+                .search(
+                    hybrid(FusionAlgorithm::WeightedSum {
+                        lexical_weight,
+                        vector_weight,
+                    })
+                    .build(),
+                )
+                .await
+                .unwrap(),
+        );
+        let expected: Vec<(String, f32)> = expected
+            .iter()
+            .map(|&(id, score)| (id.to_string(), score))
+            .collect();
+        assert_eq!(one_sided, expected, "({lexical_weight}, {vector_weight})");
+    }
+
+    // Normalized: doc1 is (lexical 1, vector 0) and doc2 is (0, 1).
+    let weighted = scores(
+        engine
+            .search(
+                hybrid(FusionAlgorithm::WeightedSum {
+                    lexical_weight: 0.2,
+                    vector_weight: 0.4,
+                })
+                .build(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        weighted,
+        [("doc2".to_string(), 0.4), ("doc1".to_string(), 0.2)],
+        "{weighted:?}"
+    );
 }

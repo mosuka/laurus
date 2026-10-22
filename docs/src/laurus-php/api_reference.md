@@ -656,7 +656,7 @@ With `$groupBy`, `getGroupKey()` returns the value the result's group shares (a 
 new \Laurus\RRF(float $k = 60.0)
 ```
 
-Reciprocal Rank Fusion. Merges lexical and vector result lists by rank position. `$k` is a smoothing constant; higher values reduce the influence of top-ranked results.
+Reciprocal Rank Fusion. Merges lexical and vector result lists by rank position. `$k` is a smoothing constant; higher values reduce the influence of top-ranked results. `$k` must be finite and at least 0; the search throws `\ValueError` otherwise (Issue #1540).
 
 ### WeightedSum
 
@@ -664,7 +664,7 @@ Reciprocal Rank Fusion. Merges lexical and vector result lists by rank position.
 new \Laurus\WeightedSum(float $lexicalWeight = 0.5, float $vectorWeight = 0.5)
 ```
 
-Normalises both score lists independently, then combines them as `$lexicalWeight * lexical_score + $vectorWeight * vector_score`.
+Normalises both score lists independently, then combines them as `$lexicalWeight * lexical_score + $vectorWeight * vector_score`. Each weight must be in `[0.0, 1.0]`, and at least one greater than 0; the search throws `\ValueError` otherwise instead of clamping them (Issue #1540).
 
 ---
 

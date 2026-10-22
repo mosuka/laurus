@@ -237,8 +237,8 @@ OS page cache に pre-fault します。HNSW グラフと IVF の centroid は�
 
 | フィールド | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `field_boosts` | `HashMap<String, f32>` | 空 | フィールドごとのスコア倍率 |
-| `min_score` | `f32` | 0.0 | 最小スコアしきい値 |
+| `field_boosts` | `HashMap<String, f32>` | 空 | フィールドごとのスコア倍率。各倍率は有限で `0` 以上（`-0.0` は拒否）。`0` では一致した文書が lexical スコア `0` で残る（`CombinedFields` のマルチフィールドクエリは今どおり `0` を拒否する） |
+| `min_score` | `f32` | 0.0 | 最小スコアしきい値。有限でなければならない。ブーストが負でなければ lexical スコアは負にならないので、負のしきい値は `0.0` と同じ |
 | `timeout_ms` | `Option<u64>` | None | 検索タイムアウト（ミリ秒） |
 | `parallel` | `bool` | false | セグメント検索を並列実行するか |
 | `sort_by` | `SortField` | `Score` | Lexical結果のソート順 |
@@ -248,7 +248,9 @@ OS page cache に pre-fault します。HNSW グラフと IVF の centroid は�
 
 | バリアント | 説明 |
 | :--- | :--- |
-| `RRF { k: f64 }` | Reciprocal Rank Fusion -- ランクベースの結合。スコア = sum(1 / (k + rank))。比較不可能なスコアの大きさを処理します。 |
-| `WeightedSum { lexical_weight, vector_weight }` | min-maxスコア正規化を用いた加重結合。重みは[0.0, 1.0]にクランプされます。 |
+| `RRF { k: f64 }` | Reciprocal Rank Fusion -- ランクベースの結合。スコア = sum(1 / (k + rank))（`rank` は 1 始まり）。比較不可能なスコアの大きさを処理します。`k` は有限で 0 以上でなければなりません。 |
+| `WeightedSum { lexical_weight, vector_weight }` | min-maxスコア正規化を用いた加重結合。各重みは [0.0, 1.0] の範囲で、少なくとも一方が 0 より大きくなければなりません。 |
+
+`Engine::search` は、これらの範囲外のブースト、lexical の `min_score`、Fusion のパラメータを、要求がそれを使わない場合でも `InvalidArgument` で拒否します（Issue #1540）。以前は重みを [0.0, 1.0] にクランプしていました。
 
 関連項目: [アーキテクチャ](../architecture.md) -- 高レベルのデータフロー図

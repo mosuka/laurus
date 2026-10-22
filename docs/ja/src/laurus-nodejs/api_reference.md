@@ -805,7 +805,8 @@ new RRF(k?: number)  // デフォルト 60.0
 ```
 
 Reciprocal Rank Fusion。ランク位置で Lexical と Vector の
-結果リストを統合。
+結果リストを統合。`k` は有限で 0 以上でなければならず、
+それ以外の値では検索が `InvalidArg` のエラーを投げる（Issue #1540）。
 
 ### WeightedSum
 
@@ -817,6 +818,8 @@ new WeightedSum(
 ```
 
 両スコアリストを個別に正規化し、加重和で結合。
+各重みは `[0, 1]` の範囲で、少なくとも一方が 0 より大きくなければならない。
+それ以外の重みは丸めずに、検索が `InvalidArg` のエラーを投げる（Issue #1540）。
 
 ---
 

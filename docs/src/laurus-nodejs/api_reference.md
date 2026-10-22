@@ -814,7 +814,8 @@ new RRF(k?: number)  // default 60.0
 ```
 
 Reciprocal Rank Fusion. Merges lexical and vector result lists
-by rank position.
+by rank position. `k` must be finite and at least 0; the search
+throws an `InvalidArg` error otherwise (Issue #1540).
 
 ### WeightedSum
 
@@ -826,6 +827,9 @@ new WeightedSum(
 ```
 
 Normalises both score lists independently, then combines them.
+Each weight must be in `[0, 1]`, and at least one greater than 0;
+the search throws an `InvalidArg` error otherwise instead of
+clamping them (Issue #1540).
 
 ---
 

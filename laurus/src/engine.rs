@@ -2922,7 +2922,9 @@ impl Engine {
         }
     }
 
-    /// Reject `field_boosts` keys that name no lexical field (Issue #1374).
+    /// Reject `field_boosts` keys that name no lexical field (Issue #1374),
+    /// and boosts that are not a finite number of at least `0` (Issue
+    /// #1540).
     ///
     /// A boost on an unknown field (e.g. a typo) or on a vector field can
     /// never match a lexical clause, so it used to be silently ignored. This
@@ -2930,11 +2932,17 @@ impl Engine {
     /// schema's fields plus `_id`. A lexical field the query does not
     /// reference is accepted; its boost is simply unused.
     ///
+    /// A boost multiplies the score. A negative one (`-0.0` included, as in
+    /// Lucene's `BoostQuery`) makes the score negative, which the collectors'
+    /// `0.0` threshold drops or ranks below every `+0.0`, and a non-finite
+    /// one gives `NaN` or infinite scores.
+    ///
     /// # Errors
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// naming the unknown fields, or else the non-lexical ones, in sorted
-    /// order.
+    /// order, or else the first field in sorted order whose boost is out of
+    /// range.
     fn validate_field_boosts(&self, boosts: &std::collections::HashMap<String, f32>) -> Result<()> {
         if boosts.is_empty() {
             return Ok(());
@@ -2965,6 +2973,15 @@ impl Engine {
                 "field_boosts names field(s) that are not a lexical field: {}; boosts apply \
                  to lexical clauses only",
                 not_lexical.join(", ")
+            )));
+        }
+        if let Some((field, boost)) = boosts
+            .iter()
+            .filter(|&(_, &boost)| !(boost.is_finite() && boost.is_sign_positive()))
+            .min_by(|a, b| a.0.cmp(b.0))
+        {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "field_boosts: boost for field {field:?} must be finite and at least 0, got {boost}"
             )));
         }
         Ok(())
@@ -3914,6 +3931,18 @@ impl Engine {
     /// document retrieval fails.
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if a [`field_boosts`](self::search::LexicalSearchOptions::field_boosts)
+    /// key names no lexical field or its boost is not a finite number of at
+    /// least `0`, if the lexical
+    /// [`min_score`](self::search::LexicalSearchOptions::min_score) is not
+    /// finite, or if the
+    /// [`fusion_algorithm`](self::search::SearchRequest::fusion_algorithm)
+    /// has an RRF `k` that is not a finite number of at least `0`, a
+    /// `WeightedSum` weight outside `0.0..=1.0`, or two `WeightedSum`
+    /// weights of `0` (Issue #1540). These are checked even when the
+    /// request has no lexical or hybrid part.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the rescore options are invalid: a window outside
     /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
     /// multi-vector field, query vectors of the wrong dimension or count, or
@@ -3954,6 +3983,12 @@ impl Engine {
         } = request;
 
         self.validate_field_boosts(&lexical_options.field_boosts)?;
+        // Issue #1540: checked whether or not the request has a lexical or a
+        // hybrid part, and before `group_by` returns early for `limit 0`.
+        lexical_options.validate_min_score()?;
+        if let Some(fusion) = &request_fusion {
+            fusion.validate()?;
+        }
         if let Some(group_by) = &request_group_by {
             self::grouping::validate(&self.schema.read(), group_by, request_offset, request_limit)?;
             if request_limit == 0 {

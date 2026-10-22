@@ -27,7 +27,9 @@ use crate::proto::laurus::v1;
 /// ([`SearchQuery::Dsl`](laurus::SearchQuery::Dsl)): the engine parses its
 /// lexical and vector clauses. `query_vectors` are added to its vector part
 /// (Issue #1366). `lexical_params` and `field_boosts` set the lexical options
-/// of a request that has a `query`.
+/// of a request that has a `query`; `field_boosts` and
+/// `lexical_params.min_score` are passed without one too, so that the engine
+/// rejects an out-of-range value (Issue #1540).
 #[allow(clippy::result_large_err)]
 pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, tonic::Status> {
     let mut builder = SearchRequestBuilder::new();
@@ -49,15 +51,21 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
         })
         .transpose()?;
 
+    // The boosts and the lexical min_score are passed even without a
+    // `query`, where they have no effect, so that the engine rejects an
+    // out-of-range value there too (Issue #1540), as an unknown sort order
+    // is rejected above. A vector-only search never reads them.
+    for (field, boost) in &proto.field_boosts {
+        builder = builder.add_field_boost(field.clone(), *boost);
+    }
+    if let Some(p) = &proto.lexical_params {
+        builder = builder.lexical_min_score(p.min_score);
+    }
+
     if !proto.query.is_empty() {
         builder = builder.query_dsl(proto.query.clone());
 
-        for (field, boost) in &proto.field_boosts {
-            builder = builder.add_field_boost(field.clone(), *boost);
-        }
-
         if let Some(p) = &proto.lexical_params {
-            builder = builder.lexical_min_score(p.min_score);
             if let Some(timeout_ms) = p.timeout_ms
                 && timeout_ms > 0
             {
@@ -107,7 +115,9 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
     }
     builder = builder.offset(proto.offset as usize);
 
-    // Fusion
+    // Fusion. The engine checks the RRF `k` and the weights (Issue #1540).
+    // proto3 sends an unset `k` as 0, which it accepts, and unset weights as
+    // 0 and 0, which it rejects.
     if let Some(fusion) = &proto.fusion
         && let Some(alg) = &fusion.algorithm
     {
@@ -445,7 +455,9 @@ fn token_vectors_from_json(json: &serde_json::Value) -> Result<v1::VectorArrayVa
 /// their keys is present and not `null` but not a number, or when neither or
 /// both are set. These used to fall back to the default (k 60, weights 0.5,
 /// or no `fusion`), and `rrf` won over `weighted_sum` (Issue #1524).
-/// `"rrf": null` is the same as omitting `rrf`.
+/// `"rrf": null` is the same as omitting `rrf`. A number of the right type
+/// but out of range, such as a negative `k`, is rejected by the engine
+/// (Issue #1540).
 pub fn fusion_algorithm_from_json(json: &serde_json::Value) -> Result<v1::FusionAlgorithm, String> {
     use v1::fusion_algorithm::Algorithm;
     let obj = json.as_object().ok_or("fusion must be an object")?;
@@ -487,7 +499,8 @@ pub fn fusion_algorithm_from_json(json: &serde_json::Value) -> Result<v1::Fusion
 ///
 /// Returns a message when `json` is not an object, or naming the field when
 /// its boost is not a number, such as `"2"`, which used to be dropped (Issue
-/// #1524).
+/// #1524). A negative or infinite boost is rejected by the engine (Issue
+/// #1540).
 pub fn field_boosts_from_json(json: &serde_json::Value) -> Result<HashMap<String, f32>, String> {
     json.as_object()
         .ok_or("field_boosts must be an object")?
@@ -1138,6 +1151,30 @@ mod tests {
         })
         .unwrap();
         assert_non_field_params(&with_vector_params);
+    }
+
+    /// Issue #1540: `field_boosts` and `lexical_params.min_score` reach the
+    /// engine without a `query` too, so that it can reject an out-of-range
+    /// value there, while the options only a lexical query uses stay unset.
+    #[test]
+    fn from_proto_passes_boosts_and_min_score_without_a_query() {
+        let request = from_proto(&v1::SearchRequest {
+            query_vectors: vec![query_vector(&[])],
+            lexical_params: Some(v1::LexicalParams {
+                min_score: f32::NAN,
+                timeout_ms: Some(5),
+                parallel: true,
+                ..Default::default()
+            }),
+            field_boosts: [("title".to_string(), -1.0)].into_iter().collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        let options = &request.lexical_options;
+        assert!(options.min_score.is_nan(), "{options:?}");
+        assert_eq!(options.field_boosts.get("title"), Some(&-1.0));
+        assert_eq!(options.timeout_ms, None);
+        assert!(!options.parallel);
     }
 
     /// Issue #1476: an unknown `SortOrder` is `INVALID_ARGUMENT` instead of

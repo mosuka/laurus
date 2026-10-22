@@ -611,7 +611,7 @@ With `group_by:`, `group_key` is the value the result's group shares (a String, 
 Laurus::RRF.new(k: 60.0)
 ```
 
-Reciprocal Rank Fusion. Merges lexical and vector result lists by rank position. `k` is a smoothing constant; higher values reduce the influence of top-ranked results.
+Reciprocal Rank Fusion. Merges lexical and vector result lists by rank position. `k` is a smoothing constant; higher values reduce the influence of top-ranked results. `k` must be finite and at least 0; the search raises `ArgumentError` otherwise (Issue #1540).
 
 ### WeightedSum
 
@@ -619,7 +619,7 @@ Reciprocal Rank Fusion. Merges lexical and vector result lists by rank position.
 Laurus::WeightedSum.new(lexical_weight: 0.5, vector_weight: 0.5)
 ```
 
-Normalises both score lists independently, then combines them as `lexical_weight * lexical_score + vector_weight * vector_score`.
+Normalises both score lists independently, then combines them as `lexical_weight * lexical_score + vector_weight * vector_score`. Each weight must be in `[0.0, 1.0]`, and at least one greater than 0; the search raises `ArgumentError` otherwise instead of clamping them (Issue #1540).
 
 ---
 

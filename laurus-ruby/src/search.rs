@@ -109,7 +109,8 @@ impl RbRRF {
     /// # Arguments
     ///
     /// * `args` - Keyword arguments:
-    ///   - `k:` (f64, default 60.0): RRF constant.
+    ///   - `k:` (f64, default 60.0): RRF constant. Must be finite and at
+    ///     least 0; the search raises `ArgumentError` otherwise.
     fn new(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
         let kwargs = get_kwargs::<_, (), (Option<f64>,), ()>(args.keywords, &[], &["k"])?;
@@ -141,6 +142,9 @@ impl RbWeightedSum {
     /// * `args` - Keyword arguments:
     ///   - `lexical_weight:` (f32, default 0.5): Weight for lexical scores.
     ///   - `vector_weight:` (f32, default 0.5): Weight for vector scores.
+    ///
+    /// Each weight must be in `[0.0, 1.0]`, and at least one greater than 0;
+    /// the search raises `ArgumentError` otherwise (weights are not clamped).
     fn new(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
         let kwargs = get_kwargs::<_, (), (Option<f32>, Option<f32>), ()>(

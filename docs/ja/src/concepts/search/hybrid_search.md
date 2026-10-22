@@ -100,7 +100,7 @@ Lexical と Vector の両方の結果が存在する場合、それらを単一�
 score(doc) = sum( 1 / (k + rank_i) )
 ```
 
-`rank_i` は各結果リストにおけるドキュメントの位置、`k` はスムージングパラメータ（デフォルト 60）です。
+`rank_i` は各結果リストにおけるドキュメントの位置（1 始まり）、`k` はスムージングパラメータ（デフォルト 60）です。`k` は有限で 0 以上でなければならず、それ以外の値は検索が `InvalidArgument` で拒否します（Issue #1540）。
 
 ```rust
 use laurus::FusionAlgorithm;
@@ -130,6 +130,8 @@ let fusion = FusionAlgorithm::WeightedSum {
     vector_weight: 0.7,
 };
 ```
+
+各スコアは、まずそれぞれの結果リストの中で min-max 正規化されます。各重みは `[0.0, 1.0]` の範囲で、少なくとも一方が 0 より大きくなければなりません。それ以外の重みは、丸めずに検索が `InvalidArgument` で拒否します（Issue #1540）。
 
 **使用場面:**
 

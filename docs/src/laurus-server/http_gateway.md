@@ -344,7 +344,11 @@ without a timeout (Issue #1490). Its `parallel` must be `true` or `false`;
 omitting it and `null` mean `false`. Anything else, such as `"true"` or `1`,
 is rejected with `400 Bad Request` instead of being read as `false`
 (Issue #1511). Its `min_score` must be a number; omitting it and `null`
-mean `0.0`, no threshold.
+mean `0.0`, no threshold. Lexical scores are never negative, so a negative
+`min_score` is the same as `0.0`. The gateway converts it to a 32-bit float,
+so a number beyond about `3.4e38`, such as `1e39`, becomes infinite and is
+rejected with `400 Bad Request`, also in a request without a `query`
+(Issue #1540); a server older than this fix returned no hits.
 
 The body must be a JSON object and `query` a string; omitting `query` or
 setting it to `null` means no query. Anything else is rejected with
@@ -395,6 +399,15 @@ object and each boost a number; a `null` boost is the same as leaving the
 field out. Anything else, such as `{"title": "2"}`, is rejected with
 `400 Bad Request` instead of being dropped (Issue #1524).
 
+A boost multiplies the field's scores, so it must be at least `0`; `0` keeps
+a match with a lexical score of `0`. The gateway converts each boost to a
+32-bit float, so a number beyond about `3.4e38` becomes infinite. A negative
+boost (`-0` included) or an infinite one is rejected with `400 Bad Request`
+(Issue #1540). Both the field and the boost are checked in a request without
+a `query` too. A server older than this fix hid the hits of a negative boost,
+returned a `null` score for a boost such as `1e39`, and ignored `field_boosts`
+in a request without a `query`.
+
 #### Hybrid Search
 
 ```bash
@@ -422,6 +435,15 @@ numbers default to the values shown when omitted or `null`. Omitting
 value of the wrong type such as `{"rrf": {"k": "1"}}`, is rejected with
 `400 Bad Request` (Issue #1524). A server older than this fix used the
 default instead, and `rrf` when both were set.
+
+`k` must be at least `0`: each result list adds `1 / (k + rank)`, `rank`
+starting at 1. Each weight must be between `0` and `1`, with at least one
+greater than `0`; the gateway converts the weights to 32-bit floats, so a
+positive weight too small for one, such as `1e-50`, becomes `0`. Any other
+value is rejected with `400 Bad Request`, even in a request with no hybrid
+part (Issue #1540).
+A server older than this fix clamped the weights into `[0, 1]` and returned
+`null` scores for a `k` such as `-1`.
 
 #### Search with Vector Parameters
 

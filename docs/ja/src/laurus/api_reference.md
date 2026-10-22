@@ -121,11 +121,11 @@ cargo doc --open
 | `.lexical_query(query)` | Lexical検索クエリを設定（`LexicalSearchQuery`） |
 | `.vector_query(query)` | Vector検索クエリを設定（`VectorSearchQuery`） |
 | `.filter_query(query)` | プレフィルタクエリを設定 |
-| `.fusion_algorithm(algo)` | フュージョンアルゴリズムを設定（デフォルト: RRF） |
+| `.fusion_algorithm(algo)` | フュージョンアルゴリズムを設定（デフォルト: RRF）。パラメータは渡した値のまま持ち、範囲外なら検索は `InvalidArgument` で失敗する（[FusionAlgorithm](#fusionalgorithm) を参照） |
 | `.limit(n)` | 最大結果数（デフォルト: 10） |
 | `.offset(n)` | N件スキップ（デフォルト: 0） |
-| `.add_field_boost(field, boost)` | Lexical検索のフィールドブーストを追加。`field` がスキーマの lexical フィールド（または `_id`）でなければ、検索は `InvalidArgument` で失敗する |
-| `.lexical_min_score(f32)` | Lexical検索の最小スコアしきい値 |
+| `.add_field_boost(field, boost)` | Lexical検索のフィールドブーストを追加。`field` がスキーマの lexical フィールド（または `_id`）でないとき、または `boost` が有限でないか `0` 未満（`-0.0` を含む）のとき、検索は `InvalidArgument` で失敗する |
+| `.lexical_min_score(f32)` | Lexical検索の最小スコアしきい値。有限でなければ、検索は `InvalidArgument` で失敗する |
 | `.lexical_timeout_ms(u64)` | Lexical検索のタイムアウト（ミリ秒） |
 | `.lexical_parallel(bool)` | Lexical検索の並列実行を有効化 |
 | `.sort_by(SortField)` | Lexical検索のソート順を設定 |
@@ -170,8 +170,10 @@ cargo doc --open
 
 | バリアント | 説明 |
 | :--- | :--- |
-| `RRF { k: f64 }` | Reciprocal Rank Fusion（デフォルト k=60.0） |
-| `WeightedSum { lexical_weight, vector_weight }` | スコアの線形結合 |
+| `RRF { k: f64 }` | Reciprocal Rank Fusion（デフォルト k=60.0）。`k` は有限で `0` 以上 |
+| `WeightedSum { lexical_weight, vector_weight }` | min-max 正規化したスコアの線形結合。各重みは `0.0..=1.0` で、少なくとも一方が `0` より大きい |
+
+`Engine::search` は、それ以外の値を、ハイブリッド部分のない要求でも `InvalidArgument` で拒否します（Issue #1540）。以前は重みを `0.0..=1.0` に丸めていました。
 
 ### RescoreOptions
 

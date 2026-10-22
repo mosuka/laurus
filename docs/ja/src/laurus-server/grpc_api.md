@@ -469,10 +469,10 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `query_vectors` | `repeated QueryVector` | いいえ | 埋め込み済みのクエリベクトル。`query` と一緒に送ると、そのベクトル部分に追加される。lexical 句だけの `query` はハイブリッド検索になる（Issue #1366） |
 | `limit` | `uint32` | いいえ | 最大結果件数（`0` はエンジンの既定値 10）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索は `INVALID_ARGUMENT` で拒否される（Issue #1367） |
 | `offset` | `uint32` | いいえ | スキップする結果件数。`limit` と合わせて `max_result_window` の対象になる |
-| `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム |
+| `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム。未指定なら `k` 60 の RRF。範囲外のパラメータ（[FusionAlgorithm](#fusionalgorithm) を参照）は、ハイブリッド部分のない要求でも `INVALID_ARGUMENT` で拒否される（Issue #1540） |
 | `lexical_params` | `LexicalParams` | いいえ | Lexical 検索パラメータ |
 | `vector_params` | `VectorParams` | いいえ | ベクトル検索パラメータ |
-| `field_boosts` | `map<string, float>` | いいえ | lexical 部分のフィールドごとのスコアブースト。キーはスキーマの lexical フィールド（または `_id`）でなければならず、未知のフィールドやベクトルフィールドは `INVALID_ARGUMENT` で拒否される（Issue #1374）。クエリで使っていない lexical フィールドは受け付けられ、効果は無い |
+| `field_boosts` | `map<string, float>` | いいえ | lexical 部分のフィールドごとのスコアブースト。キーはスキーマの lexical フィールド（または `_id`）でなければならず、未知のフィールドやベクトルフィールドは `INVALID_ARGUMENT` で拒否される（Issue #1374）。クエリで使っていない lexical フィールドは受け付けられ、効果は無い。各ブーストはそのフィールドのスコアに掛かり、有限で `0` 以上でなければならない（`-0` は拒否される）。`0` では一致した文書が lexical スコア `0` で残る。それ以外のブーストは `INVALID_ARGUMENT` で拒否される。フィールドとブーストは、`query` のない要求でも検査される（Issue #1540） |
 | `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
 | `rescore` | `RescoreParams` | いいえ | 1 段目の上位の結果を late interaction で再採点する（Issue #1351） |
 | `group_by` | `GroupByParams` | いいえ | 結果をフィールド値でグループ化する。指定すると `limit` と `offset` はグループの数を数える（Issue #1297） |
@@ -501,14 +501,16 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 以下の 2 つのオプションを持つ `oneof` です。
 
-- **RRF** (Reciprocal Rank Fusion): `k` パラメータ（デフォルト: 60）
-- **WeightedSum**: `lexical_weight` と `vector_weight`
+- **RRF** (Reciprocal Rank Fusion): 各結果リストが `1 / (k + rank)` を足します（`rank` は 1 始まり）。`k` は有限で `0` 以上でなければなりません。proto3 は未設定の `k` を 60 ではなく `0` として送ります。明示的に指定する（通常は 60）か、`fusion` を未設定にして `k` 60 を使ってください。
+- **WeightedSum**: min-max 正規化した lexical スコアとベクトルスコアに、それぞれ `lexical_weight` と `vector_weight` を掛けて足します。各重みは `[0, 1]` の範囲で、少なくとも一方が `0` より大きくなければなりません。未設定の重みは `0` なので、空の `WeightedSum` は拒否されます。
+
+それ以外の値は `INVALID_ARGUMENT` で拒否されます（Issue #1540）。以前は重みを `[0, 1]` に丸めていました。
 
 ### LexicalParams
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `min_score` | `float` | 最小スコア閾値 |
+| `min_score` | `float` | lexical スコアの下限。`0`（未設定）は閾値なし。lexical スコアは負にならないので、負の値も同じ。非有限値は、`query` のない要求でも `INVALID_ARGUMENT` で拒否される（Issue #1540） |
 | `timeout_ms` | `optional uint64` | 検索タイムアウト（ミリ秒）。未設定または `0` はタイムアウトなし |
 | `parallel` | `bool` | 並列検索を有効化 |
 | `sort_by` | `SortSpec` | スコアの代わりにフィールドでソート |

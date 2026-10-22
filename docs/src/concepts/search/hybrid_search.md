@@ -114,7 +114,7 @@ The default algorithm. Combines results based on their rank positions rather tha
 score(doc) = sum( 1 / (k + rank_i) )
 ```
 
-Where `rank_i` is the position of the document in each result list, and `k` is a smoothing parameter (default 60).
+Where `rank_i` is the position of the document in each result list, starting at 1, and `k` is a smoothing parameter (default 60). `k` must be finite and at least 0; the search rejects any other value with `InvalidArgument` (Issue #1540).
 
 ```rust
 use laurus::FusionAlgorithm;
@@ -144,6 +144,8 @@ let fusion = FusionAlgorithm::WeightedSum {
     vector_weight: 0.7,
 };
 ```
+
+Each score is min-max normalized within its own result list first. Each weight must be in `[0.0, 1.0]`, and at least one greater than 0; the search rejects any other weights with `InvalidArgument` instead of clamping them (Issue #1540).
 
 **When to use:**
 

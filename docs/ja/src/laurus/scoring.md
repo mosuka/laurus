@@ -41,6 +41,8 @@ let request = SearchRequestBuilder::new()
 
 ブーストはそのフィールドにマッチした BM25 スコア寄与に乗算されます。`1.0` は無効化と同じです。クエリで指定されたフィールド（またはスキーマの既定検索フィールド）にのみ適用されます。例外は `CombinedFields` の[マルチフィールドクエリ](#マルチフィールドクエリ)で、ブーストはスコアの乗数ではなく、BM25F の内側の重みになります。
 
+ブーストは有限で `0` 以上でなければなりません（Lucene と同じく `-0.0` は拒否されます）。`Engine::search` は、それ以外のブーストを `InvalidArgument` で拒否します（Issue #1540）。以前は、負のブーストでスコアが負になり、そのヒットが消えていました。ブースト `0` では、一致した文書が lexical スコア `0` で残ります。ただし `CombinedFields` のマルチフィールドクエリは、今どおりブースト `0` を拒否します。ハイブリッド検索では、そのヒットも[フュージョン](#ハイブリッド検索フュージョン)に加わります。RRF は順位を付け、`WeightedSum` はスコアがすべて等しいリストを `1.0` に正規化します。
+
 gRPC / HTTP 経由では同じ設定が `SearchRequest.field_boosts`（`map<string, float>`）として公開されます。[gRPC API → SearchRequest](../laurus-server/grpc_api.md#searchrequest-fields) を参照してください。
 
 ### マルチフィールドクエリ
@@ -101,14 +103,14 @@ RRF は生のスコアではなく**ランク**を統合することでスコア
 rrf_score(doc) = Σ 1 / (k + rank_i(doc))
 ```
 
-合計はドキュメントが含まれる各結果リストにわたって取ります。`k` パラメータ（デフォルト **60.0**）は分布を平滑化します — 値が大きいほど上位ランクの結果の貢献が薄まります。
+合計はドキュメントが含まれる各結果リストにわたって取ります（`rank_i` は 1 始まり）。`k` パラメータ（デフォルト **60.0**）は分布を平滑化します — 値が大きいほど上位ランクの結果の貢献が薄まります。各項が `(0, 1]` に収まるように、`k` は有限で `0` 以上でなければなりません。`Engine::search` は、それ以外の `k` を `InvalidArgument` で拒否します（Issue #1540）。
 
 ```rust
 use laurus::{FusionAlgorithm, SearchRequestBuilder};
 
 let request = SearchRequestBuilder::new()
     .query_dsl("title:rust text_vec:\"systems programming\"")
-    .fusion_algorithm(FusionAlgorithm::Rrf { k: 60.0 })
+    .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
     .build();
 ```
 
@@ -134,7 +136,7 @@ let request = SearchRequestBuilder::new()
     .build();
 ```
 
-両方の重みは `[0.0, 1.0]` にクランプされます。特定の重みを設定する理由がない場合は RRF を選んでください — パラメータが少なく、リスト間のスケール差にも頑健です。
+スコアがすべて等しいリストは `1.0` に正規化されます。重みを掛けたスコアはそのまま足し、重みの合計では割りません。各重みは `[0.0, 1.0]` の範囲で、少なくとも一方が `0` より大きくなければなりません。`Engine::search` は、それ以外の重みを `InvalidArgument` で拒否します（Issue #1540）。以前は `[0.0, 1.0]` にクランプしていました。順位を変えるのは重みの比だけなので、この範囲でどの比も表せます。特定の重みを設定する理由がない場合は RRF を選んでください — パラメータが少なく、リスト間のスケール差にも頑健です。
 
 ## 関連項目
 

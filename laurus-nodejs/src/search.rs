@@ -174,6 +174,7 @@ impl JsRRF {
     /// # Arguments
     ///
     /// * `k` - The RRF parameter (default 60.0). Higher values reduce the impact of rank differences.
+    ///   Must be finite and at least 0; the search throws an `InvalidArg` error otherwise.
     #[napi(constructor)]
     pub fn new(k: Option<f64>) -> Self {
         Self {
@@ -204,6 +205,9 @@ impl JsWeightedSum {
     ///
     /// * `lexical_weight` - Weight for lexical search scores (default 0.5).
     /// * `vector_weight` - Weight for vector search scores (default 0.5).
+    ///
+    /// Each weight must be in `[0, 1]`, and at least one greater than 0; the
+    /// search throws an `InvalidArg` error otherwise (weights are not clamped).
     #[napi(constructor)]
     pub fn new(lexical_weight: Option<f64>, vector_weight: Option<f64>) -> Self {
         Self {
