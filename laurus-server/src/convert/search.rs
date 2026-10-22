@@ -15,6 +15,10 @@ use laurus::{
 };
 
 use crate::convert::document;
+use crate::convert::json::{
+    json_optional_bool, json_optional_f64, json_optional_object, json_optional_str,
+    json_optional_string_array, json_optional_u32, json_optional_u64, json_to_string_array,
+};
 use crate::proto::laurus::v1;
 
 /// Build a laurus SearchRequest from a proto SearchRequest.
@@ -426,6 +430,144 @@ fn token_vectors_from_json(json: &serde_json::Value) -> Result<v1::VectorArrayVa
         dimension: dimension as u32,
         values,
     })
+}
+
+/// Parse the JSON form of [`v1::FusionAlgorithm`], shared by the HTTP
+/// gateway's `POST /v1/search` and the MCP `search` tool (Issue #1523):
+/// exactly one of `{"rrf": {"k": 60}}` and `{"weighted_sum":
+/// {"lexical_weight": 0.5, "vector_weight": 0.5}}`, whose numbers default to
+/// the values shown.
+///
+/// # Errors
+///
+/// Returns a message when `json` is not an object, when `rrf` or
+/// `weighted_sum` is present and not `null` but not an object, when one of
+/// their keys is present and not `null` but not a number, or when neither or
+/// both are set. These used to fall back to the default (k 60, weights 0.5,
+/// or no `fusion`), and `rrf` won over `weighted_sum` (Issue #1524).
+/// `"rrf": null` is the same as omitting `rrf`.
+pub fn fusion_algorithm_from_json(json: &serde_json::Value) -> Result<v1::FusionAlgorithm, String> {
+    use v1::fusion_algorithm::Algorithm;
+    let obj = json.as_object().ok_or("fusion must be an object")?;
+    let error = |message: String| format!("fusion: {message}");
+    let rrf = json_optional_object(obj, "rrf").map_err(error)?;
+    let weighted_sum = json_optional_object(obj, "weighted_sum").map_err(error)?;
+    let algorithm = match (rrf, weighted_sum) {
+        (Some(rrf), None) => {
+            let k = json_optional_f64(rrf, "k")
+                .map_err(|e| error(format!("rrf: {e}")))?
+                .unwrap_or(60.0);
+            Algorithm::Rrf(v1::Rrf { k })
+        }
+        (None, Some(ws)) => {
+            let weight = |key: &str| {
+                json_optional_f64(ws, key)
+                    .map(|w| w.unwrap_or(0.5) as f32)
+                    .map_err(|e| error(format!("weighted_sum: {e}")))
+            };
+            Algorithm::WeightedSum(v1::WeightedSum {
+                lexical_weight: weight("lexical_weight")?,
+                vector_weight: weight("vector_weight")?,
+            })
+        }
+        _ => {
+            return Err("fusion must have exactly one of \"rrf\" and \"weighted_sum\"".to_string());
+        }
+    };
+    Ok(v1::FusionAlgorithm {
+        algorithm: Some(algorithm),
+    })
+}
+
+/// Parse the JSON form of the field boosts (`{"title": 2.0}`), shared by the
+/// HTTP gateway's `POST /v1/search` and the MCP `search` tool (Issue #1523).
+/// A `null` boost is the same as omitting the field.
+///
+/// # Errors
+///
+/// Returns a message when `json` is not an object, or naming the field when
+/// its boost is not a number, such as `"2"`, which used to be dropped (Issue
+/// #1524).
+pub fn field_boosts_from_json(json: &serde_json::Value) -> Result<HashMap<String, f32>, String> {
+    json.as_object()
+        .ok_or("field_boosts must be an object")?
+        .iter()
+        .filter(|(_, boost)| !boost.is_null())
+        .map(|(field, boost)| {
+            boost
+                .as_f64()
+                .map(|boost| (field.clone(), boost as f32))
+                .ok_or_else(|| format!("field_boosts: \"{field}\" must be a number"))
+        })
+        .collect()
+}
+
+/// Parse the JSON form of [`v1::HighlightParams`], shared by the HTTP
+/// gateway's `POST /v1/search` and the MCP search tools (Issues #1134,
+/// #1523). Accepts either the array shorthand (just a field list) —
+/// `["title", "body"]` — or the full object form —
+/// `{"fields": ["body"], "max_fragments": 2, "tag": "em", ...}`. Returns
+/// `Ok(None)` for `null` and for an empty field list (`[]`, `{}` or
+/// `{"fields": []}`), which the gateway treats the same as an absent
+/// `highlight` key and the MCP tools reject; [`from_proto`] rejects an
+/// explicitly empty field list, but these have the right types and request
+/// nothing.
+///
+/// # Errors
+///
+/// Returns an error when `json` is neither an array of strings nor an
+/// object, when `fields` is present and not `null` but not an array of
+/// strings, or `tag` or `css_class` not a string, instead of dropping the
+/// value (Issue #1524), when `max_fragments` or `fragment_size` is present
+/// and not `null` but not an integer that fits `u32`, or
+/// `max_analyzed_chars` one that fits `u64`, instead of using the default or
+/// wrapping (Issue #1490), or when `require_field_match` or
+/// `return_entire_field_if_no_highlight` is present and not `null` but not
+/// `true` or `false`, instead of using the default (Issue #1511). Every key
+/// is checked even when the field list is empty.
+pub fn highlight_params_from_json(
+    json: &serde_json::Value,
+) -> Result<Option<v1::HighlightParams>, String> {
+    use serde_json::Value;
+
+    const SHAPE: &str = "highlight must be an array of strings or an object";
+    let obj = match json {
+        Value::Null => return Ok(None),
+        Value::Array(_) => {
+            let fields = json_to_string_array(json).ok_or_else(|| SHAPE.to_string())?;
+            return Ok((!fields.is_empty()).then(|| v1::HighlightParams {
+                fields,
+                ..Default::default()
+            }));
+        }
+        Value::Object(obj) => obj,
+        _ => return Err(SHAPE.to_string()),
+    };
+    let error = |message: String| format!("highlight: {message}");
+    let fields = json_optional_string_array(obj, "fields")
+        .map_err(error)?
+        .unwrap_or_default();
+    let max_fragments = json_optional_u32(obj, "max_fragments").map_err(error)?;
+    let fragment_size = json_optional_u32(obj, "fragment_size").map_err(error)?;
+    let tag = json_optional_str(obj, "tag").map_err(error)?;
+    let css_class = json_optional_str(obj, "css_class").map_err(error)?;
+    let max_analyzed_chars = json_optional_u64(obj, "max_analyzed_chars").map_err(error)?;
+    let require_field_match = json_optional_bool(obj, "require_field_match").map_err(error)?;
+    let return_entire_field_if_no_highlight =
+        json_optional_bool(obj, "return_entire_field_if_no_highlight").map_err(error)?;
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(v1::HighlightParams {
+        fields,
+        max_fragments,
+        fragment_size,
+        tag: tag.map(str::to_string),
+        css_class: css_class.map(str::to_string),
+        require_field_match,
+        max_analyzed_chars,
+        return_entire_field_if_no_highlight,
+    }))
 }
 
 /// Whether `params` sets any field beyond `fields`, i.e. whether a

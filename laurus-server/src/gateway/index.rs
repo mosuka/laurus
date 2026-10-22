@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::GatewayState;
 use super::convert;
 use super::error::{BadRequest, GatewayError};
+use crate::convert::json::json_optional_bool;
 use crate::proto::laurus::v1;
 
 /// `POST /v1/index` — Creates a new index.
@@ -158,7 +159,7 @@ pub async fn update_field(
     // Anything but `true`, `false` or `null` is a 400 rather than `false`,
     // so `"dry_run": "true"` cannot apply the change (Issue #1511).
     let flag = |key: &str| {
-        convert::json_optional_bool(body, key)
+        json_optional_bool(body, key)
             .map(Option::unwrap_or_default)
             .map_err(|e| BadRequest(e).into_response())
     };

@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::convert::document::to_proto;
+use crate::convert::json::{
+    json_optional_array, json_optional_bool, json_optional_f64, json_optional_object,
+    json_optional_str, json_optional_string_array, json_optional_u32, json_optional_u64,
+};
 use crate::proto::laurus::v1;
 
 // ---------------------------------------------------------------------------
@@ -1243,11 +1247,14 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
     let offset = page_value("offset", 0)?;
 
     // A malformed `fusion`, `lexical_params`, `field_boosts` or `highlight`
-    // is rejected (400) rather than dropped: see `json_to_fusion_algorithm`,
-    // `json_to_lexical_params`, `json_to_field_boosts` and
-    // `json_to_highlight_params` (Issues #1490, #1511, #1524).
-    let fusion = json_optional_object(json, "fusion")?
-        .map(json_to_fusion_algorithm)
+    // is rejected (400) rather than dropped: see `fusion_algorithm_from_json`,
+    // `json_to_lexical_params`, `field_boosts_from_json` and
+    // `highlight_params_from_json` (Issues #1490, #1511, #1524). The MCP
+    // search tools share the three `*_from_json` parsers (Issue #1523).
+    let fusion = json
+        .get("fusion")
+        .filter(|v| !v.is_null())
+        .map(crate::convert::search::fusion_algorithm_from_json)
         .transpose()?;
     let lexical_params = json_optional_object(json, "lexical_params")?
         .map(json_to_lexical_params)
@@ -1260,14 +1267,16 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         .map(json_to_vector_params)
         .transpose()?;
 
-    let field_boosts = json_optional_object(json, "field_boosts")?
-        .map(json_to_field_boosts)
+    let field_boosts = json
+        .get("field_boosts")
+        .filter(|v| !v.is_null())
+        .map(crate::convert::search::field_boosts_from_json)
         .transpose()?
         .unwrap_or_default();
 
     let highlight = json
         .get("highlight")
-        .map(json_to_highlight_params)
+        .map(crate::convert::search::highlight_params_from_json)
         .transpose()?
         .flatten();
 
@@ -1338,50 +1347,6 @@ fn json_to_query_vector(json: &Value) -> Result<v1::QueryVector, String> {
     })
 }
 
-/// Converts a JSON `fusion` object to proto `FusionAlgorithm`: exactly one
-/// of `{"rrf": {"k": 60}}` and `{"weighted_sum": {"lexical_weight": 0.5,
-/// "vector_weight": 0.5}}`, whose numbers default to the values shown.
-///
-/// # Errors
-///
-/// Returns a message for HTTP 400 when `rrf` or `weighted_sum` is present
-/// and not `null` but not an object, when one of their keys is present and
-/// not `null` but not a number, or when neither or both are set. These used
-/// to fall back to the default (k 60, weights 0.5, or no `fusion`), and
-/// `rrf` won over `weighted_sum` (Issue #1524). `"rrf": null` is the same
-/// as omitting `rrf`.
-fn json_to_fusion_algorithm(obj: &Map<String, Value>) -> Result<v1::FusionAlgorithm, String> {
-    use v1::fusion_algorithm::Algorithm;
-    let error = |message: String| format!("fusion: {message}");
-    let rrf = json_optional_object(obj, "rrf").map_err(error)?;
-    let weighted_sum = json_optional_object(obj, "weighted_sum").map_err(error)?;
-    let algorithm = match (rrf, weighted_sum) {
-        (Some(rrf), None) => {
-            let k = json_optional_f64(rrf, "k")
-                .map_err(|e| error(format!("rrf: {e}")))?
-                .unwrap_or(60.0);
-            Algorithm::Rrf(v1::Rrf { k })
-        }
-        (None, Some(ws)) => {
-            let weight = |key: &str| {
-                json_optional_f64(ws, key)
-                    .map(|w| w.unwrap_or(0.5) as f32)
-                    .map_err(|e| error(format!("weighted_sum: {e}")))
-            };
-            Algorithm::WeightedSum(v1::WeightedSum {
-                lexical_weight: weight("lexical_weight")?,
-                vector_weight: weight("vector_weight")?,
-            })
-        }
-        _ => {
-            return Err("fusion must have exactly one of \"rrf\" and \"weighted_sum\"".to_string());
-        }
-    };
-    Ok(v1::FusionAlgorithm {
-        algorithm: Some(algorithm),
-    })
-}
-
 /// Converts a JSON `lexical_params` object to proto `LexicalParams`.
 ///
 /// # Errors
@@ -1447,200 +1412,6 @@ fn json_to_sort_spec(obj: &Map<String, Value>) -> Result<v1::SortSpec, String> {
     })
 }
 
-/// Converts a JSON `field_boosts` object (`{"title": 2.0}`) to the proto
-/// map. A `null` boost is the same as omitting the field.
-///
-/// # Errors
-///
-/// Returns an error naming the field when its boost is not a number, such
-/// as `"2"`, which used to be dropped (Issue #1524).
-fn json_to_field_boosts(obj: &Map<String, Value>) -> Result<HashMap<String, f32>, String> {
-    obj.iter()
-        .filter(|(_, boost)| !boost.is_null())
-        .map(|(field, boost)| {
-            boost
-                .as_f64()
-                .map(|boost| (field.clone(), boost as f32))
-                .ok_or_else(|| format!("field_boosts: \"{field}\" must be a number"))
-        })
-        .collect()
-}
-
-/// Parse a JSON integer that must fit `u32`, naming `key` in the error, so
-/// an out-of-range or mistyped value is rejected rather than wrapped or
-/// replaced by a default.
-fn json_to_u32(value: &Value, key: &str) -> Result<u32, String> {
-    value
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u32::MAX))
-}
-
-/// Read the optional integer `key` of `obj`, which must fit `u32` when
-/// present.
-///
-/// A missing key and `null` are `None`, so the caller can leave the value
-/// unset for the engine's default (Issue #1479) instead of reading it as 0.
-///
-/// This and the other `json_optional_*` helpers take an object rather than
-/// a [`Value`], so a caller must check that the value holding `key` is an
-/// object first: [`Value::get`] answers `None` for anything else, which
-/// read a field option such as `{"text": 1}` as all defaults (Issue #1524).
-///
-/// # Errors
-///
-/// Returns an error when the value is present and not `null` but fails
-/// [`json_to_u32`] (`16.0`, `"16"`, `-1`, `4294967296`).
-fn json_optional_u32(obj: &Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => json_to_u32(value, key).map(Some),
-    }
-}
-
-/// Parse a JSON integer that must fit `u64`, naming `key` in the error, the
-/// `uint64` counterpart of [`json_to_u32`] (Issue #1490).
-fn json_to_u64(value: &Value, key: &str) -> Result<u64, String> {
-    value
-        .as_u64()
-        .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u64::MAX))
-}
-
-/// Read the optional integer `key` of `obj`, which must fit `u64` when
-/// present; the `uint64` counterpart of [`json_optional_u32`] (Issue
-/// #1490).
-///
-/// # Errors
-///
-/// Returns an error when the value is present and not `null` but fails
-/// [`json_to_u64`] (`500.0`, `"500"`, `-1`, `18446744073709551616`).
-fn json_optional_u64(obj: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => json_to_u64(value, key).map(Some),
-    }
-}
-
-/// Read the optional boolean `key` of `obj`, the boolean counterpart of
-/// [`json_optional_u32`] (Issue #1511).
-///
-/// A missing key and `null` are `None`, so the caller decides what an
-/// omitted key means: `false` for a plain proto `bool`, or the engine's
-/// default for an `optional bool`.
-///
-/// # Errors
-///
-/// Returns an error naming `key` when the value is present and not `null`
-/// but not `true` or `false` (`"true"`, `1`), instead of reading it as
-/// omitted, which made `"dry_run": "true"` apply a field change.
-pub fn json_optional_bool(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Bool(b)) => Ok(Some(*b)),
-        Some(_) => Err(format!("{key} must be true or false")),
-    }
-}
-
-/// Read the optional number `key` of `obj`, the number counterpart of
-/// [`json_optional_u32`] (Issue #1524).
-///
-/// # Errors
-///
-/// Returns an error naming `key` when the value is present and not `null`
-/// but not a number (`"2"`, `[2]`), instead of reading it as omitted.
-fn json_optional_f64(obj: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_f64()
-            .map(Some)
-            .ok_or_else(|| format!("{key} must be a number")),
-    }
-}
-
-/// Read the optional string `key` of `obj`, the string counterpart of
-/// [`json_optional_u32`] (Issue #1524).
-///
-/// # Errors
-///
-/// Returns an error naming `key` when the value is present and not `null`
-/// but not a string (`1`, `["a"]`), instead of reading it as omitted.
-fn json_optional_str<'a>(
-    obj: &'a Map<String, Value>,
-    key: &str,
-) -> Result<Option<&'a str>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s)),
-        Some(_) => Err(format!("{key} must be a string")),
-    }
-}
-
-/// Read the optional object `key` of `obj`, the object counterpart of
-/// [`json_optional_u32`] (Issue #1524).
-///
-/// # Errors
-///
-/// Returns an error naming `key` when the value is present and not `null`
-/// but not an object (`5`, `"x"`, `[]`), instead of reading it as omitted.
-fn json_optional_object<'a>(
-    obj: &'a Map<String, Value>,
-    key: &str,
-) -> Result<Option<&'a Map<String, Value>>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(map)) => Ok(Some(map)),
-        Some(_) => Err(format!("{key} must be an object")),
-    }
-}
-
-/// Read the optional array `key` of `obj`, the array counterpart of
-/// [`json_optional_u32`] (Issue #1524). The caller reads the items.
-///
-/// # Errors
-///
-/// Returns an error naming `key` when the value is present and not `null`
-/// but not an array (`"lowercase"`, `{}`), instead of reading it as omitted.
-fn json_optional_array<'a>(
-    obj: &'a Map<String, Value>,
-    key: &str,
-) -> Result<Option<&'a Vec<Value>>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(items)) => Ok(Some(items)),
-        Some(_) => Err(format!("{key} must be an array")),
-    }
-}
-
-/// Read the optional array of strings `key` of `obj` (Issue #1524).
-///
-/// # Errors
-///
-/// Returns an error naming `key` when the value is present and not `null`
-/// but not an array, or has an item that is not a string (`[1, "title"]`),
-/// instead of reading it as omitted or dropping the item.
-fn json_optional_string_array(
-    obj: &Map<String, Value>,
-    key: &str,
-) -> Result<Option<Vec<String>>, String> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => json_to_string_array(value)
-            .map(Some)
-            .ok_or_else(|| format!("{key} must be an array of strings")),
-    }
-}
-
-/// The strings of `value`, or `None` when it is not an array or has an item
-/// that is not a string.
-fn json_to_string_array(value: &Value) -> Option<Vec<String>> {
-    value
-        .as_array()?
-        .iter()
-        .map(|item| item.as_str().map(str::to_string))
-        .collect()
-}
-
 /// Converts a JSON `vector_params` object to proto `VectorParams`.
 ///
 /// A key that is absent or `null` keeps its proto default. A key with the
@@ -1692,70 +1463,6 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
         rerank_factor: uint32("rerank_factor")?,
         ef_search: uint32("ef_search")?,
     })
-}
-
-/// Converts a JSON `highlight` value to proto `HighlightParams` (Issue
-/// #1134). Accepts either the array shorthand (just a field list) —
-/// `["title", "body"]` — or the full object form —
-/// `{"fields": ["body"], "max_fragments": 2, "tag": "em", ...}`. Returns
-/// `Ok(None)` for `null` and for an empty field list (`[]`, `{}` or
-/// `{"fields": []}`), which `json_to_proto_search_request` treats the same
-/// as an absent `highlight` key; `from_proto` rejects an explicitly empty
-/// field list, but these have the right types and request nothing.
-///
-/// # Errors
-///
-/// Returns an error when `json` is neither an array of strings nor an
-/// object, when `fields` is present and not `null` but not an array of
-/// strings, or `tag` or `css_class` not a string, instead of dropping the
-/// value (Issue #1524), when `max_fragments` or `fragment_size` is present
-/// and not `null` but not an integer that fits `u32`, or
-/// `max_analyzed_chars` one that fits `u64`, instead of using the default or
-/// wrapping (Issue #1490; see [`json_optional_u32`] and
-/// [`json_optional_u64`]), or when `require_field_match` or
-/// `return_entire_field_if_no_highlight` is present and not `null` but not
-/// `true` or `false`, instead of using the default (Issue #1511; see
-/// [`json_optional_bool`]). Every key is checked even when the field list
-/// is empty.
-fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>, String> {
-    const SHAPE: &str = "highlight must be an array of strings or an object";
-    let obj = match json {
-        Value::Null => return Ok(None),
-        Value::Array(_) => {
-            let fields = json_to_string_array(json).ok_or_else(|| SHAPE.to_string())?;
-            return Ok((!fields.is_empty()).then(|| v1::HighlightParams {
-                fields,
-                ..Default::default()
-            }));
-        }
-        Value::Object(obj) => obj,
-        _ => return Err(SHAPE.to_string()),
-    };
-    let error = |message: String| format!("highlight: {message}");
-    let fields = json_optional_string_array(obj, "fields")
-        .map_err(error)?
-        .unwrap_or_default();
-    let max_fragments = json_optional_u32(obj, "max_fragments").map_err(error)?;
-    let fragment_size = json_optional_u32(obj, "fragment_size").map_err(error)?;
-    let tag = json_optional_str(obj, "tag").map_err(error)?;
-    let css_class = json_optional_str(obj, "css_class").map_err(error)?;
-    let max_analyzed_chars = json_optional_u64(obj, "max_analyzed_chars").map_err(error)?;
-    let require_field_match = json_optional_bool(obj, "require_field_match").map_err(error)?;
-    let return_entire_field_if_no_highlight =
-        json_optional_bool(obj, "return_entire_field_if_no_highlight").map_err(error)?;
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(v1::HighlightParams {
-        fields,
-        max_fragments,
-        fragment_size,
-        tag: tag.map(str::to_string),
-        css_class: css_class.map(str::to_string),
-        require_field_match,
-        max_analyzed_chars,
-        return_entire_field_if_no_highlight,
-    }))
 }
 
 /// Converts a proto `SearchResult` to a JSON value: `{"id", "score",
