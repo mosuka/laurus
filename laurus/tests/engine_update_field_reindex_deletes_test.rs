@@ -6,15 +6,26 @@
 //! deletion bitmap on storage, so a delete made since the last commit was
 //! not in it: the merge kept the deleted document, and the next commit
 //! persisted the bitmap without it and truncated the delete's WAL record.
+//!
+//! Issue #1538: a Reindex whose merge has published succeeds, even when a
+//! cleanup step after the merge fails.
+
+#[path = "common/log_capture.rs"]
+mod log_capture;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
 use laurus::DistanceMetric;
 use laurus::storage::file::FileStorageConfig;
+use laurus::storage::{FileMetadata, LoadingMode, StorageInput, StorageOutput};
 use laurus::storage::{Storage, StorageConfig, StorageFactory};
 use laurus::vector::{FlatOption, HnswOption, IvfOption, Vector};
 use laurus::{DataValue, Document, Engine, QuantizationMethod, UpdateFieldOptions};
 use laurus::{FieldOption, QueryVector, Schema, SearchRequestBuilder, VectorSearchQuery};
+use laurus::{LaurusError, Result};
 
 const DIM: usize = 24;
 const FIELD: &str = "embedding";
@@ -96,7 +107,7 @@ async fn put(engine: &Engine, id: u64, values: Vec<f32>) {
 }
 
 /// The ids and scores of the top `limit` hits for `query`.
-async fn search(engine: &Engine, query: Vec<f32>, limit: usize) -> Vec<(String, f32)> {
+async fn try_search(engine: &Engine, query: Vec<f32>, limit: usize) -> Result<Vec<(String, f32)>> {
     let request = SearchRequestBuilder::new()
         .vector_query(VectorSearchQuery::Vectors(vec![QueryVector {
             vector: Vector::new(query),
@@ -105,13 +116,17 @@ async fn search(engine: &Engine, query: Vec<f32>, limit: usize) -> Vec<(String, 
         }]))
         .limit(limit)
         .build();
-    engine
+    Ok(engine
         .search(request)
-        .await
-        .unwrap()
+        .await?
         .into_iter()
         .map(|r| (r.id, r.score))
-        .collect()
+        .collect())
+}
+
+/// [`try_search`], panicking on an error.
+async fn search(engine: &Engine, query: Vec<f32>, limit: usize) -> Vec<(String, f32)> {
+    try_search(engine, query, limit).await.unwrap()
 }
 
 fn reindex() -> UpdateFieldOptions {
@@ -122,15 +137,21 @@ fn reindex() -> UpdateFieldOptions {
 }
 
 /// Record in `failures` when `DELETED` is found, even by its own values,
-/// or when another document no longer is.
+/// when another document no longer is, or when a search fails.
 async fn check_deleted(engine: &Engine, what: &str, failures: &mut Vec<String>) {
-    let hits = search(engine, values(DELETED), DOCS as usize).await;
-    if hits.iter().any(|(id, _)| id == &DELETED.to_string()) {
-        failures.push(format!("{what}: deleted doc {DELETED} came back"));
+    match try_search(engine, values(DELETED), DOCS as usize).await {
+        Ok(hits) if hits.iter().any(|(id, _)| id == &DELETED.to_string()) => {
+            failures.push(format!("{what}: deleted doc {DELETED} came back"));
+        }
+        Ok(_) => {}
+        Err(e) => failures.push(format!("{what}: the search failed: {e}")),
     }
-    let hits = search(engine, values(1), 1).await;
-    if hits.first().map(|h| h.0.as_str()) != Some("1") {
-        failures.push(format!("{what}: doc 1 is not found: {hits:?}"));
+    match try_search(engine, values(1), 1).await {
+        Ok(hits) if hits.first().map(|h| h.0.as_str()) != Some("1") => {
+            failures.push(format!("{what}: doc 1 is not found: {hits:?}"));
+        }
+        Ok(_) => {}
+        Err(e) => failures.push(format!("{what}: the search failed: {e}")),
     }
 }
 
@@ -231,6 +252,146 @@ async fn an_upsert_since_the_last_commit_survives_a_reindex() {
         drop(engine);
         let engine = Engine::new(open_storage(&dir), schema).await.unwrap();
         check_updated(&engine, &format!("{kind}: after a reopen"), &mut failures).await;
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A [`Storage`] over `inner` that fails the first `delete_file` of a
+/// vector `.delmap` once armed, and counts that failure. The lexical store
+/// has `.delmap` files too.
+#[derive(Debug)]
+struct FailingDelmapDelete {
+    inner: Arc<dyn Storage>,
+    armed: AtomicBool,
+    fired: AtomicUsize,
+}
+
+impl Storage for FailingDelmapDelete {
+    fn loading_mode(&self) -> LoadingMode {
+        self.inner.loading_mode()
+    }
+    fn open_input(&self, name: &str) -> Result<Box<dyn StorageInput>> {
+        self.inner.open_input(name)
+    }
+    fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+        self.inner.create_output(name)
+    }
+    fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+        self.inner.create_output_append(name)
+    }
+    fn file_exists(&self, name: &str) -> bool {
+        self.inner.file_exists(name)
+    }
+    fn delete_file(&self, name: &str) -> Result<()> {
+        if name.starts_with("vector/")
+            && name.ends_with(".delmap")
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            return Err(LaurusError::storage(format!(
+                "injected failure deleting {name}"
+            )));
+        }
+        self.inner.delete_file(name)
+    }
+    fn list_files(&self) -> Result<Vec<String>> {
+        self.inner.list_files()
+    }
+    fn file_size(&self, name: &str) -> Result<u64> {
+        self.inner.file_size(name)
+    }
+    fn metadata(&self, name: &str) -> Result<FileMetadata> {
+        self.inner.metadata(name)
+    }
+    fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.inner.rename_file(old_name, new_name)
+    }
+    fn create_temp_output(&self, prefix: &str) -> Result<(String, Box<dyn StorageOutput>)> {
+        self.inner.create_temp_output(prefix)
+    }
+    fn sync(&self) -> Result<()> {
+        self.inner.sync()
+    }
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// How many warnings say that `FIELD` was rebuilt although a later step
+/// failed.
+fn rebuilt_field_warnings() -> usize {
+    let prefix = format!("vector field '{FIELD}' was rebuilt");
+    log_capture::warnings()
+        .iter()
+        .filter(|(_, message)| message.starts_with(&prefix))
+        .count()
+}
+
+/// Issue #1538: a Reindex whose merge has published succeeds, and the field
+/// uses the rebuilt segments, when forgetting the deletion marks of the
+/// documents the merge dropped fails afterwards. The schema then holds the
+/// new option, and the deleted document stays deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reindex_succeeds_once_its_merge_published() {
+    log_capture::install();
+    let mut failures = Vec::new();
+    for (kind, before, after) in cases() {
+        let dir = TempDir::new().unwrap();
+        let failing = Arc::new(FailingDelmapDelete {
+            inner: open_storage(&dir),
+            armed: AtomicBool::new(false),
+            fired: AtomicUsize::new(0),
+        });
+        let schema = Schema::builder().add_field(FIELD, before).build();
+        let engine = Engine::new(failing.clone(), schema).await.unwrap();
+        for id in 0..DOCS {
+            put(&engine, id, values(id)).await;
+        }
+        engine.commit().await.unwrap();
+        engine.delete_documents(&DELETED.to_string()).await.unwrap();
+
+        let warned = rebuilt_field_warnings();
+        failing.armed.store(true, Ordering::SeqCst);
+        let updated = engine.update_field(FIELD, after.clone(), reindex()).await;
+        failing.armed.store(false, Ordering::SeqCst);
+        if let Err(e) = updated {
+            failures.push(format!("{kind}: the reindex failed: {e}"));
+        }
+        if failing.fired.load(Ordering::SeqCst) == 0 {
+            failures.push(format!("{kind}: the injected failure was not hit"));
+        }
+        if rebuilt_field_warnings() == warned {
+            failures.push(format!("{kind}: no warning names the rebuilt field"));
+        }
+        let held = format!("{:?}", engine.schema().fields.get(FIELD));
+        if held != format!("{:?}", Some(&after)) {
+            failures.push(format!("{kind}: the schema holds {held}"));
+        }
+        check_deleted(
+            &engine,
+            &format!("{kind}: after the reindex"),
+            &mut failures,
+        )
+        .await;
+
+        if let Err(e) = engine.commit().await {
+            failures.push(format!("{kind}: the next commit failed: {e}"));
+        }
+        check_deleted(
+            &engine,
+            &format!("{kind}: after the next commit"),
+            &mut failures,
+        )
+        .await;
+
+        let schema = engine.schema();
+        drop(engine);
+        match Engine::new(open_storage(&dir), schema).await {
+            Ok(engine) => {
+                check_deleted(&engine, &format!("{kind}: after a reopen"), &mut failures).await;
+            }
+            Err(e) => failures.push(format!("{kind}: the reopen failed: {e}")),
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

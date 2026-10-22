@@ -604,18 +604,25 @@ impl VectorIndex for MultiVectorIndex {
     }
 
     fn optimize(&self) -> Result<()> {
+        self.optimize_until_published()?.map_or(Ok(()), Err)
+    }
+
+    fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
         self.check_closed()?;
         let segments = self.shared.core.manager().list_segments();
         if segments.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Filter with a frozen copy of the deletions: a soft delete takes no
         // writer lock and can land while the merge runs (Issue #1518).
         let deletions = self.shared.core.deletion_snapshot()?;
         self.shared.merge(segments, deletions.as_deref())?;
         // Every document the copy marks was dropped by the merge; a delete
-        // marked since stays marked.
-        self.shared.core.forget_deletions(deletions.as_deref())
+        // marked since stays marked. The merge has published, so a failure
+        // here is reported apart (Issue #1538): the bitmap then keeps the
+        // copy's marks, which name only documents the merge dropped.
+        let forgotten = self.shared.core.forget_deletions(deletions.as_deref());
+        Ok(forgotten.err())
     }
 
     fn searcher(&self) -> Result<Box<dyn VectorIndexSearcher>> {

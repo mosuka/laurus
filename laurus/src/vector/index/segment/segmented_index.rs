@@ -408,11 +408,15 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
     }
 
     fn optimize(&self) -> Result<()> {
+        self.optimize_until_published()?.map_or(Ok(()), Err)
+    }
+
+    fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
         self.check_closed()?;
 
         let segments = self.shared.core.manager().list_segments();
         if segments.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Force-merge everything into one segment, filtering with a frozen
         // copy of the deletions: a soft delete takes no writer lock and can
@@ -422,8 +426,11 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
             .merge(&self.config, segments, deletions.clone())?;
 
         // Every document the copy marks was physically dropped by the merge;
-        // a delete marked since stays marked.
-        self.shared.core.forget_deletions(deletions.as_deref())
+        // a delete marked since stays marked. The merge has published, so a
+        // failure here is reported apart (Issue #1538): the bitmap then keeps
+        // the copy's marks, which name only documents the merge dropped.
+        let forgotten = self.shared.core.forget_deletions(deletions.as_deref());
+        Ok(forgotten.err())
     }
 
     // `refresh` keeps its trait default (no-op), like the monolithic index:

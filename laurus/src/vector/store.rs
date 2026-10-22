@@ -1807,8 +1807,10 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns an error if flushing a cached writer's pending changes
-    /// fails, or if the underlying rebuild (`purge: false`) or purge +
-    /// recreate (`purge: true`) fails. Unlike [`Self::add_field`]/
+    /// fails, if the underlying rebuild (`purge: false`) fails before it
+    /// publishes the rewritten segments, which leaves the field as it was
+    /// (see [`VectorIndex::rebuild_field`]), or if the purge + recreate
+    /// (`purge: true`) fails. Unlike [`Self::add_field`]/
     /// [`Self::delete_field`], a flush failure is **propagated**, not
     /// cached for a later retry — the writer's buffered state is not a
     /// safe starting point for a rebuild, the same reasoning

@@ -104,6 +104,31 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Uses interior mutability for thread-safe access.
     fn optimize(&self) -> Result<()>;
 
+    /// [`Self::optimize`], telling a failure before its merge published
+    /// apart from one after it (Issue #1538).
+    ///
+    /// [`Self::rebuild_field`] optimizes a new index opened over a field's
+    /// files. Once the merge has published, only that index can read the
+    /// field, so the caller must keep it even if a later step fails.
+    ///
+    /// The default reports every [`Self::optimize`] error as one before the
+    /// publish. The segmented indexes and the MultiVector index, whose
+    /// optimize forgets the reclaimed deletions after the merge published,
+    /// override it.
+    ///
+    /// # Returns
+    ///
+    /// `None` when every step succeeded, or the error of a step after the
+    /// merge published. The index is usable either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the optimization failed before it published
+    /// anything.
+    fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
+        self.optimize().map(|()| None)
+    }
+
     /// Refresh the index metadata from storage.
     ///
     /// Should be called after external writes (e.g., by a Writer) to ensure
@@ -312,9 +337,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// The field keeps its identity and physical storage location; only
     /// the segments are rewritten under `new_config`. Implementations must
     /// leave the field's existing data completely untouched if the rebuild
-    /// fails partway through (e.g. by writing new segments before
-    /// atomically publishing them, the way [`Self::optimize`] already
-    /// does).
+    /// fails before it publishes the rewritten segments (e.g. by writing
+    /// new segments before atomically publishing them, the way
+    /// [`Self::optimize`] already does). Once they are published, the field
+    /// uses them and the call returns `Ok`; a failing cleanup step after
+    /// that is logged, not returned, because a caller such as
+    /// `Engine::update_field` updates the schema only on `Ok` (Issue
+    /// #1538).
     ///
     /// The documents deleted since the last [`Self::persist_deletions`] stay
     /// deleted (Issue #1527): the rebuild drops them, as it drops the ones
@@ -335,8 +364,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     ///
     /// The default implementation always errors; callers must gate on
     /// [`Self::supports_dynamic_fields`] first. Implementations also error
-    /// if no field named `name` is registered, or if the rebuild itself
-    /// fails.
+    /// if no field named `name` is registered, or if the rebuild fails
+    /// before it publishes the rewritten segments, which leaves the field
+    /// as it was.
     fn rebuild_field(&self, _name: &str, _new_config: VectorIndexTypeConfig) -> Result<()> {
         Err(LaurusError::InvalidOperation(
             "this index type does not support rebuilding fields dynamically".to_string(),

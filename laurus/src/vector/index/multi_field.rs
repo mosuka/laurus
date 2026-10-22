@@ -567,15 +567,27 @@ impl VectorIndex for MultiFieldVectorIndex {
             VectorIndexFactory::open_or_create(field_storage, SUB_INDEX_NAME, new_config.clone())?;
 
         // Force-merge every existing segment into one new segment under
-        // the new config. `optimize()` writes the new segment fully before
-        // atomically publishing it (see `SegmentedHnswIndex::optimize`), so
-        // a failure here never touches `self.fields` below -- the field's
-        // existing data is left completely untouched.
-        index.optimize()?;
+        // the new config. The merge writes the new segment fully before it
+        // publishes the manifest, so an error here means nothing was
+        // published, and the field keeps its existing index over untouched
+        // data. Once the merge has published, the source segments' files
+        // are gone and only the new index can read the field, so it
+        // replaces the old one whatever a later step returns (Issue #1538).
+        // That step only forgets the deletion marks of the documents the
+        // merge dropped; if it fails, the marks stay and hide nothing more
+        // until the next full merge forgets them.
+        let cleanup_error = index.optimize_until_published()?;
 
         self.fields
             .write()
             .insert(name.to_string(), FieldEntry::new(index, &new_config));
+        if let Some(e) = cleanup_error {
+            log::warn!(
+                "vector field '{name}' was rebuilt, but forgetting the deletion marks of the \
+                 documents its merge dropped failed: {e}; they stay until the next full merge, \
+                 hiding nothing"
+            );
+        }
         Ok(())
     }
 
@@ -1238,7 +1250,7 @@ impl VectorIndexReader for MultiFieldReaderFacade {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A [`VectorIndexWriter`] whose `commit()` always fails, for
     /// exercising [`MultiFieldWriter::commit`]'s "always attempt every
@@ -1680,6 +1692,211 @@ mod tests {
         }
         if index.stats().unwrap().deleted_count != 0 {
             failures.push("a reclaimed mark is still counted".to_string());
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A [`Storage`] over `inner` that fails `delete_file` of a `.delmap`
+    /// while armed, and counts those failures (Issue #1538).
+    #[derive(Debug)]
+    struct FailingDelmapDelete {
+        inner: Arc<dyn Storage>,
+        armed: AtomicBool,
+        failures: AtomicUsize,
+    }
+
+    impl Storage for FailingDelmapDelete {
+        fn loading_mode(&self) -> crate::storage::LoadingMode {
+            self.inner.loading_mode()
+        }
+        fn open_input(&self, name: &str) -> Result<Box<dyn crate::storage::StorageInput>> {
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output(name)
+        }
+        fn create_output_append(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            if self.armed.load(Ordering::SeqCst) && name.ends_with(".delmap") {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                return Err(LaurusError::storage(format!(
+                    "injected failure deleting {name}"
+                )));
+            }
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(
+            &self,
+            prefix: &str,
+        ) -> Result<(String, Box<dyn crate::storage::StorageOutput>)> {
+            self.inner.create_temp_output(prefix)
+        }
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Record in `failures` when field `name` of `index` finds the deleted
+    /// doc 2, misses doc 1 or 3, or cannot be read.
+    fn check_rebuilt_documents(
+        index: &MultiFieldVectorIndex,
+        name: &str,
+        when: &str,
+        failures: &mut Vec<String>,
+    ) {
+        let present = |doc_id| -> Result<bool> {
+            if name == "tokens" {
+                let snapshot = index
+                    .multi_vector_snapshot(name)?
+                    .ok_or_else(|| LaurusError::internal("no multi-vector snapshot"))?;
+                Ok(snapshot.vectors(doc_id)?.is_some())
+            } else {
+                Ok(index.reader()?.get_vector(doc_id, name)?.is_some())
+            }
+        };
+        for (doc_id, live) in [(1, true), (2, false), (3, true)] {
+            match present(doc_id) {
+                Ok(found) if found == live => {}
+                Ok(found) => failures.push(format!(
+                    "{name} {when}: doc {doc_id} is found: {found}, expected: {live}"
+                )),
+                Err(e) => failures.push(format!("{name} {when}: reading doc {doc_id} failed: {e}")),
+            }
+        }
+    }
+
+    /// Issue #1538: once the rebuild's merge has published, the field uses
+    /// the rebuilt index, and the call succeeds, even when forgetting the
+    /// deletion marks of the documents the merge dropped fails. The old
+    /// index lists the source segments, whose files the merge deleted.
+    #[test]
+    fn rebuild_field_keeps_the_rebuilt_index_when_forgetting_deletions_fails() {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::{
+            FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, MultiVectorIndexConfig,
+        };
+
+        // One index per kind: reading another field before the rebuild
+        // would cache the old index's readers, which hide a missing file.
+        let cases = [
+            (
+                "flat",
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hnsw",
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ivf",
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension: 2,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "tokens",
+                VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let embedder = MultiVectorIndexConfig::default().embedder;
+        let mut failures = Vec::new();
+        for (name, config) in cases {
+            let failing = Arc::new(FailingDelmapDelete {
+                inner: Arc::new(MemoryStorage::new(MemoryStorageConfig::default())),
+                armed: AtomicBool::new(false),
+                failures: AtomicUsize::new(0),
+            });
+            let storage: Arc<dyn Storage> = failing.clone();
+            let configs = BTreeMap::from([(name.to_string(), config.clone())]);
+            let index =
+                MultiFieldVectorIndex::open_or_create(storage.clone(), &configs, embedder.clone())
+                    .unwrap();
+            let mut writer = index.writer().unwrap();
+            for doc_id in 1..=3u64 {
+                let x = doc_id as f32;
+                let vectors = if name == "tokens" {
+                    vec![v(x), Vector::new(vec![0.0, x])]
+                } else {
+                    vec![Vector::new(vec![x, 1.0])]
+                };
+                writer
+                    .add_document_vectors(doc_id, vec![(name.to_string(), vectors)])
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            drop(writer);
+            index.persist_deletions().unwrap();
+            index.soft_delete_document(2).unwrap();
+
+            failing.armed.store(true, Ordering::SeqCst);
+            let rebuilt = index.rebuild_field(name, config.clone());
+            failing.armed.store(false, Ordering::SeqCst);
+            if let Err(e) = rebuilt {
+                failures.push(format!("{name}: the rebuild failed: {e}"));
+            }
+            if failing.failures.load(Ordering::SeqCst) == 0 {
+                failures.push(format!("{name}: the injected failure was not hit"));
+            }
+            check_rebuilt_documents(&index, name, "after the rebuild", &mut failures);
+
+            // The marks the failure left are on storage too, and hide nothing
+            // more after a reopen.
+            let reopened =
+                MultiFieldVectorIndex::open_or_create(storage.clone(), &configs, embedder.clone())
+                    .unwrap();
+            check_rebuilt_documents(&reopened, name, "after a reopen", &mut failures);
+            drop(reopened);
+
+            // The next full merge forgets them.
+            if let Err(e) = index.optimize() {
+                failures.push(format!("{name}: the next optimize failed: {e}"));
+            }
+            check_rebuilt_documents(&index, name, "after the next optimize", &mut failures);
+            if index.stats().unwrap().deleted_count != 0 {
+                failures.push(format!(
+                    "{name}: a mark is still counted after the next optimize"
+                ));
+            }
+            if storage.file_exists(&format!("{name}/{SUB_INDEX_NAME}.delmap")) {
+                failures.push(format!(
+                    "{name}: a mark is still on storage after the next optimize"
+                ));
+            }
         }
         assert!(failures.is_empty(), "{failures:#?}");
     }
