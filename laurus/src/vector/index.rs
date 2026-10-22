@@ -224,7 +224,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns an error if the triggered compaction fails.
+    /// Returns an error if the triggered compaction fails. The store logs it
+    /// as a warning without failing the commit, whose changes are durable by
+    /// then, and calls this again on its next commit (Issue #1500).
     fn maybe_auto_compact(&self) -> Result<bool> {
         Ok(false)
     }

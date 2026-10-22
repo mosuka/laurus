@@ -55,6 +55,23 @@ impl FailingStorage {
     fn fail_next_delete_matching(&self, prefix: &str, suffix: &str) {
         *self.fail_delete_of.lock() = Some((prefix.to_string(), suffix.to_string()));
     }
+
+    /// Asserts every armed failure was hit, for a step whose failure does
+    /// not surface: a failed merge no longer fails the commit (Issue #1500).
+    fn assert_all_hit(&self) {
+        assert!(
+            self.fail_rename_to.lock().is_none(),
+            "the rename failure was not hit"
+        );
+        assert!(
+            self.fail_delete_of.lock().is_none(),
+            "the delete failure was not hit"
+        );
+        assert!(
+            self.fail_create_of.lock().is_none(),
+            "the create failure was not hit"
+        );
+    }
 }
 
 impl Storage for FailingStorage {
@@ -701,9 +718,11 @@ fn merge_crash_before_manifest_save_resolves_to_the_sources() {
     store.commit().unwrap();
     store.upsert_document(2, doc("alpha")).unwrap();
     // Commit 2 renames segments.json twice: its own publish, then the
-    // merge transition. Skip the publish; kill the merge.
+    // merge transition. Skip the publish; kill the merge. The commit
+    // succeeds: its own publish went through (Issue #1500).
     failing.fail_rename_matching_after("segments.json", "", 1);
-    assert!(store.commit().is_err());
+    store.commit().unwrap();
+    failing.assert_all_hit();
     drop(store);
 
     let reopened = LexicalStore::new(inner.clone(), config).unwrap();
@@ -744,9 +763,10 @@ fn merge_crash_after_manifest_save_resolves_to_the_merged_segment() {
     store.commit().unwrap();
     store.upsert_document(2, doc("alpha")).unwrap();
     // The first source data-file deletion fails after the manifest already
-    // recorded the transition.
+    // recorded the transition. The commit succeeds (Issue #1500).
     failing.fail_next_delete_matching("segment_", ".cfs");
-    assert!(store.commit().is_err(), "the failure must surface");
+    store.commit().unwrap();
+    failing.assert_all_hit();
     drop(store);
 
     let reopened = LexicalStore::new(inner.clone(), config).unwrap();

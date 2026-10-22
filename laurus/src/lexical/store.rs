@@ -330,7 +330,10 @@ impl LexicalStore {
     ///   similar size. It is a no-op below the threshold; raise
     ///   `max_segments` to disable it. `max_merged_segment_bytes` (Issue
     ///   #1394) caps the combined on-disk size of the segments one merge
-    ///   takes; a segment at or over the cap is never merged again.
+    ///   takes; a segment at or over the cap is never merged again. A failed
+    ///   auto-merge does not fail the commit (Issue #1500): it runs after the
+    ///   commit's changes and WAL checkpoint are durable, so it is logged as
+    ///   a warning and retried by the next commit.
     ///
     /// # Example
     ///
@@ -452,8 +455,18 @@ impl LexicalStore {
         // Auto-merge after the new segment is visible (Issue #755): keeps the
         // segment count bounded without a manual `optimize()`. A no-op below the
         // configured threshold, so most commits pay only a segment-count check.
+        // The commit's changes and checkpoint are durable by now, so a failed
+        // merge does not fail the commit (Issue #1500): failing it would stop
+        // the engine before it commits the vector store and the documents and
+        // truncates the WAL, on every later commit too while the cause stays.
+        // The next commit retries the merge.
+        if let Err(e) = self.index.maybe_merge() {
+            log::warn!(
+                "lexical commit succeeded, but the automatic merge after it failed \
+                 and is retried on the next commit: {e}"
+            );
+        }
         // Sync again afterwards so any merge output is durable/visible.
-        self.index.maybe_merge()?;
         self.index.storage().sync()?;
         // For `InvertedIndex` this is a no-op (#1023): the writer updated
         // the index's shared metadata directly, so there is nothing fresher

@@ -403,18 +403,20 @@ impl VectorIndex for MultiFieldVectorIndex {
     fn maybe_auto_compact(&self) -> Result<bool> {
         let fields = self.fields.read();
         let mut compacted_any = false;
-        let mut first_err = None;
-        for f in fields.values() {
+        // Every field's error, named (Issue #1500): the store only logs it,
+        // and an error without the field would not say which one to repair.
+        let mut failures = Vec::new();
+        for (name, f) in fields.iter() {
             match f.index.maybe_auto_compact() {
                 Ok(true) => compacted_any = true,
                 Ok(false) => {}
-                Err(e) if first_err.is_none() => first_err = Some(e),
-                Err(_) => {}
+                Err(e) => failures.push(format!("vector field '{name}': {e}")),
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(compacted_any),
+        if failures.is_empty() {
+            Ok(compacted_any)
+        } else {
+            Err(LaurusError::index(failures.join("; ")))
         }
     }
 

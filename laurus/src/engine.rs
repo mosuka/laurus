@@ -2134,6 +2134,11 @@ impl Engine {
     /// `CommitPolicy::Interval`'s background timer runs this same ladder, so
     /// the same caveat applies to auto-commits.
     ///
+    /// The automatic segment merge each store runs after its own commit in
+    /// steps 2 and 3 does not fail the commit (Issue #1500): the store's
+    /// changes and checkpoint are durable by then, so a failed merge is
+    /// logged as a warning and the next commit retries it.
+    ///
     /// # Errors
     ///
     /// Returns an error if flushing the WAL, committing the lexical store,

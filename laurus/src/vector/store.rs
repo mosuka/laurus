@@ -724,18 +724,23 @@ impl VectorStore {
     /// committed writer stays in the cache — its in-memory state is
     /// equivalent to the file it just wrote — so the first upsert after the
     /// commit does not reload the whole index from storage. The cache is
-    /// still dropped when auto-compaction ran: compaction rewrites the index
-    /// through a fresh writer and clears the deletion bitmap, so a retained
-    /// writer would resurrect the physically reclaimed vectors on its next
-    /// commit. The writer-cache lock is held across the whole ladder so a
-    /// concurrent upsert cannot interleave with the commit.
+    /// still dropped when auto-compaction ran or failed: compaction rewrites
+    /// the index through a fresh writer and clears the deletion bitmap, so a
+    /// retained writer would resurrect the physically reclaimed vectors on
+    /// its next commit. The writer-cache lock is held across the whole
+    /// ladder so a concurrent upsert cannot interleave with the commit.
+    ///
+    /// A failed automatic merge or compaction does not fail the commit
+    /// (Issue #1500): it runs after the commit's changes and WAL checkpoint
+    /// are durable, so it is logged as a warning and retried by the next
+    /// commit.
     ///
     /// # Errors
     ///
-    /// Returns an error if the writer commit, deletion persistence,
-    /// compaction, storage sync, or index refresh fails. The cached searcher
-    /// is dropped on every return, so the next search sees whatever a
-    /// failed commit had already published (Issue #1435).
+    /// Returns an error if the writer commit, deletion persistence, storage
+    /// sync, or index refresh fails. The cached searcher is dropped on every
+    /// return, so the next search sees whatever a failed commit had already
+    /// published (Issue #1435).
     pub async fn commit(&self) -> Result<()> {
         self.commit_with_checkpoint(None).await
     }
@@ -791,30 +796,42 @@ impl VectorStore {
             *self.searcher_cache.write() = None;
             return Err(e);
         }
-        let ladder_result = Ok(())
-            // Persist any pending logical deletions (Issue #624) so the
-            // deletion bitmap survives restarts. The WAL also records
-            // deletions, so this is a durability optimization rather than the
-            // source of truth.
-            .and_then(|_| self.index.persist_deletions())
-            // Automatically compact when the deletion ratio crosses the
-            // configured threshold (Issue #782), so logically deleted vectors
-            // are physically reclaimed rather than accumulating indefinitely.
-            // A no-op unless the index supports it and `auto_compaction` is
-            // enabled.
-            .and_then(|_| self.index.maybe_auto_compact());
-        let finished = match ladder_result {
-            Ok(compacted) => {
+        // Persist any pending logical deletions (Issue #624) so the deletion
+        // bitmap survives restarts, and publish the WAL checkpoint. The WAL
+        // also records deletions, so this is a durability optimization
+        // rather than the source of truth.
+        let finished = match self.index.persist_deletions() {
+            Ok(()) => {
+                // Merge segments, and compact when the deletion ratio crosses
+                // the configured threshold (Issue #782), so logically deleted
+                // vectors are physically reclaimed rather than accumulating
+                // indefinitely. This commit's changes and checkpoint are
+                // durable by now, so a failed merge does not fail the commit
+                // (Issue #1500): failing it would stop the engine before it
+                // commits the documents and truncates the WAL, on every later
+                // commit too while the cause stays. The next commit retries
+                // the merge.
+                let compacted = match self.index.maybe_auto_compact() {
+                    Ok(compacted) => compacted,
+                    Err(e) => {
+                        log::warn!(
+                            "vector commit succeeded, but the automatic merge after it failed \
+                             and is retried on the next commit: {e}"
+                        );
+                        // A compaction that failed partway may already have
+                        // rewritten the index and cleared the deletion
+                        // bitmap behind the writer, as a finished one does.
+                        true
+                    }
+                };
                 if compacted || !self.index.retain_writer_after_commit() {
                     *writer_guard = None;
                 }
                 Ok(())
             }
             Err(e) => {
-                // A mid-ladder failure leaves the writer/disk agreement
-                // unknown — compaction in particular may have partially
-                // rewritten the index and cleared the deletion bitmap before
-                // failing. Drop the cache so the next writer reloads ground
+                // A failed persistence leaves the writer/disk agreement
+                // unknown. Drop the cache so the next writer reloads ground
                 // truth from storage (the pre-retention behavior on every
                 // path), instead of retrying — or resurrecting from — a
                 // stale writer.
@@ -830,11 +847,11 @@ impl VectorStore {
             // directory is synced.
             .and_then(|()| self.index.storage().sync())
             .and_then(|()| self.index.refresh());
-        // On the error paths too (Issue #1435): the flush above, or a
-        // compaction that failed partway, may already have changed the
-        // segment set, and a searcher fixes its segment set when it is
-        // built, so keeping it would hide those changes from every search
-        // until the next successful commit.
+        // On the error paths too (Issue #1435): the flush above, or a merge
+        // that failed partway, may already have changed the segment set,
+        // and a searcher fixes its segment set when it is built, so keeping
+        // it would hide those changes from every search until the next
+        // successful commit.
         *self.searcher_cache.write() = None;
         finished
     }
@@ -2476,15 +2493,91 @@ mod tests {
         assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
     }
 
-    /// Issue #1435 — as above, for a failed auto-compaction.
+    /// Issues #1435 and #1500 — a failed auto-compaction does not fail the
+    /// commit, whose changes are durable by then, and the commit still drops
+    /// the searcher built before it.
     #[tokio::test]
-    async fn commit_failing_to_auto_compact_drops_stale_searcher() {
+    async fn commit_whose_auto_compact_fails_succeeds_and_drops_stale_searcher() {
         let fixture = store_with_stale_searcher().await;
         *fixture.armed.lock() = Some(IndexCall::MaybeAutoCompact);
-        assert!(fixture.store.commit().await.is_err());
+        fixture.store.commit().await.unwrap();
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1500 — the storage sync still runs after a failed
+    /// auto-compaction, and its own failure still fails the commit: the sync
+    /// makes the deletion bitmap's rename durable before the engine
+    /// truncates the WAL.
+    #[tokio::test]
+    async fn commit_whose_auto_compact_fails_still_fails_on_a_failed_sync() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::MaybeAutoCompact);
+        fixture
+            .store_storage
+            .fail_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(fixture.store.commit().await.is_err());
+        fixture.assert_failure_hit();
+    }
+
+    /// Issue #1500 — a failed auto-compaction drops a retained writer, as a
+    /// finished one does: a compaction that failed partway may already have
+    /// rewritten the index behind it, and the writer would then write the
+    /// reclaimed vectors back on its next commit.
+    #[tokio::test]
+    async fn commit_whose_auto_compact_fails_drops_the_retained_writer() {
+        use crate::vector::index::config::HnswIndexConfig;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+            dimension: 4,
+            segmented: false,
+            ..Default::default()
+        });
+        let inner =
+            VectorIndexFactory::open_or_create(storage.clone(), "vector_index", config).unwrap();
+        assert!(
+            inner.retain_writer_after_commit(),
+            "precondition: the monolithic HNSW index retains its writer"
+        );
+        let armed = Arc::new(parking_lot::Mutex::new(None));
+        let store = VectorStore {
+            index: Box::new(FailingIndex {
+                inner,
+                armed: armed.clone(),
+                storage,
+            }),
+            writer_cache: Mutex::new(None),
+            searcher_cache: parking_lot::RwLock::new(None),
+            config: None,
+            base_weights: parking_lot::RwLock::new(HashMap::new()),
+            pooling_budget: PoolingBudget::for_this_machine(),
+        };
+        let upsert = |doc_id: u64| {
+            let doc = Document::builder()
+                .add_field("vec", DataValue::Vector(vec![doc_id as f32; 4]))
+                .build();
+            store.upsert_document_by_internal_id(doc_id, doc)
+        };
+
+        upsert(1).await.unwrap();
+        store.commit().await.unwrap();
+        assert!(
+            store.writer_cache.lock().await.is_some(),
+            "precondition: a commit keeps the writer"
+        );
+
+        upsert(2).await.unwrap();
+        *armed.lock() = Some(IndexCall::MaybeAutoCompact);
+        store.commit().await.unwrap();
+        assert!(armed.lock().is_none(), "the index failure was not hit");
+        assert!(
+            store.writer_cache.lock().await.is_none(),
+            "a failed auto-compaction must drop the retained writer"
+        );
     }
 
     /// Issue #1435 — as above, for a failed storage sync.

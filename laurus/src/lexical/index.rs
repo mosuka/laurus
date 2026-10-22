@@ -91,6 +91,12 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// the count exceeds `max_segments` (Issue #1397), skipping any whose
     /// combined estimated size would exceed `max_merged_segment_bytes`
     /// (Issue #1394). Must be cheap when no merge is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a merge fails. The store logs it as a warning
+    /// without failing the commit, whose changes are durable by then, and
+    /// calls this again on its next commit (Issue #1500).
     fn maybe_merge(&self) -> Result<()> {
         Ok(())
     }

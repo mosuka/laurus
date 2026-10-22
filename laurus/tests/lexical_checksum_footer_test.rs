@@ -8,6 +8,9 @@
 //! `.delmap` is an error, never "no deletions" (which resurrected deleted
 //! documents) nor a file the writer silently replaces.
 
+#[path = "common/log_capture.rs"]
+mod log_capture;
+
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -257,17 +260,35 @@ fn restamp_footer(storage: &Arc<dyn Storage>, name: &str) {
     write_file(storage, name, &bytes);
 }
 
+/// The start of the warning a commit logs when its auto-merge fails.
+const MERGE_FAILED: &str = "lexical commit succeeded, but the automatic merge after it failed";
+
 /// Reopen with the merging config, add a document and commit: the merge
-/// must fail, publishing only the new document's own segment. Returns the
-/// commit's error.
-fn assert_merge_is_refused(storage: &Arc<dyn Storage>, use_compound: bool) -> LaurusError {
+/// must fail, publishing only the new document's own segment. The commit
+/// itself succeeds and logs the merge's error (Issue #1500); returns that
+/// warning.
+fn assert_merge_is_refused(storage: &Arc<dyn Storage>, use_compound: bool) -> String {
+    log_capture::install();
     let store = LexicalStore::new(storage.clone(), config(use_compound, true)).unwrap();
     let before = list_manifest_ids(storage);
     store.upsert_document(7, doc(7)).unwrap();
-    let err = store
-        .commit()
-        .expect_err("a corrupted source segment must abort the merge");
+    let logged_before = log_capture::warnings().len();
+    store.commit().unwrap();
     drop(store);
+
+    // The commit logs on this thread; the other tests run on their own.
+    let this_thread = std::thread::current().id();
+    let mut refusals: Vec<String> = log_capture::warnings()
+        .into_iter()
+        .skip(logged_before)
+        .filter(|(thread, warning)| *thread == this_thread && warning.starts_with(MERGE_FAILED))
+        .map(|(_, warning)| warning)
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the commit must log its refused merge: {refusals:?}"
+    );
 
     let after = list_manifest_ids(storage);
     let added: Vec<&String> = after.iter().filter(|id| !before.contains(id)).collect();
@@ -277,11 +298,14 @@ fn assert_merge_is_refused(storage: &Arc<dyn Storage>, use_compound: bool) -> La
         before.iter().all(|id| after.contains(id)),
         "the source segments must stay published: {before:?} -> {after:?}"
     );
-    err
+    refusals.pop().unwrap()
 }
 
 fn assert_corruption(err: &LaurusError) {
-    let msg = err.to_string();
+    assert_corruption_message(&err.to_string());
+}
+
+fn assert_corruption_message(msg: &str) {
     assert!(
         msg.contains("checksum mismatch") || msg.contains("corrupted"),
         "expected a corruption error, got: {msg}"
@@ -360,11 +384,11 @@ fn a_corrupted_source_postings_part_aborts_the_merge() {
         let storage = build_index(use_compound, false);
         let first = list_manifest_ids(&storage)[0].clone();
         corrupt_part(&storage, &first, "post");
-        let err = assert_merge_is_refused(&storage, use_compound);
-        assert_corruption(&err);
+        let refusal = assert_merge_is_refused(&storage, use_compound);
+        assert_corruption_message(&refusal);
         assert!(
-            err.to_string().contains(".post"),
-            "compound={use_compound}: {err}"
+            refusal.contains(".post"),
+            "compound={use_compound}: {refusal}"
         );
     }
 }
@@ -376,11 +400,11 @@ fn a_corrupted_source_bkd_part_aborts_the_merge() {
         let storage = build_index(use_compound, false);
         let first = list_manifest_ids(&storage)[0].clone();
         corrupt_part(&storage, &first, "rank.bkd");
-        let err = assert_merge_is_refused(&storage, use_compound);
-        assert_corruption(&err);
+        let refusal = assert_merge_is_refused(&storage, use_compound);
+        assert_corruption_message(&refusal);
         assert!(
-            err.to_string().contains(".bkd"),
-            "compound={use_compound}: {err}"
+            refusal.contains(".bkd"),
+            "compound={use_compound}: {refusal}"
         );
     }
 }
@@ -410,9 +434,9 @@ fn a_corrupted_deletion_bitmap_is_not_treated_as_no_deletions() {
             assert_corruption(&err);
         }
         drop(store);
-        let err = assert_merge_is_refused(&storage, use_compound);
-        assert_corruption(&err);
-        assert!(err.to_string().contains("deletion bitmap"), "{err}");
+        let refusal = assert_merge_is_refused(&storage, use_compound);
+        assert_corruption_message(&refusal);
+        assert!(refusal.contains("deletion bitmap"), "{refusal}");
 
         // (b) A deletion in that segment refuses to replace the bitmap.
         let storage = build_index(use_compound, true);

@@ -48,6 +48,15 @@ impl FailingStorage {
     fn fail_next_create_matching(&self, prefix: &str, suffix: &str) {
         *self.fail_create_matching.lock() = Some((prefix.to_string(), suffix.to_string()));
     }
+
+    /// Asserts the armed failure was hit. A failed merge no longer fails the
+    /// commit (Issue #1500), so the commit's result cannot tell.
+    fn assert_hit(&self) {
+        assert!(
+            self.fail_create_matching.lock().is_none(),
+            "the injected merge failure was not hit"
+        );
+    }
 }
 
 impl Storage for FailingStorage {
@@ -144,10 +153,11 @@ fn failed_merge_must_not_duplicate_documents() {
     store.upsert_document(2, doc("banana")).unwrap();
 
     // The second commit's maybe_merge merges the two segments; kill the
-    // merged segment's first file write.
+    // merged segment's first file write. The commit still succeeds: its own
+    // segment was durable before the merge ran (Issue #1500).
     failing.fail_next_create_with_prefix("merged_");
-    let result = store.commit();
-    assert!(result.is_err(), "the injected merge failure must surface");
+    store.commit().unwrap();
+    failing.assert_hit();
     drop(store);
 
     // Reopen over the clean storage: discovery sees whatever the failed
@@ -181,7 +191,8 @@ fn failed_merge_must_not_publish_a_segment() {
 
     store.upsert_document(2, doc("banana")).unwrap();
     failing.fail_next_create_with_prefix("merged_");
-    assert!(store.commit().is_err());
+    store.commit().unwrap();
+    failing.assert_hit();
     drop(store);
 
     // The new source segment from commit 2 is expected in the manifest —
@@ -223,10 +234,8 @@ fn segment_meta_is_written_after_every_data_file() {
     store.upsert_document(2, numbered("banana", 2)).unwrap();
 
     failing.fail_next_create_matching("merged_", ".cfs");
-    assert!(
-        store.commit().is_err(),
-        "the injected .cfs failure must surface"
-    );
+    store.commit().unwrap();
+    failing.assert_hit();
     drop(store);
 
     let leaked: Vec<String> = list_manifest_ids(&inner)
