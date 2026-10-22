@@ -963,17 +963,19 @@ impl LaurusMcpServer {
             }
         };
 
-        if params.queries.is_empty() {
+        let request = match search_batch_request(params) {
+            Ok(request) => request,
+            Err(e) => return Ok(Self::tool_error(e)),
+        };
+
+        // After the parameters are checked, so an empty batch still rejects
+        // a malformed `highlight` or `group_by` (Issue #1523).
+        if request.queries.is_empty() {
             let output = json!({ "batch": [] });
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 output.to_string(),
             )]));
         }
-
-        let request = match search_batch_request(params) {
-            Ok(request) => request,
-            Err(e) => return Ok(Self::tool_error(e)),
-        };
 
         match SearchServiceClient::new(channel)
             .search_batch(request)
@@ -1193,6 +1195,97 @@ mod tests {
 
         let err = search_request(search_params(Some("{}"))).unwrap_err();
         assert!(err.starts_with("Invalid group_by JSON"), "{err}");
+    }
+
+    /// Issue #1523: a `highlight`, `fusion` or `field_boosts` value of the
+    /// wrong type is a tool error naming the parameter and the key, and no
+    /// request is built.
+    #[test]
+    fn search_request_rejects_values_of_the_wrong_type() {
+        let cases = [
+            (
+                SearchParams {
+                    highlight: Some(r#"{"fields": ["body"], "max_fragments": "2"}"#.to_string()),
+                    ..search_params(None)
+                },
+                "Invalid highlight JSON: highlight: max_fragments must be an integer between 0 and 4294967295",
+            ),
+            (
+                SearchParams {
+                    fusion: Some(r#"{"rrf": {"k": "1"}}"#.to_string()),
+                    ..search_params(None)
+                },
+                "Invalid fusion JSON: fusion: rrf: k must be a number",
+            ),
+            (
+                SearchParams {
+                    field_boosts: Some(r#"{"title": "2"}"#.to_string()),
+                    ..search_params(None)
+                },
+                "Invalid field_boosts JSON: field_boosts: \"title\" must be a number",
+            ),
+        ];
+        for (params, expected) in cases {
+            assert_eq!(
+                search_request(params).map(|_| ()),
+                Err(expected.to_string())
+            );
+        }
+    }
+
+    /// Issue #1523: `search_batch` checks `highlight` as `search` does.
+    #[test]
+    fn search_batch_request_rejects_a_highlight_of_the_wrong_type() {
+        let err = search_batch_request(SearchBatchParams {
+            queries: vec!["title:rust".to_string()],
+            limit: None,
+            offset: None,
+            highlight: Some(r#"{"fields": ["body"], "max_fragments": 4294967297}"#.to_string()),
+            group_by: None,
+        })
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid highlight JSON: highlight: max_fragments must be an integer between 0 and 4294967295"
+        );
+    }
+
+    /// Issue #1523: the `search_batch` tool rejects a `highlight` of the
+    /// wrong type even when `queries` is empty, and an empty batch with
+    /// valid parameters still returns no results without calling the
+    /// server, whose endpoint here accepts no connection.
+    #[tokio::test]
+    async fn search_batch_tool_checks_parameters_of_an_empty_batch() {
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let server = LaurusMcpServer::new(Some(channel));
+        let call = |highlight: Option<&str>| {
+            server.search_batch(Parameters(SearchBatchParams {
+                queries: Vec::new(),
+                limit: None,
+                offset: None,
+                highlight: highlight.map(str::to_string),
+                group_by: None,
+            }))
+        };
+
+        let result = serde_json::to_value(
+            call(Some(r#"{"fields": ["body"], "max_fragments": "1"}"#))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            json!(
+                "Invalid highlight JSON: highlight: max_fragments must be an integer between 0 and 4294967295"
+            )
+        );
+
+        let result = serde_json::to_value(call(None).await.unwrap()).unwrap();
+        assert_ne!(result["isError"], json!(true), "{result}");
+        assert_eq!(result["content"][0]["text"], json!(r#"{"batch":[]}"#));
     }
 
     /// Issue #1297: `search_batch` applies `group_by` to every query.

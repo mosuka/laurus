@@ -123,11 +123,13 @@ fn datetime_micros_to_json(us: i64) -> Value {
     }
 }
 
-/// Parse a JSON string into a proto [`v1::FusionAlgorithm`].
+/// Parse the `fusion` parameter of the `search` tool into a proto
+/// [`v1::FusionAlgorithm`]: the same shape as the HTTP gateway's `fusion`,
+/// exactly one of `{"rrf": {"k": 60.0}}` and
+/// `{"weighted_sum": {"lexical_weight": 0.7, "vector_weight": 0.3}}`.
 ///
-/// Accepts two formats:
-/// - `{"rrf": {"k": 60.0}}`
-/// - `{"weighted_sum": {"lexical_weight": 0.7, "vector_weight": 0.3}}`
+/// Delegates to [`laurus_server::convert::search::fusion_algorithm_from_json`],
+/// which the gateway uses too (Issue #1523).
 ///
 /// # Arguments
 ///
@@ -135,43 +137,21 @@ fn datetime_micros_to_json(us: i64) -> Value {
 ///
 /// # Errors
 ///
-/// Returns an error if the JSON is malformed or does not match either format.
+/// Returns an error if the JSON is malformed, does not hold exactly one of
+/// the two algorithms, or has a key of the wrong type, such as
+/// `{"rrf": {"k": "1"}}`, which used to fall back to the default.
 pub fn json_to_fusion_algorithm(json_str: &str) -> anyhow::Result<v1::FusionAlgorithm> {
     let val: Value = serde_json::from_str(json_str)?;
-
-    if let Some(rrf) = val.get("rrf") {
-        let k = rrf.get("k").and_then(|v| v.as_f64()).unwrap_or(60.0);
-        Ok(v1::FusionAlgorithm {
-            algorithm: Some(v1::fusion_algorithm::Algorithm::Rrf(v1::Rrf { k })),
-        })
-    } else if let Some(ws) = val.get("weighted_sum") {
-        let lexical_weight = ws
-            .get("lexical_weight")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5) as f32;
-        let vector_weight = ws
-            .get("vector_weight")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5) as f32;
-        Ok(v1::FusionAlgorithm {
-            algorithm: Some(v1::fusion_algorithm::Algorithm::WeightedSum(
-                v1::WeightedSum {
-                    lexical_weight,
-                    vector_weight,
-                },
-            )),
-        })
-    } else {
-        Err(anyhow::anyhow!(
-            "fusion must contain either \"rrf\" or \"weighted_sum\" key"
-        ))
-    }
+    laurus_server::convert::search::fusion_algorithm_from_json(&val).map_err(anyhow::Error::msg)
 }
 
-/// Parse a JSON string into a field boost map for the proto
-/// [`SearchRequest`](v1::SearchRequest).
+/// Parse the `field_boosts` parameter of the `search` tool into the field
+/// boost map of the proto [`SearchRequest`](v1::SearchRequest): the same
+/// shape as the HTTP gateway's `field_boosts`, an object mapping field names
+/// to numbers. A `null` boost is the same as omitting the field.
 ///
-/// Expects a JSON object mapping field names to numeric boost values.
+/// Delegates to [`laurus_server::convert::search::field_boosts_from_json`]
+/// (Issue #1523).
 ///
 /// # Arguments
 ///
@@ -179,18 +159,13 @@ pub fn json_to_fusion_algorithm(json_str: &str) -> anyhow::Result<v1::FusionAlgo
 ///
 /// # Errors
 ///
-/// Returns an error if the JSON is malformed or not an object.
+/// Returns an error if the JSON is malformed, not an object, or has a boost
+/// that is not a number, such as `{"title": "2"}`, which used to be dropped.
 pub fn json_to_field_boosts(
     json_str: &str,
 ) -> anyhow::Result<std::collections::HashMap<String, f32>> {
     let val: Value = serde_json::from_str(json_str)?;
-    let obj = val
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("field_boosts must be a JSON object"))?;
-    Ok(obj
-        .iter()
-        .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f as f32)))
-        .collect())
+    laurus_server::convert::search::field_boosts_from_json(&val).map_err(anyhow::Error::msg)
 }
 
 /// Parse a JSON string into a proto [`v1::HighlightParams`] (Issue #1134),
@@ -203,67 +178,28 @@ pub fn json_to_field_boosts(
 ///   "css_class": "hl", "require_field_match": false,
 ///   "max_analyzed_chars": 500, "return_entire_field_if_no_highlight": true}`.
 ///
+/// Delegates to [`laurus_server::convert::search::highlight_params_from_json`],
+/// which the gateway uses too (Issue #1523), so a `null` key is the same as
+/// omitting it.
+///
 /// # Arguments
 ///
 /// * `json_str` - JSON string in either of the two formats above.
 ///
 /// # Errors
 ///
-/// Returns an error if the JSON is malformed, not an array or object, or an
-/// object form has no non-empty `fields` array. Validation that only
-/// `from_proto` can perform (e.g. rejecting a zero `max_fragments`) is left
-/// to the server; this function only parses the shape.
+/// Returns an error if the JSON is malformed or not an array of strings or
+/// an object, if a key has the wrong type or an integer is out of the range
+/// of its proto type (such as `"max_fragments": "2"`, or `4294967297`, which
+/// used to wrap to 1), or if it names no field (`[]`, `{}`,
+/// `{"fields": []}`, `null`), which the gateway reads as no highlighting.
+/// Validation that only `from_proto` can perform (e.g. rejecting a zero
+/// `max_fragments`) is left to the server.
 pub fn json_to_highlight_params(json_str: &str) -> anyhow::Result<v1::HighlightParams> {
     let val: Value = serde_json::from_str(json_str)?;
-
-    let fields_from = |v: &Value| -> Option<Vec<String>> {
-        v.as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|f| f.as_str().map(str::to_string))
-                .collect()
-        })
-    };
-
-    if let Some(fields) = fields_from(&val) {
-        if fields.is_empty() {
-            return Err(anyhow::anyhow!("highlight field list must not be empty"));
-        }
-        return Ok(v1::HighlightParams {
-            fields,
-            ..Default::default()
-        });
-    }
-
-    let obj = val
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("highlight must be a field array or an object"))?;
-    let fields = obj.get("fields").and_then(fields_from).unwrap_or_default();
-    if fields.is_empty() {
-        return Err(anyhow::anyhow!(
-            "highlight.fields must be a non-empty array of field names"
-        ));
-    }
-    Ok(v1::HighlightParams {
-        fields,
-        max_fragments: obj
-            .get("max_fragments")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
-        fragment_size: obj
-            .get("fragment_size")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32),
-        tag: obj.get("tag").and_then(|v| v.as_str()).map(str::to_string),
-        css_class: obj
-            .get("css_class")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        require_field_match: obj.get("require_field_match").and_then(|v| v.as_bool()),
-        max_analyzed_chars: obj.get("max_analyzed_chars").and_then(|v| v.as_u64()),
-        return_entire_field_if_no_highlight: obj
-            .get("return_entire_field_if_no_highlight")
-            .and_then(|v| v.as_bool()),
-    })
+    laurus_server::convert::search::highlight_params_from_json(&val)
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("highlight must name at least one field"))
 }
 
 /// Parse a JSON string into [`v1::RescoreParams`] (Issue #1351), in the
@@ -424,6 +360,69 @@ mod tests {
         assert!(json_to_fusion_algorithm(json).is_err());
     }
 
+    /// Issue #1523: a `fusion` value of the wrong type is an error naming
+    /// the key, as in the HTTP gateway. It used to fall back to the default
+    /// (k 60, weights 0.5), and `rrf` won over `weighted_sum`.
+    #[test]
+    fn test_json_to_fusion_algorithm_rejects_values_of_the_wrong_type() {
+        let exactly_one = "fusion must have exactly one of \"rrf\" and \"weighted_sum\"";
+        let cases = [
+            (r#"{"rrf": {"k": "1"}}"#, "fusion: rrf: k must be a number"),
+            (r#"{"rrf": 5}"#, "fusion: rrf must be an object"),
+            (r#"{"rrf": []}"#, "fusion: rrf must be an object"),
+            (
+                r#"{"weighted_sum": 5}"#,
+                "fusion: weighted_sum must be an object",
+            ),
+            (
+                r#"{"weighted_sum": {"lexical_weight": "1", "vector_weight": 0}}"#,
+                "fusion: weighted_sum: lexical_weight must be a number",
+            ),
+            (
+                r#"{"weighted_sum": {"vector_weight": true}}"#,
+                "fusion: weighted_sum: vector_weight must be a number",
+            ),
+            (r#"{"rrf": {"k": 1}, "weighted_sum": {}}"#, exactly_one),
+            (r#"{"rrf": null}"#, exactly_one),
+            ("{}", exactly_one),
+            ("5", "fusion must be an object"),
+            ("null", "fusion must be an object"),
+        ];
+        // Every value that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(json, expected)| {
+                let error = json_to_fusion_algorithm(json).err().map(|e| e.to_string());
+                (error.as_deref() != Some(expected)).then(|| format!("{json}: {error:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Issue #1523: a `null` key of `fusion` is the same as omitting it.
+    #[test]
+    fn test_json_to_fusion_algorithm_null_keys_are_omitted() {
+        let rrf = |json: &str| match json_to_fusion_algorithm(json).unwrap().algorithm {
+            Some(v1::fusion_algorithm::Algorithm::Rrf(rrf)) => rrf.k,
+            other => panic!("{json}: expected RRF, got {other:?}"),
+        };
+        assert_eq!(rrf(r#"{"rrf": {"k": null}}"#), 60.0);
+        assert_eq!(rrf(r#"{"rrf": {}, "weighted_sum": null}"#), 60.0);
+
+        match json_to_fusion_algorithm(
+            r#"{"weighted_sum": {"lexical_weight": null, "vector_weight": null}, "rrf": null}"#,
+        )
+        .unwrap()
+        .algorithm
+        {
+            Some(v1::fusion_algorithm::Algorithm::WeightedSum(ws)) => {
+                assert_eq!((ws.lexical_weight, ws.vector_weight), (0.5, 0.5));
+            }
+            other => panic!("expected WeightedSum, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_json_to_field_boosts() {
         let json = r#"{"title": 2.0, "body": 1.0}"#;
@@ -444,6 +443,40 @@ mod tests {
     fn test_json_to_field_boosts_invalid() {
         let json = r#"[1, 2, 3]"#;
         assert!(json_to_field_boosts(json).is_err());
+    }
+
+    /// Issue #1523: a boost that is not a number is an error naming the
+    /// field, as in the HTTP gateway, instead of being dropped, and a `null`
+    /// boost is the same as leaving the field out.
+    #[test]
+    fn test_json_to_field_boosts_rejects_values_of_the_wrong_type() {
+        let cases = [
+            (
+                r#"{"title": "2"}"#,
+                "field_boosts: \"title\" must be a number",
+            ),
+            (
+                r#"{"title": true}"#,
+                "field_boosts: \"title\" must be a number",
+            ),
+            (
+                r#"{"body": 1, "title": [2]}"#,
+                "field_boosts: \"title\" must be a number",
+            ),
+            ("[1]", "field_boosts must be an object"),
+            ("null", "field_boosts must be an object"),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(json, expected)| {
+                let error = json_to_field_boosts(json).err().map(|e| e.to_string());
+                (error.as_deref() != Some(expected)).then(|| format!("{json}: {error:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+
+        let boosts = json_to_field_boosts(r#"{"title": null, "body": 1}"#).unwrap();
+        assert_eq!(boosts, HashMap::from([("body".to_string(), 1.0)]));
     }
 
     #[test]
@@ -512,6 +545,123 @@ mod tests {
     #[test]
     fn test_json_to_highlight_params_rejects_non_array_non_object() {
         assert!(json_to_highlight_params("42").is_err());
+    }
+
+    /// Issue #1523: a `highlight` key of the wrong type, or an integer out
+    /// of the range of its proto type, is an error naming the key, as in
+    /// the HTTP gateway. Such a value used to be read as omitted or dropped,
+    /// and `max_fragments` wrapped (`4294967297` became 1).
+    #[test]
+    fn test_json_to_highlight_params_rejects_values_of_the_wrong_type() {
+        // The JSON text of each value, so that a number above `u64::MAX`
+        // reaches the parser as `serde_json` reads it from a tool call.
+        let uint32 = [r#""1""#, "1.0", "-1", "4294967296", "4294967297"];
+        let uint64 = [r#""3""#, "3.0", "-1", "18446744073709551616"];
+        let boolean = [r#""true""#, "1"];
+        let string = ["1", r#"["em"]"#];
+        let keys: [(&str, &[&str], String); 7] = [
+            (
+                "max_fragments",
+                &uint32,
+                format!("an integer between 0 and {}", u32::MAX),
+            ),
+            (
+                "fragment_size",
+                &uint32,
+                format!("an integer between 0 and {}", u32::MAX),
+            ),
+            (
+                "max_analyzed_chars",
+                &uint64,
+                format!("an integer between 0 and {}", u64::MAX),
+            ),
+            ("require_field_match", &boolean, "true or false".to_string()),
+            (
+                "return_entire_field_if_no_highlight",
+                &boolean,
+                "true or false".to_string(),
+            ),
+            ("tag", &string, "a string".to_string()),
+            ("css_class", &string, "a string".to_string()),
+        ];
+        let mut cases: Vec<(String, String)> = keys
+            .iter()
+            .flat_map(|(key, bad_values, what)| {
+                bad_values.iter().map(move |bad| {
+                    (
+                        format!(r#"{{"fields": ["body"], "{key}": {bad}}}"#),
+                        format!("highlight: {key} must be {what}"),
+                    )
+                })
+            })
+            .collect();
+        let shape = "highlight must be an array of strings or an object";
+        let fields = "highlight: fields must be an array of strings";
+        for (json, expected) in [
+            (r#"["body", 1]"#, shape),
+            ("42", shape),
+            (r#""body""#, shape),
+            (r#"{"fields": ["body", 1]}"#, fields),
+            (r#"{"fields": "body"}"#, fields),
+            // Checked even when the highlight names no field.
+            (
+                r#"{"fields": [], "max_fragments": "1"}"#,
+                "highlight: max_fragments must be an integer between 0 and 4294967295",
+            ),
+        ] {
+            cases.push((json.to_string(), expected.to_string()));
+        }
+
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(json, expected)| {
+                let error = json_to_highlight_params(json).err().map(|e| e.to_string());
+                (error.as_ref() != Some(expected)).then(|| format!("{json}: {error:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Issue #1523: a `null` key of `highlight` is the same as omitting it,
+    /// and a `highlight` that names no field is still an error (the HTTP
+    /// gateway reads it as no highlighting).
+    #[test]
+    fn test_json_to_highlight_params_null_keys_and_no_field() {
+        let params = json_to_highlight_params(
+            r#"{
+                "fields": ["body"],
+                "max_fragments": null,
+                "fragment_size": null,
+                "tag": null,
+                "css_class": null,
+                "require_field_match": null,
+                "max_analyzed_chars": null,
+                "return_entire_field_if_no_highlight": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            params,
+            v1::HighlightParams {
+                fields: vec!["body".to_string()],
+                ..Default::default()
+            }
+        );
+
+        for json in [
+            "[]",
+            "{}",
+            r#"{"fields": []}"#,
+            r#"{"fields": null}"#,
+            "null",
+        ] {
+            let error = json_to_highlight_params(json).map_err(|e| e.to_string());
+            assert_eq!(
+                error,
+                Err("highlight must name at least one field".to_string()),
+                "{json}"
+            );
+        }
     }
 
     #[test]

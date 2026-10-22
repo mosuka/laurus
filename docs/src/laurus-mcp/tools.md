@@ -404,9 +404,9 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `query` | string | Yes | Search query in laurus unified query DSL |
 | `limit` | integer | No | Maximum results (default: 10). `offset + limit` must not exceed the server's `max_result_window` (default 10,000) |
 | `offset` | integer | No | Results to skip for pagination (default: 0) |
-| `fusion` | string | No | Fusion algorithm as JSON (for hybrid search) |
-| `field_boosts` | string | No | Per-field boost factors as JSON |
-| `highlight` | string | No | Highlighted fragments per field, as JSON (see [Highlight example](#highlight-example)) |
+| `fusion` | string | No | Fusion algorithm as JSON (for hybrid search; see [Value types](#value-types)) |
+| `field_boosts` | string | No | Per-field boost factors as JSON (see [Value types](#value-types)) |
+| `highlight` | string | No | Highlighted fragments per field, as JSON (see [Highlight example](#highlight-example) and [Value types](#value-types)) |
 | `rescore` | string | No | Late-interaction rescore of the top results, as JSON (see [Rescore example](#rescore-example)) |
 | `group_by` | string | No | Group the results by a field's value, as JSON; `limit` and `offset` then count groups (see [Group by example](#group-by-example)) |
 
@@ -486,6 +486,43 @@ The full object form adds `HighlightConfig` knobs — `max_fragments`,
 ```json
 {"fields": ["body"], "max_fragments": 2, "tag": "em"}
 ```
+
+### Value types
+
+`fusion`, `field_boosts` and `highlight` take the same JSON as in the HTTP
+gateway's [search](../laurus-server/http_gateway.md#search) (Issue #1523):
+
+- `fusion` takes exactly one of `rrf` (`{"k": 60}`) and `weighted_sum`
+  (`{"lexical_weight": 0.5, "vector_weight": 0.5}`), each an object whose
+  numbers default to the values shown.
+- Each boost of `field_boosts` is a number.
+- In `highlight`, the field names are strings, `max_fragments` and
+  `fragment_size` integers between `0` and `4294967295`,
+  `max_analyzed_chars` an integer between `0` and `18446744073709551615`,
+  `require_field_match` and `return_entire_field_if_no_highlight` `true` or
+  `false`, and `tag` and `css_class` strings.
+
+`null` is the same as omitting a key. To leave out a whole parameter, omit
+it: the string `null` is a tool error, while the HTTP gateway reads a `null`
+`fusion`, `field_boosts` or `highlight` as omitted. A value of another type,
+or an integer out of its range, is a tool error naming the key, and nothing
+is searched.
+For example, the `highlight` `{"fields": ["body"], "max_fragments": "1"}`
+returns:
+
+```text
+Invalid highlight JSON: highlight: max_fragments must be an integer between 0 and 4294967295
+```
+
+A laurus-mcp older than this fix read such a value as omitted, so
+`{"rrf": {"k": "1"}}` used `k` 60 and `{"title": "2"}` boosted nothing. It
+also dropped a field name that was not a string, wrapped a `max_fragments` or
+`fragment_size` above `4294967295` (`4294967297` became `1`), and used `rrf`
+when both algorithms were set.
+
+Unlike the HTTP gateway, a `highlight` must name at least one field: `[]`,
+`{}` and `{"fields": []}` are a tool error, not a request for no
+highlighting.
 
 ### Rescore example
 
@@ -569,7 +606,7 @@ sub-queries per turn.
 | `queries` | array of string | Yes | Query strings, each in the laurus unified query DSL (same syntax as `search`) |
 | `limit` | integer | No | Maximum results per query (default: 10). `offset + limit` must not exceed the server's `max_result_window` (default 10,000) |
 | `offset` | integer | No | Results to skip per query for pagination (default: 0) |
-| `highlight` | string | No | Highlighted fragments per field, as JSON — same format as `search`'s `highlight`, applied identically to every query |
+| `highlight` | string | No | Highlighted fragments per field, as JSON — same format and [value types](#value-types) as `search`'s `highlight`, applied identically to every query |
 | `group_by` | string | No | Group each query's results by a field's value, as JSON — same format as `search`'s `group_by`, applied identically to every query |
 
 ### Result
