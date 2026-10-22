@@ -521,7 +521,7 @@ A `oneof` with two options:
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `field` | `string` | Field name to sort by. Empty string means sort by relevance score |
-| `order` | `SortOrder` | `SORT_ORDER_ASC` (ascending) or `SORT_ORDER_DESC` (descending) |
+| `order` | `SortOrder` | `SORT_ORDER_ASC` (ascending) or `SORT_ORDER_DESC` (descending). Any other value is rejected with `INVALID_ARGUMENT`, even when `sort_by` has no effect (no `query`, or an empty `field`); an older server sorted ascending (Issue #1476) |
 
 ### VectorParams
 

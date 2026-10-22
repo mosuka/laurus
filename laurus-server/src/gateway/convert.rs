@@ -186,7 +186,18 @@ pub fn proto_document_to_json(doc: &v1::Document) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Converts a JSON object to a proto `Schema`.
+///
+/// # Errors
+///
+/// Returns an error when `json` is not an object or has no `fields` object,
+/// when a field option, analyzer or embedder is invalid, or when
+/// `default_fields` is present and not `null` but not an array of strings,
+/// or `analyzers` or `embedders` not an object, instead of reading it as
+/// omitted or dropping an item (Issue #1524).
 pub fn json_to_proto_schema(json: &Value) -> Result<v1::Schema, String> {
+    let json = json
+        .as_object()
+        .ok_or_else(|| "schema must be an object".to_string())?;
     let fields_val = json
         .get("fields")
         .ok_or_else(|| "missing \"fields\" key in schema".to_string())?;
@@ -201,19 +212,9 @@ pub fn json_to_proto_schema(json: &Value) -> Result<v1::Schema, String> {
         fields.insert(name.clone(), field_option);
     }
 
-    let default_fields = json
-        .get("default_fields")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let default_fields = json_optional_string_array(json, "default_fields")?.unwrap_or_default();
 
-    let analyzers = json
-        .get("analyzers")
-        .and_then(|v| v.as_object())
+    let analyzers = json_optional_object(json, "analyzers")?
         .map(|obj| {
             obj.iter()
                 .map(|(name, def_json)| {
@@ -226,9 +227,7 @@ pub fn json_to_proto_schema(json: &Value) -> Result<v1::Schema, String> {
         .transpose()?
         .unwrap_or_default();
 
-    let embedders = json
-        .get("embedders")
-        .and_then(|v| v.as_object())
+    let embedders = json_optional_object(json, "embedders")?
         .map(|obj| {
             obj.iter()
                 .map(|(name, def_json)| {
@@ -371,6 +370,14 @@ pub fn proto_schema_to_json(schema: &v1::Schema) -> Value {
 /// Accepts either a bare string (`"standard"`) or a structured object
 /// (`{"language": "japanese", "dict": "..."}`). The structured form
 /// currently supports only the Japanese preset.
+///
+/// # Errors
+///
+/// Returns an error when `value` is neither a string nor an object, when the
+/// object has no string `language` or names an unsupported one, when a
+/// Japanese analyzer has no string `dict`, or when its `mode` or `user_dict`
+/// is present and not `null` but not a string, instead of using the default
+/// (Issue #1524).
 fn json_to_analyzer_spec(value: &Value) -> Result<v1::AnalyzerSpec, String> {
     use v1::analyzer_spec::Spec;
     let inner = if let Some(name) = value.as_str() {
@@ -382,18 +389,17 @@ fn json_to_analyzer_spec(value: &Value) -> Result<v1::AnalyzerSpec, String> {
             .ok_or_else(|| "analyzer object must include a \"language\" field".to_string())?;
         match language {
             "japanese" => {
+                let error = |message: String| format!("analyzer: {message}");
                 let dict = obj
                     .get("dict")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "japanese analyzer requires a \"dict\" path".to_string())?;
-                let mode = obj
-                    .get("mode")
-                    .and_then(|v| v.as_str())
+                let mode = json_optional_str(obj, "mode")
+                    .map_err(error)?
                     .unwrap_or("normal")
                     .to_string();
-                let user_dict = obj
-                    .get("user_dict")
-                    .and_then(|v| v.as_str())
+                let user_dict = json_optional_str(obj, "user_dict")
+                    .map_err(error)?
                     .unwrap_or("")
                     .to_string();
                 Spec::Builtin(v1::BuiltinAnalyzerSpec {
@@ -457,99 +463,181 @@ fn analyzer_spec_to_json(spec: &v1::AnalyzerSpec) -> Option<Value> {
 ///
 /// # Errors
 ///
-/// Returns an error string if the JSON is not an object or contains an
-/// unknown field option type, or when a key of the option is invalid: a
-/// boolean key (`indexed`, `stored`, `multi_valued`, `term_vectors`,
-/// `doc_values`) that is present and not `null` but not `true` or `false`
-/// (Issue #1511; see [`json_optional_bool`]), or an integer, `analyzer` or
-/// vector option key that cannot be read.
+/// Returns an error string if the JSON is not an object, contains no known
+/// field option type or more than one whose value is not `null` (Issue
+/// #1524), or has a type whose value is not an object (`{"text": 1}`, or
+/// `{"text": null}` with no other type, which used to read as all defaults;
+/// Issue #1524), or when a key of the option is invalid: a boolean key
+/// (`indexed`, `stored`, `multi_valued`, `term_vectors`, `doc_values`) that
+/// is present and not `null` but not `true` or `false` (Issue #1511; see
+/// [`json_optional_bool`]), or an integer, `analyzer` or vector option key
+/// that cannot be read. A `null` `analyzer`, or a `null` type next to
+/// another type, is the same as omitting it.
 pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| "field option must be an object".to_string())?;
 
+    // The type is the one type key whose value is not `null`: a `null` one
+    // is the same as omitting it, as for every other key. Two type keys
+    // used to take the first one an `if` chain read, without an error
+    // (Issue #1524).
+    let mut set = FIELD_OPTION_TYPES
+        .into_iter()
+        .filter(|name| obj.get(*name).is_some_and(|v| !v.is_null()));
+    let kind = match (set.next(), set.next()) {
+        (Some(kind), None) => kind,
+        (Some(first), Some(second)) => {
+            return Err(format!(
+                "a field option must have one type, got \"{first}\" and \"{second}\""
+            ));
+        }
+        // A type key that is only `null` still names the type the client
+        // meant, so the error names it.
+        (None, _) => {
+            return Err(
+                match FIELD_OPTION_TYPES
+                    .into_iter()
+                    .find(|name| obj.contains_key(*name))
+                {
+                    Some(kind) => format!("{kind} option must be an object"),
+                    None => "unknown field option type".to_string(),
+                },
+            );
+        }
+    };
+    let value = &obj[kind];
+
     use v1::field_option::Option as Opt;
 
-    let option = if let Some(v) = obj.get("text") {
-        Opt::Text(v1::TextOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            // Unset (omitted by the client) is distinct from an explicit
-            // `false`: it means "use the engine's default" (#1083), unlike
-            // `indexed`/`stored` above, which have no such tri-state and
-            // are `false` when omitted.
-            term_vectors: json_optional_bool(v, "term_vectors")?,
-            // Same tri-state treatment for the same reason (#1047).
-            doc_values: json_optional_bool(v, "doc_values")?,
-            analyzer: v.get("analyzer").map(json_to_analyzer_spec).transpose()?,
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            // Tri-state like `term_vectors` (#1175): an omitted gap means the
-            // engine default, never 0. Anything but an integer that fits
-            // `u32` is rejected rather than read as omitted (#1490).
-            position_increment_gap: json_optional_u32(v, "position_increment_gap")?,
-        })
-    } else if let Some(v) = obj.get("integer") {
-        Opt::Integer(v1::IntegerOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            doc_values: json_optional_bool(v, "doc_values")?,
-        })
-    } else if let Some(v) = obj.get("float") {
-        Opt::Float(v1::FloatOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            doc_values: json_optional_bool(v, "doc_values")?,
-        })
-    } else if let Some(v) = obj.get("boolean") {
-        Opt::Boolean(v1::BooleanOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            doc_values: json_optional_bool(v, "doc_values")?,
-        })
-    } else if let Some(v) = obj.get("date_time") {
-        Opt::DateTime(v1::DateTimeOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            doc_values: json_optional_bool(v, "doc_values")?,
-        })
-    } else if let Some(v) = obj.get("geo") {
-        Opt::Geo(v1::GeoOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            doc_values: json_optional_bool(v, "doc_values")?,
-        })
-    } else if let Some(v) = obj.get("geo3d") {
-        Opt::Geo3d(v1::Geo3dOption {
-            indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-            doc_values: json_optional_bool(v, "doc_values")?,
-        })
-    } else if let Some(v) = obj.get("bytes") {
-        Opt::Bytes(v1::BytesOption {
-            stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-            multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
-        })
-    } else if let Some(v) = obj.get("hnsw") {
-        Opt::Hnsw(json_to_hnsw_option(v)?)
-    } else if let Some(v) = obj.get("flat") {
-        Opt::Flat(json_to_flat_option(v)?)
-    } else if let Some(v) = obj.get("ivf") {
-        Opt::Ivf(json_to_ivf_option(v)?)
-    } else if let Some(v) = obj.get("multi_vector") {
-        Opt::MultiVector(json_to_multi_vector_option(v)?)
-    } else {
-        return Err("unknown field option type".to_string());
+    let option = match kind {
+        "text" => {
+            let v = option_object(value, kind)?;
+            Opt::Text(v1::TextOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                // Unset (omitted by the client) is distinct from an explicit
+                // `false`: it means "use the engine's default" (#1083), unlike
+                // `indexed`/`stored` above, which have no such tri-state and
+                // are `false` when omitted.
+                term_vectors: json_optional_bool(v, "term_vectors")?,
+                // Same tri-state treatment for the same reason (#1047).
+                doc_values: json_optional_bool(v, "doc_values")?,
+                // `null` is the same as omitting it, as for every other key
+                // (Issue #1524).
+                analyzer: v
+                    .get("analyzer")
+                    .filter(|a| !a.is_null())
+                    .map(json_to_analyzer_spec)
+                    .transpose()?,
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                // Tri-state like `term_vectors` (#1175): an omitted gap means the
+                // engine default, never 0. Anything but an integer that fits
+                // `u32` is rejected rather than read as omitted (#1490).
+                position_increment_gap: json_optional_u32(v, "position_increment_gap")?,
+            })
+        }
+        "integer" => {
+            let v = option_object(value, kind)?;
+            Opt::Integer(v1::IntegerOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                doc_values: json_optional_bool(v, "doc_values")?,
+            })
+        }
+        "float" => {
+            let v = option_object(value, kind)?;
+            Opt::Float(v1::FloatOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                doc_values: json_optional_bool(v, "doc_values")?,
+            })
+        }
+        "boolean" => {
+            let v = option_object(value, kind)?;
+            Opt::Boolean(v1::BooleanOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                doc_values: json_optional_bool(v, "doc_values")?,
+            })
+        }
+        "date_time" => {
+            let v = option_object(value, kind)?;
+            Opt::DateTime(v1::DateTimeOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                doc_values: json_optional_bool(v, "doc_values")?,
+            })
+        }
+        "geo" => {
+            let v = option_object(value, kind)?;
+            Opt::Geo(v1::GeoOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                doc_values: json_optional_bool(v, "doc_values")?,
+            })
+        }
+        "geo3d" => {
+            let v = option_object(value, kind)?;
+            Opt::Geo3d(v1::Geo3dOption {
+                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+                doc_values: json_optional_bool(v, "doc_values")?,
+            })
+        }
+        "bytes" => {
+            let v = option_object(value, kind)?;
+            Opt::Bytes(v1::BytesOption {
+                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
+            })
+        }
+        "hnsw" => Opt::Hnsw(json_to_hnsw_option(value)?),
+        "flat" => Opt::Flat(json_to_flat_option(value)?),
+        "ivf" => Opt::Ivf(json_to_ivf_option(value)?),
+        "multi_vector" => Opt::MultiVector(json_to_multi_vector_option(value)?),
+        other => unreachable!("FIELD_OPTION_TYPES has no type \"{other}\""),
     };
 
     Ok(v1::FieldOption {
         option: Some(option),
     })
+}
+
+/// The type keys [`json_to_proto_field_option`] reads. It takes the one whose
+/// value is not `null` and rejects a field option with more than one.
+const FIELD_OPTION_TYPES: [&str; 12] = [
+    "text",
+    "integer",
+    "float",
+    "boolean",
+    "date_time",
+    "geo",
+    "geo3d",
+    "bytes",
+    "hnsw",
+    "flat",
+    "ivf",
+    "multi_vector",
+];
+
+/// The value of a field option's type key `kind` as an object.
+///
+/// # Errors
+///
+/// Returns an error naming `kind` when `value` is not an object, `null`
+/// included, instead of reading it as an option with every key omitted
+/// (Issue #1524).
+fn option_object<'a>(value: &'a Value, kind: &str) -> Result<&'a Map<String, Value>, String> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{kind} option must be an object"))
 }
 
 fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
@@ -702,15 +790,15 @@ const DISTANCE_METRICS: &str =
 ///
 /// # Arguments
 ///
-/// * `json` - The vector option object that may carry `distance`.
+/// * `obj` - The vector option object that may carry `distance`.
 ///
 /// # Errors
 ///
 /// Returns an error when `distance` is not a string or names a metric
 /// other than `cosine`, `euclidean`, `manhattan`, `dot_product` or
 /// `angular`, so a typo is a 400 instead of a cosine index (Issue #1473).
-fn json_to_distance(json: &Value) -> Result<i32, String> {
-    let name = match json.get("distance") {
+fn json_to_distance(obj: &Map<String, Value>) -> Result<i32, String> {
+    let name = match obj.get("distance") {
         None | Some(Value::Null) => return Ok(v1::DistanceMetric::Cosine as i32),
         Some(Value::String(name)) => name,
         Some(other) => {
@@ -759,7 +847,7 @@ const QUANTIZER_METHODS: &str =
 ///
 /// # Arguments
 ///
-/// * `json` - The vector option object that may carry `quantizer`.
+/// * `option` - The vector option object that may carry `quantizer`.
 ///
 /// # Errors
 ///
@@ -770,8 +858,10 @@ const QUANTIZER_METHODS: &str =
 /// rejected too: unquantized storage was removed in Issue #481 Stage 1.
 /// Also returns an error when `subvector_count` is present and not an
 /// integer that fits `u32` (Issue #1490; see [`json_optional_u32`]).
-fn json_to_quantizer(json: &Value) -> Result<Option<v1::QuantizationConfig>, String> {
-    let obj = match json.get("quantizer") {
+fn json_to_quantizer(
+    option: &Map<String, Value>,
+) -> Result<Option<v1::QuantizationConfig>, String> {
+    let obj = match option.get("quantizer") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Object(obj)) => obj,
         Some(other) => {
@@ -798,7 +888,7 @@ fn json_to_quantizer(json: &Value) -> Result<Option<v1::QuantizationConfig>, Str
     // Absent or `null` is 0, which the engine rejects for the two product
     // quantization methods (Issue #1491); anything else must be an integer
     // that fits `u32` rather than read as 0 or wrapped (Issue #1490).
-    let subvector_count = json_optional_u32(&json["quantizer"], "subvector_count")
+    let subvector_count = json_optional_u32(obj, "subvector_count")
         .map_err(|e| format!("quantizer: {e}"))?
         .unwrap_or(0);
     Ok(Some(v1::QuantizationConfig {
@@ -829,15 +919,15 @@ fn quantizer_to_json(q: &v1::QuantizationConfig) -> Value {
 ///
 /// # Arguments
 ///
-/// * `json` - The vector option object that may carry `rerank_storage`.
+/// * `obj` - The vector option object that may carry `rerank_storage`.
 ///
 /// # Errors
 ///
 /// Returns an error when `rerank_storage` is not a string or is a string
 /// other than `"F32"`, so a typo is a 400 instead of no sidecar
 /// (Issue #1473).
-fn json_to_rerank_storage(json: &Value) -> Result<Option<i32>, String> {
-    match json.get("rerank_storage") {
+fn json_to_rerank_storage(obj: &Map<String, Value>) -> Result<Option<i32>, String> {
+    match obj.get("rerank_storage") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s.eq_ignore_ascii_case("f32") => {
             Ok(Some(v1::RerankStorageKind::F32 as i32))
@@ -868,38 +958,34 @@ fn rerank_storage_to_json(value: i32) -> Option<&'static str> {
 ///
 /// # Errors
 ///
-/// Returns an error when `dimension`, `m`, `ef_construction` or
-/// `default_ef_search` is present and not an integer that fits `u32` (see
-/// [`json_optional_u32`]; Issues #1479, #1490), or when `distance`,
+/// Returns an error when `json` is not an object, when `dimension`, `m`,
+/// `ef_construction` or `default_ef_search` is present and not an integer
+/// that fits `u32` (see [`json_optional_u32`]; Issues #1479, #1490), when
+/// `base_weight` is present and not a number, or `embedder` or
+/// `pq_codebook_path` not a string (Issue #1524), or when `distance`,
 /// `quantizer` or `rerank_storage` is invalid.
 fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
+    let obj = option_object(json, "hnsw")?;
     Ok(v1::HnswOption {
-        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
-        distance: json_to_distance(json)?,
-        m: json_optional_u32(json, "m")?,
-        ef_construction: json_optional_u32(json, "ef_construction")?,
+        dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
+        distance: json_to_distance(obj)?,
+        m: json_optional_u32(obj, "m")?,
+        ef_construction: json_optional_u32(obj, "ef_construction")?,
         // Unset (omitted by the client) means "use the engine's default"
         // (#1084).
-        base_weight: json
-            .get("base_weight")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32),
-        quantizer: json_to_quantizer(json)?,
-        embedder: json
-            .get("embedder")
-            .and_then(|v| v.as_str())
+        base_weight: json_optional_f64(obj, "base_weight")?.map(|v| v as f32),
+        quantizer: json_to_quantizer(obj)?,
+        embedder: json_optional_str(obj, "embedder")?
             .unwrap_or("")
             .to_string(),
         // Issue #644: optional schema-level `ef_search` default.
-        default_ef_search: json_optional_u32(json, "default_ef_search")?,
+        default_ef_search: json_optional_u32(obj, "default_ef_search")?,
         // Issue #793: optional Stage-2 rerank sidecar storage.
-        rerank_storage: json_to_rerank_storage(json)?,
+        rerank_storage: json_to_rerank_storage(obj)?,
         // Issue #631: optional shared PQ codebook file name. An explicitly
         // empty string would configure a codebook that can never exist;
         // treat it as unset.
-        pq_codebook_path: json
-            .get("pq_codebook_path")
-            .and_then(|v| v.as_str())
+        pq_codebook_path: json_optional_str(obj, "pq_codebook_path")?
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     })
@@ -910,26 +996,24 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
 ///
 /// # Errors
 ///
-/// Returns an error when `dimension` is present and not an integer that
-/// fits `u32` (see [`json_optional_u32`]), or when `distance`, `quantizer`
-/// or `rerank_storage` is invalid.
+/// Returns an error when `json` is not an object, when `dimension` is
+/// present and not an integer that fits `u32` (see [`json_optional_u32`]),
+/// when `base_weight` is present and not a number or `embedder` not a
+/// string (Issue #1524), or when `distance`, `quantizer` or
+/// `rerank_storage` is invalid.
 fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
+    let obj = option_object(json, "flat")?;
     Ok(v1::FlatOption {
-        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
-        distance: json_to_distance(json)?,
+        dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
+        distance: json_to_distance(obj)?,
         // Unset means "use the engine's default" (#1084).
-        base_weight: json
-            .get("base_weight")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32),
-        quantizer: json_to_quantizer(json)?,
-        embedder: json
-            .get("embedder")
-            .and_then(|v| v.as_str())
+        base_weight: json_optional_f64(obj, "base_weight")?.map(|v| v as f32),
+        quantizer: json_to_quantizer(obj)?,
+        embedder: json_optional_str(obj, "embedder")?
             .unwrap_or("")
             .to_string(),
         // Issue #793: optional Stage-2 rerank sidecar storage.
-        rerank_storage: json_to_rerank_storage(json)?,
+        rerank_storage: json_to_rerank_storage(obj)?,
     })
 }
 
@@ -946,9 +1030,11 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 /// [`json_to_distance`]) or `dimension` or `pool_factor` is present but not
 /// a non-negative integer that fits in `u32` (Issues #1346, #1479; see
 /// [`json_optional_u32`]). A `dimension` or `pool_factor` of 0 passes here
-/// and is rejected by the engine.
+/// and is rejected by the engine. Also returns an error when `json` is not
+/// an object or `embedder` is present and not a string (Issue #1524).
 fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
-    let storage = match json.get("storage") {
+    let obj = option_object(json, "multi_vector")?;
+    let storage = match obj.get("storage") {
         None | Some(Value::Null) => v1::MultiVectorStorage::F32 as i32,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("f32") => {
             v1::MultiVectorStorage::F32 as i32
@@ -971,15 +1057,13 @@ fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, St
         }
     };
     Ok(v1::MultiVectorOption {
-        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
-        distance: json_to_distance(json)?,
-        embedder: json
-            .get("embedder")
-            .and_then(|v| v.as_str())
+        dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
+        distance: json_to_distance(obj)?,
+        embedder: json_optional_str(obj, "embedder")?
             .unwrap_or("")
             .to_string(),
         storage: Some(storage),
-        pool_factor: json_optional_u32(json, "pool_factor")?,
+        pool_factor: json_optional_u32(obj, "pool_factor")?,
     })
 }
 
@@ -1004,28 +1088,26 @@ fn multi_vector_storage_to_json(value: Option<i32>) -> Option<&'static str> {
 ///
 /// # Errors
 ///
-/// Returns an error when `dimension`, `n_clusters` or `n_probe` is present
-/// and not an integer that fits `u32` (see [`json_optional_u32`]), or when
-/// `distance`, `quantizer` or `rerank_storage` is invalid.
+/// Returns an error when `json` is not an object, when `dimension`,
+/// `n_clusters` or `n_probe` is present and not an integer that fits `u32`
+/// (see [`json_optional_u32`]), when `base_weight` is present and not a
+/// number or `embedder` not a string (Issue #1524), or when `distance`,
+/// `quantizer` or `rerank_storage` is invalid.
 fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
+    let obj = option_object(json, "ivf")?;
     Ok(v1::IvfOption {
-        dimension: json_optional_u32(json, "dimension")?.unwrap_or(0),
-        distance: json_to_distance(json)?,
-        n_clusters: json_optional_u32(json, "n_clusters")?,
-        n_probe: json_optional_u32(json, "n_probe")?,
+        dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
+        distance: json_to_distance(obj)?,
+        n_clusters: json_optional_u32(obj, "n_clusters")?,
+        n_probe: json_optional_u32(obj, "n_probe")?,
         // Unset means "use the engine's default" (#1084).
-        base_weight: json
-            .get("base_weight")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32),
-        quantizer: json_to_quantizer(json)?,
-        embedder: json
-            .get("embedder")
-            .and_then(|v| v.as_str())
+        base_weight: json_optional_f64(obj, "base_weight")?.map(|v| v as f32),
+        quantizer: json_to_quantizer(obj)?,
+        embedder: json_optional_str(obj, "embedder")?
             .unwrap_or("")
             .to_string(),
         // Issue #793: optional Stage-2 rerank sidecar storage.
-        rerank_storage: json_to_rerank_storage(json)?,
+        rerank_storage: json_to_rerank_storage(obj)?,
     })
 }
 
@@ -1123,20 +1205,27 @@ fn ivf_option_to_json(opt: &v1::IvfOption) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Converts a JSON object to a proto `SearchRequest`.
+///
+/// A key that is absent or `null` keeps its default.
+///
+/// # Errors
+///
+/// Returns a message for HTTP 400 naming the offending key when `json` is
+/// not an object or a key has the wrong type, instead of reading the value
+/// as omitted or dropping it (Issues #1366, #1367, #1490, #1511, #1524).
+/// `query` used to be `""` when it was not a string, which turned a hybrid
+/// request into a vector-only one.
 pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, String> {
-    let query = json
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let json = json
+        .as_object()
+        .ok_or_else(|| "search request must be an object".to_string())?;
+    let query = json_optional_str(json, "query")?.unwrap_or("").to_string();
 
     // A malformed `query_vectors` is rejected (400) rather than dropped,
     // shortened or defaulted (Issue #1366).
-    let query_vectors = match json.get("query_vectors").filter(|v| !v.is_null()) {
+    let query_vectors = match json_optional_array(json, "query_vectors")? {
         None => Vec::new(),
-        Some(value) => value
-            .as_array()
-            .ok_or_else(|| "query_vectors must be an array".to_string())?
+        Some(entries) => entries
             .iter()
             .enumerate()
             .map(|(i, entry)| {
@@ -1148,22 +1237,21 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
     // Absent or `null` keeps the default; anything else must fit `u32`
     // rather than wrap around (Issue #1367).
     let page_value = |key: &str, default: u32| -> Result<u32, String> {
-        json.get(key)
-            .filter(|v| !v.is_null())
-            .map_or(Ok(default), |v| json_to_u32(v, key))
+        json_optional_u32(json, key).map(|value| value.unwrap_or(default))
     };
     let limit = page_value("limit", 10)?;
     let offset = page_value("offset", 0)?;
 
-    let fusion = json.get("fusion").and_then(json_to_fusion_algorithm);
-    // A malformed integer or boolean in `lexical_params` or `highlight` is
-    // rejected (400) rather than dropped: see `json_to_lexical_params` and
-    // `json_to_highlight_params` (Issues #1490, #1511).
-    let lexical_params = json
-        .get("lexical_params")
+    // A malformed `fusion`, `lexical_params`, `field_boosts` or `highlight`
+    // is rejected (400) rather than dropped: see `json_to_fusion_algorithm`,
+    // `json_to_lexical_params`, `json_to_field_boosts` and
+    // `json_to_highlight_params` (Issues #1490, #1511, #1524).
+    let fusion = json_optional_object(json, "fusion")?
+        .map(json_to_fusion_algorithm)
+        .transpose()?;
+    let lexical_params = json_optional_object(json, "lexical_params")?
         .map(json_to_lexical_params)
-        .transpose()?
-        .flatten();
+        .transpose()?;
     // A malformed `vector_params` is rejected (400) rather than dropped:
     // see `json_to_vector_params`.
     let vector_params = json
@@ -1172,14 +1260,9 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         .map(json_to_vector_params)
         .transpose()?;
 
-    let field_boosts = json
-        .get("field_boosts")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f as f32)))
-                .collect()
-        })
+    let field_boosts = json_optional_object(json, "field_boosts")?
+        .map(json_to_field_boosts)
+        .transpose()?
         .unwrap_or_default();
 
     let highlight = json
@@ -1245,25 +1328,8 @@ fn json_to_query_vector(json: &Value) -> Result<v1::QueryVector, String> {
         })
         .ok_or_else(|| "vector must be a non-empty array of numbers".to_string())?;
 
-    let weight = match get("weight") {
-        None => 1.0,
-        Some(value) => value
-            .as_f64()
-            .ok_or_else(|| "weight must be a number".to_string())? as f32,
-    };
-
-    let fields = match get("fields") {
-        None => Vec::new(),
-        Some(value) => value
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .map(|item| item.as_str().map(str::to_string))
-                    .collect::<Option<Vec<_>>>()
-            })
-            .ok_or_else(|| "fields must be an array of strings".to_string())?,
-    };
+    let weight = json_optional_f64(obj, "weight")?.map_or(1.0, |weight| weight as f32);
+    let fields = json_optional_string_array(obj, "fields")?.unwrap_or_default();
 
     Ok(v1::QueryVector {
         vector,
@@ -1272,65 +1338,132 @@ fn json_to_query_vector(json: &Value) -> Result<v1::QueryVector, String> {
     })
 }
 
-fn json_to_fusion_algorithm(json: &Value) -> Option<v1::FusionAlgorithm> {
+/// Converts a JSON `fusion` object to proto `FusionAlgorithm`: exactly one
+/// of `{"rrf": {"k": 60}}` and `{"weighted_sum": {"lexical_weight": 0.5,
+/// "vector_weight": 0.5}}`, whose numbers default to the values shown.
+///
+/// # Errors
+///
+/// Returns a message for HTTP 400 when `rrf` or `weighted_sum` is present
+/// and not `null` but not an object, when one of their keys is present and
+/// not `null` but not a number, or when neither or both are set. These used
+/// to fall back to the default (k 60, weights 0.5, or no `fusion`), and
+/// `rrf` won over `weighted_sum` (Issue #1524). `"rrf": null` is the same
+/// as omitting `rrf`.
+fn json_to_fusion_algorithm(obj: &Map<String, Value>) -> Result<v1::FusionAlgorithm, String> {
     use v1::fusion_algorithm::Algorithm;
-    if let Some(rrf) = json.get("rrf") {
-        let k = rrf.get("k").and_then(|v| v.as_f64()).unwrap_or(60.0);
-        Some(v1::FusionAlgorithm {
-            algorithm: Some(Algorithm::Rrf(v1::Rrf { k })),
-        })
-    } else if let Some(ws) = json.get("weighted_sum") {
-        let lexical_weight = ws
-            .get("lexical_weight")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5) as f32;
-        let vector_weight = ws
-            .get("vector_weight")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5) as f32;
-        Some(v1::FusionAlgorithm {
-            algorithm: Some(Algorithm::WeightedSum(v1::WeightedSum {
-                lexical_weight,
-                vector_weight,
-            })),
-        })
-    } else {
-        None
-    }
+    let error = |message: String| format!("fusion: {message}");
+    let rrf = json_optional_object(obj, "rrf").map_err(error)?;
+    let weighted_sum = json_optional_object(obj, "weighted_sum").map_err(error)?;
+    let algorithm = match (rrf, weighted_sum) {
+        (Some(rrf), None) => {
+            let k = json_optional_f64(rrf, "k")
+                .map_err(|e| error(format!("rrf: {e}")))?
+                .unwrap_or(60.0);
+            Algorithm::Rrf(v1::Rrf { k })
+        }
+        (None, Some(ws)) => {
+            let weight = |key: &str| {
+                json_optional_f64(ws, key)
+                    .map(|w| w.unwrap_or(0.5) as f32)
+                    .map_err(|e| error(format!("weighted_sum: {e}")))
+            };
+            Algorithm::WeightedSum(v1::WeightedSum {
+                lexical_weight: weight("lexical_weight")?,
+                vector_weight: weight("vector_weight")?,
+            })
+        }
+        _ => {
+            return Err("fusion must have exactly one of \"rrf\" and \"weighted_sum\"".to_string());
+        }
+    };
+    Ok(v1::FusionAlgorithm {
+        algorithm: Some(algorithm),
+    })
 }
 
 /// Converts a JSON `lexical_params` object to proto `LexicalParams`.
-///
-/// Returns `Ok(None)` when `json` is not an object, which
-/// [`json_to_proto_search_request`] treats like an absent `lexical_params`.
 ///
 /// # Errors
 ///
 /// Returns an error when `timeout_ms` is present and not `null` but not an
 /// integer that fits `u64`, instead of searching without a timeout (Issue
-/// #1490; see [`json_optional_u64`]), or when `parallel` is present and not
+/// #1490; see [`json_optional_u64`]), when `parallel` is present and not
 /// `null` but not `true` or `false`, instead of searching serially (Issue
-/// #1511; see [`json_optional_bool`]).
-fn json_to_lexical_params(json: &Value) -> Result<Option<v1::LexicalParams>, String> {
-    let Some(obj) = json.as_object() else {
-        return Ok(None);
-    };
+/// #1511; see [`json_optional_bool`]), or when `min_score` is present and
+/// not `null` but not a number, instead of `0.0`, or `sort_by` is invalid
+/// (Issue #1524; see [`json_to_sort_spec`]).
+fn json_to_lexical_params(obj: &Map<String, Value>) -> Result<v1::LexicalParams, String> {
     let error = |message: String| format!("lexical_params: {message}");
-    Ok(Some(v1::LexicalParams {
-        min_score: obj.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        timeout_ms: json_optional_u64(json, "timeout_ms").map_err(error)?,
-        parallel: json_optional_bool(json, "parallel")
+    Ok(v1::LexicalParams {
+        min_score: json_optional_f64(obj, "min_score")
+            .map_err(error)?
+            .unwrap_or(0.0) as f32,
+        timeout_ms: json_optional_u64(obj, "timeout_ms").map_err(error)?,
+        parallel: json_optional_bool(obj, "parallel")
             .map_err(error)?
             .unwrap_or(false),
-        sort_by: obj.get("sort_by").and_then(|v| {
-            let field = v.get("field")?.as_str()?.to_string();
-            let order = match v.get("order").and_then(|o| o.as_str()).unwrap_or("asc") {
-                "desc" => v1::SortOrder::Desc as i32,
-                _ => v1::SortOrder::Asc as i32,
-            };
-            Some(v1::SortSpec { field, order })
-        }),
-    }))
+        sort_by: json_optional_object(obj, "sort_by")
+            .map_err(error)?
+            .map(json_to_sort_spec)
+            .transpose()
+            .map_err(error)?,
+    })
+}
+
+/// Converts a JSON `sort_by` object (`{"field": "year", "order": "desc"}`)
+/// to proto `SortSpec`.
+///
+/// `order` is `"asc"` or `"desc"`, matched case-insensitively like the
+/// other enum strings; absent or `null` is ascending. An empty `field`
+/// means a sort by score, as over gRPC.
+///
+/// # Errors
+///
+/// Returns an error when `field` is not a string, absent or `null`
+/// included, or `order` is present and not `null` but not `"asc"` or
+/// `"desc"`. A `sort_by` without a string `field` used to be dropped and
+/// any other `order`, such as `"DESC"`, sorted ascending (Issues #1476,
+/// #1524).
+fn json_to_sort_spec(obj: &Map<String, Value>) -> Result<v1::SortSpec, String> {
+    let error = |message: String| format!("sort_by: {message}");
+    let field = json_optional_str(obj, "field")
+        .map_err(error)?
+        .ok_or_else(|| error("field must be a string".to_string()))?
+        .to_string();
+    let order = match obj.get("order") {
+        None | Some(Value::Null) => v1::SortOrder::Asc,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("asc") => v1::SortOrder::Asc,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("desc") => v1::SortOrder::Desc,
+        Some(other) => {
+            return Err(error(format!(
+                "order must be \"asc\" or \"desc\", got {other}"
+            )));
+        }
+    };
+    Ok(v1::SortSpec {
+        field,
+        order: order as i32,
+    })
+}
+
+/// Converts a JSON `field_boosts` object (`{"title": 2.0}`) to the proto
+/// map. A `null` boost is the same as omitting the field.
+///
+/// # Errors
+///
+/// Returns an error naming the field when its boost is not a number, such
+/// as `"2"`, which used to be dropped (Issue #1524).
+fn json_to_field_boosts(obj: &Map<String, Value>) -> Result<HashMap<String, f32>, String> {
+    obj.iter()
+        .filter(|(_, boost)| !boost.is_null())
+        .map(|(field, boost)| {
+            boost
+                .as_f64()
+                .map(|boost| (field.clone(), boost as f32))
+                .ok_or_else(|| format!("field_boosts: \"{field}\" must be a number"))
+        })
+        .collect()
 }
 
 /// Parse a JSON integer that must fit `u32`, naming `key` in the error, so
@@ -1343,18 +1476,23 @@ fn json_to_u32(value: &Value, key: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u32::MAX))
 }
 
-/// Read the optional integer `key` of `json`, which must fit `u32` when
+/// Read the optional integer `key` of `obj`, which must fit `u32` when
 /// present.
 ///
 /// A missing key and `null` are `None`, so the caller can leave the value
 /// unset for the engine's default (Issue #1479) instead of reading it as 0.
 ///
+/// This and the other `json_optional_*` helpers take an object rather than
+/// a [`Value`], so a caller must check that the value holding `key` is an
+/// object first: [`Value::get`] answers `None` for anything else, which
+/// read a field option such as `{"text": 1}` as all defaults (Issue #1524).
+///
 /// # Errors
 ///
 /// Returns an error when the value is present and not `null` but fails
 /// [`json_to_u32`] (`16.0`, `"16"`, `-1`, `4294967296`).
-fn json_optional_u32(json: &Value, key: &str) -> Result<Option<u32>, String> {
-    match json.get(key) {
+fn json_optional_u32(obj: &Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
+    match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => json_to_u32(value, key).map(Some),
     }
@@ -1368,7 +1506,7 @@ fn json_to_u64(value: &Value, key: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{key} must be an integer between 0 and {}", u64::MAX))
 }
 
-/// Read the optional integer `key` of `json`, which must fit `u64` when
+/// Read the optional integer `key` of `obj`, which must fit `u64` when
 /// present; the `uint64` counterpart of [`json_optional_u32`] (Issue
 /// #1490).
 ///
@@ -1376,14 +1514,14 @@ fn json_to_u64(value: &Value, key: &str) -> Result<u64, String> {
 ///
 /// Returns an error when the value is present and not `null` but fails
 /// [`json_to_u64`] (`500.0`, `"500"`, `-1`, `18446744073709551616`).
-fn json_optional_u64(json: &Value, key: &str) -> Result<Option<u64>, String> {
-    match json.get(key) {
+fn json_optional_u64(obj: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => json_to_u64(value, key).map(Some),
     }
 }
 
-/// Read the optional boolean `key` of `json`, the boolean counterpart of
+/// Read the optional boolean `key` of `obj`, the boolean counterpart of
 /// [`json_optional_u32`] (Issue #1511).
 ///
 /// A missing key and `null` are `None`, so the caller decides what an
@@ -1395,12 +1533,112 @@ fn json_optional_u64(json: &Value, key: &str) -> Result<Option<u64>, String> {
 /// Returns an error naming `key` when the value is present and not `null`
 /// but not `true` or `false` (`"true"`, `1`), instead of reading it as
 /// omitted, which made `"dry_run": "true"` apply a field change.
-pub fn json_optional_bool(json: &Value, key: &str) -> Result<Option<bool>, String> {
-    match json.get(key) {
+pub fn json_optional_bool(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(format!("{key} must be true or false")),
     }
+}
+
+/// Read the optional number `key` of `obj`, the number counterpart of
+/// [`json_optional_u32`] (Issue #1524).
+///
+/// # Errors
+///
+/// Returns an error naming `key` when the value is present and not `null`
+/// but not a number (`"2"`, `[2]`), instead of reading it as omitted.
+fn json_optional_f64(obj: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a number")),
+    }
+}
+
+/// Read the optional string `key` of `obj`, the string counterpart of
+/// [`json_optional_u32`] (Issue #1524).
+///
+/// # Errors
+///
+/// Returns an error naming `key` when the value is present and not `null`
+/// but not a string (`1`, `["a"]`), instead of reading it as omitted.
+fn json_optional_str<'a>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
+/// Read the optional object `key` of `obj`, the object counterpart of
+/// [`json_optional_u32`] (Issue #1524).
+///
+/// # Errors
+///
+/// Returns an error naming `key` when the value is present and not `null`
+/// but not an object (`5`, `"x"`, `[]`), instead of reading it as omitted.
+fn json_optional_object<'a>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a Map<String, Value>>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map)),
+        Some(_) => Err(format!("{key} must be an object")),
+    }
+}
+
+/// Read the optional array `key` of `obj`, the array counterpart of
+/// [`json_optional_u32`] (Issue #1524). The caller reads the items.
+///
+/// # Errors
+///
+/// Returns an error naming `key` when the value is present and not `null`
+/// but not an array (`"lowercase"`, `{}`), instead of reading it as omitted.
+fn json_optional_array<'a>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a Vec<Value>>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => Ok(Some(items)),
+        Some(_) => Err(format!("{key} must be an array")),
+    }
+}
+
+/// Read the optional array of strings `key` of `obj` (Issue #1524).
+///
+/// # Errors
+///
+/// Returns an error naming `key` when the value is present and not `null`
+/// but not an array, or has an item that is not a string (`[1, "title"]`),
+/// instead of reading it as omitted or dropping the item.
+fn json_optional_string_array(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => json_to_string_array(value)
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be an array of strings")),
+    }
+}
+
+/// The strings of `value`, or `None` when it is not an array or has an item
+/// that is not a string.
+fn json_to_string_array(value: &Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Converts a JSON `vector_params` object to proto `VectorParams`.
@@ -1419,22 +1657,11 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| error("must be an object".to_string()))?;
-    let get = |key: &str| obj.get(key).filter(|v| !v.is_null());
+    let fields = json_optional_string_array(obj, "fields")
+        .map_err(error)?
+        .unwrap_or_default();
 
-    let fields = match get("fields") {
-        None => Vec::new(),
-        Some(value) => value
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .map(|item| item.as_str().map(str::to_string))
-                    .collect::<Option<Vec<_>>>()
-            })
-            .ok_or_else(|| error("fields must be an array of strings".to_string()))?,
-    };
-
-    let score_mode = match get("score_mode") {
+    let score_mode = match obj.get("score_mode").filter(|v| !v.is_null()) {
         None => v1::VectorScoreMode::WeightedSum,
         Some(value) => match value.as_str().map(str::to_lowercase).as_deref() {
             Some("weighted_sum") => v1::VectorScoreMode::WeightedSum,
@@ -1450,19 +1677,12 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
     };
 
     let number = |key: &str| -> Result<f32, String> {
-        get(key).map_or(Ok(0.0), |value| {
-            value
-                .as_f64()
-                .map(|n| n as f32)
-                .ok_or_else(|| error(format!("{key} must be a number")))
-        })
+        json_optional_f64(obj, key)
+            .map(|n| n.unwrap_or(0.0) as f32)
+            .map_err(error)
     };
     // Issue #481 Stage 2 (`rerank_factor`) and Issue #644 (`ef_search`).
-    let uint32 = |key: &str| -> Result<Option<u32>, String> {
-        get(key)
-            .map(|value| json_to_u32(value, key).map_err(error))
-            .transpose()
-    };
+    let uint32 = |key: &str| json_optional_u32(obj, key).map_err(error);
 
     Ok(v1::VectorParams {
         fields,
@@ -1478,57 +1698,51 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
 /// #1134). Accepts either the array shorthand (just a field list) —
 /// `["title", "body"]` — or the full object form —
 /// `{"fields": ["body"], "max_fragments": 2, "tag": "em", ...}`. Returns
-/// `Ok(None)` for anything else (including an object with no usable
-/// `fields`), which `json_to_proto_search_request` treats the same as an
-/// absent `highlight` key; `from_proto` rejects an explicitly empty field
-/// list, but a malformed shorthand silently requesting nothing is not worth
-/// a hard gateway-level error.
+/// `Ok(None)` for `null` and for an empty field list (`[]`, `{}` or
+/// `{"fields": []}`), which `json_to_proto_search_request` treats the same
+/// as an absent `highlight` key; `from_proto` rejects an explicitly empty
+/// field list, but these have the right types and request nothing.
 ///
 /// # Errors
 ///
-/// Returns an error when `max_fragments` or `fragment_size` is present and
-/// not `null` but not an integer that fits `u32`, or `max_analyzed_chars`
-/// one that fits `u64`, instead of using the default or wrapping (Issue
-/// #1490; see [`json_optional_u32`] and [`json_optional_u64`]), or when
-/// `require_field_match` or `return_entire_field_if_no_highlight` is
-/// present and not `null` but not `true` or `false`, instead of using the
-/// default (Issue #1511; see [`json_optional_bool`]). They are checked even
-/// when the object has no usable `fields`.
+/// Returns an error when `json` is neither an array of strings nor an
+/// object, when `fields` is present and not `null` but not an array of
+/// strings, or `tag` or `css_class` not a string, instead of dropping the
+/// value (Issue #1524), when `max_fragments` or `fragment_size` is present
+/// and not `null` but not an integer that fits `u32`, or
+/// `max_analyzed_chars` one that fits `u64`, instead of using the default or
+/// wrapping (Issue #1490; see [`json_optional_u32`] and
+/// [`json_optional_u64`]), or when `require_field_match` or
+/// `return_entire_field_if_no_highlight` is present and not `null` but not
+/// `true` or `false`, instead of using the default (Issue #1511; see
+/// [`json_optional_bool`]). Every key is checked even when the field list
+/// is empty.
 fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>, String> {
-    if let Some(arr) = json.as_array() {
-        let fields: Vec<String> = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        return Ok(if fields.is_empty() {
-            None
-        } else {
-            Some(v1::HighlightParams {
+    const SHAPE: &str = "highlight must be an array of strings or an object";
+    let obj = match json {
+        Value::Null => return Ok(None),
+        Value::Array(_) => {
+            let fields = json_to_string_array(json).ok_or_else(|| SHAPE.to_string())?;
+            return Ok((!fields.is_empty()).then(|| v1::HighlightParams {
                 fields,
                 ..Default::default()
-            })
-        });
-    }
-
-    let Some(obj) = json.as_object() else {
-        return Ok(None);
+            }));
+        }
+        Value::Object(obj) => obj,
+        _ => return Err(SHAPE.to_string()),
     };
     let error = |message: String| format!("highlight: {message}");
-    let max_fragments = json_optional_u32(json, "max_fragments").map_err(error)?;
-    let fragment_size = json_optional_u32(json, "fragment_size").map_err(error)?;
-    let max_analyzed_chars = json_optional_u64(json, "max_analyzed_chars").map_err(error)?;
-    let require_field_match = json_optional_bool(json, "require_field_match").map_err(error)?;
-    let return_entire_field_if_no_highlight =
-        json_optional_bool(json, "return_entire_field_if_no_highlight").map_err(error)?;
-    let fields: Vec<String> = obj
-        .get("fields")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
+    let fields = json_optional_string_array(obj, "fields")
+        .map_err(error)?
         .unwrap_or_default();
+    let max_fragments = json_optional_u32(obj, "max_fragments").map_err(error)?;
+    let fragment_size = json_optional_u32(obj, "fragment_size").map_err(error)?;
+    let tag = json_optional_str(obj, "tag").map_err(error)?;
+    let css_class = json_optional_str(obj, "css_class").map_err(error)?;
+    let max_analyzed_chars = json_optional_u64(obj, "max_analyzed_chars").map_err(error)?;
+    let require_field_match = json_optional_bool(obj, "require_field_match").map_err(error)?;
+    let return_entire_field_if_no_highlight =
+        json_optional_bool(obj, "return_entire_field_if_no_highlight").map_err(error)?;
     if fields.is_empty() {
         return Ok(None);
     }
@@ -1536,11 +1750,8 @@ fn json_to_highlight_params(json: &Value) -> Result<Option<v1::HighlightParams>,
         fields,
         max_fragments,
         fragment_size,
-        tag: obj.get("tag").and_then(|v| v.as_str()).map(str::to_string),
-        css_class: obj
-            .get("css_class")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        tag: tag.map(str::to_string),
+        css_class: css_class.map(str::to_string),
         require_field_match,
         max_analyzed_chars,
         return_entire_field_if_no_highlight,
@@ -1618,6 +1829,15 @@ pub fn proto_search_response_to_json(response: &v1::SearchResponse) -> Value {
 // Analyzer definition conversion
 // ---------------------------------------------------------------------------
 
+/// Converts a JSON analyzer definition (`{"char_filters": [...],
+/// "tokenizer": {...}, "token_filters": [...]}`) to the proto message.
+///
+/// # Errors
+///
+/// Returns an error when `json` is not an object, has no `tokenizer`, or a
+/// component is invalid, or when `char_filters` or `token_filters` is
+/// present and not `null` but not an array, which used to be the same as
+/// omitting it (Issue #1524).
 fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinition, String> {
     let obj = json
         .as_object()
@@ -1628,27 +1848,14 @@ fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinit
         .ok_or("analyzer definition missing 'tokenizer'")?;
     let tokenizer = json_to_proto_component(tokenizer)?;
 
-    let char_filters = obj
-        .get("char_filters")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(json_to_proto_component)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    let token_filters = obj
-        .get("token_filters")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(json_to_proto_component)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let components = |key: &str| -> Result<Vec<v1::ComponentConfig>, String> {
+        json_optional_array(obj, key)?
+            .map(|arr| arr.iter().map(json_to_proto_component).collect())
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let char_filters = components("char_filters")?;
+    let token_filters = components("token_filters")?;
 
     Ok(v1::AnalyzerDefinition {
         char_filters,
@@ -3320,7 +3527,7 @@ mod tests {
     }
 
     /// #1351: `rescore` reaches the proto request, and a malformed one is
-    /// an error (400) instead of being dropped like the other options.
+    /// an error (400) instead of being dropped.
     #[test]
     fn test_json_to_proto_search_request_rescore() {
         let json = json!({
@@ -3426,34 +3633,33 @@ mod tests {
     /// instead of being dropped, shortened or defaulted.
     #[test]
     fn test_json_to_proto_search_request_rejects_malformed_query_vectors() {
+        let vector = "query_vectors[0]: vector must be a non-empty array of numbers";
+        let fields = "query_vectors[0]: fields must be an array of strings";
         let cases = [
-            ("not an array", json!({"vector": [1.0]})),
-            ("entry is not an object", json!([1.0])),
-            ("missing vector", json!([{}])),
+            (json!({"vector": [1.0]}), "query_vectors must be an array"),
+            (json!([1.0]), "query_vectors[0]: must be an object"),
+            (json!([{}]), vector),
+            (json!([{"vector": "systems programming"}]), vector),
+            (json!([{"vector": []}]), vector),
+            (json!([{"vector": [1.0, "x"]}]), vector),
             (
-                "vector is a string",
-                json!([{"vector": "systems programming"}]),
-            ),
-            ("empty vector", json!([{"vector": []}])),
-            ("non-numeric element", json!([{"vector": [1.0, "x"]}])),
-            (
-                "weight is not a number",
                 json!([{"vector": [1.0], "weight": "2"}]),
+                "query_vectors[0]: weight must be a number",
             ),
-            (
-                "fields is not an array",
-                json!([{"vector": [1.0], "fields": "vec"}]),
-            ),
-            (
-                "a field is not a string",
-                json!([{"vector": [1.0], "fields": [1]}]),
-            ),
+            (json!([{"vector": [1.0], "fields": "vec"}]), fields),
+            (json!([{"vector": [1.0], "fields": [1]}]), fields),
         ];
-        for (case, query_vectors) in cases {
-            let err = json_to_proto_search_request(&json!({"query_vectors": query_vectors}))
-                .expect_err(case);
-            assert!(err.contains("query_vectors"), "{case}: {err}");
+        // Every value that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (query_vectors, expected) in cases {
+            let request = json!({ "query_vectors": query_vectors });
+            let error = json_to_proto_search_request(&request).err();
+            if error.as_deref() != Some(expected) {
+                wrong.push(format!("{query_vectors}: {error:?}"));
+            }
         }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Issue #1367: `limit` / `offset` keep their defaults when absent or
@@ -3716,6 +3922,530 @@ mod tests {
             .expect_err(case);
             assert!(err.contains("vector_params"), "{case}: {err}");
         }
+    }
+
+    /// Issue #1524: every other key of a search request rejects a value of
+    /// the wrong type with a message naming the key. Such a value used to be
+    /// read as omitted or dropped: `"order": "DESC"` sorted ascending,
+    /// `{"title": "2"}` boosted nothing and `"k": "1"` was k 60.
+    #[test]
+    fn test_json_to_proto_search_request_rejects_values_of_the_wrong_type() {
+        let shape = "highlight must be an array of strings or an object";
+        let exactly_one = "fusion must have exactly one of \"rrf\" and \"weighted_sum\"";
+        // A whole request, or a key with its value added to a request with
+        // a `query`, and the expected message.
+        let bodies = [
+            (json!(5), "search request must be an object"),
+            (json!([]), "search request must be an object"),
+            (json!("body:rust"), "search request must be an object"),
+            (json!(null), "search request must be an object"),
+            (json!({"query": 5}), "query must be a string"),
+            (json!({"query": ["body:rust"]}), "query must be a string"),
+            (
+                json!({"query": 5, "query_vectors": [{"vector": [1.0, 0.0]}]}),
+                "query must be a string",
+            ),
+        ];
+        let keys = [
+            (
+                "lexical_params",
+                json!("x"),
+                "lexical_params must be an object",
+            ),
+            (
+                "lexical_params",
+                json!([{"min_score": 100}]),
+                "lexical_params must be an object",
+            ),
+            (
+                "lexical_params",
+                json!({"min_score": "100"}),
+                "lexical_params: min_score must be a number",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": 5}),
+                "lexical_params: sort_by must be an object",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": "year"}),
+                "lexical_params: sort_by must be an object",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": {"order": "desc"}}),
+                "lexical_params: sort_by: field must be a string",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": {"field": null}}),
+                "lexical_params: sort_by: field must be a string",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": {"field": 1, "order": "desc"}}),
+                "lexical_params: sort_by: field must be a string",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": {"field": "year", "order": "descending"}}),
+                "lexical_params: sort_by: order must be \"asc\" or \"desc\", got \"descending\"",
+            ),
+            (
+                "lexical_params",
+                json!({"sort_by": {"field": "year", "order": 1}}),
+                "lexical_params: sort_by: order must be \"asc\" or \"desc\", got 1",
+            ),
+            (
+                "field_boosts",
+                json!([["title", 2]]),
+                "field_boosts must be an object",
+            ),
+            (
+                "field_boosts",
+                json!("title"),
+                "field_boosts must be an object",
+            ),
+            (
+                "field_boosts",
+                json!({"title": "2"}),
+                "field_boosts: \"title\" must be a number",
+            ),
+            (
+                "field_boosts",
+                json!({"title": [2]}),
+                "field_boosts: \"title\" must be a number",
+            ),
+            ("fusion", json!("weighted_sum"), "fusion must be an object"),
+            ("fusion", json!({}), exactly_one),
+            ("fusion", json!({"rrf": null}), exactly_one),
+            (
+                "fusion",
+                json!({"rrf": {"k": 1}, "weighted_sum": {}}),
+                exactly_one,
+            ),
+            ("fusion", json!({"rrf": 5}), "fusion: rrf must be an object"),
+            (
+                "fusion",
+                json!({"weighted_sum": "x"}),
+                "fusion: weighted_sum must be an object",
+            ),
+            (
+                "fusion",
+                json!({"rrf": {"k": "1"}}),
+                "fusion: rrf: k must be a number",
+            ),
+            (
+                "fusion",
+                json!({"weighted_sum": {"lexical_weight": "1"}}),
+                "fusion: weighted_sum: lexical_weight must be a number",
+            ),
+            (
+                "fusion",
+                json!({"weighted_sum": {"vector_weight": "0"}}),
+                "fusion: weighted_sum: vector_weight must be a number",
+            ),
+            ("highlight", json!("body"), shape),
+            ("highlight", json!(5), shape),
+            ("highlight", json!(true), shape),
+            ("highlight", json!(["body", 1]), shape),
+            ("highlight", json!([null]), shape),
+            (
+                "highlight",
+                json!({"fields": "body"}),
+                "highlight: fields must be an array of strings",
+            ),
+            (
+                "highlight",
+                json!({"fields": ["body", 1]}),
+                "highlight: fields must be an array of strings",
+            ),
+            (
+                "highlight",
+                json!({"fields": ["body"], "tag": 1}),
+                "highlight: tag must be a string",
+            ),
+            // Checked even when the field list is empty.
+            (
+                "highlight",
+                json!({"fields": [], "tag": 1}),
+                "highlight: tag must be a string",
+            ),
+            (
+                "highlight",
+                json!({"fields": ["body"], "css_class": 1}),
+                "highlight: css_class must be a string",
+            ),
+        ];
+        let requests =
+            bodies
+                .into_iter()
+                .chain(keys.into_iter().map(|(key, value, expected)| {
+                    (json!({"query": "body:rust", key: value}), expected)
+                }));
+        // Every request that is not rejected with the expected message, so
+        // a failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (request, expected) in requests {
+            let error = json_to_proto_search_request(&request).err();
+            if error.as_deref() != Some(expected) {
+                wrong.push(format!("{request}: {error:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1524: an omitted or `null` key of a search request keeps its
+    /// default, and a value of the right type is passed on.
+    #[test]
+    fn test_json_to_proto_search_request_value_types_omitted_null_and_explicit() {
+        let request = |extra: Value| {
+            let mut request = json!({"query": "body:rust"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json_to_proto_search_request(&request).unwrap()
+        };
+
+        let omitted = request(json!({}));
+        let null = request(json!({
+            "lexical_params": null,
+            "field_boosts": null,
+            "fusion": null,
+            "highlight": null
+        }));
+        assert_eq!(null, omitted);
+        let null_query = json_to_proto_search_request(&json!({"query": null})).unwrap();
+        assert_eq!(null_query.query, "");
+
+        let lexical = |params: Value| request(json!({"lexical_params": params})).lexical_params;
+        let defaults = lexical(json!({})).unwrap();
+        assert_eq!(defaults.min_score, 0.0);
+        assert_eq!(defaults.sort_by, None);
+        assert_eq!(
+            lexical(json!({"min_score": null, "sort_by": null})),
+            Some(defaults)
+        );
+        assert_eq!(lexical(json!({"min_score": 0.5})).unwrap().min_score, 0.5);
+
+        let order = |order: Value| {
+            let sort_by = json!({"sort_by": {"field": "year", "order": order}});
+            lexical(sort_by).unwrap().sort_by.unwrap().order
+        };
+        let asc = v1::SortOrder::Asc as i32;
+        let desc = v1::SortOrder::Desc as i32;
+        let orders = [
+            (json!(null), asc),
+            (json!("asc"), asc),
+            (json!("ASC"), asc),
+            (json!("desc"), desc),
+            (json!("DESC"), desc),
+            (json!("Desc"), desc),
+        ];
+        let wrong: Vec<_> = orders
+            .into_iter()
+            .filter(|(value, expected)| order(value.clone()) != *expected)
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        let sort_by = lexical(json!({"sort_by": {"field": "year"}}))
+            .unwrap()
+            .sort_by;
+        assert_eq!(
+            sort_by,
+            Some(v1::SortSpec {
+                field: "year".to_string(),
+                order: asc
+            })
+        );
+        // An empty field is a sort by score, as over gRPC.
+        let sort_by = lexical(json!({"sort_by": {"field": ""}})).unwrap().sort_by;
+        assert_eq!(sort_by.unwrap().field, "");
+
+        let boosts = request(json!({"field_boosts": {"title": 2, "body": null}})).field_boosts;
+        assert_eq!(boosts, HashMap::from([("title".to_string(), 2.0)]));
+
+        use v1::fusion_algorithm::Algorithm;
+        let fusion = |fusion: Value| {
+            request(json!({"fusion": fusion}))
+                .fusion
+                .unwrap()
+                .algorithm
+                .unwrap()
+        };
+        assert_eq!(
+            fusion(json!({"rrf": {}})),
+            Algorithm::Rrf(v1::Rrf { k: 60.0 })
+        );
+        assert_eq!(
+            fusion(json!({"rrf": {"k": null}})),
+            Algorithm::Rrf(v1::Rrf { k: 60.0 })
+        );
+        assert_eq!(
+            fusion(json!({"rrf": {"k": 1}})),
+            Algorithm::Rrf(v1::Rrf { k: 1.0 })
+        );
+        assert_eq!(
+            fusion(json!({"rrf": null, "weighted_sum": {"vector_weight": null}})),
+            Algorithm::WeightedSum(v1::WeightedSum {
+                lexical_weight: 0.5,
+                vector_weight: 0.5
+            })
+        );
+        assert_eq!(
+            fusion(json!({"weighted_sum": {"lexical_weight": 1, "vector_weight": 0}})),
+            Algorithm::WeightedSum(v1::WeightedSum {
+                lexical_weight: 1.0,
+                vector_weight: 0.0
+            })
+        );
+
+        let highlight = request(json!({
+            "highlight": {"fields": ["body"], "tag": null, "css_class": null}
+        }))
+        .highlight
+        .unwrap();
+        assert_eq!((highlight.tag, highlight.css_class), (None, None));
+        let highlight = request(json!({
+            "highlight": {"fields": ["body"], "tag": "em", "css_class": "hl"}
+        }))
+        .highlight
+        .unwrap();
+        assert_eq!(
+            (highlight.tag.as_deref(), highlight.css_class.as_deref()),
+            (Some("em"), Some("hl"))
+        );
+        let highlight = request(json!({"highlight": {"fields": null}})).highlight;
+        assert_eq!(highlight, None);
+    }
+
+    /// Issue #1524: a field option whose type has a value that is not an
+    /// object, or with two types, is rejected, and so is a vector or
+    /// Japanese analyzer key of the wrong type. `{"text": 1}` used to read
+    /// as a `text` option with every key omitted.
+    #[test]
+    fn test_field_option_rejects_values_of_the_wrong_type() {
+        let mut cases = Vec::new();
+        for kind in FIELD_OPTION_TYPES {
+            for bad in [json!(1), json!(null), json!("x"), json!([])] {
+                cases.push((
+                    json!({ kind: bad }),
+                    format!("{kind} option must be an object"),
+                ));
+            }
+        }
+        cases.push((
+            json!({"text": {}, "integer": {}}),
+            "a field option must have one type, got \"text\" and \"integer\"".to_string(),
+        ));
+        cases.push((
+            json!({"flat": {"dimension": 2}, "hnsw": {"dimension": 2}}),
+            "a field option must have one type, got \"hnsw\" and \"flat\"".to_string(),
+        ));
+        // Only `null` types: the error names the first.
+        cases.push((
+            json!({"integer": null, "text": null}),
+            "text option must be an object".to_string(),
+        ));
+        for kind in ["hnsw", "flat", "ivf"] {
+            cases.push((
+                json!({ kind: {"dimension": 2, "base_weight": "2"} }),
+                "base_weight must be a number".to_string(),
+            ));
+        }
+        for kind in ["hnsw", "flat", "ivf", "multi_vector"] {
+            cases.push((
+                json!({ kind: {"dimension": 2, "embedder": 1} }),
+                "embedder must be a string".to_string(),
+            ));
+        }
+        cases.push((
+            json!({"hnsw": {"dimension": 2, "pq_codebook_path": 1}}),
+            "pq_codebook_path must be a string".to_string(),
+        ));
+        for key in ["mode", "user_dict"] {
+            let analyzer = json!({"language": "japanese", "dict": "d", key: 1});
+            cases.push((
+                json!({"text": {"analyzer": analyzer}}),
+                format!("analyzer: {key} must be a string"),
+            ));
+        }
+        // Every option that is not rejected with the expected message, so a
+        // failure lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (option, expected) in cases {
+            let error = json_to_proto_field_option(&option).err();
+            if error.as_deref() != Some(expected.as_str()) {
+                wrong.push(format!("{option}: {error:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1524: every type [`json_to_proto_field_option`] counts is one
+    /// it reads, an omitted or `null` key of a field option keeps its
+    /// default (`"analyzer": null` included, which used to be rejected),
+    /// and a value of the right type is passed on.
+    #[test]
+    fn test_field_option_value_types_omitted_null_and_explicit() {
+        let wrong: Vec<_> = FIELD_OPTION_TYPES
+            .into_iter()
+            .filter_map(|kind| {
+                json_to_proto_field_option(&json!({ kind: {} }))
+                    .err()
+                    .map(|e| (kind, e))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+
+        let option = |json: Value| {
+            json_to_proto_field_option(&json).unwrap_or_else(|e| panic!("{json}: {e}"))
+        };
+        assert_eq!(
+            option(json!({"text": {"indexed": true, "analyzer": null}})),
+            option(json!({"text": {"indexed": true}}))
+        );
+        // A `null` type next to another type is the same as omitting it.
+        assert_eq!(
+            option(json!({"text": {"indexed": true}, "integer": null, "hnsw": null})),
+            option(json!({"text": {"indexed": true}}))
+        );
+        assert_eq!(
+            option(json!({"text": null, "hnsw": {"dimension": 2}})),
+            option(json!({"hnsw": {"dimension": 2}}))
+        );
+        for kind in ["hnsw", "flat", "ivf"] {
+            assert_eq!(
+                option(json!({ kind: {"dimension": 2, "base_weight": null, "embedder": null} })),
+                option(json!({ kind: {"dimension": 2} })),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            option(json!({"hnsw": {"dimension": 2, "pq_codebook_path": null}})),
+            option(json!({"hnsw": {"dimension": 2}}))
+        );
+
+        let hnsw = json_to_hnsw_option(&json!({
+            "dimension": 2,
+            "base_weight": 2,
+            "embedder": "e",
+            "pq_codebook_path": "p"
+        }))
+        .unwrap();
+        assert_eq!(hnsw.base_weight, Some(2.0));
+        assert_eq!(hnsw.embedder, "e");
+        assert_eq!(hnsw.pq_codebook_path.as_deref(), Some("p"));
+
+        let japanese = |mode: Value, user_dict: Value| {
+            let analyzer = json!({
+                "language": "japanese",
+                "dict": "d",
+                "mode": mode,
+                "user_dict": user_dict
+            });
+            match json_to_analyzer_spec(&analyzer).unwrap().spec {
+                Some(v1::analyzer_spec::Spec::Builtin(builtin)) => match builtin.preset {
+                    Some(v1::builtin_analyzer_spec::Preset::Japanese(jp)) => {
+                        (jp.mode, jp.user_dict)
+                    }
+                    other => panic!("not a Japanese preset: {other:?}"),
+                },
+                other => panic!("not a builtin analyzer: {other:?}"),
+            }
+        };
+        assert_eq!(
+            japanese(json!(null), json!(null)),
+            ("normal".to_string(), String::new())
+        );
+        assert_eq!(
+            japanese(json!("search"), json!("u")),
+            ("search".to_string(), "u".to_string())
+        );
+    }
+
+    /// Issue #1524: a schema that is not an object, and a `default_fields`,
+    /// `analyzers`, `embedders`, `char_filters` or `token_filters` of the
+    /// wrong type, are rejected instead of read as omitted.
+    #[test]
+    fn test_json_to_proto_schema_rejects_values_of_the_wrong_type() {
+        let title = json!({"title": {"text": {"indexed": true}}});
+        let analyzer = |key: &str, value: Value| json!({"ws": {"tokenizer": {"type": "whitespace"}, key: value}});
+        let cases = [
+            (json!(5), "schema must be an object"),
+            (json!(null), "schema must be an object"),
+            (
+                json!({"fields": title, "default_fields": "title"}),
+                "default_fields must be an array of strings",
+            ),
+            (
+                json!({"fields": title, "default_fields": [1, "title"]}),
+                "default_fields must be an array of strings",
+            ),
+            (
+                json!({"fields": title, "analyzers": "x"}),
+                "analyzers must be an object",
+            ),
+            (
+                json!({"fields": title, "embedders": "x"}),
+                "embedders must be an object",
+            ),
+            (
+                json!({"fields": title, "analyzers": analyzer("token_filters", json!("lowercase"))}),
+                "analyzer \"ws\": token_filters must be an array",
+            ),
+            (
+                json!({"fields": title, "analyzers": analyzer("char_filters", json!({}))}),
+                "analyzer \"ws\": char_filters must be an array",
+            ),
+            (
+                json!({"fields": {"title": {"text": 1}}}),
+                "field \"title\": text option must be an object",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (schema, expected) in cases {
+            let error = json_to_proto_schema(&schema).err();
+            if error.as_deref() != Some(expected) {
+                wrong.push(format!("{schema}: {error:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1524: an omitted or `null` key of a schema or an analyzer
+    /// definition keeps its default, and a value of the right type is
+    /// passed on.
+    #[test]
+    fn test_json_to_proto_schema_value_types_omitted_null_and_explicit() {
+        let title = json!({"title": {"text": {"indexed": true}}});
+        let omitted = json_to_proto_schema(&json!({"fields": title})).unwrap();
+        let null = json_to_proto_schema(&json!({
+            "fields": title,
+            "default_fields": null,
+            "analyzers": null,
+            "embedders": null
+        }))
+        .unwrap();
+        assert_eq!(null, omitted);
+
+        let schema = json_to_proto_schema(&json!({
+            "fields": title,
+            "default_fields": ["title"],
+            "analyzers": {
+                "ws": {
+                    "tokenizer": {"type": "whitespace"},
+                    "char_filters": null,
+                    "token_filters": [{"type": "lowercase"}]
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(schema.default_fields, ["title"]);
+        let ws = &schema.analyzers["ws"];
+        assert!(ws.char_filters.is_empty());
+        assert_eq!(ws.token_filters.len(), 1);
     }
 
     /// Every concrete `FieldChangeKind` value maps to its own distinct

@@ -78,7 +78,10 @@ pub async fn search_stream(
 ///
 /// Request body: `{ "queries": [SearchRequest, SearchRequest, ...] }`.
 /// Each entry follows the same schema as `POST /v1/search`'s body. Empty
-/// input returns `{ "results": [] }` without invoking the gRPC service.
+/// input returns `{ "results": [] }` without invoking the gRPC service. An
+/// entry that cannot be converted fails the whole batch with a 400 whose
+/// message starts with its position (`queries[1]: ...`), as for
+/// `POST /v1/documents:bulk` (Issue #1524).
 ///
 /// Issue [#716](https://github.com/mosuka/laurus/issues/716) Phase 3a of
 /// [#648](https://github.com/mosuka/laurus/issues/648).
@@ -95,7 +98,11 @@ pub async fn search_batch(
 
     let queries = queries_array
         .iter()
-        .map(convert::json_to_proto_search_request)
+        .enumerate()
+        .map(|(index, query)| {
+            convert::json_to_proto_search_request(query)
+                .map_err(|e| format!("queries[{index}]: {e}"))
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| BadRequest(e).into_response())?;
 

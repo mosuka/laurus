@@ -254,14 +254,20 @@ async fn search_answers_400_for_a_non_boolean_key() {
             let mut params = params.clone();
             params[key] = bad.clone();
             let search = json!({"query": "body:rust", object: params});
-            let expected = json!(format!("{object}: {key} must be true or false"));
-            for (uri, request) in [
-                ("/v1/search", search.clone()),
-                ("/v1/search/stream", search.clone()),
-                ("/v1/search/batch", json!({"queries": [search.clone()]})),
+            let expected = format!("{object}: {key} must be true or false");
+            // A batch names the entry too (Issue #1524).
+            for (uri, request, expected) in [
+                ("/v1/search", search.clone(), expected.clone()),
+                ("/v1/search/stream", search.clone(), expected.clone()),
+                (
+                    "/v1/search/batch",
+                    json!({"queries": [search.clone()]}),
+                    format!("queries[0]: {expected}"),
+                ),
             ] {
                 let (status, body) = send(&router, "POST", uri, request).await;
-                if status != StatusCode::BAD_REQUEST || body["error"]["message"] != expected {
+                if status != StatusCode::BAD_REQUEST || body["error"]["message"] != json!(expected)
+                {
                     wrong.push(format!("{uri} {object}.{key} = {bad}: {status} {body}"));
                 }
             }

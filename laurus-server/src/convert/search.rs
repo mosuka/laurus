@@ -28,6 +28,23 @@ use crate::proto::laurus::v1;
 pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, tonic::Status> {
     let mut builder = SearchRequestBuilder::new();
 
+    // An unknown order is rejected even where `sort_by` has no effect (no
+    // `query`, or an empty `field`), instead of sorting ascending (Issue
+    // #1476).
+    let sort_order = proto
+        .lexical_params
+        .as_ref()
+        .and_then(|p| p.sort_by.as_ref())
+        .map(|spec| match v1::SortOrder::try_from(spec.order) {
+            Ok(v1::SortOrder::Asc) => Ok(SortOrder::Asc),
+            Ok(v1::SortOrder::Desc) => Ok(SortOrder::Desc),
+            Err(_) => Err(tonic::Status::invalid_argument(format!(
+                "lexical_params: unknown sort_by.order {}",
+                spec.order
+            ))),
+        })
+        .transpose()?;
+
     if !proto.query.is_empty() {
         builder = builder.query_dsl(proto.query.clone());
 
@@ -46,12 +63,9 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
                 builder = builder.lexical_parallel(true);
             }
             if let Some(spec) = &p.sort_by
+                && let Some(order) = sort_order
                 && !spec.field.is_empty()
             {
-                let order = match v1::SortOrder::try_from(spec.order) {
-                    Ok(v1::SortOrder::Desc) => SortOrder::Desc,
-                    _ => SortOrder::Asc,
-                };
                 builder = builder.sort_by(SortField::Field {
                     name: spec.field.clone(),
                     order,
@@ -317,10 +331,10 @@ fn rescore_from_proto(params: &v1::RescoreParams) -> Result<RescoreOptions, toni
 /// ```
 ///
 /// `late_interaction` takes exactly one of `vectors` (equal-length numeric
-/// arrays) and `text`; `window_size` is optional. Unlike the other search
-/// options, a malformed value is an error rather than ignored: the caller
-/// asked for a rescore explicitly, and dropping it would silently return the
-/// first-stage ranking.
+/// arrays) and `text`, where `null` is the same as omitting the key (Issue
+/// #1524); `window_size` is optional. A malformed value is an error rather
+/// than ignored: the caller asked for a rescore explicitly, and dropping it
+/// would silently return the first-stage ranking.
 ///
 /// # Errors
 ///
@@ -348,7 +362,10 @@ pub fn rescore_params_from_json(json: &serde_json::Value) -> Result<v1::RescoreP
         .and_then(Value::as_str)
         .ok_or("rescore.late_interaction.field must be a string")?
         .to_string();
-    let query = match (late.get("vectors"), late.get("text")) {
+    // `null` is the same as omitting the key, as for every other key of the
+    // gateway (Issue #1524); it used to count as the key being set.
+    let present = |key: &str| late.get(key).filter(|v| !v.is_null());
+    let query = match (present("vectors"), present("text")) {
         (Some(vectors), None) => {
             v1::late_interaction_rescore::Query::Vectors(token_vectors_from_json(vectors)?)
         }
@@ -617,6 +634,37 @@ mod tests {
         assert_eq!(params.window_size, None);
     }
 
+    /// Issue #1524: `null` for one of `vectors` and `text` is the same as
+    /// omitting it; it used to count as set, so the request was rejected
+    /// for having both.
+    #[test]
+    fn rescore_params_from_json_reads_null_as_omitted() {
+        let query = |late_interaction: serde_json::Value| {
+            let params = rescore_params_from_json(&serde_json::json!({
+                "late_interaction": late_interaction
+            }));
+            match params.map(|p| p.rescorer) {
+                Ok(Some(v1::rescore_params::Rescorer::LateInteraction(late))) => Ok(late.query),
+                other => Err(format!("{other:?}")),
+            }
+        };
+        assert_eq!(
+            query(serde_json::json!({"field": "t", "text": "rust", "vectors": null})),
+            Ok(Some(v1::late_interaction_rescore::Query::Text(
+                "rust".to_string()
+            )))
+        );
+        assert_eq!(
+            query(serde_json::json!({"field": "t", "vectors": [[1, 0]], "text": null})),
+            Ok(Some(v1::late_interaction_rescore::Query::Vectors(
+                v1::VectorArrayValue {
+                    dimension: 2,
+                    values: vec![1.0, 0.0],
+                }
+            )))
+        );
+    }
+
     #[test]
     fn rescore_params_from_json_rejects_malformed_values() {
         let cases = [
@@ -636,6 +684,10 @@ mod tests {
             ),
             (
                 serde_json::json!({"late_interaction": {"field": "t", "text": "q", "vectors": [[1]]}}),
+                "exactly one of vectors and text",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t", "text": null, "vectors": null}}),
                 "exactly one of vectors and text",
             ),
             (
@@ -944,6 +996,53 @@ mod tests {
         })
         .unwrap();
         assert_non_field_params(&with_vector_params);
+    }
+
+    /// Issue #1476: an unknown `SortOrder` is `INVALID_ARGUMENT` instead of
+    /// an ascending sort, even where `sort_by` has no effect (no `query`, or
+    /// an empty `field`), and ASC and DESC sort as asked.
+    #[test]
+    fn from_proto_rejects_an_unknown_sort_order() {
+        let request = |query: &str, field: &str, order: i32| v1::SearchRequest {
+            query: query.to_string(),
+            query_vectors: vec![query_vector(&[])],
+            lexical_params: Some(v1::LexicalParams {
+                sort_by: Some(v1::SortSpec {
+                    field: field.to_string(),
+                    order,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Every request that is not rejected as expected, so a failure lists
+        // all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (query, field) in [("title:rust", "year"), ("", "year"), ("title:rust", "")] {
+            for order in [2, 7, -1] {
+                let status = from_proto(&request(query, field, order)).err();
+                let expected = format!("lexical_params: unknown sort_by.order {order}");
+                let got = status.as_ref().map(|s| (s.code(), s.message()));
+                if got != Some((tonic::Code::InvalidArgument, expected.as_str())) {
+                    wrong.push(format!("{query:?} {field:?} {order}: {status:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+
+        for (order, expected) in [
+            (v1::SortOrder::Asc, SortOrder::Asc),
+            (v1::SortOrder::Desc, SortOrder::Desc),
+        ] {
+            let sorted = from_proto(&request("title:rust", "year", order as i32)).unwrap();
+            assert_eq!(
+                sorted.lexical_options.sort_by,
+                SortField::Field {
+                    name: "year".to_string(),
+                    order: expected
+                }
+            );
+        }
     }
 
     /// proto3 cannot tell an unset `float` from `0.0`: `overfetch == 0`

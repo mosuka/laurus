@@ -145,9 +145,11 @@ pub async fn update_field(
     axum::extract::Path(name): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    let field_option_json = body
-        .get("field_option")
-        .ok_or_else(|| BadRequest("missing \"field_option\" key".to_string()).into_response())?;
+    // A body that is not an object has no `field_option` either.
+    let missing_field_option =
+        || BadRequest("missing \"field_option\" key".to_string()).into_response();
+    let body = body.as_object().ok_or_else(missing_field_option)?;
+    let field_option_json = body.get("field_option").ok_or_else(missing_field_option)?;
 
     let field_option = convert::json_to_proto_field_option(field_option_json)
         .map_err(|e| BadRequest(e).into_response())?;
@@ -156,7 +158,7 @@ pub async fn update_field(
     // Anything but `true`, `false` or `null` is a 400 rather than `false`,
     // so `"dry_run": "true"` cannot apply the change (Issue #1511).
     let flag = |key: &str| {
-        convert::json_optional_bool(&body, key)
+        convert::json_optional_bool(body, key)
             .map(Option::unwrap_or_default)
             .map_err(|e| BadRequest(e).into_response())
     };

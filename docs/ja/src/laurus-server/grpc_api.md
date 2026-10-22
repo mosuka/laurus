@@ -518,7 +518,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `field` | `string` | ソート対象のフィールド名。空文字列はスコアでソートすることを意味する |
-| `order` | `SortOrder` | `SORT_ORDER_ASC`（昇順）または `SORT_ORDER_DESC`（降順） |
+| `order` | `SortOrder` | `SORT_ORDER_ASC`（昇順）または `SORT_ORDER_DESC`（降順）。ほかの値は、`sort_by` が効かないとき（`query` がない、または `field` が空）も `INVALID_ARGUMENT` で拒否されます。古いサーバーは昇順に並べていました（Issue #1476） |
 
 ### VectorParams
 
