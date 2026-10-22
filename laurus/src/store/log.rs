@@ -19,24 +19,29 @@
 //!
 //! ## File format
 //!
-//! The WAL log file stores a sequence of length-prefixed records. There are
-//! three framings:
+//! The WAL log file stores a sequence of length-prefixed records, one per
+//! put, add or delete (Issue #1522): a put's record names the versions it
+//! replaces, and a delete's record every document it deletes, so the replay
+//! applies a mutation whole or not at all. There are four framings:
 //!
-//! - **v3** (current, #822): a 5-byte file header (`b"LWAL"` magic + version
-//!   byte `3`), then `[u32 len][u32 crc32][rkyv payload]` per entry. Same CRC
-//!   framing as v2, but each payload is a compact rkyv binary record instead of
-//!   JSON — typically 3-5x smaller (vectors store as raw `f32`, not decimal
-//!   strings) and faster to parse on recovery.
-//! - **v2** (#815): a 5-byte header (`b"LWAL"` magic + version byte `2`), then
-//!   `[u32 len][u32 crc32][json payload]` per entry. Still read for back-compat;
-//!   never written by current code.
+//! - **v4** (current, #1522): a 5-byte file header (`b"LWAL"` magic + version
+//!   byte `4`), then `[u32 len][u32 crc32][rkyv payload]` per entry, the
+//!   payload a [`LogRecord`].
+//! - **v3** (#822): the same framing with version byte `3`, whose rkyv
+//!   payloads hold one record per deleted document and a put's document in
+//!   a record of its own. Read only.
+//! - **v2** (#815): version byte `2`, with a JSON payload of the same records
+//!   as v3. Read only.
 //! - **legacy** (pre-#542): no header, `[u32 len][json payload]` per entry, no
-//!   checksum. Still read for back-compat.
+//!   checksum. Read only.
 //!
-//! The CRC-32 (v2/v3) is computed over `len || payload`, so both a corrupted
-//! length and a corrupted body are detected. A file keeps its framing for its
-//! whole life; an older file that survives an upgrade is rewritten as v3 only on
-//! the next commit/truncate, and the framings are never mixed within one file.
+//! The CRC-32 is computed over `len || payload`, so both a corrupted length
+//! and a corrupted body are detected. Every append is written in v4: a file in
+//! an older framing that survives an upgrade is rewritten in v4 before the
+//! first append to it, unless a commit empties it first, so the framings are
+//! never mixed within one file. A file whose header names a version this
+//! build does not know, written by a newer build, is not read, appended to or
+//! rewritten: opening it fails (Issue #1507).
 //!
 //! Each entry is followed by `flush_and_sync()` for durability.
 //!
@@ -50,7 +55,9 @@
 //! to continue, which keeps the recovered sequence gap-free and consistent. It
 //! also cuts the file back to the end of the last valid record, so a record
 //! appended after the open is not written behind the bad one, where the next
-//! recovery would stop before reaching it (Issue #1503).
+//! recovery would stop before reaching it (Issue #1503). A file of a version
+//! this build does not know fails [`DocumentLog::read_all`] instead, and is
+//! left as it is (Issue #1507).
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -61,9 +68,8 @@ use parking_lot::{Mutex, RwLock};
 use rkyv::api::high::HighSerializer;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
-use rkyv::with::Inline;
+use rkyv::with::{AsVec, Inline};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use serde::{Deserialize, Serialize};
 
 use crate::data::Document;
 use crate::error::Result;
@@ -73,77 +79,155 @@ use crate::store::document::UnifiedDocumentStore;
 /// Sequence number for log entries.
 pub type SeqNumber = u64;
 
-/// A single operation in the document log.
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+/// One mutation in the document log: a put, an add or a delete, each
+/// written as a single record so that its replay applies it whole or not at
+/// all (Issue #1522).
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub enum LogEntry {
-    /// Insert or update a document.
+    /// Insert a document, deleting the versions it replaces: a put, or an
+    /// add, which replaces nothing.
     Upsert {
         doc_id: u64,
         external_id: String,
         document: Document,
+        /// The internal ids of `external_id`'s versions this upsert
+        /// replaces, deleted together with the insert. Empty for an add,
+        /// and for every upsert a WAL older than v4 holds, which logged a
+        /// put's deletes as records of their own.
+        replaces: Vec<u64>,
     },
-    /// Delete a document.
+    /// Delete documents of one external id.
     Delete {
-        doc_id: u64,
-        /// External ID of the deleted document.
-        /// Uses `#[serde(default)]` for backward compatibility with old WAL
-        /// entries that lack this field.
-        #[serde(default)]
+        /// The internal ids to delete. A WAL older than v4 holds one record
+        /// per deleted document.
+        doc_ids: Vec<u64>,
+        /// External ID of the deleted documents.
         external_id: String,
     },
 }
 
 /// A log record combining a sequence number with an entry.
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct LogRecord {
     pub seq: SeqNumber,
     pub entry: LogEntry,
 }
 
 /// A borrowed mirror of [`LogEntry`], field for field and variant for
-/// variant, used only to *write* a record without cloning its `Document`
-/// (Issue #1416). `document` is archived with [`Inline`], which gives the
-/// exact same archived bytes as the owned `Document` field in [`LogEntry`]
-/// (`Inline`'s `Archived` type is `Document`'s own, see `rkyv::with::Inline`),
-/// so the v3 WAL format is unchanged. References archived with `Inline`
-/// cannot be deserialized, so this type derives `Serialize` (for the
-/// v2/legacy JSON path) and rkyv's `Serialize`, but never `Deserialize`.
-#[derive(Debug, Serialize, Archive, RkyvSerialize)]
+/// variant, used only to *write* a record without cloning its `Document` or
+/// its internal ids (Issues #1416, #1522). `document` is archived with
+/// [`Inline`], which gives the exact same archived bytes as the owned
+/// `Document` field in [`LogEntry`] (`Inline`'s `Archived` type is
+/// `Document`'s own, see `rkyv::with::Inline`), and each id slice with
+/// [`AsVec`], which archives a slice as the `Vec` it mirrors. References
+/// archived this way cannot be deserialized, so this type derives rkyv's
+/// `Serialize` but never `Deserialize`.
+#[derive(Debug, Archive, RkyvSerialize)]
 enum LogEntryRef<'a> {
     Upsert {
         doc_id: u64,
         external_id: String,
         #[rkyv(with = Inline)]
         document: &'a Document,
+        #[rkyv(with = AsVec)]
+        replaces: &'a [u64],
     },
     Delete {
-        doc_id: u64,
+        #[rkyv(with = AsVec)]
+        doc_ids: &'a [u64],
         external_id: String,
     },
 }
 
 /// A borrowed mirror of [`LogRecord`]; see [`LogEntryRef`].
-#[derive(Debug, Serialize, Archive, RkyvSerialize)]
+#[derive(Debug, Archive, RkyvSerialize)]
 struct LogRecordRef<'a> {
     seq: SeqNumber,
     entry: LogEntryRef<'a>,
 }
 
-/// Either [`LogRecord`] (owned, used by `append_delete` and the
-/// truncate/rewrite path) or [`LogRecordRef`] (borrowed, used by
-/// [`DocumentLog::append`]) can be encoded through the same WAL-writing path
-/// (Issue #1416). The bound mirrors what `rkyv::to_bytes` itself requires
-/// (`rkyv::Serialize<S>` already has `Archive` as a supertrait).
+/// Either [`LogRecord`] (owned, used by the rewrite path) or
+/// [`LogRecordRef`] (borrowed, used by the appends) can be encoded through
+/// the same WAL-writing path (Issue #1416). The bound mirrors what
+/// `rkyv::to_bytes` itself requires (`rkyv::Serialize<S>` already has
+/// `Archive` as a supertrait).
 trait WalEncodable:
-    serde::Serialize
-    + for<'x> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'x>, rkyv::rancor::Error>>
+    for<'x> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'x>, rkyv::rancor::Error>>
 {
 }
 
 impl<T> WalEncodable for T where
-    T: serde::Serialize
-        + for<'x> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'x>, rkyv::rancor::Error>>
+    T: for<'x> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'x>, rkyv::rancor::Error>>
 {
+}
+
+/// The records of WAL v3 and older, frozen as they were before every
+/// mutation became one record (Issue #1522): a v3 payload is an rkyv archive
+/// of [`LogRecord`](v3::LogRecord), a v2 or legacy payload its JSON. rkyv
+/// finds an archive's root by the root's size, which the v4 records changed,
+/// so these types keep the old layout. They are only read, and converted
+/// into the current records; tests also write them, to build WAL files of
+/// these versions.
+mod v3 {
+    use serde::Deserialize;
+
+    use super::{Archive, Document, RkyvDeserialize, SeqNumber};
+
+    /// A v3 entry: a put wrote one [`Self::Delete`] per previous version
+    /// before its [`Self::Upsert`].
+    #[derive(Debug, Deserialize, Archive, RkyvDeserialize)]
+    #[cfg_attr(test, derive(serde::Serialize, rkyv::Serialize))]
+    pub(super) enum LogEntry {
+        Upsert {
+            doc_id: u64,
+            external_id: String,
+            document: Document,
+        },
+        Delete {
+            doc_id: u64,
+            /// Absent from the oldest JSON entries.
+            #[serde(default)]
+            external_id: String,
+        },
+    }
+
+    /// A v3 record.
+    #[derive(Debug, Deserialize, Archive, RkyvDeserialize)]
+    #[cfg_attr(test, derive(serde::Serialize, rkyv::Serialize))]
+    pub(super) struct LogRecord {
+        pub(super) seq: SeqNumber,
+        pub(super) entry: LogEntry,
+    }
+
+    impl From<LogRecord> for super::LogRecord {
+        /// An upsert replaces nothing, since a put's deletes are records of
+        /// their own, and a delete deletes one document.
+        fn from(record: LogRecord) -> Self {
+            let entry = match record.entry {
+                LogEntry::Upsert {
+                    doc_id,
+                    external_id,
+                    document,
+                } => super::LogEntry::Upsert {
+                    doc_id,
+                    external_id,
+                    document,
+                    replaces: Vec::new(),
+                },
+                LogEntry::Delete {
+                    doc_id,
+                    external_id,
+                } => super::LogEntry::Delete {
+                    doc_ids: vec![doc_id],
+                    external_id,
+                },
+            };
+            Self {
+                seq: record.seq,
+                entry,
+            }
+        }
+    }
 }
 
 /// Durability policy governing when WAL appends are fsync'd.
@@ -248,29 +332,31 @@ impl WalSyncPolicy {
     }
 }
 
-/// Magic bytes at the start of a CRC-framed (v2/v3) WAL file.
+/// Magic bytes at the start of a CRC-framed (v2 and later) WAL file.
 const WAL_MAGIC: &[u8; 4] = b"LWAL";
 
-/// Current WAL file-format version stamped into the header of a freshly created
-/// or truncated file. v3 keeps the v2 CRC framing but stores each payload as a
-/// compact rkyv binary record instead of JSON (#822).
-const WAL_VERSION: u8 = 3;
+/// Current WAL file-format version, the only one written: every append, and
+/// the header of a fresh, truncated or rewritten file. v4 keeps v3's CRC
+/// framing and rkyv payload, with one record per mutation (Issue #1522).
+const WAL_VERSION: u8 = 4;
 
-/// v2 file-format version: CRC framing with a JSON payload (#815). Still read
-/// for back-compat; never written by current code.
+/// v3 file-format version: CRC framing with an rkyv payload of the
+/// [`v3`] records (#822). Still read; never written.
+const WAL_VERSION_V3: u8 = 3;
+
+/// v2 file-format version: CRC framing with a JSON payload of the [`v3`]
+/// records (#815). Still read; never written.
 const WAL_VERSION_V2: u8 = 2;
 
 /// Length of the file header: 4-byte [`WAL_MAGIC`] + 1-byte version.
 const WAL_HEADER_LEN: u64 = 5;
 
-/// On-disk framing of the WAL file currently being appended to / read.
+/// On-disk framing of a WAL file, detected once from its header.
 ///
-/// A WAL file is written in a single, consistent format for its whole life: a
-/// fresh or truncated file is always [`WalFormat::V3`]; an older file that
-/// survives an upgrade keeps its existing format ([`WalFormat::V2`] or
-/// [`WalFormat::Legacy`]) until the next commit/truncate recreates it as v3.
-/// The formats are never mixed within a file, so the reader detects the format
-/// once from the file header.
+/// Only [`WalFormat::V4`] is written. A file in an older framing that
+/// survives an upgrade is read as it is, and rewritten in v4 before the
+/// first append to it (Issue #1522), so the formats are never mixed within a
+/// file.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WalFormat {
     /// Pre-#542 frames: `[u32 len][json payload]`, no per-record checksum.
@@ -281,22 +367,26 @@ enum WalFormat {
     /// v3 frames (#822): `[u32 len][u32 crc32][rkyv payload]`, same CRC framing
     /// as v2 but a compact binary payload.
     V3,
+    /// v4 frames (#1522): v3's framing, with a payload of the current
+    /// [`LogRecord`], one per mutation.
+    V4,
+    /// A header with [`WAL_MAGIC`] and a version this build does not know,
+    /// which a newer build wrote (Issue #1507). Neither read nor written.
+    Unknown(u8),
 }
 
 impl WalFormat {
-    /// Whether this framing carries a per-record CRC-32 (v2 and v3 do; the
-    /// pre-#542 legacy framing does not).
+    /// Whether this framing carries a per-record CRC-32 (all but the
+    /// pre-#542 legacy framing do).
     fn has_crc(self) -> bool {
-        matches!(self, WalFormat::V2 | WalFormat::V3)
+        !matches!(self, WalFormat::Legacy)
     }
 }
 
-/// The open WAL append handle together with the framing of the file it points
-/// at, so [`DocumentLog::write_record`] knows whether to emit a CRC.
+/// The open WAL append handle, always on a [`WalFormat::V4`] file.
 #[derive(Debug)]
 struct WalWriterState {
     out: Box<dyn crate::storage::StorageOutput>,
-    format: WalFormat,
     /// Whether bytes have been appended since the last successful
     /// `flush_and_sync()`. Set by [`DocumentLog::append_record_bytes`] and
     /// cleared by [`DocumentLog::flush_writer`]; it lets [`DocumentLog::flush_wal`]
@@ -308,7 +398,7 @@ struct WalWriterState {
     /// on flush.
     unsynced_records: usize,
     /// Number of bytes appended since the last successful `flush_and_sync()`
-    /// (framed length, including the CRC for v2). Drives the
+    /// (framed length, including the CRC). Drives the
     /// [`WalSyncPolicy::Group`] byte threshold; reset to 0 on flush.
     unsynced_bytes: usize,
     /// Test-only: number of `flush_and_sync()` calls performed on this writer.
@@ -316,6 +406,20 @@ struct WalWriterState {
     /// path syncing once per batch instead of once per record).
     #[cfg(test)]
     sync_count: usize,
+}
+
+impl WalWriterState {
+    /// A clean state for `out`, a handle on a v4 file.
+    fn new(out: Box<dyn crate::storage::StorageOutput>) -> Self {
+        Self {
+            out,
+            dirty: false,
+            unsynced_records: 0,
+            unsynced_bytes: 0,
+            #[cfg(test)]
+            sync_count: 0,
+        }
+    }
 }
 
 /// Unified document log providing WAL, doc_id generation, and document storage.
@@ -449,10 +553,10 @@ impl DocumentLog {
     /// Detect the framing of an existing (non-empty) WAL file from its header.
     ///
     /// Reads the 5-byte header and classifies the file: the [`WAL_MAGIC`] magic
-    /// followed by version `3` is [`WalFormat::V3`], version `2` is
-    /// [`WalFormat::V2`], and anything without the magic is the pre-#542
-    /// [`WalFormat::Legacy`] framing. An unknown but magic-prefixed version is
-    /// treated as v2 (CRC-framed JSON), the most conservative readable framing.
+    /// followed by version `4`, `3` or `2` is [`WalFormat::V4`],
+    /// [`WalFormat::V3`] or [`WalFormat::V2`], followed by any other version
+    /// [`WalFormat::Unknown`], and anything without the magic is the pre-#542
+    /// [`WalFormat::Legacy`] framing.
     ///
     /// # Arguments
     ///
@@ -467,26 +571,42 @@ impl DocumentLog {
             return Ok(WalFormat::Legacy);
         }
         Ok(match header[4] {
-            WAL_VERSION => WalFormat::V3,
+            WAL_VERSION => WalFormat::V4,
+            WAL_VERSION_V3 => WalFormat::V3,
             WAL_VERSION_V2 => WalFormat::V2,
-            // An unknown but magic-prefixed version falls back to the v2 (CRC +
-            // JSON) reader — the most conservative readable CRC framing.
-            _ => WalFormat::V2,
+            version => WalFormat::Unknown(version),
         })
     }
 
-    /// Open or create the WAL file for appending, detecting its framing.
+    /// The error for a WAL whose header names `version`, a version this
+    /// build does not know (Issue #1507).
+    fn unknown_version_error(&self, version: u8) -> crate::error::LaurusError {
+        crate::error::LaurusError::IncompatibleFormat(format!(
+            "WAL '{}' has format version {version}, which this build does not know: a newer \
+             build wrote it, so open the index with that build",
+            self.wal_path
+        ))
+    }
+
+    /// Open or create the WAL file for appending, in [`WalFormat::V4`].
     ///
     /// Operates on an already-held writer guard so a caller can ensure the
-    /// writer and append within a single critical section. A fresh or truncated
-    /// (empty) file is initialized as [`WalFormat::V3`] by writing the 5-byte
-    /// header; an existing file keeps whatever framing it already has (v3/v2 by
-    /// header version, else legacy) so the formats are never mixed within one
-    /// file.
+    /// writer and append within a single critical section. A fresh or
+    /// truncated (empty) file is initialized by writing the 5-byte header. A
+    /// file in an older framing is first rewritten in v4 with the records it
+    /// holds (Issue #1522), before the append handle is opened: a handle
+    /// opened on the file it replaces would write to the replaced file. A
+    /// file of a version this build does not know is refused (Issue #1507);
+    /// [`Self::read_all`] already refuses it on open.
     ///
     /// Only the append paths call this, before they assign an id and a
     /// sequence number, so it is also where an append is refused once an
     /// earlier one left a partial frame (see [`Self::torn`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL may end in a partial frame, has an
+    /// unknown version, or cannot be read, rewritten or opened.
     fn ensure_writer(&self, writer_guard: &mut Option<WalWriterState>) -> Result<()> {
         if self.torn.load(Ordering::Acquire) {
             return Err(crate::error::LaurusError::storage(format!(
@@ -505,35 +625,42 @@ impl DocumentLog {
         } else {
             0
         };
+        let fresh = existing_size == 0;
+        if !fresh {
+            match self.detect_existing_format(existing_size)? {
+                WalFormat::V4 => {}
+                WalFormat::Unknown(version) => return Err(self.unknown_version_error(version)),
+                WalFormat::Legacy | WalFormat::V2 | WalFormat::V3 => {
+                    // `read_wal` only ever raises the id and sequence
+                    // counters, so reading the records again is safe.
+                    let records = self.read_wal()?.0;
+                    self.rewrite_wal(&records)?;
+                }
+            }
+        }
 
         let mut out = self.wal_storage.create_output_append(&self.wal_path)?;
-        let format = if existing_size == 0 {
-            // Fresh/truncated file: stamp the current (v3) header and use CRC
-            // framing with a binary payload.
+        if fresh {
             out.write_all(WAL_MAGIC)?;
             out.write_all(&[WAL_VERSION])?;
-            WalFormat::V3
-        } else {
-            // Existing file: keep appending in its own framing until the next
-            // commit/truncate recreates the file as v3.
-            self.detect_existing_format(existing_size)?
-        };
-
-        *writer_guard = Some(WalWriterState {
-            out,
-            format,
-            dirty: false,
-            unsynced_records: 0,
-            unsynced_bytes: 0,
-            #[cfg(test)]
-            sync_count: 0,
-        });
+        }
+        *writer_guard = Some(WalWriterState::new(out));
         Ok(())
     }
 
     // ── WAL operations ──────────────────────────────────────────────
 
-    /// Append an upsert entry to the log.
+    /// Append an upsert entry that replaces nothing, as for an add.
+    ///
+    /// Equivalent to [`Self::append_put`] with no versions to replace.
+    ///
+    /// Returns `(doc_id, seq_number)`.
+    pub fn append(&self, external_id: &str, doc: &Document) -> Result<(u64, SeqNumber)> {
+        self.append_put(external_id, doc, &[])
+    }
+
+    /// Append an upsert entry that replaces the documents `replaces`, a
+    /// put's previous versions, in one record (Issue #1522).
     ///
     /// Atomically assigns a new doc_id and sequence number, then writes the
     /// entry to the log file. Whether the write is fsync'd before returning
@@ -541,13 +668,34 @@ impl DocumentLog {
     /// [`WalSyncPolicy::PerRecord`], or only when the batch threshold is reached
     /// under [`WalSyncPolicy::Group`].
     ///
-    /// Returns `(doc_id, seq_number)`.
+    /// Takes `doc` and `replaces` by reference and serializes them borrowed
+    /// (Issue #1416): a caller that still needs `doc` after this call (the
+    /// engine's put path does, for the lexical store and stored-field
+    /// filtering) no longer has to clone it just to hand the WAL a copy to
+    /// own and drop.
     ///
-    /// Takes `doc` by reference and serializes it borrowed (Issue #1416): a
-    /// caller that still needs `doc` after this call (the engine's put path
-    /// does, for the lexical store and stored-field filtering) no longer has
-    /// to clone it just to hand the WAL a copy to own and drop.
-    pub fn append(&self, external_id: &str, doc: &Document) -> Result<(u64, SeqNumber)> {
+    /// # Arguments
+    ///
+    /// * `external_id` - The document's external id.
+    /// * `doc` - The document.
+    /// * `replaces` - The internal ids of `external_id`'s versions the
+    ///   document replaces, which the replay deletes with it.
+    ///
+    /// # Returns
+    ///
+    /// `(doc_id, seq_number)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL cannot be opened for appending (see
+    /// [`Self::ensure_writer`]), or encoding, writing or syncing the record
+    /// fails.
+    pub fn append_put(
+        &self,
+        external_id: &str,
+        doc: &Document,
+        replaces: &[u64],
+    ) -> Result<(u64, SeqNumber)> {
         // Single critical section: ensure the writer, allocate ids, and write
         // under one lock so the on-disk record order matches id/seq allocation.
         let mut writer_guard = self.wal_writer.lock();
@@ -562,6 +710,7 @@ impl DocumentLog {
                 doc_id,
                 external_id: external_id.to_string(),
                 document: doc,
+                replaces,
             },
         };
 
@@ -570,13 +719,25 @@ impl DocumentLog {
         Ok((doc_id, seq))
     }
 
-    /// Append a delete entry to the log.
+    /// Append a delete entry for the documents `doc_ids` of `external_id`,
+    /// in one record (Issue #1522).
     ///
-    /// As with [`append`](Self::append), the fsync timing follows the configured
-    /// [`WalSyncPolicy`].
+    /// As with [`Self::append_put`], the fsync timing follows the
+    /// configured [`WalSyncPolicy`].
     ///
-    /// Returns the assigned sequence number.
-    pub fn append_delete(&self, doc_id: u64, external_id: &str) -> Result<SeqNumber> {
+    /// # Arguments
+    ///
+    /// * `doc_ids` - The internal ids to delete.
+    /// * `external_id` - Their external id.
+    ///
+    /// # Returns
+    ///
+    /// The assigned sequence number.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::append_put`].
+    pub fn append_delete(&self, doc_ids: &[u64], external_id: &str) -> Result<SeqNumber> {
         let mut writer_guard = self.wal_writer.lock();
         self.ensure_writer(&mut writer_guard)?;
 
@@ -585,7 +746,7 @@ impl DocumentLog {
         let record = LogRecordRef {
             seq,
             entry: LogEntryRef::Delete {
-                doc_id,
+                doc_ids,
                 external_id: external_id.to_string(),
             },
         };
@@ -595,39 +756,33 @@ impl DocumentLog {
         Ok(seq)
     }
 
-    /// Encode a record's payload for the given framing.
-    ///
-    /// v3 emits a compact rkyv binary record; v2 and legacy emit a JSON
-    /// document. The bytes returned here are the *payload* only — the length
-    /// prefix and (for v2/v3) the CRC are added by [`Self::append_record_bytes`].
+    /// Encode a record's v4 payload: a compact rkyv binary record. The bytes
+    /// returned here are the *payload* only — the length prefix and the CRC
+    /// are added by [`Self::append_record_bytes`].
     ///
     /// # Arguments
     ///
     /// * `record` - The log record to encode.
-    /// * `format` - The framing of the file being appended to.
     ///
     /// # Errors
     ///
     /// Returns a [`LaurusError::SerializationError`](crate::error::LaurusError::SerializationError)
-    /// if rkyv (v3) or `serde_json` (v2/legacy) encoding fails.
-    fn encode_payload<T: WalEncodable>(record: &T, format: WalFormat) -> Result<Vec<u8>> {
-        match format {
-            WalFormat::V3 => rkyv::to_bytes::<rkyv::rancor::Error>(record)
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| {
-                    crate::error::LaurusError::SerializationError(format!(
-                        "WAL rkyv encode failed: {e}"
-                    ))
-                }),
-            WalFormat::V2 | WalFormat::Legacy => Ok(serde_json::to_vec(record)?),
-        }
+    /// if rkyv encoding fails.
+    fn encode_payload<T: WalEncodable>(record: &T) -> Result<Vec<u8>> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(record)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| {
+                crate::error::LaurusError::SerializationError(format!(
+                    "WAL rkyv encode failed: {e}"
+                ))
+            })
     }
 
     /// Decode a record's payload according to the file's framing.
     ///
-    /// The inverse of [`Self::encode_payload`]: v3 reads a compact rkyv binary
-    /// record (validated by `rkyv`/`bytecheck`), v2 and legacy read a JSON
-    /// document.
+    /// v4 reads the current [`LogRecord`] (validated by `rkyv`/`bytecheck`),
+    /// v3 an rkyv archive of the [`v3`] record, and v2 and legacy its JSON.
+    /// A [`v3`] record is converted into the current one.
     ///
     /// # Arguments
     ///
@@ -638,27 +793,32 @@ impl DocumentLog {
     ///
     /// Returns an error if the bytes do not decode under `format`; the caller
     /// ([`Self::read_all`]) treats this as a torn trailing record and stops at
-    /// the last valid record.
+    /// the last valid record. [`WalFormat::Unknown`] decodes nothing.
     fn decode_payload(buffer: &[u8], format: WalFormat) -> Result<LogRecord> {
+        let rkyv_error = |e: rkyv::rancor::Error| {
+            crate::error::LaurusError::SerializationError(format!("WAL rkyv decode failed: {e}"))
+        };
         match format {
-            WalFormat::V3 => {
-                rkyv::from_bytes::<LogRecord, rkyv::rancor::Error>(buffer).map_err(|e| {
-                    crate::error::LaurusError::SerializationError(format!(
-                        "WAL rkyv decode failed: {e}"
-                    ))
-                })
+            WalFormat::V4 => {
+                rkyv::from_bytes::<LogRecord, rkyv::rancor::Error>(buffer).map_err(rkyv_error)
             }
-            WalFormat::V2 | WalFormat::Legacy => Ok(serde_json::from_slice(buffer)?),
+            WalFormat::V3 => rkyv::from_bytes::<v3::LogRecord, rkyv::rancor::Error>(buffer)
+                .map(LogRecord::from)
+                .map_err(rkyv_error),
+            WalFormat::V2 | WalFormat::Legacy => {
+                Ok(serde_json::from_slice::<v3::LogRecord>(buffer)?.into())
+            }
+            WalFormat::Unknown(version) => Err(crate::error::LaurusError::SerializationError(
+                format!("WAL format version {version} is unknown"),
+            )),
         }
     }
 
     /// Encode and append a record's framed bytes to the WAL buffer **without**
     /// fsyncing.
     ///
-    /// v2/v3 writers emit `[u32 len][u32 crc32][payload]` (CRC over `len ||
-    /// payload`); legacy writers emit `[u32 len][payload]`. The payload encoding
-    /// (rkyv binary for v3, JSON for v2/legacy) follows the writer's
-    /// [`WalFormat`]. Durability is the caller's responsibility via
+    /// Emits a v4 frame, `[u32 len][u32 crc32][payload]` (CRC over `len ||
+    /// payload`). Durability is the caller's responsibility via
     /// [`Self::flush_writer`] — this split lets the group-commit path amortize
     /// one fsync over many appended records (#542). A no-op if no writer is open.
     ///
@@ -674,7 +834,7 @@ impl DocumentLog {
             return Ok(());
         };
 
-        let bytes = Self::encode_payload(record, state.format)?;
+        let bytes = Self::encode_payload(record)?;
         let len: u32 = bytes.len().try_into().map_err(|_| {
             crate::error::LaurusError::InvalidOperation(format!(
                 "WAL record size {} exceeds u32::MAX",
@@ -682,19 +842,16 @@ impl DocumentLog {
             ))
         })?;
         let len_bytes = len.to_le_bytes();
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&len_bytes);
+        hasher.update(&bytes);
+        let crc = hasher.finalize().to_le_bytes();
 
-        // Frame size: length prefix (+ CRC for v2/v3) + payload.
-        let mut frame_len = len_bytes.len() + bytes.len();
+        // Frame size: length prefix + CRC + payload.
+        let frame_len = len_bytes.len() + crc.len() + bytes.len();
         let written = (|| -> Result<()> {
             state.out.write_all(&len_bytes)?;
-            if state.format.has_crc() {
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&len_bytes);
-                hasher.update(&bytes);
-                let crc = hasher.finalize().to_le_bytes();
-                state.out.write_all(&crc)?;
-                frame_len += crc.len();
-            }
+            state.out.write_all(&crc)?;
             state.out.write_all(&bytes)?;
             Ok(())
         })();
@@ -905,12 +1062,19 @@ impl DocumentLog {
     /// skipped while an append handle is open, since the handle would go on
     /// writing to the replaced file (under [`WalSyncPolicy::Group`] a
     /// buffered writer can leave part of a record in the file and the rest
-    /// in its buffer), and for a header naming a version this build does
-    /// not know, whose records a newer build may still read.
+    /// in its buffer). A file in an older framing keeps it; the first append
+    /// rewrites it in v4 (see [`Self::ensure_writer`]).
+    ///
+    /// A WAL whose header names a version this build does not know was
+    /// written by a newer build, whose records this build can neither read
+    /// nor keep: appending to it, or a commit truncating it, would lose
+    /// them. Reading it fails, and the file is left as it is, so the index
+    /// does not open until the newer build opens it (Issue #1507).
     ///
     /// # Errors
     ///
-    /// Returns an error if reading the WAL, or cutting it back, fails.
+    /// Returns an error if the WAL has a version this build does not know,
+    /// or if reading the WAL, or cutting it back, fails.
     pub fn read_all(&self) -> Result<Vec<LogRecord>> {
         // Held across the read and the cut, so that no append opens the
         // file in between.
@@ -937,8 +1101,13 @@ impl DocumentLog {
     ///
     /// The records, and the length to cut the file back to: the end of the
     /// last complete record (or of the header, or 0 without a complete
-    /// header) when bytes that do not form a complete record follow it and
-    /// the header names a known version, else `None`.
+    /// header) when bytes that do not form a complete record follow it,
+    /// else `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL has a version this build does not know
+    /// (Issue #1507), or reading it fails.
     fn read_wal(&self) -> Result<(Vec<LogRecord>, Option<u64>)> {
         if !self.wal_storage.file_exists(&self.wal_path) {
             // Even with an empty WAL, sync next_doc_id with doc_store.
@@ -949,11 +1118,15 @@ impl DocumentLog {
 
         let size = self.wal_storage.open_input(&self.wal_path)?.size()?;
 
-        // Detect the framing from the file header: v3/v2 files start with the
-        // magic + version byte, a legacy file goes straight into `[u32 len]`
-        // records. The payload encoding (rkyv for v3, JSON for v2/legacy) and
-        // CRC presence (v2/v3 only) follow from the format.
+        // Detect the framing from the file header: v2 and later files start
+        // with the magic + version byte, a legacy file goes straight into
+        // `[u32 len]` records. The payload encoding (rkyv for v3 and v4, JSON
+        // for v2 and legacy) and CRC presence (all but legacy) follow from
+        // the format.
         let format = self.detect_existing_format(size)?;
+        if let WalFormat::Unknown(version) = format {
+            return Err(self.unknown_version_error(version));
+        }
         let has_header = format != WalFormat::Legacy;
 
         let mut reader = self.wal_storage.open_input(&self.wal_path)?;
@@ -963,15 +1136,12 @@ impl DocumentLog {
 
         // Skip the file header (magic + version) so the loop starts at the first
         // record; legacy files have no header.
-        let (mut position, known_version) = if has_header {
+        let mut position = if has_header {
             let mut header = [0u8; WAL_HEADER_LEN as usize];
             reader.read_exact(&mut header)?;
-            (
-                WAL_HEADER_LEN,
-                matches!(header[4], WAL_VERSION | WAL_VERSION_V2),
-            )
+            WAL_HEADER_LEN
         } else {
-            (0, true)
+            0
         };
         // Where the last complete record (or the header) ends.
         let mut valid_len = position;
@@ -985,8 +1155,8 @@ impl DocumentLog {
             let len = u32::from_le_bytes(len_bytes) as u64;
             position += 4;
 
-            // v2/v3 frames carry a CRC-32 (over `len || payload`) after the
-            // length; legacy frames do not.
+            // v2 and later frames carry a CRC-32 (over `len || payload`)
+            // after the length; legacy frames do not.
             let crc_expected = if format.has_crc() {
                 if position + 4 > size {
                     break;
@@ -1071,7 +1241,7 @@ impl DocumentLog {
         let store_next = self.doc_store.read().next_doc_id();
         self.set_next_doc_id(store_next);
 
-        let cut_at = (valid_len < size && known_version).then_some(valid_len);
+        let cut_at = (valid_len < size).then_some(valid_len);
         Ok((records, cut_at))
     }
 
@@ -1182,37 +1352,50 @@ impl DocumentLog {
             .into_iter()
             .filter(|record| record.seq > retain_after_seq)
             .collect();
+        // `retained` holds exactly the records that are NOT yet durably
+        // represented anywhere else (that is why this path exists at all), so
+        // they must never be missing from the WAL, not even for a moment: see
+        // `rewrite_wal`.
+        self.rewrite_wal(&retained)
+    }
 
-        // Build the retained tail in a TEMP file and atomically rename it over
-        // the WAL, rather than truncating the live file in place and rewriting
-        // it afterwards. `retained` holds exactly the records that are NOT yet
-        // durably represented anywhere else (that is why this path exists at
-        // all) — an in-place wipe would make the WAL durably empty for the
-        // window before the rewrite completes, so a crash in that window would
-        // permanently lose them, reintroducing the very bug (#876) this method
-        // fixes. The rename is a single atomic filesystem operation: the WAL is
-        // never observably in a state that is missing a retained record.
-        let (tmp_name, tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
-        let mut tmp_state = Some(WalWriterState {
-            out: tmp_out,
-            format: WalFormat::V3,
-            dirty: false,
-            unsynced_records: 0,
-            unsynced_bytes: 0,
-            #[cfg(test)]
-            sync_count: 0,
-        });
-        if let Some(state) = tmp_state.as_mut() {
-            state.out.write_all(WAL_MAGIC)?;
-            state.out.write_all(&[WAL_VERSION])?;
-        }
+    /// Replace the WAL with a v4 file holding `records`, atomically.
+    ///
+    /// Builds the new file under a TEMP name and renames it over the WAL,
+    /// rather than truncating the live file in place and rewriting it
+    /// afterwards: an in-place wipe would make the WAL durably empty until
+    /// the rewrite completes, so a crash in that window would lose `records`
+    /// for good (#876). The rename is a single atomic filesystem operation,
+    /// so the WAL is never observably missing a record, and storage is
+    /// synced after it, so an append that follows lands on the new file
+    /// after a crash too. Serves the slow path of
+    /// [`Self::truncate_retaining_after`] and the upgrade of an older
+    /// framing before the first append (Issue #1522).
+    ///
+    /// The caller holds the writer lock with no append handle open: a handle
+    /// open on the replaced file would go on writing to it.
+    ///
+    /// # Arguments
+    ///
+    /// * `records` - The records the new WAL holds, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the temporary file, renaming it or
+    /// syncing the storage fails. A failure before the rename leaves the
+    /// live WAL untouched.
+    fn rewrite_wal(&self, records: &[LogRecord]) -> Result<()> {
+        let (tmp_name, mut tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
+        tmp_out.write_all(WAL_MAGIC)?;
+        tmp_out.write_all(&[WAL_VERSION])?;
+        let mut tmp_state = Some(WalWriterState::new(tmp_out));
         // Defer the per-record fsync `write_record` would otherwise do under
-        // `WalSyncPolicy::PerRecord` (one syscall per retained record) and
-        // sync once after the whole tail is written instead.
+        // `WalSyncPolicy::PerRecord` (one syscall per record) and sync once
+        // after the whole file is written instead.
         {
             let _deferral = self.defer_sync();
             // No `torn` flag: a failure here leaves the live WAL untouched.
-            for record in &retained {
+            for record in records {
                 self.write_record(&mut tmp_state, record, None)?;
             }
         }
@@ -1369,13 +1552,14 @@ mod tests {
         Arc::new(MemoryStorage::new(MemoryStorageConfig::default()))
     }
 
-    /// `LogRecordRef` (the borrowed type `append` builds, Issue #1416) must
-    /// encode to exactly the same bytes as the owned `LogRecord` holding the
-    /// same values, under every WAL framing — otherwise the WAL format would
+    /// `LogRecordRef` (the borrowed type the appends build, Issues #1416,
+    /// #1522) must encode to exactly the same bytes as the owned
+    /// `LogRecord` holding the same values — otherwise the WAL format would
     /// silently change. Fails if `LogEntryRef`'s variant order, field order,
-    /// or `external_id`'s representation (e.g. switched to `&str` +
+    /// `external_id`'s representation (e.g. switched to `&str` +
     /// `InlineAsBox`, which archives as `ArchivedBox<str>` instead of
-    /// `ArchivedString`) drifts from `LogEntry`'s.
+    /// `ArchivedString`) or an id slice's (e.g. without `AsVec`) drifts from
+    /// `LogEntry`'s.
     #[test]
     fn borrowed_record_encodes_identically_to_owned() {
         let doc = Document::builder()
@@ -1386,48 +1570,134 @@ mod tests {
             .add_field("title", DataValue::Text("hello".to_string()))
             .build();
 
-        let owned = LogRecord {
-            seq: 7,
-            entry: LogEntry::Upsert {
-                doc_id: 1,
-                external_id: "ext_1".to_string(),
-                document: doc.clone(),
+        let upsert = (
+            LogRecord {
+                seq: 7,
+                entry: LogEntry::Upsert {
+                    doc_id: 9,
+                    external_id: "ext_1".to_string(),
+                    document: doc.clone(),
+                    replaces: vec![3, 5],
+                },
             },
-        };
-        let borrowed = LogRecordRef {
-            seq: 7,
-            entry: LogEntryRef::Upsert {
-                doc_id: 1,
-                external_id: "ext_1".to_string(),
-                document: &doc,
+            LogRecordRef {
+                seq: 7,
+                entry: LogEntryRef::Upsert {
+                    doc_id: 9,
+                    external_id: "ext_1".to_string(),
+                    document: &doc,
+                    replaces: &[3, 5],
+                },
             },
-        };
-
-        for format in [WalFormat::V3, WalFormat::V2, WalFormat::Legacy] {
-            let owned_bytes = DocumentLog::encode_payload(&owned, format).unwrap();
-            let borrowed_bytes = DocumentLog::encode_payload(&borrowed, format).unwrap();
+        );
+        let delete = (
+            LogRecord {
+                seq: 8,
+                entry: LogEntry::Delete {
+                    doc_ids: vec![9, 11, 12],
+                    external_id: "ext_1".to_string(),
+                },
+            },
+            LogRecordRef {
+                seq: 8,
+                entry: LogEntryRef::Delete {
+                    doc_ids: &[9, 11, 12],
+                    external_id: "ext_1".to_string(),
+                },
+            },
+        );
+        for (name, owned, borrowed) in [
+            ("upsert", &upsert.0, &upsert.1),
+            ("delete", &delete.0, &delete.1),
+        ] {
             assert_eq!(
-                owned_bytes, borrowed_bytes,
-                "archived bytes must match under {format:?}"
+                DocumentLog::encode_payload(owned).unwrap(),
+                DocumentLog::encode_payload(borrowed).unwrap(),
+                "archived bytes of the {name} must match"
             );
         }
 
-        let v3_bytes = DocumentLog::encode_payload(&borrowed, WalFormat::V3).unwrap();
-        let decoded = DocumentLog::decode_payload(&v3_bytes, WalFormat::V3).unwrap();
+        let bytes = DocumentLog::encode_payload(&upsert.1).unwrap();
+        let decoded = DocumentLog::decode_payload(&bytes, WalFormat::V4).unwrap();
         assert_eq!(decoded.seq, 7);
         match decoded.entry {
             LogEntry::Upsert {
                 doc_id,
                 external_id,
                 document,
+                replaces,
             } => {
-                assert_eq!(doc_id, 1);
+                assert_eq!(doc_id, 9);
                 assert_eq!(external_id, "ext_1");
                 assert_eq!(document.fields.len(), doc.fields.len());
+                assert_eq!(replaces, [3, 5]);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let bytes = DocumentLog::encode_payload(&delete.1).unwrap();
+        match DocumentLog::decode_payload(&bytes, WalFormat::V4)
+            .unwrap()
+            .entry
+        {
+            LogEntry::Delete {
+                doc_ids,
+                external_id,
+            } => {
+                assert_eq!(doc_ids, [9, 11, 12]);
+                assert_eq!(external_id, "ext_1");
             }
             _ => panic!("wrong variant"),
         }
     }
+
+    /// Issue #1522: the v4 record's archived layout is pinned, by its size
+    /// and by the bytes of one record of each kind. rkyv finds an archive's
+    /// root by the root's size, so a change to these types makes every
+    /// record older builds wrote unreadable, or makes an older build of v4
+    /// read the new records as torn and cut them: such a change needs a new
+    /// WAL version, with a frozen copy of these types to read the old one
+    /// (as [`v3`] is for v3), and then these expected values change.
+    #[test]
+    fn the_v4_record_layout_is_pinned() {
+        assert_eq!(size_of::<ArchivedLogRecord>(), 56);
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("_id".to_string(), DataValue::Text("a".to_string()));
+        let upsert = LogRecord {
+            seq: 3,
+            entry: LogEntry::Upsert {
+                doc_id: 2,
+                external_id: "a".to_string(),
+                document: Document { fields },
+                replaces: vec![1],
+            },
+        };
+        let delete = LogRecord {
+            seq: 4,
+            entry: LogEntry::Delete {
+                doc_ids: vec![2, 5],
+                external_id: "a".to_string(),
+            },
+        };
+        let hex = |record: &LogRecord| -> String {
+            DocumentLog::encode_payload(record)
+                .unwrap()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(
+            (hex(&upsert).as_str(), hex(&delete).as_str()),
+            (V4_UPSERT_HEX, V4_DELETE_HEX),
+            "(upsert, delete)"
+        );
+    }
+
+    /// The v4 payload of `the_v4_record_layout_is_pinned`'s upsert.
+    const V4_UPSERT_HEX: &str = "000000000000000000000000000000000000000000000000000000000000000000000000000000005f6964ffffffffff0400000061ffffffffffffff000000000000000000000000000000000000000003ff03ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00010000000000000003000000000000000000000000000000020000000000000061ffffffffffffffb8ffffff0100000002000000ccffffff0100000000000000";
+
+    /// The v4 payload of `the_v4_record_layout_is_pinned`'s delete.
+    const V4_DELETE_HEX: &str = "02000000000000000500000000000000040000000000000001000000e4ffffff0200000061ffffffffffffff00000000000000000000000000000000000000000000000000000000";
 
     fn make_log() -> DocumentLog {
         let wal_storage = make_storage();
@@ -1471,34 +1741,49 @@ mod tests {
         assert_eq!(doc_id, 1);
         assert_eq!(seq1, 1);
 
-        // Append delete.
-        let seq2 = log.append_delete(doc_id, "ext_1").unwrap();
-        assert_eq!(seq2, 2);
+        // Append a put replacing it, then a delete of both.
+        let (put_id, seq2) = log.append_put("ext_1", &doc, &[doc_id]).unwrap();
+        assert_eq!((put_id, seq2), (2, 2));
+        let seq3 = log.append_delete(&[doc_id, put_id], "ext_1").unwrap();
+        assert_eq!(seq3, 3);
 
         // Read all.
         let records = log.read_all().unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
 
         assert_eq!(records[0].seq, 1);
         match &records[0].entry {
             LogEntry::Upsert {
                 doc_id,
                 external_id,
+                replaces,
                 ..
             } => {
                 assert_eq!(*doc_id, 1);
                 assert_eq!(external_id, "ext_1");
+                assert!(replaces.is_empty());
             }
             _ => panic!("Expected Upsert"),
         }
 
         assert_eq!(records[1].seq, 2);
         match &records[1].entry {
+            LogEntry::Upsert {
+                doc_id, replaces, ..
+            } => {
+                assert_eq!(*doc_id, 2);
+                assert_eq!(replaces, &[1]);
+            }
+            _ => panic!("Expected Upsert"),
+        }
+
+        assert_eq!(records[2].seq, 3);
+        match &records[2].entry {
             LogEntry::Delete {
-                doc_id,
+                doc_ids,
                 external_id,
             } => {
-                assert_eq!(*doc_id, 1);
+                assert_eq!(doc_ids, &[1, 2]);
                 assert_eq!(external_id, "ext_1");
             }
             _ => panic!("Expected Delete"),
@@ -1528,14 +1813,14 @@ mod tests {
         assert_eq!(seq, 2);
     }
 
-    /// After a truncate the WAL is recreated as a fresh v2 file: the discarded
-    /// handle is flushed and closed, the file is reset to empty, and the next
-    /// append re-stamps the magic+version header so records round-trip gap-free.
-    /// Guards the Phase 2 truncate seam, which now flushes and closes the open
-    /// writer before dropping it rather than discarding the handle outright
-    /// (Issue #542, Phase 2).
+    /// After a truncate the WAL is recreated as a fresh file in the current
+    /// version: the discarded handle is flushed and closed, the file is reset
+    /// to empty, and the next append re-stamps the magic+version header so
+    /// records round-trip gap-free. Guards the Phase 2 truncate seam, which
+    /// now flushes and closes the open writer before dropping it rather than
+    /// discarding the handle outright (Issue #542, Phase 2).
     #[test]
-    fn truncate_recreates_fresh_v3_wal() {
+    fn truncate_recreates_a_fresh_wal() {
         use std::io::Read as _;
 
         let wal_storage = make_storage();
@@ -1550,7 +1835,7 @@ mod tests {
 
         log.truncate().unwrap();
 
-        // Truncate resets the file to empty (the v3 header is re-stamped lazily
+        // Truncate resets the file to empty (the header is re-stamped lazily
         // on the next append), so recovery finds nothing.
         assert_eq!(
             wal_storage.open_input("test.log").unwrap().size().unwrap(),
@@ -1559,7 +1844,7 @@ mod tests {
         );
         assert!(log.read_all().unwrap().is_empty());
 
-        // The next append re-initializes the file in v3 framing.
+        // The next append re-initializes the file in the current framing.
         log.append("ext_3", &doc).unwrap();
         let mut header = [0u8; WAL_HEADER_LEN as usize];
         wal_storage
@@ -1628,6 +1913,7 @@ mod tests {
                 document: Document::builder()
                     .add_field("body", DataValue::Text("deferred".to_string()))
                     .build(),
+                replaces: Vec::new(),
             },
         };
 
@@ -1921,16 +2207,13 @@ mod tests {
 
         // One valid record followed by a frame whose length prefix is intact but
         // whose body is not valid JSON.
-        let valid = LogRecord {
-            seq: 1,
-            entry: LogEntry::Upsert {
-                doc_id: 1,
-                external_id: "ext_1".to_string(),
-                document: Document::builder()
-                    .add_field("body", DataValue::Text("hello".to_string()))
-                    .build(),
-            },
-        };
+        let valid = v3_upsert(
+            1,
+            1,
+            Document::builder()
+                .add_field("body", DataValue::Text("hello".to_string()))
+                .build(),
+        );
         {
             let mut out = wal_storage.create_output("test.log").unwrap();
             out.write_all(&frame(&serde_json::to_vec(&valid).unwrap()))
@@ -1979,11 +2262,11 @@ mod tests {
         assert!(records.is_empty(), "no valid prefix to recover");
     }
 
-    /// A fresh WAL is written in v3 framing: the file starts with the magic +
-    /// version (3) header and records round-trip through `read_all` with CRC
-    /// verification (Issue #542, Phase 1; #822 binary payload).
+    /// A fresh WAL is written in v4 framing: the file starts with the magic +
+    /// version (4) header and records round-trip through `read_all` with CRC
+    /// verification (Issue #542, Phase 1; #822 binary payload; #1522).
     #[test]
-    fn wal_v3_fresh_file_has_header_and_round_trips() {
+    fn wal_v4_fresh_file_has_header_and_round_trips() {
         use std::io::Read as _;
 
         let wal_storage = make_storage();
@@ -1994,9 +2277,9 @@ mod tests {
             .add_field("body", DataValue::Text("hello".to_string()))
             .build();
         log.append("ext_1", &doc).unwrap();
-        log.append_delete(1, "ext_1").unwrap();
+        log.append_delete(&[1], "ext_1").unwrap();
 
-        // The file begins with the v2 header.
+        // The file begins with the v4 header.
         let mut header = [0u8; WAL_HEADER_LEN as usize];
         wal_storage
             .open_input("test.log")
@@ -2012,11 +2295,11 @@ mod tests {
         assert_eq!(records[1].seq, 2);
     }
 
-    /// A v3 record whose payload is corrupted fails CRC verification and is
+    /// A v4 record whose payload is corrupted fails CRC verification and is
     /// dropped as a torn tail, recovering the valid prefix (Issue #542, Phase 1;
     /// #822 binary payload).
     #[test]
-    fn wal_v3_crc_mismatch_recovers_prefix() {
+    fn wal_v4_crc_mismatch_recovers_prefix() {
         use std::io::{Read as _, Write as _};
 
         let wal_storage = make_storage();
@@ -2057,64 +2340,157 @@ mod tests {
         assert_eq!(records[0].seq, 1);
     }
 
-    /// A legacy (pre-#542, header-less) WAL still recovers, and subsequent
-    /// appends continue in legacy framing rather than mixing formats within the
-    /// same file (Issue #542, Phase 1).
-    #[test]
-    fn legacy_wal_recovers_and_appends_stay_legacy() {
-        use std::io::{Read as _, Write as _};
-
-        let wal_storage = make_storage();
-        let doc_storage = make_storage();
-
-        // Write one legacy-framed record (no header, no CRC) directly.
-        let rec = LogRecord {
-            seq: 1,
-            entry: LogEntry::Upsert {
-                doc_id: 1,
-                external_id: "ext_1".to_string(),
-                document: Document::builder()
-                    .add_field("body", DataValue::Text("legacy".to_string()))
-                    .build(),
+    /// A v3 upsert record of `doc_id` (`ext_{doc_id}`) holding `document`.
+    fn v3_upsert(seq: u64, doc_id: u64, document: Document) -> v3::LogRecord {
+        v3::LogRecord {
+            seq,
+            entry: v3::LogEntry::Upsert {
+                doc_id,
+                external_id: format!("ext_{doc_id}"),
+                document,
             },
-        };
-        {
-            let mut out = wal_storage.create_output("test.log").unwrap();
-            out.write_all(&frame(&serde_json::to_vec(&rec).unwrap()))
-                .unwrap();
-            out.flush_and_sync().unwrap();
-            out.close().unwrap();
         }
+    }
 
-        let log = DocumentLog::new(wal_storage.clone(), "test.log", doc_storage).unwrap();
-        let records = log.read_all().unwrap();
-        assert_eq!(records.len(), 1, "legacy record recovers");
+    /// A v3 delete record of `doc_id` (`ext_{doc_id}`).
+    fn v3_delete(seq: u64, doc_id: u64) -> v3::LogRecord {
+        v3::LogRecord {
+            seq,
+            entry: v3::LogEntry::Delete {
+                doc_id,
+                external_id: format!("ext_{doc_id}"),
+            },
+        }
+    }
 
-        // A new append continues the file in legacy framing.
-        let doc = Document::builder()
-            .add_field("body", DataValue::Text("more".to_string()))
-            .build();
-        log.append("ext_2", &doc).unwrap();
+    /// The WAL framings older than v4, which a file in this build is never
+    /// appended to as it is.
+    #[derive(Clone, Copy, Debug)]
+    enum OldFormat {
+        Legacy,
+        V2,
+        V3,
+    }
 
-        // The file still has no v2 header (it was not switched mid-file).
-        let mut magic = [0u8; 4];
-        wal_storage
-            .open_input("test.log")
-            .unwrap()
-            .read_exact(&mut magic)
-            .unwrap();
-        assert_ne!(
-            &magic, WAL_MAGIC,
-            "appends must not switch a legacy file to v2 mid-file"
-        );
+    /// Write a complete WAL file in `format` with the given (v3) records.
+    fn write_old_file(
+        storage: &Arc<dyn Storage>,
+        path: &str,
+        format: OldFormat,
+        records: &[v3::LogRecord],
+    ) {
+        use std::io::Write as _;
+        let mut out = storage.create_output(path).unwrap();
+        match format {
+            OldFormat::Legacy => {}
+            OldFormat::V2 => out
+                .write_all(&[&WAL_MAGIC[..], &[WAL_VERSION_V2]].concat())
+                .unwrap(),
+            OldFormat::V3 => out
+                .write_all(&[&WAL_MAGIC[..], &[WAL_VERSION_V3]].concat())
+                .unwrap(),
+        }
+        for rec in records {
+            let frame = match format {
+                OldFormat::Legacy => frame(&serde_json::to_vec(rec).unwrap()),
+                OldFormat::V2 => frame_v2(&serde_json::to_vec(rec).unwrap()),
+                OldFormat::V3 => frame_v2(&rkyv::to_bytes::<rkyv::rancor::Error>(rec).unwrap()),
+            };
+            out.write_all(&frame).unwrap();
+        }
+        out.flush_and_sync().unwrap();
+        out.close().unwrap();
+    }
 
-        // Both records read back through the legacy path.
-        let records = log.read_all().unwrap();
-        assert_eq!(records.len(), 2);
+    /// Issue #1522: a WAL in every older framing recovers through the frozen
+    /// [`v3`] records: an upsert replaces nothing, and a delete deletes the
+    /// one document its record names.
+    #[test]
+    fn an_older_wal_recovers_as_records_of_one_document_each() {
+        for format in [OldFormat::Legacy, OldFormat::V2, OldFormat::V3] {
+            let wal_storage = make_storage();
+            write_old_file(
+                &wal_storage,
+                "test.log",
+                format,
+                &[v3_delete(1, 4), v3_upsert(2, 5, small_doc())],
+            );
+            let log = reopen(&wal_storage);
+            let records = log.read_all().unwrap();
+            assert_eq!(records.len(), 2, "{format:?}");
+            match &records[0].entry {
+                LogEntry::Delete {
+                    doc_ids,
+                    external_id,
+                } => {
+                    assert_eq!(doc_ids, &[4], "{format:?}");
+                    assert_eq!(external_id, "ext_4", "{format:?}");
+                }
+                other => panic!("{format:?}: expected Delete, got {other:?}"),
+            }
+            match &records[1].entry {
+                LogEntry::Upsert {
+                    doc_id,
+                    document,
+                    replaces,
+                    ..
+                } => {
+                    assert_eq!(*doc_id, 5, "{format:?}");
+                    assert_eq!(document.fields, small_doc().fields, "{format:?}");
+                    assert!(replaces.is_empty(), "{format:?}");
+                }
+                other => panic!("{format:?}: expected Upsert, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #1522: an append to a WAL in an older framing rewrites the
+    /// file in v4 first, keeping its records, so the framings never mix in
+    /// one file and the new record, which a v3 record cannot hold, is
+    /// written in v4. The old records keep their sequence numbers. A file
+    /// in an older framing used to be appended to in that framing until
+    /// the next commit.
+    #[test]
+    fn an_append_rewrites_an_older_wal_in_v4() {
+        for format in [OldFormat::Legacy, OldFormat::V2, OldFormat::V3] {
+            let wal_storage = make_storage();
+            write_old_file(
+                &wal_storage,
+                "test.log",
+                format,
+                &[v3_upsert(1, 1, small_doc()), v3_delete(2, 1)],
+            );
+            let written = wal_file(&wal_storage);
+            let log = reopen(&wal_storage);
+            assert_eq!(log.read_all().unwrap().len(), 2, "{format:?}");
+            assert_eq!(
+                wal_file(&wal_storage),
+                written,
+                "{format:?}: opening leaves the file in its own framing"
+            );
+            log.append_put("ext_1", &small_doc(), &[1]).unwrap();
+            drop(log);
+
+            let bytes = wal_file(&wal_storage);
+            assert_eq!(
+                bytes[..WAL_HEADER_LEN as usize],
+                [&WAL_MAGIC[..], &[WAL_VERSION]].concat(),
+                "{format:?}: the file is v4"
+            );
+            let records = reopen(&wal_storage).read_all().unwrap();
+            let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
+            assert_eq!(seqs, [1, 2, 3], "{format:?}");
+            assert!(
+                matches!(&records[2].entry, LogEntry::Upsert { replaces, .. } if replaces == &[1]),
+                "{format:?}: {:?}",
+                records[2].entry
+            );
+        }
     }
 
     /// Build a CRC-framed v2 frame (`[u32 len][u32 crc32][payload]`) for a JSON
-    /// payload — the framing produced by pre-#822 writers.
+    /// payload — the framing produced by pre-#822 writers, and by v3 and v4
+    /// writers for an rkyv payload.
     fn frame_v2(body: &[u8]) -> Vec<u8> {
         let len_bytes = (body.len() as u32).to_le_bytes();
         let mut hasher = crc32fast::Hasher::new();
@@ -2129,32 +2505,20 @@ mod tests {
     }
 
     /// Write a complete v2 (CRC-framed JSON) WAL file with the given records.
-    fn write_v2_file(storage: &Arc<dyn Storage>, path: &str, records: &[LogRecord]) {
-        use std::io::Write as _;
-        let mut out = storage.create_output(path).unwrap();
-        out.write_all(WAL_MAGIC).unwrap();
-        out.write_all(&[WAL_VERSION_V2]).unwrap();
-        for rec in records {
-            out.write_all(&frame_v2(&serde_json::to_vec(rec).unwrap()))
-                .unwrap();
-        }
-        out.flush_and_sync().unwrap();
-        out.close().unwrap();
+    fn write_v2_file(storage: &Arc<dyn Storage>, path: &str, records: &[v3::LogRecord]) {
+        write_old_file(storage, path, OldFormat::V2, records);
     }
 
-    fn sample_record(seq: u64, doc_id: u64) -> LogRecord {
-        LogRecord {
+    fn sample_record(seq: u64, doc_id: u64) -> v3::LogRecord {
+        v3_upsert(
             seq,
-            entry: LogEntry::Upsert {
-                doc_id,
-                external_id: format!("ext_{doc_id}"),
-                document: Document::builder()
-                    .add_field("title", DataValue::Text("hello world".to_string()))
-                    .add_field("score", DataValue::Float64(1.5))
-                    .add_field("embedding", DataValue::Vector(vec![0.25; 64]))
-                    .build(),
-            },
-        }
+            doc_id,
+            Document::builder()
+                .add_field("title", DataValue::Text("hello world".to_string()))
+                .add_field("score", DataValue::Float64(1.5))
+                .add_field("embedding", DataValue::Vector(vec![0.25; 64]))
+                .build(),
+        )
     }
 
     /// A pre-#822 v2 WAL (CRC-framed JSON payloads) still recovers fully through
@@ -2182,10 +2546,10 @@ mod tests {
         }
     }
 
-    /// v3 (rkyv binary) records round-trip exactly through `read_all`, including
-    /// a vector field, across both Upsert and Delete entries (#822).
+    /// v4 (rkyv binary) records round-trip exactly through `read_all`, including
+    /// a vector field, across both Upsert and Delete entries (#822, #1522).
     #[test]
-    fn wal_v3_binary_round_trips_all_value_types() {
+    fn wal_v4_binary_round_trips_all_value_types() {
         let wal_storage = make_storage();
         let doc_storage = make_storage();
         let log = DocumentLog::new(wal_storage, "test.log", doc_storage).unwrap();
@@ -2199,7 +2563,7 @@ mod tests {
             .add_field("tags", DataValue::Int64Array(vec![1, 2, 3]))
             .build();
         log.append("ext_1", &doc).unwrap();
-        log.append_delete(1, "ext_1").unwrap();
+        log.append_delete(&[1], "ext_1").unwrap();
 
         let records = log.read_all().unwrap();
         assert_eq!(records.len(), 2);
@@ -2208,19 +2572,21 @@ mod tests {
                 doc_id,
                 external_id,
                 document,
+                replaces,
             } => {
                 assert_eq!(*doc_id, 1);
                 assert_eq!(external_id, "ext_1");
                 assert_eq!(document.fields, doc.fields, "all value types round-trip");
+                assert!(replaces.is_empty());
             }
             _ => panic!("expected Upsert first"),
         }
         match &records[1].entry {
             LogEntry::Delete {
-                doc_id,
+                doc_ids,
                 external_id,
             } => {
-                assert_eq!(*doc_id, 1);
+                assert_eq!(doc_ids, &[1]);
                 assert_eq!(external_id, "ext_1");
             }
             _ => panic!("expected Delete second"),
@@ -2228,10 +2594,10 @@ mod tests {
     }
 
     /// Upgrade path: a v2 file recovers, then a `truncate` recreates the file in
-    /// v3 framing and subsequent appends round-trip — old and new formats are
-    /// never mixed within one file (#822).
+    /// v4 framing and subsequent appends round-trip — old and new formats are
+    /// never mixed within one file (#822, #1522).
     #[test]
-    fn wal_upgrade_v2_to_v3_after_truncate() {
+    fn wal_upgrade_v2_to_v4_after_truncate() {
         use std::io::Read as _;
 
         let wal_storage = make_storage();
@@ -2241,7 +2607,7 @@ mod tests {
         let log = DocumentLog::new(wal_storage.clone(), "test.log", doc_storage).unwrap();
         assert_eq!(log.read_all().unwrap().len(), 1, "v2 record recovers");
 
-        // Truncate recreates the file; the next append stamps a v3 header.
+        // Truncate recreates the file; the next append stamps a v4 header.
         log.truncate().unwrap();
         let doc = Document::builder()
             .add_field("embedding", DataValue::Vector(vec![0.5; 32]))
@@ -2255,47 +2621,44 @@ mod tests {
             .read_exact(&mut header)
             .unwrap();
         assert_eq!(&header[0..4], WAL_MAGIC);
-        assert_eq!(header[4], WAL_VERSION, "recreated file is v3");
+        assert_eq!(header[4], WAL_VERSION, "recreated file is v4");
 
         let records = log.read_all().unwrap();
-        assert_eq!(records.len(), 1, "post-upgrade v3 record recovers");
+        assert_eq!(records.len(), 1, "post-upgrade v4 record recovers");
         assert_eq!(records[0].seq, 2);
     }
 
-    /// Measurement (#822 acceptance): for a vector-heavy record the v3 rkyv
-    /// payload is materially smaller than the v2 JSON payload, because each
-    /// `f32` is 4 raw bytes instead of a decimal string. Prints the ratio for
-    /// the implementation report (`cargo test -- --nocapture`).
+    /// Measurement (#822 acceptance): for a vector-heavy record the rkyv
+    /// payload (v3, and v4 since #1522) is materially smaller than the v2
+    /// JSON payload, because each `f32` is 4 raw bytes instead of a decimal
+    /// string. Prints the ratio for the implementation report
+    /// (`cargo test -- --nocapture`).
     #[test]
-    fn wal_v3_payload_smaller_than_v2_for_vectors() {
+    fn wal_v4_payload_smaller_than_v2_for_vectors() {
         // A 384-dim embedding — the dominant payload in a vector workload.
-        let record = LogRecord {
-            seq: 1,
-            entry: LogEntry::Upsert {
-                doc_id: 1,
-                external_id: "doc-1".to_string(),
-                document: Document::builder()
-                    .add_field(
-                        "title",
-                        DataValue::Text("a representative title".to_string()),
-                    )
-                    .add_field("embedding", DataValue::Vector(vec![0.123_456_7; 384]))
-                    .build(),
-            },
+        let document = || {
+            Document::builder()
+                .add_field(
+                    "title",
+                    DataValue::Text("a representative title".to_string()),
+                )
+                .add_field("embedding", DataValue::Vector(vec![0.123_456_7; 384]))
+                .build()
         };
 
-        let json = DocumentLog::encode_payload(&record, WalFormat::V2).unwrap();
-        let rkyv = DocumentLog::encode_payload(&record, WalFormat::V3).unwrap();
+        let json = serde_json::to_vec(&v3_upsert(1, 1, document())).unwrap();
+        let rkyv =
+            DocumentLog::encode_payload(&LogRecord::from(v3_upsert(1, 1, document()))).unwrap();
 
         println!(
-            "WAL payload size (384-dim vector record): v2 JSON = {} B, v3 rkyv = {} B, ratio = {:.2}x",
+            "WAL payload size (384-dim vector record): v2 JSON = {} B, v4 rkyv = {} B, ratio = {:.2}x",
             json.len(),
             rkyv.len(),
             json.len() as f64 / rkyv.len() as f64,
         );
         assert!(
             rkyv.len() < json.len(),
-            "v3 binary payload ({} B) must be smaller than v2 JSON ({} B)",
+            "v4 binary payload ({} B) must be smaller than v2 JSON ({} B)",
             rkyv.len(),
             json.len()
         );
@@ -2303,22 +2666,23 @@ mod tests {
         // close to that, far below JSON's decimal-string encoding.
         assert!(
             rkyv.len() < json.len() / 2,
-            "expected a large reduction for vector-heavy records: v2 {} B vs v3 {} B",
+            "expected a large reduction for vector-heavy records: v2 {} B vs v4 {} B",
             json.len(),
             rkyv.len()
         );
     }
 
-    /// Measurement (#822 acceptance): replay time of a v3 (rkyv) WAL versus a
-    /// v2 (JSON) WAL of the same vector-heavy records. Print-only — wall-clock is
-    /// environment-dependent, so this asserts nothing and just reports the parse
-    /// speedup for the implementation report (`cargo test -- --nocapture`).
+    /// Measurement (#822 acceptance): replay time of an rkyv WAL (v4, written
+    /// by the current writer) versus a v2 (JSON) WAL of the same vector-heavy
+    /// records. Print-only — wall-clock is environment-dependent, so this
+    /// asserts nothing and just reports the parse speedup for the
+    /// implementation report (`cargo test -- --nocapture`).
     #[test]
-    fn wal_v3_replay_time_vs_v2() {
+    fn wal_v4_replay_time_vs_v2() {
         use std::time::Instant;
 
         const N: u64 = 2000;
-        let records: Vec<LogRecord> = (1..=N).map(|i| sample_record(i, i)).collect();
+        let records: Vec<v3::LogRecord> = (1..=N).map(|i| sample_record(i, i)).collect();
 
         // v2 (JSON) file.
         let v2_storage = make_storage();
@@ -2326,18 +2690,18 @@ mod tests {
         write_v2_file(&v2_storage, "test.log", &records);
         let v2_log = DocumentLog::new(v2_storage, "test.log", v2_doc).unwrap();
 
-        // v3 (rkyv) file, produced by the current writer.
-        let v3_storage = make_storage();
-        let v3_doc = make_storage();
-        let v3_log = DocumentLog::new(v3_storage, "test.log", v3_doc).unwrap();
+        // v4 (rkyv) file, produced by the current writer.
+        let v4_storage = make_storage();
+        let v4_doc = make_storage();
+        let v4_log = DocumentLog::new(v4_storage, "test.log", v4_doc).unwrap();
         for rec in &records {
-            if let LogEntry::Upsert {
+            if let v3::LogEntry::Upsert {
                 external_id,
                 document,
                 ..
             } = &rec.entry
             {
-                v3_log.append(external_id, document).unwrap();
+                v4_log.append(external_id, document).unwrap();
             }
         }
 
@@ -2346,16 +2710,16 @@ mod tests {
         let v2_elapsed = t0.elapsed();
 
         let t1 = Instant::now();
-        let v3_recovered = v3_log.read_all().unwrap();
-        let v3_elapsed = t1.elapsed();
+        let v4_recovered = v4_log.read_all().unwrap();
+        let v4_elapsed = t1.elapsed();
 
         assert_eq!(v2_recovered.len() as u64, N);
-        assert_eq!(v3_recovered.len() as u64, N);
+        assert_eq!(v4_recovered.len() as u64, N);
         println!(
-            "WAL replay ({N} vector records): v2 JSON = {:?}, v3 rkyv = {:?}, speedup = {:.2}x",
+            "WAL replay ({N} vector records): v2 JSON = {:?}, v4 rkyv = {:?}, speedup = {:.2}x",
             v2_elapsed,
-            v3_elapsed,
-            v2_elapsed.as_secs_f64() / v3_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+            v4_elapsed,
+            v2_elapsed.as_secs_f64() / v4_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
         );
     }
 
@@ -2486,7 +2850,7 @@ mod tests {
     fn truncate_retaining_after_preserves_a_racing_delete() {
         let log = make_log();
         let retain_from = append_named(&log, "a");
-        log.append_delete(1, "b").unwrap();
+        log.append_delete(&[1], "b").unwrap();
 
         log.truncate_retaining_after(retain_from).unwrap();
 
@@ -2674,7 +3038,7 @@ mod tests {
         // The output works again; the log must refuse anyway.
         let err = log.append("third", &doc("third")).unwrap_err();
         assert!(err.to_string().contains("partially written"), "{err}");
-        let err = log.append_delete(1, "first").unwrap_err();
+        let err = log.append_delete(&[1], "first").unwrap_err();
         assert!(err.to_string().contains("partially written"), "{err}");
 
         drop(log);
@@ -2788,18 +3152,38 @@ mod tests {
         assert_eq!(surviving_ids(&reopen(&wal_storage)), vec!["a"]);
     }
 
-    /// Issue #1503: a WAL whose header names a version this build does not
-    /// know may hold records a newer build can read, so `read_all` leaves
-    /// it as it is instead of cutting every record it cannot read.
+    /// Issues #1503, #1507: a WAL whose header names a version this build
+    /// does not know holds records a newer build can read, so `read_all`
+    /// fails with an error that names the version and leaves the file as it
+    /// is, instead of cutting the records it cannot read (#1503) or reading
+    /// nothing, which let the next append write behind them and the next
+    /// commit truncate them (#1507). An append without a `read_all` first is
+    /// refused the same way.
     #[test]
-    fn read_all_leaves_a_wal_of_an_unknown_version_as_it_is() {
+    fn a_wal_of_an_unknown_version_is_refused_and_left_as_it_is() {
         let wal_storage = make_storage();
         let mut bytes = WAL_MAGIC.to_vec();
         bytes.push(WAL_VERSION + 1);
         bytes.extend_from_slice(&frame_v2(b"a record this build cannot decode"));
         write_wal_file(&wal_storage, &bytes);
 
-        assert!(reopen(&wal_storage).read_all().unwrap().is_empty());
+        let log = reopen(&wal_storage);
+        let err = log.read_all().unwrap_err();
+        assert!(
+            matches!(&err, crate::error::LaurusError::IncompatibleFormat(message)
+                if message.contains(&format!("format version {}", WAL_VERSION + 1))),
+            "{err}"
+        );
+        let err = log.append("a", &small_doc()).unwrap_err();
+        assert!(
+            matches!(err, crate::error::LaurusError::IncompatibleFormat(_)),
+            "{err}"
+        );
+        let err = reopen(&wal_storage).append_delete(&[1], "a").unwrap_err();
+        assert!(
+            matches!(err, crate::error::LaurusError::IncompatibleFormat(_)),
+            "{err}"
+        );
         assert_eq!(wal_file(&wal_storage), bytes);
     }
 

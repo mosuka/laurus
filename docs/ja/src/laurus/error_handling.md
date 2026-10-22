@@ -25,8 +25,9 @@ Laurusのすべての操作は `Result<T>` を返します。これは `std::res
 | `InvalidOperation` | 無効な操作 | コミット前の検索、二重クローズ |
 | `ResourceExhausted` | リソース制限超過 | メモリ不足、オープンファイル数超過 |
 | `SerializationError` | バイナリシリアライズエラー | ディスク上のデータ破損 |
+| `IncompatibleFormat` | このビルドが読めないディスク上の形式 | 新しいビルドが書いた、このビルドの知らないバージョンの WAL（open が失敗する。そのビルドで索引を開く）。量子化ヘッダより前のベクトルセグメント |
 | `OperationCancelled` | 操作がキャンセルされた | タイムアウト、ユーザーによるキャンセル |
-| `WritesStopped` | エンジンが書き込みの受け付けを止めた | それ以前の書き込みが WAL レコードを書いた後に失敗した（I/O エラー、ディスク容量不足）か、終わる前に panic した。索引を開き直す |
+| `WritesStopped` | エンジンが書き込みの受け付けを止めた | それ以前の書き込みが WAL への追記以降に失敗した（I/O エラー、ディスク容量不足）か、終わる前に panic した。索引を開き直す |
 | `NotImplemented` | 機能が利用不可 | 未実装の操作 |
 | `Other` | 汎用エラー | タイムアウト、無効な設定、見つからない |
 
@@ -145,7 +146,7 @@ match StorageFactory::open(StorageConfig::File {
 
 ### 書き込みの停止
 
-WAL レコードを書いた後に失敗した書き込み（I/O エラーなど）は、自身のエラーを返し、エンジンに書き込みの受け付けを止めさせます。書き込みが適用し終わる前に panic した呼び出しも同じです。以後の書き込み・コミット・スキーマ変更は、索引を開き直すまで `WritesStopped` で失敗します。開き直すと WAL が再生され、失敗した書き込みが適用されます（[失敗した書き込み](persistence.md#失敗した書き込み)を参照）。その間も検索は動きます。呼び出しのキャンセル（future の破棄）では書き込みは止まりません。各ドキュメントの書き込みは、最初の WAL への追記より前にキャンセルされる（何も残りません）か、終わるかのどちらかです。キャンセルされたバッチは、それまでに書いたドキュメントを残します。
+WAL への追記以降に失敗した書き込み（I/O エラーなど）は、自身のエラーを返し、エンジンに書き込みの受け付けを止めさせます。書き込みが適用し終わる前に panic した呼び出しも同じです。以後の書き込み・コミット・スキーマ変更は、索引を開き直すまで `WritesStopped` で失敗します。開き直すと WAL が再生され、失敗した書き込みは、レコードが WAL に完全に届いていれば丸ごと適用され、届いていなければ適用されません（[失敗した書き込み](persistence.md#失敗した書き込み)を参照）。その間も検索は動きます。呼び出しのキャンセル（future の破棄）では書き込みは止まりません。各ドキュメントの書き込みは、WAL への追記より前にキャンセルされる（何も残りません）か、終わるかのどちらかです。キャンセルされたバッチは、それまでに書いたドキュメントを残します。
 
 ```rust
 match engine.put_document("doc-1", doc).await {
@@ -155,8 +156,9 @@ match engine.put_document("doc-1", doc).await {
         eprintln!("Writes stopped: {reason}");
     }
     Err(e) => match engine.write_stop_reason() {
-        // この書き込みは WAL に届いている。索引を開き直すと適用される。
-        Some(reason) => eprintln!("Write failed after its WAL append: {reason}"),
+        // この書き込みは WAL への追記以降に失敗した。索引を開き直すと、
+        // レコードが WAL に完全に届いていれば適用される。
+        Some(reason) => eprintln!("Write failed at or after its WAL append: {reason}"),
         // この書き込みは何も変えていない。
         None => eprintln!("Write rejected: {e}"),
     },

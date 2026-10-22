@@ -2575,7 +2575,8 @@ impl InvertedIndexWriter {
             if self.deletion_manager.is_none() {
                 // The deletion log is disabled (Issue #875): nothing replays
                 // it — crash recovery is fully covered by the engine WAL,
-                // whose delete records precede every index mutation — so its
+                // whose records, deletes included, precede every index
+                // mutation — so its
                 // per-delete append + fsync is pure overhead.
                 let config = crate::maintenance::deletion::DeletionConfig {
                     enable_deletion_log: false,

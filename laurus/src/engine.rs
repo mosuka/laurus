@@ -574,13 +574,13 @@ const ID_LOCK_SHARDS: usize = 64;
 
 /// Whether the engine stopped accepting writes, and why (Issue #1492).
 ///
-/// Recorded when a mutation fails at or after its first WAL append, or
-/// panics after it before it finished applying to both stores (Issue #1499;
-/// see [`Applying`]). From
+/// Recorded when a mutation fails at or after its WAL append, or panics
+/// after it before it finished applying to both stores (Issue #1499; see
+/// [`Applying`]). From
 /// then on the in-memory stores may disagree with the WAL: a commit could
 /// persist the disagreement and truncate the record, and a later write
 /// could build on it (a put that cannot see a failed put's version of the
-/// same id writes no delete for it, so the replay would bring both back).
+/// same id does not replace it, so the replay would bring both back).
 /// Every write, commit and schema change is refused instead, until the
 /// index is reopened and the replay of the WAL decides what it holds.
 /// Shared with the [`CommitTimer`], which skips its ticks while stopped.
@@ -591,13 +591,13 @@ struct WriteStop {
 }
 
 impl WriteStop {
-    /// Record `err`, a failure at or after a mutation's first WAL append,
-    /// as the reason writes stopped, unless one is already recorded, and
-    /// return it unchanged for the failing call to report.
+    /// Record `err`, a failure at or after a mutation's WAL append, as the
+    /// reason writes stopped, unless one is already recorded, and return it
+    /// unchanged for the failing call to report.
     fn record(&self, err: LaurusError) -> LaurusError {
         let reason = format!(
-            "a write failed after its write-ahead-log record was written ({err}); reopen the \
-             index to replay the log, which applies that write"
+            "a write failed at or after its write-ahead-log append ({err}); reopen the index \
+             to replay the log, which applies that write if its record reached the log in full"
         );
         if self.reason.set(reason).is_ok() {
             log::error!("engine: stopped accepting writes: {err}");
@@ -628,7 +628,7 @@ impl WriteStop {
 /// and the [watermark](AppliedSeqs::watermark) can never pass its record, so
 /// only reopening the index, which replays it, settles it. [`Self::fail`]
 /// records the error that ended the mutation; dropping the guard with
-/// neither records that it panicked. A mutation runs from its first append
+/// neither records that it panicked. A mutation runs from its WAL append
 /// to its finish without an await (Issue #1517), so its future cannot be
 /// dropped in between, for example by laurus-server when a client
 /// disconnects; the guard would still record that as a cancellation.
@@ -674,7 +674,7 @@ impl Drop for Applying<'_> {
     }
 }
 
-/// What a put works out before its first WAL append and applies after it
+/// What a put works out before its WAL append and applies after it
 /// (Issues #1326, #1492, #1517).
 ///
 /// Preparing everything that can reject the document before the append
@@ -708,7 +708,7 @@ pub struct Engine {
     ///
     /// A put, and a delete that needs the writer, lock its writer (see
     /// [`VectorWriteLock`]) after [`Self::id_locks`] and
-    /// [`Self::schema_change_lock`], before their first WAL append, and
+    /// [`Self::schema_change_lock`], before their WAL append, and
     /// hold it to their finish (Issue #1517): the WAL, lexical, document
     /// store and watermark locks are taken inside it. Nothing takes the
     /// writer lock while holding one of those; the commit ladder releases
@@ -789,8 +789,8 @@ pub struct Engine {
     /// one). Taken *after* an [`Self::id_lock`] guard wherever both are
     /// held, since `id_locks` is documented as the outermost lock.
     schema_change_lock: tokio::sync::RwLock<()>,
-    /// Set once a mutation fails at or after its first WAL append (Issue
-    /// #1492); see [`WriteStop`]. `Arc` so the [`CommitTimer`] shares it.
+    /// Set once a mutation fails at or after its WAL append (Issue #1492);
+    /// see [`WriteStop`]. `Arc` so the [`CommitTimer`] shares it.
     write_stop: Arc<WriteStop>,
     /// Background WAL flush timer for a [`WalSyncPolicy::Group`] configured with
     /// a `max_interval`. `None` when no interval is set, or when it is zero
@@ -1157,6 +1157,16 @@ impl Engine {
     /// an [`InvalidArgument`](crate::error::LaurusError::InvalidArgument),
     /// meaning the input itself, not a transient condition, was the problem.
     ///
+    /// Each record is one whole mutation (Issue #1522): a put's record
+    /// names the versions it replaces, which each store deletes together
+    /// with the insert, and a delete's record every document it deletes.
+    /// Everything that can reject a put's document runs before either store
+    /// changes, so a discarded put also keeps the versions it would have
+    /// replaced. A WAL from before v4 holds a put's deletes as records of
+    /// their own and replays as it always did. A WAL whose version this
+    /// build does not know fails the open (Issue #1507; see
+    /// [`DocumentLog::read_all`]).
+    ///
     /// A record an older build left for a put whose lexical analysis failed
     /// (Issue #1492) still fails the open with that
     /// [`Analysis`](crate::error::LaurusError::Analysis) error, which is not
@@ -1254,16 +1264,19 @@ impl Engine {
                     doc_id,
                     external_id,
                     document,
+                    replaces,
                 } => {
                     // Restore document into document store
                     let stored_doc = self.filter_stored_fields(&document);
                     self.log.store_document(doc_id, stored_doc);
 
                     // Re-index into both stores using the recorded doc_id, in
-                    // the same order `index_internal` now uses (Issue #1326):
-                    // embed+validate the vector fields before touching the
-                    // lexical store, so neither store is mutated for a record
-                    // this build would reject. `neither_checkpointed` is true
+                    // the same order `index_internal` uses (Issues #1326,
+                    // #1522): embed+validate the vector fields and analyze
+                    // the lexical ones before touching either store, so
+                    // neither store is mutated for a record this build would
+                    // reject, and a quarantined put keeps the versions it
+                    // would have replaced. `neither_checkpointed` is true
                     // only when BOTH stores still need this record applied —
                     // i.e. the record was never durably committed anywhere,
                     // so the `put`/`add` that wrote it already returned this
@@ -1274,16 +1287,19 @@ impl Engine {
                     // other store already holds it durably.
                     let neither_checkpointed =
                         record.seq > lexical_last_seq && record.seq > vector_last_seq;
+                    let discard = |e: &LaurusError| {
+                        log::warn!(
+                            "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
+                            record.seq
+                        );
+                    };
 
                     let vectors = if record.seq > vector_last_seq {
                         let vector_fields = self.vector_field_refs(&document);
                         match self.vector.embed_fields(&vector_fields).await {
                             Ok(vectors) => Some(vectors),
                             Err(e) if neither_checkpointed && is_quarantinable(&e) => {
-                                log::warn!(
-                                    "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
-                                    record.seq
-                                );
+                                discard(&e);
                                 continue;
                             }
                             Err(e) => return Err(e),
@@ -1292,34 +1308,54 @@ impl Engine {
                         None
                     };
 
-                    if record.seq > lexical_last_seq
-                        && let Err(e) = self
-                            .lexical
-                            .upsert_document(doc_id, self.without_multi_vector_fields(&document))
-                    {
-                        if neither_checkpointed && is_quarantinable(&e) {
-                            log::warn!(
-                                "recover: discarding WAL record {} (doc_id {doc_id}, id '{external_id}'): {e}",
-                                record.seq
-                            );
-                            continue;
+                    let lexical = if record.seq > lexical_last_seq {
+                        let prepared = {
+                            let schema = self.schema.read();
+                            self.lexical
+                                .prepare_upsert(&mut Self::lexical_fields(&schema, &document))
+                        };
+                        match prepared {
+                            Ok(prepared) => Some(prepared),
+                            Err(e) if neither_checkpointed && is_quarantinable(&e) => {
+                                discard(&e);
+                                continue;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        return Err(e);
-                    }
+                    } else {
+                        None
+                    };
 
+                    // A put's previous versions are deleted together with the
+                    // insert, in each store that has not checkpointed the
+                    // record. Records older than WAL v4 replace nothing: their
+                    // deletes are records of their own.
+                    if let Some(prepared) = lexical {
+                        for &previous in &replaces {
+                            self.lexical.delete_document_by_internal_id(previous)?;
+                        }
+                        self.lexical.apply_prepared_upsert(doc_id, prepared)?;
+                    }
                     if let Some(vectors) = vectors {
+                        for &previous in &replaces {
+                            self.vector.delete_document_by_internal_id(previous).await?;
+                        }
                         self.vector.write_prepared(doc_id, vectors).await?;
                     }
                 }
                 LogEntry::Delete {
-                    doc_id,
+                    doc_ids,
                     external_id: _,
                 } => {
                     if record.seq > lexical_last_seq {
-                        self.lexical.delete_document_by_internal_id(doc_id)?;
+                        for &doc_id in &doc_ids {
+                            self.lexical.delete_document_by_internal_id(doc_id)?;
+                        }
                     }
                     if record.seq > vector_last_seq {
-                        self.vector.delete_document_by_internal_id(doc_id).await?;
+                        for &doc_id in &doc_ids {
+                            self.vector.delete_document_by_internal_id(doc_id).await?;
+                        }
                     }
                 }
             }
@@ -1368,23 +1404,29 @@ impl Engine {
     /// with the provided `id` value. A WAL entry is written before any
     /// index mutation, to ensure durability.
     ///
+    /// The put is one WAL record, which holds the document and names the
+    /// previous versions it replaces (Issue #1522). They are deleted only
+    /// after that record is written, and the replay deletes them and adds
+    /// the document together, so after any failure the reopened index holds
+    /// either the previous versions or the new one, never neither.
+    ///
     /// The document fields are routed to the appropriate underlying stores
     /// (lexical or vector) based on the schema field configuration.
     ///
-    /// Once the first WAL record of the put is written (the previous
-    /// version's delete, or the document itself), a failure, such as an
-    /// I/O error loading a deletion bitmap, can no longer be undone in this
+    /// From the WAL append on, a failure, such as an I/O error writing the
+    /// record or loading a deletion bitmap, can no longer be undone in this
     /// process (Issue #1492). The call returns that error, and the engine
     /// stops accepting writes: every later write, commit and schema change
     /// fails with [`LaurusError::WritesStopped`] until the index is
     /// reopened (see [`Self::write_stop_reason`]). Reopening replays the
-    /// WAL, which applies this put, replacing the previous version. Writes
-    /// stop the same way when the call panics after that point but before
-    /// the put finished applying to both stores (Issue #1499): the stores
-    /// may then hold it in part, and no commit may truncate its record.
-    /// Cancelling the call (dropping its future) does not stop writes: the
-    /// put waits for everything it needs, such as the vector writer a
-    /// commit holds, before its first WAL record, and runs from there to
+    /// WAL, which applies this put, replacing the previous version, if its
+    /// record reached the WAL in full; otherwise the previous version stays.
+    /// Writes stop the same way when the call panics after the append but
+    /// before the put finished applying to both stores (Issue #1499): the
+    /// stores may then hold it in part, and no commit may truncate its
+    /// record. Cancelling the call (dropping its future) does not stop
+    /// writes: the put waits for everything it needs, such as the vector
+    /// writer a commit holds, before its WAL record, and runs from there to
     /// its finish without an await (Issue #1517), so a cancelled put has
     /// either written nothing or finished.
     ///
@@ -1423,9 +1465,10 @@ impl Engine {
     /// provided `id` value. Everything that can reject the chunk runs first,
     /// as for [`Self::put_document`] (Issues #1326, #1479, #1492); a WAL
     /// entry is written only once that succeeds, before any index mutation,
-    /// to ensure durability. A failure after the WAL entry is written stops
+    /// to ensure durability. A failure at or after the WAL append stops
     /// writes until the index is reopened, and the reopen applies the
-    /// chunk, also as for [`Self::put_document`].
+    /// chunk if its entry reached the WAL in full, also as for
+    /// [`Self::put_document`].
     ///
     /// # Parameters
     ///
@@ -1486,9 +1529,10 @@ impl Engine {
     /// during embedding/validation, analysis, or while creating a writer
     /// (Issues #1326, #1479, #1492) never reaches the WAL, so there is
     /// nothing to replay or discard for it and its previous version, if
-    /// any, is untouched; a failure after its WAL record was written stops
-    /// writes, and reopening the index applies it, exactly as for a
-    /// singular put. Once writes stopped, the first document fails with
+    /// any, is untouched; a failure at or after its WAL append stops
+    /// writes, and reopening the index applies it whole or not at all,
+    /// exactly as for a singular put. Once writes stopped, the first
+    /// document fails with
     /// [`LaurusError::WritesStopped`] as its `source`.
     pub async fn put_documents(&self, docs: Vec<(String, Document)>) -> Result<()> {
         self.index_batch_internal(docs, false).await
@@ -1642,12 +1686,12 @@ impl Engine {
             self.lexical.find_doc_ids_by_term("_id", id)?
         };
 
-        // Lock the vector writer before the first WAL append and hold it
-        // until the put finished (Issue #1517). This is the put's last
-        // await: a put cancelled while it waits here, for example for a
-        // commit that holds the writer, has written nothing, and from the
-        // first append on it runs to its finish without waiting, so its
-        // future cannot be dropped halfway (Issue #1499). Locking also
+        // Lock the vector writer before the WAL append and hold it until
+        // the put finished (Issue #1517). This is the put's last await: a
+        // put cancelled while it waits here, for example for a commit that
+        // holds the writer, has written nothing, and from the append on it
+        // runs to its finish without waiting, so its future cannot be
+        // dropped halfway (Issue #1499). Locking also
         // creates the writer, which fails for a field the index cannot
         // build with (an HNSW `m` below 2 in a schema persisted before the
         // field checks), even for a document without vectors (Issue
@@ -1671,24 +1715,32 @@ impl Engine {
         Ok(doc_id)
     }
 
-    /// Everything of a put from its first WAL append to its finish: delete
-    /// `previous`, the internal ids of the id's existing versions, then
-    /// append the document's record and apply it to both stores (Issues
-    /// #1492, #1499, #1517).
+    /// Everything of a put from its WAL append to its finish: append one
+    /// record holding the document and `previous`, the internal ids of the
+    /// id's existing versions, then delete those from both stores and apply
+    /// the document (Issues #1492, #1499, #1517, #1522).
+    ///
+    /// One record makes the put all or nothing on the next open: the
+    /// previous versions are deleted only after the record is in the WAL,
+    /// whose replay deletes them and adds the document together. A failed
+    /// append thus changes nothing, and the previous versions stay. Each
+    /// previous version used to get a delete record of its own before the
+    /// document's, so a failure appending a later record left the earlier
+    /// deletes for the replay, without the document.
     ///
     /// Synchronous on purpose: the caller took everything the put waits
     /// for, the vector writer last, before calling it, so nothing here
     /// waits, and dropping the put's future cannot leave it half applied.
-    /// A failure from the first append on stops writes.
+    /// A failure from the append on stops writes.
     ///
     /// # Arguments
     ///
     /// * `id` - The document's external id.
     /// * `doc` - The document to append, with its `_id` field.
-    /// * `previous` - The internal ids of `id`'s versions to delete first;
-    ///   empty for a chunk.
+    /// * `previous` - The internal ids of `id`'s versions the document
+    ///   replaces; empty for a chunk.
     /// * `prepared` - What the prepare step filtered, analyzed and embedded.
-    /// * `vector` - The vector writer, locked before the first append.
+    /// * `vector` - The vector writer, locked before the append.
     ///
     /// # Returns
     ///
@@ -1696,7 +1748,7 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns an error if a WAL append, or applying a delete or the
+    /// Returns an error if the WAL append, or applying a delete or the
     /// document to either store, fails.
     fn write_put(
         &self,
@@ -1706,23 +1758,22 @@ impl Engine {
         prepared: PreparedPut,
         vector: &mut VectorWriteLock<'_>,
     ) -> Result<u64> {
-        // From the first WAL append on (the previous version's delete
-        // record, or the upsert record), a failure stops writes (Issue
-        // #1492): the WAL then holds a mutation the stores may not, and the
-        // replay on the next open, not this process, decides its outcome.
-        for doc_id in previous {
-            self.delete_by_internal_id(doc_id, id, vector)?;
-        }
-
-        // 3. Write-Ahead Log: assign doc_id + persist (before any index updates)
+        // 3. Write-Ahead Log: assign doc_id + persist (before any index
+        // updates). From here on a failure stops writes (Issue #1492): the
+        // WAL then holds a mutation the stores may not, and the replay on
+        // the next open, not this process, decides its outcome.
         let (doc_id, seq) = self
             .log
-            .append(id, doc)
+            .append_put(id, doc, &previous)
             .map_err(|e| self.write_stop.record(e))?;
-        // Until both stores hold the document, the guard keeps commits from
+        // Until both stores hold the whole put, the guard keeps commits from
         // truncating or checkpointing past its record (Issue #1499).
         let applying = self.applying(seq);
-        match self.apply_upsert(doc_id, prepared, vector) {
+        let applied = previous
+            .iter()
+            .try_for_each(|&previous| self.apply_delete(previous, vector))
+            .and_then(|()| self.apply_upsert(doc_id, prepared, vector));
+        match applied {
             Ok(()) => applying.finish(),
             Err(e) => return Err(applying.fail(e)),
         }
@@ -1964,16 +2015,18 @@ impl Engine {
     ///
     /// Looks up all internal document IDs associated with the given external
     /// `id` via the `_id` field in the lexical index, then removes each one
-    /// from both the lexical and vector stores. A WAL delete entry is written
-    /// for each matched document before mutation.
+    /// from both the lexical and vector stores. One WAL delete entry naming
+    /// every matched document is written before mutation (Issue #1522), so
+    /// the replay deletes all of them or, without the entry, none.
     ///
     /// If no documents match the given ID, the operation completes
     /// successfully without error (non-existent IDs are silently ignored).
     ///
-    /// A failure once a document's WAL delete record is written, or a
-    /// panic before the delete finished applying, stops writes until the
-    /// index is reopened, and the reopen applies the delete (Issues #1492,
-    /// #1499). Cancelling the call does not, as for a put (Issue #1517; see
+    /// A failure at or after the WAL append, or a panic before the delete
+    /// finished applying, stops writes until the index is reopened (Issues
+    /// #1492, #1499). The reopen applies the delete if its record reached
+    /// the WAL in full, and keeps every document otherwise. Cancelling the
+    /// call does not stop writes, as for a put (Issue #1517; see
     /// [`Self::put_document`]).
     ///
     /// # Parameters
@@ -1999,16 +2052,14 @@ impl Engine {
         // nothing is durable yet.
         let doc_ids = self.lexical.find_doc_ids_by_term("_id", id)?;
         if !doc_ids.is_empty() {
-            // Lock what the vector deletes need before the first WAL
-            // append, as a put locks the vector writer (Issue #1517): this
-            // is the delete's last await, so from the first append on it
-            // runs to its finish without waiting. Soft deletion needs no
-            // lock, so it does not wait for a commit either.
+            // Lock what the vector deletes need before the WAL append, as a
+            // put locks the vector writer (Issue #1517): this is the
+            // delete's last await, so from the append on it runs to its
+            // finish without waiting. Soft deletion needs no lock, so it
+            // does not wait for a commit either.
             let mut vector = self.vector.lock_writer_for_delete().await?;
             self.write_stop.check()?;
-            for doc_id in doc_ids {
-                self.delete_by_internal_id(doc_id, id, &mut vector)?;
-            }
+            self.write_delete(id, &doc_ids, &mut vector)?;
         }
         // Re-assert per-record durability: a concurrent batch may hold a WAL
         // sync-deferral scope, which would otherwise leave these acknowledged
@@ -2034,47 +2085,46 @@ impl Engine {
         &self.id_locks[hasher.finish() as usize & (ID_LOCK_SHARDS - 1)]
     }
 
-    /// Delete one of `id`'s documents, for [`Self::delete_documents`] or a
-    /// put's previous version: append its WAL record, then delete it from
-    /// both stores.
+    /// Everything of [`Self::delete_documents`] from its WAL append to its
+    /// finish: append one record for every document in `doc_ids`, then
+    /// delete each from both stores (Issues #1492, #1499, #1522).
+    ///
+    /// One record makes the delete all or nothing on the next open, as for
+    /// [`Self::write_put`]: each document used to get a record of its own,
+    /// so a failure appending a later one left the earlier documents
+    /// deleted and the rest in place.
     ///
     /// Any failure, from the WAL append on, stops writes (Issue #1492).
-    /// Synchronous, as [`Self::write_put`] is (Issue #1517). It does not
-    /// re-assert per-record durability, which the public entry points do
-    /// once, so the batch-ingest path, whose puts delete their previous
-    /// versions inside a WAL sync-deferral scope, does not fsync once per
-    /// deleted document.
+    /// Synchronous, as [`Self::write_put`] is (Issue #1517).
     ///
     /// # Arguments
     ///
-    /// * `doc_id` - The document's internal id.
-    /// * `id` - Its external id.
-    /// * `vector` - What the vector store needs to delete it, locked
-    ///   before the mutation's first WAL append.
+    /// * `id` - The documents' external id.
+    /// * `doc_ids` - Their internal ids.
+    /// * `vector` - What the vector store needs to delete them, locked
+    ///   before the WAL append.
     ///
     /// # Errors
     ///
-    /// Returns an error if the WAL write, the lexical deletion or the
-    /// vector deletion fails.
-    fn delete_by_internal_id(
+    /// Returns an error if the WAL append, or a lexical or vector deletion,
+    /// fails.
+    fn write_delete(
         &self,
-        doc_id: u64,
         id: &str,
+        doc_ids: &[u64],
         vector: &mut VectorWriteLock<'_>,
     ) -> Result<()> {
         // 1. Write to log
         let seq = self
             .log
-            .append_delete(doc_id, id)
+            .append_delete(doc_ids, id)
             .map_err(|e| self.write_stop.record(e))?;
-        // Until both stores hold the delete, the guard keeps commits from
-        // truncating or checkpointing past its record (Issue #1499).
+        // Until both stores hold the whole delete, the guard keeps commits
+        // from truncating or checkpointing past its record (Issue #1499).
         let applying = self.applying(seq);
-        // 2. Delete from Lexical, 3. Delete from Vector
-        let deleted = self
-            .lexical
-            .delete_document_by_internal_id(doc_id)
-            .and_then(|()| vector.delete_document_by_internal_id(doc_id));
+        let deleted = doc_ids
+            .iter()
+            .try_for_each(|&doc_id| self.apply_delete(doc_id, vector));
         match deleted {
             Ok(()) => {
                 applying.finish();
@@ -2082,6 +2132,25 @@ impl Engine {
             }
             Err(e) => Err(applying.fail(e)),
         }
+    }
+
+    /// Delete the document `doc_id` from both stores, for a delete or a
+    /// put's previous version whose WAL record is already written: 2. from
+    /// the lexical store, 3. from the vector store.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - The document's internal id.
+    /// * `vector` - What the vector store needs to delete it, locked
+    ///   before the mutation's WAL append.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lexical or the vector deletion fails.
+    fn apply_delete(&self, doc_id: u64, vector: &mut VectorWriteLock<'_>) -> Result<()> {
+        self.lexical
+            .delete_document_by_internal_id(doc_id)
+            .and_then(|()| vector.delete_document_by_internal_id(doc_id))
     }
 
     /// Guard WAL record `seq` from its append until its mutation finished
@@ -2162,12 +2231,14 @@ impl Engine {
     /// Why the engine stopped accepting writes, or `None` while it accepts
     /// them (Issue #1492).
     ///
-    /// Writes stop when a put, add or delete fails after its write-ahead-log
-    /// record was written, or panics before the write finished applying
+    /// Writes stop when a put, add or delete fails at or after its
+    /// write-ahead-log append, or panics before the write finished applying
     /// (a cancelled call does not stop them): from then on every write,
     /// commit and schema change returns [`LaurusError::WritesStopped`] until
     /// the index is reopened, and reopening replays the WAL, which applies
-    /// that write. A failing call itself returned its original error.
+    /// that write whole if its record reached the WAL in full, and
+    /// otherwise not at all (Issue #1522). A failing call itself returned
+    /// its original error.
     pub fn write_stop_reason(&self) -> Option<&str> {
         self.write_stop.reason()
     }
@@ -3279,20 +3350,6 @@ impl Engine {
             .iter()
             .filter(|(name, _)| !Self::is_multi_vector_field(schema, name))
             .map(|(name, val)| (name.as_str(), val))
-    }
-
-    /// A copy of `doc` without its multi-vector fields, for the lexical
-    /// store (see [`Self::lexical_fields`]); the token vectors are
-    /// never cloned.
-    fn without_multi_vector_fields(&self, doc: &Document) -> Document {
-        let schema = self.schema.read();
-        let mut copy = Document::new();
-        for (name, value) in &doc.fields {
-            if !Self::is_multi_vector_field(&schema, name) {
-                copy.fields.insert(name.clone(), value.clone());
-            }
-        }
-        copy
     }
 
     fn is_multi_vector_field(schema: &Schema, name: &str) -> bool {
@@ -8812,7 +8869,7 @@ mod tests {
 
         // A delete still applying while a later put finishes.
         let x = engine.lexical.find_doc_ids_by_term("_id", "x").unwrap()[0];
-        let delete_seq = engine.log.append_delete(x, "x").unwrap();
+        let delete_seq = engine.log.append_delete(&[x], "x").unwrap();
         let deleting = engine.applying(delete_seq);
         engine
             .put_document("c", vector_doc("charlie", "vec", [1.0, 1.0, 0.0]))
@@ -8996,16 +9053,16 @@ mod tests {
         assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
     }
 
-    /// Issue #1517: a put takes the vector writer before its first WAL
-    /// append and holds it to its finish, so nothing after that append
-    /// waits and dropping the put's future cannot interrupt it there. The
-    /// writer lock is fair: the test holds it, as a running commit would,
-    /// the put queues for it, and a request queued behind the put gets it
-    /// only once the put released it. The put replaces a previous version,
-    /// so its first append is that version's delete record. Under #1499 the
-    /// put took the writer before its appends and again after them, so it
-    /// waited after its upsert append, and on an engine without vector
-    /// fields, whose deletes need the writer, after the delete record too,
+    /// Issue #1517: a put takes the vector writer before its WAL append
+    /// and holds it to its finish, so nothing after that append waits and
+    /// dropping the put's future cannot interrupt it there. The writer lock
+    /// is fair: the test holds it, as a running commit would, the put
+    /// queues for it, and a request queued behind the put gets it only once
+    /// the put released it. The put replaces a previous version, which its
+    /// one record names (Issue #1522). Under #1499 the put took the writer
+    /// before its appends and again after them, so it waited after its
+    /// upsert append, and on an engine without vector fields, whose deletes
+    /// need the writer, after the previous version's delete record too,
     /// where a cancellation left the previous version deleted and no new
     /// one.
     #[tokio::test]
@@ -9033,19 +9090,19 @@ mod tests {
             assert_eq!(
                 engine.log.last_seq(),
                 seq_before,
-                "the put waits before its first append ({vector_fields:?})"
+                "the put waits before its append ({vector_fields:?})"
             );
             let mut queued = Box::pin(engine.vector.lock_writer_for_tests());
             assert!(futures::poll!(queued.as_mut()).is_pending());
             drop(held);
             assert!(
                 matches!(futures::poll!(put.as_mut()), std::task::Poll::Ready(Ok(()))),
-                "the put does not wait after its first append ({vector_fields:?})"
+                "the put does not wait after its append ({vector_fields:?})"
             );
             assert_eq!(
                 engine.log.last_seq(),
-                seq_before + 2,
-                "the previous version's delete record and the put's record"
+                seq_before + 1,
+                "the put's one record, which names the previous version"
             );
             assert_eq!(engine.applied.watermark(), engine.log.last_seq());
             assert!(engine.write_stop_reason().is_none());
@@ -9192,13 +9249,14 @@ mod tests {
                 runtime()
                     .block_on(engine.put_document("a", vector_doc("bravo", "vec", [0.0, 1.0, 0.0])))
             });
-            // Wait until the put wrote both records and released the writer.
-            // Without the deferral it blocks in its soft delete, holding the
-            // writer, before its upsert append, so this times out.
+            // Wait until the put wrote its record (Issue #1522: one, which
+            // names the previous version) and released the writer. Without
+            // the deferral it blocks in its soft delete, after the append
+            // but holding the writer, so this times out.
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let (mut written, mut writer_free) = (false, false);
             while !(written && writer_free) && std::time::Instant::now() < deadline {
-                written = engine.log.last_seq() == seq_before + 2;
+                written = engine.log.last_seq() == seq_before + 1;
                 writer_free = written && engine.vector.writer_lock_is_free_for_tests();
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -9207,7 +9265,7 @@ mod tests {
             put.join().unwrap().unwrap();
             (written, writer_free, waiting)
         });
-        assert!(written, "the put wrote its delete and upsert records");
+        assert!(written, "the put wrote its record");
         assert!(writer_free, "the put released the vector writer");
         assert!(waiting, "the put waited for the search after that");
         assert!(engine.write_stop_reason().is_none());
@@ -9359,6 +9417,57 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
+    }
+
+    /// Issue #1522: a put's record that recovery discards keeps the
+    /// versions it would have replaced. A put is one record, naming its
+    /// previous versions, and recovery deletes them only after everything
+    /// that can reject the document, as a put does before its append. As in
+    /// the test above, the record is appended directly, past the
+    /// validation of `index_internal`, with a vector of the wrong
+    /// dimension.
+    #[tokio::test]
+    async fn recover_discards_a_put_record_and_keeps_the_versions_it_replaces() {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::TextOption;
+        use crate::vector::core::field::FlatOption;
+
+        // Unlocked: the crash below leaves the engine's lock held.
+        let storage = unlocked_memory_storage();
+        let schema = Schema::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .add_field("vec", FieldOption::Flat(FlatOption::default().dimension(3)))
+            .build();
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.commit().await.unwrap();
+
+        let previous = engine.lexical.find_doc_ids_by_term("_id", "a").unwrap();
+        assert_eq!(previous.len(), 1, "precondition: one version of a");
+        let poison_doc = Document::builder()
+            .add_text("_id", "a")
+            .add_text("title", "poison")
+            .add_vector("vec", vec![1.0, 0.0])
+            .build();
+        engine.log.append_put("a", &poison_doc, &previous).unwrap();
+        // Crash: the record is in the WAL only.
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage.clone(), schema)
+            .await
+            .expect("recovery must discard the poisoned record, not fail to open");
+        let titles: Vec<_> = reopened
+            .get_documents("a")
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|doc| doc.fields.get("title").cloned())
+            .collect();
+        assert_eq!(
+            titles,
+            [DataValue::Text("alpha".to_string())],
+            "the discarded put keeps its previous version"
+        );
     }
 
     /// Issue #1479: a `put` whose vector writer cannot be created must fail

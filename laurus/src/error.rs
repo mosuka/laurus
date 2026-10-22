@@ -101,13 +101,15 @@ pub enum LaurusError {
     IncompatibleFormat(String),
 
     /// The engine stopped accepting writes because an earlier write failed
-    /// after its write-ahead-log record was written (Issue #1492).
+    /// at or after its write-ahead-log append (Issue #1492).
     ///
     /// From that point the in-memory index may disagree with the WAL, so
     /// every later write, commit and schema change is refused with this
     /// error until the index is reopened. Reopening replays the WAL, which
-    /// applies the failed write together with every write acknowledged
-    /// since the last commit. Searches and lookups keep working meanwhile.
+    /// applies every write acknowledged since the last commit, and the
+    /// failed write too if its record reached the WAL in full (a failed
+    /// `put` whose record did not keeps its previous version, Issue #1522).
+    /// Searches and lookups keep working meanwhile.
     /// The message names the original failure.
     #[error("Writes stopped: {0}")]
     WritesStopped(String),

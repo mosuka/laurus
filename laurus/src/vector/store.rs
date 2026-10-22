@@ -12,7 +12,7 @@
 //!   search executes under a shared read lock, allowing concurrent queries.
 //! - **Writer cache** is protected by a `tokio::sync::Mutex`. Embedding (potentially slow
 //!   network I/O) and pooling are performed *outside* the lock. The engine takes the lock
-//!   right before a put's first WAL append and holds it until the put finished applying
+//!   right before a put's WAL append and holds it until the put finished applying
 //!   (Issue #1517), so the critical section is the WAL append, the lexical and
 //!   document-store writes and the `delete + add_vectors` step, all synchronous; a delete
 //!   takes it only when the index cannot delete softly.
@@ -446,9 +446,9 @@ impl VectorStore {
     /// Lock the writer for a put, creating it if there is none (Issues
     /// #1479, #1517).
     ///
-    /// `Engine::index_internal` takes it before the put's first WAL append
-    /// (its previous version's delete record, or its own record) and holds
-    /// it until the put finished applying, so nothing after that append
+    /// `Engine::index_internal` takes it before the put's WAL append (one
+    /// record, Issue #1522) and holds it until the put finished applying,
+    /// so nothing after that append
     /// waits: a put cancelled while it waits here has written nothing.
     /// Creating the writer is where a field the index cannot build with
     /// fails (an HNSW `m` below 2, or a product quantizer `subvector_count`
@@ -1879,7 +1879,7 @@ impl VectorStore {
 /// Taken with [`VectorStore::lock_writer`] or
 /// [`VectorStore::lock_writer_for_delete`], the last steps of a mutation
 /// that can wait. Its methods are synchronous, so the engine runs a
-/// mutation from its first WAL append to its finish without an await, and
+/// mutation from its WAL append to its finish without an await, and
 /// dropping the mutation's future cannot interrupt it there.
 ///
 /// Dropping it releases the writer, then drops the cached searcher if a

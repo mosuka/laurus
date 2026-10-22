@@ -25,8 +25,9 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `InvalidOperation` | Invalid operation | Searching before commit, double close |
 | `ResourceExhausted` | Resource limits exceeded | Out of memory, too many open files |
 | `SerializationError` | Binary serialization errors | Corrupt data on disk |
+| `IncompatibleFormat` | An on-disk format this build cannot read | A WAL whose version this build does not know, which a newer build wrote (the open fails; open the index with that build); a vector segment from before quantization headers |
 | `OperationCancelled` | Operation was cancelled | Timeout, user cancellation |
-| `WritesStopped` | The engine stopped accepting writes | An earlier write failed after its WAL record was written (an I/O error, disk full), or panicked before it finished; reopen the index |
+| `WritesStopped` | The engine stopped accepting writes | An earlier write failed at or after its WAL append (an I/O error, disk full), or panicked before it finished; reopen the index |
 | `NotImplemented` | Feature not available | Unimplemented operation |
 | `Other` | Generic errors | Timeout, invalid config, not found |
 
@@ -145,7 +146,7 @@ match StorageFactory::open(StorageConfig::File {
 
 ### Writes Stopped
 
-A write that fails after its WAL record was written (for example on an I/O error) returns its own error and stops the engine from accepting writes, and so does a call that panics before its write finished applying: every later write, commit and schema change fails with `WritesStopped` until the index is reopened, which replays the WAL and applies the failed write (see [Failed Writes](persistence.md#failed-writes)). Searches keep working meanwhile. Cancelling a call (dropping its future) does not stop writes: each document's write is either cancelled before its first WAL append, which leaves nothing behind, or finished, and a cancelled batch keeps the documents it already wrote.
+A write that fails at or after its WAL append (for example on an I/O error) returns its own error and stops the engine from accepting writes, and so does a call that panics before its write finished applying: every later write, commit and schema change fails with `WritesStopped` until the index is reopened, which replays the WAL and applies the failed write whole if its record reached the WAL in full, or not at all (see [Failed Writes](persistence.md#failed-writes)). Searches keep working meanwhile. Cancelling a call (dropping its future) does not stop writes: each document's write is either cancelled before its WAL append, which leaves nothing behind, or finished, and a cancelled batch keeps the documents it already wrote.
 
 ```rust
 match engine.put_document("doc-1", doc).await {
@@ -155,8 +156,9 @@ match engine.put_document("doc-1", doc).await {
         eprintln!("Writes stopped: {reason}");
     }
     Err(e) => match engine.write_stop_reason() {
-        // This write reached the WAL; reopening the index applies it.
-        Some(reason) => eprintln!("Write failed after its WAL append: {reason}"),
+        // This write failed at or after its WAL append; reopening the index
+        // applies it if its record reached the WAL in full.
+        Some(reason) => eprintln!("Write failed at or after its WAL append: {reason}"),
         // This write changed nothing.
         None => eprintln!("Write rejected: {e}"),
     },

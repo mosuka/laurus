@@ -43,30 +43,35 @@ The WAL is managed by the `DocumentLog` component and stored at the root level o
 
 | Entry Type | Description |
 | :--- | :--- |
-| **Upsert** | Document content + external ID + assigned internal ID |
-| **Delete** | External ID of the document to remove |
+| **Upsert** | Document content + external ID + assigned internal ID, and the internal IDs of the versions it replaces (a `put`'s previous versions; none for an `add`) |
+| **Delete** | External ID and the internal IDs of every document it removes |
+
+Every `put`, `add` and delete writes exactly one entry, which recovery replays whole: a `put`'s previous versions are deleted together with the insert, and a delete of several chunks removes all of them ([#1522](https://github.com/mosuka/laurus/issues/1522)). A WAL from before v4 holds a `put`'s deletes, and each document of a delete, as entries of their own, and replays as it always did.
 
 ### WAL File
 
 The WAL file (`engine.wal`) is an append-only binary log. Each entry is self-contained with:
 
-- Operation type (add/delete)
+- Operation type (upsert/delete)
 - Sequence number
-- Payload (document data or ID)
+- Payload (document data and internal IDs)
 
 ### On-disk framing
 
-The file begins with a 5-byte header (`b"LWAL"` magic + a version byte) followed by length-prefixed records. There are three framings, and a file keeps a single framing for its whole life (an older file is rewritten to the current format only on the next commit/truncate — formats are never mixed within one file):
+The file begins with a 5-byte header (`b"LWAL"` magic + a version byte) followed by length-prefixed records. There are four framings. Only v4 is written: a file in an older framing that survives an upgrade is read as it is, and rewritten in v4 before the first append to it (unless a commit empties it first), so formats are never mixed within one file:
 
 | Version | Framing | Payload |
 | :--- | :--- | :--- |
-| **v3** (current) | `[u32 len][u32 crc32][payload]` | compact **rkyv binary** record |
-| **v2** | `[u32 len][u32 crc32][payload]` | JSON record (read-only, back-compat) |
+| **v4** (current) | `[u32 len][u32 crc32][payload]` | compact **rkyv binary** record, one per write |
+| **v3** | `[u32 len][u32 crc32][payload]` | rkyv binary record, a `put`'s deletes in records of their own (read-only) |
+| **v2** | `[u32 len][u32 crc32][payload]` | JSON record of the v3 entries (read-only, back-compat) |
 | **legacy** (pre-CRC) | `[u32 len][payload]` | JSON record, no checksum (read-only) |
 
-The CRC-32 (v2/v3) is computed over `len || payload`, detecting both a corrupted length and a corrupted body. The reader recovers all three formats, so a WAL written by an older build still replays after an upgrade.
+The CRC-32 (v2 and later) is computed over `len || payload`, detecting both a corrupted length and a corrupted body. The reader recovers all four formats, so a WAL written by an older build still replays after an upgrade.
 
 Since v3, each payload is a compact rkyv binary record rather than JSON. Vectors store as raw `f32` (4 bytes each) instead of decimal strings, so for vector-heavy documents the WAL is roughly 2-3x smaller and replays correspondingly faster — without changing durability (the CRC framing and recovery semantics are unchanged).
+
+A WAL whose header names a version this build does not know was written by a newer build. Opening the index fails with `LaurusError::IncompatibleFormat`, whose message names the version, and the file is left as it is, so the newer build can still replay it ([#1507](https://github.com/mosuka/laurus/issues/1507)). An older build cannot read a v4 WAL either: a build from before v4 reads it as v2 and recovers nothing from it. A commit leaves the WAL empty, so an index committed by the newer build carries no WAL records.
 
 ## Recovery
 
@@ -94,16 +99,16 @@ A write that fails returns its error, and what it changed depends on where it fa
 | Where it fails | For example | Outcome |
 | :--- | :--- | :--- |
 | Before its WAL append | A rejected embedding, an analyzer error, a writer that cannot be created, a failed flush of a full lexical buffer; the call cancelled (its future dropped, as when a `laurus serve` client's request is cancelled, its deadline expires or the client disconnects), for example while it waits for the vector writer that a commit holds | Nothing changed: no WAL record is written, and a `put` keeps the previous version. The engine keeps accepting writes. |
-| At or after its first WAL append | An I/O error writing the WAL record or loading a deletion bitmap; a panic before the write finished applying | The engine **stops accepting writes**, and reopening the index applies the write. |
+| At or after its WAL append | An I/O error writing the WAL record or loading a deletion bitmap; a panic before the write finished applying | The engine **stops accepting writes**. Reopening the index applies the whole write if its record reached the WAL in full; otherwise the write changed nothing, and a `put` keeps its previous versions. |
 
-A write takes everything it waits for, such as the vector writer, before its first WAL append, and from that append to its finish it runs without an `.await` ([#1517](https://github.com/mosuka/laurus/issues/1517)). Cancelling its call therefore takes effect either before that append, which leaves nothing behind, or after the write finished, which leaves it applied even though the caller never sees the result. Retrying a cancelled `put` of the same id is safe either way, while retrying a cancelled `add` can add the chunk twice. A cancelled `put_documents` or `add_documents` keeps the documents it applied before the cancellation; they become durable at the WAL's next fsync rather than at the one the batch runs when it ends.
+A write takes everything it waits for, such as the vector writer, before its WAL append, and from that append to its finish it runs without an `.await` ([#1517](https://github.com/mosuka/laurus/issues/1517)). Cancelling its call therefore takes effect either before that append, which leaves nothing behind, or after the write finished, which leaves it applied even though the caller never sees the result. Retrying a cancelled `put` of the same id is safe either way, while retrying a cancelled `add` can add the chunk twice. A cancelled `put_documents` or `add_documents` keeps the documents it applied before the cancellation; they become durable at the WAL's next fsync rather than at the one the batch runs when it ends.
 
-The first WAL append of a `put` is the previous version's delete record, or the document's own record when there is no previous version. From that point the in-memory index may disagree with the WAL, and going on would let a commit persist the disagreement or a later write build on it. Once writes stopped:
+A write appends one WAL record ([#1522](https://github.com/mosuka/laurus/issues/1522)): a `put`'s names the previous versions it replaces, and a delete's every document it removes. The write changes the in-memory index only after that append, so a failed append leaves the index as it was. From the append on, the in-memory index may disagree with the WAL, and going on would let a commit persist the disagreement or a later write build on it. Once writes stopped:
 
 - Every `put`, `add`, delete, `commit()` (also from `CommitPolicy::EveryDocs` and `Interval`, which skip their commits instead) and schema change (`add_field`, `delete_field`, `update_field`) fails with `LaurusError::WritesStopped`, whose message names the original failure. `Engine::write_stop_reason()` returns it.
 - Searches and lookups keep working. They may show the failed write half applied, for example a `put`'s previous version already gone from vector results.
 - No commit runs, so the WAL keeps every record since the last commit, and an engine dropped while stopped discards its lexical writer instead of committing it.
-- Reopening the index (for `laurus serve`, restarting it) replays the WAL. The failed write is applied, so a failed `put` replaces its previous version, together with every write acknowledged since the last commit. Fix the cause first (e.g. free disk space): if the replay fails again, the open fails and can be retried.
+- Reopening the index (for `laurus serve`, restarting it) replays the WAL, with every write acknowledged since the last commit. The failed write is applied whole if its record reached the WAL in full: a failed `put` replaces its previous versions, and a failed delete removes every chunk. Otherwise it changed nothing. It is never applied in part. Fix the cause first (e.g. free disk space): if the replay fails again, the open fails and can be retried.
 
 An append that failed partway through writing its record also makes every later append fail, because recovery stops at the first incomplete record and would lose any record written after it. Reopening the index cuts the incomplete record off (see [Recovery](#recovery)), and appends work again.
 
@@ -195,7 +200,7 @@ By default, each `add`/`delete` fsyncs the WAL before returning, so a successful
 | `PerRecord` (default) | Every successful write is durable | Bounded by one fsync per write | SQLite `synchronous = FULL` |
 | `Group { max_records, max_bytes }` | A crash may lose up to the last unsynced batch | fsync amortized over a batch | SQLite `synchronous = NORMAL` |
 
-Under `Group`, the fsync is deferred and issued once **either** `max_records` records **or** `max_bytes` bytes have accumulated since the last sync (whichever comes first). Configure it on the builder:
+Under `Group`, the fsync is deferred and issued once **either** `max_records` records **or** `max_bytes` bytes have accumulated since the last sync (whichever comes first). A record is one write: a `put`, `add` or delete, however many versions or chunks it replaces or removes. Configure it on the builder:
 
 ```rust
 use laurus::WalSyncPolicy;
