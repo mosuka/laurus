@@ -266,10 +266,18 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Add a new vector field to this index (Issue #948: dynamic schema
     /// evolution).
     ///
+    /// The field starts empty, also under the name of a field that
+    /// [`Self::remove_field`] removed without a purge (Issue #1535): the
+    /// implementation discards the files that field left. They stopped
+    /// receiving deletes when it was removed, and may have been written
+    /// under another configuration.
+    ///
     /// # Errors
     ///
     /// The default implementation always errors; callers must gate on
-    /// [`Self::supports_dynamic_fields`] first.
+    /// [`Self::supports_dynamic_fields`] first. Implementations also error if
+    /// a field named `name` is registered, if `name` cannot have storage of
+    /// its own, or if discarding the old files or creating the field fails.
     fn add_field(&self, _name: &str, _config: VectorIndexTypeConfig) -> Result<()> {
         Err(LaurusError::InvalidOperation(
             "this index type does not support adding fields dynamically".to_string(),
@@ -279,15 +287,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Remove a vector field from this index's routing (Issue #948: dynamic
     /// schema evolution).
     ///
-    /// With `purge: false`, this only unregisters the field -- mirrors
-    /// [`crate::vector::store::VectorStore`]'s existing "unregister only"
-    /// contract for `delete_field`, so the data can be recovered by
-    /// re-adding the field with the same name.
+    /// With `purge: false`, this only unregisters the field, as
+    /// [`crate::vector::store::VectorStore::delete_field`] does. Its files
+    /// stay until [`Self::add_field`] adds a field with the same name, which
+    /// discards them and starts empty (Issue #1535): the data is not
+    /// recovered.
     ///
     /// With `purge: true` (Issue #1080: `Engine::update_field` rebuilding a
     /// field under a new type), the field's on-disk data is also
-    /// physically deleted, so a same-name re-add under a different type
-    /// cannot misread the old bytes.
+    /// physically deleted right away.
     ///
     /// Defaults to `Ok(())` (a no-op): index types without field boundaries
     /// have nothing to unregister or purge.

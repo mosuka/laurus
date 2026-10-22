@@ -2444,6 +2444,15 @@ impl Engine {
     /// and searches can target it. Existing documents are unaffected (they
     /// simply do not have a value for the new field).
     ///
+    /// A vector field starts empty, also under the name of a field that
+    /// [`Self::delete_field`] removed: the files that field left are
+    /// discarded (Issue #1535). The stored documents keep the values they
+    /// were put with, so a document put before the removal returns its old
+    /// value for the field again, although no vector search finds it by that
+    /// value; put the document again to index it. Adding a vector field first
+    /// commits, as [`Self::commit`] does, so recovery never replays a record
+    /// written before the field was added into it.
+    ///
     /// Like [`Self::update_field`], this waits for in-flight ingestion and
     /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
     /// `schema_change_lock`), so a document is never written against fields
@@ -2468,6 +2477,7 @@ impl Engine {
     /// Returns an error if:
     /// - A field with the same name already exists.
     /// - The field references an unknown analyzer or embedder.
+    /// - The commit before a vector field is added fails.
     /// - The underlying store rejects the field.
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
@@ -2530,6 +2540,15 @@ impl Engine {
         if option.is_vector() {
             let field_embedder = self.field_embedder(name, &option).await?;
 
+            // The field starts empty, also under the name of a deleted field
+            // (Issue #1535), so it starts after a commit. Until the next
+            // commit its checkpoint is 0, and recovery would replay into it
+            // every record the WAL still holds, a put into the deleted field
+            // among them; under another dimension that replay fails, and the
+            // index no longer opens. Puts and deletes wait on the schema
+            // lock, so the commit leaves the WAL empty.
+            self.commit().await?;
+
             let vector_opt = option
                 .to_vector()
                 .expect("is_vector() was true but to_vector() returned None");
@@ -2556,6 +2575,11 @@ impl Engine {
     /// available for indexing or searching. Existing data already stored in the
     /// index is **not** deleted; it simply becomes inaccessible through the
     /// normal query path.
+    ///
+    /// A vector field's data is not recovered by adding a field with the same
+    /// name later: [`Self::add_field`] discards it and starts the field empty
+    /// (Issue #1535). Deletes stop reaching the field when it is removed, so
+    /// its data would bring deleted documents back.
     ///
     /// For lexical fields, the field is also removed from the underlying
     /// [`LexicalStore`] (if it was dynamically added) and any per-field analyzer
@@ -2671,7 +2695,9 @@ impl Engine {
     ///
     /// A `Reindex` or `Destructive` change first makes the WAL durable, as
     /// [`Self::commit`] does, and a `Reindex` keeps every delete and update
-    /// made since the last commit (Issue #1527).
+    /// made since the last commit (Issue #1527). A `Destructive` change of a
+    /// vector field first commits, so recovery never replays a record written
+    /// before the change into the recreated field (Issue #1535).
     ///
     /// Blocks concurrently with ingestion via an internal write lock (see
     /// [`Engine`]'s `schema_change_lock`), so a document is never coerced
@@ -2699,7 +2725,8 @@ impl Engine {
     ///   or [`FieldChangeKind::Destructive`](schema::FieldChangeKind::Destructive)
     ///   and `opts.reindex` is `false`.
     /// - Making the WAL durable before the rebuild fails, as in
-    ///   [`Self::flush_wal`].
+    ///   [`Self::flush_wal`], or for a `Destructive` change of a vector
+    ///   field, the commit before it.
     /// - The underlying vector or lexical rebuild/recreate fails.
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
@@ -2765,6 +2792,8 @@ impl Engine {
                     )));
                 }
 
+                let purge = classification == schema::FieldChangeKind::Destructive;
+
                 // The rebuild writes store state outside the commit ladder:
                 // the stores commit their writers, and a vector rebuild writes
                 // the deletion marks and drops the deleted documents' vectors.
@@ -2772,9 +2801,17 @@ impl Engine {
                 // covers durable (Issue #1527). A batch put defers the fsync
                 // across documents and releases the schema lock between them,
                 // so records can be unsynced here under any sync policy.
-                self.log.flush_wal()?;
+                //
+                // A destructive change of a vector field recreates it empty,
+                // so it commits instead, as `add_field` does (Issue #1535):
+                // recovery would otherwise replay into the new field the puts
+                // the WAL still holds, under the old dimension too.
+                if purge && option.is_vector() {
+                    self.commit().await?;
+                } else {
+                    self.log.flush_wal()?;
+                }
 
-                let purge = classification == schema::FieldChangeKind::Destructive;
                 if purge {
                     log::warn!(
                         "update_field: field '{name}' has a destructive change; its existing \
@@ -8509,9 +8546,9 @@ mod tests {
     /// Puts the committed `a_vec` checkpoint of an engine over
     /// `title_schema(&["a_vec", "b_vec"])` at 50, ahead of `b_vec` and of the
     /// lexical store: unregisters `b_vec`, publishes 50 for the remaining
-    /// field, and registers `b_vec` again. It reopens with its published
-    /// checkpoint; the one `add_field` seeds stays pending, since nothing
-    /// commits it.
+    /// field, and registers `b_vec` again. It starts empty (Issue #1535), with
+    /// no checkpoint published; the one `add_field` seeds stays pending,
+    /// since nothing commits it.
     async fn run_a_vec_ahead(engine: &Engine, schema: &Schema) {
         engine.vector.delete_field("b_vec").await.unwrap();
         engine.vector.set_last_wal_seq(50);

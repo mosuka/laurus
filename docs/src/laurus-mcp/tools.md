@@ -117,7 +117,8 @@ particular order.
 
 Remove a field from the index schema. Existing indexed data remains in
 storage but becomes inaccessible. Per-field analyzers and embedders are
-unregistered.
+unregistered. Adding a vector field with the same name later starts it empty
+(see [Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
 
 ### Parameters
 

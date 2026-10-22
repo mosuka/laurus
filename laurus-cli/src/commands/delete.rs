@@ -17,7 +17,8 @@ use crate::context;
 /// persists the updated schema itself (the engine returned by
 /// [`context::open_index`] is configured with a schema-persist hook — see
 /// Issue #1078). Existing data in the index is not deleted; the field
-/// simply becomes inaccessible for future indexing and searching.
+/// simply becomes inaccessible for future indexing and searching. Adding a
+/// vector field with the same name later starts it empty (Issue #1535).
 ///
 /// # Arguments
 ///

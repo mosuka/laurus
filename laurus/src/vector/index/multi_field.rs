@@ -142,6 +142,63 @@ where
     first_err.map_or(Ok(()), Err)
 }
 
+/// Whether `file`, a name in a field's directory, is one the field's
+/// sub-index creates (Issue #1535): a segment file (`segment_<ordinal>.…`),
+/// a file of the single-file layout or the deletion bitmap (named after
+/// [`SUB_INDEX_NAME`]), or a manifest (`segments.json`, `metadata.json`),
+/// each also with its `.tmp` staging suffix.
+///
+/// Anything else stays: a field name may contain `/`, so the directory of a
+/// field `a` also holds the directory of a field `a/b` and that field's PQ
+/// codebook `a/b.pqcb`, and a caller may place a codebook there too.
+fn is_sub_index_file(file: &str) -> bool {
+    if file.contains('/') {
+        return false;
+    }
+    if let Some((ordinal, _)) = file
+        .strip_prefix("segment_")
+        .and_then(|rest| rest.split_once('.'))
+    {
+        return !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit());
+    }
+    let staged = file.strip_suffix(".tmp").unwrap_or(file);
+    staged == "segments.json"
+        || staged == "metadata.json"
+        || file
+            .strip_prefix(SUB_INDEX_NAME)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Check that a new field `name` gets a directory of its own (Issue #1535).
+///
+/// [`PrefixedStorage::new`] trims leading and trailing `/`, so `a/` shares
+/// the directory of `a` and an empty name is the root, and a storage
+/// resolves empty, `.` and `..` segments and may read `\` as a separator.
+/// Such a name would make a re-add discard the files of another field.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::invalid_argument`] when `name` has such a segment
+/// or character, or when a registered field shares its directory.
+fn check_own_directory(name: &str, fields: &BTreeMap<String, FieldEntry>) -> Result<()> {
+    if name.contains('\\')
+        || name
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Err(LaurusError::invalid_argument(format!(
+            "vector field name '{name}' does not name a directory of its own: it must not \
+             be empty, start or end with '/', or have an empty, '.' or '..' segment or a '\\'"
+        )));
+    }
+    if let Some(other) = fields.keys().find(|other| other.trim_matches('/') == name) {
+        return Err(LaurusError::invalid_argument(format!(
+            "vector field '{name}' would share its directory with vector field '{other}'"
+        )));
+    }
+    Ok(())
+}
+
 /// One field's sub-index plus the cached geometry
 /// ([`FieldEntry::dimension`] / [`FieldEntry::distance_metric`]) needed for
 /// fan-out routing without paying for a `reader()`/`stats()` round trip on
@@ -249,6 +306,21 @@ impl MultiFieldVectorIndex {
             .map(|f| f.index.last_wal_seq())
             .min()
             .unwrap_or(0)
+    }
+
+    /// Delete the files the sub-index of field `name` created in its
+    /// directory ([`is_sub_index_file`]), trying every one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error listing or deleting the files gives.
+    fn purge_field_files(&self, name: &str) -> Result<()> {
+        let field_storage = PrefixedStorage::new(name.to_string(), self.storage.clone());
+        let files = field_storage.list_files()?;
+        try_all(
+            files.iter().filter(|file| is_sub_index_file(file)),
+            |file| field_storage.delete_file(file),
+        )
     }
 }
 
@@ -435,6 +507,13 @@ impl VectorIndex for MultiFieldVectorIndex {
                 "vector field '{name}' already exists"
             )));
         }
+        check_own_directory(name, &fields)?;
+        // A field removed without a purge left its files here. They stopped
+        // following the documents when it was removed -- a delete marks only
+        // the registered fields, and a commit truncates the WAL past it --
+        // and nothing in them records the option they were written under, so
+        // the field starts empty instead of reopening them (Issue #1535).
+        self.purge_field_files(name)?;
         let field_storage: Arc<dyn Storage> =
             Arc::new(PrefixedStorage::new(name.to_string(), self.storage.clone()));
         let index =
@@ -451,19 +530,14 @@ impl VectorIndex for MultiFieldVectorIndex {
     }
 
     fn remove_field(&self, name: &str, purge: bool) -> Result<()> {
-        // Unregister first (mirrors `VectorStore::delete_field`'s existing
-        // contract when `purge` is false: does not delete on-disk data, so
-        // re-adding the same field name later recovers it).
+        // Unregister first. Without `purge` the files stay until a re-add of
+        // the same name discards them (Issue #1535).
         self.fields.write().remove(name);
 
         if purge {
-            // Issue #1080: physically remove the field's files so a
-            // same-name re-add under a DIFFERENT type cannot misread old
-            // bytes. `list_files` on the field's own `PrefixedStorage`
-            // already returns only this field's (prefix-stripped) names.
-            let field_storage = PrefixedStorage::new(name.to_string(), self.storage.clone());
-            let files = field_storage.list_files()?;
-            try_all(files.iter(), |file| field_storage.delete_file(file))?;
+            // Issue #1080: physically remove the field's files now, so the
+            // space is freed even if the re-add that follows fails.
+            self.purge_field_files(name)?;
         }
         Ok(())
     }

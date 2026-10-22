@@ -734,6 +734,15 @@ When a field is deleted:
 - Any per-field analyzer or embedder registered for the field is
   unregistered.
 
+Adding a vector field with the same name later does not bring its data back:
+`Engine::add_field()` discards the files the deleted field left and starts
+the field empty (Issue #1535). Deletes stop reaching a field once it is
+removed, so its old data would return deleted documents, and it may have been
+written under another dimension or index kind. Documents put before the
+deletion still return their old value for the field from the document store,
+but no vector search finds them by it; put them again to index them. Adding
+a vector field commits first, as `Engine::commit()` does.
+
 ### Changing a Field
 
 Use `Engine::update_field()` to change an existing field's type/options on

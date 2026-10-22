@@ -483,6 +483,155 @@ fn remove_field_with_purge_deletes_on_disk_data() {
     );
 }
 
+/// Issue #1535: re-adding a field that `remove_field` removed without a
+/// purge starts it empty. The removed field's files stopped receiving
+/// deletes, and nothing in them says which configuration wrote them, so
+/// `add_field` discards them instead of reopening them.
+#[test]
+fn add_field_discards_the_files_a_removed_field_left() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "title_vec".to_string(),
+        hnsw_config(3, DistanceMetric::Cosine),
+    );
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![(1, "title_vec".to_string(), vec_of(&[1.0, 0.0, 0.0]))])
+        .unwrap();
+    writer.commit().unwrap();
+
+    index.remove_field("title_vec", false).unwrap();
+    let left: Vec<String> = index
+        .storage()
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|file| file.starts_with("title_vec/segment_"))
+        .collect();
+    assert!(!left.is_empty(), "the removal keeps the segment files");
+
+    index
+        .add_field("title_vec", hnsw_config(3, DistanceMetric::Cosine))
+        .unwrap();
+    let reader = index.reader().unwrap();
+    assert_eq!(
+        reader.get_vectors_by_field("title_vec").unwrap().len(),
+        0,
+        "the old vector must not come back"
+    );
+    let kept: Vec<&String> = left
+        .iter()
+        .filter(|file| index.storage().file_exists(file))
+        .collect();
+    assert!(kept.is_empty(), "old segment files left: {kept:?}");
+}
+
+/// Issue #1535: discarding a field's files, on a re-add or a purge, keeps
+/// the files its sub-index did not create. A field name may contain `/`, so
+/// the directory of field `a` also holds the directory of field `a/b` and
+/// its PQ codebook `a/b.pqcb`, and a caller may place a codebook there too.
+#[test]
+fn discarding_a_field_keeps_the_files_it_did_not_create() {
+    let storage = storage();
+    let mut fields = BTreeMap::new();
+    fields.insert("a".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    fields.insert("a/b".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage.clone(), &fields, Arc::new(MockEmbedder))
+            .unwrap();
+
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![
+            (1, "a".to_string(), vec_of(&[1.0, 0.0, 0.0])),
+            (1, "a/b".to_string(), vec_of(&[0.0, 1.0, 0.0])),
+        ])
+        .unwrap();
+    writer.commit().unwrap();
+    let foreign = ["a.pqcb", "a/b.pqcb", "a/user.pqcb"];
+    for name in foreign {
+        let mut output = storage.create_output(name).unwrap();
+        std::io::Write::write_all(&mut output, b"codebook").unwrap();
+        output.close().unwrap();
+    }
+
+    let mut failures = Vec::new();
+    let mut check = |what: &str| {
+        let reader = index.reader().unwrap();
+        if !reader.get_vectors_by_field("a").unwrap().is_empty() {
+            failures.push(format!("{what}: field a kept its vector"));
+        }
+        if reader.get_vectors_by_field("a/b").unwrap().len() != 1 {
+            failures.push(format!("{what}: field a/b lost its vector"));
+        }
+        for name in foreign {
+            if !storage.file_exists(name) {
+                failures.push(format!("{what}: {name} was deleted"));
+            }
+        }
+    };
+
+    index.remove_field("a", false).unwrap();
+    index
+        .add_field("a", hnsw_config(3, DistanceMetric::Cosine))
+        .unwrap();
+    check("after a re-add");
+
+    index.remove_field("a", true).unwrap();
+    index
+        .add_field("a", hnsw_config(3, DistanceMetric::Cosine))
+        .unwrap();
+    check("after a purge");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Issue #1535: `add_field` rejects a name that does not give the field a
+/// directory of its own, since a re-add discards what it finds there.
+/// `PrefixedStorage` trims leading and trailing `/` (`a/` shares `a`'s
+/// directory, an empty name is the root), and a storage resolves empty,
+/// `.` and `..` segments and may read `\` as a separator.
+#[test]
+fn add_field_rejects_a_name_without_a_directory_of_its_own() {
+    // `a/` as a schema at open may name it, sharing the directory `a`.
+    let mut fields = BTreeMap::new();
+    fields.insert("a/".to_string(), hnsw_config(3, DistanceMetric::Cosine));
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+    let mut writer = index.writer().unwrap();
+    writer
+        .add_vectors(vec![(1, "a/".to_string(), vec_of(&[1.0, 0.0, 0.0]))])
+        .unwrap();
+    writer.commit().unwrap();
+
+    let accepted: Vec<&str> = ["", "/", "b/", "/b", "b//c", "b/./c", "b/../c", "b\\c", "a"]
+        .into_iter()
+        .filter(|name| {
+            index
+                .add_field(name, hnsw_config(3, DistanceMetric::Cosine))
+                .is_ok()
+        })
+        .collect();
+    assert!(accepted.is_empty(), "accepted {accepted:?}");
+    assert_eq!(
+        index
+            .reader()
+            .unwrap()
+            .get_vectors_by_field("a/")
+            .unwrap()
+            .len(),
+        1,
+        "field a/ lost its vector"
+    );
+
+    // A nested name of its own is fine.
+    index
+        .add_field("b/c", hnsw_config(3, DistanceMetric::Cosine))
+        .unwrap();
+}
+
 /// Issue #1080: `rebuild_field` must preserve existing vectors while
 /// applying the new config, and must reject a field name that does not
 /// exist.
@@ -767,25 +916,35 @@ fn highest_wal_seq_is_the_maximum_across_fields() {
         "body_vec".to_string(),
         hnsw_config(3, DistanceMetric::Cosine),
     );
+    let storage = storage();
     let index =
-        MultiFieldVectorIndex::open_or_create(storage(), &fields, Arc::new(MockEmbedder)).unwrap();
+        MultiFieldVectorIndex::open_or_create(storage.clone(), &fields, Arc::new(MockEmbedder))
+            .unwrap();
     assert_eq!(index.highest_wal_seq(), 0);
 
     index.set_last_wal_seq(42).unwrap();
     index.persist_deletions().unwrap();
     assert_eq!(index.last_wal_seq(), 42);
     assert_eq!(index.highest_wal_seq(), 42);
+    drop(index);
 
-    // Run `title_vec` ahead: unregister `body_vec` (its data stays), publish
-    // a higher checkpoint for the remaining field, then register `body_vec`
-    // again. It reopens with its published 42; the checkpoint `add_field`
-    // seeds stays pending until the next `persist_deletions()`.
-    index.remove_field("body_vec", false).unwrap();
+    // Run `title_vec` ahead: open it alone, publish a higher checkpoint, then
+    // open both fields again. `body_vec` reopens with its published 42. (A
+    // re-add of `body_vec` would not do: it starts empty, Issue #1535.)
+    let title_only: BTreeMap<String, VectorIndexTypeConfig> = fields
+        .iter()
+        .filter(|(name, _)| name.as_str() == "title_vec")
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect();
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage.clone(), &title_only, Arc::new(MockEmbedder))
+            .unwrap();
     index.set_last_wal_seq(50).unwrap();
     index.persist_deletions().unwrap();
-    index
-        .add_field("body_vec", hnsw_config(3, DistanceMetric::Cosine))
-        .unwrap();
+    drop(index);
+
+    let index =
+        MultiFieldVectorIndex::open_or_create(storage, &fields, Arc::new(MockEmbedder)).unwrap();
     assert_eq!(index.last_wal_seq(), 42);
     assert_eq!(index.highest_wal_seq(), 50);
 }

@@ -385,7 +385,9 @@ laurus --index-dir ./my_index delete field --name category
 ```
 
 Existing indexed data for the field remains in storage but becomes
-inaccessible. Per-field analyzers and embedders are unregistered.
+inaccessible. Per-field analyzers and embedders are unregistered. Adding a
+vector field with the same name later starts it empty (see
+[Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
 
 ---
 

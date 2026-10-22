@@ -1629,7 +1629,11 @@ impl VectorStore {
     /// If the underlying index's embedder is a
     /// [`PerFieldEmbedder`](crate::embedding::per_field::PerFieldEmbedder),
     /// this method registers the given embedder for the specified field.
-    /// The writer and searcher caches are invalidated afterwards.
+    ///
+    /// The field starts empty, also under the name of a field that
+    /// [`Self::delete_field`] removed: [`VectorIndex::add_field`] discards
+    /// the files that field left (Issue #1535). The cached writer is
+    /// committed and dropped first, and the cached searcher is dropped.
     ///
     /// # Arguments
     ///
@@ -1641,15 +1645,41 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if creating the field's sub-index fails (e.g. the
-    /// field already exists, or a storage I/O error).
+    /// Returns an error if committing the cached writer's pending changes
+    /// fails, leaving the index unchanged and the writer cached for the next
+    /// [`Self::commit`] to retry, or if creating the field's sub-index fails
+    /// (e.g. the field already exists, or a storage I/O error).
     pub async fn add_field(
         &self,
         name: &str,
         vector_opt: &crate::vector::core::field::FieldOption,
         embedder: Option<Arc<dyn crate::embedding::embedder::Embedder>>,
     ) -> Result<()> {
-        if self.index.supports_dynamic_fields() {
+        // Commit the cached writer before the index changes, and fail if
+        // that fails, as `rebuild_field` does. The writer holds a sub-writer
+        // for every field it was made for: one kept from a failed commit in
+        // `delete_field` holds the removed field's, whose commit after the
+        // re-add would write that field's old manifest back into the
+        // directory the re-add emptied (Issue #1535). A failed writer stays
+        // cached (#882 review / #875): its buffered mutations are the only
+        // in-process copy. The lock is held until the field is registered,
+        // so no writer is made without it, and nothing awaits after the
+        // index changes (Issue #1530).
+        let mut writer_guard = self.writer_cache.lock().await;
+        let flush_result = match writer_guard.as_mut() {
+            Some(writer) if writer.has_pending_changes() => writer.commit(),
+            _ => Ok(()),
+        };
+        // A failed flush may still have sealed other fields' segments, as in
+        // `optimize` (Issue #1435).
+        if let Err(e) = flush_result {
+            drop(writer_guard);
+            *self.searcher_cache.write() = None;
+            return Err(e);
+        }
+        *writer_guard = None;
+
+        let added = if self.index.supports_dynamic_fields() {
             let deletion_config = self
                 .config
                 .as_ref()
@@ -1660,46 +1690,31 @@ impl VectorStore {
                 self.index.embedder(),
                 &deletion_config,
             );
-            self.index.add_field(name, field_config)?;
-        }
+            self.index.add_field(name, field_config)
+        } else {
+            Ok(())
+        };
 
-        self.base_weights.write().insert(
-            name.to_string(),
-            Self::sanitize_base_weight(vector_opt.base_weight()),
-        );
+        if added.is_ok() {
+            self.base_weights.write().insert(
+                name.to_string(),
+                Self::sanitize_base_weight(vector_opt.base_weight()),
+            );
 
-        if let Some(field_embedder) = embedder {
-            let index_embedder = self.index.embedder();
-            if let Some(pfe) = index_embedder
-                .as_any()
-                .downcast_ref::<crate::embedding::per_field::PerFieldEmbedder>()
-            {
-                pfe.add_embedder(name, field_embedder);
+            if let Some(field_embedder) = embedder {
+                let index_embedder = self.index.embedder();
+                if let Some(pfe) = index_embedder
+                    .as_any()
+                    .downcast_ref::<crate::embedding::per_field::PerFieldEmbedder>()
+                {
+                    pfe.add_embedder(name, field_embedder);
+                }
             }
         }
 
-        // Invalidate caches so the next writer/searcher uses updated config.
-        // Commit the cached writer first and KEEP it on failure (#882
-        // review / #875): its buffered mutations are the only in-process
-        // copy, and the segmented pending WAL checkpoint may already cover
-        // them — a bare drop would let a later successful commit's
-        // checkpoint hide the loss from recovery. A commit failure here is
-        // intentionally not propagated (pre-existing behavior): leaving
-        // the writer cached makes the next `commit()` retry and surface
-        // it instead.
-        {
-            let mut writer_guard = self.writer_cache.lock().await;
-            if let Some(writer) = writer_guard.as_mut()
-                && writer.has_pending_changes()
-                && writer.commit().is_err()
-            {
-                *self.searcher_cache.write() = None;
-                return Ok(());
-            }
-            *writer_guard = None;
-        }
+        drop(writer_guard);
         *self.searcher_cache.write() = None;
-        Ok(())
+        added
     }
 
     /// Remove a field from the vector store.
@@ -1708,8 +1723,10 @@ impl VectorStore {
     /// [`VectorIndex::remove_field`], a no-op for index types without
     /// field boundaries) and any field-specific embedder from the
     /// `PerFieldEmbedder`, then invalidates writer/searcher caches.
-    /// Existing vector data in the index is not deleted -- re-adding the
-    /// field with the same name recovers it.
+    /// The field's files stay on storage, but its data is not recovered:
+    /// [`Self::add_field`] with the same name discards the files and starts
+    /// the field empty (Issue #1535). From removal on, deletes no longer
+    /// reach the field, so its data would bring deleted documents back.
     ///
     /// # Arguments
     ///
@@ -2529,6 +2546,59 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(fixture.store.commit().await.is_err());
         fixture.assert_failure_hit();
+    }
+
+    /// Makes the commit in `delete_field("a")` fail sealing doc 2 into `a`,
+    /// so the store keeps the writer, which still holds `a`'s sub-writer.
+    async fn delete_field_a_keeping_the_writer(fixture: &StaleSearcherFixture) {
+        *fixture.index_storage.fail_create_prefix.lock() = Some("a/");
+        fixture.store.delete_field("a").await.unwrap();
+        fixture.assert_failure_hit();
+    }
+
+    /// Issue #1535 — `add_field` commits a writer kept from a failed commit
+    /// before it re-adds the field. Committed after the re-add, the removed
+    /// field's sub-writer would write its old manifest into the directory
+    /// the re-add emptied, naming segment files that are gone.
+    #[tokio::test]
+    async fn re_add_commits_a_kept_writer_before_it_empties_the_field() {
+        let fixture = store_with_stale_searcher().await;
+        delete_field_a_keeping_the_writer(&fixture).await;
+
+        let option = crate::vector::core::field::FieldOption::Flat(flat_option());
+        fixture.store.add_field("a", &option, None).await.unwrap();
+        assert_eq!(search_ids(&fixture.store, "a").unwrap(), Vec::<u64>::new());
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let reopened = VectorStore::new(fixture.index_storage.clone(), config).unwrap();
+        assert_eq!(search_ids(&reopened, "a").unwrap(), Vec::<u64>::new());
+        assert_eq!(search_ids(&reopened, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1535 — while the kept writer's commit fails, `add_field`
+    /// returns the error before it changes the index: the field is not
+    /// registered and the removed field's files stay.
+    #[tokio::test]
+    async fn re_add_fails_while_the_kept_writer_cannot_commit() {
+        let fixture = store_with_stale_searcher().await;
+        delete_field_a_keeping_the_writer(&fixture).await;
+
+        let option = crate::vector::core::field::FieldOption::Flat(flat_option());
+        *fixture.index_storage.fail_create_prefix.lock() = Some("a/");
+        assert!(fixture.store.add_field("a", &option, None).await.is_err());
+        fixture.assert_failure_hit();
+        assert!(!fixture.store.index.field_dimensions().contains_key("a"));
+        assert!(fixture.index_storage.file_exists("a/segments.json"));
+
+        fixture.store.add_field("a", &option, None).await.unwrap();
+        assert_eq!(search_ids(&fixture.store, "a").unwrap(), Vec::<u64>::new());
     }
 
     /// Issue #1500 — a failed auto-compaction drops a retained writer, as a
