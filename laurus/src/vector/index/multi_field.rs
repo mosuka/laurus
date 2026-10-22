@@ -400,6 +400,10 @@ impl VectorIndex for MultiFieldVectorIndex {
         try_all(self.fields.read().values(), |f| f.index.persist_deletions())
     }
 
+    fn write_deletions(&self) -> Result<()> {
+        try_all(self.fields.read().values(), |f| f.index.write_deletions())
+    }
+
     fn maybe_auto_compact(&self) -> Result<bool> {
         let fields = self.fields.read();
         let mut compacted_any = false;
@@ -463,11 +467,18 @@ impl VectorIndex for MultiFieldVectorIndex {
     }
 
     fn rebuild_field(&self, name: &str, new_config: VectorIndexTypeConfig) -> Result<()> {
-        if !self.fields.read().contains_key(name) {
+        let Some(current) = self.fields.read().get(name).map(|f| f.index.clone()) else {
             return Err(LaurusError::invalid_argument(format!(
                 "vector field '{name}' does not exist"
             )));
-        }
+        };
+
+        // The reopened index reads the deletions from storage only, so the
+        // marks made since the last commit, which the current index holds in
+        // memory, must be there first (Issue #1527). The merge below then
+        // drops their documents. The WAL checkpoint stays where the last
+        // commit published it.
+        current.write_deletions()?;
 
         // Reopen the SAME physical namespace under the new config -- this
         // does not move or lose any data, it only changes which config the
@@ -1489,5 +1500,111 @@ mod tests {
             snapshot.vectors(1).unwrap().unwrap().into_owned(),
             [0.25, 0.0, 0.0, 0.25, 0.125, 0.125]
         );
+    }
+
+    /// Issue #1527: a soft delete since the last `persist_deletions` survives
+    /// `rebuild_field`, which drops the document, for every index kind.
+    #[test]
+    fn rebuild_field_drops_the_documents_deleted_since_the_last_persist() {
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::{
+            FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, MultiVectorIndexConfig,
+        };
+
+        let configs = BTreeMap::from([
+            (
+                "flat".to_string(),
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hnsw".to_string(),
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ivf".to_string(),
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension: 2,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "monolithic".to_string(),
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension: 2,
+                    segmented: false,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "tokens".to_string(),
+                VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+        ]);
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let embedder = match &configs["tokens"] {
+            VectorIndexTypeConfig::MultiVector(config) => config.embedder.clone(),
+            _ => unreachable!(),
+        };
+        let index =
+            MultiFieldVectorIndex::open_or_create(storage.clone(), &configs, embedder).unwrap();
+        let mut writer = index.writer().unwrap();
+        for doc_id in 1..=3u64 {
+            let x = doc_id as f32;
+            let fields = configs
+                .keys()
+                .map(|name| {
+                    let vectors = if name == "tokens" {
+                        vec![v(x), Vector::new(vec![0.0, x])]
+                    } else {
+                        vec![Vector::new(vec![x, 1.0])]
+                    };
+                    (name.clone(), vectors)
+                })
+                .collect();
+            writer.add_document_vectors(doc_id, fields).unwrap();
+        }
+        writer.commit().unwrap();
+        drop(writer);
+        index.persist_deletions().unwrap();
+
+        index.soft_delete_document(2).unwrap();
+        let mut failures = Vec::new();
+        for (name, config) in &configs {
+            index.rebuild_field(name, config.clone()).unwrap();
+            let present = |doc_id| {
+                if name == "tokens" {
+                    let snapshot = index.multi_vector_snapshot(name).unwrap().unwrap();
+                    snapshot.vectors(doc_id).unwrap().is_some()
+                } else {
+                    let reader = index.reader().unwrap();
+                    reader.get_vector(doc_id, name).unwrap().is_some()
+                }
+            };
+            if present(2) {
+                failures.push(format!("{name}: deleted doc 2 came back"));
+            }
+            if !present(1) || !present(3) {
+                failures.push(format!("{name}: a live document is gone"));
+            }
+            if storage.file_exists(&format!("{name}/{SUB_INDEX_NAME}.delmap")) {
+                failures.push(format!("{name}: the reclaimed mark is still on storage"));
+            }
+        }
+        if index.stats().unwrap().deleted_count != 0 {
+            failures.push("a reclaimed mark is still counted".to_string());
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

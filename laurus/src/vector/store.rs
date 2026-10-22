@@ -1764,6 +1764,12 @@ impl VectorStore {
     /// [`FieldChangeKind::Reindex`]: crate::engine::schema::FieldChangeKind::Reindex
     /// [`FieldChangeKind::Destructive`]: crate::engine::schema::FieldChangeKind::Destructive
     ///
+    /// A rebuild keeps the deletes and re-adds made since the last commit
+    /// (Issue #1527). A soft delete takes no writer lock, so the caller must
+    /// not delete documents while this runs: a delete that lands on the
+    /// field's index being replaced is lost. `Engine::update_field` blocks
+    /// deletes for the whole call.
+    ///
     /// # Errors
     ///
     /// Returns an error if flushing a cached writer's pending changes
@@ -2218,6 +2224,9 @@ mod tests {
             self.check(IndexCall::PersistDeletions)?;
             self.inner.persist_deletions()
         }
+        fn write_deletions(&self) -> Result<()> {
+            self.inner.write_deletions()
+        }
         fn maybe_auto_compact(&self) -> Result<bool> {
             self.check(IndexCall::MaybeAutoCompact)?;
             self.inner.maybe_auto_compact()
@@ -2604,6 +2613,46 @@ mod tests {
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "a").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1527 — a document re-added under the id it was deleted with,
+    /// without a commit, survives a rebuild. The re-add clears the mark in
+    /// memory while the field's `.delmap` still holds it, so a rebuild that
+    /// read the marks from storage only dropped both versions. Ten documents
+    /// keep one delete below the auto-compaction threshold, which would
+    /// otherwise reclaim the mark at the commit.
+    #[tokio::test]
+    async fn rebuild_keeps_a_document_re_added_since_the_last_commit() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = VectorStore::new(storage.clone(), config).unwrap();
+        for doc_id in 1..=10 {
+            put_doc(&store, doc_id).await;
+        }
+        store.commit().await.unwrap();
+        store.delete_document_by_internal_id(1).await.unwrap();
+        store.commit().await.unwrap();
+        assert!(
+            storage.file_exists("a/index.delmap"),
+            "the committed delete is on storage"
+        );
+
+        put_doc(&store, 1).await;
+        store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, false)
+            .await
+            .unwrap();
+        let all: Vec<u64> = (1..=10).collect();
+        assert_eq!(search_ids(&store, "a").unwrap(), all);
+        store.commit().await.unwrap();
+        assert_eq!(search_ids(&store, "a").unwrap(), all);
     }
 
     /// Issue #1457 — a purge to a Flat or IVF option with a product

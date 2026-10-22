@@ -284,6 +284,24 @@ impl SegmentedCore {
         Ok(())
     }
 
+    /// Write the deletion bitmap to `{name}.delmap` without publishing the
+    /// pending WAL checkpoint (Issue #1527).
+    ///
+    /// Writes nothing when the bitmap was never loaded: `{name}.delmap`, if
+    /// any, already holds every mark. Removes the file when the bitmap marks
+    /// nothing, as [`Self::persist_deletions`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing or removing `{name}.delmap` fails.
+    pub(crate) fn write_deletions(&self) -> Result<()> {
+        let guard = self.deletion.read();
+        if let Some(bitmap) = guard.as_ref() {
+            self.write_delmap(bitmap)?;
+        }
+        Ok(())
+    }
+
     /// Persist the deletion bitmap, then publish the pending WAL checkpoint.
     ///
     /// This is the last vector step of the store's commit sequence: sealed
@@ -291,11 +309,7 @@ impl SegmentedCore {
     /// written, every record up to the pending sequence number is on
     /// storage and the checkpoint may be published.
     pub(crate) fn persist_deletions(&self) -> Result<()> {
-        let guard = self.deletion.read();
-        if let Some(bitmap) = guard.as_ref() {
-            self.write_delmap(bitmap)?;
-        }
-        drop(guard);
+        self.write_deletions()?;
 
         let pending = self.pending_wal_seq.load(Ordering::Acquire);
         if pending > self.manager.last_wal_seq() {
@@ -470,6 +484,41 @@ mod tests {
         core.rollback_pending_wal_seq();
         core.persist_deletions().unwrap();
         assert_eq!(core.last_wal_seq(), 4);
+    }
+
+    /// Issue #1527: `write_deletions` puts the marks on storage for an index
+    /// reopened over the same files, and publishes no checkpoint.
+    #[test]
+    fn test_write_deletions_persists_marks_without_the_checkpoint() {
+        let storage = memory_storage();
+        let core = open(&storage);
+        core.set_pending_wal_seq(4);
+        core.persist_deletions().unwrap();
+        core.set_pending_wal_seq(9);
+        core.mark_deleted(7).unwrap();
+
+        core.write_deletions().unwrap();
+        let reopened = open(&storage);
+        assert!(reopened.is_deleted(7).unwrap(), "the mark is on storage");
+        assert_eq!(core.last_wal_seq(), 4, "the checkpoint is not published");
+        assert_eq!(reopened.last_wal_seq(), 4);
+    }
+
+    /// Issue #1527: a core that never loaded its bitmap leaves the delmap
+    /// alone, and a bitmap emptied by unmarks removes it.
+    #[test]
+    fn test_write_deletions_writes_only_a_loaded_bitmap() {
+        let storage = memory_storage();
+        let core = open(&storage);
+        core.mark_deleted(1).unwrap();
+        core.persist_deletions().unwrap();
+
+        open(&storage).write_deletions().unwrap();
+        assert!(storage.file_exists("index.delmap"), "nothing was loaded");
+
+        core.unmark_deleted([1]).unwrap();
+        core.write_deletions().unwrap();
+        assert!(!storage.file_exists("index.delmap"));
     }
 
     /// Issue #1518: forgetting a snapshot replaces the bitmap with one that

@@ -495,6 +495,11 @@ impl VectorIndex for HnswIndex {
         Ok(())
     }
 
+    fn write_deletions(&self) -> Result<()> {
+        // This index has no WAL checkpoint to hold back.
+        self.persist_deletions()
+    }
+
     fn maybe_auto_compact(&self) -> Result<bool> {
         if !self.config.auto_compaction {
             return Ok(false);

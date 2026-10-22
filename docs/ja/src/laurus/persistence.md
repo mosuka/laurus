@@ -246,6 +246,7 @@ let engine = Engine::builder(storage, schema)
 ### 耐久性の保証
 
 - **`commit()` は両ポリシーで hard barrier です。** いずれのストアを materialize する前に WAL を強制的に durable 化するため、WAL がコミット済みインデックスより durability で劣ることはありません。`commit()` 成功後は、ポリシーに関わらず全データが durable です。
+- **フィールドを作り直す、または捨てる `update_field` も barrier です。** `Reindex` と `Destructive` の変更は commit の手順の外でストアの writer を commit し、vector の `Reindex` はそこでフィールドの削除も書き込むため、`commit()` と同じく先に WAL を durable 化します（[#1527](https://github.com/mosuka/laurus/issues/1527)）。
 - **`flush_wal()` は full commit なしでオンデマンドに flush します。** `Group` におけるクラッシュ時の損失窓を、アプリ任意の地点で抑えるための手段で、SQLite の WAL チェックポイントに相当します。
 
   ```rust

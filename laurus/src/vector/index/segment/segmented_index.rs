@@ -491,6 +491,10 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         self.shared.core.persist_deletions()
     }
 
+    fn write_deletions(&self) -> Result<()> {
+        self.shared.core.write_deletions()
+    }
+
     fn maybe_auto_compact(&self) -> Result<bool> {
         // Tiered auto-merge: the policy itself is the trigger — it returns
         // a candidate when a generation-contiguous, size-similar window

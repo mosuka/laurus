@@ -225,6 +225,7 @@ let engine = Engine::builder(storage, schema)
 ### Durability Guarantees
 
 - **`commit()` is a hard barrier under both policies.** It forces the WAL durable before materializing any store, so the WAL is never less durable than the committed indexes. After a successful `commit()`, all data is durable regardless of policy.
+- **An `update_field` that rebuilds or discards a field is a barrier too.** A `Reindex` or `Destructive` change commits the stores' writers outside the commit ladder, and a vector `Reindex` also writes the field's deletions there, so it forces the WAL durable first, as `commit()` does ([#1527](https://github.com/mosuka/laurus/issues/1527)).
 - **`flush_wal()` forces a flush on demand** without a full commit — the way to bound the crash-loss window under `Group` at an application-chosen point, analogous to a SQLite WAL checkpoint:
 
   ```rust

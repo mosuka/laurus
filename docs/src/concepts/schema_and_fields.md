@@ -765,6 +765,10 @@ The requested change is classified into one of three kinds, reported as
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against
 accidentally triggering an expensive rebuild or a data-losing change.
 
+A `Reindex` keeps the deletes and updates made since the last `commit()`:
+a deleted document does not come back in search after the rebuild
+([#1527](https://github.com/mosuka/laurus/issues/1527)).
+
 Applying a `Destructive` change records the field's name in the schema's
 `pending_reindex` set. This is a visibility mechanism against the known
 Solr failure mode where the schema and the index silently drift apart —

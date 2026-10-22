@@ -652,6 +652,10 @@ impl VectorIndex for MultiVectorIndex {
         self.shared.core.persist_deletions()
     }
 
+    fn write_deletions(&self) -> Result<()> {
+        self.shared.core.write_deletions()
+    }
+
     fn maybe_auto_compact(&self) -> Result<bool> {
         if self.merge_once()? {
             return Ok(true);

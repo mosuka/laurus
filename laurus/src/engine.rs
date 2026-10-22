@@ -2593,6 +2593,10 @@ impl Engine {
     ///   destructive changes behind a separate flag; see #1077's design
     ///   discussion.
     ///
+    /// A `Reindex` or `Destructive` change first makes the WAL durable, as
+    /// [`Self::commit`] does, and a `Reindex` keeps every delete and update
+    /// made since the last commit (Issue #1527).
+    ///
     /// Blocks concurrently with ingestion via an internal write lock (see
     /// [`Engine`]'s `schema_change_lock`), so a document is never coerced
     /// against a field option that is being replaced mid-write.
@@ -2618,6 +2622,8 @@ impl Engine {
     /// - The change is classified as [`FieldChangeKind::Reindex`](schema::FieldChangeKind::Reindex)
     ///   or [`FieldChangeKind::Destructive`](schema::FieldChangeKind::Destructive)
     ///   and `opts.reindex` is `false`.
+    /// - Making the WAL durable before the rebuild fails, as in
+    ///   [`Self::flush_wal`].
     /// - The underlying vector or lexical rebuild/recreate fails.
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
@@ -2682,6 +2688,15 @@ impl Engine {
                          reindex: true, .. }}` to proceed"
                     )));
                 }
+
+                // The rebuild writes store state outside the commit ladder:
+                // the stores commit their writers, and a vector rebuild writes
+                // the deletion marks and drops the deleted documents' vectors.
+                // As the ladder does first, make every WAL record that state
+                // covers durable (Issue #1527). A batch put defers the fsync
+                // across documents and releases the schema lock between them,
+                // so records can be unsynced here under any sync policy.
+                self.log.flush_wal()?;
 
                 let purge = classification == schema::FieldChangeKind::Destructive;
                 if purge {
@@ -5112,6 +5127,76 @@ mod tests {
             .build()
             .await
             .unwrap_or_else(|e| panic!("reopening failed: {e:?}"));
+    }
+
+    /// Issue #1527: a Reindex makes the WAL durable before it rebuilds, as
+    /// the commit ladder does before the stores commit. Under `Group` with
+    /// neither threshold reachable and no timer, a delete's record stays
+    /// unsynced until then, for a vector and for a lexical Reindex.
+    #[tokio::test]
+    async fn update_field_reindex_flushes_the_wal_first() {
+        use crate::data::DataValue;
+        use crate::lexical::core::field::TextOption;
+        use crate::vector::core::field::FlatOption;
+        use crate::vector::core::quantization::QuantizationMethod;
+
+        let flat = |quantizer| {
+            schema::FieldOption::Flat(FlatOption {
+                dimension: 2,
+                quantizer,
+                ..FlatOption::default()
+            })
+        };
+        let text = |term_vectors| {
+            schema::FieldOption::Text(TextOption::default().term_vectors(term_vectors))
+        };
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field("title", text(false))
+            .add_field("vec", flat(QuantizationMethod::Scalar8Bit))
+            .build();
+        let engine = Engine::builder(storage, schema)
+            .wal_sync_policy(WalSyncPolicy::Group {
+                max_records: usize::MAX,
+                max_bytes: usize::MAX,
+                max_interval: None,
+            })
+            .build()
+            .await
+            .unwrap();
+        let reindex = UpdateFieldOptions {
+            reindex: true,
+            ..Default::default()
+        };
+
+        let mut unsynced = Vec::new();
+        for (field, option) in [
+            ("vec", flat(QuantizationMethod::Float16)),
+            ("title", text(true)),
+        ] {
+            let doc = Document::builder()
+                .add_text("title", "a")
+                .add_field("vec", DataValue::Vector(vec![1.0, 0.5]))
+                .build();
+            engine.put_document("doc", doc).await.unwrap();
+            engine.commit().await.unwrap();
+            engine.delete_documents("doc").await.unwrap();
+            assert!(engine.log.wal_is_dirty(), "{field}: the delete is unsynced");
+
+            let outcome = engine.update_field(field, option, reindex).await.unwrap();
+            assert_eq!(
+                outcome.classification,
+                schema::FieldChangeKind::Reindex,
+                "{field}"
+            );
+            if engine.log.wal_is_dirty() {
+                unsynced.push(field);
+            }
+        }
+        assert!(
+            unsynced.is_empty(),
+            "the WAL is unsynced after these Reindexes: {unsynced:?}"
+        );
     }
 
     /// Issue #1309: `update_field` rejects an undeclared embedder name,

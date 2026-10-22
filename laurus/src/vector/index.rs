@@ -204,12 +204,32 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Persist any pending logical deletions to storage (Issue #624).
     ///
     /// Called by the store on commit so the deletion bitmap survives restarts.
-    /// Defaults to a no-op for indexes that do not buffer soft deletions.
+    /// The segmented indexes then also publish the pending WAL checkpoint
+    /// recorded by [`Self::set_last_wal_seq`], so this is the last vector step
+    /// of the commit ladder. Defaults to a no-op for indexes that do not
+    /// buffer soft deletions.
     ///
     /// # Errors
     ///
     /// Returns an error if writing the deletion bitmap to storage fails.
     fn persist_deletions(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Write the logical deletions to storage without publishing a WAL
+    /// checkpoint (Issue #1527).
+    ///
+    /// For a caller that opens another index over the same files, which reads
+    /// the deletions from storage only: [`Self::rebuild_field`] calls it on a
+    /// field's index before it reopens the field. Unlike
+    /// [`Self::persist_deletions`], the checkpoint stays where the last commit
+    /// published it, so recovery still replays every record since. Indexes
+    /// that buffer soft deletions must override it; the default is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the deletion bitmap to storage fails.
+    fn write_deletions(&self) -> Result<()> {
         Ok(())
     }
 
@@ -285,6 +305,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// fails partway through (e.g. by writing new segments before
     /// atomically publishing them, the way [`Self::optimize`] already
     /// does).
+    ///
+    /// The documents deleted since the last [`Self::persist_deletions`] stay
+    /// deleted (Issue #1527): the rebuild drops them, as it drops the ones
+    /// deleted before. The caller must not soft delete a document while the
+    /// rebuild runs, or the delete can land on the field's index being
+    /// replaced and be lost. `Engine::update_field` blocks deletes for the
+    /// whole call.
     ///
     /// Only valid for parameters that do not change the meaning of
     /// already-written vectors (dimension, distance metric, and embedder

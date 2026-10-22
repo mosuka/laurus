@@ -663,6 +663,8 @@ let outcome = engine.update_field(
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 
+`Reindex` は、前回の `commit()` 以降の削除と更新も保ちます。削除したドキュメントは再構築の後も検索に戻りません（[#1527](https://github.com/mosuka/laurus/issues/1527)）。
+
 `Destructive` な変更を適用すると、対象フィールド名がスキーマの `pending_reindex` に記録されます。これは Solr のように「スキーマとインデックスが静かに食い違う」状態を避けるための可視化機構で、`GetSchema` / `laurus get schema` から確認できます。既存データを失ったフィールドが分かるので、必要に応じてドキュメントの再投入で解消してください。
 
 ベクトルフィールドに登録される embedder は、新しい `embedder` の指定に従います（Issue #1354）。名前を指定すればその embedder が登録され、名前を外せば以前の embedder の登録が解除されて、フィールドは既定の embedder にフォールバックします（既定が `PrecomputedEmbedder` なら、そのフィールドに送ったテキストは拒否されます）。変更の前後どちらでも名前を指定していないフィールドでは、`EngineBuilder::embedder` で直接登録した embedder はそのまま残ります。
