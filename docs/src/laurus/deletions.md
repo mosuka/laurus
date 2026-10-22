@@ -113,6 +113,14 @@ not re-fire until deletions accumulate again — bounding tombstone growth
 without a manual `optimize()`. Set `auto_compaction` to `false` to manage
 compaction yourself.
 
+A compaction that fails does not fail the commit: the commit's changes and
+deletions are durable before the compaction starts, so `commit()` logs the
+failure as a warning that names the field and returns successfully, and the
+next commit retries the compaction. Until the cause is fixed (for example a
+field whose persisted parameters cannot write a segment), every commit logs
+the warning again, and the deleted vectors stay in the index, hidden from
+searches.
+
 ## Deletion Bitmap
 
 The deletion bitmap tracks which internal IDs have been deleted:

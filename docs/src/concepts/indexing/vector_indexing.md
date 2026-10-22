@@ -1036,7 +1036,10 @@ segments:
   the union's size. Flat has no f32 rerank sidecar to fall back on, so each
   merge dequantizes, retrains scalar-quantization parameters, and
   requantizes — a small amount of quantization drift accumulates across
-  merges, unlike HNSW's/IVF's lossless-ish requantization path.
+  merges, unlike HNSW's/IVF's lossless-ish requantization path. Merges run
+  inside `commit()` after the commit's segment and deletions are durable,
+  so a merge that fails does not fail the commit (Issue #1500): it is
+  logged as a warning that names the field, and the next commit retries it.
 - **Per-segment training**: HNSW's graphs and IVF's centroids are both
   built independently per segment — IVF adapts its cluster count to each
   segment's own size (capped by the schema's `n_clusters`) rather than
@@ -1067,7 +1070,8 @@ index is rewritten *behind* the writer — auto-compaction firing inside a
 commit, or an explicit `optimize()` — because both rebuild the file
 through a fresh writer and clear the deletion bitmap, and a stale retained
 writer would write the reclaimed vectors back — and whenever a commit
-fails partway, where the writer/disk agreement is unknown. As a bonus, a
+fails partway or its auto-compaction fails, where the writer/disk
+agreement is unknown. As a bonus, a
 retained writer with no pending changes skips the index rewrite entirely,
 so a no-change `commit()` costs no `.hnsw` write at all. The monolithic
 Flat and IVF layouts keep the previous drop-on-commit behavior, unaudited
