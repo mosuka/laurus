@@ -232,7 +232,8 @@ impl Schema {
     ///   [`FieldOption::Ivf`] field has a zero dimension, an HNSW `m` below
     ///   2 or `ef_construction` of 0, an HNSW product quantizer whose
     ///   `subvector_count` is 0 or does not divide the dimension (Issue
-    ///   #1491), or an IVF `n_clusters` or `n_probe` of 0 (see
+    ///   #1491), a PQ distance other than `Euclidean` or `Cosine` (Issue
+    ///   #1458), or an IVF `n_clusters` or `n_probe` of 0 (see
     ///   [`HnswOption::validate`], [`FlatOption::validate`] and
     ///   [`IvfOption::validate`], Issue #1479). When the index is reopened,
     ///   a persisted field that breaks one of these only logs a warning, so

@@ -44,6 +44,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LaurusError, Result};
+use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::vector::Vector;
 
 /// Quantization methods for compressing dense vectors.
@@ -66,6 +67,9 @@ pub enum QuantizationMethod {
     /// HNSW index only: a Flat or IVF field with it is rejected with
     /// [`LaurusError::InvalidArgument`] when the field is defined, and an
     /// index whose persisted schema holds one fails to open (Issue #1457).
+    /// HNSW fields using it support only the `Euclidean` and `Cosine`
+    /// distance metrics (Issue #1458); reopening an older field with
+    /// another metric warns and leaves it repairable with `update_field`.
     /// The codebook (`subvector_count × 256` centroids) is trained per
     /// segment by default, or trained once and shared across segments via
     /// `HnswOption::pq_codebook_path` / `Engine::train_pq_codebook`
@@ -83,6 +87,9 @@ pub enum QuantizationMethod {
     /// part D of [#651](https://github.com/mosuka/laurus/issues/651)); a
     /// Flat or IVF field with it is rejected like
     /// [`Self::ProductQuantization`].
+    /// It supports only the `Euclidean` and `Cosine` distance metrics;
+    /// reopening an older HNSW field with another metric warns and leaves
+    /// it repairable with `update_field` (Issue #1458).
     ///
     /// Use this when the HNSW search latency is dominated by the PQ
     /// ADC kernel and the corpus fits the FAISS-style block layout
@@ -134,6 +141,23 @@ impl QuantizationMethod {
         };
         PqParams::subvector_count_error(dimension, subvector_count)
             .map(|reason| format!("product quantization {reason}"))
+    }
+
+    /// Why this quantizer cannot compute `distance`, if it cannot (Issue #1458).
+    pub(crate) fn distance_error(&self, distance: DistanceMetric) -> Option<String> {
+        let product_quantization = match *self {
+            QuantizationMethod::ProductQuantization { .. } => true,
+            #[cfg(feature = "pq-fastscan")]
+            QuantizationMethod::ProductQuantizationFastScan { .. } => true,
+            QuantizationMethod::Scalar8Bit | QuantizationMethod::Float16 => false,
+        };
+        (product_quantization
+            && !matches!(distance, DistanceMetric::Euclidean | DistanceMetric::Cosine))
+        .then(|| {
+            format!(
+                "product quantization supports only distance Euclidean or Cosine, got {distance:?}"
+            )
+        })
     }
 }
 
@@ -1409,6 +1433,52 @@ mod tests {
                     "product quantization subvector_count 3 must divide dimension 8 (got 8 % 3 = 2)"
                 )
             );
+        }
+    }
+
+    /// Issue #1458: only product quantizers restrict their HNSW distance.
+    #[test]
+    fn distance_error_reports_only_product_quantizers() {
+        let product_quantizers = [
+            QuantizationMethod::ProductQuantization { subvector_count: 2 },
+            #[cfg(feature = "pq-fastscan")]
+            QuantizationMethod::ProductQuantizationFastScan { subvector_count: 2 },
+        ];
+        let unsupported = [
+            DistanceMetric::DotProduct,
+            DistanceMetric::Manhattan,
+            DistanceMetric::Angular,
+        ];
+
+        for quantizer in product_quantizers {
+            for distance in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+                assert_eq!(quantizer.distance_error(distance), None);
+            }
+            for distance in unsupported {
+                assert_eq!(
+                    quantizer.distance_error(distance).as_deref(),
+                    Some(match distance {
+                        DistanceMetric::DotProduct =>
+                            "product quantization supports only distance Euclidean or Cosine, got DotProduct",
+                        DistanceMetric::Manhattan =>
+                            "product quantization supports only distance Euclidean or Cosine, got Manhattan",
+                        DistanceMetric::Angular =>
+                            "product quantization supports only distance Euclidean or Cosine, got Angular",
+                        _ => unreachable!("test metrics are unsupported"),
+                    })
+                );
+            }
+        }
+        for quantizer in [QuantizationMethod::Scalar8Bit, QuantizationMethod::Float16] {
+            for distance in [
+                DistanceMetric::Euclidean,
+                DistanceMetric::Cosine,
+                DistanceMetric::DotProduct,
+                DistanceMetric::Manhattan,
+                DistanceMetric::Angular,
+            ] {
+                assert_eq!(quantizer.distance_error(distance), None, "{quantizer:?}");
+            }
         }
     }
 

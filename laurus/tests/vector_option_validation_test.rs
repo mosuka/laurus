@@ -20,6 +20,7 @@ use laurus::storage::Storage;
 use laurus::storage::file::FileStorageConfig;
 use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::vector::Vector;
+use laurus::vector::core::distance::DistanceMetric;
 use laurus::{
     Document, Engine, FieldChangeKind, FieldOption, FlatOption, HnswOption, IvfOption, LaurusError,
     QuantizationMethod, QueryVector, Schema, SearchRequestBuilder, UpdateFieldOptions,
@@ -39,8 +40,23 @@ fn ivf() -> IvfOption {
 
 /// An HNSW field with a product quantizer of `subvector_count` sub-vectors.
 fn hnsw_pq(subvector_count: usize) -> FieldOption {
+    hnsw_pq_with_distance(subvector_count, DistanceMetric::Cosine)
+}
+
+fn hnsw_pq_with_distance(subvector_count: usize, distance: DistanceMetric) -> FieldOption {
     FieldOption::Hnsw(
-        HnswOption::new(DIM).quantizer(QuantizationMethod::ProductQuantization { subvector_count }),
+        HnswOption::new(DIM)
+            .distance(distance)
+            .quantizer(QuantizationMethod::ProductQuantization { subvector_count }),
+    )
+}
+
+#[cfg(feature = "pq-fastscan")]
+fn hnsw_pq_fastscan(distance: DistanceMetric) -> FieldOption {
+    FieldOption::Hnsw(
+        HnswOption::new(DIM)
+            .distance(distance)
+            .quantizer(QuantizationMethod::ProductQuantizationFastScan { subvector_count: 2 }),
     )
 }
 
@@ -106,7 +122,7 @@ fn assert_rejects(err: &LaurusError, field: &str, reason: &str) {
 /// before the schema or the data change.
 #[tokio::test(flavor = "multi_thread")]
 async fn defining_a_field_with_unusable_parameters_fails() {
-    let cases: Vec<(FieldOption, FieldOption, &str)> = vec![
+    let mut cases: Vec<(FieldOption, FieldOption, &str)> = vec![
         (
             FieldOption::Hnsw(HnswOption::new(DIM).m(1)),
             FieldOption::Hnsw(HnswOption::new(DIM)),
@@ -158,6 +174,27 @@ async fn defining_a_field_with_unusable_parameters_fails() {
             "Flat dimension must be greater than 0",
         ),
     ];
+    for metric in [
+        DistanceMetric::DotProduct,
+        DistanceMetric::Manhattan,
+        DistanceMetric::Angular,
+    ] {
+        let reason = match metric {
+            DistanceMetric::DotProduct => {
+                "HNSW product quantization supports only distance Euclidean or Cosine, got DotProduct"
+            }
+            DistanceMetric::Manhattan => {
+                "HNSW product quantization supports only distance Euclidean or Cosine, got Manhattan"
+            }
+            DistanceMetric::Angular => {
+                "HNSW product quantization supports only distance Euclidean or Cosine, got Angular"
+            }
+            _ => unreachable!("test metrics have explicit error messages"),
+        };
+        cases.push((hnsw_pq_with_distance(2, metric), hnsw_pq(2), reason));
+        #[cfg(feature = "pq-fastscan")]
+        cases.push((hnsw_pq_fastscan(metric), hnsw_pq(2), reason));
+    }
     for (rejected, valid, reason) in cases {
         assert_rejects(
             &schema_with(rejected.clone())
@@ -292,6 +329,44 @@ async fn index_persisted_with_an_unusable_subvector_count_opens_and_update_field
         let reopened = Engine::new(open_storage(&dir), repaired).await.unwrap();
         assert_eq!(search_ids(&reopened).await.len(), 5, "{reason}");
     }
+}
+
+/// Issue #1458: an index whose persisted HNSW PQ field uses an unsupported
+/// metric still opens with a warning and can be repaired with `update_field`.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_persisted_with_an_unsupported_pq_metric_opens_and_can_be_repaired() {
+    let dir = TempDir::new().unwrap();
+    let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
+        .await
+        .unwrap();
+    put_four(&engine).await;
+    drop(engine);
+
+    let persisted = Schema::from_toml(
+        &schema_with(hnsw_pq_with_distance(2, DistanceMetric::DotProduct))
+            .to_toml()
+            .unwrap(),
+    )
+    .unwrap();
+    let engine = Engine::new(open_storage(&dir), persisted).await.unwrap();
+    let outcome = engine
+        .update_field("vec", hnsw_pq(2), REINDEX)
+        .await
+        .unwrap();
+    assert_eq!(outcome.classification, FieldChangeKind::Destructive);
+
+    let doc = Document::builder().add_field("vec", vector(9)).build();
+    engine.put_document("d9", doc).await.unwrap();
+    engine.commit().await.unwrap();
+    // Distance changes are destructive: the four vectors written under the
+    // unsupported metric are purged before the repaired field is recreated.
+    assert_eq!(search_ids(&engine).await, ["d9"]);
+    assert!(engine.schema().pending_reindex.contains("vec"));
+    let repaired = engine.schema();
+    drop(engine);
+
+    let reopened = Engine::new(open_storage(&dir), repaired).await.unwrap();
+    assert_eq!(search_ids(&reopened).await, ["d9"]);
 }
 
 /// Issue #1491: writes to such a field that an older build accepted but
