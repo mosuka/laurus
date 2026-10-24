@@ -51,7 +51,7 @@ lz4_flex = { version = "0.14", default-features = false, features = [
     "safe-decode",
     "checked-decode",
 ] }
-lru = "0.18.3"
+lru = "0.19.0"
 parking_lot = "0.12.5"
 pest = "2.8.8"
 pest_derive = "2.8.8"
