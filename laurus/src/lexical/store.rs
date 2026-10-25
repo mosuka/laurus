@@ -206,8 +206,9 @@ impl LexicalStore {
     ///
     /// Everything buffered since the last commit is dropped, and the
     /// writer's drop-time commit does not run. The engine calls this when it
-    /// is dropped after it stopped accepting writes, so that only the replay
-    /// of its WAL decides what the index holds.
+    /// is dropped after it stopped accepting writes, or when it could not
+    /// make its WAL durable before the drop (Issue #1537), so that only the
+    /// replay of its WAL decides what the index holds.
     pub(crate) fn abandon_writer(&self) {
         if let Some(mut writer) = self.writer_cache.lock().take() {
             writer.abandon();

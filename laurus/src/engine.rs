@@ -832,7 +832,10 @@ impl Drop for Engine {
     /// so every record up to the watermark is in that writer or already
     /// committed, and the next open replays the uncommitted records to the
     /// vector store only, as when mutations still set the checkpoint
-    /// themselves.
+    /// themselves. That commit runs outside the commit ladder, so the WAL is
+    /// made durable first, as the ladder does (Issue #1537): otherwise the
+    /// writer's state and checkpoint would be durable while records they
+    /// cover are not.
     ///
     /// While writes are stopped (Issue #1492), discard the cached lexical
     /// writer without that commit instead: its buffer can hold a mutation
@@ -840,12 +843,22 @@ impl Drop for Engine {
     /// holds. No commit ran after the stop, so the WAL still holds every
     /// record since the last one, and the next open replays them all. The
     /// commit timer is stopped first, since it shares the lexical store.
+    /// The writer is discarded the same way when making the WAL durable
+    /// fails, and the next open replays the records the WAL kept.
     fn drop(&mut self) {
         if self.write_stop.reason().is_none() {
-            // A failure only leaves the checkpoint where the last commit put
-            // it, so the next open replays more.
-            let _ = self.lexical.set_pending_wal_seq(self.applied.watermark());
-            return;
+            match self.log.flush_wal() {
+                Ok(()) => {
+                    // A failure only leaves the checkpoint where the last
+                    // commit put it, so the next open replays more.
+                    let _ = self.lexical.set_pending_wal_seq(self.applied.watermark());
+                    return;
+                }
+                Err(e) => log::warn!(
+                    "dropping the engine: making the WAL durable failed, so the cached \
+                     lexical writer is discarded without a commit: {e}"
+                ),
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         drop(self._commit_timer.take());
@@ -2457,6 +2470,11 @@ impl Engine {
     /// commits, as [`Self::commit`] does, so recovery never replays a record
     /// written before the field was added into it.
     ///
+    /// Registering a field commits the stores' cached writers, so this first
+    /// makes the WAL durable, as [`Self::commit`] does (Issue #1537). A
+    /// [`DynamicFieldPolicy::Dynamic`](schema::DynamicFieldPolicy::Dynamic)
+    /// put that adds a field does the same, also inside a batch put.
+    ///
     /// Like [`Self::update_field`], this waits for in-flight ingestion and
     /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
     /// `schema_change_lock`), so a document is never written against fields
@@ -2480,6 +2498,7 @@ impl Engine {
     ///
     /// Returns an error if:
     /// - A field with the same name already exists.
+    /// - Making the WAL durable fails, as in [`Self::flush_wal`].
     /// - The field references an unknown analyzer or embedder.
     /// - The commit before a vector field is added fails.
     /// - The underlying store rejects the field.
@@ -2512,6 +2531,14 @@ impl Engine {
                 )));
             }
         }
+
+        // The stores commit their cached writers below, outside the commit
+        // ladder. As the ladder does first, make every WAL record that state
+        // covers durable (Issue #1537). A batch put defers the fsync across
+        // documents and releases the schema lock between them, and a
+        // `DynamicFieldPolicy::Dynamic` put adds its fields from inside such
+        // a batch, so records can be unsynced here under any sync policy.
+        self.log.flush_wal()?;
 
         // 2. Register in the appropriate store.
         if option.is_lexical() {
@@ -2598,6 +2625,9 @@ impl Engine {
     /// `schema_change_lock`). A put between its embedding and its vector
     /// write used to find the field gone and fail after its WAL append.
     ///
+    /// Removing a field commits the stores' cached writers, so this first
+    /// makes the WAL durable, as [`Self::commit`] does (Issue #1537).
+    ///
     /// # Arguments
     ///
     /// * `name` - The name of the field to delete
@@ -2613,6 +2643,7 @@ impl Engine {
     ///
     /// Returns an error if:
     /// - No field with the given name exists in the schema.
+    /// - Making the WAL durable fails, as in [`Self::flush_wal`].
     /// - The underlying store rejects the deletion.
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
@@ -2635,6 +2666,11 @@ impl Engine {
                 ))
             })?
         };
+
+        // The stores commit their cached writers below, outside the commit
+        // ladder, so make the WAL durable first, as `add_field` does (Issue
+        // #1537).
+        self.log.flush_wal()?;
 
         // 2. Remove from the appropriate store.
         if option.is_lexical() {
@@ -5337,6 +5373,100 @@ mod tests {
         assert!(
             unsynced.is_empty(),
             "the WAL is unsynced after these Reindexes: {unsynced:?}"
+        );
+    }
+
+    /// An engine over a fresh in-memory storage with [`title_schema`]`(&["vec"])`
+    /// under `policy`, whose WAL syncs only on a flush: `Group` with neither
+    /// threshold reachable and no timer (Issue #1537).
+    async fn unsynced_wal_engine(policy: schema::DynamicFieldPolicy) -> Engine {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let mut schema = title_schema(&["vec"]);
+        schema.dynamic_field_policy = policy;
+        Engine::builder(storage, schema)
+            .wal_sync_policy(WalSyncPolicy::Group {
+                max_records: usize::MAX,
+                max_bytes: usize::MAX,
+                max_interval: None,
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// Issue #1537: `add_field` and `delete_field` make the WAL durable
+    /// before the stores commit their cached writers, as the commit ladder
+    /// does. Each case leaves a put's record unsynced first. Adding a vector
+    /// field already committed first (Issue #1535).
+    #[tokio::test]
+    async fn add_field_and_delete_field_flush_the_wal_first() {
+        use crate::lexical::core::field::TextOption;
+        use crate::vector::core::field::FlatOption;
+
+        let mut unsynced = Vec::new();
+        for case in [
+            "add a lexical field",
+            "add a vector field",
+            "delete a lexical field",
+            "delete a vector field",
+        ] {
+            let engine = unsynced_wal_engine(schema::DynamicFieldPolicy::Strict).await;
+            engine
+                .put_document("doc", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+                .await
+                .unwrap();
+            assert!(engine.log.wal_is_dirty(), "{case}: the put is unsynced");
+
+            match case {
+                "add a lexical field" => engine
+                    .add_field("body", schema::FieldOption::Text(TextOption::default()))
+                    .await
+                    .unwrap(),
+                "add a vector field" => engine
+                    .add_field(
+                        "vec2",
+                        schema::FieldOption::Flat(FlatOption::default().dimension(3)),
+                    )
+                    .await
+                    .unwrap(),
+                "delete a lexical field" => engine.delete_field("title").await.unwrap(),
+                "delete a vector field" => engine.delete_field("vec").await.unwrap(),
+                _ => unreachable!(),
+            };
+            if engine.log.wal_is_dirty() {
+                unsynced.push(case);
+            }
+        }
+        assert!(
+            unsynced.is_empty(),
+            "the WAL is unsynced after these schema changes: {unsynced:?}"
+        );
+    }
+
+    /// Issue #1537: a `DynamicFieldPolicy::Dynamic` put that adds an
+    /// undeclared field makes the WAL durable before the field's
+    /// registration commits the lexical writer, which holds the earlier
+    /// put. The put's own record is appended afterwards and stays unsynced,
+    /// as the policy allows.
+    #[tokio::test]
+    async fn a_dynamic_put_syncs_the_wal_before_it_adds_a_field() {
+        let engine = unsynced_wal_engine(schema::DynamicFieldPolicy::Dynamic).await;
+        engine
+            .put_document("first", title_doc("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(engine.log.wal_sync_count(), 0, "the first put is unsynced");
+
+        let second = Document::builder()
+            .add_text("title", "beta")
+            .add_text("body", "undeclared")
+            .build();
+        engine.put_document("second", second).await.unwrap();
+        assert!(engine.schema().fields.contains_key("body"));
+        assert_eq!(
+            engine.log.wal_sync_count(),
+            1,
+            "adding the field must sync the first put's record"
         );
     }
 
@@ -9622,7 +9752,9 @@ mod tests {
 
     /// A [`Storage`] over `inner` that, while armed, fails `open_input` or
     /// file creation (`create_output`, `create_temp_output`) for the file
-    /// names a rule accepts, and counts the failures (Issue #1492).
+    /// names a rule accepts, and counts the failures (Issue #1492). It can
+    /// also fail `flush_and_sync` on the outputs it opened for appending,
+    /// which only the WAL opens (Issue #1537).
     ///
     /// It has no lock manager, so a test can open the index over it again
     /// after `std::mem::forget`ting the engine. That is how these tests
@@ -9632,7 +9764,9 @@ mod tests {
         inner: Arc<dyn Storage>,
         fail_open: parking_lot::Mutex<Option<FaultRule>>,
         fail_create: parking_lot::Mutex<Option<FaultRule>>,
-        fired: AtomicU64,
+        /// Shared with every [`FaultOutput`] this storage opened.
+        fail_sync: Arc<std::sync::atomic::AtomicBool>,
+        fired: Arc<AtomicU64>,
     }
 
     impl FaultStorage {
@@ -9641,7 +9775,8 @@ mod tests {
                 inner: Arc::new(MemoryStorage::new(Default::default())),
                 fail_open: parking_lot::Mutex::new(None),
                 fail_create: parking_lot::Mutex::new(None),
-                fired: AtomicU64::new(0),
+                fail_sync: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fired: Arc::new(AtomicU64::new(0)),
             })
         }
 
@@ -9655,9 +9790,16 @@ mod tests {
             *self.fail_create.lock() = Some(rule);
         }
 
+        /// Fail every `flush_and_sync` of an output opened for appending
+        /// until disarmed, also of one opened before this call.
+        fn fail_sync(&self) {
+            self.fail_sync.store(true, Ordering::SeqCst);
+        }
+
         fn disarm(&self) {
             *self.fail_open.lock() = None;
             *self.fail_create.lock() = None;
+            self.fail_sync.store(false, Ordering::SeqCst);
         }
 
         /// How many calls were failed so far.
@@ -9690,7 +9832,11 @@ mod tests {
             &self,
             name: &str,
         ) -> Result<Box<dyn crate::storage::StorageOutput>> {
-            self.inner.create_output_append(name)
+            Ok(Box::new(FaultOutput {
+                inner: self.inner.create_output_append(name)?,
+                fail_sync: Arc::clone(&self.fail_sync),
+                fired: Arc::clone(&self.fired),
+            }))
         }
         fn file_exists(&self, name: &str) -> bool {
             self.inner.file_exists(name)
@@ -9722,6 +9868,50 @@ mod tests {
         }
         fn close(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    /// An output a [`FaultStorage`] opened for appending: it fails
+    /// `flush_and_sync` while the storage's sync failure is armed, and
+    /// passes everything else through (Issue #1537).
+    #[derive(Debug)]
+    struct FaultOutput {
+        inner: Box<dyn crate::storage::StorageOutput>,
+        fail_sync: Arc<std::sync::atomic::AtomicBool>,
+        fired: Arc<AtomicU64>,
+    }
+
+    impl std::io::Write for FaultOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl std::io::Seek for FaultOutput {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl crate::storage::StorageOutput for FaultOutput {
+        fn flush_and_sync(&mut self) -> Result<()> {
+            if self.fail_sync.load(Ordering::SeqCst) {
+                self.fired.fetch_add(1, Ordering::SeqCst);
+                return Err(LaurusError::storage("injected sync failure"));
+            }
+            self.inner.flush_and_sync()
+        }
+
+        fn position(&self) -> Result<u64> {
+            self.inner.position()
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
         }
     }
 
@@ -10217,6 +10407,71 @@ mod tests {
             "the replay applies the failed put to the lexical store too"
         );
         assert_eq!(vector_hits(&reopened, "z", [-1.0, 0.0]).await, 1);
+    }
+
+    /// An engine over `storage` with [`title_schema`]`(&[])`, whose WAL
+    /// syncs only on a flush: `Group` with neither threshold reachable and
+    /// no timer (Issue #1537).
+    async fn unsynced_wal_engine_over(storage: Arc<FaultStorage>) -> Engine {
+        Engine::builder(storage, title_schema(&[]))
+            .wal_sync_policy(WalSyncPolicy::Group {
+                max_records: usize::MAX,
+                max_bytes: usize::MAX,
+                max_interval: None,
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// The lexical store `storage` holds, opened on its own.
+    fn lexical_store_of(storage: Arc<FaultStorage>) -> LexicalStore {
+        LexicalStore::new(
+            Arc::new(PrefixedStorage::new("lexical", storage)),
+            LexicalIndexConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// Issue #1537: the commit the cached lexical writer runs when the
+    /// engine is dropped comes after the WAL is made durable, as in the
+    /// commit ladder. The put's record used to stay unsynced while that
+    /// commit persisted the document and a checkpoint covering it.
+    #[tokio::test]
+    async fn dropping_the_engine_flushes_the_wal_first() {
+        let storage = FaultStorage::new();
+        let engine = unsynced_wal_engine_over(storage.clone()).await;
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        let seq = engine.log.last_seq();
+        let log = Arc::clone(&engine.log);
+        assert!(log.wal_is_dirty(), "the put is unsynced");
+
+        drop(engine);
+        assert!(!log.wal_is_dirty(), "the drop must sync the put's record");
+        assert_eq!(lexical_store_of(storage).last_wal_seq(), seq);
+    }
+
+    /// Issue #1537: when making the WAL durable fails as the engine is
+    /// dropped, the cached lexical writer is discarded without its
+    /// commit, as while writes are stopped. Its commit would persist a
+    /// document and a checkpoint the WAL may not hold.
+    #[tokio::test]
+    async fn a_drop_whose_wal_flush_fails_commits_no_lexical_writer() {
+        let storage = FaultStorage::new();
+        let engine = unsynced_wal_engine_over(storage.clone()).await;
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        storage.fail_sync();
+
+        drop(engine);
+        assert!(storage.fired() > 0, "the injected failure must fire");
+        storage.disarm();
+        let lexical = lexical_store_of(storage);
+        assert_eq!(lexical.last_wal_seq(), 0, "the checkpoint must not move");
+        assert_eq!(
+            lexical.stats().unwrap().doc_count,
+            0,
+            "the document must not be committed"
+        );
     }
 
     fn grouping_doc(title: &str, parent: Option<&str>) -> Document {
