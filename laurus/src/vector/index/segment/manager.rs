@@ -25,6 +25,7 @@ use crate::error::Result;
 use crate::storage::Storage;
 use crate::storage::manifest as manifest_io;
 
+use super::field_record::FieldRecord;
 use super::merge_policy::MergePolicy;
 
 /// Manifest file name for the segment registry.
@@ -103,6 +104,14 @@ struct SegmentManifest {
 
     /// The registered segments.
     segments: Vec<ManagedSegmentInfo>,
+
+    /// The kind, dimension and distance the segments were written with
+    /// (Issue #1547), checked when the field opens. Absent in a manifest
+    /// written before, or saved again by a build that does not know the
+    /// key, and kept as raw JSON so that a value this build cannot read
+    /// counts as absent instead of failing the load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    field: Option<serde_json::Value>,
 }
 
 /// Configuration for segment manager.
@@ -209,6 +218,9 @@ pub struct SegmentManager {
     /// Last WAL sequence number recorded in the manifest (see
     /// [`SegmentManifest::last_wal_seq`]). Persisted by the next save.
     last_wal_seq: AtomicU64,
+    /// What the segments were written with (see
+    /// [`SegmentManifest::field`]). Persisted by the next save.
+    field_record: RwLock<Option<FieldRecord>>,
 }
 
 impl SegmentManager {
@@ -237,6 +249,7 @@ impl SegmentManager {
             segments: Arc::new(RwLock::new(Vec::new())),
             next_segment_id: Arc::new(RwLock::new(0)),
             last_wal_seq: AtomicU64::new(0),
+            field_record: RwLock::new(None),
         };
 
         manager.load_state()?;
@@ -257,12 +270,12 @@ impl SegmentManager {
             return Ok(());
         };
 
-        let (segments_info, next_id, wal_seq) = match format {
+        let (segments_info, next_id, wal_seq, field) = match format {
             manifest_io::ManifestFormat::Legacy => {
                 // Pre-versioning manifests carried only the segment list; the
                 // next save upgrades the file.
                 let segments: Vec<ManagedSegmentInfo> = serde_json::from_slice(&payload)?;
-                (segments, 0, 0)
+                (segments, 0, 0, None)
             }
             manifest_io::ManifestFormat::Checksummed => {
                 let manifest: SegmentManifest = serde_json::from_slice(&payload)?;
@@ -270,9 +283,17 @@ impl SegmentManager {
                     manifest.segments,
                     manifest.next_segment_id,
                     manifest.last_wal_seq,
+                    manifest.field,
                 )
             }
         };
+        *self.field_record.write() = field.and_then(|value| {
+            serde_json::from_value(value)
+                .inspect_err(|e| {
+                    log::warn!("ignoring the unreadable field record of '{MANIFEST_FILE}': {e}")
+                })
+                .ok()
+        });
 
         let mut segments = self.segments.write();
         *segments = segments_info;
@@ -331,11 +352,18 @@ impl SegmentManager {
     /// still holding the `segments` write lock — saving after dropping the
     /// lock let two racing mutators publish manifests out of order.
     fn save_state_locked(&self, segments: &[ManagedSegmentInfo]) -> Result<()> {
+        let field = self
+            .field_record
+            .read()
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
         let manifest = SegmentManifest {
             version: MANIFEST_VERSION,
             next_segment_id: *self.next_segment_id.read(),
             last_wal_seq: self.last_wal_seq.load(Ordering::Acquire),
             segments: segments.to_vec(),
+            field,
         };
         // temp + CRC-32 trailer + rename + sync, shared with every other
         // control file in the tree (#1022).
@@ -362,6 +390,18 @@ impl SegmentManager {
     /// Last WAL sequence number recorded in the manifest.
     pub fn last_wal_seq(&self) -> u64 {
         self.last_wal_seq.load(Ordering::Acquire)
+    }
+
+    /// What the manifest records the segments were written with, if it
+    /// records it (Issue #1547).
+    pub(crate) fn field_record(&self) -> Option<FieldRecord> {
+        self.field_record.read().clone()
+    }
+
+    /// Record what the segments are written with; persisted by the next
+    /// save (Issue #1547).
+    pub(crate) fn set_field_record(&self, record: FieldRecord) {
+        *self.field_record.write() = Some(record);
     }
 
     /// Best-effort sweep of files that belong to no registered segment.
@@ -1135,5 +1175,88 @@ mod tests {
         assert_eq!(segments[0].segment_id, "segment_000000");
         assert_eq!(segments[0].vector_count, 2);
         assert_eq!(segments[0].generation, 1);
+    }
+
+    fn hnsw_record(dimension: usize) -> FieldRecord {
+        FieldRecord::new(
+            &TEST_LAYOUT,
+            dimension,
+            crate::vector::core::distance::DistanceMetric::Cosine,
+        )
+    }
+
+    /// Issue #1547: the field record a manager holds is written by the next
+    /// save and read back by the next open.
+    #[test]
+    fn test_field_record_round_trips_through_the_manifest() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let manager = SegmentManager::new(
+            SegmentManagerConfig::default(),
+            storage.clone(),
+            TEST_LAYOUT,
+        )
+        .unwrap();
+        assert_eq!(manager.field_record(), None);
+        manager.set_field_record(hnsw_record(8));
+        manager
+            .add_segment(create_info("segment_000000", 2))
+            .unwrap();
+
+        let reopened =
+            SegmentManager::new(SegmentManagerConfig::default(), storage, TEST_LAYOUT).unwrap();
+        assert_eq!(reopened.field_record(), Some(hnsw_record(8)));
+        assert_eq!(
+            hnsw_record(8),
+            FieldRecord {
+                kind: "hnsw".to_string(),
+                dimension: 8,
+                distance: crate::vector::core::distance::DistanceMetric::Cosine,
+            }
+        );
+    }
+
+    /// Issue #1547: a manifest written before the record existed loads, with
+    /// no record, and a save under a manager that holds none adds no key.
+    #[test]
+    fn test_manifest_without_field_record_loads_without_one() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let json = br#"{"version":1,"next_segment_id":1,"last_wal_seq":0,"segments":[{"segment_id":"segment_000000","vector_count":2,"vector_offset":0,"generation":1,"size_bytes":42}]}"#;
+        crate::storage::manifest::save_checksummed(storage.as_ref(), MANIFEST_FILE, None, json)
+            .unwrap();
+
+        let manager = SegmentManager::new(
+            SegmentManagerConfig::default(),
+            storage.clone(),
+            TEST_LAYOUT,
+        )
+        .unwrap();
+        assert_eq!(manager.list_segments().len(), 1);
+        assert_eq!(manager.field_record(), None);
+
+        manager.save_state().unwrap();
+        let (payload, _) =
+            crate::storage::manifest::load_checksummed(storage.as_ref(), MANIFEST_FILE, None)
+                .unwrap()
+                .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(saved.get("field").is_none(), "{saved}");
+    }
+
+    /// Issue #1547: a record this build cannot read, such as a distance a
+    /// later build added, counts as no record instead of failing the load.
+    #[test]
+    fn test_unreadable_field_record_counts_as_none() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let json = br#"{"version":1,"next_segment_id":1,"last_wal_seq":0,"segments":[{"segment_id":"segment_000000","vector_count":2,"vector_offset":0,"generation":1,"size_bytes":42}],"field":{"kind":"hnsw","dimension":8,"distance":"Hamming"}}"#;
+        crate::storage::manifest::save_checksummed(storage.as_ref(), MANIFEST_FILE, None, json)
+            .unwrap();
+
+        let manager =
+            SegmentManager::new(SegmentManagerConfig::default(), storage, TEST_LAYOUT).unwrap();
+        assert_eq!(manager.list_segments().len(), 1);
+        assert_eq!(manager.field_record(), None);
     }
 }

@@ -413,12 +413,11 @@ commit は文書化された契約（`flush_wal()` や `commit()` でまだ dura
 │   │   ├── postings.post
 │   │   └── ...
 │   └── metadata.json
-├── vector/           # ベクトルインデックスセグメント
-│   ├── seg-000/
-│   │   ├── graph.hnsw
-│   │   ├── vectors.vecs
-│   │   └── ...
-│   └── metadata.json
+├── vector/           # ベクトルインデックス（フィールドごとのディレクトリ）
+│   └── <field>/
+│       ├── segment_000000.hnsw   # セグメントごとのファイル（.hnsw・.flat・.ivf・.mv）
+│       ├── segments.json         # セグメントの manifest
+│       └── index.delmap          # 削除ビットマップ
 ├── documents/        # ドキュメントストレージ
 │   └── ...
 └── engine.wal        # Write-Ahead Log
@@ -436,6 +435,17 @@ commit は文書化された契約（`flush_wal()` や `commit()` でまだ dura
 `Index`/`create index` のドキュメントを参照してください（特に、既存
 インデックスを再オープンする際はディレクトリパスのみで足り、永続化済みの
 スキーマが自動的に読み込まれます）。
+
+ベクトルフィールドの `segments.json` は、セグメントを書いたときのインデックスの
+種類・次元・距離も記録します。スキーマが別の値を指定すると、セグメントをその値
+では読めないため、フィールドを開くのに失敗します
+（[#1547](https://github.com/mosuka/laurus/issues/1547)）。記録が入る前に書かれた
+manifest は、セグメントのファイルから分かること（種類と次元）で照合され、次に
+manifest を書くときに記録が足されます。記録を知らない古い build は manifest を
+書き直すときに記録を落とすので、そうした build がフィールドに書き込んだ後は、
+再びセグメントのファイルでの照合に戻ります。詳しくは
+[既存のベクトルフィールドを編集する](../laurus-cli/schema_format.md#既存のベクトルフィールドを編集する)
+を参照してください。
 
 ## 次のステップ
 

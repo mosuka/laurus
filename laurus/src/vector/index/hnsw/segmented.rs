@@ -152,33 +152,22 @@ impl SegmentedBackend for HnswSegmentedBackend {
             .merged_segment)
     }
 
-    fn read_legacy_vector_count(
-        config: &Self::Config,
-        storage: &Arc<dyn Storage>,
-        legacy_file: &str,
-    ) -> Result<u64> {
+    fn read_segment_header(storage: &Arc<dyn Storage>, file: &str) -> Result<(u64, usize)> {
         // The `.hnsw` header is `u64 num_vectors` followed by `u32
         // dimension` (then `m` and `ef_construction`, unneeded here).
         // Unlike the trait default's `u32` count, HNSW's count is `u64`, so
         // this cannot reuse the default implementation.
-        use crate::error::LaurusError;
         use std::io::Read;
 
-        let mut input = storage.open_input(legacy_file)?;
+        let mut input = storage.open_input(file)?;
         let mut count_buf = [0u8; 8];
         input.read_exact(&mut count_buf)?;
         let mut dim_buf = [0u8; 4];
         input.read_exact(&mut dim_buf)?;
-        let vector_count = u64::from_le_bytes(count_buf);
-        let dimension = u32::from_le_bytes(dim_buf) as usize;
-
-        let expected = Self::dimension(config);
-        if dimension != expected {
-            return Err(LaurusError::index(format!(
-                "Dimension mismatch during migration: stored {dimension}, config {expected}"
-            )));
-        }
-        Ok(vector_count)
+        Ok((
+            u64::from_le_bytes(count_buf),
+            u32::from_le_bytes(dim_buf) as usize,
+        ))
     }
 
     fn writer_tracks_pending_changes(writer: &Self::Writer) -> bool {

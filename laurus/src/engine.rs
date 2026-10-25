@@ -1101,7 +1101,11 @@ impl Engine {
     /// # Errors
     ///
     /// Returns an error if storage initialization, index creation, or
-    /// WAL recovery fails.
+    /// WAL recovery fails, and
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if `schema` gives a vector field another index kind, dimension or
+    /// distance than its files were written with (Issue #1547); see
+    /// [`EngineBuilder::build`].
     pub async fn new(storage: Arc<dyn Storage>, schema: Schema) -> Result<Self> {
         EngineBuilder::new(storage, schema).build().await
     }
@@ -4831,7 +4835,10 @@ impl EngineBuilder {
     ///
     /// Returns an error if storage initialization, index creation, WAL
     /// opening, or recovery replay fails, or if a vector field names an
-    /// embedder that [`Schema::embedders`] does not declare.
+    /// embedder that [`Schema::embedders`] does not declare. Returns
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if the schema gives a vector field another index kind, dimension or
+    /// distance than its files were written with (Issue #1547).
     pub async fn build(self) -> Result<Engine> {
         // Acquire an exclusive lock on the root storage before doing
         // anything else (Issue #1086): a second `Engine` built over the

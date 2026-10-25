@@ -14,6 +14,7 @@
 //! directly on `segmented_core`/`reader_cache` instead.
 
 pub mod fanout;
+pub(crate) mod field_record;
 pub mod manager;
 pub mod merge;
 pub mod merge_policy;

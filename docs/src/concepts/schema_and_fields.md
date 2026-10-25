@@ -799,6 +799,18 @@ embedder registered directly through `EngineBuilder::embedder` in place.
 Pass `UpdateFieldOptions { dry_run: true, .. }` to see how a change would
 be classified without applying anything.
 
+A vector field's segment manifest records the index kind, `dimension` and
+`distance` its files are written with, and the index opens only under a
+schema that gives the field the same three
+([#1547](https://github.com/mosuka/laurus/issues/1547)). Change them with
+`update_field` rather than in the schema the index is opened with: a
+`dimension` or `distance` change is `Destructive`. A change of kind is
+classified as `Reindex` but fails, since the field's files cannot be read
+as another kind ([#1536](https://github.com/mosuka/laurus/issues/1536));
+delete the field and add it again instead. See
+[Editing an existing vector field](../laurus-cli/schema_format.md#editing-an-existing-vector-field)
+for what may still change in `schema.toml`.
+
 ## Schema Design Tips
 
 1. **Separate lexical and vector fields** — a field is either lexical or vector, never both. For hybrid search, create separate fields (e.g., `body` for text, `body_vec` for vector).

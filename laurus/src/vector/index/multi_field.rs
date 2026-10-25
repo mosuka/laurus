@@ -102,6 +102,25 @@ type FieldGroupedVectors = BTreeMap<String, Vec<(u64, String, Vector)>>;
 /// name itself, a field literally named `"segment_0"` still works.
 pub(crate) const SUB_INDEX_NAME: &str = "index";
 
+/// Open or create the sub-index of field `name` over `storage`, the field's
+/// own [`PrefixedStorage`] namespace.
+///
+/// The factory sees only the field's directory, so an
+/// [`LaurusError::InvalidArgument`] it returns, such as a config the field's
+/// segments were not written with (Issue #1547), is given the field name.
+fn open_field_index(
+    storage: Arc<dyn Storage>,
+    name: &str,
+    config: VectorIndexTypeConfig,
+) -> Result<Box<dyn VectorIndex>> {
+    VectorIndexFactory::open_or_create(storage, SUB_INDEX_NAME, config).map_err(|e| match e {
+        LaurusError::InvalidArgument(reason) => {
+            LaurusError::invalid_argument(format!("vector field '{name}': {reason}"))
+        }
+        e => e,
+    })
+}
+
 /// Run `f` over every value in `map`, tolerating individual failures until
 /// every entry has been attempted.
 ///
@@ -284,8 +303,7 @@ impl MultiFieldVectorIndex {
         for (name, config) in field_configs {
             let field_storage: Arc<dyn Storage> =
                 Arc::new(PrefixedStorage::new(name.clone(), storage.clone()));
-            let index =
-                VectorIndexFactory::open_or_create(field_storage, SUB_INDEX_NAME, config.clone())?;
+            let index = open_field_index(field_storage, name, config.clone())?;
             fields.insert(name.clone(), FieldEntry::new(index, config));
         }
 
@@ -510,14 +528,13 @@ impl VectorIndex for MultiFieldVectorIndex {
         check_own_directory(name, &fields)?;
         // A field removed without a purge left its files here. They stopped
         // following the documents when it was removed -- a delete marks only
-        // the registered fields, and a commit truncates the WAL past it --
-        // and nothing in them records the option they were written under, so
-        // the field starts empty instead of reopening them (Issue #1535).
+        // the registered fields, and a commit truncates the WAL past it -- so
+        // the field starts empty instead of reopening them (Issue #1535), even
+        // when they were written under the same option.
         self.purge_field_files(name)?;
         let field_storage: Arc<dyn Storage> =
             Arc::new(PrefixedStorage::new(name.to_string(), self.storage.clone()));
-        let index =
-            VectorIndexFactory::open_or_create(field_storage, SUB_INDEX_NAME, config.clone())?;
+        let index = open_field_index(field_storage, name, config.clone())?;
         // Seed the new field's checkpoint with the current aggregate
         // (min-across-fields) so it does not drag `last_wal_seq()` (also a
         // min) backwards -- a fresh field starting at 0 would otherwise
@@ -558,13 +575,14 @@ impl VectorIndex for MultiFieldVectorIndex {
 
         // Reopen the SAME physical namespace under the new config -- this
         // does not move or lose any data, it only changes which config the
-        // existing segments are read/merged under. `open_or_create` always
-        // takes the `open` path here (the field's `metadata.json` already
-        // exists), so the existing segment manifest is picked up as-is.
+        // existing segments are read/merged under. The segmented index picks
+        // up the existing segment manifest as-is, and refuses a config whose
+        // kind, dimension or distance the segments were not written with
+        // (Issue #1547): a Reindex keeps all three, except a change between
+        // kinds, which fails here (Issue #1536).
         let field_storage: Arc<dyn Storage> =
             Arc::new(PrefixedStorage::new(name.to_string(), self.storage.clone()));
-        let index =
-            VectorIndexFactory::open_or_create(field_storage, SUB_INDEX_NAME, new_config.clone())?;
+        let index = open_field_index(field_storage, name, new_config.clone())?;
 
         // Force-merge every existing segment into one new segment under
         // the new config. The merge writes the new segment fully before it

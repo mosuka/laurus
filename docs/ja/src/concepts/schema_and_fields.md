@@ -675,6 +675,8 @@ let outcome = engine.update_field(
 
 `UpdateFieldOptions { dry_run: true, .. }` を指定すると、実際には何も適用せずに分類結果だけを確認できます。
 
+ベクトルフィールドのセグメントの manifest は、ファイルを書いたときのインデックスの種類・`dimension`・`distance` を記録します。インデックスは、スキーマがフィールドに同じ 3 つを指定するときだけ開けます（[#1547](https://github.com/mosuka/laurus/issues/1547)）。この 3 つは、インデックスを開くときのスキーマではなく、`update_field` で変えてください。`dimension` と `distance` の変更は `Destructive` です。種類の変更は `Reindex` に分類されますが、フィールドのファイルを別の種類として読めないため失敗します（[#1536](https://github.com/mosuka/laurus/issues/1536)）。代わりに、フィールドを消してから足し直してください。`schema.toml` で変えてよい項目は、[既存のベクトルフィールドを編集する](../laurus-cli/schema_format.md#既存のベクトルフィールドを編集する)を参照してください。
+
 ### 共通の注意事項
 
 `Engine::builder().persist_schema_with(hook)` でスキーマ永続化フックを設定していれば、

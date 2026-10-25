@@ -44,10 +44,11 @@ use crate::vector::core::token_pooling::{
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::MultiVectorIndexConfig;
 use crate::vector::index::multivector::LAYOUT;
-use crate::vector::index::multivector::format::{DocEntry, SegmentReader, write_segment};
+use crate::vector::index::multivector::format::{self, DocEntry, SegmentReader, write_segment};
 use crate::vector::index::multivector::reader::{
     MultiVectorReaderFacade, MultiVectorSearcher, MultiVectorSnapshot,
 };
+use crate::vector::index::segment::field_record::{FieldRecord, check_field_record};
 use crate::vector::index::segment::manager::{
     ManagedSegmentInfo, MergeCandidate, SegmentManager, SegmentManagerConfig,
 };
@@ -478,8 +479,10 @@ impl MultiVectorIndex {
     ///
     /// Returns [`LaurusError::invalid_config`] when `name` collides with the
     /// generated segment-id namespace or the dimension / distance cannot
-    /// describe a multi-vector field, and an error when the segment manifest
-    /// fails to load.
+    /// describe a multi-vector field, an error when the segment manifest
+    /// fails to load, and [`LaurusError::InvalidArgument`] when the segments
+    /// were written with another dimension or distance, or as another index
+    /// kind (Issue #1547).
     pub fn open_or_create(
         storage: Arc<dyn Storage>,
         name: &str,
@@ -513,6 +516,12 @@ impl MultiVectorIndex {
             storage.clone(),
             LAYOUT,
         )?);
+        check_field_record(
+            &manager,
+            storage.as_ref(),
+            FieldRecord::new(&LAYOUT, config.dimension, config.distance_metric),
+            |file| format::read_dimension(storage.as_ref(), file),
+        )?;
         Ok(Self {
             shared: Arc::new(Shared {
                 core: SegmentedCore::new(name, storage, manager),
@@ -1565,11 +1574,13 @@ mod tests {
         );
     }
 
+    /// Segments written with another dimension fail the open (Issue #1547),
+    /// before any of them is read.
     #[test]
     fn test_segment_of_another_dimension_is_rejected() {
         let storage = storage();
         commit(&open(&storage), &[(1, &[[1.0, 1.0]])]);
-        let wider = MultiVectorIndex::open_or_create(
+        let err = MultiVectorIndex::open_or_create(
             storage,
             "index",
             MultiVectorIndexConfig {
@@ -1577,9 +1588,16 @@ mod tests {
                 ..config(DistanceMetric::DotProduct)
             },
         )
-        .unwrap();
-        let err = wider.snapshot().unwrap_err();
-        assert!(err.to_string().contains("has dimension 2"), "{err}");
+        .expect_err("opening under another dimension fails");
+        assert!(
+            matches!(
+                &err,
+                LaurusError::InvalidArgument(reason) if reason
+                    == "its files were written with kind MultiVector, dimension 2 and distance \
+                        DotProduct, so it cannot be opened with dimension 4"
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

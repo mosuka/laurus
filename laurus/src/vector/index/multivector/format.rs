@@ -376,6 +376,21 @@ pub(crate) struct SegmentReader {
     stream: Option<Mutex<Box<dyn StorageInput>>>,
 }
 
+/// Read the dimension from the header of the segment `file_name`, without
+/// the document table [`SegmentReader::open`] also reads (Issue #1547).
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, and
+/// [`LaurusError::IncompatibleFormat`] for a file that is not an LMV1
+/// segment or uses an unsupported version / element kind.
+pub(crate) fn read_dimension(storage: &dyn Storage, file_name: &str) -> Result<usize> {
+    let mut input = storage.open_input(file_name)?;
+    let mut header_bytes = [0u8; HEADER_LEN];
+    input.read_exact(&mut header_bytes)?;
+    Ok(Header::decode(&header_bytes)?.dimension)
+}
+
 impl SegmentReader {
     /// Open the segment `file_name`.
     ///

@@ -405,12 +405,11 @@ The engine uses `PrefixedStorage` to organize data:
 │   │   ├── postings.post
 │   │   └── ...
 │   └── metadata.json
-├── vector/           # Vector index segments
-│   ├── seg-000/
-│   │   ├── graph.hnsw
-│   │   ├── vectors.vecs
-│   │   └── ...
-│   └── metadata.json
+├── vector/           # Vector index, one directory per field
+│   └── <field>/
+│       ├── segment_000000.hnsw   # one file per segment: .hnsw, .flat, .ivf or .mv
+│       ├── segments.json         # segment manifest
+│       └── index.delmap          # deletion bitmap
 ├── documents/        # Document storage
 │   └── ...
 └── engine.wal        # Write-ahead log
@@ -427,6 +426,17 @@ the others without restructuring anything on disk; see each binding's
 `Index`/`create index` documentation for the exact create-vs-reopen
 semantics (in particular, reopening an existing index only needs the
 directory path — the persisted schema is loaded automatically).
+
+A vector field's `segments.json` also records the index kind, dimension and
+distance its segments are written with, and opening the field under a
+schema that gives another one fails, since the segments cannot be read
+under it ([#1547](https://github.com/mosuka/laurus/issues/1547)). A
+manifest written before the record existed is checked against what the
+segment files show (their kind and dimension), and the next manifest write
+adds the record. A build older than the record drops it when it rewrites
+the manifest, so after such a build has written to the field, the check
+falls back to the segment files again. See
+[Editing an existing vector field](../laurus-cli/schema_format.md#editing-an-existing-vector-field).
 
 ## Next Steps
 

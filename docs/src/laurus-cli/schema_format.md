@@ -327,6 +327,27 @@ pool_factor = 2   # optional; omit (or 1) to keep every token vector
 
 A document's value is an array of equal-length numeric arrays, between 1 and 8,192 of them, or text when the field has an embedder. The field is not stored in the document store.
 
+#### Editing an existing vector field
+
+A vector field's files can only be read under the index kind (`Hnsw`, `Flat`, `Ivf` or `MultiVector`), `dimension` and `distance` they were written with, so these three cannot be changed by editing `schema.toml`. The field's `segments.json` records them, and an index whose `schema.toml` gives the field another one fails to open (Issue #1547).
+
+For example, with `dimension = 4` changed to `dimension = 8` for an `Hnsw` field `embedding` that holds a document:
+
+```text
+$ laurus search "title:hello"
+Error: Invalid argument: vector field 'embedding': its files were written with kind Hnsw, dimension 4 and distance Cosine, so it cannot be opened with dimension 8
+```
+
+To open the index, set the field back to the values the message names. Then change them on the open index: [`laurus update field`](commands.md#update-field) with `--reindex` changes `dimension` or `distance` and discards the field's vectors, and a field of another kind is made with [`laurus delete field`](commands.md#delete-field) followed by [`laurus add field`](commands.md#add-field) (Issue #1536). Each of these leaves the field empty, so its documents need to be put again.
+
+Every other option of a vector field may still change in `schema.toml` while the index is closed: `quantizer`, `m`, `ef_construction`, `n_clusters`, `n_probe`, `rerank_storage`, `pq_codebook_path`, `base_weight` and `embedder`, and a `MultiVector` field's `storage` and `pool_factor`. Segments already written keep what they were written with until a reindex or a merge rewrites them.
+
+Exceptions:
+
+- A field that holds no vector yet takes any kind, `dimension` and `distance`.
+- An index written before this check records nothing until the next commit that changes the index, whichever fields the change touches. Until then, opening it fails only on a kind or `dimension` that its segment files show, and a change of `distance` is not detected.
+- An index that an earlier build opened under a changed kind or `dimension`, and that then took documents, holds segments of both, so no option opens it. Remove the field from `schema.toml`, open the index, and add the field again with `laurus add field`, which starts it empty.
+
 ## Distance Metrics
 
 The `distance` option for vector fields accepts the following values:

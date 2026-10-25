@@ -24,6 +24,7 @@ use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::DistanceMetric;
 use crate::vector::index::segment::fanout::{SegmentFanoutSearcher, SegmentedReaderFacade};
+use crate::vector::index::segment::field_record::{FieldRecord, check_field_record};
 use crate::vector::index::segment::manager::{
     ManagedSegmentInfo, SegmentFileLayout, SegmentManager, SegmentManagerConfig,
 };
@@ -102,25 +103,35 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
         new_segment_id: String,
     ) -> Result<ManagedSegmentInfo>;
 
-    /// Read the committed vector count from a legacy monolithic index's
-    /// header, validating its dimension against `config`.
+    /// Read the vector count and the dimension from the header of the
+    /// primary file `file`, which a sealed segment and a legacy monolithic
+    /// index share.
     ///
     /// The default matches Flat's and IVF's on-disk header: a `u32` count
     /// followed by a `u32` dimension.
+    fn read_segment_header(storage: &Arc<dyn Storage>, file: &str) -> Result<(u64, usize)> {
+        use std::io::Read;
+
+        let mut input = storage.open_input(file)?;
+        let mut count_buf = [0u8; 4];
+        input.read_exact(&mut count_buf)?;
+        let mut dim_buf = [0u8; 4];
+        input.read_exact(&mut dim_buf)?;
+        Ok((
+            u32::from_le_bytes(count_buf) as u64,
+            u32::from_le_bytes(dim_buf) as usize,
+        ))
+    }
+
+    /// Read the committed vector count from a legacy monolithic index's
+    /// header ([`Self::read_segment_header`]), validating its dimension
+    /// against `config`.
     fn read_legacy_vector_count(
         config: &Self::Config,
         storage: &Arc<dyn Storage>,
         legacy_file: &str,
     ) -> Result<u64> {
-        use std::io::Read;
-
-        let mut input = storage.open_input(legacy_file)?;
-        let mut count_buf = [0u8; 4];
-        input.read_exact(&mut count_buf)?;
-        let mut dim_buf = [0u8; 4];
-        input.read_exact(&mut dim_buf)?;
-        let vector_count = u32::from_le_bytes(count_buf) as u64;
-        let dimension = u32::from_le_bytes(dim_buf) as usize;
+        let (vector_count, dimension) = Self::read_segment_header(storage, legacy_file)?;
 
         let expected = Self::dimension(config);
         if dimension != expected {
@@ -242,10 +253,16 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
     /// deletion bitmap in both layouts (and `delete_segment_files` never
     /// touches `.delmap` files for exactly this reason).
     ///
+    /// The manifest records the kind, dimension and distance the segments
+    /// are written with, and an index that has segments only opens under
+    /// the same ones (Issue #1547; see [`check_field_record`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the manifest fails to load (corruption fails
-    /// loudly), when reading the legacy file's header during migration
+    /// loudly), [`LaurusError::InvalidArgument`] when the segments were
+    /// written with another kind, dimension or distance than `config`'s,
+    /// and an error when reading the legacy file's header during migration
     /// fails, or when the legacy file's persisted dimension does not match
     /// `config`'s.
     pub fn open_or_create(
@@ -276,6 +293,20 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
             storage.clone(),
             B::LAYOUT,
         )?);
+
+        // Before a migration registers the legacy file: until then there is
+        // no segment, so the check only records `config`, which the
+        // migration's manifest save then writes.
+        check_field_record(
+            &manager,
+            storage.as_ref(),
+            FieldRecord::new(
+                &B::LAYOUT,
+                B::dimension(&config),
+                B::distance_metric(&config),
+            ),
+            |file| B::read_segment_header(&storage, file).map(|(_, dimension)| dimension),
+        )?;
 
         if migrate {
             let vector_count = B::read_legacy_vector_count(&config, &storage, &legacy_file)?;
