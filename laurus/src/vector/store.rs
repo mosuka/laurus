@@ -1728,6 +1728,14 @@ impl VectorStore {
     /// the field empty (Issue #1535). From removal on, deletes no longer
     /// reach the field, so its data would bring deleted documents back.
     ///
+    /// The writer lock is taken before anything changes, as in
+    /// [`Self::add_field`], so nothing awaits after the index changes: a
+    /// call dropped while it waits for a commit that holds the writer has
+    /// removed nothing (Issue #1530). A failed commit of the cached writer
+    /// is not an error: the writer stays cached, still holding the removed
+    /// field's buffered vectors, and [`Self::add_field`] commits it before
+    /// it adds the field again.
+    ///
     /// # Arguments
     ///
     /// * `name` - The vector field name to remove
@@ -1737,6 +1745,12 @@ impl VectorStore {
     /// Returns an error if unregistering the field from the underlying
     /// index fails.
     pub async fn delete_field(&self, name: &str) -> Result<()> {
+        // Taken before the index changes, as in `add_field`: waiting for it
+        // after the removal let a cancelled call leave the field in the
+        // engine's schema but not in the index, where a later put of the
+        // field failed after its WAL append and stopped writes (Issue #1530).
+        let mut writer_guard = self.writer_cache.lock().await;
+
         // `purge: false` -- this method's existing "unregister only"
         // contract (documented above) is unchanged; physical deletion is
         // opt-in via `Self::rebuild_field` (Issue #1080).
@@ -1750,17 +1764,14 @@ impl VectorStore {
         // Same commit-then-drop-on-success guard as `add_field` (#882
         // review): never rely on a bare drop while buffered mutations are
         // the only in-process copy.
-        {
-            let mut writer_guard = self.writer_cache.lock().await;
-            if let Some(writer) = writer_guard.as_mut()
-                && writer.has_pending_changes()
-                && writer.commit().is_err()
-            {
-                *self.searcher_cache.write() = None;
-                return Ok(());
-            }
+        let committed = match writer_guard.as_mut() {
+            Some(writer) if writer.has_pending_changes() => writer.commit().is_ok(),
+            _ => true,
+        };
+        if committed {
             *writer_guard = None;
         }
+        drop(writer_guard);
         *self.searcher_cache.write() = None;
         Ok(())
     }

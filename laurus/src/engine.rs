@@ -2480,6 +2480,11 @@ impl Engine {
     /// `schema_change_lock`), so a document is never written against fields
     /// that changed after it was embedded and analyzed.
     ///
+    /// Everything this waits for, the commit before a vector field is added
+    /// and the vector writer among them, comes before either store changes,
+    /// so a call whose future is dropped, as when a laurus-server client
+    /// disconnects, has added nothing (Issue #1530).
+    ///
     /// # Arguments
     ///
     /// * `name` - The field name. Must not collide with an existing field.
@@ -2624,6 +2629,10 @@ impl Engine {
     /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
     /// `schema_change_lock`). A put between its embedding and its vector
     /// write used to find the field gone and fail after its WAL append.
+    ///
+    /// Everything this waits for, the vector writer among them, comes before
+    /// either store changes, so a call whose future is dropped, as when a
+    /// laurus-server client disconnects, has removed nothing (Issue #1530).
     ///
     /// Removing a field commits the stores' cached writers, so this first
     /// makes the WAL durable, as [`Self::commit`] does (Issue #1537).
@@ -9395,6 +9404,95 @@ mod tests {
         engine.delete_documents("a").await.unwrap();
         engine.commit().await.unwrap();
         assert!(title_hits(&engine, "alpha").await.is_empty());
+    }
+
+    /// Issue #1530: `delete_field` of a vector field takes the vector writer
+    /// before the index changes. Dropped while it waits for it, as when a
+    /// laurus-server client disconnects while a commit holds the writer, it
+    /// has removed nothing: the field stays in the schema and the index, and
+    /// a later put of it is applied. It used to remove the field from the
+    /// index first, so the schema kept a field the index no longer had, and
+    /// the next put of it failed after its WAL append, which stopped writes.
+    #[tokio::test]
+    async fn a_delete_field_cancelled_while_it_waits_for_the_vector_writer_removes_nothing() {
+        let engine = Engine::new(unlocked_memory_storage(), title_schema(&["vec"]))
+            .await
+            .unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        let held = engine.vector.lock_writer_for_tests().await;
+        let mut delete = Box::pin(engine.delete_field("vec"));
+        assert!(futures::poll!(delete.as_mut()).is_pending());
+        // The client goes away while the call waits.
+        drop(delete);
+        drop(held);
+        assert!(engine.schema().fields.contains_key("vec"));
+
+        engine
+            .put_document("b", vector_doc("bravo", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        assert!(engine.write_stop_reason().is_none());
+        engine.commit().await.unwrap();
+        assert_eq!(nearest_id(&engine, [1.0, 0.0, 0.0]).await, vec!["a"]);
+        assert_eq!(nearest_id(&engine, [0.0, 1.0, 0.0]).await, vec!["b"]);
+
+        let schema = engine.delete_field("vec").await.unwrap();
+        assert!(!schema.fields.contains_key("vec"));
+    }
+
+    /// Issue #1530: `add_field` of a vector field commits, then takes the
+    /// vector writer before the index changes (Issue #1545). Dropped while
+    /// it waits for the writer after its commit, it has added nothing: the
+    /// field is in neither the schema nor the index, so adding it again
+    /// succeeds. The writer lock is fair: the test holds it, as a running
+    /// commit would, `add_field`'s commit queues for it, and a request
+    /// queued behind that commit gets the writer before `add_field` asks
+    /// for it again in the store. Before #1545 the store added the field
+    /// to the index first, and adding it again failed as already existing.
+    #[tokio::test]
+    async fn an_add_field_cancelled_while_it_waits_for_the_vector_writer_adds_nothing() {
+        let engine = Engine::new(unlocked_memory_storage(), title_schema(&["vec"]))
+            .await
+            .unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let option = schema::FieldOption::Flat(
+            crate::vector::core::field::FlatOption::default().dimension(3),
+        );
+
+        let held = engine.vector.lock_writer_for_tests().await;
+        let mut add = Box::pin(engine.add_field("vec2", option.clone()));
+        assert!(futures::poll!(add.as_mut()).is_pending());
+        let mut queued = Box::pin(engine.vector.lock_writer_for_tests());
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        drop(held);
+        assert!(futures::poll!(add.as_mut()).is_pending());
+        assert_eq!(
+            nearest_id(&engine, [1.0, 0.0, 0.0]).await,
+            vec!["a"],
+            "add_field's commit ran, so it waits in the store"
+        );
+        // The client goes away while the call waits.
+        drop(add);
+        assert!(futures::poll!(queued.as_mut()).is_ready());
+        drop(queued);
+        assert!(!engine.schema().fields.contains_key("vec2"));
+
+        engine.add_field("vec2", option).await.unwrap();
+        engine
+            .put_document("b", vector_doc("bravo", "vec2", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        assert!(engine.write_stop_reason().is_none());
+        engine.commit().await.unwrap();
+        assert_eq!(nearest_id(&engine, [0.0, 1.0, 0.0]).await, vec!["b"]);
     }
 
     /// Issue #1517: a delete served by soft deletion, as on an engine whose
