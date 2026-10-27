@@ -731,6 +731,14 @@ When a field is deleted:
 - Existing indexed data for the field **remains** in the index but becomes
   inaccessible through queries.
 - If the field was listed in `default_fields`, it is automatically removed.
+- If the field was listed in `pending_reindex`, it is removed from it too, so
+  `GetSchema` no longer reports the field as having lost its data. A
+  `schema.toml` written before
+  [#1548](https://github.com/mosuka/laurus/issues/1548) can still name a
+  deleted field there. The engine drops such a name when it opens the index,
+  so the schema it persists after the next `add_field`, `delete_field` or
+  `update_field` no longer has it. `GetSchema` and `laurus get schema` read
+  `schema.toml`, so they show the name until then.
 - Any per-field analyzer or embedder registered for the field is
   unregistered.
 

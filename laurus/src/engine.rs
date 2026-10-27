@@ -2623,7 +2623,9 @@ impl Engine {
     /// unregistered and writer/searcher caches are invalidated.
     ///
     /// If the deleted field appears in [`Schema::default_fields`], it is removed
-    /// from that list as well.
+    /// from that list as well. It is also removed from
+    /// [`Schema::pending_reindex`], so the schema no longer reports it as
+    /// having lost its data (Issue #1548).
     ///
     /// Like [`Self::update_field`], this waits for in-flight ingestion and
     /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
@@ -2700,6 +2702,9 @@ impl Engine {
             let mut schema = self.schema.write();
             schema.fields.remove(name);
             schema.default_fields.retain(|f| f != name);
+            // Otherwise the schema keeps reporting the deleted field as
+            // having lost its data (Issue #1548).
+            schema.pending_reindex.remove(name);
         }
 
         let updated = self.schema.read().clone();
@@ -4876,6 +4881,11 @@ impl EngineBuilder {
     /// then runs WAL recovery to replay any uncommitted changes from a
     /// previous session.
     ///
+    /// Drops from [`Schema::pending_reindex`] the names of fields the schema
+    /// does not have. Before Issue #1548, [`Engine::delete_field`] left a
+    /// deleted field's name there, so a `schema.toml` written then can hold
+    /// one.
+    ///
     /// # Errors
     ///
     /// Returns an error if storage initialization, index creation, WAL
@@ -4884,7 +4894,7 @@ impl EngineBuilder {
     /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the schema gives a vector field another index kind, dimension or
     /// distance than its files were written with (Issue #1547).
-    pub async fn build(self) -> Result<Engine> {
+    pub async fn build(mut self) -> Result<Engine> {
         // Acquire an exclusive lock on the root storage before doing
         // anything else (Issue #1086): a second `Engine` built over the
         // same storage -- another process, or another instance in this
@@ -4911,6 +4921,12 @@ impl EngineBuilder {
             },
             None => None, // This storage backend doesn't support locking.
         };
+
+        // `update_field` records only fields in the schema, so any other
+        // name is one `delete_field` left behind before Issue #1548.
+        self.schema
+            .pending_reindex
+            .retain(|name| self.schema.fields.contains_key(name));
 
         let (lexical_config, vector_config) = Engine::split_schema(
             &self.schema,
@@ -6914,6 +6930,107 @@ mod tests {
         assert!(
             outcome.schema.pending_reindex.contains("embedding"),
             "a Destructive change must be recorded in pending_reindex"
+        );
+    }
+
+    /// Issue #1548: `delete_field` removes the field from `pending_reindex`
+    /// in the schema it returns, keeps and persists, so the deleted field is
+    /// not reported as having lost its data, and a field added again under
+    /// its name, which starts empty (Issue #1535), is not recorded either.
+    #[tokio::test]
+    async fn delete_field_removes_the_field_from_pending_reindex() {
+        use crate::vector::core::field::FlatOption;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field(
+                "embedding",
+                schema::FieldOption::Flat(FlatOption::default().dimension(24)),
+            )
+            .build();
+        let persisted: Arc<parking_lot::Mutex<Vec<Schema>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let persisted_clone = Arc::clone(&persisted);
+        let engine = Engine::builder(storage, schema)
+            .persist_schema_with(Arc::new(move |schema: &Schema| {
+                persisted_clone.lock().push(schema.clone());
+                Ok(())
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        engine
+            .add_document(
+                "doc1",
+                Document::builder()
+                    .add_vector("embedding", vec![1.0; 24])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        let outcome = engine
+            .update_field(
+                "embedding",
+                schema::FieldOption::Flat(FlatOption::default().dimension(16)),
+                UpdateFieldOptions {
+                    reindex: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.classification, schema::FieldChangeKind::Destructive);
+        assert!(outcome.schema.pending_reindex.contains("embedding"));
+
+        let updated = engine.delete_field("embedding").await.unwrap();
+        assert!(
+            updated.pending_reindex.is_empty(),
+            "the returned schema still records the deleted field: {:?}",
+            updated.pending_reindex
+        );
+        assert!(engine.schema().pending_reindex.is_empty());
+        let last_persisted = persisted.lock().last().cloned().unwrap();
+        assert!(!last_persisted.fields.contains_key("embedding"));
+        assert!(
+            last_persisted.pending_reindex.is_empty(),
+            "the persisted schema still records the deleted field: {:?}",
+            last_persisted.pending_reindex
+        );
+
+        let readded = engine
+            .add_field(
+                "embedding",
+                schema::FieldOption::Flat(FlatOption::default().dimension(16)),
+            )
+            .await
+            .unwrap();
+        assert!(readded.pending_reindex.is_empty());
+    }
+
+    /// Issue #1548: an engine built with a schema whose `pending_reindex`
+    /// names a field that is not in the schema, as a `schema.toml` written
+    /// before the fix can after a Destructive change and a `delete_field`,
+    /// drops that name and keeps the others.
+    #[tokio::test]
+    async fn build_drops_pending_reindex_names_of_fields_not_in_the_schema() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let mut schema = Schema::builder()
+            .add_field(
+                "title",
+                schema::FieldOption::Text(crate::lexical::core::field::TextOption::default()),
+            )
+            .build();
+        schema.pending_reindex.insert("title".to_string());
+        schema.pending_reindex.insert("embedding".to_string());
+
+        let engine = Engine::new(storage, schema).await.unwrap();
+
+        assert_eq!(
+            engine.schema().pending_reindex,
+            std::collections::BTreeSet::from(["title".to_string()])
         );
     }
 

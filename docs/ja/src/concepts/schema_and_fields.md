@@ -640,6 +640,7 @@ let updated_schema = engine.delete_field("category").await?;
 
 - スキーマからフィールド定義が削除されます。
 - `default_fields` に含まれている場合、そこからも削除されます。
+- `pending_reindex` に含まれている場合、そこからも削除されます。`GetSchema` は、そのフィールドをデータを失ったフィールドとして報告しなくなります。[#1548](https://github.com/mosuka/laurus/issues/1548) より前に書かれた `schema.toml` には、削除したフィールドの名前が残っていることがあります。エンジンはインデックスを開くときにその名前を落とすので、次の `add_field`・`delete_field`・`update_field` の後に保存するスキーマには、その名前はありません。`GetSchema` と `laurus get schema` は `schema.toml` を読むので、それまではその名前を表示します。
 - フィールドに紐づくアナライザーおよびエンベッダーの登録が解除されます。
 - 既にインデックスされたデータは物理的に残りますが、スキーマから削除されたフィールドにはアクセスできなくなります。
 

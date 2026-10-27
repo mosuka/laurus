@@ -177,7 +177,9 @@ pub struct Schema {
     /// leaving the inconsistency undiscoverable. A field is added when a
     /// destructive [`FieldChangeKind`] is applied and is expected to be
     /// removed once the field has been rebuilt (rebuilding itself is out
-    /// of scope for this phase — see #1080/#1081).
+    /// of scope for this phase — see #1080/#1081). Deleting the field
+    /// removes it, and building an engine drops the name of any field the
+    /// schema does not have (Issue #1548).
     ///
     /// [`Engine::update_field`]: crate::engine::Engine::update_field
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
