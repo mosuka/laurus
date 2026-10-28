@@ -213,6 +213,12 @@ let metric = DistanceMetric::Angular;      // Angular distance
 | **PQ FastScan** *(実験的)* | `ProductQuantizationFastScan { subvector_count }` | Issue #695 — `M × 16` centroid、各ベクトルを `M` 個の 4 ビットコードで保存。cargo feature `pq-fastscan` が必要 | 約 32-128 倍 | HNSW |
 | **Float16** | `Float16` | Issue #623 — IEEE 754 半精度、1 次元あたり 2 バイト。学習は不要（[Float16](#float16issue-623) を参照） | 約 2 倍 | HNSW、Flat、IVF |
 
+Product Quantization と PQ FastScan が対応する距離メトリクスは
+`Euclidean` と `Cosine` のみです。これ以外のメトリクスを使った HNSW
+フィールド定義は拒否されます。既存インデックスを開くと警告されますが、
+`Engine::update_field` で修復できます。その他の距離メトリクスには
+`Scalar8Bit` や `Float16` などの非 PQ quantizer を選択してください。
+
 インデックス型が対応していない quantizer を Flat / IVF のフィールドに
 指定すると、インデックスの作成時とフィールドの追加・更新時に拒否します
 （Issue #1457）。

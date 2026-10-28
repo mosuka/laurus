@@ -126,6 +126,13 @@ An `hnsw`, `flat` or `ivf` field may set `quantizer` to pick how its vectors are
 | `"product_quantization"` | HNSW | `subvector_count` must be at least `1` and divide `dimension` |
 | `"product_quantization_fastscan"` | HNSW | Experimental; the server must be built with the `pq-fastscan` feature. `subvector_count` must be at least `1` and divide `dimension` |
 
+Product Quantization and PQ FastScan support only the `Euclidean` and
+`Cosine` distance metrics (Issue #1458); creating or updating a field with
+another distance is rejected with 400. An existing index with such a field
+still opens with a warning. To repair it without losing vectors, use a
+non-PQ quantizer with the same distance; changing the distance discards the
+field's vectors.
+
 `subvector_count` is used only by the two product quantization methods, but with any method it must be an integer between `0` and `4294967295`, and `null` is the same as omitting it: a value such as `"48"`, `48.0` or `-1` is rejected with 400 instead of being read as `0`, and one above `4294967295` instead of wrapping around (Issue #1490). Any other `method`, including `"none"` (unquantized storage was removed in Issue #481), a quantizer without a string `method`, and `"product_quantization_fastscan"` on a server built without `pq-fastscan` are rejected with 400 (Issue #1459), and nothing is written:
 
 ```bash

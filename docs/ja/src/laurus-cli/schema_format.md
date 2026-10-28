@@ -409,6 +409,13 @@ subvector_count = 48
 | :--- | :--- | :--- |
 | `subvector_count` | `integer` | サブベクトルの数。1 以上で、`dimension` を均等に割り切れる必要があります。 |
 
+Product Quantization と PQ FastScan が対応する距離メトリクスは
+`Euclidean` と `Cosine` のみです（Issue #1458）。それ以外の距離を
+使ったフィールドの作成・更新は拒否されます。既存インデックスは警告を
+出して開きます。ベクトルを失わずに修復するには、同じ距離の非 PQ
+quantizer を使ってください。距離を変更するとフィールドのベクトルは
+破棄されます。
+
 インデックスの作成、`laurus add field`、[`laurus update field`](commands.md#update-field) は、
 `subvector_count` が 0 のものと `dimension` を割り切らないものを拒否
 します（Issue #1491）。この検査の前は、そうしたフィールドが受け付け

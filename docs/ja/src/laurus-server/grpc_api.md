@@ -139,6 +139,8 @@ message AnalyzerDefinition {
 
 **直積量子化の `subvector_count`:** `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` のとき、`CreateIndex`・`AddField`・`UpdateField` は、`0` の `subvector_count`（クライアントが省略したときに送られる値）、`dimension` を割り切らない値、`subvector_count` か `dimension / subvector_count` が `65535` を超える値を `INVALID_ARGUMENT` で拒否します（Issue #1491）。この検査より古いサーバーはそうしたフィールドを受け付け、後の commit が `INTERNAL` で失敗します。`dimension` を割り切らない値では、そのフィールドのベクトルを含む最初の commit で、`0` では、フィールドのセグメントが 256 件（FastScan は 16 件）に達した時点で失敗し、以後の commit もすべて失敗します。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出て、フィールドを直すまではすべてのドキュメントの書き込みが、適用されずに失敗します。フィールドは `UpdateField` で有効な `subvector_count` を指定して直します（`reindex` が要り、フィールドはそのセグメントから作り直されます）。直すまでは、フィールドの compaction（フィールドのドキュメントを多く削除すると起きる）が commit のたびに失敗します。commit 自体は成功し、失敗をフィールド名付きの警告としてログに出します（Issue #1500）。削除したベクトルは、検索から隠されたままフィールドに残ります。commit が失敗したためにインデックスが開けない場合は、インデックスの `schema.toml` に有効な `subvector_count` を書いてサーバーを起動し直してください。
 
+**直積量子化の距離:** `PRODUCT_QUANTIZATION` と `PRODUCT_QUANTIZATION_FASTSCAN` が対応する距離は `Euclidean` と `Cosine` のみです（Issue #1458）。それ以外の距離は `CreateIndex`・`AddField`・`UpdateField` で `INVALID_ARGUMENT` として拒否されます。既存インデックスは警告付きで開けます。ベクトルを保って再 index するには、同じ距離の非 PQ quantizer で `UpdateField` してください。距離を変更するとベクトルは破棄されます。
+
 **QuantizationConfig 構造:**
 
 | フィールド | 型 | 説明 |

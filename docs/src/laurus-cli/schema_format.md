@@ -412,6 +412,13 @@ subvector_count = 48
 | :--- | :--- | :--- |
 | `subvector_count` | `integer` | Number of subvectors. Must be at least 1 and evenly divide `dimension`. |
 
+Product Quantization and PQ FastScan support only the `Euclidean` and
+`Cosine` distance metrics (Issue #1458); creating or updating a field with
+another distance is rejected. An existing index with such a field still
+opens with a warning. To repair it without losing vectors, use a non-PQ
+quantizer with the same distance; changing the distance discards the field's
+vectors.
+
 Creating an index, `laurus add field` and [`laurus update field`](commands.md#update-field) reject a
 `subvector_count` of 0 or one that does not divide `dimension`
 (Issue #1491); before that check, such a field was accepted and a later

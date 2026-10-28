@@ -155,9 +155,9 @@ impl FieldOption {
     /// Why the field's index cannot work with these parameters, if it
     /// cannot: everything [`Self::validate`] checks except whether the
     /// index kind implements the quantizer ([`quantizer_support_error`]),
-    /// which opening an index still refuses (Issue #1457). A product
-    /// quantizer's `subvector_count` that does not fit the dimension is a
-    /// parameter error (Issue #1491), reported here.
+    /// which opening an index still refuses (Issue #1457). Product
+    /// quantization's `subvector_count` and supported distance metrics are
+    /// parameter errors (Issues #1491 and #1458), reported here.
     ///
     /// Opening an index uses this to warn about a field persisted before
     /// the checks existed (Issue #1479) instead of refusing to open it, so
@@ -841,11 +841,13 @@ impl HnswOption {
         self
     }
 
-    /// Check that the options describe a usable HNSW field (Issues #1479,
-    /// #1491).
+    /// Check that the options describe a usable HNSW field (Issues #1458,
+    /// #1479 and #1491).
     ///
-    /// HNSW implements every quantizer, so a product quantizer is checked
-    /// only for whether its `subvector_count` fits [`Self::dimension`].
+    /// HNSW implements every quantizer. Product Quantization (including
+    /// FastScan) additionally supports only the `Euclidean` and `Cosine`
+    /// distance metrics; its `subvector_count` must also fit
+    /// [`Self::dimension`].
     ///
     /// # Arguments
     ///
@@ -861,7 +863,7 @@ impl HnswOption {
     /// [`Self::quantizer`] is a product quantizer whose `subvector_count`
     /// is `0`, does not divide the dimension, or leaves it or the
     /// sub-vector dimension above `u16::MAX`, which the writer cannot
-    /// encode with.
+    /// encode with, or whose distance is neither `Euclidean` nor `Cosine`.
     pub fn validate(&self, field_name: &str) -> Result<()> {
         reject_field(field_name, self.params_error())
     }
@@ -879,6 +881,7 @@ impl HnswOption {
         }
         self.quantizer
             .dimension_error(self.dimension)
+            .or_else(|| self.quantizer.distance_error(self.distance))
             .map(|reason| format!("HNSW {reason}"))
     }
 }

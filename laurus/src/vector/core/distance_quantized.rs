@@ -576,8 +576,9 @@ impl PqQuery {
 /// Returns the same metric scale as
 /// [`crate::vector::core::distance::DistanceMetric::distance`]
 /// (smaller = more similar). Only Cosine and Euclidean are supported
-/// in Stage 3; other metrics return [`f32::INFINITY`] so the searcher
-/// can refuse the segment cleanly without a panic.
+/// for PQ; HNSW field validation rejects other metrics on field definition
+/// and warns when reopening a persisted schema. The infinity fallback
+/// protects callers that bypass those checks.
 pub fn distance_pq_adc(metric: DistanceMetric, query: &PqQuery, codes: &[u8]) -> f32 {
     debug_assert_eq!(codes.len(), query.params.m as usize);
     let m = query.params.m as usize;
@@ -602,10 +603,9 @@ pub fn distance_pq_adc(metric: DistanceMetric, query: &PqQuery, codes: &[u8]) ->
             // `[0, 2]`.
             (l2_sq * 0.5).clamp(0.0, 2.0)
         }
-        // Stage 3 ships Cosine + Euclidean only. Other metrics fall
-        // back to +inf so the searcher's segment-level dispatch can
-        // surface a clear NotImplemented at session start (kernel-level
-        // panic would be harder to attribute).
+        // Keep a defensive sentinel for callers that bypass field
+        // validation. A field persisted before Issue #1458 opens with a
+        // warning and still reaches this arm.
         _ => f32::INFINITY,
     }
 }

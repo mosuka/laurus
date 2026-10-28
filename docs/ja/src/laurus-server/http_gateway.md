@@ -114,6 +114,13 @@ curl -X POST http://localhost:8080/v1/index \
 | `"product_quantization"` | HNSW | `subvector_count` は `1` 以上で `dimension` を割り切る値にする |
 | `"product_quantization_fastscan"` | HNSW | 実験的。サーバーを `pq-fastscan` feature 付きでビルドする必要がある。`subvector_count` は `1` 以上で `dimension` を割り切る値にする |
 
+Product Quantization と PQ FastScan が対応する距離メトリクスは
+`Euclidean` と `Cosine` のみです（Issue #1458）。それ以外の距離を
+使ったフィールドの作成・更新は 400 で拒否されます。既存インデックスは
+警告を出して開きます。ベクトルを失わずに修復するには、同じ距離の非 PQ
+quantizer を使ってください。距離を変更するとフィールドのベクトルは
+破棄されます。
+
 `subvector_count` を使うのは、2 つの直積量子化（product quantization）の方式のときだけです。ただし、どの方式でも値は `0` から `4294967295` までの整数で、`null` は省略と同じです。`"48"`・`48.0`・`-1` などの値は `0` として読まれるのではなく、`4294967295` を超える値は折り返されるのではなく、400 で拒否されます（Issue #1490）。ほかの `method`（`"none"` を含む。量子化なしの保存は Issue #481 で廃止）、文字列の `method` を持たない quantizer、`pq-fastscan` なしでビルドしたサーバーへの `"product_quantization_fastscan"` は 400 で拒否され（Issue #1459）、何も書き込まれません。
 
 ```bash
