@@ -9,7 +9,9 @@ use crate::lexical::index::inverted::reader::InvertedIndexReader;
 use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::scorer::Scorer;
-use crate::lexical::query::{HighlightTerm, Query, QueryResult};
+use crate::lexical::query::{
+    HighlightTerm, Query, QueryResult, check_field_boosts, check_query_boost,
+};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// Configuration for [`AdvancedQuery::execute`].
@@ -204,7 +206,14 @@ impl AdvancedQuery {
     /// `BooleanQuery` expresses: the minimum score and the
     /// [`AdvancedQueryConfig`]'s timeout and early termination. Results are
     /// sorted by descending score.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when a boost of this query or
+    /// of a sub-query is not finite or is negative (Issue #1550): this runs
+    /// without the searcher, which checks them for a search.
     pub fn execute(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<QueryResult>> {
+        self.validate_boosts()?;
         // Build the matcher and scorer in one pass (#999).
         let (mut matcher, scorer) = self.lowered().matcher_scorer(reader)?;
         let min_score = self.min_score.max(self.config.min_score);
@@ -366,6 +375,16 @@ impl Query for AdvancedQuery {
         {
             filter.collect_positional_field_refs(out);
         }
+    }
+
+    /// Check this query's field boosts, then the query a search runs
+    /// (`lowered`): the core query with those field boosts
+    /// multiplied in, every filter, the negative filters included, and this
+    /// query's own boost (Issue #1550). Checking the lowered query also
+    /// rejects a field boost times a core boost too large for an `f32`.
+    fn validate_boosts(&self) -> Result<()> {
+        check_field_boosts("AdvancedQuery field boost", &self.field_boosts)?;
+        self.lowered().validate_boosts()
     }
 
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
@@ -758,6 +777,19 @@ impl Query for MultiFieldQuery {
             if let Some(field_boost) = self.fields.get_mut(f) {
                 *field_boost *= b;
             }
+        }
+    }
+
+    /// Check this query's own boost and every per-field boost (Issue
+    /// #1550): finite and at least `0`, or, for a
+    /// [`MultiFieldQueryType::CombinedFields`] query, the stricter rule of
+    /// `check_weights` (greater than `0`), checked here too so that it does
+    /// not depend on the data.
+    fn validate_boosts(&self) -> Result<()> {
+        check_query_boost(self.boost, || self.description())?;
+        match self.query_type {
+            MultiFieldQueryType::CombinedFields => self.check_weights(),
+            _ => check_field_boosts("MultiFieldQuery boost", &self.fields),
         }
     }
 
@@ -2051,5 +2083,253 @@ mod tests {
                 .query_type(query_type);
             assert!(query.rewrite(reader.as_ref()).unwrap().is_none());
         }
+    }
+
+    // ── Query boosts (Issue #1550) ──────────────────────────────────────
+
+    /// Boosts every node rejects: negative (`-0.0` included) or not finite.
+    const BAD_BOOSTS: [f32; 5] = [-1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+    fn apple(boost: f32) -> Box<dyn Query> {
+        Box::new(TermQuery::new("title", "apple").with_boost(boost))
+    }
+
+    /// A `BooleanQuery` with a valid `Should` clause and `clause` as `occur`.
+    fn with_clause(occur: Occur, clause: Box<dyn Query>) -> BooleanQuery {
+        let mut query = BooleanQuery::new();
+        query.add_should(apple(1.0));
+        query.add_clause(BooleanClause::new(clause, occur));
+        query
+    }
+
+    /// Every shape of query tree the checks walk, with `boost` on one node,
+    /// and the message fragment a bad `boost` there gives.
+    fn boost_shapes(boost: f32) -> Vec<(&'static str, Box<dyn Query>, String)> {
+        let node = format!("query boost must be finite and at least 0, got {boost}");
+        let mut multi_field_own =
+            MultiFieldQuery::new("apple".to_string()).add_field("title".to_string(), 1.0);
+        multi_field_own.set_boost(boost);
+        // A leaf's message names the leaf itself.
+        let leaf = format!("{node}: {}", apple(boost).description());
+        vec![
+            ("leaf", apple(boost), leaf),
+            (
+                "boolean's own",
+                Box::new(with_clause(Occur::Should, apple(1.0)).with_boost(boost)),
+                node.clone(),
+            ),
+            (
+                "must clause",
+                Box::new(with_clause(Occur::Must, apple(boost))),
+                node.clone(),
+            ),
+            (
+                "should clause",
+                Box::new(with_clause(Occur::Should, apple(boost))),
+                node.clone(),
+            ),
+            (
+                "must_not clause",
+                Box::new(with_clause(Occur::MustNot, apple(boost))),
+                node.clone(),
+            ),
+            (
+                "filter clause",
+                Box::new(with_clause(Occur::Filter, apple(boost))),
+                node.clone(),
+            ),
+            (
+                "nested boolean",
+                Box::new(with_clause(
+                    Occur::Should,
+                    Box::new(with_clause(Occur::Must, apple(boost))),
+                )),
+                node.clone(),
+            ),
+            (
+                "advanced's own",
+                Box::new(AdvancedQuery::new(apple(1.0)).with_boost(boost)),
+                node.clone(),
+            ),
+            (
+                "advanced field boost",
+                Box::new(
+                    AdvancedQuery::new(apple(1.0)).add_field_boost("title".to_string(), boost),
+                ),
+                format!(
+                    "AdvancedQuery field boost for field \"title\" must be finite and at least 0, got {boost}"
+                ),
+            ),
+            (
+                "advanced core",
+                Box::new(AdvancedQuery::new(apple(boost))),
+                node.clone(),
+            ),
+            (
+                "advanced filter",
+                Box::new(AdvancedQuery::new(apple(1.0)).with_filter(apple(boost))),
+                node.clone(),
+            ),
+            (
+                "advanced negative filter",
+                Box::new(AdvancedQuery::new(apple(1.0)).with_negative_filter(apple(boost))),
+                node.clone(),
+            ),
+            (
+                "advanced post filter",
+                Box::new(AdvancedQuery::new(apple(1.0)).with_post_filter(apple(boost))),
+                node.clone(),
+            ),
+            ("multi-field's own", Box::new(multi_field_own), node),
+            (
+                "multi-field weight",
+                Box::new(
+                    MultiFieldQuery::new("apple".to_string()).add_field("title".to_string(), boost),
+                ),
+                format!(
+                    "MultiFieldQuery boost for field \"title\" must be finite and at least 0, got {boost}"
+                ),
+            ),
+        ]
+    }
+
+    /// Issue #1550: a bad boost on any node of the tree is rejected with a
+    /// message naming it, `MustNot` and filter clauses included; `0`, `1`,
+    /// `2.5` and a large finite boost are accepted everywhere.
+    #[test]
+    fn validate_boosts_checks_every_node() {
+        // Every shape not rejected (or accepted) as expected, so a failure
+        // lists all of them rather than the first.
+        let mut wrong = Vec::new();
+        for boost in BAD_BOOSTS {
+            for (shape, query, expected) in boost_shapes(boost) {
+                let result = query.validate_boosts();
+                if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected))
+                {
+                    wrong.push(format!("{shape} {boost}: {result:?}"));
+                }
+            }
+        }
+        for boost in [0.0, 1.0, 2.5, 1e30] {
+            for (shape, query, _) in boost_shapes(boost) {
+                if let Err(error) = query.validate_boosts() {
+                    wrong.push(format!("{shape} {boost} rejected: {error}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1550: a `CombinedFields` query applies `check_weights`'
+    /// stricter rule (greater than `0`) when its boosts are checked, so that
+    /// it does not wait for the scorer; and an `AdvancedQuery` checks the
+    /// query it runs, so its field boost times the core's boost too large
+    /// for an `f32` is rejected.
+    #[test]
+    fn validate_boosts_checks_combined_fields_weights_and_advanced_products() {
+        let mut wrong = Vec::new();
+        for weight in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let expected = format!(
+                "MultiFieldQuery CombinedFields boost for field \"title\" must be finite and greater than 0, got {weight}"
+            );
+            let result = combined(&[("title", weight), ("body", 1.0)]).validate_boosts();
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!("combined fields {weight}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        combined(&[("title", 0.5), ("body", 1.0)])
+            .validate_boosts()
+            .unwrap();
+
+        let product = AdvancedQuery::new(apple(1e30))
+            .add_field_boost("title".to_string(), 1e30)
+            .validate_boosts();
+        assert!(
+            matches!(&product, Err(LaurusError::InvalidArgument(m))
+                if m.contains("query boost must be finite and at least 0, got inf")),
+            "{product:?}"
+        );
+        AdvancedQuery::new(apple(1e30))
+            .add_field_boost("title".to_string(), 2.0)
+            .validate_boosts()
+            .unwrap();
+    }
+
+    /// Issue #1550: the searcher's `search` and `count` reject a bad boost
+    /// before anything returns early, so a term the index does not hold
+    /// (an empty query) is rejected too, and so is `count`'s term shortcut,
+    /// with and without a deleted document.
+    #[test]
+    fn lexical_search_and_count_reject_a_bad_boost() {
+        let store = store_with_field_docs(&[&[
+            (0, &[("title", "apple fig"), ("body", "plum")]),
+            (1, NO_APPLE),
+        ]]);
+        let mut wrong = Vec::new();
+        let mut check = |store: &LexicalStore, label: &str| {
+            for boost in BAD_BOOSTS {
+                let expected = format!("query boost must be finite and at least 0, got {boost}");
+                for term in ["apple", "nosuchterm"] {
+                    let request = || {
+                        LexicalSearchRequest::new(Box::new(
+                            TermQuery::new("title", term).with_boost(boost),
+                        ))
+                    };
+                    let searched = store.search(request()).map(|r| r.hits.len());
+                    if !matches!(&searched, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected))
+                    {
+                        wrong.push(format!("{label} search {term} {boost}: {searched:?}"));
+                    }
+                    let counted = store.count(request());
+                    if !matches!(&counted, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected))
+                    {
+                        wrong.push(format!("{label} count {term} {boost}: {counted:?}"));
+                    }
+                }
+            }
+        };
+        {
+            let reader = store.reader_for_tests().unwrap();
+            assert!(
+                !reader.has_effective_deletions() && reader.term_info_is_authoritative(),
+                "the first pass needs count's term shortcut"
+            );
+        }
+        check(&store, "no deletions");
+        store.delete_document_by_internal_id(1).unwrap();
+        store.commit().unwrap();
+        assert!(
+            store.reader_for_tests().unwrap().has_effective_deletions(),
+            "the second pass needs a deletion, which turns off count's term shortcut"
+        );
+        check(&store, "a deletion");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1550: `AdvancedQuery::execute` scores without the searcher,
+    /// so it checks the boosts itself.
+    #[test]
+    fn execute_rejects_a_bad_boost() {
+        let store = store_with_field_docs(&[&[(0, &[("title", "apple fig"), ("body", "plum")])]]);
+        let reader = store.reader_for_tests().unwrap();
+        let mut wrong = Vec::new();
+        for boost in BAD_BOOSTS {
+            let expected = format!("query boost must be finite and at least 0, got {boost}");
+            let result = AdvancedQuery::new(apple(boost))
+                .execute(reader.as_ref())
+                .map(|hits| hits.len());
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!("{boost}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert_eq!(
+            AdvancedQuery::new(apple(2.0))
+                .execute(reader.as_ref())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

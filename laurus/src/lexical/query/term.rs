@@ -45,7 +45,9 @@ impl TermQuery {
         &self.term
     }
 
-    /// Set the boost factor.
+    /// Set the boost factor. It must be finite and at least `0` (`-0.0` is
+    /// rejected); a search rejects any other value with `InvalidArgument`
+    /// (see [`Query::validate_boosts`]).
     pub fn with_boost(mut self, boost: f32) -> Self {
         self.boost = boost;
         self

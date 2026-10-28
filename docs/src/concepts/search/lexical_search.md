@@ -156,8 +156,9 @@ let query = NumericRangeQuery::new(
 ```
 
 Numeric range queries are **constant-scored**: every matching document
-receives the same score (the query's boost, `1.0` by default), following
-Lucene's `PointRangeQuery` semantics. Matching uses the field's BKD tree
+receives the same score (the query's boost, `1.0` by default, finite and
+at least `0`), following Lucene's `PointRangeQuery` semantics. Matching
+uses the field's BKD tree
 when the segment has one; segments without a BKD tree for the field
 (for example, segments none of whose documents carry the field, or a
 field configured `indexed = false, stored = true`) fall back to scanning
@@ -196,7 +197,8 @@ let query = DateTimeRangeQuery::from_literals(
 
 `new(field, lower, upper, lower_inclusive, upper_inclusive)` takes
 `Option<DateTime<Utc>>` bounds; `on_or_after`, `before` and `on_or_before`
-complete the one-sided helpers, and `.with_boost()` sets the constant score.
+complete the one-sided helpers, and `.with_boost()` sets the constant score
+(finite and at least `0`).
 The query is evaluated against the field's one-dimensional BKD point
 (seconds with a microsecond fraction, so sub-second bounds compare exactly)
 with the same constant scoring and stored-document fallback as
@@ -324,7 +326,7 @@ Lexical search behavior is controlled via `LexicalSearchOptions` on the `SearchR
 | Option | Default | Description |
 | :--- | :--- | :--- |
 | `field_boosts` | empty | Per-field score multipliers, each finite and at least `0` (`-0.0` is rejected); `0` keeps a match with a score of `0` (a `CombinedFields` multi-field query still rejects `0`) |
-| `min_score` | 0.0 | Minimum score threshold; must be finite. With non-negative boosts, scores are never negative, so a negative threshold is the same as `0.0` |
+| `min_score` | 0.0 | Minimum score threshold; must be finite. A search rejects a negative boost, so scores are never negative and a negative threshold is the same as `0.0` |
 | `timeout_ms` | None | Search time budget in milliseconds (see note below) |
 | `parallel` | false | Enable parallel search across segments |
 | `sort_by` | `Score` | Sort by relevance score, or by a field (`asc` / `desc`) |

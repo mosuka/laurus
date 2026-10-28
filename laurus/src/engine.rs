@@ -3066,16 +3066,7 @@ impl Engine {
                 not_lexical.join(", ")
             )));
         }
-        if let Some((field, boost)) = boosts
-            .iter()
-            .filter(|&(_, &boost)| !(boost.is_finite() && boost.is_sign_positive()))
-            .min_by(|a, b| a.0.cmp(b.0))
-        {
-            return Err(crate::error::LaurusError::invalid_argument(format!(
-                "field_boosts: boost for field {field:?} must be finite and at least 0, got {boost}"
-            )));
-        }
-        Ok(())
+        crate::lexical::query::check_field_boosts("field_boosts: boost", boosts)
     }
 
     /// Reject phrase and span queries on fields that store no positions.
@@ -4035,6 +4026,15 @@ impl Engine {
     /// request has no lexical or hybrid part.
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if a boost of the lexical query or of the `filter_query`, or of any
+    /// of their sub-queries, is not finite or is negative (`-0.0` included),
+    /// such as a DSL `^` boost too large for an `f32` (Issue #1550; see
+    /// [`Query::validate_boosts`](crate::lexical::query::Query::validate_boosts)).
+    /// The lexical query is checked with the request's `field_boosts`
+    /// multiplied in, and both before a filter that matches nothing returns
+    /// early.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the rescore options are invalid: a window outside
     /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
     /// multi-vector field, query vectors of the wrong dimension or count, or
@@ -4145,9 +4145,9 @@ impl Engine {
         )?;
 
         // 0b. Resolve the user's lexical query once. The searcher gets it
-        // filter-wrapped and boosted below; the highlighter gets this
+        // boosted here and filter-wrapped below; the highlighter gets this
         // unwrapped form, so request-level filter terms never highlight.
-        let user_lexical_query: Option<Box<dyn crate::lexical::query::Query>> =
+        let mut user_lexical_query: Option<Box<dyn crate::lexical::query::Query>> =
             match &lexical_search_request {
                 Some(lex_req) => Some(self.resolve_query(lex_req.query.clone())?),
                 None => None,
@@ -4157,11 +4157,23 @@ impl Engine {
             _ => None,
         };
 
-        if let Some(query) = &user_lexical_query {
+        if let Some(query) = &mut user_lexical_query {
             self.validate_positional_field_refs(query.as_ref())?;
+            // The request's field boosts apply to the user's query only: a
+            // filter does not score (Issue #1550).
+            if let Some(lex_req) = &lexical_search_request
+                && !lex_req.field_boosts.is_empty()
+            {
+                query.apply_field_boosts(&lex_req.field_boosts);
+            }
+            // Issue #1550: checked with the field boosts multiplied in, and
+            // before a filter that matches nothing returns early below, so
+            // the outcome does not depend on the data.
+            query.validate_boosts()?;
         }
         if let Some(filter_query) = &request_filter {
             self.validate_positional_field_refs(filter_query.as_ref())?;
+            filter_query.validate_boosts()?;
         }
 
         // 0c. Pre-process Filter
@@ -4194,14 +4206,7 @@ impl Engine {
         };
 
         // 1. Execute Lexical Search
-        let mut lexical_query_to_use = lexical_query_override.or(user_lexical_query);
-
-        if let Some(query) = &mut lexical_query_to_use
-            && let Some(lex_req) = &lexical_search_request
-            && !lex_req.field_boosts.is_empty()
-        {
-            query.apply_field_boosts(&lex_req.field_boosts);
-        }
+        let lexical_query_to_use = lexical_query_override.or(user_lexical_query);
 
         // Build the lexical request; its limit is set per round below.
         let lexical = if let Some(query) = &lexical_query_to_use {

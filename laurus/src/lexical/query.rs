@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lexical::index::inverted::core::automaton::LevenshteinAutomaton;
 
-use crate::error::Result;
+use crate::error::{LaurusError, Result};
 #[allow(unused_imports)]
 use crate::lexical::core::document::Document;
 use crate::lexical::reader::LexicalIndexReader;
@@ -179,10 +179,16 @@ pub trait Query: Send + Sync + Debug {
         Ok((self.matcher(reader)?, self.scorer(reader)?))
     }
 
-    /// Get the boost factor for this query.
+    /// Get the boost factor for this query, which multiplies its score. A
+    /// search requires it to be finite and at least `0` (see
+    /// [`validate_boosts`](Self::validate_boosts)).
     fn boost(&self) -> f32;
 
     /// Set the boost factor for this query.
+    ///
+    /// The value is stored as given; a search rejects a boost that is not
+    /// finite or is negative (`-0.0` included) with `InvalidArgument` (see
+    /// [`validate_boosts`](Self::validate_boosts)).
     fn set_boost(&mut self, boost: f32);
 
     /// Get a human-readable description of this query.
@@ -319,6 +325,30 @@ pub trait Query: Send + Sync + Debug {
         }
     }
 
+    /// Reject a boost that is not finite or is negative (`-0.0` included,
+    /// as in Lucene's `BoostQuery`) in this query or any of its sub-queries
+    /// (Issue #1550).
+    ///
+    /// A boost multiplies the score: a negative one makes it negative, which
+    /// the collectors' `0.0` threshold drops, and a non-finite one gives
+    /// `NaN` or infinite scores. A boost of `0` is accepted. The checks run
+    /// where a query is received, before anything returns early, so the
+    /// outcome does not depend on the data:
+    /// [`Engine::search`](crate::engine::Engine::search) and the lexical
+    /// searcher's `search` and `count`.
+    ///
+    /// The default checks [`boost`](Self::boost). Composite queries override
+    /// this to check every child too, including `MustNot` clauses and
+    /// filters, whose boosts have no effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] naming the first query (or
+    /// per-field boost) found out of range.
+    fn validate_boosts(&self) -> Result<()> {
+        check_query_boost(self.boost(), || self.description())
+    }
+
     /// Return a stable, canonical cache key identifying the **set of documents**
     /// this query matches within a reader snapshot, or `None` if the query must
     /// not be cached.
@@ -347,6 +377,54 @@ pub trait Query: Send + Sync + Debug {
     /// `Some(canonical_key)` if this query may be cached, `None` otherwise.
     fn cache_key(&self) -> Option<String> {
         None
+    }
+}
+
+/// Whether `boost` is a usable boost: finite and at least `0`, with `-0.0`
+/// rejected as in Lucene's `BoostQuery` (Issues #1540, #1550). A `-0.0`
+/// boost gives `-0.0` scores, which rank below every `+0.0`.
+pub(crate) fn is_valid_boost(boost: f32) -> bool {
+    boost.is_finite() && boost.is_sign_positive()
+}
+
+/// Check a query's own boost (see [`Query::validate_boosts`]).
+///
+/// `description` describes the query and runs only when the boost is out
+/// of range.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] when the boost is not finite or
+/// is negative.
+pub(crate) fn check_query_boost(boost: f32, description: impl FnOnce() -> String) -> Result<()> {
+    if is_valid_boost(boost) {
+        return Ok(());
+    }
+    Err(LaurusError::invalid_argument(format!(
+        "query boost must be finite and at least 0, got {boost}: {}",
+        description()
+    )))
+}
+
+/// Check the values of a per-field boost map, such as a request's
+/// `field_boosts` or [`AdvancedQuery`]'s field boosts, reporting the first
+/// bad field in key order as `{owner} for field "{field}" must be finite and
+/// at least 0, got {boost}`.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] when a boost is not finite or is
+/// negative.
+pub(crate) fn check_field_boosts(owner: &str, boosts: &HashMap<String, f32>) -> Result<()> {
+    match boosts
+        .iter()
+        .filter(|&(_, &boost)| !is_valid_boost(boost))
+        .min_by(|a, b| a.0.cmp(b.0))
+    {
+        Some((field, boost)) => Err(LaurusError::invalid_argument(format!(
+            "{owner} for field {field:?} must be finite and at least 0, got {boost}"
+        ))),
+        None => Ok(()),
     }
 }
 

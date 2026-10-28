@@ -363,8 +363,9 @@ async fn search_answers_400_for_a_value_of_the_wrong_type() {
 
 /// Issue #1540: the requests of the issue, which used to give a `null`
 /// score, hide a hit or be clamped, are a 400 naming the value, from each
-/// search endpoint; so are weights of 0 and 0, and a boost sent without a
-/// `query`. The boundaries still search.
+/// search endpoint; so are weights of 0 and 0, a boost sent without a
+/// `query`, and a DSL `^` boost too large for an `f32` (Issue #1550). The
+/// boundaries still search.
 #[tokio::test]
 async fn search_answers_400_for_a_number_out_of_range() {
     let dir = tempfile::tempdir().unwrap();
@@ -415,6 +416,13 @@ async fn search_answers_400_for_a_number_out_of_range() {
         (
             hybrid("lexical_params", json!({"min_score": 1e39})),
             "lexical min_score must be finite, got inf".to_string(),
+        ),
+        // Issue #1550: a DSL boost too large for an `f32`. The index holds
+        // no documents, so this also shows the check does not depend on
+        // the data.
+        (
+            json!({"query": format!("title:rust^{}", "1".repeat(40))}),
+            "query boost must be finite and at least 0, got inf".to_string(),
         ),
     ];
     // Every request that is not rejected as expected, so a failure lists all
