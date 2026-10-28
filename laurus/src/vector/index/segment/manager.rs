@@ -49,6 +49,9 @@ pub struct SegmentFileLayout {
     /// HNSW's f32 rerank sidecar. Counted by [`SegmentManager::add_segment`]
     /// size measurement and removed by
     /// [`SegmentManager::delete_segment_files`] alongside the primary file.
+    /// A sidecar is staged through its suffix plus `.tmp` (e.g.
+    /// `.hnsw.f32.tmp`), which the orphan sweep on open also reclaims
+    /// (Issue #1532).
     pub sidecars: &'static [&'static str],
 
     /// Suffix for a segment's own atomic-write temp-staging file, e.g.
@@ -61,15 +64,23 @@ impl SegmentFileLayout {
     /// All suffixes this layout recognizes for a segment's own files, plus
     /// the layout-independent `.delmap` suffix, ordered **longest first**.
     ///
+    /// A segment's own files include each sidecar's staging file, the
+    /// sidecar suffix plus `.tmp` (e.g. `.hnsw.f32.tmp`), which a write that
+    /// fails or crashes before its rename leaves (Issue #1532).
+    ///
     /// A shorter suffix that is itself the tail of a longer one (e.g.
     /// `.hnsw` is the tail of `.hnsw.tmp`) must be tried last, or the longer
     /// file gets mis-stemmed (`foo.hnsw.tmp` stripped of `.hnsw` leaves
     /// `foo` + a dangling `.tmp`, not the segment id `foo`).
-    fn ordered_suffixes(&self) -> Vec<&'static str> {
-        let mut suffixes: Vec<&'static str> = self.sidecars.to_vec();
-        suffixes.push(self.primary);
-        suffixes.push(self.tmp);
-        suffixes.push(".delmap");
+    fn ordered_suffixes(&self) -> Vec<String> {
+        let mut suffixes: Vec<String> = self
+            .sidecars
+            .iter()
+            .flat_map(|sidecar| [sidecar.to_string(), format!("{sidecar}.tmp")])
+            .collect();
+        suffixes.push(self.primary.to_string());
+        suffixes.push(self.tmp.to_string());
+        suffixes.push(".delmap".to_string());
         suffixes.sort_by_key(|s| std::cmp::Reverse(s.len()));
         suffixes
     }
@@ -407,7 +418,8 @@ impl SegmentManager {
     /// Best-effort sweep of files that belong to no registered segment.
     ///
     /// Only touches names this manager itself generates (`segment_NNNNNN`
-    /// plus its [`SegmentFileLayout`] suffixes) and the manifest temp file,
+    /// plus its [`SegmentFileLayout`] suffixes, the staging files of the
+    /// primary and of each sidecar among them) and the manifest temp file,
     /// so foreign files — e.g. a monolithic `vector_index.hnsw` in the same
     /// directory — are never affected. Runs only after a successful
     /// manifest load.
@@ -424,7 +436,10 @@ impl SegmentManager {
             }
             // Strip a known suffix (longest first); skip files that are not
             // segment-shaped.
-            let Some(stem) = suffixes.iter().find_map(|suffix| file.strip_suffix(suffix)) else {
+            let Some(stem) = suffixes
+                .iter()
+                .find_map(|suffix| file.strip_suffix(suffix.as_str()))
+            else {
                 continue;
             };
             let Some(ordinal) = stem.strip_prefix("segment_") else {
@@ -1037,6 +1052,57 @@ mod tests {
             "a different index type's segment file must never be swept by this layout"
         );
         assert!(storage.file_exists("vector_index.flat"), "foreign spared");
+    }
+
+    /// Issue #1532: the Flat, HNSW and IVF writers stage a rerank sidecar as
+    /// the sidecar's name plus `.tmp` and rename it after the primary file,
+    /// so a write that fails or crashes in between leaves
+    /// `segment_N.{flat,hnsw,ivf}.f32.tmp`. Under each real layout the sweep
+    /// reclaims it for an unregistered segment, and keeps a registered
+    /// segment's primary and sidecar.
+    #[test]
+    fn test_cleanup_orphans_reclaims_a_sidecar_staging_file() {
+        for (layout, kind) in [
+            (crate::vector::index::flat::segment::LAYOUT, "flat"),
+            (crate::vector::index::hnsw::segment::LAYOUT, "hnsw"),
+            (crate::vector::index::ivf::segment::LAYOUT, "ivf"),
+        ] {
+            let config = SegmentManagerConfig::default();
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let write = |name: &str| {
+                let mut out = storage.create_output(name).unwrap();
+                std::io::Write::write_all(&mut out, b"x").unwrap();
+                out.close().unwrap();
+            };
+
+            {
+                let manager = SegmentManager::new(config.clone(), storage.clone(), layout).unwrap();
+                manager
+                    .add_segment(create_info("segment_000000", 100))
+                    .unwrap();
+            }
+            // The names the writers give the files (`sidecar_tmp` in
+            // `{flat,hnsw,ivf}/writer.rs`).
+            let registered = [
+                format!("segment_000000.{kind}"),
+                format!("segment_000000.{kind}.f32"),
+            ];
+            let orphans = [
+                format!("segment_000042.{kind}"),
+                format!("segment_000042.{kind}.f32.tmp"),
+            ];
+            for name in registered.iter().chain(&orphans) {
+                write(name);
+            }
+
+            let _manager = SegmentManager::new(config, storage.clone(), layout).unwrap();
+            for name in &registered {
+                assert!(storage.file_exists(name), "{name} must stay");
+            }
+            for name in &orphans {
+                assert!(!storage.file_exists(name), "{name} must be swept");
+            }
+        }
     }
 
     /// #879/#882: deleting a segment's files removes its sidecars along
