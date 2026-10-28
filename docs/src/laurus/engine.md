@@ -240,7 +240,7 @@ call multiple times and is a no-op for lexical-only workloads.
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `field_boosts` | `HashMap<String, f32>` | Empty | Per-field score multipliers, each finite and at least `0` (`-0.0` is rejected); `0` keeps a match with a lexical score of `0` (a `CombinedFields` multi-field query still rejects `0`) |
-| `min_score` | `f32` | 0.0 | Minimum score threshold; must be finite. With non-negative boosts, lexical scores are never negative, so a negative threshold is the same as `0.0` |
+| `min_score` | `f32` | 0.0 | Minimum score threshold; must be finite. A search rejects a negative boost, so lexical scores are never negative and a negative threshold is the same as `0.0` |
 | `timeout_ms` | `Option<u64>` | None | Search timeout in milliseconds |
 | `parallel` | `bool` | false | Run segment search in parallel |
 | `sort_by` | `SortField` | `Score` | Sort order for lexical results |
@@ -253,6 +253,6 @@ call multiple times and is a no-op for lexical-only workloads.
 | `RRF { k: f64 }` | Reciprocal Rank Fusion -- rank-based combining. Score = sum(1 / (k + rank)), `rank` starting at 1. Handles incomparable score magnitudes. `k` must be finite and at least 0. |
 | `WeightedSum { lexical_weight, vector_weight }` | Weighted combination with min-max score normalization. Each weight must be in [0.0, 1.0], and at least one greater than 0. |
 
-`Engine::search` rejects a boost, a lexical `min_score` or a fusion parameter outside these ranges with `InvalidArgument`, even when the request does not use it (Issue #1540). The weights used to be clamped into [0.0, 1.0].
+`Engine::search` rejects a boost, a lexical `min_score` or a fusion parameter outside these ranges with `InvalidArgument`, even when the request does not use it (Issue #1540). The weights used to be clamped into [0.0, 1.0]. It also rejects a query whose own boost, or a sub-query's, is not finite or is negative, with the request's field boosts multiplied in, whatever the data, also when a filter matches nothing (Issue #1550; see [Boost](../concepts/query_dsl.md#boost)).
 
 See also: [Architecture](../architecture.md) for the high-level data flow diagrams.

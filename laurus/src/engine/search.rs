@@ -150,10 +150,10 @@ pub struct LexicalSearchOptions {
     /// Minimum score threshold. Results below this score are discarded.
     /// Defaults to `0.0` (no threshold). Must be finite;
     /// [`Engine::search`](super::Engine::search) rejects `NaN` and the
-    /// infinities with `InvalidArgument` (Issue #1540). With non-negative
-    /// boosts (the only kind a DSL query or `field_boosts` can carry),
-    /// lexical scores are never negative, so a negative threshold is the
-    /// same as `0.0`.
+    /// infinities with `InvalidArgument` (Issue #1540). A search rejects a
+    /// negative boost, a query's own included (Issue #1550), so lexical
+    /// scores are never negative and a negative threshold is the same as
+    /// `0.0`.
     pub min_score: f32,
 
     /// Timeout for the search operation in milliseconds.

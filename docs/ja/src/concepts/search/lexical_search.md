@@ -156,8 +156,9 @@ let query = NumericRangeQuery::new(
 ```
 
 数値範囲クエリは**定数スコア（constant scoring）**です。マッチしたすべての
-ドキュメントは同じスコア（クエリの boost、デフォルト `1.0`）を受け取ります。
-これは Lucene の `PointRangeQuery` のセマンティクスに従うものです。マッチングには
+ドキュメントは同じスコア（クエリの boost、デフォルト `1.0`。有限で
+`0` 以上）を受け取ります。これは Lucene の `PointRangeQuery` の
+セマンティクスに従うものです。マッチングには
 セグメントに BKD tree があればそれを使用し、対象フィールドの BKD tree を持たない
 セグメント（例: そのフィールドを持つドキュメントが 1 件もないセグメントや、
 `indexed = false, stored = true` と設定されたフィールド）では、そのセグメントに
@@ -196,9 +197,10 @@ let query = DateTimeRangeQuery::from_literals(
 
 `new(field, lower, upper, lower_inclusive, upper_inclusive)` は境界を
 `Option<DateTime<Utc>>` で受け取ります。片側だけのヘルパーとして
-`on_or_after`・`before`・`on_or_before` もあり、`.with_boost()` で定数スコアを
-設定します。クエリはフィールドの 1 次元 BKD ポイント（マイクロ秒の小数部を持つ秒。
-秒未満の境界も正確に比較されます）に対して評価され、定数スコアと保存済み
+`on_or_after`・`before`・`on_or_before` もあり、`.with_boost()` で定数スコア
+（有限で `0` 以上）を設定します。クエリはフィールドの 1 次元 BKD ポイント
+（マイクロ秒の小数部を持つ秒。秒未満の境界も正確に比較されます）に対して
+評価され、定数スコアと保存済み
 ドキュメントへのフォールバックは `NumericRangeQuery` と同じです。`from_literals` は
 RFC 3339、オフセットなしの `YYYY-MM-DDTHH:MM:SS[.fff]`（UTC）、`YYYY-MM-DD`
 （その日の 0 時 UTC）を受け付け、DSL の `created_at:[2024-01-01 TO 2024-12-31]` が
@@ -322,7 +324,7 @@ Lexical 検索の動作パラメータは `SearchRequestBuilder` のメソッド
 | オプション | デフォルト | 説明 |
 | :--- | :--- | :--- |
 | `field_boosts` | 空 | フィールドごとのスコア倍率。各倍率は有限で `0` 以上（`-0.0` は拒否）。`0` では一致した文書がスコア `0` で残る（`CombinedFields` のマルチフィールドクエリは今どおり `0` を拒否する） |
-| `min_score` | 0.0 | 最小スコア閾値。有限でなければならない。ブーストが負でなければスコアは負にならないので、負の閾値は `0.0` と同じ |
+| `min_score` | 0.0 | 最小スコア閾値。有限でなければならない。検索は負のブーストを拒否するので、スコアは負にならず、負の閾値は `0.0` と同じ |
 | `timeout_ms` | None | 検索の時間予算（ミリ秒、下記の注記を参照） |
 | `parallel` | false | セグメント間の並列検索を有効にする |
 | `sort_by` | `Score` | 関連性スコアでソート、またはフィールドでソート（`asc` / `desc`） |

@@ -5,14 +5,20 @@
 //! Issue #1540: a boost that is not a finite number of at least `0`, and a
 //! lexical `min_score` that is not finite, are rejected instead of hiding
 //! hits or giving `NaN` or infinite scores.
+//!
+//! Issue #1550: so is a query's own boost, from the DSL `^` or a query
+//! object, whatever the data; and the DSL boost of a fuzzy or wildcard term
+//! is applied instead of being dropped.
 
 use std::sync::Arc;
 
+use laurus::lexical::query::advanced_query::{MultiFieldQuery, MultiFieldQueryType};
+use laurus::lexical::{BooleanQueryBuilder, Query, TermQuery};
 use laurus::storage::Storage;
 use laurus::storage::memory::MemoryStorage;
 use laurus::vector::{FlatOption, QueryVector, Vector, VectorSearchQuery};
 use laurus::{DataValue, Document, Engine, FieldOption, LaurusError, Schema};
-use laurus::{SearchRequestBuilder, TextOption};
+use laurus::{LexicalSearchQuery, SearchRequestBuilder, TextOption};
 
 async fn engine() -> Engine {
     let schema = Schema::builder()
@@ -203,4 +209,265 @@ async fn zero_boost_and_negative_min_score_keep_the_hits() {
     let negative = hits(search_with_min_score(-1.0).await.unwrap());
     assert_eq!(at_zero.len(), 2, "{at_zero:?}");
     assert_eq!(negative, at_zero);
+}
+
+/// Boosts a query must not carry: negative (`-0.0` included) or not finite.
+const BAD_BOOSTS: [f32; 5] = [-1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+fn rust_term(boost: f32) -> Box<dyn Query> {
+    Box::new(TermQuery::new("title", "rust").with_boost(boost))
+}
+
+/// Issue #1550: a DSL boost too large for an `f32` (forty `1`s parse to
+/// infinity) is rejected on every clause type that takes one, also for a
+/// term the index does not hold and under a filter that matches nothing,
+/// where the search returns before it runs; `^0` and `^2` still search.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dsl_boost_too_large_for_an_f32_is_rejected() {
+    let engine = engine().await;
+    let big = "1".repeat(40);
+    let expected = "query boost must be finite and at least 0, got inf";
+    let nothing = || Box::new(TermQuery::new("title", "nosuchterm")) as Box<dyn Query>;
+    // Every request that is not rejected as expected, so a failure lists all
+    // of them rather than the first.
+    let mut wrong = Vec::new();
+    for dsl in [
+        format!("title:rust^{big}"),
+        format!("title:\"rust\"^{big}"),
+        format!("(title:rust title:java)^{big}"),
+        format!("title:rusk~1^{big}"),
+        format!("title:rus*^{big}"),
+        format!("title:nosuchterm^{big}"),
+    ] {
+        for (shape, builder) in [
+            ("plain", SearchRequestBuilder::new().query_dsl(dsl.clone())),
+            (
+                "under a filter that matches nothing",
+                SearchRequestBuilder::new()
+                    .query_dsl(dsl.clone())
+                    .filter_query(nothing()),
+            ),
+        ] {
+            let result = engine.search(builder.build()).await;
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(expected)) {
+                wrong.push(format!("{shape} {dsl}: {:?}", result.map(|r| r.len())));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    for dsl in ["title:rust^0", "title:rust^2"] {
+        let results = engine
+            .search(SearchRequestBuilder::new().query_dsl(dsl).build())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "{dsl}");
+    }
+}
+
+/// Issue #1550: `Engine::search` rejects a query object whose boost is out
+/// of range, on a leaf, a `Filter` or `MustNot` clause (which do not score)
+/// and the `filter_query`, also next to a vector-only search.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_query_object_boost_is_rejected() {
+    let engine = engine().await;
+    let lexical = |query: Box<dyn Query>| {
+        SearchRequestBuilder::new().lexical_query(LexicalSearchQuery::Obj(query))
+    };
+    let mut wrong = Vec::new();
+    for boost in BAD_BOOSTS {
+        let expected = format!("query boost must be finite and at least 0, got {boost}");
+        for (shape, builder) in [
+            ("leaf", lexical(rust_term(boost))),
+            (
+                "filter clause",
+                lexical(Box::new(
+                    BooleanQueryBuilder::new()
+                        .must(rust_term(1.0))
+                        .filter(rust_term(boost))
+                        .build(),
+                )),
+            ),
+            (
+                "must_not clause",
+                lexical(Box::new(
+                    BooleanQueryBuilder::new()
+                        .must(rust_term(1.0))
+                        .must_not(rust_term(boost))
+                        .build(),
+                )),
+            ),
+            (
+                "filter_query",
+                lexical(rust_term(1.0)).filter_query(rust_term(boost)),
+            ),
+            (
+                "filter_query of a vector-only search",
+                SearchRequestBuilder::new()
+                    .vector_query(vectors())
+                    .filter_query(rust_term(boost)),
+            ),
+        ] {
+            let result = engine.search(builder.build()).await;
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!("{shape} {boost}: {:?}", result.map(|r| r.len())));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Issue #1550: `Engine::search` checks the user's query with the request's
+/// field boosts multiplied in, so a query boost times a field boost too
+/// large for an `f32` is rejected, also under a filter that matches
+/// nothing. The field boosts do not apply to the filter, which does not
+/// score, so a large filter boost is not multiplied into `inf`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boost_times_a_field_boost_too_large_for_an_f32_is_rejected() {
+    let engine = engine().await;
+    let product = || {
+        SearchRequestBuilder::new()
+            .lexical_query(LexicalSearchQuery::Obj(rust_term(1e30)))
+            .add_field_boost("title", 1e30)
+    };
+    let nothing = Box::new(TermQuery::new("title", "nosuchterm")) as Box<dyn Query>;
+    let mut wrong = Vec::new();
+    for (shape, builder) in [
+        ("plain", product()),
+        (
+            "under a filter that matches nothing",
+            product().filter_query(nothing),
+        ),
+    ] {
+        let result = engine.search(builder.build()).await;
+        if !matches!(&result, Err(LaurusError::InvalidArgument(m))
+            if m.contains("query boost must be finite and at least 0, got inf"))
+        {
+            wrong.push(format!("{shape}: {:?}", result.map(|r| r.len())));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let filtered = engine
+        .search(
+            SearchRequestBuilder::new()
+                .lexical_query(LexicalSearchQuery::Obj(rust_term(1.0)))
+                .filter_query(rust_term(1e30))
+                .add_field_boost("title", 1e30)
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+}
+
+/// Issue #1550: a `CombinedFields` query's weight of `0`, which its scorer
+/// rejects, is rejected whatever the data, also under a filter that matches
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_combined_fields_weight_is_rejected_whatever_the_data() {
+    let engine = engine().await;
+    let combined = || {
+        Box::new(
+            MultiFieldQuery::new("rust".to_string())
+                .query_type(MultiFieldQueryType::CombinedFields)
+                .add_field("title".to_string(), 0.0),
+        ) as Box<dyn Query>
+    };
+    let nothing = Box::new(TermQuery::new("title", "nosuchterm")) as Box<dyn Query>;
+    let mut wrong = Vec::new();
+    for (shape, builder) in [
+        (
+            "plain",
+            SearchRequestBuilder::new().lexical_query(LexicalSearchQuery::Obj(combined())),
+        ),
+        (
+            "under a filter that matches nothing",
+            SearchRequestBuilder::new()
+                .lexical_query(LexicalSearchQuery::Obj(combined()))
+                .filter_query(nothing),
+        ),
+    ] {
+        let result = engine.search(builder.build()).await;
+        if !matches!(&result, Err(LaurusError::InvalidArgument(m))
+            if m.contains("CombinedFields boost for field \"title\" must be finite and greater than 0"))
+        {
+            wrong.push(format!("{shape}: {:?}", result.map(|r| r.len())));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An engine over a `title` text field holding one document per title,
+/// each committed on its own, so that a search runs the per-segment fanout.
+async fn engine_with_titles(titles: &[&str]) -> Engine {
+    let schema = Schema::builder()
+        .add_text_field("title", TextOption::default())
+        .build();
+    let engine = Engine::new(Arc::new(MemoryStorage::new(Default::default())), schema)
+        .await
+        .unwrap();
+    for (i, title) in titles.iter().enumerate() {
+        engine
+            .put_document(
+                &format!("d{i}"),
+                Document::builder().add_text("title", *title).build(),
+            )
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+    }
+    engine
+}
+
+/// The hits of `dsl`, as `(id, score)` in id order.
+async fn scores(engine: &Engine, dsl: &str, parallel: bool) -> Vec<(String, f32)> {
+    let mut hits: Vec<(String, f32)> = engine
+        .search(
+            SearchRequestBuilder::new()
+                .query_dsl(dsl)
+                .lexical_parallel(parallel)
+                .build(),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.id, r.score))
+        .collect();
+    hits.sort_by(|a, b| a.0.cmp(&b.0));
+    hits
+}
+
+/// Issue #1550: the DSL boost of a fuzzy or wildcard term used to be
+/// dropped; `^5` now multiplies every hit's score by 5, whether the term
+/// expands to one word or to several (scored by Block-Max WAND), serially
+/// and in parallel.
+#[tokio::test(flavor = "multi_thread")]
+async fn fuzzy_and_wildcard_boosts_apply() {
+    let engine = engine_with_titles(&["rust", "rush"]).await;
+    let mut wrong = Vec::new();
+    for (dsl, words) in [
+        ("title:rustt~1", 1),
+        ("title:rusx~1", 2),
+        ("title:rust*", 1),
+        ("title:rus*", 2),
+    ] {
+        for parallel in [false, true] {
+            let plain = scores(&engine, dsl, parallel).await;
+            let boosted = scores(&engine, &format!("{dsl}^5"), parallel).await;
+            let close = |a: f32, b: f32| (a - b).abs() <= 1e-5 * b.abs().max(f32::MIN_POSITIVE);
+            let as_expected = plain.len() == words
+                && boosted.len() == words
+                && plain
+                    .iter()
+                    .zip(&boosted)
+                    .all(|((id, s), (boosted_id, b))| id == boosted_id && close(*b, 5.0 * s));
+            if !as_expected {
+                wrong.push(format!(
+                    "{dsl} parallel={parallel}: {plain:?} and ^5 {boosted:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

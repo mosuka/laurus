@@ -1327,6 +1327,11 @@ impl InvertedIndexSearcher {
             LexicalSearchQuery::Obj(q) => q.clone_box(),
         };
 
+        // Issue #1550: reject a boost that is not finite or is negative
+        // before anything returns early (an empty query below), so the
+        // outcome does not depend on the data.
+        query.validate_boosts()?;
+
         // Check if query is empty
         if query.is_empty(self.reader.as_ref())? {
             return Ok(LexicalSearchResults {
@@ -1458,6 +1463,11 @@ impl InvertedIndexSearcher {
                 _ => unreachable!(),
             }
         };
+
+        // Issue #1550: reject a boost that is not finite or is negative
+        // before an empty query or the shortcuts below return: every query
+        // but those shortcuts is scored to be counted.
+        query.validate_boosts()?;
 
         // Check if query is empty
         if query.is_empty(self.reader.as_ref())? {

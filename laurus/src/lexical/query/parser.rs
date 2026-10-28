@@ -743,8 +743,7 @@ impl LexicalQueryParser {
     /// synonyms as above, and the others are one `PhraseQuery` when there
     /// is one of them and a `GraphPhraseQuery` otherwise, which matches
     /// them all without listing them (#1271); the query is a `Should` of
-    /// these. The boost goes on each clause, since the Block-Max-WAND fast
-    /// path ignores a `BooleanQuery`'s own boost.
+    /// these, each carrying the boost.
     fn parse_phrase_query(
         &self,
         pair: pest::iterators::Pair<Rule>,
@@ -784,8 +783,7 @@ impl LexicalQueryParser {
             }
 
             let slop = slop.unwrap_or(0);
-            // The boost goes on each clause here, since the Block-Max-WAND
-            // fast path ignores a `BooleanQuery`'s own boost.
+            // The boost goes on each clause here.
             let one_position =
                 |alternatives: Vec<String>| one_position_query(field_name, alternatives, boost);
             let phrase = |positions: Vec<Vec<String>>| -> Box<dyn Query> {
@@ -847,6 +845,7 @@ impl LexicalQueryParser {
     ) -> Result<Box<dyn Query>> {
         let mut term = String::new();
         let mut fuzziness: u8 = 2; // Default fuzziness
+        let mut boost = 1.0;
 
         for inner_pair in pair.into_inner() {
             match inner_pair.as_rule() {
@@ -859,6 +858,11 @@ impl LexicalQueryParser {
                             fuzziness = fuzz_pair.as_str().parse().unwrap_or(2);
                         }
                     }
+                }
+                // The grammar always accepted `term~2^5`; the boost used to
+                // be dropped here (Issue #1550).
+                Rule::boost => {
+                    boost = self.parse_boost(inner_pair)?;
                 }
                 _ => {}
             }
@@ -877,7 +881,9 @@ impl LexicalQueryParser {
             };
 
             Ok(Box::new(
-                FuzzyQuery::new(field_name, normalized_term).max_edits(fuzziness as u32),
+                FuzzyQuery::new(field_name, normalized_term)
+                    .max_edits(fuzziness as u32)
+                    .with_boost(boost),
             ))
         })
     }
@@ -888,15 +894,26 @@ impl LexicalQueryParser {
         field: Option<&str>,
     ) -> Result<Box<dyn Query>> {
         let mut pattern = String::new();
+        let mut boost = 1.0;
 
         for inner_pair in pair.into_inner() {
-            if inner_pair.as_rule() == Rule::wildcard_pattern {
-                pattern = inner_pair.as_str().to_string();
+            match inner_pair.as_rule() {
+                Rule::wildcard_pattern => {
+                    pattern = inner_pair.as_str().to_string();
+                }
+                // The grammar always accepted `wild*^5`; the boost used to
+                // be dropped here (Issue #1550).
+                Rule::boost => {
+                    boost = self.parse_boost(inner_pair)?;
+                }
+                _ => {}
             }
         }
 
         self.create_query_over_fields(field, |field_name| {
-            Ok(Box::new(WildcardQuery::new(field_name, &pattern)?))
+            Ok(Box::new(
+                WildcardQuery::new(field_name, &pattern)?.with_boost(boost),
+            ))
         })
     }
 
@@ -2024,8 +2041,7 @@ mod tests {
         assert_eq!(should_clauses(query.as_ref()), vec![term("dog", 1.0)]);
     }
 
-    /// The BMW fast path ignores a BooleanQuery's own boost, so the boost
-    /// must sit on the clause itself; slop has nothing to apply to.
+    /// The boost sits on each clause itself; slop has nothing to apply to.
     #[test]
     fn stacked_alternatives_carry_the_boost_on_each_clause() {
         let query = synonym_parser().parse("\"big\"~3^2").unwrap();

@@ -12,7 +12,7 @@ use crate::lexical::query::matcher::{
     PreComputedMatcher,
 };
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
-use crate::lexical::query::{HighlightTerm, Query};
+use crate::lexical::query::{HighlightTerm, Query, check_query_boost};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// Occurrence requirements for boolean clauses.
@@ -536,6 +536,15 @@ impl Query for BooleanQuery {
         for clause in &self.clauses {
             clause.query.collect_positional_field_refs(out);
         }
+    }
+
+    /// Check this query's own boost and every clause's, including `MustNot`
+    /// and `Filter` clauses, whose boosts have no effect (Issue #1550).
+    fn validate_boosts(&self) -> Result<()> {
+        check_query_boost(self.boost, || self.description())?;
+        self.clauses
+            .iter()
+            .try_for_each(|clause| clause.query.validate_boosts())
     }
 
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
