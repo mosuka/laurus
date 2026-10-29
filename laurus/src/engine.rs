@@ -4045,6 +4045,13 @@ impl Engine {
     /// The `min_score` is checked even when the request has no vector part.
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if a query vector has a `NaN` or infinite
+    /// [component](crate::vector::store::request::QueryVector::vector)
+    /// (Issue #1573): one the request gives is checked with the weights,
+    /// and one the embedder returns for a payload or a DSL vector clause
+    /// as soon as it is embedded.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the rescore options are invalid: a window outside
     /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
     /// multi-vector field, query vectors of the wrong dimension or count, or
@@ -4095,14 +4102,16 @@ impl Engine {
         // the request's vector part, which are also checked before anything
         // is embedded and before a filter that matches nothing returns early.
         // A DSL clause's weight is checked by the vector parser, before it
-        // embeds the clauses.
+        // embeds the clauses. Issue #1573: this call also checks the
+        // components of the request's query vectors; a vector the embedder
+        // returns is checked as it is embedded (`embed_batch_with_cache`).
         vector_options.validate_min_score()?;
         match &request_query {
             self::search::SearchQuery::Vector(vector)
             | self::search::SearchQuery::Hybrid { vector, .. }
             | self::search::SearchQuery::DslWithVectors {
                 vectors: vector, ..
-            } => vector.validate_weights()?,
+            } => vector.validate()?,
             self::search::SearchQuery::Dsl(_) | self::search::SearchQuery::Lexical(_) => {}
         }
         if let Some(group_by) = &request_group_by {

@@ -366,7 +366,8 @@ async fn search_answers_400_for_a_value_of_the_wrong_type() {
 /// search endpoint; so are weights of 0 and 0, a boost sent without a
 /// `query`, a DSL `^` boost too large for an `f32` (Issue #1550), and a
 /// query vector weight that is negative or too large for an `f32`, in
-/// `query_vectors` or in a DSL vector clause (Issue #1552). The boundaries
+/// `query_vectors` or in a DSL vector clause (Issue #1552), and a query
+/// vector component too large for an `f32` (Issue #1573). The boundaries
 /// still search.
 #[tokio::test]
 async fn search_answers_400_for_a_number_out_of_range() {
@@ -442,6 +443,18 @@ async fn search_answers_400_for_a_number_out_of_range() {
             json!({"query": format!("vec:x^{}", "1".repeat(40))}),
             "query vector weight must be finite and at least 0, got inf".to_string(),
         ),
+        // Issue #1573: a query vector component too large for an `f32`,
+        // which becomes infinite, alone or next to a lexical query.
+        (
+            json!({"query_vectors": [{"vector": [1e39, 0.0]}]}),
+            "query vector components must be finite, got inf at component 0: query vector 0"
+                .to_string(),
+        ),
+        (
+            json!({"query": "body:rust", "query_vectors": [{"vector": [1.0, -1e39]}]}),
+            "query vector components must be finite, got -inf at component 1: query vector 0"
+                .to_string(),
+        ),
     ];
     // Every request that is not rejected as expected, so a failure lists all
     // of them rather than the first.
@@ -478,6 +491,10 @@ async fn search_answers_400_for_a_number_out_of_range() {
     let search = json!({"query_vectors": [{"vector": [1.0, 0.0], "weight": 0}]});
     let (status, body) = send(&router, "POST", "/v1/search", search).await;
     assert_eq!(status, StatusCode::OK, "weight 0: {body}");
+    // Issue #1573: a component that fits in an `f32` searches.
+    let search = json!({"query_vectors": [{"vector": [3.4e38, 0.0]}]});
+    let (status, body) = send(&router, "POST", "/v1/search", search).await;
+    assert_eq!(status, StatusCode::OK, "component 3.4e38: {body}");
 }
 
 /// The case in #1476 and in the Issue: `sort_by.order` is matched

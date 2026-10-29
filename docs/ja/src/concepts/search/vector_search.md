@@ -61,7 +61,7 @@ let request = VectorSearchRequestBuilder::new()
 | メソッド | 説明 |
 | :--- | :--- |
 | `add_text(field, text)` | 特定のフィールドに対するテキストクエリを追加（検索時にエンベディング） |
-| `add_vector(field, vector)` | 特定のフィールドに対する事前計算済みクエリベクトルを追加 |
+| `add_vector(field, vector)` | 特定のフィールドに対する事前計算済みクエリベクトルを追加（成分はすべて有限。表の後の説明を参照） |
 | `add_vector_with_weight(field, vector, weight)` | 明示的なウェイトを持つ事前計算済みベクトルを追加（ウェイトは有限で `0` 以上。[ウェイト](#ウェイト)を参照） |
 | `add_payload(field, payload)` | エンベディング対象の汎用 `DataValue` ペイロードを追加 |
 | `add_bytes(field, bytes, mime)` | バイナリペイロードを追加（例: マルチモーダル用の画像バイト） |
@@ -72,6 +72,16 @@ let request = VectorSearchRequestBuilder::new()
 | `min_score(f32)` | 最小類似度閾値（デフォルト: 0.0）。有限でなければならない（[ウェイト](#ウェイト)を参照） |
 | `overfetch(f32)` | オーバーフェッチ係数（デフォルト: 2.0、#675）。各クエリは `ceil(limit × overfetch)` 件の候補を取得し、融合後に `limit` へ切り詰める。`<= 1.0` で無効化 |
 | `build()` | `VectorSearchRequest` を構築 |
+
+クエリベクトルの成分は、文書のベクトルと同じく、すべて有限でなければ
+なりません。`NaN` や無限大の成分があると、データによらず、フィルタが何も
+一致しない場合も、検索は `InvalidArgument`（HTTP 400、gRPC の
+`INVALID_ARGUMENT`）で失敗します（Issue #1573）。以前はそのまま検索し、
+距離メトリクスによって、結果が 0 件になるか、すべての文書がスコア `0` に
+なるか、スコアが大きくなっていました。`QueryPayload` や DSL の句に対して
+エンベダーが返したベクトルも、埋め込んだ時点で同じように検査します。HTTP
+では、32 ビットの浮動小数点数に収まらない数は無限大になるので、これも
+拒否されます。
 
 ## マルチフィールド Vector 検索
 

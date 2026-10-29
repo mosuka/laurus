@@ -251,6 +251,6 @@ OS page cache に pre-fault します。HNSW グラフと IVF の centroid は�
 | `RRF { k: f64 }` | Reciprocal Rank Fusion -- ランクベースの結合。スコア = sum(1 / (k + rank))（`rank` は 1 始まり）。比較不可能なスコアの大きさを処理します。`k` は有限で 0 以上でなければなりません。 |
 | `WeightedSum { lexical_weight, vector_weight }` | min-maxスコア正規化を用いた加重結合。各重みは [0.0, 1.0] の範囲で、少なくとも一方が 0 より大きくなければなりません。 |
 
-`Engine::search` は、これらの範囲外のブースト、lexical の `min_score`、Fusion のパラメータを、要求がそれを使わない場合でも `InvalidArgument` で拒否します（Issue #1540）。以前は重みを [0.0, 1.0] にクランプしていました。クエリ自体やその中のクエリのブースト（リクエストの field boost を掛けた後の値）が、有限でないか負である場合も、データによらず、フィルタが何も一致しない場合も拒否します（Issue #1550。[ブースト](../concepts/query_dsl.md#ブースト)を参照）。同じく、クエリベクトル、ペイロード、DSL のベクトルの句（`^`）の重みが有限でないか負である場合と、vector の `min_score` が有限でない場合も、データによらず、クエリのベクトルを埋め込む前に拒否します（Issue #1552。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照）。
+`Engine::search` は、これらの範囲外のブースト、lexical の `min_score`、Fusion のパラメータを、要求がそれを使わない場合でも `InvalidArgument` で拒否します（Issue #1540）。以前は重みを [0.0, 1.0] にクランプしていました。クエリ自体やその中のクエリのブースト（リクエストの field boost を掛けた後の値）が、有限でないか負である場合も、データによらず、フィルタが何も一致しない場合も拒否します（Issue #1550。[ブースト](../concepts/query_dsl.md#ブースト)を参照）。同じく、クエリベクトル、ペイロード、DSL のベクトルの句（`^`）の重みが有限でないか負である場合と、vector の `min_score` が有限でない場合も、データによらず、クエリのベクトルを埋め込む前に拒否します（Issue #1552。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照）。`NaN` や無限大の成分を持つクエリベクトルもデータによらず拒否し、ペイロードや DSL のベクトルの句に対してエンベダーがそのようなベクトルを返した場合も、埋め込んだ時点で拒否します（Issue #1573。[VectorSearchRequestBuilder](../concepts/search/vector_search.md#vectorsearchrequestbuilder)を参照）。
 
 関連項目: [アーキテクチャ](../architecture.md) -- 高レベルのデータフロー図

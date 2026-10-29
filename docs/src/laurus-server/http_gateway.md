@@ -437,7 +437,10 @@ rejected with `400 Bad Request` instead of being dropped. A `weight` that
 is negative, or too large for a 32-bit float, is rejected with `400`
 instead of inverting the ranking or giving `null` scores (Issue #1552).
 `0`, and any weight that becomes zero as a 32-bit float (such as `-0` or
-`-1e-50`), means the default, `1.0`, as over gRPC.
+`-1e-50`), means the default, `1.0`, as over gRPC. A `vector` component too
+large for a 32-bit float, which would become infinite, is rejected with
+`400`, whatever the data, instead of returning no results, every document
+at a score of `0`, or inflated scores (Issue #1573).
 
 `fusion` takes exactly one of `rrf` (`{"k": 60}`) and `weighted_sum`
 (`{"lexical_weight": 0.5, "vector_weight": 0.5}`), each an object whose

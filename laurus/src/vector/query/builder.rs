@@ -45,7 +45,9 @@ impl VectorSearchRequestBuilder {
         }
     }
 
-    /// Add a raw query vector for a specific field.
+    /// Add a raw query vector for a specific field. Every component must be
+    /// finite (see
+    /// [`QueryVector::vector`](crate::vector::store::request::QueryVector::vector)).
     pub fn add_vector(mut self, field: impl Into<String>, vector: Vec<f32>) -> Self {
         self.query_vectors.push(QueryVector {
             vector: Vector::new(vector),
@@ -57,7 +59,9 @@ impl VectorSearchRequestBuilder {
 
     /// Add a raw query vector with explicit weight for a specific field. The
     /// weight must be finite and at least `0` (see
-    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)).
+    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)),
+    /// and every component of the vector finite (see
+    /// [`QueryVector::vector`](crate::vector::store::request::QueryVector::vector)).
     pub fn add_vector_with_weight(
         mut self,
         field: impl Into<String>,

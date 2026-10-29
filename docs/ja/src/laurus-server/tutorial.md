@@ -486,7 +486,7 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
-`precomputed` エンベッダーではベクトルを直接渡す必要があります（`query_vectors` の `vector` は数値の配列）が、`candle_bert` のようなテキスト対応エンベッダーを使うと、インデックス時も検索時もテキストを直接渡せます。
+`precomputed` エンベッダーではベクトルを直接渡す必要があります（`query_vectors` の `vector` は数値の配列で、各成分は 32 ビットの浮動小数点数に収まる値）が、`candle_bert` のようなテキスト対応エンベッダーを使うと、インデックス時も検索時もテキストを直接渡せます。
 
 ### OpenAI Embeddings の利用
 

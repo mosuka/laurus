@@ -62,9 +62,19 @@ The vector search query is specified as a `VectorSearchQuery` enum:
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `vector` | `Vector` | Pre-computed dense vector embedding |
+| `vector` | `Vector` | Pre-computed dense vector embedding; every component finite |
 | `weight` | `f32` | Score weight (default: 1.0); finite and at least `0` (see [Weights](#weights)) |
 | `fields` | `Option<Vec<String>>` | Optional field restriction |
+
+Every component of a query vector must be finite, as for a document's
+vector. A `NaN` or infinite component makes the search fail with
+`InvalidArgument` (HTTP 400, gRPC `INVALID_ARGUMENT`), whatever the data,
+also when a filter matches nothing (Issue #1573). Such a query used to
+search and, depending on the distance metric, return no results, every
+document at a score of `0`, or inflated scores. A vector the embedder
+returns for a `QueryPayload` or a DSL clause is checked the same way as
+soon as it is embedded. Over HTTP, a number too large for a 32-bit float
+becomes infinite, so it is rejected too.
 
 ### Examples
 

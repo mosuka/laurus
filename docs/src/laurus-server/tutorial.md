@@ -480,7 +480,7 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
-With the `precomputed` embedder you must pass raw vectors (in `query_vectors`, whose `vector` must be an array of numbers), but text-capable embedders like `candle_bert` accept text directly for both indexing and searching.
+With the `precomputed` embedder you must pass raw vectors (in `query_vectors`, whose `vector` must be an array of numbers, each within the range of a 32-bit float), but text-capable embedders like `candle_bert` accept text directly for both indexing and searching.
 
 ### Using OpenAI Embeddings
 

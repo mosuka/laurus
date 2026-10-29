@@ -113,6 +113,10 @@ impl VectorQueryParser {
     /// too large for an `f32` (Issue #1552; see
     /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)),
     /// before any clause is embedded.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when the embedder returns a
+    /// vector with a `NaN` or infinite component for a clause (Issue #1573;
+    /// see [`QueryVector::vector`](crate::vector::store::request::QueryVector::vector)).
     pub async fn parse(&self, query_str: &str) -> Result<VectorSearchRequest> {
         let pairs = VectorQueryStringParser::parse(Rule::query, query_str).map_err(|e| {
             LaurusError::invalid_argument(format!("Failed to parse vector query: {}", e))

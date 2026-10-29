@@ -468,7 +468,7 @@ $bq->mustNot($query);
 new \Laurus\VectorQuery(string $field, array $vector)
 ```
 
-事前計算済みエンベディングベクトルを使った近似最近傍検索を行います。`$vector` は Float の配列です。
+事前計算済みエンベディングベクトルを使った近似最近傍検索を行います。`$vector` は Float の配列で、成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では検索が `\ValueError` を投げます（Issue #1573）。
 
 ### VectorTextQuery
 

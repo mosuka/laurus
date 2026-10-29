@@ -211,3 +211,26 @@ async fn test_out_of_range_query_vector_weights_are_invalid_argument() {
     assert_eq!(scores(0.0).await, one, "a weight of 0 searches as 1.0");
     assert_eq!(scores(-0.0).await, one, "so does -0");
 }
+
+/// Issue #1573: a query vector with a `NaN` or infinite component is
+/// `INVALID_ARGUMENT` naming the component, instead of searching with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_non_finite_query_vector_components_are_invalid_argument() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let service = search_service(&dir).await;
+
+    let mut accepted = Vec::new();
+    for component in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut request = vector_request(v1::VectorParams::default());
+        request.query_vectors[0].vector = vec![1.0, component];
+        match service.search(Request::new(request)).await {
+            Err(status)
+                if status.code() == Code::InvalidArgument
+                    && status.message().contains(&format!(
+                        "query vector components must be finite, got {component} at component 1"
+                    )) => {}
+            other => accepted.push(format!("{component}: {other:?}")),
+        }
+    }
+    assert!(accepted.is_empty(), "{accepted:#?}");
+}
