@@ -460,6 +460,33 @@ pub enum VectorSearchQuery {
     Vectors(Vec<crate::vector::store::request::QueryVector>),
 }
 
+impl VectorSearchQuery {
+    /// Check the weight of every query vector or payload (Issue #1552; see
+    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// naming the first query vector or payload whose weight is not finite
+    /// or is negative.
+    pub(crate) fn validate_weights(&self) -> Result<()> {
+        use crate::vector::store::request::check_query_vector_weight;
+        match self {
+            Self::Vectors(vectors) => vectors.iter().enumerate().try_for_each(|(i, qv)| {
+                check_query_vector_weight(qv.weight, || match &qv.fields {
+                    Some(fields) => format!("query vector {i} (fields {fields:?})"),
+                    None => format!("query vector {i}"),
+                })
+            }),
+            Self::Payloads(payloads) => payloads.iter().try_for_each(|payload| {
+                check_query_vector_weight(payload.weight, || {
+                    format!("query payload for field {:?}", payload.field)
+                })
+            }),
+        }
+    }
+}
+
 fn default_query_limit() -> usize {
     10
 }
@@ -510,6 +537,10 @@ pub struct VectorSearchParams {
     /// `weight` and the field's `base_weight` (Issue #1084) are applied —
     /// this is a similarity floor, not a final-score floor, matching the
     /// pre-existing contract for `QueryVector.weight`.
+    ///
+    /// Must be finite: [`VectorStore::search`](crate::vector::store::VectorStore::search)
+    /// rejects `NaN` and infinities with `InvalidArgument` (Issue #1552).
+    /// Similarity is in `[0, 1]`, so a negative value is the same as `0`.
     #[serde(default)]
     pub min_score: f32,
     /// List of allowed document IDs (for internal use by Engine filtering).

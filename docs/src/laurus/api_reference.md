@@ -132,7 +132,7 @@ A collection of named field values.
 | `.highlight(fields)` | Request highlights on these stored text fields ([Highlighting](./highlighting.md)) |
 | `.highlight_config(HighlightConfig)` | Set the tag/fragment/`require_field_match` settings used for highlighting |
 | `.vector_score_mode(VectorScoreMode)` | Set score combination mode for vector search |
-| `.vector_min_score(f32)` | Set minimum score threshold for vector search |
+| `.vector_min_score(f32)` | Set minimum similarity threshold for vector search. The search fails with `InvalidArgument` if it is not finite |
 | `.vector_rerank_factor(usize)` | Set the Stage 2 rerank widening factor for vector search |
 | `.vector_ef_search(usize)` | Override the HNSW `ef_search` candidate-list size for this search |
 | `.vector_fields(Vec<FieldSelector>)` | Restrict query vectors that name no field to these fields (a query vector's own fields take precedence) |
@@ -154,6 +154,8 @@ A collection of named field values.
 | :--- | :--- |
 | `VectorSearchQuery::Payloads(Vec<QueryPayload>)` | Raw payloads (text, bytes, etc.) to be embedded at search time |
 | `VectorSearchQuery::Vectors(Vec<QueryVector>)` | Pre-embedded query vectors ready for nearest-neighbor search |
+
+The `weight` of each `QueryPayload` and `QueryVector` must be finite and at least `0` (`-0.0` is rejected); the search fails with `InvalidArgument` otherwise (Issue #1552; see [Weights](../concepts/search/vector_search.md#weights)).
 
 ### SearchResult
 

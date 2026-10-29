@@ -55,7 +55,9 @@ impl VectorSearchRequestBuilder {
         self
     }
 
-    /// Add a raw query vector with explicit weight for a specific field.
+    /// Add a raw query vector with explicit weight for a specific field. The
+    /// weight must be finite and at least `0` (see
+    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)).
     pub fn add_vector_with_weight(
         mut self,
         field: impl Into<String>,
@@ -141,7 +143,8 @@ impl VectorSearchRequestBuilder {
         self
     }
 
-    /// Set the minimum score threshold.
+    /// Set the minimum score threshold. It must be finite (see
+    /// [`VectorSearchParams::min_score`](crate::vector::search::searcher::VectorSearchParams::min_score)).
     pub fn min_score(mut self, min_score: f32) -> Self {
         self.params.min_score = min_score;
         self

@@ -134,7 +134,9 @@ message LateInteractionRescore {
 message QueryVector {
   // The query embedding.
   repeated float vector = 1;
-  // Multiplier on this vector's similarity. `0` (unset) means `1.0`.
+  // Multiplier on this vector's similarity. `0` (unset) means `1.0`, and so
+  // does `-0`. Any other negative value, or a non-finite one, is rejected
+  // with INVALID_ARGUMENT.
   float weight = 2;
   // Vector fields to search. Empty means `VectorParams.fields` if set,
   // otherwise every vector field whose dimension matches.

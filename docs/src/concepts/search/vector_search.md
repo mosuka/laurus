@@ -56,14 +56,14 @@ The vector search query is specified as a `VectorSearchQuery` enum:
 | :--- | :--- | :--- |
 | `field` | `String` | Target vector field name |
 | `payload` | `DataValue` | The payload to embed (e.g., `DataValue::Text(...)`) |
-| `weight` | `f32` | Score weight (default: 1.0) |
+| `weight` | `f32` | Score weight (default: 1.0); finite and at least `0` (see [Weights](#weights)) |
 
 ### QueryVector
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `vector` | `Vector` | Pre-computed dense vector embedding |
-| `weight` | `f32` | Score weight (default: 1.0) |
+| `weight` | `f32` | Score weight (default: 1.0); finite and at least `0` (see [Weights](#weights)) |
 | `fields` | `Option<Vec<String>>` | Optional field restriction |
 
 ### Examples
@@ -196,6 +196,26 @@ text_vec:"cute kitten"^1.0 image_vec:"fluffy cat"^0.5
 ```
 
 This means text similarity counts twice as much as image similarity.
+
+A weight must be finite and at least `0` (`-0.0` is rejected); any other
+weight makes the search fail with `InvalidArgument` (HTTP 400, gRPC
+`INVALID_ARGUMENT`), whatever the data, also when a filter matches nothing
+(Issue #1552). A weight of `0` gives the vector's hits a score of `0`; in a
+hybrid search they still take part in fusion: RRF ranks them, and
+`WeightedSum` normalizes a list whose scores are all equal to `1.0`. A
+negative weight cannot push results away from a vector: each query
+vector's candidates are its nearest neighbors, so it would only reverse
+their order. In the DSL, a `^` too large for a 32-bit float is rejected
+before any clause is embedded. Over gRPC and HTTP a weight of `0` or `-0`
+means unset, so it searches with `1.0`; proto3 cannot tell them apart, and
+the HTTP gateway turns a negative number too small for a 32-bit float into
+`-0`. A very large finite weight, multiplied by a field's `base_weight` or
+summed over several query vectors, can still overflow a score to `null`;
+there is no upper bound.
+
+The vector `min_score` is compared with the similarity before any weight
+is applied. Similarity is in `[0, 1]`, so a negative `min_score` is the same
+as `0`; a `min_score` that is not finite is rejected with `InvalidArgument`.
 
 A vector field's schema-level `base_weight` (Issue #1084) works the same
 way but is a per-field default rather than a per-query override: it is

@@ -132,7 +132,7 @@ cargo doc --open
 | `.highlight(fields)` | これらの保存済みテキストフィールドに対するハイライトを要求（[ハイライト](./highlighting.md)） |
 | `.highlight_config(HighlightConfig)` | ハイライトに使うタグ・フラグメント・`require_field_match` の設定を指定 |
 | `.vector_score_mode(VectorScoreMode)` | Vector検索のスコア結合モードを設定 |
-| `.vector_min_score(f32)` | Vector検索の最小スコアしきい値 |
+| `.vector_min_score(f32)` | Vector検索の最小類似度しきい値。有限でなければ、検索は `InvalidArgument` で失敗する |
 | `.vector_rerank_factor(usize)` | Vector検索の Stage 2 rerank の widening 係数を設定 |
 | `.vector_ef_search(usize)` | この検索での HNSW の `ef_search` 候補リストサイズを上書き |
 | `.vector_fields(Vec<FieldSelector>)` | フィールドを指定していないクエリベクトルの検索対象をこれらのフィールドに絞る（クエリベクトル自身のフィールド指定が優先） |
@@ -151,9 +151,11 @@ cargo doc --open
 | `.add_bytes(field, bytes, mime)` | バイナリペイロードを追加（マルチモーダル用） |
 | `.limit(n)` | 最大結果数 |
 | `.score_mode(VectorScoreMode)` | スコア結合モード（WeightedSum、MaxSim） |
-| `.min_score(f32)` | 最小スコアしきい値 |
+| `.min_score(f32)` | 最小類似度しきい値。有限でなければ、検索は `InvalidArgument` で失敗する |
 | `.field(name)` | 検索を特定のフィールドに制限 |
 | `.build()` | リクエストを構築 |
+
+`QueryPayload` と `QueryVector` の `weight` は、有限で `0` 以上でなければなりません（`-0.0` は拒否されます）。それ以外の値では、検索は `InvalidArgument` で失敗します（Issue #1552。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照）。
 
 ### SearchResult
 

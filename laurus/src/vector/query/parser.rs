@@ -14,7 +14,7 @@ use crate::data::DataValue;
 use crate::embedding::embedder::{EmbedInput, Embedder};
 use crate::error::{LaurusError, Result};
 use crate::vector::store::request::{
-    QueryPayload, QueryVector, VectorSearchQuery, VectorSearchRequest,
+    QueryPayload, QueryVector, VectorSearchQuery, VectorSearchRequest, check_query_vector_weight,
 };
 
 /// Pest grammar parser for vector query DSL.
@@ -108,6 +108,11 @@ impl VectorQueryParser {
     /// Returns [`LaurusError::InvalidArgument`] when the string does not
     /// parse, when a clause has no field and no default field is set, or when
     /// a clause uses the removed `~` marker (`content:~"cute kitten"`).
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when a clause's `^` weight is
+    /// too large for an `f32` (Issue #1552; see
+    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)),
+    /// before any clause is embedded.
     pub async fn parse(&self, query_str: &str) -> Result<VectorSearchRequest> {
         let pairs = VectorQueryStringParser::parse(Rule::query, query_str).map_err(|e| {
             LaurusError::invalid_argument(format!("Failed to parse vector query: {}", e))
@@ -211,6 +216,10 @@ impl VectorQueryParser {
                             weight = b_inner.as_str().parse::<f32>().map_err(|e| {
                                 LaurusError::invalid_argument(format!("Invalid boost value: {}", e))
                             })?;
+                            // Issue #1552: a number too long for an `f32`
+                            // parses as infinity rather than failing, so check
+                            // the range here, before any clause is embedded.
+                            check_query_vector_weight(weight, || clause.to_string())?;
                         }
                     }
                 }
@@ -297,6 +306,29 @@ mod tests {
         Arc::new(MockEmbedder { dimension: 4 })
     }
 
+    /// Mock embedder that counts the inputs it embeds.
+    #[derive(Debug, Default)]
+    struct CountingEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vector::new(vec![0.0; 4]))
+        }
+        fn supported_input_types(&self) -> Vec<EmbedInputType> {
+            vec![EmbedInputType::Text]
+        }
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     /// Extract query vectors from a VectorSearchRequest, panicking if the
     /// query is not the `Vectors` variant.
     fn get_vectors(req: &VectorSearchRequest) -> &[QueryVector] {
@@ -335,6 +367,34 @@ mod tests {
         assert_eq!(qv.fields.as_ref().unwrap()[0], "content");
         assert_eq!(qv.weight, 1.0);
         assert_eq!(qv.vector.dimension(), 4);
+    }
+
+    /// Issue #1552: a `^` weight too large for an `f32` parses as infinity;
+    /// it is rejected before any clause is embedded. `^0` and `^0.8` are
+    /// accepted.
+    #[tokio::test]
+    async fn test_overflowing_boost_is_rejected_before_embedding() {
+        let embedder = Arc::new(CountingEmbedder::default());
+        let parser = VectorQueryParser::new(embedder.clone());
+        let query = format!(r#"content:"ok" content:"text"^{}"#, "1".repeat(40));
+        let err = parser.parse(&query).await.unwrap_err();
+        assert!(matches!(err, LaurusError::InvalidArgument(_)), "{err:?}");
+        assert!(
+            err.to_string().contains(
+                "query vector weight must be finite and at least 0, got inf: content:\"text\"^111"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing is embedded"
+        );
+
+        for (query, weight) in [(r#"content:"text"^0"#, 0.0), (r#"content:"text"^0.8"#, 0.8)] {
+            let request = parser.parse(query).await.unwrap();
+            assert_eq!(get_vectors(&request)[0].weight, weight, "{query}");
+        }
     }
 
     #[tokio::test]

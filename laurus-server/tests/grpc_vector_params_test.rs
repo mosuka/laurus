@@ -162,3 +162,52 @@ async fn test_unusable_vector_params_are_invalid_argument() {
         assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
     }
 }
+
+/// Issue #1552: a query vector weight that is negative or not finite is
+/// `INVALID_ARGUMENT` naming the weight, instead of inverting the ranking
+/// or giving `NaN` scores. A weight of `0` or `-0` means unset (proto3),
+/// so it searches as `1.0`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_out_of_range_query_vector_weights_are_invalid_argument() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let service = search_service(&dir).await;
+    let with_weight = |weight: f32| {
+        let mut request = vector_request(v1::VectorParams::default());
+        request.query_vectors[0].weight = weight;
+        request
+    };
+
+    let mut accepted = Vec::new();
+    for weight in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        match service.search(Request::new(with_weight(weight))).await {
+            Err(status)
+                if status.code() == Code::InvalidArgument
+                    && status
+                        .message()
+                        .contains("query vector weight must be finite and at least 0") => {}
+            other => accepted.push(format!("{weight}: {other:?}")),
+        }
+    }
+    assert!(accepted.is_empty(), "{accepted:#?}");
+
+    let scores = |weight: f32| {
+        let service = &service;
+        async move {
+            let mut scores: Vec<(String, f32)> = service
+                .search(Request::new(with_weight(weight)))
+                .await
+                .unwrap()
+                .into_inner()
+                .results
+                .into_iter()
+                .map(|r| (r.id, r.score))
+                .collect();
+            scores.sort_by(|a, b| a.0.cmp(&b.0));
+            scores
+        }
+    };
+    let one = scores(1.0).await;
+    assert_eq!(one.len(), 3, "{one:?}");
+    assert_eq!(scores(0.0).await, one, "a weight of 0 searches as 1.0");
+    assert_eq!(scores(-0.0).await, one, "so does -0");
+}

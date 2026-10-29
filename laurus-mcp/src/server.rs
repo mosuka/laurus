@@ -139,7 +139,8 @@ struct SearchParams {
     /// **Vector search** — semantic similarity on vector fields:
     /// - `content:"cute kitten"` — vector search on a specific field
     /// - `content:python` — unquoted text vector search
-    /// - `content:"cute kitten"^0.8` — with weight/boost
+    /// - `content:"cute kitten"^0.8` — with weight/boost (a weight too
+    ///   large for a 32-bit float is an error)
     ///
     /// **Hybrid search** — combine both in one query:
     /// - `title:hello content:"cute kitten"` — OR: union of lexical + vector results

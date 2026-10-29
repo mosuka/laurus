@@ -50,7 +50,9 @@ use crate::vector::search::searcher::{VectorIndexQuery, VectorIndexSearcher};
 use crate::vector::writer::{FieldVectors, VectorIndexWriter};
 
 use self::config::VectorIndexConfig;
-use self::request::{FieldSelector, QueryVector, VectorScoreMode, VectorSearchRequest};
+use self::request::{
+    FieldSelector, QueryVector, VectorScoreMode, VectorSearchRequest, check_vector_min_score,
+};
 use self::response::{VectorHit, VectorSearchResults, VectorStats};
 
 /// What [`VectorStore::rebuild_field`] does with the field's entry in the
@@ -1032,6 +1034,12 @@ impl VectorStore {
     ///
     /// Returns an error if obtaining the searcher or executing the underlying
     /// index search fails, or if the query contains unresolved payloads.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if a query vector's weight is not finite or is negative (`-0.0`
+    /// included), or if the
+    /// [`min_score`](crate::vector::search::searcher::VectorSearchParams::min_score)
+    /// is not finite (Issue #1552), whatever the index holds.
     pub fn search(&self, request: VectorSearchRequest) -> Result<VectorSearchResults> {
         self.search_impl(request, None)
     }
@@ -1157,6 +1165,11 @@ impl VectorStore {
         threshold_override: Option<usize>,
     ) -> Result<VectorSearchResults> {
         use crate::vector::search::searcher::VectorSearchQuery;
+
+        // Issue #1552: checked before anything returns early, so a direct
+        // caller gets the same answer whatever the index holds.
+        check_vector_min_score(request.params.min_score)?;
+        request.query.validate_weights()?;
 
         let query_vectors = match &request.query {
             VectorSearchQuery::Vectors(vecs) => vecs,
@@ -2067,6 +2080,65 @@ mod tests {
         assert!(!store.is_closed());
         store.close().await.unwrap();
         assert!(store.is_closed());
+    }
+
+    /// Issue #1552: `VectorStore::search` rejects a query vector weight that
+    /// is not finite or is negative, and a `min_score` that is not finite,
+    /// whatever the index holds (here nothing). A weight of `0` and a
+    /// negative `min_score` are accepted.
+    #[test]
+    fn search_rejects_an_out_of_range_weight_or_min_score() {
+        use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store =
+            VectorStore::with_index_type_config(storage, VectorIndexTypeConfig::default()).unwrap();
+        // The default index is a 128-dimensional Flat one.
+        let request = |weight: f32, min_score: f32, vectors: usize| VectorSearchRequest {
+            query: VectorSearchQuery::Vectors(
+                (0..vectors)
+                    .map(|_| QueryVector {
+                        vector: Vector::new(vec![1.0; 128]),
+                        weight,
+                        fields: None,
+                    })
+                    .collect(),
+            ),
+            params: VectorSearchParams {
+                min_score,
+                ..Default::default()
+            },
+        };
+        let rejected = |request: VectorSearchRequest, message: &str| match store.search(request) {
+            Err(LaurusError::InvalidArgument(m)) => m.contains(message),
+            _ => false,
+        };
+
+        let accepted: Vec<f32> = [-1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .filter(|&weight| {
+                !rejected(
+                    request(weight, 0.0, 1),
+                    "query vector weight must be finite and at least 0",
+                )
+            })
+            .collect();
+        assert!(accepted.is_empty(), "weights accepted: {accepted:?}");
+        // With no query vector the search returns early; `min_score` is
+        // checked before that.
+        let accepted: Vec<f32> = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .filter(|&min_score| {
+                !rejected(
+                    request(1.0, min_score, 0),
+                    "vector min_score must be finite",
+                )
+            })
+            .collect();
+        assert!(accepted.is_empty(), "min_scores accepted: {accepted:?}");
+
+        assert!(store.search(request(0.0, 0.0, 1)).unwrap().hits.is_empty());
+        assert!(store.search(request(1.0, -1.0, 1)).unwrap().hits.is_empty());
     }
 
     /// Build a `VectorStore` (Flat, Euclidean — no normalization, so the

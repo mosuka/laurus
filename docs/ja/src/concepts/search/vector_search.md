@@ -62,14 +62,14 @@ let request = VectorSearchRequestBuilder::new()
 | :--- | :--- |
 | `add_text(field, text)` | 特定のフィールドに対するテキストクエリを追加（検索時にエンベディング） |
 | `add_vector(field, vector)` | 特定のフィールドに対する事前計算済みクエリベクトルを追加 |
-| `add_vector_with_weight(field, vector, weight)` | 明示的なウェイトを持つ事前計算済みベクトルを追加 |
+| `add_vector_with_weight(field, vector, weight)` | 明示的なウェイトを持つ事前計算済みベクトルを追加（ウェイトは有限で `0` 以上。[ウェイト](#ウェイト)を参照） |
 | `add_payload(field, payload)` | エンベディング対象の汎用 `DataValue` ペイロードを追加 |
 | `add_bytes(field, bytes, mime)` | バイナリペイロードを追加（例: マルチモーダル用の画像バイト） |
 | `field(name)` | 検索を特定のフィールドに制限 |
 | `fields(names)` | 検索を複数のフィールドに制限 |
 | `limit(n)` | 結果の最大件数（デフォルト: 10） |
 | `score_mode(VectorScoreMode)` | スコア結合モード（`WeightedSum`、`MaxSim`、`LateInteraction`） |
-| `min_score(f32)` | 最小スコア閾値（デフォルト: 0.0） |
+| `min_score(f32)` | 最小類似度閾値（デフォルト: 0.0）。有限でなければならない（[ウェイト](#ウェイト)を参照） |
 | `overfetch(f32)` | オーバーフェッチ係数（デフォルト: 2.0、#675）。各クエリは `ceil(limit × overfetch)` 件の候補を取得し、融合後に `limit` へ切り詰める。`<= 1.0` で無効化 |
 | `build()` | `VectorSearchRequest` を構築 |
 
@@ -165,6 +165,26 @@ text_vec:"cute kitten"^1.0 image_vec:"fluffy cat"^0.5
 ```
 
 これは、テキストの類似度が画像の類似度の 2 倍の重みを持つことを意味します。
+
+ウェイトは有限で `0` 以上でなければなりません（`-0.0` は拒否されます）。
+それ以外のウェイトでは、データによらず、フィルタが何も一致しない場合も、
+検索は `InvalidArgument`（HTTP 400、gRPC の `INVALID_ARGUMENT`）で失敗
+します（Issue #1552）。ウェイト `0` のベクトルの hit は、スコアが `0` に
+なります。ハイブリッド検索では、それでも融合に加わります。RRF は順位を
+付け、`WeightedSum` はスコアがすべて等しいリストを `1.0` に正規化します。
+負のウェイトで、あるベクトルから遠い結果を探すことはできません。各クエリ
+ベクトルの候補は最も近い文書なので、負のウェイトはその並びを逆にするだけ
+です。DSL では、32 ビットの浮動小数点数に収まらない `^` は、どの句も
+埋め込む前に拒否されます。gRPC と HTTP では、ウェイト `0` と `-0` は未設定
+の意味になり、`1.0` で検索します。proto3 では両者を区別できず、HTTP
+ゲートウェイは 32 ビットの浮動小数点数で表せないほど小さい負の数を `-0`
+にするためです。有限でも非常に大きいウェイトは、フィールドの
+`base_weight` を掛けたときや、複数のクエリベクトルを足したときに、
+スコアを `null` にあふれさせることがあります。上限はありません。
+
+vector の `min_score` は、ウェイトを掛ける前の類似度と比べます。類似度は
+`[0, 1]` に収まるので、負の `min_score` は `0` と同じです。有限でない
+`min_score` は `InvalidArgument` で拒否されます。
 
 vector フィールドのスキーマレベルの `base_weight`（Issue #1084）も同様に
 機能しますが、クエリ単位の上書きではなくフィールド単位のデフォルト値

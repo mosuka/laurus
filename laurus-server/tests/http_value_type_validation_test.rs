@@ -364,8 +364,10 @@ async fn search_answers_400_for_a_value_of_the_wrong_type() {
 /// Issue #1540: the requests of the issue, which used to give a `null`
 /// score, hide a hit or be clamped, are a 400 naming the value, from each
 /// search endpoint; so are weights of 0 and 0, a boost sent without a
-/// `query`, and a DSL `^` boost too large for an `f32` (Issue #1550). The
-/// boundaries still search.
+/// `query`, a DSL `^` boost too large for an `f32` (Issue #1550), and a
+/// query vector weight that is negative or too large for an `f32`, in
+/// `query_vectors` or in a DSL vector clause (Issue #1552). The boundaries
+/// still search.
 #[tokio::test]
 async fn search_answers_400_for_a_number_out_of_range() {
     let dir = tempfile::tempdir().unwrap();
@@ -424,6 +426,22 @@ async fn search_answers_400_for_a_number_out_of_range() {
             json!({"query": format!("title:rust^{}", "1".repeat(40))}),
             "query boost must be finite and at least 0, got inf".to_string(),
         ),
+        // Issue #1552: a query vector weight that is negative or too large
+        // for an `f32`, also in a DSL vector clause. The index has no
+        // embedder, so the DSL case also shows it is rejected before the
+        // clause is embedded.
+        (
+            json!({"query_vectors": [{"vector": [1.0, 0.0], "weight": -1}]}),
+            "query vector weight must be finite and at least 0, got -1".to_string(),
+        ),
+        (
+            json!({"query_vectors": [{"vector": [1.0, 0.0], "weight": 1e39}]}),
+            "query vector weight must be finite and at least 0, got inf".to_string(),
+        ),
+        (
+            json!({"query": format!("vec:x^{}", "1".repeat(40))}),
+            "query vector weight must be finite and at least 0, got inf".to_string(),
+        ),
     ];
     // Every request that is not rejected as expected, so a failure lists all
     // of them rather than the first.
@@ -456,6 +474,10 @@ async fn search_answers_400_for_a_number_out_of_range() {
         let (status, body) = send(&router, "POST", "/v1/search", search).await;
         assert_eq!(status, StatusCode::OK, "{key} {value}: {body}");
     }
+    // Issue #1552: a weight of 0 means unset (proto3), so it searches.
+    let search = json!({"query_vectors": [{"vector": [1.0, 0.0], "weight": 0}]});
+    let (status, body) = send(&router, "POST", "/v1/search", search).await;
+    assert_eq!(status, StatusCode::OK, "weight 0: {body}");
 }
 
 /// The case in #1476 and in the Issue: `sort_by.order` is matched

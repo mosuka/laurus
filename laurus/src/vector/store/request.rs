@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::data::DataValue;
+use crate::error::{LaurusError, Result};
 use crate::vector::core::vector::Vector;
 
 // Re-export high-level types from their canonical location for backward compatibility.
@@ -79,6 +80,16 @@ pub struct QueryVector {
     pub vector: Vector,
     /// Multiplicative weight applied to the similarity score produced by this
     /// vector. Defaults to `1.0`.
+    ///
+    /// Must be finite and at least `0` (`-0.0` is rejected); a search with any
+    /// other weight fails with
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// (Issue #1552). A weight of `0` gives the vector's hits a score of `0`;
+    /// in a hybrid search they still take part in fusion (RRF ranks them, and
+    /// `WeightedSum` normalizes a list whose scores are all equal to `1.0`).
+    /// A negative weight is rejected because candidates are retrieved nearest
+    /// first: it would only reverse the order of the nearest candidates,
+    /// never find far documents.
     #[serde(default = "QueryVector::default_weight")]
     pub weight: f32,
     /// Optional list of fields to restrict this query vector to.
@@ -107,7 +118,8 @@ pub struct QueryPayload {
     pub field: String,
     /// The payload to embed.
     pub payload: DataValue,
-    /// Weight for this query vector (default: 1.0).
+    /// Weight for this query vector (default: 1.0), in the range of
+    /// [`QueryVector::weight`].
     pub weight: f32,
 }
 
@@ -121,7 +133,8 @@ impl QueryPayload {
         }
     }
 
-    /// Create a new query payload with a specific weight.
+    /// Create a new query payload with a specific weight, in the range of
+    /// [`QueryVector::weight`] (checked when the search runs).
     pub fn with_weight(field: impl Into<String>, payload: DataValue, weight: f32) -> Self {
         Self {
             field: field.into(),
@@ -132,5 +145,90 @@ impl QueryPayload {
 
     fn default_weight() -> f32 {
         1.0
+    }
+}
+
+/// Check a query vector's weight (Issue #1552; see [`QueryVector::weight`]):
+/// finite and at least `0`, with `-0.0` rejected, the rule of a query boost
+/// ([`is_valid_boost`](crate::lexical::query::is_valid_boost), Issues #1540,
+/// #1550).
+///
+/// `describe` names the query vector, payload or DSL clause, and runs only
+/// when the weight is out of range.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] when the weight is not finite or
+/// is negative.
+pub(crate) fn check_query_vector_weight(
+    weight: f32,
+    describe: impl FnOnce() -> String,
+) -> Result<()> {
+    if crate::lexical::query::is_valid_boost(weight) {
+        return Ok(());
+    }
+    Err(LaurusError::invalid_argument(format!(
+        "query vector weight must be finite and at least 0, got {weight}: {}",
+        describe()
+    )))
+}
+
+/// Check a vector `min_score` (Issue #1552): finite, as the lexical one
+/// (Issue #1540). Similarity is in `[0, 1]`, so `+inf` would drop every hit,
+/// `-inf` would keep them all like any value of `0` or less, and `NaN` would
+/// drop or keep every hit depending on the search path.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] when `min_score` is `NaN` or
+/// infinite.
+pub(crate) fn check_vector_min_score(min_score: f32) -> Result<()> {
+    if min_score.is_finite() {
+        return Ok(());
+    }
+    Err(LaurusError::invalid_argument(format!(
+        "vector min_score must be finite, got {min_score}"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The values of `values` that `check` accepts, so one assertion lists
+    /// every out-of-range value that got through.
+    fn accepted(values: &[f32], check: impl Fn(f32) -> Result<()>) -> Vec<f32> {
+        values
+            .iter()
+            .copied()
+            .filter(|&value| check(value).is_ok())
+            .collect()
+    }
+
+    /// Issue #1552: a weight must be finite and at least `0`, `-0.0` rejected.
+    #[test]
+    fn query_vector_weight_range() {
+        let check = |weight| check_query_vector_weight(weight, || "test".to_string());
+        let bad = [-1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        assert_eq!(accepted(&bad, check), Vec::<f32>::new());
+        for weight in [0.0, 1.0, 2.5, 1e30] {
+            check(weight).unwrap();
+        }
+        let err = check(f32::INFINITY).unwrap_err().to_string();
+        assert!(
+            err.contains("query vector weight must be finite and at least 0, got inf: test"),
+            "{err}"
+        );
+    }
+
+    /// Issue #1552: a vector `min_score` must be finite; a negative one is
+    /// accepted (it is the same as `0`).
+    #[test]
+    fn vector_min_score_range() {
+        let bad = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        assert_eq!(accepted(&bad, check_vector_min_score), Vec::<f32>::new());
+        for min_score in [-1.0, 0.0, 0.5, 1.0] {
+            check_vector_min_score(min_score).unwrap();
+        }
     }
 }
