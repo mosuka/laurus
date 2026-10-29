@@ -444,6 +444,9 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `content:"cute kitten"^0.8` | Vector search with weight/boost |
 | `a:"cats" b:"dogs"^0.5` | Multiple vector queries |
 
+A weight (`^`) too large for a 32-bit float is an error, returned before
+any clause is embedded (Issue #1552).
+
 #### Hybrid search
 
 | Query | Description |

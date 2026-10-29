@@ -291,7 +291,7 @@ The field name must refer to a vector field defined in the schema. The parser us
 | :--- | :---: | :--- | :--- |
 | `field:` | **Yes** | Target vector field name (must be a vector field in the schema) | `content:` |
 | `"text"` or `text` | **Yes** | Text to embed (quoted or unquoted). In the unified DSL an unquoted value ends at whitespace or a parenthesis, so `(content:cats)` closes its group; quote the text to include them (Issue #1377) | `"cute kitten"`, `python` |
-| `^weight` | No | Score weight (default: 1.0) | `^0.8` |
+| `^weight` | No | Score weight (default: 1.0). A number too large for a 32-bit float is rejected with `InvalidArgument` (HTTP 400) before any clause is embedded; see [Weights](search/vector_search.md#weights) for the range (Issue #1552) | `^0.8` |
 
 Versions before 0.6.0 marked a vector clause with `~` (`content:~"cute kitten"`). The marker is no longer part of the syntax: both `VectorQueryParser` and the unified parser reject a vector clause whose value starts with an unquoted `~`, with an error that names the marker (Issue #1495). Quote text that starts with `~`: `content:"~text"`.
 

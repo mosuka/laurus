@@ -433,7 +433,11 @@ only lexical clauses becomes a hybrid search, with or without
 `lexical_params` / `field_boosts` (Issue #1366). Each entry needs a
 non-empty numeric `vector`; `weight` (a number) and `fields` (an array of
 strings) are optional, and `null` keeps their defaults. Any other shape is
-rejected with `400 Bad Request` instead of being dropped.
+rejected with `400 Bad Request` instead of being dropped. A `weight` that
+is negative, or too large for a 32-bit float, is rejected with `400`
+instead of inverting the ranking or giving `null` scores (Issue #1552).
+`0`, and any weight that becomes zero as a 32-bit float (such as `-0` or
+`-1e-50`), means the default, `1.0`, as over gRPC.
 
 `fusion` takes exactly one of `rrf` (`{"k": 60}`) and `weighted_sum`
 (`{"lexical_weight": 0.5, "vector_weight": 0.5}`), each an object whose

@@ -222,6 +222,11 @@ pub struct VectorSearchOptions {
     /// per-field similarity BEFORE `QueryVector.weight` and the field's
     /// `base_weight` (Issue #1084) are applied — a similarity floor, not a
     /// final-score floor.
+    ///
+    /// Must be finite; [`Engine::search`](crate::Engine::search) rejects
+    /// `NaN` and infinities with `InvalidArgument`, even when the request
+    /// has no vector part (Issue #1552). Similarity is in `[0, 1]`, so a
+    /// negative value is the same as `0`.
     pub min_score: f32,
 
     /// Optional Stage 2 rerank factor (Issue #481).
@@ -277,6 +282,21 @@ impl Default for VectorSearchOptions {
             fields: None,
             overfetch: crate::vector::search::searcher::DEFAULT_OVERFETCH,
         }
+    }
+}
+
+impl VectorSearchOptions {
+    /// Reject a [`min_score`](Self::min_score) that is not finite (Issue
+    /// #1552), as [`LexicalSearchOptions::validate_min_score`] does for the
+    /// lexical one: `+inf` would drop every hit, `-inf` keep them all, and
+    /// `NaN` drop or keep them all depending on the search path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] when `min_score` is `NaN` or
+    /// infinite.
+    pub(crate) fn validate_min_score(&self) -> Result<()> {
+        crate::vector::store::request::check_vector_min_score(self.min_score)
     }
 }
 
@@ -827,7 +847,8 @@ impl SearchRequestBuilder {
         self
     }
 
-    /// Set the minimum score threshold for vector search.
+    /// Set the minimum score threshold for vector search. It must be finite
+    /// (see [`VectorSearchOptions::min_score`]).
     pub fn vector_min_score(mut self, min_score: f32) -> Self {
         self.vector_options.min_score = min_score;
         self

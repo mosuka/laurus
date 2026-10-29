@@ -4035,6 +4035,16 @@ impl Engine {
     /// early.
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if the [`weight`](crate::vector::store::request::QueryVector::weight)
+    /// of a query vector or payload, or of a DSL vector clause (`^`), is not
+    /// finite or is negative (`-0.0` included), or if the vector
+    /// [`min_score`](self::search::VectorSearchOptions::min_score) is not
+    /// finite (Issue #1552). A query vector or payload is checked before
+    /// anything is embedded, and a DSL clause before the clauses are
+    /// embedded; both before a filter that matches nothing returns early.
+    /// The `min_score` is checked even when the request has no vector part.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the rescore options are invalid: a window outside
     /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
     /// multi-vector field, query vectors of the wrong dimension or count, or
@@ -4080,6 +4090,20 @@ impl Engine {
         lexical_options.validate_min_score()?;
         if let Some(fusion) = &request_fusion {
             fusion.validate()?;
+        }
+        // Issue #1552: the same for the vector `min_score` and the weights of
+        // the request's vector part, which are also checked before anything
+        // is embedded and before a filter that matches nothing returns early.
+        // A DSL clause's weight is checked by the vector parser, before it
+        // embeds the clauses.
+        vector_options.validate_min_score()?;
+        match &request_query {
+            self::search::SearchQuery::Vector(vector)
+            | self::search::SearchQuery::Hybrid { vector, .. }
+            | self::search::SearchQuery::DslWithVectors {
+                vectors: vector, ..
+            } => vector.validate_weights()?,
+            self::search::SearchQuery::Dsl(_) | self::search::SearchQuery::Lexical(_) => {}
         }
         if let Some(group_by) = &request_group_by {
             self::grouping::validate(&self.schema.read(), group_by, request_offset, request_limit)?;

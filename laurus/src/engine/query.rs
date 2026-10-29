@@ -177,6 +177,10 @@ impl UnifiedQueryParser {
     /// Returns [`LaurusError::InvalidArgument`] if a vector field clause uses
     /// the removed `~` marker (`content:~"cute kitten"`) or lexical-only
     /// syntax (proximity/fuzzy `~`, range queries).
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if a vector field clause's
+    /// `^` weight is too large for an `f32` (Issue #1552), before any vector
+    /// clause is embedded.
     pub async fn parse(&self, query_str: &str) -> Result<SearchRequest> {
         let query_str = query_str.trim();
         if query_str.is_empty() {
