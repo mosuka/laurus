@@ -140,6 +140,13 @@ impl EmbeddingCache {
 /// * `embedder` - The configured embedder.
 /// * `field` - The vector field the payload targets.
 /// * `input` - The prepared embedding input.
+///
+/// # Errors
+///
+/// Returns the embedder's error, or
+/// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+/// if it returns a vector with a `NaN` or infinite component, which a query
+/// vector must not have (Issue #1573); such a vector is not cached.
 pub async fn embed_with_cache(
     cache: Option<&Arc<EmbeddingCache>>,
     embedder: &Arc<dyn Embedder>,
@@ -164,6 +171,11 @@ pub async fn embed_with_cache(
         embedder.embed(input).await?
     };
 
+    // Issue #1573: checked before it can be cached, as in
+    // `embed_batch_with_cache`, which may share the cache.
+    crate::vector::store::request::check_query_vector_components(&vector, || {
+        format!("the embedding of a query for field {field:?}")
+    })?;
     if let (Some(cache), Some(key)) = (cache, key) {
         cache.put(key, vector.clone());
     }
@@ -201,6 +213,10 @@ pub async fn embed_with_cache(
 ///
 /// Returns an error if any underlying [`Embedder::embed_batch`] call fails, or
 /// (defensively) if an embedder returns fewer vectors than inputs.
+///
+/// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+/// if an embedder returns a vector with a `NaN` or infinite component, which
+/// a query vector must not have (Issue #1573); such a vector is not cached.
 pub async fn embed_batch_with_cache(
     cache: Option<&Arc<EmbeddingCache>>,
     embedder: &Arc<dyn Embedder>,
@@ -260,6 +276,11 @@ pub async fn embed_batch_with_cache(
         };
         let vectors = group_embedder.embed_batch(&inputs).await?;
         for (&i, vector) in idxs.iter().zip(vectors) {
+            // Issue #1573: a query vector must be finite, as a document's
+            // embedding must be; checked before it can be cached.
+            crate::vector::store::request::check_query_vector_components(&vector, || {
+                format!("the embedding of a query for field {:?}", items[i].0)
+            })?;
             if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                 cache.put(key.clone(), vector.clone());
             }
@@ -624,5 +645,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counter.embed_batch_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Embeds `"nan"` as `[NaN]` and anything else as `[1]`, counting the
+    /// `embed` and `embed_batch` calls.
+    #[derive(Debug, Default)]
+    struct NanEmbedder {
+        embed_calls: AtomicUsize,
+        embed_batch_calls: AtomicUsize,
+    }
+
+    fn nan_or_one(input: &EmbedInput<'_>) -> Vector {
+        match input {
+            EmbedInput::Text("nan") => Vector::new(vec![f32::NAN]),
+            _ => Vector::new(vec![1.0]),
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for NanEmbedder {
+        async fn embed(&self, input: &EmbedInput<'_>) -> Result<Vector> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(nan_or_one(input))
+        }
+        async fn embed_batch(&self, inputs: &[EmbedInput<'_>]) -> Result<Vec<Vector>> {
+            self.embed_batch_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(inputs.iter().map(nan_or_one).collect())
+        }
+        fn supported_input_types(&self) -> Vec<EmbedInputType> {
+            vec![EmbedInputType::Text]
+        }
+        fn name(&self) -> &str {
+            "nan"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Issue #1573: an embedding with a `NaN` component is rejected, naming
+    /// the field, and is not cached, so the next search embeds it again.
+    #[tokio::test]
+    async fn rejects_and_does_not_cache_a_non_finite_embedding() {
+        let counter = Arc::new(NanEmbedder::default());
+        let embedder: Arc<dyn Embedder> = counter.clone();
+        let cache = cache(16);
+        let items = [item("f", "fine"), item("f", "nan")];
+
+        for round in 1..=2 {
+            let err = embed_batch_with_cache(Some(&cache), &embedder, &items)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    crate::error::LaurusError::InvalidArgument(message)
+                        if message.contains(
+                            "query vector components must be finite, got NaN at component 0: \
+                             the embedding of a query for field \"f\""
+                        )
+                ),
+                "round {round}: {err:?}"
+            );
+            assert_eq!(
+                counter.embed_batch_calls.load(Ordering::SeqCst),
+                round,
+                "round {round}: the NaN embedding is not served from the cache"
+            );
+        }
+    }
+
+    /// Issue #1573: the single-input helper rejects it too and does not
+    /// cache it, so a batch sharing the cache never gets it as a hit.
+    #[tokio::test]
+    async fn rejects_and_does_not_cache_a_non_finite_single_embedding() {
+        let counter = Arc::new(NanEmbedder::default());
+        let embedder: Arc<dyn Embedder> = counter.clone();
+        let cache = cache(16);
+
+        for round in 1..=2 {
+            let err = embed_with_cache(Some(&cache), &embedder, "f", &EmbedInput::Text("nan"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    crate::error::LaurusError::InvalidArgument(message)
+                        if message.contains(
+                            "query vector components must be finite, got NaN at component 0: \
+                             the embedding of a query for field \"f\""
+                        )
+                ),
+                "round {round}: {err:?}"
+            );
+            assert_eq!(
+                counter.embed_calls.load(Ordering::SeqCst),
+                round,
+                "round {round}: the NaN embedding is not served from the cache"
+            );
+        }
+        assert!(
+            embed_batch_with_cache(Some(&cache), &embedder, &[item("f", "nan")])
+                .await
+                .is_err(),
+            "the batch helper does not find it in the shared cache"
+        );
     }
 }

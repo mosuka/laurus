@@ -132,7 +132,8 @@ message LateInteractionRescore {
 }
 
 message QueryVector {
-  // The query embedding.
+  // The query embedding. A NaN or infinite component is rejected with
+  // INVALID_ARGUMENT.
   repeated float vector = 1;
   // Multiplier on this vector's similarity. `0` (unset) means `1.0`, and so
   // does `-0`. Any other negative value, or a non-finite one, is rejected

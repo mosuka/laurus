@@ -155,7 +155,7 @@ A collection of named field values.
 | `VectorSearchQuery::Payloads(Vec<QueryPayload>)` | Raw payloads (text, bytes, etc.) to be embedded at search time |
 | `VectorSearchQuery::Vectors(Vec<QueryVector>)` | Pre-embedded query vectors ready for nearest-neighbor search |
 
-The `weight` of each `QueryPayload` and `QueryVector` must be finite and at least `0` (`-0.0` is rejected); the search fails with `InvalidArgument` otherwise (Issue #1552; see [Weights](../concepts/search/vector_search.md#weights)).
+The `weight` of each `QueryPayload` and `QueryVector` must be finite and at least `0` (`-0.0` is rejected); the search fails with `InvalidArgument` otherwise (Issue #1552; see [Weights](../concepts/search/vector_search.md#weights)). Every component of a `QueryVector`'s `vector` must be finite, and so must every component of the vector the embedder returns for a `QueryPayload`, which is checked as soon as it is embedded; the search fails with `InvalidArgument` otherwise (Issue #1573; see [QueryVector](../concepts/search/vector_search.md#queryvector)).
 
 ### SearchResult
 

@@ -495,7 +495,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `vector` | `repeated float` | クエリベクトル |
+| `vector` | `repeated float` | クエリベクトル。`NaN` や無限大の成分は、データによらず `INVALID_ARGUMENT` で拒否される（Issue #1573） |
 | `weight` | `float` | このベクトルの重み（デフォルト: 1.0。proto3 では未指定と区別できないため、`0` と `-0` も 1.0 として扱う）。それ以外の負の値と非有限値は `INVALID_ARGUMENT` で拒否される（Issue #1552） |
 | `fields` | `repeated string` | 対象のベクトルフィールド（空の場合は全フィールド） |
 

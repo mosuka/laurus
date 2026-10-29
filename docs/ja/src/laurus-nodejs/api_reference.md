@@ -40,7 +40,7 @@ class Index {
 | `flushWal()` | WAL の永続性バリアを強制する。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照。 |
 | `search(query, limit?, offset?, highlight?, rescore?, groupBy?)` | DSL 文字列で検索。`rescore` は上位の結果を late interaction で並べ替えます。[Late interaction による再採点（Rescore）](#late-interaction-による再採点rescore)を参照。`groupBy` は結果をフィールドの値でグループ化します。[検索結果のグループ化](#検索結果のグループ化)を参照。 |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | 完全一致 Term 検索。 |
-| `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。 |
+| `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。成分はすべて有限でなければならない（[VectorQuery](#vectorquery)を参照）。 |
 | `searchVectorText(field, text, limit?, offset?)` | テキストを自動埋め込みして検索。 |
 | `searchWithRequest(request)` | `SearchRequest` で検索。 |
 | `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` と `groupBy` はすべてのクエリに同一に適用されます。 |
@@ -545,7 +545,7 @@ SpanQuery.within(
 new VectorQuery(field: string, vector: number[])
 ```
 
-事前計算済み埋め込みベクトルによる最近傍検索。
+事前計算済み埋め込みベクトルによる最近傍検索。`vector` の成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では検索が `InvalidArg` エラーを投げます（Issue #1573）。
 
 ### VectorTextQuery
 

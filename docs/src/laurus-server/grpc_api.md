@@ -500,7 +500,7 @@ At least one of `query` or `query_vectors` must be provided.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `vector` | `repeated float` | Query vector |
+| `vector` | `repeated float` | Query vector. A `NaN` or infinite component is rejected with `INVALID_ARGUMENT`, whatever the data (Issue #1573) |
 | `weight` | `float` | Weight for this vector (default: 1.0; `0` and `-0` also mean 1.0, since proto3 cannot tell them from unset). Any other negative weight, or a non-finite one, is rejected with `INVALID_ARGUMENT` (Issue #1552) |
 | `fields` | `repeated string` | Target vector fields (empty = all) |
 

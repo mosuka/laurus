@@ -472,7 +472,7 @@ while `nearSpans` takes an array of `SpanQuery` objects for nested expressions
 new \Laurus\VectorQuery(string $field, array $vector)
 ```
 
-Approximate nearest-neighbor search using a pre-computed embedding vector. `$vector` is an array of floats.
+Approximate nearest-neighbor search using a pre-computed embedding vector. `$vector` is an array of floats, each finite and within the range of a 32-bit float; the search throws `\ValueError` otherwise (Issue #1573).
 
 ### VectorTextQuery
 

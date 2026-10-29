@@ -5,6 +5,9 @@
 //! Issue #1552: `Engine::search` rejects a query vector weight that is not
 //! finite or is negative, and a vector `min_score` that is not finite,
 //! whatever the data and before anything is embedded.
+//!
+//! Issue #1573: it also rejects a query vector with a `NaN` or infinite
+//! component, whether the request gives it or the embedder returns it.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -163,7 +166,8 @@ impl Embedder for CountingEmbedder {
 
 /// An engine with a text field `title` and a 2-dimensional vector field
 /// `vec`: doc1 (`rust`, `[1, 0]`) and doc2 (`go`, `[0.6, 0.8]`), committed.
-async fn weight_engine(embedder: Arc<CountingEmbedder>) -> Engine {
+/// The vectors are given, so `embedder` embeds queries only.
+async fn weight_engine(embedder: Arc<dyn Embedder>) -> Engine {
     let schema = Schema::builder()
         .add_text_field("title", TextOption::default())
         .add_field("vec", flat(2))
@@ -215,26 +219,24 @@ fn is_weight_error(result: &Result<Vec<SearchResult>>) -> bool {
     )
 }
 
-/// Builds a search request around a query vector of the given weight.
-type RequestWithWeight = Box<dyn Fn(f32) -> SearchRequest>;
+/// Builds a search request around a query vector made from a value (its
+/// weight, or one of its components).
+type RequestWith = Box<dyn Fn(f32) -> SearchRequest>;
 
-/// Issue #1552: an out-of-range weight of a `Vector`, `Hybrid` or
-/// `DslWithVectors` query is rejected even where the search returns early
-/// without searching the vectors: under a filter that matches nothing, or
-/// grouped with `limit` `0`.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_bad_query_vector_weight_is_rejected_whatever_the_data() {
-    let engine = weight_engine(Arc::new(CountingEmbedder::default())).await;
-    let with = |weight| SearchRequestBuilder::new().vector_query(weighted(weight));
-    let shapes: [(&str, RequestWithWeight); 4] = [
+/// The requests that return early without searching the vectors, each
+/// around `query(value)`: `Vector`, `Hybrid` and `DslWithVectors` under a
+/// filter that matches nothing, and `Vector` grouped with `limit` `0`.
+fn early_return_shapes(query: fn(f32) -> VectorSearchQuery) -> [(&'static str, RequestWith); 4] {
+    let with = move |value| SearchRequestBuilder::new().vector_query(query(value));
+    [
         (
             "vector, filter matches nothing",
-            Box::new(move |weight| with(weight).filter_query(nothing()).build()),
+            Box::new(move |value| with(value).filter_query(nothing()).build()),
         ),
         (
             "hybrid, filter matches nothing",
-            Box::new(move |weight| {
-                with(weight)
+            Box::new(move |value| {
+                with(value)
                     .lexical_query(LexicalSearchQuery::Obj(Box::new(TermQuery::new(
                         "title", "rust",
                     ))))
@@ -244,8 +246,8 @@ async fn a_bad_query_vector_weight_is_rejected_whatever_the_data() {
         ),
         (
             "dsl with vectors, filter matches nothing",
-            Box::new(move |weight| {
-                with(weight)
+            Box::new(move |value| {
+                with(value)
                     .query_dsl("title:rust")
                     .filter_query(nothing())
                     .build()
@@ -253,9 +255,19 @@ async fn a_bad_query_vector_weight_is_rejected_whatever_the_data() {
         ),
         (
             "vector, grouped with limit 0",
-            Box::new(move |weight| with(weight).group_by(GroupBy::new("_id")).limit(0).build()),
+            Box::new(move |value| with(value).group_by(GroupBy::new("_id")).limit(0).build()),
         ),
-    ];
+    ]
+}
+
+/// Issue #1552: an out-of-range weight of a `Vector`, `Hybrid` or
+/// `DslWithVectors` query is rejected even where the search returns early
+/// without searching the vectors: under a filter that matches nothing, or
+/// grouped with `limit` `0`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_query_vector_weight_is_rejected_whatever_the_data() {
+    let engine = weight_engine(Arc::new(CountingEmbedder::default())).await;
+    let shapes = early_return_shapes(weighted);
 
     let mut accepted = Vec::new();
     for (shape, request) in &shapes {
@@ -403,4 +415,151 @@ async fn a_zero_or_positive_weight_scales_the_scores() {
             "{id}: {score} -> {doubled}"
         );
     }
+}
+
+/// The query vector `[1, component]` on `vec`, with weight `1`.
+fn with_component(component: f32) -> VectorSearchQuery {
+    VectorSearchQuery::Vectors(vec![QueryVector {
+        vector: Vector::new(vec![1.0, component]),
+        weight: 1.0,
+        fields: Some(vec!["vec".to_string()]),
+    }])
+}
+
+/// Components that are not finite.
+const BAD_COMPONENTS: [f32; 3] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+/// Whether `result` is the `InvalidArgument` of the second component of the
+/// request's first query vector.
+fn is_component_error(result: &Result<Vec<SearchResult>>) -> bool {
+    matches!(
+        result,
+        Err(LaurusError::InvalidArgument(message))
+            if message.contains("query vector components must be finite, got ")
+                && message.contains(" at component 1: query vector 0")
+    )
+}
+
+/// Issue #1573: a query vector with a `NaN` or infinite component is
+/// rejected in every shape of request: where the search returns early
+/// without searching the vectors, and where there is data to search. A
+/// finite component, however large, is not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_finite_query_vector_component_is_rejected_whatever_the_data() {
+    let engine = weight_engine(Arc::new(CountingEmbedder::default())).await;
+    let with = |component| SearchRequestBuilder::new().vector_query(with_component(component));
+    let vector: RequestWith = Box::new(move |component| with(component).build());
+    let hybrid: RequestWith = Box::new(move |component| {
+        with(component)
+            .lexical_query(LexicalSearchQuery::Obj(Box::new(TermQuery::new(
+                "title", "rust",
+            ))))
+            .build()
+    });
+    let mut shapes = Vec::from(early_return_shapes(with_component));
+    shapes.push(("vector", vector));
+    shapes.push(("hybrid", hybrid));
+
+    let mut accepted = Vec::new();
+    for (shape, request) in &shapes {
+        for component in BAD_COMPONENTS {
+            let result = engine.search(request(component)).await;
+            if !is_component_error(&result) {
+                accepted.push(format!("{shape}: {component} -> {result:?}"));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "not rejected:\n{}",
+        accepted.join("\n")
+    );
+
+    engine
+        .search(with(f32::MAX).build())
+        .await
+        .expect("a finite component is not an error");
+}
+
+/// Embeds any text as `[NaN, 0]`.
+#[derive(Debug)]
+struct NanEmbedder;
+
+#[async_trait]
+impl Embedder for NanEmbedder {
+    async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
+        Ok(Vector::new(vec![f32::NAN, 0.0]))
+    }
+    fn supported_input_types(&self) -> Vec<EmbedInputType> {
+        vec![EmbedInputType::Text]
+    }
+    fn name(&self) -> &str {
+        "nan"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Issue #1573: a query vector the embedder returns with a `NaN` component
+/// is rejected as soon as it is embedded, naming the field: a DSL vector
+/// clause, also under a filter that matches nothing (the clause is embedded
+/// while the DSL is parsed, before the filter runs), and a payload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_finite_embedded_query_vector_is_rejected() {
+    let engine = weight_engine(Arc::new(NanEmbedder)).await;
+    let payload = || {
+        VectorSearchQuery::Payloads(vec![QueryPayload::new(
+            "vec",
+            DataValue::Text("payload text".to_string()),
+        )])
+    };
+    let requests = [
+        (
+            "dsl clause",
+            SearchRequestBuilder::new()
+                .query_dsl("vec:\"dsl text\"")
+                .build(),
+        ),
+        (
+            "dsl clause, filter matches nothing",
+            SearchRequestBuilder::new()
+                .query_dsl("vec:\"dsl text\"")
+                .filter_query(nothing())
+                .build(),
+        ),
+        (
+            "dsl with a payload, filter matches nothing",
+            SearchRequestBuilder::new()
+                .vector_query(payload())
+                .query_dsl("title:rust")
+                .filter_query(nothing())
+                .build(),
+        ),
+        (
+            "payload",
+            SearchRequestBuilder::new().vector_query(payload()).build(),
+        ),
+    ];
+
+    let mut accepted = Vec::new();
+    for (shape, request) in requests {
+        let result = engine.search(request).await;
+        let rejected = matches!(
+            &result,
+            Err(LaurusError::InvalidArgument(message))
+                if message.contains(
+                    "query vector components must be finite, got NaN at component 0: \
+                     the embedding of a query for field \"vec\""
+                )
+        );
+        if !rejected {
+            accepted.push(format!("{shape} -> {result:?}"));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "not rejected:\n{}",
+        accepted.join("\n")
+    );
 }

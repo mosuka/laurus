@@ -462,21 +462,29 @@ pub enum VectorSearchQuery {
 
 impl VectorSearchQuery {
     /// Check the weight of every query vector or payload (Issue #1552; see
-    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)).
+    /// [`QueryVector::weight`](crate::vector::store::request::QueryVector::weight)),
+    /// and the components of every query vector (Issue #1573; see
+    /// [`QueryVector::vector`](crate::vector::store::request::QueryVector::vector)).
+    /// A payload has no components until it is embedded.
     ///
     /// # Errors
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// naming the first query vector or payload whose weight is not finite
-    /// or is negative.
-    pub(crate) fn validate_weights(&self) -> Result<()> {
-        use crate::vector::store::request::check_query_vector_weight;
+    /// or is negative, or the first query vector with a component that is
+    /// not finite.
+    pub(crate) fn validate(&self) -> Result<()> {
+        use crate::vector::store::request::{
+            check_query_vector_components, check_query_vector_weight,
+        };
         match self {
             Self::Vectors(vectors) => vectors.iter().enumerate().try_for_each(|(i, qv)| {
-                check_query_vector_weight(qv.weight, || match &qv.fields {
+                let describe = || match &qv.fields {
                     Some(fields) => format!("query vector {i} (fields {fields:?})"),
                     None => format!("query vector {i}"),
-                })
+                };
+                check_query_vector_weight(qv.weight, describe)?;
+                check_query_vector_components(&qv.vector, describe)
             }),
             Self::Payloads(payloads) => payloads.iter().try_for_each(|payload| {
                 check_query_vector_weight(payload.weight, || {
@@ -770,5 +778,42 @@ mod tests {
         );
         // limit == 0 stays 0 regardless of factor.
         assert_eq!(params_with_overfetch(0, 4.0).overfetch_top_k(), 0);
+    }
+
+    /// Issue #1573: `validate` checks each query vector's components and
+    /// names the one at fault; a payload has none to check.
+    #[test]
+    fn validate_names_the_query_vector_with_a_non_finite_component() {
+        use crate::data::DataValue;
+        use crate::vector::core::vector::Vector;
+        use crate::vector::store::request::{QueryPayload, QueryVector};
+
+        let query_vector = |data: Vec<f32>| QueryVector {
+            vector: Vector::new(data),
+            weight: 1.0,
+            fields: Some(vec!["vec".to_string()]),
+        };
+        let query = VectorSearchQuery::Vectors(vec![
+            query_vector(vec![1.0, 0.0]),
+            query_vector(vec![0.0, f32::NAN]),
+        ]);
+        let err = query.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "query vector components must be finite, got NaN at component 1: \
+                 query vector 1 (fields [\"vec\"])"
+            ),
+            "{err}"
+        );
+
+        VectorSearchQuery::Vectors(vec![query_vector(vec![1.0, 0.0])])
+            .validate()
+            .unwrap();
+        VectorSearchQuery::Payloads(vec![QueryPayload::new(
+            "vec",
+            DataValue::Text("text".to_string()),
+        )])
+        .validate()
+        .unwrap();
     }
 }

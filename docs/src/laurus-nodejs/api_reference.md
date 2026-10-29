@@ -40,7 +40,7 @@ class Index {
 | `flushWal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
 | `search(query, limit?, offset?, highlight?, rescore?, groupBy?)` | Search with a DSL string. `rescore` reorders the top results by late interaction; see [Late-interaction rescore](#late-interaction-rescore). `groupBy` groups the results by a field's value; see [Result grouping](#result-grouping). |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | Search with an exact term match. |
-| `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector. |
+| `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector, whose components must be finite (see [VectorQuery](#vectorquery)). |
 | `searchVectorText(field, text, limit?, offset?)` | Search with text (auto-embedded). |
 | `searchWithRequest(request)` | Search with a `SearchRequest`. |
 | `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` and `groupBy` apply identically to every query. |
@@ -552,7 +552,7 @@ Positional/proximity span queries.
 new VectorQuery(field: string, vector: number[])
 ```
 
-Nearest-neighbor search using a pre-computed embedding vector.
+Nearest-neighbor search using a pre-computed embedding vector. Every component of `vector` must be finite and within the range of a 32-bit float; the search throws an `InvalidArg` error otherwise (Issue #1573).
 
 ### VectorTextQuery
 

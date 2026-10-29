@@ -1039,7 +1039,8 @@ impl VectorStore {
     /// if a query vector's weight is not finite or is negative (`-0.0`
     /// included), or if the
     /// [`min_score`](crate::vector::search::searcher::VectorSearchParams::min_score)
-    /// is not finite (Issue #1552), whatever the index holds.
+    /// is not finite (Issue #1552), or if a query vector has a `NaN` or
+    /// infinite component (Issue #1573), whatever the index holds.
     pub fn search(&self, request: VectorSearchRequest) -> Result<VectorSearchResults> {
         self.search_impl(request, None)
     }
@@ -1166,10 +1167,10 @@ impl VectorStore {
     ) -> Result<VectorSearchResults> {
         use crate::vector::search::searcher::VectorSearchQuery;
 
-        // Issue #1552: checked before anything returns early, so a direct
-        // caller gets the same answer whatever the index holds.
+        // Issues #1552 and #1573: checked before anything returns early, so
+        // a direct caller gets the same answer whatever the index holds.
         check_vector_min_score(request.params.min_score)?;
-        request.query.validate_weights()?;
+        request.query.validate()?;
 
         let query_vectors = match &request.query {
             VectorSearchQuery::Vectors(vecs) => vecs,
@@ -2139,6 +2140,48 @@ mod tests {
 
         assert!(store.search(request(0.0, 0.0, 1)).unwrap().hits.is_empty());
         assert!(store.search(request(1.0, -1.0, 1)).unwrap().hits.is_empty());
+    }
+
+    /// Issue #1573: `VectorStore::search` rejects a query vector with a
+    /// `NaN` or infinite component, whatever the index holds (here
+    /// nothing), naming the query vector.
+    #[test]
+    fn search_rejects_a_non_finite_query_vector_component() {
+        use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store =
+            VectorStore::with_index_type_config(storage, VectorIndexTypeConfig::default()).unwrap();
+        // The default index is a 128-dimensional Flat one.
+        let request = |value: f32| {
+            let mut data = vec![1.0; 128];
+            data[127] = value;
+            VectorSearchRequest {
+                query: VectorSearchQuery::Vectors(vec![QueryVector {
+                    vector: Vector::new(data),
+                    weight: 1.0,
+                    fields: None,
+                }]),
+                params: VectorSearchParams::default(),
+            }
+        };
+
+        let accepted: Vec<f32> = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .filter(|&value| {
+                let expected = format!(
+                    "query vector components must be finite, got {value} at component 127: \
+                     query vector 0"
+                );
+                !matches!(
+                    store.search(request(value)),
+                    Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)
+                )
+            })
+            .collect();
+        assert!(accepted.is_empty(), "components accepted: {accepted:?}");
+
+        assert!(store.search(request(f32::MAX)).unwrap().hits.is_empty());
     }
 
     /// Build a `VectorStore` (Flat, Euclidean — no normalization, so the

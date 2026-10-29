@@ -181,6 +181,10 @@ impl UnifiedQueryParser {
     /// Returns [`LaurusError::InvalidArgument`] if a vector field clause's
     /// `^` weight is too large for an `f32` (Issue #1552), before any vector
     /// clause is embedded.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if the embedder returns a
+    /// vector with a `NaN` or infinite component for a vector field clause
+    /// (Issue #1573).
     pub async fn parse(&self, query_str: &str) -> Result<SearchRequest> {
         let query_str = query_str.trim();
         if query_str.is_empty() {

@@ -77,6 +77,11 @@ pub enum VectorScoreMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryVector {
     /// Dense vector embedding representing the query.
+    ///
+    /// Every component must be finite, as for a document's vector; a search
+    /// with a `NaN` or infinite component fails with
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// (Issue #1573).
     pub vector: Vector,
     /// Multiplicative weight applied to the similarity score produced by this
     /// vector. Defaults to `1.0`.
@@ -173,6 +178,35 @@ pub(crate) fn check_query_vector_weight(
     )))
 }
 
+/// Check a query vector's components (Issue #1573; see
+/// [`QueryVector::vector`]): every one finite, as for a document's vector
+/// and a rescore's query vectors.
+///
+/// `describe` names the query vector or the embedded payload, and runs only
+/// when a component is not finite.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] naming the first component that
+/// is `NaN` or infinite, and its position.
+pub(crate) fn check_query_vector_components(
+    vector: &Vector,
+    describe: impl FnOnce() -> String,
+) -> Result<()> {
+    match vector
+        .data
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        None => Ok(()),
+        Some((position, value)) => Err(LaurusError::invalid_argument(format!(
+            "query vector components must be finite, got {value} at component {position}: {}",
+            describe()
+        ))),
+    }
+}
+
 /// Check a vector `min_score` (Issue #1552): finite, as the lexical one
 /// (Issue #1540). Similarity is in `[0, 1]`, so `+inf` would drop every hit,
 /// `-inf` would keep them all like any value of `0` or less, and `NaN` would
@@ -217,6 +251,40 @@ mod tests {
         let err = check(f32::INFINITY).unwrap_err().to_string();
         assert!(
             err.contains("query vector weight must be finite and at least 0, got inf: test"),
+            "{err}"
+        );
+    }
+
+    /// Issue #1573: every component must be finite, wherever the bad one is;
+    /// the message names the first bad value and its position.
+    #[test]
+    fn query_vector_components_must_be_finite() {
+        let check =
+            |data: Vec<f32>| check_query_vector_components(&Vector::new(data), || "test".into());
+        let mut accepted = Vec::new();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for position in 0..3 {
+                let mut data = vec![0.5; 3];
+                data[position] = bad;
+                if check(data.clone()).is_ok() {
+                    accepted.push(data);
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+
+        for data in [
+            vec![f32::MAX, f32::MIN],
+            vec![-0.0, f32::MIN_POSITIVE / 2.0],
+            vec![],
+        ] {
+            check(data).unwrap();
+        }
+        let err = check(vec![1.0, f32::INFINITY, f32::NAN])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("query vector components must be finite, got inf at component 1: test"),
             "{err}"
         );
     }
