@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::vector::core::distance::{DistanceMetric, PreparedQuery};
-use crate::vector::core::distance_f16::distance_f16;
+use crate::vector::core::distance_f16::distance_f16_unchecked;
 #[cfg(feature = "pq-fastscan")]
 use crate::vector::core::distance_pq_fastscan::PqFastScanQuery;
 use crate::vector::core::distance_quantized::{
@@ -126,9 +126,10 @@ enum QuantizedSearchCtx<'a> {
     },
     /// Float16 hot path (Issue #623): the f32 query against the stored
     /// binary16 rows on the heap (`Eager` loading), read in place by
-    /// [`crate::vector::core::distance_f16::distance_f16`].
+    /// [`crate::vector::core::distance_f16::distance_f16_unchecked`].
     Float16Heap {
-        /// The query values (shared with the request, not copied).
+        /// The query values (shared with the request, not copied), of the
+        /// pool's dimension ([`Self::float16`] checks it, Issue #1575).
         query: Arc<Vec<f32>>,
         /// `‖query‖²` for Cosine / Angular, `0.0` otherwise.
         norm_sq: f32,
@@ -180,14 +181,21 @@ impl<'a> QuantizedSearchCtx<'a> {
     }
 
     /// The Float16 context for `pool`, with the storage kind resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if `query` does not have the pool's dimension (Issue #1575): the
+    /// context's rows are scored without checking the length of each.
     fn float16(
         pool: &'a F16VectorPool,
         query: Arc<Vec<f32>>,
         norm_sq: f32,
         field_idx: Arc<HashMap<u64, u32>>,
         metric: DistanceMetric,
-    ) -> Self {
-        match pool.rows() {
+    ) -> Result<Self> {
+        pool.check_query(&query)?;
+        Ok(match pool.rows() {
             F16Rows::Heap(rows) => Self::Float16Heap {
                 query,
                 norm_sq,
@@ -202,7 +210,7 @@ impl<'a> QuantizedSearchCtx<'a> {
                 field_idx,
                 metric,
             },
-        }
+        })
     }
 
     /// Compute distance from the prepared query to the candidate at
@@ -274,7 +282,9 @@ impl<'a> QuantizedSearchCtx<'a> {
                     data: query.as_slice(),
                     norm_sq: *norm_sq,
                 };
-                distance_f16(*metric, &prepared, rows.row_at(pos))
+                // SAFETY: `float16` checked that the query has the pool's
+                // dimension, and the pool's rows are `2 × dim` bytes.
+                unsafe { distance_f16_unchecked(*metric, &prepared, rows.row_at(pos)) }
             }
             Self::Float16Mapped {
                 query,
@@ -287,7 +297,8 @@ impl<'a> QuantizedSearchCtx<'a> {
                     data: query.as_slice(),
                     norm_sq: *norm_sq,
                 };
-                distance_f16(*metric, &prepared, rows.row_at(pos))
+                // SAFETY: as for `Float16Heap`.
+                unsafe { distance_f16_unchecked(*metric, &prepared, rows.row_at(pos)) }
             }
         }
     }
@@ -707,54 +718,62 @@ impl HnswSearcher {
         //   [`distance_quantized`].
         // * Stage 3 (`OwnedPq`, Issue #481 PQ): ADC LUT via
         //   [`distance_pq_adc`].
-        // * `Float16` (Issue #623): [`distance_f16`] over the stored rows.
+        // * `Float16` (Issue #623): [`distance_f16_unchecked`] over the
+        //   stored rows, once the query's dimension is checked (Issue #1575).
         // The legacy `Owned` storage falls through to the f32 reference
         // path in `calc_dist`.
         let metric = reader.distance_metric();
-        let quant_ctx: Option<QuantizedSearchCtx> = if let Some(pool) =
-            reader.vectors().quantized_pool()
-        {
-            pool.field_position_index(field_name).map(|field_idx| {
-                let prepared = QuantizedQuery::prepare(&query.data, &pool.params);
-                QuantizedSearchCtx::scalar_8bit(pool, prepared, field_idx, metric)
-            })
-        } else if let Some(pool) = reader.vectors().pq_pool() {
-            pool.field_position_index(field_name).map(|field_idx| {
-                let prepared = PqQuery::prepare(&query.data, pool.params, &pool.codebook);
-                QuantizedSearchCtx::Pq {
-                    prepared,
-                    pool: pool.clone(),
-                    field_idx,
-                    metric,
-                }
-            })
-        } else if let Some(pool) = reader.vectors().f16_pool() {
-            pool.field_position_index(field_name).map(|field_idx| {
-                let norm_sq = metric.prepare_query(&query.data).norm_sq;
-                QuantizedSearchCtx::float16(pool, query.data.clone(), norm_sq, field_idx, metric)
-            })
-        } else {
-            #[cfg(feature = "pq-fastscan")]
-            {
-                if let Some(pool) = reader.vectors().pq_fastscan_pool() {
-                    let field_idx = pool.field_position_index(field_name);
-                    let prepared =
-                        PqFastScanQuery::prepare(&query.data, pool.params, &pool.codebook)?;
-                    field_idx.map(|field_idx| QuantizedSearchCtx::PqFastScan {
+        let quant_ctx: Option<QuantizedSearchCtx> =
+            if let Some(pool) = reader.vectors().quantized_pool() {
+                pool.field_position_index(field_name).map(|field_idx| {
+                    let prepared = QuantizedQuery::prepare(&query.data, &pool.params);
+                    QuantizedSearchCtx::scalar_8bit(pool, prepared, field_idx, metric)
+                })
+            } else if let Some(pool) = reader.vectors().pq_pool() {
+                pool.field_position_index(field_name).map(|field_idx| {
+                    let prepared = PqQuery::prepare(&query.data, pool.params, &pool.codebook);
+                    QuantizedSearchCtx::Pq {
                         prepared,
                         pool: pool.clone(),
                         field_idx,
                         metric,
+                    }
+                })
+            } else if let Some(pool) = reader.vectors().f16_pool() {
+                pool.field_position_index(field_name)
+                    .map(|field_idx| {
+                        let norm_sq = metric.prepare_query(&query.data).norm_sq;
+                        QuantizedSearchCtx::float16(
+                            pool,
+                            query.data.clone(),
+                            norm_sq,
+                            field_idx,
+                            metric,
+                        )
                     })
-                } else {
+                    .transpose()?
+            } else {
+                #[cfg(feature = "pq-fastscan")]
+                {
+                    if let Some(pool) = reader.vectors().pq_fastscan_pool() {
+                        let field_idx = pool.field_position_index(field_name);
+                        let prepared =
+                            PqFastScanQuery::prepare(&query.data, pool.params, &pool.codebook)?;
+                        field_idx.map(|field_idx| QuantizedSearchCtx::PqFastScan {
+                            prepared,
+                            pool: pool.clone(),
+                            field_idx,
+                            metric,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "pq-fastscan"))]
+                {
                     None
                 }
-            }
-            #[cfg(not(feature = "pq-fastscan"))]
-            {
-                None
-            }
-        };
+            };
 
         // f32 reference path (no quantized context): cache the query norm once
         // so `calc_dist` uses `distance_with_prepared` (candidate-norm-only

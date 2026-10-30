@@ -115,12 +115,45 @@ pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
 /// # Returns
 ///
 /// The distance (lower is closer).
+///
+/// # Panics
+///
+/// If `row` is not `2 × query.data.len()` bytes long, in every build
+/// (Issue #1575): the SIMD kernels read the row for as many elements as the
+/// query has. A search checks the query's dimension once per pool instead
+/// and scores its rows without this check.
 #[inline]
 pub fn distance_f16(metric: DistanceMetric, query: &PreparedQuery<'_>, row: &[u8]) -> f32 {
-    debug_assert_eq!(row.len(), query.data.len() * F16_BYTES);
+    assert_eq!(
+        row.len(),
+        query.data.len() * F16_BYTES,
+        "float16 row of {} bytes for a {}-element query",
+        row.len(),
+        query.data.len()
+    );
+    // SAFETY: the lengths were checked above.
+    unsafe { distance_f16_unchecked(metric, query, row) }
+}
+
+/// [`distance_f16`] without its length check, for a search that checked
+/// once that the query has its pool's dimension (Issue #1575), so that the
+/// check is not repeated for every candidate.
+///
+/// # Safety
+///
+/// `row` must be `2 × query.data.len()` bytes long: the SIMD kernels read
+/// the row for as many elements as the query has.
+#[inline]
+pub(crate) unsafe fn distance_f16_unchecked(
+    metric: DistanceMetric,
+    query: &PreparedQuery<'_>,
+    row: &[u8],
+) -> f32 {
+    // SAFETY (every `accumulate` call below): the caller guarantees the
+    // lengths.
     match metric {
         DistanceMetric::Cosine | DistanceMetric::Angular => {
-            let (dot, norm_b_sq) = accumulate::<OP_DOT_NORM>(query.data, row);
+            let (dot, norm_b_sq) = unsafe { accumulate::<OP_DOT_NORM>(query.data, row) };
             let norm_a = query.norm_sq.sqrt();
             let norm_b = norm_b_sq.sqrt();
             let zero = norm_a == 0.0 || norm_b == 0.0;
@@ -132,9 +165,11 @@ pub fn distance_f16(metric: DistanceMetric, query: &PreparedQuery<'_>, row: &[u8
                 (_, false) => cosine().acos(),
             }
         }
-        DistanceMetric::DotProduct => -accumulate::<OP_DOT>(query.data, row).0,
-        DistanceMetric::Euclidean => accumulate::<OP_SQ_DIFF>(query.data, row).0.sqrt(),
-        DistanceMetric::Manhattan => accumulate::<OP_ABS_DIFF>(query.data, row).0,
+        DistanceMetric::DotProduct => -unsafe { accumulate::<OP_DOT>(query.data, row) }.0,
+        DistanceMetric::Euclidean => unsafe { accumulate::<OP_SQ_DIFF>(query.data, row) }
+            .0
+            .sqrt(),
+        DistanceMetric::Manhattan => unsafe { accumulate::<OP_ABS_DIFF>(query.data, row) }.0,
     }
 }
 
@@ -144,17 +179,24 @@ pub fn distance_f16(metric: DistanceMetric, query: &PreparedQuery<'_>, row: &[u8
 ///
 /// `(primary, Σ x²)`; the second value is only meaningful for
 /// [`OP_DOT_NORM`] and is `0.0` otherwise.
+///
+/// # Safety
+///
+/// `row` must be `2 × q.len()` bytes long: the SIMD kernels read `row` for
+/// as many elements as `q` has.
 #[inline]
-pub(crate) fn accumulate<const OP: u8>(q: &[f32], row: &[u8]) -> (f32, f32) {
+unsafe fn accumulate<const OP: u8>(q: &[f32], row: &[u8]) -> (f32, f32) {
     debug_assert_eq!(row.len(), q.len() * F16_BYTES);
-    // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads
-    // at most `q.len()` floats and `row.len()` bytes.
+    // SAFETY: NEON is part of the aarch64 baseline, and with the lengths
+    // the caller guarantees the kernel reads `q.len()` floats and
+    // `row.len()` bytes.
     #[cfg(target_arch = "aarch64")]
     let result = unsafe { crate::vector::core::f16_neon::accumulate_neon::<OP>(q, row) };
     #[cfg(target_arch = "x86_64")]
     let result = if crate::vector::core::f16_avx2::is_f16c_avx2_supported() {
-        // SAFETY: F16C, AVX2 and FMA were detected at run time, and the
-        // kernel reads at most `q.len()` floats and `row.len()` bytes.
+        // SAFETY: F16C, AVX2 and FMA were detected at run time, and with
+        // the lengths the caller guarantees the kernel reads `q.len()`
+        // floats and `row.len()` bytes.
         unsafe { crate::vector::core::f16_avx2::accumulate_avx2::<OP>(q, row) }
     } else {
         accumulate_portable::<OP>(q, row)
@@ -402,24 +444,26 @@ mod tests {
                     accumulate_portable::<OP_ABS_DIFF>(&query, &stored),
                     (abs, 0.0),
                 );
+                // SAFETY (the four calls below): `stored` encodes `dim`
+                // elements, as many as `query` has.
                 check(
                     "dispatch dot_norm",
-                    accumulate::<OP_DOT_NORM>(&query, &stored),
+                    unsafe { accumulate::<OP_DOT_NORM>(&query, &stored) },
                     (dot, norm),
                 );
                 check(
                     "dispatch dot",
-                    accumulate::<OP_DOT>(&query, &stored),
+                    unsafe { accumulate::<OP_DOT>(&query, &stored) },
                     (dot, 0.0),
                 );
                 check(
                     "dispatch sq",
-                    accumulate::<OP_SQ_DIFF>(&query, &stored),
+                    unsafe { accumulate::<OP_SQ_DIFF>(&query, &stored) },
                     (sq, 0.0),
                 );
                 check(
                     "dispatch abs",
-                    accumulate::<OP_ABS_DIFF>(&query, &stored),
+                    unsafe { accumulate::<OP_ABS_DIFF>(&query, &stored) },
                     (abs, 0.0),
                 );
             }
@@ -441,5 +485,28 @@ mod tests {
             distance_f16(metric, &prepared, &stored).to_bits(),
             distance_f16(metric, &prepared, &shifted[1..]).to_bits()
         );
+    }
+
+    /// Issue #1575: a query at least 8 elements longer than the row made
+    /// the SIMD kernels read past the row's end in a release build. The
+    /// length is now checked first, in every build.
+    #[test]
+    #[should_panic(expected = "float16 row of 4 bytes for a 10-element query")]
+    fn distance_f16_rejects_a_query_longer_than_the_row() {
+        let row = encode(&[0.5, 0.5]);
+        let query = [1.0f32; 10];
+        let metric = DistanceMetric::Cosine;
+        distance_f16(metric, &metric.prepare_query(&query), &row);
+    }
+
+    /// Issue #1575: a query shorter than the row is rejected the same way
+    /// (it used to be scored against the start of the row).
+    #[test]
+    #[should_panic(expected = "float16 row of 20 bytes for a 2-element query")]
+    fn distance_f16_rejects_a_query_shorter_than_the_row() {
+        let row = encode(&[0.5; 10]);
+        let query = [1.0f32, 0.0];
+        let metric = DistanceMetric::Euclidean;
+        distance_f16(metric, &metric.prepare_query(&query), &row);
     }
 }

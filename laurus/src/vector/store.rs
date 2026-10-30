@@ -1040,7 +1040,10 @@ impl VectorStore {
     /// included), or if the
     /// [`min_score`](crate::vector::search::searcher::VectorSearchParams::min_score)
     /// is not finite (Issue #1552), or if a query vector has a `NaN` or
-    /// infinite component (Issue #1573), whatever the index holds.
+    /// infinite component (Issue #1573), or if a query vector's dimension
+    /// differs from a field it names or the request's
+    /// [`fields`](crate::vector::search::searcher::VectorSearchParams::fields)
+    /// pick for it (Issue #1575), whatever the index holds.
     pub fn search(&self, request: VectorSearchRequest) -> Result<VectorSearchResults> {
         self.search_impl(request, None)
     }
@@ -1091,6 +1094,72 @@ impl VectorStore {
     /// every field of a store built via [`Self::with_index_type_config`]).
     fn base_weight_of(&self, field: &str) -> f32 {
         self.base_weights.read().get(field).copied().unwrap_or(1.0)
+    }
+
+    /// Check that every query vector has the dimension of each field it is
+    /// searched in (Issue #1575).
+    ///
+    /// The fields are resolved as the search resolves them
+    /// ([`Self::resolve_target_fields`]): a query vector's own `fields`, else
+    /// `selectors`. A field-less query vector is not checked, since the
+    /// search matches it only to the fields of its own dimension. A name
+    /// that is not a searchable vector field of this store (an unknown name,
+    /// or a multi-vector field) is skipped and keeps the error the search
+    /// gives it. A store built via [`Self::with_index_type_config`] has no
+    /// per-field dimensions and is not checked, as for documents.
+    ///
+    /// # Arguments
+    ///
+    /// * `vectors` - The query vectors.
+    /// * `selectors` - The request's field selectors
+    ///   ([`VectorSearchParams::fields`](crate::vector::search::searcher::VectorSearchParams::fields)).
+    /// * `describe` - Names the query vector at a position of `vectors` in
+    ///   the error, e.g. `query vector 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] naming the first query vector
+    /// whose dimension differs from a field it is searched in, the field and
+    /// both dimensions.
+    pub(crate) fn check_query_dimensions(
+        &self,
+        vectors: &[QueryVector],
+        selectors: Option<&[FieldSelector]>,
+        describe: impl Fn(usize) -> String,
+    ) -> Result<()> {
+        if selectors.is_none() && vectors.iter().all(|qv| qv.fields.is_none()) {
+            return Ok(());
+        }
+        let mut dims = self.index.field_dimensions();
+        if dims.is_empty() {
+            return Ok(());
+        }
+        for name in self.index.late_interaction_fields() {
+            dims.remove(&name);
+        }
+        // A prefix expands over the searchable fields, as in `search_impl`,
+        // which is the only use of their names.
+        let has_prefix = selectors
+            .is_some_and(|sels| sels.iter().any(|s| matches!(s, FieldSelector::Prefix(_))));
+        let names: Vec<String> = if has_prefix {
+            dims.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        for (i, qv) in vectors.iter().enumerate() {
+            for field in Self::resolve_target_fields(qv, selectors, &names) {
+                if let Some(&expected) = dims.get(&field)
+                    && qv.vector.dimension() != expected
+                {
+                    return Err(LaurusError::invalid_argument(format!(
+                        "{} has dimension {}, but field '{field}' has {expected}",
+                        describe(i),
+                        qv.vector.dimension()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the set of vector fields a single query should be routed to
@@ -1181,6 +1250,12 @@ impl VectorStore {
                 ));
             }
         };
+        // Issue #1575: also before anything returns early. The engine checks
+        // every query vector itself, before its own early returns where it
+        // can; this covers a direct caller.
+        self.check_query_dimensions(query_vectors, request.params.fields.as_deref(), |i| {
+            format!("query vector {i}")
+        })?;
 
         if query_vectors.is_empty() {
             return Ok(VectorSearchResults::default());
@@ -2182,6 +2257,205 @@ mod tests {
         assert!(accepted.is_empty(), "components accepted: {accepted:?}");
 
         assert!(store.search(request(f32::MAX)).unwrap().hits.is_empty());
+    }
+
+    /// Issue #1575: `VectorStore::search` rejects a query vector whose
+    /// dimension differs from a field it names or the request's selectors
+    /// pick for it, whatever the index holds (here nothing). A field-less
+    /// query vector is not checked, and an unknown or multi-vector name
+    /// keeps its own error.
+    #[test]
+    fn search_rejects_a_query_vector_of_another_dimension() {
+        use crate::vector::core::field::{FieldOption, FlatOption, MultiVectorOption};
+        use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery};
+
+        let flat = |dimension| FlatOption {
+            dimension,
+            ..Default::default()
+        };
+        let config = VectorIndexConfig::builder()
+            .add_field("two", flat(2))
+            .unwrap()
+            .add_field("three", flat(3))
+            .unwrap()
+            .add_field(
+                "tokens",
+                FieldOption::MultiVector(MultiVectorOption::new(3)),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = VectorStore::new(storage, config).unwrap();
+        // The first query vector always fits, so a failure names query
+        // vector 1.
+        let search = |dimension: usize, field: Option<&str>, selector: Option<FieldSelector>| {
+            let query_vector = |dimension: usize, field: Option<&str>| QueryVector {
+                vector: Vector::new(vec![1.0; dimension]),
+                weight: 1.0,
+                fields: field.map(|field| vec![field.to_string()]),
+            };
+            store.search(VectorSearchRequest {
+                query: VectorSearchQuery::Vectors(vec![
+                    query_vector(2, Some("two")),
+                    query_vector(dimension, field),
+                ]),
+                params: VectorSearchParams {
+                    fields: selector.map(|selector| vec![selector]),
+                    ..Default::default()
+                },
+            })
+        };
+        let exact = |name: &str| Some(FieldSelector::Exact(name.to_string()));
+        let prefix = || Some(FieldSelector::Prefix("t".to_string()));
+        let error = |result: &Result<VectorSearchResults>| match result {
+            Ok(_) => "Ok".to_string(),
+            Err(e) => e.to_string(),
+        };
+
+        // `Prefix("t")` picks `three` and `two` (in that order), never the
+        // multi-vector `tokens`.
+        let rejected = [
+            (
+                search(3, Some("two"), None),
+                "query vector 1 has dimension 3, but field 'two' has 2",
+            ),
+            (
+                search(2, None, exact("three")),
+                "query vector 1 has dimension 2, but field 'three' has 3",
+            ),
+            (
+                search(2, None, prefix()),
+                "query vector 1 has dimension 2, but field 'three' has 3",
+            ),
+            (
+                search(3, None, prefix()),
+                "query vector 1 has dimension 3, but field 'two' has 2",
+            ),
+        ];
+        let accepted: Vec<String> = rejected
+            .iter()
+            .filter(|(result, expected)| {
+                !matches!(result, Err(LaurusError::InvalidArgument(m)) if m == expected)
+            })
+            .map(|(result, expected)| format!("{expected}: got {}", error(result)))
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "not rejected as expected: {accepted:?}"
+        );
+
+        assert!(search(3, Some("three"), None).unwrap().hits.is_empty());
+        assert!(search(5, None, None).unwrap().hits.is_empty());
+        // Not checked here: each keeps the error the search gives it.
+        let own_errors = [
+            (
+                search(5, Some("unknown"), None),
+                "unknown vector field 'unknown'",
+            ),
+            (
+                search(5, Some("tokens"), None),
+                "a MultiVector field is not a vector-search target",
+            ),
+        ];
+        let other: Vec<String> = own_errors
+            .iter()
+            .filter(|(result, expected)| {
+                !matches!(result, Err(LaurusError::InvalidArgument(m)) if m.contains(expected))
+            })
+            .map(|(result, expected)| format!("{expected}: got {}", error(result)))
+            .collect();
+        assert!(other.is_empty(), "not their own errors: {other:?}");
+    }
+
+    /// Issue #1575: a Float16 segment checks the query's dimension once per
+    /// search and then scores its rows without checking the length of each,
+    /// so a query of another dimension that reaches its searcher is
+    /// rejected instead of being read past the rows. A store built via
+    /// `with_index_type_config` has no field dimensions to check the query
+    /// against first, so the query reaches the searcher here.
+    #[tokio::test]
+    async fn a_float16_segment_rejects_a_query_of_another_dimension() {
+        use crate::vector::core::quantization::QuantizationMethod;
+        use crate::vector::index::config::{FlatIndexConfig, HnswIndexConfig, IvfIndexConfig};
+        use crate::vector::search::searcher::{VectorSearchParams, VectorSearchQuery};
+
+        let float16 = QuantizationMethod::Float16;
+        let configs = [
+            (
+                "flat",
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 4,
+                    quantization_method: float16,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hnsw",
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension: 4,
+                    quantization_method: float16,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ivf",
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension: 4,
+                    quantization_method: float16,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let search = |store: &VectorStore, dimension: usize| {
+            store.search(VectorSearchRequest {
+                query: VectorSearchQuery::Vectors(vec![QueryVector {
+                    vector: Vector::new(vec![1.0; dimension]),
+                    weight: 1.0,
+                    fields: None,
+                }]),
+                params: VectorSearchParams::default(),
+            })
+        };
+
+        let mut wrong = Vec::new();
+        for (name, config) in configs {
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let store = VectorStore::with_index_type_config(storage, config).unwrap();
+            for doc_id in 1..=4u64 {
+                let doc = Document::builder()
+                    .add_field("f", DataValue::Vector(vec![doc_id as f32, 1.0, 0.5, 0.25]))
+                    .build();
+                store
+                    .upsert_document_by_internal_id(doc_id, doc)
+                    .await
+                    .unwrap();
+            }
+            store.commit().await.unwrap();
+
+            // 8 elements longer than the rows (the SIMD kernels read past a
+            // row for a query at least that much longer), and shorter.
+            for dimension in [12, 2] {
+                let expected = format!(
+                    "query vector has dimension {dimension}, but the field's vectors have 4"
+                );
+                match search(&store, dimension) {
+                    Err(LaurusError::InvalidArgument(m)) if m == expected => {}
+                    Err(e) => wrong.push(format!("{name} {dimension}: {e}")),
+                    Ok(results) => {
+                        wrong.push(format!("{name} {dimension}: {} hits", results.hits.len()))
+                    }
+                }
+            }
+            match search(&store, 4) {
+                Ok(results) if !results.hits.is_empty() => {}
+                Ok(_) => wrong.push(format!("{name}: no hits for a query of dimension 4")),
+                Err(e) => wrong.push(format!("{name}: dimension 4: {e}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Build a `VectorStore` (Flat, Euclidean — no normalization, so the

@@ -521,7 +521,7 @@ are keyword-only.
 VectorQuery(field: str, vector: list[float])
 ```
 
-Approximate nearest-neighbor search using a pre-computed embedding vector. Every component of `vector` must be finite and within the range of a 32-bit float; the search raises `ValueError` otherwise (Issue #1573).
+Approximate nearest-neighbor search using a pre-computed embedding vector. Every component of `vector` must be finite and within the range of a 32-bit float; the search raises `ValueError` otherwise (Issue #1573). Its length must be the field's dimension, or the search raises `ValueError` as well, whatever the index holds (Issue #1575).
 
 ### VectorTextQuery
 

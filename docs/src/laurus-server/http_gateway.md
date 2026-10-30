@@ -440,7 +440,10 @@ instead of inverting the ranking or giving `null` scores (Issue #1552).
 `-1e-50`), means the default, `1.0`, as over gRPC. A `vector` component too
 large for a 32-bit float, which would become infinite, is rejected with
 `400`, whatever the data, instead of returning no results, every document
-at a score of `0`, or inflated scores (Issue #1573).
+at a score of `0`, or inflated scores (Issue #1573). A `vector` whose length
+differs from the dimension of a field in its `fields`, or of a field
+`vector_params.fields` picks for it, is rejected with `400`, whatever the
+data, instead of failing with `500` or crashing the server (Issue #1575).
 
 `fusion` takes exactly one of `rrf` (`{"k": 60}`) and `weighted_sum`
 (`{"lexical_weight": 0.5, "vector_weight": 0.5}`), each an object whose

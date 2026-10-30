@@ -155,7 +155,7 @@ cargo doc --open
 | `.field(name)` | 検索を特定のフィールドに制限 |
 | `.build()` | リクエストを構築 |
 
-`QueryPayload` と `QueryVector` の `weight` は、有限で `0` 以上でなければなりません（`-0.0` は拒否されます）。それ以外の値では、検索は `InvalidArgument` で失敗します（Issue #1552。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照）。`QueryVector` の `vector` の成分は、すべて有限でなければなりません。`QueryPayload` に対してエンベダーが返すベクトルの成分も同じで、埋め込んだ時点で検査します。それ以外では、検索は `InvalidArgument` で失敗します（Issue #1573。[VectorSearchRequestBuilder](../concepts/search/vector_search.md#vectorsearchrequestbuilder)を参照）。
+`QueryPayload` と `QueryVector` の `weight` は、有限で `0` 以上でなければなりません（`-0.0` は拒否されます）。それ以外の値では、検索は `InvalidArgument` で失敗します（Issue #1552。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照）。`QueryVector` の `vector` の成分は、すべて有限でなければなりません。`QueryPayload` に対してエンベダーが返すベクトルの成分も同じで、埋め込んだ時点で検査します。それ以外では、検索は `InvalidArgument` で失敗します（Issue #1573。[VectorSearchRequestBuilder](../concepts/search/vector_search.md#vectorsearchrequestbuilder)を参照）。`QueryVector` の `vector` と、`QueryPayload` に対してエンベダーが返すベクトルは、検索の対象のすべてのフィールド（`fields`、payload のフィールド、`VectorSearchParams::fields` が選ぶフィールド）と同じ次元でなければならず、それ以外では、検索は `InvalidArgument` で失敗します（Issue #1575。[フィールドルーティング](../concepts/search/vector_search.md#フィールドルーティング)を参照）。
 
 ### SearchResult
 

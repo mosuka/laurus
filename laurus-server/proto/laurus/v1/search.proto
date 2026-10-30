@@ -140,7 +140,9 @@ message QueryVector {
   // with INVALID_ARGUMENT.
   float weight = 2;
   // Vector fields to search. Empty means `VectorParams.fields` if set,
-  // otherwise every vector field whose dimension matches.
+  // otherwise every vector field whose dimension matches. A field named
+  // here or picked by `VectorParams.fields` whose dimension differs from
+  // the vector's is rejected with INVALID_ARGUMENT.
   repeated string fields = 3;
 }
 
@@ -201,8 +203,9 @@ message VectorParams {
   // own fields take precedence, and every DSL vector clause names its
   // field, so this is rejected with INVALID_ARGUMENT when no searched
   // `query_vectors` entry names no field. An unknown name fails the
-  // search with INVALID_ARGUMENT. Empty means every vector field whose
-  // dimension matches.
+  // search with INVALID_ARGUMENT, and so does a field whose dimension
+  // differs from a query vector's it is picked for. Empty means every
+  // vector field whose dimension matches.
   repeated string fields = 1;
 
   // How to combine scores across query vectors. An unknown value is

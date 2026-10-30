@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::vector::core::distance_f16::distance_f16;
+use crate::vector::core::distance_f16::distance_f16_unchecked;
 use crate::vector::core::distance_quantized::{QuantizedQuery, distance_quantized};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::flat::reader::FlatVectorIndexReader;
@@ -107,6 +107,11 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                 pool.field_position_index(field_name)
                     .map(|idx| (pool, pool.rows(), idx))
             });
+            // Issue #1575: checked once here, so the rows are scored below
+            // without checking the length of each.
+            if let Some((pool, _, _)) = &f16_ctx {
+                pool.check_query(&request.query.data)?;
+            }
 
             // Distance scan, parallelised across candidates above
             // PARALLEL_SCAN_THRESHOLD (#662). The quantized hot path and the
@@ -141,7 +146,12 @@ impl VectorIndexSearcher for FlatVectorSearcher {
                         && let Some(&pos) = idx.get(&doc_id)
                         && !flat_reader.is_some_and(|r| r.is_deleted(doc_id))
                     {
-                        let distance = distance_f16(metric, &prepared_query, rows.row_at(pos));
+                        // SAFETY: the query has the pool's dimension
+                        // (`check_query` above), and the pool's rows are
+                        // `2 × dim` bytes.
+                        let distance = unsafe {
+                            distance_f16_unchecked(metric, &prepared_query, rows.row_at(pos))
+                        };
                         let similarity = metric.distance_to_similarity(distance);
                         let vector = request
                             .params

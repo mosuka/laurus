@@ -521,7 +521,9 @@ fn default_overfetch() -> f32 {
 /// of the query specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchParams {
-    /// Fields to search in.
+    /// Fields to search in, for the query vectors that name none. A query
+    /// vector must have the dimension of every field they pick for it
+    /// (Issue #1575).
     #[serde(default)]
     pub fields: Option<Vec<crate::vector::store::request::FieldSelector>>,
     /// Maximum number of results to return.

@@ -62,9 +62,9 @@ The vector search query is specified as a `VectorSearchQuery` enum:
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `vector` | `Vector` | Pre-computed dense vector embedding; every component finite |
+| `vector` | `Vector` | Pre-computed dense vector embedding; every component finite, and the dimension of every field it is searched in |
 | `weight` | `f32` | Score weight (default: 1.0); finite and at least `0` (see [Weights](#weights)) |
-| `fields` | `Option<Vec<String>>` | Optional field restriction |
+| `fields` | `Option<Vec<String>>` | Optional field restriction (see [Field routing](#field-routing)) |
 
 Every component of a query vector must be finite, as for a document's
 vector. A `NaN` or infinite component makes the search fail with
@@ -75,6 +75,23 @@ document at a score of `0`, or inflated scores. A vector the embedder
 returns for a `QueryPayload` or a DSL clause is checked the same way as
 soon as it is embedded. Over HTTP, a number too large for a 32-bit float
 becomes infinite, so it is rejected too.
+
+A query vector must also have the dimension of every field it is searched
+in: a field it names, or a field the request's `fields` pick for it (see
+[Field routing](#field-routing)). Otherwise the search fails with
+`InvalidArgument` (HTTP 400, gRPC `INVALID_ARGUMENT`), whatever the data,
+also when the field holds no vectors or a filter matches nothing
+(Issue #1575). Such a query used to fail with an internal error (HTTP 500),
+panic, or crash the process, depending on the field's quantizer; it was
+answered without an error only when nothing was compared with it, for
+example while the field it named held no vectors. The vector the embedder
+returns for a DSL clause is checked once the DSL is parsed, also when a
+filter matches nothing. The vector it returns for a `QueryPayload` is
+checked once the payload is embedded: with a DSL query, when the DSL is
+parsed; otherwise after the filter, so a filter that matches nothing
+skips it. A query vector that names no field, with no `fields` in the
+request, is searched only in the fields of its own dimension and is not
+checked.
 
 ### Examples
 
@@ -262,8 +279,14 @@ Two routing inputs are honored, in priority order:
    - `Prefix("image_")` — match every field whose name starts with the
      prefix (resolved against the index's field names).
 
-When neither is set, all fields are searched (the default). A query routed
-to a field never returns documents that lack a vector in that field.
+When neither is set, every field of the query vector's dimension is searched
+(the default). A query routed to a field never returns documents that lack a
+vector in that field.
+
+A field a query vector is routed to by either input must have the query
+vector's dimension, or the search fails with `InvalidArgument`, whatever
+the data (Issue #1575). A `Prefix` therefore must not pick fields of
+another dimension than the query vectors it routes.
 
 A document that holds vectors in two or more of the searched fields still
 comes back only once: the field-less fanout collapses to that document's

@@ -497,6 +497,54 @@ async fn search_answers_400_for_a_number_out_of_range() {
     assert_eq!(status, StatusCode::OK, "component 3.4e38: {body}");
 }
 
+/// Issue #1575: a query vector of another dimension than a field it names,
+/// or than a field `vector_params.fields` picks for it, is a 400 on the
+/// three search endpoints. The index holds no documents, so this also shows
+/// the check does not depend on the data. A query vector that names no
+/// field is searched only in the fields of its own dimension, as before.
+#[tokio::test]
+async fn search_answers_400_for_a_query_vector_of_another_dimension() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    create_index(&router, search_fields()).await;
+
+    let cases = [
+        (
+            json!({"query_vectors": [{"vector": [1.0, 0.0, 0.0], "fields": ["vec"]}]}),
+            "query vector 0 has dimension 3, but field 'vec' has 2",
+        ),
+        (
+            json!({"query": "body:rust", "query_vectors": [{"vector": [1.0], "fields": ["vec"]}]}),
+            "query vector 0 has dimension 1, but field 'vec' has 2",
+        ),
+        (
+            json!({"query_vectors": [{"vector": [1.0]}], "vector_params": {"fields": ["vec"]}}),
+            "query vector 0 has dimension 1, but field 'vec' has 2",
+        ),
+    ];
+    // Every request that is not rejected as expected, so a failure lists all
+    // of them rather than the first.
+    let mut wrong = Vec::new();
+    for (search, expected) in cases {
+        for (uri, request) in [
+            ("/v1/search", search.clone()),
+            ("/v1/search/stream", search.clone()),
+            ("/v1/search/batch", json!({"queries": [search.clone()]})),
+        ] {
+            let (status, body) = send(&router, "POST", uri, request.clone()).await;
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            if status != StatusCode::BAD_REQUEST || !message.contains(expected) {
+                wrong.push(format!("{uri} {request}: {status} {body}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let search = json!({"query_vectors": [{"vector": [1.0, 0.0, 0.0]}]});
+    let (status, body) = send(&router, "POST", "/v1/search", search).await;
+    assert_eq!(status, StatusCode::OK, "a field-less query vector: {body}");
+}
+
 /// The case in #1476 and in the Issue: `sort_by.order` is matched
 /// case-insensitively, so `"DESC"` sorts descending instead of ascending,
 /// and an omitted or `null` order sorts ascending. Keys of the right type

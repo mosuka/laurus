@@ -184,7 +184,7 @@ const results = await index.search("body:rust", 10, 0, {
 
 - **引数:**
   - `field` (string) -- ベクトルフィールド名
-  - `vector` (number[]) -- クエリ埋め込みベクトル。成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では Promise がエラーメッセージで reject される（Issue #1573）
+  - `vector` (number[]) -- クエリ埋め込みベクトル。成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では Promise がエラーメッセージで reject される（Issue #1573）。長さはフィールドの次元と同じでなければならず、違えば、インデックスの中身によらず Promise が reject される（Issue #1575）
   - `limit`, `offset` (number, 省略可)
   - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
   - `groupBy` (`GroupByOptions`, 省略可) -- `search` の `groupBy` 引数と同じ

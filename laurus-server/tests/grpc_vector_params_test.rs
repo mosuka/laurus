@@ -234,3 +234,44 @@ async fn test_non_finite_query_vector_components_are_invalid_argument() {
     }
     assert!(accepted.is_empty(), "{accepted:#?}");
 }
+
+/// Issue #1575: a query vector of another dimension than a field it names,
+/// or than a field `vector_params.fields` picks for it, is
+/// `INVALID_ARGUMENT` naming both dimensions, instead of reaching the
+/// distance kernels. A query vector that names no field is searched only in
+/// the fields of its own dimension, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_query_vector_of_another_dimension_is_invalid_argument() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let service = search_service(&dir).await;
+
+    let mut named = vector_request(v1::VectorParams::default());
+    named.query_vectors[0].vector = vec![1.0, 0.0, 0.0];
+    named.query_vectors[0].fields = vec!["a".to_string()];
+    let mut picked = vector_request(v1::VectorParams {
+        fields: vec!["b".to_string()],
+        ..Default::default()
+    });
+    picked.query_vectors[0].vector = vec![1.0];
+
+    let mut accepted = Vec::new();
+    for (request, expected) in [
+        (named, "query vector 0 has dimension 3, but field 'a' has 2"),
+        (
+            picked,
+            "query vector 0 has dimension 1, but field 'b' has 2",
+        ),
+    ] {
+        match service.search(Request::new(request)).await {
+            Err(status)
+                if status.code() == Code::InvalidArgument
+                    && status.message().contains(expected) => {}
+            other => accepted.push(format!("{expected}: {other:?}")),
+        }
+    }
+    assert!(accepted.is_empty(), "{accepted:#?}");
+
+    let mut unnamed = vector_request(v1::VectorParams::default());
+    unnamed.query_vectors[0].vector = vec![1.0, 0.0, 0.0];
+    assert!(ids(&service, unnamed).await.is_empty());
+}

@@ -4052,6 +4052,19 @@ impl Engine {
     /// as soon as it is embedded.
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if a query vector's dimension differs from a field it is searched
+    /// in: a field it names, the field of a DSL vector clause or payload,
+    /// or a field the request's
+    /// [`fields`](self::search::VectorSearchOptions::fields) pick for it
+    /// (Issue #1575). A query vector the request gives is checked with the
+    /// weights, and the embedding of a DSL vector clause or of a
+    /// `DslWithVectors` payload once the DSL is parsed, before a filter that
+    /// matches nothing returns early; a `Vector` or `Hybrid` payload is
+    /// checked once it is embedded, after the filter. A field-less query
+    /// vector is searched only in the fields of its own dimension and is
+    /// not checked.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the rescore options are invalid: a window outside
     /// `1..=RescoreOptions::MAX_WINDOW_SIZE`, a target that is not a
     /// multi-vector field, query vectors of the wrong dimension or count, or
@@ -4105,13 +4118,25 @@ impl Engine {
         // embeds the clauses. Issue #1573: this call also checks the
         // components of the request's query vectors; a vector the embedder
         // returns is checked as it is embedded (`embed_batch_with_cache`).
+        // Issue #1575: and their dimensions against the fields they are
+        // searched in; an embedding's is checked once the DSL is parsed
+        // below, or once a payload is embedded after the filter.
         vector_options.validate_min_score()?;
         match &request_query {
             self::search::SearchQuery::Vector(vector)
             | self::search::SearchQuery::Hybrid { vector, .. }
             | self::search::SearchQuery::DslWithVectors {
                 vectors: vector, ..
-            } => vector.validate()?,
+            } => {
+                vector.validate()?;
+                if let self::search::VectorSearchQuery::Vectors(vectors) = vector {
+                    self.vector.check_query_dimensions(
+                        vectors,
+                        vector_options.fields.as_deref(),
+                        |i| format!("query vector {i}"),
+                    )?;
+                }
+            }
             self::search::SearchQuery::Dsl(_) | self::search::SearchQuery::Lexical(_) => {}
         }
         if let Some(group_by) = &request_group_by {
@@ -4156,6 +4181,10 @@ impl Engine {
         // variant is listed explicitly, so a new one fails to compile here
         // instead of reaching `resolve_search_query_from_parts`'s
         // `unreachable!` at run time.
+        let parses_dsl = matches!(
+            request_query,
+            self::search::SearchQuery::Dsl(_) | self::search::SearchQuery::DslWithVectors { .. }
+        );
         let resolved = match request_query {
             self::search::SearchQuery::Dsl(dsl) => {
                 self.parse_unified_dsl(&dsl, request_fusion).await?
@@ -4176,6 +4205,20 @@ impl Engine {
             &lexical_options,
             &vector_options,
         )?;
+        // Issue #1575: parsing the DSL embedded its vector clauses and a
+        // `DslWithVectors` payload, so their dimensions are checked here,
+        // before a filter that matches nothing returns early. The vectors
+        // the request gave passed this check at the top.
+        if parses_dsl
+            && let Some(vector_request) = &vector_search_request
+            && let self::search::VectorSearchQuery::Vectors(vectors) = &vector_request.query
+        {
+            self.vector.check_query_dimensions(
+                vectors,
+                vector_request.params.fields.as_deref(),
+                |_| "the embedding of a query".to_string(),
+            )?;
+        }
 
         // 0b. Resolve the user's lexical query once. The searcher gets it
         // boosted here and filter-wrapped below; the highlighter gets this
@@ -4281,9 +4324,16 @@ impl Engine {
             if let crate::vector::search::searcher::VectorSearchQuery::Payloads(ref payloads) =
                 vreq.query
             {
-                vreq.query = crate::vector::search::searcher::VectorSearchQuery::Vectors(
-                    self.embed_query_payloads(payloads).await?,
-                );
+                let vectors = self.embed_query_payloads(payloads).await?;
+                // Issue #1575: named as an embedding, as after the DSL is
+                // parsed (the store would name its position among the
+                // embedded payloads only).
+                self.vector.check_query_dimensions(
+                    &vectors,
+                    vreq.params.fields.as_deref(),
+                    |_| "the embedding of a query".to_string(),
+                )?;
+                vreq.query = crate::vector::search::searcher::VectorSearchQuery::Vectors(vectors);
             }
             Some(vreq)
         } else {
