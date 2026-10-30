@@ -444,16 +444,19 @@ pub enum FieldChangeKind {
 /// Changing between two lexical variants (e.g. `Text` -> `Integer`) is a
 /// [`FieldChangeKind::Reindex`] — analysis just needs to run again over the
 /// stored values. Changing between two vector variants (e.g. `Hnsw` ->
-/// `Flat`) is likewise a [`FieldChangeKind::Reindex`] in principle (the raw
-/// vectors on disk are the same regardless of index algorithm), escalated
-/// to [`FieldChangeKind::Destructive`] if `dimension`, `distance`, or
-/// `embedder` also changed. Changing between [`FieldOption::MultiVector`]
-/// and any other vector variant is always [`FieldChangeKind::Destructive`]:
-/// per-document token vectors and one searchable vector per document share
-/// no on-disk layout. Changing between a lexical and a vector variant
-/// is always [`FieldChangeKind::Destructive`]: the two subsystems have no
-/// shared "rebuild from existing data" path (vector fields are always
-/// stored as raw vectors; lexical fields honor `stored` independently).
+/// `Flat`) is always [`FieldChangeKind::Destructive`]: each index kind reads
+/// only its own segment files, so applying the change discards the field's
+/// vectors and recreates it empty under the new kind (Issue #1536).
+/// Rebuilding the field as another kind from its decoded vectors, which
+/// would make a change between `Hnsw`, `Flat` and `Ivf` a
+/// [`FieldChangeKind::Reindex`], is Issue #1579. Between
+/// [`FieldOption::MultiVector`] and any other vector variant there is
+/// nothing to rebuild from at all: per-document token vectors and one
+/// searchable vector per document share no on-disk layout. Changing between
+/// a lexical and a vector variant is always
+/// [`FieldChangeKind::Destructive`]: the two subsystems have no shared
+/// "rebuild from existing data" path (vector fields are always stored as
+/// raw vectors; lexical fields honor `stored` independently).
 pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind {
     match (old, new) {
         (FieldOption::Text(o), FieldOption::Text(n)) => {
@@ -529,16 +532,13 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         (FieldOption::MultiVector(o), FieldOption::MultiVector(n)) => {
             classify_vector_common(old, new).max(classify_multi_vector_specific(o, n))
         }
-        // Token vectors and a single searchable vector share no on-disk
-        // layout, so there is nothing to rebuild from.
-        (o, n) if o.is_multi_vector() != n.is_multi_vector() && o.is_vector() && n.is_vector() => {
-            FieldChangeKind::Destructive
-        }
+        // Each index kind reads only its own segment files, so a field cannot
+        // be rebuilt as another kind from them (Issue #1536, and #1579 for
+        // a rebuild that would). Token vectors and a single searchable
+        // vector share no on-disk layout either.
+        (o, n) if o.is_vector() && n.is_vector() => FieldChangeKind::Destructive,
 
         (o, n) if o.is_lexical() && n.is_lexical() => FieldChangeKind::Reindex,
-        (o, n) if o.is_vector() && n.is_vector() => {
-            classify_vector_common(o, n).max(FieldChangeKind::Reindex)
-        }
         _ => FieldChangeKind::Destructive,
     }
 }
@@ -749,8 +749,9 @@ fn classify_bytes(
 }
 
 /// Classification for the parameters shared by every vector variant
-/// (`dimension`, `distance`, `embedder`), regardless of whether `old`/`new`
-/// are the same variant.
+/// (`dimension`, `distance`, `embedder`), for a change that keeps the
+/// variant (a change between variants is always `Destructive`, see
+/// [`classify_change`]).
 ///
 /// All three are [`FieldChangeKind::Destructive`]: `dimension` makes
 /// existing vectors the wrong shape; `embedder` changes what a document's
@@ -1912,11 +1913,12 @@ mod tests {
                 Reindex,
             ),
             // ---- Cross-variant: vector <-> vector ----
+            // Each kind reads only its own segment files (Issue #1536).
             (
-                "hnsw -> flat with identical dimension/distance/embedder is a reindex",
+                "hnsw -> flat with identical dimension/distance/embedder is destructive",
                 hnsw(|o| o),
                 flat(|o| o),
-                Reindex,
+                Destructive,
             ),
             (
                 "hnsw -> flat with a dimension change is destructive",
@@ -1928,10 +1930,34 @@ mod tests {
                 Destructive,
             ),
             (
-                "flat -> ivf with identical dimension/distance/embedder is a reindex",
+                "hnsw -> ivf with identical dimension/distance/embedder is destructive",
+                hnsw(|o| o),
+                ivf(|o| o),
+                Destructive,
+            ),
+            (
+                "flat -> hnsw with identical dimension/distance/embedder is destructive",
+                flat(|o| o),
+                hnsw(|o| o),
+                Destructive,
+            ),
+            (
+                "flat -> ivf with identical dimension/distance/embedder is destructive",
                 flat(|o| o),
                 ivf(|o| o),
-                Reindex,
+                Destructive,
+            ),
+            (
+                "ivf -> hnsw with identical dimension/distance/embedder is destructive",
+                ivf(|o| o),
+                hnsw(|o| o),
+                Destructive,
+            ),
+            (
+                "ivf -> flat with identical dimension/distance/embedder is destructive",
+                ivf(|o| o),
+                flat(|o| o),
+                Destructive,
             ),
             // ---- MultiVector ----
             (
@@ -2069,9 +2095,19 @@ mod tests {
             ),
         ];
 
-        for (desc, old, new, expected) in cases {
-            assert_eq!(classify_change(&old, &new), expected, "case failed: {desc}");
-        }
+        // Every case that fails is reported, not only the first.
+        let failures: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(desc, old, new, expected)| {
+                let got = classify_change(&old, &new);
+                (got != expected).then(|| format!("{desc}: expected {expected:?}, got {got:?}"))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "cases failed:\n{}",
+            failures.join("\n")
+        );
     }
 
     /// Issue #1060: `Schema`'s `analyzers`/`embedders`/`fields` are

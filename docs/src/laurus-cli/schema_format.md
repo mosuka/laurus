@@ -338,7 +338,7 @@ $ laurus search "title:hello"
 Error: Invalid argument: vector field 'embedding': its files were written with kind Hnsw, dimension 4 and distance Cosine, so it cannot be opened with dimension 8
 ```
 
-To open the index, set the field back to the values the message names. Then change them on the open index: [`laurus update field`](commands.md#update-field) with `--reindex` changes `dimension` or `distance` and discards the field's vectors, and a field of another kind is made with [`laurus delete field`](commands.md#delete-field) followed by [`laurus add field`](commands.md#add-field) (Issue #1536). Each of these leaves the field empty, so its documents need to be put again.
+To open the index, set the field back to the values the message names. Then change them on the open index: [`laurus update field`](commands.md#update-field) with `--reindex` changes the kind, `dimension` or `distance` and discards the field's vectors (a change of kind since Issue #1536). The field is left empty, so its documents need to be put again.
 
 Every other option of a vector field may still change in `schema.toml` while the index is closed: `quantizer`, `m`, `ef_construction`, `n_clusters`, `n_probe`, `rerank_storage`, `pq_codebook_path`, `base_weight` and `embedder`, and a `MultiVector` field's `storage` and `pool_factor`. Segments already written keep what they were written with until a reindex or a merge rewrites them.
 

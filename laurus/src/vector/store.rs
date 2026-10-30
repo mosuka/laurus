@@ -1818,7 +1818,9 @@ impl VectorStore {
     ///   discards the field's existing data ([`VectorIndex::remove_field`]
     ///   with `purge: true`) and recreates it empty under the new config
     ///   ([`VectorIndex::add_field`]) -- `dimension`/`distance`/`embedder`
-    ///   changes cannot be rebuilt from already-encoded data.
+    ///   changes cannot be rebuilt from already-encoded data, and a change of
+    ///   index kind cannot be rebuilt from another kind's segment files
+    ///   (Issue #1536).
     ///
     /// [`FieldChangeKind::Reindex`]: crate::engine::schema::FieldChangeKind::Reindex
     /// [`FieldChangeKind::Destructive`]: crate::engine::schema::FieldChangeKind::Destructive

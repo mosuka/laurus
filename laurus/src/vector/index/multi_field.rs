@@ -578,8 +578,8 @@ impl VectorIndex for MultiFieldVectorIndex {
         // existing segments are read/merged under. The segmented index picks
         // up the existing segment manifest as-is, and refuses a config whose
         // kind, dimension or distance the segments were not written with
-        // (Issue #1547): a Reindex keeps all three, except a change between
-        // kinds, which fails here (Issue #1536).
+        // (Issue #1547): a Reindex keeps all three, since a change of any of
+        // them is Destructive (Issue #1536 for the kind).
         let field_storage: Arc<dyn Storage> =
             Arc::new(PrefixedStorage::new(name.to_string(), self.storage.clone()));
         let index = open_field_index(field_storage, name, new_config.clone())?;

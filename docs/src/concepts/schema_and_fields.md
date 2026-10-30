@@ -775,8 +775,9 @@ The requested change is classified into one of three kinds, reported as
   `m`/`ef_construction`).
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
-  `distance`, a type change on a `stored: false` field, or turning
-  `multi_valued` off on a `stored: false` Boolean, Text or Bytes field).
+  `distance` or its index kind, a type change on a `stored: false` field,
+  or turning `multi_valued` off on a `stored: false` Boolean, Text or Bytes
+  field).
 
 `Reindex` and `Destructive` changes are rejected unless you explicitly
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against
@@ -811,11 +812,13 @@ A vector field's segment manifest records the index kind, `dimension` and
 `distance` its files are written with, and the index opens only under a
 schema that gives the field the same three
 ([#1547](https://github.com/mosuka/laurus/issues/1547)). Change them with
-`update_field` rather than in the schema the index is opened with: a
-`dimension` or `distance` change is `Destructive`. A change of kind is
-classified as `Reindex` but fails, since the field's files cannot be read
-as another kind ([#1536](https://github.com/mosuka/laurus/issues/1536));
-delete the field and add it again instead. See
+`update_field` rather than in the schema the index is opened with. A
+change of any of the three is `Destructive`: a change of kind, such as
+HNSW to Flat, recreates the field empty under the new kind, since each
+kind reads only its own segment files
+([#1536](https://github.com/mosuka/laurus/issues/1536); keeping the
+vectors through a change of kind is
+[#1579](https://github.com/mosuka/laurus/issues/1579)). See
 [Editing an existing vector field](../laurus-cli/schema_format.md#editing-an-existing-vector-field)
 for what may still change in `schema.toml`.
 

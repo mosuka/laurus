@@ -2735,8 +2735,9 @@ impl Engine {
     /// - [`FieldChangeKind::Destructive`](schema::FieldChangeKind::Destructive):
     ///   the field's existing data is discarded rather than rebuilt (data
     ///   loss — "warn and proceed", see #1077's investigation). For a
-    ///   **vector** field (`dimension`/`distance`/`embedder`) this
-    ///   physically deletes the field's data and recreates it empty. For a
+    ///   **vector** field (`dimension`/`distance`/`embedder`, or the index
+    ///   kind, e.g. HNSW to Flat, Issue #1536) this physically deletes the
+    ///   field's data and recreates it empty under the new option. For a
     ///   **lexical** field (any change on a `stored: false` field) there
     ///   is no separate purge step: the rebuild above naturally leaves the
     ///   field empty for every document that has no stored value to

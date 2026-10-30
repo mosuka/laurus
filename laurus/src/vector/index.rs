@@ -353,10 +353,11 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// whole call.
     ///
     /// Only valid for parameters that do not change the meaning of
-    /// already-written vectors (dimension, distance metric, and embedder
-    /// must be unchanged -- callers gate this via
-    /// `laurus::engine::schema::classify_change`). Rebuilding under a
-    /// different `dimension`/`distance`/`embedder` is a
+    /// already-written vectors or how they are stored (dimension, distance
+    /// metric, embedder and index kind must be unchanged -- callers gate
+    /// this via `laurus::engine::schema::classify_change`). Rebuilding under
+    /// a different `dimension`/`distance`/`embedder`, or as another index
+    /// kind (Issue #1536), is a
     /// [`crate::engine::schema::FieldChangeKind::Destructive`] change
     /// instead, handled by the caller as remove-then-add.
     ///
