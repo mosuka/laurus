@@ -323,7 +323,7 @@ mod tests {
         let fusion = json_to_fusion_algorithm(json).unwrap();
         match fusion.algorithm {
             Some(v1::fusion_algorithm::Algorithm::Rrf(rrf)) => {
-                assert!((rrf.k - 30.0).abs() < f64::EPSILON);
+                assert_eq!(rrf.k, Some(30.0));
             }
             _ => panic!("Expected RRF"),
         }
@@ -335,7 +335,7 @@ mod tests {
         let fusion = json_to_fusion_algorithm(json).unwrap();
         match fusion.algorithm {
             Some(v1::fusion_algorithm::Algorithm::Rrf(rrf)) => {
-                assert!((rrf.k - 60.0).abs() < f64::EPSILON);
+                assert_eq!(rrf.k, Some(60.0));
             }
             _ => panic!("Expected RRF with default k"),
         }
@@ -347,8 +347,10 @@ mod tests {
         let fusion = json_to_fusion_algorithm(json).unwrap();
         match fusion.algorithm {
             Some(v1::fusion_algorithm::Algorithm::WeightedSum(ws)) => {
-                assert!((ws.lexical_weight - 0.7).abs() < f32::EPSILON);
-                assert!((ws.vector_weight - 0.3).abs() < f32::EPSILON);
+                assert_eq!(
+                    (ws.lexical_weight, ws.vector_weight),
+                    (Some(0.7), Some(0.3))
+                );
             }
             _ => panic!("Expected WeightedSum"),
         }
@@ -407,8 +409,8 @@ mod tests {
             Some(v1::fusion_algorithm::Algorithm::Rrf(rrf)) => rrf.k,
             other => panic!("{json}: expected RRF, got {other:?}"),
         };
-        assert_eq!(rrf(r#"{"rrf": {"k": null}}"#), 60.0);
-        assert_eq!(rrf(r#"{"rrf": {}, "weighted_sum": null}"#), 60.0);
+        assert_eq!(rrf(r#"{"rrf": {"k": null}}"#), Some(60.0));
+        assert_eq!(rrf(r#"{"rrf": {}, "weighted_sum": null}"#), Some(60.0));
 
         match json_to_fusion_algorithm(
             r#"{"weighted_sum": {"lexical_weight": null, "vector_weight": null}, "rrf": null}"#,
@@ -417,7 +419,10 @@ mod tests {
         .algorithm
         {
             Some(v1::fusion_algorithm::Algorithm::WeightedSum(ws)) => {
-                assert_eq!((ws.lexical_weight, ws.vector_weight), (0.5, 0.5));
+                assert_eq!(
+                    (ws.lexical_weight, ws.vector_weight),
+                    (Some(0.5), Some(0.5))
+                );
             }
             other => panic!("expected WeightedSum, got {other:?}"),
         }

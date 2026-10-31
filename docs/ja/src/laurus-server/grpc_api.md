@@ -503,8 +503,10 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 以下の 2 つのオプションを持つ `oneof` です。
 
-- **RRF** (Reciprocal Rank Fusion): 各結果リストが `1 / (k + rank)` を足します（`rank` は 1 始まり）。`k` は有限で `0` 以上でなければなりません。proto3 は未設定の `k` を 60 ではなく `0` として送ります。明示的に指定する（通常は 60）か、`fusion` を未設定にして `k` 60 を使ってください。
-- **WeightedSum**: min-max 正規化した lexical スコアとベクトルスコアに、それぞれ `lexical_weight` と `vector_weight` を掛けて足します。各重みは `[0, 1]` の範囲で、少なくとも一方が `0` より大きくなければなりません。未設定の重みは `0` なので、空の `WeightedSum` は拒否されます。
+- **RRF** (Reciprocal Rank Fusion): 各結果リストが `1 / (k + rank)` を足します（`rank` は 1 始まり）。`k`（`optional double`）は有限で `0` 以上でなければなりません。未設定の `k` は、HTTP ゲートウェイや MCP と同じく、また `fusion` を未設定にしたときと同じく `60` です。明示した `0` はそのまま使われます（Issue #1551）。
+- **WeightedSum**: min-max 正規化した lexical スコアとベクトルスコアに、それぞれ `lexical_weight` と `vector_weight`（どちらも `optional float`）を掛けて足します。各重みは `[0, 1]` の範囲で、少なくとも一方が `0` より大きくなければなりません。未設定の重みは、HTTP ゲートウェイや MCP と同じく `0.5` なので、空の `WeightedSum` は両方に `0.5` を掛けます。明示した `0` はそのまま使われます（Issue #1551）。
+
+Issue #1551 より前は、この 3 つのフィールドが proto3 の素のスカラーだったため、未設定の `k` は `0` として融合され、空の `WeightedSum` は拒否されていました。その proto から作ったクライアントは明示の `0` を送れない（proto3 は送らない）ので、その `0` は `60` または `0.5` として扱われます。今の proto から作ったクライアントが明示した `0` は、そのまま使われます。
 
 それ以外の値は `INVALID_ARGUMENT` で拒否されます（Issue #1540）。以前は重みを `[0, 1]` に丸めていました。
 

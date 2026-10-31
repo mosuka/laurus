@@ -508,8 +508,10 @@ At least one of `query` or `query_vectors` must be provided.
 
 A `oneof` with two options:
 
-- **RRF** (Reciprocal Rank Fusion): each result list adds `1 / (k + rank)`, `rank` starting at 1. `k` must be finite and at least `0`. proto3 sends an unset `k` as `0`, not 60: set it explicitly (60 is the usual value), or leave `fusion` unset for `k` 60.
-- **WeightedSum**: the min-max normalized lexical and vector scores, multiplied by `lexical_weight` and `vector_weight` and added. Each weight must be in `[0, 1]`, and at least one greater than `0`. An unset weight is `0`, so an empty `WeightedSum` is rejected.
+- **RRF** (Reciprocal Rank Fusion): each result list adds `1 / (k + rank)`, `rank` starting at 1. `k` (`optional double`) must be finite and at least `0`. An unset `k` means `60`, as over the HTTP gateway and MCP and as for an unset `fusion`; an explicit `0` is kept (Issue #1551).
+- **WeightedSum**: the min-max normalized lexical and vector scores, multiplied by `lexical_weight` and `vector_weight` (both `optional float`) and added. Each weight must be in `[0, 1]`, and at least one greater than `0`. An unset weight means `0.5`, as over the HTTP gateway and MCP, so an empty `WeightedSum` weighs both sides `0.5`; an explicit `0` is kept (Issue #1551).
+
+Before Issue #1551 the three fields were plain proto3 scalars, so an unset `k` fused with `k` `0` and an empty `WeightedSum` was rejected. A client built from that proto cannot send an explicit `0` (proto3 omits it), so its `0` now means `60` or `0.5`; a client built from the current proto sends an explicit `0` that is kept.
 
 Any other value is rejected with `INVALID_ARGUMENT` (Issue #1540); weights used to be clamped to `[0, 1]`.
 

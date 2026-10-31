@@ -212,7 +212,7 @@ async fn test_out_of_range_search_parameters_are_rejected() {
         (
             "NaN k",
             v1::SearchRequest {
-                fusion: fusion(Algorithm::Rrf(v1::Rrf { k: f64::NAN })),
+                fusion: fusion(Algorithm::Rrf(v1::Rrf { k: Some(f64::NAN) })),
                 ..hybrid_request("title:rust")
             },
             "fusion: rrf: k must be finite and at least 0, got NaN",
@@ -221,17 +221,20 @@ async fn test_out_of_range_search_parameters_are_rejected() {
             "NaN weight",
             v1::SearchRequest {
                 fusion: fusion(Algorithm::WeightedSum(v1::WeightedSum {
-                    lexical_weight: 0.5,
-                    vector_weight: f32::NAN,
+                    lexical_weight: Some(0.5),
+                    vector_weight: Some(f32::NAN),
                 })),
                 ..hybrid_request("title:rust")
             },
             "fusion: weighted_sum: vector_weight must be between 0 and 1, got NaN",
         ),
         (
-            "empty weighted_sum",
+            "zero weights",
             v1::SearchRequest {
-                fusion: fusion(Algorithm::WeightedSum(v1::WeightedSum::default())),
+                fusion: fusion(Algorithm::WeightedSum(v1::WeightedSum {
+                    lexical_weight: Some(0.0),
+                    vector_weight: Some(0.0),
+                })),
                 ..hybrid_request("title:rust")
             },
             "fusion: weighted_sum: lexical_weight or vector_weight must be greater than 0",
@@ -252,10 +255,101 @@ async fn test_out_of_range_search_parameters_are_rejected() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
 
-    let empty_rrf = v1::SearchRequest {
-        fusion: fusion(Algorithm::Rrf(v1::Rrf::default())),
+/// The `(id, score)` pairs a hybrid search for `title:rust` returns with
+/// `fusion` set to `algorithm` (unset when `None`), or the error message.
+async fn fused_scores(
+    service: &SearchService,
+    algorithm: Option<v1::fusion_algorithm::Algorithm>,
+) -> Result<Vec<(String, f32)>, String> {
+    let request = v1::SearchRequest {
+        fusion: algorithm.map(|algorithm| v1::FusionAlgorithm {
+            algorithm: Some(algorithm),
+        }),
         ..hybrid_request("title:rust")
     };
-    assert_eq!(ids(&service, empty_rrf).await, ["lexical", "vector"]);
+    match service.search(Request::new(request)).await {
+        Ok(response) => Ok(response
+            .into_inner()
+            .results
+            .into_iter()
+            .map(|r| (r.id, r.score))
+            .collect()),
+        Err(status) => Err(status.message().to_string()),
+    }
+}
+
+/// Issue #1551: an unset RRF `k` means 60 and an unset WeightedSum weight
+/// 0.5, as over the HTTP gateway and MCP, and an explicit 0 is kept. proto3
+/// used to send an unset `k` as 0, which fused with `1 / rank`, and unset
+/// weights as 0, which the engine rejects.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unset_fusion_parameters_take_the_defaults_of_the_http_gateway() {
+    use v1::fusion_algorithm::Algorithm;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let service = search_service(&dir).await;
+    let rrf = |k| Some(Algorithm::Rrf(v1::Rrf { k }));
+    let weighted_sum = |lexical_weight, vector_weight| {
+        Some(Algorithm::WeightedSum(v1::WeightedSum {
+            lexical_weight,
+            vector_weight,
+        }))
+    };
+
+    // Every comparison that does not hold, so a failure lists all of them.
+    let mut wrong = Vec::new();
+    let mut expect_same = |what: &str, left, right| {
+        if left != right {
+            wrong.push(format!("{what}: {left:?} != {right:?}"));
+        }
+    };
+
+    let k_60 = fused_scores(&service, rrf(Some(60.0))).await;
+    expect_same(
+        "an unset fusion is RRF with k 60",
+        fused_scores(&service, None).await,
+        k_60.clone(),
+    );
+    expect_same(
+        "an unset k is 60",
+        fused_scores(&service, rrf(None)).await,
+        k_60,
+    );
+    // `lexical` is first in the lexical list and second in the vector list,
+    // `vector` first in the vector list: 1/1 + 1/2 and 1/1 with k 0.
+    expect_same(
+        "an explicit k of 0 is kept",
+        fused_scores(&service, rrf(Some(0.0))).await,
+        Ok(vec![
+            ("lexical".to_string(), 1.5),
+            ("vector".to_string(), 1.0),
+        ]),
+    );
+
+    expect_same(
+        "unset weights are 0.5",
+        fused_scores(&service, weighted_sum(None, None)).await,
+        fused_scores(&service, weighted_sum(Some(0.5), Some(0.5))).await,
+    );
+    expect_same(
+        "an unset vector weight is 0.5",
+        fused_scores(&service, weighted_sum(Some(1.0), None)).await,
+        fused_scores(&service, weighted_sum(Some(1.0), Some(0.5))).await,
+    );
+    // With a vector weight of 0, `vector` (absent from the lexical list)
+    // scores 0; with 0.5 it would score 0.5.
+    let zero_vector_weight = fused_scores(&service, weighted_sum(Some(1.0), Some(0.0))).await;
+    let vector_score = zero_vector_weight.as_ref().ok().and_then(|hits| {
+        hits.iter()
+            .find(|(id, _)| id == "vector")
+            .map(|(_, score)| *score)
+    });
+    if vector_score != Some(0.0) {
+        wrong.push(format!(
+            "an explicit vector weight of 0 is kept: {zero_vector_weight:?}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

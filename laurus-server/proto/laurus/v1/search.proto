@@ -155,17 +155,18 @@ message FusionAlgorithm {
 
 // Reciprocal Rank Fusion: each list adds 1 / (k + rank), rank starting at 1.
 message RRF {
-  // Finite and at least 0. proto3 sends an unset k as 0, not 60: set it
-  // explicitly (60 is the usual value), or leave `fusion` unset for k = 60.
-  double k = 1;
+  // Finite and at least 0. Unset means 60, as over the HTTP gateway and MCP
+  // and as for an unset `fusion`; an explicit 0 is kept (Issue #1551).
+  optional double k = 1;
 }
 
 // Min-max normalized scores, each multiplied by its weight and added. Each
-// weight must be in [0, 1] and at least one greater than 0; an unset weight
-// is 0, so an empty WeightedSum is rejected.
+// weight must be in [0, 1] and at least one greater than 0. An unset weight
+// means 0.5, as over the HTTP gateway and MCP; an explicit 0 is kept (Issue
+// #1551).
 message WeightedSum {
-  float lexical_weight = 1;
-  float vector_weight = 2;
+  optional float lexical_weight = 1;
+  optional float vector_weight = 2;
 }
 
 message LexicalParams {
