@@ -1,0 +1,50 @@
+name: Match libclang to clang
+description: >
+  Point bindgen at the libclang of the runner's default `clang` by setting
+  `LIBCLANG_PATH` and `CLANG_PATH`. Needed by the jobs that build
+  `ext-php-rs` (laurus-php). See issue #1577.
+
+  Without these variables, clang-sys (which bindgen uses to find LLVM) loads
+  the newest libclang it finds, but asks the `clang` on PATH for the include
+  paths. The ubuntu-26.04 image installs clang 20, 21 and 22 with 21 as the
+  default, so bindgen parsed clang 21's builtin headers with libclang 22,
+  which does not know builtins those headers call (`__builtin_ia32_sqrtps`
+  and others), and failed with "Unable to generate bindings for PHP".
+
+  This pins no version: it pairs whatever `clang` the image makes the default
+  with that LLVM's own libclang. When there is no `clang` on PATH, or no
+  libclang next to it, it only warns and sets nothing. It can be removed once
+  bindgen matches the two itself
+  (https://github.com/rust-lang/rust-bindgen/issues/2682).
+
+  Linux-only: the caller gates this with `if: runner.os == 'Linux'`.
+
+runs:
+  using: composite
+  steps:
+    - name: Match libclang to clang
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if ! clang_on_path=$(command -v clang); then
+          echo "::warning::No clang on PATH; LIBCLANG_PATH and CLANG_PATH are left unset"
+          exit 0
+        fi
+        # /usr/bin/clang -> /etc/alternatives/clang -> /usr/bin/clang-21
+        # -> /usr/lib/llvm-21/bin/clang on the Ubuntu images.
+        clang_bin=$(readlink -f "${clang_on_path}")
+        libclang_dir="$(dirname "$(dirname "${clang_bin}")")/lib"
+
+        # The file names clang-sys looks for in LIBCLANG_PATH on Linux.
+        if ! compgen -G "${libclang_dir}/libclang.so*" >/dev/null &&
+           ! compgen -G "${libclang_dir}/libclang-[0-9]*.so*" >/dev/null; then
+          echo "::warning::No libclang in ${libclang_dir} for ${clang_bin}; LIBCLANG_PATH and CLANG_PATH are left unset"
+          exit 0
+        fi
+
+        echo "CLANG_PATH=${clang_bin}" >> "${GITHUB_ENV}"
+        echo "LIBCLANG_PATH=${libclang_dir}" >> "${GITHUB_ENV}"
+        echo "CLANG_PATH=${clang_bin}"
+        echo "LIBCLANG_PATH=${libclang_dir}"
+        "${clang_bin}" --version
