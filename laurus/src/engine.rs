@@ -3197,7 +3197,9 @@ impl Engine {
                     field_boosts: lexical_options.field_boosts.clone(),
                 };
                 let vec_req = self.build_vector_request(vector, vector_options, fetch_count);
-                let fusion = fusion_algorithm.or(Some(FusionAlgorithm::RRF { k: 60.0 }));
+                let fusion = fusion_algorithm.or(Some(FusionAlgorithm::RRF {
+                    k: FusionAlgorithm::DEFAULT_RRF_K,
+                }));
                 Ok((Some(lex_req), Some(vec_req), fusion, mode))
             }
         }
@@ -4345,7 +4347,9 @@ impl Engine {
             hybrid: lexical_search_request.is_some() && vector_search_request.is_some(),
             lexical,
             vector,
-            fusion_algorithm: fusion_algorithm.unwrap_or(FusionAlgorithm::RRF { k: 60.0 }),
+            fusion_algorithm: fusion_algorithm.unwrap_or(FusionAlgorithm::RRF {
+                k: FusionAlgorithm::DEFAULT_RRF_K,
+            }),
             hybrid_mode,
         };
 

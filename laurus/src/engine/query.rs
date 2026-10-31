@@ -102,7 +102,9 @@ impl UnifiedQueryParser {
             vector_fields,
             known_fields: HashSet::new(),
             multi_vector_fields: HashSet::new(),
-            default_fusion: FusionAlgorithm::RRF { k: 60.0 },
+            default_fusion: FusionAlgorithm::RRF {
+                k: FusionAlgorithm::DEFAULT_RRF_K,
+            },
         }
     }
 

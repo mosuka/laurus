@@ -3883,28 +3883,28 @@ mod tests {
         };
         assert_eq!(
             fusion(json!({"rrf": {}})),
-            Algorithm::Rrf(v1::Rrf { k: 60.0 })
+            Algorithm::Rrf(v1::Rrf { k: Some(60.0) })
         );
         assert_eq!(
             fusion(json!({"rrf": {"k": null}})),
-            Algorithm::Rrf(v1::Rrf { k: 60.0 })
+            Algorithm::Rrf(v1::Rrf { k: Some(60.0) })
         );
         assert_eq!(
             fusion(json!({"rrf": {"k": 1}})),
-            Algorithm::Rrf(v1::Rrf { k: 1.0 })
+            Algorithm::Rrf(v1::Rrf { k: Some(1.0) })
         );
         assert_eq!(
             fusion(json!({"rrf": null, "weighted_sum": {"vector_weight": null}})),
             Algorithm::WeightedSum(v1::WeightedSum {
-                lexical_weight: 0.5,
-                vector_weight: 0.5
+                lexical_weight: Some(0.5),
+                vector_weight: Some(0.5)
             })
         );
         assert_eq!(
             fusion(json!({"weighted_sum": {"lexical_weight": 1, "vector_weight": 0}})),
             Algorithm::WeightedSum(v1::WeightedSum {
-                lexical_weight: 1.0,
-                vector_weight: 0.0
+                lexical_weight: Some(1.0),
+                vector_weight: Some(0.0)
             })
         );
 

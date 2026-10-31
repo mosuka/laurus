@@ -21,6 +21,11 @@ use crate::convert::json::{
 };
 use crate::proto::laurus::v1;
 
+/// The `WeightedSum` weight a gRPC, HTTP or MCP request leaves unset (Issue
+/// #1551). The engine has no default weight: this is the front ends'
+/// convention, which the bindings share.
+pub const DEFAULT_WEIGHTED_SUM_WEIGHT: f32 = 0.5;
+
 /// Build a laurus SearchRequest from a proto SearchRequest.
 ///
 /// The proto `query` field is always the unified query DSL
@@ -115,17 +120,19 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
     }
     builder = builder.offset(proto.offset as usize);
 
-    // Fusion. The engine checks the RRF `k` and the weights (Issue #1540).
-    // proto3 sends an unset `k` as 0, which it accepts, and unset weights as
-    // 0 and 0, which it rejects.
+    // Fusion. An unset `k` or weight takes the default the HTTP gateway and
+    // MCP fill in, and an explicit 0 is kept (Issue #1551); the engine checks
+    // the values (Issue #1540).
     if let Some(fusion) = &proto.fusion
         && let Some(alg) = &fusion.algorithm
     {
         let fusion_alg = match alg {
-            v1::fusion_algorithm::Algorithm::Rrf(rrf) => FusionAlgorithm::RRF { k: rrf.k },
+            v1::fusion_algorithm::Algorithm::Rrf(rrf) => FusionAlgorithm::RRF {
+                k: rrf.k.unwrap_or(FusionAlgorithm::DEFAULT_RRF_K),
+            },
             v1::fusion_algorithm::Algorithm::WeightedSum(ws) => FusionAlgorithm::WeightedSum {
-                lexical_weight: ws.lexical_weight,
-                vector_weight: ws.vector_weight,
+                lexical_weight: ws.lexical_weight.unwrap_or(DEFAULT_WEIGHTED_SUM_WEIGHT),
+                vector_weight: ws.vector_weight.unwrap_or(DEFAULT_WEIGHTED_SUM_WEIGHT),
             },
         };
         builder = builder.fusion_algorithm(fusion_alg);
@@ -468,13 +475,13 @@ pub fn fusion_algorithm_from_json(json: &serde_json::Value) -> Result<v1::Fusion
         (Some(rrf), None) => {
             let k = json_optional_f64(rrf, "k")
                 .map_err(|e| error(format!("rrf: {e}")))?
-                .unwrap_or(60.0);
-            Algorithm::Rrf(v1::Rrf { k })
+                .unwrap_or(FusionAlgorithm::DEFAULT_RRF_K);
+            Algorithm::Rrf(v1::Rrf { k: Some(k) })
         }
         (None, Some(ws)) => {
             let weight = |key: &str| {
                 json_optional_f64(ws, key)
-                    .map(|w| w.unwrap_or(0.5) as f32)
+                    .map(|w| Some(w.map_or(DEFAULT_WEIGHTED_SUM_WEIGHT, |w| w as f32)))
                     .map_err(|e| error(format!("weighted_sum: {e}")))
             };
             Algorithm::WeightedSum(v1::WeightedSum {

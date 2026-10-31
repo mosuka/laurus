@@ -597,6 +597,11 @@ pub enum FusionAlgorithm {
 }
 
 impl FusionAlgorithm {
+    /// The RRF `k` of the default fusion, used when a request names none,
+    /// and by the server for an RRF whose `k` a gRPC, HTTP or MCP request
+    /// leaves unset (Issue #1551).
+    pub const DEFAULT_RRF_K: f64 = 60.0;
+
     /// Reject parameters the fusion cannot use (Issue #1540). An RRF `k` of
     /// at least `0` keeps every term `1 / (k + rank)` in `(0, 1]`, while a
     /// negative one makes a term infinite (`k = -rank`) or negative
