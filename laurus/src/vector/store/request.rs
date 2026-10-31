@@ -82,6 +82,11 @@ pub struct QueryVector {
     /// with a `NaN` or infinite component fails with
     /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// (Issue #1573).
+    ///
+    /// Its dimension must be that of every field it is searched in (see
+    /// [`fields`](Self::fields)); a search where it is not fails with
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument),
+    /// whatever the index holds (Issue #1575).
     pub vector: Vector,
     /// Multiplicative weight applied to the similarity score produced by this
     /// vector. Defaults to `1.0`.
@@ -98,7 +103,11 @@ pub struct QueryVector {
     #[serde(default = "QueryVector::default_weight")]
     pub weight: f32,
     /// Optional list of fields to restrict this query vector to.
-    /// If None, it applies to all target fields.
+    /// If None, the request's
+    /// [`fields`](crate::vector::search::searcher::VectorSearchParams::fields)
+    /// pick them, and with none of those either it is searched in every
+    /// field of its own dimension. The fields it names or the request picks
+    /// for it must have its dimension (Issue #1575).
     #[serde(default)]
     pub fields: Option<Vec<String>>,
 }

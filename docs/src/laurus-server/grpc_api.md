@@ -500,9 +500,9 @@ At least one of `query` or `query_vectors` must be provided.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `vector` | `repeated float` | Query vector. A `NaN` or infinite component is rejected with `INVALID_ARGUMENT`, whatever the data (Issue #1573) |
+| `vector` | `repeated float` | Query vector. A `NaN` or infinite component is rejected with `INVALID_ARGUMENT`, whatever the data (Issue #1573), and so is a vector whose dimension differs from a field it is searched in (Issue #1575; see `fields`) |
 | `weight` | `float` | Weight for this vector (default: 1.0; `0` and `-0` also mean 1.0, since proto3 cannot tell them from unset). Any other negative weight, or a non-finite one, is rejected with `INVALID_ARGUMENT` (Issue #1552) |
-| `fields` | `repeated string` | Target vector fields (empty = all) |
+| `fields` | `repeated string` | Target vector fields. Empty means `VectorParams.fields` if set, otherwise every vector field whose dimension matches. A field named here or picked by `VectorParams.fields` must have the vector's dimension, or the search is rejected with `INVALID_ARGUMENT`, whatever the data (Issue #1575) |
 
 ### FusionAlgorithm
 
@@ -541,7 +541,7 @@ effect or is rejected with `INVALID_ARGUMENT`.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `fields` | `repeated string` | Vector fields (exact names) to search with query vectors that name no field. A query vector's own `fields` take precedence, and every DSL vector clause names its field, so `fields` is rejected when no searched `query_vectors` entry names no field. An unknown name is rejected. Empty means every vector field whose dimension matches. |
+| `fields` | `repeated string` | Vector fields (exact names) to search with query vectors that name no field. A query vector's own `fields` take precedence, and every DSL vector clause names its field, so `fields` is rejected when no searched `query_vectors` entry names no field. An unknown name is rejected, and so is a field whose dimension differs from a query vector's it is picked for (Issue #1575). Empty means every vector field whose dimension matches. |
 | `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, or `LATE_INTERACTION`. Any other value is rejected. |
 | `overfetch` | `float` | Each per-field index query fetches `ceil(limit * overfetch)` candidates before scores are combined. `0` (unset) means the default, `2.0`; a value in `(0, 1]` turns overfetch off. Negative or non-finite values are rejected. |
 | `min_score` | `float` | Minimum per-field similarity, compared before query and field weights are applied. `0` (unset) means no threshold; similarity is in `[0, 1]`, so a negative value is the same. A non-finite value is rejected. |

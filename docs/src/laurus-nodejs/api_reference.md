@@ -552,7 +552,7 @@ Positional/proximity span queries.
 new VectorQuery(field: string, vector: number[])
 ```
 
-Nearest-neighbor search using a pre-computed embedding vector. Every component of `vector` must be finite and within the range of a 32-bit float; the search throws an `InvalidArg` error otherwise (Issue #1573).
+Nearest-neighbor search using a pre-computed embedding vector. Every component of `vector` must be finite and within the range of a 32-bit float; the search throws an `InvalidArg` error otherwise (Issue #1573). Its length must be the field's dimension, or the search throws an `InvalidArg` error as well, whatever the index holds (Issue #1575).
 
 ### VectorTextQuery
 

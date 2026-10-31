@@ -259,7 +259,9 @@ pub struct VectorSearchOptions {
     /// routes [`VectorSearchQuery::Vectors`] entries whose `fields` is
     /// `None`. `None` (the default) searches every vector field whose
     /// dimension matches. An unknown [`FieldSelector::Exact`] name fails the
-    /// search with `InvalidArgument`.
+    /// search with `InvalidArgument`, and so does a picked field whose
+    /// dimension differs from the query vector's, whatever the data (Issue
+    /// #1575).
     pub fields: Option<Vec<FieldSelector>>,
 
     /// Overfetch factor (Issue #1342): each per-field index query fetches

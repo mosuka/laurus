@@ -451,7 +451,7 @@ Laurus::SpanQuery.within(field, include_span, exclude_span, distance)
 Laurus::VectorQuery.new(field, vector)
 ```
 
-事前計算済みエンベディングベクトルを使った近似最近傍検索を行います。`vector` は Float の配列で、成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では検索が `ArgumentError` を送出します（Issue #1573）。
+事前計算済みエンベディングベクトルを使った近似最近傍検索を行います。`vector` は Float の配列で、成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では検索が `ArgumentError` を送出します（Issue #1573）。長さはフィールドの次元と同じでなければならず、違えば、インデックスの中身によらず検索が `ArgumentError` を送出します（Issue #1575）。
 
 ### VectorTextQuery
 

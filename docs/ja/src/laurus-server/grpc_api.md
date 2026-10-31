@@ -495,9 +495,9 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `vector` | `repeated float` | クエリベクトル。`NaN` や無限大の成分は、データによらず `INVALID_ARGUMENT` で拒否される（Issue #1573） |
+| `vector` | `repeated float` | クエリベクトル。`NaN` や無限大の成分は、データによらず `INVALID_ARGUMENT` で拒否される（Issue #1573）。検索の対象のフィールドと次元が違うベクトルも同じく拒否される（Issue #1575。`fields` を参照） |
 | `weight` | `float` | このベクトルの重み（デフォルト: 1.0。proto3 では未指定と区別できないため、`0` と `-0` も 1.0 として扱う）。それ以外の負の値と非有限値は `INVALID_ARGUMENT` で拒否される（Issue #1552） |
-| `fields` | `repeated string` | 対象のベクトルフィールド（空の場合は全フィールド） |
+| `fields` | `repeated string` | 対象のベクトルフィールド。空の場合は、`VectorParams.fields` があればそのフィールド、なければ次元の一致するすべてのベクトルフィールド。ここで指定したフィールドや `VectorParams.fields` が選んだフィールドは、ベクトルと同じ次元でなければならず、そうでなければ、データによらず `INVALID_ARGUMENT` で拒否される（Issue #1575） |
 
 ### FusionAlgorithm
 
@@ -530,7 +530,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `fields` | `repeated string` | フィールドを指定していないクエリベクトルで検索するベクトルフィールド（完全一致の名前）。クエリベクトル自身の `fields` が優先され、DSL のベクトル句は必ず自分のフィールドを指定するため、検索に使われる `query_vectors` のうちフィールドを指定していないものが1本も無ければ拒否されます。未知の名前も拒否されます。空なら、次元の一致するすべてのベクトルフィールドを検索します。 |
+| `fields` | `repeated string` | フィールドを指定していないクエリベクトルで検索するベクトルフィールド（完全一致の名前）。クエリベクトル自身の `fields` が優先され、DSL のベクトル句は必ず自分のフィールドを指定するため、検索に使われる `query_vectors` のうちフィールドを指定していないものが1本も無ければ拒否されます。未知の名前も、選ばれた先のクエリベクトルと次元の違うフィールドも拒否されます（Issue #1575）。空なら、次元の一致するすべてのベクトルフィールドを検索します。 |
 | `score_mode` | `VectorScoreMode` | `WEIGHTED_SUM`, `MAX_SIM`, または `LATE_INTERACTION`。それ以外の値は拒否されます。 |
 | `overfetch` | `float` | フィールドごとの index クエリは、スコアを結合する前に `ceil(limit * overfetch)` 件の候補を取得します。`0`（未指定）は既定値の `2.0`、`(0, 1]` の値は overfetch 無効を意味します。負の値や非有限値は拒否されます。 |
 | `min_score` | `float` | フィールドごとの類似度の下限で、クエリやフィールドの重みを掛ける前の値と比べます。`0`（未指定）は閾値なしです。類似度は `[0, 1]` に収まるので、負の値も同じです。非有限値は拒否されます。 |

@@ -455,7 +455,7 @@ Positional / proximity span queries. `near` takes an Array of term Strings, whil
 Laurus::VectorQuery.new(field, vector)
 ```
 
-Approximate nearest-neighbor search using a pre-computed embedding vector. `vector` is an Array of Floats, each finite and within the range of a 32-bit float; the search raises `ArgumentError` otherwise (Issue #1573).
+Approximate nearest-neighbor search using a pre-computed embedding vector. `vector` is an Array of Floats, each finite and within the range of a 32-bit float; the search raises `ArgumentError` otherwise (Issue #1573). Its length must be the field's dimension, or the search raises `ArgumentError` as well, whatever the index holds (Issue #1575).
 
 ### VectorTextQuery
 

@@ -8,6 +8,9 @@
 //!
 //! Issue #1573: it also rejects a query vector with a `NaN` or infinite
 //! component, whether the request gives it or the embedder returns it.
+//!
+//! Issue #1575: and a query vector whose dimension differs from a field it
+//! is searched in, whether the request gives it or the embedder returns it.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -481,24 +484,32 @@ async fn a_non_finite_query_vector_component_is_rejected_whatever_the_data() {
         .expect("a finite component is not an error");
 }
 
-/// Embeds any text as `[NaN, 0]`.
+/// Embeds any text as the vector it holds.
 #[derive(Debug)]
-struct NanEmbedder;
+struct FixedEmbedder(Vec<f32>);
 
 #[async_trait]
-impl Embedder for NanEmbedder {
+impl Embedder for FixedEmbedder {
     async fn embed(&self, _input: &EmbedInput<'_>) -> Result<Vector> {
-        Ok(Vector::new(vec![f32::NAN, 0.0]))
+        Ok(Vector::new(self.0.clone()))
     }
     fn supported_input_types(&self) -> Vec<EmbedInputType> {
         vec![EmbedInputType::Text]
     }
     fn name(&self) -> &str {
-        "nan"
+        "fixed"
     }
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// A text payload on `vec`.
+fn payload() -> VectorSearchQuery {
+    VectorSearchQuery::Payloads(vec![QueryPayload::new(
+        "vec",
+        DataValue::Text("payload text".to_string()),
+    )])
 }
 
 /// Issue #1573: a query vector the embedder returns with a `NaN` component
@@ -507,13 +518,7 @@ impl Embedder for NanEmbedder {
 /// while the DSL is parsed, before the filter runs), and a payload.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_finite_embedded_query_vector_is_rejected() {
-    let engine = weight_engine(Arc::new(NanEmbedder)).await;
-    let payload = || {
-        VectorSearchQuery::Payloads(vec![QueryPayload::new(
-            "vec",
-            DataValue::Text("payload text".to_string()),
-        )])
-    };
+    let engine = weight_engine(Arc::new(FixedEmbedder(vec![f32::NAN, 0.0]))).await;
     let requests = [
         (
             "dsl clause",
@@ -554,6 +559,163 @@ async fn a_non_finite_embedded_query_vector_is_rejected() {
                 )
         );
         if !rejected {
+            accepted.push(format!("{shape} -> {result:?}"));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "not rejected:\n{}",
+        accepted.join("\n")
+    );
+}
+
+/// The query vector of `dimension` ones on `vec`. The dimension is given as
+/// an `f32` so that it fits `early_return_shapes`.
+fn named_of_dimension(dimension: f32) -> VectorSearchQuery {
+    VectorSearchQuery::Vectors(vec![QueryVector {
+        vector: Vector::new(vec![1.0; dimension as usize]),
+        weight: 1.0,
+        fields: Some(vec!["vec".to_string()]),
+    }])
+}
+
+/// The query vector of `dimension` ones, naming no field.
+fn unnamed_of_dimension(dimension: usize) -> VectorSearchQuery {
+    VectorSearchQuery::Vectors(vec![QueryVector {
+        vector: Vector::new(vec![1.0; dimension]),
+        weight: 1.0,
+        fields: None,
+    }])
+}
+
+/// Dimensions other than `vec`'s `2`: one shorter, one longer.
+const BAD_DIMENSIONS: [f32; 2] = [1.0, 3.0];
+
+/// Whether `result` is the `InvalidArgument` of `subject` having `dimension`
+/// where `vec` has `2`.
+fn is_dimension_error(result: &Result<Vec<SearchResult>>, subject: &str, dimension: usize) -> bool {
+    let expected = format!("{subject} has dimension {dimension}, but field 'vec' has 2");
+    matches!(
+        result,
+        Err(LaurusError::InvalidArgument(message)) if *message == expected
+    )
+}
+
+/// Issue #1575: a query vector of another dimension than the field it names,
+/// or than the field the request's `vector_fields` pick for it, is rejected
+/// in every shape of request: where the search returns early without
+/// searching the vectors, and where there is data to search. A query vector
+/// that names no field, with no `vector_fields`, is still searched only in
+/// the fields of its own dimension.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_vector_of_another_dimension_is_rejected_whatever_the_data() {
+    let engine = weight_engine(Arc::new(CountingEmbedder::default())).await;
+    let named = |dimension| SearchRequestBuilder::new().vector_query(named_of_dimension(dimension));
+    let picked = |dimension: f32| {
+        SearchRequestBuilder::new()
+            .vector_query(unnamed_of_dimension(dimension as usize))
+            .vector_fields(vec![FieldSelector::Exact("vec".to_string())])
+    };
+    let mut shapes = Vec::from(early_return_shapes(named_of_dimension));
+    shapes.push((
+        "vector",
+        Box::new(move |dimension| named(dimension).build()),
+    ));
+    shapes.push((
+        "hybrid",
+        Box::new(move |dimension| {
+            named(dimension)
+                .lexical_query(LexicalSearchQuery::Obj(Box::new(TermQuery::new(
+                    "title", "rust",
+                ))))
+                .build()
+        }),
+    ));
+    shapes.push((
+        "vector_fields, filter matches nothing",
+        Box::new(move |dimension| picked(dimension).filter_query(nothing()).build()),
+    ));
+    shapes.push((
+        "vector_fields, grouped with limit 0",
+        Box::new(move |dimension| {
+            picked(dimension)
+                .group_by(GroupBy::new("_id"))
+                .limit(0)
+                .build()
+        }),
+    ));
+    shapes.push((
+        "vector_fields",
+        Box::new(move |dimension| picked(dimension).build()),
+    ));
+
+    let mut accepted = Vec::new();
+    for (shape, request) in &shapes {
+        for dimension in BAD_DIMENSIONS {
+            let result = engine.search(request(dimension)).await;
+            if !is_dimension_error(&result, "query vector 0", dimension as usize) {
+                accepted.push(format!("{shape}: {dimension} -> {result:?}"));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "not rejected:\n{}",
+        accepted.join("\n")
+    );
+
+    let unnamed = engine
+        .search(
+            SearchRequestBuilder::new()
+                .vector_query(unnamed_of_dimension(3))
+                .build(),
+        )
+        .await
+        .expect("a query vector that names no field is not checked");
+    assert!(unnamed.is_empty(), "no field has 3 dimensions: {unnamed:?}");
+    let fitting = engine.search(named(2.0).build()).await.unwrap();
+    assert_eq!(sorted_ids(&fitting), vec!["doc1", "doc2"]);
+}
+
+/// Issue #1575: a query vector the embedder returns with another dimension
+/// than its field is rejected: a DSL vector clause and a `DslWithVectors`
+/// payload once the DSL is parsed, also under a filter that matches nothing
+/// (before the filter runs), and a `Vector` payload once it is embedded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedded_query_vector_of_another_dimension_is_rejected() {
+    let engine = weight_engine(Arc::new(FixedEmbedder(vec![1.0, 0.0, 0.0]))).await;
+    let requests = [
+        (
+            "dsl clause",
+            SearchRequestBuilder::new()
+                .query_dsl("vec:\"dsl text\"")
+                .build(),
+        ),
+        (
+            "dsl clause, filter matches nothing",
+            SearchRequestBuilder::new()
+                .query_dsl("vec:\"dsl text\"")
+                .filter_query(nothing())
+                .build(),
+        ),
+        (
+            "dsl with a payload, filter matches nothing",
+            SearchRequestBuilder::new()
+                .vector_query(payload())
+                .query_dsl("title:rust")
+                .filter_query(nothing())
+                .build(),
+        ),
+        (
+            "payload",
+            SearchRequestBuilder::new().vector_query(payload()).build(),
+        ),
+    ];
+
+    let mut accepted = Vec::new();
+    for (shape, request) in requests {
+        let result = engine.search(request).await;
+        if !is_dimension_error(&result, "the embedding of a query", 3) {
             accepted.push(format!("{shape} -> {result:?}"));
         }
     }

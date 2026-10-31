@@ -45,8 +45,8 @@ pub enum VectorStorage {
     OwnedPqFastScan(Arc<PqFastScanPool>),
     /// Float16 rows (Issue #623), on the heap or read in place from the
     /// mapped segment depending on the loading mode. The search hot loop
-    /// reads rows through [`Self::f16_pool`] and
-    /// [`crate::vector::core::distance_f16::distance_f16`]; [`Self::get`]
+    /// reads rows through [`Self::f16_pool`] and scores them with the
+    /// kernels of [`crate::vector::core::distance_f16`]; [`Self::get`]
     /// decodes to f32.
     Float16(Arc<F16VectorPool>),
 }

@@ -256,6 +256,11 @@ impl VectorIndexSearcher for IvfSearcher {
         // query (`prepared_query` above).
         let f16_pool = ivf_reader.and_then(|r| r.vectors().f16_pool().cloned());
         let f16_ctx = f16_pool.as_ref().map(|pool| (pool, pool.rows()));
+        // Issue #1575: checked once here, so the rows are scored below
+        // without checking the length of each.
+        if let Some((pool, _)) = &f16_ctx {
+            pool.check_query(&request.query.data)?;
+        }
 
         // Filter-aware allow-set honoured inline (Issue #740). Borrowed once
         // before the scan; `&AHashSet` is `Send + Sync`, so it composes with
@@ -298,11 +303,16 @@ impl VectorIndexSearcher for IvfSearcher {
                     && !ivf_reader.is_some_and(|r| r.is_deleted(*doc_id))
                 {
                     let row = rows.row_at(pos);
-                    let distance = crate::vector::core::distance_f16::distance_f16(
-                        metric,
-                        &prepared_query,
-                        row,
-                    );
+                    // SAFETY: the query has the pool's dimension
+                    // (`check_query` above), and the pool's rows are
+                    // `2 × dim` bytes.
+                    let distance = unsafe {
+                        crate::vector::core::distance_f16::distance_f16_unchecked(
+                            metric,
+                            &prepared_query,
+                            row,
+                        )
+                    };
                     let similarity = metric.distance_to_similarity(distance);
                     let vector = request
                         .params

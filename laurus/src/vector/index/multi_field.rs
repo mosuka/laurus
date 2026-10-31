@@ -923,6 +923,25 @@ struct SearcherEntry {
     multi_vector: bool,
 }
 
+impl SearcherEntry {
+    /// Check that a query of `dimension` fits this field, `field_name`
+    /// (Issue #1575). A multi-vector field is not checked: its searcher
+    /// rejects every query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if the dimensions differ.
+    fn check_dimension(&self, field_name: &str, dimension: usize) -> Result<()> {
+        if !self.multi_vector && self.dimension != dimension {
+            return Err(LaurusError::invalid_argument(format!(
+                "query vector has dimension {dimension}, but field '{field_name}' has {}",
+                self.dimension
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Searcher over a [`MultiFieldVectorIndex`]'s per-field sub-searchers.
 ///
 /// A field-targeted query (`request.field_name.is_some()`) is delegated
@@ -951,6 +970,20 @@ impl MultiFieldFanoutSearcher {
                 "unknown vector field '{field_name}': no index configured for it"
             ))
         })
+    }
+
+    /// [`Self::resolve_field`], also checking that a query of `dimension`
+    /// fits the field (Issue #1575).
+    ///
+    /// The engine and the store check the dimension against the live field
+    /// configuration before searching. This searcher may still hold a field
+    /// that a concurrent `delete_field` or `update_field` has since removed
+    /// or changed, so the query is checked again against the field it
+    /// actually reaches. A multi-vector field keeps its own rejection.
+    fn resolve_field_for(&self, field_name: &str, dimension: usize) -> Result<&SearcherEntry> {
+        let entry = self.resolve_field(field_name)?;
+        entry.check_dimension(field_name, dimension)?;
+        Ok(entry)
     }
 
     /// Searchable fields whose configured dimension matches `dim`, in
@@ -1014,14 +1047,20 @@ impl MultiFieldFanoutSearcher {
 impl VectorIndexSearcher for MultiFieldFanoutSearcher {
     fn search(&self, request: &VectorIndexQuery) -> Result<VectorIndexQueryResults> {
         match &request.field_name {
-            Some(field_name) => self.resolve_field(field_name)?.searcher.search(request),
+            Some(field_name) => self
+                .resolve_field_for(field_name, request.query.data.len())?
+                .searcher
+                .search(request),
             None => self.search_fanout(request),
         }
     }
 
     fn count(&self, request: VectorIndexQuery) -> Result<u64> {
         if let Some(field_name) = request.field_name.clone() {
-            return self.resolve_field(&field_name)?.searcher.count(request);
+            return self
+                .resolve_field_for(&field_name, request.query.data.len())?
+                .searcher
+                .count(request);
         }
         let dim = request.query.data.len();
         let mut total = 0u64;
@@ -1070,6 +1109,9 @@ impl VectorIndexSearcher for MultiFieldFanoutSearcher {
             match field_name {
                 Some(field_name) => {
                     let entry = self.resolve_field(&field_name)?;
+                    for &i in &indices {
+                        entry.check_dimension(&field_name, queries[i].query.data.len())?;
+                    }
                     let bucket_queries: Vec<VectorIndexQuery> =
                         indices.iter().map(|&i| queries[i].clone()).collect();
                     let bucket_results = entry
@@ -1917,5 +1959,80 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A searcher that answers every query with no hits.
+    #[derive(Debug)]
+    struct EmptySearcher;
+
+    impl VectorIndexSearcher for EmptySearcher {
+        fn search(&self, _request: &VectorIndexQuery) -> Result<VectorIndexQueryResults> {
+            Ok(VectorIndexQueryResults::new())
+        }
+        fn count(&self, _request: VectorIndexQuery) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Issue #1575: a query naming a field is checked against the dimension
+    /// of the field it reaches in this searcher, which can be older than
+    /// the field configuration the store checked it against (a concurrent
+    /// `delete_field` or `update_field`). A field-less query and a
+    /// multi-vector field are not checked here.
+    #[test]
+    fn fanout_searcher_rejects_a_query_of_another_dimension_than_its_field() {
+        let entry = |dimension, multi_vector| SearcherEntry {
+            searcher: Box::new(EmptySearcher),
+            dimension,
+            distance_metric: DistanceMetric::Cosine,
+            multi_vector,
+        };
+        let searcher = MultiFieldFanoutSearcher::new(BTreeMap::from([
+            ("a".to_string(), entry(2, false)),
+            ("tokens".to_string(), entry(4, true)),
+        ]));
+        let query = |dimension: usize, field: Option<&str>| {
+            let query = VectorIndexQuery::new(Vector::new(vec![1.0; dimension]));
+            match field {
+                Some(field) => query.field_name(field.to_string()),
+                None => query,
+            }
+        };
+        let rejected = |result: Result<()>, dimension: usize| {
+            matches!(
+                result,
+                Err(LaurusError::InvalidArgument(m))
+                    if m == format!("query vector has dimension {dimension}, but field 'a' has 2")
+            )
+        };
+
+        // A shorter and a longer query.
+        let mut accepted = Vec::new();
+        for dimension in [1, 3] {
+            if !rejected(
+                searcher.search(&query(dimension, Some("a"))).map(|_| ()),
+                dimension,
+            ) {
+                accepted.push(format!("search {dimension}"));
+            }
+            if !rejected(
+                searcher.count(query(dimension, Some("a"))).map(|_| ()),
+                dimension,
+            ) {
+                accepted.push(format!("count {dimension}"));
+            }
+            let batch = [query(2, Some("a")), query(dimension, Some("a"))];
+            if !rejected(
+                searcher.search_batch_with_threshold(&batch, 4).map(|_| ()),
+                dimension,
+            ) {
+                accepted.push(format!("search_batch_with_threshold {dimension}"));
+            }
+        }
+        assert!(accepted.is_empty(), "not rejected: {accepted:?}");
+
+        searcher.search(&query(2, Some("a"))).unwrap();
+        searcher.search(&query(3, None)).unwrap();
+        searcher.search(&query(5, Some("tokens"))).unwrap();
     }
 }

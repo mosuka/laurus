@@ -104,7 +104,10 @@ pub(crate) struct F16HeapRows<'a> {
 }
 
 impl<'a> F16HeapRows<'a> {
-    /// The row at `pos`.
+    /// The row at `pos`: exactly `row_size` (`2 × dim`) bytes. The Float16
+    /// searchers rely on this length when they score the row with
+    /// [`distance_f16_unchecked`](crate::vector::core::distance_f16::distance_f16_unchecked)
+    /// after checking only the query's (Issue #1575).
     ///
     /// # Panics
     ///
@@ -131,7 +134,8 @@ pub(crate) struct F16MappedRows<'a> {
 }
 
 impl<'a> F16MappedRows<'a> {
-    /// The row at `pos`.
+    /// The row at `pos`: exactly `row_size` (`2 × dim`) bytes, which the
+    /// Float16 searchers rely on (see [`F16HeapRows::row_at`]).
     ///
     /// # Panics
     ///
@@ -176,7 +180,8 @@ impl<'a> F16Rows<'a> {
 pub struct F16VectorPool {
     /// Vector dimension.
     dim: usize,
-    /// Bytes per row (`2 × dim`).
+    /// Bytes per row (`2 × dim`): every row [`Self::rows`] hands out has
+    /// exactly this length (see [`Self::check_query`]).
     row_size: usize,
     rows: Rows,
     /// Per-field `doc_id -> position`.
@@ -190,6 +195,28 @@ impl F16VectorPool {
     #[inline]
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Check that `query` has this pool's dimension (Issue #1575).
+    ///
+    /// Every row of the pool, as [`Self::rows`] hands it out, is
+    /// `2 × dim` bytes, so after this check a search may score them with
+    /// [`distance_f16_unchecked`](crate::vector::core::distance_f16::distance_f16_unchecked)
+    /// instead of checking the length of every row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if `query` has another
+    /// length.
+    pub(crate) fn check_query(&self, query: &[f32]) -> Result<()> {
+        if query.len() != self.dim {
+            return Err(LaurusError::invalid_argument(format!(
+                "query vector has dimension {}, but the field's vectors have {}",
+                query.len(),
+                self.dim
+            )));
+        }
+        Ok(())
     }
 
     /// Number of stored rows.

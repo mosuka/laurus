@@ -79,7 +79,9 @@ impl MappedRows {
             as usize
     }
 
-    /// The `len` bytes of the row at position `pos`.
+    /// The `len` bytes of the row at position `pos`: exactly `len` bytes,
+    /// or a panic. The Float16 searchers rely on this length when they
+    /// score a row without checking it (Issue #1575).
     ///
     /// # Panics
     ///
@@ -149,7 +151,8 @@ pub(crate) struct MappedRowsView<'a> {
 }
 
 impl<'a> MappedRowsView<'a> {
-    /// The `len` bytes of the row at position `pos`.
+    /// The `len` bytes of the row at position `pos`: exactly `len` bytes,
+    /// or a panic, as for [`MappedRows::row`].
     ///
     /// # Panics
     ///

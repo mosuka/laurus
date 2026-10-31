@@ -545,7 +545,7 @@ SpanQuery.within(
 new VectorQuery(field: string, vector: number[])
 ```
 
-事前計算済み埋め込みベクトルによる最近傍検索。`vector` の成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では検索が `InvalidArg` エラーを投げます（Issue #1573）。
+事前計算済み埋め込みベクトルによる最近傍検索。`vector` の成分はすべて有限で、32 ビットの浮動小数点数に収まる値でなければならず、それ以外では検索が `InvalidArg` エラーを投げます（Issue #1573）。長さはフィールドの次元と同じでなければならず、違えば、インデックスの中身によらず検索が `InvalidArg` エラーを投げます（Issue #1575）。
 
 ### VectorTextQuery
 

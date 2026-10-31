@@ -187,7 +187,7 @@ Search by vector similarity.
 
 - **Parameters:**
   - `field` (string) -- Vector field name.
-  - `vector` (number[]) -- Query embedding. Every component must be finite and within the range of a 32-bit float; otherwise the promise rejects with the error message (Issue #1573).
+  - `vector` (number[]) -- Query embedding. Every component must be finite and within the range of a 32-bit float; otherwise the promise rejects with the error message (Issue #1573). Its length must be the field's dimension, or the promise rejects as well, whatever the index holds (Issue #1575).
   - `limit`, `offset` (number, optional)
   - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
   - `groupBy` (`GroupByOptions`, optional) -- Same as `search`'s `groupBy` argument.
