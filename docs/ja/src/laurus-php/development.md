@@ -116,6 +116,38 @@ PHP と Ruby のバインディングが workspace メンバーとして共存�
 `libclang` をビルド時のみ使用し（`bindgen` によるヘッダー解析）、最終バイナリには
 リンクされないため、この変更は安全です。
 
+### 複数の LLVM が入った環境
+
+`clang-sys` は、`bindgen` がロードする `libclang` と、`bindgen` が include パスを
+問い合わせる `clang` を、別々に選びます。`LIBCLANG_PATH` がなければ、見つかった中で
+最も新しい `libclang` をロードします。`CLANG_PATH` がなければ、`llvm-config --bindir`
+か `PATH` で見つかる `clang` を使います。複数の LLVM が入っていて、既定の `clang` が
+最新でない環境では、`bindgen` がある版の組み込みヘッダーを別の版の `libclang` で
+解析し、`ext-php-rs` の build script が失敗します。既定が clang 21 で、libclang 22 も
+入っている場合の例です（Issue #1577）:
+
+```text
+/usr/lib/llvm-21/lib/clang/21/include/xmmintrin.h:245:10: error: invalid conversion between vector type '__m128' (vector of 4 'float' values) and integer type 'int' of different size
+/usr/lib/llvm-21/lib/clang/21/include/xmmintrin.h:262:10: error: returning 'int' from a function with incompatible result type '__m128' (vector of 4 'float' values)
+/usr/lib/llvm-21/lib/clang/21/include/emmintrin.h:253:11: error: initializing '__m128d' (vector of 2 'double' values) with an expression of incompatible type 'int'
+/usr/lib/llvm-21/lib/clang/21/include/emmintrin.h:269:10: error: returning 'int' from a function with incompatible result type '__m128d' (vector of 2 'double' values)
+Error: Unable to generate bindings for PHP
+```
+
+2 つの変数を同じ LLVM に向けてください。LLVM 21 の例です:
+
+```bash
+cd laurus-php
+LIBCLANG_PATH=/usr/lib/llvm-21/lib CLANG_PATH=/usr/lib/llvm-21/bin/clang cargo build
+```
+
+`laurus-php` をビルドする CI のジョブは、先に `.github/actions/match-libclang` を
+実行します。この action は、2 つの変数をランナーの既定の `clang` の LLVM に向けます。
+GitHub の `ubuntu-26.04` のイメージには clang 20・21・22 が入っていて、既定は 21 です。
+この食い違いは、上流の
+[rust-lang/rust-bindgen#2682](https://github.com/rust-lang/rust-bindgen/issues/2682)
+で追跡されています。
+
 ## macOS リンカーフラグ (`-undefined dynamic_lookup`)
 
 PHP 拡張は共有ライブラリ（`.so` / `.dylib`）であり、実行時に PHP インタプリタに
