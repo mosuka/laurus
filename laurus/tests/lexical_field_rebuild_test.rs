@@ -11,6 +11,7 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use laurus::lexical::core::field::TextOption;
 use laurus::lexical::{
@@ -192,10 +193,17 @@ async fn update_field_enables_term_vectors_and_phrase_query_starts_matching() ->
 /// armed prefix -- aimed at `InvertedIndex::rebuild_field`'s rebuilt
 /// segment (named `merged_<generation>`, see `inverted.rs`), so the rebuild
 /// dies before it ever calls `segment_manifest::publish_with`.
+///
+/// It can also fail the `sync` that follows the next rename onto a given
+/// name, as a manifest save whose directory sync fails after the rename
+/// published the new manifest (Issue #1542).
 #[derive(Debug)]
 struct FailingStorage {
     inner: Arc<dyn Storage>,
     fail_create_with_prefix: parking_lot::Mutex<Option<String>>,
+    fail_sync_after_rename_onto: parking_lot::Mutex<Option<String>>,
+    sync_fails: AtomicBool,
+    sync_failures: AtomicUsize,
 }
 
 impl FailingStorage {
@@ -203,11 +211,18 @@ impl FailingStorage {
         Self {
             inner,
             fail_create_with_prefix: parking_lot::Mutex::new(None),
+            fail_sync_after_rename_onto: parking_lot::Mutex::new(None),
+            sync_fails: AtomicBool::new(false),
+            sync_failures: AtomicUsize::new(0),
         }
     }
 
     fn fail_next_create_with_prefix(&self, prefix: &str) {
         *self.fail_create_with_prefix.lock() = Some(prefix.to_string());
+    }
+
+    fn fail_sync_after_next_rename_onto(&self, name: &str) {
+        *self.fail_sync_after_rename_onto.lock() = Some(name.to_string());
     }
 }
 
@@ -247,7 +262,13 @@ impl Storage for FailingStorage {
     }
 
     fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
-        self.inner.rename_file(old_name, new_name)
+        self.inner.rename_file(old_name, new_name)?;
+        let mut guard = self.fail_sync_after_rename_onto.lock();
+        if guard.as_deref() == Some(new_name) {
+            *guard = None;
+            self.sync_fails.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn list_files(&self) -> Result<Vec<String>> {
@@ -259,6 +280,10 @@ impl Storage for FailingStorage {
     }
 
     fn sync(&self) -> Result<()> {
+        if self.sync_fails.swap(false, Ordering::SeqCst) {
+            self.sync_failures.fetch_add(1, Ordering::SeqCst);
+            return Err(LaurusError::storage("injected sync failure"));
+        }
         self.inner.sync()
     }
 
@@ -273,6 +298,138 @@ impl Storage for FailingStorage {
     fn close(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Issue #1542: an `update_field` Reindex whose rebuilt postings are
+/// published, but whose `lexical/segments.json` sync fails after the
+/// rename, succeeds: the schema holds the new option, and the phrase query
+/// that the rebuilt positions answer matches, before and after a reopen.
+/// Before, the call failed and the schema kept `term_vectors: false`, while
+/// the manifest listed the rebuilt segments.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_field_succeeds_when_the_manifest_sync_fails_after_the_publish() -> Result<()> {
+    let inner = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let failing = Arc::new(FailingStorage::new(inner.clone()));
+    let schema: Schema = serde_json::from_str(SCHEMA_JSON).expect("valid schema JSON");
+    let engine = Engine::new(failing.clone(), schema).await?;
+    engine
+        .put_document(
+            "doc1",
+            Document::builder()
+                .add_text("body", "the quick brown fox")
+                .build(),
+        )
+        .await?;
+    engine.commit().await?;
+
+    failing.fail_sync_after_next_rename_onto("lexical/segments.json");
+    let new_option = SchemaFieldOption::Text(TextOption::default().term_vectors(true));
+    let outcome = engine
+        .update_field(
+            "body",
+            new_option.clone(),
+            UpdateFieldOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(failing.sync_failures.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.classification, FieldChangeKind::Reindex);
+    assert_eq!(
+        format!("{:?}", engine.schema().fields.get("body")),
+        format!("{:?}", Some(&new_option))
+    );
+
+    async fn phrase_hits(engine: &Engine) -> Result<Vec<String>> {
+        let request = engine
+            .unified_query_parser()?
+            .parse("body:\"quick brown\"")
+            .await?;
+        Ok(engine
+            .search(request)
+            .await?
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect())
+    }
+    assert_eq!(phrase_hits(&engine).await?, ["doc1"]);
+
+    let schema = engine.schema();
+    drop(engine);
+    let engine = Engine::new(inner, schema).await?;
+    assert_eq!(phrase_hits(&engine).await?, ["doc1"], "after a reopen");
+    Ok(())
+}
+
+/// Issue #1542: a `delete_field` whose segments without the field are
+/// published, but whose `lexical/segments.json` sync fails after the
+/// rename, succeeds: the schema no longer has the field, and the field,
+/// added again, starts empty, before and after a reopen. Before, the call
+/// failed and the schema kept the field, while the manifest listed the
+/// segments without its data.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_field_succeeds_when_the_manifest_sync_fails_after_the_publish() -> Result<()> {
+    const SCHEMA_WITH_TAG: &str = r#"
+    {
+        "default_fields": ["body"],
+        "fields": {
+            "body": { "Text": { "indexed": true, "stored": true, "term_vectors": false } },
+            "tag": { "Text": { "indexed": true, "stored": true, "term_vectors": false } }
+        }
+    }
+    "#;
+    async fn hits(engine: &Engine, query: &str) -> Result<Vec<String>> {
+        let request = engine.unified_query_parser()?.parse(query).await?;
+        Ok(engine
+            .search(request)
+            .await?
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect())
+    }
+    let tag = || SchemaFieldOption::Text(TextOption::default());
+
+    let inner = StorageFactory::create(StorageConfig::Memory(MemoryStorageConfig::default()))?;
+    let failing = Arc::new(FailingStorage::new(inner.clone()));
+    let schema: Schema = serde_json::from_str(SCHEMA_WITH_TAG).expect("valid schema JSON");
+    let engine = Engine::new(failing.clone(), schema).await?;
+    engine
+        .put_document(
+            "doc1",
+            Document::builder()
+                .add_text("body", "the quick brown fox")
+                .add_text("tag", "rust")
+                .build(),
+        )
+        .await?;
+    engine.commit().await?;
+    assert_eq!(hits(&engine, "tag:rust").await?, ["doc1"]);
+
+    failing.fail_sync_after_next_rename_onto("lexical/segments.json");
+    let schema = engine.delete_field("tag").await?;
+    assert_eq!(failing.sync_failures.load(Ordering::SeqCst), 1);
+    assert!(!schema.fields.contains_key("tag"), "{schema:?}");
+    assert!(!engine.schema().fields.contains_key("tag"));
+
+    engine.add_field("tag", tag()).await?;
+    assert_eq!(hits(&engine, "tag:rust").await?, Vec::<String>::new());
+    assert_eq!(hits(&engine, "body:quick").await?, ["doc1"]);
+
+    drop(engine);
+    let engine = Engine::new(inner, schema).await?;
+    engine.add_field("tag", tag()).await?;
+    assert_eq!(
+        hits(&engine, "tag:rust").await?,
+        Vec::<String>::new(),
+        "after a reopen"
+    );
+    assert_eq!(
+        hits(&engine, "body:quick").await?,
+        ["doc1"],
+        "after a reopen"
+    );
+    Ok(())
 }
 
 fn doc(body: &str) -> Document {

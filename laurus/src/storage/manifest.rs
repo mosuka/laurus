@@ -22,6 +22,12 @@
 //! A crash before step 4 leaves the previous file untouched; a crash after it
 //! leaves the new one. There is no window in which a reader sees half a file.
 //!
+//! Step 4 publishes the new file: from then on a reader and the next open
+//! read it. When only step 5 fails, the new file is published but its
+//! rename is not known to be durable, so a crash may still bring back the
+//! previous file. The `*_until_published` forms tell that failure apart from
+//! one that published nothing (Issue #1542).
+//!
 //! # Legacy files
 //!
 //! Call sites that predate the framing wrote bare JSON in place. The loader
@@ -74,16 +80,46 @@ pub enum ManifestFormat {
 /// # Errors
 ///
 /// Returns [`LaurusError`] if serialization, either write, the rename, or the
-/// sync fails. On failure the previous file is left intact.
+/// sync fails. A failure up to the rename leaves the previous file intact.
+/// The sync runs after the rename: when it fails, the new file is already
+/// published, and a crash may still bring back the previous one.
+/// [`save_checksummed_json_until_published`] tells the two apart.
 pub fn save_checksummed_json<T: Serialize>(
     storage: &dyn Storage,
     name: &str,
     magic: Option<u32>,
     value: &T,
 ) -> Result<()> {
+    save_checksummed_json_until_published(storage, name, magic, value)?.map_or(Ok(()), Err)
+}
+
+/// [`save_checksummed_json`], telling a save that published nothing apart
+/// from one that published the new file but failed to sync it (Issue
+/// #1542).
+///
+/// # Arguments
+///
+/// The same as [`save_checksummed_json`].
+///
+/// # Returns
+///
+/// `None` when the new file is published and the sync succeeded, or the
+/// error of the sync that failed after the new file was published, which a
+/// crash may then undo (see [`save_checksummed_until_published`]).
+///
+/// # Errors
+///
+/// Returns [`LaurusError`] if serialization, either write, or the rename
+/// fails. The previous file is then left intact.
+pub fn save_checksummed_json_until_published<T: Serialize>(
+    storage: &dyn Storage,
+    name: &str,
+    magic: Option<u32>,
+    value: &T,
+) -> Result<Option<LaurusError>> {
     let json = serde_json::to_vec(value)
         .map_err(|e| LaurusError::index(format!("failed to serialize {name}: {e}")))?;
-    save_checksummed(storage, name, magic, &json)
+    save_checksummed_until_published(storage, name, magic, &json)
 }
 
 /// Write raw `payload` bytes, atomically and with a checksum.
@@ -101,12 +137,47 @@ pub fn save_checksummed_json<T: Serialize>(
 /// # Errors
 ///
 /// Returns [`LaurusError`] if either write, the rename, or the sync fails.
+/// A failure up to the rename leaves the previous file intact. The sync
+/// runs after the rename: when it fails, the new file is already
+/// published, and a crash may still bring back the previous one.
+/// [`save_checksummed_until_published`] tells the two apart.
 pub fn save_checksummed(
     storage: &dyn Storage,
     name: &str,
     magic: Option<u32>,
     payload: &[u8],
 ) -> Result<()> {
+    save_checksummed_until_published(storage, name, magic, payload)?.map_or(Ok(()), Err)
+}
+
+/// [`save_checksummed`], telling a save that published nothing apart from
+/// one that published the new file but failed to sync it (Issue #1542).
+///
+/// The rename publishes the new file: from then on a reader and the next
+/// open read it. The sync that follows makes the rename durable. When the
+/// sync fails, the new file stays published, but a crash may bring back the
+/// previous one, so a caller must keep whatever the previous file needs
+/// until a later sync succeeds or the next open settles it.
+///
+/// # Arguments
+///
+/// The same as [`save_checksummed`].
+///
+/// # Returns
+///
+/// `None` when the new file is published and the sync succeeded, or the
+/// error of the sync that failed after the new file was published.
+///
+/// # Errors
+///
+/// Returns [`LaurusError`] if either write or the rename fails. The
+/// previous file is then left intact.
+pub fn save_checksummed_until_published(
+    storage: &dyn Storage,
+    name: &str,
+    magic: Option<u32>,
+    payload: &[u8],
+) -> Result<Option<LaurusError>> {
     let tmp_name = format!("{name}{TMP_SUFFIX}");
 
     // The writer accumulates the CRC-32 of every byte; `close` writes it in
@@ -123,9 +194,12 @@ pub fn save_checksummed(
     // The rename itself is only durable once the directory entry is. Without
     // this a crash can lose the rename and leave the *previous* file — safe,
     // but not what the caller was told happened.
-    storage.sync()?;
-
-    Ok(())
+    Ok(storage.sync().err().map(|e| {
+        LaurusError::storage(format!(
+            "{name} is published, but syncing the storage after its rename failed, so a \
+             crash may bring back the previous {name}: {e}"
+        ))
+    }))
 }
 
 /// Read a JSON value written by [`save_checksummed_json`].
@@ -306,6 +380,124 @@ fn looks_like_json(content: &[u8]) -> bool {
         .find(|b| !b.is_ascii_whitespace())
         .unwrap_or(0);
     first == b'{' || first == b'['
+}
+
+/// A storage that fails the sync after a save's rename, for the tests of a
+/// save that published but could not sync (Issue #1542).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::error::{LaurusError, Result};
+    use crate::storage::{
+        FileMetadata, LoadingMode, LockManager, Storage, StorageInput, StorageOutput,
+    };
+
+    /// A [`Storage`] over `inner` that, while armed, fails the `sync` that
+    /// follows a rename onto a file whose name ends with `target`, or, with
+    /// `fail_rename` set, that rename itself.
+    #[derive(Debug)]
+    pub(crate) struct FailSyncAfterRename {
+        inner: Arc<dyn Storage>,
+        target: &'static str,
+        /// Whether failures are injected.
+        pub(crate) armed: AtomicBool,
+        /// Fail the rename onto `target` instead of the sync after it.
+        pub(crate) fail_rename: AtomicBool,
+        /// How many failures were injected.
+        pub(crate) failures: AtomicUsize,
+        renamed: AtomicBool,
+    }
+
+    impl FailSyncAfterRename {
+        pub(crate) fn new(inner: Arc<dyn Storage>, target: &'static str) -> Self {
+            Self {
+                inner,
+                target,
+                armed: AtomicBool::new(false),
+                fail_rename: AtomicBool::new(false),
+                failures: AtomicUsize::new(0),
+                renamed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl Storage for FailSyncAfterRename {
+        fn loading_mode(&self) -> LoadingMode {
+            self.inner.loading_mode()
+        }
+        fn open_input(&self, name: &str) -> Result<Box<dyn StorageInput>> {
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+            self.inner.create_output(name)
+        }
+        fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+            self.inner.create_output_append(name)
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            if self.armed.load(Ordering::SeqCst) && new_name.ends_with(self.target) {
+                if self.fail_rename.load(Ordering::SeqCst) {
+                    self.failures.fetch_add(1, Ordering::SeqCst);
+                    return Err(LaurusError::storage(format!(
+                        "injected failure renaming {old_name}"
+                    )));
+                }
+                self.inner.rename_file(old_name, new_name)?;
+                self.renamed.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(&self, prefix: &str) -> Result<(String, Box<dyn StorageOutput>)> {
+            self.inner.create_temp_output(prefix)
+        }
+        fn sync(&self) -> Result<()> {
+            if self.renamed.swap(false, Ordering::SeqCst) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                return Err(LaurusError::storage("injected sync failure"));
+            }
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn lock_manager(&self) -> Option<Arc<dyn LockManager>> {
+            self.inner.lock_manager()
+        }
+    }
+
+    /// The bytes of `name` on `storage`.
+    pub(crate) fn read_file(storage: &dyn Storage, name: &str) -> Vec<u8> {
+        let mut input = storage.open_input(name).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut input, &mut bytes).unwrap();
+        bytes
+    }
+
+    /// Replace `name` on `storage` with `bytes`, as a crash that loses a
+    /// rename brings the previous file back.
+    pub(crate) fn write_file(storage: &dyn Storage, name: &str, bytes: &[u8]) {
+        let mut output = storage.create_output(name).unwrap();
+        std::io::Write::write_all(&mut output, bytes).unwrap();
+        output.close().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -566,5 +758,52 @@ mod tests {
             .unwrap();
         assert_eq!(loaded, updated);
         assert!(!storage.file_exists("m.json.tmp"));
+    }
+
+    /// Issue #1542: a save whose sync fails after the rename has published
+    /// the new file, and `*_until_published` says so instead of reporting
+    /// that nothing changed. A failed rename publishes nothing.
+    #[test]
+    fn until_published_tells_a_failed_sync_from_a_save_that_published_nothing() {
+        use super::test_support::FailSyncAfterRename;
+        use std::sync::atomic::Ordering;
+
+        let updated = Sample {
+            name: "beta".to_string(),
+            count: 7,
+        };
+        let load = |storage: &dyn Storage| -> Sample {
+            load_checksummed_json(storage, "m.json", None)
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let failing = FailSyncAfterRename::new(storage(), "m.json");
+        assert_eq!(
+            save_checksummed_json_until_published(&failing, "m.json", None, &sample())
+                .unwrap()
+                .map(|e| e.to_string()),
+            None
+        );
+
+        failing.armed.store(true, Ordering::SeqCst);
+        let error = save_checksummed_json_until_published(&failing, "m.json", None, &updated)
+            .unwrap()
+            .expect("the failed sync is reported");
+        assert!(
+            error.to_string().contains("injected sync failure"),
+            "{error}"
+        );
+        assert_eq!(load(&failing), updated);
+        assert!(!failing.file_exists("m.json.tmp"));
+
+        let error = save_checksummed_json(&failing, "m.json", None, &sample()).unwrap_err();
+        assert!(error.to_string().contains("is published"), "{error}");
+        assert_eq!(load(&failing), sample());
+
+        failing.fail_rename.store(true, Ordering::SeqCst);
+        save_checksummed_json_until_published(&failing, "m.json", None, &updated).unwrap_err();
+        assert_eq!(load(&failing), sample());
+        assert_eq!(failing.failures.load(Ordering::SeqCst), 3);
     }
 }

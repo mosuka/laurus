@@ -588,12 +588,15 @@ impl VectorIndex for MultiFieldVectorIndex {
         // the new config. The merge writes the new segment fully before it
         // publishes the manifest, so an error here means nothing was
         // published, and the field keeps its existing index over untouched
-        // data. Once the merge has published, the source segments' files
-        // are gone and only the new index can read the field, so it
+        // data. Once the merge has published, the manifest lists only the
+        // merged segment and only the new index can read the field, so it
         // replaces the old one whatever a later step returns (Issue #1538).
-        // That step only forgets the deletion marks of the documents the
-        // merge dropped; if it fails, the marks stay and hide nothing more
-        // until the next full merge forgets them.
+        // A later step either syncs the published manifest, which keeps the
+        // source segments' files and the deletion marks when it fails, in
+        // case a crash brings back the previous manifest (Issue #1542), or
+        // forgets the deletion marks of the documents the merge dropped.
+        // Marks left behind hide nothing more until the next full merge
+        // forgets them.
         let cleanup_error = index.optimize_until_published()?;
 
         self.fields
@@ -601,9 +604,8 @@ impl VectorIndex for MultiFieldVectorIndex {
             .insert(name.to_string(), FieldEntry::new(index, &new_config));
         if let Some(e) = cleanup_error {
             log::warn!(
-                "vector field '{name}' was rebuilt, but forgetting the deletion marks of the \
-                 documents its merge dropped failed: {e}; they stay until the next full merge, \
-                 hiding nothing"
+                "vector field '{name}' was rebuilt and uses the rebuilt segments, but a step \
+                 after its merge published failed: {e}"
             );
         }
         Ok(())
@@ -2054,5 +2056,144 @@ mod tests {
         searcher.search(&query(2, Some("a"))).unwrap();
         searcher.search(&query(3, None)).unwrap();
         searcher.search(&query(5, Some("tokens"))).unwrap();
+    }
+
+    /// Issue #1542: a merge whose `segments.json` sync fails after the
+    /// rename is published, so a rebuild keeps the rebuilt index and
+    /// succeeds, and `optimize_until_published` reports the failure as one
+    /// after the publish. The deleted doc 2 stays hidden in process and
+    /// after a reopen, both when the reopen reads the published manifest
+    /// and when a crash brings back the previous one: the merge keeps the
+    /// sources' files and the deletion marks.
+    #[test]
+    fn a_merge_whose_manifest_sync_fails_is_published() {
+        use crate::storage::manifest::test_support::{FailSyncAfterRename, read_file, write_file};
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::{
+            FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, MultiVectorIndexConfig,
+        };
+
+        let cases = [
+            (
+                "flat",
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hnsw",
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ivf",
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension: 2,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "tokens",
+                VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let embedder = MultiVectorIndexConfig::default().embedder;
+        let mut failures = Vec::new();
+        for (name, config) in cases {
+            for rebuild in [true, false] {
+                for crash in [false, true] {
+                    let case = format!(
+                        "{} with crash: {crash}",
+                        if rebuild { "rebuild_field" } else { "optimize" }
+                    );
+                    let inner: Arc<dyn Storage> =
+                        Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+                    let failing =
+                        Arc::new(FailSyncAfterRename::new(inner.clone(), "segments.json"));
+                    let storage: Arc<dyn Storage> = failing.clone();
+                    let configs = BTreeMap::from([(name.to_string(), config.clone())]);
+                    let index = MultiFieldVectorIndex::open_or_create(
+                        storage.clone(),
+                        &configs,
+                        embedder.clone(),
+                    )
+                    .unwrap();
+                    let mut writer = index.writer().unwrap();
+                    for doc_id in 1..=3u64 {
+                        let x = doc_id as f32;
+                        let vectors = if name == "tokens" {
+                            vec![v(x), Vector::new(vec![0.0, x])]
+                        } else {
+                            vec![Vector::new(vec![x, 1.0])]
+                        };
+                        writer
+                            .add_document_vectors(doc_id, vec![(name.to_string(), vectors)])
+                            .unwrap();
+                    }
+                    writer.commit().unwrap();
+                    drop(writer);
+                    index.soft_delete_document(2).unwrap();
+                    // A committed delete: its mark is on storage, as a
+                    // crash after the merge finds it.
+                    index.persist_deletions().unwrap();
+                    let manifests: Vec<String> = inner
+                        .list_files()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|file| file.ends_with("segments.json"))
+                        .collect();
+                    let [manifest] = manifests.as_slice() else {
+                        panic!("{name}: one manifest expected: {manifests:?}");
+                    };
+                    let previous_manifest = read_file(inner.as_ref(), manifest);
+
+                    failing.armed.store(true, Ordering::SeqCst);
+                    if rebuild {
+                        if let Err(e) = index.rebuild_field(name, config.clone()) {
+                            failures.push(format!("{name} {case}: the rebuild failed: {e}"));
+                        }
+                    } else {
+                        let field = index.fields.read()[name].index.clone();
+                        match field.optimize_until_published() {
+                            Ok(Some(e)) if e.to_string().contains("injected sync failure") => {}
+                            outcome => failures.push(format!(
+                                "{name} {case}: expected the sync failure after the publish, \
+                                 got {outcome:?}"
+                            )),
+                        }
+                    }
+                    failing.armed.store(false, Ordering::SeqCst);
+                    if failing.failures.load(Ordering::SeqCst) == 0 {
+                        failures.push(format!("{name} {case}: the sync failure was not hit"));
+                    }
+                    check_rebuilt_documents(&index, name, &case, &mut failures);
+
+                    if crash {
+                        write_file(inner.as_ref(), manifest, &previous_manifest);
+                    }
+                    let reopened = MultiFieldVectorIndex::open_or_create(
+                        inner.clone(),
+                        &configs,
+                        embedder.clone(),
+                    )
+                    .unwrap();
+                    check_rebuilt_documents(
+                        &reopened,
+                        name,
+                        &format!("{case}, after a reopen"),
+                        &mut failures,
+                    );
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

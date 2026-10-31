@@ -9,6 +9,9 @@
 //!
 //! Issue #1538: a Reindex whose merge has published succeeds, even when a
 //! cleanup step after the merge fails.
+//!
+//! Issue #1542: so does a Reindex whose merge published its manifest but
+//! failed to sync it after the rename.
 
 #[path = "common/log_capture.rs"]
 mod log_capture;
@@ -317,14 +320,125 @@ impl Storage for FailingDelmapDelete {
     }
 }
 
+/// A [`Storage`] over `inner` that, once armed, fails the `sync` after the
+/// first rename onto `FIELD`'s `segments.json`, and counts that failure.
+#[derive(Debug)]
+struct FailingManifestSync {
+    inner: Arc<dyn Storage>,
+    armed: AtomicBool,
+    renamed: AtomicBool,
+    fired: AtomicUsize,
+}
+
+impl Storage for FailingManifestSync {
+    fn loading_mode(&self) -> LoadingMode {
+        self.inner.loading_mode()
+    }
+    fn open_input(&self, name: &str) -> Result<Box<dyn StorageInput>> {
+        self.inner.open_input(name)
+    }
+    fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+        self.inner.create_output(name)
+    }
+    fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
+        self.inner.create_output_append(name)
+    }
+    fn file_exists(&self, name: &str) -> bool {
+        self.inner.file_exists(name)
+    }
+    fn delete_file(&self, name: &str) -> Result<()> {
+        self.inner.delete_file(name)
+    }
+    fn list_files(&self) -> Result<Vec<String>> {
+        self.inner.list_files()
+    }
+    fn file_size(&self, name: &str) -> Result<u64> {
+        self.inner.file_size(name)
+    }
+    fn metadata(&self, name: &str) -> Result<FileMetadata> {
+        self.inner.metadata(name)
+    }
+    fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.inner.rename_file(old_name, new_name)?;
+        if new_name == format!("vector/{FIELD}/segments.json") {
+            self.renamed
+                .store(self.armed.swap(false, Ordering::SeqCst), Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    fn create_temp_output(&self, prefix: &str) -> Result<(String, Box<dyn StorageOutput>)> {
+        self.inner.create_temp_output(prefix)
+    }
+    fn sync(&self) -> Result<()> {
+        if self.renamed.swap(false, Ordering::SeqCst) {
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            return Err(LaurusError::storage("injected sync failure"));
+        }
+        self.inner.sync()
+    }
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// How many warnings say that `FIELD` was rebuilt although a later step
-/// failed.
-fn rebuilt_field_warnings() -> usize {
+/// failed with the failure `S` injects. The tests of this binary run in
+/// parallel and rebuild the same field, so the text of the injected failure
+/// tells this test's warnings from the others' (see
+/// [`log_capture::warnings`]).
+fn rebuilt_field_warnings<S: InjectedFailure>() -> usize {
     let prefix = format!("vector field '{FIELD}' was rebuilt");
     log_capture::warnings()
         .iter()
-        .filter(|(_, message)| message.starts_with(&prefix))
+        .filter(|(_, message)| message.starts_with(&prefix) && message.contains(S::INJECTED))
         .count()
+}
+
+/// A [`Storage`] that injects one failure once armed.
+trait InjectedFailure: Storage + Sized + 'static {
+    /// The start of the injected error's text, which the warning about the
+    /// rebuilt field quotes.
+    const INJECTED: &'static str;
+    /// The storage over `inner`, not armed.
+    fn over(inner: Arc<dyn Storage>) -> Self;
+    fn arm(&self, armed: bool);
+    /// How many failures were injected.
+    fn fired(&self) -> usize;
+}
+
+impl InjectedFailure for FailingDelmapDelete {
+    const INJECTED: &'static str = "injected failure deleting";
+    fn over(inner: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            fired: AtomicUsize::new(0),
+        }
+    }
+    fn arm(&self, armed: bool) {
+        self.armed.store(armed, Ordering::SeqCst);
+    }
+    fn fired(&self) -> usize {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl InjectedFailure for FailingManifestSync {
+    const INJECTED: &'static str = "injected sync failure";
+    fn over(inner: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            renamed: AtomicBool::new(false),
+            fired: AtomicUsize::new(0),
+        }
+    }
+    fn arm(&self, armed: bool) {
+        self.armed.store(armed, Ordering::SeqCst);
+    }
+    fn fired(&self) -> usize {
+        self.fired.load(Ordering::SeqCst)
+    }
 }
 
 /// Issue #1538: a Reindex whose merge has published succeeds, and the field
@@ -333,15 +447,31 @@ fn rebuilt_field_warnings() -> usize {
 /// new option, and the deleted document stays deleted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reindex_succeeds_once_its_merge_published() {
+    let failures = reindex_with_a_failure_after_the_publish::<FailingDelmapDelete>().await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Issue #1542: a Reindex whose merge published its `segments.json` but
+/// failed to sync it after the rename succeeds as well. Before, the call
+/// failed and kept the old option in the schema, while the field's
+/// manifest listed the segment the merge wrote under the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reindex_succeeds_when_its_manifest_sync_fails() {
+    let failures = reindex_with_a_failure_after_the_publish::<FailingManifestSync>().await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Reindex each of [`cases`] over an `S` armed across the call, after a
+/// delete since the last commit, and return what went wrong: the call
+/// failing, the failure not being injected, no warning naming the field,
+/// the schema not holding the new option, or the deleted document coming
+/// back after the call, the next commit or a reopen.
+async fn reindex_with_a_failure_after_the_publish<S: InjectedFailure>() -> Vec<String> {
     log_capture::install();
     let mut failures = Vec::new();
     for (kind, before, after) in cases() {
         let dir = TempDir::new().unwrap();
-        let failing = Arc::new(FailingDelmapDelete {
-            inner: open_storage(&dir),
-            armed: AtomicBool::new(false),
-            fired: AtomicUsize::new(0),
-        });
+        let failing = Arc::new(S::over(open_storage(&dir)));
         let schema = Schema::builder().add_field(FIELD, before).build();
         let engine = Engine::new(failing.clone(), schema).await.unwrap();
         for id in 0..DOCS {
@@ -350,17 +480,17 @@ async fn a_reindex_succeeds_once_its_merge_published() {
         engine.commit().await.unwrap();
         engine.delete_documents(&DELETED.to_string()).await.unwrap();
 
-        let warned = rebuilt_field_warnings();
-        failing.armed.store(true, Ordering::SeqCst);
+        let warned = rebuilt_field_warnings::<S>();
+        failing.arm(true);
         let updated = engine.update_field(FIELD, after.clone(), reindex()).await;
-        failing.armed.store(false, Ordering::SeqCst);
+        failing.arm(false);
         if let Err(e) = updated {
             failures.push(format!("{kind}: the reindex failed: {e}"));
         }
-        if failing.fired.load(Ordering::SeqCst) == 0 {
+        if failing.fired() == 0 {
             failures.push(format!("{kind}: the injected failure was not hit"));
         }
-        if rebuilt_field_warnings() == warned {
+        if rebuilt_field_warnings::<S>() == warned {
             failures.push(format!("{kind}: no warning names the rebuilt field"));
         }
         let held = format!("{:?}", engine.schema().fields.get(FIELD));
@@ -393,5 +523,5 @@ async fn a_reindex_succeeds_once_its_merge_published() {
             Err(e) => failures.push(format!("{kind}: the reopen failed: {e}")),
         }
     }
-    assert!(failures.is_empty(), "{failures:#?}");
+    failures
 }

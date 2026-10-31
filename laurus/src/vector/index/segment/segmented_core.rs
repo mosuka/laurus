@@ -372,12 +372,18 @@ impl SegmentedCore {
     /// `merge` receives `deletions` (the [`Self::deletion_snapshot`] the
     /// merge filters with), the source segments and a freshly allocated
     /// segment id, writes the merged segment, and returns its info. The
-    /// source segments are then replaced by it and their files deleted.
+    /// source segments are then replaced by it (see
+    /// [`SegmentManager::apply_merge`]).
     ///
     /// # Returns
     ///
     /// The ids of the replaced source segments, so the caller can drop any
-    /// state it cached for them.
+    /// state it cached for them, and the error of the manifest sync that
+    /// failed after the merge was published, if it failed (Issue #1542).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge failed before it was published.
     pub(crate) fn merge_segments(
         &self,
         segments: Vec<ManagedSegmentInfo>,
@@ -387,7 +393,7 @@ impl SegmentedCore {
             Vec<ManagedSegmentInfo>,
             String,
         ) -> Result<ManagedSegmentInfo>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, Option<LaurusError>)> {
         let new_segment_id = self.manager.generate_segment_id();
         let merged = merge(deletions, segments.clone(), new_segment_id)?;
 
@@ -397,8 +403,8 @@ impl SegmentedCore {
             total_size: segments.iter().map(|s| s.size_bytes).sum(),
             segments,
         };
-        self.manager.apply_merge(candidate, merged)?;
-        Ok(source_ids)
+        let sync_error = self.manager.apply_merge(candidate, merged)?;
+        Ok((source_ids, sync_error))
     }
 }
 
@@ -680,7 +686,7 @@ mod tests {
         core.mark_deleted(9).unwrap();
 
         let mut seen = None;
-        let replaced = core
+        let (replaced, sync_error) = core
             .merge_segments(
                 vec![first.clone(), second.clone()],
                 core.deletion_snapshot().unwrap(),
@@ -697,6 +703,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(seen, Some((true, 2)), "the merge sees the bitmap");
+        assert!(sync_error.is_none(), "{sync_error:?}");
         assert_eq!(replaced, vec![first.segment_id, second.segment_id]);
         let segments = core.manager().list_segments();
         assert_eq!(segments.len(), 1);

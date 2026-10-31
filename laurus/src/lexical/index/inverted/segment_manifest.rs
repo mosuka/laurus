@@ -11,14 +11,22 @@
 //! The in-memory copy (owned by
 //! [`InvertedIndex`](super::InvertedIndex), shared with its writer) is a
 //! mirror of the last **successfully persisted** manifest, never ahead of
-//! it. Every mutation goes through [`publish_with`]: build a candidate
-//! under the write guard, persist it, and only on success swap it into
-//! memory. This deliberately deviates from the vector manager's
-//! mutate-then-save: there, a failed save leaves memory ahead of disk,
+//! it. Every mutation goes through [`publish_with`] or
+//! [`publish_with_until_published`]: build a candidate under the write
+//! guard, persist it, and swap it into memory only once it is published.
+//! This deliberately deviates from the vector manager's `add_segment`,
+//! which mutates then saves: there, a failed save leaves memory ahead of disk,
 //! which is survivable when every later save rewrites the full list — but
 //! here a retried commit would find its pending state consumed, publish
 //! nothing, and still advance the WAL checkpoint, after which a reopen
 //! would neither replay nor discover the segments.
+//!
+//! A save whose only failure is the directory sync after its rename has
+//! still published the new manifest: a reader and the next open read it.
+//! [`publish_with`] leaves memory on the previous list then, and the next
+//! publish rewrites the file from memory. [`publish_with_until_published`],
+//! which a field rebuild uses, swaps the published list into memory
+//! instead, so the rebuild takes effect (Issue #1542).
 //!
 //! The manifest lock is a **leaf**: nothing under its guard may construct
 //! readers, list storage, or take the index's metadata lock. The guard is
@@ -32,9 +40,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
 use crate::storage::Storage;
 use crate::storage::manifest as manifest_io;
+use crate::{LaurusError, Result};
 
 use super::segment::SegmentInfo;
 
@@ -124,14 +132,36 @@ pub(crate) fn load(storage: &dyn Storage) -> Result<Option<(u32, Vec<SegmentInfo
 ///
 /// # Errors
 ///
-/// Returns an error if serializing or persisting fails; the previous
-/// manifest is left intact in that case (temp + rename).
+/// Returns an error if serializing or persisting fails. A failure up to the
+/// rename leaves the previous manifest intact. A failed sync after the
+/// rename leaves the new manifest published, and a crash may still bring
+/// back the previous one; [`save_until_published`] tells the two apart
+/// (Issue #1542).
 pub(crate) fn save(storage: &dyn Storage, segments: &[SegmentInfo]) -> Result<()> {
+    save_until_published(storage, segments)?.map_or(Ok(()), Err)
+}
+
+/// [`save`], telling a save that published nothing apart from one that
+/// published the manifest but failed to sync it (Issue #1542).
+///
+/// # Returns
+///
+/// `None` when the manifest is published and synced, or the error of the
+/// sync that failed after it was published.
+///
+/// # Errors
+///
+/// Returns an error if the manifest was not published; the previous one is
+/// then left intact.
+pub(crate) fn save_until_published(
+    storage: &dyn Storage,
+    segments: &[SegmentInfo],
+) -> Result<Option<LaurusError>> {
     let manifest = SegmentManifest {
         version: MANIFEST_VERSION,
         segments: segments.to_vec(),
     };
-    manifest_io::save_checksummed_json(storage, MANIFEST_FILE, None, &manifest)
+    manifest_io::save_checksummed_json_until_published(storage, MANIFEST_FILE, None, &manifest)
 }
 
 /// Mutate the shared manifest under the save-then-swap rule.
@@ -151,7 +181,9 @@ pub(crate) fn save(storage: &dyn Storage, segments: &[SegmentInfo]) -> Result<()
 ///
 /// # Errors
 ///
-/// Returns the persistence error, leaving memory unchanged.
+/// Returns the persistence error, leaving memory unchanged. When only the
+/// sync after the rename failed, storage already holds the candidate (see
+/// [`save`]); the next publish rewrites it from memory.
 pub(crate) fn publish_with<F>(
     storage: &dyn Storage,
     shared: &RwLock<ManifestState>,
@@ -166,6 +198,44 @@ where
     save(storage, &candidate)?;
     guard.segments = candidate;
     Ok(())
+}
+
+/// [`publish_with`], swapping the candidate into memory once it is
+/// published, even when the sync after its rename failed (Issue #1542).
+///
+/// For a mutation that must take effect once storage shows it, such as a
+/// field rebuild: the next open reads the published manifest whether or
+/// not the sync succeeded, so memory follows it. The caller must keep
+/// whatever the previous manifest needs while the sync error stands, as a
+/// crash may bring that manifest back.
+///
+/// # Arguments
+///
+/// The same as [`publish_with`].
+///
+/// # Returns
+///
+/// `None` when the candidate is published and synced, or the error of the
+/// sync that failed after it was published.
+///
+/// # Errors
+///
+/// Returns an error if the candidate was not published, leaving memory
+/// unchanged.
+pub(crate) fn publish_with_until_published<F>(
+    storage: &dyn Storage,
+    shared: &RwLock<ManifestState>,
+    mutate: F,
+) -> Result<Option<LaurusError>>
+where
+    F: FnOnce(&mut Vec<SegmentInfo>),
+{
+    let mut guard = shared.write();
+    let mut candidate = guard.segments.clone();
+    mutate(&mut candidate);
+    let sync_error = save_until_published(storage, &candidate)?;
+    guard.segments = candidate;
+    Ok(sync_error)
 }
 
 /// The index's document and deletion counts, summed over the committed
