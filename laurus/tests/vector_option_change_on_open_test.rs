@@ -10,6 +10,9 @@
 //! succeeded and mixed segments of both into the field. The field's
 //! `segments.json` now records the three, and the open fails instead.
 //! Every other option, such as the quantizer, may still change.
+//!
+//! Issue #1536: `update_field` changes any of the three as a Destructive
+//! change, which recreates the field empty, also for a change of kind.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,7 +27,7 @@ use laurus::storage::{StorageConfig, StorageFactory};
 use laurus::vector::Vector;
 use laurus::vector::core::distance::DistanceMetric;
 use laurus::{
-    Document, Engine, FieldOption, FlatOption, HnswOption, IvfOption, LaurusError,
+    Document, Engine, FieldChangeKind, FieldOption, FlatOption, HnswOption, IvfOption, LaurusError,
     MultiVectorOption, MultiVectorStorage, QuantizationMethod, QueryVector, RerankStorageKind,
     Schema, SearchRequestBuilder, TextOption, UpdateFieldOptions, VectorSearchQuery,
 };
@@ -36,6 +39,11 @@ const MANIFEST: &str = "vector/vec/segments.json";
 const REINDEX: UpdateFieldOptions = UpdateFieldOptions {
     reindex: true,
     dry_run: false,
+};
+
+const DRY_RUN: UpdateFieldOptions = UpdateFieldOptions {
+    reindex: false,
+    dry_run: true,
 };
 
 fn flat(dimension: usize) -> FlatOption {
@@ -118,6 +126,11 @@ async fn create_index(dir: &TempDir, option: &FieldOption) {
 /// The hits, with their scores, of a search of `vec` for the vector of
 /// seed 1.
 async fn search(engine: &Engine, dimension: usize) -> Vec<(String, f32)> {
+    try_search(engine, dimension).await.unwrap()
+}
+
+/// [`search`], returning the error of a failed search.
+async fn try_search(engine: &Engine, dimension: usize) -> laurus::Result<Vec<(String, f32)>> {
     let request = SearchRequestBuilder::new()
         .vector_query(VectorSearchQuery::Vectors(vec![QueryVector {
             vector: Vector::new(vector(1, dimension)),
@@ -126,13 +139,12 @@ async fn search(engine: &Engine, dimension: usize) -> Vec<(String, f32)> {
         }]))
         .limit(20)
         .build();
-    engine
+    Ok(engine
         .search(request)
-        .await
-        .unwrap()
+        .await?
         .into_iter()
         .map(|hit| (hit.id, hit.score))
-        .collect()
+        .collect())
 }
 
 /// Every file under the field's directory, with its bytes.
@@ -533,33 +545,140 @@ async fn an_index_with_segments_of_two_dimensions_needs_the_field_added_again() 
     assert_eq!(search(&engine, 4).await.len(), 1);
 }
 
-/// `update_field` classifies a change between single-vector kinds as a
-/// Reindex, which reopens the new kind over the old kind's files (Issue
-/// #1536). That reopen now fails on the record, before anything changes.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_kind_changing_update_field_fails_and_keeps_the_field() {
-    let dir = TempDir::new().unwrap();
-    let written = FieldOption::Hnsw(hnsw(DIM));
-    create_index(&dir, &written).await;
-    let engine = Engine::new(open_storage(&dir), schema_with(written))
-        .await
-        .unwrap();
-    let schema_before = format!("{:?}", engine.schema().fields["vec"]);
-    let before = search(&engine, DIM).await;
+/// The primary file suffix, without the dot, of a single-vector kind's
+/// segments.
+fn kind_suffix(option: &FieldOption) -> &'static str {
+    match option {
+        FieldOption::Flat(_) => "flat",
+        FieldOption::Hnsw(_) => "hnsw",
+        FieldOption::Ivf(_) => "ivf",
+        other => panic!("not a single-vector kind: {other:?}"),
+    }
+}
 
-    let err = engine
-        .update_field("vec", FieldOption::Flat(flat(DIM)), REINDEX)
+/// The ids, sorted, of the hits of [`try_search`].
+async fn found_ids(engine: &Engine) -> Result<Vec<String>, String> {
+    let mut ids: Vec<String> = try_search(engine, DIM)
         .await
-        .unwrap_err();
-    let expected = "vector field 'vec': its files were written with kind Hnsw, dimension 8 \
-                    and distance Cosine, so it cannot be opened with kind Flat";
-    assert!(
-        matches!(&err, LaurusError::InvalidArgument(message) if message == expected),
-        "expected InvalidArgument({expected:?}), got {err:?}"
-    );
-    assert_eq!(
-        format!("{:?}", engine.schema().fields["vec"]),
-        schema_before
-    );
-    assert_eq!(search(&engine, DIM).await, before);
+        .map_err(|e| format!("search failed: {e}"))?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+/// Change field `vec` from `written` to `changed` with `update_field` and
+/// check each step, returning the first that went wrong.
+async fn change_kind(written: &FieldOption, changed: &FieldOption) -> Result<(), String> {
+    let dir = TempDir::new().unwrap();
+    create_index(&dir, written).await;
+    let engine = Engine::new(open_storage(&dir), schema_with(written.clone()))
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    let before = found_ids(&engine).await?;
+    if before.is_empty() {
+        return Err("the search found nothing before the change".to_string());
+    }
+
+    // The dry run reports the classification and changes nothing.
+    let outcome = engine
+        .update_field("vec", changed.clone(), DRY_RUN)
+        .await
+        .map_err(|e| format!("dry run: {e}"))?;
+    if outcome.classification != FieldChangeKind::Destructive {
+        return Err(format!(
+            "the dry run classified it as {:?}",
+            outcome.classification
+        ));
+    }
+    if format!("{:?}", engine.schema().fields["vec"]) != format!("{written:?}") {
+        return Err("the dry run changed the schema".to_string());
+    }
+    if found_ids(&engine).await? != before {
+        return Err("the dry run changed the search results".to_string());
+    }
+
+    // Applying it discards the field's vectors.
+    let outcome = engine
+        .update_field("vec", changed.clone(), REINDEX)
+        .await
+        .map_err(|e| format!("update_field: {e}"))?;
+    if outcome.classification != FieldChangeKind::Destructive {
+        return Err(format!("it was applied as {:?}", outcome.classification));
+    }
+    let schema = engine.schema();
+    if format!("{:?}", schema.fields["vec"]) != format!("{changed:?}") {
+        return Err(format!("the schema has {:?}", schema.fields["vec"]));
+    }
+    if !schema.pending_reindex.contains("vec") {
+        return Err("pending_reindex does not name the field".to_string());
+    }
+    let after = found_ids(&engine).await?;
+    if !after.is_empty() {
+        return Err(format!("the search still found {after:?}"));
+    }
+
+    // Documents put afterwards are indexed and searched under the new kind,
+    // and the old kind's segment files are gone.
+    for i in 10..13 {
+        engine
+            .put_document(&format!("n{i}"), doc(changed, i))
+            .await
+            .map_err(|e| format!("put: {e}"))?;
+    }
+    engine.commit().await.map_err(|e| format!("commit: {e}"))?;
+    let expected = vec!["n10".to_string(), "n11".to_string(), "n12".to_string()];
+    let found = found_ids(&engine).await?;
+    if found != expected {
+        return Err(format!("the search after the put found {found:?}"));
+    }
+    let old_suffix = format!(".{}", kind_suffix(written));
+    let left: Vec<String> = field_files(&dir)
+        .into_keys()
+        .filter(|name| name.contains(&old_suffix))
+        .collect();
+    if !left.is_empty() {
+        return Err(format!("files of the old kind are left: {left:?}"));
+    }
+
+    drop(engine);
+    let engine = Engine::new(open_storage(&dir), schema_with(changed.clone()))
+        .await
+        .map_err(|e| format!("reopen: {e}"))?;
+    let found = found_ids(&engine).await?;
+    if found != expected {
+        return Err(format!("the search after the reopen found {found:?}"));
+    }
+    Ok(())
+}
+
+/// A change between single-vector kinds is Destructive, since each kind
+/// reads only its own segment files (Issue #1536). The dry run says so,
+/// and applying it discards the field's vectors and recreates the field
+/// empty under the new kind, marked in `pending_reindex`. Documents put
+/// afterwards are searched under the new kind, also after a reopen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_changing_update_field_recreates_the_field_empty_under_the_new_kind() {
+    let kinds = [
+        FieldOption::Flat(flat(DIM)),
+        FieldOption::Hnsw(hnsw(DIM)),
+        FieldOption::Ivf(ivf(DIM)),
+    ];
+    let mut failures = Vec::new();
+    for written in &kinds {
+        for changed in &kinds {
+            if kind_suffix(written) == kind_suffix(changed) {
+                continue;
+            }
+            if let Err(failure) = change_kind(written, changed).await {
+                failures.push(format!(
+                    "{} -> {}: {failure}",
+                    kind_suffix(written),
+                    kind_suffix(changed)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

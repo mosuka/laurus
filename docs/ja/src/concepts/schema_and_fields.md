@@ -662,7 +662,7 @@ let outcome = engine.update_field(
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
 - **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、HNSW の `m`/`ef_construction` 変更）。
-- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` 変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` / `Bytes` フィールドの `multi_valued` を無効にする変更）。
+- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` やインデックスの種類の変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` / `Bytes` フィールドの `multi_valued` を無効にする変更）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 
@@ -676,7 +676,7 @@ let outcome = engine.update_field(
 
 `UpdateFieldOptions { dry_run: true, .. }` を指定すると、実際には何も適用せずに分類結果だけを確認できます。
 
-ベクトルフィールドのセグメントの manifest は、ファイルを書いたときのインデックスの種類・`dimension`・`distance` を記録します。インデックスは、スキーマがフィールドに同じ 3 つを指定するときだけ開けます（[#1547](https://github.com/mosuka/laurus/issues/1547)）。この 3 つは、インデックスを開くときのスキーマではなく、`update_field` で変えてください。`dimension` と `distance` の変更は `Destructive` です。種類の変更は `Reindex` に分類されますが、フィールドのファイルを別の種類として読めないため失敗します（[#1536](https://github.com/mosuka/laurus/issues/1536)）。代わりに、フィールドを消してから足し直してください。`schema.toml` で変えてよい項目は、[既存のベクトルフィールドを編集する](../laurus-cli/schema_format.md#既存のベクトルフィールドを編集する)を参照してください。
+ベクトルフィールドのセグメントの manifest は、ファイルを書いたときのインデックスの種類・`dimension`・`distance` を記録します。インデックスは、スキーマがフィールドに同じ 3 つを指定するときだけ開けます（[#1547](https://github.com/mosuka/laurus/issues/1547)）。この 3 つは、インデックスを開くときのスキーマではなく、`update_field` で変えてください。3 つのどれを変えても `Destructive` です。HNSW から Flat のような種類の変更では、フィールドを新しい種類で空から作り直します。種類ごとに、自分のセグメントのファイルしか読めないためです（[#1536](https://github.com/mosuka/laurus/issues/1536)。種類を変えてもベクトルを保つ件は [#1579](https://github.com/mosuka/laurus/issues/1579)）。`schema.toml` で変えてよい項目は、[既存のベクトルフィールドを編集する](../laurus-cli/schema_format.md#既存のベクトルフィールドを編集する)を参照してください。
 
 ### 共通の注意事項
 
