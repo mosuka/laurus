@@ -73,11 +73,14 @@ pub fn is_neon_supported() -> bool {
 ///   before calling (the function is also `#[cfg]`-gated so it is
 ///   only compiled on aarch64).
 /// - `packed_block.len() >= query.params.m as usize * BYTES_PER_SUB_PER_BLOCK`.
-/// - `query.lut4_global.len() == query.params.m as usize * 16`.
+/// - `query.lut4_global.len() >= query.params.m as usize * 16`.
 /// - `query.params.m as usize <= 64` so the u16 accumulator cannot
-///   overflow (`255 × 64 = 16320 < 65535`). The dispatcher
-///   [`crate::vector::index::pq_fastscan_avx2::distance_pq_fastscan_block`]
-///   enforces this by routing larger `M` to the scalar fallback.
+///   overflow (`255 × 64 = 16320 < 65535`).
+///
+/// The safe dispatcher
+/// [`crate::vector::index::pq_fastscan_avx2::distance_pq_fastscan_block`]
+/// checks the two lengths (Issue #1578) and routes larger `M` to the
+/// scalar fallback.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn distance_pq_fastscan_block_neon(
     metric: DistanceMetric,
