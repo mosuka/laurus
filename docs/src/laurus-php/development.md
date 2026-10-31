@@ -120,6 +120,38 @@ into `patches/`, comment out its `links = "clang"` line, and point
 `clang-sys` uses `libclang` only at build time (for `bindgen` header parsing)
 and does not link it into the final binary.
 
+### Several LLVM versions on one machine
+
+`clang-sys` picks two things separately: the `libclang` that `bindgen`
+loads, and the `clang` that `bindgen` asks for its include paths. Without
+`LIBCLANG_PATH`, it loads the newest `libclang` it finds. Without
+`CLANG_PATH`, it uses the `clang` that `llvm-config --bindir` or `PATH`
+gives. When several LLVM versions are installed and the default `clang` is
+not the newest, `bindgen` parses one version's builtin headers with another
+version's `libclang`, and the `ext-php-rs` build script fails. With clang 21
+as the default and libclang 22 installed (Issue #1577):
+
+```text
+/usr/lib/llvm-21/lib/clang/21/include/xmmintrin.h:245:10: error: invalid conversion between vector type '__m128' (vector of 4 'float' values) and integer type 'int' of different size
+/usr/lib/llvm-21/lib/clang/21/include/xmmintrin.h:262:10: error: returning 'int' from a function with incompatible result type '__m128' (vector of 4 'float' values)
+/usr/lib/llvm-21/lib/clang/21/include/emmintrin.h:253:11: error: initializing '__m128d' (vector of 2 'double' values) with an expression of incompatible type 'int'
+/usr/lib/llvm-21/lib/clang/21/include/emmintrin.h:269:10: error: returning 'int' from a function with incompatible result type '__m128d' (vector of 2 'double' values)
+Error: Unable to generate bindings for PHP
+```
+
+Point both variables at the same LLVM, for example LLVM 21:
+
+```bash
+cd laurus-php
+LIBCLANG_PATH=/usr/lib/llvm-21/lib CLANG_PATH=/usr/lib/llvm-21/bin/clang cargo build
+```
+
+The CI jobs that build `laurus-php` run the `.github/actions/match-libclang`
+action first. It sets both variables to the LLVM of the runner's default
+`clang`: the GitHub `ubuntu-26.04` image installs clang 20, 21 and 22, with
+21 as the default. The mismatch is tracked upstream in
+[rust-lang/rust-bindgen#2682](https://github.com/rust-lang/rust-bindgen/issues/2682).
+
 ## macOS linker flag (`-undefined dynamic_lookup`)
 
 PHP extensions are shared libraries (`.so` / `.dylib`) that are loaded by the

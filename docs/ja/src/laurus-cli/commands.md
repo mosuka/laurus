@@ -409,7 +409,7 @@ laurus update field --name <NAME> --field-option <JSON> [--reindex] [--dry-run]
 | :--- | :--- | :--- | :--- |
 | `MetadataOnly` | 変わらない | Hnsw フィールドの `default_ef_search` | 常に適用 |
 | `Reindex` | インデックスにあるデータから作り直す | Hnsw フィールドの `m`・`ef_construction`、Text フィールドの `analyzer` | `--reindex` を付けたときだけ |
-| `Destructive` | 捨てる | ベクトルフィールドの `dimension`・`distance`・`embedder` | `--reindex` を付けたときだけ |
+| `Destructive` | 捨てる | ベクトルフィールドの `dimension`・`distance`・`embedder`・インデックスの種類（Hnsw から Flat など） | `--reindex` を付けたときだけ |
 
 `Destructive` の変更を適用すると、そのフィールドはスキーマの `pending_reindex` にも載ります。`laurus get schema` で表示されるので、ドキュメントを入れ直す必要のあるフィールドを見つけられます。
 

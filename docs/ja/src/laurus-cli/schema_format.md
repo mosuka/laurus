@@ -336,7 +336,7 @@ $ laurus search "title:hello"
 Error: Invalid argument: vector field 'embedding': its files were written with kind Hnsw, dimension 4 and distance Cosine, so it cannot be opened with dimension 8
 ```
 
-インデックスを開くには、フィールドをメッセージに書かれた値に戻してください。値を変えるのは、開いたインデックスに対して行います。`dimension` と `distance` は [`laurus update field`](commands.md#update-field) に `--reindex` を付けて変えられ、フィールドのベクトルは捨てられます。別の種類のフィールドにするには、[`laurus delete field`](commands.md#delete-field) で消してから [`laurus add field`](commands.md#add-field) で足し直します（Issue #1536）。どの方法でもフィールドは空になるので、文書を put し直す必要があります。
+インデックスを開くには、フィールドをメッセージに書かれた値に戻してください。値を変えるのは、開いたインデックスに対して行います。種類・`dimension`・`distance` は [`laurus update field`](commands.md#update-field) に `--reindex` を付けて変えられ、フィールドのベクトルは捨てられます（種類の変更は Issue #1536 から）。フィールドは空になるので、文書を put し直す必要があります。
 
 ベクトルフィールドのそれ以外の option は、インデックスを閉じている間に `schema.toml` で変えられます。対象は `quantizer`、`m`、`ef_construction`、`n_clusters`、`n_probe`、`rerank_storage`、`pq_codebook_path`、`base_weight`、`embedder`、`MultiVector` フィールドの `storage` と `pool_factor` です。書き込み済みのセグメントは、reindex か merge で書き直されるまで、書いたときの値のままです。
 
