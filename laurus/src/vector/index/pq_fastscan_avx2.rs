@@ -289,6 +289,48 @@ mod tests {
         assert_eq!(scalar, dispatch);
     }
 
+    /// Issue #1578: the safe dispatcher rejects a `packed_block` that is
+    /// shorter than `m` sub-quantisers need, before the AVX2 (x86_64) or
+    /// NEON (aarch64) kernel reads it. The block is the front of the
+    /// pool's buffer, one byte short, so without the check the kernel's
+    /// read stays inside that buffer and the test fails by not panicking.
+    #[test]
+    #[should_panic(expected = "FastScan block of 127 bytes for 8 sub-quantisers (needs 128)")]
+    fn dispatch_panics_on_a_packed_block_shorter_than_its_sub_quantisers() {
+        let (params, codebook, vectors) = train_small_codebook(8, 2, 200);
+        let pool = build_pool(&vectors, params, &codebook);
+        let query = PqFastScanQuery::prepare(&vectors[0].data, params, &codebook).unwrap();
+        let stride = pool.block_stride();
+        assert!(
+            pool.packed.len() > stride,
+            "the pool must hold more than one block"
+        );
+
+        distance_pq_fastscan_block(
+            DistanceMetric::Euclidean,
+            &query,
+            &pool.packed[..stride - 1],
+        );
+    }
+
+    /// Issue #1578: the safe dispatcher rejects a query whose
+    /// `lut4_global` is shorter than its `params.m` needs: the query's
+    /// fields are public, so `prepare`'s lengths do not bind a caller.
+    /// The LUT is truncated in place, keeping its allocation, so without
+    /// the check the kernel's read stays inside it and the test fails by
+    /// not panicking.
+    #[test]
+    #[should_panic(expected = "FastScan LUT of 64 bytes for 8 sub-quantisers (needs 128)")]
+    fn dispatch_panics_on_a_query_lut_shorter_than_its_sub_quantisers() {
+        let (params, codebook, vectors) = train_small_codebook(8, 2, 200);
+        let pool = build_pool(&vectors, params, &codebook);
+        let mut query = PqFastScanQuery::prepare(&vectors[0].data, params, &codebook).unwrap();
+        query.lut4_global.truncate(4 * 16);
+        let block = block_slice(&pool, 0);
+
+        distance_pq_fastscan_block(DistanceMetric::Euclidean, &query, &block);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_block_matches_scalar_for_random_codebook() {
