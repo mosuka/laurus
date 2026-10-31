@@ -60,6 +60,10 @@ jobs:
         with:
           shared-key: "stable-x86_64-unknown-linux-gnu"
 
+      - name: Match libclang to clang
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/match-libclang
+
       - name: Run clippy
         run: cargo clippy --all-targets --features embeddings-all -- -D warnings
 
@@ -454,6 +458,10 @@ jobs:
           # must not share a cache entry with the debug-profile test jobs
           # or the full-LTO release.yml builds using the same target triple.
           shared-key: "stable-${{ matrix.platform.target }}-ci"
+
+      - name: Match libclang to clang
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/match-libclang
 
       - name: Build PHP extension
         shell: bash
