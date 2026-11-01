@@ -114,6 +114,8 @@ A write appends one WAL record ([#1522](https://github.com/mosuka/laurus/issues/
 
 An append that failed partway through writing its record also makes every later append fail, because recovery stops at the first incomplete record and would lose any record written after it. Reopening the index cuts the incomplete record off (see [Recovery](#recovery)), and appends work again.
 
+A write is acknowledged only once the name of the WAL file it went to survives a crash ([#1566](https://github.com/mosuka/laurus/issues/1566)). Creating the WAL, or replacing it with a new file renamed over it (a commit's truncation that a write raced, the upgrade of a WAL an older build wrote, the cut of an incomplete record on open), changes only its directory, which the fsync of each append does not make durable. The first write after the index opens therefore syncs the storage before its record is appended, unless the open synced it after cutting an incomplete record; on Unix this fsyncs every directory of the index. A commit or an open whose sync after replacing the WAL fails returns that error, and the next write syncs the storage again before its record is appended. If that sync fails too, the write fails before its record is written, and writes stop as for any failed append, until the index is reopened.
+
 The WAL keeps the failed write's record with concurrent writers too, even against a commit that was already running when the write failed: a commit truncates the WAL, and records the stores' checkpoints, only up to the highest sequence number at or below which every write had finished applying when the commit started. A write that never finishes holds that number below its record until the index is reopened ([#1499](https://github.com/mosuka/laurus/issues/1499); see the [commit ladder](#commit-durability-ladder--crash-safety)).
 
 ## The Commit Lifecycle
@@ -325,7 +327,10 @@ The commit ladder is:
 5. **`truncate_retaining_after(watermark)`** — discard every WAL record this
    commit covered; **retain** every record above the watermark, which includes
    every record whose mutation had not finished applying to both stores when
-   the commit started (Issues #876, #1499).
+   the commit started (Issues #876, #1499). Retained records go to a new file
+   that is renamed over the WAL before the storage is synced. If only that sync
+   fails, the commit returns the error, and the next write syncs the storage
+   before it is acknowledged (Issue #1566; see [Failed Writes](#failed-writes)).
 
 This order guarantees two invariants:
 
