@@ -55,6 +55,8 @@ gRPC / HTTP 経由では同じ設定が `SearchRequest.field_boosts`（`map<stri
 | `MostFields` | すべてのフィールド | 各フィールドの BM25 スコアの合計（Elasticsearch の `most_fields`） |
 | `CombinedFields` | いずれかのフィールド | BM25F: 複数のフィールドを連結した 1 つのフィールドとしてスコア付けする（Elasticsearch の `combined_fields`、Lucene の `CombinedFieldQuery`） |
 
+`tie_breaker`（デフォルト 0）は 0 から 1 の間でなければなりません。0 は最良のフィールドのスコアだけを残し、1 はマッチしたすべてのフィールドのスコアを合計します。`tie_breaker` がこの範囲の外にあるか `NaN` のクエリは、種類によらず、検索で `InvalidArgument` により拒否されます（Issue #1570）。
+
 `BestFields` と `MostFields` は、各フィールドをそのフィールド自身の統計でスコア付けします。あるフィールドで珍しいタームはそのフィールドで IDF が高くなるため、同じテキストでも、どのフィールドに入ったかでスコアが変わります。`CombinedFields` は統計をブレンドし、各ドキュメントを次の値の BM25 で 1 回だけスコア付けします。
 
 ```text

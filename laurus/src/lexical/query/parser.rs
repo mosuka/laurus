@@ -207,6 +207,9 @@ impl LexicalQueryParser {
     /// - The query string has invalid syntax (e.g., unbalanced quotes or brackets).
     /// - The parsed input contains no valid query (e.g., an empty string).
     /// - A sub-query (boolean clause, range, etc.) fails to parse.
+    /// - A phrase's slop (`"a b"~N`) or a fuzzy term's fuzziness (`a~N`) is
+    ///   too large for a `u32` ([`LaurusError::InvalidArgument`], Issue
+    ///   #1570).
     pub fn parse(&self, query_str: &str) -> Result<Box<dyn Query>> {
         let pairs = QueryStringParser::parse(Rule::query, query_str)
             .map_err(|e| LaurusError::parse(format!("Parse error: {e}")))?;
@@ -761,7 +764,7 @@ impl LexicalQueryParser {
                 Rule::proximity => {
                     for prox_pair in inner_pair.into_inner() {
                         if prox_pair.as_rule() == Rule::number {
-                            slop = Some(prox_pair.as_str().parse().unwrap_or(0));
+                            slop = Some(parse_count(prox_pair.as_str(), "phrase slop")?);
                         }
                     }
                 }
@@ -844,7 +847,7 @@ impl LexicalQueryParser {
         field: Option<&str>,
     ) -> Result<Box<dyn Query>> {
         let mut term = String::new();
-        let mut fuzziness: u8 = 2; // Default fuzziness
+        let mut fuzziness: u32 = 2; // Default fuzziness
         let mut boost = 1.0;
 
         for inner_pair in pair.into_inner() {
@@ -855,7 +858,7 @@ impl LexicalQueryParser {
                 Rule::fuzziness => {
                     for fuzz_pair in inner_pair.into_inner() {
                         if fuzz_pair.as_rule() == Rule::number {
-                            fuzziness = fuzz_pair.as_str().parse().unwrap_or(2);
+                            fuzziness = parse_count(fuzz_pair.as_str(), "fuzziness")?;
                         }
                     }
                 }
@@ -882,7 +885,7 @@ impl LexicalQueryParser {
 
             Ok(Box::new(
                 FuzzyQuery::new(field_name, normalized_term)
-                    .max_edits(fuzziness as u32)
+                    .max_edits(fuzziness)
                     .with_boost(boost),
             ))
         })
@@ -1152,6 +1155,26 @@ fn collect_signed_floats(pair: pest::iterators::Pair<Rule>) -> Result<Vec<f64>> 
         }
     }
     Ok(out)
+}
+
+/// Parse a `number` token (digits only) as a `u32`: a phrase's slop or a
+/// fuzzy term's fuzziness (Issue #1570). A number too large for a `u32` used
+/// to become the default silently, `0` for a slop and `2` for a fuzziness;
+/// it is rejected instead. The grammar admits nothing but digits, so that is
+/// the only way the parse can fail.
+///
+/// # Arguments
+///
+/// * `text` - The token's text.
+/// * `what` - What the number is, for the error message.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] if `text` does not fit a `u32`.
+fn parse_count(text: &str, what: &str) -> Result<u32> {
+    text.parse::<u32>().map_err(|_| {
+        LaurusError::invalid_argument(format!("{what} must be at most {}, got {text}", u32::MAX))
+    })
 }
 
 /// Builder for constructing a [`QueryParser`] with a fluent API.
@@ -1688,6 +1711,67 @@ mod tests {
         let parser = create_test_parser().with_default_field("content");
         let query = parser.parse("title:\"hello\"~3").unwrap();
         assert_eq!(expect_term_query(query.as_ref()).term(), "hello");
+    }
+
+    /// Issue #1570: a slop too large for a `u32` used to become `0`, an
+    /// exact phrase, without an error. It is rejected, also on a quoted
+    /// single token, which ignores its slop; the largest `u32` still parses.
+    #[test]
+    fn a_slop_too_large_for_a_u32_is_rejected() {
+        let parser = create_test_parser().with_default_field("content");
+        let query = parser.parse("\"hello world\"~4294967295").unwrap();
+        let phrase_q = query
+            .as_any()
+            .downcast_ref::<PhraseQuery>()
+            .unwrap_or_else(|| panic!("expected PhraseQuery, got {query:?}"));
+        assert_eq!(phrase_q.slop(), u32::MAX);
+
+        let mut wrong = Vec::new();
+        for (dsl, got) in [
+            ("\"hello world\"~4294967296", "4294967296"),
+            ("\"hello world\"~99999999999", "99999999999"),
+            ("title:\"hello\"~4294967296", "4294967296"),
+        ] {
+            let expected = format!("phrase slop must be at most 4294967295, got {got}");
+            let result = parser.parse(dsl);
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!("{dsl}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1570: a fuzziness parses as a `u32`, the type of
+    /// `FuzzyQuery::max_edits`, rather than as a `u8` whose overflow (256
+    /// and up) became the default `2` without an error. A number too large
+    /// for a `u32` is rejected.
+    #[test]
+    fn a_fuzziness_parses_as_a_u32_and_rejects_a_larger_one() {
+        let parser = create_test_parser().with_default_field("content");
+        let mut wrong = Vec::new();
+        for (dsl, expected) in [
+            ("hello~", 2),
+            ("hello~0", 0),
+            ("hello~256", 256),
+            ("hello~4294967295", u32::MAX),
+        ] {
+            let got = parser.parse(dsl).ok().and_then(|query| {
+                query
+                    .as_any()
+                    .downcast_ref::<FuzzyQuery>()
+                    .map(FuzzyQuery::get_max_edits)
+            });
+            if got != Some(expected) {
+                wrong.push(format!("{dsl}: {got:?}, expected {expected}"));
+            }
+        }
+        let result = parser.parse("hello~4294967296");
+        if !matches!(&result, Err(LaurusError::InvalidArgument(m))
+            if m.contains("fuzziness must be at most 4294967295, got 4294967296"))
+        {
+            wrong.push(format!("hello~4294967296: {result:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A Japanese sentence tokenized by Lindera into several morphemes

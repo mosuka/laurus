@@ -4032,10 +4032,13 @@ impl Engine {
     /// if a boost of the lexical query or of the `filter_query`, or of any
     /// of their sub-queries, is not finite or is negative (`-0.0` included),
     /// such as a DSL `^` boost too large for an `f32` (Issue #1550; see
-    /// [`Query::validate_boosts`](crate::lexical::query::Query::validate_boosts)).
-    /// The lexical query is checked with the request's `field_boosts`
-    /// multiplied in, and both before a filter that matches nothing returns
-    /// early.
+    /// [`Query::validate_boosts`](crate::lexical::query::Query::validate_boosts)),
+    /// or if a `MultiFieldQuery`'s `tie_breaker` among them is outside
+    /// `[0, 1]` (Issue #1570). The lexical query is checked with the
+    /// request's `field_boosts` multiplied in, and both before a filter that
+    /// matches nothing returns early. A DSL phrase slop or fuzziness too
+    /// large for a `u32` is rejected the same way, when the DSL is parsed
+    /// (Issue #1570).
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if the [`weight`](crate::vector::store::request::QueryVector::weight)

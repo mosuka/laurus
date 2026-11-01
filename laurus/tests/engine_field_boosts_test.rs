@@ -9,6 +9,9 @@
 //! Issue #1550: so is a query's own boost, from the DSL `^` or a query
 //! object, whatever the data; and the DSL boost of a fuzzy or wildcard term
 //! is applied instead of being dropped.
+//!
+//! Issue #1570: so is a `MultiFieldQuery` whose `tie_breaker` is outside
+//! `[0, 1]`.
 
 use std::sync::Arc;
 
@@ -396,6 +399,68 @@ async fn a_zero_combined_fields_weight_is_rejected_whatever_the_data() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Issue #1570: a `MultiFieldQuery` whose `tie_breaker` is outside `[0, 1]`,
+/// or `NaN`, is rejected whatever the data: as the query, as the
+/// `filter_query`, and under a filter that matches nothing; `0` and `1`
+/// search.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tie_breaker_outside_zero_to_one_is_rejected() {
+    let engine = engine().await;
+    let multi_field = |tie_breaker: f32| {
+        Box::new(
+            MultiFieldQuery::new("rust".to_string())
+                .add_field("title".to_string(), 1.0)
+                .tie_breaker(tie_breaker),
+        ) as Box<dyn Query>
+    };
+    let nothing = || Box::new(TermQuery::new("title", "nosuchterm")) as Box<dyn Query>;
+    let mut wrong = Vec::new();
+    for tie_breaker in [-1.0, 1.5, f32::NAN, f32::INFINITY] {
+        let expected =
+            format!("MultiFieldQuery tie_breaker must be between 0 and 1, got {tie_breaker}");
+        for (shape, builder) in [
+            (
+                "plain",
+                SearchRequestBuilder::new()
+                    .lexical_query(LexicalSearchQuery::Obj(multi_field(tie_breaker))),
+            ),
+            (
+                "as the filter_query",
+                SearchRequestBuilder::new()
+                    .query_dsl("title:rust")
+                    .filter_query(multi_field(tie_breaker)),
+            ),
+            (
+                "under a filter that matches nothing",
+                SearchRequestBuilder::new()
+                    .lexical_query(LexicalSearchQuery::Obj(multi_field(tie_breaker)))
+                    .filter_query(nothing()),
+            ),
+        ] {
+            let result = engine.search(builder.build()).await;
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!(
+                    "{shape} {tie_breaker}: {:?}",
+                    result.map(|r| r.len())
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    for tie_breaker in [0.0, 1.0] {
+        let results = engine
+            .search(
+                SearchRequestBuilder::new()
+                    .lexical_query(LexicalSearchQuery::Obj(multi_field(tie_breaker)))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "{tie_breaker}");
+    }
 }
 
 /// An engine over a `title` text field holding one document per title,

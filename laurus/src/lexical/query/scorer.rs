@@ -1121,7 +1121,9 @@ impl Scorer for DisjunctionMaxScorer {
     /// `1 - tie_breaker >= 0`, is maximised at the largest `m_i` — i.e.
     /// exactly the expression below. Block-max methods are left at their
     /// trait defaults (forwarding here), the same "correct but loose"
-    /// bound `SynonymQuery` and others already rely on.
+    /// bound `SynonymQuery` and others already rely on. A search rejects a
+    /// `MultiFieldQuery` whose `tie_breaker` is outside that range before it
+    /// gets here (`validate_boosts`, Issue #1570).
     fn max_score(&self) -> f32 {
         let clauses = self.clauses.borrow();
         let mut max_m = 0.0_f32;
