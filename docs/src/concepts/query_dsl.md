@@ -75,6 +75,8 @@ Match an exact phrase using double quotes. Optional proximity (`~N`) allows N wo
 
 On a multi-valued text field the phrase (or its `~N` proximity window) never crosses from one element into the next unless `N` reaches the field's `position_increment_gap` (default 100).
 
+`N` is a number from 0 to 4294967295, the largest 32-bit unsigned integer. A larger one is rejected with `InvalidArgument` (HTTP 400), also on a quoted value that ignores it (below). It used to become 0, an exact phrase, without an error (Issue #1570).
+
 A quoted value that the field's analyzer turns into a single token is an exact term match, the same as a [Term Query](#term-query) (any `~N` is ignored). This is how to search a `keyword` field for a value the unquoted form does not accept, such as a path, a URL, or an ID containing `.`, `/`, or `:`:
 
 ```text
@@ -94,6 +96,8 @@ Approximate matching with edit distance. Append `~` and optionally the maximum e
 roam~
 roam~2
 ```
+
+Without a number, the maximum edit distance is 2. The number can be anything from 0 to 4294967295; a larger one is rejected with `InvalidArgument` (HTTP 400). One of 256 or more used to become 2 without an error (Issue #1570). There is no smaller limit: a distance at least as long as the term matches every term of the field. The query expands to the 50 matching terms with the highest document frequency, not to the closest ones.
 
 ### Wildcard Query
 

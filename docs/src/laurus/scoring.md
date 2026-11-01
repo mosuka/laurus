@@ -55,6 +55,8 @@ Over gRPC and HTTP, the same setting is exposed as `SearchRequest.field_boosts` 
 | `MostFields` | Every field | The sum of the fields' BM25 scores (Elasticsearch `most_fields`) |
 | `CombinedFields` | Any field | BM25F: the fields are scored as one concatenated field (Elasticsearch `combined_fields`, Lucene `CombinedFieldQuery`) |
 
+`tie_breaker` (default 0) must be between 0 and 1: 0 keeps only the best field's score, and 1 sums every matching field's. A search rejects a query whose `tie_breaker` is outside that range, or `NaN`, with `InvalidArgument`, whatever its type (Issue #1570).
+
 `BestFields` and `MostFields` score each field with that field's own statistics. A term that is rare in one field gets a high IDF there, so the same text scores differently depending on which field it lands in. `CombinedFields` blends the statistics and scores each document once, with BM25 over:
 
 ```text

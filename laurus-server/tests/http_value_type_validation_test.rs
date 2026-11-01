@@ -8,7 +8,8 @@
 //! A number of the right type that the engine cannot use is a 400 too
 //! (Issue #1540): a field boost, a lexical `min_score`, an RRF `k` or a
 //! `weighted_sum` weight out of range, including a number too large for the
-//! 32-bit float it is converted to.
+//! 32-bit float it is converted to. So is a DSL phrase slop or fuzziness
+//! too large for a `u32` (Issue #1570).
 //!
 //! The gateway forwards each call to the gRPC services and maps the status
 //! they return, so these requests go through both, over a gRPC connection
@@ -364,7 +365,8 @@ async fn search_answers_400_for_a_value_of_the_wrong_type() {
 /// Issue #1540: the requests of the issue, which used to give a `null`
 /// score, hide a hit or be clamped, are a 400 naming the value, from each
 /// search endpoint; so are weights of 0 and 0, a boost sent without a
-/// `query`, a DSL `^` boost too large for an `f32` (Issue #1550), and a
+/// `query`, a DSL `^` boost too large for an `f32` (Issue #1550), a DSL
+/// phrase slop or fuzziness too large for a `u32` (Issue #1570), and a
 /// query vector weight that is negative or too large for an `f32`, in
 /// `query_vectors` or in a DSL vector clause (Issue #1552), and a query
 /// vector component too large for an `f32` (Issue #1573). The boundaries
@@ -426,6 +428,16 @@ async fn search_answers_400_for_a_number_out_of_range() {
         (
             json!({"query": format!("title:rust^{}", "1".repeat(40))}),
             "query boost must be finite and at least 0, got inf".to_string(),
+        ),
+        // Issue #1570: a DSL phrase slop or fuzziness too large for a `u32`,
+        // which used to become `0` (an exact phrase) or `2`.
+        (
+            json!({"query": "title:\"rust java\"~4294967296"}),
+            "phrase slop must be at most 4294967295, got 4294967296".to_string(),
+        ),
+        (
+            json!({"query": "title:rust~4294967296"}),
+            "fuzziness must be at most 4294967295, got 4294967296".to_string(),
         ),
         // Issue #1552: a query vector weight that is negative or too large
         // for an `f32`, also in a DSL vector clause. The index has no
@@ -495,6 +507,11 @@ async fn search_answers_400_for_a_number_out_of_range() {
     let search = json!({"query_vectors": [{"vector": [3.4e38, 0.0]}]});
     let (status, body) = send(&router, "POST", "/v1/search", search).await;
     assert_eq!(status, StatusCode::OK, "component 3.4e38: {body}");
+    // Issue #1570: the largest slop and fuzziness search.
+    for query in ["title:\"rust java\"~4294967295", "title:rust~4294967295"] {
+        let (status, body) = send(&router, "POST", "/v1/search", json!({"query": query})).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    }
 }
 
 /// Issue #1575: a query vector of another dimension than a field it names,

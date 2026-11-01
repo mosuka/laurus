@@ -210,8 +210,10 @@ impl AdvancedQuery {
     /// # Errors
     ///
     /// Returns [`LaurusError::InvalidArgument`] when a boost of this query or
-    /// of a sub-query is not finite or is negative (Issue #1550): this runs
-    /// without the searcher, which checks them for a search.
+    /// of a sub-query is not finite or is negative (Issue #1550), or a
+    /// [`MultiFieldQuery`]'s `tie_breaker` is outside `[0, 1]` (Issue
+    /// #1570): this runs without the searcher, which checks them for a
+    /// search.
     pub fn execute(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<QueryResult>> {
         self.validate_boosts()?;
         // Build the matcher and scorer in one pass (#999).
@@ -525,8 +527,9 @@ pub struct MultiFieldQuery {
     query_type: MultiFieldQueryType,
 
     /// Weight given to every matching field but the best one, when
-    /// `query_type` is [`MultiFieldQueryType::BestFields`]. Expected to be
-    /// in `[0, 1]`; `0.0` (the default) keeps only the best field's score,
+    /// `query_type` is [`MultiFieldQueryType::BestFields`]. Must be in
+    /// `[0, 1]`, which [`Query::validate_boosts`] checks for every query type
+    /// (Issue #1570); `0.0` (the default) keeps only the best field's score,
     /// `1.0` sums every matching field's score. Other query types ignore it.
     tie_breaker: f32,
 
@@ -605,6 +608,11 @@ impl MultiFieldQuery {
     }
 
     /// Set tie breaker for best fields queries.
+    ///
+    /// The value must be in `[0, 1]`. One outside it, or `NaN`, is stored,
+    /// and the search rejects the query with
+    /// [`LaurusError::InvalidArgument`] (see [`Query::validate_boosts`],
+    /// Issue #1570).
     pub fn tie_breaker(mut self, tie_breaker: f32) -> Self {
         self.tie_breaker = tie_breaker;
         self
@@ -785,8 +793,20 @@ impl Query for MultiFieldQuery {
     /// [`MultiFieldQueryType::CombinedFields`] query, the stricter rule of
     /// `check_weights` (greater than `0`), checked here too so that it does
     /// not depend on the data.
+    ///
+    /// Also check that `tie_breaker` is in `[0, 1]`, for every query type
+    /// (Issue #1570): a negative or `NaN` one makes a `BestFields` score
+    /// negative or `NaN`, and the dis-max scorer's upper bound holds only in
+    /// that range, so a search that stops early on it could drop real top
+    /// hits.
     fn validate_boosts(&self) -> Result<()> {
         check_query_boost(self.boost, || self.description())?;
+        if !(0.0..=1.0).contains(&self.tie_breaker) {
+            return Err(LaurusError::invalid_argument(format!(
+                "MultiFieldQuery tie_breaker must be between 0 and 1, got {}",
+                self.tie_breaker
+            )));
+        }
         match self.query_type {
             MultiFieldQueryType::CombinedFields => self.check_weights(),
             _ => check_field_boosts("MultiFieldQuery boost", &self.fields),
@@ -2254,6 +2274,118 @@ mod tests {
             .add_field_boost("title".to_string(), 2.0)
             .validate_boosts()
             .unwrap();
+    }
+
+    // ── tie_breaker (Issue #1570) ────────────────────────────────────────
+
+    /// Tie breakers every query type rejects: outside `[0, 1]`, or `NaN`.
+    const BAD_TIE_BREAKERS: [f32; 5] = [-1.0, 1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+    /// A `MultiFieldQuery` for `apple` over `title` and `body`, of
+    /// `query_type`, with `tie_breaker`.
+    fn tie_breaking(query_type: MultiFieldQueryType, tie_breaker: f32) -> Box<dyn Query> {
+        Box::new(
+            MultiFieldQuery::new("apple".to_string())
+                .add_field("title".to_string(), 1.0)
+                .add_field("body".to_string(), 1.0)
+                .query_type(query_type)
+                .tie_breaker(tie_breaker),
+        )
+    }
+
+    /// Every query type, alone and where the checks reach it inside other
+    /// queries, with `tie_breaker`.
+    fn tie_breaker_shapes(tie_breaker: f32) -> Vec<(String, Box<dyn Query>)> {
+        let mut shapes: Vec<(String, Box<dyn Query>)> = Vec::new();
+        for query_type in [
+            MultiFieldQueryType::BestFields,
+            MultiFieldQueryType::MostFields,
+            MultiFieldQueryType::CombinedFields,
+        ] {
+            let query = || tie_breaking(query_type.clone(), tie_breaker);
+            shapes.push((format!("{query_type:?}"), query()));
+            shapes.push((
+                format!("{query_type:?} as a filter clause"),
+                Box::new(with_clause(Occur::Filter, query())),
+            ));
+            shapes.push((
+                format!("{query_type:?} as a must_not clause"),
+                Box::new(with_clause(Occur::MustNot, query())),
+            ));
+            shapes.push((
+                format!("{query_type:?} as an advanced core"),
+                Box::new(AdvancedQuery::new(query())),
+            ));
+            shapes.push((
+                format!("{query_type:?} as an advanced filter"),
+                Box::new(AdvancedQuery::new(apple(1.0)).with_filter(query())),
+            ));
+        }
+        shapes
+    }
+
+    /// Issue #1570: a `tie_breaker` outside `[0, 1]`, or `NaN`, is rejected
+    /// for every query type, which only `BestFields` uses, also in a
+    /// `Filter` or `MustNot` clause and in an `AdvancedQuery`'s core or
+    /// filter; `0`, `-0.0`, `0.5` and `1` are accepted.
+    #[test]
+    fn validate_boosts_checks_the_tie_breaker_everywhere() {
+        let mut wrong = Vec::new();
+        for tie_breaker in BAD_TIE_BREAKERS {
+            let expected =
+                format!("MultiFieldQuery tie_breaker must be between 0 and 1, got {tie_breaker}");
+            for (shape, query) in tie_breaker_shapes(tie_breaker) {
+                let result = query.validate_boosts();
+                if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected))
+                {
+                    wrong.push(format!("{shape} {tie_breaker}: {result:?}"));
+                }
+            }
+        }
+        for tie_breaker in [0.0, -0.0, 0.5, 1.0] {
+            for (shape, query) in tie_breaker_shapes(tie_breaker) {
+                if let Err(error) = query.validate_boosts() {
+                    wrong.push(format!("{shape} {tie_breaker} rejected: {error}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1570: the searcher's `search` and `count` reject a bad
+    /// `tie_breaker` too, also for a term the index does not hold.
+    #[test]
+    fn lexical_search_and_count_reject_a_bad_tie_breaker() {
+        let store = store_with_field_docs(&[&[
+            (0, &[("title", "apple fig"), ("body", "plum")]),
+            (1, NO_APPLE),
+        ]]);
+        let mut wrong = Vec::new();
+        for tie_breaker in BAD_TIE_BREAKERS {
+            let expected =
+                format!("MultiFieldQuery tie_breaker must be between 0 and 1, got {tie_breaker}");
+            for text in ["apple", "nosuchterm"] {
+                let request = || {
+                    LexicalSearchRequest::new(Box::new(
+                        MultiFieldQuery::new(text.to_string())
+                            .add_field("title".to_string(), 1.0)
+                            .add_field("body".to_string(), 1.0)
+                            .tie_breaker(tie_breaker),
+                    ))
+                };
+                let searched = store.search(request()).map(|r| r.hits.len());
+                if !matches!(&searched, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected))
+                {
+                    wrong.push(format!("search {text} {tie_breaker}: {searched:?}"));
+                }
+                let counted = store.count(request());
+                if !matches!(&counted, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected))
+                {
+                    wrong.push(format!("count {text} {tie_breaker}: {counted:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Issue #1550: the searcher's `search` and `count` reject a bad boost
