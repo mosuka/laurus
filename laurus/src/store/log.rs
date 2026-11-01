@@ -462,6 +462,24 @@ pub struct DocumentLog {
     /// #1503). Set under the WAL writer lock, so no append can slip in
     /// between the failure and the flag.
     torn: AtomicBool,
+    /// Whether the name of the WAL file is known to survive a crash: the
+    /// storage was synced since the file was last created or replaced
+    /// (Issue #1566). Creating the file, or renaming another over it,
+    /// changes only its directory, which fsyncing the file does not make
+    /// durable. Until a storage sync succeeds, a crash can take the file
+    /// away again, or bring back the one it replaced, with every record
+    /// appended to it since. [`Self::ensure_writer`] therefore syncs the
+    /// storage before it opens an append handle while this is unset, and
+    /// fails if that sync fails, so that no append is acknowledged on such
+    /// a file.
+    ///
+    /// A new log starts unset, since it cannot tell whether an earlier one
+    /// left a rename whose sync failed, or a file it created. This assumes
+    /// that a later successful sync makes an earlier rename durable too, as
+    /// on ext4 and xfs, where a failed metadata commit aborts the journal and
+    /// every later sync fails as well. Read and written under the WAL writer
+    /// lock, like [`Self::torn`].
+    wal_name_synced: AtomicBool,
 }
 
 impl DocumentLog {
@@ -547,6 +565,7 @@ impl DocumentLog {
             sync_policy,
             sync_deferral_depth: AtomicUsize::new(0),
             torn: AtomicBool::new(false),
+            wal_name_synced: AtomicBool::new(false),
         })
     }
 
@@ -601,12 +620,16 @@ impl DocumentLog {
     ///
     /// Only the append paths call this, before they assign an id and a
     /// sequence number, so it is also where an append is refused once an
-    /// earlier one left a partial frame (see [`Self::torn`]).
+    /// earlier one left a partial frame (see [`Self::torn`]), and where it
+    /// waits for the WAL file's name to be durable: while
+    /// [`Self::wal_name_synced`] is unset, as on the first append of this
+    /// log and after a sync of a rename failed, it syncs the storage before
+    /// the handle opens.
     ///
     /// # Errors
     ///
     /// Returns an error if the WAL may end in a partial frame, has an
-    /// unknown version, or cannot be read, rewritten or opened.
+    /// unknown version, or cannot be read, rewritten, opened or synced.
     fn ensure_writer(&self, writer_guard: &mut Option<WalWriterState>) -> Result<()> {
         if self.torn.load(Ordering::Acquire) {
             return Err(crate::error::LaurusError::storage(format!(
@@ -640,6 +663,13 @@ impl DocumentLog {
         }
 
         let mut out = self.wal_storage.create_output_append(&self.wal_path)?;
+        // Until a storage sync succeeds after the file was created or
+        // replaced, by this log or an earlier one, a crash can undo that and
+        // lose every record appended to the file (Issue #1566). On a
+        // failure, `out` is dropped with nothing written.
+        if !self.wal_name_synced.load(Ordering::Acquire) {
+            self.sync_wal_storage()?;
+        }
         if fresh {
             out.write_all(WAL_MAGIC)?;
             out.write_all(&[WAL_VERSION])?;
@@ -688,8 +718,8 @@ impl DocumentLog {
     /// # Errors
     ///
     /// Returns an error if the WAL cannot be opened for appending (see
-    /// [`Self::ensure_writer`]), or encoding, writing or syncing the record
-    /// fails.
+    /// [`Self::ensure_writer`], which can sync the storage first), or
+    /// encoding, writing or syncing the record fails.
     pub fn append_put(
         &self,
         external_id: &str,
@@ -1074,7 +1104,9 @@ impl DocumentLog {
     /// # Errors
     ///
     /// Returns an error if the WAL has a version this build does not know,
-    /// or if reading the WAL, or cutting it back, fails.
+    /// or if reading the WAL, or cutting it back, fails. A cut whose only
+    /// failure is the storage sync after its rename leaves the cut file in
+    /// place (see [`Self::cut_wal`]).
     pub fn read_all(&self) -> Result<Vec<LogRecord>> {
         // Held across the read and the cut, so that no append opens the
         // file in between.
@@ -1255,10 +1287,15 @@ impl DocumentLog {
     /// holding the writer lock with no append handle open, so the file
     /// cannot change during the copy.
     ///
+    /// The storage is synced after the rename, as in [`Self::rewrite_wal`],
+    /// which also says what a failure of only that sync leaves: here too,
+    /// the file a crash could bring back holds every record the cut one
+    /// does.
+    ///
     /// # Errors
     ///
-    /// Returns an error if reading the WAL, writing the temporary file, or
-    /// renaming it fails.
+    /// Returns an error if reading the WAL, writing the temporary file,
+    /// renaming it, or syncing the storage fails.
     fn cut_wal(&self, valid_len: u64) -> Result<()> {
         let (tmp_name, mut tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
         {
@@ -1270,9 +1307,12 @@ impl DocumentLog {
         tmp_out.flush_and_sync()?;
         tmp_out.close()?;
 
+        // A crash can undo the rename until a storage sync succeeds (Issue
+        // #1566).
+        self.wal_name_synced.store(false, Ordering::Release);
         self.wal_storage.rename_file(&tmp_name, &self.wal_path)?;
         // Make the rename durable before an append lands on the cut file.
-        self.wal_storage.sync()?;
+        self.sync_wal_storage()?;
 
         Ok(())
     }
@@ -1309,7 +1349,9 @@ impl DocumentLog {
     /// # Errors
     ///
     /// Returns an error if flushing, reading back, recreating, or re-appending
-    /// to the WAL file fails.
+    /// to the WAL file, or syncing the storage after it, fails. When the slow
+    /// path fails only at the sync after its rename, the WAL is the new file
+    /// already (see [`Self::rewrite_wal`]).
     pub fn truncate_retaining_after(&self, retain_after_seq: SeqNumber) -> Result<()> {
         // Hold the writer lock across the whole operation so a concurrent
         // append cannot interleave with the read-back and rewrite; it blocks
@@ -1366,11 +1408,17 @@ impl DocumentLog {
     /// afterwards: an in-place wipe would make the WAL durably empty until
     /// the rewrite completes, so a crash in that window would lose `records`
     /// for good (#876). The rename is a single atomic filesystem operation,
-    /// so the WAL is never observably missing a record, and storage is
-    /// synced after it, so an append that follows lands on the new file
-    /// after a crash too. Serves the slow path of
-    /// [`Self::truncate_retaining_after`] and the upgrade of an older
-    /// framing before the first append (Issue #1522).
+    /// so the WAL is never observably missing a record, and the storage is
+    /// synced after it, so that the rename survives a crash. Serves the slow
+    /// path of [`Self::truncate_retaining_after`] and the upgrade of an
+    /// older framing before the first append (Issue #1522).
+    ///
+    /// When only that sync fails, the error is returned with the rename
+    /// done: the WAL is the new file, but a crash can still bring back the
+    /// replaced one. That loses none of `records`, which the replaced file
+    /// holds as well, but it would lose any record appended to the new file
+    /// since, so [`Self::wal_name_synced`] stays unset, and the next append
+    /// syncs the storage before it is acknowledged (Issue #1566).
     ///
     /// The caller holds the writer lock with no append handle open: a handle
     /// open on the replaced file would go on writing to it.
@@ -1404,12 +1452,31 @@ impl DocumentLog {
             state.out.close()?;
         }
 
+        // A crash can undo the rename until a storage sync succeeds (Issue
+        // #1566).
+        self.wal_name_synced.store(false, Ordering::Release);
         self.wal_storage.rename_file(&tmp_name, &self.wal_path)?;
-        // Sync storage to ensure the renamed WAL file is visible. Critical on
-        // Windows where directory listings and file metadata may be cached.
-        self.wal_storage.sync()?;
+        // Make the rename durable: on Unix, `FileStorage::sync` fsyncs the
+        // directories, which is where a rename is recorded.
+        self.sync_wal_storage()?;
 
         Ok(())
+    }
+
+    /// Sync the WAL's storage, which makes the WAL file's name durable, and
+    /// record in [`Self::wal_name_synced`] whether it succeeded (Issue
+    /// #1566).
+    ///
+    /// The caller holds the WAL writer lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if syncing the storage fails.
+    fn sync_wal_storage(&self) -> Result<()> {
+        let synced = self.wal_storage.sync();
+        self.wal_name_synced
+            .store(synced.is_ok(), Ordering::Release);
+        synced
     }
 
     /// Get the last used sequence number.
