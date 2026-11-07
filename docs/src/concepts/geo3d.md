@@ -131,9 +131,15 @@ let centre = GeoEcefPoint::new(-3_955_182.0, 3_350_553.0, 3_700_276.0);
 let query = Geo3dDistanceQuery::new("position", centre, 5_000.0); // 5 km radius
 ```
 
-The visitor uses [`AABB::min_distance_sq_to_point`] for the `Outside`
-test and [`AABB::max_distance_sq_to_point`] for the `Inside` test, so
-both cell-vs-sphere checks run in squared-distance space and avoid `sqrt`.
+The visitor prunes cells with [`AABB::min_distance_sq_to_point`] (the
+`Outside` test, in squared-distance space so it avoids `sqrt`) and never
+returns `CellRelation::Inside` from `compare`: the `Inside` path reports doc
+ids without their coordinates, and the query needs every point's real
+distance for its score and its distance-ascending order. A cell that lies
+wholly within the sphere is therefore visited as `Crosses` and its points
+decoded, as the k-NN visitor below does. (Before #1594 such cells were
+reported `Inside`, and every point under them got distance `0` and score
+`1.0` regardless of where it actually was.)
 
 ### Bounding Box — `Geo3dBoundingBoxQuery`
 

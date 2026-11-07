@@ -52,11 +52,9 @@ use crate::lexical::reader::LexicalIndexReader;
 ///
 /// Scoring follows the same shape as the 2D
 /// [`GeoDistanceQuery`](super::geo::GeoDistanceQuery): score is
-/// `1.0 - distance / radius`, clamped to `[0, 1]`. Documents that the BKD
-/// reader classified as "fully inside" (their enclosing cell sits
-/// entirely within the sphere) are reported with the maximum score `1.0`
-/// because the visitor never observes their exact coordinates — see the
-/// trade-off note on [`SphereVisitor::visit_inside`].
+/// `1.0 - distance / radius`, clamped to `[0, 1]`, computed from every
+/// matched point's real coordinates, so the result order and the scores
+/// do not depend on how the BKD tree happens to be split (#1594).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Geo3dDistanceQuery {
     /// Field containing 3D ECEF coordinates.
@@ -120,9 +118,7 @@ impl Geo3dDistanceQuery {
         let radius = self.distance_m;
         for hit in visitor.hits {
             let distance = hit.distance_sq.sqrt();
-            let score = if hit.from_inside_cell {
-                1.0
-            } else if radius <= 0.0 {
+            let score = if radius <= 0.0 {
                 0.0
             } else {
                 (1.0 - distance / radius).clamp(0.0, 1.0) as f32
@@ -154,9 +150,7 @@ impl Geo3dDistanceQuery {
 pub struct Geo3dMatch {
     /// Document id.
     pub doc_id: u64,
-    /// Straight-line distance to the query center in meters. `0.0` for
-    /// hits reported via [`SphereVisitor::visit_inside`] (the visitor
-    /// does not observe the point's coordinates in that case).
+    /// Straight-line distance to the query center in meters.
     pub distance_m: f64,
     /// Final relevance score in `[0, 1]`, before the query's boost is
     /// applied by the [`Scorer`].
@@ -164,12 +158,20 @@ pub struct Geo3dMatch {
 }
 
 /// `IntersectVisitor` that collects every doc whose stored point lies
-/// within a sphere of radius `distance_m` centered at `center`.
+/// within a sphere of radius `distance_m` centered at `center`, with its
+/// squared distance to the center.
 ///
-/// The classification logic uses [`AABB::min_distance_sq_to_point`] (for
-/// the Outside test) and [`AABB::max_distance_sq_to_point`] (for the
-/// Inside test) so both checks happen in squared-distance space and
-/// avoid `sqrt`.
+/// `compare` prunes cells with [`AABB::min_distance_sq_to_point`] in
+/// squared-distance space (no `sqrt`) and never returns
+/// [`CellRelation::Inside`]: the `Inside` path reports doc ids via
+/// `visit_inside` **without** coordinates, and the query scores and
+/// ranks by distance. Before #1594 a cell whose farthest corner lay
+/// within the sphere was reported `Inside` and every point under it got
+/// distance `0.0` and score `1.0`, ranking it above closer points and
+/// making a document's score depend on the segment's BKD layout.
+/// Returning `Crosses` for a contained cell costs decoding its points,
+/// never correctness (same pattern as the 2D `GeoBoxPointsVisitor` and
+/// [`NearestVisitor`]).
 struct SphereVisitor {
     center: [f64; 3],
     radius_sq: f64,
@@ -179,14 +181,8 @@ struct SphereVisitor {
 #[derive(Debug, Clone, Copy)]
 struct SphereHit {
     doc_id: u64,
-    /// Squared distance from `center` to the doc's stored point. `0.0`
-    /// for hits arriving via `visit_inside` (the visitor does not
-    /// observe the coordinates in that case).
+    /// Squared distance from `center` to the doc's stored point.
     distance_sq: f64,
-    /// `true` if the hit was reported via `visit_inside` rather than
-    /// `visit`. The query layer treats Inside-cell hits as having a
-    /// score of `1.0` regardless of their unknown distance.
-    from_inside_cell: bool,
 }
 
 impl SphereVisitor {
@@ -207,27 +203,16 @@ impl IntersectVisitor for SphereVisitor {
         if min_d_sq > self.radius_sq {
             return CellRelation::Outside;
         }
-        let max_d_sq = cell.max_distance_sq_to_point(&self.center);
-        if max_d_sq <= self.radius_sq {
-            return CellRelation::Inside;
-        }
+        // Always Crosses, even for a cell entirely within the sphere:
+        // the query needs the per-point distance the Inside path
+        // withholds (see the type-level note).
         CellRelation::Crosses
     }
 
-    /// Trade-off note: `visit_inside` is invoked for every doc beneath a
-    /// subtree whose AABB is fully inside the sphere, which by definition
-    /// means the doc's point is inside the sphere too — but the visitor
-    /// does not get the coordinates, so the exact distance is unknown.
-    /// We mark the hit accordingly; the scorer surfaces it as `1.0`. If
-    /// callers need exact per-doc distances they should consume
-    /// [`Geo3dMatch::distance_m`] only when `score < 1.0`, or fall back
-    /// to the `Geo3dNearestQuery` k-NN flavour from #302.
-    fn visit_inside(&mut self, doc_id: u64) {
-        self.hits.push(SphereHit {
-            doc_id,
-            distance_sq: 0.0,
-            from_inside_cell: true,
-        });
+    fn visit_inside(&mut self, _doc_id: u64) {
+        // Unreachable in practice — `compare` never returns Inside — but
+        // if a future BKD impl chooses to call this we ignore the hit (we
+        // have no coordinates to score it with).
     }
 
     fn visit(&mut self, doc_id: u64, point: &[f64]) {
@@ -240,7 +225,6 @@ impl IntersectVisitor for SphereVisitor {
             self.hits.push(SphereHit {
                 doc_id,
                 distance_sq: d_sq,
-                from_inside_cell: false,
             });
         }
     }
@@ -1024,13 +1008,15 @@ mod tests {
         assert_eq!(v.compare(&c), CellRelation::Outside);
     }
 
+    /// #1594: a cell entirely within the sphere is reported `Crosses`,
+    /// never `Inside`, so its points are decoded and scored by distance.
     #[test]
-    fn sphere_visitor_compare_inside() {
+    fn sphere_visitor_compare_contained_cell_crosses() {
         // Sphere radius 100 around origin; cell tightly centered fits
         // entirely inside (corner distance √(3) * 1 < 100).
         let v = visitor(0.0, 0.0, 0.0, 100.0);
         let c = cell([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
-        assert_eq!(v.compare(&c), CellRelation::Inside);
+        assert_eq!(v.compare(&c), CellRelation::Crosses);
     }
 
     #[test]
@@ -1052,18 +1038,16 @@ mod tests {
         v.visit(3, &[10.0, 0.0, 0.0]);
         assert_eq!(v.hits.len(), 2);
         assert_eq!(v.hits[0].doc_id, 1);
-        assert!(!v.hits[0].from_inside_cell);
         assert_eq!(v.hits[1].doc_id, 2);
     }
 
+    /// #1594: a coordinate-less `visit_inside` call records nothing, so
+    /// no hit can ever carry a fabricated distance of `0.0`.
     #[test]
-    fn sphere_visitor_visit_inside_marks_hit_uniformly() {
+    fn sphere_visitor_visit_inside_records_nothing() {
         let mut v = visitor(0.0, 0.0, 0.0, 100.0);
         v.visit_inside(42);
-        assert_eq!(v.hits.len(), 1);
-        assert_eq!(v.hits[0].doc_id, 42);
-        assert_eq!(v.hits[0].distance_sq, 0.0);
-        assert!(v.hits[0].from_inside_cell);
+        assert!(v.hits.is_empty());
     }
 
     #[test]
@@ -1300,6 +1284,188 @@ mod tests {
             reader.calls(),
             1,
             "find_matches must run exactly once for the matcher/scorer pair"
+        );
+    }
+
+    /// Reader whose 3D field is a real [`BKDReader`] written over
+    /// `points` with small blocks, so that whole leaves and index nodes
+    /// fall inside a query sphere and `compare` pruning runs.
+    #[derive(Debug)]
+    struct RealBkdReader {
+        tree: std::sync::Arc<dyn crate::lexical::index::structures::bkd_tree::BKDTree>,
+        max_doc: u64,
+    }
+
+    impl RealBkdReader {
+        fn new(points: &[(u64, [f64; 3])]) -> Self {
+            use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDWriter};
+            use crate::storage::Storage;
+            use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+            let storage = std::sync::Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let flat: Vec<f64> = points.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+            let doc_ids: Vec<u64> = points.iter().map(|(id, _)| *id).collect();
+            {
+                let output = storage.create_output("geo3d.bkd").unwrap();
+                let mut writer = BKDWriter::new(output, 3).with_block_size(16);
+                writer.write(&flat, &doc_ids).unwrap();
+                writer.finish().unwrap();
+            }
+            let reader = BKDReader::open(storage, "geo3d.bkd").unwrap();
+            RealBkdReader {
+                tree: std::sync::Arc::new(reader),
+                max_doc: doc_ids.iter().max().map_or(0, |m| m + 1),
+            }
+        }
+    }
+
+    impl LexicalIndexReader for RealBkdReader {
+        fn doc_count(&self) -> u64 {
+            self.max_doc
+        }
+        fn max_doc(&self) -> u64 {
+            self.max_doc
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(
+            &self,
+            _doc_id: u64,
+        ) -> crate::error::Result<Option<crate::lexical::core::document::Document>> {
+            Ok(None)
+        }
+        fn get_bkd_tree(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<
+            Option<std::sync::Arc<dyn crate::lexical::index::structures::bkd_tree::BKDTree>>,
+        > {
+            Ok(Some(self.tree.clone()))
+        }
+        fn term_info(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(None)
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>>
+        {
+            Ok(None)
+        }
+        fn field_stats(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// #1594: with a sphere large enough to contain whole BKD cells, every
+    /// hit is still scored `1 - d / r` from its real coordinates, the
+    /// reported distance is real, and the order is by true distance —
+    /// exactly the set a linear scan finds.
+    #[test]
+    fn geo3d_distance_query_scores_points_of_contained_cells_by_real_distance() {
+        // Deterministic LCG so a failure reproduces.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        // 4 000 points uniform in a 200 km cube around the centre; with
+        // 16-point leaves, a 120 km sphere contains many whole cells.
+        let center = GeoEcefPoint::new(-3_955_182.0, 3_350_553.0, 3_700_276.0);
+        let points: Vec<(u64, [f64; 3])> = (0..4_000u64)
+            .map(|i| {
+                (
+                    i,
+                    [
+                        center.x + (next() - 0.5) * 200_000.0,
+                        center.y + (next() - 0.5) * 200_000.0,
+                        center.z + (next() - 0.5) * 200_000.0,
+                    ],
+                )
+            })
+            .collect();
+        let true_distance = |doc_id: u64| -> f64 {
+            let p = points[doc_id as usize].1;
+            ((p[0] - center.x).powi(2) + (p[1] - center.y).powi(2) + (p[2] - center.z).powi(2))
+                .sqrt()
+        };
+        let radius = 120_000.0;
+        let reader = RealBkdReader::new(&points);
+
+        // Sanity: the sphere really does contain whole cells.
+        let mut probe = SphereVisitor::new(center, radius);
+        let contained = cell(
+            [center.x - 1.0, center.y - 1.0, center.z - 1.0],
+            [center.x + 1.0, center.y + 1.0, center.z + 1.0],
+        );
+        assert_eq!(probe.compare(&contained), CellRelation::Crosses);
+        probe.visit_inside(0);
+        assert!(probe.hits.is_empty());
+
+        let matches = Geo3dDistanceQuery::new("position", center, radius)
+            .find_matches(&reader)
+            .unwrap();
+
+        let mut expected: Vec<u64> = (0..points.len() as u64)
+            .filter(|&id| true_distance(id) <= radius)
+            .collect();
+        expected.sort_unstable();
+        let mut got: Vec<u64> = matches.iter().map(|m| m.doc_id).collect();
+        got.sort_unstable();
+        assert_eq!(got, expected, "same set as the linear scan");
+        assert!(
+            expected.len() > 1_000,
+            "the sphere should be well populated"
+        );
+
+        for m in &matches {
+            let d = true_distance(m.doc_id);
+            assert!(
+                (m.distance_m - d).abs() < 1e-6,
+                "doc {}: reported distance {} vs real {d}",
+                m.doc_id,
+                m.distance_m
+            );
+            let expected_score = (1.0 - d / radius) as f32;
+            assert!(
+                (m.score - expected_score).abs() < 1e-6,
+                "doc {}: score {} vs expected {expected_score} (d = {d})",
+                m.doc_id,
+                m.score
+            );
+        }
+        assert!(
+            matches
+                .windows(2)
+                .all(|w| w[0].distance_m <= w[1].distance_m),
+            "results are ordered by true distance"
+        );
+        let nearest = (0..points.len() as u64)
+            .min_by(|&a, &b| true_distance(a).total_cmp(&true_distance(b)))
+            .unwrap();
+        assert_eq!(
+            matches[0].doc_id, nearest,
+            "the true nearest point is first"
         );
     }
 }
