@@ -248,14 +248,14 @@ impl GeoDistanceQuery {
     pub fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<GeoMatch>> {
         let mut matches = Vec::new();
 
-        // Create a bounding box for efficient filtering
-        let bounding_box = self.create_bounding_box();
+        // The lat/lon rectangle(s) enclosing the circle, for BKD pruning.
+        let bounds = self.cap_bounds();
 
         // Get candidates from the index. Every point is evaluated — a
         // document may appear several times (multi-valued field, #1174;
         // multi-segment reader) and is deduplicated *after* the radius
         // test below so a far-away point never shadows a matching one.
-        let candidates = self.get_spatial_candidates(reader, &bounding_box)?;
+        let candidates = self.get_spatial_candidates(reader, &bounds)?;
 
         for (doc_id, point) in candidates {
             let distance = self.center.distance_to(&point);
@@ -295,66 +295,106 @@ impl GeoDistanceQuery {
         Ok(matches)
     }
 
-    /// Create a bounding box for efficient spatial filtering.
-    fn create_bounding_box(&self) -> GeoBoundingBox {
-        // Approximate degree distance at the center latitude
-        let lat_deg_m = 111_000.0; // ~111 km (= 111 000 m) per degree latitude
-        // At poles cos(lat) ≈ 0 → clamp to avoid division by zero
-        let lon_deg_m = (111_000.0 * self.center.lat.to_radians().cos()).max(1.0);
+    /// The lat/lon rectangle(s) enclosing the spherical cap of radius
+    /// `distance_m` around `center`, used to prune the BKD before the exact
+    /// haversine test in [`find_matches`](Self::find_matches).
+    ///
+    /// The cap is bounded exactly, on the same sphere as
+    /// [`GeoPoint::distance_to`] (#1593):
+    ///
+    /// * latitude spans `center.lat ± δ` where `δ = distance_m / R` in degrees;
+    /// * if that span reaches a pole the cap wraps around it and every
+    ///   longitude is in range;
+    /// * otherwise the cap's widest longitude extent is
+    ///   `Δλ = asin(sin δ / cos φ)` (not at the centre's latitude but nearer the
+    ///   pole, so `δ / cos φ` would be too narrow), and `center.lon ± Δλ` is
+    ///   split in two when it crosses the antimeridian.
+    ///
+    /// The previous `111 km/°` box clamped longitude to `[-180, 180]`, so a
+    /// circle crossing the antimeridian, containing a pole, or large at high
+    /// latitude lost the matches outside the box before the exact test ran.
+    fn cap_bounds(&self) -> CapBounds {
+        const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
-        let lat_delta = self.distance_m / lat_deg_m;
-        let lon_delta = self.distance_m / lon_deg_m;
+        if self.distance_m.is_nan() || self.distance_m <= 0.0 {
+            // Zero, negative or NaN radius: only the centre itself can match.
+            return CapBounds {
+                min_lat: self.center.lat,
+                max_lat: self.center.lat,
+                lon_ranges: vec![(self.center.lon, self.center.lon)],
+            };
+        }
 
-        // Clamp to the valid lat/lon ranges so the resulting GeoPoints are
-        // always in-range (the infallible `GeoPoint::new` debug-asserts).
-        let min = GeoPoint::new(
-            (self.center.lat - lat_delta).clamp(-90.0, 90.0),
-            (self.center.lon - lon_delta).clamp(-180.0, 180.0),
-        );
-        let max = GeoPoint::new(
-            (self.center.lat + lat_delta).clamp(-90.0, 90.0),
-            (self.center.lon + lon_delta).clamp(-180.0, 180.0),
-        );
+        let delta_rad = self.distance_m / EARTH_RADIUS_M;
+        if delta_rad >= std::f64::consts::PI {
+            return CapBounds::whole_sphere();
+        }
+        let delta_deg = delta_rad.to_degrees();
 
-        GeoBoundingBox::new(min, max).unwrap_or_else(|_| {
-            // Fallback to a tiny box around the center if validation fails
-            // (extreme deltas at the poles can produce inverted boxes).
-            let fmin = GeoPoint::new(
-                (self.center.lat - 0.01).clamp(-90.0, 90.0),
-                (self.center.lon - 0.01).clamp(-180.0, 180.0),
-            );
-            let fmax = GeoPoint::new(
-                (self.center.lat + 0.01).clamp(-90.0, 90.0),
-                (self.center.lon + 0.01).clamp(-180.0, 180.0),
-            );
-            GeoBoundingBox::new(fmin, fmax).unwrap_or(GeoBoundingBox {
-                min: self.center,
-                max: self.center,
-            })
-        })
+        let min_lat = self.center.lat - delta_deg;
+        let max_lat = self.center.lat + delta_deg;
+        if min_lat <= -90.0 || max_lat >= 90.0 {
+            // The cap contains a pole: every meridian passes through it.
+            return CapBounds {
+                min_lat: min_lat.max(-90.0),
+                max_lat: max_lat.min(90.0),
+                lon_ranges: vec![(-180.0, 180.0)],
+            };
+        }
+
+        // cos φ > 0 here because |center.lat| < 90 - δ. The ratio is < 1 for
+        // the same reason, but clamp it so rounding never yields NaN.
+        let ratio = (delta_rad.sin() / self.center.lat.to_radians().cos()).min(1.0);
+        let lon_delta = ratio.asin().to_degrees();
+        if lon_delta >= 180.0 {
+            return CapBounds {
+                min_lat,
+                max_lat,
+                lon_ranges: vec![(-180.0, 180.0)],
+            };
+        }
+
+        let min_lon = self.center.lon - lon_delta;
+        let max_lon = self.center.lon + lon_delta;
+        // `<=` / `>=`: a range ending exactly on the antimeridian also
+        // covers the point stored with the other sign (-180 == 180).
+        let lon_ranges = if min_lon <= -180.0 {
+            vec![(-180.0, max_lon), (min_lon + 360.0, 180.0)]
+        } else if max_lon >= 180.0 {
+            vec![(min_lon, 180.0), (-180.0, max_lon - 360.0)]
+        } else {
+            vec![(min_lon, max_lon)]
+        };
+
+        CapBounds {
+            min_lat,
+            max_lat,
+            lon_ranges,
+        }
     }
 
-    /// Get spatial candidates from the index within the bounding box.
+    /// Get spatial candidates from the index within the cap bounds.
     fn get_spatial_candidates(
         &self,
         reader: &dyn LexicalIndexReader,
-        bounding_box: &GeoBoundingBox,
+        bounds: &CapBounds,
     ) -> Result<Vec<(u64, GeoPoint)>> {
         let mut candidates = Vec::new();
 
         // Try to use BKD tree for efficient candidate retrieval. The
         // coordinates come straight from the BKD leaves via the visitor
         // — no stored-document probes, so `indexed = true, stored =
-        // false` geo fields work too (#1000).
+        // false` geo fields work too (#1000). One traversal per longitude
+        // range: two when the cap crosses the antimeridian.
         if let Some(bkd_tree) = reader.get_bkd_tree(&self.field)? {
-            let mut visitor = GeoBoxPointsVisitor::new(
-                bounding_box.min.lat,
-                bounding_box.min.lon,
-                bounding_box.max.lat,
-                bounding_box.max.lon,
-            );
-            bkd_tree.intersect(&mut visitor)?;
-            return Ok(visitor.into_candidates());
+            for &(min_lon, max_lon) in &bounds.lon_ranges {
+                let mut visitor =
+                    GeoBoxPointsVisitor::new(bounds.min_lat, min_lon, bounds.max_lat, max_lon);
+                bkd_tree.intersect(&mut visitor)?;
+                candidates.extend(visitor.into_candidates());
+            }
+            candidates.sort_by_key(|(doc_id, _)| *doc_id);
+            return Ok(candidates);
         }
 
         // Fallback: scan the stored documents present in this reader
@@ -369,7 +409,7 @@ impl GeoDistanceQuery {
                     // `find_matches` keeps the closest one per document.
                     for geo_point in stored_geo_points(field_value) {
                         // First check bounding box for efficiency, then exact distance
-                        if bounding_box.contains(&geo_point) {
+                        if bounds.contains(&geo_point) {
                             let distance = self.center.distance_to(&geo_point);
                             // Double-check with exact distance calculation
                             if distance <= self.distance_m {
@@ -382,6 +422,37 @@ impl GeoDistanceQuery {
         }
 
         Ok(candidates)
+    }
+}
+
+/// Lat/lon bounds of a spherical cap: one latitude span and one or two
+/// closed longitude ranges (two when the cap crosses the antimeridian).
+/// Built by [`GeoDistanceQuery::cap_bounds`].
+#[derive(Debug, Clone, PartialEq)]
+struct CapBounds {
+    min_lat: f64,
+    max_lat: f64,
+    /// Closed `(min_lon, max_lon)` ranges, each within `[-180, 180]`.
+    lon_ranges: Vec<(f64, f64)>,
+}
+
+impl CapBounds {
+    fn whole_sphere() -> Self {
+        CapBounds {
+            min_lat: -90.0,
+            max_lat: 90.0,
+            lon_ranges: vec![(-180.0, 180.0)],
+        }
+    }
+
+    /// Whether `point` lies inside the bounds (closed on every edge).
+    fn contains(&self, point: &GeoPoint) -> bool {
+        point.lat >= self.min_lat
+            && point.lat <= self.max_lat
+            && self
+                .lon_ranges
+                .iter()
+                .any(|&(min_lon, max_lon)| point.lon >= min_lon && point.lon <= max_lon)
     }
 }
 
@@ -1336,20 +1407,26 @@ mod tests {
         let center = GeoPoint::try_new(40.7128, -74.0060).unwrap(); // NYC
         let query = GeoDistanceQuery::new("location", center, 5_000.0); // 5 km radius
 
-        let bbox = query.create_bounding_box();
+        let bounds = query.cap_bounds();
 
-        // Check that the bounding box contains the center
-        assert!(bbox.contains(&center));
+        // Check that the bounds contain the center
+        assert!(bounds.contains(&center));
 
-        // Check that the bounding box is roughly the right size
-        let (width, height) = bbox.dimensions();
+        // Check that the bounds are roughly the right size
+        assert_eq!(bounds.lon_ranges.len(), 1, "no antimeridian crossing");
+        let (min_lon, max_lon) = bounds.lon_ranges[0];
+        let width = max_lon - min_lon;
+        let height = bounds.max_lat - bounds.min_lat;
         assert!(width > 0.0 && width < 1.0); // Should be less than 1 degree
         assert!(height > 0.0 && height < 1.0);
 
-        // The center should be approximately in the middle of the bounding box
+        // The center should be approximately in the middle of the bounds
         // (within ~1 km).
-        let bbox_center = bbox.center();
-        let center_distance = center.distance_to(&bbox_center);
+        let bounds_center = GeoPoint::new(
+            (bounds.min_lat + bounds.max_lat) / 2.0,
+            (min_lon + max_lon) / 2.0,
+        );
+        let center_distance = center.distance_to(&bounds_center);
         assert!(center_distance < 1_000.0);
     }
 
@@ -1560,9 +1637,9 @@ mod tests {
     fn distance_query_keeps_the_closest_point_per_document() {
         let center = GeoPoint::new(0.0, 0.0);
         let query = GeoDistanceQuery::new("location", center, 150_000.0);
-        let bbox = query.create_bounding_box();
-        // A rectangle corner: inside the bbox, outside the circle.
-        let corner = [bbox.max.lat - 1e-6, bbox.max.lon - 1e-6];
+        let bounds = query.cap_bounds();
+        // A rectangle corner: inside the bounds, outside the circle.
+        let corner = [bounds.max_lat - 1e-6, bounds.lon_ranges[0].1 - 1e-6];
         assert!(center.distance_to(&GeoPoint::new(corner[0], corner[1])) > 150_000.0);
 
         let reader = BkdBackedReader::new(vec![
@@ -1748,5 +1825,287 @@ mod tests {
             2,
             "fallback must probe only the present ids"
         );
+    }
+
+    /// Reader whose geo field is a real [`BKDReader`] written over
+    /// `points`, so `compare` pruning runs (the [`FakeBkdTree`] above
+    /// visits every point and never prunes).
+    #[derive(Debug)]
+    struct RealBkdReader {
+        tree: std::sync::Arc<dyn crate::lexical::index::structures::bkd_tree::BKDTree>,
+        max_doc: u64,
+    }
+
+    impl RealBkdReader {
+        fn new(points: &[(u64, [f64; 2])]) -> Self {
+            use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDWriter};
+            use crate::storage::Storage;
+            use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+            let storage = std::sync::Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let flat: Vec<f64> = points.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+            let doc_ids: Vec<u64> = points.iter().map(|(id, _)| *id).collect();
+            {
+                let output = storage.create_output("geo.bkd").unwrap();
+                // Small blocks so that a few hundred points span many
+                // leaves and the index-node pruning is exercised.
+                let mut writer = BKDWriter::new(output, 2).with_block_size(16);
+                writer.write(&flat, &doc_ids).unwrap();
+                writer.finish().unwrap();
+            }
+            let reader = BKDReader::open(storage, "geo.bkd").unwrap();
+            RealBkdReader {
+                tree: std::sync::Arc::new(reader),
+                max_doc: doc_ids.iter().max().map_or(0, |m| m + 1),
+            }
+        }
+    }
+
+    impl LexicalIndexReader for RealBkdReader {
+        fn doc_count(&self) -> u64 {
+            self.max_doc
+        }
+        fn max_doc(&self) -> u64 {
+            self.max_doc
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(
+            &self,
+            _doc_id: u64,
+        ) -> crate::error::Result<Option<crate::lexical::core::document::Document>> {
+            Ok(None)
+        }
+        fn get_bkd_tree(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<
+            Option<std::sync::Arc<dyn crate::lexical::index::structures::bkd_tree::BKDTree>>,
+        > {
+            Ok(Some(self.tree.clone()))
+        }
+        fn term_info(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(None)
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>>
+        {
+            Ok(None)
+        }
+        fn field_stats(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Doc ids within `distance_m` of `center` by a linear haversine scan:
+    /// the reference every pruned search below is compared against.
+    fn brute_force_within(
+        center: GeoPoint,
+        distance_m: f64,
+        points: &[(u64, [f64; 2])],
+    ) -> Vec<u64> {
+        let mut ids: Vec<u64> = points
+            .iter()
+            .filter(|(_, p)| center.distance_to(&GeoPoint::new(p[0], p[1])) <= distance_m)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn matched_ids(query: &GeoDistanceQuery, reader: &dyn LexicalIndexReader) -> Vec<u64> {
+        let mut ids: Vec<u64> = query
+            .find_matches(reader)
+            .unwrap()
+            .iter()
+            .map(|m| m.doc_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// #1593: a circle crossing the antimeridian matches the points on
+    /// both sides of it.
+    #[test]
+    fn distance_query_crosses_the_antimeridian() {
+        let points = vec![
+            (1, [0.0, 179.8]),  // ≈ 11 km east of the centre
+            (2, [0.0, -179.9]), // ≈ 22 km, on the far side of ±180
+            (3, [0.0, -179.0]), // ≈ 122 km, outside
+            (4, [0.0, 179.0]),  // ≈ 100 km, outside
+            (5, [0.1, -180.0]), // ≈ 15 km, stored with the -180 sign
+        ];
+        let center = GeoPoint::new(0.0, 179.9);
+        let query = GeoDistanceQuery::new("location", center, 50_000.0);
+        assert_eq!(brute_force_within(center, 50_000.0, &points), vec![1, 2, 5]);
+
+        let bounds = query.cap_bounds();
+        assert_eq!(
+            bounds.lon_ranges.len(),
+            2,
+            "split at the antimeridian: {bounds:?}"
+        );
+
+        assert_eq!(
+            matched_ids(&query, &RealBkdReader::new(&points)),
+            vec![1, 2, 5]
+        );
+        assert_eq!(
+            matched_ids(&query, &BkdBackedReader::new(points)),
+            vec![1, 2, 5]
+        );
+    }
+
+    /// #1593: a circle containing a pole covers every longitude.
+    #[test]
+    fn distance_query_wraps_around_the_pole() {
+        let points = vec![
+            (1, [89.9, 160.0]),  // ≈ 2 km
+            (2, [89.9, -170.0]), // ≈ 4 km, "behind" the pole in longitude
+            (3, [89.9, -10.0]),  // ≈ 22 km, through the pole
+            (4, [89.0, 170.0]),  // ≈ 100 km, outside
+            (5, [-89.9, 170.0]), // the other pole, outside
+        ];
+        let center = GeoPoint::new(89.9, 170.0);
+        let query = GeoDistanceQuery::new("location", center, 50_000.0);
+        assert_eq!(brute_force_within(center, 50_000.0, &points), vec![1, 2, 3]);
+
+        let bounds = query.cap_bounds();
+        assert_eq!(bounds.lon_ranges, vec![(-180.0, 180.0)], "{bounds:?}");
+        assert_eq!(bounds.max_lat, 90.0);
+
+        assert_eq!(
+            matched_ids(&query, &RealBkdReader::new(&points)),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            matched_ids(&query, &BkdBackedReader::new(points)),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// #1593: at high latitude the circle's widest longitude extent lies
+    /// nearer the pole than the centre, so a box of `δ / cos(center.lat)`
+    /// degrees cuts off the circle's flanks.
+    #[test]
+    fn distance_query_keeps_the_flanks_of_a_high_latitude_circle() {
+        let points = vec![
+            (1, [80.0, 20.0]),    // ≈ 384 km, inside the old box
+            (2, [81.059, 26.5]),  // ≈ 494 km, inside the circle, outside the old box
+            (3, [81.059, -26.5]), // mirror of 2
+            (4, [80.0, 30.0]),    // ≈ 572 km, outside
+        ];
+        let center = GeoPoint::new(80.0, 0.0);
+        let query = GeoDistanceQuery::new("location", center, 500_000.0);
+        assert_eq!(
+            brute_force_within(center, 500_000.0, &points),
+            vec![1, 2, 3]
+        );
+
+        assert_eq!(
+            matched_ids(&query, &RealBkdReader::new(&points)),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            matched_ids(&query, &BkdBackedReader::new(points)),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// #1593: the pruned search returns exactly the linear-scan set for
+    /// random centres (including near the poles and the antimeridian) and
+    /// radii up to 1 000 km, against a real BKD tree.
+    #[test]
+    fn distance_query_matches_brute_force_everywhere() {
+        // Deterministic LCG so a failure reproduces.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+
+        // Points everywhere, denser near the poles and the antimeridian
+        // where the old box failed.
+        let mut points: Vec<(u64, [f64; 2])> = Vec::new();
+        for i in 0..1_500u64 {
+            let (lat, lon) = match i % 3 {
+                0 => (next() * 180.0 - 90.0, next() * 360.0 - 180.0),
+                1 => (
+                    (next() * 10.0 + 80.0) * if next() < 0.5 { 1.0 } else { -1.0 },
+                    next() * 360.0 - 180.0,
+                ),
+                _ => (
+                    next() * 180.0 - 90.0,
+                    (next() * 20.0 + 170.0) * if next() < 0.5 { 1.0 } else { -1.0 },
+                ),
+            };
+            points.push((i, [lat, lon.clamp(-180.0, 180.0)]));
+        }
+        let reader = RealBkdReader::new(&points);
+
+        let mut nonempty = 0;
+        for _ in 0..300 {
+            let (lat, lon) = match (next() * 3.0) as u32 {
+                0 => (next() * 180.0 - 90.0, next() * 360.0 - 180.0),
+                1 => (
+                    (next() * 10.0 + 80.0) * if next() < 0.5 { 1.0 } else { -1.0 },
+                    next() * 360.0 - 180.0,
+                ),
+                _ => (
+                    next() * 180.0 - 90.0,
+                    (next() * 10.0 + 170.0) * if next() < 0.5 { 1.0 } else { -1.0 },
+                ),
+            };
+            let center = GeoPoint::new(lat, lon.clamp(-180.0, 180.0));
+            let distance_m = next() * 1_000_000.0;
+            let query = GeoDistanceQuery::new("location", center, distance_m);
+            let expected = brute_force_within(center, distance_m, &points);
+            nonempty += usize::from(!expected.is_empty());
+            assert_eq!(
+                matched_ids(&query, &reader),
+                expected,
+                "center=({lat}, {lon}) radius={distance_m}"
+            );
+        }
+        assert!(
+            nonempty > 100,
+            "the random queries should mostly hit something"
+        );
+    }
+
+    /// A radius covering the whole sphere or more is bounded by the whole
+    /// sphere, not by an inverted box.
+    #[test]
+    fn cap_bounds_degenerate_radii() {
+        let center = GeoPoint::new(10.0, 20.0);
+        let whole = GeoDistanceQuery::new("location", center, 25_000_000.0).cap_bounds();
+        assert_eq!(whole, CapBounds::whole_sphere());
+
+        let zero = GeoDistanceQuery::new("location", center, 0.0).cap_bounds();
+        assert!(zero.contains(&center));
+        assert!(!zero.contains(&GeoPoint::new(10.0, 20.001)));
     }
 }

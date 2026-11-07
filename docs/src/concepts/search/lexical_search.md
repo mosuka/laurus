@@ -236,6 +236,13 @@ whose documents carry the field, or a field configured
 `indexed = false, stored = true`) fall back to scanning only the stored
 documents actually present in that segment.
 
+`GeoDistanceQuery` is exact on the sphere: the circle is bounded by the
+lat/lon extent of its spherical cap before the haversine test, so a circle
+that crosses the antimeridian (±180° longitude), contains a pole, or is
+large at high latitude still matches every document within the radius.
+`GeoBoundingBoxQuery` is a plain rectangle in `[-90, 90] × [-180, 180]`;
+a box that crosses the antimeridian cannot be expressed yet (#1595).
+
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 
 Three queries target 3D `Geo3d` fields backed by ECEF Cartesian coordinates
