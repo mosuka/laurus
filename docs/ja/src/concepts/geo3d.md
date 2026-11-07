@@ -132,9 +132,14 @@ let centre = GeoEcefPoint::new(-3_955_182.0, 3_350_553.0, 3_700_276.0);
 let query = Geo3dDistanceQuery::new("position", centre, 5_000.0); // 5 km 半径
 ```
 
-ビジタは `Outside` 判定に [`AABB::min_distance_sq_to_point`]、
-`Inside` 判定に [`AABB::max_distance_sq_to_point`] を使う。どちらも
-2 乗距離空間で比較するため、`sqrt` を回避できる。
+ビジタは [`AABB::min_distance_sq_to_point`] によるセルの枝刈り（`Outside`
+判定。2 乗距離空間で比較するため `sqrt` を回避できる）だけを行い、`compare`
+から `CellRelation::Inside` を返すことはない。`Inside` 経路は座標なしで
+doc id を報告するが、このクエリはスコアと距離昇順の並びのために全ポイントの
+実際の距離を必要とするためである。そのため球の内側に完全に収まるセルも
+`Crosses` として訪問し、ポイントをデコードする（後述の k-NN ビジタと同じ）。
+（#1594 以前はこうしたセルを `Inside` と報告し、その配下の全ポイントが実際の
+位置に関係なく距離 `0`・スコア `1.0` になっていた。）
 
 ### バウンディングボックス — `Geo3dBoundingBoxQuery`
 
