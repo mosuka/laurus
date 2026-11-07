@@ -235,6 +235,13 @@ BKD tree があればそれを使用し、座標は tree 自体から直接読�
 `indexed = false, stored = true` と設定されたフィールド）では、そのセグメントに
 実際に存在する保存済みドキュメントのみを走査するフォールバックを使用します。
 
+`GeoDistanceQuery` は球面上で正確に動作します。haversine による判定の前に、
+円を球冠（spherical cap）の緯度・経度範囲で囲い込むため、日付変更線
+（経度 ±180°）をまたぐ円、極を含む円、高緯度の大きな円でも、半径内の
+ドキュメントをすべてマッチします。`GeoBoundingBoxQuery` は
+`[-90, 90] × [-180, 180]` 内の単純な矩形で、日付変更線をまたぐボックスは
+まだ表現できません（#1595）。
+
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 
 3 種類のクエリが、ECEF 直交座標（メートル）にバックアップされた 3D の
