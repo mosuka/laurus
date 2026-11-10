@@ -817,6 +817,35 @@ class LaurusTest extends TestCase
         );
     }
 
+    /**
+     * Issue #1605: a bound that is neither null, an int nor a float used to
+     * become an open side without an error; it now throws a TypeError naming
+     * the bound, in an integer and in a float range.
+     */
+    public function testNumericRangeQueryRejectsABoundItCannotRead(): void
+    {
+        $wrong = [];
+        foreach (
+            [
+                ["5", 10, "integer", "min"],
+                [0, "10", "float", "max"],
+                [[1], 10, "integer", "min"],
+                [0, true, "float", "max"],
+                [false, 10, "integer", "min"],
+            ] as [$min, $max, $type, $bound]
+        ) {
+            try {
+                new Laurus\NumericRangeQuery("price", $min, $max, $type);
+                $wrong[] = "$type $bound: no error";
+            } catch (\TypeError $e) {
+                if (!str_contains($e->getMessage(), "NumericRangeQuery: $bound must be")) {
+                    $wrong[] = "$type $bound: " . $e->getMessage();
+                }
+            }
+        }
+        $this->assertSame([], $wrong);
+    }
+
     // ── SpanQuery ───────────────────────────────────────────────────────
 
     public function testSpanQueryNear(): void

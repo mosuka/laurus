@@ -388,6 +388,9 @@ an open bound. `min` and `max` are keyword-only. The numeric type (integer or
 float) is inferred from the Python type of `min`/`max`. A bound compares as a
 number, so `max=float("inf")` finds what `max=None` finds; a
 `float("nan")` bound would match nothing, so the search raises `ValueError`.
+A bound that cannot be read as a number of the range's type, such as a
+`str` next to a number or an `int` too large for a signed 64-bit integer,
+raises `ValueError` when the query is built.
 
 ### DateTimeRangeQuery
 

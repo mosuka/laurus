@@ -284,7 +284,10 @@ impl PyWildcardQuery {
 /// Numeric range filter query (integer or float).
 ///
 /// The type is inferred from the Python type of `min`/`max`:
-/// pass `int` values for integer range, `float` for float range.
+/// pass `int` values for integer range, `float` for float range. A bound
+/// that cannot be read as a number of that type (a `str` next to a number,
+/// an `int` too large for a signed 64-bit integer) raises `ValueError`
+/// rather than leaving that side open (Issue #1605).
 ///
 /// ## Example
 ///
@@ -317,11 +320,37 @@ impl PyNumericRangeQuery {
         let is_float = min.map(|v| v.is_instance_of::<PyFloat>()).unwrap_or(false)
             || max.map(|v| v.is_instance_of::<PyFloat>()).unwrap_or(false);
 
+        // A bound that does not convert raises, naming the bound and the
+        // value (Issue #1605); `.ok()` used to turn it into an open side.
+        let unreadable = |name: &str, value: &Bound<PyAny>, expected: &str| {
+            let shown = value
+                .repr()
+                .map(|r| r.to_string())
+                .unwrap_or_else(|_| "an unprintable value".to_string());
+            PyValueError::new_err(format!(
+                "NumericRangeQuery: {name} must be {expected}, got {shown}"
+            ))
+        };
+        let float_bound = |name: &str, value: Option<&Bound<PyAny>>| -> PyResult<Option<f64>> {
+            value
+                .map(|v| {
+                    v.extract::<f64>()
+                        .map_err(|_| unreadable(name, v, "a number that fits in a 64-bit float"))
+                })
+                .transpose()
+        };
+        let int_bound = |name: &str, value: Option<&Bound<PyAny>>| -> PyResult<Option<i64>> {
+            value
+                .map(|v| {
+                    v.extract::<i64>().map_err(|_| {
+                        unreadable(name, v, "an int that fits in a signed 64-bit integer")
+                    })
+                })
+                .transpose()
+        };
+
         let kind = if is_float {
-            NumericKind::Float(
-                min.and_then(|v| v.extract::<f64>().ok()),
-                max.and_then(|v| v.extract::<f64>().ok()),
-            )
+            NumericKind::Float(float_bound("min", min)?, float_bound("max", max)?)
         } else {
             let is_int = min.map(|v| v.is_instance_of::<PyInt>()).unwrap_or(false)
                 || max.map(|v| v.is_instance_of::<PyInt>()).unwrap_or(false);
@@ -330,10 +359,7 @@ impl PyNumericRangeQuery {
                     "NumericRangeQuery: min/max must be int or float",
                 ));
             }
-            NumericKind::Integer(
-                min.and_then(|v| v.extract::<i64>().ok()),
-                max.and_then(|v| v.extract::<i64>().ok()),
-            )
+            NumericKind::Integer(int_bound("min", min)?, int_bound("max", max)?)
         };
         Ok(Self { field, kind })
     }

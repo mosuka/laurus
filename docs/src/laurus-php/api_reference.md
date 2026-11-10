@@ -356,7 +356,7 @@ Pattern match. `*` matches any sequence of characters, `?` matches any single ch
 new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $numericType = "integer")
 ```
 
-Matches numeric values in the range `[$min, $max]`. Pass `null` for an open bound. Set `$numericType` to `"integer"` or `"float"`. Either type takes an `int` or a `float` as a bound, and an integer range truncates a `float`. A bound compares as a number, so `INF` as `$max` finds what `null` finds; a `NAN` bound would match nothing, so the search throws `ValueError`.
+Matches numeric values in the range `[$min, $max]`. Pass `null` for an open bound. Set `$numericType` to `"integer"` or `"float"`. Either type takes an `int` or a `float` as a bound, and an integer range truncates a `float`. A bound compares as a number, so `INF` as `$max` finds what `null` finds; a `NAN` bound would match nothing, so the search throws `ValueError`. A bound of any other type, such as a string, an array or a `bool`, throws `TypeError` when the query is constructed.
 
 ### DateTimeRangeQuery
 

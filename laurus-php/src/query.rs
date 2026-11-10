@@ -15,8 +15,10 @@
 use std::cell::RefCell;
 
 use ext_php_rs::convert::FromZval;
+use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendClassObject, Zval};
+use ext_php_rs::zend::ce;
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
@@ -372,13 +374,31 @@ pub enum NumericKind {
 /// `int`, so `NAN` or `2.5` in an integer range, or `5` in a float range,
 /// used to become an open side without an error. Read this way, `NAN`
 /// reaches the search, which rejects it, and a fraction in an integer range
-/// is truncated as the core truncates it. A value of any other type is
-/// still no bound.
-fn numeric_bound(zval: &Zval) -> Option<f64> {
+/// is truncated as the core truncates it.
+///
+/// # Errors
+///
+/// Throws `\TypeError` naming the bound (`name`) for a value of any other
+/// type, such as a string, an array or a `bool`, which used to become no
+/// bound without an error (Issue #1605).
+fn numeric_bound(name: &str, zval: &Zval) -> PhpResult<Option<f64>> {
     if zval.is_null() {
-        return None;
+        return Ok(None);
     }
-    zval.long().map(|v| v as f64).or_else(|| zval.double())
+    zval.long()
+        .map(|v| v as f64)
+        .or_else(|| zval.double())
+        .map(Some)
+        .ok_or_else(|| {
+            PhpException::new(
+                format!(
+                    "NumericRangeQuery: {name} must be an int, a float or null, got {}",
+                    zval.get_type()
+                ),
+                0,
+                ce::type_error(),
+            )
+        })
 }
 
 /// How `__toString` shows an integer range's bound: the `i64` the range
@@ -415,20 +435,25 @@ impl PhpNumericRangeQuery {
     ///
     /// A `NAN` bound is rejected with `ValueError` when the query is
     /// searched (Issue #1601).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\TypeError` if `min` or `max` is neither `null`, an `int`
+    /// nor a `float` (Issue #1605).
     pub fn __construct(
         field: String,
         min: &Zval,
         max: &Zval,
         numeric_type: Option<String>,
-    ) -> Self {
+    ) -> PhpResult<Self> {
         let nt = numeric_type.unwrap_or_else(|| "integer".to_string());
-        let (min, max) = (numeric_bound(min), numeric_bound(max));
+        let (min, max) = (numeric_bound("min", min)?, numeric_bound("max", max)?);
         let kind = if nt == "float" {
             NumericKind::Float(min, max)
         } else {
             NumericKind::Integer(min, max)
         };
-        Self { field, kind }
+        Ok(Self { field, kind })
     }
 
     /// Return a string representation.
