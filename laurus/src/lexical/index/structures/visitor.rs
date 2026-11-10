@@ -121,23 +121,61 @@ impl RangeQueryVisitor {
     }
 
     fn point_matches(&self, point: &[f64]) -> bool {
-        for (d, &v) in point.iter().enumerate() {
-            let lower_ok = if self.include_min {
-                v >= self.mins[d]
-            } else {
-                v > self.mins[d]
-            };
-            let upper_ok = if self.include_max {
-                v <= self.maxs[d]
-            } else {
-                v < self.maxs[d]
-            };
-            if !(lower_ok && upper_ok) {
-                return false;
-            }
-        }
-        true
+        point.iter().enumerate().all(|(d, &v)| {
+            value_in_range(
+                v,
+                self.mins[d],
+                self.maxs[d],
+                self.include_min,
+                self.include_max,
+            )
+        })
     }
+}
+
+/// Whether `value` lies within `[min, max]` on one axis, with
+/// `include_min` and `include_max` deciding whether a value equal to a
+/// bound matches.
+///
+/// This is the per-point check of [`RangeQueryVisitor`], and the
+/// stored-document scan of
+/// [`NumericRangeQuery`](crate::lexical::query::NumericRangeQuery), which
+/// runs when a segment has no BKD tree for the field, uses it too, so the
+/// two give the same documents (Issue #1600). Values are compared as `f64`:
+/// a `NaN` value compares false with every bound and so is in no range,
+/// and `-0.0` equals `0.0`. An open side is `f64::NEG_INFINITY` or
+/// `f64::INFINITY`, as [`RangeQueryVisitor::new`] makes it.
+///
+/// # Arguments
+///
+/// * `value` - The value to test.
+/// * `min` - The lower bound.
+/// * `max` - The upper bound.
+/// * `include_min` - Whether a value equal to `min` matches.
+/// * `include_max` - Whether a value equal to `max` matches.
+///
+/// # Returns
+///
+/// `true` when `value` is within the range.
+#[inline]
+pub(crate) fn value_in_range(
+    value: f64,
+    min: f64,
+    max: f64,
+    include_min: bool,
+    include_max: bool,
+) -> bool {
+    let lower_ok = if include_min {
+        value >= min
+    } else {
+        value > min
+    };
+    let upper_ok = if include_max {
+        value <= max
+    } else {
+        value < max
+    };
+    lower_ok && upper_ok
 }
 
 impl IntersectVisitor for RangeQueryVisitor {

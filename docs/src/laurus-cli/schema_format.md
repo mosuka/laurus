@@ -85,7 +85,7 @@ doc_values = true
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | Enables range and exact-match queries |
+| `indexed` | `bool` | `true` | Enables exact-match queries and indexes the values in a BKD tree for range queries; without it, a range query scans the stored documents |
 | `stored` | `bool` | `true` | Stores the original value |
 | `multi_valued` | `bool` | `false` | Accept arrays of integers; range queries match if **any** value satisfies the predicate (Lucene-style "any match" with constant scoring) |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
@@ -104,7 +104,7 @@ doc_values = true
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | Enables range queries |
+| `indexed` | `bool` | `true` | Indexes the values in a BKD tree for range queries; without it, a range query scans the stored documents |
 | `stored` | `bool` | `true` | Stores the original value |
 | `multi_valued` | `bool` | `false` | Accept arrays of floats; range queries match if **any** value satisfies the predicate (Lucene-style "any match" with constant scoring) |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
@@ -142,7 +142,7 @@ doc_values = true
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | Enables range queries on date/time |
+| `indexed` | `bool` | `true` | Indexes the instants in a BKD tree for range queries; without it, a range query scans the stored documents |
 | `stored` | `bool` | `true` | Stores the original value |
 | `multi_valued` | `bool` | `false` | Accept arrays of instants; range queries match if **any** instant satisfies the predicate (Lucene-style "any match") |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
