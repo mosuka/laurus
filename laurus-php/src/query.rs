@@ -21,8 +21,8 @@ use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
-    TermQuery, WildcardQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, NumericType,
+    PhraseQuery, TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -353,12 +353,42 @@ impl PhpWildcardQuery {
 // ---------------------------------------------------------------------------
 
 /// Internal representation of numeric range kind.
+///
+/// Both kinds hold their bounds as `f64`, as read by [`numeric_bound`];
+/// an integer range is truncated to `i64` when it is built, as
+/// `NumericRangeQuery::i64_range` would (it, too, goes through `f64`).
 #[derive(Clone)]
 pub enum NumericKind {
     /// Integer range with optional min and max.
-    Integer(Option<i64>, Option<i64>),
+    Integer(Option<f64>, Option<f64>),
     /// Float range with optional min and max.
     Float(Option<f64>, Option<f64>),
+}
+
+/// Read a range bound: `null` is no bound, and an `int` or a `float` is read
+/// as an `f64` whichever numeric type the range has (Issue #1601).
+///
+/// `i64::from_zval` returns `None` for a `float` and `f64::from_zval` for an
+/// `int`, so `NAN` or `2.5` in an integer range, or `5` in a float range,
+/// used to become an open side without an error. Read this way, `NAN`
+/// reaches the search, which rejects it, and a fraction in an integer range
+/// is truncated as the core truncates it. A value of any other type is
+/// still no bound.
+fn numeric_bound(zval: &Zval) -> Option<f64> {
+    if zval.is_null() {
+        return None;
+    }
+    zval.long().map(|v| v as f64).or_else(|| zval.double())
+}
+
+/// How `__toString` shows an integer range's bound: the `i64` the range
+/// searches with, or `NaN`, which the search rejects.
+fn integer_bound_repr(bound: Option<f64>) -> String {
+    match bound {
+        None => "None".to_string(),
+        Some(v) if v.is_nan() => "Some(NaN)".to_string(),
+        Some(v) => format!("Some({})", v as i64),
+    }
 }
 
 /// Numeric range filter query (`Laurus\NumericRangeQuery`).
@@ -378,9 +408,13 @@ impl PhpNumericRangeQuery {
     /// # Arguments
     ///
     /// * `field` - Field name.
-    /// * `min` - Lower bound (optional, pass null for unbounded).
-    /// * `max` - Upper bound (optional, pass null for unbounded).
+    /// * `min` - Lower bound, an `int` or a `float` for either numeric type
+    ///   (pass null for unbounded). An integer range truncates a `float`.
+    /// * `max` - Upper bound, as `min`.
     /// * `numeric_type` - "integer" or "float" (default: "integer").
+    ///
+    /// A `NAN` bound is rejected with `ValueError` when the query is
+    /// searched (Issue #1601).
     pub fn __construct(
         field: String,
         min: &Zval,
@@ -388,30 +422,11 @@ impl PhpNumericRangeQuery {
         numeric_type: Option<String>,
     ) -> Self {
         let nt = numeric_type.unwrap_or_else(|| "integer".to_string());
+        let (min, max) = (numeric_bound(min), numeric_bound(max));
         let kind = if nt == "float" {
-            let min_f = if min.is_null() {
-                None
-            } else {
-                f64::from_zval(min)
-            };
-            let max_f = if max.is_null() {
-                None
-            } else {
-                f64::from_zval(max)
-            };
-            NumericKind::Float(min_f, max_f)
+            NumericKind::Float(min, max)
         } else {
-            let min_i = if min.is_null() {
-                None
-            } else {
-                i64::from_zval(min)
-            };
-            let max_i = if max.is_null() {
-                None
-            } else {
-                i64::from_zval(max)
-            };
-            NumericKind::Integer(min_i, max_i)
+            NumericKind::Integer(min, max)
         };
         Self { field, kind }
     }
@@ -421,8 +436,10 @@ impl PhpNumericRangeQuery {
         match &self.kind {
             NumericKind::Integer(min, max) => {
                 format!(
-                    "NumericRangeQuery(field='{}', min={:?}, max={:?}, type='integer')",
-                    self.field, min, max
+                    "NumericRangeQuery(field='{}', min={}, max={}, type='integer')",
+                    self.field,
+                    integer_bound_repr(*min),
+                    integer_bound_repr(*max)
                 )
             }
             NumericKind::Float(min, max) => {
@@ -442,9 +459,16 @@ impl PhpNumericRangeQuery {
             NumericKind::Float(min, max) => {
                 Box::new(NumericRangeQuery::f64_range(&self.field, *min, *max))
             }
-            NumericKind::Integer(min, max) => {
-                Box::new(NumericRangeQuery::i64_range(&self.field, *min, *max))
-            }
+            // `new` truncates each bound to an `i64` and keeps a `NaN`
+            // bound so that the search rejects it (Issue #1601).
+            NumericKind::Integer(min, max) => Box::new(NumericRangeQuery::new(
+                &self.field,
+                NumericType::Integer,
+                *min,
+                *max,
+                true,
+                true,
+            )),
         }
     }
 }

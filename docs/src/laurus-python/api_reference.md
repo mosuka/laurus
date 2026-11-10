@@ -385,7 +385,9 @@ NumericRangeQuery(field: str, *, min: int | float | None = None, max: int | floa
 
 Matches numeric values in the range `[min, max]`. Pass `None` (or omit) for
 an open bound. `min` and `max` are keyword-only. The numeric type (integer or
-float) is inferred from the Python type of `min`/`max`.
+float) is inferred from the Python type of `min`/`max`. A bound compares as a
+number, so `max=float("inf")` finds what `max=None` finds; a
+`float("nan")` bound would match nothing, so the search raises `ValueError`.
 
 ### DateTimeRangeQuery
 

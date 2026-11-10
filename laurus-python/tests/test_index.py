@@ -345,6 +345,32 @@ def test_numeric_range_query():
     assert results[0].id == "doc2"
 
 
+def _price_index():
+    schema = laurus.Schema()
+    schema.add_float_field("price")
+    idx = laurus.Index(schema=schema)
+    idx.put_document("neg", {"price": -1.5})
+    idx.put_document("small", {"price": 3.0})
+    idx.put_document("big", {"price": 10.0})
+    idx.commit()
+    return idx
+
+
+@pytest.mark.parametrize("kwargs", [{"min": float("nan"), "max": 5.0}, {"max": float("nan")}])
+def test_numeric_range_query_rejects_a_nan_bound(kwargs):
+    """Issue #1601: a NaN bound used to match nothing without an error."""
+    idx = _price_index()
+    with pytest.raises(ValueError, match="has a NaN bound"):
+        idx.search(laurus.NumericRangeQuery("price", **kwargs), limit=5)
+
+
+def test_numeric_range_query_infinite_bound_is_an_open_side():
+    """Issue #1601: an infinite bound compares as a number."""
+    idx = _price_index()
+    unbounded = idx.search(laurus.NumericRangeQuery("price", min=0.0, max=float("inf")), limit=5)
+    assert _ids(unbounded) == ["big", "small"]
+
+
 def _datetime_index():
     schema = laurus.Schema()
     schema.add_datetime_field("created_at")

@@ -353,7 +353,7 @@ new \Laurus\WildcardQuery(string $field, string $pattern)
 new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $numericType = "integer")
 ```
 
-`[$min, $max]` の範囲内の数値を検索します。開いた境界には `null` を指定します。`$numericType` には `"integer"` または `"float"` を設定します。
+`[$min, $max]` の範囲内の数値を検索します。開いた境界には `null` を指定します。`$numericType` には `"integer"` または `"float"` を設定します。どちらの型でも、境界には `int` と `float` のどちらも渡せ、整数の範囲は `float` を切り捨てます。境界は数として比べるので、`$max` の `INF` は `null` と同じ文書に一致します。`NAN` の境界はどの値にも一致しないので、検索が `ValueError` をスローします。
 
 ### DateTimeRangeQuery
 

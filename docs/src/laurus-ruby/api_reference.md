@@ -351,7 +351,7 @@ Pattern match. `*` matches any sequence of characters, `?` matches any single ch
 Laurus::NumericRangeQuery.new(field, min: nil, max: nil)
 ```
 
-Matches numeric values in the range `[min, max]`. Pass `nil` for an open bound. The type (integer or float) is inferred from the Ruby type of `min`/`max`.
+Matches numeric values in the range `[min, max]`. Pass `nil` for an open bound. The type (integer or float) is inferred from the Ruby type of `min`/`max`. A bound compares as a number, so `max: Float::INFINITY` finds what `max: nil` finds; a `Float::NAN` bound would match nothing, so the search raises `ArgumentError`.
 
 ### DateTimeRangeQuery
 

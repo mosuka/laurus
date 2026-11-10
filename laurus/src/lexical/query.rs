@@ -342,12 +342,15 @@ pub trait Query: Send + Sync + Debug {
     /// filters, whose boosts have no effect. A query with another scoring
     /// parameter that has a range checks it here too:
     /// [`MultiFieldQuery`](crate::lexical::query::advanced_query::MultiFieldQuery)'s
-    /// `tie_breaker` must be in `[0, 1]` (Issue #1570).
+    /// `tie_breaker` must be in `[0, 1]` (Issue #1570). So does a query
+    /// parameter that would otherwise match nothing without an error:
+    /// [`NumericRangeQuery`](crate::lexical::query::NumericRangeQuery)
+    /// rejects a `NaN` bound (Issue #1601).
     ///
     /// # Errors
     ///
     /// Returns [`LaurusError::InvalidArgument`] naming the first query (or
-    /// per-field boost, or `tie_breaker`) found out of range.
+    /// per-field boost, `tie_breaker` or range bound) found out of range.
     fn validate_boosts(&self) -> Result<()> {
         check_query_boost(self.boost(), || self.description())
     }
