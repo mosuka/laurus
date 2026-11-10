@@ -6,8 +6,8 @@ use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
-    TermQuery, WildcardQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, NumericType,
+    PhraseQuery, TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -164,10 +164,16 @@ impl JsNumericRangeQuery {
                 self.max,
             ))
         } else {
-            Box::new(NumericRangeQuery::i64_range(
+            // `new` truncates each bound to an `i64` itself, and keeps a
+            // `NaN` bound so that the search rejects it (Issue #1601);
+            // converting here with `as i64` would turn `NaN` into 0.
+            Box::new(NumericRangeQuery::new(
                 &self.field,
-                self.min.map(|v| v as i64),
-                self.max.map(|v| v as i64),
+                NumericType::Integer,
+                self.min,
+                self.max,
+                true,
+                true,
             ))
         }
     }
@@ -383,5 +389,48 @@ mod datetime_range_tests {
             extract_lexical_query(&JsQuery::DateTimeRangeQuery(bad)).is_err(),
             "the dispatcher must surface the error"
         );
+    }
+}
+
+#[cfg(test)]
+mod numeric_range_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Issue #1601: an integer range (the default) used to turn a `NaN`
+    /// bound into 0 with `as i64` before the core could see it. Built with
+    /// `NumericRangeQuery::new`, the bound reaches the check the search
+    /// runs, which rejects it with `InvalidArgument`, as it does for a float
+    /// range. Finite, infinite and open bounds pass.
+    #[wasm_bindgen_test]
+    fn a_nan_bound_reaches_the_search_check() {
+        let mut wrong = Vec::new();
+        for is_float in [false, true] {
+            for (min, max, rejected) in [
+                (Some(f64::NAN), Some(5.0), true),
+                (None, Some(f64::NAN), true),
+                (Some(-1.5), Some(f64::INFINITY), false),
+                (None, None, false),
+            ] {
+                let query = JsNumericRangeQuery {
+                    field: "price".to_string(),
+                    min,
+                    max,
+                    is_float,
+                };
+                let result = query.build().validate_boosts();
+                let ok = if rejected {
+                    matches!(result, Err(laurus::LaurusError::InvalidArgument(_)))
+                } else {
+                    result.is_ok()
+                };
+                if !ok {
+                    wrong.push(format!(
+                        "is_float {is_float} [{min:?}, {max:?}]: {result:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

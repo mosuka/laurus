@@ -423,6 +423,44 @@ describe("Query types", () => {
     expect(() => new NumericRangeQuery("year", 0, 1, "double")).toThrow();
   });
 
+  it("numeric range query rejects a NaN bound (#1601)", async () => {
+    const schema = new Schema();
+    schema.addFloatField("price");
+    const index = await Index.create(null, schema);
+    await index.putDocument("neg", { price: -1.5 });
+    await index.putDocument("small", { price: 3.0 });
+    await index.putDocument("big", { price: 10.0 });
+    await index.commit();
+
+    const ids = (results) => results.map((r) => r.id).sort();
+    const search = (q) => {
+      const req = new SearchRequest({ limit: 5 });
+      req.setLexicalNumericRange(q);
+      return index.searchWithRequest(req);
+    };
+
+    // A NaN bound used to match nothing without an error, and an integer
+    // range (the default) turned it into 0.
+    await expect(search(new NumericRangeQuery("price", NaN, 5))).rejects.toThrow(/NaN bound/);
+    await expect(search(new NumericRangeQuery("price", NaN, 5, "float"))).rejects.toThrow(
+      /NaN bound/,
+    );
+    const filtered = new SearchRequest({ limit: 5 });
+    filtered.setLexicalNumericRange(new NumericRangeQuery("price", null, null, "float"));
+    filtered.setFilterNumericRange(new NumericRangeQuery("price", 0, NaN, "float"));
+    await expect(index.searchWithRequest(filtered)).rejects.toThrow(/NaN bound/);
+
+    // An infinite bound compares as a number: the same as an open side.
+    expect(ids(await search(new NumericRangeQuery("price", 0, Infinity, "float")))).toEqual([
+      "big",
+      "small",
+    ]);
+    expect(ids(await search(new NumericRangeQuery("price", -Infinity, 5)))).toEqual([
+      "neg",
+      "small",
+    ]);
+  });
+
   it("datetime range query (#1179)", async () => {
     const schema = new Schema();
     schema.addDatetimeField("createdAt");

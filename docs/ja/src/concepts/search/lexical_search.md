@@ -166,6 +166,12 @@ let query = NumericRangeQuery::new(
 走査も BKD tree と同じく値を数として比べるので、負の値と負の境界も一致し、
 `-0.0` は `0.0` と等しく、`NaN` の値はどの範囲にも一致しません。
 
+境界も `f64` として比べます。下限の `f64::NEG_INFINITY` と上限の
+`f64::INFINITY` は、`None` と同じ文書に一致します。`NaN` の境界はどの値にも
+一致しないので、クエリ、フィルタ、ほかのクエリの節のどれとして渡しても、
+検索が `InvalidArgument` で失敗します。`NumericType::Integer` では、境界は
+`i64` に切り捨てられ、無限大は `i64::MIN` か `i64::MAX` になります。
+
 ### DateTimeRangeQuery
 
 `DateTime` フィールドの値が指定された範囲内にあるドキュメントをマッチングします。

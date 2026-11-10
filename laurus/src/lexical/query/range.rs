@@ -274,10 +274,27 @@ pub struct NumericRangeQuery {
     upper_inclusive: bool,
     /// The boost factor for this query.
     boost: f32,
+    /// Whether a bound given to [`Self::new`] was `NaN`, which
+    /// [`Query::validate_boosts`] rejects at search (Issue #1601). The
+    /// encoded bounds cannot tell: an `Integer` range truncates a `NaN`
+    /// bound to 0.
+    has_nan_bound: bool,
 }
 
 impl NumericRangeQuery {
     /// Create a new numeric range query.
+    ///
+    /// `None` leaves a side open. A bound compares as an `f64`, as the BKD
+    /// tree does, so `f64::NEG_INFINITY` as the lower bound and
+    /// `f64::INFINITY` as the upper bound are the same as `None`, while
+    /// `f64::INFINITY` as the lower bound matches only that infinity. For
+    /// [`NumericType::Integer`] a bound is truncated to an `i64`, an
+    /// infinity to `i64::MIN` or `i64::MAX`.
+    ///
+    /// A `NaN` bound matches no value, so it is not an error here but at
+    /// search: [`Query::validate_boosts`] rejects it with
+    /// [`LaurusError::InvalidArgument`], whichever route the query comes
+    /// from (Issue #1601).
     pub fn new<S: Into<String>>(
         field: S,
         numeric_type: NumericType,
@@ -286,6 +303,7 @@ impl NumericRangeQuery {
         lower_inclusive: bool,
         upper_inclusive: bool,
     ) -> Self {
+        let has_nan_bound = lower.is_some_and(f64::is_nan) || upper.is_some_and(f64::is_nan);
         let lower_bound = lower.map(|v| Self::encode_numeric(v, numeric_type));
         let upper_bound = upper.map(|v| Self::encode_numeric(v, numeric_type));
 
@@ -297,6 +315,7 @@ impl NumericRangeQuery {
             lower_inclusive,
             upper_inclusive,
             boost: 1.0,
+            has_nan_bound,
         }
     }
 
@@ -714,6 +733,31 @@ impl Query for NumericRangeQuery {
 
     fn set_boost(&mut self, boost: f32) {
         self.boost = boost;
+    }
+
+    /// Reject a bad boost, as every query does, and a `NaN` bound
+    /// (Issue #1601).
+    ///
+    /// A `NaN` bound compares false with every value, so the range would
+    /// match nothing without an error; an `Integer` range would even search
+    /// it as 0. It is rejected here, where a query is received, so it fails
+    /// the same way from the Rust API, a binding, a filter or a composite
+    /// query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] for a boost that is not
+    /// finite or is negative, or for a `NaN` bound.
+    fn validate_boosts(&self) -> Result<()> {
+        crate::lexical::query::check_query_boost(self.boost, || self.description())?;
+        if self.has_nan_bound {
+            return Err(LaurusError::invalid_argument(format!(
+                "NumericRangeQuery on field '{}' has a NaN bound; a bound must be a \
+                 number, or None to leave that side open",
+                self.field
+            )));
+        }
+        Ok(())
     }
 
     fn description(&self) -> String {
@@ -2014,5 +2058,66 @@ mod tests {
             2,
             "fallback must probe only the present ids"
         );
+    }
+
+    /// Issue #1601: a `NaN` bound, lower, upper or both, is rejected by
+    /// `validate_boosts` for `Float` and for `Integer`, whose encoded
+    /// bounds turn `NaN` into 0; the error names the field. Finite,
+    /// infinite and open bounds pass.
+    #[test]
+    fn validate_boosts_rejects_a_nan_bound() {
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        let mut wrong = Vec::new();
+        for numeric_type in [NumericType::Float, NumericType::Integer] {
+            for (lower, upper, rejected) in [
+                (Some(nan), Some(5.0), true),
+                (None, Some(nan), true),
+                (Some(nan), None, true),
+                (Some(nan), Some(nan), true),
+                (Some(-5.0), Some(5.0), false),
+                (Some(-inf), Some(inf), false),
+                (Some(inf), None, false),
+                (None, Some(-inf), false),
+                (None, None, false),
+            ] {
+                let query = NumericRangeQuery::new("price", numeric_type, lower, upper, true, true);
+                let result = query.validate_boosts();
+                let ok = if rejected {
+                    matches!(
+                        &result,
+                        Err(LaurusError::InvalidArgument(m))
+                            if m.contains("field 'price' has a NaN bound")
+                    )
+                } else {
+                    result.is_ok()
+                };
+                if !ok {
+                    wrong.push(format!(
+                        "{numeric_type:?} [{lower:?}, {upper:?}]: {result:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1601: `NumericRangeQuery` overrides `validate_boosts`, so it
+    /// must still reject a bad boost as every query does (Issue #1550).
+    #[test]
+    fn validate_boosts_still_rejects_a_bad_boost_on_a_numeric_range() {
+        let mut wrong = Vec::new();
+        for boost in [-1.0, f32::NAN, f32::INFINITY] {
+            let query =
+                NumericRangeQuery::f64_range("price", Some(0.0), Some(5.0)).with_boost(boost);
+            let result = query.validate_boosts();
+            if !matches!(
+                &result,
+                Err(LaurusError::InvalidArgument(m)) if m.contains("query boost must be")
+            ) {
+                wrong.push(format!("boost {boost}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

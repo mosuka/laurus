@@ -7,8 +7,8 @@ use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
-    TermQuery, WildcardQuery,
+    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, NumericType,
+    PhraseQuery, TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -374,10 +374,16 @@ impl JsNumericRangeQuery {
                 self.max,
             ))
         } else {
-            Box::new(NumericRangeQuery::i64_range(
+            // `new` truncates each bound to an `i64` itself, and keeps a
+            // `NaN` bound so that the search rejects it (Issue #1601);
+            // converting here with `as i64` would turn `NaN` into 0.
+            Box::new(NumericRangeQuery::new(
                 &self.field,
-                self.min.map(|v| v as i64),
-                self.max.map(|v| v as i64),
+                NumericType::Integer,
+                self.min,
+                self.max,
+                true,
+                true,
             ))
         }
     }

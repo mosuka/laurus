@@ -752,6 +752,71 @@ class LaurusTest extends TestCase
         $this->assertEquals("d2", $results[0]->getId());
     }
 
+    private function priceIndex(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addFloatField("price");
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("neg", ["price" => -1.5]);
+        $idx->putDocument("small", ["price" => 3.0]);
+        $idx->putDocument("big", ["price" => 10.0]);
+        $idx->commit();
+        return $idx;
+    }
+
+    private static function ids(array $results): array
+    {
+        $ids = array_map(fn ($r) => $r->getId(), $results);
+        sort($ids);
+        return $ids;
+    }
+
+    /**
+     * Issue #1601: a NAN bound used to match nothing without an error in a
+     * float range, and to become an open side in an integer range (the
+     * default), where `i64::from_zval` returned `None` for a float.
+     */
+    public function testNumericRangeQueryRejectsANanBound(): void
+    {
+        $idx = $this->priceIndex();
+        $wrong = [];
+        foreach ([[NAN, 5.0, "integer"], [NAN, 5.0, "float"], [0.0, NAN, "float"]] as [$min, $max, $type]) {
+            try {
+                $idx->search(new Laurus\NumericRangeQuery("price", $min, $max, $type));
+                $wrong[] = "$type [$min, $max]: no error";
+            } catch (\ValueError $e) {
+                if (!str_contains($e->getMessage(), "has a NaN bound")) {
+                    $wrong[] = "$type [$min, $max]: " . $e->getMessage();
+                }
+            }
+        }
+        $this->assertSame([], $wrong);
+    }
+
+    /**
+     * Issue #1601: a bound of the other numeric type is read as a number
+     * instead of becoming an open side, and an infinite bound compares as a
+     * number, like an open side.
+     */
+    public function testNumericRangeQueryReadsEitherNumericType(): void
+    {
+        $idx = $this->priceIndex();
+        // An int in a float range: the bound 5, not an open side.
+        $this->assertSame(
+            ["neg", "small"],
+            self::ids($idx->search(new Laurus\NumericRangeQuery("price", null, 5, "float")))
+        );
+        // A float in an integer range is truncated: [-1.9, 4.9] is [-1, 4].
+        $this->assertSame(
+            ["small"],
+            self::ids($idx->search(new Laurus\NumericRangeQuery("price", -1.9, 4.9)))
+        );
+        $this->assertSame(
+            ["big", "small"],
+            self::ids($idx->search(new Laurus\NumericRangeQuery("price", 0.0, INF, "float")))
+        );
+    }
+
     // ── SpanQuery ───────────────────────────────────────────────────────
 
     public function testSpanQueryNear(): void

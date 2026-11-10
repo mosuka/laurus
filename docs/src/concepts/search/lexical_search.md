@@ -166,6 +166,13 @@ only the stored documents actually present in that segment. The scan
 compares the values as numbers, as the BKD tree does: negative values and
 bounds match, `-0.0` equals `0.0`, and a `NaN` value matches no range.
 
+A bound compares as an `f64` too: `f64::NEG_INFINITY` as the lower bound or
+`f64::INFINITY` as the upper bound finds what `None` finds. A `NaN` bound
+would match nothing, so a search with one, as the query, a filter or a
+clause of another query, fails with `InvalidArgument`. For
+`NumericType::Integer` a bound is truncated to an `i64`, an infinity to
+`i64::MIN` or `i64::MAX`.
+
 ### DateTimeRangeQuery
 
 Matches documents whose `DateTime` field value falls within a range.

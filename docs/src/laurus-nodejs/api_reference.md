@@ -400,7 +400,10 @@ new NumericRangeQuery(
 
 Matches numeric values in `[min, max]`. Pass `null` (or omit) for an
 open bound. `numericType` selects the underlying range type
-(`"integer"` (default) or `"float"`); other values throw.
+(`"integer"` (default) or `"float"`); other values throw. An integer range
+truncates a fractional bound. A bound compares as a number, so `Infinity` as
+`max` finds what `null` finds; a `NaN` bound would match nothing, so the
+search throws.
 
 ### DateTimeRangeQuery
 

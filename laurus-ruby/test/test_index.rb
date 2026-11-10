@@ -336,6 +336,35 @@ class TestIndex < Minitest::Test
     assert_equal "doc2", results[0].id
   end
 
+  def price_index
+    schema = Laurus::Schema.new
+    schema.add_float_field("price")
+    idx = Laurus::Index.new(schema: schema)
+    idx.put_document("neg", { "price" => -1.5 })
+    idx.put_document("small", { "price" => 3.0 })
+    idx.put_document("big", { "price" => 10.0 })
+    idx.commit
+    idx
+  end
+
+  # Issue #1601: a NaN bound used to match nothing without an error.
+  def test_numeric_range_query_rejects_a_nan_bound
+    idx = price_index
+    [{ min: Float::NAN, max: 5.0 }, { max: Float::NAN }].each do |kwargs|
+      err = assert_raises(ArgumentError, kwargs.inspect) do
+        idx.search(Laurus::NumericRangeQuery.new("price", **kwargs), limit: 5)
+      end
+      assert_match(/has a NaN bound/, err.message)
+    end
+  end
+
+  # Issue #1601: an infinite bound compares as a number, like an open side.
+  def test_numeric_range_query_infinite_bound_is_an_open_side
+    idx = price_index
+    results = idx.search(Laurus::NumericRangeQuery.new("price", min: 0.0, max: Float::INFINITY), limit: 5)
+    assert_equal %w[big small], results.map(&:id).sort
+  end
+
   def datetime_index
     schema = Laurus::Schema.new
     schema.add_datetime_field("created_at")

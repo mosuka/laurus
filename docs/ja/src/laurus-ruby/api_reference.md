@@ -348,7 +348,7 @@ Laurus::WildcardQuery.new(field, pattern)
 Laurus::NumericRangeQuery.new(field, min: nil, max: nil)
 ```
 
-`[min, max]` の範囲内の数値を検索します。開いた境界には `nil` を指定します。型（整数または浮動小数点）は `min`/`max` の Ruby 型から推論されます。
+`[min, max]` の範囲内の数値を検索します。開いた境界には `nil` を指定します。型（整数または浮動小数点）は `min`/`max` の Ruby 型から推論されます。境界は数として比べるので、`max: Float::INFINITY` は `max: nil` と同じ文書に一致します。`Float::NAN` の境界はどの値にも一致しないので、検索が `ArgumentError` を送出します。
 
 ### DateTimeRangeQuery
 

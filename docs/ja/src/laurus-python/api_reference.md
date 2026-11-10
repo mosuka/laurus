@@ -384,6 +384,9 @@ NumericRangeQuery(field: str, *, min: int | float | None = None, max: int | floa
 `[min, max]` の範囲内の数値を検索します。開いた境界には `None` を指定する
 （または省略する）と開放されます。`min` と `max` はキーワード専用引数です。
 数値型（整数または浮動小数点）は `min`/`max` の Python 型から推論されます。
+境界は数として比べるので、`max=float("inf")` は `max=None` と同じ文書に
+一致します。`float("nan")` の境界はどの値にも一致しないので、検索が
+`ValueError` を送出します。
 
 ### DateTimeRangeQuery
 
