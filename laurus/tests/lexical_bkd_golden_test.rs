@@ -15,7 +15,7 @@
 //! - multi-valued fields repeat values inside one document;
 //! - documents are re-upserted, deleted, and deleted then re-upserted while
 //!   still buffered, and some of the deleted versions carry extreme values
-//!   and NaN that must not leak into the written trees;
+//!   and an infinity that must not leak into the written trees;
 //! - one field's points are all deleted, so it must produce no `.bkd`;
 //! - one id is buffered twice through `upsert_analyzed_document`, whose two
 //!   entries both reach the tree;
@@ -101,7 +101,9 @@ fn point_doc(id: u64, version: u64) -> Document {
 }
 
 /// A version of `id` whose values must never reach a written tree: extreme
-/// integers, NaN, and a field (`gone`) that only deleted documents carry.
+/// integers, an infinite float, and a field (`gone`) that only deleted
+/// documents carry. (A `NaN` before Issue #1604, which rejects one when the
+/// document is upserted.)
 fn doomed_doc(id: u64) -> Document {
     Document::builder()
         .add_integer(
@@ -112,7 +114,7 @@ fn doomed_doc(id: u64) -> Document {
                 i64::MIN
             },
         )
-        .add_float("f", f64::NAN)
+        .add_float("f", f64::INFINITY)
         .add_int64_array("tags", vec![i64::MAX, i64::MIN, 0])
         .add_integer("gone", id as i64)
         .build()
@@ -219,8 +221,8 @@ const COMMIT_PATH: &[(&str, u64, u64)] = &[
 /// The standalone writer's commit path, committing every 500 documents so
 /// the corpus spans several segments. (Explicit commits rather than
 /// count-triggered auto-flushes: an auto-flush could land between a doomed
-/// version's upsert and its delete and write its NaN, which the writer
-/// rightly rejects. Both reach the same `flush_segment`.)
+/// version's upsert and its delete and write its extreme values, which
+/// would change the pinned bytes. Both reach the same `flush_segment`.)
 #[test]
 fn commit_path_bkd_bytes_are_pinned() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));

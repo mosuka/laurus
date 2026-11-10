@@ -736,6 +736,19 @@ pub(crate) fn analyze_field_value(
         | DataValue::VectorArray(_)
         | DataValue::Null => {}
     }
+    // The BKD writer rejects a `NaN` coordinate, but only when the segment
+    // is written at commit, after the document reached the WAL, so every
+    // later commit failed too (Issue #1604). Rejected here with
+    // `InvalidArgument` instead, before anything is buffered: the engine
+    // checks values at put already, and `recover` analyzes a WAL record
+    // before applying it, so a record an older build left with such a value
+    // is discarded rather than failing every open. An infinite coordinate is
+    // a valid point.
+    if points.iter().flatten().any(|c| c.is_nan()) {
+        return Err(LaurusError::invalid_argument(format!(
+            "field '{field_name}': a NaN value cannot be indexed"
+        )));
+    }
     Ok((terms, points))
 }
 
@@ -4540,17 +4553,41 @@ mod tests {
         assert!(!has_bkd(&storage, "gone"));
     }
 
-    /// A NaN in a version replaced while buffered never reaches the BKD
-    /// writer (which rejects NaN), and the replacement's point, which shares
-    /// the doc id, is written.
+    /// A point of a version replaced while buffered never reaches the BKD
+    /// writer, and the replacement's point, which shares the doc id, is
+    /// written. The replaced version holds a 2-dimensional point in the
+    /// 1-dimensional field, so a leak would fail the flush on the mixed
+    /// dimensionalities. (This test used a `NaN`, which the BKD writer
+    /// rejects too, until the analysis began rejecting a `NaN` point before
+    /// it is buffered, Issue #1604.)
     #[test]
-    fn a_replaced_nan_point_does_not_fail_the_flush() {
+    fn a_replaced_point_does_not_fail_the_flush() {
         let storage = memory_storage();
         let mut writer = manual_flush_writer(storage.clone());
-        writer.upsert_document(1, float_doc("f", f64::NAN)).unwrap();
+        let geo = Document::builder().add_geo("f", 35.0, 139.0).build();
+        writer.upsert_document(1, geo).unwrap();
         writer.upsert_document(1, float_doc("f", 1.0)).unwrap();
         writer.commit().unwrap();
 
+        assert!(has_bkd(&storage, "f"));
+    }
+
+    /// Issue #1604: a document with a `NaN` point is rejected when it is
+    /// upserted, so nothing is buffered and the next commit succeeds; the
+    /// BKD writer used to reject it only at that commit.
+    #[test]
+    fn a_nan_point_is_rejected_at_upsert() {
+        let storage = memory_storage();
+        let mut writer = manual_flush_writer(storage.clone());
+        let err = writer
+            .upsert_document(1, float_doc("f", f64::NAN))
+            .unwrap_err();
+        assert!(
+            matches!(&err, LaurusError::InvalidArgument(m) if m.contains("a NaN value cannot be indexed")),
+            "{err:?}"
+        );
+        writer.upsert_document(2, float_doc("f", 1.0)).unwrap();
+        writer.commit().unwrap();
         assert!(has_bkd(&storage, "f"));
     }
 
@@ -4584,5 +4621,72 @@ mod tests {
         writer.delete_document(2).unwrap();
         writer.commit().unwrap();
         assert!(has_bkd(&storage, "x"));
+    }
+
+    /// Issue #1604: a `NaN` coordinate of a BKD point is rejected with
+    /// `InvalidArgument` when the value is analyzed, before anything is
+    /// buffered, rather than by the BKD writer at commit. An infinite
+    /// coordinate is still a point.
+    #[test]
+    fn analysis_rejects_a_nan_point_and_keeps_an_infinite_one() {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+        use crate::data::{GeoEcefPoint, GeoPoint};
+
+        let analyzer: Arc<dyn Analyzer> =
+            Arc::new(PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new())));
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        let mut wrong = Vec::new();
+        for (name, value, rejected) in [
+            ("Float64 NaN", DataValue::Float64(nan), true),
+            (
+                "Float64Array NaN",
+                DataValue::Float64Array(vec![1.0, nan]),
+                true,
+            ),
+            (
+                "Geo NaN",
+                DataValue::Geo(GeoPoint { lat: nan, lon: 0.0 }),
+                true,
+            ),
+            (
+                "GeoArray NaN",
+                DataValue::GeoArray(vec![GeoPoint { lat: 0.0, lon: nan }]),
+                true,
+            ),
+            (
+                "GeoEcef NaN",
+                DataValue::GeoEcef(GeoEcefPoint::new(0.0, 0.0, nan)),
+                true,
+            ),
+            (
+                "GeoEcefArray NaN",
+                DataValue::GeoEcefArray(vec![GeoEcefPoint::new(nan, 0.0, 0.0)]),
+                true,
+            ),
+            ("Float64 inf", DataValue::Float64(inf), false),
+            (
+                "Float64Array -inf",
+                DataValue::Float64Array(vec![-inf]),
+                false,
+            ),
+            ("Float64 finite", DataValue::Float64(1.5), false),
+        ] {
+            let result = analyze_field_value("price", &value, &analyzer, 100);
+            let ok = if rejected {
+                matches!(
+                    &result,
+                    Err(LaurusError::InvalidArgument(m))
+                        if m.contains("field 'price': a NaN value cannot be indexed")
+                )
+            } else {
+                matches!(&result, Ok((_, points)) if !points.is_empty())
+            };
+            if !ok {
+                wrong.push(format!("{name}: {:?}", result.map(|(_, p)| p)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

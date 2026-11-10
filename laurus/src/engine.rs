@@ -1957,6 +1957,11 @@ impl Engine {
                 // are indexed under the newly-added fields.
                 let mut kept: Vec<(String, crate::data::DataValue)> = Vec::new();
                 for (name, value) in undeclared.drain(..) {
+                    // An undeclared value is kept as is rather than coerced,
+                    // so it gets the declared fields' check of a `NaN` or
+                    // infinite number here (Issue #1604), before the field
+                    // is added to the schema.
+                    type_coercion::check_finite(&name, &value)?;
                     match type_inference::infer_option_from_data_value(&value)? {
                         Some(option) => {
                             match self.add_field(&name, option).await {
@@ -9938,6 +9943,62 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
+    }
+
+    /// Issue #1604: an index an older build left with a `NaN` in an indexed
+    /// field's WAL record must open again. That build accepted the value at
+    /// put, and the BKD writer rejected it at every commit, the commit that
+    /// ends `recover` included, so the index could not open; the CLI, which
+    /// opens the index for every command, could not even delete the
+    /// document. Put now rejects such a value before the append, so this
+    /// test appends the record directly, as that build did. The lexical
+    /// analysis rejects the `NaN` point with `InvalidArgument`, and
+    /// `recover` discards the record.
+    #[tokio::test]
+    async fn recover_discards_a_record_with_a_nan_point_an_older_build_left() {
+        use crate::engine::schema::FieldOption;
+        use crate::lexical::core::field::{FloatOption, TextOption};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .add_field("price", FieldOption::Float(FloatOption::default()))
+            .build();
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+
+        let nan_doc = Document::builder()
+            .add_text("title", "nan")
+            .add_float("price", f64::NAN)
+            .build();
+        engine.log.append("nan", &nan_doc).unwrap();
+
+        // Crash: drop without a commit, leaving both records WAL-only.
+        drop(engine);
+        assert!(
+            wal_bytes(&storage) > 0,
+            "precondition: WAL has pending records"
+        );
+
+        let reopened = Engine::new(storage.clone(), schema)
+            .await
+            .expect("recovery must discard the NaN record, not fail to open");
+        assert_eq!(
+            wal_bytes(&storage),
+            0,
+            "the discarded record must not linger in the WAL"
+        );
+        assert_eq!(
+            reopened.stats().unwrap().document_count,
+            1,
+            "only 'a' must exist; the NaN record must not have been applied"
+        );
+        assert_eq!(title_hits(&reopened, "alpha").await, vec!["a"]);
+
+        // And the index commits again.
+        reopened.put_document("b", title_doc("beta")).await.unwrap();
+        reopened.commit().await.unwrap();
+        assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
     }
 
     /// Issue #1522: a put's record that recovery discards keeps the

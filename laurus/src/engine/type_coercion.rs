@@ -16,6 +16,10 @@
 //! - Geographic and (future) multi-valued numeric fields have strict typing.
 //! - Bytes fields accept a plain string as base64-encoded data, in addition
 //!   to a pass-through `Bytes` value.
+//! - A `NaN` or infinite number is rejected, whatever it was coerced from
+//!   (`"nan"`, `"inf"` and `"1e400"` parse to one), and an `Integer` field
+//!   rejects a `NaN` or infinite float rather than truncating it
+//!   (Issue #1604): the document store could not read it back.
 //!
 //! Values that cannot be coerced produce an error. The caller (see
 //! [`Engine`](crate::Engine)) decides what to do with the error based on the
@@ -47,9 +51,10 @@ use super::schema::FieldOption;
 /// # Errors
 ///
 /// Returns [`LaurusError::invalid_argument`] if the value cannot be coerced
-/// to the field's declared type.
+/// to the field's declared type, or if the coerced value holds a `NaN` or
+/// infinite number (see [`check_finite`]).
 pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) -> Result<DataValue> {
-    match option {
+    let coerced = match option {
         FieldOption::Text(opt) => coerce_to_text(field_name, opt, value),
         FieldOption::Integer(opt) => coerce_to_integer(field_name, opt, value),
         FieldOption::Float(opt) => coerce_to_float(field_name, opt, value),
@@ -62,6 +67,69 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
             coerce_to_vector(field_name, value)
         }
         FieldOption::MultiVector(opt) => coerce_to_vector_array(field_name, opt, value),
+    }?;
+    // After coercion, so that a `Text` such as "nan", "inf" or "1e400",
+    // which `parse::<f64>()` reads as a non-finite float, is caught too.
+    check_finite(field_name, &coerced)?;
+    Ok(coerced)
+}
+
+/// Reject a value holding a `NaN` or infinite number (Issue #1604): a
+/// `Float64`, an element of a `Float64Array`, or a coordinate of a `Geo`,
+/// `GeoEcef`, `GeoArray` or `GeoEcefArray` point. Other variants pass.
+///
+/// The document store writes a document as JSON, which has no literal for
+/// a non-finite number: such a value is written as `null` and the document
+/// can no longer be read back. A `NaN` in an indexed field also cannot be
+/// a BKD point, so it failed every commit until the document was deleted.
+/// The check runs before the document reaches the WAL, as the vector
+/// store's check of a `NaN` or infinite vector does (Issue #1326). Vectors
+/// are left to that check.
+///
+/// # Arguments
+///
+/// * `field_name` - The field the value belongs to, for the error message.
+/// * `value` - The value to check.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::invalid_argument`] naming the field and the first
+/// non-finite number.
+pub(crate) fn check_finite(field_name: &str, value: &DataValue) -> Result<()> {
+    let numbers: Box<dyn Iterator<Item = f64> + '_> = match value {
+        DataValue::Float64(f) => Box::new(std::iter::once(*f)),
+        DataValue::Float64Array(arr) => Box::new(arr.iter().copied()),
+        DataValue::Geo(p) => Box::new([p.lat, p.lon].into_iter()),
+        DataValue::GeoArray(arr) => Box::new(arr.iter().flat_map(|p| [p.lat, p.lon])),
+        DataValue::GeoEcef(p) => Box::new([p.x, p.y, p.z].into_iter()),
+        DataValue::GeoEcefArray(arr) => Box::new(arr.iter().flat_map(|p| [p.x, p.y, p.z])),
+        _ => return Ok(()),
+    };
+    for number in numbers {
+        if !number.is_finite() {
+            return Err(non_finite_error(field_name, number));
+        }
+    }
+    Ok(())
+}
+
+/// The error for a `NaN` or infinite number in `field_name` (Issue #1604).
+fn non_finite_error(field_name: &str, number: f64) -> LaurusError {
+    LaurusError::invalid_argument(format!(
+        "field '{field_name}': {number} is not a valid value; a number must be finite \
+         (NaN and infinity cannot be stored)"
+    ))
+}
+
+/// Truncate a float to an `i64` for an `Integer` field, rejecting a `NaN`
+/// or infinite one (Issue #1604), which `as i64` would turn into 0,
+/// `i64::MIN` or `i64::MAX` without an error. A finite value is truncated
+/// toward zero, saturating at the `i64` range, as before.
+fn float_to_integer(field_name: &str, f: f64) -> Result<i64> {
+    if f.is_finite() {
+        Ok(f as i64)
+    } else {
+        Err(non_finite_error(field_name, f))
     }
 }
 
@@ -149,11 +217,15 @@ fn coerce_to_integer(
         // truncated element-wise (Lucene-style information-losing).
         match value {
             DataValue::Int64Array(arr) => Ok(DataValue::Int64Array(arr)),
-            DataValue::Float64Array(arr) => Ok(DataValue::Int64Array(
-                arr.iter().map(|f| *f as i64).collect(),
-            )),
+            DataValue::Float64Array(arr) => arr
+                .iter()
+                .map(|f| float_to_integer(field_name, *f))
+                .collect::<Result<Vec<i64>>>()
+                .map(DataValue::Int64Array),
             DataValue::Int64(i) => Ok(DataValue::Int64Array(vec![i])),
-            DataValue::Float64(f) => Ok(DataValue::Int64Array(vec![f as i64])),
+            DataValue::Float64(f) => Ok(DataValue::Int64Array(vec![float_to_integer(
+                field_name, f,
+            )?])),
             DataValue::Bool(b) => Ok(DataValue::Int64Array(vec![if b { 1 } else { 0 }])),
             // Element-wise extension of the scalar `Bool` -> 0 / 1 rule
             // above (#1180): bindings hand a list of bools over as a
@@ -191,8 +263,10 @@ fn coerce_to_integer(
     } else {
         match value {
             DataValue::Int64(i) => Ok(DataValue::Int64(i)),
-            // Information-losing truncation: documented as intentional.
-            DataValue::Float64(f) => Ok(DataValue::Int64(f as i64)),
+            // Information-losing truncation: documented as intentional. A
+            // `NaN` or infinite float is rejected rather than truncated
+            // (Issue #1604).
+            DataValue::Float64(f) => Ok(DataValue::Int64(float_to_integer(field_name, f)?)),
             DataValue::Bool(b) => Ok(DataValue::Int64(if b { 1 } else { 0 })),
             DataValue::Text(s) => s.trim().parse::<i64>().map(DataValue::Int64).map_err(|_| {
                 LaurusError::invalid_argument(format!(
@@ -1368,5 +1442,196 @@ mod tests {
     fn bytes_rejects_other_types() {
         assert!(coerce_value("f", &bytes(), DataValue::Int64(42)).is_err());
         assert!(coerce_value("f", &bytes(), DataValue::Bool(true)).is_err());
+    }
+
+    /// Issue #1604: a `NaN` or infinite number is rejected whatever it was
+    /// coerced from, and the error names the field. The document store
+    /// could not read such a value back, and an indexed `NaN` failed every
+    /// commit; an `Integer` field turned it into 0 or `i64::MAX`.
+    #[test]
+    fn non_finite_values_are_rejected() {
+        use crate::data::{GeoEcefPoint, GeoPoint};
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        let point = |lat, lon| GeoPoint { lat, lon };
+        let cases: Vec<(&str, FieldOption, DataValue)> = vec![
+            ("Float NaN", float(), DataValue::Float64(nan)),
+            ("Float inf", float(), DataValue::Float64(inf)),
+            ("Float -inf", float(), DataValue::Float64(-inf)),
+            ("Float text nan", float(), DataValue::Text("nan".into())),
+            ("Float text inf", float(), DataValue::Text("inf".into())),
+            (
+                "Float text -Infinity",
+                float(),
+                DataValue::Text("-Infinity".into()),
+            ),
+            ("Float text 1e400", float(), DataValue::Text("1e400".into())),
+            (
+                "multi Float array",
+                multi_float(),
+                DataValue::Float64Array(vec![1.0, nan]),
+            ),
+            ("multi Float single", multi_float(), DataValue::Float64(inf)),
+            (
+                "multi Float text array",
+                multi_float(),
+                DataValue::TextArray(vec!["1".into(), "inf".into()]),
+            ),
+            (
+                "multi Float text",
+                multi_float(),
+                DataValue::Text("nan".into()),
+            ),
+            ("Integer NaN", integer(), DataValue::Float64(nan)),
+            ("Integer inf", integer(), DataValue::Float64(inf)),
+            (
+                "multi Integer array",
+                multi_integer(),
+                DataValue::Float64Array(vec![1.0, nan]),
+            ),
+            (
+                "multi Integer single",
+                multi_integer(),
+                DataValue::Float64(-inf),
+            ),
+            ("Geo NaN lat", geo(), DataValue::Geo(point(nan, 0.0))),
+            ("Geo inf lon", geo(), DataValue::Geo(point(0.0, inf))),
+            (
+                "multi Geo array",
+                geo_multi(),
+                DataValue::GeoArray(vec![point(1.0, 1.0), point(nan, 0.0)]),
+            ),
+            (
+                "multi Geo single",
+                geo_multi(),
+                DataValue::Geo(point(0.0, nan)),
+            ),
+            (
+                "Geo3d NaN z",
+                geo3d(),
+                DataValue::GeoEcef(GeoEcefPoint::new(0.0, 0.0, nan)),
+            ),
+            (
+                "multi Geo3d array",
+                geo3d_multi(),
+                DataValue::GeoEcefArray(vec![GeoEcefPoint::new(inf, 0.0, 0.0)]),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, option, value) in cases {
+            let result = coerce_value("price", &option, value);
+            if !matches!(
+                &result,
+                Err(LaurusError::InvalidArgument(m))
+                    if m.contains("field 'price'") && m.contains("must be finite")
+            ) {
+                wrong.push(format!("{name}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1604: finite values coerce as before, including the largest
+    /// float, `-0.0`, a fraction truncated into an `Integer` field and a
+    /// float out of `i64`'s range, which saturates.
+    #[test]
+    fn finite_values_still_coerce() {
+        use crate::data::{GeoEcefPoint, GeoPoint};
+        let tokyo = DataValue::Geo(GeoPoint {
+            lat: 35.0,
+            lon: 139.0,
+        });
+        let ecef = DataValue::GeoEcef(GeoEcefPoint::new(1.0, 2.0, 3.0));
+        let cases: Vec<(&str, FieldOption, DataValue, DataValue)> = vec![
+            (
+                "Float max",
+                float(),
+                DataValue::Float64(f64::MAX),
+                DataValue::Float64(f64::MAX),
+            ),
+            (
+                "Float -0.0",
+                float(),
+                DataValue::Float64(-0.0),
+                DataValue::Float64(-0.0),
+            ),
+            (
+                "Float text 1e308",
+                float(),
+                DataValue::Text("1e308".into()),
+                DataValue::Float64(1e308),
+            ),
+            (
+                "Integer 3.9",
+                integer(),
+                DataValue::Float64(3.9),
+                DataValue::Int64(3),
+            ),
+            (
+                "Integer 1e30",
+                integer(),
+                DataValue::Float64(1e30),
+                DataValue::Int64(i64::MAX),
+            ),
+            (
+                "multi Integer",
+                multi_integer(),
+                DataValue::Float64Array(vec![1.5, -2.5]),
+                DataValue::Int64Array(vec![1, -2]),
+            ),
+            ("Geo", geo(), tokyo.clone(), tokyo),
+            ("Geo3d", geo3d(), ecef.clone(), ecef),
+        ];
+        let mut wrong = Vec::new();
+        for (name, option, value, want) in cases {
+            let result = coerce_value("price", &option, value);
+            if result.as_ref().ok() != Some(&want) {
+                wrong.push(format!("{name}: {result:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1604: `check_finite`, which the engine also runs on an
+    /// undeclared field's value under the dynamic policy, rejects each
+    /// variant that holds a non-finite number and passes everything else.
+    #[test]
+    fn check_finite_covers_every_float_variant() {
+        use crate::data::{GeoEcefPoint, GeoPoint};
+        let nan = f64::NAN;
+        let mut wrong = Vec::new();
+        for (name, value, rejected) in [
+            ("Float64", DataValue::Float64(nan), true),
+            (
+                "Float64Array",
+                DataValue::Float64Array(vec![0.0, nan]),
+                true,
+            ),
+            ("Geo", DataValue::Geo(GeoPoint { lat: nan, lon: 0.0 }), true),
+            (
+                "GeoArray",
+                DataValue::GeoArray(vec![GeoPoint { lat: 0.0, lon: nan }]),
+                true,
+            ),
+            (
+                "GeoEcef",
+                DataValue::GeoEcef(GeoEcefPoint::new(0.0, nan, 0.0)),
+                true,
+            ),
+            (
+                "GeoEcefArray",
+                DataValue::GeoEcefArray(vec![GeoEcefPoint::new(0.0, 0.0, nan)]),
+                true,
+            ),
+            ("finite Float64", DataValue::Float64(1.5), false),
+            ("Text", DataValue::Text("nan".into()), false),
+            ("Vector", DataValue::Vector(vec![f32::NAN]), false),
+        ] {
+            let result = check_finite("price", &value);
+            if result.is_err() != rejected {
+                wrong.push(format!("{name}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
