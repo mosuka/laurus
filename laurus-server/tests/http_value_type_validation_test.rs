@@ -9,7 +9,8 @@
 //! (Issue #1540): a field boost, a lexical `min_score`, an RRF `k` or a
 //! `weighted_sum` weight out of range, including a number too large for the
 //! 32-bit float it is converted to. So is a DSL phrase slop or fuzziness
-//! too large for a `u32` (Issue #1570).
+//! too large for a `u32` (Issue #1570), and a DSL range bound too large for
+//! an `f64` or a word next to a numeric bound (Issue #1591).
 //!
 //! The gateway forwards each call to the gRPC services and maps the status
 //! they return, so these requests go through both, over a gRPC connection
@@ -366,7 +367,9 @@ async fn search_answers_400_for_a_value_of_the_wrong_type() {
 /// score, hide a hit or be clamped, are a 400 naming the value, from each
 /// search endpoint; so are weights of 0 and 0, a boost sent without a
 /// `query`, a DSL `^` boost too large for an `f32` (Issue #1550), a DSL
-/// phrase slop or fuzziness too large for a `u32` (Issue #1570), and a
+/// phrase slop or fuzziness too large for a `u32` (Issue #1570), a DSL
+/// range bound too large for an `f64` or a word next to a numeric bound
+/// (Issue #1591), and a
 /// query vector weight that is negative or too large for an `f32`, in
 /// `query_vectors` or in a DSL vector clause (Issue #1552), and a query
 /// vector component too large for an `f32` (Issue #1573). The boundaries
@@ -439,6 +442,17 @@ async fn search_answers_400_for_a_number_out_of_range() {
             json!({"query": "title:rust~4294967296"}),
             "fuzziness must be at most 4294967295, got 4294967296".to_string(),
         ),
+        // Issue #1591: a DSL range bound too large for an `f64`, which used
+        // to become an infinite bound, and a word next to a numeric bound,
+        // which used to search as `year:[* TO 2020]`.
+        (
+            json!({"query": "year:[1e400 TO *]"}),
+            "range bound 1e400 does not fit a 64-bit float".to_string(),
+        ),
+        (
+            json!({"query": "year:[-inf TO 2020]"}),
+            "mixes a numeric bound with a bound that is not a number".to_string(),
+        ),
         // Issue #1552: a query vector weight that is negative or too large
         // for an `f32`, also in a DSL vector clause. The index has no
         // embedder, so the DSL case also shows it is rejected before the
@@ -507,8 +521,14 @@ async fn search_answers_400_for_a_number_out_of_range() {
     let search = json!({"query_vectors": [{"vector": [3.4e38, 0.0]}]});
     let (status, body) = send(&router, "POST", "/v1/search", search).await;
     assert_eq!(status, StatusCode::OK, "component 3.4e38: {body}");
-    // Issue #1570: the largest slop and fuzziness search.
-    for query in ["title:\"rust java\"~4294967295", "title:rust~4294967295"] {
+    // Issue #1570: the largest slop and fuzziness search. Issue #1591: a
+    // range bound written with a sign, a leading `.` or an exponent is still
+    // a number and searches.
+    for query in [
+        "title:\"rust java\"~4294967295",
+        "title:rust~4294967295",
+        "year:[-1.5 TO .5e4]",
+    ] {
         let (status, body) = send(&router, "POST", "/v1/search", json!({"query": query})).await;
         assert_eq!(status, StatusCode::OK, "{query}: {body}");
     }

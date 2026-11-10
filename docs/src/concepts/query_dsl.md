@@ -118,6 +118,23 @@ date:{2024-01-01 TO 2024-12-31}
 price:[* TO 100]
 ```
 
+#### Numeric bounds
+
+The parser has no schema, so a range takes its type from its bounds. A bound is a number when it is written in digits: an optional sign, then digits with an optional fraction and exponent (`100`, `-1.5`, `+5`, `.5`, `1e3`). A range with a numeric bound builds a `NumericRangeQuery`, evaluated against the field's BKD tree with constant scoring.
+
+```text
+# A sign, a fraction and an exponent
+price:[-1.5 TO 1e3]
+
+# * leaves a side open; there is no -inf or inf
+price:[* TO 100]
+```
+
+- `nan`, `inf` and `infinity`, in any case and with or without a sign, are words, not numbers. Write `*` for an open side: `price:[* TO 100]`, not `price:[-inf TO 100]`.
+- A numeric bound next to a bound that is neither a number nor `*`, such as `price:[100 TO abc]` or `price:[nan TO 100]`, is a parse error (HTTP 400). Such a bound used to leave its side open (Issue #1591).
+- A number too large for a 64-bit float, such as `1e400`, is rejected with `InvalidArgument` (HTTP 400) instead of becoming an infinite bound. A number too small to tell from `0`, such as `1e-400`, is `0`.
+- Quoting a bound does not change its type: `price:["100" TO 500]` is a numeric range.
+
 #### Date and datetime bounds
 
 A range whose bounds are datetime literals builds a `DateTimeRangeQuery`,
@@ -146,7 +163,7 @@ created_at:{2024-01-01 TO 2025-01-01}
 
 - A date-only bound is midnight UTC, so `[2024-01-01 TO 2024-12-31]` includes `2024-12-31T00:00:00Z` and nothing later that day. To cover the whole year, give the upper bound a time (`[2024-01-01 TO 2024-12-31T23:59:59.999999]`) or end an exclusive range on the next day (`{2024-01-01 TO 2025-01-01}` — note that `{}` also excludes the exact instant `2024-01-01T00:00:00Z`).
 - `*` leaves a side open.
-- Bare numbers are still numeric bounds: on a `DateTime` field they are epoch seconds and build a `NumericRangeQuery`.
+- Numbers ([Numeric bounds](#numeric-bounds)) are still numeric bounds: on a `DateTime` field they are epoch seconds and build a `NumericRangeQuery`.
 - Mixing a numeric bound with a datetime bound (`[1704067200 TO 2024-12-31]`), or a datetime bound with a string that is not a datetime literal (`[2024-01-01 TO tomorrow]`), is a parse error rather than a silent empty result. A range whose bounds are neither numbers nor datetime literals (`title:[A TO Z]`) still parses but matches nothing, as before.
 
 > Document ingestion coerces text into a `DateTime` field only from RFC 3339;

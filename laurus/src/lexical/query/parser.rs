@@ -210,6 +210,10 @@ impl LexicalQueryParser {
     /// - A phrase's slop (`"a b"~N`) or a fuzzy term's fuzziness (`a~N`) is
     ///   too large for a `u32` ([`LaurusError::InvalidArgument`], Issue
     ///   #1570).
+    /// - A range bound is a number too large for an `f64`, such as `1e400`
+    ///   ([`LaurusError::InvalidArgument`], Issue #1591).
+    /// - A range mixes a numeric bound with a bound that is not a number,
+    ///   such as `[5 TO abc]` or `[nan TO 5]` (Issue #1591).
     pub fn parse(&self, query_str: &str) -> Result<Box<dyn Query>> {
         let pairs = QueryStringParser::parse(Rule::query, query_str)
             .map_err(|e| LaurusError::parse(format!("Parse error: {e}")))?;
@@ -586,6 +590,38 @@ impl LexicalQueryParser {
         ))
     }
 
+    /// Parse a range (`[a TO b]` inclusive, `{a TO b}` exclusive) on `field`,
+    /// or on the default fields when `field` is `None`.
+    ///
+    /// The parser has no schema, so the range takes its type from its
+    /// bounds, `*` leaving a side open:
+    ///
+    /// - a bound written in digits ([`parse_numeric_bound`]) builds a
+    ///   [`NumericRangeQuery`];
+    /// - otherwise a datetime literal builds a [`DateTimeRangeQuery`]
+    ///   (#1179);
+    /// - otherwise the bounds are strings and build a [`RangeQuery`], which
+    ///   matches nothing.
+    ///
+    /// A range that mixes those kinds is an error rather than a silent
+    /// empty or widened result.
+    ///
+    /// # Arguments
+    ///
+    /// * `pair` - The `range_query` pair.
+    /// * `field` - The field the range names, if any.
+    ///
+    /// # Returns
+    ///
+    /// The range query, or a boolean query over the default fields.
+    ///
+    /// # Errors
+    ///
+    /// - [`LaurusError::InvalidArgument`] if a bound is a number that does
+    ///   not fit an `f64`, such as `1e400` (Issue #1591).
+    /// - [`LaurusError::Query`] if the range mixes a numeric bound with a
+    ///   datetime bound or with a string (Issue #1591), or a datetime bound
+    ///   with a string.
     fn parse_range_query(
         &self,
         pair: pest::iterators::Pair<Rule>,
@@ -629,10 +665,20 @@ impl LexicalQueryParser {
         }
 
         // Bound shape is inferred from the literal (the parser has no schema):
-        // numeric first, so `[100 TO 500]` and epoch-second bounds keep their
-        // meaning, then datetime literals (#1179), then plain strings.
-        let lower_num = lower.as_ref().and_then(|s| s.parse::<f64>().ok());
-        let upper_num = upper.as_ref().and_then(|s| s.parse::<f64>().ok());
+        // a number written in digits first (Issue #1591), so `[100 TO 500]`
+        // and epoch-second bounds keep their meaning, then datetime literals
+        // (#1179), then plain strings. A number too large for an `f64` is an
+        // error rather than an infinite bound.
+        let lower_num = lower
+            .as_deref()
+            .map(parse_numeric_bound)
+            .transpose()?
+            .flatten();
+        let upper_num = upper
+            .as_deref()
+            .map(parse_numeric_bound)
+            .transpose()?
+            .flatten();
         let is_open = |bound: &Option<String>| bound.as_deref().is_none_or(|s| s == "*");
         let datetime_bound = |bound: &Option<String>| {
             bound
@@ -658,6 +704,22 @@ impl LexicalQueryParser {
                     return Err(crate::error::LaurusError::parse(format!(
                         "range {} on field '{field_name}' mixes a numeric bound with a \
                          datetime bound",
+                        describe()
+                    )));
+                }
+                // With no datetime bound here, a bound that is neither `*`
+                // nor a number is a string. It used to become an open bound,
+                // so `[5 TO abc]` searched `[5 TO *]` (Issue #1591), and
+                // `[nan TO 5]` would search `[* TO 5]` now that `nan` is a
+                // word.
+                let is_string = |bound: &Option<String>, number: Option<f64>| {
+                    !is_open(bound) && number.is_none()
+                };
+                if is_string(&lower, lower_num) || is_string(&upper, upper_num) {
+                    return Err(crate::error::LaurusError::parse(format!(
+                        "range {} on field '{field_name}' mixes a numeric bound with a \
+                         bound that is not a number; a number is written in digits \
+                         (nan, inf and infinity are words), and * leaves a side open",
                         describe()
                     )));
                 }
@@ -1177,6 +1239,47 @@ fn parse_count(text: &str, what: &str) -> Result<u32> {
     })
 }
 
+/// Read a range bound as a number (Issue #1591).
+///
+/// The parser has no schema, so a range takes its type from its bounds. A
+/// bound is a number when it is written in digits: after one optional `+`
+/// or `-`, it starts with an ASCII digit or `.` and parses as an `f64`
+/// (`100`, `-1.5`, `+5`, `.5`, `5.`, `1e3`). Rust's `f64` parser also
+/// accepts the words `nan`, `inf` and `infinity`, in any case and with a
+/// sign. They are not numbers here, so they stay string bounds instead of
+/// becoming a `NaN` bound, which matches nothing, or an infinite one.
+///
+/// A number too small to tell from `0`, such as `1e-400`, rounds to `0`,
+/// as any `f64` literal rounds to the nearest `f64`.
+///
+/// # Arguments
+///
+/// * `text` - The bound, with its quotes removed.
+///
+/// # Returns
+///
+/// `Some(value)` for a number, and `None` for anything else: `*`, a
+/// datetime literal or a string.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] if `text` is a number that does
+/// not fit an `f64`, such as `1e400`, which `f64` parsing turns into an
+/// infinity.
+fn parse_numeric_bound(text: &str) -> Result<Option<f64>> {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if !unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return Ok(None);
+    }
+    match text.parse::<f64>() {
+        Ok(value) if value.is_finite() => Ok(Some(value)),
+        Ok(_) => Err(LaurusError::invalid_argument(format!(
+            "range bound {text} does not fit a 64-bit float"
+        ))),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Builder for constructing a [`QueryParser`] with a fluent API.
 ///
 /// Allows configuring the analyzer, default search fields, and default boolean
@@ -1340,6 +1443,120 @@ mod tests {
         let range = query.as_any().downcast_ref::<RangeQuery>().unwrap();
         assert_eq!(range.lower_bound(), &Bound::Excluded("A".to_string()));
         assert_eq!(range.upper_bound(), &Bound::Unbounded);
+    }
+
+    // ---- Range queries (#1591: numeric bounds) ----
+
+    /// Issue #1591: `nan`, `inf` and `infinity` are words, not numbers, in
+    /// any case, with a sign or quoted, so a range of them is a string range
+    /// like `title:[A TO Z]`. Rust's `f64` parser read them as a `NaN` or an
+    /// infinite numeric bound.
+    #[test]
+    fn range_words_nan_inf_infinity_are_string_bounds() {
+        let text = |s: &str| s.to_string();
+        let mut wrong = Vec::new();
+        for (dsl, lower, upper) in [
+            (
+                "name:[nan TO inf]",
+                Bound::Included(text("nan")),
+                Bound::Included(text("inf")),
+            ),
+            (
+                "name:[-Infinity TO zzz]",
+                Bound::Included(text("-Infinity")),
+                Bound::Included(text("zzz")),
+            ),
+            (
+                "name:{NaN TO *}",
+                Bound::Excluded(text("NaN")),
+                Bound::Unbounded,
+            ),
+            (
+                "name:[\"inf\" TO z]",
+                Bound::Included(text("inf")),
+                Bound::Included(text("z")),
+            ),
+        ] {
+            match create_test_parser().parse(dsl) {
+                Ok(query) => match query.as_any().downcast_ref::<RangeQuery>() {
+                    Some(range)
+                        if range.lower_bound() == &lower && range.upper_bound() == &upper => {}
+                    _ => wrong.push(format!("{dsl}: {query:?}")),
+                },
+                Err(e) => wrong.push(format!("{dsl}: {e}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1591: a numeric bound next to a bound that is not a number is
+    /// a parse error, as a numeric or datetime bound next to a datetime
+    /// bound or a string already is (#1179). The other bound used to become
+    /// open, so `[5 TO abc]` searched `[5 TO *]`, and `[nan TO 5]` would
+    /// search `[* TO 5]` now that `nan` is a word.
+    #[test]
+    fn range_number_next_to_a_string_bound_is_an_error() {
+        let expected = "mixes a numeric bound with a bound that is not a number";
+        let mut wrong = Vec::new();
+        for dsl in [
+            "price:[5 TO abc]",
+            "price:[abc TO 5]",
+            "price:[nan TO 5]",
+            "price:[-inf TO 5]",
+            "price:{0 TO Infinity}",
+            "price:[1_000 TO 5]",
+        ] {
+            let result = create_test_parser().parse(dsl);
+            if !matches!(&result, Err(LaurusError::Query(m)) if m.contains(expected)) {
+                wrong.push(format!("{dsl}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1591: a number too large for an `f64` is rejected with
+    /// `InvalidArgument`, as a boost too large for an `f32` (#1550) and a
+    /// slop too large for a `u32` (#1570) are, instead of becoming an
+    /// infinite bound.
+    #[test]
+    fn range_number_too_large_for_an_f64_is_invalid_argument() {
+        let mut wrong = Vec::new();
+        for (dsl, bound) in [
+            ("price:[1e400 TO *]", "1e400"),
+            ("price:[-1e309 TO 5]", "-1e309"),
+            ("price:[* TO 1e999]", "1e999"),
+        ] {
+            let expected = format!("range bound {bound} does not fit a 64-bit float");
+            let result = create_test_parser().parse(dsl);
+            if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
+                wrong.push(format!("{dsl}: {result:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1591: every way of writing a number in digits stays a numeric
+    /// bound with its value: a sign, a leading or trailing `.`, an exponent
+    /// in either case, and a number too small to tell from `0`.
+    #[test]
+    fn range_numbers_in_every_digit_form_stay_numeric() {
+        let mut wrong = Vec::new();
+        for (dsl, min, max) in [
+            ("price:[+5 TO .5e1]", 5.0, 5.0),
+            ("price:[-1.5 TO 5.]", -1.5, 5.0),
+            ("price:[-.5E1 TO 1e3]", -5.0, 1000.0),
+            ("price:[1e-400 TO 1]", 0.0, 1.0),
+        ] {
+            match create_test_parser().parse(dsl) {
+                Ok(query) => match query.as_any().downcast_ref::<NumericRangeQuery>() {
+                    Some(range) if range.min_f64() == Some(min) && range.max_f64() == Some(max) => {
+                    }
+                    _ => wrong.push(format!("{dsl}: {query:?}")),
+                },
+                Err(e) => wrong.push(format!("{dsl}: {e}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
