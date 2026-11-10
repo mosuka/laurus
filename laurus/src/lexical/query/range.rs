@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::datetime::{datetime_to_point, parse_datetime_literal};
 use crate::lexical::core::field::NumericType;
+use crate::lexical::index::structures::visitor::value_in_range;
 use crate::lexical::query::Query;
 use crate::lexical::query::matcher::{EmptyMatcher, Matcher, PreComputedMatcher};
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
@@ -387,7 +388,15 @@ impl NumericRangeQuery {
         self.numeric_type
     }
 
-    /// Encode a numeric value for efficient storage and comparison.
+    /// Encode a numeric value as the bytes this query holds a bound in: the
+    /// big-endian bytes of the `f64` for [`NumericType::Float`], and of the
+    /// value truncated to an `i64` for [`NumericType::Integer`].
+    ///
+    /// The bytes are not in numeric order: a negative number has its sign
+    /// bit set, so its bytes compare above those of every non-negative
+    /// number. Compare through [`Self::contains_numeric`] or
+    /// [`Self::contains_encoded`], which decode the bytes and compare
+    /// numbers (Issue #1600).
     pub fn encode_numeric(value: f64, numeric_type: NumericType) -> Vec<u8> {
         match numeric_type {
             NumericType::Integer => (value as i64).to_be_bytes().to_vec(),
@@ -395,39 +404,44 @@ impl NumericRangeQuery {
         }
     }
 
-    /// Check if an encoded value falls within the range.
+    /// Check if an encoded value, as [`Self::encode_numeric`] returns it
+    /// for this query's numeric type, falls within the range.
+    ///
+    /// The bytes are decoded to a number and compared by
+    /// [`Self::contains_numeric`], not compared as bytes, since their byte
+    /// order is not numeric order (Issue #1600). A value that is not 8 bytes
+    /// long is not in the range.
     pub fn contains_encoded(&self, encoded_value: &[u8]) -> bool {
-        // Check lower bound
-        if let Some(ref lower) = self.lower_bound {
-            let cmp = encoded_value.cmp(lower);
-            if self.lower_inclusive {
-                if cmp == std::cmp::Ordering::Less {
-                    return false;
-                }
-            } else if cmp != std::cmp::Ordering::Greater {
-                return false;
-            }
-        }
-
-        // Check upper bound
-        if let Some(ref upper) = self.upper_bound {
-            let cmp = encoded_value.cmp(upper);
-            if self.upper_inclusive {
-                if cmp == std::cmp::Ordering::Greater {
-                    return false;
-                }
-            } else if cmp != std::cmp::Ordering::Less {
-                return false;
-            }
-        }
-
-        true
+        let Ok(bytes) = <[u8; 8]>::try_from(encoded_value) else {
+            return false;
+        };
+        let value = match self.numeric_type {
+            NumericType::Integer => i64::from_be_bytes(bytes) as f64,
+            NumericType::Float => f64::from_be_bytes(bytes),
+        };
+        self.contains_numeric(value)
     }
 
     /// Check if a numeric value falls within the range.
+    ///
+    /// The value is compared with the bounds as numbers, by the check the
+    /// BKD tree's
+    /// [`RangeQueryVisitor`](crate::lexical::index::structures::visitor::RangeQueryVisitor)
+    /// applies to each point, so the stored-document scan of
+    /// [`Query::matcher`] matches the same values as the tree
+    /// (Issue #1600): negative values and bounds compare in
+    /// numeric order, `-0.0` equals `0.0`, and a `NaN` value is in no
+    /// range. An open side is `f64::NEG_INFINITY` or `f64::INFINITY`, as in
+    /// the tree. For [`NumericType::Integer`] the value is not truncated:
+    /// the tree, too, compares its `f64` point with the bounds.
     pub fn contains_numeric(&self, value: f64) -> bool {
-        let encoded = Self::encode_numeric(value, self.numeric_type);
-        self.contains_encoded(&encoded)
+        value_in_range(
+            value,
+            self.min_f64().unwrap_or(f64::NEG_INFINITY),
+            self.max_f64().unwrap_or(f64::INFINITY),
+            self.lower_inclusive,
+            self.upper_inclusive,
+        )
     }
 
     /// Get the minimum f64 value if the range has a lower bound.
@@ -520,7 +534,9 @@ impl NumericRangeQuery {
     /// contributes its BKD point (#1179), so the stored-document fallback
     /// agrees with the tree. `Text` (and, since #1175, `TextArray`
     /// element-wise) is parsed as a number because stored docs lose type
-    /// info in some paths. Other variants return `false`.
+    /// info in some paths. Other variants return `false`. Every number is
+    /// tested by [`Self::contains_numeric`], with the tree's per-point
+    /// check (Issue #1600).
     fn value_matches_any(&self, val: &crate::data::DataValue) -> bool {
         match val {
             crate::data::DataValue::Int64(i) => self.contains_numeric(*i as f64),
@@ -657,7 +673,9 @@ impl Query for NumericRangeQuery {
         // filter by numeric range. Multi-valued fields match if ANY value
         // falls in the range (Lucene-style "any match"), and the document
         // is recorded at most once per query. The predicate is shared with
-        // `count_matching_documents` so the two can never disagree.
+        // `count_matching_documents` so the two can never disagree, and it
+        // compares numbers with the BKD tree's per-point check, so a
+        // segment without a tree matches what a tree would (Issue #1600).
         let mut matching_docs = Vec::new();
 
         for doc_id in scan_doc_ids(reader)? {
@@ -733,110 +751,6 @@ impl Query for NumericRangeQuery {
             self.lower_inclusive,
             self.upper_inclusive
         ))
-    }
-}
-
-/// Optimized matcher for numeric range queries.
-#[derive(Debug)]
-pub struct NumericRangeMatcher {
-    /// Lower bound as bytes.
-    lower_bound: Option<Vec<u8>>,
-    /// Upper bound as bytes.
-    upper_bound: Option<Vec<u8>>,
-    /// Whether lower bound is inclusive.
-    lower_inclusive: bool,
-    /// Whether upper bound is inclusive.
-    upper_inclusive: bool,
-    /// Current document ID.
-    current_doc: u64,
-    /// Boost factor for scoring.
-    #[allow(dead_code)]
-    boost: f32,
-    /// Whether we've reached the end.
-    exhausted: bool,
-}
-
-impl NumericRangeMatcher {
-    /// Create a new numeric range matcher.
-    pub fn new(
-        lower_bound: Option<Vec<u8>>,
-        upper_bound: Option<Vec<u8>>,
-        lower_inclusive: bool,
-        upper_inclusive: bool,
-        boost: f32,
-    ) -> Self {
-        NumericRangeMatcher {
-            lower_bound,
-            upper_bound,
-            lower_inclusive,
-            upper_inclusive,
-            current_doc: 0,
-            boost,
-            exhausted: true, // Will be set to false when actual matching is implemented
-        }
-    }
-
-    /// Check if an encoded value falls within the range.
-    pub fn contains_encoded(&self, encoded_value: &[u8]) -> bool {
-        // Check lower bound
-        if let Some(ref lower) = self.lower_bound {
-            let cmp = encoded_value.cmp(lower);
-            if self.lower_inclusive {
-                if cmp == std::cmp::Ordering::Less {
-                    return false;
-                }
-            } else if cmp != std::cmp::Ordering::Greater {
-                return false;
-            }
-        }
-
-        // Check upper bound
-        if let Some(ref upper) = self.upper_bound {
-            let cmp = encoded_value.cmp(upper);
-            if self.upper_inclusive {
-                if cmp == std::cmp::Ordering::Greater {
-                    return false;
-                }
-            } else if cmp != std::cmp::Ordering::Less {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-impl Matcher for NumericRangeMatcher {
-    fn doc_id(&self) -> u64 {
-        if self.exhausted {
-            u64::MAX
-        } else {
-            self.current_doc
-        }
-    }
-
-    fn next(&mut self) -> Result<bool> {
-        // Implementation would iterate through document postings
-        // and check if numeric values fall within range
-        Ok(false)
-    }
-
-    fn skip_to(&mut self, _target: u64) -> Result<bool> {
-        // Implementation would skip to target document
-        // and check subsequent documents
-        Ok(false)
-    }
-
-    fn cost(&self) -> u64 {
-        // Numeric range queries are typically efficient
-        100
-    }
-
-    fn is_exhausted(&self) -> bool {
-        self.exhausted
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -1008,26 +922,19 @@ impl DateTimeRangeQuery {
     }
 
     /// Check if a BKD point value falls within the range.
+    ///
+    /// Uses the per-point check of the BKD tree's
+    /// [`RangeQueryVisitor`](crate::lexical::index::structures::visitor::RangeQueryVisitor),
+    /// the same one the stored-document scan of [`Query::matcher`] uses, so
+    /// this agrees with the documents the query matches (Issue #1600).
     pub fn contains_point(&self, point: f64) -> bool {
-        if let Some(lower) = self.min_point() {
-            if self.lower_inclusive {
-                if point < lower {
-                    return false;
-                }
-            } else if point <= lower {
-                return false;
-            }
-        }
-        if let Some(upper) = self.max_point() {
-            if self.upper_inclusive {
-                if point > upper {
-                    return false;
-                }
-            } else if point >= upper {
-                return false;
-            }
-        }
-        true
+        value_in_range(
+            point,
+            self.min_point().unwrap_or(f64::NEG_INFINITY),
+            self.max_point().unwrap_or(f64::INFINITY),
+            self.lower_inclusive,
+            self.upper_inclusive,
+        )
     }
 
     /// Check if a whole-second Unix timestamp falls within the range.
@@ -1503,30 +1410,397 @@ mod tests {
         assert!(scorer.as_any().downcast_ref::<RangeScorer>().is_some());
     }
 
-    #[test]
-    fn test_numeric_encoding() {
-        // Test that encoding preserves ordering for different numeric types
-        let values = [1.0, 2.0, 3.0, 100.0, 1000.0];
+    /// Reader whose stored documents carry one value of any type in the
+    /// field `v` and no BKD tree, so a range query takes the
+    /// stored-document scan (Issue #1600).
+    #[derive(Debug)]
+    struct StoredValueReader {
+        docs: Vec<(u64, crate::data::DataValue)>,
+    }
 
-        for &numeric_type in &[
-            NumericType::Integer,
-            NumericType::Integer,
-            NumericType::Float,
-            NumericType::Float,
-        ] {
-            let encoded_values: Vec<_> = values
+    impl LexicalIndexReader for StoredValueReader {
+        fn doc_count(&self) -> u64 {
+            self.docs.len() as u64
+        }
+        fn max_doc(&self) -> u64 {
+            self.docs.iter().map(|(id, _)| id + 1).max().unwrap_or(0)
+        }
+        fn is_deleted(&self, _doc_id: u64) -> bool {
+            false
+        }
+        fn document(
+            &self,
+            doc_id: u64,
+        ) -> crate::error::Result<Option<crate::lexical::core::document::Document>> {
+            Ok(self
+                .docs
                 .iter()
-                .map(|&v| NumericRangeQuery::encode_numeric(v, numeric_type))
-                .collect();
+                .find(|(id, _)| *id == doc_id)
+                .map(|(_, value)| {
+                    crate::data::Document::builder()
+                        .add_field("v", value.clone())
+                        .build()
+                }))
+        }
+        fn doc_ids(&self) -> crate::error::Result<Vec<u64>> {
+            Ok(self.docs.iter().map(|(id, _)| *id).collect())
+        }
+        fn term_info(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::ReaderTermInfo>> {
+            Ok(None)
+        }
+        fn postings(
+            &self,
+            _field: &str,
+            _term: &str,
+        ) -> crate::error::Result<Option<Box<dyn crate::lexical::reader::PostingIterator>>>
+        {
+            Ok(None)
+        }
+        fn field_stats(
+            &self,
+            _field: &str,
+        ) -> crate::error::Result<Option<crate::lexical::reader::FieldStats>> {
+            Ok(None)
+        }
+        fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
-            // Check that encoded values maintain ordering
-            for i in 1..encoded_values.len() {
-                assert!(
-                    encoded_values[i - 1] < encoded_values[i],
-                    "Ordering not preserved for {numeric_type:?}"
-                );
+    /// A reader holding `values` as documents 1, 2, 3, ... in order.
+    fn stored_values(values: Vec<crate::data::DataValue>) -> StoredValueReader {
+        StoredValueReader {
+            docs: (1u64..).zip(values).collect(),
+        }
+    }
+
+    /// The `(name, query, documents)` cases whose scan over `reader` does
+    /// not match exactly `documents`, described for an assertion message.
+    fn scan_mismatches(
+        reader: &StoredValueReader,
+        cases: Vec<(&str, Box<dyn Query>, Vec<u64>)>,
+    ) -> Vec<String> {
+        cases
+            .into_iter()
+            .filter_map(|(name, query, want)| {
+                let got = drain(query.matcher(reader).unwrap());
+                (got != want).then(|| format!("{name}: got {got:?}, want {want:?}"))
+            })
+            .collect()
+    }
+
+    /// A `Float` range over `v` with the given bounds and inclusivity.
+    fn float_range(
+        lower: Option<f64>,
+        upper: Option<f64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Box<dyn Query> {
+        Box::new(NumericRangeQuery::new(
+            "v",
+            NumericType::Float,
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        ))
+    }
+
+    /// Documents 1 to 6 hold -5.0, -1.5, -0.0, 0.0, 2.5 and `NaN`.
+    fn float_reader() -> StoredValueReader {
+        use crate::data::DataValue::Float64;
+        stored_values(vec![
+            Float64(-5.0),
+            Float64(-1.5),
+            Float64(-0.0),
+            Float64(0.0),
+            Float64(2.5),
+            Float64(f64::NAN),
+        ])
+    }
+
+    /// Issue #1600: the scan compares `Float` values as numbers, as the BKD
+    /// tree does. It used to compare the big-endian bytes, which put every
+    /// negative number above every non-negative one, in reverse order. A
+    /// `NaN` value is in no range, and `-0.0` equals `0.0`.
+    #[test]
+    fn scan_compares_float_values_as_numbers() {
+        let reader = float_reader();
+        let wrong = scan_mismatches(
+            &reader,
+            vec![
+                (
+                    "[-5, 5]",
+                    float_range(Some(-5.0), Some(5.0), true, true),
+                    vec![1, 2, 3, 4, 5],
+                ),
+                (
+                    "[-3, 0]",
+                    float_range(Some(-3.0), Some(0.0), true, true),
+                    vec![2, 3, 4],
+                ),
+                (
+                    "(-5, -1.5]",
+                    float_range(Some(-5.0), Some(-1.5), false, true),
+                    vec![2],
+                ),
+                (
+                    "[-1.5, 0)",
+                    float_range(Some(-1.5), Some(0.0), true, false),
+                    vec![2],
+                ),
+                (
+                    "[*, -2]",
+                    float_range(None, Some(-2.0), true, true),
+                    vec![1],
+                ),
+                (
+                    "[-1, *]",
+                    float_range(Some(-1.0), None, true, true),
+                    vec![3, 4, 5],
+                ),
+                (
+                    "[0, 0]",
+                    float_range(Some(0.0), Some(0.0), true, true),
+                    vec![3, 4],
+                ),
+                (
+                    "[*, *]",
+                    float_range(None, None, true, true),
+                    vec![1, 2, 3, 4, 5],
+                ),
+            ],
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1600: an `Integer` range, which the bindings build with
+    /// `i64_range`, compares the values as numbers too. Its bytes used to
+    /// put every negative value above every non-negative one. The value is
+    /// not truncated, as the BKD tree does not truncate its point, so 2.5 is
+    /// not in `[2, 2]`.
+    #[test]
+    fn scan_compares_integer_ranges_as_numbers() {
+        use crate::data::DataValue::{Float64, Int64};
+        let reader = stored_values(vec![Int64(-5), Int64(-1), Int64(0), Int64(3), Float64(2.5)]);
+        let range = |lower: Option<i64>, upper: Option<i64>| -> Box<dyn Query> {
+            Box::new(NumericRangeQuery::i64_range("v", lower, upper))
+        };
+        let wrong = scan_mismatches(
+            &reader,
+            vec![
+                ("[-5, 5]", range(Some(-5), Some(5)), vec![1, 2, 3, 4, 5]),
+                ("[-3, 0]", range(Some(-3), Some(0)), vec![2, 3]),
+                ("[*, -2]", range(None, Some(-2)), vec![1]),
+                ("[2, 2]", range(Some(2), Some(2)), vec![]),
+                ("[2, 3]", range(Some(2), Some(3)), vec![4, 5]),
+                (
+                    "(-1, *]",
+                    Box::new(NumericRangeQuery::greater_than(
+                        "v",
+                        NumericType::Integer,
+                        -1.0,
+                    )) as Box<dyn Query>,
+                    vec![3, 4, 5],
+                ),
+            ],
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1600: numbers parsed from `Text` and `TextArray` values, and
+    /// the elements of `Float64Array` and `Int64Array` values, compare as
+    /// numbers too.
+    #[test]
+    fn scan_compares_text_and_array_values_as_numbers() {
+        use crate::data::DataValue::{Float64Array, Int64Array, Text, TextArray};
+        let reader = stored_values(vec![
+            Text("-1".to_string()),
+            TextArray(vec!["-7".to_string(), "9".to_string()]),
+            Float64Array(vec![-7.0, 9.0]),
+            Int64Array(vec![-7, 9]),
+            Text("3".to_string()),
+        ]);
+        let wrong = scan_mismatches(
+            &reader,
+            vec![
+                (
+                    "[-8, -6]",
+                    float_range(Some(-8.0), Some(-6.0), true, true),
+                    vec![2, 3, 4],
+                ),
+                (
+                    "[-2, 0]",
+                    float_range(Some(-2.0), Some(0.0), true, true),
+                    vec![1],
+                ),
+                (
+                    "[-1, -1]",
+                    float_range(Some(-1.0), Some(-1.0), true, true),
+                    vec![1],
+                ),
+                (
+                    "[0, 5]",
+                    float_range(Some(0.0), Some(5.0), true, true),
+                    vec![5],
+                ),
+            ],
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1600: a `DateTimeRangeQuery` over instants before 1970, whose
+    /// BKD points are negative, scans like a numeric range, and
+    /// `contains_datetime` agrees with the documents the matcher returns.
+    #[test]
+    fn datetime_scan_matches_instants_before_1970() {
+        use crate::data::DataValue::{DateTime, DateTimeArray};
+        use chrono::{TimeZone, Utc};
+        let at = |y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32| {
+            Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+        };
+        let singles = [
+            at(1960, 6, 1, 0, 0, 0),
+            at(1969, 12, 31, 23, 59, 59),
+            at(1970, 1, 1, 0, 0, 0),
+            at(1975, 1, 1, 0, 0, 0),
+        ];
+        let mut values: Vec<_> = singles.iter().map(|dt| DateTime(*dt)).collect();
+        values.push(DateTimeArray(vec![
+            at(1950, 1, 1, 0, 0, 0),
+            at(2000, 1, 1, 0, 0, 0),
+        ]));
+        let reader = stored_values(values);
+
+        let queries = [
+            (
+                "[1960-01-01, 1980-01-01]",
+                DateTimeRangeQuery::between("v", at(1960, 1, 1, 0, 0, 0), at(1980, 1, 1, 0, 0, 0)),
+                vec![1, 2, 3, 4],
+            ),
+            (
+                "[1960-01-01, 1969-12-31T23:59:59]",
+                DateTimeRangeQuery::between(
+                    "v",
+                    at(1960, 1, 1, 0, 0, 0),
+                    at(1969, 12, 31, 23, 59, 59),
+                ),
+                vec![1, 2],
+            ),
+            (
+                "[*, 1965-01-01]",
+                DateTimeRangeQuery::on_or_before("v", at(1965, 1, 1, 0, 0, 0)),
+                // Document 5 holds 1950, so it matches: any element does.
+                vec![1, 5],
+            ),
+            (
+                "[1949-01-01, 1951-01-01]",
+                DateTimeRangeQuery::between("v", at(1949, 1, 1, 0, 0, 0), at(1951, 1, 1, 0, 0, 0)),
+                vec![5],
+            ),
+            (
+                "(1969-12-31T23:59:59, *]",
+                DateTimeRangeQuery::after("v", at(1969, 12, 31, 23, 59, 59)),
+                vec![3, 4, 5],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, query, want) in queries {
+            let got = drain(query.matcher(&reader).unwrap());
+            if got != want {
+                wrong.push(format!("{name}: got {got:?}, want {want:?}"));
+            }
+            for (id, dt) in (1u64..).zip(singles.iter()) {
+                if query.contains_datetime(dt) != got.contains(&id) {
+                    wrong.push(format!(
+                        "{name}: contains_datetime({dt}) disagrees with the matcher"
+                    ));
+                }
             }
         }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1600: `count_matching_documents` shares the scan's
+    /// comparison, so it counts negative values in the range too.
+    #[test]
+    fn count_matching_documents_agrees_with_the_scan() {
+        let reader = float_reader();
+        let mut wrong = Vec::new();
+        for (name, query, want) in [
+            (
+                "[-5, 5]",
+                NumericRangeQuery::f64_range("v", Some(-5.0), Some(5.0)),
+                5,
+            ),
+            (
+                "[-3, 0]",
+                NumericRangeQuery::f64_range("v", Some(-3.0), Some(0.0)),
+                3,
+            ),
+            (
+                "[*, -2]",
+                NumericRangeQuery::f64_range("v", None, Some(-2.0)),
+                1,
+            ),
+        ] {
+            let count = query.count_matching_documents(&reader).unwrap();
+            let matched = drain(query.matcher(&reader).unwrap()).len() as u64;
+            if count != want || matched != want {
+                wrong.push(format!(
+                    "{name}: count {count}, matcher {matched}, want {want}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1600: `contains_encoded` decodes the bytes for the query's
+    /// type and compares numbers, so negative values are in order; bytes
+    /// that are not 8 long are in no range.
+    #[test]
+    fn contains_encoded_compares_decoded_numbers() {
+        let float = NumericRangeQuery::f64_range("v", Some(-5.0), Some(-1.0));
+        let integer = NumericRangeQuery::i64_range("v", Some(-5), Some(-1));
+        let mut wrong = Vec::new();
+        for (query, values, want) in [
+            (
+                &float,
+                vec![-6.0, -5.0, -3.5, -1.0, -0.5, 0.0, 2.0],
+                vec![false, true, true, true, false, false, false],
+            ),
+            (
+                &integer,
+                vec![-6.0, -5.0, -3.0, -1.0, 0.0, 2.0],
+                vec![false, true, true, true, false, false],
+            ),
+        ] {
+            for (value, want) in values.into_iter().zip(want) {
+                let encoded = NumericRangeQuery::encode_numeric(value, query.numeric_type());
+                let got = query.contains_encoded(&encoded);
+                if got != want || got != query.contains_numeric(value) {
+                    wrong.push(format!(
+                        "{:?} {value}: contains_encoded {got}, contains_numeric {}, want {want}",
+                        query.numeric_type(),
+                        query.contains_numeric(value)
+                    ));
+                }
+            }
+        }
+        if float.contains_encoded(&[0u8; 4]) {
+            wrong.push("4 bytes are in the range".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

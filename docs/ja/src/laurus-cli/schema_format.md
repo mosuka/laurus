@@ -85,7 +85,7 @@ doc_values = true
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | 範囲クエリおよび完全一致クエリを有効にする |
+| `indexed` | `bool` | `true` | 完全一致クエリを有効にし、範囲クエリ用に値を BKD tree に索引する。索引しないフィールドの範囲クエリは、保存した文書を走査する |
 | `stored` | `bool` | `true` | 元の値を保存する |
 | `multi_valued` | `bool` | `false` | 整数の配列を受け付け、範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア） |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
@@ -104,7 +104,7 @@ doc_values = true
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | 範囲クエリを有効にする |
+| `indexed` | `bool` | `true` | 範囲クエリ用に値を BKD tree に索引する。索引しないフィールドの範囲クエリは、保存した文書を走査する |
 | `stored` | `bool` | `true` | 元の値を保存する |
 | `multi_valued` | `bool` | `false` | 浮動小数点の配列を受け付け、範囲クエリは**いずれかの値**が条件を満たせばマッチ（Lucene 流の "any match"、constant スコア） |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
@@ -142,7 +142,7 @@ doc_values = true
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | 日時の範囲クエリを有効にする |
+| `indexed` | `bool` | `true` | 範囲クエリ用に日時を BKD tree に索引する。索引しないフィールドの範囲クエリは、保存した文書を走査する |
 | `stored` | `bool` | `true` | 元の値を保存する |
 | `multi_valued` | `bool` | `false` | 時刻の配列を受け付け、範囲クエリは**いずれかの時刻**が条件を満たせばマッチ（Lucene 流の "any match"） |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |

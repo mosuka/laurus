@@ -162,7 +162,9 @@ uses the field's BKD tree
 when the segment has one; segments without a BKD tree for the field
 (for example, segments none of whose documents carry the field, or a
 field configured `indexed = false, stored = true`) fall back to scanning
-only the stored documents actually present in that segment.
+only the stored documents actually present in that segment. The scan
+compares the values as numbers, as the BKD tree does: negative values and
+bounds match, `-0.0` equals `0.0`, and a `NaN` value matches no range.
 
 ### DateTimeRangeQuery
 
