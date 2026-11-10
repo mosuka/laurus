@@ -606,8 +606,11 @@ to coerce the value to the declared type. The coercion rules are:
 | `Integer` | `Float64(3.14)` | **truncated to `3`** (information loss — see warning below) |
 | `Integer` | `Text("42")` | parsed as `42` |
 | `Integer` | `Text("abc")` | error |
+| `Integer` | `NaN` or infinite `Float64` | error (not truncated) |
 | `Float` | `Int64` | widened to `f64` |
 | `Float` | `Text("3.14")` | parsed |
+| `Float` | `NaN` or infinite `Float64`, or a `Text` that parses to one (`"nan"`, `"inf"`, `"1e400"`) | error |
+| `Geo` / `Geo3d` | a point with a `NaN` or infinite coordinate | error |
 | `Boolean` | `Int64(0)` / `Int64(1)` | `false` / `true` |
 | `Boolean` | `Text("true"/"false")` | parsed (case-insensitive) |
 | `Text` | any scalar | stringified |
@@ -648,6 +651,13 @@ to coerce the value to the declared type. The coercion rules are:
 | `MultiVector` | `VectorArray` with 1–8,192 vectors of the field's dimension, all finite | stored as-is |
 | `MultiVector` | anything else (a single vector, a flat numeric array, text) | error |
 
+A number must be finite: a `NaN` or infinite value, or an element of a
+multi-valued field that is one, is rejected with `InvalidArgument` before the
+document reaches the WAL. The document store could not read such a value
+back, and a `NaN` cannot be indexed. An undeclared field under the `Dynamic`
+policy is checked the same way before it is added to the schema. Vector
+fields reject a `NaN` or infinite component in the vector store.
+
 Coercion errors interact with the policy:
 
 - `Strict`: error is returned immediately.
@@ -661,7 +671,8 @@ Coercion errors interact with the policy:
 > Several coercions throw away information without reporting an error:
 >
 > - An `Integer` field **truncates** incoming `Float` values (`3.14` → `3`,
->   `-3.9` → `-3`). Ingest does not fail.
+>   `-3.9` → `-3`). Ingest does not fail, except for a `NaN` or infinite
+>   value, which is rejected rather than truncated.
 > - A `Float` field may lose precision for very large integers that do not
 >   fit in an `f64` mantissa.
 > - A `Text` field accepts any scalar by stringifying it, losing the

@@ -10,7 +10,9 @@
 //! `weighted_sum` weight out of range, including a number too large for the
 //! 32-bit float it is converted to. So is a DSL phrase slop or fuzziness
 //! too large for a `u32` (Issue #1570), and a DSL range bound too large for
-//! an `f64` or a word next to a numeric bound (Issue #1591).
+//! an `f64` or a word next to a numeric bound (Issue #1591). So is a
+//! document whose `Float` value parses to `NaN` or an infinity
+//! (Issue #1604).
 //!
 //! The gateway forwards each call to the gRPC services and maps the status
 //! they return, so these requests go through both, over a gRPC connection
@@ -650,4 +652,53 @@ async fn search_sorts_by_an_order_matched_case_insensitively() {
     let (status, body) = send(&router, "POST", "/v1/search", search).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(ids(&body).len(), 2, "{body}");
+}
+
+/// `PUT /v1/documents/:id` with a string that parses to a `NaN` or infinite
+/// float in a `Float` field is a 400 naming the field, and the index keeps
+/// committing (Issue #1604). JSON has no literal for such a number, but
+/// the `Float` coercion parses `"nan"`, `"inf"` and `"1e400"`; the value
+/// used to fail every later commit (`"nan"` in an indexed field) or every
+/// read of the document.
+#[tokio::test]
+async fn put_document_answers_400_for_a_non_finite_float() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    create_index(
+        &router,
+        json!({
+            "title": {"text": {"indexed": true, "stored": true}},
+            "price": {"float": {"indexed": true, "stored": true}}
+        }),
+    )
+    .await;
+
+    let mut wrong = Vec::new();
+    for value in ["nan", "inf", "-inf", "1e400"] {
+        let document = json!({"fields": {"title": "bad", "price": value}});
+        let (status, body) = send(&router, "PUT", "/v1/documents/bad", document).await;
+        let message = body.to_string();
+        if status != StatusCode::BAD_REQUEST
+            || !message.contains("field 'price'")
+            || !message.contains("must be finite")
+        {
+            wrong.push(format!("{value}: {status} {body}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let document = json!({"fields": {"title": "good", "price": 1.5}});
+    let (status, body) = send(&router, "PUT", "/v1/documents/good", document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(&router, "POST", "/v1/commit", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (query, expected) in [("title:good", vec!["good"]), ("title:bad", vec![])] {
+        let (status, body) = send(&router, "POST", "/v1/search", json!({"query": query})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .map(|hits| hits.iter().map(|hit| hit["id"].as_str().unwrap()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, expected, "{query}: {body}");
+    }
 }
