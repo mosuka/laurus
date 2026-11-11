@@ -1689,6 +1689,56 @@ class LaurusTest extends TestCase
         $this->assertEquals($viaArgument[0]->getHighlights(), $viaRequest[0]->getHighlights());
     }
 
+    /**
+     * Issue #1609: these parameters were cast with `as usize` or `as u64`, so
+     * a negative limit returned every hit and a negative offset none. A
+     * negative value now throws a ValueError naming the parameter, while 0
+     * still works.
+     */
+    public function testUnsignedIntegerParametersRejectANegativeValue(): void
+    {
+        $idx = $this->createHighlightIndex();
+        $highlight = fn(string $key, int $v) =>
+            $idx->search("body:rust", 10, 0, ["fields" => ["body"], $key => $v]);
+        $calls = [
+            "Index::search: limit" => fn(int $v) => $idx->search("body:rust", $v),
+            "Index::search: offset" => fn(int $v) => $idx->search("body:rust", 10, $v),
+            "Index::searchBatch: limit" => fn(int $v) => $idx->searchBatch(["body:rust"], $v),
+            "Index::searchBatch: offset" => fn(int $v) => $idx->searchBatch(["body:rust"], 10, $v),
+            "SearchRequest: limit" =>
+                fn(int $v) => new Laurus\SearchRequest("body:rust", null, null, null, null, $v),
+            "SearchRequest: offset" =>
+                fn(int $v) => new Laurus\SearchRequest("body:rust", null, null, null, null, 10, $v),
+            "highlight: max_fragments" => fn(int $v) => $highlight("max_fragments", $v),
+            "highlight: fragment_size" => fn(int $v) => $highlight("fragment_size", $v),
+            "highlight: max_analyzed_chars" => fn(int $v) => $highlight("max_analyzed_chars", $v),
+            "WalSyncPolicy::group: max_records" => fn(int $v) => Laurus\WalSyncPolicy::group($v),
+            "WalSyncPolicy::group: max_bytes" => fn(int $v) => Laurus\WalSyncPolicy::group(null, $v),
+            "WalSyncPolicy::group: max_interval_ms" =>
+                fn(int $v) => Laurus\WalSyncPolicy::group(null, null, $v),
+        ];
+        $wrong = [];
+        foreach ($calls as $param => $call) {
+            foreach ([-1, PHP_INT_MIN] as $value) {
+                try {
+                    $call($value);
+                    $wrong[] = "$param $value: no error";
+                } catch (\ValueError $e) {
+                    $expected = "$param must be at least 0, got $value";
+                    if ($e->getMessage() !== $expected) {
+                        $wrong[] = "$param $value: " . $e->getMessage();
+                    }
+                }
+            }
+            try {
+                $call(0);
+            } catch (\Throwable $e) {
+                $wrong[] = "$param 0: " . $e->getMessage();
+            }
+        }
+        $this->assertSame([], $wrong);
+    }
+
     // ── HNSW quantizer / rerank_storage options (#797) ────────────────────
     //
     // These assert the values configured on addHnswField actually reach the

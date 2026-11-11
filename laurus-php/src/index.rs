@@ -19,7 +19,7 @@ use laurus::{
     StorageConfig, StorageFactory, WalSyncPolicy,
 };
 
-use crate::convert::{document_to_hashtable, hashtable_to_document};
+use crate::convert::{document_to_hashtable, hashtable_to_document, unsigned_param};
 use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::schema::PhpSchema;
 use crate::search::{
@@ -108,22 +108,32 @@ impl PhpWalSyncPolicy {
     /// # Returns
     ///
     /// A `WalSyncPolicy` wrapping [`WalSyncPolicy::Group`].
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if an argument is negative (Issue #1609).
     pub fn group(
         max_records: Option<i64>,
         max_bytes: Option<i64>,
         max_interval_ms: Option<i64>,
-    ) -> Self {
-        Self {
+    ) -> PhpResult<Self> {
+        const CONTEXT: &str = "WalSyncPolicy::group";
+        Ok(Self {
             inner: WalSyncPolicy::Group {
                 max_records: max_records
-                    .map(|v| v as usize)
+                    .map(|v| unsigned_param(CONTEXT, "max_records", v))
+                    .transpose()?
                     .unwrap_or(DEFAULT_GROUP_MAX_RECORDS),
                 max_bytes: max_bytes
-                    .map(|v| v as usize)
+                    .map(|v| unsigned_param(CONTEXT, "max_bytes", v))
+                    .transpose()?
                     .unwrap_or(DEFAULT_GROUP_MAX_BYTES),
-                max_interval: max_interval_ms.map(|v| std::time::Duration::from_millis(v as u64)),
+                max_interval: max_interval_ms
+                    .map(|v| unsigned_param(CONTEXT, "max_interval_ms", v))
+                    .transpose()?
+                    .map(std::time::Duration::from_millis),
             },
-        }
+        })
     }
 
     /// Return a string representation.
@@ -559,11 +569,16 @@ impl PhpIndex {
     ///   (Issue #1297); `$limit` and `$offset` then count groups.
     ///
     /// When `$query` is a `SearchRequest`, the other arguments are ignored
-    /// in favor of the request's own values.
+    /// in favor of the request's own values, though they are still checked.
     ///
     /// # Returns
     ///
     /// An array of `SearchResult` objects.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
+    /// #1609).
     #[php(defaults(limit = 10, offset = 0))]
     pub fn search(
         &self,
@@ -574,13 +589,15 @@ impl PhpIndex {
         rescore: Option<&Zval>,
         groupBy: Option<&Zval>,
     ) -> PhpResult<Vec<PhpSearchResult>> {
+        let limit = unsigned_param("Index::search", "limit", limit)?;
+        let offset = unsigned_param("Index::search", "offset", offset)?;
         let highlight = parse_highlight_option(highlight)?;
         let rescore = parse_rescore_option(rescore)?;
         let group_by = parse_group_by_option(groupBy)?;
         let request = build_request_from_php(
             query,
-            limit as usize,
-            offset as usize,
+            limit,
+            offset,
             highlight.as_ref(),
             rescore.as_ref(),
             group_by.as_ref(),
@@ -621,6 +638,11 @@ impl PhpIndex {
     /// `queries[i]`. Empty input returns an empty array without
     /// invoking the engine.
     ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
+    /// #1609), even when `queries` is empty.
+    ///
     /// Issue [#720](https://github.com/mosuka/laurus/issues/720)
     /// Phase 3e of [#648](https://github.com/mosuka/laurus/issues/648).
     #[php(defaults(limit = 10, offset = 0))]
@@ -632,6 +654,8 @@ impl PhpIndex {
         highlight: Option<&ZendHashTable>,
         groupBy: Option<&Zval>,
     ) -> PhpResult<Vec<Vec<PhpSearchResult>>> {
+        let limit = unsigned_param("Index::searchBatch", "limit", limit)?;
+        let offset = unsigned_param("Index::searchBatch", "offset", offset)?;
         let highlight = parse_highlight_option(highlight)?;
         let group_by = parse_group_by_option(groupBy)?;
         let arr = queries.array().ok_or_else(|| {
@@ -648,8 +672,8 @@ impl PhpIndex {
         for (_, value) in arr.iter() {
             requests.push(build_request_from_php(
                 value,
-                limit as usize,
-                offset as usize,
+                limit,
+                offset,
                 highlight.as_ref(),
                 None,
                 group_by.as_ref(),

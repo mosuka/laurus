@@ -3,10 +3,46 @@
 use chrono::{DateTime, Utc};
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::convert::FromZval;
+use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::PhpResult;
 use ext_php_rs::types::array::ArrayKey;
 use ext_php_rs::types::{ZendHashTable, Zval};
+use ext_php_rs::zend::ce;
 use laurus::{DataValue, Document};
+
+/// Convert a PHP integer parameter to the unsigned integer type `T` the
+/// engine takes (`usize` or `u64`).
+///
+/// A PHP integer is a signed 64-bit integer. An `as` cast turned a negative
+/// value into a huge number without an error, so a negative `limit`
+/// returned every hit and a negative `offset` none (Issue #1609).
+///
+/// # Arguments
+///
+/// * `context` - The method or option group the value was passed to, such
+///   as `Index::search`, which starts the error message.
+/// * `name` - The parameter's name.
+/// * `value` - The PHP integer.
+///
+/// # Errors
+///
+/// Throws `\ValueError` if `value` does not fit in `T`: a negative value
+/// (`Index::search: limit must be at least 0, got -1`), or, where `T` is
+/// narrower than 64 bits, a value above its maximum.
+pub fn unsigned_param<T: TryFrom<i64>>(context: &str, name: &str, value: i64) -> PhpResult<T> {
+    T::try_from(value).map_err(|_| {
+        let reason = if value < 0 {
+            "must be at least 0"
+        } else {
+            "is too large"
+        };
+        PhpException::new(
+            format!("{context}: {name} {reason}, got {value}"),
+            0,
+            ce::value_error(),
+        )
+    })
+}
 
 /// Convert a PHP associative array (HashTable) to a [`Document`].
 ///

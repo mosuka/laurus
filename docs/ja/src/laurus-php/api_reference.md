@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
 | `commit(): void` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flushWal(): void` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$groupBy` は結果をフィールドの値でグループ化し（Issue #1297）、このとき `$limit`/`$offset` はグループの数を数えます。[GroupBy](#groupby) を参照。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` を使い、他の引数は無視されます。 |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` と `$groupBy` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。 |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$groupBy` は結果をフィールドの値でグループ化し（Issue #1297）、このとき `$limit`/`$offset` はグループの数を数えます。[GroupBy](#groupby) を参照。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` を使い、他の引数は無視されます（ただし検査はされます）。`$limit` か `$offset` が負なら `\ValueError` を投げます（Issue #1609）。 |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` と `$groupBy` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。`$limit` か `$offset` が負なら、`$queries` が空でも `\ValueError` を投げます（Issue #1609）。 |
 | `stats(): array` | インデックス統計（`"documentCount"`、`"vectorFields"`）を返します。 |
 
 ### `search` の query 引数
@@ -52,6 +52,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 
 - **フィールド名のリスト**: `["body"]`
 - **連想配列**: 必須の `"fields"` キーに加えて、`HighlightConfig` の任意の設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`）を指定 — 例: `["fields" => ["body"], "tag" => "em", "max_fragments" => 2]`
+
+`max_fragments`、`fragment_size`、`max_analyzed_chars` が負なら `\ValueError` を投げます（Issue #1609）。
 
 ```php
 $results = $index->search("body:rust", 10, 0, ["body"]);
@@ -88,7 +90,7 @@ $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems pro
 | コンストラクタ | 説明 |
 | :--- | :--- |
 | `WalSyncPolicy::perRecord()` | デフォルト。すべてのレコードは書き込みが返る前に `fsync` されます。書き込みごとに完全に耐久的です。 |
-| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | `fsync` をまとめます。すべての引数が `null` の場合はデフォルト（`max_records = 1024`、`max_bytes = 1 MiB`、タイマーなし）を使用します。WAL は `$max_records` **または** `$max_bytes` のいずれかが蓄積したとき、および毎回の `commit()` 時にフラッシュされます。`$max_interval_ms` を指定すると、定期タイマーでもフラッシュします。`0` はタイマーを動かさず、append ごとに sync します。 |
+| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | `fsync` をまとめます。すべての引数が `null` の場合はデフォルト（`max_records = 1024`、`max_bytes = 1 MiB`、タイマーなし）を使用します。WAL は `$max_records` **または** `$max_bytes` のいずれかが蓄積したとき、および毎回の `commit()` 時にフラッシュされます。`$max_interval_ms` を指定すると、定期タイマーでもフラッシュします。`0` はタイマーを動かさず、append ごとに sync します。負の引数は `\ValueError` になります（Issue #1609）。 |
 
 Group commit は SQLite の `synchronous = NORMAL` に相当します。クラッシュ時に
 失われるのは最後の未同期バッチのレコードまでで、インデックスが破損する
@@ -510,8 +512,8 @@ new \Laurus\SearchRequest(
 | `$vectorQuery` | 明示的なハイブリッド検索の Vector コンポーネント。 |
 | `$filterQuery` | スコアリング後に適用する Lexical フィルター。 |
 | `$fusion` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。 |
-| `$limit` | 最大結果件数（デフォルト 10）。 |
-| `$offset` | ページネーションオフセット（デフォルト 0）。 |
+| `$limit` | 最大結果件数（デフォルト 10）。負の値は `\ValueError` になります（Issue #1609）。 |
+| `$offset` | ページネーションオフセット（デフォルト 0）。負の値は `\ValueError` になります（Issue #1609）。 |
 | `$highlight` | `Index->search()` の `$highlight` と同じリストまたは連想配列の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。`$limit`/`$offset` 以外は PHP レベルのデフォルトを持たないため、`$highlight` を名前付き引数で渡す場合もそれ以前の引数はすべて位置または名前で渡す必要があります。 |
 | `$rescore` | 上位の結果を並べ替える `LateInteractionRescore`（Issue #1351）。それ以外のオブジェクトは `\TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
 | `$groupBy` | 結果をグループ化する `GroupBy`（Issue #1297）。それ以外の値は `\TypeError` になります。[GroupBy](#groupby) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
