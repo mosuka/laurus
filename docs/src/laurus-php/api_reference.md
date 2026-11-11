@@ -340,7 +340,7 @@ Matches documents containing the terms in order. `$terms` is an array of strings
 new \Laurus\FuzzyQuery(string $field, string $term, int $maxEdits = 2)
 ```
 
-Approximate match allowing up to `$maxEdits` edit-distance errors.
+Approximate match allowing up to `$maxEdits` edit-distance errors. `$maxEdits` must be between 0 and 4294967295; the constructor throws `\ValueError` otherwise (Issue #1590).
 
 ### WildcardQuery
 
@@ -430,7 +430,8 @@ Axis-aligned 3D bounding-box search.
 
 k-nearest-neighbour search over a 3D ECEF point field. The optional
 `$initialRadiusM` and `$maxRadiusM` parameters tune the iterative-expansion
-search cone.
+search cone. `$k` must be between 0 and 4294967295; `kNearest` throws
+`\ValueError` otherwise (Issue #1590).
 
 ### BooleanQuery
 
@@ -464,7 +465,9 @@ Compound boolean query. `must` clauses all have to match; `mustNot` clauses must
 
 Positional / proximity span queries. `near` takes an array of term strings,
 while `nearSpans` takes an array of `SpanQuery` objects for nested expressions
-(each clause's field is re-rooted to the outer `$field`).
+(each clause's field is re-rooted to the outer `$field`). `$slop` and
+`$distance` must be between 0 and 4294967295; the method throws `\ValueError`
+otherwise (Issue #1590).
 
 ### VectorQuery
 

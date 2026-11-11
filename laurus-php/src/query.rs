@@ -276,6 +276,29 @@ impl PhpPhraseQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: read an unsigned 32-bit query parameter
+// ---------------------------------------------------------------------------
+
+/// Convert a PHP integer parameter (`name` of `query`) to the `u32` the
+/// core query takes.
+///
+/// Throws `\ValueError` naming the query and the parameter for a value
+/// outside `0..=4294967295`. An `as u32` cast kept only the low 32 bits, so
+/// `-1` became 4294967295 and 4294967296 became 0 (Issue #1590).
+fn u32_param(query: &str, name: &str, value: i64) -> PhpResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        PhpException::new(
+            format!(
+                "{query}: {name} must be between 0 and {}, got {value}",
+                u32::MAX
+            ),
+            0,
+            ce::value_error(),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // FuzzyQuery
 // ---------------------------------------------------------------------------
 
@@ -297,13 +320,17 @@ impl PhpFuzzyQuery {
     /// * `field` - Field name.
     /// * `term` - Term to match approximately.
     /// * `maxEdits` - Maximum edit distance (default: 2).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `maxEdits` is outside `0..=4294967295`.
     #[php(defaults(maxEdits = 2))]
-    pub fn __construct(field: String, term: String, maxEdits: i64) -> Self {
-        Self {
+    pub fn __construct(field: String, term: String, maxEdits: i64) -> PhpResult<Self> {
+        Ok(Self {
             field,
             term,
-            max_edits: maxEdits as u32,
-        }
+            max_edits: u32_param("FuzzyQuery", "maxEdits", maxEdits)?,
+        })
     }
 
     /// Return a string representation.
@@ -854,6 +881,10 @@ impl PhpGeo3dNearestQuery {
     ///   in meters (optional, default 1000.0).
     /// * `max_radius_m` - Hard cap on the search radius in meters (optional,
     ///   default 1e10).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `k` is outside `0..=4294967295`.
     #[allow(clippy::too_many_arguments)]
     pub fn k_nearest(
         field: String,
@@ -863,16 +894,16 @@ impl PhpGeo3dNearestQuery {
         k: i64,
         initial_radius_m: Option<f64>,
         max_radius_m: Option<f64>,
-    ) -> Self {
-        Self {
+    ) -> PhpResult<Self> {
+        Ok(Self {
             field,
             x,
             y,
             z,
-            k: k as u32,
+            k: u32_param("Geo3dNearestQuery::kNearest", "k", k)?,
             initial_radius_m,
             max_radius_m,
-        }
+        })
     }
 
     /// Return a string representation.
@@ -1027,13 +1058,18 @@ impl PhpSpanQuery {
     /// * `terms` - Array of term strings.
     /// * `slop` - Maximum token distance between terms (default: 0).
     /// * `ordered` - Whether terms must appear in order (default: true).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `slop` is outside `0..=4294967295`.
     #[php(defaults(slop = 0, ordered = true))]
-    pub fn near(field: String, terms: Vec<String>, slop: i64, ordered: bool) -> Self {
+    pub fn near(field: String, terms: Vec<String>, slop: i64, ordered: bool) -> PhpResult<Self> {
+        let slop = u32_param("SpanQuery::near", "slop", slop)?;
         let kinds = terms.into_iter().map(SpanKind::Term).collect();
-        Self {
+        Ok(Self {
             field,
-            kind: SpanKind::Near(kinds, slop as u32, ordered),
-        }
+            kind: SpanKind::Near(kinds, slop, ordered),
+        })
     }
 
     /// SpanNear with nested `SpanQuery` clauses instead of plain terms.
@@ -1050,18 +1086,23 @@ impl PhpSpanQuery {
     ///   re-rooted onto the outer field.
     /// * `slop` - Maximum token distance between clauses (default: 0).
     /// * `ordered` - Whether clauses must appear in order (default: true).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `slop` is outside `0..=4294967295`.
     #[php(defaults(slop = 0, ordered = true))]
     pub fn near_spans(
         field: String,
         clauses: Vec<&PhpSpanQuery>,
         slop: i64,
         ordered: bool,
-    ) -> Self {
+    ) -> PhpResult<Self> {
+        let slop = u32_param("SpanQuery::nearSpans", "slop", slop)?;
         let kinds: Vec<SpanKind> = clauses.iter().map(|c| c.kind.clone()).collect();
-        Self {
+        Ok(Self {
             field,
-            kind: SpanKind::Near(kinds, slop as u32, ordered),
-        }
+            kind: SpanKind::Near(kinds, slop, ordered),
+        })
     }
 
     /// SpanContaining: a span that contains another span.
@@ -1086,20 +1127,25 @@ impl PhpSpanQuery {
     /// * `include` - Span to include.
     /// * `exclude` - Span to exclude.
     /// * `distance` - Maximum distance.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `distance` is outside `0..=4294967295`.
     pub fn within(
         field: String,
         include: &PhpSpanQuery,
         exclude: &PhpSpanQuery,
         distance: i64,
-    ) -> Self {
-        Self {
+    ) -> PhpResult<Self> {
+        let distance = u32_param("SpanQuery::within", "distance", distance)?;
+        Ok(Self {
             field,
             kind: SpanKind::Within(
                 Box::new(include.kind.clone()),
                 Box::new(exclude.kind.clone()),
-                distance as u32,
+                distance,
             ),
-        }
+        })
     }
 
     /// Return a string representation.

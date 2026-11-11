@@ -337,7 +337,7 @@ new \Laurus\PhraseQuery(string $field, array $terms)
 new \Laurus\FuzzyQuery(string $field, string $term, int $maxEdits = 2)
 ```
 
-編集距離が `$maxEdits` 以内の近似一致を検索します。
+編集距離が `$maxEdits` 以内の近似一致を検索します。`$maxEdits` は 0 以上 4294967295 以下でなければならず、それ以外ではコンストラクタが `\ValueError` を投げます（Issue #1590）。
 
 ### WildcardQuery
 
@@ -426,7 +426,9 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 ```
 
 3D ECEF 座標フィールドへの k 最近傍検索。`$initialRadiusM` / `$maxRadiusM`
-（オプション）で反復拡張サーチの探索コーンを調整できます。
+（オプション）で反復拡張サーチの探索コーンを調整できます。`$k` は 0 以上
+4294967295 以下でなければならず、それ以外では `kNearest` が `\ValueError` を
+投げます（Issue #1590）。
 
 ### BooleanQuery
 
@@ -460,7 +462,9 @@ $bq->mustNot($query);
 
 位置・近接スパンクエリ。`near` は語句文字列の配列を受け取り、`nearSpans` は
 ネスト式のために `SpanQuery` オブジェクトの配列を受け取ります（各句のフィールド
-は外側の `$field` に再ルートされます）。
+は外側の `$field` に再ルートされます）。`$slop` と `$distance` は 0 以上
+4294967295 以下でなければならず、それ以外ではメソッドが `\ValueError` を投げます
+（Issue #1590）。
 
 ### VectorQuery
 
