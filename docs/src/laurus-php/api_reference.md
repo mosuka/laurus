@@ -31,8 +31,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | Delete all versions for the given ID. |
 | `commit(): void` | Flush buffered writes and make all pending changes searchable. |
 | `flushWal(): void` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records. Useful when running under a group-commit policy (see below). |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | Execute a search query. Returns an array of `SearchResult`. `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. `$groupBy` groups the results by a field's value (Issue #1297), and `$limit`/`$offset` then count groups; see [GroupBy](#groupby). When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` are used and the other arguments are ignored. |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` and `$groupBy` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | Execute a search query. Returns an array of `SearchResult`. `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. `$groupBy` groups the results by a field's value (Issue #1297), and `$limit`/`$offset` then count groups; see [GroupBy](#groupby). When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` are used and the other arguments are ignored, though they are still checked. A negative `$limit` or `$offset` throws `\ValueError` (Issue #1609). |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` and `$groupBy` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. A negative `$limit` or `$offset` throws `\ValueError`, even when `$queries` is empty (Issue #1609). |
 | `stats(): array` | Return index statistics (`"documentCount"`, `"vectorFields"`). |
 
 ### `search` query argument
@@ -52,6 +52,8 @@ The same value kinds are accepted as the elements of `searchBatch`'s `$queries` 
 
 - A **list of field names**: `["body"]`
 - An **associative array** with a required `"fields"` key plus any of the optional `HighlightConfig` knobs — `max_fragments`, `fragment_size`, `tag`, `css_class`, `require_field_match`, `max_analyzed_chars`, `return_entire_field_if_no_highlight` — e.g. `["fields" => ["body"], "tag" => "em", "max_fragments" => 2]`
+
+A negative `max_fragments`, `fragment_size` or `max_analyzed_chars` throws `\ValueError` (Issue #1609).
 
 ```php
 $results = $index->search("body:rust", 10, 0, ["body"]);
@@ -87,7 +89,7 @@ flushed. Pass it to the `Index` constructor's `$wal_sync_policy` argument.
 | Constructor | Description |
 | :--- | :--- |
 | `WalSyncPolicy::perRecord()` | Default. Every record is `fsync`ed before the write returns — fully durable per write. |
-| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | Batch `fsync`s. With all arguments `null` uses the defaults (`max_records = 1024`, `max_bytes = 1 MiB`, no timer). The WAL is flushed when **either** `$max_records` **or** `$max_bytes` accumulate, and on every `commit()`. Pass `$max_interval_ms` to also flush on a periodic timer; `0` runs no timer but syncs every append. |
+| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | Batch `fsync`s. With all arguments `null` uses the defaults (`max_records = 1024`, `max_bytes = 1 MiB`, no timer). The WAL is flushed when **either** `$max_records` **or** `$max_bytes` accumulate, and on every `commit()`. Pass `$max_interval_ms` to also flush on a periodic timer; `0` runs no timer but syncs every append. A negative argument throws `\ValueError` (Issue #1609). |
 
 Group commit is analogous to SQLite's `synchronous = NORMAL`: a crash can lose
 at most the last unsynced batch of records, but the index never corrupts.
@@ -513,8 +515,8 @@ new \Laurus\SearchRequest(
 | `$vectorQuery` | Vector component for explicit hybrid search. |
 | `$filterQuery` | Lexical filter applied after scoring. |
 | `$fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k: 60)` when both components are set. |
-| `$limit` | Maximum number of results (default 10). |
-| `$offset` | Pagination offset (default 0). |
+| `$limit` | Maximum number of results (default 10). A negative value throws `\ValueError` (Issue #1609). |
+| `$offset` | Pagination offset (default 0). A negative value throws `\ValueError` (Issue #1609). |
 | `$highlight` | Same list-or-associative-array shape as `Index->search()`'s `$highlight` (Issue #1134). See [Highlighting](#highlighting). Only `$limit`/`$offset` have PHP-level defaults today, so a call that names `$highlight` must still pass every earlier parameter positionally or by name. |
 | `$rescore` | A `LateInteractionRescore` that reorders the top results (Issue #1351); any other object throws `\TypeError`. See [LateInteractionRescore](#lateinteractionrescore). As with `$highlight`, pass every earlier parameter too. |
 | `$groupBy` | A `GroupBy` that groups the results (Issue #1297); any other value throws `\TypeError`. See [GroupBy](#groupby). As with `$highlight`, pass every earlier parameter too. |

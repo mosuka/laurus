@@ -24,6 +24,7 @@ use laurus::{
 
 use crate::convert::{
     data_value_to_zval, document_to_hashtable, is_token_vector_list, php_token_vectors,
+    unsigned_param,
 };
 use crate::query::{
     extract_lexical_query, is_vector_query, zval_to_lexical_search_query,
@@ -116,14 +117,17 @@ fn ht_get_string_opt(ht: &ZendHashTable, key: &str) -> PhpResult<Option<String>>
         .ok_or_else(|| format!("'{key}' must be a string").into())
 }
 
+/// Read the highlight option `key` as a non-negative integer.
+///
+/// Throws `\ValueError` for a negative value (Issue #1609), and an
+/// `Exception` for a value that is not an integer.
 fn ht_get_usize(ht: &ZendHashTable, key: &str) -> PhpResult<Option<usize>> {
     let Some(zv) = ht.get(key) else {
         return Ok(None);
     };
-    i64::from_zval(zv)
-        .map(|n| n as usize)
-        .map(Some)
-        .ok_or_else(|| format!("'{key}' must be an integer").into())
+    let n = i64::from_zval(zv)
+        .ok_or_else(|| PhpException::from(format!("'{key}' must be an integer")))?;
+    unsigned_param("highlight", key, n).map(Some)
 }
 
 fn ht_get_bool(ht: &ZendHashTable, key: &str) -> PhpResult<Option<bool>> {
@@ -577,6 +581,11 @@ impl PhpSearchRequest {
     ///   (Issue #1351).
     /// * `groupBy` - `GroupBy` grouping the results by a field's value
     ///   (Issue #1297).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
+    /// #1609).
     #[php(defaults(limit = 10, offset = 0))]
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
@@ -653,8 +662,8 @@ impl PhpSearchRequest {
             vector_query: vec_q,
             filter_query: filter,
             fusion: fusion_alg,
-            limit: limit as usize,
-            offset: offset as usize,
+            limit: unsigned_param("SearchRequest", "limit", limit)?,
+            offset: unsigned_param("SearchRequest", "offset", offset)?,
             highlight,
             rescore,
             group_by,
