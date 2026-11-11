@@ -386,7 +386,9 @@ NumericRangeQuery(field: str, *, min: int | float | None = None, max: int | floa
 数値型（整数または浮動小数点）は `min`/`max` の Python 型から推論されます。
 境界は数として比べるので、`max=float("inf")` は `max=None` と同じ文書に
 一致します。`float("nan")` の境界はどの値にも一致しないので、検索が
-`ValueError` を送出します。
+`ValueError` を送出します。範囲の型の数として読めない境界（数と並べた
+`str` や、符号付き 64 ビット整数に収まらない `int` など）は、クエリを
+作る時点で `ValueError` を送出します。
 
 ### DateTimeRangeQuery
 

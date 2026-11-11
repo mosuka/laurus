@@ -371,6 +371,34 @@ def test_numeric_range_query_infinite_bound_is_an_open_side():
     assert _ids(unbounded) == ["big", "small"]
 
 
+@pytest.mark.parametrize(
+    "kwargs, bound",
+    [
+        ({"min": 1, "max": "x"}, "max"),
+        ({"min": "x", "max": 1}, "min"),
+        ({"min": 1.0, "max": "x"}, "max"),
+        ({"min": [1], "max": 2.0}, "min"),
+        ({"max": 2**63}, "max"),
+        ({"min": -(2**63) - 1, "max": 0}, "min"),
+        ({"min": 0.0, "max": 10**400}, "max"),
+    ],
+)
+def test_numeric_range_query_rejects_a_bound_it_cannot_read(kwargs, bound):
+    """Issue #1605: such a bound used to become an open side without an error."""
+    with pytest.raises(ValueError, match=f"NumericRangeQuery: {bound} must be"):
+        laurus.NumericRangeQuery("price", **kwargs)
+
+
+def test_numeric_range_query_still_reads_numbers():
+    """Issue #1605: valid bounds search as before, an int in a float range
+    included, and the largest and smallest 64-bit integers are bounds."""
+    idx = _price_index()
+    found = idx.search(laurus.NumericRangeQuery("price", min=0, max=5.0), limit=5)
+    assert _ids(found) == ["small"]
+    widest = idx.search(laurus.NumericRangeQuery("price", min=-(2**63), max=2**63 - 1), limit=5)
+    assert _ids(widest) == ["big", "neg", "small"]
+
+
 def _datetime_index():
     schema = laurus.Schema()
     schema.add_datetime_field("created_at")
