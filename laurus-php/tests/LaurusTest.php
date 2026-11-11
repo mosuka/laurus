@@ -277,6 +277,46 @@ class LaurusTest extends TestCase
         $this->assertSame(["doc1"], $this->idsOf($idx->search($oneEdit)));
     }
 
+    /**
+     * Issue #1590: these parameters were cast with `as u32`, so -1 became
+     * 4294967295 and 4294967296 became 0. A value outside 0..=4294967295 now
+     * throws a ValueError naming the parameter, while both ends still build.
+     */
+    public function testUnsignedQueryParametersRejectAValueOutsideU32(): void
+    {
+        $term = Laurus\SpanQuery::term("body", "quick");
+        $builders = [
+            "FuzzyQuery: maxEdits" => fn(int $v) => new Laurus\FuzzyQuery("title", "rast", $v),
+            "Geo3dNearestQuery::kNearest: k" =>
+                fn(int $v) => Laurus\Geo3dNearestQuery::kNearest("position", 0.0, 0.0, 0.0, $v),
+            "SpanQuery::near: slop" => fn(int $v) => Laurus\SpanQuery::near("body", ["quick", "fox"], $v),
+            "SpanQuery::nearSpans: slop" => fn(int $v) => Laurus\SpanQuery::nearSpans("body", [$term, $term], $v),
+            "SpanQuery::within: distance" => fn(int $v) => Laurus\SpanQuery::within("body", $term, $term, $v),
+        ];
+        $wrong = [];
+        foreach ($builders as $param => $build) {
+            foreach ([-1, 4294967296, PHP_INT_MIN, PHP_INT_MAX] as $value) {
+                try {
+                    $build($value);
+                    $wrong[] = "$param $value: no error";
+                } catch (\ValueError $e) {
+                    $expected = "$param must be between 0 and 4294967295, got $value";
+                    if ($e->getMessage() !== $expected) {
+                        $wrong[] = "$param $value: " . $e->getMessage();
+                    }
+                }
+            }
+            foreach ([0, 4294967295] as $value) {
+                try {
+                    $build($value);
+                } catch (\Throwable $e) {
+                    $wrong[] = "$param $value: " . $e->getMessage();
+                }
+            }
+        }
+        $this->assertSame([], $wrong);
+    }
+
     public function testBooleanQuery(): void
     {
         $idx = $this->createIndex();
