@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use laurus::vector::core::field::{
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
+};
 use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
     CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
@@ -238,6 +241,29 @@ fn parse_rerank_storage(name: Option<&str>) -> PyResult<Option<RerankStorageKind
 pub struct PySchema {
     pub inner: Schema,
 }
+
+// `add_hnsw_field` and `add_ivf_field` write their defaults as literals in
+// `#[pyo3(signature)]`, because pyo3 shows any other expression as `...` in
+// `help()`. These checks fail the build if the engine's defaults change
+// without the signatures (Issue #1493).
+const _: () = {
+    assert!(
+        DEFAULT_HNSW_M == 16,
+        "update `m=` in add_hnsw_field's signature"
+    );
+    assert!(
+        DEFAULT_HNSW_EF_CONSTRUCTION == 200,
+        "update `ef_construction=` in add_hnsw_field's signature"
+    );
+    assert!(
+        DEFAULT_IVF_N_CLUSTERS == 100,
+        "update `n_clusters=` in add_ivf_field's signature"
+    );
+    assert!(
+        DEFAULT_IVF_N_PROBE == 1,
+        "update `n_probe=` in add_ivf_field's signature"
+    );
+};
 
 #[pymethods]
 impl PySchema {

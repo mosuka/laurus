@@ -3,20 +3,11 @@
 use std::sync::Arc;
 
 use crate::error::{LaurusError, Result};
+use crate::vector::core::field::DEFAULT_IVF_N_PROBE;
 use crate::vector::core::vector::Vector;
 use crate::vector::reader::VectorIndexReader;
 use crate::vector::search::searcher::VectorIndexSearcher;
 use crate::vector::search::searcher::{VectorIndexQuery, VectorIndexQueryResults};
-
-/// Fallback `n_probe` used when no schema-level value is supplied.
-///
-/// Matches the
-/// [`IvfIndexConfig`](crate::vector::index::config::IvfIndexConfig) default,
-/// so a searcher built via [`IvfSearcher::new`] probes only the single
-/// nearest cluster. Callers that go through the index
-/// [`searcher()`](crate::vector::index::VectorIndex::searcher) factory
-/// instead receive the configured `n_probe` via [`IvfSearcher::with_n_probe`].
-const IVF_DEFAULT_N_PROBE: usize = 1;
 
 /// IVF (Inverted File) vector searcher that performs approximate search by
 /// restricting distance computations to vectors in the `n_probe` nearest
@@ -29,8 +20,9 @@ pub struct IvfSearcher {
 }
 
 impl IvfSearcher {
-    /// Create a new IVF searcher with the built-in fallback `n_probe`
-    /// ([`IVF_DEFAULT_N_PROBE`] = 1).
+    /// Create a new IVF searcher with the schema's default `n_probe`
+    /// ([`DEFAULT_IVF_N_PROBE`], the value an IVF field gets when its schema
+    /// omits `n_probe`).
     ///
     /// Most callers should construct the searcher through the index
     /// [`searcher()`](crate::vector::index::VectorIndex::searcher) factory,
@@ -48,7 +40,7 @@ impl IvfSearcher {
     ///
     /// A new `IvfSearcher` instance.
     pub fn new(index_reader: Arc<dyn VectorIndexReader>) -> Result<Self> {
-        Self::with_n_probe(index_reader, IVF_DEFAULT_N_PROBE)
+        Self::with_n_probe(index_reader, DEFAULT_IVF_N_PROBE)
     }
 
     /// Create a new IVF searcher that probes the configured number of

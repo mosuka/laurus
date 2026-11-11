@@ -2,6 +2,9 @@
 
 use std::str::FromStr;
 
+use laurus::vector::core::field::{
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
+};
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
@@ -544,8 +547,8 @@ impl JsSchema {
         let opt = HnswOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
-            m: m.unwrap_or(16) as usize,
-            ef_construction: ef_construction.unwrap_or(200) as usize,
+            m: m.map_or(DEFAULT_HNSW_M, |m| m as usize),
+            ef_construction: ef_construction.map_or(DEFAULT_HNSW_EF_CONSTRUCTION, |ef| ef as usize),
             default_ef_search: default_ef_search.map(|v| v as usize),
             quantizer: parse_quantizer(quantizer.as_deref(), subvector_count.map(|v| v as usize))?,
             rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
@@ -635,8 +638,8 @@ impl JsSchema {
         let opt = IvfOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
-            n_clusters: n_clusters.unwrap_or(100) as usize,
-            n_probe: n_probe.unwrap_or(1) as usize,
+            n_clusters: n_clusters.map_or(DEFAULT_IVF_N_CLUSTERS, |n| n as usize),
+            n_probe: n_probe.map_or(DEFAULT_IVF_N_PROBE, |n| n as usize),
             quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight: base_weight.unwrap_or(1.0) as f32,
