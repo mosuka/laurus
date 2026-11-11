@@ -169,7 +169,10 @@ use laurus::lexical::core::field::{
     TextOption,
 };
 use laurus::vector::DistanceMetric;
-use laurus::vector::core::field::{FlatOption, HnswOption, IvfOption, MultiVectorOption};
+use laurus::vector::core::field::{
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
+    FlatOption, HnswOption, IvfOption, MultiVectorOption,
+};
 use laurus::vector::core::multi_vector::MultiVectorStorage;
 use laurus::vector::core::rerank::RerankStorageKind;
 use laurus::{AnalyzerSpec, BuiltinAnalyzerSpec, FieldOption, Schema};
@@ -596,8 +599,8 @@ fn prompt_base_weight() -> Result<f32> {
 fn prompt_hnsw_option() -> Result<FieldOption> {
     let dimension = prompt_usize("Dimension", 128)?;
     let distance = prompt_distance_metric()?;
-    let m = prompt_usize("M (max connections per node)", 16)?;
-    let ef_construction = prompt_usize("ef_construction", 200)?;
+    let m = prompt_usize("M (max connections per node)", DEFAULT_HNSW_M)?;
+    let ef_construction = prompt_usize("ef_construction", DEFAULT_HNSW_EF_CONSTRUCTION)?;
     let quantizer = prompt_quantization_method(dimension)?;
     let pq_codebook_path = prompt_pq_codebook_path(&quantizer)?;
     let rerank_storage = prompt_rerank_storage()?;
@@ -806,8 +809,8 @@ fn prompt_pool_factor() -> Result<u32> {
 fn prompt_ivf_option() -> Result<FieldOption> {
     let dimension = prompt_usize("Dimension", 128)?;
     let distance = prompt_distance_metric()?;
-    let n_clusters = prompt_usize("Number of clusters", 100)?;
-    let n_probe = prompt_usize("Number of probes", 1)?;
+    let n_clusters = prompt_usize("Number of clusters", DEFAULT_IVF_N_CLUSTERS)?;
+    let n_probe = prompt_usize("Number of probes", DEFAULT_IVF_N_PROBE)?;
     let quantizer = prompt_flat_ivf_quantization_method()?;
     let base_weight = prompt_base_weight()?;
 

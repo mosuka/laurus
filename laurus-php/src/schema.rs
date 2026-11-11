@@ -5,6 +5,9 @@ use std::str::FromStr;
 
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::ZendHashTable;
+use laurus::vector::core::field::{
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
+};
 use laurus::{
     AnalyzerDefinition, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
     DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FloatOption, Geo3dOption,
@@ -12,7 +15,7 @@ use laurus::{
     QuantizationMethod, RerankStorageKind, Schema, TextOption, TokenFilterConfig, TokenizerConfig,
 };
 
-use crate::convert::hashtable_to_json_value;
+use crate::convert::{hashtable_to_json_value, unsigned_param};
 use crate::errors::{io_err_with_path, laurus_err};
 
 /// Parse a distance metric string into [`DistanceMetric`].
@@ -558,9 +561,14 @@ impl PhpSchema {
     /// Throws `\Exception` if `distance`, `quantizer` or `rerank_storage`
     /// is not a known name, or if `subvector_count` is missing for, or
     /// supplied without, `"product_quantization"`. Throws `\ValueError` if
-    /// `name` starts with `_` (other than `_id`), which is reserved for
-    /// system fields.
-    #[php(defaults(m = 16, ef_construction = 200, base_weight = 1.0))]
+    /// `dimension`, `m`, `ef_construction`, `default_ef_search` or
+    /// `subvector_count` is negative (Issue #1493), or if `name` starts with
+    /// `_` (other than `_id`), which is reserved for system fields.
+    #[php(defaults(
+        m = DEFAULT_HNSW_M as i64,
+        ef_construction = DEFAULT_HNSW_EF_CONSTRUCTION as i64,
+        base_weight = 1.0
+    ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
         &self,
@@ -577,14 +585,22 @@ impl PhpSchema {
         pq_codebook_path: Option<String>,
         base_weight: f64,
     ) -> PhpResult<()> {
+        const CONTEXT: &str = "Schema::addHnswField";
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = HnswOption {
-            dimension: dimension as usize,
+            dimension: unsigned_param(CONTEXT, "dimension", dimension)?,
             distance: parse_distance(&dist_str)?,
-            m: m as usize,
-            ef_construction: ef_construction as usize,
-            default_ef_search: default_ef_search.map(|v| v as usize),
-            quantizer: parse_quantizer(quantizer.as_deref(), subvector_count.map(|v| v as usize))?,
+            m: unsigned_param(CONTEXT, "m", m)?,
+            ef_construction: unsigned_param(CONTEXT, "ef_construction", ef_construction)?,
+            default_ef_search: default_ef_search
+                .map(|v| unsigned_param(CONTEXT, "default_ef_search", v))
+                .transpose()?,
+            quantizer: parse_quantizer(
+                quantizer.as_deref(),
+                subvector_count
+                    .map(|v| unsigned_param(CONTEXT, "subvector_count", v))
+                    .transpose()?,
+            )?,
             rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
             embedder,
             pq_codebook_path,
@@ -612,8 +628,8 @@ impl PhpSchema {
     ///
     /// Throws `\Exception` if `distance` or `quantizer` is not a known
     /// name or `quantizer` is `"product_quantization"`, or `\ValueError`
-    /// if `name` starts with `_` (other than `_id`), which is reserved for
-    /// system fields.
+    /// if `dimension` is negative (Issue #1493) or `name` starts with `_`
+    /// (other than `_id`), which is reserved for system fields.
     #[php(defaults(base_weight = 1.0))]
     pub fn add_flat_field(
         &self,
@@ -626,7 +642,7 @@ impl PhpSchema {
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = laurus::FlatOption {
-            dimension: dimension as usize,
+            dimension: unsigned_param("Schema::addFlatField", "dimension", dimension)?,
             distance: parse_distance(&dist_str)?,
             quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
@@ -657,9 +673,14 @@ impl PhpSchema {
     ///
     /// Throws `\Exception` if `distance` or `quantizer` is not a known
     /// name or `quantizer` is `"product_quantization"`, or `\ValueError`
-    /// if `name` starts with `_` (other than `_id`), which is reserved for
+    /// if `dimension`, `n_clusters` or `n_probe` is negative (Issue #1493)
+    /// or `name` starts with `_` (other than `_id`), which is reserved for
     /// system fields.
-    #[php(defaults(n_clusters = 100, n_probe = 1, base_weight = 1.0))]
+    #[php(defaults(
+        n_clusters = DEFAULT_IVF_N_CLUSTERS as i64,
+        n_probe = DEFAULT_IVF_N_PROBE as i64,
+        base_weight = 1.0
+    ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
         &self,
@@ -672,12 +693,13 @@ impl PhpSchema {
         base_weight: f64,
         quantizer: Option<String>,
     ) -> PhpResult<()> {
+        const CONTEXT: &str = "Schema::addIvfField";
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
         let opt = IvfOption {
-            dimension: dimension as usize,
+            dimension: unsigned_param(CONTEXT, "dimension", dimension)?,
             distance: parse_distance(&dist_str)?,
-            n_clusters: n_clusters as usize,
-            n_probe: n_probe as usize,
+            n_clusters: unsigned_param(CONTEXT, "n_clusters", n_clusters)?,
+            n_probe: unsigned_param(CONTEXT, "n_probe", n_probe)?,
             quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
             base_weight: base_weight as f32,

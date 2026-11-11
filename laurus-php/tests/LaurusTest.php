@@ -1739,6 +1739,51 @@ class LaurusTest extends TestCase
         $this->assertSame([], $wrong);
     }
 
+    /**
+     * Issue #1493: the vector field parameters were cast with `as usize`, so
+     * -1 became 18446744073709551615 in the schema. A negative value now
+     * throws a ValueError naming the parameter, while 0 is still accepted by
+     * the call (the engine's checks reject it where they do).
+     */
+    public function testVectorFieldParametersRejectANegativeValue(): void
+    {
+        $hnsw = fn(...$args) => (new Laurus\Schema())->addHnswField("v", ...$args);
+        $ivf = fn(...$args) => (new Laurus\Schema())->addIvfField("v", ...$args);
+        $calls = [
+            "Schema::addHnswField: dimension" => fn(int $v) => $hnsw($v),
+            "Schema::addHnswField: m" => fn(int $v) => $hnsw(8, null, $v),
+            "Schema::addHnswField: ef_construction" => fn(int $v) => $hnsw(8, null, 16, $v),
+            "Schema::addHnswField: default_ef_search" => fn(int $v) => $hnsw(8, null, 16, 200, $v),
+            "Schema::addHnswField: subvector_count" =>
+                fn(int $v) => $hnsw(8, null, 16, 200, null, null, "product_quantization", $v),
+            "Schema::addFlatField: dimension" =>
+                fn(int $v) => (new Laurus\Schema())->addFlatField("v", $v),
+            "Schema::addIvfField: dimension" => fn(int $v) => $ivf($v),
+            "Schema::addIvfField: n_clusters" => fn(int $v) => $ivf(8, null, $v),
+            "Schema::addIvfField: n_probe" => fn(int $v) => $ivf(8, null, 100, $v),
+        ];
+        $wrong = [];
+        foreach ($calls as $param => $call) {
+            foreach ([-1, PHP_INT_MIN] as $value) {
+                try {
+                    $call($value);
+                    $wrong[] = "$param $value: no error";
+                } catch (\ValueError $e) {
+                    $expected = "$param must be at least 0, got $value";
+                    if ($e->getMessage() !== $expected) {
+                        $wrong[] = "$param $value: " . $e->getMessage();
+                    }
+                }
+            }
+            try {
+                $call(0);
+            } catch (\Throwable $e) {
+                $wrong[] = "$param 0: " . $e->getMessage();
+            }
+        }
+        $this->assertSame([], $wrong);
+    }
+
     // ── HNSW quantizer / rerank_storage options (#797) ────────────────────
     //
     // These assert the values configured on addHnswField actually reach the

@@ -6,6 +6,9 @@ use std::sync::Arc;
 use crate::embedding::embedder::{EmbedInput, EmbedInputType, Embedder};
 use crate::error::Result;
 use crate::vector::core::distance::DistanceMetric;
+use crate::vector::core::field::{
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
+};
 use crate::vector::core::multi_vector::MultiVectorStorage;
 use crate::vector::core::quantization;
 use crate::vector::core::rerank::RerankStorageKind;
@@ -688,8 +691,8 @@ impl Default for HnswIndexConfig {
             distance_metric: DistanceMetric::Cosine,
 
             normalize_vectors: true,
-            m: 16,
-            ef_construction: 200,
+            m: DEFAULT_HNSW_M,
+            ef_construction: DEFAULT_HNSW_EF_CONSTRUCTION,
             default_ef_search: None,
             segmented: true,
             max_vectors_per_segment: 1000000,
@@ -929,8 +932,8 @@ impl Default for IvfIndexConfig {
             distance_metric: DistanceMetric::Cosine,
 
             normalize_vectors: true,
-            n_clusters: 100,
-            n_probe: 1,
+            n_clusters: DEFAULT_IVF_N_CLUSTERS,
+            n_probe: DEFAULT_IVF_N_PROBE,
             max_vectors_per_segment: 1000000,
             quantization_method: quantization::QuantizationMethod::Scalar8Bit,
             rerank_storage: None,
