@@ -494,7 +494,7 @@ laurus train pq-codebook --field <FIELD> (--input <JSONL> | --from-index) \
 | `--update-schema` | フィールドの `pq_codebook_path` が学習済みファイルを指すよう `schema.toml` を書き換えます。 |
 
 commit が codebook を使うのは、スキーマの `pq_codebook_path` が
-そのファイルを指している場合のみです（[スキーマ形式](schema_format.md#product-quantization-hnsw-のみ)
+そのファイルを指している場合のみです（[スキーマ形式](schema_format.md#product-quantizationhnsw-のみ)
 参照）— 学習と同時に設定するには `--update-schema` を渡してください。
 `pq_codebook_path` が設定済みで codebook が未学習のまま commit
 すると、本コマンドを示すエラーで失敗します（per-segment 学習への

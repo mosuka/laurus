@@ -28,7 +28,7 @@ cargo doc --open
 | `engine.stats()?` | インデックス統計の取得 |
 | `engine.write_stop_reason()` | WAL への追記の後に書き込みが失敗した（または panic した）ために、エンジンが書き込みの受け付けを止めた理由。止まっていなければ `None`（[失敗した書き込み](persistence.md#失敗した書き込み)を参照） |
 
-> **`put_document` と `add_document` の違い:** `put_document` はUpsertを実行します。同じ外部IDのドキュメントが既に存在する場合、削除して置き換えます。`add_document` は常に追加し、複数のドキュメントチャンクが同じ外部IDを共有できます。詳細は [Schema & Fields -- ドキュメントのインデキシング](../concepts/schema_and_fields.md#indexing-documents) を参照してください。
+> **`put_document` と `add_document` の違い:** `put_document` はUpsertを実行します。同じ外部IDのドキュメントが既に存在する場合、削除して置き換えます。`add_document` は常に追加し、複数のドキュメントチャンクが同じ外部IDを共有できます。詳細は [Schema & Fields -- ドキュメントのインデキシング](../concepts/schema_and_fields.md#ドキュメントのインデクシング) を参照してください。
 >
 > **バッチ形式:** `put_documents` / `add_documents` は `(id, doc)` ペアを入力順に逐次適用します（1 回の `put_documents` バッチ内で重複した ID は逐次 put と同じくデデュープされ、最後の出現が勝ちます）。適用できないドキュメントに遭遇すると fail-fast で `LaurusError::BatchIngest { failed_index, failed_id, applied, .. }` を返します。バッチロールバックはありません: 適用済みドキュメントは WAL と NRT バッファに残るため、バッチ（またはその suffix）の再試行は冪等です。耐久性の詳細は[バッチインジェスト](persistence.md#バッチインジェスト)を参照してください。
 
