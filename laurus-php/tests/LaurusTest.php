@@ -1129,6 +1129,75 @@ class LaurusTest extends TestCase
         $this->assertSame("doc1", $results[0]->getId());
     }
 
+    /**
+     * A hybrid request on `title` and `vec` with the given fusion.
+     */
+    private function hybridFusionRequest(mixed $fusion): Laurus\SearchRequest
+    {
+        return new Laurus\SearchRequest(
+            query: null,
+            lexicalQuery: new Laurus\TermQuery("title", "rust"),
+            vectorQuery: new Laurus\VectorQuery("vec", [1.0, 0.0]),
+            filterQuery: null,
+            fusion: $fusion,
+            limit: 10,
+            offset: 0,
+        );
+    }
+
+    /**
+     * Issue #1555: a fusion that was neither an RRF nor a WeightedSum was
+     * dropped, so the search ran with the default RRF (k = 60). It now
+     * throws a TypeError.
+     */
+    public function testSearchRequestRejectsAFusionOfAnotherType(): void
+    {
+        $cases = ["string" => "rrf", "array" => ["k" => 1.0], "int" => 42, "object" => new \stdClass()];
+        $mismatches = [];
+        foreach ($cases as $name => $fusion) {
+            try {
+                $this->hybridFusionRequest($fusion);
+                $mismatches[] = "{$name}: no error";
+            } catch (\TypeError $e) {
+                if ($e->getMessage() !== "fusion must be a Laurus\\RRF or a Laurus\\WeightedSum") {
+                    $mismatches[] = "{$name}: {$e->getMessage()}";
+                }
+            }
+        }
+        $this->assertSame([], $mismatches);
+    }
+
+    /**
+     * Issue #1555: null, an RRF and a WeightedSum still choose the fusion.
+     */
+    public function testSearchRequestAppliesNullRrfAndWeightedSum(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("title");
+        $schema->addFlatField("vec", 2);
+        $idx = new Laurus\Index(null, $schema);
+        $idx->putDocument("a", ["title" => "rust a", "vec" => [1.0, 0.0]]);
+        $idx->putDocument("b", ["title" => "rust b", "vec" => [0.0, 1.0]]);
+        $idx->putDocument("c", ["title" => "python c", "vec" => [0.8, 0.6]]);
+        $idx->commit();
+        $scores = function (mixed $fusion) use ($idx): array {
+            $out = [];
+            foreach ($idx->search($this->hybridFusionRequest($fusion)) as $hit) {
+                $out[$hit->getId()] = round($hit->getScore(), 6);
+            }
+            return $out;
+        };
+
+        $default = $scores(null);
+        $this->assertSame($default, $scores(new Laurus\RRF(60.0)));
+        $rrf1 = $scores(new Laurus\RRF(1.0));
+        $this->assertSame(1.0, $rrf1["a"]);
+        $this->assertNotSame($default, $rrf1);
+        $weighted = $scores(new Laurus\WeightedSum(0.9, 0.1));
+        $this->assertNotSame($default, $weighted);
+        $this->assertNotSame($rrf1, $weighted);
+    }
+
     // ── Fusion algorithms ───────────────────────────────────────────────
 
     public function testRRFRepr(): void

@@ -276,6 +276,32 @@ pub fn rb_to_rescore_options(value: Value) -> Result<RescoreOptions, Error> {
         })
 }
 
+/// Convert a Ruby `fusion:` value into a [`FusionAlgorithm`].
+///
+/// Anything else used to be dropped, so the search ran with the default
+/// RRF (`k = 60`) instead of failing (Issue #1555).
+///
+/// # Errors
+///
+/// Raises `TypeError` if `value` is neither a `Laurus::RRF` nor a
+/// `Laurus::WeightedSum`.
+fn rb_to_fusion(value: Value) -> Result<FusionAlgorithm, Error> {
+    if let Ok(rrf) = <&RbRRF>::try_convert(value) {
+        Ok(FusionAlgorithm::RRF { k: rrf.k })
+    } else if let Ok(ws) = <&RbWeightedSum>::try_convert(value) {
+        Ok(FusionAlgorithm::WeightedSum {
+            lexical_weight: ws.lexical_weight,
+            vector_weight: ws.vector_weight,
+        })
+    } else {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        Err(Error::new(
+            ruby.exception_type_error(),
+            "fusion must be a Laurus::RRF or a Laurus::WeightedSum",
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GroupBy (Issue #1297)
 // ---------------------------------------------------------------------------
@@ -522,7 +548,8 @@ impl RbSearchRequest {
     ///   - `lexical_query:` - Lexical query for hybrid search.
     ///   - `vector_query:` - Vector query for hybrid search.
     ///   - `filter_query:` - Post-scoring filter query.
-    ///   - `fusion:` - `RRF` or `WeightedSum` fusion algorithm.
+    ///   - `fusion:` - `RRF` or `WeightedSum` fusion algorithm; anything
+    ///     else but `nil` raises `TypeError` (Issue #1555).
     ///   - `limit:` (usize, default 10): Maximum results.
     ///   - `offset:` (usize, default 0): Pagination offset.
     ///   - `highlight:` - Field list (Array) or config Hash for
@@ -589,21 +616,12 @@ impl RbSearchRequest {
             .transpose()?;
         let rescore = rescore_val.map(rb_to_rescore_options).transpose()?;
 
-        // Convert fusion
-        let fusion = if let Some(f) = fusion_val {
-            if let Ok(rrf) = <&RbRRF>::try_convert(f) {
-                Some(FusionAlgorithm::RRF { k: rrf.k })
-            } else if let Ok(ws) = <&RbWeightedSum>::try_convert(f) {
-                Some(FusionAlgorithm::WeightedSum {
-                    lexical_weight: ws.lexical_weight,
-                    vector_weight: ws.vector_weight,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Convert fusion. An explicit `fusion: nil` arrives as a nil value,
+        // and keeps the default, as an omitted one does.
+        let fusion = fusion_val
+            .filter(|value| !value.is_nil())
+            .map(rb_to_fusion)
+            .transpose()?;
 
         // Convert filter query
         let filter_query = filter_query_val.map(extract_lexical_query).transpose()?;

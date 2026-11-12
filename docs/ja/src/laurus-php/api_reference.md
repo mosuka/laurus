@@ -511,7 +511,7 @@ new \Laurus\SearchRequest(
 | `$lexicalQuery` | 明示的なハイブリッド検索の Lexical コンポーネント。 |
 | `$vectorQuery` | 明示的なハイブリッド検索の Vector コンポーネント。 |
 | `$filterQuery` | スコアリング後に適用する Lexical フィルター。 |
-| `$fusion` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。 |
+| `$fusion` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。それ以外を渡すと `\TypeError`（`fusion must be a Laurus\RRF or a Laurus\WeightedSum`）を投げます（Issue #1555）。 |
 | `$limit` | 最大結果件数（デフォルト 10）。負の値は `\ValueError` になります（Issue #1609）。 |
 | `$offset` | ページネーションオフセット（デフォルト 0）。負の値は `\ValueError` になります（Issue #1609）。 |
 | `$highlight` | `Index->search()` の `$highlight` と同じリストまたは連想配列の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。`$limit`/`$offset` 以外は PHP レベルのデフォルトを持たないため、`$highlight` を名前付き引数で渡す場合もそれ以前の引数はすべて位置または名前で渡す必要があります。 |
