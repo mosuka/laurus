@@ -14,7 +14,8 @@ use laurus::vector::Vector;
 use laurus::{
     DataValue, Document, Engine, FieldOption, FlatOption, GroupBy, IntegerOption, LaurusError,
     LexicalSearchQuery, MultiVectorOption, QueryVector, RescoreOptions, Result, Schema,
-    SearchRequestBuilder, SearchResult, SortField, SortOrder, TextOption, VectorSearchQuery,
+    SearchRequest, SearchRequestBuilder, SearchResult, SortField, SortOrder, TextOption,
+    VectorSearchQuery,
 };
 
 const TOKENS: &str = "tokens";
@@ -23,6 +24,14 @@ fn schema() -> Schema {
     Schema::builder()
         .add_text_field("title", TextOption::default())
         .add_text_field("parent", TextOption::default())
+        // No positions, so a phrase on it is rejected (Issue #1592).
+        .add_text_field(
+            "no_positions",
+            TextOption {
+                term_vectors: false,
+                ..Default::default()
+            },
+        )
         .add_integer_field("year", IntegerOption::default())
         .add_text_field(
             "tags",
@@ -625,5 +634,98 @@ async fn an_ungrouped_search_returns_no_group_fields() -> Result<()> {
             .iter()
             .all(|result| result.group_key.is_none() && result.inner_hits.is_empty())
     );
+    Ok(())
+}
+
+/// Issue #1592: a grouped search with `limit` 0 returned no hits before the
+/// request's query and rescore were checked, so it answered a request that
+/// the same search with `limit` 1 rejects. Each request below is searched
+/// with `limit` 1 and with `limit` 0, and both must fail with the same
+/// error; the requests that did not are collected and reported at once. A
+/// valid request with `limit` 0 still returns no hits.
+#[tokio::test]
+async fn a_grouped_search_with_limit_0_rejects_what_limit_1_rejects() -> Result<()> {
+    type Shape = (&'static str, Box<dyn Fn(usize) -> SearchRequest>);
+    let engine = chunked_engine().await?;
+    let rust = |boost: f32| {
+        LexicalSearchQuery::Obj(Box::new(TermQuery::new("title", "rust").with_boost(boost)))
+    };
+    let grouped = |limit: usize| {
+        SearchRequestBuilder::new()
+            .group_by(GroupBy::new("_id"))
+            .limit(limit)
+    };
+    let tokens = || vec![Vector::new(vec![1.0, 0.0])];
+    let shapes: Vec<Shape> = vec![
+        (
+            "a DSL syntax error",
+            Box::new(move |limit| grouped(limit).query_dsl("title:(").build()),
+        ),
+        (
+            "a DSL phrase slop too large for a u32",
+            Box::new(move |limit| {
+                grouped(limit)
+                    .query_dsl("title:\"rust guide\"~99999999999")
+                    .build()
+            }),
+        ),
+        (
+            "a phrase on a field without positions",
+            Box::new(move |limit| {
+                grouped(limit)
+                    .query_dsl("no_positions:\"rust guide\"")
+                    .build()
+            }),
+        ),
+        (
+            "a lexical query boost below 0",
+            Box::new(move |limit| grouped(limit).lexical_query(rust(-1.0)).build()),
+        ),
+        (
+            "a filter query boost that is NaN",
+            Box::new(move |limit| {
+                grouped(limit)
+                    .lexical_query(rust(1.0))
+                    .filter_query(Box::new(
+                        TermQuery::new("title", "rust").with_boost(f32::NAN),
+                    ))
+                    .build()
+            }),
+        ),
+        (
+            "a rescore window of 0",
+            Box::new(move |limit| {
+                grouped(limit)
+                    .lexical_query(rust(1.0))
+                    .rescore(RescoreOptions::late_interaction(TOKENS, tokens()).window_size(0))
+                    .build()
+            }),
+        ),
+        (
+            "a rescore of a field that is not multi-vector",
+            Box::new(move |limit| {
+                grouped(limit)
+                    .lexical_query(rust(1.0))
+                    .rescore(RescoreOptions::late_interaction("vec", tokens()))
+                    .build()
+            }),
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (shape, request) in &shapes {
+        let one = engine.search(request(1)).await;
+        let zero = engine.search(request(0)).await;
+        match (&one, &zero) {
+            (Err(one), Err(zero)) if one.to_string() == zero.to_string() => {}
+            _ => mismatches.push(format!("{shape}: limit 1 -> {one:?}, limit 0 -> {zero:?}")),
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+
+    let valid = engine
+        .search(grouped(0).lexical_query(rust(1.0)).build())
+        .await?;
+    assert!(valid.is_empty(), "a valid request with limit 0: {valid:?}");
     Ok(())
 }

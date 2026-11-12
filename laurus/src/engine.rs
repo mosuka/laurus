@@ -4003,7 +4003,9 @@ impl Engine {
     /// ranked hits (after rescore) are grouped by the field's value and
     /// `offset` and `limit` count groups; the first stage widens its
     /// candidate pool until it holds `offset + limit` groups or runs out of
-    /// hits (see [`GroupBy`](self::search::GroupBy)).
+    /// hits (see [`GroupBy`](self::search::GroupBy)). A grouped search with
+    /// `limit` 0 checks the request as any other search does, and then
+    /// returns no hits without searching (Issue #1592).
     ///
     /// When `lexical_options.highlight` is set, each returned hit's
     /// [`highlights`](self::search::SearchResult::highlights) is filled from
@@ -4152,9 +4154,6 @@ impl Engine {
         }
         if let Some(group_by) = &request_group_by {
             self::grouping::validate(&self.schema.read(), group_by, request_offset, request_limit)?;
-            if request_limit == 0 {
-                return Ok(Vec::new());
-            }
         }
 
         // Validate the rescore options, and embed a text query, before any
@@ -4261,6 +4260,16 @@ impl Engine {
         if let Some(filter_query) = &request_filter {
             self.validate_positional_field_refs(filter_query.as_ref())?;
             filter_query.validate_boosts()?;
+        }
+
+        // A grouped search counts its page in groups, so with `limit` 0 it
+        // has nothing to return. It returns here, after every check of the
+        // request above and before anything is searched, so that it rejects
+        // what the same search with `limit` 1 rejects (Issue #1592); it
+        // used to return right after `grouping::validate`, before the DSL,
+        // the boosts and the rescore were checked.
+        if request_group_by.is_some() && request_limit == 0 {
+            return Ok(Vec::new());
         }
 
         // 0c. Pre-process Filter
