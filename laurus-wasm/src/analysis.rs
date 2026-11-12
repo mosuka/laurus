@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::convert::unsigned_param;
 use crate::errors::laurus_err;
 use laurus::Analyzer;
 use laurus::analysis::analyzer::language::japanese::JapaneseAnalyzer;
@@ -19,28 +20,32 @@ use wasm_bindgen::prelude::*;
 // ---------------------------------------------------------------------------
 
 /// A single token produced by the analysis pipeline.
+///
+/// The positions and offsets are numbers, checked when a token is passed
+/// to `SynonymGraphFilter.apply`, so that an error names the token and the
+/// field (Issue #1612).
 #[derive(Serialize, Deserialize)]
 pub struct WasmToken {
     /// The token text.
     pub text: String,
     /// Position in the token stream.
-    pub position: u32,
+    pub position: f64,
     /// UTF-8 byte start offset in the original text.
     #[serde(rename = "startOffset")]
-    pub start_offset: u32,
+    pub start_offset: f64,
     /// UTF-8 byte end offset in the original text.
     #[serde(rename = "endOffset")]
-    pub end_offset: u32,
+    pub end_offset: f64,
     /// Score boost factor (1.0 = no adjustment).
     pub boost: f64,
     /// Whether this token has been removed by a stop filter.
     pub stopped: bool,
     /// Difference from the previous token's position.
     #[serde(rename = "positionIncrement")]
-    pub position_increment: u32,
+    pub position_increment: f64,
     /// Number of positions spanned by this token.
     #[serde(rename = "positionLength")]
-    pub position_length: u32,
+    pub position_length: f64,
     /// Token type, such as `"alphanum"` or `"synonym"`. A token built by
     /// hand may leave it out.
     #[serde(rename = "tokenType", default, skip_serializing_if = "Option::is_none")]
@@ -51,13 +56,13 @@ impl From<Token> for WasmToken {
     fn from(t: Token) -> Self {
         Self {
             text: t.text,
-            position: t.position as u32,
-            start_offset: t.start_offset as u32,
-            end_offset: t.end_offset as u32,
+            position: t.position as f64,
+            start_offset: t.start_offset as f64,
+            end_offset: t.end_offset as f64,
             boost: t.boost as f64,
             stopped: t.stopped,
-            position_increment: t.position_increment as u32,
-            position_length: t.position_length as u32,
+            position_increment: t.position_increment as f64,
+            position_length: t.position_length as f64,
             token_type: t
                 .metadata
                 .and_then(|m| m.token_type)
@@ -70,25 +75,40 @@ impl From<Token> for WasmToken {
 ///
 /// Token metadata other than the type (original text, language,
 /// attributes) is not carried.
-impl TryFrom<WasmToken> for Token {
-    type Error = JsValue;
-
-    fn try_from(t: WasmToken) -> Result<Self, JsValue> {
-        let mut token = Token::with_offsets(
-            t.text,
-            t.position as usize,
-            t.start_offset as usize,
-            t.end_offset as usize,
+///
+/// # Arguments
+///
+/// * `t` - The token.
+/// * `index` - Its index in the array passed to `apply`, which an error
+///   message names.
+///
+/// # Errors
+///
+/// Returns an error string if a position or offset is not an integer from
+/// 0 to 4294967295 (Issue #1612), or for an unknown `tokenType`.
+fn wasm_token_to_core(t: WasmToken, index: usize) -> Result<Token, JsValue> {
+    let integer = |name: &str, value: f64| {
+        unsigned_param(
+            "SynonymGraphFilter.apply",
+            &format!("tokens[{index}].{name}"),
+            value,
         )
+        .map(|v| v as usize)
+    };
+    let position = integer("position", t.position)?;
+    let start_offset = integer("startOffset", t.start_offset)?;
+    let end_offset = integer("endOffset", t.end_offset)?;
+    let position_increment = integer("positionIncrement", t.position_increment)?;
+    let position_length = integer("positionLength", t.position_length)?;
+    let mut token = Token::with_offsets(t.text, position, start_offset, end_offset)
         .with_boost(t.boost as f32)
-        .with_position_increment(t.position_increment as usize)
-        .with_position_length(t.position_length as usize);
-        token.stopped = t.stopped;
-        if let Some(name) = t.token_type {
-            token = token.with_token_type(name.parse::<TokenType>().map_err(laurus_err)?);
-        }
-        Ok(token)
+        .with_position_increment(position_increment)
+        .with_position_length(position_length);
+    token.stopped = t.stopped;
+    if let Some(name) = t.token_type {
+        token = token.with_token_type(name.parse::<TokenType>().map_err(laurus_err)?);
     }
+    Ok(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +210,12 @@ impl WasmSynonymGraphFilter {
     /// Apply the synonym filter to a list of tokens.
     ///
     /// Accepts and returns a JS array of Token objects (serialized via serde).
+    ///
+    /// # Errors
+    ///
+    /// Throws if `tokens` is not an array of Token objects, if a token's
+    /// position or offset is not an integer from 0 to 4294967295 (Issue
+    /// #1612), or for an unknown `tokenType`.
     #[wasm_bindgen]
     pub fn apply(&self, tokens: JsValue) -> Result<JsValue, JsValue> {
         let wasm_tokens: Vec<WasmToken> = serde_wasm_bindgen::from_value(tokens)
@@ -197,7 +223,8 @@ impl WasmSynonymGraphFilter {
 
         let rust_tokens = wasm_tokens
             .into_iter()
-            .map(Token::try_from)
+            .enumerate()
+            .map(|(index, t)| wasm_token_to_core(t, index))
             .collect::<Result<Vec<_>, _>>()?;
 
         let stream: Box<dyn Iterator<Item = Token> + Send> = Box::new(rust_tokens.into_iter());
@@ -493,6 +520,45 @@ mod tests {
                 .as_string()
                 .unwrap_or_default();
             assert!(err.contains("unknown token type 'bogus'"), "{err}");
+        }
+
+        /// Issue #1612: a token's position or offset must be an integer
+        /// from 0 to 4294967295, and the message names the token and the
+        /// field (serde named neither).
+        #[wasm_bindgen_test]
+        fn apply_rejects_a_position_or_offset_that_is_not_an_integer() {
+            use crate::convert::unsigned_param_testing::{BAD, check};
+
+            let filter = filter(&["rust", "rustlang"]);
+            let mut mismatches = Vec::new();
+            for field in [
+                "position",
+                "startOffset",
+                "endOffset",
+                "positionIncrement",
+                "positionLength",
+            ] {
+                for case in BAD {
+                    let tokens = tokenize("rust is");
+                    let token = js_sys::Array::from(&tokens).get(1);
+                    js_sys::Reflect::set(
+                        &token,
+                        &JsValue::from_str(field),
+                        &JsValue::from_f64(case.0),
+                    )
+                    .unwrap();
+                    let name = format!("tokens[1].{field}");
+                    let result = filter.apply(tokens);
+                    check(
+                        &mut mismatches,
+                        "SynonymGraphFilter.apply",
+                        &name,
+                        case,
+                        result,
+                    );
+                }
+            }
+            assert!(mismatches.is_empty(), "{mismatches:#?}");
         }
     }
 }

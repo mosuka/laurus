@@ -1,9 +1,84 @@
-//! Conversions between serde_json values and Laurus types.
+//! Conversions between serde_json values and Laurus types, and of the
+//! numbers passed to integer parameters.
 
 use chrono::DateTime;
 use laurus::{DataValue, Document};
 use serde_json::Value;
 use wasm_bindgen::JsValue;
+
+/// Convert a number passed to an unsigned integer parameter to a `u32`.
+///
+/// Such a parameter was a `u32`. The wasm-bindgen glue passed an optional
+/// one as `(value) >>> 0` and a required one as it is, for WebAssembly to
+/// convert with `ToInt32`; either way only the low 32 bits of the number
+/// were kept, without an error, so `-1` became 4294967295, `1.5` became 1,
+/// 4294967296 became 0, and `NaN` and the infinities became 0 (Issue
+/// #1612). The parameter is now a number, checked here. An option field
+/// read with `serde_wasm_bindgen` is a number too, so that its error names
+/// the field.
+///
+/// A number parameter has no type check in the glue, so a non-number
+/// argument is converted as JavaScript's `Number()` does: `"5"` becomes 5
+/// and `true` 1 (and `null` 0 for a required parameter; an optional one
+/// takes `null` as omitted), as a release build's glue did before, while
+/// `"abc"` becomes `NaN`, which is rejected here. Only a `--dev` build's
+/// glue used to reject a non-number for a 32-bit integer parameter.
+///
+/// `value.fract() == 0.0` rejects a fraction, and `NaN` and the infinities
+/// as well, whose `fract()` is `NaN`; the range rejects the rest. `-0` is
+/// taken as 0.
+///
+/// # Arguments
+///
+/// * `context` - The method, such as `Schema.addHnswField`, which starts
+///   the error message.
+/// * `name` - The parameter's JavaScript name, such as `efConstruction`,
+///   or an option field's path, such as `highlight.fragmentSize`.
+/// * `value` - The number passed.
+///
+/// # Errors
+///
+/// Returns an error string such as
+/// `Schema.addHnswField: m must be an integer from 0 to 4294967295, got -1`
+/// unless `value` is an integer from 0 to 4294967295.
+pub fn unsigned_param(context: &str, name: &str, value: f64) -> Result<u32, JsValue> {
+    if value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&value) {
+        Ok(value as u32)
+    } else {
+        Err(JsValue::from_str(&format!(
+            "{context}: {name} must be an integer from 0 to {}, got {}",
+            u32::MAX,
+            js_number(value)
+        )))
+    }
+}
+
+/// [`unsigned_param`] for an optional parameter or option field: `None`
+/// (omitted, `undefined` or `null`) stays `None`.
+///
+/// # Errors
+///
+/// Returns the error string of [`unsigned_param`].
+pub fn optional_unsigned_param(
+    context: &str,
+    name: &str,
+    value: Option<f64>,
+) -> Result<Option<u32>, JsValue> {
+    value.map(|v| unsigned_param(context, name, v)).transpose()
+}
+
+/// Write a number as JavaScript writes `NaN`, `Infinity` and `-Infinity`,
+/// where Rust writes `NaN`, `inf` and `-inf`. Other numbers are written by
+/// Rust, which writes a large integer in full (`1e21` as 22 digits).
+fn js_number(value: f64) -> String {
+    if value == f64::INFINITY {
+        "Infinity".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else {
+        value.to_string()
+    }
+}
 
 /// Convert a `serde_json::Value` (object) to a [`Document`].
 ///
@@ -222,11 +297,101 @@ pub fn data_value_to_json(value: &DataValue) -> Value {
     }
 }
 
+/// Values and the check shared by the tests of the integer parameters
+/// (Issue #1612).
+#[cfg(test)]
+pub(crate) mod unsigned_param_testing {
+    use wasm_bindgen::JsValue;
+
+    /// A negative number, a fraction, a number above 4294967295, `NaN` and
+    /// an infinity, each with the way the error message writes it. The
+    /// glue turned each into another number before Issue #1612.
+    pub(crate) const BAD: [(f64, &str); 5] = [
+        (-1.0, "-1"),
+        (1.5, "1.5"),
+        (4_294_967_296.0, "4294967296"),
+        (f64::NAN, "NaN"),
+        (f64::INFINITY, "Infinity"),
+    ];
+
+    /// Record in `mismatches` a call, passing a value of [`BAD`] (written
+    /// as `written`) to `name` of `context`, that did not fail with the
+    /// expected message.
+    pub(crate) fn check<T>(
+        mismatches: &mut Vec<String>,
+        context: &str,
+        name: &str,
+        (_, written): (f64, &str),
+        result: Result<T, JsValue>,
+    ) {
+        let expected =
+            format!("{context}: {name} must be an integer from 0 to 4294967295, got {written}");
+        match result {
+            Ok(_) => mismatches.push(format!("{context} {name} {written}: no error")),
+            Err(e) => {
+                let got = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+                if got != expected {
+                    mismatches.push(format!("{context} {name} {written}: {got}"));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Issue #1612: an integer from 0 to 4294967295 converts as it is, and
+    /// `-0` is 0.
+    #[wasm_bindgen_test]
+    fn unsigned_param_takes_an_integer_from_0_to_u32_max() {
+        for (value, expected) in [(0.0, 0), (-0.0, 0), (1.0, 1), (4_294_967_295.0, u32::MAX)] {
+            assert_eq!(
+                unsigned_param("C", "n", value).unwrap(),
+                expected,
+                "{value}"
+            );
+        }
+        assert_eq!(optional_unsigned_param("C", "n", None).unwrap(), None);
+        assert_eq!(
+            optional_unsigned_param("C", "n", Some(7.0)).unwrap(),
+            Some(7)
+        );
+    }
+
+    /// Issue #1612: anything else fails with a message naming the context
+    /// and the parameter and writing the value as JavaScript does.
+    #[wasm_bindgen_test]
+    fn unsigned_param_rejects_a_value_that_is_not_an_integer_from_0_to_u32_max() {
+        use super::unsigned_param_testing::{BAD, check};
+
+        let mut mismatches = Vec::new();
+        let more = [
+            (f64::NEG_INFINITY, "-Infinity"),
+            (-0.5, "-0.5"),
+            (4_294_967_295.5, "4294967295.5"),
+        ];
+        for case in BAD.into_iter().chain(more) {
+            check(
+                &mut mismatches,
+                "C",
+                "n",
+                case,
+                unsigned_param("C", "n", case.0),
+            );
+            check(
+                &mut mismatches,
+                "C",
+                "n",
+                case,
+                optional_unsigned_param("C", "n", Some(case.0)),
+            );
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
 
     /// Issue #1184: an array of RFC 3339 strings is a multi-valued datetime
     /// and renders back as RFC 3339 strings normalized to UTC.

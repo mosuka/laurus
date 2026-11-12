@@ -16,6 +16,8 @@ use laurus::{DataValue, LexicalSearchQuery, QueryPayload, VectorSearchQuery};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::convert::{optional_unsigned_param, unsigned_param};
+
 // ---------------------------------------------------------------------------
 // Helper: extract a lexical query from a JsQuery enum
 // ---------------------------------------------------------------------------
@@ -254,13 +256,19 @@ impl JsFuzzyQuery {
     /// * `field` - The field name to search in.
     /// * `term` - The approximate term to match.
     /// * `max_edits` - Maximum edit distance (default 2).
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `maxEdits` is not an integer from 0
+    /// to 4294967295 (Issue #1612).
     #[napi(constructor)]
-    pub fn new(field: String, term: String, max_edits: Option<u32>) -> Self {
-        Self {
+    pub fn new(field: String, term: String, max_edits: Option<f64>) -> Result<Self> {
+        let max_edits = optional_unsigned_param("FuzzyQuery", "maxEdits", max_edits)?;
+        Ok(Self {
             field,
             term,
             max_edits: max_edits.unwrap_or(2),
-        }
+        })
     }
 }
 
@@ -733,17 +741,23 @@ impl JsGeo3dNearestQuery {
     ///   search (default 1000 m). Optional.
     /// * `max_radius_m` - Hard cap on the search radius (default 1e10 m).
     ///   Optional.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `k` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[napi(factory)]
     pub fn k_nearest(
         field: String,
         x: f64,
         y: f64,
         z: f64,
-        k: u32,
+        k: f64,
         initial_radius_m: Option<f64>,
         max_radius_m: Option<f64>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let k = unsigned_param("Geo3dNearestQuery.kNearest", "k", k)?;
+        Ok(Self {
             field,
             x,
             y,
@@ -751,7 +765,7 @@ impl JsGeo3dNearestQuery {
             k,
             initial_radius_m,
             max_radius_m,
-        }
+        })
     }
 }
 
@@ -1129,18 +1143,24 @@ impl JsSpanQuery {
     /// * `terms` - List of term strings.
     /// * `slop` - Maximum token distance between terms (default 0).
     /// * `ordered` - Whether terms must appear in the given order (default `true`).
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `slop` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[napi(factory)]
     pub fn near(
         field: String,
         terms: Vec<String>,
-        slop: Option<u32>,
+        slop: Option<f64>,
         ordered: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let slop = optional_unsigned_param("SpanQuery.near", "slop", slop)?;
         let kinds = terms.into_iter().map(SpanKind::Term).collect();
-        Self {
+        Ok(Self {
             field,
             kind: SpanKind::Near(kinds, slop.unwrap_or(0), ordered.unwrap_or(true)),
-        }
+        })
     }
 
     /// SpanNear with nested SpanQuery clauses instead of plain terms.
@@ -1151,18 +1171,24 @@ impl JsSpanQuery {
     /// * `clauses` - List of SpanQuery objects.
     /// * `slop` - Maximum token distance (default 0).
     /// * `ordered` - Whether clauses must appear in order (default `true`).
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `slop` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[napi(factory)]
     pub fn near_spans(
         field: String,
         clauses: Vec<&JsSpanQuery>,
-        slop: Option<u32>,
+        slop: Option<f64>,
         ordered: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let slop = optional_unsigned_param("SpanQuery.nearSpans", "slop", slop)?;
         let kinds: Vec<SpanKind> = clauses.iter().map(|c| c.kind.clone()).collect();
-        Self {
+        Ok(Self {
             field,
             kind: SpanKind::Near(kinds, slop.unwrap_or(0), ordered.unwrap_or(true)),
-        }
+        })
     }
 
     /// SpanContaining: a span that contains another span.
@@ -1188,21 +1214,27 @@ impl JsSpanQuery {
     /// * `include` - The span to include.
     /// * `exclude` - The span to measure distance from.
     /// * `distance` - Maximum distance.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `distance` is not an integer from 0
+    /// to 4294967295 (Issue #1612).
     #[napi(factory)]
     pub fn within(
         field: String,
         include: &JsSpanQuery,
         exclude: &JsSpanQuery,
-        distance: u32,
-    ) -> Self {
-        Self {
+        distance: f64,
+    ) -> Result<Self> {
+        let distance = unsigned_param("SpanQuery.within", "distance", distance)?;
+        Ok(Self {
             field,
             kind: SpanKind::Within(
                 Box::new(include.kind.clone()),
                 Box::new(exclude.kind.clone()),
                 distance,
             ),
-        }
+        })
     }
 }
 

@@ -1,11 +1,80 @@
-//! Conversions between serde_json values and Laurus types.
+//! Conversions between serde_json values and Laurus types, and of the
+//! numbers passed to integer parameters.
 //!
 //! napi-rs v3 with `serde-json` feature automatically converts `serde_json::Value`
 //! to/from JS values, so we work at the serde_json level.
 
 use chrono::DateTime;
 use laurus::{DataValue, Document};
+use napi::Status;
 use serde_json::Value;
+
+/// Convert a number passed to an unsigned integer parameter to a `u32`.
+///
+/// Such a parameter was a `u32`, which napi-rs reads with
+/// `napi_get_value_uint32`: it keeps the low 32 bits of the number without
+/// an error, so `-1` became 4294967295, `1.5` became 1, 4294967296 became
+/// 0, and `NaN` and the infinities became 0 (Issue #1612). The parameter is
+/// now a number, checked here.
+///
+/// `value.fract() == 0.0` rejects a fraction, and `NaN` and the infinities
+/// as well, whose `fract()` is `NaN`; the range rejects the rest. `-0` is
+/// taken as 0.
+///
+/// # Arguments
+///
+/// * `context` - The method, or the class for a constructor, such as
+///   `Schema.addHnswField`, which starts the error message.
+/// * `name` - The parameter's JavaScript name, such as `efConstruction`,
+///   or an option field's path, such as `highlight.fragmentSize`.
+/// * `value` - The number passed.
+///
+/// # Errors
+///
+/// Returns an `InvalidArg` error such as
+/// `Schema.addHnswField: m must be an integer from 0 to 4294967295, got -1`
+/// unless `value` is an integer from 0 to 4294967295.
+pub fn unsigned_param(context: &str, name: &str, value: f64) -> napi::Result<u32> {
+    if value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&value) {
+        Ok(value as u32)
+    } else {
+        Err(napi::Error::new(
+            Status::InvalidArg,
+            format!(
+                "{context}: {name} must be an integer from 0 to {}, got {}",
+                u32::MAX,
+                js_number(value)
+            ),
+        ))
+    }
+}
+
+/// [`unsigned_param`] for an optional parameter or option field: `None`
+/// (omitted, `undefined` or `null`) stays `None`.
+///
+/// # Errors
+///
+/// Returns the `InvalidArg` error of [`unsigned_param`].
+pub fn optional_unsigned_param(
+    context: &str,
+    name: &str,
+    value: Option<f64>,
+) -> napi::Result<Option<u32>> {
+    value.map(|v| unsigned_param(context, name, v)).transpose()
+}
+
+/// Write a number as JavaScript writes `NaN`, `Infinity` and `-Infinity`,
+/// where Rust writes `NaN`, `inf` and `-inf`. Other numbers are written by
+/// Rust, which writes a large integer in full (`1e21` as 22 digits).
+fn js_number(value: f64) -> String {
+    if value == f64::INFINITY {
+        "Infinity".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else {
+        value.to_string()
+    }
+}
 
 /// Convert a `serde_json::Value` (object) to a [`Document`].
 ///

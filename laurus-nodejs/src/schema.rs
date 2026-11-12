@@ -15,6 +15,7 @@ use laurus::{
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::convert::{optional_unsigned_param, unsigned_param};
 use crate::errors::laurus_err;
 
 /// Parse a distance metric string into [`DistanceMetric`].
@@ -198,7 +199,8 @@ impl JsSchema {
     /// # Errors
     ///
     /// Throws if `name` starts with `_` (other than `_id`), which is
-    /// reserved for system fields.
+    /// reserved for system fields, and an `InvalidArg` error if
+    /// `positionIncrementGap` is not an integer from 0 to 4294967295.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
@@ -210,8 +212,13 @@ impl JsSchema {
         doc_values: Option<bool>,
         analyzer: Option<String>,
         multi_valued: Option<bool>,
-        position_increment_gap: Option<u32>,
+        position_increment_gap: Option<f64>,
     ) -> Result<()> {
+        let position_increment_gap = optional_unsigned_param(
+            "Schema.addTextField",
+            "positionIncrementGap",
+            position_increment_gap,
+        )?;
         self.insert_field(
             name,
             FieldOption::Text(TextOption {
@@ -527,23 +534,33 @@ impl JsSchema {
     /// reserved for system fields; if `distance`, `quantizer` or
     /// `rerankStorage` is not a known name; or if `subvectorCount` is
     /// missing for "product_quantization" or given for another quantizer.
+    /// Throws an `InvalidArg` error if `dimension`, `m`, `efConstruction`,
+    /// `defaultEfSearch` or `subvectorCount` is not an integer from 0 to
+    /// 4294967295.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
         &mut self,
         name: String,
-        dimension: u32,
+        dimension: f64,
         distance: Option<String>,
-        m: Option<u32>,
-        ef_construction: Option<u32>,
-        default_ef_search: Option<u32>,
+        m: Option<f64>,
+        ef_construction: Option<f64>,
+        default_ef_search: Option<f64>,
         embedder: Option<String>,
         quantizer: Option<String>,
-        subvector_count: Option<u32>,
+        subvector_count: Option<f64>,
         rerank_storage: Option<String>,
         pq_codebook_path: Option<String>,
         base_weight: Option<f64>,
     ) -> Result<()> {
+        const CONTEXT: &str = "Schema.addHnswField";
+        let dimension = unsigned_param(CONTEXT, "dimension", dimension)?;
+        let m = optional_unsigned_param(CONTEXT, "m", m)?;
+        let ef_construction = optional_unsigned_param(CONTEXT, "efConstruction", ef_construction)?;
+        let default_ef_search =
+            optional_unsigned_param(CONTEXT, "defaultEfSearch", default_ef_search)?;
+        let subvector_count = optional_unsigned_param(CONTEXT, "subvectorCount", subvector_count)?;
         let opt = HnswOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
@@ -578,17 +595,20 @@ impl JsSchema {
     ///
     /// Throws if `name` starts with `_` (other than `_id`), which is
     /// reserved for system fields, if `distance` or `quantizer` is not a
-    /// known name, or if `quantizer` is "product_quantization".
+    /// known name, or if `quantizer` is "product_quantization". Throws an
+    /// `InvalidArg` error if `dimension` is not an integer from 0 to
+    /// 4294967295.
     #[napi]
     pub fn add_flat_field(
         &mut self,
         name: String,
-        dimension: u32,
+        dimension: f64,
         distance: Option<String>,
         embedder: Option<String>,
         base_weight: Option<f64>,
         quantizer: Option<String>,
     ) -> Result<()> {
+        let dimension = unsigned_param("Schema.addFlatField", "dimension", dimension)?;
         let opt = FlatOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
@@ -621,20 +641,26 @@ impl JsSchema {
     ///
     /// Throws if `name` starts with `_` (other than `_id`), which is
     /// reserved for system fields, if `distance` or `quantizer` is not a
-    /// known name, or if `quantizer` is "product_quantization".
+    /// known name, or if `quantizer` is "product_quantization". Throws an
+    /// `InvalidArg` error if `dimension`, `nClusters` or `nProbe` is not an
+    /// integer from 0 to 4294967295.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
         &mut self,
         name: String,
-        dimension: u32,
+        dimension: f64,
         distance: Option<String>,
-        n_clusters: Option<u32>,
-        n_probe: Option<u32>,
+        n_clusters: Option<f64>,
+        n_probe: Option<f64>,
         embedder: Option<String>,
         base_weight: Option<f64>,
         quantizer: Option<String>,
     ) -> Result<()> {
+        const CONTEXT: &str = "Schema.addIvfField";
+        let dimension = unsigned_param(CONTEXT, "dimension", dimension)?;
+        let n_clusters = optional_unsigned_param(CONTEXT, "nClusters", n_clusters)?;
+        let n_probe = optional_unsigned_param(CONTEXT, "nProbe", n_probe)?;
         let opt = IvfOption {
             dimension: dimension as usize,
             distance: parse_distance(distance.as_deref().unwrap_or("cosine"))?,
@@ -670,17 +696,22 @@ impl JsSchema {
     ///
     /// Throws if `name` starts with `_` (other than `_id`), if `dimension`
     /// is 0, if `distance` is neither cosine nor dot_product, if `storage`
-    /// is not a known kind, or if `pool_factor` is 0.
+    /// is not a known kind, or if `pool_factor` is 0. Throws an
+    /// `InvalidArg` error if `dimension` or `poolFactor` is not an integer
+    /// from 0 to 4294967295.
     #[napi]
     pub fn add_multi_vector_field(
         &mut self,
         name: String,
-        dimension: u32,
+        dimension: f64,
         distance: Option<String>,
         embedder: Option<String>,
         storage: Option<String>,
-        pool_factor: Option<u32>,
+        pool_factor: Option<f64>,
     ) -> Result<()> {
+        const CONTEXT: &str = "Schema.addMultiVectorField";
+        let dimension = unsigned_param(CONTEXT, "dimension", dimension)?;
+        let pool_factor = optional_unsigned_param(CONTEXT, "poolFactor", pool_factor)?;
         let mut opt = MultiVectorOption::new(dimension as usize)
             .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
             .storage(parse_multi_vector_storage(

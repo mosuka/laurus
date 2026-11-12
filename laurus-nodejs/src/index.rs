@@ -11,7 +11,8 @@ use crate::schema::JsSchema;
 use crate::search::{
     JsGroupByOptions, JsHighlightOptions, JsRescoreOptions, JsSearchRequest, JsSearchResult,
     build_dsl_request, build_lexical_request, build_vector_request, js_group_by_options_to_core,
-    js_highlight_options_to_core, js_rescore_options_to_core, to_js_search_result,
+    js_highlight_options_to_core, js_rescore_options_to_core, limit_and_offset,
+    to_js_search_result,
 };
 use crate::wal::JsWalSyncPolicy;
 use laurus::index_dir::CreateRollback;
@@ -337,27 +338,37 @@ impl JsIndex {
     /// # Returns
     ///
     /// An array of SearchResult objects.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with an `InvalidArg` error if `limit`, `offset` or an
+    /// integer of `highlight`, `rescore` or `groupBy` is not an integer
+    /// from 0 to 4294967295 (Issue #1612).
     #[napi]
     pub async fn search(
         &self,
         query: String,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         highlight: Option<JsHighlightOptions>,
         rescore: Option<JsRescoreOptions>,
         group_by: Option<JsGroupByOptions>,
     ) -> Result<Vec<JsSearchResult>> {
-        let mut request = build_dsl_request(
-            query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        );
-        request.lexical_options.highlight = highlight.as_ref().map(js_highlight_options_to_core);
+        const CONTEXT: &str = "Index.search";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let mut request = build_dsl_request(query, limit, offset);
+        request.lexical_options.highlight = highlight
+            .as_ref()
+            .map(|h| js_highlight_options_to_core(h, CONTEXT))
+            .transpose()?;
         request.rescore = rescore
             .as_ref()
-            .map(js_rescore_options_to_core)
+            .map(|r| js_rescore_options_to_core(r, CONTEXT))
             .transpose()?;
-        request.group_by = group_by.as_ref().map(js_group_by_options_to_core);
+        request.group_by = group_by
+            .as_ref()
+            .map(|g| js_group_by_options_to_core(g, CONTEXT))
+            .transpose()?;
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
@@ -375,22 +386,30 @@ impl JsIndex {
     /// # Returns
     ///
     /// An array of SearchResult objects.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with an `InvalidArg` error if `limit`, `offset` or an
+    /// integer of `highlight` is not an integer from 0 to 4294967295
+    /// (Issue #1612).
     #[napi]
     pub async fn search_term(
         &self,
         field: String,
         term: String,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         highlight: Option<JsHighlightOptions>,
     ) -> Result<Vec<JsSearchResult>> {
+        const CONTEXT: &str = "Index.searchTerm";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let highlight = highlight
+            .as_ref()
+            .map(|h| js_highlight_options_to_core(h, CONTEXT))
+            .transpose()?;
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
-        let mut request = build_lexical_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        )?;
-        request.lexical_options.highlight = highlight.as_ref().map(js_highlight_options_to_core);
+        let mut request = build_lexical_request(&query, limit, offset)?;
+        request.lexical_options.highlight = highlight;
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
@@ -407,23 +426,25 @@ impl JsIndex {
     /// # Returns
     ///
     /// An array of SearchResult objects.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with an `InvalidArg` error if `limit` or `offset` is not an
+    /// integer from 0 to 4294967295 (Issue #1612).
     #[napi]
     pub async fn search_vector(
         &self,
         field: String,
         vector: Vec<f64>,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
     ) -> Result<Vec<JsSearchResult>> {
+        let (limit, offset) = limit_and_offset("Index.searchVector", limit, offset)?;
         let query = JsVectorQuery::VectorQuery(JsVectorQueryInner {
             field,
             vector: vector.into_iter().map(|v| v as f32).collect(),
         });
-        let request = build_vector_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        );
+        let request = build_vector_request(&query, limit, offset);
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
@@ -440,20 +461,22 @@ impl JsIndex {
     /// # Returns
     ///
     /// An array of SearchResult objects.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with an `InvalidArg` error if `limit` or `offset` is not an
+    /// integer from 0 to 4294967295 (Issue #1612).
     #[napi]
     pub async fn search_vector_text(
         &self,
         field: String,
         text: String,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
     ) -> Result<Vec<JsSearchResult>> {
+        let (limit, offset) = limit_and_offset("Index.searchVectorText", limit, offset)?;
         let query = JsVectorQuery::VectorTextQuery(JsVectorTextQuery { field, text });
-        let request = build_vector_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        );
+        let request = build_vector_request(&query, limit, offset);
         let results = self.engine()?.search(request).await.map_err(laurus_err)?;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
@@ -501,23 +524,35 @@ impl JsIndex {
     ///
     /// Issue [#718](https://github.com/mosuka/laurus/issues/718)
     /// Phase 3c of [#648](https://github.com/mosuka/laurus/issues/648).
+    ///
+    /// # Errors
+    ///
+    /// Rejects with an `InvalidArg` error if `limit`, `offset` or an
+    /// integer of `highlight` or `groupBy` is not an integer from 0 to
+    /// 4294967295 (Issue #1612), even for an empty `queries`.
     #[napi]
     pub async fn search_batch(
         &self,
         queries: Vec<String>,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         highlight: Option<JsHighlightOptions>,
         group_by: Option<JsGroupByOptions>,
     ) -> Result<Vec<Vec<JsSearchResult>>> {
+        const CONTEXT: &str = "Index.searchBatch";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let highlight = highlight
+            .as_ref()
+            .map(|h| js_highlight_options_to_core(h, CONTEXT))
+            .transpose()?;
+        let group_by = group_by
+            .as_ref()
+            .map(|g| js_group_by_options_to_core(g, CONTEXT))
+            .transpose()?;
         if queries.is_empty() {
             return Ok(Vec::new());
         }
 
-        let limit = limit.unwrap_or(10) as usize;
-        let offset = offset.unwrap_or(0) as usize;
-        let highlight = highlight.as_ref().map(js_highlight_options_to_core);
-        let group_by = group_by.as_ref().map(js_group_by_options_to_core);
         let requests: Vec<_> = queries
             .into_iter()
             .map(|q| {

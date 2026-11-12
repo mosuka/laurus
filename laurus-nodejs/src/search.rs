@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::convert::data_value_to_json;
+use crate::convert::{data_value_to_json, optional_unsigned_param};
 use crate::query::{
     JsBooleanQuery, JsDateTimeRangeQuery, JsFuzzyQuery, JsGeo3dBoundingBoxQuery,
     JsGeo3dDistanceQuery, JsGeo3dNearestQuery, JsGeoBoundingBoxQuery, JsGeoDistanceQuery,
@@ -34,10 +34,12 @@ use napi_derive::napi;
 pub struct JsHighlightOptions {
     /// Stored text fields to highlight.
     pub fields: Vec<String>,
-    /// Target fragment length in characters (default 150).
-    pub fragment_size: Option<u32>,
-    /// Maximum number of fragments per field (default 5).
-    pub max_fragments: Option<u32>,
+    /// Target fragment length in characters (default 150), an integer
+    /// from 0 to 4294967295.
+    pub fragment_size: Option<f64>,
+    /// Maximum number of fragments per field (default 5), an integer from
+    /// 0 to 4294967295.
+    pub max_fragments: Option<f64>,
     /// HTML tag to wrap matches (default `"mark"`).
     pub tag: Option<String>,
     /// CSS class added to the tag.
@@ -49,12 +51,30 @@ pub struct JsHighlightOptions {
 /// Convert [`JsHighlightOptions`] into the core [`HighlightOptions`]. Takes
 /// `&JsHighlightOptions` rather than by value since `JsSearchRequest::build`
 /// only has `&self`.
-pub fn js_highlight_options_to_core(options: &JsHighlightOptions) -> HighlightOptions {
+///
+/// # Arguments
+///
+/// * `options` - The highlight options.
+/// * `context` - The method the options were passed to, such as
+///   `Index.search`, which starts an error message.
+///
+/// # Errors
+///
+/// Returns an `InvalidArg` error if `fragmentSize` or `maxFragments` is not
+/// an integer from 0 to 4294967295 (Issue #1612).
+pub fn js_highlight_options_to_core(
+    options: &JsHighlightOptions,
+    context: &str,
+) -> Result<HighlightOptions> {
+    let fragment_size =
+        optional_unsigned_param(context, "highlight.fragmentSize", options.fragment_size)?;
+    let max_fragments =
+        optional_unsigned_param(context, "highlight.maxFragments", options.max_fragments)?;
     let mut config = HighlightConfig::new();
-    if let Some(fragment_size) = options.fragment_size {
+    if let Some(fragment_size) = fragment_size {
         config = config.fragment_size(fragment_size as usize);
     }
-    if let Some(max_fragments) = options.max_fragments {
+    if let Some(max_fragments) = max_fragments {
         config = config.max_fragments(max_fragments as usize);
     }
     if let Some(tag) = &options.tag {
@@ -66,7 +86,7 @@ pub fn js_highlight_options_to_core(options: &JsHighlightOptions) -> HighlightOp
     if let Some(require_field_match) = options.require_field_match {
         config = config.require_field_match(require_field_match);
     }
-    HighlightOptions::new(options.fields.clone()).with_config(config)
+    Ok(HighlightOptions::new(options.fields.clone()).with_config(config))
 }
 
 // ---------------------------------------------------------------------------
@@ -90,16 +110,29 @@ pub struct JsRescoreOptions {
     /// "candle_colbert" one).
     pub text: Option<String>,
     /// How many top results to rescore (default 100, at most 10,000).
-    pub window_size: Option<u32>,
+    pub window_size: Option<f64>,
 }
 
 /// Convert [`JsRescoreOptions`] into the core [`RescoreOptions`]. Only the
-/// shape is checked here; the engine checks the values when searching.
+/// shape and the integer are checked here; the engine checks the values
+/// when searching.
+///
+/// # Arguments
+///
+/// * `options` - The rescore options.
+/// * `context` - The method the options were passed to, such as
+///   `Index.search`, which starts an error message.
 ///
 /// # Errors
 ///
-/// Returns `InvalidArg` unless exactly one of `vectors` and `text` is set.
-pub fn js_rescore_options_to_core(options: &JsRescoreOptions) -> Result<RescoreOptions> {
+/// Returns `InvalidArg` if `windowSize` is not an integer from 0 to
+/// 4294967295 (Issue #1612), or unless exactly one of `vectors` and `text`
+/// is set.
+pub fn js_rescore_options_to_core(
+    options: &JsRescoreOptions,
+    context: &str,
+) -> Result<RescoreOptions> {
+    let window_size = optional_unsigned_param(context, "rescore.windowSize", options.window_size)?;
     let field = options.field.clone();
     let rescore = match (&options.vectors, &options.text) {
         (Some(vectors), None) => RescoreOptions::late_interaction(
@@ -117,7 +150,7 @@ pub fn js_rescore_options_to_core(options: &JsRescoreOptions) -> Result<RescoreO
             ));
         }
     };
-    Ok(match options.window_size {
+    Ok(match window_size {
         Some(window_size) => rescore.window_size(window_size as usize),
         None => rescore,
     })
@@ -137,17 +170,46 @@ pub struct JsGroupByOptions {
     pub field: String,
     /// How many hits each group keeps, the returned result included
     /// (default 1, at most 100).
-    pub group_size: Option<u32>,
+    pub group_size: Option<f64>,
 }
 
-/// Convert [`JsGroupByOptions`] into the core [`GroupBy`]. The engine
-/// checks the values when searching.
-pub fn js_group_by_options_to_core(options: &JsGroupByOptions) -> GroupBy {
+/// Convert [`JsGroupByOptions`] into the core [`GroupBy`]. Only the
+/// integer is checked here; the engine checks the values when searching.
+///
+/// # Arguments
+///
+/// * `options` - The grouping options.
+/// * `context` - The method the options were passed to, such as
+///   `Index.search`, which starts an error message.
+///
+/// # Errors
+///
+/// Returns an `InvalidArg` error if `groupSize` is not an integer from 0 to
+/// 4294967295 (Issue #1612).
+pub fn js_group_by_options_to_core(options: &JsGroupByOptions, context: &str) -> Result<GroupBy> {
+    let group_size = optional_unsigned_param(context, "groupBy.groupSize", options.group_size)?;
     let group_by = GroupBy::new(options.field.clone());
-    match options.group_size {
+    Ok(match group_size {
         Some(group_size) => group_by.group_size(group_size as usize),
         None => group_by,
-    }
+    })
+}
+
+/// Convert the `limit` and `offset` passed to `context` (a search method
+/// or `SearchRequest`), which default to 10 and 0.
+///
+/// # Errors
+///
+/// Returns an `InvalidArg` error if `limit` or `offset` is not an integer
+/// from 0 to 4294967295 (Issue #1612).
+pub fn limit_and_offset(
+    context: &str,
+    limit: Option<f64>,
+    offset: Option<f64>,
+) -> Result<(usize, usize)> {
+    let limit = optional_unsigned_param(context, "limit", limit)?.unwrap_or(10);
+    let offset = optional_unsigned_param(context, "offset", offset)?.unwrap_or(0);
+    Ok((limit as usize, offset as usize))
 }
 
 // ---------------------------------------------------------------------------
@@ -343,10 +405,11 @@ pub struct JsSearchRequestOptions {
     /// Optional query DSL string (e.g. `"title:hello"`). See
     /// [`JsSearchRequest::set_query_dsl`] for combining it with other queries.
     pub query_dsl: Option<String>,
-    /// Maximum number of results (default 10).
-    pub limit: Option<u32>,
-    /// Pagination offset (default 0).
-    pub offset: Option<u32>,
+    /// Maximum number of results (default 10), an integer from 0 to
+    /// 4294967295.
+    pub limit: Option<f64>,
+    /// Pagination offset (default 0), an integer from 0 to 4294967295.
+    pub offset: Option<f64>,
     /// Request highlighted fragments per field (Issue #1134). Plain data,
     /// so — unlike the polymorphic fields below — it lives here directly
     /// rather than behind a setter.
@@ -379,8 +442,15 @@ impl JsSearchRequest {
     /// req2.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2]));
     /// req2.setRrfFusion(new RRF(60.0));
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `limit` or `offset` is not an
+    /// integer from 0 to 4294967295 (Issue #1612). The integers of
+    /// `highlight`, `rescore` and `groupBy` are checked when the request is
+    /// searched, like the rest of those options.
     #[napi(constructor)]
-    pub fn new(options: Option<JsSearchRequestOptions>) -> Self {
+    pub fn new(options: Option<JsSearchRequestOptions>) -> Result<Self> {
         let options = options.unwrap_or(JsSearchRequestOptions {
             query_dsl: None,
             limit: None,
@@ -389,18 +459,19 @@ impl JsSearchRequest {
             rescore: None,
             group_by: None,
         });
-        Self {
+        let (limit, offset) = limit_and_offset("SearchRequest", options.limit, options.offset)?;
+        Ok(Self {
             query_dsl: options.query_dsl,
             lexical_query: None,
             vector_query: None,
             filter_query: None,
             fusion: None,
-            limit: options.limit.unwrap_or(10) as usize,
-            offset: options.offset.unwrap_or(0) as usize,
+            limit,
+            offset,
             highlight: options.highlight,
             rescore: options.rescore,
             group_by: options.group_by,
-        }
+        })
     }
 
     /// Set a DSL string query.
@@ -642,16 +713,16 @@ impl JsSearchRequest {
         // Highlighting (Issue #1134). Applied before every branch below
         // returns, so it takes effect regardless of which query shape is set.
         if let Some(h) = &self.highlight {
-            let options = js_highlight_options_to_core(h);
+            let options = js_highlight_options_to_core(h, "SearchRequest")?;
             builder = builder
                 .highlight(options.fields)
                 .highlight_config(options.config);
         }
         if let Some(rescore) = &self.rescore {
-            builder = builder.rescore(js_rescore_options_to_core(rescore)?);
+            builder = builder.rescore(js_rescore_options_to_core(rescore, "SearchRequest")?);
         }
         if let Some(group_by) = &self.group_by {
-            builder = builder.group_by(js_group_by_options_to_core(group_by));
+            builder = builder.group_by(js_group_by_options_to_core(group_by, "SearchRequest")?);
         }
 
         // DSL with a lexical / vector query (Issue #1372). A DSL is searched
