@@ -140,6 +140,23 @@ pub enum LaurusError {
         source: Box<LaurusError>,
     },
 
+    /// A request of [`Engine::search_batch`](crate::Engine::search_batch)
+    /// failed, which fails the whole batch (Issue #1553).
+    ///
+    /// The requests run concurrently, and the batch stops at the first one
+    /// whose search returns an error; when several would fail, this is the
+    /// first to do so, not necessarily the one with the lowest position.
+    /// Front ends name the request in their own terms (laurus-server says
+    /// `queries[i]`) and classify the error by its `source`.
+    #[error("search request {failed_index} failed: {source}")]
+    BatchSearch {
+        /// Zero-based position of the failing request in the batch.
+        failed_index: usize,
+        /// The error the request's search returned.
+        #[source]
+        source: Box<LaurusError>,
+    },
+
     /// JSON serialization/deserialization errors
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

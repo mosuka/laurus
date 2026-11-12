@@ -577,6 +577,12 @@ HTTP ゲートウェイと違い、`highlight` はフィールドを 1 つ以上
 }
 ```
 
+サーバーが拒否するクエリがあると、バッチ全体が失敗します。ツールのエラーは、サーバーの [`SearchBatch`](../laurus-server/grpc_api.md#searchbatch) と同じく、そのクエリを `queries` の中の位置で示します（Issue #1553）。`["body:rust", "nosuch:rust"]` のとき:
+
+```text
+Batch search failed: code: 'Client specified an invalid argument', message: "queries[1]: Invalid argument: query references unknown field(s) [\"nosuch\"]; declare them in the schema or check for typos"
+```
+
 ---
 
 ## 典型的なワークフロー

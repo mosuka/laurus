@@ -38,6 +38,9 @@ pub fn laurus_err(err: LaurusError) -> Error {
         LaurusError::InvalidArgument(m) => {
             Error::new(ruby.exception_arg_error(), format!("Invalid argument: {m}"))
         }
+        // `search_batch` wraps a request's error with its position (Issue
+        // #1553); raise the request's own error, as before.
+        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
         other => Error::new(ruby.exception_runtime_error(), other.to_string()),
     }
 }

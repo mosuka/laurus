@@ -512,10 +512,10 @@ curl -X POST http://localhost:8080/v1/search/batch \
 {"error":{"code":400,"message":"queries[1]: query must be a string"}}
 ```
 
-エンジンが拒否する値（100 を超える `group_size` など）もリクエスト全体を失敗させますが、そのメッセージはどのクエリのものかを示しません（Issue #1553）。
+エンジンが拒否する値（100 を超える `group_size`、未知のフィールドなど）も、同じようにリクエスト全体を失敗させ、メッセージは位置の後にエンジンのメッセージが続きます（Issue #1553）。複数のクエリが失敗したときは、最初に失敗したものを示します。位置が最も小さいものとは限りません。
 
 ```json
-{"error":{"code":400,"message":"Invalid argument: group_by: group_size must be between 1 and 100, got 1000"}}
+{"error":{"code":400,"message":"queries[1]: Invalid argument: group_by: group_size must be between 1 and 100, got 1000"}}
 ```
 
 ## JSON フィールド値の型推論

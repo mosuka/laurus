@@ -99,4 +99,16 @@ class TestSearchBatch < Minitest::Test
       assert results.length <= 1
     end
   end
+
+  # Issue #1553: the engine wraps the error of a batch with the query's
+  # position, which the binding unwraps, so a query the engine rejects
+  # raises the ArgumentError that #search raises for it.
+  def test_search_batch_engine_error_raises_as_search_does
+    idx = create_index
+    single = assert_raises(ArgumentError) { idx.search("nosuch:rust") }
+    batch = assert_raises(ArgumentError) { idx.search_batch(["title:rust", "nosuch:rust"]) }
+
+    assert_includes batch.message, "unknown field"
+    assert_equal single.message, batch.message
+  end
 end

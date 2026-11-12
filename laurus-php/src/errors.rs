@@ -37,6 +37,9 @@ pub fn laurus_err(err: LaurusError) -> PhpException {
         LaurusError::InvalidArgument(m) => {
             PhpException::new(format!("Invalid argument: {m}"), 0, ce::value_error())
         }
+        // `search_batch` wraps a request's error with its position (Issue
+        // #1553); throw the request's own error, as before.
+        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
         other => PhpException::new(other.to_string(), 0, ce::exception()),
     }
 }

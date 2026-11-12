@@ -90,4 +90,25 @@ describe("searchBatch", () => {
       expect(results.length).toBeLessThanOrEqual(1);
     }
   });
+
+  // Issue #1553: the engine wraps the error of a batch with the query's
+  // position, which the binding unwraps, so a query the engine rejects
+  // rejects the batch as it rejects `search()`.
+  it("rejects a query the engine rejects as search does", async () => {
+    const index = await createTextIndex();
+    const single = await index.search("nosuch:rust").then(
+      () => null,
+      (e) => e,
+    );
+    const batch = await index.searchBatch(["title:rust", "nosuch:rust"]).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(single).not.toBeNull();
+    expect(batch).not.toBeNull();
+    expect(batch.code).toBe("InvalidArg");
+    expect(batch.message).toContain("unknown field");
+    expect(batch.message).toBe(single.message);
+  });
 });

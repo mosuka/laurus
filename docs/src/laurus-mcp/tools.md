@@ -642,6 +642,15 @@ The `batch` array preserves input order: `batch[i]` is the result set for
 }
 ```
 
+A query the server rejects fails the whole batch, and the tool error names
+it by its position in `queries`, as the server's
+[`SearchBatch`](../laurus-server/grpc_api.md#searchbatch) does
+(Issue #1553). For `["body:rust", "nosuch:rust"]`:
+
+```text
+Batch search failed: code: 'Client specified an invalid argument', message: "queries[1]: Invalid argument: query references unknown field(s) [\"nosuch\"]; declare them in the schema or check for typos"
+```
+
 ---
 
 ## Typical Workflow

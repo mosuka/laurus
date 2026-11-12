@@ -21,6 +21,9 @@ pub fn laurus_err(err: LaurusError) -> napi::Error {
         LaurusError::InvalidArgument(m) => {
             napi::Error::new(Status::InvalidArg, format!("Invalid argument: {m}"))
         }
+        // `search_batch` wraps a request's error with its position (Issue
+        // #1553); throw the request's own error, as before.
+        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
         other => napi::Error::new(Status::GenericFailure, other.to_string()),
     }
 }

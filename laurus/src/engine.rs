@@ -4788,7 +4788,10 @@ impl Engine {
     ///
     /// Short-circuits with the first error encountered; the other
     /// in-flight requests are dropped per
-    /// [`futures::future::try_join_all`] semantics.
+    /// [`futures::future::try_join_all`] semantics. The error is
+    /// [`LaurusError::BatchSearch`], which carries the failing request's
+    /// position and, as its `source`, the error that request's
+    /// [`Self::search`] returned (Issue #1553).
     ///
     /// Issue [#715](https://github.com/mosuka/laurus/issues/715)
     /// (Phase 3 prerequisite of
@@ -4800,7 +4803,17 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        futures::future::try_join_all(requests.into_iter().map(|r| self.search(r))).await
+        futures::future::try_join_all(requests.into_iter().enumerate().map(
+            |(failed_index, request)| async move {
+                self.search(request)
+                    .await
+                    .map_err(|source| LaurusError::BatchSearch {
+                        failed_index,
+                        source: Box::new(source),
+                    })
+            },
+        ))
+        .await
     }
 }
 

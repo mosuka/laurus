@@ -29,6 +29,9 @@ pub fn laurus_err(err: LaurusError) -> PyErr {
         LaurusError::Query(m) => PyValueError::new_err(format!("Query error: {m}")),
         LaurusError::Field(m) => PyValueError::new_err(format!("Field error: {m}")),
         LaurusError::InvalidArgument(m) => PyValueError::new_err(format!("Invalid argument: {m}")),
+        // `search_batch` wraps a request's error with its position (Issue
+        // #1553); raise the request's own error, as before.
+        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }

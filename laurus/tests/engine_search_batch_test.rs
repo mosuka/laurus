@@ -10,10 +10,12 @@
 //! - Multi-request batch preserves input order and returns one result
 //!   list per query.
 //! - Existing `Engine::search` behaviour is unchanged.
+//! - A failing request fails the batch with its position (Issue #1553).
 
 use tempfile::TempDir;
 
 use laurus::Engine;
+use laurus::LaurusError;
 use laurus::SearchRequestBuilder;
 use laurus::lexical::Query;
 use laurus::lexical::TermQuery;
@@ -144,6 +146,40 @@ async fn test_search_batch_existing_search_unchanged() -> laurus::Result<()> {
     assert!(
         results.iter().any(|r| r.id == "doc1"),
         "Engine::search must still find doc1 for term 'rust' — batch refactor must not regress"
+    );
+    Ok(())
+}
+
+/// Issue #1553: a request whose search fails fails the batch with
+/// `LaurusError::BatchSearch`, which carries the request's position and its
+/// own error as the source, so that a front end can say which query failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_search_batch_error_names_the_failing_request() -> laurus::Result<()> {
+    let engine = build_engine_with_corpus().await?;
+    let unknown_field = SearchRequestBuilder::new().query_dsl("nosuch:rust").build();
+
+    let err = engine
+        .search_batch(vec![term_request("rust"), unknown_field])
+        .await
+        .expect_err("a request naming an unknown field must fail the batch");
+    match &err {
+        LaurusError::BatchSearch {
+            failed_index,
+            source,
+        } => {
+            assert_eq!(*failed_index, 1, "{err}");
+            assert!(
+                matches!(**source, LaurusError::InvalidArgument(_)),
+                "the source must be the request's own error: {err}"
+            );
+            assert!(source.to_string().contains("unknown field"), "{err}");
+        }
+        other => panic!("expected BatchSearch, got: {other:?}"),
+    }
+    assert!(
+        err.to_string()
+            .starts_with("search request 1 failed: Invalid argument: "),
+        "{err}"
     );
     Ok(())
 }

@@ -93,3 +93,15 @@ def test_search_batch_limit_per_query(index):
     assert len(batch) == 2
     for results in batch:
         assert len(results) <= 1
+
+
+def test_search_batch_engine_error_raises_as_search_does(index):
+    """A query the engine rejects raises the ``ValueError`` that ``search()``
+    raises for it (Issue #1553: the engine wraps the error of a batch with
+    the query's position, which the binding unwraps)."""
+    with pytest.raises(ValueError) as single:
+        index.search("nosuch:rust")
+    with pytest.raises(ValueError) as batch:
+        index.search_batch(["title:rust", "nosuch:rust"])
+    assert "unknown field" in str(batch.value)
+    assert str(batch.value) == str(single.value)

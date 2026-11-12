@@ -502,9 +502,14 @@ An empty `queries` returns an empty `results`. Every query is read before
 any runs, and one the server rejects while reading it, such as a query
 whose `offset + limit` exceeds `max_result_window`, fails the call with a
 message that starts with its position (`queries[1]: ...`). An error from the
-engine, such as an unknown field in the query or a `group_by` out of range,
-also fails the whole call, but its message does not say which query it came
-from (Issue #1553). Either way, no results are returned.
+engine while the queries run, such as an unknown field in the query or a
+`group_by` out of range, fails the whole call the same way, with the
+engine's message after the position and the status code of that error
+(Issue #1553):
+`queries[1]: Invalid argument: query references unknown field(s) ["nosuch"]; ...`.
+When several queries fail, the message names the
+first to fail, which is not necessarily the lowest position. Either way, no
+results are returned.
 
 With the four chunks of the [grouping example](#example-grouping), a batch
 of two searches returns each one's hits. The server has no reflection, so

@@ -148,10 +148,12 @@ impl SearchServiceTrait for SearchService {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("No index is open"))?;
 
+        // Issue #1553: an engine error names its query as `queries[i]`, as a
+        // conversion error above does.
         let batch_results = engine
             .search_batch(search_requests)
             .await
-            .map_err(error::to_status)?;
+            .map_err(error::batch_search_to_status)?;
 
         let results: Vec<SearchResponse> = batch_results
             .into_iter()
@@ -276,6 +278,33 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
             status.message().contains("unknown field"),
+            "unexpected message: {}",
+            status.message()
+        );
+    }
+
+    /// Issue #1553: an error the engine returns for one query of a batch
+    /// names it, as a conversion error does, and keeps its own code.
+    #[tokio::test]
+    async fn search_batch_names_the_query_of_an_engine_error() {
+        let service = service_with_title_field().await;
+        let unknown_field = SearchRequest {
+            query: "nope:rust".to_string(),
+            limit: 10,
+            ..Default::default()
+        };
+
+        let status = service
+            .search_batch(Request::new(SearchBatchRequest {
+                queries: vec![page(0, 10), unknown_field],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert!(
+            status
+                .message()
+                .starts_with("queries[1]: Invalid argument: query references unknown field"),
             "unexpected message: {}",
             status.message()
         );
