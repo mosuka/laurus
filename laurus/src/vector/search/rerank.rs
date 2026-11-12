@@ -150,8 +150,7 @@ impl RerankStage for F32SidecarStage {
         let prepared = self.metric.prepare_query(&query.data);
         let take_n = take_n.min(candidates.len());
         let mut rescored = RerankCandidates::with_capacity(take_n);
-        for i in 0..take_n {
-            let doc_id = candidates.doc_ids[i];
+        for &doc_id in candidates.doc_ids.iter().take(take_n) {
             // A doc without a sidecar record for this field cannot be
             // scored on the exact basis — drop it (pre-refactor
             // behavior: the inline arm `continue`d on a missing
@@ -213,8 +212,7 @@ impl RerankStage for SqRerankStage {
         let prepared = QuantizedQuery::prepare(&query.data, &self.pool.params);
         let take_n = take_n.min(candidates.len());
         let mut rescored = RerankCandidates::with_capacity(take_n);
-        for i in 0..take_n {
-            let doc_id = candidates.doc_ids[i];
+        for &doc_id in candidates.doc_ids.iter().take(take_n) {
             // A doc without an int8 record for this field cannot be
             // scored on this stage's basis — drop it, mirroring
             // `F32SidecarStage`'s missing-position behavior.
