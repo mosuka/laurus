@@ -409,7 +409,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | 3D 軸並行バウンディングボックス |
 | `position:geo3d_nearest(x, y, z, k)` | `(x, y, z)` に最も近い k 個の近傍点 |
 
-`position` はフィールド名で、スキーマで宣言した実際の `Geo3d` 型フィールドに置き換えてください。完全な DSL 構文は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-geographic-queries-geo3d_) を参照してください。
+`position` はフィールド名で、スキーマで宣言した実際の `Geo3d` 型フィールドに置き換えてください。完全な DSL 構文は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-地理クエリgeo3d_) を参照してください。
 
 #### Vector 検索
 

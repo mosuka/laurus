@@ -43,7 +43,7 @@ let request = SearchRequestBuilder::new()
 
 ブーストは有限で `0` 以上でなければなりません（Lucene と同じく `-0.0` は拒否されます）。`Engine::search` は、それ以外のブーストを `InvalidArgument` で拒否します（Issue #1540）。DSL の `^` や `with_boost` で付けるクエリ自体のブーストも同じで、検索はデータによらず、フィルタが何も一致しない場合もそれを検査します（Issue #1550。[ブースト](../concepts/query_dsl.md#ブースト)を参照）。以前は、負のブーストでスコアが負になり、そのヒットが消えていました。ブースト `0` では、一致した文書が lexical スコア `0` で残ります。ただし `CombinedFields` のマルチフィールドクエリは、今どおりブースト `0` を拒否します。ハイブリッド検索では、そのヒットも[フュージョン](#ハイブリッド検索フュージョン)に加わります。RRF は順位を付け、`WeightedSum` はスコアがすべて等しいリストを `1.0` に正規化します。
 
-gRPC / HTTP 経由では同じ設定が `SearchRequest.field_boosts`（`map<string, float>`）として公開されます。[gRPC API → SearchRequest](../laurus-server/grpc_api.md#searchrequest-fields) を参照してください。
+gRPC / HTTP 経由では同じ設定が `SearchRequest.field_boosts`（`map<string, float>`）として公開されます。[gRPC API → SearchRequest](../laurus-server/grpc_api.md#searchrequest-フィールド) を参照してください。
 
 ### マルチフィールドクエリ
 

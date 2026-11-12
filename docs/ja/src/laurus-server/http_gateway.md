@@ -550,7 +550,7 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
-`geo3d_bbox` および `geo3d_nearest` の構文は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-geographic-queries-geo3d_) を参照してください。
+`geo3d_bbox` および `geo3d_nearest` の構文は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-地理クエリgeo3d_) を参照してください。
 
 ## リクエスト/レスポンス形式
 
