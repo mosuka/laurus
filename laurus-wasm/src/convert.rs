@@ -202,23 +202,6 @@ pub fn json_to_data_value(value: &Value) -> Result<DataValue, JsValue> {
     }
 }
 
-/// Convert a [`Document`] to a `serde_json::Value`.
-///
-/// # Arguments
-///
-/// * `doc` - The document to convert.
-///
-/// # Returns
-///
-/// A JSON object with fields from the document.
-pub fn document_to_json(doc: &Document) -> Value {
-    let mut map = serde_json::Map::new();
-    for (field, value) in &doc.fields {
-        map.insert(field.clone(), data_value_to_json(value));
-    }
-    Value::Object(map)
-}
-
 /// Convert a [`DataValue`] to a `serde_json::Value`.
 ///
 /// # Arguments

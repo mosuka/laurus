@@ -132,17 +132,3 @@ export async function opfs_delete_file(dir, name) {
     // Ignore if file doesn't exist
   }
 }
-
-/**
- * Delete an entire index directory and all its contents.
- * @param {string} name - Index directory name.
- * @returns {Promise<void>}
- */
-export async function opfs_delete_index(name) {
-  const root = await navigator.storage.getDirectory();
-  try {
-    await root.removeEntry(name, { recursive: true });
-  } catch {
-    // Ignore if directory doesn't exist
-  }
-}
