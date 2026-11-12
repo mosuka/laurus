@@ -11,7 +11,7 @@ use laurus::lexical::{
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
-use laurus::{DataValue, LexicalSearchQuery, QueryPayload, VectorSearchQuery};
+use laurus::{DataValue, QueryPayload, VectorSearchQuery};
 use wasm_bindgen::JsValue;
 
 // ---------------------------------------------------------------------------
@@ -69,11 +69,6 @@ pub fn extract_lexical_query(query: &JsQuery) -> Result<Box<dyn laurus::lexical:
         JsQuery::BooleanQuery(q) => q.build_query(),
         JsQuery::SpanQuery(q) => Ok(Box::new(SpanQueryWrapper::new(q.kind.build(&q.field)))),
     }
-}
-
-/// Convert a [`JsQuery`] into a [`LexicalSearchQuery`].
-pub fn query_to_lexical_search_query(query: &JsQuery) -> Result<LexicalSearchQuery, JsValue> {
-    Ok(LexicalSearchQuery::Obj(extract_lexical_query(query)?))
 }
 
 /// Convert a [`JsVectorQuery`] into a [`VectorSearchQuery`].

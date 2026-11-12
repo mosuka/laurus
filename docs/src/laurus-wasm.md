@@ -12,7 +12,8 @@ Vercel Edge Functions, Deno Deploy) without a server.
 - **Vector Search** -- Approximate nearest neighbor (ANN) search
   using Flat, HNSW, or IVF indexes
 - **Hybrid Search** -- Combine lexical and vector results with
-  fusion algorithms (RRF, WeightedSum)
+  fusion algorithms (RRF, WeightedSum), chosen with the
+  [`fusion` argument](laurus-wasm/api_reference.md#hybrid-fusion) of `search`
 - **Late-Interaction Rescore** -- Reorder the top results by
   ColBERT-style MaxSim over per-token vectors in a multi-vector field
 - **Rich Query DSL** -- Term, Phrase, Fuzzy, Wildcard,

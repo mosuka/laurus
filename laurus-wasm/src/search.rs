@@ -1,10 +1,8 @@
-//! WASM wrappers for search request/result and fusion algorithm types.
+//! Reading the options of the WASM search methods (highlight, rescore,
+//! grouping and fusion) and building their search requests.
 
 use crate::convert::optional_unsigned_param;
-use crate::query::{
-    JsQuery, JsVectorQuery, extract_lexical_query, query_to_lexical_search_query,
-    vector_query_to_search_query,
-};
+use crate::query::{JsQuery, JsVectorQuery, extract_lexical_query, vector_query_to_search_query};
 use laurus::vector::Vector;
 use laurus::{
     FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions, LexicalSearchQuery,
@@ -202,94 +200,80 @@ pub fn parse_group_by_options(
 }
 
 // ---------------------------------------------------------------------------
-// SearchRequest internal types
+// Fusion (Issue #1554)
 // ---------------------------------------------------------------------------
 
-pub enum FusionChoice {
-    RRF(f64),
-    WeightedSum(f32, f32),
+/// JS-facing shape of [`FusionAlgorithm`], deserialized via
+/// `serde_wasm_bindgen` from a plain JS object with exactly one key, e.g.
+/// `{ rrf: { k: 60 } }` or
+/// `{ weightedSum: { lexicalWeight: 0.3, vectorWeight: 0.7 } }`: the HTTP
+/// gateway's `fusion` with camelCase keys. `null` is the same as an omitted
+/// key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmFusionOptions {
+    rrf: Option<WasmRrfOptions>,
+    weighted_sum: Option<WasmWeightedSumOptions>,
 }
 
-/// Internal search request state.
-pub struct WasmSearchRequestInner {
-    pub query_dsl: Option<String>,
-    pub lexical_query: Option<JsQuery>,
-    pub vector_query: Option<JsVectorQuery>,
-    pub filter_query: Option<JsQuery>,
-    pub fusion: Option<FusionChoice>,
-    pub limit: usize,
-    pub offset: usize,
+/// The `rrf` of [`WasmFusionOptions`]. An omitted `k` is
+/// [`FusionAlgorithm::DEFAULT_RRF_K`].
+#[derive(Deserialize)]
+struct WasmRrfOptions {
+    k: Option<f64>,
 }
 
-impl WasmSearchRequestInner {
-    pub fn new(limit: usize, offset: usize) -> Self {
-        Self {
-            query_dsl: None,
-            lexical_query: None,
-            vector_query: None,
-            filter_query: None,
-            fusion: None,
-            limit,
-            offset,
-        }
-    }
+/// The `weightedSum` of [`WasmFusionOptions`]. An omitted weight is
+/// [`DEFAULT_WEIGHTED_SUM_WEIGHT`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmWeightedSumOptions {
+    lexical_weight: Option<f64>,
+    vector_weight: Option<f64>,
+}
 
-    /// Build the Laurus [`laurus::SearchRequest`] from this wrapper.
-    pub fn build(&self) -> Result<laurus::SearchRequest, JsValue> {
-        let mut builder = SearchRequestBuilder::new()
-            .limit(self.limit)
-            .offset(self.offset);
+/// The weight of a `weightedSum` that leaves it out, as in Node.js and the
+/// server.
+const DEFAULT_WEIGHTED_SUM_WEIGHT: f64 = 0.5;
 
-        // Fusion algorithm
-        if let Some(fusion) = &self.fusion {
-            match fusion {
-                FusionChoice::RRF(k) => {
-                    builder = builder.fusion_algorithm(FusionAlgorithm::RRF { k: *k });
-                }
-                FusionChoice::WeightedSum(lw, vw) => {
-                    builder = builder.fusion_algorithm(FusionAlgorithm::WeightedSum {
-                        lexical_weight: *lw,
-                        vector_weight: *vw,
-                    });
-                }
-            }
-        }
+/// Parse an optional fusion JS object into the [`FusionAlgorithm`] that
+/// merges the lexical and vector results of a hybrid search. Only the shape
+/// is checked here; the engine checks the values when searching (Issue
+/// #1540), whether or not the query is hybrid. `None` (no object passed)
+/// means the engine's default, RRF with `k` 60, and returns `Ok(None)`.
+///
+/// # Arguments
+///
+/// * `options` - The fusion options object.
+///
+/// # Errors
+///
+/// Returns an error string if the object does not have the shape above, or
+/// unless exactly one of `rrf` and `weightedSum` is set.
+pub fn parse_fusion_options(
+    options: Option<js_sys::Object>,
+) -> Result<Option<FusionAlgorithm>, JsValue> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let parsed: WasmFusionOptions = serde_wasm_bindgen::from_value(options.into())
+        .map_err(|e| JsValue::from_str(&format!("Invalid fusion options: {e}")))?;
 
-        // Filter query
-        if let Some(fq) = &self.filter_query {
-            builder = builder.filter_query(extract_lexical_query(fq)?);
-        }
-
-        // Explicit hybrid: lexical_query + vector_query both set
-        if let (Some(lq), Some(vq)) = (&self.lexical_query, &self.vector_query) {
-            builder = builder
-                .lexical_query(query_to_lexical_search_query(lq)?)
-                .vector_query(vector_query_to_search_query(vq));
-            if self.fusion.is_none() {
-                builder = builder.fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 });
-            }
-            return Ok(builder.build());
-        }
-
-        // Only lexical_query set
-        if let Some(lq) = &self.lexical_query {
-            builder = builder.lexical_query(query_to_lexical_search_query(lq)?);
-            return Ok(builder.build());
-        }
-
-        // Only vector_query set
-        if let Some(vq) = &self.vector_query {
-            builder = builder.vector_query(vector_query_to_search_query(vq));
-            return Ok(builder.build());
-        }
-
-        // DSL string
-        if let Some(dsl) = &self.query_dsl {
-            builder = builder.query_dsl(dsl.clone());
-            return Ok(builder.build());
-        }
-
-        Ok(builder.build())
+    match (parsed.rrf, parsed.weighted_sum) {
+        (Some(rrf), None) => Ok(Some(FusionAlgorithm::RRF {
+            k: rrf.k.unwrap_or(FusionAlgorithm::DEFAULT_RRF_K),
+        })),
+        (None, Some(weighted_sum)) => Ok(Some(FusionAlgorithm::WeightedSum {
+            lexical_weight: weighted_sum
+                .lexical_weight
+                .unwrap_or(DEFAULT_WEIGHTED_SUM_WEIGHT) as f32,
+            vector_weight: weighted_sum
+                .vector_weight
+                .unwrap_or(DEFAULT_WEIGHTED_SUM_WEIGHT) as f32,
+        })),
+        _ => Err(JsValue::from_str(
+            "Invalid fusion options: set exactly one of rrf or weightedSum",
+        )),
     }
 }
 

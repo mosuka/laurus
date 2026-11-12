@@ -10,7 +10,7 @@ WebAssembly バインディング —
   Wildcard、Geo、Boolean、Span クエリ
 - **Vector 検索** — HNSW、Flat、IVF インデックスと複数の距離メトリクス
 - **Hybrid 検索** — Lexical 検索と Vector 検索を
-  RRF または Weighted Sum フュージョンで組み合わせ
+  RRF または Weighted Sum フュージョンで組み合わせ（`search` の `fusion` 引数で選ぶ）
 - **Late interaction による再採点** — MultiVector フィールドのトークンごとの
   ベクトルを使い、ColBERT 型の MaxSim で上位の結果を並べ替え
 - **CJK 対応** — [Lindera](https://github.com/lindera/lindera) による日本語・中国語・韓国語のトークナイズ

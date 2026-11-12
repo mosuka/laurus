@@ -128,7 +128,7 @@ OPFS で永続化されたインデックスを開くか、新規作成します
 
 - **戻り値:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?)`
+#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?, fusion?)`
 
 DSL 文字列クエリで検索します。
 
@@ -136,9 +136,10 @@ DSL 文字列クエリで検索します。
   - `query` (string) -- クエリ DSL（例: `"title:hello"`）
   - `limit` (number, デフォルト 10)
   - `offset` (number, デフォルト 0)
-  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照。`rescore` か `groupBy` だけを使う場合は `undefined` を渡す
+  - `highlight` (`HighlightOptions`, 省略可) -- フィールドごとのハイライト済みフラグメントを要求する（Issue #1134）。詳細は下記の[ハイライト](#ハイライト)を参照。`rescore`、`groupBy`、`fusion` だけを使う場合は `undefined` を渡す
   - `rescore` (`RescoreOptions`, 省略可) -- 上位の結果を、MultiVector フィールドに対する late interaction で並べ替える（Issue #1351）。詳細は下記の [Late interaction による再採点](#late-interaction-による再採点)を参照
   - `groupBy` (`GroupByOptions`, 省略可) -- 結果をフィールドの値でグループ化する（Issue #1297）。詳細は下記の[検索結果のグループ化](#検索結果のグループ化)を参照
+  - `fusion` (`FusionOptions`, 省略可) -- ハイブリッドのクエリが lexical と vector の結果を融合する方法を、RRF と WeightedSum から選ぶ（Issue #1554）。詳細は下記の[ハイブリッド検索の融合](#ハイブリッド検索の融合)を参照
 - **戻り値:** `Promise<SearchResult[]>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
@@ -285,6 +286,39 @@ const results = await index.search("body:lifetimes", 10, 0, undefined, undefined
 });
 results.map((r) => [r.groupKey, r.innerHits.map((hit) => hit.document.body)]);
 // => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
+```
+
+#### ハイブリッド検索の融合
+
+`search` は、末尾に省略可能な `fusion` 引数を受け付けます（Issue #1554）。`title:rust embedding:"systems programming"` のように lexical と vector の両方の節を持つクエリで、2 つの結果のリストをどう融合するかを選びます。指定しない場合は、RRF（`k = 60`）で融合します。ほかの検索メソッドはハイブリッドにならないため、`fusion` 引数はありません。引数は、次の 2 つのキーのちょうど 1 つを持つ単純なオブジェクトです。
+
+```typescript
+type FusionOptions =
+  | { rrf: { k?: number } }
+  | { weightedSum: { lexicalWeight?: number; vectorWeight?: number } };
+```
+
+| キー | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `rrf.k` | number | `60` | Reciprocal Rank Fusion の平滑化の定数。有限で `0` 以上 |
+| `weightedSum.lexicalWeight` | number | `0.5` | min-max 正規化した lexical のスコアの重み。`0`〜`1` |
+| `weightedSum.vectorWeight` | number | `0.5` | min-max 正規化した vector のスコアの重み。`0`〜`1`。2 つの重みの少なくとも一方は `0` より大きくする |
+
+`null` はキーを省略したのと同じなので、`{ rrf: {} }` は既定の融合と同じです。各アルゴリズムのスコアの計算は、[ハイブリッド検索 → フュージョンアルゴリズム](../concepts/search/hybrid_search.md#フュージョンアルゴリズムfusion-algorithms) を参照してください。
+
+`rrf` と `weightedSum` のちょうど 1 つを指定しない場合は、`Invalid fusion options: set exactly one of rrf or weightedSum` で例外になります。型の合わない値（文字列の `k` など）も `Invalid fusion options: ...` で例外になり、未知のキーは無視されます。値はエンジンが検索の実行時に検査し、ハイブリッドでないクエリでも、範囲外の値は `fusion: ...` を含むエラーになります。たとえば `fusion: rrf: k must be finite and at least 0, got -1` です。
+
+```js
+// キーワードの一致よりもベクトルの類似度を重くする。
+const results = await index.search(
+  'title:rust embedding:"systems programming"',
+  10,
+  0,
+  undefined,
+  undefined,
+  undefined,
+  { weightedSum: { lexicalWeight: 0.3, vectorWeight: 0.7 } },
+);
 ```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
