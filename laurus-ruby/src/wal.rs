@@ -102,12 +102,28 @@ impl RbWalSyncPolicy {
     /// an `ArgumentError` if an unexpected keyword is supplied.
     fn group(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let kwargs = get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<u64>), ()>(
+        // `Option<Option<_>>`: an explicit `nil` is the same as leaving the
+        // keyword out (Issue #1616).
+        let kwargs = get_kwargs::<
+            _,
+            (),
+            (
+                Option<Option<usize>>,
+                Option<Option<usize>>,
+                Option<Option<u64>>,
+            ),
+            (),
+        >(
             args.keywords,
             &[],
             &["max_records", "max_bytes", "max_interval_ms"],
         )?;
         let (max_records, max_bytes, max_interval_ms) = kwargs.optional;
+        let (max_records, max_bytes, max_interval_ms) = (
+            max_records.flatten(),
+            max_bytes.flatten(),
+            max_interval_ms.flatten(),
+        );
         Ok(Self {
             inner: WalSyncPolicy::Group {
                 max_records: max_records.unwrap_or(DEFAULT_GROUP_MAX_RECORDS),

@@ -569,19 +569,21 @@ impl RbSearchRequest {
             .filter(|value| !value.is_nil())
             .map(rb_to_group_by)
             .transpose()?;
+        // `Option<Option<Value>>` for the keywords whose default is `nil`:
+        // an explicit `nil` is the same as leaving them out (Issue #1616).
         let kwargs = get_kwargs::<
             _,
             (),
             (
-                Option<Value>,
-                Option<Value>,
-                Option<Value>,
-                Option<Value>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
                 Option<Value>,
                 Option<usize>,
                 Option<usize>,
-                Option<Value>,
-                Option<Value>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
             ),
             (),
         >(
@@ -610,6 +612,13 @@ impl RbSearchRequest {
             highlight_val,
             rescore_val,
         ) = kwargs.optional;
+        let (query_val, lexical_query_val, vector_query_val, filter_query_val) = (
+            query_val.flatten(),
+            lexical_query_val.flatten(),
+            vector_query_val.flatten(),
+            filter_query_val.flatten(),
+        );
+        let (highlight_val, rescore_val) = (highlight_val.flatten(), rescore_val.flatten());
 
         let highlight = highlight_val
             .map(|v| rb_to_highlight_options(&ruby, v))
