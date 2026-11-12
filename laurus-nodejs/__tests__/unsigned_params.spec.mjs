@@ -50,7 +50,11 @@ function applyTokens(field, value) {
 
 // [context, parameter, call with the value]
 const CASES = [
-  ["Schema.addTextField", "positionIncrementGap", (v) => new Schema().addTextField("t", u, u, u, u, u, true, v)],
+  [
+    "Schema.addTextField",
+    "positionIncrementGap",
+    (v) => new Schema().addTextField("t", undefined, undefined, undefined, undefined, undefined, true, v),
+  ],
   ["Schema.addHnswField", "dimension", (v) => new Schema().addHnswField("v", v)],
   ["Schema.addHnswField", "m", (v) => new Schema().addHnswField("v", 8, u, v)],
   ["Schema.addHnswField", "efConstruction", (v) => new Schema().addHnswField("v", 8, u, u, v)],
