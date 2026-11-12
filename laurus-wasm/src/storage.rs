@@ -58,10 +58,6 @@ extern "C" {
     /// Delete a file from the OPFS directory.
     #[wasm_bindgen(catch)]
     async fn opfs_delete_file(dir: &JsValue, name: &str) -> Result<JsValue, JsValue>;
-
-    /// Delete an entire index directory.
-    #[wasm_bindgen(catch)]
-    async fn opfs_delete_index(name: &str) -> Result<JsValue, JsValue>;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +71,7 @@ extern "C" {
 pub struct OpfsPersistence {
     /// The OPFS directory handle (opaque JS object).
     dir: JsValue,
-    /// The index name (used for error messages and deletion).
+    /// The index name, used in error messages.
     name: String,
 }
 
@@ -177,12 +173,6 @@ impl OpfsPersistence {
             opfs_write_file(&self.dir, file_name, &data).await?;
         }
 
-        Ok(())
-    }
-
-    /// Delete the entire index from OPFS.
-    pub async fn delete(&self) -> Result<(), JsValue> {
-        opfs_delete_index(&self.name).await?;
         Ok(())
     }
 

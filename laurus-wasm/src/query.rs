@@ -1,13 +1,12 @@
-//! WASM wrappers for all Laurus query types.
+//! The queries the WASM search methods build from their arguments.
 //!
-//! Each query struct stores the data needed to construct the Rust query.
+//! JavaScript has no query classes: `Index.search` takes the query DSL, and
+//! the other search methods (`searchTerm`, `searchDateTimeRange`, the Geo3d
+//! searches, `searchVector` and `searchVectorText`) build one of these.
 
 use laurus::GeoEcefPoint;
-use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
-    BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, NumericType,
-    PhraseQuery, TermQuery, WildcardQuery,
+    DateTimeRangeQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery, TermQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -18,24 +17,16 @@ use wasm_bindgen::JsValue;
 // Internal enum types (not exported to JS)
 // ---------------------------------------------------------------------------
 
-/// Enum wrapping all supported lexical query types.
+/// The lexical query a search method builds.
 pub enum JsQuery {
     TermQuery(JsTermQuery),
-    PhraseQuery(JsPhraseQuery),
-    FuzzyQuery(JsFuzzyQuery),
-    WildcardQuery(JsWildcardQuery),
-    NumericRangeQuery(JsNumericRangeQuery),
     DateTimeRangeQuery(JsDateTimeRangeQuery),
-    GeoDistanceQuery(JsGeoDistanceQuery),
-    GeoBoundingBoxQuery(JsGeoBoundingBoxQuery),
     Geo3dDistanceQuery(JsGeo3dDistanceQuery),
     Geo3dBoundingBoxQuery(JsGeo3dBoundingBoxQuery),
     Geo3dNearestQuery(JsGeo3dNearestQuery),
-    BooleanQuery(JsBooleanQuery),
-    SpanQuery(JsSpanQuery),
 }
 
-/// Enum wrapping all supported vector query types.
+/// The vector query a search method builds.
 pub enum JsVectorQuery {
     VectorQuery(JsVectorQueryInner),
     VectorTextQuery(JsVectorTextQuery),
@@ -49,25 +40,12 @@ pub enum JsVectorQuery {
 pub fn extract_lexical_query(query: &JsQuery) -> Result<Box<dyn laurus::lexical::Query>, JsValue> {
     match query {
         JsQuery::TermQuery(q) => Ok(Box::new(TermQuery::new(&q.field, &q.term))),
-        JsQuery::PhraseQuery(q) => Ok(Box::new(PhraseQuery::new(&q.field, q.terms.clone()))),
-        JsQuery::FuzzyQuery(q) => Ok(Box::new(
-            FuzzyQuery::new(&q.field, &q.term).max_edits(q.max_edits),
-        )),
-        JsQuery::WildcardQuery(q) => Ok(Box::new(
-            WildcardQuery::new(&q.field, &q.pattern)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        )),
-        JsQuery::NumericRangeQuery(q) => Ok(q.build()),
         JsQuery::DateTimeRangeQuery(q) => q.build().map_err(|e| JsValue::from_str(&e.to_string())),
-        JsQuery::GeoDistanceQuery(q) => q.build().map_err(|e| JsValue::from_str(&e.to_string())),
-        JsQuery::GeoBoundingBoxQuery(q) => q.build().map_err(|e| JsValue::from_str(&e.to_string())),
         JsQuery::Geo3dDistanceQuery(q) => Ok(q.build()),
         JsQuery::Geo3dBoundingBoxQuery(q) => {
             q.build().map_err(|e| JsValue::from_str(&e.to_string()))
         }
         JsQuery::Geo3dNearestQuery(q) => Ok(q.build()),
-        JsQuery::BooleanQuery(q) => q.build_query(),
-        JsQuery::SpanQuery(q) => Ok(Box::new(SpanQueryWrapper::new(q.kind.build(&q.field)))),
     }
 }
 
@@ -87,91 +65,13 @@ pub fn vector_query_to_search_query(query: &JsVectorQuery) -> VectorSearchQuery 
 }
 
 // ---------------------------------------------------------------------------
-// Span-query recipe enum (Clone so it can be nested)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub enum SpanKind {
-    Term(String),
-    Near(Vec<SpanKind>, u32, bool),
-    Containing(Box<SpanKind>, Box<SpanKind>),
-    Within(Box<SpanKind>, Box<SpanKind>, u32),
-}
-
-impl SpanKind {
-    pub fn build(&self, field: &str) -> Box<dyn laurus::lexical::span::SpanQuery> {
-        let sb = SpanQueryBuilder::new(field);
-        match self {
-            SpanKind::Term(t) => Box::new(sb.term(t)),
-            SpanKind::Near(clauses, slop, ordered) => {
-                let built: Vec<Box<dyn laurus::lexical::span::SpanQuery>> =
-                    clauses.iter().map(|c| c.build(field)).collect();
-                Box::new(sb.near(built, *slop, *ordered))
-            }
-            SpanKind::Containing(big, little) => {
-                Box::new(sb.containing(big.build(field), little.build(field)))
-            }
-            SpanKind::Within(include, exclude, dist) => {
-                Box::new(sb.within(include.build(field), exclude.build(field), *dist))
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Query data structs (used internally by search.rs and index.rs)
 // ---------------------------------------------------------------------------
 
+/// Term query (internal; built by `Index.searchTerm`).
 pub struct JsTermQuery {
     pub field: String,
     pub term: String,
-}
-
-pub struct JsPhraseQuery {
-    pub field: String,
-    pub terms: Vec<String>,
-}
-
-pub struct JsFuzzyQuery {
-    pub field: String,
-    pub term: String,
-    pub max_edits: u32,
-}
-
-pub struct JsWildcardQuery {
-    pub field: String,
-    pub pattern: String,
-}
-
-pub struct JsNumericRangeQuery {
-    pub field: String,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub is_float: bool,
-}
-
-impl JsNumericRangeQuery {
-    pub fn build(&self) -> Box<dyn laurus::lexical::Query> {
-        if self.is_float {
-            Box::new(NumericRangeQuery::f64_range(
-                &self.field,
-                self.min,
-                self.max,
-            ))
-        } else {
-            // `new` truncates each bound to an `i64` itself, and keeps a
-            // `NaN` bound so that the search rejects it (Issue #1601);
-            // converting here with `as i64` would turn `NaN` into 0.
-            Box::new(NumericRangeQuery::new(
-                &self.field,
-                NumericType::Integer,
-                self.min,
-                self.max,
-                true,
-                true,
-            ))
-        }
-    }
 }
 
 /// DateTime range query (internal; reached through `Index.searchDateTimeRange`,
@@ -196,59 +96,7 @@ impl JsDateTimeRangeQuery {
     }
 }
 
-/// 2D Geo distance (radius) query (internal).
-///
-/// Construction is internal — JS callers reach 2D Geo through the DSL
-/// (`field:geo_distance(...)`) since `JsGeoDistanceQuery` is not exposed
-/// as a JS class.
-pub struct JsGeoDistanceQuery {
-    pub field: String,
-    pub lat: f64,
-    pub lon: f64,
-    pub distance_m: f64,
-}
-
-impl JsGeoDistanceQuery {
-    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
-        Ok(Box::new(GeoDistanceQuery::within_radius(
-            &self.field,
-            self.lat,
-            self.lon,
-            self.distance_m,
-        )?))
-    }
-}
-
-/// 2D Geo bounding-box query (internal).
-///
-/// Construction is internal — JS callers reach 2D Geo through the DSL
-/// (`field:geo_bbox(...)`) since `JsGeoBoundingBoxQuery` is not exposed
-/// as a JS class.
-pub struct JsGeoBoundingBoxQuery {
-    pub field: String,
-    pub min_lat: f64,
-    pub min_lon: f64,
-    pub max_lat: f64,
-    pub max_lon: f64,
-}
-
-impl JsGeoBoundingBoxQuery {
-    pub fn build(&self) -> laurus::Result<Box<dyn laurus::lexical::Query>> {
-        Ok(Box::new(GeoBoundingBoxQuery::within_bounding_box(
-            &self.field,
-            self.min_lat,
-            self.min_lon,
-            self.max_lat,
-            self.max_lon,
-        )?))
-    }
-}
-
-/// 3D ECEF sphere query (internal).
-///
-/// Constructed by `Index::searchGeo3dDistance`. JS callers cannot
-/// instantiate this directly; the method-on-Index pattern matches the
-/// existing 2D `JsGeoDistanceQuery` and `JsTermQuery` flows.
+/// 3D ECEF sphere query (internal; built by `Index.searchGeo3dDistance`).
 pub struct JsGeo3dDistanceQuery {
     pub field: String,
     pub x: f64,
@@ -267,7 +115,8 @@ impl JsGeo3dDistanceQuery {
     }
 }
 
-/// 3D ECEF axis-aligned bounding-box query (internal).
+/// 3D ECEF axis-aligned bounding-box query (internal; built by
+/// `Index.searchGeo3dBoundingBox`).
 pub struct JsGeo3dBoundingBoxQuery {
     pub field: String,
     pub min_x: f64,
@@ -288,7 +137,8 @@ impl JsGeo3dBoundingBoxQuery {
     }
 }
 
-/// 3D ECEF k-nearest-neighbours query (internal).
+/// 3D ECEF k-nearest-neighbours query (internal; built by
+/// `Index.searchGeo3dNearest`).
 pub struct JsGeo3dNearestQuery {
     pub field: String,
     pub x: f64,
@@ -316,38 +166,15 @@ impl JsGeo3dNearestQuery {
     }
 }
 
-pub struct JsBooleanQuery {
-    pub musts: Vec<JsQuery>,
-    pub shoulds: Vec<JsQuery>,
-    pub must_nots: Vec<JsQuery>,
-}
-
-impl JsBooleanQuery {
-    pub fn build_query(&self) -> Result<Box<dyn laurus::lexical::Query>, JsValue> {
-        let mut bq = BooleanQuery::new();
-        for q in &self.musts {
-            bq.add_must(extract_lexical_query(q)?);
-        }
-        for q in &self.shoulds {
-            bq.add_should(extract_lexical_query(q)?);
-        }
-        for q in &self.must_nots {
-            bq.add_must_not(extract_lexical_query(q)?);
-        }
-        Ok(Box::new(bq))
-    }
-}
-
-pub struct JsSpanQuery {
-    pub field: String,
-    pub kind: SpanKind,
-}
-
+/// Vector query with a precomputed vector (internal; built by
+/// `Index.searchVector`).
 pub struct JsVectorQueryInner {
     pub field: String,
     pub vector: Vec<f32>,
 }
 
+/// Vector query with text to embed (internal; built by
+/// `Index.searchVectorText`).
 pub struct JsVectorTextQuery {
     pub field: String,
     pub text: String,
@@ -384,48 +211,5 @@ mod datetime_range_tests {
             extract_lexical_query(&JsQuery::DateTimeRangeQuery(bad)).is_err(),
             "the dispatcher must surface the error"
         );
-    }
-}
-
-#[cfg(test)]
-mod numeric_range_tests {
-    use super::*;
-    use wasm_bindgen_test::wasm_bindgen_test;
-
-    /// Issue #1601: an integer range (the default) used to turn a `NaN`
-    /// bound into 0 with `as i64` before the core could see it. Built with
-    /// `NumericRangeQuery::new`, the bound reaches the check the search
-    /// runs, which rejects it with `InvalidArgument`, as it does for a float
-    /// range. Finite, infinite and open bounds pass.
-    #[wasm_bindgen_test]
-    fn a_nan_bound_reaches_the_search_check() {
-        let mut wrong = Vec::new();
-        for is_float in [false, true] {
-            for (min, max, rejected) in [
-                (Some(f64::NAN), Some(5.0), true),
-                (None, Some(f64::NAN), true),
-                (Some(-1.5), Some(f64::INFINITY), false),
-                (None, None, false),
-            ] {
-                let query = JsNumericRangeQuery {
-                    field: "price".to_string(),
-                    min,
-                    max,
-                    is_float,
-                };
-                let result = query.build().validate_boosts();
-                let ok = if rejected {
-                    matches!(result, Err(laurus::LaurusError::InvalidArgument(_)))
-                } else {
-                    result.is_ok()
-                };
-                if !ok {
-                    wrong.push(format!(
-                        "is_float {is_float} [{min:?}, {max:?}]: {result:?}"
-                    ));
-                }
-            }
-        }
-        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

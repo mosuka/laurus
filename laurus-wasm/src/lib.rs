@@ -9,7 +9,6 @@
 //! ```
 
 #![deny(clippy::all)]
-#![allow(dead_code)]
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::enum_variant_names)]
 
