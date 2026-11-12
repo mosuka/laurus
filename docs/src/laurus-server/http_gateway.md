@@ -44,6 +44,7 @@ If `http_port` is not set, only the gRPC server starts.
 | POST | `/v1/flush_wal` | `DocumentService/FlushWal` | Force buffered WAL records durable without a full commit |
 | POST | `/v1/search` | `SearchService/Search` | Search (unary) |
 | POST | `/v1/search/stream` | `SearchService/SearchStream` | Search (Server-Sent Events) |
+| POST | `/v1/search/batch` | `SearchService/SearchBatch` | Run several searches in one request |
 
 ## API Examples
 
@@ -633,6 +634,45 @@ With `group_by`, each event is one group: its best result, with its
 data: {"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","score":0.012571428902447224}
 
 data: {"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}
+```
+
+### Batch Search
+
+`POST /v1/search/batch` runs several independent searches in one request
+(Issue #714). `queries` is an array whose elements each take the body of
+[`POST /v1/search`](#search); the server runs them in parallel, and the
+response holds one `{"results": [...]}` per query, in the order of
+`queries`:
+
+```bash
+curl -X POST http://localhost:8080/v1/search/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"queries": [{"query": "body:ownership"}, {"query": "body:garbage", "limit": 1}]}'
+```
+
+With the four chunks of the [grouping example](#search-with-grouping), the
+response is:
+
+```json
+{"results":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.7456220984458923}]},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}]}]}
+```
+
+An empty `queries` returns `{"results":[]}`. A body without `queries` is
+rejected with `400 Bad Request` (``missing `queries` field``), and so is a
+`queries` that is not an array (`` `queries` must be an array``). Every
+query is read before any runs, and one that is malformed, or whose
+`offset + limit` exceeds `max_result_window`, is rejected with
+`400 Bad Request` whose message starts with its position:
+
+```json
+{"error":{"code":400,"message":"queries[1]: query must be a string"}}
+```
+
+A value the engine rejects, such as a `group_size` above 100, also fails the
+whole request, but its message does not name the query (Issue #1553):
+
+```json
+{"error":{"code":400,"message":"Invalid argument: group_by: group_size must be between 1 and 100, got 1000"}}
 ```
 
 ## JSON Field Value Inference

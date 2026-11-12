@@ -9,7 +9,7 @@ All services are defined under the `laurus.v1` protobuf package.
 | `HealthService` | `Check` | Health checking |
 | `IndexService` | `CreateIndex`, `GetIndex`, `GetSchema`, `AddField`, `DeleteField`, `UpdateField` | Index lifecycle and schema |
 | `DocumentService` | `PutDocument`, `AddDocument`, `PutDocuments`, `AddDocuments`, `GetDocuments`, `DeleteDocuments`, `Commit`, `FlushWal` | Document CRUD, bulk ingestion, commit, and WAL flush |
-| `SearchService` | `Search`, `SearchStream` | Unary and streaming search |
+| `SearchService` | `Search`, `SearchStream`, `SearchBatch` | Unary, streaming and batch search |
 
 ---
 
@@ -467,6 +467,100 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 With `group_by`, each message is one group: its best hit, with the group's
 next best hits in `inner_hits`.
+
+### `SearchBatch`
+
+Execute several independent searches in one call (Issue #714). The server
+runs them in parallel and returns one `SearchResponse` per query, in the
+order of `queries`.
+
+```protobuf
+rpc SearchBatch(SearchBatchRequest) returns (SearchBatchResponse);
+
+message SearchBatchRequest {
+  repeated SearchRequest queries = 1;
+}
+
+message SearchBatchResponse {
+  repeated SearchResponse results = 1;
+}
+```
+
+**Request fields:**
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `queries` | `repeated SearchRequest` | The searches to run, each with the [fields](#searchrequest-fields) of a `Search` request |
+
+**Response fields:**
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `results` | `repeated SearchResponse` | One response per query, in the order of `queries` |
+
+An empty `queries` returns an empty `results`. Every query is read before
+any runs, and one the server rejects while reading it, such as a query
+whose `offset + limit` exceeds `max_result_window`, fails the call with a
+message that starts with its position (`queries[1]: ...`). An error from the
+engine, such as an unknown field in the query or a `group_by` out of range,
+also fails the whole call, but its message does not say which query it came
+from (Issue #1553). Either way, no results are returned.
+
+With the four chunks of the [grouping example](#example-grouping), a batch
+of two searches returns each one's hits. The server has no reflection, so
+`grpcurl` is given the proto files; it prints the proto3 JSON names, such as
+`textValue` for `text_value`:
+
+```bash
+grpcurl -plaintext -import-path laurus-server/proto -proto laurus/v1/search.proto \
+  -d '{"queries": [{"query": "body:ownership"}, {"query": "body:garbage", "limit": 1}]}' \
+  localhost:50051 laurus.v1.SearchService/SearchBatch
+```
+
+```json
+{
+  "results": [
+    {
+      "results": [
+        {
+          "id": "manual",
+          "score": 0.7456221,
+          "document": {
+            "fields": {
+              "body": {
+                "textValue": "Rust ownership rules for Rust programs"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "results": [
+        {
+          "id": "faq",
+          "score": 0.92279965,
+          "document": {
+            "fields": {
+              "body": {
+                "textValue": "Why Rust has no garbage collector"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+A second query with `"offset": 10000, "limit": 1` fails the batch:
+
+```text
+ERROR:
+  Code: InvalidArgument
+  Message: queries[1]: offset + limit (10001) exceeds the max result window (10000); page with a smaller offset, or raise server.max_result_window (--max-result-window)
+```
 
 ### SearchRequest Fields
 

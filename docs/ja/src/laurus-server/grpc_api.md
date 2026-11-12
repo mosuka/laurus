@@ -9,7 +9,7 @@
 | `HealthService` | `Check` | ヘルスチェック |
 | `IndexService` | `CreateIndex`, `GetIndex`, `GetSchema`, `AddField`, `DeleteField`, `UpdateField` | インデックスのライフサイクルとスキーマ |
 | `DocumentService` | `PutDocument`, `AddDocument`, `PutDocuments`, `AddDocuments`, `GetDocuments`, `DeleteDocuments`, `Commit`, `FlushWal` | ドキュメント CRUD・バルクインジェスト・コミット・WAL flush |
-| `SearchService` | `Search`, `SearchStream` | 単発検索とストリーミング検索 |
+| `SearchService` | `Search`, `SearchStream`, `SearchBatch` | 単発検索、ストリーミング検索、バッチ検索 |
 
 ---
 
@@ -462,6 +462,89 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 `group_by` を指定すると、各メッセージは 1 つのグループになります。グループの
 最上位の結果で、グループの 2 番目以降の結果は `inner_hits` に入ります。
+
+### `SearchBatch`
+
+独立した複数の検索を 1 回の呼び出しで実行します（Issue #714）。サーバーはそれらを並列に実行し、クエリごとの `SearchResponse` を `queries` の順に返します。
+
+```protobuf
+rpc SearchBatch(SearchBatchRequest) returns (SearchBatchResponse);
+
+message SearchBatchRequest {
+  repeated SearchRequest queries = 1;
+}
+
+message SearchBatchResponse {
+  repeated SearchResponse results = 1;
+}
+```
+
+**リクエストフィールド:**
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `queries` | `repeated SearchRequest` | 実行する検索。それぞれ `Search` のリクエストと同じ[フィールド](#searchrequest-フィールド)を持つ |
+
+**レスポンスフィールド:**
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `results` | `repeated SearchResponse` | クエリごとのレスポンス。`queries` の順 |
+
+`queries` が空なら、空の `results` を返します。サーバーはどのクエリを実行するよりも先に全クエリを読み、読む段階で拒むクエリ（`offset + limit` が `max_result_window` を超えるクエリなど）があれば、その位置で始まるメッセージ（`queries[1]: ...`）で呼び出し全体を失敗させます。エンジンのエラー（クエリの未知のフィールド、範囲外の `group_by` など）も呼び出し全体を失敗させますが、そのメッセージはどのクエリのものかを示しません（Issue #1553）。どちらの場合も、結果は返りません。
+
+[グループ化の例](#例-グループ化)の 4 つのチャンクに対して 2 つの検索をまとめて実行すると、それぞれのヒットが返ります。サーバーは reflection を持たないので、`grpcurl` には proto ファイルを渡します。`grpcurl` は proto3 の JSON の名前（`text_value` なら `textValue`）で出力します。
+
+```bash
+grpcurl -plaintext -import-path laurus-server/proto -proto laurus/v1/search.proto \
+  -d '{"queries": [{"query": "body:ownership"}, {"query": "body:garbage", "limit": 1}]}' \
+  localhost:50051 laurus.v1.SearchService/SearchBatch
+```
+
+```json
+{
+  "results": [
+    {
+      "results": [
+        {
+          "id": "manual",
+          "score": 0.7456221,
+          "document": {
+            "fields": {
+              "body": {
+                "textValue": "Rust ownership rules for Rust programs"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "results": [
+        {
+          "id": "faq",
+          "score": 0.92279965,
+          "document": {
+            "fields": {
+              "body": {
+                "textValue": "Why Rust has no garbage collector"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+2 つ目のクエリに `"offset": 10000, "limit": 1` を付けると、バッチは失敗します。
+
+```text
+ERROR:
+  Code: InvalidArgument
+  Message: queries[1]: offset + limit (10001) exceeds the max result window (10000); page with a smaller offset, or raise server.max_result_window (--max-result-window)
+```
 
 ### SearchRequest フィールド
 
