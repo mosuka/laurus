@@ -44,6 +44,7 @@ laurus serve --config config.toml
 | POST | `/v1/flush_wal` | `DocumentService/FlushWal` | full commit なしでバッファされた WAL レコードを durable 化 |
 | POST | `/v1/search` | `SearchService/Search` | 検索（単発） |
 | POST | `/v1/search/stream` | `SearchService/SearchStream` | 検索（Server-Sent Events） |
+| POST | `/v1/search/batch` | `SearchService/SearchBatch` | 複数の検索を 1 回のリクエストで実行 |
 
 ## API の使用例
 
@@ -487,6 +488,34 @@ data: {"id":"doc2","score":0.4210,"fields":{...}}
 data: {"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"manual","id":"manual","score":0.012571428902447224}
 
 data: {"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}
+```
+
+### バッチ検索
+
+`POST /v1/search/batch` は、独立した複数の検索を 1 回のリクエストで実行します（Issue #714）。`queries` は配列で、各要素は [`POST /v1/search`](#検索) の本文と同じものを受け付けます。サーバーはそれらを並列に実行し、レスポンスはクエリごとの `{"results": [...]}` を `queries` の順に持ちます。
+
+```bash
+curl -X POST http://localhost:8080/v1/search/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"queries": [{"query": "body:ownership"}, {"query": "body:garbage", "limit": 1}]}'
+```
+
+[グループ化付き検索](#グループ化付き検索)の 4 つの chunk に対して実行すると、レスポンスは次のとおりです。
+
+```json
+{"results":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.7456220984458923}]},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}]}]}
+```
+
+`queries` が空なら `{"results":[]}` を返します。`queries` のない本文は `400 Bad Request`（``missing `queries` field``）で拒否され、配列でない `queries` も同じく拒否されます（`` `queries` must be an array``）。サーバーはどのクエリを実行するよりも先に全クエリを読み、不正なクエリや、`offset + limit` が `max_result_window` を超えるクエリがあれば、その位置で始まるメッセージの `400 Bad Request` で拒否します。
+
+```json
+{"error":{"code":400,"message":"queries[1]: query must be a string"}}
+```
+
+エンジンが拒否する値（100 を超える `group_size` など）もリクエスト全体を失敗させますが、そのメッセージはどのクエリのものかを示しません（Issue #1553）。
+
+```json
+{"error":{"code":400,"message":"Invalid argument: group_by: group_size must be between 1 and 100, got 1000"}}
 ```
 
 ## JSON フィールド値の型推論
