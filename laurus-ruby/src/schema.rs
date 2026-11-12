@@ -745,6 +745,8 @@ impl RbSchema {
     fn add_hnsw_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
+        // `Option<Option<_>>` for the keywords whose default is `nil`: an
+        // explicit `nil` is the same as leaving them out (Issue #1616).
         let kwargs = get_kwargs::<
             _,
             (),
@@ -752,12 +754,12 @@ impl RbSchema {
                 Option<String>,
                 Option<usize>,
                 Option<usize>,
-                Option<usize>,
+                Option<Option<usize>>,
                 Option<Option<String>>,
-                Option<String>,
-                Option<usize>,
-                Option<String>,
-                Option<String>,
+                Option<Option<String>>,
+                Option<Option<usize>>,
+                Option<Option<String>>,
+                Option<Option<String>>,
             ),
             RHash,
         >(
@@ -792,11 +794,11 @@ impl RbSchema {
             distance: parse_distance(distance_str)?,
             m: m.unwrap_or(DEFAULT_HNSW_M),
             ef_construction: ef_construction.unwrap_or(DEFAULT_HNSW_EF_CONSTRUCTION),
-            default_ef_search,
-            quantizer: parse_quantizer(quantizer.as_deref(), subvector_count)?,
-            rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
+            default_ef_search: default_ef_search.flatten(),
+            quantizer: parse_quantizer(quantizer.flatten().as_deref(), subvector_count.flatten())?,
+            rerank_storage: parse_rerank_storage(rerank_storage.flatten().as_deref())?,
             embedder: embedder.flatten(),
-            pq_codebook_path,
+            pq_codebook_path: pq_codebook_path.flatten(),
             base_weight: base_weight_from_splat(kwargs.splat)?,
         };
         self.insert_field(name, FieldOption::Hnsw(opt))
@@ -826,13 +828,15 @@ impl RbSchema {
     fn add_flat_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
+        // `Option<Option<_>>` for the keywords whose default is `nil`: an
+        // explicit `nil` is the same as leaving them out (Issue #1616).
         let kwargs = get_kwargs::<
             _,
             (),
             (
                 Option<String>,
                 Option<Option<String>>,
-                Option<String>,
+                Option<Option<String>>,
                 Option<f64>,
             ),
             (),
@@ -846,7 +850,7 @@ impl RbSchema {
         let opt = laurus::FlatOption {
             dimension,
             distance: parse_distance(distance_str)?,
-            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
+            quantizer: parse_flat_ivf_quantizer(quantizer.flatten().as_deref())?,
             embedder: embedder.flatten(),
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()
@@ -880,6 +884,8 @@ impl RbSchema {
     fn add_ivf_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;
+        // `Option<Option<_>>` for the keywords whose default is `nil`: an
+        // explicit `nil` is the same as leaving them out (Issue #1616).
         let kwargs = get_kwargs::<
             _,
             (),
@@ -888,7 +894,7 @@ impl RbSchema {
                 Option<usize>,
                 Option<usize>,
                 Option<Option<String>>,
-                Option<String>,
+                Option<Option<String>>,
                 Option<f64>,
             ),
             (),
@@ -911,7 +917,7 @@ impl RbSchema {
             distance: parse_distance(distance_str)?,
             n_clusters: n_clusters.unwrap_or(DEFAULT_IVF_N_CLUSTERS),
             n_probe: n_probe.unwrap_or(DEFAULT_IVF_N_PROBE),
-            quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
+            quantizer: parse_flat_ivf_quantizer(quantizer.flatten().as_deref())?,
             embedder: embedder.flatten(),
             base_weight: base_weight.unwrap_or(1.0) as f32,
             ..Default::default()

@@ -362,12 +362,15 @@ impl RbNumericRangeQuery {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (field,) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<Value>, Option<Value>), ()>(
+        // `Option<Option<Value>>`: an explicit `nil` is an open bound, as
+        // leaving the keyword out is (Issue #1616).
+        let kwargs = get_kwargs::<_, (), (Option<Option<Value>>, Option<Option<Value>>), ()>(
             args.keywords,
             &[],
             &["min", "max"],
         )?;
         let (min_val, max_val) = kwargs.optional;
+        let (min_val, max_val) = (min_val.flatten(), max_val.flatten());
 
         let is_float = min_val
             .as_ref()
@@ -795,7 +798,9 @@ impl RbGeo3dNearestQuery {
     fn k_nearest(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(String, f64, f64, f64, u32), (), (), (), RHash, ()>(args)?;
         let (field, x, y, z, k) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<f64>, Option<f64>), ()>(
+        // `Option<Option<f64>>`: an explicit `nil` keeps the default, as
+        // leaving the keyword out does (Issue #1616).
+        let kwargs = get_kwargs::<_, (), (Option<Option<f64>>, Option<Option<f64>>), ()>(
             args.keywords,
             &[],
             &["initial_radius_m", "max_radius_m"],
@@ -807,8 +812,8 @@ impl RbGeo3dNearestQuery {
             y,
             z,
             k,
-            initial_radius_m,
-            max_radius_m,
+            initial_radius_m: initial_radius_m.flatten(),
+            max_radius_m: max_radius_m.flatten(),
         })
     }
 

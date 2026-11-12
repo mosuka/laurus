@@ -1,5 +1,9 @@
 # API Reference
 
+## Keyword arguments
+
+A keyword argument shown below with a `nil` default (such as `highlight: nil` or `quantizer: nil`) also takes an explicit `nil`, which is the same as leaving it out (Issue #1616). One shown with another default is not: a number or string one (such as `limit: 10` or `distance: "cosine"`) raises `TypeError` for `nil`, and a boolean one (such as `stored: true`) takes `nil` as `false`, as Ruby does.
+
 ## Index
 
 The primary entry point. Wraps the Laurus search engine.

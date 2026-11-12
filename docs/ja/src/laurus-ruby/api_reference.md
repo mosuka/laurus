@@ -1,5 +1,9 @@
 # API リファレンス
 
+## キーワード引数
+
+以下で既定値が `nil` のキーワード引数（`highlight: nil`、`quantizer: nil` など）は、`nil` を明示して渡しても、省略したときと同じになります（Issue #1616）。それ以外の既定値のキーワード引数は、そうはなりません。数や文字列の引数（`limit: 10`、`distance: "cosine"` など）は `nil` で `TypeError` になり、真偽値の引数（`stored: true` など）は、Ruby の扱いどおり `nil` を `false` として受け付けます。
+
 ## Index
 
 Laurus 検索エンジンをラップするメインクラスです。

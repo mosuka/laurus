@@ -380,15 +380,18 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (query,) = args.required;
+        // `Option<Option<Value>>`: an explicit `nil` for `highlight:`,
+        // `rescore:` or `group_by:` is the same as leaving it out (Issue
+        // #1616).
         let kwargs = get_kwargs::<
             _,
             (),
             (
                 Option<usize>,
                 Option<usize>,
-                Option<Value>,
-                Option<Value>,
-                Option<Value>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
             ),
             (),
         >(
@@ -400,10 +403,11 @@ impl RbIndex {
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
         let highlight = highlight
+            .flatten()
             .map(|v| rb_to_highlight_options(&ruby, v))
             .transpose()?;
-        let rescore = rescore.map(rb_to_rescore_options).transpose()?;
-        let group_by = group_by.map(rb_to_group_by).transpose()?;
+        let rescore = rescore.flatten().map(rb_to_rescore_options).transpose()?;
+        let group_by = group_by.flatten().map(rb_to_group_by).transpose()?;
 
         let request = build_request_from_rb(
             query,
@@ -459,19 +463,31 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (queries,) = args.required;
-        let kwargs =
-            get_kwargs::<_, (), (Option<usize>, Option<usize>, Option<Value>, Option<Value>), ()>(
-                args.keywords,
-                &[],
-                &["limit", "offset", "highlight", "group_by"],
-            )?;
+        // `Option<Option<Value>>`: an explicit `nil` for `highlight:` or
+        // `group_by:` is the same as leaving it out (Issue #1616).
+        let kwargs = get_kwargs::<
+            _,
+            (),
+            (
+                Option<usize>,
+                Option<usize>,
+                Option<Option<Value>>,
+                Option<Option<Value>>,
+            ),
+            (),
+        >(
+            args.keywords,
+            &[],
+            &["limit", "offset", "highlight", "group_by"],
+        )?;
         let (limit, offset, highlight, group_by) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
         let highlight = highlight
+            .flatten()
             .map(|v| rb_to_highlight_options(&ruby, v))
             .transpose()?;
-        let group_by = group_by.map(rb_to_group_by).transpose()?;
+        let group_by = group_by.flatten().map(rb_to_group_by).transpose()?;
 
         let queries_array: RArray = TryConvert::try_convert(queries).map_err(|_| {
             Error::new(
