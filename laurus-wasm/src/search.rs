@@ -1,5 +1,6 @@
 //! WASM wrappers for search request/result and fusion algorithm types.
 
+use crate::convert::optional_unsigned_param;
 use crate::query::{
     JsQuery, JsVectorQuery, extract_lexical_query, query_to_lexical_search_query,
     vector_query_to_search_query,
@@ -24,13 +25,15 @@ use wasm_bindgen::JsValue;
 /// to be worth tuning from JS (the last one).
 ///
 /// Deserialized via `serde_wasm_bindgen` from a plain JS object, e.g.
-/// `{ fields: ["body"], maxFragments: 2, tag: "em" }`.
+/// `{ fields: ["body"], maxFragments: 2, tag: "em" }`. The integers are
+/// numbers here, checked by [`optional_unsigned_param`] so that an error
+/// names the field (Issue #1612).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WasmHighlightOptions {
     fields: Vec<String>,
-    fragment_size: Option<u32>,
-    max_fragments: Option<u32>,
+    fragment_size: Option<f64>,
+    max_fragments: Option<f64>,
     tag: Option<String>,
     css_class: Option<String>,
     require_field_match: Option<bool>,
@@ -38,20 +41,37 @@ struct WasmHighlightOptions {
 
 /// Parse an optional highlight-options JS object into [`HighlightOptions`].
 /// `None` (no object passed) means "don't highlight" and returns `Ok(None)`.
+///
+/// # Arguments
+///
+/// * `options` - The highlight options object.
+/// * `context` - The method the options were passed to, such as
+///   `Index.search`, which starts an error message.
+///
+/// # Errors
+///
+/// Returns an error string if the object does not have the shape above, or
+/// if `fragmentSize` or `maxFragments` is not an integer from 0 to
+/// 4294967295.
 pub fn parse_highlight_options(
     options: Option<js_sys::Object>,
+    context: &str,
 ) -> Result<Option<HighlightOptions>, JsValue> {
     let Some(options) = options else {
         return Ok(None);
     };
     let parsed: WasmHighlightOptions = serde_wasm_bindgen::from_value(options.into())
         .map_err(|e| JsValue::from_str(&format!("Invalid highlight options: {e}")))?;
+    let fragment_size =
+        optional_unsigned_param(context, "highlight.fragmentSize", parsed.fragment_size)?;
+    let max_fragments =
+        optional_unsigned_param(context, "highlight.maxFragments", parsed.max_fragments)?;
 
     let mut config = HighlightConfig::new();
-    if let Some(fragment_size) = parsed.fragment_size {
+    if let Some(fragment_size) = fragment_size {
         config = config.fragment_size(fragment_size as usize);
     }
-    if let Some(max_fragments) = parsed.max_fragments {
+    if let Some(max_fragments) = max_fragments {
         config = config.max_fragments(max_fragments as usize);
     }
     if let Some(tag) = parsed.tag {
@@ -83,20 +103,35 @@ struct WasmRescoreOptions {
     field: String,
     vectors: Option<Vec<Vec<f32>>>,
     text: Option<String>,
-    window_size: Option<u32>,
+    window_size: Option<f64>,
 }
 
 /// Parse an optional rescore JS object into [`RescoreOptions`]. Only the
-/// shape is checked here; the engine checks the values when searching.
-/// `None` (no object passed) means "don't rescore" and returns `Ok(None)`.
+/// shape and the integer are checked here; the engine checks the values
+/// when searching. `None` (no object passed) means "don't rescore" and
+/// returns `Ok(None)`.
+///
+/// # Arguments
+///
+/// * `options` - The rescore options object.
+/// * `context` - The method the options were passed to, such as
+///   `Index.search`, which starts an error message.
+///
+/// # Errors
+///
+/// Returns an error string if the object does not have the shape above,
+/// if `windowSize` is not an integer from 0 to 4294967295, or unless
+/// exactly one of `vectors` and `text` is set.
 pub fn parse_rescore_options(
     options: Option<js_sys::Object>,
+    context: &str,
 ) -> Result<Option<RescoreOptions>, JsValue> {
     let Some(options) = options else {
         return Ok(None);
     };
     let parsed: WasmRescoreOptions = serde_wasm_bindgen::from_value(options.into())
         .map_err(|e| JsValue::from_str(&format!("Invalid rescore options: {e}")))?;
+    let window_size = optional_unsigned_param(context, "rescore.windowSize", parsed.window_size)?;
 
     let rescore = match (parsed.vectors, parsed.text) {
         (Some(vectors), None) => RescoreOptions::late_interaction(
@@ -110,7 +145,7 @@ pub fn parse_rescore_options(
             ));
         }
     };
-    Ok(Some(match parsed.window_size {
+    Ok(Some(match window_size {
         Some(window_size) => rescore.window_size(window_size as usize),
         None => rescore,
     }))
@@ -130,21 +165,37 @@ pub fn parse_rescore_options(
 #[serde(rename_all = "camelCase")]
 struct WasmGroupByOptions {
     field: String,
-    group_size: Option<u32>,
+    group_size: Option<f64>,
 }
 
-/// Parse an optional grouping JS object into [`GroupBy`]. Only the shape is
-/// checked here; the engine checks the values when searching. `None` (no
-/// object passed) means "don't group" and returns `Ok(None)`.
-pub fn parse_group_by_options(options: Option<js_sys::Object>) -> Result<Option<GroupBy>, JsValue> {
+/// Parse an optional grouping JS object into [`GroupBy`]. Only the shape and
+/// the integer are checked here; the engine checks the values when
+/// searching. `None` (no object passed) means "don't group" and returns
+/// `Ok(None)`.
+///
+/// # Arguments
+///
+/// * `options` - The grouping options object.
+/// * `context` - The method the options were passed to, such as
+///   `Index.search`, which starts an error message.
+///
+/// # Errors
+///
+/// Returns an error string if the object does not have the shape above, or
+/// if `groupSize` is not an integer from 0 to 4294967295.
+pub fn parse_group_by_options(
+    options: Option<js_sys::Object>,
+    context: &str,
+) -> Result<Option<GroupBy>, JsValue> {
     let Some(options) = options else {
         return Ok(None);
     };
     let parsed: WasmGroupByOptions = serde_wasm_bindgen::from_value(options.into())
         .map_err(|e| JsValue::from_str(&format!("Invalid groupBy options: {e}")))?;
+    let group_size = optional_unsigned_param(context, "groupBy.groupSize", parsed.group_size)?;
 
     let group_by = GroupBy::new(parsed.field);
-    Ok(Some(match parsed.group_size {
+    Ok(Some(match group_size {
         Some(group_size) => group_by.group_size(group_size as usize),
         None => group_by,
     }))
@@ -245,6 +296,23 @@ impl WasmSearchRequestInner {
 // ---------------------------------------------------------------------------
 // Helper: build a SearchRequest from index.search() arguments
 // ---------------------------------------------------------------------------
+
+/// Convert the `limit` and `offset` passed to the search method `context`,
+/// which default to 10 and 0.
+///
+/// # Errors
+///
+/// Returns an error string if `limit` or `offset` is not an integer from 0
+/// to 4294967295 (Issue #1612).
+pub fn limit_and_offset(
+    context: &str,
+    limit: Option<f64>,
+    offset: Option<f64>,
+) -> Result<(usize, usize), JsValue> {
+    let limit = optional_unsigned_param(context, "limit", limit)?.unwrap_or(10);
+    let offset = optional_unsigned_param(context, "offset", offset)?.unwrap_or(0);
+    Ok((limit as usize, offset as usize))
+}
 
 /// Build a [`laurus::SearchRequest`] from a DSL string with limit/offset.
 pub fn build_dsl_request(dsl: String, limit: usize, offset: usize) -> laurus::SearchRequest {

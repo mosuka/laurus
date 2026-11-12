@@ -5,7 +5,10 @@
 //! language bindings and by [`crate::wal::JsWalSyncPolicy`].
 
 use laurus::CommitPolicy;
+use napi::Result;
 use napi_derive::napi;
+
+use crate::convert::unsigned_param;
 
 // ---------------------------------------------------------------------------
 // CommitPolicy
@@ -75,11 +78,17 @@ impl JsCommitPolicy {
     /// # Returns
     ///
     /// A `CommitPolicy` representing `EveryDocs(n)`.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `n` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[napi(factory)]
-    pub fn every_docs(n: u32) -> Self {
-        Self {
+    pub fn every_docs(n: f64) -> Result<Self> {
+        let n = unsigned_param("CommitPolicy.everyDocs", "n", n)?;
+        Ok(Self {
             inner: CommitPolicy::EveryDocs(n as usize),
-        }
+        })
     }
 
     /// Create an auto-commit-at-least-every-`ms`-milliseconds policy.
@@ -100,10 +109,16 @@ impl JsCommitPolicy {
     /// # Returns
     ///
     /// A `CommitPolicy` representing `Interval(Duration::from_millis(ms))`.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `ms` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[napi(factory)]
-    pub fn interval_ms(ms: u32) -> Self {
-        Self {
-            inner: CommitPolicy::Interval(std::time::Duration::from_millis(ms as u64)),
-        }
+    pub fn interval_ms(ms: f64) -> Result<Self> {
+        let ms = unsigned_param("CommitPolicy.intervalMs", "ms", ms)?;
+        Ok(Self {
+            inner: CommitPolicy::Interval(std::time::Duration::from_millis(u64::from(ms))),
+        })
     }
 }

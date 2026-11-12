@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::commit::WasmCommitPolicy;
+use crate::convert::unsigned_param;
 use crate::convert::{data_value_to_json, json_to_document};
 use crate::errors::laurus_err;
 use crate::query::{
@@ -11,8 +12,8 @@ use crate::query::{
 };
 use crate::schema::WasmSchema;
 use crate::search::{
-    build_dsl_request, build_lexical_request, build_vector_request, parse_group_by_options,
-    parse_highlight_options, parse_rescore_options,
+    build_dsl_request, build_lexical_request, build_vector_request, limit_and_offset,
+    parse_group_by_options, parse_highlight_options, parse_rescore_options,
 };
 use crate::storage::OpfsPersistence;
 use crate::wal::WasmWalSyncPolicy;
@@ -550,24 +551,27 @@ impl WasmIndex {
     /// for a hit without a value) and `innerHits` holds the group's next
     /// best hits in ranking order; otherwise `groupKey` is `null` and
     /// `innerHits` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit`, `offset` or an integer of `highlight`, `rescore`
+    /// or `groupBy` is not an integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen]
     pub async fn search(
         &self,
         query: String,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         highlight: Option<js_sys::Object>,
         rescore: Option<js_sys::Object>,
         group_by: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
-        let mut request = build_dsl_request(
-            query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        );
-        request.lexical_options.highlight = parse_highlight_options(highlight)?;
-        request.rescore = parse_rescore_options(rescore)?;
-        request.group_by = parse_group_by_options(group_by)?;
+        const CONTEXT: &str = "Index.search";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let mut request = build_dsl_request(query, limit, offset);
+        request.lexical_options.highlight = parse_highlight_options(highlight, CONTEXT)?;
+        request.rescore = parse_rescore_options(rescore, CONTEXT)?;
+        request.group_by = parse_group_by_options(group_by, CONTEXT)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -582,22 +586,26 @@ impl WasmIndex {
     /// * `offset` - Pagination offset (default 0).
     /// * `highlight` - Optional highlight request; same shape as `search`'s
     ///   `highlight` argument (Issue #1134).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit`, `offset` or an integer of `highlight` is not an
+    /// integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchTerm")]
     pub async fn search_term(
         &self,
         field: String,
         term: String,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         highlight: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchTerm";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let highlight = parse_highlight_options(highlight, CONTEXT)?;
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
-        let mut request = build_lexical_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        )?;
-        request.lexical_options.highlight = parse_highlight_options(highlight)?;
+        let mut request = build_lexical_request(&query, limit, offset)?;
+        request.lexical_options.highlight = highlight;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -619,24 +627,25 @@ impl WasmIndex {
     /// * `highlight` - Optional highlight request; same shape as `search`'s
     ///   `highlight` argument.
     ///
-    /// Rejects with an error when a bound is not a recognized literal.
+    /// Rejects with an error when a bound is not a recognized literal, or
+    /// when `limit`, `offset` or an integer of `highlight` is not an
+    /// integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchDateTimeRange")]
     pub async fn search_date_time_range(
         &self,
         field: String,
         min: Option<String>,
         max: Option<String>,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         highlight: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchDateTimeRange";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let highlight = parse_highlight_options(highlight, CONTEXT)?;
         let query = JsQuery::DateTimeRangeQuery(JsDateTimeRangeQuery { field, min, max });
-        let mut request = build_lexical_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        )?;
-        request.lexical_options.highlight = parse_highlight_options(highlight)?;
+        let mut request = build_lexical_request(&query, limit, offset)?;
+        request.lexical_options.highlight = highlight;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -651,6 +660,11 @@ impl WasmIndex {
     ///   (i.e. the search sphere's radius).
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit` or `offset` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchGeo3dDistance")]
     #[allow(clippy::too_many_arguments)]
     pub async fn search_geo3d_distance(
@@ -660,9 +674,10 @@ impl WasmIndex {
         y: f64,
         z: f64,
         distance_m: f64,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
     ) -> Result<JsValue, JsValue> {
+        let (limit, offset) = limit_and_offset("Index.searchGeo3dDistance", limit, offset)?;
         let query = JsQuery::Geo3dDistanceQuery(JsGeo3dDistanceQuery {
             field,
             x,
@@ -670,11 +685,7 @@ impl WasmIndex {
             z,
             distance_m,
         });
-        let request = build_lexical_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        )?;
+        let request = build_lexical_request(&query, limit, offset)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -688,6 +699,11 @@ impl WasmIndex {
     /// * `max_x`, `max_y`, `max_z` - Upper corner of the box.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit` or `offset` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchGeo3dBoundingBox")]
     #[allow(clippy::too_many_arguments)]
     pub async fn search_geo3d_bounding_box(
@@ -699,9 +715,10 @@ impl WasmIndex {
         max_x: f64,
         max_y: f64,
         max_z: f64,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
     ) -> Result<JsValue, JsValue> {
+        let (limit, offset) = limit_and_offset("Index.searchGeo3dBoundingBox", limit, offset)?;
         let query = JsQuery::Geo3dBoundingBoxQuery(JsGeo3dBoundingBoxQuery {
             field,
             min_x,
@@ -711,11 +728,7 @@ impl WasmIndex {
             max_y,
             max_z,
         });
-        let request = build_lexical_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        )?;
+        let request = build_lexical_request(&query, limit, offset)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -729,6 +742,11 @@ impl WasmIndex {
     /// * `k` - Number of nearest neighbours to return.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `k`, `limit` or `offset` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchGeo3dNearest")]
     #[allow(clippy::too_many_arguments)]
     pub async fn search_geo3d_nearest(
@@ -737,12 +755,15 @@ impl WasmIndex {
         x: f64,
         y: f64,
         z: f64,
-        k: u32,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        k: f64,
+        limit: Option<f64>,
+        offset: Option<f64>,
         initial_radius_m: Option<f64>,
         max_radius_m: Option<f64>,
     ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchGeo3dNearest";
+        let k = unsigned_param(CONTEXT, "k", k)?;
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
         let query = JsQuery::Geo3dNearestQuery(JsGeo3dNearestQuery {
             field,
             x,
@@ -752,11 +773,7 @@ impl WasmIndex {
             initial_radius_m,
             max_radius_m,
         });
-        let request = build_lexical_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        )?;
+        let request = build_lexical_request(&query, limit, offset)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -773,27 +790,32 @@ impl WasmIndex {
     ///   `search`'s `rescore` argument (Issue #1351).
     /// * `group_by` - Optional grouping of the results; same shape as
     ///   `search`'s `group_by` argument (Issue #1297).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit`, `offset` or an integer of `rescore` or `groupBy`
+    /// is not an integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchVector")]
     pub async fn search_vector(
         &self,
         field: String,
         vector: Vec<f64>,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         rescore: Option<js_sys::Object>,
         group_by: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchVector";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let rescore = parse_rescore_options(rescore, CONTEXT)?;
+        let group_by = parse_group_by_options(group_by, CONTEXT)?;
         let query = JsVectorQuery::VectorQuery(JsVectorQueryInner {
             field,
             vector: vector.into_iter().map(|v| v as f32).collect(),
         });
-        let mut request = build_vector_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        );
-        request.rescore = parse_rescore_options(rescore)?;
-        request.group_by = parse_group_by_options(group_by)?;
+        let mut request = build_vector_request(&query, limit, offset);
+        request.rescore = rescore;
+        request.group_by = group_by;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -810,24 +832,29 @@ impl WasmIndex {
     ///   `search`'s `rescore` argument (Issue #1351).
     /// * `group_by` - Optional grouping of the results; same shape as
     ///   `search`'s `group_by` argument (Issue #1297).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit`, `offset` or an integer of `rescore` or `groupBy`
+    /// is not an integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "searchVectorText")]
     pub async fn search_vector_text(
         &self,
         field: String,
         text: String,
-        limit: Option<u32>,
-        offset: Option<u32>,
+        limit: Option<f64>,
+        offset: Option<f64>,
         rescore: Option<js_sys::Object>,
         group_by: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchVectorText";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let rescore = parse_rescore_options(rescore, CONTEXT)?;
+        let group_by = parse_group_by_options(group_by, CONTEXT)?;
         let query = JsVectorQuery::VectorTextQuery(JsVectorTextQuery { field, text });
-        let mut request = build_vector_request(
-            &query,
-            limit.unwrap_or(10) as usize,
-            offset.unwrap_or(0) as usize,
-        );
-        request.rescore = parse_rescore_options(rescore)?;
-        request.group_by = parse_group_by_options(group_by)?;
+        let mut request = build_vector_request(&query, limit, offset);
+        request.rescore = rescore;
+        request.group_by = group_by;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -1278,17 +1305,17 @@ mod tests {
             ("addBytesField", |s, n| s.add_bytes_field(n, None, None)),
             ("addHnswField", |s, n| {
                 s.add_hnsw_field(
-                    n, 3, None, None, None, None, None, None, None, None, None, None,
+                    n, 3.0, None, None, None, None, None, None, None, None, None, None,
                 )
             }),
             ("addFlatField", |s, n| {
-                s.add_flat_field(n, 3, None, None, None, None)
+                s.add_flat_field(n, 3.0, None, None, None, None)
             }),
             ("addIvfField", |s, n| {
-                s.add_ivf_field(n, 3, None, None, None, None, None, None)
+                s.add_ivf_field(n, 3.0, None, None, None, None, None, None)
             }),
             ("addMultiVectorField", |s, n| {
-                s.add_multi_vector_field(n, 3, None, None, None, None)
+                s.add_multi_vector_field(n, 3.0, None, None, None, None)
             }),
         ];
         for (method, add_field) in methods {
@@ -1379,7 +1406,7 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_flat_field("vec".to_string(), 2, None, None, None, None)
+            .add_flat_field("vec".to_string(), 2.0, None, None, None, None)
             .unwrap();
         if let Some(func) = callback {
             schema
@@ -1392,7 +1419,7 @@ mod tests {
         schema
             .add_multi_vector_field(
                 "tokens".to_string(),
-                2,
+                2.0,
                 Some("dot_product".to_string()),
                 callback.map(|_| "colbert".to_string()),
                 None,
@@ -1538,7 +1565,7 @@ mod tests {
         schema
             .add_multi_vector_field(
                 "tokens".to_string(),
-                2,
+                2.0,
                 None,
                 Some("colbert".to_string()),
                 None,
@@ -1637,23 +1664,29 @@ mod tests {
     #[wasm_bindgen_test]
     fn add_multi_vector_field_rejects_invalid_options() {
         let cases = [
-            (0, None, None, None, "dimension must be greater than 0"),
+            (0.0, None, None, None, "dimension must be greater than 0"),
             (
-                2,
+                2.0,
                 Some("euclidean"),
                 None,
                 None,
                 "distance must be Cosine or DotProduct",
             ),
-            (2, None, Some("bogus"), None, "Unknown multi-vector storage"),
             (
-                2,
+                2.0,
+                None,
+                Some("bogus"),
+                None,
+                "Unknown multi-vector storage",
+            ),
+            (
+                2.0,
                 Some("dot_product"),
                 Some("binary"),
                 None,
                 "requires distance Cosine",
             ),
-            (2, None, None, Some(0), "pool_factor must be at least 1"),
+            (2.0, None, None, Some(0.0), "pool_factor must be at least 1"),
         ];
         for (dimension, distance, storage, pool_factor, message) in cases {
             let mut schema = WasmSchema::new();
@@ -1677,7 +1710,7 @@ mod tests {
     fn add_multi_vector_field_accepts_a_pool_factor() {
         let mut schema = WasmSchema::new();
         schema
-            .add_multi_vector_field("tokens".to_string(), 2, None, None, None, Some(2))
+            .add_multi_vector_field("tokens".to_string(), 2.0, None, None, None, Some(2.0))
             .unwrap_or_else(|err| panic!("pool_factor=2 must be accepted: {err:?}"));
         assert_eq!(schema.field_names(), vec!["tokens".to_string()]);
     }
@@ -1689,7 +1722,7 @@ mod tests {
             schema
                 .add_multi_vector_field(
                     "tokens".to_string(),
-                    2,
+                    2.0,
                     None,
                     None,
                     Some(storage.to_string()),
@@ -1897,5 +1930,389 @@ mod tests {
             let error = err.as_string().unwrap();
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    // ── Integer parameters (Issue #1612) ───────────────────────────────────
+    //
+    // A `u32` parameter kept only the low 32 bits of the number (the glue's
+    // `(value) >>> 0` for an optional one, WebAssembly's `ToInt32` for a
+    // required one): `-1` became 4294967295, `1.5` became 1, 4294967296
+    // became 0, and `NaN` and the infinities became 0. Each test passes
+    // every value of `BAD` to each parameter, collects the calls that did
+    // not fail with the expected message, and asserts once.
+
+    use crate::commit::WasmCommitPolicy;
+    use crate::convert::unsigned_param_testing::{BAD, check};
+    use crate::wal::WasmWalSyncPolicy;
+
+    /// A JS object built from `value` with `key` set to `number`, which
+    /// may be `NaN` or an infinity (a `serde_json::Value` cannot hold one).
+    fn object_with(value: serde_json::Value, key: &str, number: f64) -> js_sys::Object {
+        let object = highlight_object(value);
+        js_sys::Reflect::set(&object, &JsValue::from_str(key), &JsValue::from_f64(number)).unwrap();
+        object
+    }
+
+    #[wasm_bindgen_test]
+    fn schema_integer_parameters_reject_a_value_that_is_not_an_integer() {
+        type Call = fn(&mut WasmSchema, f64) -> Result<(), JsValue>;
+        let cases: [(&str, &str, Call); 12] = [
+            ("Schema.addTextField", "positionIncrementGap", |s, v| {
+                s.add_text_field(
+                    "v".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    Some(v),
+                )
+            }),
+            ("Schema.addHnswField", "dimension", |s, v| {
+                s.add_hnsw_field(
+                    "v".into(),
+                    v,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }),
+            ("Schema.addHnswField", "m", |s, v| {
+                s.add_hnsw_field(
+                    "v".into(),
+                    8.0,
+                    None,
+                    Some(v),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }),
+            ("Schema.addHnswField", "efConstruction", |s, v| {
+                s.add_hnsw_field(
+                    "v".into(),
+                    8.0,
+                    None,
+                    None,
+                    Some(v),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }),
+            ("Schema.addHnswField", "defaultEfSearch", |s, v| {
+                s.add_hnsw_field(
+                    "v".into(),
+                    8.0,
+                    None,
+                    None,
+                    None,
+                    Some(v),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }),
+            ("Schema.addHnswField", "subvectorCount", |s, v| {
+                s.add_hnsw_field(
+                    "v".into(),
+                    8.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("product_quantization".into()),
+                    Some(v),
+                    None,
+                    None,
+                    None,
+                )
+            }),
+            ("Schema.addFlatField", "dimension", |s, v| {
+                s.add_flat_field("v".into(), v, None, None, None, None)
+            }),
+            ("Schema.addIvfField", "dimension", |s, v| {
+                s.add_ivf_field("v".into(), v, None, None, None, None, None, None)
+            }),
+            ("Schema.addIvfField", "nClusters", |s, v| {
+                s.add_ivf_field("v".into(), 8.0, None, Some(v), None, None, None, None)
+            }),
+            ("Schema.addIvfField", "nProbe", |s, v| {
+                s.add_ivf_field("v".into(), 8.0, None, None, Some(v), None, None, None)
+            }),
+            ("Schema.addMultiVectorField", "dimension", |s, v| {
+                s.add_multi_vector_field("v".into(), v, None, None, None, None)
+            }),
+            ("Schema.addMultiVectorField", "poolFactor", |s, v| {
+                s.add_multi_vector_field("v".into(), 8.0, None, None, None, Some(v))
+            }),
+        ];
+        let mut mismatches = Vec::new();
+        for (context, name, call) in cases {
+            for case in BAD {
+                let result = call(&mut WasmSchema::new(), case.0);
+                check(&mut mismatches, context, name, case, result);
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_integer_parameters_reject_a_value_that_is_not_an_integer() {
+        let index = group_index().await;
+        let n = String::from;
+        let vec = || vec![1.0, 0.0];
+        let mut m = Vec::new();
+        for case in BAD {
+            let v = case.0;
+            let result = index
+                .search(n("title:rust"), Some(v), None, None, None, None)
+                .await;
+            check(&mut m, "Index.search", "limit", case, result);
+            let result = index
+                .search(n("title:rust"), Some(10.0), Some(v), None, None, None)
+                .await;
+            check(&mut m, "Index.search", "offset", case, result);
+            let result = index
+                .search_term(n("title"), n("rust"), Some(v), None, None)
+                .await;
+            check(&mut m, "Index.searchTerm", "limit", case, result);
+            let result = index
+                .search_term(n("title"), n("rust"), Some(10.0), Some(v), None)
+                .await;
+            check(&mut m, "Index.searchTerm", "offset", case, result);
+            let result = index
+                .search_date_time_range(n("title"), None, None, Some(v), None, None)
+                .await;
+            check(&mut m, "Index.searchDateTimeRange", "limit", case, result);
+            let result = index
+                .search_date_time_range(n("title"), None, None, Some(10.0), Some(v), None)
+                .await;
+            check(&mut m, "Index.searchDateTimeRange", "offset", case, result);
+            let result = index
+                .search_geo3d_distance(n("p"), 0.0, 0.0, 0.0, 1.0, Some(v), None)
+                .await;
+            check(&mut m, "Index.searchGeo3dDistance", "limit", case, result);
+            let result = index
+                .search_geo3d_distance(n("p"), 0.0, 0.0, 0.0, 1.0, Some(10.0), Some(v))
+                .await;
+            check(&mut m, "Index.searchGeo3dDistance", "offset", case, result);
+            let result = index
+                .search_geo3d_bounding_box(n("p"), 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, Some(v), None)
+                .await;
+            check(
+                &mut m,
+                "Index.searchGeo3dBoundingBox",
+                "limit",
+                case,
+                result,
+            );
+            let result = index
+                .search_geo3d_bounding_box(
+                    n("p"),
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    Some(10.0),
+                    Some(v),
+                )
+                .await;
+            check(
+                &mut m,
+                "Index.searchGeo3dBoundingBox",
+                "offset",
+                case,
+                result,
+            );
+            let result = index
+                .search_geo3d_nearest(n("p"), 0.0, 0.0, 0.0, v, None, None, None, None)
+                .await;
+            check(&mut m, "Index.searchGeo3dNearest", "k", case, result);
+            let result = index
+                .search_geo3d_nearest(n("p"), 0.0, 0.0, 0.0, 1.0, Some(v), None, None, None)
+                .await;
+            check(&mut m, "Index.searchGeo3dNearest", "limit", case, result);
+            let result = index
+                .search_geo3d_nearest(n("p"), 0.0, 0.0, 0.0, 1.0, Some(10.0), Some(v), None, None)
+                .await;
+            check(&mut m, "Index.searchGeo3dNearest", "offset", case, result);
+            let result = index
+                .search_vector(n("vec"), vec(), Some(v), None, None, None)
+                .await;
+            check(&mut m, "Index.searchVector", "limit", case, result);
+            let result = index
+                .search_vector(n("vec"), vec(), Some(10.0), Some(v), None, None)
+                .await;
+            check(&mut m, "Index.searchVector", "offset", case, result);
+            let result = index
+                .search_vector_text(n("vec"), n("rust"), Some(v), None, None, None)
+                .await;
+            check(&mut m, "Index.searchVectorText", "limit", case, result);
+            let result = index
+                .search_vector_text(n("vec"), n("rust"), Some(10.0), Some(v), None, None)
+                .await;
+            check(&mut m, "Index.searchVectorText", "offset", case, result);
+        }
+        assert!(m.is_empty(), "{m:#?}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn option_integers_reject_a_value_that_is_not_an_integer() {
+        let index = group_index().await;
+        let n = String::from;
+        let highlight = || serde_json::json!({ "fields": ["title"] });
+        let rescore = || serde_json::json!({ "field": "tokens", "vectors": [[1.0, 0.0]] });
+        let group_by = || serde_json::json!({ "field": "_id" });
+        let mut m = Vec::new();
+        for case in BAD {
+            let v = case.0;
+            let options = object_with(highlight(), "fragmentSize", v);
+            let result = index
+                .search(n("title:rust"), None, None, Some(options), None, None)
+                .await;
+            check(
+                &mut m,
+                "Index.search",
+                "highlight.fragmentSize",
+                case,
+                result,
+            );
+            let options = object_with(highlight(), "maxFragments", v);
+            let result = index
+                .search(n("title:rust"), None, None, Some(options), None, None)
+                .await;
+            check(
+                &mut m,
+                "Index.search",
+                "highlight.maxFragments",
+                case,
+                result,
+            );
+            let options = object_with(rescore(), "windowSize", v);
+            let result = index
+                .search(n("title:rust"), None, None, None, Some(options), None)
+                .await;
+            check(&mut m, "Index.search", "rescore.windowSize", case, result);
+            let options = object_with(group_by(), "groupSize", v);
+            let result = index
+                .search(n("title:rust"), None, None, None, None, Some(options))
+                .await;
+            check(&mut m, "Index.search", "groupBy.groupSize", case, result);
+        }
+
+        // The message names the method the options were passed to.
+        let case = BAD[0];
+        let options = object_with(highlight(), "maxFragments", case.0);
+        let result = index
+            .search_term(n("title"), n("rust"), None, None, Some(options))
+            .await;
+        check(
+            &mut m,
+            "Index.searchTerm",
+            "highlight.maxFragments",
+            case,
+            result,
+        );
+        let options = object_with(highlight(), "fragmentSize", case.0);
+        let result = index
+            .search_date_time_range(n("title"), None, None, None, None, Some(options))
+            .await;
+        check(
+            &mut m,
+            "Index.searchDateTimeRange",
+            "highlight.fragmentSize",
+            case,
+            result,
+        );
+        let options = object_with(group_by(), "groupSize", case.0);
+        let result = index
+            .search_vector(n("vec"), vec![1.0, 0.0], None, None, None, Some(options))
+            .await;
+        check(
+            &mut m,
+            "Index.searchVector",
+            "groupBy.groupSize",
+            case,
+            result,
+        );
+        let options = object_with(rescore(), "windowSize", case.0);
+        let result = index
+            .search_vector_text(n("vec"), n("rust"), None, None, Some(options), None)
+            .await;
+        check(
+            &mut m,
+            "Index.searchVectorText",
+            "rescore.windowSize",
+            case,
+            result,
+        );
+        assert!(m.is_empty(), "{m:#?}");
+    }
+
+    #[wasm_bindgen_test]
+    fn policy_integer_parameters_reject_a_value_that_is_not_an_integer() {
+        let mut m = Vec::new();
+        for case in BAD {
+            let v = case.0;
+            let result = WasmCommitPolicy::every_docs(v);
+            check(&mut m, "CommitPolicy.everyDocs", "n", case, result);
+            let result = WasmCommitPolicy::interval_ms(v);
+            check(&mut m, "CommitPolicy.intervalMs", "ms", case, result);
+            let result = WasmWalSyncPolicy::group(Some(v), None, None);
+            check(&mut m, "WalSyncPolicy.group", "maxRecords", case, result);
+            let result = WasmWalSyncPolicy::group(None, Some(v), None);
+            check(&mut m, "WalSyncPolicy.group", "maxBytes", case, result);
+        }
+        assert!(m.is_empty(), "{m:#?}");
+    }
+
+    /// An integer from 0 to 4294967295 behaves as before: `-0` is 0, the
+    /// largest value is kept, and `limit` takes every hit or none.
+    #[wasm_bindgen_test]
+    async fn integer_parameters_accept_an_integer_from_0_to_u32_max() {
+        let dimension = |value: f64| {
+            let mut schema = WasmSchema::new();
+            schema
+                .add_flat_field("v".to_string(), value, None, None, None, None)
+                .unwrap();
+            schema.to_toml().unwrap()
+        };
+        assert!(dimension(4_294_967_295.0).contains("dimension = 4294967295\n"));
+        assert!(dimension(-0.0).contains("dimension = 0\n"));
+
+        let index = group_index().await;
+        let search = |limit: Option<f64>| {
+            index.search("title:rust".to_string(), limit, None, None, None, None)
+        };
+        let default = ids(search(None).await.unwrap());
+        assert!(!default.is_empty());
+        assert_eq!(ids(search(Some(4_294_967_295.0)).await.unwrap()), default);
+        assert!(ids(search(Some(0.0)).await.unwrap()).is_empty());
+        assert!(WasmCommitPolicy::every_docs(0.0).is_ok());
+        assert!(WasmWalSyncPolicy::group(Some(4_294_967_295.0), Some(0.0), None).is_ok());
     }
 }

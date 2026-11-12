@@ -1,5 +1,16 @@
 # API リファレンス
 
+## 整数の引数
+
+件数・大きさ・位置・距離を表す整数の引数と options の欄（`limit`、`offset`、`dimension`、`m`、`maxEdits`、`slop`、`groupSize`、トークンの `position` など）は、0 から 4294967295 までの整数を受け付けます。それ以外の値（負の数、小数、`NaN`、`Infinity`、4294967295 を超える数）を渡すと、メソッドと引数の名前を含む `InvalidArg` エラーを投げます。Promise を返すメソッドは、そのエラーで reject します（Issue #1612）。
+
+```text
+Schema.addHnswField: m must be an integer from 0 to 4294967295, got -1
+Index.search: highlight.fragmentSize must be an integer from 0 to 4294967295, got 1.5
+```
+
+以前は、こうした値がエラーにならずに別の数に変わっていました（`-1` は 4294967295、`1.5` は 1、4294967296 は 0）。範囲内の整数の扱いは変わらず、エンジンの検査（`dimension` は 0 より大きい、など）もこれまでどおり行われます。`WalSyncPolicy.group` の `maxIntervalMs` はミリ秒の数値で、この規則の対象ではありません。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。
+
 ## Index
 
 主要なエントリポイント。Laurus 検索エンジンをラップします。
@@ -878,6 +889,8 @@ interface Token {
 `startOffset` と `endOffset` は、元テキストの UTF-8 バイトオフセットです。非 ASCII のテキストでは JavaScript の文字列（UTF-16）の添字と一致しないため、エンコードしたバイト列を切り出します: `new TextDecoder().decode(new TextEncoder().encode(text).slice(tok.startOffset, tok.endOffset))`。
 
 `tokenType` は `"alphanum"`、`"num"`、`"cjk"`、`"katakana"`、`"hiragana"`、`"hangul"`、`"punctuation"`、`"whitespace"`、`"synonym"`、`"email"`、`"url"`、`"other"` のいずれかです。`SynonymGraphFilter.apply` は各トークンのオフセットと種別を保ち、挿入する同義語には種別 `"synonym"` と、置き換える語のオフセットを付けます。これ以外の `tokenType` を渡すと例外を投げます。
+
+`apply` に渡すトークンの位置とオフセットも[整数の引数](#整数の引数)で、エラーはトークンを示します（例: `SynonymGraphFilter.apply: tokens[1].position must be an integer from 0 to 4294967295, got -1`）。
 
 手で組み立てたトークンでは `tokenType` を省略できます。その場合、複数語の同義語は語のオフセットが連続しているときだけ一致するため、空白で区切られた語には `tokenType: "alphanum"` を付けてください。
 

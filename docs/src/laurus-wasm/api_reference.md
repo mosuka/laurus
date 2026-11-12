@@ -1,5 +1,16 @@
 # API Reference
 
+## Integer arguments
+
+An integer argument or option field — a count, size, position or distance such as `limit`, `offset`, `k`, `dimension`, `m`, `groupSize` or a token's `position` — takes an integer from 0 to 4294967295. Anything else (a negative number, a fraction, `NaN`, `Infinity` or a number above 4294967295) throws an error naming the method and the argument, or a method that returns a promise rejects with one (Issue #1612). Like the other errors of laurus-wasm, it is a string:
+
+```text
+Schema.addHnswField: m must be an integer from 0 to 4294967295, got -1
+Index.search: highlight.fragmentSize must be an integer from 0 to 4294967295, got 1.5
+```
+
+An argument used to become another number without an error: `-1` became 4294967295, `1.5` became 1 and 4294967296 became 0. The fields of the `highlight`, `rescore` and `groupBy` objects and of the tokens passed to `SynonymGraphFilter.apply` were rejected already, with a message that did not name the field. An integer in the range behaves as before, and the checks of the engine (such as a `dimension` greater than 0) still apply. `WalSyncPolicy.group`'s `maxIntervalMs` is a number of milliseconds instead; see [WAL sync policy / durability](#wal-sync-policy--durability).
+
 ## Module Functions
 
 ### `version()`
@@ -982,3 +993,5 @@ const expanded = filter.apply(tokens);
 ```
 
 `apply` keeps each token's offsets and type, and gives each synonym it inserts the type `"synonym"` and the offsets of the words it replaces. It throws on an unknown `tokenType`. A token built by hand may leave `tokenType` out; a multi-word synonym then matches only if the words' offsets touch, so set `tokenType: "alphanum"` on words separated by spaces.
+
+The positions and offsets of a token passed to `apply` are [integer arguments](#integer-arguments), and the error names the token, such as `SynonymGraphFilter.apply: tokens[1].position must be an integer from 0 to 4294967295, got -1`.

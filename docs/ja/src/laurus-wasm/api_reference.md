@@ -1,5 +1,16 @@
 # API リファレンス
 
+## 整数の引数
+
+件数・大きさ・位置・距離を表す整数の引数と options の欄（`limit`、`offset`、`k`、`dimension`、`m`、`groupSize`、トークンの `position` など）は、0 から 4294967295 までの整数を受け付けます。それ以外の値（負の数、小数、`NaN`、`Infinity`、4294967295 を超える数）を渡すと、メソッドと引数の名前を含むエラーを投げます。Promise を返すメソッドは、そのエラーで reject します（Issue #1612）。laurus-wasm のほかのエラーと同じく、エラーは文字列です。
+
+```text
+Schema.addHnswField: m must be an integer from 0 to 4294967295, got -1
+Index.search: highlight.fragmentSize must be an integer from 0 to 4294967295, got 1.5
+```
+
+以前は、引数がエラーにならずに別の数に変わっていました（`-1` は 4294967295、`1.5` は 1、4294967296 は 0）。`highlight`・`rescore`・`groupBy` のオブジェクトの欄と、`SynonymGraphFilter.apply` に渡すトークンの欄は以前から拒んでいましたが、メッセージに欄の名前が入っていませんでした。範囲内の整数の扱いは変わらず、エンジンの検査（`dimension` は 0 より大きい、など）もこれまでどおり行われます。`WalSyncPolicy.group` の `maxIntervalMs` はミリ秒の数値で、この規則の対象ではありません。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。
+
 ## モジュール関数
 
 ### `version()`
@@ -954,3 +965,5 @@ const expanded = filter.apply(tokens);
 `SynonymDictionary` の同義語でトークンを展開するトークンフィルターです。
 
 `apply` は各トークンのオフセットと種別を保ち、挿入する同義語には種別 `"synonym"` と、置き換える語のオフセットを付けます。未知の `tokenType` を渡すと例外を投げます。手で組み立てたトークンでは `tokenType` を省略できますが、その場合、複数語の同義語は語のオフセットが連続しているときだけ一致するため、空白で区切られた語には `tokenType: "alphanum"` を付けてください。
+
+`apply` に渡すトークンの位置とオフセットも[整数の引数](#整数の引数)で、エラーはトークンを示します（例: `SynonymGraphFilter.apply: tokens[1].position must be an integer from 0 to 4294967295, got -1`）。

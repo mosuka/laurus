@@ -7,7 +7,10 @@
 use std::time::Duration;
 
 use laurus::{DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, WalSyncPolicy};
+use napi::Result;
 use napi_derive::napi;
+
+use crate::convert::optional_unsigned_param;
 
 // ---------------------------------------------------------------------------
 // WalSyncPolicy
@@ -100,13 +103,21 @@ impl JsWalSyncPolicy {
     /// # Returns
     ///
     /// A `WalSyncPolicy` representing `Group`.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if `maxRecords` or `maxBytes` is not an
+    /// integer from 0 to 4294967295 (Issue #1612).
     #[napi(factory)]
     pub fn group(
-        max_records: Option<u32>,
-        max_bytes: Option<u32>,
+        max_records: Option<f64>,
+        max_bytes: Option<f64>,
         max_interval_ms: Option<f64>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        const CONTEXT: &str = "WalSyncPolicy.group";
+        let max_records = optional_unsigned_param(CONTEXT, "maxRecords", max_records)?;
+        let max_bytes = optional_unsigned_param(CONTEXT, "maxBytes", max_bytes)?;
+        Ok(Self {
             inner: WalSyncPolicy::Group {
                 max_records: max_records
                     .map(|v| v as usize)
@@ -116,6 +127,6 @@ impl JsWalSyncPolicy {
                     .unwrap_or(DEFAULT_GROUP_MAX_BYTES),
                 max_interval: max_interval_ms.map(|ms| Duration::from_millis(ms as u64)),
             },
-        }
+        })
     }
 }

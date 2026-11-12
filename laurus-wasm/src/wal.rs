@@ -8,6 +8,8 @@ use std::time::Duration;
 use laurus::{DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, WalSyncPolicy};
 use wasm_bindgen::prelude::*;
 
+use crate::convert::optional_unsigned_param;
+
 /// Write-ahead-log (WAL) durability policy for an [`crate::index::WasmIndex`].
 ///
 /// Controls when WAL appends are made durable (fsync'd):
@@ -85,13 +87,21 @@ impl WasmWalSyncPolicy {
     /// # Returns
     ///
     /// A `WalSyncPolicy` wrapping [`WalSyncPolicy::Group`].
+    ///
+    /// # Errors
+    ///
+    /// Throws if `maxRecords` or `maxBytes` is not an integer from 0 to
+    /// 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "group")]
     pub fn group(
-        max_records: Option<u32>,
-        max_bytes: Option<u32>,
+        max_records: Option<f64>,
+        max_bytes: Option<f64>,
         max_interval_ms: Option<f64>,
-    ) -> WasmWalSyncPolicy {
-        WasmWalSyncPolicy {
+    ) -> Result<WasmWalSyncPolicy, JsValue> {
+        const CONTEXT: &str = "WalSyncPolicy.group";
+        let max_records = optional_unsigned_param(CONTEXT, "maxRecords", max_records)?;
+        let max_bytes = optional_unsigned_param(CONTEXT, "maxBytes", max_bytes)?;
+        Ok(WasmWalSyncPolicy {
             inner: WalSyncPolicy::Group {
                 max_records: max_records
                     .map(|v| v as usize)
@@ -101,7 +111,7 @@ impl WasmWalSyncPolicy {
                     .unwrap_or(DEFAULT_GROUP_MAX_BYTES),
                 max_interval: max_interval_ms.map(|ms| Duration::from_millis(ms as u64)),
             },
-        }
+        })
     }
 }
 
@@ -129,7 +139,7 @@ mod tests {
     /// `group()` with no arguments must equal the core defaults.
     #[wasm_bindgen_test]
     fn group_no_args_uses_defaults() {
-        let policy = WasmWalSyncPolicy::group(None, None, None);
+        let policy = WasmWalSyncPolicy::group(None, None, None).unwrap();
         match policy.inner {
             WalSyncPolicy::Group {
                 max_records,
@@ -148,7 +158,9 @@ mod tests {
     /// [`Duration`] in milliseconds.
     #[wasm_bindgen_test]
     fn group_explicit_args_are_honored() {
-        let policy = WasmWalSyncPolicy::group(Some(2048), Some(2 * 1024 * 1024), Some(50.0));
+        let policy =
+            WasmWalSyncPolicy::group(Some(2048.0), Some(2.0 * 1024.0 * 1024.0), Some(50.0))
+                .unwrap();
         match policy.inner {
             WalSyncPolicy::Group {
                 max_records,
@@ -167,7 +179,7 @@ mod tests {
     /// defaults for the omitted thresholds.
     #[wasm_bindgen_test]
     fn group_partial_args_mix_with_defaults() {
-        let policy = WasmWalSyncPolicy::group(Some(64), None, None);
+        let policy = WasmWalSyncPolicy::group(Some(64.0), None, None).unwrap();
         match policy.inner {
             WalSyncPolicy::Group {
                 max_records,

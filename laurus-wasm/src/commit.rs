@@ -6,6 +6,8 @@
 use laurus::CommitPolicy;
 use wasm_bindgen::prelude::*;
 
+use crate::convert::unsigned_param;
+
 /// Auto-commit policy for an [`crate::index::WasmIndex`].
 ///
 /// Controls when the engine automatically runs the commit ladder during
@@ -69,11 +71,16 @@ impl WasmCommitPolicy {
     /// # Returns
     ///
     /// A `CommitPolicy` wrapping [`CommitPolicy::EveryDocs`].
+    ///
+    /// # Errors
+    ///
+    /// Throws if `n` is not an integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "everyDocs")]
-    pub fn every_docs(n: u32) -> WasmCommitPolicy {
-        WasmCommitPolicy {
+    pub fn every_docs(n: f64) -> Result<WasmCommitPolicy, JsValue> {
+        let n = unsigned_param("CommitPolicy.everyDocs", "n", n)?;
+        Ok(WasmCommitPolicy {
             inner: CommitPolicy::EveryDocs(n as usize),
-        }
+        })
     }
 
     /// The auto-commit-at-least-every-interval policy (Issue #892).
@@ -94,10 +101,15 @@ impl WasmCommitPolicy {
     /// # Returns
     ///
     /// A `CommitPolicy` wrapping [`CommitPolicy::Interval`].
+    ///
+    /// # Errors
+    ///
+    /// Throws if `ms` is not an integer from 0 to 4294967295 (Issue #1612).
     #[wasm_bindgen(js_name = "intervalMs")]
-    pub fn interval_ms(ms: u32) -> WasmCommitPolicy {
-        WasmCommitPolicy {
-            inner: CommitPolicy::Interval(std::time::Duration::from_millis(ms as u64)),
-        }
+    pub fn interval_ms(ms: f64) -> Result<WasmCommitPolicy, JsValue> {
+        let ms = unsigned_param("CommitPolicy.intervalMs", "ms", ms)?;
+        Ok(WasmCommitPolicy {
+            inner: CommitPolicy::Interval(std::time::Duration::from_millis(u64::from(ms))),
+        })
     }
 }
