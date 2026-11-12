@@ -488,7 +488,7 @@ Laurus::SearchRequest.new(
 | `lexical_query:` | 明示的なハイブリッド検索の Lexical コンポーネント。 |
 | `vector_query:` | 明示的なハイブリッド検索の Vector コンポーネント。 |
 | `filter_query:` | スコアリング後に適用する Lexical フィルター。 |
-| `fusion:` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。 |
+| `fusion:` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k: 60)`。それ以外を渡すと `TypeError`（`fusion must be a Laurus::RRF or a Laurus::WeightedSum`）が発生します（Issue #1555）。 |
 | `limit:` | 最大結果件数（デフォルト 10）。 |
 | `offset:` | ページネーションオフセット（デフォルト 0）。 |
 | `highlight:` | `Index#search` の `highlight:` と同じ配列または Hash の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |

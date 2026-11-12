@@ -514,7 +514,7 @@ new \Laurus\SearchRequest(
 | `$lexicalQuery` | Lexical component for explicit hybrid search. |
 | `$vectorQuery` | Vector component for explicit hybrid search. |
 | `$filterQuery` | Lexical filter applied after scoring. |
-| `$fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k: 60)` when both components are set. |
+| `$fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k: 60)` when both components are set. Anything else throws `\TypeError` (`fusion must be a Laurus\RRF or a Laurus\WeightedSum`, Issue #1555). |
 | `$limit` | Maximum number of results (default 10). A negative value throws `\ValueError` (Issue #1609). |
 | `$offset` | Pagination offset (default 0). A negative value throws `\ValueError` (Issue #1609). |
 | `$highlight` | Same list-or-associative-array shape as `Index->search()`'s `$highlight` (Issue #1134). See [Highlighting](#highlighting). Only `$limit`/`$offset` have PHP-level defaults today, so a call that names `$highlight` must still pass every earlier parameter positionally or by name. |

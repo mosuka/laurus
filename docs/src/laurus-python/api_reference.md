@@ -566,7 +566,7 @@ class SearchRequest:
 | `lexical_query` | Lexical component for explicit hybrid search. |
 | `vector_query` | Vector component for explicit hybrid search. |
 | `filter_query` | Lexical filter applied after scoring. |
-| `fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k=60)` when both components are set. |
+| `fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k=60)` when both components are set. Anything else raises `TypeError` (`fusion must be a laurus.RRF or a laurus.WeightedSum`, Issue #1555). |
 | `limit` | Maximum number of results (default 10). |
 | `offset` | Pagination offset (default 0). |
 | `highlight` | Same list-or-dict shape as `Index.search`'s `highlight` parameter (Issue #1134). See [Highlighting](#highlighting). |

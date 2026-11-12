@@ -315,6 +315,35 @@ pub fn parse_rescore_option(rescore: Option<&Zval>) -> PhpResult<Option<RescoreO
         })
 }
 
+/// Convert a PHP `$fusion` argument into a [`FusionAlgorithm`]; `null`
+/// gives `None`, the default.
+///
+/// Anything else used to be dropped, so the search ran with the default
+/// RRF (`k = 60`) instead of failing (Issue #1555).
+///
+/// # Errors
+///
+/// Throws `\TypeError` if `fusion` is neither `null`, a `Laurus\RRF` nor a
+/// `Laurus\WeightedSum`.
+fn parse_fusion_option(fusion: &Zval) -> PhpResult<Option<FusionAlgorithm>> {
+    if fusion.is_null() {
+        Ok(None)
+    } else if let Some(rrf) = <&ZendClassObject<PhpRRF>>::from_zval(fusion) {
+        Ok(Some(FusionAlgorithm::RRF { k: rrf.k }))
+    } else if let Some(ws) = <&ZendClassObject<PhpWeightedSum>>::from_zval(fusion) {
+        Ok(Some(FusionAlgorithm::WeightedSum {
+            lexical_weight: ws.lexical_weight,
+            vector_weight: ws.vector_weight,
+        }))
+    } else {
+        Err(PhpException::new(
+            "fusion must be a Laurus\\RRF or a Laurus\\WeightedSum".to_string(),
+            0,
+            ce::type_error(),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GroupBy (Issue #1297)
 // ---------------------------------------------------------------------------
@@ -585,7 +614,8 @@ impl PhpSearchRequest {
     /// # Errors
     ///
     /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
-    /// #1609).
+    /// #1609), and `\TypeError` if `fusion` is neither `null`, an `RRF` nor
+    /// a `WeightedSum` (Issue #1555).
     #[php(defaults(limit = 10, offset = 0))]
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
@@ -601,22 +631,7 @@ impl PhpSearchRequest {
         groupBy: Option<&Zval>,
     ) -> PhpResult<Self> {
         // Convert fusion
-        let fusion_alg = if !fusion.is_null() {
-            if let Some(rrf_obj) = <&ZendClassObject<PhpRRF>>::from_zval(fusion) {
-                let rrf: &PhpRRF = rrf_obj;
-                Some(FusionAlgorithm::RRF { k: rrf.k })
-            } else if let Some(ws_obj) = <&ZendClassObject<PhpWeightedSum>>::from_zval(fusion) {
-                let ws: &PhpWeightedSum = ws_obj;
-                Some(FusionAlgorithm::WeightedSum {
-                    lexical_weight: ws.lexical_weight,
-                    vector_weight: ws.vector_weight,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let fusion_alg = parse_fusion_option(fusion)?;
 
         // Convert filter query
         let filter = if !filterQuery.is_null() {

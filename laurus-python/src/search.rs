@@ -402,8 +402,9 @@ pub struct PySearchRequest {
     pub vector_query: Option<Py<PyAny>>,
     /// Optional lexical filter query applied after scoring.
     pub filter_query: Option<Py<PyAny>>,
-    /// Fusion algorithm for hybrid results (`RRF` or `WeightedSum`).
-    pub fusion: Option<Py<PyAny>>,
+    /// Fusion algorithm for hybrid results, converted from the `RRF` or
+    /// `WeightedSum` passed to the constructor.
+    pub fusion: Option<FusionAlgorithm>,
     pub limit: usize,
     pub offset: usize,
     /// Highlight request: a list of field names, or a dict adding
@@ -432,31 +433,36 @@ impl PySearchRequest {
         rescore=None,
         group_by=None
     ))]
+    ///
+    /// # Errors
+    ///
+    /// Raises `TypeError` if `fusion` is neither an `RRF` nor a
+    /// `WeightedSum` (Issue #1555). `None` keeps the default.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         query: Option<Py<PyAny>>,
         lexical_query: Option<Py<PyAny>>,
         vector_query: Option<Py<PyAny>>,
         filter_query: Option<Py<PyAny>>,
-        fusion: Option<Py<PyAny>>,
+        fusion: Option<&Bound<'_, PyAny>>,
         limit: usize,
         offset: usize,
         highlight: Option<Py<PyAny>>,
         rescore: Option<PyLateInteractionRescore>,
         group_by: Option<PyGroupBy>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        Ok(Self {
             query,
             lexical_query,
             vector_query,
             filter_query,
-            fusion,
+            fusion: fusion.map(py_to_fusion).transpose()?,
             limit,
             offset,
             highlight,
             rescore,
             group_by,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -464,6 +470,30 @@ impl PySearchRequest {
             "SearchRequest(limit={}, offset={})",
             self.limit, self.offset
         )
+    }
+}
+
+/// Convert the `fusion` passed to `SearchRequest` into a
+/// [`FusionAlgorithm`].
+///
+/// Anything else used to be dropped, so the search ran with the default
+/// RRF (`k = 60`) instead of failing (Issue #1555).
+///
+/// # Errors
+///
+/// Raises `TypeError` unless `obj` is an `RRF` or a `WeightedSum`.
+fn py_to_fusion(obj: &Bound<'_, PyAny>) -> PyResult<FusionAlgorithm> {
+    if let Ok(rrf) = obj.extract::<PyRef<PyRRF>>() {
+        Ok(FusionAlgorithm::RRF { k: rrf.k })
+    } else if let Ok(ws) = obj.extract::<PyRef<PyWeightedSum>>() {
+        Ok(FusionAlgorithm::WeightedSum {
+            lexical_weight: ws.lexical_weight,
+            vector_weight: ws.vector_weight,
+        })
+    } else {
+        Err(PyTypeError::new_err(
+            "fusion must be a laurus.RRF or a laurus.WeightedSum",
+        ))
     }
 }
 
@@ -475,16 +505,8 @@ impl PySearchRequest {
             .offset(self.offset);
 
         // ── Fusion algorithm ──────────────────────────────────────────────
-        if let Some(f) = &self.fusion {
-            let fobj: &Bound<'_, PyAny> = f.bind(py);
-            if let Ok(rrf) = fobj.extract::<PyRef<PyRRF>>() {
-                builder = builder.fusion_algorithm(FusionAlgorithm::RRF { k: rrf.k });
-            } else if let Ok(ws) = fobj.extract::<PyRef<PyWeightedSum>>() {
-                builder = builder.fusion_algorithm(FusionAlgorithm::WeightedSum {
-                    lexical_weight: ws.lexical_weight,
-                    vector_weight: ws.vector_weight,
-                });
-            }
+        if let Some(fusion) = self.fusion {
+            builder = builder.fusion_algorithm(fusion);
         }
 
         // ── Filter query ──────────────────────────────────────────────────
