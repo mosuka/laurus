@@ -131,7 +131,7 @@ durable persistence.
 
 - **Returns:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?)`
+#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?, fusion?)`
 
 Search using a DSL string query.
 
@@ -139,9 +139,10 @@ Search using a DSL string query.
   - `query` (string) -- Query DSL (e.g. `"title:hello"`).
   - `limit` (number, default 10)
   - `offset` (number, default 0)
-  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below. Pass `undefined` to skip it when you only need `rescore` or `groupBy`.
+  - `highlight` (`HighlightOptions`, optional) -- Request highlighted fragments per field (Issue #1134). See [Highlighting](#highlighting) below. Pass `undefined` to skip it when you only need `rescore`, `groupBy` or `fusion`.
   - `rescore` (`RescoreOptions`, optional) -- Reorder the top results by late interaction against a multi-vector field (Issue #1351). See [Late-interaction rescore](#late-interaction-rescore) below.
   - `groupBy` (`GroupByOptions`, optional) -- Group the results by a field's value (Issue #1297). See [Result grouping](#result-grouping) below.
+  - `fusion` (`FusionOptions`, optional) -- Choose how a hybrid query merges its lexical and vector results: RRF or WeightedSum (Issue #1554). See [Hybrid fusion](#hybrid-fusion) below.
 - **Returns:** `Promise<SearchResult[]>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
@@ -288,6 +289,39 @@ const results = await index.search("body:lifetimes", 10, 0, undefined, undefined
 });
 results.map((r) => [r.groupKey, r.innerHits.map((hit) => hit.document.body)]);
 // => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
+```
+
+#### Hybrid fusion
+
+`search` accepts an optional trailing `fusion` argument (Issue #1554). It chooses how a query with both lexical and vector clauses, such as `title:rust embedding:"systems programming"`, merges the two result lists. Without it, such a query fuses with RRF and `k = 60`. The other search methods cannot be hybrid and have no `fusion` argument. The argument is a plain object with exactly one of two keys:
+
+```typescript
+type FusionOptions =
+  | { rrf: { k?: number } }
+  | { weightedSum: { lexicalWeight?: number; vectorWeight?: number } };
+```
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `rrf.k` | number | `60` | The smoothing constant of Reciprocal Rank Fusion, finite and at least `0`. |
+| `weightedSum.lexicalWeight` | number | `0.5` | The weight of the min-max normalized lexical score, `0`–`1`. |
+| `weightedSum.vectorWeight` | number | `0.5` | The weight of the min-max normalized vector score, `0`–`1`. At least one of the two weights must be greater than `0`. |
+
+`null` is the same as an omitted key, so `{ rrf: {} }` is the default fusion. See [Hybrid Search → Fusion Algorithms](../concepts/search/hybrid_search.md#fusion-algorithms) for how each algorithm scores.
+
+Unless exactly one of `rrf` and `weightedSum` is set, the call throws `Invalid fusion options: set exactly one of rrf or weightedSum`. A value of the wrong type (for example a string `k`) also throws `Invalid fusion options: ...`, while unknown keys are ignored. The engine checks the values when the search runs, even for a query that is not hybrid, and throws an error containing `fusion: ...` for a value out of range, for example `fusion: rrf: k must be finite and at least 0, got -1`.
+
+```js
+// Weigh the vector similarity more than the keyword match.
+const results = await index.search(
+  'title:rust embedding:"systems programming"',
+  10,
+  0,
+  undefined,
+  undefined,
+  undefined,
+  { weightedSum: { lexicalWeight: 0.3, vectorWeight: 0.7 } },
+);
 ```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`

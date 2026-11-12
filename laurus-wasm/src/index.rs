@@ -13,7 +13,7 @@ use crate::query::{
 use crate::schema::WasmSchema;
 use crate::search::{
     build_dsl_request, build_lexical_request, build_vector_request, limit_and_offset,
-    parse_group_by_options, parse_highlight_options, parse_rescore_options,
+    parse_fusion_options, parse_group_by_options, parse_highlight_options, parse_rescore_options,
 };
 use crate::storage::OpfsPersistence;
 use crate::wal::WasmWalSyncPolicy;
@@ -542,6 +542,12 @@ impl WasmIndex {
     ///   field; `groupSize` (default 1, at most 100) is how many hits each
     ///   group keeps. Each result is then a group's best hit; `limit` and
     ///   `offset` count groups.
+    /// * `fusion` - Optional algorithm that merges the lexical and vector
+    ///   results of a hybrid query (Issue #1554): `{ rrf: { k? } }` (`k`
+    ///   default 60, finite and at least 0) or
+    ///   `{ weightedSum: { lexicalWeight?, vectorWeight? } }` (each weight
+    ///   default 0.5, between 0 and 1, at least one greater than 0). Without
+    ///   it, a hybrid query fuses with RRF and `k` 60.
     ///
     /// # Returns
     ///
@@ -555,8 +561,12 @@ impl WasmIndex {
     /// # Errors
     ///
     /// Rejects if `limit`, `offset` or an integer of `highlight`, `rescore`
-    /// or `groupBy` is not an integer from 0 to 4294967295 (Issue #1612).
+    /// or `groupBy` is not an integer from 0 to 4294967295 (Issue #1612),
+    /// if `fusion` does not set exactly one of `rrf` and `weightedSum`, or
+    /// if its values are out of range, whether or not the query is hybrid
+    /// (Issue #1540).
     #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
         query: String,
@@ -565,6 +575,7 @@ impl WasmIndex {
         highlight: Option<js_sys::Object>,
         rescore: Option<js_sys::Object>,
         group_by: Option<js_sys::Object>,
+        fusion: Option<js_sys::Object>,
     ) -> Result<JsValue, JsValue> {
         const CONTEXT: &str = "Index.search";
         let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
@@ -572,6 +583,7 @@ impl WasmIndex {
         request.lexical_options.highlight = parse_highlight_options(highlight, CONTEXT)?;
         request.rescore = parse_rescore_options(rescore, CONTEXT)?;
         request.group_by = parse_group_by_options(group_by, CONTEXT)?;
+        request.fusion_algorithm = parse_fusion_options(fusion)?;
         let results = self.engine.search(request).await.map_err(laurus_err)?;
         search_results_to_js(results)
     }
@@ -1006,6 +1018,7 @@ mod tests {
                 Some(highlight),
                 None,
                 None,
+                None,
             )
             .await
             .expect("search must succeed");
@@ -1025,7 +1038,7 @@ mod tests {
         let index = text_index().await;
 
         let js_results = index
-            .search("body:rust".to_string(), None, None, None, None, None)
+            .search("body:rust".to_string(), None, None, None, None, None, None)
             .await
             .expect("search must succeed");
         let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
@@ -1110,14 +1123,14 @@ mod tests {
 
         // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
         let title_hits = index
-            .search("title:ell".to_string(), None, None, None, None, None)
+            .search("title:ell".to_string(), None, None, None, None, None, None)
             .await
             .expect("search must succeed");
         let title_hits: serde_json::Value = serde_wasm_bindgen::from_value(title_hits).unwrap();
         assert_eq!(title_hits.as_array().unwrap().len(), 1);
 
         let plain_hits = index
-            .search("plain:ell".to_string(), None, None, None, None, None)
+            .search("plain:ell".to_string(), None, None, None, None, None, None)
             .await
             .expect("search must succeed");
         let plain_hits: serde_json::Value = serde_wasm_bindgen::from_value(plain_hits).unwrap();
@@ -1167,7 +1180,7 @@ mod tests {
         index.commit().await.expect("commit must succeed");
 
         let hits = index
-            .search("title:ell".to_string(), None, None, None, None, None)
+            .search("title:ell".to_string(), None, None, None, None, None, None)
             .await
             .expect("search must succeed");
         let hits: serde_json::Value = serde_wasm_bindgen::from_value(hits).unwrap();
@@ -1477,7 +1490,7 @@ mod tests {
     async fn search_is_reordered_by_late_interaction() {
         let index = rescore_index(None).await;
         let baseline = index
-            .search("title:rust".to_string(), None, None, None, None, None)
+            .search("title:rust".to_string(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_ne!(ids(baseline), EXPECTED);
@@ -1489,6 +1502,7 @@ mod tests {
                 None,
                 None,
                 Some(vectors_rescore()),
+                None,
                 None,
             )
             .await
@@ -1545,6 +1559,7 @@ mod tests {
                     None,
                     None,
                     Some(rescore),
+                    None,
                     None,
                 )
                 .await
@@ -1650,6 +1665,7 @@ mod tests {
                     None,
                     None,
                     Some(highlight_object(rescore)),
+                    None,
                     None,
                 )
                 .await
@@ -1866,6 +1882,7 @@ mod tests {
                 Some(highlight_object(
                     serde_json::json!({ "field": "_id", "groupSize": 2 }),
                 )),
+                None,
             )
             .await
             .unwrap();
@@ -1930,6 +1947,308 @@ mod tests {
             let error = err.as_string().unwrap();
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    // ── Fusion (Issue #1554) ───────────────────────────────────────────────
+    //
+    // `HYBRID` has a lexical and a vector clause: every corpus title has
+    // `rust`, and the callback embeds the query text as [1, 0]. The expected
+    // fused scores are computed from the rankings of a lexical-only and a
+    // vector-only search of the same index, so the tests do not depend on
+    // the BM25 scores.
+
+    const HYBRID: &str = "title:rust vec:\"q\"";
+
+    /// The corpus with its `vec` values, in a `vec` field whose callback
+    /// embedder embeds any query text as [1, 0].
+    async fn fusion_index() -> WasmIndex {
+        let mut schema = WasmSchema::new();
+        schema
+            .add_text_field(
+                "title".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let config = highlight_object(serde_json::json!({ "type": "callback" }));
+        let embed = js_sys::Function::new_with_args("text", "return Promise.resolve([1, 0]);");
+        js_sys::Reflect::set(&config, &JsValue::from_str("embed"), &embed).unwrap();
+        schema
+            .add_embedder("query".to_string(), config.into())
+            .unwrap();
+        schema
+            .add_flat_field(
+                "vec".to_string(),
+                2.0,
+                None,
+                Some("query".to_string()),
+                None,
+                None,
+            )
+            .unwrap();
+        let index = WasmIndex::create(Some(schema), None, None)
+            .await
+            .expect("index creation must succeed");
+        for doc in corpus().as_array().unwrap() {
+            let value = serde_wasm_bindgen::to_value(
+                &serde_json::json!({ "title": doc[1], "vec": doc[2] }),
+            )
+            .unwrap();
+            index
+                .put_document(doc[0].as_str().unwrap().to_string(), value)
+                .await
+                .expect("put_document must succeed");
+        }
+        index.commit().await.expect("commit must succeed");
+        index
+    }
+
+    /// `(id, score)` of each result, in ranking order.
+    fn id_scores(js_results: JsValue) -> Vec<(String, f64)> {
+        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["score"].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Search `HYBRID` with `fusion`, or return the error message.
+    async fn search_hybrid(
+        index: &WasmIndex,
+        fusion: Option<serde_json::Value>,
+    ) -> Result<Vec<(String, f64)>, String> {
+        index
+            .search(
+                HYBRID.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                fusion.map(highlight_object),
+            )
+            .await
+            .map(id_scores)
+            .map_err(|err| err.as_string().unwrap_or_default())
+    }
+
+    /// The RRF scores of the two rankings with `k`, by id.
+    fn rrf_scores(
+        lexical: &[(String, f64)],
+        vector: &[(String, f64)],
+        k: f64,
+    ) -> Vec<(String, f64)> {
+        let mut scores = std::collections::BTreeMap::<String, f64>::new();
+        for ranking in [lexical, vector] {
+            for (rank, (id, _)) in ranking.iter().enumerate() {
+                *scores.entry(id.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+            }
+        }
+        scores.into_iter().collect()
+    }
+
+    /// Whether `a` and `b` hold the same ids, each with a score within 1e-5,
+    /// in any order.
+    fn same_scores(a: &[(String, f64)], b: &[(String, f64)]) -> bool {
+        let by_id = |results: &[(String, f64)]| {
+            let mut results = results.to_vec();
+            results.sort_by(|x, y| x.0.cmp(&y.0));
+            results
+        };
+        let (a, b) = (by_id(a), by_id(b));
+        a.len() == b.len()
+            && a.iter()
+                .zip(&b)
+                .all(|((id_a, a), (id_b, b))| id_a == id_b && (a - b).abs() < 1e-5)
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_fuses_hybrid_results_with_the_given_fusion() {
+        let index = fusion_index().await;
+        let lexical = id_scores(
+            index
+                .search("title:rust".to_string(), None, None, None, None, None, None)
+                .await
+                .unwrap(),
+        );
+        let vector = id_scores(
+            index
+                .search_vector("vec".to_string(), vec![1.0, 0.0], None, None, None, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(lexical.len(), 5, "{lexical:?}");
+        assert_eq!(vector.len(), 5, "{vector:?}");
+
+        // The vector scores, min-max normalized: what WeightedSum with the
+        // weights (0, 1) gives, in the vector-only order.
+        let (min, max) = (vector[4].1, vector[0].1);
+        let normalized: Vec<(String, f64)> = vector
+            .iter()
+            .map(|(id, score)| (id.clone(), (score - min) / (max - min)))
+            .collect();
+        let half = search_hybrid(
+            &index,
+            Some(
+                serde_json::json!({ "weightedSum": { "lexicalWeight": 0.5, "vectorWeight": 0.5 } }),
+            ),
+        )
+        .await;
+
+        let cases = [
+            ("no fusion", None, rrf_scores(&lexical, &vector, 60.0)),
+            (
+                "rrf {}",
+                Some(serde_json::json!({ "rrf": {} })),
+                rrf_scores(&lexical, &vector, 60.0),
+            ),
+            (
+                "rrf k 60",
+                Some(serde_json::json!({ "rrf": { "k": 60 } })),
+                rrf_scores(&lexical, &vector, 60.0),
+            ),
+            (
+                "rrf k 0",
+                Some(serde_json::json!({ "rrf": { "k": 0 } })),
+                rrf_scores(&lexical, &vector, 0.0),
+            ),
+            (
+                "weightedSum (0, 1)",
+                Some(
+                    serde_json::json!({ "weightedSum": { "lexicalWeight": 0, "vectorWeight": 1 } }),
+                ),
+                normalized.clone(),
+            ),
+            (
+                "weightedSum {}",
+                Some(serde_json::json!({ "weightedSum": {} })),
+                half.clone().unwrap_or_default(),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, fusion, expected) in cases {
+            match search_hybrid(&index, fusion).await {
+                Ok(results) if same_scores(&results, &expected) => {}
+                result => mismatches.push(format!("{name}: {result:?}, expected {expected:?}")),
+            }
+        }
+        // The weights (0, 1) rank as the vector-only search, and the default
+        // weights differ from them.
+        let vector_only = search_hybrid(
+            &index,
+            Some(serde_json::json!({ "weightedSum": { "lexicalWeight": 0, "vectorWeight": 1 } })),
+        )
+        .await;
+        let order = |results: &[(String, f64)]| -> Vec<String> {
+            results.iter().map(|(id, _)| id.clone()).collect()
+        };
+        if vector_only.as_deref().map(order) != Ok(order(&normalized)) {
+            mismatches.push(format!(
+                "weightedSum (0, 1) order: {vector_only:?}, expected {normalized:?}"
+            ));
+        }
+        match &half {
+            Ok(half) if !same_scores(half, &normalized) => {}
+            half => mismatches.push(format!(
+                "weightedSum (0.5, 0.5) must differ from (0, 1): {half:?}"
+            )),
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn invalid_fusion_is_rejected() {
+        let index = fusion_index().await;
+        let exactly_one = "Invalid fusion options: set exactly one of rrf or weightedSum";
+        let bad_k = "fusion: rrf: k must be finite and at least 0";
+        let nan_k = highlight_object(serde_json::json!({}));
+        js_sys::Reflect::set(
+            &nan_k,
+            &JsValue::from_str("rrf"),
+            &object_with(serde_json::json!({}), "k", f64::NAN),
+        )
+        .unwrap();
+        let json = |value: serde_json::Value| highlight_object(value);
+        let cases = [
+            ("{}", HYBRID, json(serde_json::json!({})), exactly_one),
+            (
+                "both",
+                HYBRID,
+                json(serde_json::json!({ "rrf": {}, "weightedSum": {} })),
+                exactly_one,
+            ),
+            (
+                "both null",
+                HYBRID,
+                json(serde_json::json!({ "rrf": null, "weightedSum": null })),
+                exactly_one,
+            ),
+            (
+                "k a string",
+                HYBRID,
+                json(serde_json::json!({ "rrf": { "k": "60" } })),
+                "Invalid fusion options: Error: invalid type: string",
+            ),
+            (
+                "k -1",
+                HYBRID,
+                json(serde_json::json!({ "rrf": { "k": -1 } })),
+                bad_k,
+            ),
+            ("k NaN", HYBRID, nan_k, bad_k),
+            (
+                "lexicalWeight 1.5",
+                HYBRID,
+                json(serde_json::json!({ "weightedSum": { "lexicalWeight": 1.5 } })),
+                "fusion: weighted_sum: lexical_weight must be between 0 and 1, got 1.5",
+            ),
+            (
+                "weights 0",
+                HYBRID,
+                json(
+                    serde_json::json!({ "weightedSum": { "lexicalWeight": 0, "vectorWeight": 0 } }),
+                ),
+                "fusion: weighted_sum: lexical_weight or vector_weight must be greater than 0",
+            ),
+            (
+                "k -1, lexical only",
+                "title:rust",
+                json(serde_json::json!({ "rrf": { "k": -1 } })),
+                bad_k,
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, query, fusion, message) in cases {
+            match index
+                .search(
+                    query.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fusion),
+                )
+                .await
+            {
+                Err(err) if err.as_string().is_some_and(|e| e.contains(message)) => {}
+                Err(err) => mismatches.push(format!("{name}: {err:?}, expected {message}")),
+                Ok(_) => mismatches.push(format!("{name}: accepted, expected {message}")),
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     // ── Integer parameters (Issue #1612) ───────────────────────────────────
@@ -2087,11 +2406,11 @@ mod tests {
         for case in BAD {
             let v = case.0;
             let result = index
-                .search(n("title:rust"), Some(v), None, None, None, None)
+                .search(n("title:rust"), Some(v), None, None, None, None, None)
                 .await;
             check(&mut m, "Index.search", "limit", case, result);
             let result = index
-                .search(n("title:rust"), Some(10.0), Some(v), None, None, None)
+                .search(n("title:rust"), Some(10.0), Some(v), None, None, None, None)
                 .await;
             check(&mut m, "Index.search", "offset", case, result);
             let result = index
@@ -2192,7 +2511,7 @@ mod tests {
             let v = case.0;
             let options = object_with(highlight(), "fragmentSize", v);
             let result = index
-                .search(n("title:rust"), None, None, Some(options), None, None)
+                .search(n("title:rust"), None, None, Some(options), None, None, None)
                 .await;
             check(
                 &mut m,
@@ -2203,7 +2522,7 @@ mod tests {
             );
             let options = object_with(highlight(), "maxFragments", v);
             let result = index
-                .search(n("title:rust"), None, None, Some(options), None, None)
+                .search(n("title:rust"), None, None, Some(options), None, None, None)
                 .await;
             check(
                 &mut m,
@@ -2214,12 +2533,12 @@ mod tests {
             );
             let options = object_with(rescore(), "windowSize", v);
             let result = index
-                .search(n("title:rust"), None, None, None, Some(options), None)
+                .search(n("title:rust"), None, None, None, Some(options), None, None)
                 .await;
             check(&mut m, "Index.search", "rescore.windowSize", case, result);
             let options = object_with(group_by(), "groupSize", v);
             let result = index
-                .search(n("title:rust"), None, None, None, None, Some(options))
+                .search(n("title:rust"), None, None, None, None, Some(options), None)
                 .await;
             check(&mut m, "Index.search", "groupBy.groupSize", case, result);
         }
@@ -2306,7 +2625,15 @@ mod tests {
 
         let index = group_index().await;
         let search = |limit: Option<f64>| {
-            index.search("title:rust".to_string(), limit, None, None, None, None)
+            index.search(
+                "title:rust".to_string(),
+                limit,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         };
         let default = ids(search(None).await.unwrap());
         assert!(!default.is_empty());

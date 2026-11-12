@@ -8,7 +8,7 @@
 
 - **レキシカル検索** -- BM25 スコアリングによる転置インデックスベースの全文検索
 - **ベクトル検索** -- Flat、HNSW、IVF インデックスによる近似最近傍探索
-- **ハイブリッド検索** -- RRF、WeightedSum による融合アルゴリズム
+- **ハイブリッド検索** -- RRF、WeightedSum による融合アルゴリズム。`search` の [`fusion` 引数](laurus-wasm/api_reference.md#ハイブリッド検索の融合)で選ぶ
 - **Late interaction による再採点** -- MultiVector フィールドのトークンごとのベクトルを使い、ColBERT 型の MaxSim で上位の結果を並べ替え
 - **クエリ DSL** -- Term、Phrase、Fuzzy、Wildcard、NumericRange、Geo、Boolean、Span
 - **テキスト分析** -- トークナイザー、フィルター、同義語展開

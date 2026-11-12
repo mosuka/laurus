@@ -10,7 +10,7 @@ unified lexical, vector, and hybrid search in the browser.
   Wildcard, Geo, Boolean, and Span queries
 - **Vector search** — HNSW, Flat, and IVF indexes with multiple distance metrics
 - **Hybrid search** — Combine lexical and vector search
-  with RRF or Weighted Sum fusion
+  with RRF or Weighted Sum fusion, chosen with the `fusion` argument of `search`
 - **Late-interaction rescore** — Reorder the top results by ColBERT-style
   MaxSim over per-token vectors in a multi-vector field
 - **CJK support** — Japanese, Chinese, and Korean tokenization via [Lindera](https://github.com/lindera/lindera)
