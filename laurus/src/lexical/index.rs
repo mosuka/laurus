@@ -157,12 +157,14 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
         ))
     }
 
-    /// Dynamically remove a field from the index at runtime.
+    /// Dynamically remove a field from the index at runtime, with its data
+    /// (Issue #1546).
     ///
-    /// Only fields that were dynamically added via [`add_field`](Self::add_field)
-    /// can be removed. Fields defined in the initial index configuration are not
-    /// affected at the index level (though the engine-level schema will no longer
-    /// list them).
+    /// A field from the initial index configuration is removed like one
+    /// added with [`add_field`](Self::add_field): the next writer no longer
+    /// indexes it, and [`add_field`](Self::add_field) can add it again,
+    /// starting empty. The caller commits any writer it holds first, since
+    /// the field's data is discarded from the segments on storage.
     ///
     /// # Arguments
     ///
@@ -171,7 +173,8 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the index implementation does not support dynamic field
-    /// deletion.
+    /// deletion, or if discarding the field's data fails, which leaves the
+    /// field and its data in place.
     fn delete_field(&self, _name: &str) -> Result<()> {
         Err(crate::error::LaurusError::InvalidOperation(
             "This index implementation does not support dynamic field deletion".to_string(),

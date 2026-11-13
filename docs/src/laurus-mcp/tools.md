@@ -115,10 +115,11 @@ particular order.
 
 ## delete_field
 
-Remove a field from the index schema. Existing indexed data remains in
-storage but becomes inaccessible. Per-field analyzers and embedders are
-unregistered. Adding a vector field with the same name later starts it empty
-(see [Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
+Remove a field from the index schema. A lexical field's data is discarded from every segment, which takes time
+in proportion to the index. A vector field's files stay until a field with
+the same name is added again. Per-field analyzers and embedders are
+unregistered. A field added again with the same name starts empty (see
+[Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
 
 ### Parameters
 

@@ -136,9 +136,15 @@ pub struct InvertedIndex {
     /// Inverted index specific configuration.
     config: InvertedIndexConfig,
 
-    /// Fields added dynamically at runtime via [`add_field()`](Self::add_field).
-    /// These are merged with `config.fields` when creating a new writer.
-    extra_fields: RwLock<HashMap<String, FieldOption>>,
+    /// The fields the index has now and their options: `config.fields` at
+    /// create or open, then changed by [`add_field()`](Self::add_field),
+    /// [`delete_field()`](Self::delete_field),
+    /// [`update_field_option()`](Self::update_field_option) and
+    /// [`rebuild_field()`](Self::rebuild_field). A new writer is built with
+    /// these. `config.fields` keeps the fields the index was opened with and
+    /// decides nothing once the index is open, so a field from it can be
+    /// deleted and added again like any other (Issue #1546).
+    fields: RwLock<HashMap<String, FieldOption>>,
 
     /// Whether the index is closed (thread-safe).
     closed: AtomicBool,
@@ -195,8 +201,8 @@ impl InvertedIndex {
 
         let index = InvertedIndex {
             storage,
+            fields: RwLock::new(config.fields.clone()),
             config,
-            extra_fields: RwLock::new(HashMap::new()),
             closed: AtomicBool::new(false),
             metadata: Arc::new(RwLock::new(metadata)),
             segment_manifest: Arc::new(RwLock::new(segment_manifest::ManifestState {
@@ -287,8 +293,8 @@ impl InvertedIndex {
 
         Ok(InvertedIndex {
             storage,
+            fields: RwLock::new(config.fields.clone()),
             config,
-            extra_fields: RwLock::new(HashMap::new()),
             closed: AtomicBool::new(false),
             metadata: Arc::new(RwLock::new(metadata)),
             segment_manifest: Arc::new(RwLock::new(segment_manifest::ManifestState {
@@ -447,19 +453,12 @@ impl InvertedIndex {
         }
     }
 
-    /// The config a writer created now is built with: the base config's
-    /// fields overlaid with `extra_fields`, which [`LexicalIndex::add_field`],
-    /// [`LexicalIndex::rebuild_field`] and
-    /// [`LexicalIndex::update_field_option`] change (Issue #1494).
+    /// The config a writer created now is built with: the index's current
+    /// fields (`self.fields`), which [`LexicalIndex::add_field`],
+    /// [`LexicalIndex::delete_field`], [`LexicalIndex::rebuild_field`] and
+    /// [`LexicalIndex::update_field_option`] change (Issues #1494, #1546).
     fn writer_config(&self) -> InvertedIndexWriterConfig {
-        // Merge base config fields with dynamically added fields.
-        let mut fields = self.config.fields.clone();
-        fields.extend(
-            self.extra_fields
-                .read()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
+        let fields = self.fields.read().clone();
 
         // Every writer setting the index config carries must be set here:
         // `..Default::default()` would otherwise mask it — the flush
@@ -475,6 +474,119 @@ impl InvertedIndex {
             store_doc_values: self.config.store_doc_values,
             ..Default::default()
         }
+    }
+
+    /// Rewrite every published segment into a new one with `rewrite`, and
+    /// publish all of them in one manifest write: what
+    /// [`LexicalIndex::rebuild_field`] and [`LexicalIndex::delete_field`]
+    /// (Issue #1546) do to one field. `rewrite` gets the merge engine, the
+    /// published segments and one fresh segment ID per segment, in order,
+    /// and returns one result per segment, as
+    /// [`MergeEngine::rebuild_field_across_segments`] does. With no
+    /// segment, nothing is rewritten. `field` names the field in the log.
+    ///
+    /// [`MergeEngine::rebuild_field_across_segments`]: self::segment::merge_engine::MergeEngine::rebuild_field_across_segments
+    ///
+    /// # Errors
+    ///
+    /// An error means nothing was published: the manifest lists the same
+    /// segments as before. Deleting the replaced segments' files after the
+    /// manifest write is cleanup only: a failure there is logged at `warn`
+    /// and not returned (Issue #1436), and the files left behind are
+    /// reclaimed by the orphan sweep when the index is next opened.
+    fn rewrite_segments(
+        &self,
+        field: &str,
+        rewrite: impl FnOnce(
+            &self::segment::merge_engine::MergeEngine,
+            &[self::segment::ManagedSegmentInfo],
+            &[String],
+        ) -> Result<Vec<self::segment::merge_engine::MergeResult>>,
+    ) -> Result<()> {
+        let segments = self.load_segments()?;
+        if !segments.is_empty() {
+            use self::segment::ManagedSegmentInfo;
+            use self::segment::merge_engine::{MergeConfig, MergeEngine};
+
+            let managed: Vec<ManagedSegmentInfo> = segments
+                .iter()
+                .map(|info| {
+                    let mut mi = ManagedSegmentInfo::new(info.clone());
+                    mi.size_bytes = self.segment_size_bytes(&info.segment_id);
+                    mi
+                })
+                .collect();
+
+            // Reserve one fresh generation per source segment up front, so
+            // every rebuilt segment has a final ID before any I/O runs —
+            // the merge engine writes to `new_segment_ids` directly, no
+            // renumbering needed after the fact.
+            let mut new_segment_ids = Vec::with_capacity(segments.len());
+            for _ in &segments {
+                let generation = self.next_generation()?;
+                new_segment_ids.push(format!("merged_{generation}"));
+            }
+
+            let engine = MergeEngine::new(
+                MergeConfig {
+                    use_compound: self.config.use_compound,
+                    field_doc_values: self.current_field_doc_values(),
+                    default_doc_values: self.config.store_doc_values,
+                    index_analyzer: Some(self.config.analyzer.clone()),
+                    ..MergeConfig::default()
+                },
+                self.storage.clone(),
+            );
+            // Nothing is published yet: a failure here leaves every source
+            // segment and the manifest completely untouched (Issue #1081's
+            // acceptance criterion). Only a partially-written new segment
+            // file might exist on disk, which is not referenced by any
+            // manifest and is swept up as an orphan on next open, the same
+            // as an aborted `perform_merge`.
+            let results = rewrite(&engine, &managed, &new_segment_ids)?;
+
+            // Publish the whole batch as ONE manifest write (mirrors
+            // `merge_segment_set`): drop every source and insert every
+            // rebuilt segment, each keeping the generation its own ID
+            // already encodes.
+            let mut new_infos: Vec<SegmentInfo> = Vec::with_capacity(results.len());
+            for (result, new_segment_id) in results.into_iter().zip(&new_segment_ids) {
+                let mut info = result.new_segment.segment_info;
+                if let Some(generation) = segment_manifest::stem_ordinal(new_segment_id) {
+                    info.generation = generation;
+                }
+                new_infos.push(info);
+            }
+            let source_ids: Vec<String> = segments.iter().map(|s| s.segment_id.clone()).collect();
+            segment_manifest::publish_with(
+                self.storage.as_ref(),
+                &self.segment_manifest,
+                |list| {
+                    list.retain(|entry| !source_ids.contains(&entry.segment_id));
+                    for info in new_infos {
+                        segment_manifest::upsert_entry(list, info);
+                    }
+                },
+            )?;
+            self.release_replaced_segment_readers();
+
+            // Physical cleanup only: the manifest write above already
+            // removed the sources from discovery atomically, so a file left
+            // behind is an unreferenced orphan the next open's sweep
+            // reclaims. Returning its error would skip the option update
+            // below and report a rebuild that took effect as a failed one,
+            // so the caller would keep the old analyzer (Issue #1436).
+            for info in &segments {
+                if let Err(e) = self.delete_segment_files(&info.segment_id) {
+                    log::warn!(
+                        "cannot delete the files of segment {} replaced by rewriting field \
+                         {field}: {e}; they are left for the next open's orphan sweep",
+                        info.segment_id
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load the segments a reader may see, i.e. the published ones.
@@ -739,24 +851,16 @@ impl InvertedIndex {
     /// files are removed — minimizing any window in which a document could be
     /// seen in both a source and the merged segment). A no-op for fewer than
     /// two sources.
-    /// Every currently-declared field's `doc_values` setting, merging the
-    /// initial schema (`config.fields`) with fields added at runtime
-    /// (`extra_fields`) -- the same union [`Self::writer`] builds for
-    /// `InvertedIndexWriterConfig::fields`. Feeds
+    /// Every currently-declared field's `doc_values` setting, from the
+    /// index's current fields (`self.fields`) -- the same table
+    /// [`Self::writer`] builds `InvertedIndexWriterConfig::fields` from. Feeds
     /// [`MergeConfig::field_doc_values`](self::segment::merge_engine::MergeConfig::field_doc_values)
     /// so a merge or field rebuild resolves DocValues from the CURRENT
     /// schema first (Issue #1047), not from whatever a source segment
     /// happens to have on disk.
     fn current_field_doc_values(&self) -> HashMap<String, bool> {
         let mut out = HashMap::new();
-        for (name, option) in &self.config.fields {
-            if let Some(dv) = option.doc_values() {
-                out.insert(name.clone(), dv);
-            }
-        }
-        // Runtime-added fields win over the initial schema on a name
-        // clash, mirroring `writer()`'s `fields.extend(extra_fields)`.
-        for (name, option) in self.extra_fields.read().iter() {
+        for (name, option) in self.fields.read().iter() {
             if let Some(dv) = option.doc_values() {
                 out.insert(name.clone(), dv);
             }
@@ -1185,36 +1289,60 @@ impl LexicalIndex for InvertedIndex {
     }
 
     fn add_field(&self, name: &str, option: FieldOption) -> Result<()> {
-        // Check for duplicates in both base config and extra fields.
-        if self.config.fields.contains_key(name) || self.extra_fields.read().contains_key(name) {
+        let mut fields = self.fields.write();
+        if fields.contains_key(name) {
             return Err(LaurusError::invalid_argument(format!(
                 "Field '{name}' already exists in the lexical index"
             )));
         }
-        self.extra_fields.write().insert(name.to_string(), option);
+        fields.insert(name.to_string(), option);
         Ok(())
     }
 
+    /// Discard `name`'s data from every segment, then remove it from the
+    /// index's fields (Issue #1546).
+    ///
+    /// The discard rewrites every segment, as [`Self::rebuild_field`] does,
+    /// without the field's postings, BKD points, norms, doc values and
+    /// stored value ([`MergeEngine::discard_field_across_segments`]), and
+    /// publishes the rewritten segments in one manifest write. So the next
+    /// writer no longer indexes the field, and a field added again under
+    /// the same name starts empty, whether it came from the config the
+    /// index was opened with or was added later. A name the index does not
+    /// have is left alone.
+    ///
+    /// [`MergeEngine::discard_field_across_segments`]: self::segment::merge_engine::MergeEngine::discard_field_across_segments
+    ///
+    /// # Errors
+    ///
+    /// An error means nothing was published: the segments still hold the
+    /// field's data and the field stays. Failing to delete the replaced
+    /// segments' files after the manifest write is logged and not returned,
+    /// as in [`Self::rebuild_field`].
     fn delete_field(&self, name: &str) -> Result<()> {
-        // Only dynamically added fields (in extra_fields) can be removed at
-        // the index level. Fields from the initial config remain in the
-        // underlying index data but will be hidden from the engine-level schema.
-        self.extra_fields.write().remove(name);
+        self.check_closed()?;
+        if !self.fields.read().contains_key(name) {
+            return Ok(());
+        }
+        self.rewrite_segments(name, |engine, segments, new_segment_ids| {
+            engine.discard_field_across_segments(segments, name, new_segment_ids)
+        })?;
+        self.fields.write().remove(name);
         Ok(())
     }
 
-    /// Replace `name`'s option through `extra_fields`, which overrides the
-    /// base config in [`Self::writer`] -- the same mechanism
+    /// Replace `name`'s option in the index's fields (`self.fields`), which
+    /// the next writer is built with -- the same table
     /// [`Self::rebuild_field`] ends with, without its segment rewrite
     /// (Issue #1494).
     fn update_field_option(&self, name: &str, option: FieldOption) -> Result<()> {
-        let mut extra_fields = self.extra_fields.write();
-        if !self.config.fields.contains_key(name) && !extra_fields.contains_key(name) {
+        let mut fields = self.fields.write();
+        let Some(slot) = fields.get_mut(name) else {
             return Err(LaurusError::invalid_argument(format!(
                 "Field '{name}' does not exist in the lexical index"
             )));
-        }
-        extra_fields.insert(name.to_string(), option);
+        };
+        *slot = option;
         Ok(())
     }
 
@@ -1257,103 +1385,22 @@ impl LexicalIndex for InvertedIndex {
         // back to the index-wide default in exactly that one case.
         let target_doc_values = option.doc_values().unwrap_or(self.config.store_doc_values);
 
-        let segments = self.load_segments()?;
-        if !segments.is_empty() {
-            use self::segment::ManagedSegmentInfo;
-            use self::segment::merge_engine::{MergeConfig, MergeEngine};
-
-            let managed: Vec<ManagedSegmentInfo> = segments
-                .iter()
-                .map(|info| {
-                    let mut mi = ManagedSegmentInfo::new(info.clone());
-                    mi.size_bytes = self.segment_size_bytes(&info.segment_id);
-                    mi
-                })
-                .collect();
-
-            // Reserve one fresh generation per source segment up front, so
-            // every rebuilt segment has a final ID before any I/O runs —
-            // the merge engine writes to `new_segment_ids` directly, no
-            // renumbering needed after the fact.
-            let mut new_segment_ids = Vec::with_capacity(segments.len());
-            for _ in &segments {
-                let generation = self.next_generation()?;
-                new_segment_ids.push(format!("merged_{generation}"));
-            }
-
-            let engine = MergeEngine::new(
-                MergeConfig {
-                    use_compound: self.config.use_compound,
-                    field_doc_values: self.current_field_doc_values(),
-                    default_doc_values: self.config.store_doc_values,
-                    index_analyzer: Some(self.config.analyzer.clone()),
-                    ..MergeConfig::default()
-                },
-                self.storage.clone(),
-            );
-            // Nothing is published yet: a failure here leaves every source
-            // segment and the manifest completely untouched (Issue #1081's
-            // acceptance criterion). Only a partially-written new segment
-            // file might exist on disk, which is not referenced by any
-            // manifest and is swept up as an orphan on next open, the same
-            // as an aborted `perform_merge`.
-            let results = engine.rebuild_field_across_segments(
-                &managed,
+        self.rewrite_segments(name, |engine, segments, new_segment_ids| {
+            engine.rebuild_field_across_segments(
+                segments,
                 name,
                 analyzer.as_ref(),
                 target_term_vectors,
                 target_doc_values,
                 target_position_increment_gap,
-                &new_segment_ids,
-            )?;
+                new_segment_ids,
+            )
+        })?;
 
-            // Publish the whole batch as ONE manifest write (mirrors
-            // `merge_segment_set`): drop every source and insert every
-            // rebuilt segment, each keeping the generation its own ID
-            // already encodes.
-            let mut new_infos: Vec<SegmentInfo> = Vec::with_capacity(results.len());
-            for (result, new_segment_id) in results.into_iter().zip(&new_segment_ids) {
-                let mut info = result.new_segment.segment_info;
-                if let Some(generation) = segment_manifest::stem_ordinal(new_segment_id) {
-                    info.generation = generation;
-                }
-                new_infos.push(info);
-            }
-            let source_ids: Vec<String> = segments.iter().map(|s| s.segment_id.clone()).collect();
-            segment_manifest::publish_with(
-                self.storage.as_ref(),
-                &self.segment_manifest,
-                |list| {
-                    list.retain(|entry| !source_ids.contains(&entry.segment_id));
-                    for info in new_infos {
-                        segment_manifest::upsert_entry(list, info);
-                    }
-                },
-            )?;
-            self.release_replaced_segment_readers();
-
-            // Physical cleanup only: the manifest write above already
-            // removed the sources from discovery atomically, so a file left
-            // behind is an unreferenced orphan the next open's sweep
-            // reclaims. Returning its error would skip the option update
-            // below and report a rebuild that took effect as a failed one,
-            // so the caller would keep the old analyzer (Issue #1436).
-            for info in &segments {
-                if let Err(e) = self.delete_segment_files(&info.segment_id) {
-                    log::warn!(
-                        "cannot delete the files of segment {} replaced by rebuilding field \
-                         {name}: {e}; they are left for the next open's orphan sweep",
-                        info.segment_id
-                    );
-                }
-            }
-        }
-
-        // Update the field's option — same "extra_fields overrides base
-        // config" mechanism `add_field`/`writer()` already rely on (#1081:
-        // this also covers a field originally declared in the base config,
-        // which `add_field` cannot touch since it rejects duplicates).
-        self.extra_fields.write().insert(name.to_string(), option);
+        // Update the field's option in the index's fields, which the next
+        // writer is built with (#1081: also for a field from the config the
+        // index was opened with).
+        self.fields.write().insert(name.to_string(), option);
         Ok(())
     }
 }
@@ -2677,5 +2724,46 @@ mod tests {
 
         let error = index.update_field_option("nosuch", new_option).unwrap_err();
         assert!(matches!(error, LaurusError::InvalidArgument(_)), "{error}");
+    }
+
+    /// Issue #1546: a field from the config the index was created with is
+    /// deleted like one added later. Adding it while the index has it is
+    /// refused; once deleted, the next writer no longer has it, and adding
+    /// it again uses the re-added option, not one `update_field_option`
+    /// set before the deletion.
+    #[test]
+    fn a_field_from_the_config_can_be_deleted_and_added_again() {
+        use crate::lexical::core::field::TextOption;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut config = InvertedIndexConfig::default();
+        config.fields.insert(
+            "title".to_string(),
+            FieldOption::Text(TextOption::default()),
+        );
+        let index = InvertedIndex::create(storage, config).unwrap();
+        let readded = FieldOption::Text(TextOption::default());
+
+        let error = index.add_field("title", readded.clone()).unwrap_err();
+        assert!(matches!(error, LaurusError::InvalidArgument(_)), "{error}");
+
+        index
+            .update_field_option(
+                "title",
+                FieldOption::Text(TextOption::default().stored(false)),
+            )
+            .unwrap();
+        index.delete_field("title").unwrap();
+        assert!(!index.writer_config().fields.contains_key("title"));
+
+        index.add_field("title", readded).unwrap();
+        assert_eq!(
+            index
+                .writer_config()
+                .fields
+                .get("title")
+                .map(FieldOption::stored),
+            Some(true)
+        );
     }
 }

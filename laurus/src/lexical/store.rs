@@ -1143,12 +1143,21 @@ impl LexicalStore {
         updated
     }
 
-    /// Remove a field from the lexical store.
+    /// Remove a field from the lexical store, with its data (Issue #1546).
     ///
-    /// Removes the field from the underlying index (if it was dynamically added)
-    /// and unregisters any field-specific analyzer from the `PerFieldAnalyzer`.
-    /// After this call, the field will no longer be available for indexing or
-    /// searching, but existing data in the index is not deleted.
+    /// The cached writer is committed and dropped first, as in
+    /// [`Self::rebuild_field`]: the index discards the field's data from the
+    /// segments on storage, so the documents the writer buffers must be
+    /// there too. Then the index discards the field's data from every
+    /// segment and removes the field (see
+    /// [`InvertedIndex`](crate::lexical::index::inverted::InvertedIndex)'s
+    /// `delete_field`), and any field-specific analyzer is unregistered from
+    /// the `PerFieldAnalyzer`. The field is then no longer indexed, and a
+    /// field added again under the same name starts empty, whether it came
+    /// from the config the store was opened with or was added later.
+    ///
+    /// The writer lock is held throughout, so no write lands between the
+    /// commit and the discard.
     ///
     /// # Arguments
     ///
@@ -1156,14 +1165,25 @@ impl LexicalStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying index does not support dynamic field
-    /// deletion.
+    /// Returns an error if committing the cached writer fails, which keeps
+    /// the writer cached with its buffered state and the field as it was,
+    /// as [`Self::commit`] does (Issue #875), or if the index fails to
+    /// discard the field's data, which publishes nothing and keeps the
+    /// field and its data.
     pub fn delete_field(&self, name: &str) -> Result<()> {
-        // Remove the field from the underlying index.
-        self.index.delete_field(name)?;
+        let mut writer_guard = self.writer_cache.lock();
+        // Same commit-then-drop-on-success guard as `add_field` (Issue
+        // #875): never rely on the silent Drop-close commit to persist
+        // buffered deletion state.
+        if let Some(writer) = writer_guard.as_mut() {
+            writer.commit()?;
+        }
+        *writer_guard = None;
 
-        // Remove the field-specific analyzer from the PerFieldAnalyzer if present.
-        if let Ok(index_analyzer) = self.analyzer()
+        let deleted = self.index.delete_field(name);
+
+        if deleted.is_ok()
+            && let Ok(index_analyzer) = self.analyzer()
             && let Some(pfa) = index_analyzer
                 .as_any()
                 .downcast_ref::<crate::analysis::analyzer::per_field::PerFieldAnalyzer>(
@@ -1172,21 +1192,14 @@ impl LexicalStore {
             pfa.remove_analyzer(name);
         }
 
-        // Invalidate caches so the next writer/searcher uses updated config.
-        // Same commit-then-drop-on-success guard as `add_field` (Issue #875):
-        // never rely on the silent Drop-close commit to persist buffered
-        // deletion state.
-        {
-            let mut writer_guard = self.writer_cache.lock();
-            if let Some(writer) = writer_guard.as_mut() {
-                writer.commit()?;
-            }
-            *writer_guard = None;
-            // Before the writer lock is released, as in `commit` (Issue #1207).
-            *self.searcher_cache.write() = None;
-        }
-
-        Ok(())
+        // Before the writer lock is released, as in `commit` (Issue #1207),
+        // and on the error path too, as in `rebuild_field` (Issue #1424):
+        // the commit above emptied the writer, so a searcher built before
+        // it would hide the documents that commit published from the `_id`
+        // lookup.
+        *self.searcher_cache.write() = None;
+        drop(writer_guard);
+        deleted
     }
 }
 
@@ -2383,5 +2396,144 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
+    }
+
+    /// Issue #1546 — `delete_field` discards the field's data from every
+    /// segment (its doc values, its BKD points and its stored value), so a
+    /// field added again under the same name starts empty. The other
+    /// fields keep theirs.
+    #[test]
+    fn delete_field_discards_the_field_from_every_segment() {
+        use crate::lexical::core::field::{FieldOption, IntegerOption};
+        use crate::lexical::query::range::NumericRangeQuery;
+        use crate::lexical::search::searcher::DocValueLookup;
+
+        let integer = || FieldOption::Integer(IntegerOption::default());
+        let storage = Arc::new(FailOnceStorage::new());
+        let config = LexicalIndexConfig::builder()
+            .add_field("title", title_option())
+            .add_field("n", integer())
+            .build();
+        let store = LexicalStore::new(storage, config).unwrap();
+        let doc = |id: &str, n: i64| {
+            Document::builder()
+                .add_text("_id", id)
+                .add_text("title", "rust programming")
+                .add_field("n", DataValue::Int64(n))
+                .build()
+        };
+        // One segment per commit.
+        store.upsert_document(1, doc("ida", 10)).unwrap();
+        store.commit().unwrap();
+        store.upsert_document(2, doc("idb", 20)).unwrap();
+        store.commit().unwrap();
+        let n_range = || -> Box<dyn Query> {
+            Box::new(NumericRangeQuery::i64_range("n", Some(0), Some(100)))
+        };
+        assert_eq!(
+            store
+                .search(LexicalSearchRequest::new(n_range()))
+                .unwrap()
+                .hits
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .doc_values_batch("n", &[1, 2])
+                .unwrap()
+                .iter()
+                .all(|v| matches!(v, DocValueLookup::Value(_)))
+        );
+
+        store.delete_field("n").unwrap();
+        store.add_field("n", integer(), None).unwrap();
+
+        let mut kept = Vec::new();
+        let doc_values = store.doc_values_batch("n", &[1, 2]).unwrap();
+        if doc_values
+            .iter()
+            .any(|v| matches!(v, DocValueLookup::Value(_)))
+        {
+            kept.push(format!("doc values: {doc_values:?}"));
+        }
+        let in_range = store
+            .search(LexicalSearchRequest::new(n_range()))
+            .unwrap()
+            .hits
+            .len();
+        if in_range != 0 {
+            kept.push(format!("BKD points: {in_range} documents in range"));
+        }
+        let request =
+            LexicalSearchRequest::new(Box::new(TermQuery::new("title", "rust")) as Box<dyn Query>)
+                .load_documents(true);
+        let hits = store.search(request).unwrap().hits;
+        if hits.len() != 2 {
+            kept.push(format!("the title finds {} documents, not 2", hits.len()));
+        }
+        if hits
+            .iter()
+            .any(|hit| hit.document.as_ref().is_some_and(|doc| doc.has_field("n")))
+        {
+            kept.push("the stored value".to_string());
+        }
+        assert!(kept.is_empty(), "left after delete_field: {kept:#?}");
+    }
+
+    /// Issue #1546 — a `delete_field` whose segment rewrite fails publishes
+    /// nothing: the error is returned, and the field, its data and its
+    /// per-field analyzer stay.
+    #[test]
+    fn delete_field_failure_keeps_the_field_and_its_data() {
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+
+        let storage = Arc::new(FailOnceStorage::new());
+        let config = LexicalIndexConfig::builder()
+            .analyzer(Arc::new(PerFieldAnalyzer::new(Arc::new(
+                StandardAnalyzer::new().unwrap(),
+            ))))
+            .add_field("title", title_option())
+            .build();
+        let store = LexicalStore::new(storage.clone(), config).unwrap();
+        store.upsert_document(1, titled_doc("ida")).unwrap();
+        store.commit().unwrap();
+        let title_analyzer: Arc<dyn Analyzer> = Arc::new(StandardAnalyzer::new().unwrap());
+        let registered = || {
+            let analyzer = store.analyzer().unwrap();
+            let per_field = analyzer
+                .as_any()
+                .downcast_ref::<PerFieldAnalyzer>()
+                .unwrap()
+                .get_analyzer("title");
+            Arc::ptr_eq(&per_field, &title_analyzer)
+        };
+        store
+            .analyzer()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<PerFieldAnalyzer>()
+            .unwrap()
+            .add_analyzer("title", title_analyzer.clone());
+        assert!(registered());
+
+        // The rewritten segments are named `merged_*`, as a rebuild's are.
+        *storage.fail_create.lock() = Some("merged_");
+        assert!(store.delete_field("title").is_err());
+        assert!(
+            storage.fail_create.lock().is_none(),
+            "the rewrite must hit the injected failure"
+        );
+
+        let request =
+            LexicalSearchRequest::new(Box::new(TermQuery::new("title", "rust")) as Box<dyn Query>);
+        assert_eq!(store.search(request).unwrap().hits.len(), 1);
+        let error = store.add_field("title", title_option(), None).unwrap_err();
+        assert!(
+            error.to_string().contains("already exists"),
+            "the field must still be there: {error}"
+        );
+        assert!(registered(), "the field must keep its analyzer");
     }
 }

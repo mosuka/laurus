@@ -16,9 +16,10 @@ use crate::context;
 /// Opens the index at `index_dir` and calls [`Engine::delete_field`], which
 /// persists the updated schema itself (the engine returned by
 /// [`context::open_index`] is configured with a schema-persist hook — see
-/// Issue #1078). Existing data in the index is not deleted; the field
-/// simply becomes inaccessible for future indexing and searching. Adding a
-/// vector field with the same name later starts it empty (Issue #1535).
+/// Issue #1078). The field is no longer indexed or searchable. A lexical
+/// field's data is discarded from every segment (Issue #1546), and a
+/// vector field's when a field with the same name is added again (Issue
+/// #1535), so a field added again starts empty.
 ///
 /// # Arguments
 ///
