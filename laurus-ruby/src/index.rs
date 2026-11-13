@@ -250,6 +250,12 @@ impl RbIndex {
     /// position and id; documents applied before the failure are **not**
     /// rolled back (retrying the batch is idempotent).
     ///
+    /// Every pair is converted before any is applied: an entry that is not
+    /// an `[id, hash]` pair of a String and a Hash raises `TypeError`
+    /// (`ArgumentError` for an Array that does not hold two elements), and a
+    /// document that cannot be converted raises what `put_document` raises
+    /// for it, each message starting with `documents[i]: ` (Issue #1630).
+    ///
     /// # Arguments
     ///
     /// * `docs` - An Array of `[id, hash]` pairs.
@@ -577,9 +583,13 @@ impl RbIndex {
 // ---------------------------------------------------------------------------
 
 /// Convert an Array of `[id, hash]` pairs into the engine's
-/// `(String, Document)` batch, raising an ArgumentError that names the
-/// offending position on any entry that is not a two-element `[String, Hash]`
-/// pair.
+/// `(String, Document)` batch, naming the position of the pair that fails
+/// as `documents[i]` (Issue #1630).
+///
+/// An entry that is not an Array, an id that is not a String or a document
+/// that is not a Hash raises `TypeError`, and an Array that does not hold
+/// two elements raises `ArgumentError`. A document whose content cannot be
+/// converted raises the exception `put_document` raises for it.
 ///
 /// # Arguments
 ///
@@ -588,31 +598,36 @@ impl RbIndex {
 fn pairs_to_documents(ruby: &Ruby, docs: RArray) -> Result<Vec<(String, laurus::Document)>, Error> {
     let mut batch = Vec::with_capacity(docs.len());
     for (index, item) in docs.into_iter().enumerate() {
+        let context = format!("documents[{index}]");
         let pair: RArray = TryConvert::try_convert(item).map_err(|_| {
             Error::new(
-                ruby.exception_arg_error(),
-                format!("documents[{index}]: expected an [id, hash] pair"),
+                ruby.exception_type_error(),
+                format!("{context}: expected an [id, hash] pair"),
             )
         })?;
         if pair.len() != 2 {
             return Err(Error::new(
                 ruby.exception_arg_error(),
-                format!("documents[{index}]: expected a 2-element [id, hash] pair"),
+                format!(
+                    "{context}: expected a 2-element [id, hash] pair, got {} elements",
+                    pair.len()
+                ),
             ));
         }
         let id: String = TryConvert::try_convert(pair.entry(0)?).map_err(|_| {
             Error::new(
-                ruby.exception_arg_error(),
-                format!("documents[{index}]: id must be a String"),
+                ruby.exception_type_error(),
+                format!("{context}: id must be a String"),
             )
         })?;
         let hash: RHash = TryConvert::try_convert(pair.entry(1)?).map_err(|_| {
             Error::new(
-                ruby.exception_arg_error(),
-                format!("documents[{index}]: document must be a Hash"),
+                ruby.exception_type_error(),
+                format!("{context}: document must be a Hash"),
             )
         })?;
-        batch.push((id, hash_to_document(ruby, hash)?));
+        let document = hash_to_document(ruby, hash).map_err(|e| with_context(e, &context))?;
+        batch.push((id, document));
     }
     Ok(batch)
 }

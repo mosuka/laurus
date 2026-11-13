@@ -38,12 +38,41 @@ class TestBatchIngest < Minitest::Test
     assert_equal 2, idx.get_documents("doc").length
   end
 
+  # Issue #1630: a malformed pair raises TypeError for a wrong type (it was
+  # an ArgumentError) and ArgumentError for the wrong number of elements,
+  # naming its position.
   def test_put_documents_rejects_malformed_entry
-    idx = Laurus::Index.new
-    error = assert_raises(ArgumentError) do
-      idx.put_documents([["ok", { "title" => "fine" }], "not-a-pair"])
+    cases = {
+      "not a pair" => ["not-a-pair", TypeError, "documents[1]: expected an [id, hash] pair"],
+      "one element" => [["b"], ArgumentError, "documents[1]: expected a 2-element [id, hash] pair, got 1 elements"],
+      "three elements" => [["b", {}, 1], ArgumentError,
+                           "documents[1]: expected a 2-element [id, hash] pair, got 3 elements"],
+      "id not a String" => [[1, {}], TypeError, "documents[1]: id must be a String"],
+      "document not a Hash" => [%w[b x], TypeError, "documents[1]: document must be a Hash"]
+    }
+    cases.each do |label, (entry, error_class, message)|
+      idx = Laurus::Index.new
+      error = assert_raises(StandardError, label) do
+        idx.put_documents([["ok", { "title" => "fine" }], entry])
+      end
+      assert_equal error_class, error.class, label
+      assert_equal message, error.message, label
     end
-    assert_includes error.message, "documents[1]"
+  end
+
+  # Issue #1630: a document whose content cannot be converted fails the
+  # batch with the exception put_document raises for it, its message
+  # starting with the document's position.
+  def test_batch_names_the_document_that_cannot_be_converted
+    %i[put_documents add_documents].each do |method|
+      idx = Laurus::Index.new
+      single = assert_raises(StandardError) { idx.put_document("b", { "x" => Object.new }) }
+      batch = assert_raises(StandardError, method.to_s) do
+        idx.public_send(method, [["a", { "title" => "a" }], ["b", { "x" => Object.new }]])
+      end
+      assert_equal single.class, batch.class, method.to_s
+      assert_equal "documents[1]: #{single.message}", batch.message, method.to_s
+    end
   end
 
   # Issue #1627: a document the engine rejects fails the batch with the

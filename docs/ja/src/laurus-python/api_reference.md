@@ -32,7 +32,7 @@ class Index:
 | :--- | :--- |
 | `put_document(id, doc)` | ドキュメントをアップサート（upsert）します。同じ ID の既存バージョンをすべて置換します。 |
 | `add_document(id, doc)` | 既存バージョンを削除せずにドキュメントチャンクを追記します。 |
-| `put_documents(docs)` | バッチ upsert。`docs` は `(id, dict)` ペアのイテラブルで、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `put_document` に渡したときと同じ例外（予約名のフィールドなど呼び出し側の誤りなら `ValueError`）を送出し、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。 |
+| `put_documents(docs)` | バッチ upsert。`docs` は `(id, dict)` ペアのイテラブルで、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `put_document` に渡したときと同じ例外（予約名のフィールドなど呼び出し側の誤りなら `ValueError`）を送出し、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。`(str, dict)` のタプルでない組は `TypeError`（要素が 2 つでないタプルは `ValueError`）を送出し、中身を変換できない文書は `put_document` がその文書に送出するのと同じ例外を送出します。どちらもメッセージの先頭に位置が付きます: `documents[1]: ...`（Issue #1630）。 |
 | `add_documents(docs)` | バッチチャンク追記。エラーも含めて `put_documents` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
 | `get_documents(id) -> list[dict]` | 指定 ID の全保存バージョンを返します。 |
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |

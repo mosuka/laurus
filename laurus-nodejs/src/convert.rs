@@ -87,10 +87,16 @@ fn js_number(value: f64) -> String {
 /// # Returns
 ///
 /// A [`Document`] with fields populated from the JSON object.
+///
+/// # Errors
+///
+/// Returns an `InvalidArg` error, a caller's mistake, if `value` is not an
+/// object or one of its values cannot be converted (see
+/// [`json_to_data_value`]); it was `GenericFailure` (Issue #1630).
 pub fn json_to_document(value: &Value) -> napi::Result<Document> {
     let obj = value
         .as_object()
-        .ok_or_else(|| napi::Error::from_reason("Document must be a JSON object"))?;
+        .ok_or_else(|| napi::Error::new(Status::InvalidArg, "Document must be a JSON object"))?;
 
     let mut builder = Document::builder();
     for (field, val) in obj {
@@ -141,7 +147,7 @@ pub fn json_to_data_value(value: &Value) -> napi::Result<DataValue> {
             } else if let Some(f) = n.as_f64() {
                 Ok(DataValue::Float64(f))
             } else {
-                Err(napi::Error::from_reason("Invalid number value"))
+                Err(napi::Error::new(Status::InvalidArg, "Invalid number value"))
             }
         }
         Value::String(s) => {
@@ -168,7 +174,7 @@ pub fn json_to_data_value(value: &Value) -> napi::Result<DataValue> {
                 return Ok(DataValue::Int64Array(Vec::new()));
             }
             match laurus::infer_from_json(value)
-                .map_err(|e| napi::Error::from_reason(e.to_string()))?
+                .map_err(|e| napi::Error::new(Status::InvalidArg, e.to_string()))?
             {
                 laurus::InferredValue::Inferred {
                     value: inferred, ..
@@ -182,8 +188,9 @@ pub fn json_to_data_value(value: &Value) -> napi::Result<DataValue> {
                 obj.get("lat").and_then(|v| v.as_f64()),
                 obj.get("lon").and_then(|v| v.as_f64()),
             ) {
-                let point = laurus::lexical::GeoPoint::try_new(lat, lon)
-                    .map_err(|e| napi::Error::from_reason(format!("invalid geo point: {e}")))?;
+                let point = laurus::lexical::GeoPoint::try_new(lat, lon).map_err(|e| {
+                    napi::Error::new(Status::InvalidArg, format!("invalid geo point: {e}"))
+                })?;
                 return Ok(DataValue::Geo(point));
             }
             // Check for geo3d { x, y, z } (must come after the 2D Geo check
@@ -195,7 +202,8 @@ pub fn json_to_data_value(value: &Value) -> napi::Result<DataValue> {
             ) {
                 return Ok(DataValue::GeoEcef(laurus::GeoEcefPoint::new(x, y, z)));
             }
-            Err(napi::Error::from_reason(
+            Err(napi::Error::new(
+                Status::InvalidArg,
                 "Cannot convert JSON object to DataValue: expected { lat, lon } or { x, y, z }",
             ))
         }

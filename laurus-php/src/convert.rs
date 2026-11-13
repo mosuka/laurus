@@ -10,6 +10,18 @@ use ext_php_rs::types::{ZendHashTable, Zval};
 use ext_php_rs::zend::ce;
 use laurus::{DataValue, Document};
 
+/// A `\TypeError` for a document's value or key of the wrong type, such as
+/// an object or an integer key (Issue #1630).
+fn type_error(message: impl Into<String>) -> PhpException {
+    PhpException::new(message.into(), 0, ce::type_error())
+}
+
+/// A `\ValueError` for a document's value of the right type but a wrong
+/// value, such as a geo point out of range (Issue #1630).
+fn value_error(message: impl Into<String>) -> PhpException {
+    PhpException::new(message.into(), 0, ce::value_error())
+}
+
 /// Convert a PHP integer parameter to the unsigned integer type `T` the
 /// engine takes (`usize` or `u64`).
 ///
@@ -55,6 +67,13 @@ pub fn unsigned_param<T: TryFrom<i64>>(context: &str, name: &str, value: i64) ->
 /// # Returns
 ///
 /// A `Document` with fields populated from the array.
+///
+/// # Errors
+///
+/// Throws `\TypeError` for a key or value of the wrong type (an integer key,
+/// an object, a non-numeric element of a numeric array) and `\ValueError`
+/// for a wrong value (a key that is not UTF-8, a geo point out of range, an
+/// array mixing 2D and 3D geo points), as a caller's mistake (Issue #1630).
 pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
     let mut builder = Document::builder();
     for (key, val) in ht.iter() {
@@ -63,10 +82,10 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
             ArrayKey::Str(s) => s.to_string(),
             ArrayKey::ZendString(s) => s
                 .as_str()
-                .map_err(|_| "array key must be valid UTF-8")?
+                .map_err(|_| value_error("array key must be valid UTF-8"))?
                 .to_string(),
             ArrayKey::Long(_) => {
-                return Err("array key must be a string, not an integer".into());
+                return Err(type_error("array key must be a string, not an integer"));
             }
         };
         let dv = zval_to_data_value(val)?;
@@ -104,7 +123,8 @@ pub fn hashtable_to_document(ht: &ZendHashTable) -> PhpResult<Document> {
 ///
 /// # Returns
 ///
-/// The corresponding `DataValue`, or an error if the type is unsupported.
+/// The corresponding `DataValue`, or `\TypeError` / `\ValueError` as in
+/// [`hashtable_to_document`].
 pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
     // null
     if zv.is_null() {
@@ -140,10 +160,10 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
 
         // Check for geo: associative array with "lat" and "lon" keys
         if let (Some(lat_zv), Some(lon_zv)) = (ht.get("lat"), ht.get("lon")) {
-            let lat = f64::from_zval(lat_zv).ok_or("'lat' must be a float")?;
-            let lon = f64::from_zval(lon_zv).ok_or("'lon' must be a float")?;
+            let lat = f64::from_zval(lat_zv).ok_or_else(|| type_error("'lat' must be a float"))?;
+            let lon = f64::from_zval(lon_zv).ok_or_else(|| type_error("'lon' must be a float"))?;
             let point = laurus::lexical::GeoPoint::try_new(lat, lon)
-                .map_err(|e| format!("invalid geo point: {e}"))?;
+                .map_err(|e| value_error(format!("invalid geo point: {e}")))?;
             return Ok(DataValue::Geo(point));
         }
 
@@ -151,9 +171,9 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
         // come after the {lat, lon} check so existing 2D Geo semantics are
         // preserved).
         if let (Some(x_zv), Some(y_zv), Some(z_zv)) = (ht.get("x"), ht.get("y"), ht.get("z")) {
-            let x = f64::from_zval(x_zv).ok_or("'x' must be a float")?;
-            let y = f64::from_zval(y_zv).ok_or("'y' must be a float")?;
-            let z = f64::from_zval(z_zv).ok_or("'z' must be a float")?;
+            let x = f64::from_zval(x_zv).ok_or_else(|| type_error("'x' must be a float"))?;
+            let y = f64::from_zval(y_zv).ok_or_else(|| type_error("'y' must be a float"))?;
+            let z = f64::from_zval(z_zv).ok_or_else(|| type_error("'z' must be a float"))?;
             return Ok(DataValue::GeoEcef(laurus::GeoEcefPoint::new(x, y, z)));
         }
 
@@ -225,16 +245,15 @@ pub fn zval_to_data_value(zv: &Zval) -> PhpResult<DataValue> {
             } else {
                 f64::from_zval(val)
             };
-            floats.push(f.ok_or("numeric array elements must be numeric")?);
+            floats.push(f.ok_or_else(|| type_error("numeric array elements must be numeric"))?);
         }
         return Ok(DataValue::Float64Array(floats));
     }
 
-    Err(format!(
+    Err(type_error(format!(
         "cannot convert PHP value of type {:?} to DataValue",
         zv.get_type()
-    )
-    .into())
+    )))
 }
 
 /// Whether `ht` is a list whose elements are all lists, the shape of token
@@ -255,7 +274,7 @@ pub fn php_token_vectors(ht: &ZendHashTable) -> PhpResult<Vec<Vec<f32>>> {
         .map(|(i, row)| {
             let row = row
                 .array()
-                .ok_or_else(|| format!("token vector {i} must be an array"))?;
+                .ok_or_else(|| type_error(format!("token vector {i} must be an array")))?;
             row.values()
                 .map(|val| {
                     let value = if val.is_long() {
@@ -265,9 +284,9 @@ pub fn php_token_vectors(ht: &ZendHashTable) -> PhpResult<Vec<Vec<f32>>> {
                     } else {
                         None
                     };
-                    value
-                        .map(|v| v as f32)
-                        .ok_or_else(|| format!("token vector {i} must hold only numbers").into())
+                    value.map(|v| v as f32).ok_or_else(|| {
+                        type_error(format!("token vector {i} must hold only numbers"))
+                    })
                 })
                 .collect()
         })
@@ -392,13 +411,13 @@ fn zval_array_of_arrays_to_geo_array(ht: &ZendHashTable) -> PhpResult<DataValue>
         match zval_to_data_value(val)? {
             DataValue::Geo(p) => geo.push(p),
             DataValue::GeoEcef(p) => ecef.push(p),
-            _ => return Err(MIXED.into()),
+            _ => return Err(value_error(MIXED)),
         }
     }
     match (geo.is_empty(), ecef.is_empty()) {
         (false, true) => Ok(DataValue::GeoArray(geo)),
         (true, false) => Ok(DataValue::GeoEcefArray(ecef)),
-        _ => Err(MIXED.into()),
+        _ => Err(value_error(MIXED)),
     }
 }
 

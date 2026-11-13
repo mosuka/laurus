@@ -175,6 +175,11 @@ impl JsIndex {
     ///
     /// * `id` - External document identifier (string).
     /// * `doc` - An object mapping field names to values.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with `InvalidArg` if `doc` is not an object or one of its
+    /// values cannot be converted (Issue #1630; it was `GenericFailure`).
     #[napi]
     pub async fn put_document(&self, id: String, doc: Value) -> Result<()> {
         let document = json_to_document(&doc)?;
@@ -193,6 +198,10 @@ impl JsIndex {
     ///
     /// * `id` - External document identifier.
     /// * `doc` - An object mapping field names to values.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with `InvalidArg` as `putDocument` does (Issue #1630).
     #[napi]
     pub async fn add_document(&self, id: String, doc: Value) -> Result<()> {
         let document = json_to_document(&doc)?;
@@ -214,11 +223,19 @@ impl JsIndex {
     /// applied before the failure are **not** rolled back (retrying the
     /// batch is idempotent).
     ///
+    /// Every pair is converted before any is applied: an element that is
+    /// not an `[id, doc]` pair of a string and an object, or a document
+    /// that cannot be converted, rejects with `InvalidArg` and a message
+    /// starting with `documents[i]: ` (Issue #1630).
+    ///
     /// # Arguments
     ///
     /// * `docs` - An array of `[id, doc]` pairs.
     #[napi]
-    pub async fn put_documents(&self, docs: Vec<(String, Value)>) -> Result<()> {
+    pub async fn put_documents(
+        &self,
+        #[napi(ts_arg_type = "Array<[string, any]>")] docs: Vec<Value>,
+    ) -> Result<()> {
         let batch = pairs_to_documents(docs)?;
         if batch.is_empty() {
             return Ok(());
@@ -233,14 +250,18 @@ impl JsIndex {
     /// versions.
     ///
     /// Batched form of `addDocument`. Ordering, single-fsync durability, and
-    /// fail-fast error semantics match `putDocuments`, but repeated ids
-    /// accumulate as separate versions instead of deduplicating.
+    /// fail-fast error semantics match `putDocuments`, conversion errors
+    /// included, but repeated ids accumulate as separate versions instead of
+    /// deduplicating.
     ///
     /// # Arguments
     ///
     /// * `docs` - An array of `[id, doc]` pairs.
     #[napi]
-    pub async fn add_documents(&self, docs: Vec<(String, Value)>) -> Result<()> {
+    pub async fn add_documents(
+        &self,
+        #[napi(ts_arg_type = "Array<[string, any]>")] docs: Vec<Value>,
+    ) -> Result<()> {
         let batch = pairs_to_documents(docs)?;
         if batch.is_empty() {
             return Ok(());
@@ -650,16 +671,37 @@ fn dsl_queries(queries: Vec<Value>) -> Result<Vec<String>> {
         .collect()
 }
 
-/// Convert an array of `(id, doc)` pairs into the engine's
-/// `(String, Document)` batch, naming the offending position on any entry
-/// whose document cannot be converted.
-fn pairs_to_documents(docs: Vec<(String, Value)>) -> Result<Vec<(String, laurus::Document)>> {
+/// Convert `putDocuments`' and `addDocuments`' `docs` into the engine's
+/// `(String, Document)` batch, naming the position of the pair that fails
+/// as `documents[i]` (Issue #1630).
+///
+/// An element that is not an array of two, or whose id is not a string,
+/// fails with `InvalidArg`, the code napi gave a malformed pair when it
+/// converted them (napi named no position and took an array of three or
+/// more). A document that cannot be converted keeps the code `putDocument`
+/// gives it (`InvalidArg` for a caller's mistake).
+fn pairs_to_documents(docs: Vec<Value>) -> Result<Vec<(String, laurus::Document)>> {
     docs.into_iter()
         .enumerate()
-        .map(|(index, (id, doc))| {
-            let document = json_to_document(&doc)
-                .map_err(|e| laurus::LaurusError::other(format!("documents[{index}]: {e}")))
-                .map_err(laurus_err)?;
+        .map(|(index, pair)| {
+            let invalid = |what: &str| {
+                napi::Error::new(Status::InvalidArg, format!("documents[{index}]: {what}"))
+            };
+            let Value::Array(pair) = pair else {
+                return Err(invalid("expected an [id, doc] pair"));
+            };
+            let [id, doc]: [Value; 2] = pair.try_into().map_err(|pair: Vec<Value>| {
+                invalid(&format!(
+                    "expected a 2-element [id, doc] pair, got {} elements",
+                    pair.len()
+                ))
+            })?;
+            let Value::String(id) = id else {
+                return Err(invalid("id must be a string"));
+            };
+            let document = json_to_document(&doc).map_err(|e| {
+                napi::Error::new(e.status, format!("documents[{index}]: {}", e.reason))
+            })?;
             Ok((id, document))
         })
         .collect()
