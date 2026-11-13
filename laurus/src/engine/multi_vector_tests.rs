@@ -295,6 +295,29 @@ async fn test_field_less_vector_search_skips_multi_vector_fields() -> Result<()>
     Ok(())
 }
 
+/// Issue #1494: an `update_field` that repeats a multi-vector field's
+/// option is its only metadata-only change. The open vector store applies
+/// it to the field's index, which accepts it, and the field keeps its
+/// tokens.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_field_repeating_the_option_is_metadata_only() -> Result<()> {
+    let engine = Engine::new(storage(), schema()).await?;
+    engine
+        .put_document("a", doc("first", [1.0, 0.0], &[[1.0, 2.0]]))
+        .await?;
+    engine.commit().await?;
+
+    let outcome = engine
+        .update_field(TOKENS, tokens_option(), UpdateFieldOptions::default())
+        .await?;
+    assert_eq!(
+        outcome.classification,
+        crate::engine::schema::FieldChangeKind::MetadataOnly
+    );
+    assert_eq!(stored_tokens(&engine, "a"), Some(vec![1.0, 2.0]));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_add_update_and_delete_a_multi_vector_field() -> Result<()> {
     let schema = Schema::builder()

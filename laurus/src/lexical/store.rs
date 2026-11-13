@@ -1107,6 +1107,42 @@ impl LexicalStore {
         rebuilt
     }
 
+    /// Apply a `MetadataOnly` change of the field `name` to the open store,
+    /// without touching its data (Issue #1494): `stored`, or `indexed`,
+    /// `doc_values` or `term_vectors` going from `true` to `false`.
+    ///
+    /// The cached writer was created with the old option, so it is
+    /// committed and dropped first, as in [`Self::add_field`] (Issue #875):
+    /// the documents it buffers are written under the option they were
+    /// added with, and none is lost. The next writer is created with the
+    /// new option. The writer lock is held throughout, so no write lands
+    /// between the commit and the swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if committing the cached writer fails, which keeps
+    /// the writer cached with its buffered state and the option unchanged,
+    /// as [`Self::commit`] does, or if the index has no field named `name`.
+    pub fn update_field_option(
+        &self,
+        name: &str,
+        option: crate::lexical::core::field::FieldOption,
+    ) -> Result<()> {
+        let mut writer_guard = self.writer_cache.lock();
+        if let Some(writer) = writer_guard.as_mut() {
+            writer.commit()?;
+        }
+        *writer_guard = None;
+        let updated = self.index.update_field_option(name, option);
+        // Before the writer lock is released, as in `commit` (Issue #1207):
+        // the commit above emptied the writer, so a searcher built before it
+        // would hide the documents that commit published from the `_id`
+        // lookup.
+        *self.searcher_cache.write() = None;
+        drop(writer_guard);
+        updated
+    }
+
     /// Remove a field from the lexical store.
     ///
     /// Removes the field from the underlying index (if it was dynamically added)
@@ -2319,5 +2355,33 @@ mod tests {
                 DocValueLookup::Value(crate::data::DataValue::Text("z".into())),
             ]
         );
+    }
+
+    /// Issue #1494 — `update_field_option` commits and drops the cached
+    /// writer, so it must drop the cached searcher too: one built while a
+    /// document was still in the writer would hide that document from the
+    /// `_id` lookup once the writer is gone.
+    #[test]
+    fn update_field_option_keeps_a_buffered_document_resolvable() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = LexicalIndexConfig::builder()
+            .add_field("title", FieldOption::Text(TextOption::default()))
+            .build();
+        let store = LexicalStore::new(storage, config).unwrap();
+        store.upsert_document(1, id_doc("ida")).unwrap();
+        // Resolved from the writer; the lookup also caches a searcher, which
+        // sees no segment yet.
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
+
+        store
+            .update_field_option(
+                "title",
+                FieldOption::Text(TextOption::default().stored(false)),
+            )
+            .unwrap();
+
+        assert_eq!(store.find_doc_ids_by_term("_id", "ida").unwrap(), vec![1]);
     }
 }

@@ -440,7 +440,7 @@ async fn pending_writes_survive_until_the_subvector_count_is_fixed() {
 
 /// An index created with IVF `n_probe` 0 holds documents no search finds.
 /// It opens, and a metadata-only `update_field` of `n_probe` makes them
-/// searchable once the index is reopened.
+/// searchable at once, without a reopen (Issue #1494), and after one.
 #[tokio::test(flavor = "multi_thread")]
 async fn index_persisted_with_ivf_n_probe_0_opens_and_update_field_repairs_it() {
     let dir = TempDir::new().unwrap();
@@ -454,11 +454,19 @@ async fn index_persisted_with_ivf_n_probe_0_opens_and_update_field_repairs_it() 
 
     let persisted = Schema::from_toml(&schema_with(broken).to_toml().unwrap()).unwrap();
     let engine = Engine::new(open_storage(&dir), persisted).await.unwrap();
+    // This search caches a searcher built with `n_probe` 0, which the
+    // update must not leave in place.
+    assert_eq!(search_ids(&engine).await, Vec::<String>::new());
     let outcome = engine
         .update_field("vec", FieldOption::Ivf(ivf()), REINDEX)
         .await
         .unwrap();
     assert_eq!(outcome.classification, FieldChangeKind::MetadataOnly);
+    assert_eq!(
+        search_ids(&engine).await.len(),
+        4,
+        "the open engine must probe with the new n_probe (Issue #1494)"
+    );
     let repaired = engine.schema();
     drop(engine);
 

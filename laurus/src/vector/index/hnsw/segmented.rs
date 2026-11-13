@@ -45,7 +45,7 @@ use crate::error::Result;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::DistanceMetric;
-use crate::vector::index::config::HnswIndexConfig;
+use crate::vector::index::config::{HnswIndexConfig, VectorIndexTypeConfig};
 use crate::vector::index::hnsw::reader::HnswIndexReader;
 use crate::vector::index::hnsw::searcher::HnswSearcher;
 use crate::vector::index::hnsw::segment::merge_engine::MergeEngine;
@@ -86,6 +86,13 @@ impl SegmentedBackend for HnswSegmentedBackend {
 
     fn compaction_threshold(config: &Self::Config) -> f64 {
         config.compaction_threshold
+    }
+
+    fn config_from(config: VectorIndexTypeConfig) -> Option<Self::Config> {
+        match config {
+            VectorIndexTypeConfig::HNSW(config) => Some(config),
+            _ => None,
+        }
     }
 
     fn load_segment_reader(

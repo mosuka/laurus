@@ -228,6 +228,31 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
             "This index implementation does not support rebuilding fields dynamically".to_string(),
         ))
     }
+
+    /// Replace an existing field's option, without touching its data, for a
+    /// `laurus::engine::schema::FieldChangeKind::MetadataOnly` change (Issue
+    /// #1494): `stored`, or `indexed`, `doc_values` or `term_vectors` going
+    /// from `true` to `false`.
+    ///
+    /// Writers created afterwards write the field under the new option;
+    /// documents already written keep what was written for them. A writer
+    /// created before keeps the option it was created with, so the caller
+    /// commits and drops any it caches first.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always errors, the same as
+    /// [`Self::rebuild_field`]. Implementations also error if no field named
+    /// `name` is registered.
+    fn update_field_option(
+        &self,
+        _name: &str,
+        _option: crate::lexical::core::field::FieldOption,
+    ) -> Result<()> {
+        Err(crate::error::LaurusError::InvalidOperation(
+            "This index implementation does not support updating a field's option".to_string(),
+        ))
+    }
 }
 
 pub mod config;

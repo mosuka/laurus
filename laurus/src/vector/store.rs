@@ -1990,6 +1990,51 @@ impl VectorStore {
         *self.searcher_cache.write() = None;
         rebuilt
     }
+
+    /// Apply a [`FieldChangeKind::MetadataOnly`] change of the field `name`
+    /// to the open store, without touching its data (Issue #1494).
+    ///
+    /// Swaps the config of the field's index, whose search-time parameters
+    /// (HNSW `default_ef_search`, IVF `n_probe`) the next searcher reads
+    /// (see [`VectorIndex::update_field_config`]), and the field's base
+    /// weight, which every search reads; then drops the cached searcher,
+    /// built under the old config. The searcher cache is dropped after the
+    /// swap, so a searcher a concurrent search builds from the old config
+    /// cannot outlive the call in the cache. The cached writer stays: it
+    /// does not read these parameters.
+    ///
+    /// [`FieldChangeKind::MetadataOnly`]: crate::engine::schema::FieldChangeKind::MetadataOnly
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `new_option` is not valid for the field, or if
+    /// the index refuses the config: no field named `name`, or another kind
+    /// of index, dimension or distance. The field then keeps its config and
+    /// base weight.
+    pub fn update_field_config(
+        &self,
+        name: &str,
+        new_option: &crate::vector::core::field::FieldOption,
+    ) -> Result<()> {
+        new_option.validate(name)?;
+        let deletion_config = self
+            .config
+            .as_ref()
+            .map(|c| c.deletion_config.clone())
+            .unwrap_or_default();
+        let new_config = self::config::build_field_index_config(
+            new_option,
+            self.index.embedder(),
+            &deletion_config,
+        );
+        self.index.update_field_config(name, new_config)?;
+        self.base_weights.write().insert(
+            name.to_string(),
+            Self::sanitize_base_weight(new_option.base_weight()),
+        );
+        *self.searcher_cache.write() = None;
+        Ok(())
+    }
 }
 
 /// What a put or delete holds of a [`VectorStore`] from before its first
@@ -3467,5 +3512,55 @@ mod tests {
         let long = token_array(9);
         let fields = futures::executor::block_on(store.embed_fields(&[("tokens", &long)])).unwrap();
         assert!(fields[0].pooled.is_some());
+    }
+
+    /// Issue #1494 — `update_field_config` checks the option before it
+    /// touches the field (the engine checks first, but the store is
+    /// public): an IVF `n_probe` of `0`, which the field's index alone
+    /// would accept, is refused, and so are a field the store does not have
+    /// and a dimension the field's index refuses. No refusal changes a base
+    /// weight; a valid option does.
+    #[test]
+    fn update_field_config_refuses_an_invalid_option_and_an_unknown_field() {
+        use crate::vector::core::field::{FieldOption, IvfOption};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", IvfOption::new(4))
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = VectorStore::new(storage, config).unwrap();
+        let weighted =
+            |n_probe| FieldOption::Ivf(IvfOption::new(4).n_probe(n_probe).base_weight(3.0));
+
+        let invalid = store.update_field_config("a", &weighted(0)).unwrap_err();
+        assert!(
+            matches!(invalid, LaurusError::InvalidArgument(_)),
+            "{invalid}"
+        );
+        let unknown = store
+            .update_field_config("nosuch", &weighted(1))
+            .unwrap_err();
+        assert!(
+            matches!(unknown, LaurusError::InvalidArgument(_)),
+            "{unknown}"
+        );
+        // A valid option the field's index refuses; the error names the
+        // field.
+        let other_dimension = FieldOption::Ivf(IvfOption::new(8).base_weight(3.0));
+        let refused = store
+            .update_field_config("a", &other_dimension)
+            .unwrap_err();
+        assert!(
+            matches!(&refused, LaurusError::InvalidArgument(m) if m.contains("vector field 'a'")),
+            "{refused}"
+        );
+        assert_eq!(store.base_weight_of("a"), 1.0);
+        assert!(!store.base_weights.read().contains_key("nosuch"));
+
+        store.update_field_config("a", &weighted(1)).unwrap();
+        assert_eq!(store.base_weight_of("a"), 3.0);
     }
 }
