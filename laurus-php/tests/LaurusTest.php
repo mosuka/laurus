@@ -1629,6 +1629,31 @@ class LaurusTest extends TestCase
         }
     }
 
+    /**
+     * Issue #1553: the engine wraps the error of a batch with the query's
+     * position, which the binding unwraps, so a query the engine rejects
+     * throws the \ValueError that search() throws for it.
+     */
+    public function testSearchBatchEngineErrorThrowsAsSearchDoes(): void
+    {
+        $idx = $this->createBatchIndex();
+        $single = null;
+        try {
+            $idx->search("nosuch:rust");
+        } catch (\ValueError $e) {
+            $single = $e->getMessage();
+        }
+        $this->assertNotNull($single, "search() must throw a ValueError");
+
+        try {
+            $idx->searchBatch(["title:rust", "nosuch:rust"]);
+            $this->fail("searchBatch() must throw a ValueError");
+        } catch (\ValueError $e) {
+            $this->assertStringContainsString("unknown field", $e->getMessage());
+            $this->assertSame($single, $e->getMessage());
+        }
+    }
+
     public function testSearchBatchWithQueryObjects(): void
     {
         $idx = $this->createBatchIndex();

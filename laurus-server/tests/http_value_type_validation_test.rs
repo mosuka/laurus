@@ -584,6 +584,37 @@ async fn search_answers_400_for_a_query_vector_of_another_dimension() {
     assert_eq!(status, StatusCode::OK, "a field-less query vector: {body}");
 }
 
+/// Issue #1553: a query of `POST /v1/search/batch` that the engine rejects
+/// fails the batch with a 400 whose message starts with the query's
+/// position, as a malformed query's does.
+#[tokio::test]
+async fn search_batch_names_the_query_the_engine_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    create_index(&router, search_fields()).await;
+
+    let cases = [
+        (
+            json!({"query": "nosuch:rust"}),
+            "queries[1]: Invalid argument: query references unknown field(s) [\"nosuch\"]",
+        ),
+        (
+            json!({"query": "title:rust", "group_by": {"field": "_id", "group_size": 1000}}),
+            "queries[1]: Invalid argument: group_by: group_size must be between 1 and 100, got 1000",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (second, expected) in cases {
+        let request = json!({"queries": [{"query": "title:rust"}, second]});
+        let (status, body) = send(&router, "POST", "/v1/search/batch", request.clone()).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        if status != StatusCode::BAD_REQUEST || !message.starts_with(expected) {
+            wrong.push(format!("{request}: {status} {body}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The case in #1476 and in the Issue: `sort_by.order` is matched
 /// case-insensitively, so `"DESC"` sorts descending instead of ascending,
 /// and an omitted or `null` order sorts ascending. Keys of the right type

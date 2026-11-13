@@ -668,11 +668,13 @@ query is read before any runs, and one that is malformed, or whose
 {"error":{"code":400,"message":"queries[1]: query must be a string"}}
 ```
 
-A value the engine rejects, such as a `group_size` above 100, also fails the
-whole request, but its message does not name the query (Issue #1553):
+A value the engine rejects, such as a `group_size` above 100 or an unknown
+field, fails the whole request the same way, with the engine's message after
+the position (Issue #1553). When several queries fail, the message names the
+first to fail, which is not necessarily the lowest position:
 
 ```json
-{"error":{"code":400,"message":"Invalid argument: group_by: group_size must be between 1 and 100, got 1000"}}
+{"error":{"code":400,"message":"queries[1]: Invalid argument: group_by: group_size must be between 1 and 100, got 1000"}}
 ```
 
 ## JSON Field Value Inference

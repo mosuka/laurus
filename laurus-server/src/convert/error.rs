@@ -12,13 +12,32 @@ pub fn to_status(err: LaurusError) -> Status {
     Status::new(code_for(&err), err.to_string())
 }
 
+/// Convert the error of [`laurus::Engine::search_batch`] into a tonic
+/// Status that names the failing query as `queries[i]`, the name
+/// `SearchBatch` gives a malformed query too (Issue #1553). The code is
+/// that of the query's own error. Any other error converts as in
+/// [`to_status`].
+pub fn batch_search_to_status(err: LaurusError) -> Status {
+    match err {
+        LaurusError::BatchSearch {
+            failed_index,
+            source,
+        } => Status::new(
+            code_for(&source),
+            format!("queries[{failed_index}]: {source}"),
+        ),
+        other => to_status(other),
+    }
+}
+
 /// Classify a [`LaurusError`] into a gRPC status code.
 ///
-/// [`LaurusError::BatchIngest`] is classified by its **source** — a batch
-/// that failed on a caller mistake (e.g. a schema violation at position k)
-/// surfaces as `INVALID_ARGUMENT`, while a storage failure stays `INTERNAL`.
-/// The status *message* still carries the full batch context
-/// (`failed_index`, `failed_id`, `applied`) from the error's `Display`.
+/// [`LaurusError::BatchIngest`] and [`LaurusError::BatchSearch`] are
+/// classified by their **source** — a batch that failed on a caller mistake
+/// (e.g. a schema violation at position k) surfaces as `INVALID_ARGUMENT`,
+/// while a storage failure stays `INTERNAL`. The status *message* still
+/// carries the batch context (`failed_index` and, for ingestion, `failed_id`
+/// and `applied`) from the error's `Display`.
 fn code_for(err: &LaurusError) -> tonic::Code {
     match err {
         LaurusError::Schema(_)
@@ -30,7 +49,9 @@ fn code_for(err: &LaurusError) -> tonic::Code {
         LaurusError::NotImplemented(_) => tonic::Code::Unimplemented,
         // Retrying cannot succeed until the index is reopened (Issue #1492).
         LaurusError::WritesStopped(_) => tonic::Code::FailedPrecondition,
-        LaurusError::BatchIngest { source, .. } => code_for(source),
+        LaurusError::BatchIngest { source, .. } | LaurusError::BatchSearch { source, .. } => {
+            code_for(source)
+        }
         _ => tonic::Code::Internal,
     }
 }
@@ -108,5 +129,35 @@ mod tests {
             source: Box::new(stopped()),
         };
         assert_eq!(to_status(batch).code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// Issue #1553: a failed search batch names its query as `queries[i]`
+    /// and is classified by the query's own error, by both converters.
+    #[test]
+    fn batch_search_names_the_query_and_is_classified_by_its_source() {
+        let batch = |source: LaurusError| LaurusError::BatchSearch {
+            failed_index: 3,
+            source: Box::new(source),
+        };
+
+        let status = batch_search_to_status(batch(LaurusError::invalid_argument("bad value")));
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "queries[3]: Invalid argument: bad value");
+
+        let status = batch_search_to_status(batch(LaurusError::storage("disk on fire")));
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "queries[3]: Storage error: disk on fire");
+
+        let status = to_status(batch(LaurusError::invalid_argument("bad value")));
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "search request 3 failed: Invalid argument: bad value"
+        );
+
+        // Any other error converts as `to_status` does.
+        let status = batch_search_to_status(LaurusError::invalid_argument("bad value"));
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "Invalid argument: bad value");
     }
 }
