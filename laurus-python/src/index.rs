@@ -16,9 +16,9 @@ use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Embedder, Engine,
     EngineStats, Schema, Storage, StorageConfig, StorageFactory, WalSyncPolicy,
 };
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 
 // ---------------------------------------------------------------------------
 // WalSyncPolicy
@@ -623,6 +623,11 @@ impl PyIndex {
     /// a caller's mistake, Issue #1627); its message names the failing
     /// position and id. Documents applied before the failure are **not**
     /// rolled back (retrying the batch is idempotent).
+    /// Every pair is converted before any is applied: an entry that is not
+    /// a `(str, dict)` tuple raises `TypeError` (`ValueError` for a tuple
+    /// that does not hold two elements), and a document that cannot be
+    /// converted raises what `put_document` raises for it, each message
+    /// starting with `documents[i]: ` (Issue #1630).
     /// Call [`commit`] to make the changes visible to searches.
     pub fn put_documents(&self, py: Python, docs: &Bound<PyAny>) -> PyResult<()> {
         let batch = pairs_to_documents(py, docs)?;
@@ -906,8 +911,13 @@ impl PyIndex {
 // ---------------------------------------------------------------------------
 
 /// Convert a Python iterable of `(id, dict)` pairs into the engine's
-/// `(String, Document)` batch, naming the offending position on any entry
-/// that is not a two-element `(str, dict)` pair.
+/// `(String, Document)` batch, naming the position of the pair that fails
+/// as `documents[i]` (Issue #1630).
+///
+/// An entry that is not a tuple, an id that is not a `str` or a document
+/// that is not a `dict` raises `TypeError`, and a tuple that does not hold
+/// two elements raises `ValueError`. A document whose content cannot be
+/// converted raises the exception `put_document` raises for it.
 fn pairs_to_documents(
     py: Python,
     docs: &Bound<PyAny>,
@@ -921,12 +931,26 @@ fn pairs_to_documents(
     let mut batch = Vec::new();
     for (index, item) in iter.enumerate() {
         let item = item?;
-        let (id, doc): (String, Bound<PyDict>) = item.extract().map_err(|_| {
-            PyRuntimeError::new_err(format!(
-                "documents[{index}]: expected a (id: str, doc: dict) pair"
-            ))
+        let context = format!("documents[{index}]");
+        let pair = item.cast::<PyTuple>().map_err(|_| {
+            PyTypeError::new_err(format!("{context}: expected a (id: str, doc: dict) pair"))
         })?;
-        batch.push((id, dict_to_document(py, &doc)?));
+        if pair.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "{context}: expected a 2-element (id, doc) pair, got {} elements",
+                pair.len()
+            )));
+        }
+        let id: String = pair
+            .get_item(0)?
+            .extract()
+            .map_err(|_| PyTypeError::new_err(format!("{context}: id must be a str")))?;
+        let doc = pair.get_item(1)?;
+        let doc = doc
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err(format!("{context}: document must be a dict")))?;
+        let document = dict_to_document(py, doc).map_err(|e| with_context(py, e, &context))?;
+        batch.push((id, document));
     }
     Ok(batch)
 }

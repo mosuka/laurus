@@ -23,9 +23,9 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 
 | Method | Description |
 | :--- | :--- |
-| `putDocument(string $id, array $doc): void` | Upsert a document. Replaces all existing versions with the same ID. |
+| `putDocument(string $id, array $doc): void` | Upsert a document. Replaces all existing versions with the same ID. A value or key of the wrong type (an object, an integer key) throws `\TypeError`, and a wrong value (a geo point out of range, an array mixing 2D and 3D geo points) `\ValueError` (Issue #1630). |
 | `addDocument(string $id, array $doc): void` | Append a document chunk without removing existing versions. |
-| `putDocuments(array $docs): void` | Batched upsert. `$docs` is an array of `[$id, $doc]` pairs, applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. A document the engine rejects throws the exception `putDocument` throws for it (`\ValueError` for a caller's mistake such as a reserved field name), with a message naming its position and id: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...` (Issue #1627). |
+| `putDocuments(array $docs): void` | Batched upsert. `$docs` is an array of `[$id, $doc]` pairs, applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. A document the engine rejects throws the exception `putDocument` throws for it (`\ValueError` for a caller's mistake such as a reserved field name), with a message naming its position and id: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...` (Issue #1627). A pair that is not an `[$id, $doc]` pair of a string and an array throws `\TypeError` (`\ValueError` for an array that does not hold two elements), and a document whose content cannot be converted throws what `putDocument` throws for it, each with the position among the elements in front of the message: `documents[1]: ...` (Issue #1630). |
 | `addDocuments(array $docs): void` | Batched chunk append. Like `putDocuments`, errors included, but repeated ids accumulate as separate versions. |
 | `getDocuments(string $id): array` | Return all stored versions for the given ID. |
 | `deleteDocuments(string $id): void` | Delete all versions for the given ID. |
@@ -552,7 +552,7 @@ The top `$windowSize` first-stage results -- lexical, vector, or hybrid -- are r
 
 ### Errors
 
-- The constructor throws `\TypeError` (`query must be a string or a list of numeric lists`) when `$query` is neither, and `\Exception` (`token vector N must hold only numbers`) when a token vector holds a non-number such as a `bool` or `string`.
+- The constructor throws `\TypeError` (`query must be a string or a list of numeric lists`) when `$query` is neither, and `\TypeError` (`token vector N must hold only numbers`, Issue #1630) when a token vector holds a non-number such as a `bool` or `string`.
 - `Index->search()` and `SearchRequest` throw `\TypeError` (`rescore must be a Laurus\LateInteractionRescore`) for any other `$rescore` object.
 - Everything else is checked by the engine when searching, before any search runs, and throws `\ValueError` with a message containing `rescore: ...`: the field is unknown or not a multi-vector field, the query does not hold between 1 and 1,024 finite vectors of the field's dimension, a text query is blank or the field has no token-level embedder, or `$windowSize` is outside `1..=10,000`.
 
@@ -749,7 +749,7 @@ PHP values are automatically converted to Laurus `DataValue` types:
 | `array` with `"x"`, `"y"`, `"z"` | `GeoEcef` | Three `float` values, meters (3D ECEF Cartesian) |
 | `array` of `["lat" => .., "lon" => ..]` arrays | `GeoArray` | Sequential array; requires `$multiValued = true` on the field |
 | `array` of `["x" => .., "y" => .., "z" => ..]` arrays | `GeoEcefArray` | Sequential array; requires `$multiValued = true` on the field |
-| `array` of numeric lists (sequential, e.g. `[[0.1, 0.2], [0.3, 0.4]]`) | `VectorArray` | Token vectors of a multi-vector field (Issue #1351). The inner arrays are lists, not keyed geo points, so the two never collide. Integers are widened; a `bool` or `string` element throws ("token vector N must hold only numbers"). The vector count and dimension are checked against the field (`\ValueError`). Not stored: `getDocuments` and search results omit the field |
+| `array` of numeric lists (sequential, e.g. `[[0.1, 0.2], [0.3, 0.4]]`) | `VectorArray` | Token vectors of a multi-vector field (Issue #1351). The inner arrays are lists, not keyed geo points, so the two never collide. Integers are widened; a `bool` or `string` element throws `\TypeError` ("token vector N must hold only numbers"). The vector count and dimension are checked against the field (`\ValueError`). Not stored: `getDocuments` and search results omit the field |
 | `string` (ISO 8601) | `DateTime` | Parsed from ISO 8601 format |
 | `array` of ISO 8601 strings (sequential) | `DateTimeArray` | Chosen only when every element parses as ISO 8601. Requires `$multiValued = true` on the field |
 | `array` of `string` (sequential, not all ISO 8601) | `TextArray` | Multi-valued text field (Issue #1175); read back as an array of strings. Requires `$multiValued = true` on the field. On a declared multi-valued `Bytes` field, the same array of base64 strings is instead decoded element-wise (Issue #1176) |

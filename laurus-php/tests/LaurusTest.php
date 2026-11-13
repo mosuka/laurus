@@ -204,6 +204,90 @@ class LaurusTest extends TestCase
         }
     }
 
+    /**
+     * Issue #1630: a document whose content cannot be converted fails the
+     * batch with the exception putDocument() throws for it (a \TypeError
+     * for an object; it was an \Exception), its message starting with the
+     * document's position.
+     */
+    public function testBatchNamesTheDocumentThatCannotBeConverted(): void
+    {
+        foreach (["putDocuments", "addDocuments"] as $method) {
+            $idx = new Laurus\Index();
+            $single = null;
+            try {
+                $idx->putDocument("b", ["x" => new \stdClass()]);
+            } catch (\Throwable $e) {
+                $single = $e;
+            }
+            $this->assertInstanceOf(\TypeError::class, $single, "putDocument() must throw a TypeError");
+
+            try {
+                $idx->{$method}([["a", ["title" => "a"]], ["b", ["x" => new \stdClass()]]]);
+                $this->fail("{$method}() must throw");
+            } catch (\Throwable $e) {
+                $this->assertSame(get_class($single), get_class($e), $method);
+                $this->assertSame("documents[1]: {$single->getMessage()}", $e->getMessage(), $method);
+            }
+        }
+    }
+
+    /**
+     * Issue #1630: a malformed pair throws \TypeError for a wrong type and
+     * \ValueError for the wrong number of elements (it was an \Exception),
+     * naming its position.
+     */
+    public function testBatchRejectsAMalformedPair(): void
+    {
+        $cases = [
+            "not a pair" => ["x", \TypeError::class, "documents[1]: expected an [id, doc] pair"],
+            "one element" => [["b"], \ValueError::class,
+                "documents[1]: expected a 2-element [id, doc] pair, got 1 elements"],
+            "three elements" => [["b", [], 1], \ValueError::class,
+                "documents[1]: expected a 2-element [id, doc] pair, got 3 elements"],
+            "id not a string" => [[[], []], \TypeError::class, "documents[1]: id must be a string"],
+            "document not an array" => [["b", "x"], \TypeError::class,
+                "documents[1]: document must be an array"],
+        ];
+        foreach ($cases as $label => [$entry, $class, $message]) {
+            $idx = new Laurus\Index();
+            try {
+                $idx->putDocuments([["a", ["title" => "a"]], $entry]);
+                $this->fail("{$label}: putDocuments() must throw");
+            } catch (\Throwable $e) {
+                $this->assertSame($class, get_class($e), $label);
+                $this->assertSame($message, $e->getMessage(), $label);
+            }
+        }
+    }
+
+    /**
+     * Issue #1630: a value or key of the wrong type throws \TypeError, and a
+     * wrong value \ValueError, where both were an \Exception.
+     */
+    public function testPutDocumentThrowsTypeOrValueErrorForAValueItCannotConvert(): void
+    {
+        $cases = [
+            "an object" => [["x" => new \stdClass()], \TypeError::class],
+            "an integer key" => [["t" => "x", 5 => "y"], \TypeError::class],
+            "a non-numeric element" => [["n" => [1, "a"]], \TypeError::class],
+            "a geo point out of range" => [["loc" => ["lat" => 100.0, "lon" => 0.0]], \ValueError::class],
+            "mixed 2D and 3D geo points" => [
+                ["g" => [["lat" => 1.0, "lon" => 2.0], ["x" => 1.0, "y" => 2.0, "z" => 3.0]]],
+                \ValueError::class,
+            ],
+        ];
+        foreach ($cases as $label => [$doc, $class]) {
+            $idx = new Laurus\Index();
+            try {
+                $idx->putDocument("b", $doc);
+                $this->fail("{$label}: putDocument() must throw");
+            } catch (\Throwable $e) {
+                $this->assertSame($class, get_class($e), "{$label}: {$e->getMessage()}");
+            }
+        }
+    }
+
     // ── Statistics ───────────────────────────────────────────────────────
 
     public function testDocumentCount(): void
@@ -2822,7 +2906,9 @@ class LaurusTest extends TestCase
                 $this->assertStringContainsString("query must be a string or a list of numeric lists", $e->getMessage());
             }
         }
-        $this->expectException(\Exception::class);
+        // A non-numeric element is a wrong type: \TypeError, as the other
+        // cases above (Issue #1630; it was an \Exception).
+        $this->expectException(\TypeError::class);
         $this->expectExceptionMessage("token vector 0 must hold only numbers");
         new Laurus\LateInteractionRescore("tokens", [[1.0, "x"]]);
     }
@@ -2867,7 +2953,8 @@ class LaurusTest extends TestCase
             try {
                 $idx->putDocument("x", ["title" => "rust", "tokens" => $tokens]);
                 $this->fail("accepted " . json_encode($tokens));
-            } catch (\Exception $e) {
+            } catch (\TypeError $e) {
+                // Issue #1630: a wrong type is a \TypeError (it was an \Exception).
                 $this->assertStringContainsString("token vector 0 must hold only numbers", $e->getMessage());
             }
         }

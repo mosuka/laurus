@@ -13,6 +13,7 @@ use std::sync::Arc;
 use ext_php_rs::convert::FromZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
+use ext_php_rs::zend::ce;
 use laurus::index_dir::CreateRollback;
 use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Engine, EngineStats, Storage,
@@ -440,6 +441,12 @@ impl PhpIndex {
     /// position and id; documents applied before the failure are **not**
     /// rolled back (retrying the batch is idempotent).
     ///
+    /// Every pair is converted before any is applied: an entry that is not
+    /// an `[id, doc]` pair of a string and an array throws `\TypeError`
+    /// (`\ValueError` for an array that does not hold two elements), and a
+    /// document that cannot be converted throws what `putDocument()` throws
+    /// for it, each message starting with `documents[i]: ` (Issue #1630).
+    ///
     /// # Arguments
     ///
     /// * `docs` - An array of `[id, doc]` pairs.
@@ -780,8 +787,14 @@ impl PhpIndex {
 // ---------------------------------------------------------------------------
 
 /// Convert an array of `[id, doc]` pairs into the engine's
-/// `(String, Document)` batch, raising an exception that names the offending
-/// position on any entry that is not a two-element `[string, array]` pair.
+/// `(String, Document)` batch, naming the position of the pair that fails
+/// as `documents[i]`, counted in the order of the elements whatever the
+/// array's keys (Issue #1630).
+///
+/// An entry that is not an array, an id that is not a string or a document
+/// that is not an array throws `\TypeError`, and an array that does not hold
+/// two elements throws `\ValueError`. A document whose content cannot be
+/// converted throws the exception `putDocument` throws for it.
 ///
 /// # Arguments
 ///
@@ -793,22 +806,29 @@ fn pairs_to_documents(docs: &Zval) -> PhpResult<Vec<(String, laurus::Document)>>
 
     let mut batch = Vec::with_capacity(arr.len());
     for (index, (_, pair_zv)) in arr.iter().enumerate() {
-        let pair = pair_zv.array().ok_or_else(|| {
-            PhpException::from(format!("documents[{index}]: expected an [id, doc] pair"))
-        })?;
+        let context = format!("documents[{index}]");
+        let type_error =
+            |what: &str| PhpException::new(format!("{context}: {what}"), 0, ce::type_error());
+        let pair = pair_zv
+            .array()
+            .ok_or_else(|| type_error("expected an [id, doc] pair"))?;
         let values: Vec<&Zval> = pair.iter().map(|(_, v)| v).collect();
         if values.len() != 2 {
-            return Err(PhpException::from(format!(
-                "documents[{index}]: expected a 2-element [id, doc] pair"
-            )));
+            return Err(PhpException::new(
+                format!(
+                    "{context}: expected a 2-element [id, doc] pair, got {} elements",
+                    values.len()
+                ),
+                0,
+                ce::value_error(),
+            ));
         }
-        let id = String::from_zval(values[0]).ok_or_else(|| {
-            PhpException::from(format!("documents[{index}]: id must be a string"))
-        })?;
-        let doc = values[1].array().ok_or_else(|| {
-            PhpException::from(format!("documents[{index}]: document must be an array"))
-        })?;
-        batch.push((id, hashtable_to_document(doc)?));
+        let id = String::from_zval(values[0]).ok_or_else(|| type_error("id must be a string"))?;
+        let doc = values[1]
+            .array()
+            .ok_or_else(|| type_error("document must be an array"))?;
+        let document = hashtable_to_document(doc).map_err(|e| with_context(e, &context))?;
+        batch.push((id, document));
     }
     Ok(batch)
 }

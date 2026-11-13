@@ -23,9 +23,9 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `putDocument(string $id, array $doc): void` | ドキュメントをアップサート（upsert）します。同じ ID の既存バージョンをすべて置換します。 |
+| `putDocument(string $id, array $doc): void` | ドキュメントをアップサート（upsert）します。同じ ID の既存バージョンをすべて置換します。型の誤った値やキー（オブジェクト、整数のキー）は `\TypeError` を、誤った値（範囲外の geo の点、2D と 3D の geo の点が混ざった配列）は `\ValueError` を投げます（Issue #1630）。 |
 | `addDocument(string $id, array $doc): void` | 既存バージョンを削除せずにドキュメントチャンクを追記します。 |
-| `putDocuments(array $docs): void` | バッチ upsert。`$docs` は `[$id, $doc]` ペアの配列で、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `putDocument` に渡したときと同じ例外（予約名のフィールドなど呼び出し側の誤りなら `\ValueError`）を投げ、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。 |
+| `putDocuments(array $docs): void` | バッチ upsert。`$docs` は `[$id, $doc]` ペアの配列で、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `putDocument` に渡したときと同じ例外（予約名のフィールドなど呼び出し側の誤りなら `\ValueError`）を投げ、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。文字列と配列の `[$id, $doc]` でない組は `\TypeError`（要素が 2 つでない配列は `\ValueError`）を投げ、中身を変換できない文書は `putDocument` がその文書に投げるのと同じ例外を投げます。どちらもメッセージの先頭に、要素の並びでの位置が付きます: `documents[1]: ...`（Issue #1630）。 |
 | `addDocuments(array $docs): void` | バッチチャンク追記。エラーも含めて `putDocuments` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
 | `getDocuments(string $id): array` | 指定 ID の全保存バージョンを返します。 |
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
@@ -549,7 +549,7 @@ new \Laurus\LateInteractionRescore(string $field, string|array $query, ?int $win
 
 ### エラー
 
-- コンストラクタは、`$query` が文字列でも数値リストのリストでもない場合に `\TypeError`（`query must be a string or a list of numeric lists`）を、トークンベクトルが `bool` や `string` など数値以外を含む場合に `\Exception`（`token vector N must hold only numbers`）を投げます。
+- コンストラクタは、`$query` が文字列でも数値リストのリストでもない場合に `\TypeError`（`query must be a string or a list of numeric lists`）を、トークンベクトルが `bool` や `string` など数値以外を含む場合に `\TypeError`（`token vector N must hold only numbers`、Issue #1630）を投げます。
 - `Index->search()` と `SearchRequest` は、`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError`（`rescore must be a Laurus\LateInteractionRescore`）を投げます。
 - それ以外の値は検索時、検索を始める前にエンジンがチェックし、`rescore: ...` を含むメッセージの `\ValueError` を投げます。フィールドが存在しないか MultiVector フィールドでない場合、クエリがフィールドの次元を持つ有限値のベクトルを 1〜1,024 本含まない場合、テキストのクエリが空かフィールドにトークン単位のエンベダーがない場合、`$windowSize` が `1..=10,000` の範囲外の場合です。
 
@@ -746,7 +746,7 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（`"x"`, `"y"`, `"z"`） | `GeoEcef` | 3 つの `float` 値（メートル単位、3D ECEF 直交座標） |
 | `array`（`["lat" => .., "lon" => ..]` 配列の配列） | `GeoArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
-| `array`（数値リストのリスト、シーケンシャル。例: `[[0.1, 0.2], [0.3, 0.4]]`） | `VectorArray` | MultiVector フィールドのトークンベクトル（Issue #1351）。内側の配列はキー付きの地理座標ではなくリストなので、両者が衝突することはない。整数は拡張される。`bool` や `string` の要素はエラー（"token vector N must hold only numbers"）。ベクトルの本数と次元はフィールドに対してチェックされる（`\ValueError`）。保存されないため、`getDocuments` や検索結果には含まれない |
+| `array`（数値リストのリスト、シーケンシャル。例: `[[0.1, 0.2], [0.3, 0.4]]`） | `VectorArray` | MultiVector フィールドのトークンベクトル（Issue #1351）。内側の配列はキー付きの地理座標ではなくリストなので、両者が衝突することはない。整数は拡張される。`bool` や `string` の要素は `\TypeError`（"token vector N must hold only numbers"）。ベクトルの本数と次元はフィールドに対してチェックされる（`\ValueError`）。保存されないため、`getDocuments` や検索結果には含まれない |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
 | `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 全要素が ISO 8601 としてパースできる場合のみ選ばれる。フィールドに `$multiValued = true` が必要 |
 | `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multiValued = true` が必要。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列が要素ごとにデコードされる（Issue #1176） |

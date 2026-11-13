@@ -41,9 +41,9 @@ class Index {
 
 | Method | Description |
 | :--- | :--- |
-| `putDocument(id, doc)` | Upsert a document. Replaces all existing versions. |
+| `putDocument(id, doc)` | Upsert a document. Replaces all existing versions. A `doc` that is not an object, or a value that cannot be converted, rejects with `InvalidArg` (Issue #1630). |
 | `addDocument(id, doc)` | Append a document chunk without removing existing versions. |
-| `putDocuments(docs)` | Batched upsert. `docs` is an `Array<[id, doc]>` applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. A document the engine rejects rejects with the code `putDocument` gives it (`InvalidArg` for a caller's mistake such as a reserved field name), with a message naming its position and id: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...` (Issue #1627). |
+| `putDocuments(docs)` | Batched upsert. `docs` is an `Array<[id, doc]>` applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. A document the engine rejects rejects with the code `putDocument` gives it (`InvalidArg` for a caller's mistake such as a reserved field name), with a message naming its position and id: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...` (Issue #1627). Each element must be an `[id, doc]` pair of a string and an object: a malformed pair, and a document whose content cannot be converted, reject with `InvalidArg` and the position in front of the message: `documents[1]: ...` (Issue #1630). |
 | `addDocuments(docs)` | Batched chunk append. Like `putDocuments`, errors included, but repeated ids accumulate as separate versions. |
 | `getDocuments(id)` | Return all stored versions for the given ID. |
 | `deleteDocuments(id)` | Delete all versions for the given ID. |

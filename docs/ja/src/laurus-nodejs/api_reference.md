@@ -41,9 +41,9 @@ class Index {
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `putDocument(id, doc)` | ドキュメントを上書き保存。 |
+| `putDocument(id, doc)` | ドキュメントを上書き保存。オブジェクトでない `doc` や変換できない値は、code `InvalidArg` の例外を投げます（Issue #1630）。 |
 | `addDocument(id, doc)` | 既存バージョンを残してチャンクを追記。 |
-| `putDocuments(docs)` | バッチ upsert。`docs` は `Array<[id, doc]>` で、バッチごとに WAL fsync 1 回で順に適用（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `putDocument` に渡したときと同じ code（予約名のフィールドなど呼び出し側の誤りなら `InvalidArg`）の例外を投げ、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。 |
+| `putDocuments(docs)` | バッチ upsert。`docs` は `Array<[id, doc]>` で、バッチごとに WAL fsync 1 回で順に適用（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `putDocument` に渡したときと同じ code（予約名のフィールドなど呼び出し側の誤りなら `InvalidArg`）の例外を投げ、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。各要素は文字列とオブジェクトの `[id, doc]` の組でなければならず、形の誤った組と、中身を変換できない文書は、code `InvalidArg` とメッセージの先頭の位置（`documents[1]: ...`）の例外を投げます（Issue #1630）。 |
 | `addDocuments(docs)` | バッチチャンク追記。エラーも含めて `putDocuments` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
 | `getDocuments(id)` | 指定 ID の全バージョンを取得。 |
 | `deleteDocuments(id)` | 指定 ID の全バージョンを削除。 |
