@@ -20,7 +20,7 @@ use laurus::{
 };
 
 use crate::convert::{document_to_hashtable, hashtable_to_document, unsigned_param};
-use crate::errors::{closed_err, index_dir_err, laurus_err};
+use crate::errors::{closed_err, index_dir_err, laurus_err, with_context};
 use crate::schema::PhpSchema;
 use crate::search::{
     PhpSearchResult, build_request_from_php, parse_group_by_option, parse_highlight_option,
@@ -434,8 +434,11 @@ impl PhpIndex {
     /// sequentially, in order, with one WAL fsync for the whole batch.
     /// Duplicate ids within one batch deduplicate exactly like the same puts
     /// issued one by one (the last occurrence wins). Fails fast at the first
-    /// document that cannot be indexed; documents applied before the failure
-    /// are **not** rolled back (retrying the batch is idempotent).
+    /// document that cannot be indexed, throwing the exception
+    /// `putDocument()` throws for that document (`\ValueError` for a
+    /// caller's mistake, Issue #1627) with a message naming the failing
+    /// position and id; documents applied before the failure are **not**
+    /// rolled back (retrying the batch is idempotent).
     ///
     /// # Arguments
     ///
@@ -643,6 +646,11 @@ impl PhpIndex {
     /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
     /// #1609), even when `queries` is empty.
     ///
+    /// Throws the exception `search` throws for a query that cannot be
+    /// converted or that the engine rejects, its message starting with
+    /// `queries[i]: ` for the query's position `i` among the elements
+    /// (Issue #1627).
+    ///
     /// Issue [#720](https://github.com/mosuka/laurus/issues/720)
     /// Phase 3e of [#648](https://github.com/mosuka/laurus/issues/648).
     #[php(defaults(limit = 10, offset = 0))]
@@ -669,15 +677,20 @@ impl PhpIndex {
         }
 
         let mut requests = Vec::with_capacity(arr.len());
-        for (_, value) in arr.iter() {
-            requests.push(build_request_from_php(
+        for (index, (_, value)) in arr.iter().enumerate() {
+            // Name the query a conversion error came from, as the engine's
+            // errors are (Issue #1627). The position counts the elements in
+            // order, whatever the array's keys.
+            let request = build_request_from_php(
                 value,
                 limit,
                 offset,
                 highlight.as_ref(),
                 None,
                 group_by.as_ref(),
-            )?);
+            )
+            .map_err(|e| with_context(e, &format!("queries[{index}]")))?;
+            requests.push(request);
         }
 
         let engine = self.engine()?;

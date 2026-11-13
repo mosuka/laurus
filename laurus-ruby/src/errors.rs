@@ -1,7 +1,8 @@
 //! Error conversion between Laurus errors and Ruby exceptions.
 
 use laurus::LaurusError;
-use magnus::{Error, Ruby};
+use magnus::error::ErrorType;
+use magnus::{Error, ExceptionClass, Ruby};
 
 /// Error returned by any `Index` method called after
 /// [`crate::index::RbIndex::close`] (Issue #1097).
@@ -14,34 +15,74 @@ pub fn closed_err() -> Error {
 ///
 /// # Mapping
 ///
-/// | Laurus variant                 | Ruby exception    |
-/// |--------------------------------|-------------------|
-/// | `LaurusError::Io`              | `IOError`         |
-/// | `LaurusError::Schema`          | `ArgumentError`   |
-/// | `LaurusError::Query`           | `ArgumentError`   |
-/// | `LaurusError::Field`           | `ArgumentError`   |
-/// | `LaurusError::InvalidArgument` | `ArgumentError`   |
-/// | other                          | `RuntimeError`    |
+/// | Laurus variant                 | Ruby exception             |
+/// |--------------------------------|----------------------------|
+/// | `LaurusError::Io`              | `IOError`                  |
+/// | `LaurusError::Schema`          | `ArgumentError`            |
+/// | `LaurusError::Query`           | `ArgumentError`            |
+/// | `LaurusError::Field`           | `ArgumentError`            |
+/// | `LaurusError::InvalidArgument` | `ArgumentError`            |
+/// | `LaurusError::BatchIngest`     | the exception of its source |
+/// | `LaurusError::BatchSearch`     | the exception of its source |
+/// | other                          | `RuntimeError`             |
+///
+/// A failed batch raises the exception of its source, so a batch that
+/// failed on a caller's mistake raises `ArgumentError` as the same call on
+/// its own would (Issue #1627). The message is [`message`].
 pub fn laurus_err(err: LaurusError) -> Error {
     let ruby = Ruby::get().expect("called from Ruby thread");
+    Error::new(class_for(&ruby, &err), message(&err))
+}
+
+/// Choose the Ruby exception class a [`LaurusError`] raises; see the table
+/// of [`laurus_err`].
+fn class_for(ruby: &Ruby, err: &LaurusError) -> ExceptionClass {
     match err {
-        LaurusError::Io(e) => Error::new(ruby.exception_io_error(), e.to_string()),
-        LaurusError::Schema(m) => {
-            Error::new(ruby.exception_arg_error(), format!("Schema error: {m}"))
+        LaurusError::Io(_) => ruby.exception_io_error(),
+        LaurusError::Schema(_)
+        | LaurusError::Query(_)
+        | LaurusError::Field(_)
+        | LaurusError::InvalidArgument(_) => ruby.exception_arg_error(),
+        LaurusError::BatchIngest { source, .. } | LaurusError::BatchSearch { source, .. } => {
+            class_for(ruby, source)
         }
-        LaurusError::Query(m) => {
-            Error::new(ruby.exception_arg_error(), format!("Query error: {m}"))
-        }
-        LaurusError::Field(m) => {
-            Error::new(ruby.exception_arg_error(), format!("Field error: {m}"))
-        }
-        LaurusError::InvalidArgument(m) => {
-            Error::new(ruby.exception_arg_error(), format!("Invalid argument: {m}"))
-        }
-        // `search_batch` wraps a request's error with its position (Issue
-        // #1553); raise the request's own error, as before.
-        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
-        other => Error::new(ruby.exception_runtime_error(), other.to_string()),
+        _ => ruby.exception_runtime_error(),
+    }
+}
+
+/// The message of the Ruby exception a [`LaurusError`] raises.
+///
+/// It is the error's `Display`, except that `LaurusError::Io` gives the
+/// `io::Error` alone and `LaurusError::BatchSearch` gives its source's
+/// message with the failing query's position in front, as
+/// `queries[{failed_index}]: ...` (Issue #1627). `LaurusError::BatchIngest`
+/// keeps its `Display`, which names the failing document's position and id
+/// and the number of documents applied before it.
+fn message(err: &LaurusError) -> String {
+    match err {
+        LaurusError::Io(e) => e.to_string(),
+        LaurusError::BatchSearch {
+            failed_index,
+            source,
+        } => format!("queries[{failed_index}]: {}", message(source)),
+        other => other.to_string(),
+    }
+}
+
+/// Put `context` (such as `queries[1]`) in front of `err`'s message,
+/// keeping its exception class.
+///
+/// `search_batch` uses it to name the query a conversion error came from
+/// (Issue #1627). An exception raised by Ruby code keeps its class too; an
+/// interrupt (`break`, `throw`) is returned as it is.
+pub fn with_context(err: Error, context: &str) -> Error {
+    match err.error_type() {
+        ErrorType::Error(class, message) => Error::new(*class, format!("{context}: {message}")),
+        ErrorType::Exception(exception) => Error::new(
+            exception.exception_class(),
+            format!("{context}: {exception}"),
+        ),
+        ErrorType::Jump(_) => err,
     }
 }
 

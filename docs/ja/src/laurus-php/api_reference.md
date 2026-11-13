@@ -25,14 +25,14 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | :--- | :--- |
 | `putDocument(string $id, array $doc): void` | ドキュメントをアップサート（upsert）します。同じ ID の既存バージョンをすべて置換します。 |
 | `addDocument(string $id, array $doc): void` | 既存バージョンを削除せずにドキュメントチャンクを追記します。 |
-| `putDocuments(array $docs): void` | バッチ upsert。`$docs` は `[$id, $doc]` ペアの配列で、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。 |
-| `addDocuments(array $docs): void` | バッチチャンク追記。`putDocuments` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
+| `putDocuments(array $docs): void` | バッチ upsert。`$docs` は `[$id, $doc]` ペアの配列で、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `putDocument` に渡したときと同じ例外（予約名のフィールドなど呼び出し側の誤りなら `\ValueError`）を投げ、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。 |
+| `addDocuments(array $docs): void` | バッチチャンク追記。エラーも含めて `putDocuments` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
 | `getDocuments(string $id): array` | 指定 ID の全保存バージョンを返します。 |
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
 | `commit(): void` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flushWal(): void` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
 | `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$groupBy` は結果をフィールドの値でグループ化し（Issue #1297）、このとき `$limit`/`$offset` はグループの数を数えます。[GroupBy](#groupby) を参照。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` を使い、他の引数は無視されます（ただし検査はされます）。`$limit` か `$offset` が負なら `\ValueError` を投げます（Issue #1609）。 |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` と `$groupBy` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。`$limit` か `$offset` が負なら、`$queries` が空でも `\ValueError` を投げます（Issue #1609）。 |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` と `$groupBy` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。`$limit` か `$offset` が負なら、`$queries` が空でも `\ValueError` を投げます（Issue #1609）。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリに投げるのと同じクラスと code の例外を投げ、メッセージの先頭に、要素の並びでのクエリの位置（配列のキーによらない）が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats(): array` | インデックス統計（`"documentCount"`、`"vectorFields"`）を返します。 |
 
 ### `search` の query 引数

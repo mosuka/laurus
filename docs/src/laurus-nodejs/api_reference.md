@@ -43,8 +43,8 @@ class Index {
 | :--- | :--- |
 | `putDocument(id, doc)` | Upsert a document. Replaces all existing versions. |
 | `addDocument(id, doc)` | Append a document chunk without removing existing versions. |
-| `putDocuments(docs)` | Batched upsert. `docs` is an `Array<[id, doc]>` applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. |
-| `addDocuments(docs)` | Batched chunk append. Like `putDocuments` but repeated ids accumulate as separate versions. |
+| `putDocuments(docs)` | Batched upsert. `docs` is an `Array<[id, doc]>` applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. A document the engine rejects rejects with the code `putDocument` gives it (`InvalidArg` for a caller's mistake such as a reserved field name), with a message naming its position and id: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...` (Issue #1627). |
+| `addDocuments(docs)` | Batched chunk append. Like `putDocuments`, errors included, but repeated ids accumulate as separate versions. |
 | `getDocuments(id)` | Return all stored versions for the given ID. |
 | `deleteDocuments(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush writes and make pending changes searchable. |
@@ -54,7 +54,7 @@ class Index {
 | `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector, whose components must be finite (see [VectorQuery](#vectorquery)). |
 | `searchVectorText(field, text, limit?, offset?)` | Search with text (auto-embedded). |
 | `searchWithRequest(request)` | Search with a `SearchRequest`. |
-| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` and `groupBy` apply identically to every query. |
+| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` and `groupBy` apply identically to every query. For an element that is not a string, the promise rejects with code `StringExpected` and a message naming its position (`queries[1]: expected a DSL string, got a number`); for a query the engine rejects, with the error `search` gives that query, its message starting with the query's position (`queries[1]: ...`) (Issue #1627). |
 | `stats()` | Return index statistics (`documentCount`, `vectorFields`). |
 
 All document methods and search methods are async

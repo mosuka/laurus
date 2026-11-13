@@ -100,15 +100,26 @@ class TestSearchBatch < Minitest::Test
     end
   end
 
-  # Issue #1553: the engine wraps the error of a batch with the query's
-  # position, which the binding unwraps, so a query the engine rejects
-  # raises the ArgumentError that #search raises for it.
-  def test_search_batch_engine_error_raises_as_search_does
+  # Issues #1553 and #1627: a query the engine rejects raises the
+  # ArgumentError that #search raises for it, its message starting with the
+  # query's position.
+  def test_search_batch_engine_error_names_the_query
     idx = create_index
     single = assert_raises(ArgumentError) { idx.search("nosuch:rust") }
     batch = assert_raises(ArgumentError) { idx.search_batch(["title:rust", "nosuch:rust"]) }
 
     assert_includes batch.message, "unknown field"
-    assert_equal single.message, batch.message
+    assert_equal "queries[1]: #{single.message}", batch.message
+  end
+
+  # Issue #1627: a query that cannot be converted raises the exception
+  # #search raises for it, its message starting with the query's position.
+  def test_search_batch_conversion_error_names_the_query
+    idx = create_index
+    single = assert_raises(StandardError) { idx.search(42) }
+    batch = assert_raises(StandardError) { idx.search_batch(["title:rust", 42]) }
+
+    assert_equal single.class, batch.class
+    assert_equal "queries[1]: #{single.message}", batch.message
   end
 end

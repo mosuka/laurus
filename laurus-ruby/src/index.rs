@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::commit_policy::RbCommitPolicy;
 use crate::convert::{document_to_hash, hash_to_document};
-use crate::errors::{closed_err, index_dir_err, laurus_err};
+use crate::errors::{closed_err, index_dir_err, laurus_err, with_context};
 use crate::gvl::without_gvl;
 use crate::schema::RbSchema;
 use crate::search::{
@@ -244,8 +244,11 @@ impl RbIndex {
     /// sequentially, in order, with one WAL fsync for the whole batch.
     /// Duplicate ids within one batch deduplicate exactly like the same puts
     /// issued one by one (the last occurrence wins). Fails fast at the first
-    /// document that cannot be indexed; documents applied before the failure
-    /// are **not** rolled back (retrying the batch is idempotent).
+    /// document that cannot be indexed, raising the exception
+    /// `put_document` raises for that document (`ArgumentError` for a
+    /// caller's mistake, Issue #1627) with a message naming the failing
+    /// position and id; documents applied before the failure are **not**
+    /// rolled back (retrying the batch is idempotent).
     ///
     /// # Arguments
     ///
@@ -457,6 +460,12 @@ impl RbIndex {
     /// `queries[i]`. Empty input returns an empty Array without
     /// invoking the engine.
     ///
+    /// # Errors
+    ///
+    /// Raises the exception `search` raises for a query that cannot be
+    /// converted or that the engine rejects, its message starting with
+    /// `queries[i]: ` for the query's position `i` (Issue #1627).
+    ///
     /// Issue [#719](https://github.com/mosuka/laurus/issues/719)
     /// Phase 3d of [#648](https://github.com/mosuka/laurus/issues/648).
     fn search_batch(&self, args: &[Value]) -> Result<RArray, Error> {
@@ -501,15 +510,19 @@ impl RbIndex {
         }
 
         let mut requests = Vec::with_capacity(queries_array.len());
-        for item in queries_array.into_iter() {
-            requests.push(build_request_from_rb(
+        for (index, item) in queries_array.into_iter().enumerate() {
+            // Name the query a conversion error came from, as the engine's
+            // errors are (Issue #1627).
+            let request = build_request_from_rb(
                 item,
                 limit,
                 offset,
                 highlight.as_ref(),
                 None,
                 group_by.as_ref(),
-            )?);
+            )
+            .map_err(|e| with_context(e, &format!("queries[{index}]")))?;
+            requests.push(request);
         }
 
         let engine = self.engine()?;
