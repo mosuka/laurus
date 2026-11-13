@@ -23,6 +23,7 @@ use crate::error::{LaurusError, Result};
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::DistanceMetric;
+use crate::vector::index::config::VectorIndexTypeConfig;
 use crate::vector::index::segment::fanout::{SegmentFanoutSearcher, SegmentedReaderFacade};
 use crate::vector::index::segment::field_record::{FieldRecord, check_field_record};
 use crate::vector::index::segment::manager::{
@@ -70,6 +71,10 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
 
     /// The deletion ratio at which compaction triggers.
     fn compaction_threshold(config: &Self::Config) -> f64;
+
+    /// This backend's config inside `config`, or `None` when `config` is
+    /// for another kind of index (Issue #1494).
+    fn config_from(config: VectorIndexTypeConfig) -> Option<Self::Config>;
 
     /// Load one sealed segment's reader, with the deletion bitmap attached
     /// when `bitmap` is `Some`.
@@ -226,7 +231,11 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
 /// docs).
 pub struct SegmentedIndex<B: SegmentedBackend> {
     shared: Arc<SegmentedShared<B>>,
-    config: B::Config,
+    /// Behind a lock so that a metadata-only `update_field` can swap the
+    /// search-time parameters (HNSW `default_ef_search`, IVF `n_probe`) of
+    /// the open index (Issue #1494). Readers take a copy through
+    /// [`Self::config`]; its heavy fields (embedder, PQ codebook) are `Arc`s.
+    config: parking_lot::RwLock<B::Config>,
     closed: AtomicBool,
 }
 
@@ -234,7 +243,7 @@ impl<B: SegmentedBackend> fmt::Debug for SegmentedIndex<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SegmentedIndex")
             .field("shared", &self.shared)
-            .field("config", &self.config)
+            .field("config", &*self.config.read())
             .field("closed", &self.closed)
             .finish()
     }
@@ -328,9 +337,16 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
                 core: SegmentedCore::new(name, storage, manager),
                 reader_cache: SegmentedReaderCache::new(),
             }),
-            config,
+            config: parking_lot::RwLock::new(config),
             closed: AtomicBool::new(false),
         })
+    }
+
+    /// A copy of the current config. A metadata-only `update_field` may
+    /// swap it at any time (Issue #1494), so a caller takes one copy per
+    /// operation rather than holding the lock.
+    fn config(&self) -> B::Config {
+        self.config.read().clone()
     }
 
     fn check_closed(&self) -> Result<()> {
@@ -357,7 +373,7 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
         };
         let deletions = self.shared.core.deletion_snapshot()?;
         self.shared
-            .merge(&self.config, candidate.segments, deletions)?;
+            .merge(&self.config(), candidate.segments, deletions)?;
         Ok(true)
     }
 }
@@ -365,13 +381,14 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
 impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
     fn reader(&self) -> Result<Arc<dyn VectorIndexReader>> {
         self.check_closed()?;
-        let readers = self.shared.sealed_readers_newest_first(&self.config)?;
+        let config = self.config();
+        let readers = self.shared.sealed_readers_newest_first(&config)?;
         let bitmap = self.shared.core.bitmap()?;
         Ok(Arc::new(SegmentedReaderFacade::new(
             readers,
             bitmap,
-            B::dimension(&self.config),
-            B::distance_metric(&self.config),
+            B::dimension(&config),
+            B::distance_metric(&config),
         )))
     }
 
@@ -381,7 +398,7 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         // A fresh, EMPTY active-segment writer per call: constructing it does
         // not touch the existing segments — the whole point of the layout.
         let segment_id = self.shared.core.manager().generate_segment_id();
-        let inner = B::new_segment_writer(&self.config, self.shared.core.storage(), &segment_id)?;
+        let inner = B::new_segment_writer(&self.config(), self.shared.core.storage(), &segment_id)?;
         let writer = SegmentedWriter::<B> {
             shared: self.shared.clone(),
             segment_id,
@@ -422,7 +439,7 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         let stats = manager.stats();
         Ok(VectorIndexStats {
             vector_count: total.saturating_sub(deleted),
-            dimension: B::dimension(&self.config),
+            dimension: B::dimension(&self.config()),
             total_size: stats.total_size,
             deleted_count: deleted,
             last_modified: 0,
@@ -454,7 +471,7 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         // land while the merge runs (Issue #1518).
         let deletions = self.shared.core.deletion_snapshot()?;
         self.shared
-            .merge(&self.config, segments, deletions.clone())?;
+            .merge(&self.config(), segments, deletions.clone())?;
 
         // Every document the copy marks was physically dropped by the merge;
         // a delete marked since stays marked. The merge has published, so a
@@ -473,12 +490,12 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
 
     fn searcher(&self) -> Result<Box<dyn VectorIndexSearcher>> {
         self.check_closed()?;
-        let readers = self.shared.sealed_readers_newest_first(&self.config)?;
+        let readers = self.shared.sealed_readers_newest_first(&self.config())?;
         let bitmap = self.shared.core.bitmap()?;
         // `SegmentFanoutSearcher::new`'s per-segment builder must be `'static`,
         // so the config is cloned into it rather than borrowed; its heavy
         // fields (embedder, PQ codebook) are `Arc`s, so this is cheap.
-        let config = self.config.clone();
+        let config = self.config();
         Ok(Box::new(SegmentFanoutSearcher::new(
             readers,
             bitmap,
@@ -487,7 +504,36 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
     }
 
     fn embedder(&self) -> Arc<dyn Embedder> {
-        B::embedder(&self.config)
+        B::embedder(&self.config())
+    }
+
+    /// Swap the config in place (Issue #1494). Searchers built afterwards
+    /// use it; a searcher built before keeps the config it was built with,
+    /// so the caller drops any it caches. The segments and the active
+    /// writer are untouched: the caller passes only a metadata-only change,
+    /// whose parameters are read at search time.
+    fn update_config(&self, new_config: VectorIndexTypeConfig) -> Result<()> {
+        self.check_closed()?;
+        let Some(new_config) = B::config_from(new_config) else {
+            return Err(LaurusError::invalid_argument(
+                "a config update cannot change the kind of index",
+            ));
+        };
+        let mut config = self.config.write();
+        if B::dimension(&new_config) != B::dimension(&config)
+            || B::distance_metric(&new_config) != B::distance_metric(&config)
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "a config update cannot change the dimension or distance (from {} and {:?} \
+                 to {} and {:?})",
+                B::dimension(&config),
+                B::distance_metric(&config),
+                B::dimension(&new_config),
+                B::distance_metric(&new_config),
+            )));
+        }
+        *config = new_config;
+        Ok(())
     }
 
     fn last_wal_seq(&self) -> u64 {
@@ -545,11 +591,12 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
             return Ok(true);
         }
 
-        if B::auto_compaction(&self.config)
+        let config = self.config();
+        if B::auto_compaction(&config)
             && self
                 .shared
                 .core
-                .needs_compaction(B::compaction_threshold(&self.config))?
+                .needs_compaction(B::compaction_threshold(&config))?
         {
             self.optimize()?;
             return Ok(true);
@@ -768,5 +815,64 @@ impl<B: SegmentedBackend> Drop for SegmentedWriter<B> {
         if self.has_pending_changes() {
             self.shared.core.rollback_pending_wal_seq();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+    use crate::vector::index::config::{FlatIndexConfig, HnswIndexConfig};
+    use crate::vector::index::hnsw::segmented::SegmentedHnswIndex;
+
+    fn hnsw(dimension: usize, default_ef_search: Option<usize>) -> HnswIndexConfig {
+        HnswIndexConfig {
+            dimension,
+            default_ef_search,
+            ..Default::default()
+        }
+    }
+
+    /// Issue #1494: `update_config` swaps the open index's
+    /// `default_ef_search`, which `searcher()` copies into every segment
+    /// searcher it builds (a search result cannot show the width: it is
+    /// raised to at least `top_k`). A config for another kind of index, or
+    /// with another dimension or distance, is refused and leaves the config
+    /// as it was.
+    #[test]
+    fn update_config_swaps_the_search_width_and_refuses_another_layout() {
+        use crate::vector::core::distance::DistanceMetric;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = SegmentedHnswIndex::open_or_create(storage, "vec", hnsw(4, Some(16))).unwrap();
+
+        index
+            .update_config(VectorIndexTypeConfig::HNSW(hnsw(4, Some(300))))
+            .unwrap();
+        assert_eq!(index.config().default_ef_search, Some(300));
+
+        let other_kind = VectorIndexTypeConfig::Flat(FlatIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        });
+        let other_dimension = VectorIndexTypeConfig::HNSW(hnsw(8, Some(16)));
+        let other_distance = VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+            distance_metric: DistanceMetric::Euclidean,
+            ..hnsw(4, Some(16))
+        });
+        let accepted: Vec<&str> = [
+            ("another kind", other_kind),
+            ("another dimension", other_dimension),
+            ("another distance", other_distance),
+        ]
+        .into_iter()
+        .filter_map(|(case, config)| match index.update_config(config) {
+            Err(LaurusError::InvalidArgument(_)) => None,
+            _ => Some(case),
+        })
+        .collect();
+        assert!(accepted.is_empty(), "not refused: {accepted:?}");
+        assert_eq!(index.config().default_ef_search, Some(300));
     }
 }

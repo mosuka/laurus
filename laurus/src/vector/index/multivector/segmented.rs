@@ -42,7 +42,7 @@ use crate::vector::core::token_pooling::{
     POOLING_BUDGET_BYTES, PooledTokens, TokenPooling, pool_windows, pooled_count, pooling_bytes,
 };
 use crate::vector::core::vector::Vector;
-use crate::vector::index::config::MultiVectorIndexConfig;
+use crate::vector::index::config::{MultiVectorIndexConfig, VectorIndexTypeConfig};
 use crate::vector::index::multivector::LAYOUT;
 use crate::vector::index::multivector::format::{self, DocEntry, SegmentReader, write_segment};
 use crate::vector::index::multivector::reader::{
@@ -641,6 +641,27 @@ impl VectorIndex for MultiVectorIndex {
 
     fn embedder(&self) -> Arc<dyn Embedder> {
         Arc::clone(&self.shared.config.embedder)
+    }
+
+    /// A multi-vector field has no metadata-only parameter of its own
+    /// (`storage` and `pool_factor` need a rebuild), so the only
+    /// metadata-only change is one that repeats the option: nothing to swap
+    /// (Issue #1494).
+    fn update_config(&self, new_config: VectorIndexTypeConfig) -> Result<()> {
+        let VectorIndexTypeConfig::MultiVector(new_config) = new_config else {
+            return Err(LaurusError::invalid_argument(
+                "a config update cannot change the kind of index",
+            ));
+        };
+        let config = &self.shared.config;
+        if new_config.dimension != config.dimension
+            || new_config.distance_metric != config.distance_metric
+        {
+            return Err(LaurusError::invalid_argument(
+                "a config update cannot change the dimension or distance",
+            ));
+        }
+        Ok(())
     }
 
     fn last_wal_seq(&self) -> u64 {
@@ -2582,5 +2603,43 @@ mod tests {
             assert!(err.to_string().contains("dimension"), "{err}");
             assert!(!writer.has_pending_changes());
         }
+    }
+
+    /// Issue #1494: a config update that repeats the index's own config,
+    /// the only metadata-only change of a multi-vector field, is accepted;
+    /// one of another kind of index, dimension or distance is refused.
+    #[test]
+    fn update_config_accepts_its_own_config_and_refuses_another_layout() {
+        use crate::vector::index::config::FlatIndexConfig;
+
+        let index = open(&storage());
+        index
+            .update_config(VectorIndexTypeConfig::MultiVector(config(
+                DistanceMetric::DotProduct,
+            )))
+            .unwrap();
+
+        let other_kind = VectorIndexTypeConfig::Flat(FlatIndexConfig {
+            dimension: 2,
+            distance_metric: DistanceMetric::DotProduct,
+            ..Default::default()
+        });
+        let other_dimension = VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+            dimension: 3,
+            ..config(DistanceMetric::DotProduct)
+        });
+        let other_distance = VectorIndexTypeConfig::MultiVector(config(DistanceMetric::Cosine));
+        let accepted: Vec<&str> = [
+            ("another kind", other_kind),
+            ("another dimension", other_dimension),
+            ("another distance", other_distance),
+        ]
+        .into_iter()
+        .filter_map(|(case, refused)| match index.update_config(refused) {
+            Err(LaurusError::InvalidArgument(_)) => None,
+            _ => Some(case),
+        })
+        .collect();
+        assert!(accepted.is_empty(), "not refused: {accepted:?}");
     }
 }

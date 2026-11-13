@@ -2728,7 +2728,12 @@ impl Engine {
     /// [`schema::classify_change`] decides which:
     ///
     /// - [`FieldChangeKind::MetadataOnly`](schema::FieldChangeKind::MetadataOnly):
-    ///   applied immediately; no existing data is touched.
+    ///   applied to the open index at once, with no reopen and no existing
+    ///   data touched (Issue #1494). A vector field's `default_ef_search`,
+    ///   `n_probe` and `base_weight` take effect from the next search; a
+    ///   lexical field's `stored`, `indexed`, `doc_values` and
+    ///   `term_vectors` from the next document written, after the lexical
+    ///   store commits the documents it buffered under the old option.
     /// - [`FieldChangeKind::Reindex`](schema::FieldChangeKind::Reindex):
     ///   rebuilt in place from the field's existing on-disk data. For a
     ///   **vector** field (e.g. HNSW `m`/`ef_construction`, any index
@@ -2787,10 +2792,12 @@ impl Engine {
     /// - The change is classified as [`FieldChangeKind::Reindex`](schema::FieldChangeKind::Reindex)
     ///   or [`FieldChangeKind::Destructive`](schema::FieldChangeKind::Destructive)
     ///   and `opts.reindex` is `false`.
-    /// - Making the WAL durable before the rebuild fails, as in
+    /// - Making the WAL durable before the rebuild, or before a lexical
+    ///   `MetadataOnly` change commits the store's writer, fails, as in
     ///   [`Self::flush_wal`], or for a `Destructive` change of a vector
     ///   field, the commit before it.
-    /// - The underlying vector or lexical rebuild/recreate fails.
+    /// - The underlying vector or lexical rebuild/recreate fails, or a store
+    ///   refuses a `MetadataOnly` change (the schema then stays as it was).
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
     /// - Writes stopped ([`LaurusError::WritesStopped`], Issue #1492).
@@ -2804,8 +2811,9 @@ impl Engine {
         // a document is never coerced against a field option this call is
         // in the middle of replacing.
         let _schema_guard = self.schema_change_lock.write().await;
-        // A rebuild commits the stores' cached writers; a dry run reports
-        // what the real call would do (Issue #1492).
+        // A rebuild, and a metadata-only change of a lexical field, commit
+        // the stores' cached writers; a dry run reports what the real call
+        // would do (Issue #1492).
         self.write_stop.check()?;
 
         let old_option = {
@@ -2835,6 +2843,27 @@ impl Engine {
 
         match classification {
             schema::FieldChangeKind::MetadataOnly => {
+                // Apply the change to the open stores before the schema, so
+                // the open index uses the new value at once and the schema
+                // never reports one the stores do not use (Issue #1494).
+                if option.is_vector() {
+                    let vector_opt = option
+                        .to_vector()
+                        .expect("is_vector() was true but to_vector() returned None");
+                    self.vector.update_field_config(name, &vector_opt)?;
+                } else {
+                    let lexical_opt = option
+                        .to_lexical()
+                        .expect("is_lexical() was true but to_lexical() returned None");
+                    // The store commits its cached writer, which writes store
+                    // state outside the commit ladder: make the WAL records it
+                    // covers durable first, as the rebuild below does (Issue
+                    // #1527), and hand it the watermark as its checkpoint, as
+                    // `add_field` does (Issue #1499).
+                    self.log.flush_wal()?;
+                    self.lexical.set_pending_wal_seq(self.applied.watermark())?;
+                    self.lexical.update_field_option(name, lexical_opt)?;
+                }
                 {
                     let mut schema = self.schema.write();
                     schema.fields.insert(name.to_string(), option);
@@ -3669,8 +3698,8 @@ impl Engine {
                 log::warn!(
                     "schema.fields entry '{name}' is not usable as persisted: {reason}; \
                      fix it with update_field (a new m, ef_construction, n_clusters or \
-                     quantizer rebuilds the field, a new n_probe applies once the index is \
-                     reopened, a new distance or dimension discards the field's vectors), or in \
+                     quantizer rebuilds the field, a new n_probe applies at once, a new \
+                     distance or dimension discards the field's vectors), or in \
                      schema.toml while the index is closed, which is the only way when a \
                      pending write keeps the index from opening"
                 );
@@ -5552,7 +5581,8 @@ mod tests {
     /// Issue #1537: `add_field` and `delete_field` make the WAL durable
     /// before the stores commit their cached writers, as the commit ladder
     /// does. Each case leaves a put's record unsynced first. Adding a vector
-    /// field already committed first (Issue #1535).
+    /// field already committed first (Issue #1535). A metadata-only change
+    /// of a lexical field commits the lexical writer too (Issue #1494).
     #[tokio::test]
     async fn add_field_and_delete_field_flush_the_wal_first() {
         use crate::lexical::core::field::TextOption;
@@ -5564,6 +5594,7 @@ mod tests {
             "add a vector field",
             "delete a lexical field",
             "delete a vector field",
+            "change a lexical field's metadata",
         ] {
             let engine = unsynced_wal_engine(schema::DynamicFieldPolicy::Strict).await;
             engine
@@ -5586,6 +5617,22 @@ mod tests {
                     .unwrap(),
                 "delete a lexical field" => engine.delete_field("title").await.unwrap(),
                 "delete a vector field" => engine.delete_field("vec").await.unwrap(),
+                "change a lexical field's metadata" => {
+                    let outcome = engine
+                        .update_field(
+                            "title",
+                            schema::FieldOption::Text(TextOption::default().indexed(false)),
+                            UpdateFieldOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        outcome.classification,
+                        schema::FieldChangeKind::MetadataOnly,
+                        "{case}"
+                    );
+                    outcome.schema
+                }
                 _ => unreachable!(),
             };
             if engine.log.wal_is_dirty() {
@@ -6711,6 +6758,136 @@ mod tests {
         }
         // The hook was invoked with the updated schema.
         assert_eq!(persisted.lock().len(), 1);
+    }
+
+    /// Issue #1494: a metadata-only `base_weight` change takes effect from
+    /// the next search of the open engine, without a reopen. `b`'s vector is
+    /// a little farther from the query than `a`'s, so `a` ranks first until
+    /// `b_vec`'s weight outweighs the difference. The query names both
+    /// fields, because a field-less search applies no `base_weight` (Issue
+    /// #1084).
+    #[tokio::test]
+    async fn metadata_only_base_weight_applies_to_the_next_search() {
+        use crate::vector::core::field::FlatOption;
+        use crate::vector::store::request::QueryVector;
+
+        async fn nearest_id(engine: &Engine, vector: [f32; 3]) -> Vec<String> {
+            let request = search::SearchRequestBuilder::new()
+                .vector_query(search::VectorSearchQuery::Vectors(vec![QueryVector {
+                    vector: Vector::new(vector.to_vec()),
+                    weight: 1.0,
+                    fields: Some(vec!["a_vec".to_string(), "b_vec".to_string()]),
+                }]))
+                .limit(1)
+                .build();
+            hit_ids(engine, request).await
+        }
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let engine = Engine::new(storage, title_schema(&["a_vec", "b_vec"]))
+            .await
+            .unwrap();
+        engine
+            .put_document("a", vector_doc("a", "a_vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine
+            .put_document("b", vector_doc("b", "b_vec", [0.9, 0.1, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(nearest_id(&engine, [1.0, 0.0, 0.0]).await, vec!["a"]);
+
+        let outcome = engine
+            .update_field(
+                "b_vec",
+                schema::FieldOption::Flat(FlatOption::default().dimension(3).base_weight(5.0)),
+                UpdateFieldOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.classification,
+            schema::FieldChangeKind::MetadataOnly
+        );
+        assert_eq!(nearest_id(&engine, [1.0, 0.0, 0.0]).await, vec!["b"]);
+    }
+
+    /// Issue #1494: a metadata-only change of a lexical field (here,
+    /// `indexed` going to `false`) takes effect for the next document
+    /// written, without a reopen. A document put before it and not yet
+    /// committed is committed under the option it was put with, not lost.
+    #[tokio::test]
+    async fn metadata_only_lexical_change_applies_to_the_next_document() {
+        use crate::lexical::core::field::TextOption;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let engine = Engine::new(storage, title_schema(&[])).await.unwrap();
+        let rust = || Document::builder().add_text("title", "rust").build();
+        // Still buffered in the lexical writer when the change comes.
+        engine.put_document("before", rust()).await.unwrap();
+
+        let outcome = engine
+            .update_field(
+                "title",
+                schema::FieldOption::Text(TextOption::default().indexed(false)),
+                UpdateFieldOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.classification,
+            schema::FieldChangeKind::MetadataOnly
+        );
+
+        engine.put_document("after", rust()).await.unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(title_hits(&engine, "rust").await, vec!["before"]);
+    }
+
+    /// Issue #1494: after a metadata-only change of an integer field's
+    /// `doc_values` to `false`, a document written next has no DocValues,
+    /// without a reopen, while one put before it keeps its value.
+    #[tokio::test]
+    async fn metadata_only_doc_values_change_applies_to_the_next_document() {
+        use crate::lexical::core::field::IntegerOption;
+        use crate::lexical::search::searcher::DocValueLookup;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_field("n", schema::FieldOption::Integer(IntegerOption::default()))
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+        let doc = |n: i64| Document::builder().add_integer("n", n).build();
+        engine.put_document("before", doc(1)).await.unwrap();
+
+        let outcome = engine
+            .update_field(
+                "n",
+                schema::FieldOption::Integer(IntegerOption::default().doc_values(false)),
+                UpdateFieldOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.classification,
+            schema::FieldChangeKind::MetadataOnly
+        );
+
+        engine.put_document("after", doc(2)).await.unwrap();
+        engine.commit().await.unwrap();
+        let doc_ids = [
+            internal_id(&engine, "before"),
+            internal_id(&engine, "after"),
+        ];
+        let answers = engine.lexical.doc_values_batch("n", &doc_ids).unwrap();
+        assert_eq!(answers[0], DocValueLookup::Value(DataValue::Int64(1)));
+        assert!(
+            !matches!(answers[1], DocValueLookup::Value(_)),
+            "a document written after doc_values became false has a value: {:?}",
+            answers[1]
+        );
     }
 
     /// Issue #1081 (Phase 3): a `Reindex`-classified change on a LEXICAL
@@ -9531,6 +9708,23 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
+
+        // A metadata-only change commits the lexical writer too (Issue
+        // #1494). The analyzer stays, so only `indexed` changes.
+        engine.put_document("d", title_doc("delta")).await.unwrap();
+        let outcome = engine
+            .update_field(
+                "title",
+                schema::FieldOption::Text(TextOption::default().analyzer("keyword").indexed(false)),
+                UpdateFieldOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.classification,
+            schema::FieldChangeKind::MetadataOnly
+        );
         assert_eq!(engine.lexical.last_wal_seq(), engine.log.last_seq());
     }
 

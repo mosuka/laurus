@@ -677,6 +677,8 @@ let outcome = engine.update_field(
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 
+`MetadataOnly` の変更は、インデックスを開き直したり `laurus serve` を再起動したりしなくても、開いているインデックスにすぐ効きます（[#1494](https://github.com/mosuka/laurus/issues/1494)）。ベクトルフィールドの新しい `default_ef_search`・`n_probe`・`base_weight` は、次の検索から使われます。lexical フィールドの新しいオプション（例: `stored`、無効にした `indexed`・`doc_values`）は、変更の後に書いたドキュメントに効きます。変更の前に書いたドキュメントは、書いたときのオプションのままです。
+
 `Reindex` は、前回の `commit()` 以降の削除と更新も保ちます。削除したドキュメントは再構築の後も検索に戻りません（[#1527](https://github.com/mosuka/laurus/issues/1527)）。
 
 ベクトルフィールドの `Reindex` は、作り直したセグメントを公開した時点で成功します。その後の後片付けが失敗しても、フィールド名付きの警告をログに出すだけで、フィールドは作り直したセグメントを使います（[#1538](https://github.com/mosuka/laurus/issues/1538)）。

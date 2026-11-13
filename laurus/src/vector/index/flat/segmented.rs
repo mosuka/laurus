@@ -44,7 +44,7 @@ use crate::error::Result;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::DistanceMetric;
-use crate::vector::index::config::FlatIndexConfig;
+use crate::vector::index::config::{FlatIndexConfig, VectorIndexTypeConfig};
 use crate::vector::index::flat::reader::FlatVectorIndexReader;
 use crate::vector::index::flat::searcher::FlatVectorSearcher;
 use crate::vector::index::flat::segment::merge_engine::MergeEngine;
@@ -85,6 +85,13 @@ impl SegmentedBackend for FlatSegmentedBackend {
 
     fn compaction_threshold(config: &Self::Config) -> f64 {
         config.compaction_threshold
+    }
+
+    fn config_from(config: VectorIndexTypeConfig) -> Option<Self::Config> {
+        match config {
+            VectorIndexTypeConfig::Flat(config) => Some(config),
+            _ => None,
+        }
     }
 
     fn load_segment_reader(

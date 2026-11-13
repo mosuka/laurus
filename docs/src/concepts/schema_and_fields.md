@@ -794,6 +794,15 @@ The requested change is classified into one of three kinds, reported as
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against
 accidentally triggering an expensive rebuild or a data-losing change.
 
+A `MetadataOnly` change takes effect in the open index at once, without
+reopening it or restarting `laurus serve`
+([#1494](https://github.com/mosuka/laurus/issues/1494)). A vector field's
+new `default_ef_search`, `n_probe` or `base_weight` applies to the next
+search. A lexical field's new option (e.g. `stored`, or `indexed` or
+`doc_values` turned off) applies to the documents written after the
+change; the documents written before it keep the option they were
+written with.
+
 A `Reindex` keeps the deletes and updates made since the last `commit()`:
 a deleted document does not come back in search after the rebuild
 ([#1527](https://github.com/mosuka/laurus/issues/1527)).

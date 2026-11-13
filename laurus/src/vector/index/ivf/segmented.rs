@@ -53,7 +53,7 @@ use crate::error::Result;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::DistanceMetric;
-use crate::vector::index::config::IvfIndexConfig;
+use crate::vector::index::config::{IvfIndexConfig, VectorIndexTypeConfig};
 use crate::vector::index::ivf::reader::IvfIndexReader;
 use crate::vector::index::ivf::searcher::IvfSearcher;
 use crate::vector::index::ivf::segment::merge_engine::MergeEngine;
@@ -94,6 +94,13 @@ impl SegmentedBackend for IvfSegmentedBackend {
 
     fn compaction_threshold(config: &Self::Config) -> f64 {
         config.compaction_threshold
+    }
+
+    fn config_from(config: VectorIndexTypeConfig) -> Option<Self::Config> {
+        match config {
+            VectorIndexTypeConfig::IVF(config) => Some(config),
+            _ => None,
+        }
     }
 
     fn load_segment_reader(

@@ -374,6 +374,42 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Swap the config of the field `name` for `new_config`, in place,
+    /// without touching its data (Issue #1494).
+    ///
+    /// Only valid for a [`crate::engine::schema::FieldChangeKind::MetadataOnly`]
+    /// change, whose parameters (HNSW `default_ef_search`, IVF `n_probe`)
+    /// are read when a searcher is built: searchers built afterwards use the
+    /// new config, so a caller that caches one drops it.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always errors; callers must gate on
+    /// [`Self::supports_dynamic_fields`] first. Implementations also error
+    /// if no field named `name` is registered, or as
+    /// [`Self::update_config`] does.
+    fn update_field_config(&self, _name: &str, _new_config: VectorIndexTypeConfig) -> Result<()> {
+        Err(LaurusError::InvalidOperation(
+            "this index type does not support updating a field's config".to_string(),
+        ))
+    }
+
+    /// Swap this index's config for `new_config`, in place, without touching
+    /// its data (Issue #1494); see [`Self::update_field_config`].
+    ///
+    /// # Errors
+    ///
+    /// Implementations error if `new_config` is for another kind of index,
+    /// or has another dimension or distance. The default implementation
+    /// always errors: it is kept by the monolithic Flat, HNSW and IVF
+    /// indexes, which the engine never opens (it opens every vector field in
+    /// the segmented layout), so they keep their config until reopened.
+    fn update_config(&self, _new_config: VectorIndexTypeConfig) -> Result<()> {
+        Err(LaurusError::InvalidOperation(
+            "this index type does not support updating its config in place; reopen it".to_string(),
+        ))
+    }
+
     /// The configured vector dimension of every field, keyed by field name
     /// (Issue #948: multi-field stats/routing need per-field dimensions
     /// without paying for a full `reader()`/`stats()` round trip).

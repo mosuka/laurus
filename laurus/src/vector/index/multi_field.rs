@@ -609,6 +609,26 @@ impl VectorIndex for MultiFieldVectorIndex {
         Ok(())
     }
 
+    /// Swap the field's config in its own index, in place (Issue #1494).
+    /// Unlike [`Self::rebuild_field`], nothing is reopened or merged: the
+    /// field keeps its index object, so no second object ever shares its
+    /// storage namespace. Its [`FieldEntry`] caches only the dimension, the
+    /// distance and whether it is multi-vector, which a config update cannot
+    /// change.
+    fn update_field_config(&self, name: &str, new_config: VectorIndexTypeConfig) -> Result<()> {
+        let Some(index) = self.fields.read().get(name).map(|f| f.index.clone()) else {
+            return Err(LaurusError::invalid_argument(format!(
+                "vector field '{name}' does not exist"
+            )));
+        };
+        index.update_config(new_config).map_err(|e| match e {
+            LaurusError::InvalidArgument(reason) => {
+                LaurusError::invalid_argument(format!("vector field '{name}': {reason}"))
+            }
+            e => e,
+        })
+    }
+
     fn field_dimensions(&self) -> BTreeMap<String, usize> {
         self.fields
             .read()

@@ -447,6 +447,36 @@ impl InvertedIndex {
         }
     }
 
+    /// The config a writer created now is built with: the base config's
+    /// fields overlaid with `extra_fields`, which [`LexicalIndex::add_field`],
+    /// [`LexicalIndex::rebuild_field`] and
+    /// [`LexicalIndex::update_field_option`] change (Issue #1494).
+    fn writer_config(&self) -> InvertedIndexWriterConfig {
+        // Merge base config fields with dynamically added fields.
+        let mut fields = self.config.fields.clone();
+        fields.extend(
+            self.extra_fields
+                .read()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+
+        // Every writer setting the index config carries must be set here:
+        // `..Default::default()` would otherwise mask it — the flush
+        // thresholds were silently ignored until Issue #1200.
+        InvertedIndexWriterConfig {
+            analyzer: self.config.analyzer.clone(),
+            shard_id: self.config.shard_id,
+            fields,
+            use_compound: self.config.use_compound,
+            max_buffered_docs: self.config.max_buffered_docs,
+            max_buffer_memory: self.config.max_buffer_memory,
+            store_term_positions: self.config.store_term_vectors,
+            store_doc_values: self.config.store_doc_values,
+            ..Default::default()
+        }
+    }
+
     /// Load the segments a reader may see, i.e. the published ones.
     ///
     /// The writer flushes a segment as soon as its buffer fills, so a
@@ -1053,29 +1083,7 @@ impl LexicalIndex for InvertedIndex {
     fn writer(&self) -> Result<Box<dyn LexicalIndexWriter>> {
         self.check_closed()?;
 
-        // Merge base config fields with dynamically added fields.
-        let mut fields = self.config.fields.clone();
-        fields.extend(
-            self.extra_fields
-                .read()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
-
-        // Every writer setting the index config carries must be set here:
-        // `..Default::default()` would otherwise mask it — the flush
-        // thresholds were silently ignored until Issue #1200.
-        let writer_config = InvertedIndexWriterConfig {
-            analyzer: self.config.analyzer.clone(),
-            shard_id: self.config.shard_id,
-            fields,
-            use_compound: self.config.use_compound,
-            max_buffered_docs: self.config.max_buffered_docs,
-            max_buffer_memory: self.config.max_buffer_memory,
-            store_term_positions: self.config.store_term_vectors,
-            store_doc_values: self.config.store_doc_values,
-            ..Default::default()
-        };
+        let writer_config = self.writer_config();
         // Hand the writer the shared metadata and manifest handles
         // (#1023 / #1021). This is the ONLY constructor that does: writers
         // built through the public `InvertedIndexWriter::new` — the merge
@@ -1192,6 +1200,21 @@ impl LexicalIndex for InvertedIndex {
         // the index level. Fields from the initial config remain in the
         // underlying index data but will be hidden from the engine-level schema.
         self.extra_fields.write().remove(name);
+        Ok(())
+    }
+
+    /// Replace `name`'s option through `extra_fields`, which overrides the
+    /// base config in [`Self::writer`] -- the same mechanism
+    /// [`Self::rebuild_field`] ends with, without its segment rewrite
+    /// (Issue #1494).
+    fn update_field_option(&self, name: &str, option: FieldOption) -> Result<()> {
+        let mut extra_fields = self.extra_fields.write();
+        if !self.config.fields.contains_key(name) && !extra_fields.contains_key(name) {
+            return Err(LaurusError::invalid_argument(format!(
+                "Field '{name}' does not exist in the lexical index"
+            )));
+        }
+        extra_fields.insert(name.to_string(), option);
         Ok(())
     }
 
@@ -2620,5 +2643,39 @@ mod tests {
 
         index.close().unwrap();
         assert!(held.iter().all(|segment| segment.upgrade().is_none()));
+    }
+
+    /// Issue #1494: `update_field_option` replaces a base-config field's
+    /// option in the config the next writer is built with, so a
+    /// metadata-only `stored` or `term_vectors` change reaches the documents
+    /// written next (the engine cannot observe either: it answers `stored`
+    /// from the document store and rejects phrase queries once
+    /// `term_vectors` is off). A field the index does not have is refused.
+    #[test]
+    fn update_field_option_replaces_the_option_the_next_writer_uses() {
+        use crate::lexical::core::field::TextOption;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let mut config = InvertedIndexConfig::default();
+        config.fields.insert(
+            "title".to_string(),
+            FieldOption::Text(TextOption::default().term_vectors(true)),
+        );
+        let index = InvertedIndex::create(storage, config).unwrap();
+        assert!(index.writer_config().stores_term_positions("title"));
+
+        let new_option = FieldOption::Text(TextOption::default().stored(false).term_vectors(false));
+        index
+            .update_field_option("title", new_option.clone())
+            .unwrap();
+        let writer_config = index.writer_config();
+        assert!(!writer_config.stores_term_positions("title"));
+        assert_eq!(
+            writer_config.fields.get("title").map(FieldOption::stored),
+            Some(false)
+        );
+
+        let error = index.update_field_option("nosuch", new_option).unwrap_err();
+        assert!(matches!(error, LaurusError::InvalidArgument(_)), "{error}");
     }
 }
