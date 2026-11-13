@@ -4,8 +4,8 @@ use std::io;
 use std::path::Path;
 
 use laurus::LaurusError;
-use pyo3::PyErr;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
+use pyo3::{PyErr, Python};
 
 /// Error returned by any `Index` method called after
 /// [`crate::index::PyIndex::close`] (Issue #1097).
@@ -22,18 +22,64 @@ pub fn reload_requires_path_err() -> PyErr {
 }
 
 /// Convert a [`LaurusError`] into a Python exception.
+///
+/// The exception is chosen by [`exception_for`] and carries [`message`].
 pub fn laurus_err(err: LaurusError) -> PyErr {
+    exception_for(&err)(message(&err))
+}
+
+/// Choose the Python exception a [`LaurusError`] raises.
+///
+/// - `OSError` for `LaurusError::Io`.
+/// - `ValueError` for a caller's mistake: `LaurusError::Schema`, `Query`,
+///   `Field` and `InvalidArgument`.
+/// - `RuntimeError` for anything else.
+///
+/// A failed batch (`LaurusError::BatchIngest` and `BatchSearch`) raises the
+/// exception of its source, so a batch that failed on a caller's mistake
+/// raises `ValueError` as the same call on its own would (Issue #1627).
+fn exception_for(err: &LaurusError) -> fn(String) -> PyErr {
     match err {
-        LaurusError::Io(e) => PyIOError::new_err(e.to_string()),
-        LaurusError::Schema(m) => PyValueError::new_err(format!("Schema error: {m}")),
-        LaurusError::Query(m) => PyValueError::new_err(format!("Query error: {m}")),
-        LaurusError::Field(m) => PyValueError::new_err(format!("Field error: {m}")),
-        LaurusError::InvalidArgument(m) => PyValueError::new_err(format!("Invalid argument: {m}")),
-        // `search_batch` wraps a request's error with its position (Issue
-        // #1553); raise the request's own error, as before.
-        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
-        other => PyRuntimeError::new_err(other.to_string()),
+        LaurusError::Io(_) => PyIOError::new_err::<String>,
+        LaurusError::Schema(_)
+        | LaurusError::Query(_)
+        | LaurusError::Field(_)
+        | LaurusError::InvalidArgument(_) => PyValueError::new_err::<String>,
+        LaurusError::BatchIngest { source, .. } | LaurusError::BatchSearch { source, .. } => {
+            exception_for(source)
+        }
+        _ => PyRuntimeError::new_err::<String>,
     }
+}
+
+/// The message of the Python exception a [`LaurusError`] raises.
+///
+/// It is the error's `Display`, except that `LaurusError::Io` gives the
+/// `io::Error` alone and `LaurusError::BatchSearch` gives its source's
+/// message with the failing query's position in front, as
+/// `queries[{failed_index}]: ...` (Issue #1627). `LaurusError::BatchIngest`
+/// keeps its `Display`, which names the failing document's position and id
+/// and the number of documents applied before it.
+fn message(err: &LaurusError) -> String {
+    match err {
+        LaurusError::Io(e) => e.to_string(),
+        LaurusError::BatchSearch {
+            failed_index,
+            source,
+        } => format!("queries[{failed_index}]: {}", message(source)),
+        other => other.to_string(),
+    }
+}
+
+/// Put `context` (such as `queries[1]`) in front of `err`'s message, keeping
+/// its exception type, and chain `err` as the new exception's `__cause__`.
+///
+/// `search_batch` uses it to name the query a conversion error came from
+/// (Issue #1627).
+pub fn with_context(py: Python<'_>, err: PyErr, context: &str) -> PyErr {
+    let wrapped = PyErr::from_type(err.get_type(py), format!("{context}: {}", err.value(py)));
+    wrapped.set_cause(py, Some(err));
+    wrapped
 }
 
 /// Wrap a filesystem I/O error with the path that caused it, then convert

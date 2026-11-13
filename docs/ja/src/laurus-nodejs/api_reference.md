@@ -43,8 +43,8 @@ class Index {
 | :--- | :--- |
 | `putDocument(id, doc)` | ドキュメントを上書き保存。 |
 | `addDocument(id, doc)` | 既存バージョンを残してチャンクを追記。 |
-| `putDocuments(docs)` | バッチ upsert。`docs` は `Array<[id, doc]>` で、バッチごとに WAL fsync 1 回で順に適用（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。 |
-| `addDocuments(docs)` | バッチチャンク追記。`putDocuments` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
+| `putDocuments(docs)` | バッチ upsert。`docs` は `Array<[id, doc]>` で、バッチごとに WAL fsync 1 回で順に適用（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `putDocument` に渡したときと同じ code（予約名のフィールドなど呼び出し側の誤りなら `InvalidArg`）の例外を投げ、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。 |
+| `addDocuments(docs)` | バッチチャンク追記。エラーも含めて `putDocuments` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
 | `getDocuments(id)` | 指定 ID の全バージョンを取得。 |
 | `deleteDocuments(id)` | 指定 ID の全バージョンを削除。 |
 | `commit()` | 書き込みをフラッシュし変更を検索可能にする。 |
@@ -54,7 +54,7 @@ class Index {
 | `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。成分はすべて有限でなければならない（[VectorQuery](#vectorquery)を参照）。 |
 | `searchVectorText(field, text, limit?, offset?)` | テキストを自動埋め込みして検索。 |
 | `searchWithRequest(request)` | `SearchRequest` で検索。 |
-| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` と `groupBy` はすべてのクエリに同一に適用されます。 |
+| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` と `groupBy` はすべてのクエリに同一に適用されます。文字列でない要素は、code `StringExpected` と位置を示すメッセージ（`queries[1]: expected a DSL string, got a number`）の例外を投げます。エンジンが断ったクエリは、`search` がそのクエリに投げるのと同じ例外を投げ、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats()` | インデックス統計（`documentCount`、`vectorFields`）を返す。 |
 
 ドキュメント操作と検索メソッドはすべて非同期で Promise を返します。

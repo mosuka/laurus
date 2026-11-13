@@ -32,14 +32,14 @@ class Index:
 | :--- | :--- |
 | `put_document(id, doc)` | ドキュメントをアップサート（upsert）します。同じ ID の既存バージョンをすべて置換します。 |
 | `add_document(id, doc)` | 既存バージョンを削除せずにドキュメントチャンクを追記します。 |
-| `put_documents(docs)` | バッチ upsert。`docs` は `(id, dict)` ペアのイテラブルで、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。 |
-| `add_documents(docs)` | バッチチャンク追記。`put_documents` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
+| `put_documents(docs)` | バッチ upsert。`docs` は `(id, dict)` ペアのイテラブルで、バッチごとに WAL fsync 1 回で順に適用します（重複 ID はデデュープ、最後が勝ち）。最初の不正エントリで fail-fast し、適用済みの prefix はロールバックされません。エンジンが断った文書は、その文書を `put_document` に渡したときと同じ例外（予約名のフィールドなど呼び出し側の誤りなら `ValueError`）を送出し、メッセージで文書の位置と ID を示します: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...`（Issue #1627）。 |
+| `add_documents(docs)` | バッチチャンク追記。エラーも含めて `put_documents` と同様ですが、繰り返した ID は別バージョンとして蓄積されます。 |
 | `get_documents(id) -> list[dict]` | 指定 ID の全保存バージョンを返します。 |
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit()` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal()` | WAL の永続性バリアを強制します。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。 |
 | `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None) -> list[SearchResult]` | 検索クエリを実行します。`rescore` には、MultiVector フィールドに対する late interaction で上位の結果を並べ替える [`LateInteractionRescore`](#lateinteractionrescore) を渡します（Issue #1351）。`group_by` には、結果をフィールドの値でグループ化する [`GroupBy`](#groupby) を渡します（Issue #1297）。このとき `limit` と `offset` はグループの数を数えます。`query` が `SearchRequest` の場合はリクエスト自身の `rescore` と `group_by` を使い、これらのキーワードは無視されます。 |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` と `group_by` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。 |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` と `group_by` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリに送出するのと同じ例外を送出し、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats() -> dict` | インデックス統計（`document_count`、`vector_fields`）を返します。 |
 
 ### `search` の query 引数

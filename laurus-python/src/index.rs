@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::convert::{dict_to_document, document_to_dict};
-use crate::errors::{closed_err, index_dir_err, laurus_err, reload_requires_path_err};
+use crate::errors::{
+    closed_err, index_dir_err, laurus_err, reload_requires_path_err, with_context,
+};
 use crate::schema::PySchema;
 use crate::search::{
     PyGroupBy, PyLateInteractionRescore, PySearchResult, build_request_from_py, to_py_search_result,
@@ -616,9 +618,11 @@ impl PyIndex {
     /// Args:
     ///     docs: An iterable of `(id, dict)` pairs.
     ///
-    /// Fails fast at the first document that cannot be indexed; the raised
-    /// error names the failing position and id. Documents applied before the
-    /// failure are **not** rolled back (retrying the batch is idempotent).
+    /// Fails fast at the first document that cannot be indexed, raising the
+    /// exception `put_document` raises for that document (`ValueError` for
+    /// a caller's mistake, Issue #1627); its message names the failing
+    /// position and id. Documents applied before the failure are **not**
+    /// rolled back (retrying the batch is idempotent).
     /// Call [`commit`] to make the changes visible to searches.
     pub fn put_documents(&self, py: Python, docs: &Bound<PyAny>) -> PyResult<()> {
         let batch = pairs_to_documents(py, docs)?;
@@ -797,6 +801,11 @@ impl PyIndex {
     ///     `queries[i]`. Empty input returns an empty list without
     ///     invoking the engine.
     ///
+    /// Raises:
+    ///     The exception `search()` raises for a query that cannot be
+    ///     converted or that the engine rejects, its message starting with
+    ///     `queries[i]: ` for the query's position `i` (Issue #1627).
+    ///
     /// Issue [#717](https://github.com/mosuka/laurus/issues/717)
     /// Phase 3b of [#648](https://github.com/mosuka/laurus/issues/648).
     #[pyo3(signature = (queries, *, limit=10, offset=0, highlight=None, group_by=None))]
@@ -816,17 +825,14 @@ impl PyIndex {
         })?;
 
         let mut requests = Vec::new();
-        for item in queries_seq {
+        for (index, item) in queries_seq.enumerate() {
             let item = item?;
-            requests.push(build_request_from_py(
-                py,
-                &item,
-                limit,
-                offset,
-                highlight,
-                None,
-                group_by.as_ref(),
-            )?);
+            // Name the query a conversion error came from, as the engine's
+            // errors are (Issue #1627).
+            let request =
+                build_request_from_py(py, &item, limit, offset, highlight, None, group_by.as_ref())
+                    .map_err(|e| with_context(py, e, &format!("queries[{index}]")))?;
+            requests.push(request);
         }
 
         if requests.is_empty() {

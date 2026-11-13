@@ -9,6 +9,8 @@ These tests cover the Python-facing batched ingestion API:
 - ``add_documents`` accumulates repeated ids as separate versions.
 - A malformed entry (not an ``(id, dict)`` pair) is rejected naming its
   position.
+- A document the engine rejects fails the batch with the exception it
+  raises alone (#1627).
 """
 
 import pytest
@@ -59,3 +61,18 @@ def test_put_documents_rejects_malformed_entry():
     with pytest.raises(Exception) as excinfo:
         idx.put_documents([("ok", {"title": "fine"}), "not-a-pair"])
     assert "documents[1]" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("method", ["put_documents", "add_documents"])
+def test_batch_raises_the_exception_of_the_failing_document(method):
+    """A document the engine rejects fails the batch with the ``ValueError``
+    the same document raises alone, the message naming its position and id
+    (Issue #1627: it was a ``RuntimeError``)."""
+    idx = laurus.Index()
+    with pytest.raises(ValueError) as single:
+        idx.put_document("b", {"_x": "v"})
+    with pytest.raises(ValueError) as batch:
+        getattr(idx, method)([("a", {"title": "a"}), ("b", {"_x": "v"})])
+    message = str(batch.value)
+    assert "doc 1 (id 'b')" in message
+    assert message.endswith(str(single.value))

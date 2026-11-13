@@ -95,13 +95,26 @@ def test_search_batch_limit_per_query(index):
         assert len(results) <= 1
 
 
-def test_search_batch_engine_error_raises_as_search_does(index):
+def test_search_batch_engine_error_names_the_query(index):
     """A query the engine rejects raises the ``ValueError`` that ``search()``
-    raises for it (Issue #1553: the engine wraps the error of a batch with
-    the query's position, which the binding unwraps)."""
+    raises for it, its message starting with the query's position (Issues
+    #1553 and #1627)."""
     with pytest.raises(ValueError) as single:
         index.search("nosuch:rust")
     with pytest.raises(ValueError) as batch:
         index.search_batch(["title:rust", "nosuch:rust"])
     assert "unknown field" in str(batch.value)
-    assert str(batch.value) == str(single.value)
+    assert str(batch.value) == f"queries[1]: {single.value}"
+
+
+def test_search_batch_conversion_error_names_the_query(index):
+    """A query that cannot be converted raises the exception ``search()``
+    raises for it, its message starting with the query's position and the
+    original exception chained as its cause (Issue #1627)."""
+    with pytest.raises(Exception) as single:
+        index.search(42)
+    with pytest.raises(Exception) as batch:
+        index.search_batch(["title:rust", 42])
+    assert type(batch.value) is type(single.value)
+    assert str(batch.value) == f"queries[1]: {single.value}"
+    assert str(batch.value.__cause__) == str(single.value)

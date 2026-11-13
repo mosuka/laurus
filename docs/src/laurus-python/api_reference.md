@@ -32,14 +32,14 @@ class Index:
 | :--- | :--- |
 | `put_document(id, doc)` | Upsert a document. Replaces all existing versions with the same ID. |
 | `add_document(id, doc)` | Append a document chunk without removing existing versions. |
-| `put_documents(docs)` | Batched upsert. `docs` is an iterable of `(id, dict)` pairs, applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. |
-| `add_documents(docs)` | Batched chunk append. Like `put_documents` but repeated ids accumulate as separate versions. |
+| `put_documents(docs)` | Batched upsert. `docs` is an iterable of `(id, dict)` pairs, applied in order with one WAL fsync per batch (duplicate ids dedup, last wins). Fails fast at the first bad entry; the applied prefix is not rolled back. A document the engine rejects raises the exception `put_document` raises for it (`ValueError` for a caller's mistake such as a reserved field name), with a message naming its position and id: `batch ingest failed at doc 1 (id 'b') after 1 documents were applied: ...` (Issue #1627). |
+| `add_documents(docs)` | Batched chunk append. Like `put_documents`, errors included, but repeated ids accumulate as separate versions. |
 | `get_documents(id) -> list[dict]` | Return all stored versions for the given ID. |
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
 | `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None) -> list[SearchResult]` | Execute a search query. `rescore` takes a [`LateInteractionRescore`](#lateinteractionrescore) that reorders the top results by late interaction over a multi-vector field (Issue #1351). `group_by` takes a [`GroupBy`](#groupby) that groups the results by a field's value (Issue #1297); `limit` and `offset` then count groups. When `query` is a `SearchRequest`, the request's own `rescore` and `group_by` are used and these keywords are ignored. |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` and `group_by` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` and `group_by` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. A query that cannot be converted or that the engine rejects raises the exception `search` raises for it, with the query's position in front of the message: `queries[1]: ...` (Issue #1627). |
 | `stats() -> dict` | Return index statistics (`document_count`, `vector_fields`). |
 
 ### `search` query argument

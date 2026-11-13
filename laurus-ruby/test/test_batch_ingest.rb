@@ -45,4 +45,19 @@ class TestBatchIngest < Minitest::Test
     end
     assert_includes error.message, "documents[1]"
   end
+
+  # Issue #1627: a document the engine rejects fails the batch with the
+  # ArgumentError the same document raises alone (it was a RuntimeError),
+  # the message naming its position and id.
+  def test_batch_raises_the_exception_of_the_failing_document
+    %i[put_documents add_documents].each do |method|
+      idx = Laurus::Index.new
+      single = assert_raises(ArgumentError) { idx.put_document("b", { "_x" => "v" }) }
+      batch = assert_raises(ArgumentError, method.to_s) do
+        idx.public_send(method, [["a", { "title" => "a" }], ["b", { "_x" => "v" }]])
+      end
+      assert_includes batch.message, "doc 1 (id 'b')", method.to_s
+      assert batch.message.end_with?(single.message), "#{method}: #{batch.message}"
+    end
+  end
 end

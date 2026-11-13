@@ -94,7 +94,9 @@ describe("searchBatch", () => {
   // Issue #1553: the engine wraps the error of a batch with the query's
   // position, which the binding unwraps, so a query the engine rejects
   // rejects the batch as it rejects `search()`.
-  it("rejects a query the engine rejects as search does", async () => {
+  // Issues #1553 and #1627: the error of the query the engine rejects,
+  // with the query's position in front of its message.
+  it("rejects a query the engine rejects as search does, naming it", async () => {
     const index = await createTextIndex();
     const single = await index.search("nosuch:rust").then(
       () => null,
@@ -109,6 +111,29 @@ describe("searchBatch", () => {
     expect(batch).not.toBeNull();
     expect(batch.code).toBe("InvalidArg");
     expect(batch.message).toContain("unknown field");
-    expect(batch.message).toBe(single.message);
+    expect(batch.message).toBe(`queries[1]: ${single.message}`);
+  });
+
+  // Issue #1627: an element that is not a string is named by its position,
+  // with the code `search` gives such a value. `search(42)` throws before it
+  // returns a promise (napi converts the argument first), so both calls are
+  // awaited inside `try`.
+  it("rejects an element that is not a string, naming it", async () => {
+    const index = await createTextIndex();
+    const errorOf = async (call) => {
+      try {
+        await call();
+        return null;
+      } catch (e) {
+        return e;
+      }
+    };
+    const single = await errorOf(() => index.search(42));
+    const batch = await errorOf(() => index.searchBatch(["title:rust", 42]));
+
+    expect(single).not.toBeNull();
+    expect(batch).not.toBeNull();
+    expect(batch.code).toBe(single.code);
+    expect(batch.message).toBe("queries[1]: expected a DSL string, got a number");
   });
 });

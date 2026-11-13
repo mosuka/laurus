@@ -6,6 +6,8 @@
  * - `putDocuments` applies the batch and deduplicates duplicate ids within
  *   one batch (last occurrence wins).
  * - `addDocuments` accumulates repeated ids as separate versions.
+ * - A document the engine rejects fails the batch with the code it gets
+ *   alone (#1627).
  */
 
 import { describe, it, expect } from "vitest";
@@ -53,4 +55,31 @@ describe("putDocuments / addDocuments", () => {
     const docs = await index.getDocuments("doc");
     expect(docs.length).toBe(2);
   });
+
+  // Issue #1627: a document the engine rejects fails the batch with the
+  // code the same document gets alone (it was `GenericFailure`), the
+  // message naming its position and id.
+  for (const method of ["putDocuments", "addDocuments"]) {
+    it(`${method} rejects with the code of the failing document`, async () => {
+      const index = await createTextIndex();
+      const single = await index.putDocument("b", { _x: "v" }).then(
+        () => null,
+        (e) => e,
+      );
+      const batch = await index[method]([
+        ["a", { title: "a" }],
+        ["b", { _x: "v" }],
+      ]).then(
+        () => null,
+        (e) => e,
+      );
+
+      expect(single).not.toBeNull();
+      expect(single.code).toBe("InvalidArg");
+      expect(batch).not.toBeNull();
+      expect(batch.code).toBe(single.code);
+      expect(batch.message).toContain("doc 1 (id 'b')");
+      expect(batch.message.endsWith(single.message)).toBe(true);
+    });
+  }
 });

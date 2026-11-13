@@ -10,21 +10,51 @@ pub fn closed_err() -> napi::Error {
 }
 
 /// Convert a [`LaurusError`] into a napi [`napi::Error`].
+///
+/// The error's code is chosen by [`status_for`] and its message is
+/// [`message`].
 pub fn laurus_err(err: LaurusError) -> napi::Error {
+    napi::Error::new(status_for(&err), message(&err))
+}
+
+/// Choose the code of the napi error a [`LaurusError`] becomes.
+///
+/// - `InvalidArg` for a caller's mistake: `LaurusError::Schema`, `Query`,
+///   `Field` and `InvalidArgument`.
+/// - `GenericFailure` for anything else, `LaurusError::Io` included.
+///
+/// A failed batch (`LaurusError::BatchIngest` and `BatchSearch`) takes the
+/// code of its source, so a batch that failed on a caller's mistake is
+/// `InvalidArg` as the same call on its own would be (Issue #1627).
+fn status_for(err: &LaurusError) -> Status {
     match err {
-        LaurusError::Io(e) => napi::Error::new(Status::GenericFailure, format!("IO error: {e}")),
-        LaurusError::Schema(m) => {
-            napi::Error::new(Status::InvalidArg, format!("Schema error: {m}"))
+        LaurusError::Schema(_)
+        | LaurusError::Query(_)
+        | LaurusError::Field(_)
+        | LaurusError::InvalidArgument(_) => Status::InvalidArg,
+        LaurusError::BatchIngest { source, .. } | LaurusError::BatchSearch { source, .. } => {
+            status_for(source)
         }
-        LaurusError::Query(m) => napi::Error::new(Status::InvalidArg, format!("Query error: {m}")),
-        LaurusError::Field(m) => napi::Error::new(Status::InvalidArg, format!("Field error: {m}")),
-        LaurusError::InvalidArgument(m) => {
-            napi::Error::new(Status::InvalidArg, format!("Invalid argument: {m}"))
-        }
-        // `search_batch` wraps a request's error with its position (Issue
-        // #1553); throw the request's own error, as before.
-        LaurusError::BatchSearch { source, .. } => laurus_err(*source),
-        other => napi::Error::new(Status::GenericFailure, other.to_string()),
+        _ => Status::GenericFailure,
+    }
+}
+
+/// The message of the napi error a [`LaurusError`] becomes.
+///
+/// It is the error's `Display`, except that `LaurusError::Io` is
+/// `IO error: ...` and `LaurusError::BatchSearch` gives its source's
+/// message with the failing query's position in front, as
+/// `queries[{failed_index}]: ...` (Issue #1627). `LaurusError::BatchIngest`
+/// keeps its `Display`, which names the failing document's position and id
+/// and the number of documents applied before it.
+fn message(err: &LaurusError) -> String {
+    match err {
+        LaurusError::Io(e) => format!("IO error: {e}"),
+        LaurusError::BatchSearch {
+            failed_index,
+            source,
+        } => format!("queries[{failed_index}]: {}", message(source)),
+        other => other.to_string(),
     }
 }
 

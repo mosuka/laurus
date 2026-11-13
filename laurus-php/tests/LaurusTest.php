@@ -177,6 +177,33 @@ class LaurusTest extends TestCase
         $this->assertCount(2, $idx->getDocuments("doc"));
     }
 
+    /**
+     * Issue #1627: a document the engine rejects fails the batch with the
+     * \ValueError the same document throws alone (it was an \Exception),
+     * the message naming its position and id.
+     */
+    public function testBatchThrowsTheExceptionOfTheFailingDocument(): void
+    {
+        foreach (["putDocuments", "addDocuments"] as $method) {
+            $idx = new Laurus\Index();
+            $single = null;
+            try {
+                $idx->putDocument("b", ["_x" => "v"]);
+            } catch (\ValueError $e) {
+                $single = $e->getMessage();
+            }
+            $this->assertNotNull($single, "putDocument() must throw a ValueError");
+
+            try {
+                $idx->{$method}([["a", ["title" => "a"]], ["b", ["_x" => "v"]]]);
+                $this->fail("{$method}() must throw a ValueError");
+            } catch (\ValueError $e) {
+                $this->assertStringContainsString("doc 1 (id 'b')", $e->getMessage(), $method);
+                $this->assertStringEndsWith($single, $e->getMessage(), $method);
+            }
+        }
+    }
+
     // ── Statistics ───────────────────────────────────────────────────────
 
     public function testDocumentCount(): void
@@ -1630,11 +1657,11 @@ class LaurusTest extends TestCase
     }
 
     /**
-     * Issue #1553: the engine wraps the error of a batch with the query's
-     * position, which the binding unwraps, so a query the engine rejects
-     * throws the \ValueError that search() throws for it.
+     * Issues #1553 and #1627: a query the engine rejects throws the
+     * \ValueError that search() throws for it, its message starting with
+     * the query's position.
      */
-    public function testSearchBatchEngineErrorThrowsAsSearchDoes(): void
+    public function testSearchBatchEngineErrorNamesTheQuery(): void
     {
         $idx = $this->createBatchIndex();
         $single = null;
@@ -1650,7 +1677,42 @@ class LaurusTest extends TestCase
             $this->fail("searchBatch() must throw a ValueError");
         } catch (\ValueError $e) {
             $this->assertStringContainsString("unknown field", $e->getMessage());
-            $this->assertSame($single, $e->getMessage());
+            $this->assertSame("queries[1]: {$single}", $e->getMessage());
+        }
+    }
+
+    /**
+     * Issue #1627: a query that cannot be converted throws the exception
+     * search() throws for it, of the same class and code, its message
+     * starting with the query's position. The position counts the elements
+     * in order, whatever the array's keys. A \ValueError (a SearchRequest
+     * whose DSL `query` is combined with `lexicalQuery`) stays one.
+     */
+    public function testSearchBatchConversionErrorNamesTheQuery(): void
+    {
+        $idx = $this->createBatchIndex();
+        $lexical = new Laurus\TermQuery("title", "rust");
+        $cases = [
+            "not a query" => 42,
+            "a SearchRequest build rejects" => new Laurus\SearchRequest("title:rust", $lexical, null, null, null),
+        ];
+        foreach ($cases as $label => $query) {
+            $single = null;
+            try {
+                $idx->search($query);
+            } catch (\Throwable $e) {
+                $single = $e;
+            }
+            $this->assertNotNull($single, "{$label}: search() must throw");
+
+            try {
+                $idx->searchBatch(["first" => "title:rust", "second" => $query]);
+                $this->fail("{$label}: searchBatch() must throw");
+            } catch (\Throwable $e) {
+                $this->assertSame(get_class($single), get_class($e), $label);
+                $this->assertSame($single->getCode(), $e->getCode(), $label);
+                $this->assertSame("queries[1]: {$single->getMessage()}", $e->getMessage(), $label);
+            }
         }
     }
 

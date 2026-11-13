@@ -208,8 +208,11 @@ impl JsIndex {
     /// sequentially, in order, with one WAL fsync for the whole batch.
     /// Duplicate ids within one batch deduplicate exactly like the same puts
     /// issued one by one (the last occurrence wins). Fails fast at the first
-    /// document that cannot be indexed; documents applied before the failure
-    /// are **not** rolled back (retrying the batch is idempotent).
+    /// document that cannot be indexed, with the error code `putDocument`
+    /// gives that document (`InvalidArg` for a caller's mistake, Issue
+    /// #1627) and a message naming the failing position and id; documents
+    /// applied before the failure are **not** rolled back (retrying the
+    /// batch is idempotent).
     ///
     /// # Arguments
     ///
@@ -530,10 +533,17 @@ impl JsIndex {
     /// Rejects with an `InvalidArg` error if `limit`, `offset` or an
     /// integer of `highlight` or `groupBy` is not an integer from 0 to
     /// 4294967295 (Issue #1612), even for an empty `queries`.
+    ///
+    /// Rejects with a `StringExpected` error whose message starts with
+    /// `queries[i]:` if an element is not a string, and with the error
+    /// `search` gives for a query, its message starting with `queries[i]:`,
+    /// if the engine rejects one (Issue #1627).
     #[napi]
     pub async fn search_batch(
         &self,
-        queries: Vec<String>,
+        // Each element is checked in `dsl_queries`, which names the one
+        // that is not a string; the TypeScript type stays `string[]`.
+        #[napi(ts_arg_type = "Array<string>")] queries: Vec<Value>,
         limit: Option<f64>,
         offset: Option<f64>,
         highlight: Option<JsHighlightOptions>,
@@ -549,6 +559,7 @@ impl JsIndex {
             .as_ref()
             .map(|g| js_group_by_options_to_core(g, CONTEXT))
             .transpose()?;
+        let queries = dsl_queries(queries)?;
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -610,8 +621,34 @@ impl JsIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Batch-ingestion helper
+// Batch helpers
 // ---------------------------------------------------------------------------
+
+/// Take the DSL strings of `searchBatch`'s `queries`, naming the position of
+/// an element that is not a string (Issue #1627).
+///
+/// The error's code is `StringExpected`, the code napi gives a value that is
+/// not a string where one is expected (and `search` gives for one).
+fn dsl_queries(queries: Vec<Value>) -> Result<Vec<String>> {
+    queries
+        .into_iter()
+        .enumerate()
+        .map(|(index, query)| {
+            let kind = match query {
+                Value::String(dsl) => return Ok(dsl),
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+            };
+            Err(napi::Error::new(
+                Status::StringExpected,
+                format!("queries[{index}]: expected a DSL string, got {kind}"),
+            ))
+        })
+        .collect()
+}
 
 /// Convert an array of `(id, doc)` pairs into the engine's
 /// `(String, Document)` batch, naming the offending position on any entry
