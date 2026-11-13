@@ -204,11 +204,21 @@ impl IndexServiceTrait for IndexService {
             .await
             .map_err(error::to_status)?;
 
-        tracing::info!(
-            "Field '{}' updated (classification: {:?})",
-            name,
-            outcome.classification
-        );
+        // A dry run changes nothing, so it is not logged as an update (Issue
+        // #1512); the wording is the CLI's for the same outcome.
+        if req.dry_run {
+            tracing::info!(
+                "Dry run: change to field '{}' classified as {:?}. Nothing was applied.",
+                name,
+                outcome.classification
+            );
+        } else {
+            tracing::info!(
+                "Field '{}' updated (classification: {:?})",
+                name,
+                outcome.classification
+            );
+        }
         let proto_schema = schema_convert::to_proto(&outcome.schema);
         Ok(Response::new(UpdateFieldResponse {
             classification: schema_convert::field_change_kind_to_proto(outcome.classification)
@@ -900,5 +910,118 @@ mod tests {
             Some(Opt::Ivf(o)) => assert_eq!((o.n_clusters, o.n_probe), (Some(100), Some(1))),
             other => panic!("unexpected option: {other:?}"),
         }
+    }
+
+    /// The index `update_field_*` tests below change: one HNSW field `vec`
+    /// with the engine's default `m` (16).
+    const HNSW_VEC: &str = r#"
+        [fields.vec.Hnsw]
+        dimension = 8
+        "#;
+
+    /// An `UpdateField` request setting `vec`'s `m` to 32, a `Reindex`
+    /// change.
+    fn update_m_to_32(reindex: bool, dry_run: bool) -> UpdateFieldRequest {
+        UpdateFieldRequest {
+            name: "vec".to_string(),
+            field_option: Some(v1::FieldOption {
+                option: Some(v1::field_option::Option::Hnsw(v1::HnswOption {
+                    dimension: 8,
+                    m: Some(32),
+                    ..Default::default()
+                })),
+            }),
+            reindex,
+            dry_run,
+        }
+    }
+
+    /// Issue #1512: a `Reindex` change without `reindex` is
+    /// `INVALID_ARGUMENT`, and the message names the opt-in as the request
+    /// does (`reindex`), not by the library's `UpdateFieldOptions`. The MCP
+    /// `update_field` tool puts this status in its tool error unchanged.
+    #[tokio::test]
+    async fn update_field_rejection_names_reindex() {
+        let (_dir, service) = service_with_index(HNSW_VEC).await;
+
+        let status = service
+            .update_field(Request::new(update_m_to_32(false, false)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "Invalid argument: updating field 'vec' requires rebuilding or discarding existing \
+             data (classified as Reindex); enable `reindex` to proceed"
+        );
+    }
+
+    /// A writer that keeps what a `tracing` subscriber writes, for a test to
+    /// read the log lines.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Issue #1512: a dry run, which changes nothing, is logged as a dry
+    /// run, and only an applied change as an update.
+    #[tokio::test]
+    async fn update_field_logs_a_dry_run_as_a_dry_run() {
+        let (_dir, service) = service_with_index(HNSW_VEC).await;
+        let log = CapturedLog::default();
+        // The test runs on a current-thread runtime, so the thread's default
+        // subscriber sees the service's log lines.
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        service
+            .update_field(Request::new(update_m_to_32(true, true)))
+            .await
+            .unwrap();
+        let dry_run = log.text();
+        assert!(
+            dry_run.contains(
+                "Dry run: change to field 'vec' classified as Reindex. Nothing was applied."
+            ),
+            "{dry_run}"
+        );
+        assert!(!dry_run.contains("Field 'vec' updated"), "{dry_run}");
+
+        service
+            .update_field(Request::new(update_m_to_32(true, false)))
+            .await
+            .unwrap();
+        let applied = log.text()[dry_run.len()..].to_string();
+        assert!(
+            applied.contains("Field 'vec' updated (classification: Reindex)"),
+            "{applied}"
+        );
     }
 }

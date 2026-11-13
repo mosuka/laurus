@@ -430,7 +430,7 @@ laurus --index-dir ./my_index update field --name embedding \
 # Reindex の変更は --reindex なしでは拒否される
 laurus --index-dir ./my_index update field --name embedding \
     --field-option '{"Hnsw": {"dimension": 384, "m": 32}}'
-# Error: Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed
+# Error: Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); enable `reindex` to proceed
 
 # 適用する。フィールドのグラフは保存されているベクトルから作り直される
 laurus --index-dir ./my_index update field --name embedding \
@@ -447,8 +447,6 @@ laurus --index-dir ./my_index update field --name embedding \
     --field-option '{"Hnsw": {"m": 32}}' --dry-run
 # Dry run: change to field 'embedding' classified as Destructive. Nothing was applied.
 ```
-
-エラーメッセージはライブラリのオプション `UpdateFieldOptions` を挙げますが、コマンドラインでは `--reindex` を付けてください。
 
 ---
 
