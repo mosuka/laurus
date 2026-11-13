@@ -70,3 +70,37 @@ pub async fn run_field(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laurus::Schema;
+
+    /// Issue #1512: a reindex change without `--reindex` is rejected with a
+    /// message that names the opt-in as `reindex`, not by the library's
+    /// `UpdateFieldOptions`, which a command-line user cannot pass.
+    #[tokio::test]
+    async fn run_field_rejection_names_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Schema::from_toml("[fields.embedding.Hnsw]\ndimension = 4\n").unwrap();
+        context::create_index_from_schema(dir.path(), schema)
+            .await
+            .unwrap();
+
+        let error = run_field(
+            "embedding",
+            r#"{"Hnsw": {"dimension": 4, "m": 32}}"#,
+            false,
+            false,
+            dir.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument: updating field 'embedding' requires rebuilding or discarding \
+             existing data (classified as Reindex); enable `reindex` to proceed"
+        );
+    }
+}

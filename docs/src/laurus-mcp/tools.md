@@ -179,7 +179,7 @@ The same call without `dry_run` is a tool error, because the change needs
 `reindex`:
 
 ```text
-Failed to update field: code: 'Client specified an invalid argument', message: "Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"
+Failed to update field: code: 'Client specified an invalid argument', message: "Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); enable `reindex` to proceed"
 ```
 
 With `"reindex": true` in place of `"dry_run": true`, the change is applied:
@@ -187,8 +187,7 @@ With `"reindex": true` in place of `"dry_run": true`, the change is applied:
 Result: `{"classification":"reindex","fields":["title","embedding"],"message":"Field 'embedding' updated successfully."}`
 
 The result lists the field names, not the schema; call `get_schema` to see
-the field's new option. The error message names `UpdateFieldOptions`, the
-library's option that the `reindex` parameter sets.
+the field's new option.
 
 ---
 

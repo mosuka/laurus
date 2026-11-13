@@ -60,8 +60,11 @@ pub struct UpdateFieldOptions {
     /// doing potentially expensive -- or destructive -- work on every
     /// call). Ignored for a [`schema::FieldChangeKind::MetadataOnly`]
     /// change, which always applies. `false` (the default) rejects both
-    /// `Reindex` and `Destructive` changes with an error naming the
-    /// classification.
+    /// `Reindex` and `Destructive` changes with an
+    /// [`InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// error naming the classification: `updating field '<name>' requires
+    /// rebuilding or discarding existing data (classified as Reindex);
+    /// enable `reindex` to proceed`.
     pub reindex: bool,
     /// When `true`, classify the change and report the outcome without
     /// applying anything — not even a
@@ -2845,10 +2848,13 @@ impl Engine {
             }
             schema::FieldChangeKind::Reindex | schema::FieldChangeKind::Destructive => {
                 if !opts.reindex {
+                    // The message names the opt-in by the name every front end
+                    // gives it (`--reindex`, the `reindex` field or parameter,
+                    // `UpdateFieldOptions::reindex`), not by a Rust type a CLI,
+                    // HTTP, gRPC or MCP user cannot pass (Issue #1512).
                     return Err(crate::error::LaurusError::invalid_argument(format!(
                         "updating field '{name}' requires rebuilding or discarding existing \
-                         data (classified as {classification:?}); pass `UpdateFieldOptions {{ \
-                         reindex: true, .. }}` to proceed"
+                         data (classified as {classification:?}); enable `reindex` to proceed"
                     )));
                 }
 
@@ -6730,10 +6736,19 @@ mod tests {
             .update_field("title", new_option, UpdateFieldOptions::default())
             .await;
 
-        assert!(
-            result.is_err(),
-            "a Reindex change without opts.reindex must be rejected"
-        );
+        // A Reindex change without opts.reindex is rejected, and the message
+        // names the opt-in as every front end does, not by the library's type
+        // (Issue #1512).
+        match result {
+            Err(crate::error::LaurusError::InvalidArgument(message)) => {
+                assert!(
+                    message.ends_with("(classified as Reindex); enable `reindex` to proceed"),
+                    "{message}"
+                );
+                assert!(!message.contains("UpdateFieldOptions"), "{message}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
         // The schema is untouched: still the original (analyzer: None) option.
         match engine.schema().fields.get("title") {
             Some(schema::FieldOption::Text(opt)) => assert!(opt.analyzer.is_none()),
@@ -6936,10 +6951,17 @@ mod tests {
             .update_field("embedding", new_option, UpdateFieldOptions::default())
             .await;
 
-        assert!(
-            result.is_err(),
-            "a Destructive change without opts.reindex must be rejected"
-        );
+        // Rejected, with the message of a Reindex change (Issue #1512).
+        match result {
+            Err(crate::error::LaurusError::InvalidArgument(message)) => {
+                assert!(
+                    message.ends_with("(classified as Destructive); enable `reindex` to proceed"),
+                    "{message}"
+                );
+                assert!(!message.contains("UpdateFieldOptions"), "{message}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
         match engine.schema().fields.get("embedding") {
             Some(schema::FieldOption::Hnsw(opt)) => assert_eq!(opt.dimension, 4),
             other => panic!("expected FieldOption::Hnsw, got {other:?}"),

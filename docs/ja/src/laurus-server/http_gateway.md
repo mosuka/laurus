@@ -215,7 +215,7 @@ curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
 curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
   -H 'Content-Type: application/json' \
   -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}}'
-# => {"error":{"code":400,"message":"Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"}}
+# => {"error":{"code":400,"message":"Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); enable `reindex` to proceed"}}
 
 # 適用する
 curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
@@ -223,8 +223,6 @@ curl -X PATCH http://localhost:8080/v1/schema/fields/embedding \
   -d '{"field_option": {"hnsw": {"dimension": 384, "m": 32}}, "reindex": true}'
 # => {"classification":"reindex","schema":{"default_fields":[],"dynamic_field_policy":"dynamic","fields":{"embedding":{"hnsw":{"base_weight":1.0,"dimension":384,"distance":"cosine","ef_construction":200,"m":32,"quantizer":{"method":"scalar_8bit","subvector_count":0}}}}}}
 ```
-
-エラーメッセージが挙げる `UpdateFieldOptions` は、`reindex` が設定するライブラリのオプションです。
 
 ### ドキュメントの Upsert（PUT）
 

@@ -359,14 +359,14 @@ name: "category"
 同じ呼び出しから `dry_run` を除くと、変更に `reindex` が要るため、ツールエラーになります:
 
 ```text
-Failed to update field: code: 'Client specified an invalid argument', message: "Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed"
+Failed to update field: code: 'Client specified an invalid argument', message: "Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); enable `reindex` to proceed"
 ```
 
 `"dry_run": true` の代わりに `"reindex": true` を指定すると、変更が適用されます:
 
 結果: `{"classification":"reindex","fields":["title","embedding"],"message":"Field 'embedding' updated successfully."}`
 
-結果に含まれるのはフィールド名で、スキーマではありません。フィールドの新しいオプションは `get_schema` で確認してください。エラーメッセージが挙げる `UpdateFieldOptions` は、`reindex` パラメーターが設定するライブラリのオプションです。
+結果に含まれるのはフィールド名で、スキーマではありません。フィールドの新しいオプションは `get_schema` で確認してください。
 
 ---
 

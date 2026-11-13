@@ -446,7 +446,7 @@ laurus --index-dir ./my_index update field --name embedding \
 # A Reindex change is rejected without --reindex
 laurus --index-dir ./my_index update field --name embedding \
     --field-option '{"Hnsw": {"dimension": 384, "m": 32}}'
-# Error: Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); pass `UpdateFieldOptions { reindex: true, .. }` to proceed
+# Error: Invalid argument: updating field 'embedding' requires rebuilding or discarding existing data (classified as Reindex); enable `reindex` to proceed
 
 # Apply it; the field's graph is rebuilt from its stored vectors
 laurus --index-dir ./my_index update field --name embedding \
@@ -463,9 +463,6 @@ laurus --index-dir ./my_index update field --name embedding \
     --field-option '{"Hnsw": {"m": 32}}' --dry-run
 # Dry run: change to field 'embedding' classified as Destructive. Nothing was applied.
 ```
-
-The error message names `UpdateFieldOptions`, the library's option; on the
-command line, pass `--reindex`.
 
 ---
 

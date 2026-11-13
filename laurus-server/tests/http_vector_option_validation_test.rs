@@ -1,7 +1,9 @@
 //! The HTTP gateway answers 400 when the engine rejects a vector field's
 //! options on CreateIndex, AddField and UpdateField (Issues #1479, #1491),
 //! or when the gateway cannot parse one of its integer keys (Issue #1490),
-//! and its schema responses keep `default_ef_search` (Issue #1490).
+//! and its schema responses keep `default_ef_search` (Issue #1490). A
+//! reindex change sent without `reindex` is rejected with a message that
+//! names `reindex` (Issue #1512).
 //!
 //! The gateway forwards each call to the gRPC service and maps the status
 //! it returns, so these requests go through both, over a gRPC connection
@@ -196,4 +198,26 @@ async fn schema_responses_keep_default_ef_search() {
     let (_, body) = send(&router, "GET", "/v1/schema", json!({})).await;
     let hnsw = &body["schema"]["fields"]["vec"]["hnsw"];
     assert!(hnsw.get("default_ef_search").is_none(), "{body}");
+}
+
+/// Issue #1512: a reindex change sent without `"reindex": true` answers
+/// 400, and the message names the opt-in as the request does, not by the
+/// library's `UpdateFieldOptions`.
+#[tokio::test]
+async fn update_field_rejection_names_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    let schema = json!({"schema": {"fields": {"embedding": {"hnsw": {"dimension": 384}}}}});
+    let (status, body) = send(&router, "POST", "/v1/index", schema).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let update = json!({"field_option": {"hnsw": {"dimension": 384, "m": 32}}});
+    let (status, body) = send(&router, "PATCH", "/v1/schema/fields/embedding", update).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "Invalid argument: updating field 'embedding' requires rebuilding or discarding \
+         existing data (classified as Reindex); enable `reindex` to proceed",
+        "{body}"
+    );
 }
