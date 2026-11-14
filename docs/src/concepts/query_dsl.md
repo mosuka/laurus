@@ -23,6 +23,14 @@ set the schema's [`dynamic_field_policy`](./schema_and_fields.md#dynamic-schema)
 so that the field gets added during ingestion. Once a field is part of the
 schema, queries referencing it succeed.
 
+A pre-built lexical query (`SearchQuery::Lexical`, as a query object or a
+DSL string, and the lexical part of a hybrid search) and a `filter_query` are
+checked too ([#1635](https://github.com/mosuka/laurus/issues/1635)). They
+may read only the schema's lexical fields and `_id`: a field the schema does
+not have, or a vector field, which a lexical query can never match, is
+rejected with `InvalidArgument`. A bare term expands to the schema's
+`default_fields`, so it no longer reaches a default field that was deleted.
+
 ## Lexical Query Syntax
 
 Lexical queries search the inverted index using exact or approximate keyword matching.

@@ -79,6 +79,18 @@ pub trait SpanQuery: Send + Sync + std::fmt::Debug {
     fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
         let _ = out;
     }
+
+    /// Collect the field this span query reads and, for a composite, the
+    /// fields its children read (Issue #1635).
+    ///
+    /// A composite's children may name other fields than the composite
+    /// itself, so `SpanQueryWrapper` reports these for the engine's schema
+    /// checks (an unknown or non-lexical field, a field without positions)
+    /// instead of the composite's own field only. Composites recurse into
+    /// every child, as [`Self::collect_highlight_terms`] does.
+    fn collect_field_names(&self, out: &mut std::collections::HashSet<String>) {
+        out.insert(self.field_name().to_string());
+    }
 }
 
 /// A span query that matches a single term.
@@ -221,6 +233,13 @@ impl SpanQuery for SpanNearQuery {
     fn collect_highlight_terms(&self, out: &mut Vec<HighlightTerm>) {
         for clause in &self.clauses {
             clause.collect_highlight_terms(out);
+        }
+    }
+
+    fn collect_field_names(&self, out: &mut std::collections::HashSet<String>) {
+        out.insert(self.field.clone());
+        for clause in &self.clauses {
+            clause.collect_field_names(out);
         }
     }
 
@@ -401,6 +420,12 @@ impl SpanQuery for SpanContainingQuery {
         self.little.collect_highlight_terms(out);
     }
 
+    fn collect_field_names(&self, out: &mut std::collections::HashSet<String>) {
+        out.insert(self.field.clone());
+        self.big.collect_field_names(out);
+        self.little.collect_field_names(out);
+    }
+
     fn get_spans(&self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<Vec<Span>> {
         let big_spans = self.big.get_spans(doc_id, reader)?;
         let little_spans = self.little.get_spans(doc_id, reader)?;
@@ -489,6 +514,12 @@ impl SpanQuery for SpanWithinQuery {
         // `exclude` bounds where `include` may appear; both are matched.
         self.include.collect_highlight_terms(out);
         self.exclude.collect_highlight_terms(out);
+    }
+
+    fn collect_field_names(&self, out: &mut std::collections::HashSet<String>) {
+        out.insert(self.field.clone());
+        self.include.collect_field_names(out);
+        self.exclude.collect_field_names(out);
     }
 
     fn get_spans(&self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<Vec<Span>> {
@@ -767,12 +798,15 @@ impl Query for SpanQueryWrapper {
         self
     }
 
+    /// Every field the span and its children read (Issue #1635), so the
+    /// engine rejects a child on an unknown or non-lexical field too.
     fn collect_field_refs(&self, out: &mut std::collections::HashSet<String>) {
-        out.insert(self.span_query.field_name().to_string());
+        self.span_query.collect_field_names(out);
     }
 
+    /// Every field the span and its children read: each needs positions.
     fn collect_positional_field_refs(&self, out: &mut std::collections::HashSet<String>) {
-        out.insert(self.span_query.field_name().to_string());
+        self.span_query.collect_field_names(out);
     }
 
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {

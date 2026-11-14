@@ -121,18 +121,21 @@ async fn test_schema_lexical_guardrails() -> Result<()> {
         "Field 'stored_only' should be stored"
     );
 
-    // Case D: Search "unknown_field" -> Should NOT find it
+    // Case D: "unknown_field" is not in the schema, so a lexical query on
+    // it is rejected (Issue #1635) instead of returning no hits.
     let req_d = SearchRequestBuilder::new()
         .lexical_query(LexicalSearchQuery::Obj(Box::new(TermQuery::new(
             "unknown_field",
             "should",
         ))))
         .build();
-    let res_d = engine.search(req_d).await?;
-    assert_eq!(
-        res_d.len(),
-        0,
-        "Should NOT find 'unknown_field' because it's not in schema"
+    let err_d = engine
+        .search(req_d)
+        .await
+        .expect_err("a lexical query on a field not in the schema must fail");
+    assert!(
+        matches!(&err_d, laurus::LaurusError::InvalidArgument(m) if m.contains("unknown_field")),
+        "{err_d}"
     );
     let docs_d = engine.get_documents(&res_a[0].id).await?;
     let doc_d = &docs_d[0];

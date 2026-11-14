@@ -510,10 +510,10 @@ new \Laurus\SearchRequest(
 
 | Parameter | Description |
 | :--- | :--- |
-| `$query` | A DSL string or single query object. A DSL string can be combined with `$vectorQuery`: both are searched, and `$vectorQuery` is added to the DSL's vector part (fused by `$fusion`, `RRF(k: 60)` by default). Any other combination with `$lexicalQuery` / `$vectorQuery` throws `\ValueError` (Issue #1372): write the lexical clauses in the DSL, or pass a query object as `$lexicalQuery` / `$vectorQuery` instead. |
-| `$lexicalQuery` | Lexical component for explicit hybrid search. |
+| `$query` | A DSL string or single query object. A DSL string can be combined with `$vectorQuery`: both are searched, and `$vectorQuery` is added to the DSL's vector part (fused by `$fusion`, `RRF(k: 60)` by default). Any other combination with `$lexicalQuery` / `$vectorQuery` throws `\ValueError` (Issue #1372): write the lexical clauses in the DSL, or pass a query object as `$lexicalQuery` / `$vectorQuery` instead. A query object is checked as `$lexicalQuery` is. |
+| `$lexicalQuery` | Lexical component for explicit hybrid search. Its fields must be lexical fields of the schema or `_id`; any other field, such as a typo or a vector field, throws `\ValueError` (Issue #1635). |
 | `$vectorQuery` | Vector component for explicit hybrid search. |
-| `$filterQuery` | Lexical filter applied after scoring. |
+| `$filterQuery` | Lexical filter applied after scoring. Its fields must be lexical fields of the schema or `_id`; any other field, such as a typo or a vector field, throws `\ValueError` (Issue #1635). |
 | `$fusion` | Fusion algorithm (`RRF` or `WeightedSum`). Defaults to `RRF(k: 60)` when both components are set. Anything else throws `\TypeError` (`fusion must be a Laurus\RRF or a Laurus\WeightedSum`, Issue #1555). |
 | `$limit` | Maximum number of results (default 10). A negative value throws `\ValueError` (Issue #1609). |
 | `$offset` | Pagination offset (default 0). A negative value throws `\ValueError` (Issue #1609). |

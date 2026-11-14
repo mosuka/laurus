@@ -2355,7 +2355,9 @@ impl Engine {
     /// Returns an error if the lexical query parser cannot be constructed
     /// (e.g. the analyzer is misconfigured).
     pub fn unified_query_parser(&self) -> Result<self::query::UnifiedQueryParser> {
-        let lexical_parser = self.lexical.query_parser()?;
+        // The schema's default fields, not the ones the lexical index was
+        // opened with (Issue #1635).
+        let lexical_parser = self.lexical_query_parser()?;
         let embedder = self.embedder();
 
         let schema = self.schema.read();
@@ -3044,8 +3046,11 @@ impl Engine {
     /// Resolve a [`LexicalSearchQuery`] into a concrete [`Query`] object.
     ///
     /// If the query is already an `Obj` variant, it is returned as-is.
-    /// If it is a `Dsl` string, it is parsed using the lexical store's
-    /// query parser (which includes the configured analyzer and default fields).
+    /// If it is a `Dsl` string, it is parsed with
+    /// [`Self::lexical_query_parser`] (the configured analyzer and the
+    /// schema's default fields). [`Self::search`] checks the fields of
+    /// either against the schema afterwards
+    /// ([`Self::validate_lexical_field_refs`], Issue #1635).
     ///
     /// # Arguments
     ///
@@ -3061,10 +3066,91 @@ impl Engine {
         match query {
             crate::lexical::search::searcher::LexicalSearchQuery::Obj(q) => Ok(q),
             crate::lexical::search::searcher::LexicalSearchQuery::Dsl(dsl) => {
-                let parser = self.lexical.query_parser()?;
+                let parser = self.lexical_query_parser()?;
                 parser.parse(&dsl)
             }
         }
+    }
+
+    /// The lexical query parser for a query the engine parses: the lexical
+    /// part of the unified DSL and a [`LexicalSearchQuery::Dsl`], with the
+    /// schema's default fields (Issue #1635).
+    ///
+    /// [`LexicalStore::query_parser`] takes the default fields the lexical
+    /// index was opened with, which [`Self::delete_field`] does not change,
+    /// so a bare term kept expanding to a deleted default field: the unified
+    /// DSL then rejected it as unknown, and a `LexicalSearchQuery::Dsl`
+    /// searched the deleted field. With no default field, a bare term fails
+    /// to parse ("No field specified").
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lexical store cannot build its parser.
+    fn lexical_query_parser(&self) -> Result<crate::lexical::query::parser::LexicalQueryParser> {
+        let default_fields = self.schema.read().default_fields.clone();
+        Ok(self
+            .lexical
+            .query_parser()?
+            .with_default_fields(default_fields))
+    }
+
+    /// Reject a lexical query that reads a field the schema has no lexical
+    /// field for (Issue #1635): a field the schema does not have (e.g. a
+    /// typo, or a field deleted with its data left by an earlier version),
+    /// or a vector field, which a lexical query can never match. Either
+    /// used to return no hits, as if nothing matched.
+    ///
+    /// The fields are the ones [`Query::collect_field_refs`] reports; `_id`
+    /// is always allowed. This is the rule [`Self::validate_field_boosts`]
+    /// follows (Issue #1374). The unified DSL checks its query against every
+    /// schema field instead, since it sends a clause on a vector field to
+    /// vector search; the lexical query it hands on reads only lexical
+    /// fields and `_id`, so it passes this check too.
+    ///
+    /// [`Query::collect_field_refs`]: crate::lexical::query::Query::collect_field_refs
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - A lexical query or `filter_query` about to be executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// naming the unknown fields, or else the non-lexical ones, in sorted
+    /// order.
+    fn validate_lexical_field_refs(&self, query: &dyn crate::lexical::query::Query) -> Result<()> {
+        let mut refs = HashSet::new();
+        query.collect_field_refs(&mut refs);
+        refs.remove(schema::RESERVED_ID_FIELD);
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.schema.read();
+        let mut unknown = Vec::new();
+        let mut not_lexical = Vec::new();
+        for field in refs {
+            match schema.fields.get(&field) {
+                None => unknown.push(field),
+                Some(option) if !option.is_lexical() => not_lexical.push(field),
+                Some(_) => {}
+            }
+        }
+        unknown.sort_unstable();
+        not_lexical.sort_unstable();
+        if !unknown.is_empty() {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "query references unknown field(s) {unknown:?}; \
+                 declare them in the schema or check for typos"
+            )));
+        }
+        if !not_lexical.is_empty() {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "query references field(s) {not_lexical:?} that are not a lexical field; \
+                 a lexical query cannot match them"
+            )));
+        }
+        Ok(())
     }
 
     /// Reject `field_boosts` keys that name no lexical field (Issue #1374),
@@ -4084,6 +4170,13 @@ impl Engine {
     /// request has no lexical or hybrid part.
     ///
     /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// if the lexical query (a [`SearchQuery::Lexical`](self::search::SearchQuery::Lexical)
+    /// query, `Obj` or `Dsl`, or the lexical part of a hybrid search) or the
+    /// `filter_query` reads a field the schema does not have, or a field
+    /// that is not lexical, such as a vector field (Issue #1635). `_id` is
+    /// always allowed. The unified DSL rejects an unknown field the same way.
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
     /// if a boost of the lexical query or of the `filter_query`, or of any
     /// of their sub-queries, is not finite or is negative (`-0.0` included),
     /// such as a DSL `^` boost too large for an `f32` (Issue #1550; see
@@ -4292,6 +4385,7 @@ impl Engine {
         };
 
         if let Some(query) = &mut user_lexical_query {
+            self.validate_lexical_field_refs(query.as_ref())?;
             self.validate_positional_field_refs(query.as_ref())?;
             // The request's field boosts apply to the user's query only: a
             // filter does not score (Issue #1550).
@@ -4306,6 +4400,7 @@ impl Engine {
             query.validate_boosts()?;
         }
         if let Some(filter_query) = &request_filter {
+            self.validate_lexical_field_refs(filter_query.as_ref())?;
             self.validate_positional_field_refs(filter_query.as_ref())?;
             filter_query.validate_boosts()?;
         }

@@ -17,6 +17,8 @@ Vector 句と Lexical 句の区別は、フィールド名に基づいて行わ�
 
 未知のフィールドを含むドキュメントを受け付けたい場合は、スキーマの [`dynamic_field_policy`](./schema_and_fields.md#動的スキーマ) を設定して、投入時にフィールドを追加する動作を有効にしてください。一度フィールドがスキーマに登録されれば、それを参照するクエリは正常に動作します。
 
+組み立て済みの lexical クエリ（`SearchQuery::Lexical` のクエリオブジェクトと DSL 文字列、ハイブリッド検索の lexical の部分）と `filter_query` も検証されます（[#1635](https://github.com/mosuka/laurus/issues/1635)）。読めるのはスキーマの lexical フィールドと `_id` だけです。スキーマにないフィールドと、lexical クエリが当たりえないベクトルフィールドは、`InvalidArgument` で拒否されます。語だけの句はスキーマの `default_fields` に展開されるので、削除した既定のフィールドには届きません。
+
 ## Lexical クエリ構文
 
 Lexical クエリは、完全一致または近似のキーワードマッチングを使用して転置インデックスを検索します。
