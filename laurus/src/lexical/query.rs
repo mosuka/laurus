@@ -705,6 +705,63 @@ mod leaf_field_tests {
         }
     }
 
+    /// Issue #1635: a query that reads more than one field reports all of
+    /// them, so the engine's schema check sees every field. That is every
+    /// field of a `MultiFieldQuery`, and the children of a composite span,
+    /// which may name other fields than the composite; a span reports them
+    /// as positional too.
+    #[test]
+    fn queries_over_several_fields_report_every_field() {
+        use crate::lexical::query::advanced_query::MultiFieldQuery;
+        use crate::lexical::query::span::{
+            SpanContainingQuery, SpanNearQuery, SpanQuery, SpanQueryWrapper, SpanTermQuery,
+            SpanWithinQuery,
+        };
+
+        let fields = |query: &dyn Query, positional: bool| {
+            let mut refs = HashSet::new();
+            if positional {
+                query.collect_positional_field_refs(&mut refs);
+            } else {
+                query.collect_field_refs(&mut refs);
+            }
+            let mut names: Vec<String> = refs.into_iter().collect();
+            names.sort();
+            names
+        };
+        let multi = MultiFieldQuery::new("rust".to_string())
+            .add_field("title".to_string(), 1.0)
+            .add_field("body".to_string(), 1.0);
+        assert_eq!(fields(&multi, false), ["body", "title"]);
+
+        let term = |field: &str| -> Box<dyn SpanQuery> { Box::new(SpanTermQuery::new(field, "x")) };
+        let spans: Vec<(&str, Box<dyn SpanQuery>)> = vec![
+            (
+                "near",
+                Box::new(SpanNearQuery::new("a", vec![term("a"), term("b")], 1, true)),
+            ),
+            (
+                "containing",
+                Box::new(SpanContainingQuery::new("a", term("a"), term("b"))),
+            ),
+            (
+                "within",
+                Box::new(SpanWithinQuery::new("a", term("a"), term("b"), 1)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, span) in spans {
+            let query = SpanQueryWrapper::new(span);
+            for positional in [false, true] {
+                let got = fields(&query, positional);
+                if got != ["a", "b"] {
+                    wrong.push(format!("{name} (positional: {positional}): {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// `apply_field_boosts` scales a leaf's boost only when its field is
     /// in the map — so it must know its field.
     #[test]

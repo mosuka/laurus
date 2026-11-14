@@ -65,9 +65,16 @@ impl Default for LexicalSearchParams {
 }
 
 /// Query representation that can be either a DSL string or a Query object.
+///
+/// Through `Engine::search`, either may read only the schema's lexical
+/// fields and `_id`; any other field fails the search with
+/// `InvalidArgument` (Issue #1635). A `LexicalStore` searched directly has
+/// no schema and checks no field.
 #[derive(Debug)]
 pub enum LexicalSearchQuery {
-    /// Query specified as a DSL string (will be parsed at search time).
+    /// Query specified as a DSL string (will be parsed at search time). A
+    /// bare term expands to the schema's default fields under
+    /// `Engine::search`, and to the store's under `LexicalStore::search`.
     Dsl(String),
     /// Query specified as a Query object.
     Obj(Box<dyn Query>),

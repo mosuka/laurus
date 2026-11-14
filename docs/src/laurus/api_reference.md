@@ -148,6 +148,8 @@ A collection of named field values.
 | `LexicalSearchQuery::Dsl(String)` | Query specified as a DSL string (parsed at search time) |
 | `LexicalSearchQuery::Obj(Box<dyn Query>)` | Query specified as a pre-built Query object |
 
+Through `Engine::search`, either may read only the schema's lexical fields and `_id`; any other field, such as a typo or a vector field, fails the search with `InvalidArgument` ([#1635](https://github.com/mosuka/laurus/issues/1635)). A bare term in a `Dsl` string expands to the schema's `default_fields`. A `filter_query` is checked the same way.
+
 ### VectorSearchQuery
 
 | Variant | Description |

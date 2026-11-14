@@ -835,6 +835,13 @@ impl Query for MultiFieldQuery {
         self
     }
 
+    /// Every field the query searches (Issue #1635): it has no single
+    /// [`Query::field`], so the default reported none, and the engine's
+    /// schema check let an unknown field through.
+    fn collect_field_refs(&self, out: &mut std::collections::HashSet<String>) {
+        out.extend(self.fields.keys().cloned());
+    }
+
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
         // The matcher expands to one unanalysed `TermQuery` per configured
         // field, so the raw text is the exact term.
