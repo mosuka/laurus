@@ -56,6 +56,12 @@ pub enum SearchQuery {
     },
 
     /// Pre-built lexical (BM25) search query.
+    ///
+    /// Every field it reads must be a lexical field of the schema, or
+    /// `_id`: `Engine::search` rejects a field the schema does not have, or
+    /// a vector field, with `InvalidArgument` (Issue #1635), as the unified
+    /// DSL rejects an unknown field. So does the lexical part of a
+    /// [`Hybrid`](Self::Hybrid) search.
     Lexical(LexicalSearchQuery),
 
     /// Pre-built vector (nearest-neighbor) search query.
@@ -537,6 +543,10 @@ pub struct SearchRequest {
     ///
     /// When set, the filter is evaluated first and **both** lexical and
     /// vector searches are restricted to documents matching this filter.
+    ///
+    /// Like a [`SearchQuery::Lexical`] query, it may read only the schema's
+    /// lexical fields and `_id`; any other field fails the search with
+    /// `InvalidArgument` (Issue #1635).
     pub filter_query: Option<Box<dyn Query>>,
 
     /// Parameters controlling lexical search behavior.

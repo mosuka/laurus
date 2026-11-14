@@ -14,10 +14,10 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `Index` | Index operation errors | Corrupt index, segment read failure |
 | `Schema` | Schema-related errors | Unknown field name, type mismatch |
 | `Analysis` | Text analysis errors | Tokenizer failure, invalid filter config |
-| `Query` | Query parsing/execution errors | Malformed Query DSL, unknown field in query |
+| `Query` | Query parsing/execution errors | Malformed Query DSL, a phrase or span query on a field without positions |
 | `Storage` | Storage backend errors | Failed to open storage, write failure |
 | `Field` | Field definition errors | Invalid field options, duplicate field name |
-| `InvalidArgument` | The caller passed an invalid argument | Unknown field in a DSL query, wrong value type in a document, out-of-range value |
+| `InvalidArgument` | The caller passed an invalid argument | Unknown field in a DSL query, a lexical query or a `filter_query` (or a vector field in the latter two), wrong value type in a document, out-of-range value |
 | `BenchmarkFailed` | Benchmark errors | Benchmark execution failure |
 | `ThreadJoinError` | Thread join errors | Panic in a worker thread |
 | `Json` | JSON serialization errors | Malformed document JSON |

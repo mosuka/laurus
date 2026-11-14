@@ -560,10 +560,10 @@ class SearchRequest:
 
 | パラメータ | 説明 |
 | :--- | :--- |
-| `query` | DSL 文字列または単一クエリオブジェクト。DSL 文字列は `vector_query` と組み合わせられます。両方で検索し、`vector_query` は DSL のベクトル部分に加わります（融合は `fusion`、デフォルトは `RRF(k=60)`）。それ以外で `lexical_query` / `vector_query` と組み合わせると `ValueError` になります（Issue #1372）。Lexical の句は DSL に書くか、クエリオブジェクトを `lexical_query` / `vector_query` として渡してください。 |
-| `lexical_query` | 明示的なハイブリッド検索の Lexical コンポーネント。 |
+| `query` | DSL 文字列または単一クエリオブジェクト。DSL 文字列は `vector_query` と組み合わせられます。両方で検索し、`vector_query` は DSL のベクトル部分に加わります（融合は `fusion`、デフォルトは `RRF(k=60)`）。それ以外で `lexical_query` / `vector_query` と組み合わせると `ValueError` になります（Issue #1372）。Lexical の句は DSL に書くか、クエリオブジェクトを `lexical_query` / `vector_query` として渡してください。クエリオブジェクトは `lexical_query` と同じく検証されます。 |
+| `lexical_query` | 明示的なハイブリッド検索の Lexical コンポーネント。読めるのはスキーマの lexical フィールドと `_id` だけで、それ以外のフィールド（typo やベクトルフィールドなど）は `ValueError` を送出します（Issue #1635）。 |
 | `vector_query` | 明示的なハイブリッド検索の Vector コンポーネント。 |
-| `filter_query` | スコアリング後に適用する Lexical フィルター。 |
+| `filter_query` | スコアリング後に適用する Lexical フィルター。読めるのはスキーマの lexical フィールドと `_id` だけで、それ以外のフィールド（typo やベクトルフィールドなど）は `ValueError` を送出します（Issue #1635）。 |
 | `fusion` | フュージョンアルゴリズム（`RRF` または `WeightedSum`）。両コンポーネント指定時のデフォルトは `RRF(k=60)`。それ以外を渡すと `TypeError`（`fusion must be a laurus.RRF or a laurus.WeightedSum`）を送出します（Issue #1555）。 |
 | `limit` | 最大結果件数（デフォルト 10）。 |
 | `offset` | ページネーションオフセット（デフォルト 0）。 |
