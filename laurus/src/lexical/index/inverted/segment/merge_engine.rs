@@ -594,6 +594,71 @@ impl MergeEngine {
         target_position_increment_gap: u32,
         new_segment_ids: &[String],
     ) -> Result<Vec<MergeResult>> {
+        self.rewrite_field_across_segments(
+            segments,
+            target_field,
+            analyzer,
+            target_term_vectors,
+            target_doc_values,
+            target_position_increment_gap,
+            true,
+            new_segment_ids,
+        )
+    }
+
+    /// Rewrite every one of `segments` into a same-count set of NEW
+    /// segments, as [`Self::rebuild_field_across_segments`] does, with
+    /// `target_field` dropped from every document: its postings, BKD
+    /// points, norms, doc values and stored value (Issue #1546:
+    /// `InvertedIndex::delete_field` discards a deleted field's data, so
+    /// a field added again under the same name starts empty).
+    ///
+    /// The doc values go with the stored value, since a flush builds them
+    /// from the stored values, and no norms are recorded for a field that
+    /// is not re-analyzed. Every other field is carried over unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::rebuild_field_across_segments`]'s: nothing is
+    /// committed when an error is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_segment_ids.len() != segments.len()`.
+    pub fn discard_field_across_segments(
+        &self,
+        segments: &[ManagedSegmentInfo],
+        target_field: &str,
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
+        self.rewrite_field_across_segments(
+            segments,
+            target_field,
+            None,
+            false,
+            false,
+            0,
+            false,
+            new_segment_ids,
+        )
+    }
+
+    /// The body of [`Self::rebuild_field_across_segments`] and
+    /// [`Self::discard_field_across_segments`]. `keep_target_stored` is
+    /// `false` to drop `target_field`'s stored value too (see
+    /// [`Self::reconstruct_segment_with_field_override`]).
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_field_across_segments(
+        &self,
+        segments: &[ManagedSegmentInfo],
+        target_field: &str,
+        analyzer: Option<&Arc<dyn Analyzer>>,
+        target_term_vectors: bool,
+        target_doc_values: bool,
+        target_position_increment_gap: u32,
+        keep_target_stored: bool,
+        new_segment_ids: &[String],
+    ) -> Result<Vec<MergeResult>> {
         assert_eq!(
             segments.len(),
             new_segment_ids.len(),
@@ -627,6 +692,7 @@ impl MergeEngine {
                 target_field,
                 analyzer,
                 target_position_increment_gap,
+                keep_target_stored,
             )?;
 
             let doc_count = reconstructed.len() as u64;
@@ -1038,6 +1104,11 @@ impl MergeEngine {
     /// schema; callers (`InvertedIndex::rebuild_field`, gated by
     /// `Engine::update_field`'s `classify_change` call) are responsible
     /// for that.
+    ///
+    /// `keep_target_stored` is `false` when the field is discarded (Issue
+    /// #1546, with `analyzer` `None`): `target_field`'s stored value is
+    /// dropped too, and with it the doc values a flush builds from it, so
+    /// nothing of the field is left in the segment.
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_segment_with_field_override(
         &self,
@@ -1048,6 +1119,7 @@ impl MergeEngine {
         target_field: &str,
         analyzer: Option<&Arc<dyn Analyzer>>,
         target_position_increment_gap: u32,
+        keep_target_stored: bool,
     ) -> Result<Vec<(u64, AnalyzedDocument)>> {
         // Pass 1: bucket postings into per-doc analyzed terms, EXCEPT
         // `target_field` — its old postings were built under the previous
@@ -1146,6 +1218,9 @@ impl MergeEngine {
             analyzed.point_values = points.remove(&doc_id).unwrap_or_default();
 
             for (field_name, value) in &stored.fields {
+                if !keep_target_stored && field_name == target_field {
+                    continue;
+                }
                 if InvertedIndexWriter::is_doc_values_candidate(value) {
                     // `target_field` is pre-seeded by
                     // `rebuild_field_across_segments` with the field's NEW
@@ -2805,6 +2880,7 @@ mod tests {
                     "num",
                     None,
                     0,
+                    true,
                 )
                 .map(|_| ()),
         );

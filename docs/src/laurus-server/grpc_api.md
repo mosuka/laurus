@@ -222,9 +222,10 @@ rpc DeleteField(DeleteFieldRequest) returns (DeleteFieldResponse);
 | :--- | :--- | :--- |
 | `schema` | `Schema` | The updated schema after removal |
 
-Existing indexed data for the field remains in storage but becomes
-inaccessible. Per-field analyzers and embedders are unregistered. Adding a
-vector field with the same name later starts it empty (see
+A lexical field's data is discarded from every segment, which takes time
+in proportion to the index. A vector field's files stay until a field with
+the same name is added again. Per-field analyzers and embedders are
+unregistered. A field added again with the same name starts empty (see
 [Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
 
 **HTTP gateway:** `DELETE /v1/schema/fields/{name}`

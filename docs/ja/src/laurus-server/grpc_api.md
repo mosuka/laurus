@@ -218,7 +218,7 @@ rpc AddField(AddFieldRequest) returns (AddFieldResponse);
 
 ### `DeleteField`
 
-稼働中のインデックスからフィールドを動的に削除します。既にインデックスされたデータは残りますが、削除されたフィールドにはアクセスできなくなります。あとで同じ名前のベクトルフィールドを追加すると、空の状態から始まります（[フィールドの削除](../concepts/schema_and_fields.md#フィールドの削除)を参照）。
+稼働中のインデックスからフィールドを動的に削除します。lexical フィールドのデータはすべてのセグメントから捨てられ、インデックスの大きさに比例して時間がかかります。ベクトルフィールドのファイルは、同じ名前のフィールドを追加し直すまで残ります。あとで同じ名前のフィールドを追加すると、空の状態から始まります（[フィールドの削除](../concepts/schema_and_fields.md#フィールドの削除)を参照）。
 
 ```protobuf
 rpc DeleteField(DeleteFieldRequest) returns (DeleteFieldResponse);

@@ -397,6 +397,44 @@ fn update_field_option_propagates_writer_commit_failure_and_preserves_deletions(
     assert_eq!(hits(&store, "gamma"), 1, "the field must still be indexed");
 }
 
+/// `delete_field` commits the cached writer before the index discards the
+/// field's data (Issue #1546), and must do it with error propagation, as
+/// `add_field` does: a writer dropped after a failed commit loses its
+/// buffered deletions, and its silent Drop-close retry would hide the
+/// failure. A failed deletion also leaves the field in place.
+#[test]
+fn delete_field_propagates_writer_commit_failure_and_preserves_deletions() {
+    use laurus::lexical::core::field::{FieldOption, TextOption};
+
+    let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let recording = Arc::new(RecordingStorage::new(inner));
+    let storage: Arc<dyn Storage> = recording.clone();
+    let config = LexicalIndexConfig::builder()
+        .add_field("title", FieldOption::Text(TextOption::default()))
+        .build();
+    let store = LexicalStore::new(storage, config).unwrap();
+
+    store.upsert_document(1, doc("alpha")).unwrap();
+    store.commit().unwrap();
+
+    // Buffer the deletion of committed doc 1 (existing-id upsert).
+    store.upsert_document(1, doc("beta")).unwrap();
+
+    recording.set_fail_contains(Some(".delmap"));
+    store
+        .delete_field("title")
+        .expect_err("delete_field must propagate the writer-commit failure");
+    recording.set_fail_contains(None);
+
+    store.commit().unwrap();
+    assert_eq!(hits(&store, "beta"), 1, "the field must still be indexed");
+    assert_eq!(
+        hits(&store, "alpha"),
+        0,
+        "the deferred deletion must survive a failed delete_field and persist (#875)"
+    );
+}
+
 /// `rollback()` keeps buffered deletions: deletions were never rollback-able
 /// (they used to be persisted synchronously at delete time) and their WAL
 /// records are already acknowledged — so the next commit persists them.

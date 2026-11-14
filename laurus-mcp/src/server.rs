@@ -524,7 +524,7 @@ impl LaurusMcpServer {
 
     /// Remove a field from the index schema.
     #[tool(
-        description = "Remove a field from the index schema. The field will no longer be available for indexing or searching, but existing data in the index is not deleted. Adding a vector field with the same name later starts it empty. Returns the updated schema."
+        description = "Remove a field from the index schema. The field will no longer be available for indexing or searching. A lexical field's data is deleted from the index (which rewrites every segment), and a field added again with the same name starts empty. Returns the updated schema."
     )]
     async fn delete_field(
         &self,

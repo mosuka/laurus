@@ -739,8 +739,13 @@ let updated_schema = engine.delete_field("category").await?;
 When a field is deleted:
 
 - The field definition is removed from the schema.
-- Existing indexed data for the field **remains** in the index but becomes
-  inaccessible through queries.
+- A lexical field's data is discarded: every segment is rewritten without
+  the field's postings, points, norms, doc values and stored values
+  ([#1546](https://github.com/mosuka/laurus/issues/1546)). Like a lexical
+  `Reindex`, this takes time in proportion to the index, and puts wait for
+  it. A field deleted by an earlier version keeps its data in the segments.
+- A vector field's files stay in storage until a field with the same name
+  is added again (see below).
 - If the field was listed in `default_fields`, it is automatically removed.
 - If the field was listed in `pending_reindex`, it is removed from it too, so
   `GetSchema` no longer reports the field as having lost its data. A
@@ -753,14 +758,17 @@ When a field is deleted:
 - Any per-field analyzer or embedder registered for the field is
   unregistered.
 
-Adding a vector field with the same name later does not bring its data back:
-`Engine::add_field()` discards the files the deleted field left and starts
-the field empty (Issue #1535). Deletes stop reaching a field once it is
-removed, so its old data would return deleted documents, and it may have been
-written under another dimension or index kind. Documents put before the
-deletion still return their old value for the field from the document store,
-but no vector search finds them by it; put them again to index them. Adding
-a vector field commits first, as `Engine::commit()` does.
+Adding a field with the same name later does not bring its data back, and
+the field starts empty. A lexical field's data was discarded when it was
+deleted, also for a field from the schema the engine was opened with, which
+can be added again in the same process (Issue #1546). For a vector field,
+`Engine::add_field()` discards the files the deleted field left
+(Issue #1535). Deletes stop reaching a field once it is removed, so its old
+data would return deleted documents, and it may have been written under another
+type, analyzer, dimension or index kind. Documents put before the deletion
+still return their old value for the field from the document store, but no
+search finds them by it; put them again to index them. Adding a vector field
+commits first, as `Engine::commit()` does.
 
 ### Changing a Field
 

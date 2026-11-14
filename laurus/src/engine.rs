@@ -2478,6 +2478,12 @@ impl Engine {
     /// commits, as [`Self::commit`] does, so recovery never replays a record
     /// written before the field was added into it.
     ///
+    /// A lexical field starts empty too: [`Self::delete_field`] discards a
+    /// lexical field's data when it removes the field, also for a field from
+    /// the schema the engine was opened with, which can be added again in
+    /// the same process (Issue #1546). Its stored values come back as a
+    /// vector field's do.
+    ///
     /// Registering a field commits the stores' cached writers, so this first
     /// makes the WAL durable, as [`Self::commit`] does (Issue #1537). A
     /// [`DynamicFieldPolicy::Dynamic`](schema::DynamicFieldPolicy::Dynamic)
@@ -2616,19 +2622,26 @@ impl Engine {
     /// Dynamically remove a field from the engine schema at runtime.
     ///
     /// This removes the field definition from the schema so that it is no longer
-    /// available for indexing or searching. Existing data already stored in the
-    /// index is **not** deleted; it simply becomes inaccessible through the
-    /// normal query path.
+    /// available for indexing or searching.
     ///
-    /// A vector field's data is not recovered by adding a field with the same
-    /// name later: [`Self::add_field`] discards it and starts the field empty
+    /// A lexical field's data is discarded: the [`LexicalStore`] commits its
+    /// cached writer, then rewrites every segment without the field's
+    /// postings, points, norms, doc values and stored values, and removes
+    /// the field, also one from the schema the engine was opened with (Issue
+    /// #1546). Like a lexical `Reindex`, this takes time in proportion to
+    /// the index, and puts wait for it. Its per-field analyzer is
+    /// unregistered. A field deleted by an earlier version keeps its data in
+    /// the segments.
+    ///
+    /// A vector field's files stay until a field with the same name is added
+    /// again: [`Self::add_field`] discards them and starts the field empty
     /// (Issue #1535). Deletes stop reaching the field when it is removed, so
-    /// its data would bring deleted documents back.
+    /// its data would bring deleted documents back. Its per-field embedder is
+    /// unregistered and the writer and searcher caches are invalidated.
     ///
-    /// For lexical fields, the field is also removed from the underlying
-    /// [`LexicalStore`] (if it was dynamically added) and any per-field analyzer
-    /// is unregistered. For vector fields, the per-field embedder is
-    /// unregistered and writer/searcher caches are invalidated.
+    /// The document store keeps the values documents were put with, so a
+    /// field added again under the same name returns them, though no search
+    /// finds a document by them.
     ///
     /// If the deleted field appears in [`Schema::default_fields`], it is removed
     /// from that list as well. It is also removed from
