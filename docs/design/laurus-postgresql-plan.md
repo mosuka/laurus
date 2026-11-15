@@ -11,7 +11,8 @@
   - Every desk review so far has found a problem that affected the design. The rest will be found by running the items in 2.11 and 7.1 on a prototype.
 - **Target**: PostgreSQL 17 or later (`aminsertcleanup`, which reports the end of a statement, was added in 17). Implemented with pgrx.
 - **Paths**: Laurus code paths are relative to `laurus/src/`.
-- **Names**: The extension name, the access method name, the schema name (`laurus`) and the operator names used in this document are placeholders (2.16).
+- **Names**: The extension, the access method and the schema are all named `laurus` for now; this is revisited if a problem shows up. Operator and function names are placeholders (2.16).
+- **Tracking**: #1640.
 
 ### How to read
 
@@ -481,7 +482,7 @@ LIMIT 10;
 | Hybrid | A function that takes the fusion method and weights |
 | Top-k pushdown | An index scan at first. Later a Custom Scan that hands `LIMIT`, score order and filters on other columns to Laurus |
 | Choosing the analyzer | Index option |
-| Names | The extension name, access method name, schema name and operator names |
+| Names | Operator and function names. The extension, access method and schema are named `laurus` for now |
 
 The representation of pushdown is shared with the DataFusion SQL layer (1.4).
 
