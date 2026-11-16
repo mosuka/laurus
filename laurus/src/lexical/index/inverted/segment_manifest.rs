@@ -14,12 +14,12 @@
 //! it. Every mutation goes through [`publish_with`] or
 //! [`publish_with_until_published`]: build a candidate under the write
 //! guard, persist it, and swap it into memory only once it is published.
-//! This deliberately deviates from the vector manager's `add_segment`,
-//! which mutates then saves: there, a failed save leaves memory ahead of disk,
-//! which is survivable when every later save rewrites the full list — but
-//! here a retried commit would find its pending state consumed, publish
-//! nothing, and still advance the WAL checkpoint, after which a reopen
-//! would neither replay nor discover the segments.
+//! Memory ahead of disk would break a retried commit here: it would find
+//! its pending state consumed, publish nothing, and still advance the WAL
+//! checkpoint, after which a reopen would neither replay nor discover the
+//! segments. The vector `SegmentManager` follows the same rule since Issue
+//! #1583, where memory ahead of disk made a commit retried after a failed
+//! save register its segment twice.
 //!
 //! A save whose only failure is the directory sync after its rename has
 //! still published the new manifest: a reader and the next open read it.

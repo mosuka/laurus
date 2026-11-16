@@ -791,8 +791,10 @@ impl VectorStore {
         // their sequence numbers — dropping the writer while a later
         // successful commit publishes that checkpoint would let recovery
         // skip records whose effects were silently discarded. The seal is
-        // atomic (tmp+rename before manifest registration), so a retry from
-        // the retained writer is sound.
+        // atomic (tmp+rename before manifest registration), and a failed
+        // registration leaves the segment manager's list unchanged (Issue
+        // #1583), so a retry from the retained writer is sound: it writes
+        // the segment again and registers it once.
         if let Err(e) = flush_result {
             drop(writer_guard);
             *self.searcher_cache.write() = None;
@@ -3564,5 +3566,141 @@ mod tests {
 
         store.update_field_config("a", &weighted(1)).unwrap();
         assert_eq!(store.base_weight_of("a"), 3.0);
+    }
+
+    /// The number of segments the one segment manifest on `storage` lists.
+    fn manifest_segment_entries(storage: &dyn Storage) -> usize {
+        let manifests: Vec<String> = storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.ends_with("segments.json"))
+            .collect();
+        let [manifest] = manifests.as_slice() else {
+            panic!("one manifest expected: {manifests:?}");
+        };
+        let bytes = crate::storage::manifest::test_support::read_file(storage, manifest);
+        String::from_utf8_lossy(&bytes)
+            .matches("\"segment_id\"")
+            .count()
+    }
+
+    /// Issue #1583: a commit whose registration of its new segment in the
+    /// manifest fails keeps its writer, and the next commit retries from
+    /// it. The retry registers the segment once, whether the failed save
+    /// published nothing (the rename failed) or published the manifest and
+    /// failed the sync after it, so each document is found once, before and
+    /// after a reopen.
+    #[tokio::test]
+    async fn a_commit_retried_after_a_failed_segment_registration_finds_each_document_once() {
+        use crate::storage::manifest::test_support::FailSyncAfterRename;
+        use crate::vector::core::field::{
+            FieldOption, FlatOption, HnswOption, IvfOption, MultiVectorOption,
+        };
+        use std::sync::atomic::Ordering;
+
+        let fields = [
+            (
+                "flat",
+                FieldOption::Flat(FlatOption {
+                    dimension: 4,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hnsw",
+                FieldOption::Hnsw(HnswOption {
+                    dimension: 4,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ivf",
+                FieldOption::Ivf(IvfOption {
+                    dimension: 4,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "tokens",
+                FieldOption::MultiVector(MultiVectorOption::new(4)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (field, option) in fields {
+            for published in [false, true] {
+                let case = format!(
+                    "{field}, {}",
+                    if published {
+                        "published, sync failed"
+                    } else {
+                        "not published"
+                    }
+                );
+                let inner: Arc<dyn Storage> =
+                    Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+                let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), "segments.json"));
+                let config = VectorIndexConfig::builder()
+                    .add_field(field, option.clone())
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let store = VectorStore::new(failing.clone(), config.clone()).unwrap();
+                for doc_id in 1..=3u64 {
+                    let vector = vec![doc_id as f32; 4];
+                    let value = if field == "tokens" {
+                        DataValue::VectorArray(vec![vector.clone(), vector])
+                    } else {
+                        DataValue::Vector(vector)
+                    };
+                    let doc = Document::builder().add_field(field, value).build();
+                    store
+                        .upsert_document_by_internal_id(doc_id, doc)
+                        .await
+                        .unwrap();
+                }
+
+                failing.fail_rename.store(!published, Ordering::SeqCst);
+                failing.armed.store(true, Ordering::SeqCst);
+                let first = store.commit().await;
+                failing.armed.store(false, Ordering::SeqCst);
+                if first.is_ok() || failing.failures.load(Ordering::SeqCst) == 0 {
+                    wrong.push(format!(
+                        "{case}: the first commit must fail on the manifest save: {first:?}"
+                    ));
+                    continue;
+                }
+                if let Err(e) = store.commit().await {
+                    wrong.push(format!("{case}: the retried commit failed: {e}"));
+                    continue;
+                }
+                // The retry saved the manager's in-memory list, so the
+                // manifest lists what the manager holds.
+                let entries = manifest_segment_entries(inner.as_ref());
+                if entries != 1 {
+                    wrong.push(format!("{case}: the manifest lists {entries} segments"));
+                }
+                // A MultiVector field is read by late-interaction rescoring,
+                // not searched.
+                if field != "tokens" {
+                    match search_ids(&store, field) {
+                        Ok(ids) if ids == [1, 2, 3] => {}
+                        other => wrong.push(format!("{case}: search after the retry: {other:?}")),
+                    }
+                }
+                drop(store);
+
+                let reopened = VectorStore::new(inner.clone(), config).unwrap();
+                if field != "tokens" {
+                    match search_ids(&reopened, field) {
+                        Ok(ids) if ids == [1, 2, 3] => {}
+                        other => wrong.push(format!("{case}: search after a reopen: {other:?}")),
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

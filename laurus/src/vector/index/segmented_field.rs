@@ -381,19 +381,29 @@ impl VectorFieldWriter for SegmentedVectorField {
     async fn flush(&self) -> Result<()> {
         let mut active_lock = self.active_segment.write();
         if let Some((segment_id, mut writer)) = active_lock.take() {
-            writer.finalize()?;
-            writer.write()?;
+            let registered = (|| {
+                writer.finalize()?;
+                writer.write()?;
 
-            let vector_count = writer.vectors().len() as u64;
+                let vector_count = writer.vectors().len() as u64;
 
-            let info = ManagedSegmentInfo::new(
-                segment_id,
-                vector_count,
-                0, // offset
-                0, // generation
-            );
+                let info = ManagedSegmentInfo::new(
+                    segment_id.clone(),
+                    vector_count,
+                    0, // offset
+                    0, // generation
+                );
 
-            self.segment_manager.add_segment(info)?;
+                self.segment_manager.add_segment(info)
+            })();
+            if let Err(e) = registered {
+                // A failed registration leaves the manager's list as it was
+                // (Issue #1583), so keep the writer: its vectors stay
+                // searchable as the active segment, and the next flush
+                // writes and registers them again under the same id.
+                *active_lock = Some((segment_id, writer));
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -868,5 +878,76 @@ mod tests {
             "the stale old copy must stay shadowed (#880), got {:?}",
             results.hits
         );
+    }
+
+    /// Issue #1583: a flush whose registration of the segment fails keeps
+    /// its writer, whether the manifest save failed at the rename or at the
+    /// sync after it. The vectors stay searchable from the active segment,
+    /// and the next flush registers the segment once.
+    #[tokio::test]
+    async fn flush_whose_registration_fails_keeps_its_writer() {
+        use crate::storage::manifest::test_support::FailSyncAfterRename;
+        use std::sync::atomic::Ordering;
+
+        for fail_rename in [true, false] {
+            let case = if fail_rename {
+                "rename failed"
+            } else {
+                "sync failed"
+            };
+            let inner: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), "segments.json"));
+            let storage: Arc<dyn Storage> = failing.clone();
+            let layout = crate::vector::index::hnsw::segment::LAYOUT;
+            let manager = Arc::new(
+                SegmentManager::new(SegmentManagerConfig::default(), storage.clone(), layout)
+                    .unwrap(),
+            );
+            let config = VectorFieldConfig {
+                vector: Some(FieldOption::Hnsw(HnswOption {
+                    dimension: 4,
+                    ..Default::default()
+                })),
+                lexical: None,
+            };
+            let field =
+                SegmentedVectorField::create("embedding", config, manager.clone(), storage, None)
+                    .unwrap();
+            for (doc_id, vector) in [(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])] {
+                field
+                    .add_stored_vector(doc_id, &StoredVector::new(vector.to_vec()), 0)
+                    .await
+                    .unwrap();
+            }
+
+            failing.fail_rename.store(fail_rename, Ordering::SeqCst);
+            failing.armed.store(true, Ordering::SeqCst);
+            let first = field.flush().await;
+            failing.armed.store(false, Ordering::SeqCst);
+            assert!(first.is_err(), "{case}: the first flush must fail");
+            assert_eq!(failing.failures.load(Ordering::SeqCst), 1, "{case}");
+            assert!(manager.list_segments().is_empty(), "{case}");
+            let hits = field
+                .search(query(vec![1.0, 0.0, 0.0, 0.0], 10))
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 2, "{case}: the active segment keeps them");
+
+            field.flush().await.unwrap();
+            assert_eq!(manager.list_segments().len(), 1, "{case}");
+            let mut ids: Vec<u64> = field
+                .search(query(vec![1.0, 0.0, 0.0, 0.0], 10))
+                .unwrap()
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id)
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [1, 2], "{case}");
+            let reopened =
+                SegmentManager::new(SegmentManagerConfig::default(), inner, layout).unwrap();
+            assert_eq!(reopened.list_segments().len(), 1, "{case}");
+        }
     }
 }
