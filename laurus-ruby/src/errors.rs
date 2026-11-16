@@ -105,12 +105,13 @@ pub fn io_err_with_path(path: &str, e: std::io::Error) -> Error {
 /// |--------------------------|-----------------|
 /// | `SchemaConflict`         | `ArgumentError` |
 /// | `LegacyFlatLayout`       | `ArgumentError` |
+/// | `LeftoverStore`          | `ArgumentError` |
 /// | `NotAnIndexDirectory`    | `ArgumentError` |
 /// | `Io`                     | `IOError`       |
 /// | `Core`                   | see [`laurus_err`] |
 ///
-/// `SchemaConflict`/`LegacyFlatLayout`/`NotAnIndexDirectory` are all
-/// caller-fixable misuse, so they map to `ArgumentError` — the same class
+/// `SchemaConflict`/`LegacyFlatLayout`/`LeftoverStore`/`NotAnIndexDirectory`
+/// are all caller-fixable misuse, so they map to `ArgumentError` — the same class
 /// [`laurus_err`] uses for
 /// `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`. `Io` maps to `IOError` like
 /// `LaurusError::Io` above; unlike the Python binding, there is no
@@ -123,6 +124,7 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> Error {
     match err {
         IndexDirError::SchemaConflict { .. }
         | IndexDirError::LegacyFlatLayout { .. }
+        | IndexDirError::LeftoverStore { .. }
         | IndexDirError::NotAnIndexDirectory { .. } => {
             Error::new(ruby.exception_arg_error(), err.to_string())
         }

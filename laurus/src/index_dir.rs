@@ -17,15 +17,19 @@
 //!   are found directly under `index_dir` (this project's pre-Issue-1059
 //!   flat layout), that's refused as [`IndexDirError::LegacyFlatLayout`]
 //!   rather than silently starting a fresh, empty index alongside
-//!   orphaned data. Otherwise, the given schema (or [`Schema::default`]
-//!   when omitted) is checked with [`Schema::validate_for_create`],
-//!   written to `schema.toml`, and a fresh `store/` directory is created.
+//!   orphaned data. A `store/` left without `schema.toml` is refused as
+//!   [`IndexDirError::LeftoverStore`] rather than opened as the new
+//!   index's storage, which would serve its documents (Issue #1560).
+//!   Otherwise, the given schema (or [`Schema::default`] when omitted) is
+//!   checked with [`Schema::validate_for_create`], written to
+//!   `schema.toml`, and a new `store/` directory is created.
 //!
 //! [`open_or_create`] itself is not used by `laurus-cli`/`laurus-server`
 //! (see Issue #1061) — it exists solely for the four bindings, which had no
-//! shared convention before Issue #1059. [`CreateRollback`], however, is
-//! shared by all three entry points, since the write-then-build-engine
-//! shape (and the cleanup a failed build needs) is the same everywhere.
+//! shared convention before Issue #1059. [`check_no_leftover_store`] and
+//! [`CreateRollback`], however, are shared by all three entry points, since
+//! the write-then-build-engine shape (and the checks and cleanup it needs)
+//! is the same everywhere.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,6 +80,24 @@ pub enum IndexDirError {
         path: PathBuf,
     },
 
+    /// `path` has a `store/` but no `schema.toml` (Issue #1560).
+    ///
+    /// Creating an index there would open the leftover `store/` as the new
+    /// index's storage and serve its documents. They may be the documents
+    /// of an earlier index whose `schema.toml` was removed by hand or by a
+    /// rollback that failed to remove `store/`, so the store is neither
+    /// reused nor removed: restoring `schema.toml` opens that index again,
+    /// and removing `store/` lets the create go ahead.
+    #[error(
+        "{path} has no {SCHEMA_FILE} but has a {STORE_DIR}/, which may hold the documents of an \
+         earlier index; restore {SCHEMA_FILE} to open that index, or remove the {STORE_DIR}/ to \
+         create a new one"
+    )]
+    LeftoverStore {
+        /// The index directory holding the leftover `store/`.
+        path: PathBuf,
+    },
+
     /// A filesystem operation on `path` failed.
     #[error("{path}: {source}")]
     Io {
@@ -112,8 +134,10 @@ pub enum IndexDirError {
 /// building an engine (`laurus-cli`, `laurus-server`, and each binding's
 /// `Index` constructor, all built on this module's convention) takes a
 /// snapshot right after checking that a complete index doesn't already
-/// exist, and calls [`Self::rollback`] if the build fails -- otherwise a
-/// retry is blocked by state the failed attempt left behind.
+/// exist and that no `store/` is left without `schema.toml`
+/// ([`check_no_leftover_store`]), and calls [`Self::rollback`] if the
+/// build fails -- otherwise a retry is blocked by state the failed attempt
+/// left behind.
 #[must_use = "take the snapshot before the create attempt and call rollback() if it fails"]
 pub struct CreateRollback {
     index_dir: PathBuf,
@@ -134,19 +158,19 @@ impl CreateRollback {
         }
     }
 
-    /// Undo whatever the create attempt added, leaving anything that
-    /// predates the attempt untouched:
+    /// Undo whatever the create attempt added, and never remove anything
+    /// that predates the snapshot:
     ///
     /// - `index_dir` itself didn't exist: remove the whole directory.
-    /// - `schema.toml` didn't exist (this attempt was creating, not
-    ///   reopening): remove `store/` -- even a stale one that predates the
-    ///   attempt, since storage creation already overwrote it and the
-    ///   both-exist case is rejected before any snapshot is taken, so a
-    ///   `store/` reachable here was never part of a complete index -- and
-    ///   the `schema.toml` this attempt wrote.
-    /// - `schema.toml` existed (reopening, or the CLI's recovery path):
-    ///   never touch it, and only remove `store/` if this attempt created
-    ///   it fresh.
+    /// - Otherwise, remove `store/` only if it didn't exist, and
+    ///   `schema.toml` only if it didn't exist. A reopen (both existed)
+    ///   touches nothing, and the CLI's recovery path (only `schema.toml`
+    ///   existed) keeps `schema.toml`.
+    ///
+    /// A `store/` that predates the snapshot without `schema.toml` is
+    /// refused before any snapshot is taken ([`check_no_leftover_store`]),
+    /// so keeping it only matters for a caller that skips that check: the
+    /// store may hold the documents of an earlier index (Issue #1560).
     ///
     /// Best-effort: a removal failure is logged through the `log` crate and
     /// otherwise ignored, since the caller is already on its way to
@@ -157,12 +181,10 @@ impl CreateRollback {
             return;
         }
 
-        if self.schema_existed {
-            if !self.store_existed {
-                Self::remove_best_effort(&self.index_dir.join(STORE_DIR), true);
-            }
-        } else {
+        if !self.store_existed {
             Self::remove_best_effort(&self.index_dir.join(STORE_DIR), true);
+        }
+        if !self.schema_existed {
             Self::remove_best_effort(&self.index_dir.join(SCHEMA_FILE), false);
         }
     }
@@ -182,6 +204,29 @@ impl CreateRollback {
             );
         }
     }
+}
+
+/// Refuse to create an index in `index_dir` when it has a `store/` but no
+/// `schema.toml` (Issue #1560).
+///
+/// Creating the storage does not empty an existing `store/`, so a create
+/// there would serve the leftover store's documents as the new index's.
+/// Every entry point that creates the `schema.toml` + `store/` layout
+/// (`laurus-cli`, `laurus-server`, and [`open_or_create`] for the bindings)
+/// calls this before it writes anything or takes a [`CreateRollback`]
+/// snapshot.
+///
+/// # Errors
+///
+/// Returns [`IndexDirError::LeftoverStore`] when `schema.toml` is absent and
+/// `store` exists, whether it is a directory or not.
+pub fn check_no_leftover_store(index_dir: &Path) -> Result<(), IndexDirError> {
+    if !index_dir.join(SCHEMA_FILE).exists() && index_dir.join(STORE_DIR).exists() {
+        return Err(IndexDirError::LeftoverStore {
+            path: index_dir.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve `index_dir` into a `(Schema, Storage)` pair, creating a new
@@ -209,6 +254,7 @@ pub fn open_or_create(
                 path: index_dir.to_path_buf(),
             });
         }
+        check_no_leftover_store(index_dir)?;
         let schema = schema.unwrap_or_default();
         // Before anything is written, so a rejected schema leaves no
         // schema.toml behind to block the retry.
@@ -423,20 +469,32 @@ mod tests {
     }
 
     #[test]
-    fn create_rollback_removes_a_stale_store_with_no_schema() {
+    fn create_rollback_never_removes_a_store_that_predates_it() {
         let dir = tempfile::TempDir::new().unwrap();
-        // A leftover store/ with no schema.toml: not a complete index (the
-        // both-exist case is rejected before any snapshot), so rollback may
-        // remove it even though it predates the attempt.
-        std::fs::create_dir_all(dir.path().join(STORE_DIR).join("stale")).unwrap();
+        // A store/ left without schema.toml. Every entry point refuses to
+        // create over it before taking a snapshot (Issue #1560), but a
+        // caller that skips that check must still not lose it to a
+        // rollback: it may hold the documents of an earlier index.
+        let stale = dir.path().join(STORE_DIR).join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
 
         let rollback = CreateRollback::snapshot(dir.path());
-        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        // What such a caller's create attempt would write first.
+        std::fs::write(
+            dir.path().join(SCHEMA_FILE),
+            Schema::new().to_toml().unwrap(),
+        )
+        .unwrap();
 
         rollback.rollback();
-        assert!(dir.path().is_dir());
-        assert!(!dir.path().join(SCHEMA_FILE).exists());
-        assert!(!dir.path().join(STORE_DIR).exists());
+        assert!(
+            stale.is_dir(),
+            "a store/ that predates the snapshot must survive the rollback"
+        );
+        assert!(
+            !dir.path().join(SCHEMA_FILE).exists(),
+            "the schema.toml the attempt wrote must be removed"
+        );
     }
 
     #[test]
@@ -486,6 +544,126 @@ mod tests {
 
         let err = open_or_create(dir.path(), None).unwrap_err();
         assert!(matches!(err, IndexDirError::LegacyFlatLayout { .. }));
+    }
+
+    // --- A store/ left without schema.toml (Issue #1560) ---
+
+    /// A schema with a `title` text field and, when `dimension` is given, a
+    /// Flat vector field `vec` of that dimension.
+    fn leftover_store_schema(dimension: Option<usize>) -> Schema {
+        let builder = Schema::builder().add_text_field("title", crate::TextOption::default());
+        match dimension {
+            Some(dimension) => builder.add_field(
+                "vec",
+                crate::FieldOption::Flat(crate::vector::FlatOption {
+                    dimension,
+                    distance: crate::DistanceMetric::Cosine,
+                    ..crate::vector::FlatOption::default()
+                }),
+            ),
+            None => builder,
+        }
+        .build()
+    }
+
+    /// Create an index with `schema` at `dir`, put and commit the document
+    /// `old`, then remove `schema.toml` by hand, which leaves the state a
+    /// removed `schema.toml` or a rollback that failed to remove `store/`
+    /// leaves. Returns the removed `schema.toml`.
+    async fn leave_a_store_without_schema(dir: &Path, schema: Schema) -> String {
+        let has_vector = schema.fields.contains_key("vec");
+        let (schema, storage) = open_or_create(dir, Some(schema)).unwrap();
+        let engine = crate::Engine::builder(storage, schema)
+            .build()
+            .await
+            .unwrap();
+        let mut document = crate::Document::builder().add_text("title", "hello");
+        if has_vector {
+            document = document.add_vector("vec", vec![1.0, 0.0, 0.0, 0.0]);
+        }
+        engine.put_document("old", document.build()).await.unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let schema_toml = std::fs::read_to_string(dir.join(SCHEMA_FILE)).unwrap();
+        std::fs::remove_file(dir.join(SCHEMA_FILE)).unwrap();
+        schema_toml
+    }
+
+    /// A create with `requested` over a store written with `written` is
+    /// refused, writes nothing, and keeps the store's document: restoring
+    /// `schema.toml` opens it again.
+    async fn assert_create_over_leftover_store_is_refused(
+        case: &str,
+        written: Option<usize>,
+        requested: Option<usize>,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema_toml =
+            leave_a_store_without_schema(dir.path(), leftover_store_schema(written)).await;
+
+        let err = match open_or_create(dir.path(), Some(leftover_store_schema(requested))) {
+            Ok(_) => panic!("{case}: a create over a leftover store/ must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, IndexDirError::LeftoverStore { .. }),
+            "{case}: got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("has no schema.toml but has a store/"),
+            "{case}: got {err}"
+        );
+        assert!(
+            !dir.path().join(SCHEMA_FILE).exists(),
+            "{case}: a refused create must write nothing"
+        );
+
+        std::fs::write(dir.path().join(SCHEMA_FILE), schema_toml).unwrap();
+        let (schema, storage) = open_or_create(dir.path(), None).unwrap();
+        let engine = crate::Engine::builder(storage, schema)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_documents("old").await.unwrap().len(),
+            1,
+            "{case}: the leftover store/ must keep its document"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_over_a_leftover_text_only_store_is_refused() {
+        assert_create_over_leftover_store_is_refused("text only", None, None).await;
+    }
+
+    #[tokio::test]
+    async fn create_over_a_leftover_store_with_the_same_vector_field_is_refused() {
+        assert_create_over_leftover_store_is_refused("same vector field", Some(4), Some(4)).await;
+    }
+
+    /// Before Issue #1560, this create failed on the vector field check of
+    /// Issue #1547, and its rollback removed the store that predated it.
+    #[tokio::test]
+    async fn create_over_a_leftover_store_with_another_vector_dimension_is_refused() {
+        assert_create_over_leftover_store_is_refused("another dimension", Some(4), Some(8)).await;
+    }
+
+    #[test]
+    fn create_over_a_file_named_store_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(STORE_DIR), b"").unwrap();
+
+        let err = match open_or_create(dir.path(), None) {
+            Ok(_) => panic!("a create over a file named store must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, IndexDirError::LeftoverStore { .. }),
+            "got {err}"
+        );
+        assert!(!dir.path().join(SCHEMA_FILE).exists());
     }
 
     #[test]

@@ -102,7 +102,9 @@ impl RbIndex {
     ///
     /// Raises a Ruby `ArgumentError` if `path:` points at an existing index
     /// and `schema:` was also given, if `path:` contains an index in the
-    /// pre-existing (pre-Issue-1059) flat layout, or if a new index's
+    /// pre-existing (pre-Issue-1059) flat layout, if `path:` has a `store/`
+    /// but no `schema.toml` (Issue #1560; the store is kept, so restoring
+    /// `schema.toml` opens it again), or if a new index's
     /// `schema:` defines a custom analyzer under a name reserved for a
     /// built-in analyzer (nothing is written then). A build-time failure
     /// (e.g. analyzer resolution against a malformed regex, embedder

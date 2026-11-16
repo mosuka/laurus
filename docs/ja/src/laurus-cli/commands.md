@@ -75,7 +75,7 @@ laurus --index-dir ./my_index create index --schema schema.toml \
 # Trained codebook 'embedding.pqcb' (m = 4, k = 256, sub_dim = 8, dimension = 32) from 300 vectors.
 ```
 
-> **注意:** `schema.toml` と `store/` の両方が存在する場合はエラーが返されます。再作成するにはインデックスディレクトリを削除してください。`schema.toml` のみ存在する場合（作成が中断された場合など）は、`--schema` なしで `create index` を実行すると既存スキーマからストレージが復旧されます。
+> **注意:** `schema.toml` と `store/` の両方が存在する場合はエラーが返されます。再作成するにはインデックスディレクトリを削除してください。`schema.toml` のみ存在する場合（作成が中断された場合など）は、`--schema` なしで `create index` を実行すると既存スキーマからストレージが復旧されます。`store/` のみ存在する場合（`schema.toml` を手で削除した場合など）は、`store/` に以前のインデックスのドキュメントが残っている可能性があるため、エラーが返され、何も書き込まず何も削除しません。そのインデックスを開くには `schema.toml` を戻し、新しいインデックスを作るには `store/` を削除してください（Issue #1560）。このチェックより前の `create index` は、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。
 
 ### `create schema`
 

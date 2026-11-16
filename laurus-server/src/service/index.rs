@@ -55,6 +55,12 @@ impl IndexServiceTrait for IndexService {
         if guard.is_some() {
             return Err(Status::already_exists("Index already exists"));
         }
+        // A store/ left without schema.toml would be opened as the new
+        // index's storage and serve its documents (Issue #1560). Checked
+        // here for the same reason as `validate_for_create`, so that it is
+        // reported as FailedPrecondition.
+        laurus::index_dir::check_no_leftover_store(&self.data_dir)
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
 
         let engine =
             context::create_index(&self.data_dir, &schema, self.wal_policy, self.commit_policy)
@@ -322,6 +328,67 @@ mod tests {
         );
         assert!(!data_dir.exists(), "a rejected create must write nothing");
         assert!(service.engine.read().await.is_none());
+    }
+
+    /// Issue #1560: CreateIndex over a `store/` left without `schema.toml`
+    /// fails with FailedPrecondition instead of serving the store's
+    /// documents, writes nothing, and keeps the store: restoring
+    /// `schema.toml` opens its document again.
+    #[tokio::test]
+    async fn create_index_rejects_a_leftover_store() {
+        const SCHEMA_TOML: &str = "[fields.title.Text]\nindexed = true\nstored = true\n";
+        let (dir, service) = service_with_index(SCHEMA_TOML).await;
+        let data_dir = dir.path().join("data");
+        {
+            let guard = service.engine.read().await;
+            let engine = guard.as_ref().unwrap();
+            engine
+                .put_document(
+                    "old",
+                    laurus::Document::builder()
+                        .add_text("title", "hello")
+                        .build(),
+                )
+                .await
+                .unwrap();
+            engine.commit().await.unwrap();
+        }
+        *service.engine.write().await = None;
+        let schema_toml = std::fs::read_to_string(data_dir.join("schema.toml")).unwrap();
+        std::fs::remove_file(data_dir.join("schema.toml")).unwrap();
+
+        let status = service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema_convert::to_proto(
+                    &Schema::from_toml(SCHEMA_TOML).unwrap(),
+                )),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status
+                .message()
+                .contains("has no schema.toml but has a store/"),
+            "got: {}",
+            status.message()
+        );
+        assert!(service.engine.read().await.is_none());
+        assert!(
+            !data_dir.join("schema.toml").exists(),
+            "a refused create must write nothing"
+        );
+
+        std::fs::write(data_dir.join("schema.toml"), schema_toml).unwrap();
+        let engine = context::open_index(&data_dir, WalSyncPolicy::PerRecord, CommitPolicy::Manual)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_documents("old").await.unwrap().len(),
+            1,
+            "the leftover store/ must keep its document"
+        );
     }
 
     /// Issue #1329: CreateIndex rejects a `_`-prefixed field other than

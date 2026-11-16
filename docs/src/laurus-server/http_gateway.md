@@ -87,6 +87,13 @@ keys. Anything else, such as `"default_fields": "title"` or
 created (Issue #1524). A server older than this fix read such a value as
 omitted, or dropped the item that was not a string.
 
+If the data directory has a `store/` but no `schema.toml`, the request is
+rejected with 412 and nothing is written or removed, since the `store/` may
+hold the documents of an earlier index (Issue #1560). Restore `schema.toml`
+and restart the server to open that index, or remove `store/` to create a
+new one. A server older than this check opened such a `store/` as the new
+index's storage and served its documents.
+
 ### Get Index Statistics
 
 ```bash

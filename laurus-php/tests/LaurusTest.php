@@ -2417,6 +2417,28 @@ class LaurusTest extends TestCase
         $this->assertFileExists($dir . "/schema.toml");
     }
 
+    public function testStoreLeftWithoutSchemaTomlIsRejectedAndKept(): void
+    {
+        $dir = sys_get_temp_dir() . "/laurus_indexdir_" . uniqid();
+        // Issue #1560: a store/ whose schema.toml was removed by hand, or by
+        // a rollback that failed to remove store/, may hold the documents of
+        // an earlier index, so it must be neither reused nor removed.
+        mkdir($dir . "/store", 0777, true);
+        file_put_contents($dir . "/store/stale", "");
+
+        try {
+            new Laurus\Index($dir);
+            $this->fail("a store/ left without schema.toml must be rejected");
+        } catch (\ValueError $e) {
+            $this->assertMatchesRegularExpression(
+                '#has no schema\.toml but has a store/#',
+                $e->getMessage()
+            );
+        }
+        $this->assertFileDoesNotExist($dir . "/schema.toml");
+        $this->assertFileExists($dir . "/store/stale");
+    }
+
     // ── Build-failure cleanup (Issue #1308) ───────────────────────────────
     //
     // `schema.toml` and `store/` are written before the `Engine` is built,

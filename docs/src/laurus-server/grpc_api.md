@@ -35,7 +35,7 @@ rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
 
 ### `CreateIndex`
 
-Create a new index with the given schema. Fails with `ALREADY_EXISTS` if an index is already open.
+Create a new index with the given schema. Fails with `ALREADY_EXISTS` if an index is already open, and with `FAILED_PRECONDITION` if the data directory has a `store/` but no `schema.toml` (Issue #1560): the `store/` may hold the documents of an earlier index, so nothing is written or removed. Restore `schema.toml` and restart the server to open that index, or remove `store/` to create a new one. A server older than this check opened such a `store/` as the new index's storage and served its documents.
 
 ```protobuf
 rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
@@ -839,6 +839,7 @@ gRPC errors are returned as standard `Status` codes:
 | Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query, a search whose `offset + limit` exceeds `max_result_window` |
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
 | Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed at or after its write-ahead-log append; restart the server to replay the log, which applies that write whole if its record reached the log in full, and otherwise not at all (see [Failed Writes](../laurus/persistence.md#failed-writes)). A write whose call is cancelled, whose deadline expires or whose client disconnects does not stop writes: each of its documents is either applied in full or not written at all |
+| Leftover store | `FAILED_PRECONDITION` | `CreateIndex` over a data directory that has a `store/` but no `schema.toml` |
 | Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |
 | Internal errors | `INTERNAL` | I/O, storage, or unexpected errors |

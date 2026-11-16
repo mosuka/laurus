@@ -75,7 +75,7 @@ laurus --index-dir ./my_index create index --schema schema.toml \
 # Trained codebook 'embedding.pqcb' (m = 4, k = 256, sub_dim = 8, dimension = 32) from 300 vectors.
 ```
 
-> **Note:** If both `schema.toml` and `store/` already exist, an error is returned. Delete the index directory to recreate. If only `schema.toml` exists (e.g. after an interrupted creation), running `create index` without `--schema` recovers the index by creating the missing storage from the existing schema.
+> **Note:** If both `schema.toml` and `store/` already exist, an error is returned. Delete the index directory to recreate. If only `schema.toml` exists (e.g. after an interrupted creation), running `create index` without `--schema` recovers the index by creating the missing storage from the existing schema. If only `store/` exists (e.g. `schema.toml` was removed by hand), an error is returned and nothing is written or removed, since `store/` may hold the documents of an earlier index: restore `schema.toml` to open that index, or remove `store/` to create a new one (Issue #1560). Before this check, `create index` opened such a `store/` as the new index's storage and served its documents.
 
 ### `create schema`
 

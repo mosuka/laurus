@@ -107,8 +107,8 @@ pub fn with_context(err: PhpException, context: &str) -> PhpException {
 
 /// Convert a [`laurus::index_dir::IndexDirError`] into a PHP exception.
 ///
-/// `SchemaConflict`/`LegacyFlatLayout`/`NotAnIndexDirectory` are all
-/// caller-fixable misuse, so they map to `ValueError` (matching how
+/// `SchemaConflict`/`LegacyFlatLayout`/`LeftoverStore`/`NotAnIndexDirectory`
+/// are all caller-fixable misuse, so they map to `ValueError` (matching how
 /// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`). `Io` maps to
 /// `Exception`, same as `LaurusError::Io` in [`laurus_err`]; there is no
 /// PHP-specific path-preserving I/O exception in this crate, so
@@ -119,6 +119,7 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PhpException {
     match err {
         IndexDirError::SchemaConflict { .. }
         | IndexDirError::LegacyFlatLayout { .. }
+        | IndexDirError::LeftoverStore { .. }
         | IndexDirError::NotAnIndexDirectory { .. } => {
             PhpException::new(err.to_string(), 0, ce::value_error())
         }

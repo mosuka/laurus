@@ -87,6 +87,23 @@ class TestIndexDirLayout < Minitest::Test
     end
   end
 
+  def test_store_left_without_schema_toml_is_rejected_and_kept
+    Dir.mktmpdir do |dir|
+      # Issue #1560: a store/ whose schema.toml was removed by hand, or by a
+      # rollback that failed to remove store/, may hold the documents of an
+      # earlier index, so it must be neither reused nor removed.
+      Dir.mkdir(File.join(dir, "store"))
+      File.write(File.join(dir, "store", "stale"), "")
+
+      err = assert_raises(ArgumentError) do
+        Laurus::Index.new(path: dir)
+      end
+      assert_match(%r{has no schema\.toml but has a store/}, err.message)
+      refute File.exist?(File.join(dir, "schema.toml"))
+      assert File.file?(File.join(dir, "store", "stale"))
+    end
+  end
+
   # ---------------------------------------------------------------------
   # Engine build failure must leave nothing behind (Issue #1308)
   # ---------------------------------------------------------------------
