@@ -162,9 +162,9 @@ pub struct InvertedIndex {
 
     /// The committed segment set, mirroring `segments.json` (#1021).
     ///
-    /// Mutated only through
-    /// [`segment_manifest::publish_with`] (save-then-swap), so it is never
-    /// ahead of the persisted manifest. Shared with writers built by
+    /// Mutated only through [`segment_manifest::publish_with`] and
+    /// [`segment_manifest::publish_with_until_published`] (save-then-swap),
+    /// so it is never ahead of the published manifest. Shared with writers built by
     /// [`Self::writer`]; writers built through the public
     /// `InvertedIndexWriter::new` get no handle. Deliberately NOT part of
     /// the `Debug` impl: publication holds the write guard across storage
@@ -493,7 +493,12 @@ impl InvertedIndex {
     /// segments as before. Deleting the replaced segments' files after the
     /// manifest write is cleanup only: a failure there is logged at `warn`
     /// and not returned (Issue #1436), and the files left behind are
-    /// reclaimed by the orphan sweep when the index is next opened.
+    /// reclaimed by the orphan sweep when the index is next opened. A
+    /// manifest whose sync failed after its rename is published too, as the
+    /// next open reads it: that failure is logged at `warn` and not
+    /// returned, and the replaced segments' files are kept for the sweep,
+    /// because a crash may bring back the previous manifest that lists them
+    /// (Issue #1542).
     fn rewrite_segments(
         &self,
         field: &str,
@@ -558,7 +563,11 @@ impl InvertedIndex {
                 new_infos.push(info);
             }
             let source_ids: Vec<String> = segments.iter().map(|s| s.segment_id.clone()).collect();
-            segment_manifest::publish_with(
+            // Once the manifest is published the rewrite has taken effect,
+            // even when the sync after its rename failed: the next open
+            // reads the rewritten segments, so memory and the caller's
+            // change to the field must follow (Issue #1542).
+            let sync_error = segment_manifest::publish_with_until_published(
                 self.storage.as_ref(),
                 &self.segment_manifest,
                 |list| {
@@ -570,19 +579,31 @@ impl InvertedIndex {
             )?;
             self.release_replaced_segment_readers();
 
-            // Physical cleanup only: the manifest write above already
-            // removed the sources from discovery atomically, so a file left
-            // behind is an unreferenced orphan the next open's sweep
-            // reclaims. Returning its error would skip the option update
-            // below and report a rebuild that took effect as a failed one,
-            // so the caller would keep the old analyzer (Issue #1436).
-            for info in &segments {
-                if let Err(e) = self.delete_segment_files(&info.segment_id) {
-                    log::warn!(
-                        "cannot delete the files of segment {} replaced by rewriting field \
-                         {field}: {e}; they are left for the next open's orphan sweep",
-                        info.segment_id
-                    );
+            if let Some(e) = sync_error {
+                // A crash may bring back the previous manifest, which lists
+                // the replaced segments, so their files stay. The next
+                // open's orphan sweep removes whichever segments the
+                // manifest it reads does not list.
+                log::warn!(
+                    "the rewrite of field {field} has taken effect: {e}. The files of the \
+                     segments it replaced are left for the next open's orphan sweep"
+                );
+            } else {
+                // Physical cleanup only: the manifest write above already
+                // removed the sources from discovery atomically, so a file
+                // left behind is an unreferenced orphan the next open's
+                // sweep reclaims. Returning its error would skip the
+                // caller's change to the field and report a rewrite that
+                // took effect as a failed one, so a rebuild would keep the
+                // old analyzer (Issue #1436).
+                for info in &segments {
+                    if let Err(e) = self.delete_segment_files(&info.segment_id) {
+                        log::warn!(
+                            "cannot delete the files of segment {} replaced by rewriting field \
+                             {field}: {e}; they are left for the next open's orphan sweep",
+                            info.segment_id
+                        );
+                    }
                 }
             }
         }
@@ -1318,7 +1339,10 @@ impl LexicalIndex for InvertedIndex {
     /// An error means nothing was published: the segments still hold the
     /// field's data and the field stays. Failing to delete the replaced
     /// segments' files after the manifest write is logged and not returned,
-    /// as in [`Self::rebuild_field`].
+    /// as in [`Self::rebuild_field`]. So is a failed sync after the
+    /// manifest's rename: the rewritten segments are published, so the
+    /// field is removed, and the replaced segments' files are kept for the
+    /// next open's orphan sweep (Issue #1542).
     fn delete_field(&self, name: &str) -> Result<()> {
         self.check_closed()?;
         if !self.fields.read().contains_key(name) {
@@ -1353,12 +1377,15 @@ impl LexicalIndex for InvertedIndex {
     ///
     /// An error means nothing was published: the manifest lists the same
     /// segments as before and the field's option is unchanged. Once the
-    /// manifest write succeeds, the call returns `Ok` and the field's
-    /// option is the new `option`, so documents indexed afterwards use it.
+    /// manifest is published, the call returns `Ok` and the field's option
+    /// is the new `option`, so documents indexed afterwards use it.
     /// Deleting the replaced segments' files after that is cleanup only: a
     /// failure there is logged at `warn` and not returned (Issue #1436),
     /// and the files left behind are reclaimed by the orphan sweep when the
-    /// index is next opened.
+    /// index is next opened. A manifest whose sync failed after its rename
+    /// is published too: that failure is logged at `warn`, and the replaced
+    /// segments' files are kept for the sweep, since a crash may bring back
+    /// the previous manifest that lists them (Issue #1542).
     fn rebuild_field(
         &self,
         name: &str,

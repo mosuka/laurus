@@ -682,7 +682,7 @@ let outcome = engine.update_field(
 
 `Reindex` は、前回の `commit()` 以降の削除と更新も保ちます。削除したドキュメントは再構築の後も検索に戻りません（[#1527](https://github.com/mosuka/laurus/issues/1527)）。
 
-ベクトルフィールドの `Reindex` は、作り直したセグメントを公開した時点で成功します。その後の後片付けが失敗しても、フィールド名付きの警告をログに出すだけで、フィールドは作り直したセグメントを使います（[#1538](https://github.com/mosuka/laurus/issues/1538)）。
+`Reindex` は、作り直したセグメントを公開した時点で成功します。その後に再構築の手順が失敗しても、フィールド名付きの警告をログに出すだけで、フィールドは作り直したセグメントを使います（[#1436](https://github.com/mosuka/laurus/issues/1436)、[#1538](https://github.com/mosuka/laurus/issues/1538)）。公開した manifest を永続化するストレージの sync も、その手順に含まれます。sync が失敗したときは、crash で前の manifest が戻る場合に備えて、置き換えられたセグメントのファイルを次にインデックスを開くまで残します（[#1542](https://github.com/mosuka/laurus/issues/1542)）。
 
 `Destructive` な変更を適用すると、対象フィールド名がスキーマの `pending_reindex` に記録されます。これは Solr のように「スキーマとインデックスが静かに食い違う」状態を避けるための可視化機構で、`GetSchema` / `laurus get schema` から確認できます。既存データを失ったフィールドが分かるので、必要に応じてドキュメントの再投入で解消してください。
 

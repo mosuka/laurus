@@ -812,13 +812,15 @@ impl VectorStore {
                 // (Issue #1500): failing it would stop the engine before it
                 // commits the documents and truncates the WAL, on every later
                 // commit too while the cause stays. The next commit retries
-                // the merge.
+                // a merge that published nothing; one whose manifest sync
+                // failed after the publish has already taken effect (Issue
+                // #1542).
                 let compacted = match self.index.maybe_auto_compact() {
                     Ok(compacted) => compacted,
                     Err(e) => {
                         log::warn!(
-                            "vector commit succeeded, but the automatic merge after it failed \
-                             and is retried on the next commit: {e}"
+                            "vector commit succeeded, but the automatic merge after it failed; \
+                             a merge that published nothing is retried on the next commit: {e}"
                         );
                         // A compaction that failed partway may already have
                         // rewritten the index and cleared the deletion

@@ -112,9 +112,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// field, so the caller must keep it even if a later step fails.
     ///
     /// The default reports every [`Self::optimize`] error as one before the
-    /// publish. The segmented indexes and the MultiVector index, whose
-    /// optimize forgets the reclaimed deletions after the merge published,
-    /// override it.
+    /// publish. The segmented indexes and the MultiVector index override
+    /// it: after their merge publishes its manifest, the sync of that
+    /// manifest can fail, and their optimize then keeps the source
+    /// segments' files and the deletion marks in case a crash brings back
+    /// the previous manifest (Issue #1542); otherwise it forgets the
+    /// reclaimed deletions, which can fail too.
     ///
     /// # Returns
     ///

@@ -1058,7 +1058,10 @@ impl LexicalStore {
     /// field's option and analyzer switched to the new ones, even if
     /// deleting the replaced segments' files fails afterwards: that failure
     /// is logged at `warn`, and the files are reclaimed when the index is
-    /// next opened (Issue #1436).
+    /// next opened (Issue #1436). The same holds when the sync after the
+    /// manifest's rename fails: the rebuilt postings are published, so the
+    /// failure is logged at `warn`, and the replaced segments' files are
+    /// kept until the next open (Issue #1542).
     pub fn rebuild_field(
         &self,
         name: &str,
@@ -1170,6 +1173,12 @@ impl LexicalStore {
     /// as [`Self::commit`] does (Issue #875), or if the index fails to
     /// discard the field's data, which publishes nothing and keeps the
     /// field and its data.
+    ///
+    /// Once the segments without the field are published, this returns
+    /// `Ok` and unregisters the field's analyzer, also when the sync after
+    /// the manifest's rename fails: that failure is logged at `warn`, and
+    /// the replaced segments' files are kept until the next open (Issue
+    /// #1542).
     pub fn delete_field(&self, name: &str) -> Result<()> {
         let mut writer_guard = self.writer_cache.lock();
         // Same commit-then-drop-on-success guard as `add_field` (Issue
@@ -1631,6 +1640,102 @@ mod tests {
             rebuilt.is_ok(),
             "a cleanup failure after publishing is not an error: {rebuilt:?}"
         );
+    }
+
+    /// Issue #1542 — a rebuild whose `segments.json` sync fails after the
+    /// rename has published the rebuilt postings, so it switches the
+    /// field's option and analyzer like any rebuild that published, and
+    /// keeps the replaced segments' files. A reopen reads the published
+    /// manifest under the new option and analyzer; after a crash that
+    /// brings back the previous manifest, a reopen under the old ones reads
+    /// the replaced segments.
+    #[test]
+    fn rebuild_with_a_failed_manifest_sync_switches_option_and_analyzer() {
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+        use crate::analysis::analyzer::simple::SimpleAnalyzer;
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+        use crate::lexical::core::field::{FieldOption, TextOption};
+        use crate::storage::manifest::test_support::{FailSyncAfterRename, read_file, write_file};
+        use std::sync::atomic::Ordering;
+
+        // The old analyzer lowercases; the new one keeps case.
+        let config = |rebuilt: bool| {
+            let analyzer = Arc::new(PerFieldAnalyzer::new(Arc::new(
+                StandardAnalyzer::new().unwrap(),
+            )));
+            if rebuilt {
+                analyzer.add_analyzer(
+                    "title",
+                    Arc::new(SimpleAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))),
+                );
+            }
+            LexicalIndexConfig::builder()
+                .analyzer(analyzer)
+                .add_field(
+                    "title",
+                    FieldOption::Text(TextOption::default().term_vectors(rebuilt)),
+                )
+                .build()
+        };
+        let hits = |store: &LexicalStore, query: &str| -> Vec<u64> {
+            let query = store.query_parser().unwrap().parse(query).unwrap();
+            let results = store.search(LexicalSearchRequest::new(query)).unwrap();
+            results.hits.iter().map(|hit| hit.doc_id).collect()
+        };
+        for crash in [false, true] {
+            let inner: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), "segments.json"));
+            let store = LexicalStore::new(failing.clone(), config(false)).unwrap();
+            let doc = Document::builder()
+                .add_text("title", "Rust Programming")
+                .build();
+            store.upsert_document(1, doc).unwrap();
+            store.commit().unwrap();
+            let replaced: Vec<String> = inner
+                .list_files()
+                .unwrap()
+                .into_iter()
+                .filter(|file| file.starts_with("segment_"))
+                .collect();
+            assert!(!replaced.is_empty(), "crash: {crash}");
+            let previous_manifest = read_file(inner.as_ref(), "segments.json");
+
+            failing.armed.store(true, Ordering::SeqCst);
+            let rebuilt = store.rebuild_field(
+                "title",
+                FieldOption::Text(TextOption::default().term_vectors(true)),
+                Some(Arc::new(SimpleAnalyzer::new(Arc::new(
+                    WhitespaceTokenizer::new(),
+                )))),
+            );
+            failing.armed.store(false, Ordering::SeqCst);
+            assert_eq!(failing.failures.load(Ordering::SeqCst), 1, "crash: {crash}");
+            assert!(
+                rebuilt.is_ok(),
+                "crash: {crash}: a failed sync after publishing is not an error: {rebuilt:?}"
+            );
+            assert_eq!(
+                hits(&store, "title:Rust"),
+                vec![1],
+                "crash: {crash}: the query must be parsed with the new analyzer"
+            );
+            for file in &replaced {
+                assert!(
+                    inner.file_exists(file),
+                    "crash: {crash}: {file} must stay until the next open"
+                );
+            }
+            drop(store);
+
+            if crash {
+                write_file(inner.as_ref(), "segments.json", &previous_manifest);
+            }
+            let reopened = LexicalStore::new(inner.clone(), config(!crash)).unwrap();
+            let query = if crash { "title:rust" } else { "title:Rust" };
+            assert_eq!(hits(&reopened, query), vec![1], "crash: {crash}");
+        }
     }
 
     /// #1016 — a document written before the writer's automatic
@@ -2535,5 +2640,121 @@ mod tests {
             "the field must still be there: {error}"
         );
         assert!(registered(), "the field must keep its analyzer");
+    }
+
+    /// Issue #1542 — a `delete_field` whose `segments.json` sync fails after
+    /// the rename has published the segments without the field, so it
+    /// removes the field and its per-field analyzer like any deletion that
+    /// published, and keeps the replaced segments' files until the next
+    /// open. A reopen reads the segments without the field.
+    #[test]
+    fn delete_field_with_a_failed_manifest_sync_removes_the_field() {
+        use crate::analysis::analyzer::per_field::PerFieldAnalyzer;
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+        use crate::lexical::core::field::{FieldOption, IntegerOption};
+        use crate::lexical::query::range::NumericRangeQuery;
+        use crate::storage::manifest::test_support::FailSyncAfterRename;
+        use std::sync::atomic::Ordering;
+
+        let config = || {
+            LexicalIndexConfig::builder()
+                .analyzer(Arc::new(PerFieldAnalyzer::new(Arc::new(
+                    StandardAnalyzer::new().unwrap(),
+                ))))
+                .add_field("title", title_option())
+                .add_field("n", FieldOption::Integer(IntegerOption::default()))
+                .build()
+        };
+        let title_hits = |store: &LexicalStore| {
+            let query = Box::new(TermQuery::new("title", "rust")) as Box<dyn Query>;
+            store
+                .search(LexicalSearchRequest::new(query))
+                .unwrap()
+                .hits
+                .len()
+        };
+        let n_hits = |store: &LexicalStore| {
+            let query: Box<dyn Query> =
+                Box::new(NumericRangeQuery::i64_range("n", Some(0), Some(100)));
+            store
+                .search(LexicalSearchRequest::new(query))
+                .unwrap()
+                .hits
+                .len()
+        };
+
+        let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), "segments.json"));
+        let store = LexicalStore::new(failing.clone(), config()).unwrap();
+        let doc = Document::builder()
+            .add_text("_id", "ida")
+            .add_text("title", "rust programming")
+            .add_field("n", DataValue::Int64(10))
+            .build();
+        store.upsert_document(1, doc).unwrap();
+        store.commit().unwrap();
+        assert_eq!((title_hits(&store), n_hits(&store)), (1, 1));
+        let title_analyzer: Arc<dyn Analyzer> = Arc::new(StandardAnalyzer::new().unwrap());
+        let per_field = |store: &LexicalStore| {
+            let analyzer = store.analyzer().unwrap();
+            let per_field = analyzer
+                .as_any()
+                .downcast_ref::<PerFieldAnalyzer>()
+                .unwrap()
+                .get_analyzer("title");
+            Arc::ptr_eq(&per_field, &title_analyzer)
+        };
+        store
+            .analyzer()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<PerFieldAnalyzer>()
+            .unwrap()
+            .add_analyzer("title", title_analyzer.clone());
+        assert!(per_field(&store));
+        let replaced: Vec<String> = inner
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.starts_with("segment_"))
+            .collect();
+        assert!(!replaced.is_empty());
+
+        failing.armed.store(true, Ordering::SeqCst);
+        let deleted = store.delete_field("title");
+        failing.armed.store(false, Ordering::SeqCst);
+        assert_eq!(failing.failures.load(Ordering::SeqCst), 1);
+        assert!(
+            deleted.is_ok(),
+            "a failed sync after publishing is not an error: {deleted:?}"
+        );
+        assert!(
+            !per_field(&store),
+            "the field's analyzer must be unregistered"
+        );
+        for file in &replaced {
+            assert!(
+                inner.file_exists(file),
+                "{file} must stay until the next open"
+            );
+        }
+        // The field is gone, so it can be added again, and it starts empty.
+        store.add_field("title", title_option(), None).unwrap();
+        assert_eq!(title_hits(&store), 0, "the field's data must be discarded");
+        assert_eq!(n_hits(&store), 1, "the other field keeps its data");
+        drop(store);
+
+        let reopened = LexicalStore::new(inner.clone(), config()).unwrap();
+        assert_eq!(
+            (title_hits(&reopened), n_hits(&reopened)),
+            (0, 1),
+            "a reopen reads the segments without the field"
+        );
+        for file in &replaced {
+            assert!(
+                !inner.file_exists(file),
+                "the reopen's orphan sweep removes {file}"
+            );
+        }
     }
 }

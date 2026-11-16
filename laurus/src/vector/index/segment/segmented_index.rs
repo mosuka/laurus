@@ -201,13 +201,23 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
     /// Merge `segments` into one new segment, dropping the documents
     /// `deletions` (a [`SegmentedCore::deletion_snapshot`]) marks, and drop
     /// their cached readers.
+    ///
+    /// # Returns
+    ///
+    /// The error of the manifest sync that failed after the merge was
+    /// published, if it failed (Issue #1542). The readers are dropped
+    /// either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge failed before it was published.
     fn merge(
         &self,
         config: &B::Config,
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<Arc<DeletionBitmap>>,
-    ) -> Result<()> {
-        let source_ids = self.core.merge_segments(
+    ) -> Result<Option<LaurusError>> {
+        let (source_ids, sync_error) = self.core.merge_segments(
             segments,
             deletions,
             |deletions, segments, new_segment_id| {
@@ -223,7 +233,7 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
         for id in &source_ids {
             self.reader_cache.invalidate(id);
         }
-        Ok(())
+        Ok(sync_error)
     }
 }
 
@@ -362,6 +372,9 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
     /// through the deletion-filtering, duplicate-collapsing merge engine;
     /// source readers are invalidated afterwards. Returns whether a merge
     /// actually ran.
+    ///
+    /// A merge whose manifest sync failed after it was published is
+    /// returned as an error, which the commit logs (Issue #1542).
     fn merge_once(&self) -> Result<bool> {
         let Some(candidate) = self
             .shared
@@ -372,8 +385,12 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
             return Ok(false);
         };
         let deletions = self.shared.core.deletion_snapshot()?;
-        self.shared
-            .merge(&self.config(), candidate.segments, deletions)?;
+        if let Some(e) = self
+            .shared
+            .merge(&self.config(), candidate.segments, deletions)?
+        {
+            return Err(e);
+        }
         Ok(true)
     }
 }
@@ -470,8 +487,15 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         // copy of the deletions: a soft delete takes no writer lock and can
         // land while the merge runs (Issue #1518).
         let deletions = self.shared.core.deletion_snapshot()?;
-        self.shared
-            .merge(&self.config(), segments, deletions.clone())?;
+        if let Some(e) = self
+            .shared
+            .merge(&self.config(), segments, deletions.clone())?
+        {
+            // Published, but a crash may bring back the manifest that lists
+            // the sources, so their deleted documents stay marked (Issue
+            // #1542).
+            return Ok(Some(e));
+        }
 
         // Every document the copy marks was physically dropped by the merge;
         // a delete marked since stays marked. The merge has published, so a

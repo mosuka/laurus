@@ -174,7 +174,11 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     ///
     /// Returns an error if the index implementation does not support dynamic field
     /// deletion, or if discarding the field's data fails, which leaves the
-    /// field and its data in place.
+    /// field and its data in place. Once the data without the field is
+    /// published, implementations remove the field and return `Ok`, as
+    /// [`rebuild_field`](Self::rebuild_field) does, also when cleaning up
+    /// the replaced data fails afterwards or the storage sync after the
+    /// publication does (Issue #1542).
     fn delete_field(&self, _name: &str) -> Result<()> {
         Err(crate::error::LaurusError::InvalidOperation(
             "This index implementation does not support dynamic field deletion".to_string(),

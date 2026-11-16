@@ -225,11 +225,21 @@ impl Shared {
     /// [`SegmentedCore::deletion_snapshot`]) marks and stale copies. Pass 2
     /// copies each surviving document's payload, so memory stays
     /// proportional to the document count.
+    ///
+    /// # Returns
+    ///
+    /// The error of the manifest sync that failed after the merge was
+    /// published, if it failed (Issue #1542). The merged segment replaces
+    /// the sources either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge failed before it was published.
     fn merge(
         &self,
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<&DeletionBitmap>,
-    ) -> Result<()> {
+    ) -> Result<Option<LaurusError>> {
         self.merge_within(segments, deletions, POOLING_BUDGET_BYTES)
     }
 
@@ -243,7 +253,7 @@ impl Shared {
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<&DeletionBitmap>,
         pooling_budget: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<LaurusError>> {
         let mut binary = self.binary.lock();
         let mut sources = segments.clone();
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
@@ -373,12 +383,12 @@ impl Shared {
             .iter()
             .map(|s| s.segment_id.clone())
             .collect();
-        self.core.manager().apply_merge(candidate, merged)?;
+        let sync_error = self.core.manager().apply_merge(candidate, merged)?;
         Self::publish(&mut binary, &target, trained);
         for id in &source_ids {
             self.readers.invalidate(id);
         }
-        Ok(())
+        Ok(sync_error)
     }
 
     /// Pool the stored rows of the survivors at `window` (indices into
@@ -552,6 +562,9 @@ impl MultiVectorIndex {
 
     /// Merge one policy-selected window of segments; returns whether a
     /// merge ran.
+    ///
+    /// A merge whose manifest sync failed after it was published is
+    /// returned as an error, which the commit logs (Issue #1542).
     fn merge_once(&self) -> Result<bool> {
         let Some(candidate) = self
             .shared
@@ -562,8 +575,12 @@ impl MultiVectorIndex {
             return Ok(false);
         };
         let deletions = self.shared.core.deletion_snapshot()?;
-        self.shared
-            .merge(candidate.segments, deletions.as_deref())?;
+        if let Some(e) = self
+            .shared
+            .merge(candidate.segments, deletions.as_deref())?
+        {
+            return Err(e);
+        }
         Ok(true)
     }
 }
@@ -625,7 +642,12 @@ impl VectorIndex for MultiVectorIndex {
         // Filter with a frozen copy of the deletions: a soft delete takes no
         // writer lock and can land while the merge runs (Issue #1518).
         let deletions = self.shared.core.deletion_snapshot()?;
-        self.shared.merge(segments, deletions.as_deref())?;
+        if let Some(e) = self.shared.merge(segments, deletions.as_deref())? {
+            // Published, but a crash may bring back the manifest that lists
+            // the sources, so their deleted documents stay marked (Issue
+            // #1542).
+            return Ok(Some(e));
+        }
         // Every document the copy marks was dropped by the merge; a delete
         // marked since stays marked. The merge has published, so a failure
         // here is reported apart (Issue #1538): the bitmap then keeps the

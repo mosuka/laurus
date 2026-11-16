@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
-use crate::error::Result;
+use crate::error::{LaurusError, Result};
 use crate::storage::Storage;
 use crate::storage::manifest as manifest_io;
 
@@ -363,6 +363,28 @@ impl SegmentManager {
     /// still holding the `segments` write lock — saving after dropping the
     /// lock let two racing mutators publish manifests out of order.
     fn save_state_locked(&self, segments: &[ManagedSegmentInfo]) -> Result<()> {
+        self.save_state_until_published(segments)?
+            .map_or(Ok(()), Err)
+    }
+
+    /// [`Self::save_state_locked`], telling a save that published nothing
+    /// apart from one that published the manifest but failed to sync it
+    /// (Issue #1542, see
+    /// [`manifest_io::save_checksummed_until_published`]).
+    ///
+    /// # Returns
+    ///
+    /// `None` when the manifest is published and synced, or the error of
+    /// the sync that failed after it was published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest was not published; the previous one
+    /// is then left intact.
+    fn save_state_until_published(
+        &self,
+        segments: &[ManagedSegmentInfo],
+    ) -> Result<Option<LaurusError>> {
         let field = self
             .field_record
             .read()
@@ -378,15 +400,23 @@ impl SegmentManager {
         };
         // temp + CRC-32 trailer + rename + sync, shared with every other
         // control file in the tree (#1022).
-        manifest_io::save_checksummed_json(self.storage.as_ref(), MANIFEST_FILE, None, &manifest)
+        manifest_io::save_checksummed_json_until_published(
+            self.storage.as_ref(),
+            MANIFEST_FILE,
+            None,
+            &manifest,
+        )
     }
 
     /// Persist the current manifest state.
     ///
     /// # Errors
     ///
-    /// Returns an error if serializing or writing the manifest fails; the
-    /// previously published manifest stays intact (atomic rename).
+    /// Returns an error if serializing or writing the manifest fails. A
+    /// failure up to the rename leaves the previously published manifest
+    /// intact (atomic rename); a failed sync after the rename leaves the new
+    /// one published, though a crash may still bring back the previous one
+    /// (Issue #1542).
     pub fn save_state(&self) -> Result<()> {
         let segments = self.segments.read();
         self.save_state_locked(&segments)
@@ -576,35 +606,58 @@ impl SegmentManager {
     }
 
     /// Apply a merge result by replacing source segments with the merged segment.
+    ///
+    /// The manifest that lists the merged segment instead of the sources is
+    /// published first, and the in-memory list takes it only once it is.
+    /// The sources' files are deleted only once that manifest is also
+    /// synced: when the sync fails, a crash may bring back the previous
+    /// manifest, which lists the sources, so their files stay for the next
+    /// open's orphan sweep, which removes whichever segments the manifest it
+    /// reads does not list (Issue #1542).
+    ///
+    /// # Returns
+    ///
+    /// `None` when the merge is published and synced, or the error of the
+    /// sync that failed after it was published. The merged segment replaces
+    /// the sources in memory either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest was not published. The in-memory
+    /// list and the manifest then still list the sources, and the merged
+    /// segment's files are left for the next open's orphan sweep.
     pub fn apply_merge(
         &self,
         candidate: MergeCandidate,
         mut merged_segment: ManagedSegmentInfo,
-    ) -> Result<()> {
+    ) -> Result<Option<LaurusError>> {
         // Replace the engine's estimated size with the on-storage size of
         // the merged segment file + sidecars (mirrors `add_segment`, #879).
         merged_segment.size_bytes = self.measure_segment_size(&merged_segment.segment_id);
         let mut segments_lock = self.segments.write();
 
-        // 1. Remove source segments
+        // 1. Replace the sources with the merged segment, on a copy until
+        //    the manifest is published.
         let ids_to_remove: std::collections::HashSet<_> =
             candidate.segments.iter().map(|s| &s.segment_id).collect();
+        let mut merged_list = segments_lock.clone();
+        merged_list.retain(|s| !ids_to_remove.contains(&s.segment_id));
+        merged_list.push(merged_segment);
 
-        segments_lock.retain(|s| !ids_to_remove.contains(&s.segment_id));
-
-        // 2. Add new segment
-        segments_lock.push(merged_segment);
-
-        // 3. Save state (lock held — see `save_state_locked`)
-        self.save_state_locked(&segments_lock)?;
+        // 2. Publish it (lock held — see `save_state_locked`).
+        let sync_error = self.save_state_until_published(&merged_list)?;
+        *segments_lock = merged_list;
         drop(segments_lock);
+        if sync_error.is_some() {
+            return Ok(sync_error);
+        }
 
-        // 4. Cleanup physical files of source segments
+        // 3. Cleanup physical files of source segments
         for segment in candidate.segments {
             self.delete_segment_files(&segment.segment_id)?;
         }
 
-        Ok(())
+        Ok(None)
     }
     pub fn total_vectors(&self) -> u64 {
         self.segments.read().iter().map(|s| s.vector_count).sum()
@@ -1324,5 +1377,141 @@ mod tests {
             SegmentManager::new(SegmentManagerConfig::default(), storage, TEST_LAYOUT).unwrap();
         assert_eq!(manager.list_segments().len(), 1);
         assert_eq!(manager.field_record(), None);
+    }
+
+    const MERGE_SOURCES: [&str; 2] = ["segment_000000", "segment_000001"];
+    const MERGED: &str = "segment_000002";
+
+    /// A manager over `storage` whose manifest lists the two
+    /// [`MERGE_SOURCES`], with the files of those and of [`MERGED`] written
+    /// to `inner`, the storage under `storage`.
+    fn manager_ready_to_merge(
+        inner: &Arc<dyn Storage>,
+        storage: Arc<dyn Storage>,
+    ) -> SegmentManager {
+        let manager =
+            SegmentManager::new(SegmentManagerConfig::default(), storage, TEST_LAYOUT).unwrap();
+        for id in MERGE_SOURCES.iter().chain([&MERGED]) {
+            for name in segment_files(id) {
+                crate::storage::manifest::test_support::write_file(inner.as_ref(), &name, b"x");
+            }
+        }
+        for id in MERGE_SOURCES {
+            manager.add_segment(create_info(id, 10)).unwrap();
+        }
+        manager
+    }
+
+    fn segment_files(id: &str) -> [String; 2] {
+        [format!("{id}.hnsw"), format!("{id}.hnsw.f32")]
+    }
+
+    fn segment_ids(manager: &SegmentManager) -> Vec<String> {
+        manager
+            .list_segments()
+            .into_iter()
+            .map(|s| s.segment_id)
+            .collect()
+    }
+
+    fn merge_candidate(manager: &SegmentManager) -> MergeCandidate {
+        MergeCandidate {
+            segments: manager.list_segments(),
+            total_vectors: 20,
+            total_size: 0,
+        }
+    }
+
+    /// Issue #1542: a merge whose manifest sync fails after the rename is
+    /// published. The merged segment replaces the sources in memory, and
+    /// the sources' files stay, so the next open finds every file the
+    /// manifest it reads lists: the published one, or the previous one a
+    /// crash brings back. Its orphan sweep removes the others.
+    #[test]
+    fn test_apply_merge_keeps_the_sources_when_the_manifest_sync_fails() {
+        use crate::storage::manifest::test_support::{FailSyncAfterRename, read_file, write_file};
+        use std::sync::atomic::Ordering;
+
+        for crash in [false, true] {
+            let inner: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), MANIFEST_FILE));
+            let manager = manager_ready_to_merge(&inner, failing.clone());
+            let previous_manifest = read_file(inner.as_ref(), MANIFEST_FILE);
+
+            failing.armed.store(true, Ordering::SeqCst);
+            let merged = manager.apply_merge(merge_candidate(&manager), create_info(MERGED, 20));
+            failing.armed.store(false, Ordering::SeqCst);
+            let sync_error = merged
+                .expect("the merge is published")
+                .expect("the failed sync is reported");
+            assert!(
+                sync_error.to_string().contains("injected sync failure"),
+                "{sync_error}"
+            );
+            assert_eq!(segment_ids(&manager), [MERGED]);
+            for id in MERGE_SOURCES.iter().chain([&MERGED]) {
+                for name in segment_files(id) {
+                    assert!(
+                        inner.file_exists(&name),
+                        "{name} must stay until the next open"
+                    );
+                }
+            }
+
+            if crash {
+                write_file(inner.as_ref(), MANIFEST_FILE, &previous_manifest);
+            }
+            let reopened =
+                SegmentManager::new(SegmentManagerConfig::default(), inner.clone(), TEST_LAYOUT)
+                    .unwrap();
+            let (live, swept) = if crash {
+                (MERGE_SOURCES.to_vec(), vec![MERGED])
+            } else {
+                (vec![MERGED], MERGE_SOURCES.to_vec())
+            };
+            assert_eq!(segment_ids(&reopened), live, "crash: {crash}");
+            for id in &live {
+                for name in segment_files(id) {
+                    assert!(inner.file_exists(&name), "crash: {crash}: {name} must stay");
+                }
+            }
+            for id in &swept {
+                for name in segment_files(id) {
+                    assert!(
+                        !inner.file_exists(&name),
+                        "crash: {crash}: {name} must be swept"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #1542: a merge whose manifest is not published changes
+    /// nothing: memory and the manifest still list the sources, and their
+    /// files stay.
+    #[test]
+    fn test_apply_merge_changes_nothing_when_the_manifest_is_not_published() {
+        use crate::storage::manifest::test_support::{FailSyncAfterRename, read_file};
+        use std::sync::atomic::Ordering;
+
+        let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), MANIFEST_FILE));
+        let manager = manager_ready_to_merge(&inner, failing.clone());
+        let previous_manifest = read_file(inner.as_ref(), MANIFEST_FILE);
+
+        failing.armed.store(true, Ordering::SeqCst);
+        failing.fail_rename.store(true, Ordering::SeqCst);
+        let error = manager
+            .apply_merge(merge_candidate(&manager), create_info(MERGED, 20))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected failure"), "{error}");
+        assert_eq!(segment_ids(&manager), MERGE_SOURCES);
+        assert_eq!(read_file(inner.as_ref(), MANIFEST_FILE), previous_manifest);
+        for id in MERGE_SOURCES {
+            for name in segment_files(id) {
+                assert!(inner.file_exists(&name), "{name} must stay");
+            }
+        }
     }
 }

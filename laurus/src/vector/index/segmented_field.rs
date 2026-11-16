@@ -158,6 +158,13 @@ impl SegmentedVectorField {
     }
 
     /// Trigger a merge with a specific policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge fails, including when the manifest
+    /// sync fails after the merge was published: the merged segment then
+    /// replaces the sources, whose files stay until the next open (see
+    /// [`SegmentManager::apply_merge`]).
     pub fn perform_merge_with_policy(
         &self,
         policy: &dyn crate::vector::index::segment::merge_policy::MergePolicy,
@@ -239,10 +246,15 @@ impl SegmentedVectorField {
                 .map(|s| s.segment_id.clone())
                 .collect();
 
-            self.segment_manager.apply_merge(candidate, info)?;
+            let sync_error = self.segment_manager.apply_merge(candidate, info)?;
 
             for id in &source_ids {
                 self.reader_cache.invalidate(id);
+            }
+            // Published, but not synced (Issue #1542): the merged segment
+            // replaces the sources, whose files stay for the next open.
+            if let Some(e) = sync_error {
+                return Err(e);
             }
         }
         Ok(())

@@ -815,10 +815,15 @@ A `Reindex` keeps the deletes and updates made since the last `commit()`:
 a deleted document does not come back in search after the rebuild
 ([#1527](https://github.com/mosuka/laurus/issues/1527)).
 
-A vector field's `Reindex` succeeds once it has published the rebuilt
-segments. A cleanup step that fails after that is logged as a warning that
-names the field, and the field uses the rebuilt segments
-([#1538](https://github.com/mosuka/laurus/issues/1538)).
+A `Reindex` succeeds once it has published the rebuilt segments. A step of
+the rebuild that fails after that is logged as a warning that names the
+field, and the field uses the rebuilt segments
+([#1436](https://github.com/mosuka/laurus/issues/1436),
+[#1538](https://github.com/mosuka/laurus/issues/1538)). That includes the
+storage sync that makes the published manifest durable: when it fails, the
+replaced segments' files are kept until the index is next opened, in case
+a crash brings back the previous manifest
+([#1542](https://github.com/mosuka/laurus/issues/1542)).
 
 Applying a `Destructive` change records the field's name in the schema's
 `pending_reindex` set. This is a visibility mechanism against the known
