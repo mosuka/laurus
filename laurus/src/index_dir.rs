@@ -21,25 +21,34 @@
 //!   [`IndexDirError::LeftoverStore`] rather than opened as the new
 //!   index's storage, which would serve its documents (Issue #1560).
 //!   Otherwise, the given schema (or [`Schema::default`] when omitted) is
-//!   checked with [`Schema::validate_for_create`], written to
-//!   `schema.toml`, and a new `store/` directory is created.
+//!   checked with [`Schema::validate_for_create`], and
+//!   [`create_schema_and_store`] writes it to `schema.toml` and creates a
+//!   new `store/` directory, durably and in that order (Issue #1587).
 //!
 //! [`open_or_create`] itself is not used by `laurus-cli`/`laurus-server`
 //! (see Issue #1061) — it exists solely for the four bindings, which had no
-//! shared convention before Issue #1059. [`check_no_leftover_store`] and
-//! [`CreateRollback`], however, are shared by all three entry points, since
-//! the write-then-build-engine shape (and the checks and cleanup it needs)
-//! is the same everywhere.
+//! shared convention before Issue #1059. [`check_no_leftover_store`],
+//! [`create_schema_and_store`] and [`CreateRollback`], however, are shared
+//! by all three entry points, since the write-then-build-engine shape (and
+//! the checks, ordering and cleanup it needs) is the same everywhere, and
+//! `laurus-cli` and `laurus-server` persist every schema change with
+//! [`write_schema`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::storage::durable;
 use crate::storage::file::FileStorageConfig;
 use crate::storage::{Storage, StorageConfig, StorageFactory};
 use crate::{LaurusError, Schema};
 
 /// Name of the schema file within an index directory.
 pub const SCHEMA_FILE: &str = "schema.toml";
+
+/// Name of the temporary file [`write_schema`] writes and then renames over
+/// [`SCHEMA_FILE`] (Issue #1587). One that a crash left behind is truncated
+/// and reused by the next write.
+pub const SCHEMA_TMP_FILE: &str = "schema.toml.tmp";
 
 /// Name of the storage subdirectory within an index directory.
 pub const STORE_DIR: &str = "store";
@@ -137,7 +146,8 @@ pub enum IndexDirError {
 /// exist and that no `store/` is left without `schema.toml`
 /// ([`check_no_leftover_store`]), and calls [`Self::rollback`] if the
 /// build fails -- otherwise a retry is blocked by state the failed attempt
-/// left behind.
+/// left behind. [`create_schema_and_store`] takes its own snapshot too, and
+/// rolls back when writing the layout itself fails (Issue #1587).
 #[must_use = "take the snapshot before the create attempt and call rollback() if it fails"]
 pub struct CreateRollback {
     index_dir: PathBuf,
@@ -229,6 +239,90 @@ pub fn check_no_leftover_store(index_dir: &Path) -> Result<(), IndexDirError> {
     Ok(())
 }
 
+/// Write `schema` to `<index_dir>/schema.toml`, replacing the file
+/// atomically and durably (Issue #1587).
+///
+/// The TOML goes to [`SCHEMA_TMP_FILE`] first, which is synced and renamed
+/// over `schema.toml`, and then `index_dir` is synced, so a crash leaves
+/// either the old schema or the new one, never a partial file that no entry
+/// point can parse. On Unix, the new file gets the old one's permissions. A
+/// symlinked `schema.toml` is replaced by a regular file. `index_dir` must
+/// exist.
+///
+/// Every create path writes the first `schema.toml` with this (through
+/// [`create_schema_and_store`]), and `laurus-cli` and `laurus-server`
+/// persist each schema change with it.
+///
+/// # Errors
+///
+/// Returns [`IndexDirError::Core`] if the schema cannot be serialized, and
+/// [`IndexDirError::Io`] if writing, syncing or renaming the file, or
+/// syncing `index_dir`, fails. After a failed sync of `index_dir`, the new
+/// `schema.toml` is already in place.
+pub fn write_schema(index_dir: &Path, schema: &Schema) -> Result<(), IndexDirError> {
+    let toml = schema.to_toml()?;
+    let schema_path = index_dir.join(SCHEMA_FILE);
+    durable::replace_file(
+        &schema_path,
+        &index_dir.join(SCHEMA_TMP_FILE),
+        toml.as_bytes(),
+    )
+    .map_err(|source| IndexDirError::Io {
+        path: schema_path,
+        source,
+    })
+}
+
+/// Create a new index's `schema.toml` and `store/` in `index_dir`, and
+/// return the storage over `store/` (Issue #1587).
+///
+/// The steps run in this order, each made durable before the next:
+///
+/// 1. `index_dir` and any missing parent are created, each synced into the
+///    directory that holds it.
+/// 2. `schema.toml` is written with [`write_schema`].
+/// 3. `store/` is created, and `index_dir` synced, by
+///    [`FileStorage::new`](crate::storage::file::FileStorage::new).
+///
+/// Once this returns, `schema.toml` and `store/` survive a crash. A crash
+/// before that leaves nothing, empty directories, [`SCHEMA_TMP_FILE`] or
+/// `schema.toml` alone, and every entry point recovers from each of them;
+/// it never leaves a `store/` without `schema.toml`
+/// ([`IndexDirError::LeftoverStore`]) or a partial `schema.toml`.
+///
+/// The caller checks first that neither `schema.toml` nor `store/` exists
+/// (see [`check_no_leftover_store`]) and validates the schema
+/// ([`Schema::validate_for_create`]). Every entry point that creates an
+/// index (`laurus-cli`, `laurus-server`, and [`open_or_create`] for the
+/// bindings) calls this.
+///
+/// # Errors
+///
+/// Returns [`IndexDirError::Io`] if a directory cannot be created or
+/// synced, or `schema.toml` cannot be written, and [`IndexDirError::Core`]
+/// if the schema cannot be serialized or the storage cannot be created. On
+/// an error, what this call created is removed again, as by
+/// [`CreateRollback::rollback`], so it does not block a retry.
+pub fn create_schema_and_store(
+    index_dir: &Path,
+    schema: &Schema,
+) -> Result<Arc<dyn Storage>, IndexDirError> {
+    let rollback = CreateRollback::snapshot(index_dir);
+    let created = (|| {
+        durable::create_dir_all(index_dir).map_err(|source| IndexDirError::Io {
+            path: index_dir.to_path_buf(),
+            source,
+        })?;
+        write_schema(index_dir, schema)?;
+        let config = StorageConfig::File(FileStorageConfig::new(index_dir.join(STORE_DIR)));
+        Ok(StorageFactory::create(config)?)
+    })();
+    if created.is_err() {
+        rollback.rollback();
+    }
+    created
+}
+
 /// Resolve `index_dir` into a `(Schema, Storage)` pair, creating a new
 /// index or opening an existing one as appropriate. See the module docs
 /// for the exact rules.
@@ -239,16 +333,7 @@ pub fn open_or_create(
     let schema_path = index_dir.join(SCHEMA_FILE);
     let store_path = index_dir.join(STORE_DIR);
 
-    let resolved_schema = if schema_path.exists() {
-        if schema.is_some() {
-            return Err(IndexDirError::SchemaConflict { path: schema_path });
-        }
-        let content = std::fs::read_to_string(&schema_path).map_err(|e| IndexDirError::Io {
-            path: schema_path.clone(),
-            source: e,
-        })?;
-        Schema::from_toml(&content)?
-    } else {
+    if !schema_path.exists() {
         if index_dir.join(LEGACY_LAYOUT_MARKER).exists() {
             return Err(IndexDirError::LegacyFlatLayout {
                 path: index_dir.to_path_buf(),
@@ -259,18 +344,21 @@ pub fn open_or_create(
         // Before anything is written, so a rejected schema leaves no
         // schema.toml behind to block the retry.
         schema.validate_for_create()?;
-        std::fs::create_dir_all(index_dir).map_err(|e| IndexDirError::Io {
-            path: index_dir.to_path_buf(),
-            source: e,
-        })?;
-        let toml = schema.to_toml()?;
-        std::fs::write(&schema_path, toml).map_err(|e| IndexDirError::Io {
-            path: schema_path.clone(),
-            source: e,
-        })?;
-        schema
-    };
+        let storage = create_schema_and_store(index_dir, &schema)?;
+        return Ok((schema, storage));
+    }
 
+    if schema.is_some() {
+        return Err(IndexDirError::SchemaConflict { path: schema_path });
+    }
+    let content = std::fs::read_to_string(&schema_path).map_err(|e| IndexDirError::Io {
+        path: schema_path.clone(),
+        source: e,
+    })?;
+    let resolved_schema = Schema::from_toml(&content)?;
+
+    // A `store/` missing beside `schema.toml` (a create interrupted between
+    // the two) is created here, durably, by `FileStorage::new`.
     let config = StorageConfig::File(FileStorageConfig::new(&store_path));
     let storage = if store_path.exists() {
         StorageFactory::open(config)
@@ -330,6 +418,7 @@ pub fn peek_commit_generation(index_dir: &Path) -> Result<u64, IndexDirError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::durable::{SyncEvent, SyncTrace};
 
     #[test]
     fn test_create_writes_schema_and_store() {
@@ -718,5 +807,154 @@ mod tests {
 
         assert_eq!(peek_commit_generation(dir.path()).unwrap(), expected);
         assert_eq!(expected, 1);
+    }
+
+    fn titled_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema.default_fields = vec!["title".to_string()];
+        schema
+    }
+
+    /// Issue #1587: `schema.toml` is replaced through a synced temporary
+    /// file, and the directory is synced after the rename.
+    #[test]
+    fn write_schema_syncs_the_temp_file_renames_it_then_syncs_the_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema_path = dir.path().join(SCHEMA_FILE);
+        let tmp_path = dir.path().join(SCHEMA_TMP_FILE);
+        std::fs::write(&schema_path, "old").unwrap();
+        let schema = titled_schema();
+
+        let trace = SyncTrace::start();
+        write_schema(dir.path(), &schema).unwrap();
+
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::File(tmp_path.clone()),
+                SyncEvent::Rename {
+                    from: tmp_path.clone(),
+                    to: schema_path.clone(),
+                },
+                SyncEvent::Dir(dir.path().to_path_buf()),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&schema_path).unwrap(),
+            schema.to_toml().unwrap()
+        );
+        assert!(!tmp_path.exists());
+    }
+
+    /// Issue #1587: a temporary file left by a crash, longer than the new
+    /// schema, is truncated before it is reused.
+    #[test]
+    fn write_schema_replaces_a_leftover_temp_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema = titled_schema();
+        let toml = schema.to_toml().unwrap();
+        let junk = "#".repeat(toml.len() + 100);
+        std::fs::write(dir.path().join(SCHEMA_TMP_FILE), junk).unwrap();
+
+        write_schema(dir.path(), &schema).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SCHEMA_FILE)).unwrap(),
+            toml
+        );
+    }
+
+    /// Issue #1587: a write that fails removes its temporary file and leaves
+    /// what was at `schema.toml` (here a directory, so the rename fails on
+    /// every platform).
+    #[test]
+    fn write_schema_that_fails_removes_its_temp_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(SCHEMA_FILE)).unwrap();
+
+        let err = write_schema(dir.path(), &titled_schema()).unwrap_err();
+
+        assert!(matches!(err, IndexDirError::Io { .. }), "got: {err}");
+        assert!(!dir.path().join(SCHEMA_TMP_FILE).exists());
+        assert!(dir.path().join(SCHEMA_FILE).is_dir());
+    }
+
+    /// Issue #1587: the replaced `schema.toml` keeps the permission bits the
+    /// old one had, not those a new file gets from the umask.
+    #[cfg(unix)]
+    #[test]
+    fn write_schema_keeps_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "").unwrap();
+        let new_file_mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+        let kept_mode = if new_file_mode == 0o600 { 0o640 } else { 0o600 };
+        assert_ne!(kept_mode, new_file_mode, "the test needs a distinct mode");
+
+        let schema_path = dir.path().join(SCHEMA_FILE);
+        std::fs::write(&schema_path, "old").unwrap();
+        std::fs::set_permissions(&schema_path, std::fs::Permissions::from_mode(kept_mode)).unwrap();
+
+        write_schema(dir.path(), &titled_schema()).unwrap();
+
+        let mode = std::fs::metadata(&schema_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, kept_mode);
+    }
+
+    /// Issue #1587: a create through `open_or_create` (the bindings' path)
+    /// syncs each directory it creates into its parent, then makes
+    /// `schema.toml` durable, and only then creates `store/` and syncs the
+    /// index directory again, so a crash never leaves `store/` alone.
+    #[test]
+    fn open_or_create_syncs_new_parents_then_schema_then_store() {
+        let root = tempfile::TempDir::new().unwrap();
+        let index_dir = root.path().join("new").join("idx");
+        let schema_path = index_dir.join(SCHEMA_FILE);
+        let tmp_path = index_dir.join(SCHEMA_TMP_FILE);
+
+        let trace = SyncTrace::start();
+        open_or_create(&index_dir, Some(titled_schema())).unwrap();
+
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Dir(root.path().to_path_buf()),
+                SyncEvent::Dir(root.path().join("new")),
+                SyncEvent::File(tmp_path.clone()),
+                SyncEvent::Rename {
+                    from: tmp_path,
+                    to: schema_path,
+                },
+                SyncEvent::Dir(index_dir.clone()),
+                SyncEvent::Dir(index_dir.clone()),
+            ]
+        );
+        assert!(index_dir.join(STORE_DIR).is_dir());
+    }
+
+    /// Issue #1587: a create whose sync of the index directory fails (after
+    /// `schema.toml` was renamed into place) removes what it created, so
+    /// the retry is not blocked.
+    #[test]
+    fn create_whose_directory_sync_fails_leaves_nothing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let index_dir = root.path().join("idx");
+
+        let trace = SyncTrace::start();
+        trace.fail_dir_sync(&index_dir);
+        let err = open_or_create(&index_dir, Some(titled_schema())).unwrap_err();
+        drop(trace);
+
+        assert!(matches!(err, IndexDirError::Io { .. }), "got: {err}");
+        assert!(!index_dir.exists(), "the failed create must be rolled back");
+
+        open_or_create(&index_dir, Some(titled_schema())).unwrap();
+        assert!(index_dir.join(SCHEMA_FILE).is_file());
     }
 }

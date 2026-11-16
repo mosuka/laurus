@@ -446,6 +446,47 @@ the manifest, so after such a build has written to the field, the check
 falls back to the segment files again. See
 [Editing an existing vector field](../laurus-cli/schema_format.md#editing-an-existing-vector-field).
 
+### Durability of the index directory
+
+Creating an index through `laurus-cli`, `laurus-server` or a binding writes
+the layout in a fixed order and makes each step durable before the next
+([#1587](https://github.com/mosuka/laurus/issues/1587)):
+
+1. The index directory and any missing parent are created, and each
+   directory created is synced into the directory that holds it.
+2. The schema is written to `schema.toml.tmp`, which is synced and renamed
+   over `schema.toml`, and the index directory is synced.
+3. `store/` is created, and the index directory is synced again.
+
+Once the create returns, `schema.toml`, `store/` and every directory it
+created survive a crash. A directory that existed before the create is not
+synced into its own parent. A crash during the create leaves nothing, empty
+directories, `schema.toml.tmp`, or `schema.toml` alone. The create can then
+be retried, and it reuses a leftover `schema.toml.tmp`. An index with
+`schema.toml` alone is recovered by `create index` and opened by every entry
+point, which creates the missing `store/`. A crash never leaves a `store/`
+without `schema.toml`, which a create refuses, or a partial `schema.toml`. A
+create that fails removes what it wrote.
+
+`laurus-cli` and `laurus-server` persist every schema change (`add_field`,
+`delete_field`, `update_field`, and
+`laurus train pq-codebook --update-schema`) the same way: a synced
+`schema.toml.tmp` is renamed over `schema.toml`, and the index directory is
+synced. A crash leaves the old
+schema or the new one, never a partial file. Because the file is replaced by
+a rename:
+
+- A symlinked `schema.toml` becomes a regular file.
+- On Unix, the new file keeps the old one's permission bits, and a read-only
+  `schema.toml` is replaced too, since a rename does not check the file's
+  own permissions.
+- If the sync of the index directory after the rename fails, the schema
+  change returns an error, but the new `schema.toml` is already in place.
+
+On Windows, `std` cannot open a directory to sync it, so only the file
+contents and the atomicity of the rename hold there, as for the storage's
+own directory syncs.
+
 ## Next Steps
 
 - How deletions are handled: [Deletions & Compaction](deletions.md)

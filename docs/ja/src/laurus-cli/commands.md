@@ -75,7 +75,7 @@ laurus --index-dir ./my_index create index --schema schema.toml \
 # Trained codebook 'embedding.pqcb' (m = 4, k = 256, sub_dim = 8, dimension = 32) from 300 vectors.
 ```
 
-> **注意:** `schema.toml` と `store/` の両方が存在する場合はエラーが返されます。再作成するにはインデックスディレクトリを削除してください。`schema.toml` のみ存在する場合（作成が中断された場合など）は、`--schema` なしで `create index` を実行すると既存スキーマからストレージが復旧されます。`store/` のみ存在する場合（`schema.toml` を手で削除した場合など）は、`store/` に以前のインデックスのドキュメントが残っている可能性があるため、エラーが返され、何も書き込まず何も削除しません。そのインデックスを開くには `schema.toml` を戻し、新しいインデックスを作るには `store/` を削除してください（Issue #1560）。このチェックより前の `create index` は、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。
+> **注意:** `schema.toml` と `store/` の両方が存在する場合はエラーが返されます。再作成するにはインデックスディレクトリを削除してください。`schema.toml` のみ存在する場合（作成が中断された場合など）は、`--schema` なしで `create index` を実行すると既存スキーマからストレージが復旧されます。`create index` は `store/` を作成する前に `schema.toml` を永続化するので、作成が中断されても残るのは多くて `schema.toml` だけで、`store/` だけが残ることはありません（[インデックスディレクトリの耐久性](../laurus/persistence.md#インデックスディレクトリの耐久性)を参照）。`store/` のみ存在する場合（`schema.toml` を手で削除した場合など）は、`store/` に以前のインデックスのドキュメントが残っている可能性があるため、エラーが返され、何も書き込まず何も削除しません。そのインデックスを開くには `schema.toml` を戻し、新しいインデックスを作るには `store/` を削除してください（Issue #1560）。このチェックより前の `create index` は、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。
 
 ### `create schema`
 
@@ -489,7 +489,7 @@ laurus train pq-codebook --field <FIELD> (--input <JSONL> | --from-index) \
 | `--from-index` | ファイルの代わりに、このインデックスにコミット済みのベクトルを直接サンプリングします（Issue #920）— JSONL エクスポート不要。`--input` と `--from-index` はどちらか一方のみ指定できます。注意: 既に PQ エンコード済みのフィールドではサンプルは有損の再構成ベクトルになります。想定フローはフィールドの PQ 有効化**前**にコミットしたベクトルからの学習です。 |
 | `--sample-size` | 先頭 N 件のみを使用（決定的: `--input` はファイル順、`--from-index` は doc_id 昇順）。省略時は全件を使用。代表的なベクトル数千件で十分です。 |
 | `--output` | ストレージ相対の codebook ファイル名。デフォルトはフィールドの `pq_codebook_path`、未設定なら `{field}.pqcb`。稼働中の codebook の横に v2 を学習する場合に使用。 |
-| `--update-schema` | フィールドの `pq_codebook_path` が学習済みファイルを指すよう `schema.toml` を書き換えます。 |
+| `--update-schema` | フィールドの `pq_codebook_path` が学習済みファイルを指すよう `schema.toml` を書き換えます。ほかのスキーマ変更と同じく、ファイルは原子的に置き換えます。 |
 
 commit が codebook を使うのは、スキーマの `pq_codebook_path` が
 そのファイルを指している場合のみです（[スキーマ形式](schema_format.md#product-quantizationhnsw-のみ)

@@ -62,6 +62,13 @@ let storage: Arc<dyn Storage> = Arc::new(FileStorage::new("/tmp/laurus-data", co
 | Speed | Moderate (disk I/O) |
 | Use case | General production use |
 
+When the directory does not exist, `FileStorage::new` creates it and any
+missing parent. On Unix, it syncs each directory it creates into the
+directory that holds it, so the storage root survives a crash once `new`
+returns ([#1587](https://github.com/mosuka/laurus/issues/1587)). It
+therefore fails when it cannot open such a parent, for example one with
+write but no read permission. Opening an existing directory syncs nothing.
+
 ### FileStorage with Memory Mapping
 
 `FileStorage` supports memory-mapped file access via the `use_mmap`

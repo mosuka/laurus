@@ -75,7 +75,7 @@ laurus --index-dir ./my_index create index --schema schema.toml \
 # Trained codebook 'embedding.pqcb' (m = 4, k = 256, sub_dim = 8, dimension = 32) from 300 vectors.
 ```
 
-> **Note:** If both `schema.toml` and `store/` already exist, an error is returned. Delete the index directory to recreate. If only `schema.toml` exists (e.g. after an interrupted creation), running `create index` without `--schema` recovers the index by creating the missing storage from the existing schema. If only `store/` exists (e.g. `schema.toml` was removed by hand), an error is returned and nothing is written or removed, since `store/` may hold the documents of an earlier index: restore `schema.toml` to open that index, or remove `store/` to create a new one (Issue #1560). Before this check, `create index` opened such a `store/` as the new index's storage and served its documents.
+> **Note:** If both `schema.toml` and `store/` already exist, an error is returned. Delete the index directory to recreate. If only `schema.toml` exists (e.g. after an interrupted creation), running `create index` without `--schema` recovers the index by creating the missing storage from the existing schema. Since `create index` makes `schema.toml` durable before it creates `store/`, an interrupted creation leaves at most `schema.toml`, never `store/` alone (see [Durability of the index directory](../laurus/persistence.md#durability-of-the-index-directory)). If only `store/` exists (e.g. `schema.toml` was removed by hand), an error is returned and nothing is written or removed, since `store/` may hold the documents of an earlier index: restore `schema.toml` to open that index, or remove `store/` to create a new one (Issue #1560). Before this check, `create index` opened such a `store/` as the new index's storage and served its documents.
 
 ### `create schema`
 
@@ -506,7 +506,7 @@ laurus train pq-codebook --field <FIELD> (--input <JSONL> | --from-index) \
 | `--from-index` | Sample the vectors already committed to this index instead of reading a file (Issue #920) — no JSONL export needed. Exactly one of `--input` and `--from-index` must be given. Note: on a field that is already PQ-encoded, the sampled vectors are lossy reconstructions; the intended flow is to train from vectors committed **before** enabling PQ on the field. |
 | `--sample-size` | Use only the first N vectors (deterministic: file order for `--input`, ascending doc_id for `--from-index`). Omit to use all of them; thousands of representative vectors are enough. |
 | `--output` | Storage-relative codebook file name. Defaults to the field's configured `pq_codebook_path`, else `{field}.pqcb`. Use to train a v2 codebook alongside a live one. |
-| `--update-schema` | Rewrite `schema.toml` so the field's `pq_codebook_path` names the trained file. |
+| `--update-schema` | Rewrite `schema.toml` so the field's `pq_codebook_path` names the trained file. The file is replaced atomically, as on any schema change. |
 
 Commits use the codebook only when the schema's `pq_codebook_path`
 names it (see [Schema Format](schema_format.md#product-quantization-hnsw-only)) —

@@ -51,6 +51,9 @@ use crate::error::{LaurusError, Result};
 pub mod checksum;
 pub mod column;
 #[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub mod durable;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod file;
 pub mod manifest;
 pub mod memory;
