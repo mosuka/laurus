@@ -367,6 +367,30 @@ impl SegmentManager {
             .map_or(Ok(()), Err)
     }
 
+    /// Save `next` as the manifest and make it the in-memory list, only
+    /// once the save fully succeeds (Issue #1583).
+    ///
+    /// The in-memory list mirrors the last manifest saved in full, as the
+    /// lexical manifest's does: a failed save leaves it unchanged, so a
+    /// caller that retries the mutation (a commit retried from a retained
+    /// writer) applies it once. When only the sync after the rename fails,
+    /// the published manifest is ahead of memory until the next save
+    /// rewrites it from memory. The WAL checkpoint the manifest carries is
+    /// published only by a commit that succeeded (`persist_deletions`), so
+    /// a save in between never covers the records of the failed mutation.
+    ///
+    /// Called with the `segments` write lock held (see
+    /// [`Self::save_state_locked`]).
+    fn publish_locked(
+        &self,
+        segments: &mut Vec<ManagedSegmentInfo>,
+        next: Vec<ManagedSegmentInfo>,
+    ) -> Result<()> {
+        self.save_state_locked(&next)?;
+        *segments = next;
+        Ok(())
+    }
+
     /// [`Self::save_state_locked`], telling a save that published nothing
     /// apart from one that published the manifest but failed to sync it
     /// (Issue #1542, see
@@ -492,9 +516,15 @@ impl SegmentManager {
     /// next generation after the currently registered maximum — both feed
     /// the metadata-driven merge policy.
     ///
+    /// The segment joins the in-memory list only once the manifest that
+    /// lists it is saved in full, so a commit retried after a failed save
+    /// registers it once (Issue #1583).
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the manifest fails.
+    /// Returns an error if persisting the manifest fails. The in-memory
+    /// list is then unchanged; see [`Self::publish_locked`] for a save that
+    /// published the manifest but failed to sync it.
     pub fn add_segment(&self, mut info: ManagedSegmentInfo) -> Result<()> {
         if info.size_bytes == 0 {
             info.size_bytes = self.measure_segment_size(&info.segment_id);
@@ -503,8 +533,9 @@ impl SegmentManager {
         if info.generation == 0 {
             info.generation = segments.iter().map(|s| s.generation).max().unwrap_or(0) + 1;
         }
-        segments.push(info);
-        self.save_state_locked(&segments)
+        let mut next = segments.clone();
+        next.push(info);
+        self.publish_locked(&mut segments, next)
     }
 
     /// Sum the on-storage sizes of a segment's primary file and sidecars.
@@ -522,11 +553,21 @@ impl SegmentManager {
     }
 
     /// Remove a segment.
+    ///
+    /// The segment leaves the in-memory list only once the manifest without
+    /// it is saved in full (Issue #1583). Removing an id that is not listed
+    /// does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the manifest fails. The in-memory
+    /// list then still lists the segment.
     pub fn remove_segment(&self, segment_id: &str) -> Result<()> {
         let mut segments = self.segments.write();
         if let Some(pos) = segments.iter().position(|s| s.segment_id == segment_id) {
-            segments.remove(pos);
-            self.save_state_locked(&segments)
+            let mut next = segments.clone();
+            next.remove(pos);
+            self.publish_locked(&mut segments, next)
         } else {
             Ok(())
         }
@@ -553,15 +594,22 @@ impl SegmentManager {
     }
 
     /// Update a segment info.
+    ///
+    /// The new info replaces the listed one in memory only once the
+    /// manifest with it is saved in full (Issue #1583). An id that is not
+    /// listed changes nothing, but the manifest is still saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the manifest fails. The in-memory
+    /// list then keeps the previous info.
     pub fn update_segment(&self, info: ManagedSegmentInfo) -> Result<()> {
         let mut segments = self.segments.write();
-        if let Some(idx) = segments
-            .iter()
-            .position(|s| s.segment_id == info.segment_id)
-        {
-            segments[idx] = info;
+        let mut next = segments.clone();
+        if let Some(idx) = next.iter().position(|s| s.segment_id == info.segment_id) {
+            next[idx] = info;
         }
-        self.save_state_locked(&segments)
+        self.publish_locked(&mut segments, next)
     }
 
     /// Get segment information.
@@ -1512,6 +1560,145 @@ mod tests {
             for name in segment_files(id) {
                 assert!(inner.file_exists(&name), "{name} must stay");
             }
+        }
+    }
+
+    /// A manager over a storage that can fail its manifest saves, with
+    /// `segment_000000` registered, and the label of the failure point
+    /// `fail_rename` selects: the rename (nothing published) or the sync
+    /// after it (published).
+    fn manager_with_failing_saves(
+        fail_rename: bool,
+    ) -> (
+        Arc<dyn Storage>,
+        Arc<crate::storage::manifest::test_support::FailSyncAfterRename>,
+        SegmentManager,
+        &'static str,
+    ) {
+        use crate::storage::manifest::test_support::FailSyncAfterRename;
+
+        let inner: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), MANIFEST_FILE));
+        failing
+            .fail_rename
+            .store(fail_rename, std::sync::atomic::Ordering::SeqCst);
+        let manager = SegmentManager::new(
+            SegmentManagerConfig::default(),
+            failing.clone(),
+            TEST_LAYOUT,
+        )
+        .unwrap();
+        manager
+            .add_segment(create_info("segment_000000", 10))
+            .unwrap();
+        let case = if fail_rename {
+            "rename failed"
+        } else {
+            "sync failed"
+        };
+        (inner, failing, manager, case)
+    }
+
+    /// Run `mutation` with one injected manifest save failure, and check
+    /// that it failed on it.
+    fn fail_once(
+        failing: &crate::storage::manifest::test_support::FailSyncAfterRename,
+        case: &str,
+        mutation: impl FnOnce() -> Result<()>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        failing.armed.store(true, Ordering::SeqCst);
+        let result = mutation();
+        failing.armed.store(false, Ordering::SeqCst);
+        assert!(result.is_err(), "{case}: the save must fail");
+        assert_eq!(
+            failing.failures.load(Ordering::SeqCst),
+            1,
+            "{case}: the injected failure must be hit"
+        );
+    }
+
+    /// Issue #1583: an `add_segment` whose manifest save fails leaves the
+    /// in-memory list unchanged, so calling it again, as a commit retried
+    /// from its writer does, lists the segment once.
+    #[test]
+    fn add_segment_whose_save_fails_leaves_the_list_unchanged() {
+        for fail_rename in [true, false] {
+            let (inner, failing, manager, case) = manager_with_failing_saves(fail_rename);
+
+            fail_once(&failing, case, || {
+                manager.add_segment(create_info("segment_000001", 20))
+            });
+            assert_eq!(segment_ids(&manager), ["segment_000000"], "{case}");
+
+            manager
+                .add_segment(create_info("segment_000001", 20))
+                .unwrap();
+            assert_eq!(
+                segment_ids(&manager),
+                ["segment_000000", "segment_000001"],
+                "{case}"
+            );
+            let reopened =
+                SegmentManager::new(SegmentManagerConfig::default(), inner, TEST_LAYOUT).unwrap();
+            assert_eq!(
+                segment_ids(&reopened),
+                ["segment_000000", "segment_000001"],
+                "{case}"
+            );
+        }
+    }
+
+    /// Issue #1583: a `remove_segment` whose manifest save fails keeps the
+    /// segment in memory, so calling it again removes it and saves.
+    #[test]
+    fn remove_segment_whose_save_fails_keeps_the_segment() {
+        for fail_rename in [true, false] {
+            let (inner, failing, manager, case) = manager_with_failing_saves(fail_rename);
+
+            fail_once(&failing, case, || manager.remove_segment("segment_000000"));
+            assert_eq!(segment_ids(&manager), ["segment_000000"], "{case}");
+
+            manager.remove_segment("segment_000000").unwrap();
+            assert!(segment_ids(&manager).is_empty(), "{case}");
+            let reopened =
+                SegmentManager::new(SegmentManagerConfig::default(), inner, TEST_LAYOUT).unwrap();
+            assert!(segment_ids(&reopened).is_empty(), "{case}");
+        }
+    }
+
+    /// Issue #1583: an `update_segment` whose manifest save fails keeps the
+    /// previous info in memory.
+    #[test]
+    fn update_segment_whose_save_fails_keeps_the_previous_entry() {
+        for fail_rename in [true, false] {
+            let (inner, failing, manager, case) = manager_with_failing_saves(fail_rename);
+
+            fail_once(&failing, case, || {
+                manager.update_segment(create_info("segment_000000", 99))
+            });
+            assert_eq!(
+                manager.get_segment("segment_000000").unwrap().vector_count,
+                10,
+                "{case}"
+            );
+
+            manager
+                .update_segment(create_info("segment_000000", 99))
+                .unwrap();
+            assert_eq!(
+                manager.get_segment("segment_000000").unwrap().vector_count,
+                99,
+                "{case}"
+            );
+            let reopened =
+                SegmentManager::new(SegmentManagerConfig::default(), inner, TEST_LAYOUT).unwrap();
+            assert_eq!(
+                reopened.get_segment("segment_000000").unwrap().vector_count,
+                99,
+                "{case}"
+            );
         }
     }
 }
