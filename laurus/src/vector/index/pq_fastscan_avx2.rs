@@ -31,9 +31,11 @@ use crate::vector::core::distance_pq_fastscan::apply_metric;
 use crate::vector::core::distance_pq_fastscan::{
     PqFastScanQuery, distance_pq_fastscan_u8_global_scalar,
 };
-use crate::vector::index::pq_fastscan_storage::BLOCK_SIZE;
-#[cfg(target_arch = "x86_64")]
-use crate::vector::index::pq_fastscan_storage::BYTES_PER_SUB_PER_BLOCK;
+use crate::vector::index::pq_fastscan_storage::{BLOCK_SIZE, BYTES_PER_SUB_PER_BLOCK};
+
+/// Bytes of [`PqFastScanQuery::lut4_global`] per sub-quantiser: one `u8`
+/// entry for each of the K = 16 centroids.
+const LUT_BYTES_PER_SUB: usize = 16;
 
 /// Returns `true` when the current x86_64 CPU supports AVX2.
 ///
@@ -78,10 +80,12 @@ pub fn is_avx2_supported() -> bool {
 /// Caller must guarantee:
 /// - The CPU supports AVX2. Use [`is_avx2_supported`] before calling.
 /// - `packed_block.len() >= query.params.m as usize * BYTES_PER_SUB_PER_BLOCK`.
-/// - `query.lut4_global.len() == query.params.m as usize * 16`.
+/// - `query.lut4_global.len() >= query.params.m as usize * 16`.
 /// - `query.params.m as usize <= 64` so the u16 accumulator cannot
-///   overflow (the dispatcher [`distance_pq_fastscan_block`] enforces
-///   this by routing larger `M` to the scalar fallback).
+///   overflow.
+///
+/// The safe dispatcher [`distance_pq_fastscan_block`] checks the two
+/// lengths (Issue #1578) and routes larger `M` to the scalar fallback.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn distance_pq_fastscan_block_avx2(
@@ -194,29 +198,50 @@ pub fn distance_pq_fastscan_block_scalar(
 /// The `M ≤ 64` guard keeps the u16 accumulator from overflowing
 /// (`255 × 64 = 16320 < 65535`); larger `M` always falls through to
 /// the scalar path regardless of architecture.
+///
+/// # Panics
+///
+/// If `packed_block` is shorter than one block for `query.params.m`
+/// sub-quantisers (`m * BYTES_PER_SUB_PER_BLOCK` bytes), or
+/// `query.lut4_global` is shorter than `m * 16` bytes, on every path
+/// (Issue #1578). The SIMD kernels read that many bytes from each, and
+/// the query's fields are public, so the lengths
+/// [`PqFastScanQuery::prepare`] gives them do not bind a caller.
 pub fn distance_pq_fastscan_block(
     metric: DistanceMetric,
     query: &PqFastScanQuery,
     packed_block: &[u8],
 ) -> [f32; BLOCK_SIZE] {
+    let m = query.params.m as usize;
+    let block_len = m * BYTES_PER_SUB_PER_BLOCK;
+    let lut_len = m * LUT_BYTES_PER_SUB;
+    assert!(
+        packed_block.len() >= block_len,
+        "FastScan block of {} bytes for {m} sub-quantisers (needs {block_len})",
+        packed_block.len()
+    );
+    assert!(
+        query.lut4_global.len() >= lut_len,
+        "FastScan LUT of {} bytes for {m} sub-quantisers (needs {lut_len})",
+        query.lut4_global.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_avx2_supported() && (query.params.m as usize) <= 64 {
-            // SAFETY: AVX2 is detected at runtime, and the M ≤ 64
-            // guard ensures the u16 accumulator cannot overflow. The
-            // buffer lengths are validated by
-            // `PqFastScanQuery::prepare()` and the pool layout.
+        if is_avx2_supported() && m <= 64 {
+            // SAFETY: AVX2 is detected at runtime, the M ≤ 64 guard
+            // ensures the u16 accumulator cannot overflow, and the
+            // buffer lengths were checked above.
             return unsafe { distance_pq_fastscan_block_avx2(metric, query, packed_block) };
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         use crate::vector::index::pq_fastscan_neon::distance_pq_fastscan_block_neon;
-        if (query.params.m as usize) <= 64 {
+        if m <= 64 {
             // SAFETY: NEON is part of the ARMv8 baseline (mandatory
             // on aarch64), the M ≤ 64 guard ensures the u16
-            // accumulator cannot overflow, and the buffer lengths are
-            // validated upstream.
+            // accumulator cannot overflow, and the buffer lengths were
+            // checked above.
             return unsafe { distance_pq_fastscan_block_neon(metric, query, packed_block) };
         }
     }
@@ -287,6 +312,48 @@ mod tests {
         let scalar = distance_pq_fastscan_block_scalar(DistanceMetric::Euclidean, &query, &block);
         let dispatch = distance_pq_fastscan_block(DistanceMetric::Euclidean, &query, &block);
         assert_eq!(scalar, dispatch);
+    }
+
+    /// Issue #1578: the safe dispatcher rejects a `packed_block` that is
+    /// shorter than `m` sub-quantisers need, before the AVX2 (x86_64) or
+    /// NEON (aarch64) kernel reads it. The block is the front of the
+    /// pool's buffer, one byte short, so without the check the kernel's
+    /// read stays inside that buffer and the test fails by not panicking.
+    #[test]
+    #[should_panic(expected = "FastScan block of 127 bytes for 8 sub-quantisers (needs 128)")]
+    fn dispatch_panics_on_a_packed_block_shorter_than_its_sub_quantisers() {
+        let (params, codebook, vectors) = train_small_codebook(8, 2, 200);
+        let pool = build_pool(&vectors, params, &codebook);
+        let query = PqFastScanQuery::prepare(&vectors[0].data, params, &codebook).unwrap();
+        let stride = pool.block_stride();
+        assert!(
+            pool.packed.len() > stride,
+            "the pool must hold more than one block"
+        );
+
+        distance_pq_fastscan_block(
+            DistanceMetric::Euclidean,
+            &query,
+            &pool.packed[..stride - 1],
+        );
+    }
+
+    /// Issue #1578: the safe dispatcher rejects a query whose
+    /// `lut4_global` is shorter than its `params.m` needs: the query's
+    /// fields are public, so `prepare`'s lengths do not bind a caller.
+    /// The LUT is truncated in place, keeping its allocation, so without
+    /// the check the kernel's read stays inside it and the test fails by
+    /// not panicking.
+    #[test]
+    #[should_panic(expected = "FastScan LUT of 64 bytes for 8 sub-quantisers (needs 128)")]
+    fn dispatch_panics_on_a_query_lut_shorter_than_its_sub_quantisers() {
+        let (params, codebook, vectors) = train_small_codebook(8, 2, 200);
+        let pool = build_pool(&vectors, params, &codebook);
+        let mut query = PqFastScanQuery::prepare(&vectors[0].data, params, &codebook).unwrap();
+        query.lut4_global.truncate(4 * 16);
+        let block = block_slice(&pool, 0);
+
+        distance_pq_fastscan_block(DistanceMetric::Euclidean, &query, &block);
     }
 
     #[cfg(target_arch = "x86_64")]
