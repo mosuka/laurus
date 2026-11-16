@@ -57,7 +57,7 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::error::{LaurusError, Result};
 use crate::storage::{
-    LockManager, Storage, StorageError, StorageInput, StorageLock, StorageOutput,
+    LockManager, Storage, StorageError, StorageInput, StorageLock, StorageOutput, durable,
 };
 
 /// Configuration specific to file-based storage.
@@ -209,12 +209,23 @@ pub struct FileStorage {
 
 impl FileStorage {
     /// Create a new file storage in the given directory.
+    ///
+    /// A missing directory is created together with any missing parent, and
+    /// each directory created is made durable by syncing the directory that
+    /// holds it (on Unix; Issue #1587), so a crash after this returns does not
+    /// lose the storage root and, with it, what [`Storage::sync`] made
+    /// durable inside it. Opening an existing directory syncs nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a directory cannot be created or synced, or if
+    /// `directory` exists but is not a directory.
     pub fn new<P: AsRef<Path>>(directory: P, config: FileStorageConfig) -> Result<Self> {
         let directory = directory.as_ref().to_path_buf();
 
         // Create directory if it doesn't exist
         if !directory.exists() {
-            std::fs::create_dir_all(&directory)
+            durable::create_dir_all(&directory)
                 .map_err(|e| LaurusError::storage(format!("Failed to create directory: {e}")))?;
         }
 
@@ -275,20 +286,11 @@ impl FileStorage {
             }
         }
 
-        // Fsync the directory itself (Unix only).
-        // Windows does not support opening directories as files for fsync.
-        #[cfg(unix)]
-        {
-            let dir_file = File::open(dir).map_err(|e| {
-                LaurusError::storage(format!(
-                    "Failed to open directory {:?} for sync: {}",
-                    dir, e
-                ))
-            })?;
-            dir_file.sync_all().map_err(|e| {
-                LaurusError::storage(format!("Failed to sync directory {:?}: {}", dir, e))
-            })?;
-        }
+        // Fsync the directory itself (a no-op on Windows, which does not
+        // support opening directories as files for fsync).
+        durable::sync_dir(dir).map_err(|e| {
+            LaurusError::storage(format!("Failed to sync directory {:?}: {}", dir, e))
+        })?;
 
         Ok(())
     }
@@ -1178,6 +1180,38 @@ mod tests {
     fn test_file_storage_creation() {
         let (_temp_dir, storage) = create_test_storage();
         assert!(!storage.closed);
+    }
+
+    /// Issue #1587: a storage root created by `new`, and each missing parent,
+    /// is synced into the directory that holds it, top-down.
+    #[test]
+    fn new_syncs_the_parent_of_each_directory_it_creates() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("a").join("b").join("store");
+
+        let trace = durable::SyncTrace::start();
+        FileStorage::new(&root, FileStorageConfig::new(&root)).unwrap();
+
+        assert!(root.is_dir());
+        assert_eq!(
+            trace.events(),
+            vec![
+                durable::SyncEvent::Dir(temp_dir.path().to_path_buf()),
+                durable::SyncEvent::Dir(temp_dir.path().join("a")),
+                durable::SyncEvent::Dir(temp_dir.path().join("a").join("b")),
+            ]
+        );
+    }
+
+    /// Issue #1587: opening an existing storage root syncs nothing.
+    #[test]
+    fn new_over_an_existing_directory_syncs_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let trace = durable::SyncTrace::start();
+        FileStorage::new(temp_dir.path(), FileStorageConfig::new(temp_dir.path())).unwrap();
+
+        assert_eq!(trace.events(), Vec::new());
     }
 
     /// Issue #1086: `Storage::lock_manager()` must actually be wired to

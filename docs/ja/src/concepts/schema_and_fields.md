@@ -696,8 +696,8 @@ let outcome = engine.update_field(
 
 `Engine::builder().persist_schema_with(hook)` でスキーマ永続化フックを設定していれば、
 `add_field`/`delete_field`/`update_field` は返却前に自らそのフックを呼び出してスキーマを永続化します
-（`laurus-cli` と `laurus-server` はどちらもこのフックで `schema.toml` への書き出しを
-行っています）。フックを設定していない場合は、従来どおり返却された `Schema` を
+（`laurus-cli` と `laurus-server` はどちらもこのフックで `schema.toml` を原子的かつ
+永続的に置き換えています。[インデックスディレクトリの耐久性](../laurus/persistence.md#インデックスディレクトリの耐久性)を参照）。フックを設定していない場合は、従来どおり返却された `Schema` を
 呼び出し側で永続化する必要があります（例: `schema.toml` への書き出し）。
 
 ## スキーマ設計のヒント

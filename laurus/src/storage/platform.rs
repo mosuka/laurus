@@ -19,6 +19,6 @@ pub mod unix;
 pub mod windows;
 
 #[cfg(unix)]
-pub use unix::default_use_mmap;
+pub use unix::{copy_permissions, default_use_mmap, sync_dir};
 #[cfg(windows)]
-pub use windows::default_use_mmap;
+pub use windows::{copy_permissions, default_use_mmap, sync_dir};

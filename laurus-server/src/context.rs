@@ -36,6 +36,11 @@ fn schema_persist_hook(data_dir: &Path) -> laurus::SchemaPersistHook {
 ///
 /// The function persists the schema as `schema.toml`, initialises file-based
 /// storage under the `store/` subdirectory, and returns a ready-to-use [`Engine`].
+/// Both are written by [`laurus::index_dir::create_schema_and_store`]: the
+/// directories it creates, then `schema.toml`, then `store/`, each synced
+/// before the next, so once this returns they survive a crash, and a crash
+/// before that leaves at most `schema.toml`, which start-up opens (Issue
+/// #1587).
 ///
 /// # Arguments
 ///
@@ -50,11 +55,11 @@ fn schema_persist_hook(data_dir: &Path) -> laurus::SchemaPersistHook {
 ///
 /// # Errors
 ///
-/// Returns an error if an index already exists at `data_dir`, if directory
-/// creation fails, or if the engine cannot be initialised. A failure in
-/// storage/engine initialisation leaves `data_dir` in the state it was in
-/// before this call -- nothing is left behind to block a retry (Issue
-/// #1308).
+/// Returns an error if an index already exists at `data_dir`, if the
+/// directory, `schema.toml` or `store/` cannot be created or synced, or if
+/// the engine cannot be initialised. Any of these failures leaves
+/// `data_dir` in the state it was in before this call -- nothing is left
+/// behind to block a retry (Issue #1308, #1587).
 ///
 /// A `store/` left without `schema.toml` is not checked here: the caller,
 /// `IndexService::create_index`, refuses it first with
@@ -76,22 +81,15 @@ pub async fn create_index(
 
     let rollback = CreateRollback::snapshot(data_dir);
 
-    // Ensure the data directory exists.
-    std::fs::create_dir_all(data_dir)
+    // Create the data directory, schema.toml and store/, durably and in that
+    // order (Issue #1587). A failure there is rolled back by the call itself.
+    let storage = laurus::index_dir::create_schema_and_store(data_dir, schema)
         .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
 
-    // Serialize the schema to TOML and persist it.
-    let schema_toml =
-        toml::to_string_pretty(schema).context("Failed to serialize schema to TOML")?;
-    std::fs::write(&schema_path, &schema_toml).context("Failed to write schema file")?;
-
-    // Initialize storage and create the engine. A failure here must not
-    // leave schema.toml/store/ behind to block a retry (Issue #1308), so
-    // undo exactly what this call added above.
-    let store_path = data_dir.join(STORE_DIR);
-    let storage_config = StorageConfig::File(FileStorageConfig::new(&store_path));
+    // Create the engine. A failure here must not leave schema.toml/store/
+    // behind to block a retry (Issue #1308), so undo exactly what this call
+    // added above.
     let build_result: anyhow::Result<Engine> = async {
-        let storage = StorageFactory::create(storage_config)?;
         let engine = Engine::builder(storage, schema.clone())
             .wal_sync_policy(wal_policy)
             .commit_policy(commit_policy)
@@ -172,8 +170,11 @@ pub async fn open_index(
 
 /// Persist the current schema back to the data directory.
 ///
-/// Serializes the given schema as TOML and writes it to `schema.toml`
-/// inside `data_dir`, overwriting the existing file.
+/// Serializes the given schema as TOML and replaces `schema.toml` inside
+/// `data_dir` atomically and durably with
+/// [`laurus::index_dir::write_schema`] (Issue #1587), so a crash during a
+/// schema change leaves either the old schema or the new one, never a
+/// partial file the server cannot start with.
 ///
 /// # Arguments
 ///
@@ -182,13 +183,9 @@ pub async fn open_index(
 ///
 /// # Errors
 ///
-/// Returns an error if serialization or file write fails.
+/// Returns an error if serialization, the write or a sync fails.
 pub fn save_schema(data_dir: &Path, schema: &Schema) -> anyhow::Result<()> {
-    let schema_toml =
-        toml::to_string_pretty(schema).context("Failed to serialize schema to TOML")?;
-    let schema_dest = data_dir.join(SCHEMA_FILE);
-    std::fs::write(&schema_dest, &schema_toml).context("Failed to write schema file")?;
-    Ok(())
+    laurus::index_dir::write_schema(data_dir, schema).context("Failed to write schema file")
 }
 
 /// Read the schema from the data directory without opening the full engine.
@@ -218,6 +215,7 @@ pub fn read_schema(data_dir: &Path) -> anyhow::Result<Schema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use laurus::storage::durable::{SyncEvent, SyncTrace};
 
     /// Issue #1308: a malformed regex parses fine as TOML (it's just a
     /// string) but fails when the analyzer is resolved during the engine
@@ -346,5 +344,91 @@ mod tests {
             0,
             "an explicit commit still truncates the WAL"
         );
+    }
+
+    /// The recorded events outside `store/`, which the storage and the
+    /// engine sync on their own.
+    fn outside_store(events: Vec<SyncEvent>, data_dir: &Path) -> Vec<SyncEvent> {
+        let store = data_dir.join(STORE_DIR);
+        events
+            .into_iter()
+            .filter(|event| !event.path().starts_with(&store))
+            .collect()
+    }
+
+    /// Issue #1587: `CreateIndex` syncs each directory it creates into its
+    /// parent, then makes `schema.toml` durable, and only then creates
+    /// `store/` and syncs the data directory again.
+    #[tokio::test]
+    async fn create_index_syncs_new_parents_then_schema_then_store() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("new").join("idx");
+        let schema_path = data_dir.join(SCHEMA_FILE);
+        let tmp_path = data_dir.join(laurus::index_dir::SCHEMA_TMP_FILE);
+
+        let trace = SyncTrace::start();
+        create_index(
+            &data_dir,
+            &Schema::new(),
+            WalSyncPolicy::default(),
+            CommitPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outside_store(trace.events(), &data_dir),
+            vec![
+                SyncEvent::Dir(root.path().to_path_buf()),
+                SyncEvent::Dir(root.path().join("new")),
+                SyncEvent::File(tmp_path.clone()),
+                SyncEvent::Rename {
+                    from: tmp_path,
+                    to: schema_path,
+                },
+                SyncEvent::Dir(data_dir.clone()),
+                SyncEvent::Dir(data_dir.clone()),
+            ]
+        );
+    }
+
+    /// Issue #1587: a schema change replaces `schema.toml` through a synced
+    /// temporary file and syncs the data directory, instead of rewriting the
+    /// file in place.
+    #[tokio::test]
+    async fn schema_change_replaces_schema_toml_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("idx");
+        let engine = create_index(
+            &data_dir,
+            &Schema::new(),
+            WalSyncPolicy::default(),
+            CommitPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let tmp_path = data_dir.join(laurus::index_dir::SCHEMA_TMP_FILE);
+
+        let trace = SyncTrace::start();
+        engine
+            .add_field(
+                "title",
+                laurus::FieldOption::Text(laurus::TextOption::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outside_store(trace.events(), &data_dir),
+            vec![
+                SyncEvent::File(tmp_path.clone()),
+                SyncEvent::Rename {
+                    from: tmp_path,
+                    to: data_dir.join(SCHEMA_FILE),
+                },
+                SyncEvent::Dir(data_dir.clone()),
+            ]
+        );
+        assert!(read_schema(&data_dir).unwrap().fields.contains_key("title"));
     }
 }

@@ -725,7 +725,9 @@ If a schema-persist hook was configured via
 `Engine::builder().persist_schema_with(hook)`, `add_field`/`delete_field`/
 `update_field` call it themselves before returning, persisting the schema
 on the caller's behalf (both `laurus-cli` and `laurus-server` configure
-this hook to write `schema.toml`). Otherwise, as before, the returned
+this hook to replace `schema.toml` atomically and durably; see
+[Durability of the index directory](../laurus/persistence.md#durability-of-the-index-directory)).
+Otherwise, as before, the returned
 `Schema` should be persisted (e.g., to `schema.toml`) by the caller.
 
 ### Removing a Field
