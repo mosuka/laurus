@@ -50,6 +50,7 @@ fn schema_persist_hook(index_dir: &Path) -> laurus::SchemaPersistHook {
 /// Returns an error if:
 /// - A complete index already exists in `index_dir` (both `schema.toml` and
 ///   `store/` are present).
+/// - `index_dir` has a `store/` but no `schema.toml` (Issue #1560).
 /// - The schema file cannot be read or parsed.
 /// - The index directory cannot be created.
 /// - The engine or storage initialisation fails.
@@ -82,6 +83,7 @@ pub async fn create_index(index_dir: &Path, schema_path: &Path) -> Result<()> {
 /// Returns an error if:
 /// - A complete index already exists in `index_dir` (both `schema.toml` and
 ///   `store/` are present).
+/// - `index_dir` has a `store/` but no `schema.toml` (Issue #1560).
 /// - The index directory cannot be created.
 /// - The engine or storage initialisation fails.
 pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Result<()> {
@@ -95,9 +97,15 @@ pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Resul
 /// | `schema.toml` | `store/` | Action |
 /// |:---:|:---:|:---|
 /// | absent | absent | Write schema, create storage |
-/// | absent | present | Write schema, create storage (stale store overwritten) |
+/// | absent | present | Error — leftover store (see below) |
 /// | present | absent | **Use existing schema**, create storage (recovery) |
 /// | present | present | Error — index already exists |
+///
+/// A `store/` without `schema.toml` is refused rather than opened as the
+/// new index's storage, which would serve its documents (Issue #1560). It
+/// may hold the documents of an earlier index, so it is not removed either:
+/// restoring `schema.toml` opens that index again, and removing `store/`
+/// lets the create go ahead.
 ///
 /// When `schema.toml` already exists but `store/` does not, the function
 /// ignores the `schema` argument and reads the existing file instead so that
@@ -135,6 +143,7 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
             index_dir.display()
         );
     }
+    laurus::index_dir::check_no_leftover_store(index_dir)?;
 
     let rollback = CreateRollback::snapshot(index_dir);
 
@@ -643,5 +652,105 @@ mod tests {
 
         let engine = open_index(dir.path()).await.unwrap();
         assert!(engine.schema().fields.contains_key("_secret"));
+    }
+
+    // --- Issue #1560: a store/ left without schema.toml ---
+
+    /// A schema with a `title` text field and, when `with_vector`, a Flat
+    /// vector field `vec` of dimension 4.
+    fn leftover_store_schema(with_vector: bool) -> Schema {
+        let builder = Schema::builder().add_field(
+            "title",
+            laurus::FieldOption::Text(laurus::TextOption::default()),
+        );
+        if with_vector {
+            builder.add_field(
+                "vec",
+                laurus::FieldOption::Flat(laurus::vector::FlatOption {
+                    dimension: 4,
+                    distance: laurus::DistanceMetric::Cosine,
+                    ..laurus::vector::FlatOption::default()
+                }),
+            )
+        } else {
+            builder
+        }
+        .build()
+    }
+
+    /// Create an index at `index_dir`, put and commit the document `old`,
+    /// then remove `schema.toml` by hand. Returns the removed file.
+    async fn leave_a_store_without_schema(index_dir: &Path, with_vector: bool) -> String {
+        create_index_from_schema(index_dir, leftover_store_schema(with_vector))
+            .await
+            .unwrap();
+        {
+            let engine = open_index(index_dir).await.unwrap();
+            let mut document = laurus::Document::builder().add_text("title", "hello");
+            if with_vector {
+                document = document.add_vector("vec", vec![1.0, 0.0, 0.0, 0.0]);
+            }
+            engine.put_document("old", document.build()).await.unwrap();
+            engine.commit().await.unwrap();
+        }
+        let schema_toml = std::fs::read_to_string(index_dir.join(SCHEMA_FILE)).unwrap();
+        std::fs::remove_file(index_dir.join(SCHEMA_FILE)).unwrap();
+        schema_toml
+    }
+
+    /// `create index` over a leftover store/ is refused and writes nothing;
+    /// the store keeps its document (restoring `schema.toml` opens it), and
+    /// removing the store, as the error says, lets the create go ahead with
+    /// an empty index.
+    async fn assert_create_over_leftover_store_is_refused(with_vector: bool) {
+        let case = if with_vector { "vector" } else { "text only" };
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("idx");
+        let schema_toml = leave_a_store_without_schema(&index_dir, with_vector).await;
+
+        let result = create_index_from_schema(&index_dir, leftover_store_schema(with_vector)).await;
+        let msg = match result {
+            Ok(()) => panic!("{case}: create index over a leftover store/ must be refused"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(
+            msg.contains("has no schema.toml but has a store/"),
+            "{case}: got: {msg}"
+        );
+        assert!(
+            !index_dir.join(SCHEMA_FILE).exists(),
+            "{case}: a refused create must write nothing"
+        );
+
+        std::fs::write(index_dir.join(SCHEMA_FILE), schema_toml).unwrap();
+        {
+            let engine = open_index(&index_dir).await.unwrap();
+            assert_eq!(
+                engine.get_documents("old").await.unwrap().len(),
+                1,
+                "{case}: the leftover store/ must keep its document"
+            );
+        }
+
+        std::fs::remove_file(index_dir.join(SCHEMA_FILE)).unwrap();
+        std::fs::remove_dir_all(index_dir.join(STORE_DIR)).unwrap();
+        create_index_from_schema(&index_dir, leftover_store_schema(with_vector))
+            .await
+            .unwrap();
+        let engine = open_index(&index_dir).await.unwrap();
+        assert!(
+            engine.get_documents("old").await.unwrap().is_empty(),
+            "{case}: a create after removing store/ must start empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_over_a_leftover_text_only_store_is_refused() {
+        assert_create_over_leftover_store_is_refused(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_index_over_a_leftover_store_with_a_vector_field_is_refused() {
+        assert_create_over_leftover_store_is_refused(true).await;
     }
 }

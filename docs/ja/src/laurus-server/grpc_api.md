@@ -35,7 +35,7 @@ rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
 
 ### `CreateIndex`
 
-指定されたスキーマで新しいインデックスを作成します。インデックスが既に開いている場合は `ALREADY_EXISTS` エラーを返します。
+指定されたスキーマで新しいインデックスを作成します。インデックスが既に開いている場合は `ALREADY_EXISTS` エラーを返します。データディレクトリに `store/` があり `schema.toml` がない場合は `FAILED_PRECONDITION` エラーを返します（Issue #1560）。`store/` に以前のインデックスのドキュメントが残っている可能性があるため、何も書き込まず何も削除しません。そのインデックスを開くには `schema.toml` を戻してサーバーを再起動し、新しいインデックスを作るには `store/` を削除してください。このチェックより前のサーバーは、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。
 
 ```protobuf
 rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
@@ -804,6 +804,7 @@ gRPC エラーは標準の `Status` コードとして返されます。
 | Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ、クエリ内の不明なフィールド、`offset + limit` が `max_result_window` を超える検索 |
 | インデックス未オープン | `FAILED_PRECONDITION` | `CreateIndex` の前に RPC が呼び出された場合 |
 | 書き込みの停止 | `FAILED_PRECONDITION` | それ以前の書き込みが write-ahead log への追記以降に失敗した後の、書き込み・コミット・フィールド変更。サーバーを再起動するとログが再生され、レコードがログに完全に届いていればその書き込みが丸ごと適用され、届いていなければ適用されません（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照）。呼び出しがキャンセルされても、期限が切れても、クライアントが切断しても、書き込みは止まりません。その呼び出しの各ドキュメントは、すべて適用されているか、まったく書かれていないかのどちらかです |
+| 残った store | `FAILED_PRECONDITION` | `store/` があり `schema.toml` がないデータディレクトリで `CreateIndex` が呼び出された場合 |
 | インデックスが既に存在 | `ALREADY_EXISTS` | `CreateIndex` が 2 回呼び出された場合 |
 | 未実装 | `UNIMPLEMENTED` | まだサポートされていない機能 |
 | 内部エラー | `INTERNAL` | I/O、ストレージ、または予期しないエラー |

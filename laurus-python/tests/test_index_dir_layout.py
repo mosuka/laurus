@@ -71,6 +71,20 @@ def test_new_empty_directory_is_not_treated_as_legacy(tmp_path):
     assert (tmp_path / "schema.toml").is_file()
 
 
+def test_store_left_without_schema_toml_is_rejected_and_kept(tmp_path):
+    # Issue #1560: a store/ whose schema.toml was removed by hand, or by a
+    # rollback that failed to remove store/, may hold the documents of an
+    # earlier index, so it must be neither reused nor removed.
+    (tmp_path / "store").mkdir()
+    (tmp_path / "store" / "stale").write_bytes(b"")
+
+    with pytest.raises(ValueError, match="has no schema.toml but has a store/"):
+        laurus.Index(path=str(tmp_path))
+
+    assert not (tmp_path / "schema.toml").exists()
+    assert (tmp_path / "store" / "stale").is_file()
+
+
 # ---------------------------------------------------------------------------
 # Build-failure cleanup (Issue #1308)
 # ---------------------------------------------------------------------------

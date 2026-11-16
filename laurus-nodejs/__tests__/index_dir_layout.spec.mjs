@@ -7,7 +7,7 @@
 // conflict error, and legacy-layout detection.
 
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Index, Schema } from "../index.js";
@@ -75,6 +75,21 @@ describe("Index(path) directory layout (#1059)", () => {
     const dir = freshDir();
     await Index.create(dir);
     expect(existsSync(join(dir, "schema.toml"))).toBe(true);
+  });
+
+  it("rejects a store/ left without schema.toml and keeps it (#1560)", async () => {
+    const dir = freshDir();
+    // A store/ whose schema.toml was removed by hand, or by a rollback that
+    // failed to remove store/: it may hold the documents of an earlier
+    // index, so it must be neither reused nor removed.
+    mkdirSync(join(dir, "store"));
+    writeFileSync(join(dir, "store", "stale"), "");
+
+    await expect(Index.create(dir)).rejects.toThrow(
+      /has no schema\.toml but has a store\//,
+    );
+    expect(existsSync(join(dir, "schema.toml"))).toBe(false);
+    expect(existsSync(join(dir, "store", "stale"))).toBe(true);
   });
 });
 

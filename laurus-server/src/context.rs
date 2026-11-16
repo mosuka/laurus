@@ -55,6 +55,11 @@ fn schema_persist_hook(data_dir: &Path) -> laurus::SchemaPersistHook {
 /// storage/engine initialisation leaves `data_dir` in the state it was in
 /// before this call -- nothing is left behind to block a retry (Issue
 /// #1308).
+///
+/// A `store/` left without `schema.toml` is not checked here: the caller,
+/// `IndexService::create_index`, refuses it first with
+/// [`laurus::index_dir::check_no_leftover_store`], so that it is reported
+/// as FailedPrecondition rather than Internal (Issue #1560).
 pub async fn create_index(
     data_dir: &Path,
     schema: &Schema,

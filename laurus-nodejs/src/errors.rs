@@ -60,8 +60,8 @@ fn message(err: &LaurusError) -> String {
 
 /// Convert a [`laurus::index_dir::IndexDirError`] into a napi [`napi::Error`].
 ///
-/// `SchemaConflict`/`LegacyFlatLayout`/`NotAnIndexDirectory` are
-/// caller-fixable misuse, so they map to `InvalidArg` (matching how
+/// `SchemaConflict`/`LegacyFlatLayout`/`LeftoverStore`/`NotAnIndexDirectory`
+/// are caller-fixable misuse, so they map to `InvalidArg` (matching how
 /// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`). `Io` matches
 /// the `LaurusError::Io` treatment above (`GenericFailure`, `"IO error: "`
 /// prefix) for consistency.
@@ -70,6 +70,7 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> napi::Error {
     match err {
         IndexDirError::SchemaConflict { .. }
         | IndexDirError::LegacyFlatLayout { .. }
+        | IndexDirError::LeftoverStore { .. }
         | IndexDirError::NotAnIndexDirectory { .. } => {
             napi::Error::new(Status::InvalidArg, err.to_string())
         }
