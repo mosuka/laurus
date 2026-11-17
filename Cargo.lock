@@ -2823,7 +2823,6 @@ dependencies = [
  "tabled",
  "tempfile",
  "tokio",
- "toml",
 ]
 
 [[package]]

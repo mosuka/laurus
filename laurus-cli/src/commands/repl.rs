@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use laurus::index_dir::SCHEMA_FILE;
 use laurus::{Engine, FieldOption, Schema, SearchRequestBuilder};
 use rustyline::DefaultEditor;
 
@@ -187,7 +188,7 @@ pub async fn run(index_dir: &Path, format: OutputFormat) -> Result<()> {
 
 /// Try to open an existing index. Returns `None` if the index does not exist.
 async fn try_open_index(index_dir: &Path) -> Option<(Engine, Schema)> {
-    let schema_path = index_dir.join("schema.toml");
+    let schema_path = index_dir.join(SCHEMA_FILE);
     if !schema_path.exists() {
         return None;
     }
@@ -254,7 +255,7 @@ async fn handle_create(
                 None => {
                     // If schema.toml already exists, use it directly instead
                     // of launching the wizard (recovery for missing store/).
-                    if index_dir.join("schema.toml").exists() {
+                    if index_dir.join(SCHEMA_FILE).exists() {
                         let existing = context::read_schema(index_dir)?;
                         context::create_index_from_schema(index_dir, existing).await?;
                     } else {

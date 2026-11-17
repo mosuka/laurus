@@ -8,15 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use laurus::index_dir::{IndexDirClaim, IndexDirError};
+use laurus::index_dir::{IndexDirClaim, IndexDirError, SCHEMA_FILE, STORE_DIR};
 use laurus::storage::file::FileStorageConfig;
 use laurus::{CommitPolicy, Engine, LaurusError, Schema, StorageConfig, StorageFactory};
-
-/// File name used to persist the schema inside the index directory.
-const SCHEMA_FILE: &str = "schema.toml";
-
-/// Subdirectory name used for the storage backend within the index directory.
-const STORE_DIR: &str = "store";
 
 /// Build a [`laurus::SchemaPersistHook`] that writes `schema.toml` inside
 /// `index_dir` (Issue #1078).
@@ -319,13 +313,20 @@ pub async fn open_index_with_commit_policy(
 
 /// Read the schema from the index directory.
 ///
+/// Parses `schema.toml` with [`Schema::from_toml`], as `laurus::index_dir`
+/// and the server do (Issue #1669). It neither takes the index directory's
+/// lock nor syncs the file; a path that builds an engine reads the schema
+/// with [`IndexDirClaim::read_schema`] instead.
+///
 /// # Arguments
 ///
 /// * `index_dir` - The index directory containing `schema.toml`.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or parsed.
+/// Returns an error if the file cannot be read or parsed. A file that is not
+/// a valid schema TOML fails with a [`LaurusError::Schema`] as the error's
+/// source.
 pub fn read_schema(index_dir: &Path) -> Result<Schema> {
     let schema_path = index_dir.join(SCHEMA_FILE);
     let schema_toml =
@@ -1101,5 +1102,26 @@ mod tests {
             err.to_string().contains("being created or opened"),
             "got: {err:#}"
         );
+    }
+
+    /// Issue #1669: `read_schema` (`get schema`, the REPL, `train
+    /// --update-schema`) parses `schema.toml` with `Schema::from_toml`, as
+    /// `laurus::index_dir` and the server do, so a file that is not a valid
+    /// schema TOML fails with a `LaurusError::Schema` as its source.
+    #[test]
+    fn read_schema_fails_on_an_invalid_schema_toml_with_a_schema_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SCHEMA_FILE), "[fields.body.Text\n").unwrap();
+
+        let err = read_schema(dir.path()).unwrap_err();
+
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<LaurusError>(),
+                Some(LaurusError::Schema(message)) if message.starts_with("invalid schema TOML:")
+            )),
+            "the parse error must come from Schema::from_toml: {err:#}"
+        );
+        assert_eq!(err.to_string(), "Failed to parse schema TOML");
     }
 }
