@@ -20,11 +20,11 @@ pub mod windows;
 
 #[cfg(unix)]
 pub use unix::{
-    copy_permissions, default_use_mmap, is_lock_file_current, open_lock_file, remove_lock_file,
-    sync_dir,
+    copy_permissions, default_use_mmap, is_lock_file_current, open_for_sync, open_lock_file,
+    remove_lock_file, sync_dir,
 };
 #[cfg(windows)]
 pub use windows::{
-    copy_permissions, default_use_mmap, is_lock_file_current, open_lock_file, remove_lock_file,
-    sync_dir,
+    copy_permissions, default_use_mmap, is_lock_file_current, open_for_sync, open_lock_file,
+    remove_lock_file, sync_dir,
 };

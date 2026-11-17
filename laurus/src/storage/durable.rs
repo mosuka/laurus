@@ -4,8 +4,9 @@
 //! durable with [`Storage::sync`](crate::storage::Storage::sync). This
 //! module covers what lies outside a root: creating the root directory
 //! itself (and any missing parent), replacing a file such as an index
-//! directory's `schema.toml` atomically, and removing what a failed create
-//! of an index directory wrote (Issue #1666).
+//! directory's `schema.toml` atomically, removing what a failed create of
+//! an index directory wrote (Issue #1666), and making a `schema.toml` that
+//! was edited by hand durable before an open relies on it (Issue #1668).
 //!
 //! A name created, renamed or removed in a directory is durable only once
 //! that directory is synced, so every operation here syncs the directory
@@ -23,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -261,6 +262,38 @@ pub(crate) fn replace_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Resu
     sync_dir(parent_dir(path))
 }
 
+/// Read the file `path` as UTF-8 and make what was read durable, by syncing
+/// the file through the handle it was read from (Issue #1668).
+///
+/// For a file that another program wrote, such as an index directory's
+/// `schema.toml` edited by hand, which laurus is about to rely on. The file
+/// is opened with [`platform::open_for_sync`]: read-only on Unix, for reading
+/// and writing on Windows, where a sync needs write access. A file that
+/// cannot be opened that way, other than a missing one (on Windows, a
+/// read-only file, for example), is read without the sync, and a warning is
+/// logged.
+///
+/// # Errors
+///
+/// Returns the error from opening, reading or syncing the file.
+pub(crate) fn read_synced(path: &Path) -> io::Result<String> {
+    let mut file = match platform::open_for_sync(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(err),
+        Err(err) => {
+            log::warn!(
+                "{} cannot be opened to be synced ({err}); reading it without the sync",
+                path.display()
+            );
+            return std::fs::read_to_string(path);
+        }
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    sync_file(&file, path)?;
+    Ok(contents)
+}
+
 /// Remove the file `path` and make the removal durable by syncing the
 /// directory that held it (Issue #1666).
 ///
@@ -490,6 +523,51 @@ mod tests {
                 SyncEvent::Remove(missing)
             ]
         );
+    }
+
+    /// Issue #1668: a file another program wrote is synced through the
+    /// handle it is read from.
+    #[test]
+    fn read_synced_syncs_the_file_it_read() {
+        let root = tempfile::TempDir::new().unwrap();
+        let file = root.path().join("schema.toml");
+        std::fs::write(&file, "edited by hand").unwrap();
+
+        let trace = SyncTrace::start();
+        let contents = read_synced(&file).unwrap();
+
+        assert_eq!(contents, "edited by hand");
+        assert_eq!(trace.events(), vec![SyncEvent::File(file)]);
+    }
+
+    /// Issue #1668: a read-only file is still read. On Unix it is synced
+    /// through a read-only descriptor; on Windows, where a sync needs write
+    /// access, it is read without the sync.
+    #[test]
+    fn read_synced_reads_a_read_only_file() {
+        let root = tempfile::TempDir::new().unwrap();
+        let file = root.path().join("schema.toml");
+        std::fs::write(&file, "read-only").unwrap();
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions.clone()).unwrap();
+
+        let contents = read_synced(&file);
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        assert_eq!(contents.unwrap(), "read-only");
+    }
+
+    /// Issue #1668: a missing file is reported as missing, not read again.
+    #[test]
+    fn read_synced_of_a_missing_file_fails_with_not_found() {
+        let root = tempfile::TempDir::new().unwrap();
+
+        let err = read_synced(&root.path().join("missing")).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

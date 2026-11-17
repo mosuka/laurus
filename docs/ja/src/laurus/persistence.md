@@ -507,6 +507,17 @@ sync した `schema.toml.tmp` を `schema.toml` に rename し、インデック
 - rename の後のインデックスディレクトリの sync が失敗すると、スキーマ変更は
   エラーを返しますが、新しい `schema.toml` はすでに置き換わっています。
 
+インデックスを開くエントリポイントは、どれも（`laurus-cli`・`laurus-server`・
+各バインディング。`store/` のない `schema.toml` を `create index` で復旧する
+場合も含む）、エンジンを作る前に、`schema.toml` を読んだ handle で sync し、
+続けてインデックスディレクトリを sync します
+（[#1668](https://github.com/mosuka/laurus/issues/1668)）。そのため、
+インデックスを閉じている間に手で編集した `schema.toml` は、エディタが新しい
+ファイルを rename で置き換えて保存した場合も含めて、その下に何かが書かれた
+後のクラッシュで失われません。Windows ではファイルの sync に書き込みの権限が
+要るので、書き込みで開けない `schema.toml`（読み取り専用のファイルなど）は
+sync せずに読み、警告をログに出します。
+
 Windows では `std` でディレクトリを開いて sync できないため、ストレージ自身の
 ディレクトリの sync と同じく、ファイルの中身と rename の原子性だけが保証
 されます。

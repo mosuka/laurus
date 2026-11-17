@@ -338,7 +338,7 @@ Error: Invalid argument: vector field 'embedding': its files were written with k
 
 インデックスを開くには、フィールドをメッセージに書かれた値に戻してください。値を変えるのは、開いたインデックスに対して行います。種類・`dimension`・`distance` は [`laurus update field`](commands.md#update-field) に `--reindex` を付けて変えられ、フィールドのベクトルは捨てられます（種類の変更は Issue #1536 から）。フィールドは空になるので、文書を put し直す必要があります。
 
-ベクトルフィールドのそれ以外の option は、インデックスを閉じている間に `schema.toml` で変えられます。対象は `quantizer`、`m`、`ef_construction`、`n_clusters`、`n_probe`、`rerank_storage`、`pq_codebook_path`、`base_weight`、`embedder`、`MultiVector` フィールドの `storage` と `pool_factor` です。書き込み済みのセグメントは、reindex か merge で書き直されるまで、書いたときの値のままです。
+ベクトルフィールドのそれ以外の option は、インデックスを閉じている間に `schema.toml` で変えられます。対象は `quantizer`、`m`、`ef_construction`、`n_clusters`、`n_probe`、`rerank_storage`、`pq_codebook_path`、`base_weight`、`embedder`、`MultiVector` フィールドの `storage` と `pool_factor` です。書き込み済みのセグメントは、reindex か merge で書き直されるまで、書いたときの値のままです。次にインデックスを開くとき、laurus は新しいスキーマで何かを書く前に、編集した `schema.toml` とインデックスディレクトリを sync するので、エディタが sync しなかった編集もクラッシュで失われません（Issue #1668。Windows については[インデックスディレクトリの耐久性](../laurus/persistence.md#インデックスディレクトリの耐久性)を参照）。
 
 例外があります。
 
@@ -651,7 +651,7 @@ Hugging Face のモデルは初回の使用時にダウンロードされます�
 Error: Invalid argument: Unknown embedder 'missing' for field 'vec': not defined in schema.embedders
 ```
 
-このインデックスを開くには、`schema.toml` を編集します。その名前を `type = "precomputed"` で宣言すれば、フィールドはそれまでどおり、文書が与えるベクトルで動きます。フィールドの `embedder` の行を削除しても同じです。
+このインデックスを開くには、`schema.toml` を編集します。その名前を `type = "precomputed"` で宣言すれば、フィールドはそれまでどおり、文書が与えるベクトルで動きます。フィールドの `embedder` の行を削除しても同じです。続く open は、インデックスに書き込む前に、編集したファイルを sync します（Issue #1668）。
 
 ### 例: 1 つのエンベダーを 2 つのフィールドで共有する
 

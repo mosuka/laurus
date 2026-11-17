@@ -182,11 +182,11 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
             // A crash left schema.toml without store/, since a create in
             // progress would hold the claim. Recover using the existing
             // schema rather than the one passed in (which may come from the
-            // wizard).
-            let content = std::fs::read_to_string(&schema_path)
+            // wizard), made durable before store/ is written under it (Issue
+            // #1668).
+            let schema = claim
+                .read_schema()
                 .context("Failed to read existing schema file")?;
-            let schema =
-                Schema::from_toml(&content).context("Failed to parse existing schema TOML")?;
             let config = StorageConfig::File(FileStorageConfig::new(&store_path));
             (schema, StorageFactory::create(config)?)
         } else {
@@ -295,10 +295,9 @@ pub async fn open_index_with_commit_policy(
         Err(err) => return Err(err.into()),
     };
 
-    // Read the schema.
-    let schema_toml =
-        std::fs::read_to_string(&schema_path).context("Failed to read schema file")?;
-    let schema = Schema::from_toml(&schema_toml).context("Failed to parse schema TOML")?;
+    // Read the schema, made durable before the engine writes under it, since
+    // it may have been edited by hand (Issue #1668).
+    let schema = claim.read_schema().context("Failed to read schema file")?;
 
     // Open or create storage depending on whether the store directory exists.
     let store_path = index_dir.join(STORE_DIR);
@@ -814,6 +813,64 @@ mod tests {
             .into_iter()
             .filter(|event| !event.path().starts_with(&store))
             .collect()
+    }
+
+    /// Issue #1668: every command's open makes `schema.toml`, which may have
+    /// been edited by hand while the index was closed, durable, and then the
+    /// index directory, before it builds the engine.
+    #[tokio::test]
+    async fn open_index_syncs_schema_toml_then_the_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        create_index_from_schema(dir.path(), titled("title"))
+            .await
+            .unwrap();
+
+        let trace = SyncTrace::start();
+        let engine = open_index(dir.path()).await.unwrap();
+        drop(engine);
+
+        assert_eq!(
+            outside_store(trace.events(), dir.path()),
+            vec![
+                SyncEvent::File(dir.path().join(SCHEMA_FILE)),
+                SyncEvent::Dir(dir.path().to_path_buf()),
+            ]
+        );
+    }
+
+    /// Issue #1668: `create index` recovering a `schema.toml` without
+    /// `store/` makes the file durable, and then the index directory, before
+    /// it creates `store/` (the last sync of the index directory).
+    #[tokio::test]
+    async fn create_index_recovery_syncs_schema_toml_before_it_creates_store() {
+        let root = tempfile::TempDir::new().unwrap();
+        let index_dir = root.path().join("idx");
+        std::fs::create_dir(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join(SCHEMA_FILE),
+            titled("title").to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let trace = SyncTrace::start();
+        create_index_from_schema(&index_dir, titled("other"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outside_store(trace.events(), &index_dir),
+            vec![
+                SyncEvent::File(index_dir.join(SCHEMA_FILE)),
+                SyncEvent::Dir(index_dir.clone()),
+                SyncEvent::Dir(index_dir.clone()),
+            ]
+        );
+        assert!(
+            read_schema(&index_dir)
+                .unwrap()
+                .fields
+                .contains_key("title")
+        );
     }
 
     /// Issue #1587: `create index` syncs each directory it creates into its
