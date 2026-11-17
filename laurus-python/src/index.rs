@@ -11,7 +11,7 @@ use crate::schema::PySchema;
 use crate::search::{
     PyGroupBy, PyLateInteractionRescore, PySearchResult, build_request_from_py, to_py_search_result,
 };
-use laurus::index_dir::CreateRollback;
+use laurus::index_dir::IndexDirClaim;
 use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Embedder, Engine,
     EngineStats, Schema, Storage, StorageConfig, StorageFactory, WalSyncPolicy,
@@ -395,7 +395,9 @@ impl PyIndex {
         let path_for_resolve = path.clone();
 
         let engine = py.detach(|| -> PyResult<Engine> {
-            let (schema_arg, storage, rollback) =
+            // A file-backed index's claim is held until the engine is built
+            // (Issue #1665).
+            let (schema_arg, storage, claim) =
                 resolve_storage_and_schema(path_for_resolve.as_deref(), schema_arg)?;
 
             let mut builder = Engine::builder(storage, schema_arg);
@@ -407,12 +409,15 @@ impl PyIndex {
             }
 
             match rt.block_on(builder.build()) {
-                Ok(engine) => Ok(engine),
+                Ok(engine) => {
+                    drop(claim);
+                    Ok(engine)
+                }
                 Err(e) => {
                     // A failure here must not leave schema.toml/store/
                     // behind to block a retry (Issue #1308).
-                    if let Some(rollback) = rollback {
-                        rollback.rollback();
+                    if let Some(claim) = claim {
+                        claim.rollback();
                     }
                     Err(laurus_err(e))
                 }
@@ -495,10 +500,12 @@ impl PyIndex {
     ///
     /// Raises `ValueError` if this index has no directory (was constructed
     /// with `path=None`). Raises the usual construction errors if rebuilding
-    /// the engine fails; in that case this index is left `close()`d (the
-    /// old engine's lock was already released), but every cached value
-    /// needed for a retry (path, schema, embedder) is preserved, so calling
-    /// `reload()` again retries cleanly.
+    /// the engine fails, including a `RuntimeError` when another call is
+    /// creating or opening the index at that moment (Issue #1665); in that
+    /// case this index is left `close()`d (the old engine's lock was already
+    /// released), anything the rebuild wrote is removed again as by the
+    /// constructor, and every cached value needed for a retry (path, schema,
+    /// embedder) is preserved, so calling `reload()` again retries cleanly.
     ///
     /// Returns:
     ///     `True` if the commit generation advanced (something was actually
@@ -531,7 +538,8 @@ impl PyIndex {
         let rt = self.rt.clone();
 
         let engine = py.detach(move || -> PyResult<Engine> {
-            let (new_schema, storage) =
+            // Held until the engine is built, as in `new` (Issue #1665).
+            let (new_schema, storage, claim) =
                 laurus::index_dir::open_or_create(Path::new(&path), None).map_err(index_dir_err)?;
 
             let reuse_embedder = last_schema.as_ref().is_some_and(|old_schema| {
@@ -549,7 +557,17 @@ impl PyIndex {
                 builder = builder.commit_policy(policy);
             }
 
-            rt.block_on(builder.build()).map_err(laurus_err)
+            match rt.block_on(builder.build()) {
+                Ok(engine) => {
+                    drop(claim);
+                    Ok(engine)
+                }
+                Err(e) => {
+                    // Undo what this call wrote, as `new` does (Issue #1308).
+                    claim.rollback();
+                    Err(laurus_err(e))
+                }
+            }
         })?;
 
         let changed = engine.commit_generation() != baseline_generation;
@@ -961,20 +979,20 @@ fn pairs_to_documents(
 // Storage factory helper
 // ---------------------------------------------------------------------------
 
-/// Resolve the `(Schema, Storage, CreateRollback)` triple for [`PyIndex::new`].
+/// Resolve the `(Schema, Storage, IndexDirClaim)` triple for [`PyIndex::new`].
 ///
 /// `path=None` keeps the pre-existing in-memory behavior (schema defaults
 /// to empty, no persistence, no conflict checking) and returns `None` for
-/// the rollback, since nothing is ever written to disk on that path.
-/// `path=Some(p)` snapshots `p` with [`CreateRollback::snapshot`] *before*
-/// deferring to [`laurus::index_dir::open_or_create`] (which applies the
-/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`),
-/// and returns the rollback so the caller can undo the write if building the
-/// engine then fails (Issue #1308).
+/// the claim, since nothing is ever written to disk on that path.
+/// `path=Some(p)` defers to [`laurus::index_dir::open_or_create`] (which
+/// applies the `<p>/schema.toml` + `<p>/store/` convention shared with
+/// `laurus-cli`), and returns the directory's claim, which the caller holds
+/// until the engine is built and uses to undo the write if the build fails
+/// (Issue #1308, #1665).
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<Schema>,
-) -> PyResult<(Schema, Arc<dyn Storage>, Option<CreateRollback>)> {
+) -> PyResult<(Schema, Arc<dyn Storage>, Option<IndexDirClaim>)> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
@@ -984,10 +1002,9 @@ fn resolve_storage_and_schema(
             Ok((schema, storage, None))
         }
         Some(p) => {
-            let rollback = CreateRollback::snapshot(Path::new(p));
-            let (schema, storage) =
+            let (schema, storage, claim) =
                 laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err)?;
-            Ok((schema, storage, Some(rollback)))
+            Ok((schema, storage, Some(claim)))
         }
     }
 }

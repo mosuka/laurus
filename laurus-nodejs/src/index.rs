@@ -15,7 +15,7 @@ use crate::search::{
     to_js_search_result,
 };
 use crate::wal::JsWalSyncPolicy;
-use laurus::index_dir::CreateRollback;
+use laurus::index_dir::IndexDirClaim;
 use laurus::{Engine, Schema, Storage, StorageConfig, StorageFactory};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -125,7 +125,9 @@ impl JsIndex {
     /// constructing an embedder -- likewise leaves nothing behind: any
     /// `schema.toml`/`store/` this call created are removed before the
     /// error is thrown (Issue #1308), so a retry isn't blocked by a failed
-    /// attempt's leftovers.
+    /// attempt's leftovers. Also throws, without waiting, if another call
+    /// (in this process or another) is creating or opening an index at
+    /// `path` at the same moment (Issue #1665).
     #[napi(factory)]
     pub async fn create(
         path: Option<String>,
@@ -134,7 +136,9 @@ impl JsIndex {
         commit_policy: Option<&JsCommitPolicy>,
     ) -> Result<Self> {
         let schema = schema.map(|s| s.inner.clone());
-        let (schema, storage, rollback) = resolve_storage_and_schema(path.as_deref(), schema)?;
+        // A file-backed index's claim is held until the engine is built
+        // (Issue #1665).
+        let (schema, storage, claim) = resolve_storage_and_schema(path.as_deref(), schema)?;
 
         let mut builder = Engine::builder(storage, schema);
         if let Some(policy) = wal_sync_policy {
@@ -144,12 +148,15 @@ impl JsIndex {
             builder = builder.commit_policy(policy.inner);
         }
         match builder.build().await {
-            Ok(engine) => Ok(Self {
-                engine: Some(Arc::new(engine)),
-            }),
+            Ok(engine) => {
+                drop(claim);
+                Ok(Self {
+                    engine: Some(Arc::new(engine)),
+                })
+            }
             Err(err) => {
-                if let Some(rollback) = rollback {
-                    rollback.rollback();
+                if let Some(claim) = claim {
+                    claim.rollback();
                 }
                 Err(laurus_err(err))
             }
@@ -750,20 +757,21 @@ pub fn peek_commit_generation(path: String) -> Result<f64> {
 // Storage factory helper
 // ---------------------------------------------------------------------------
 
-/// Resolve the `(Schema, Storage)` pair for [`JsIndex::create`], plus a
-/// [`CreateRollback`] snapshot taken before any file-backed write (Issue
-/// #1308), so the caller can undo a failed engine build.
+/// Resolve the `(Schema, Storage)` pair for [`JsIndex::create`], plus the
+/// directory's [`IndexDirClaim`] for a file-backed index, which the caller
+/// holds until the engine is built and uses to undo a failed build (Issue
+/// #1308, #1665).
 ///
 /// `path=None` keeps the pre-existing in-memory behavior (schema defaults
 /// to empty, no persistence, no conflict checking) -- nothing is ever
-/// written to disk, so there's nothing to roll back, hence `None`.
-/// `path=Some(p)` snapshots `p` and then defers to
-/// [`laurus::index_dir::open_or_create`], which applies the
-/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`.
+/// written to disk, so there's nothing to claim or roll back, hence `None`.
+/// `path=Some(p)` defers to [`laurus::index_dir::open_or_create`], which
+/// applies the `<p>/schema.toml` + `<p>/store/` convention shared with
+/// `laurus-cli`.
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<Schema>,
-) -> Result<(Schema, Arc<dyn Storage>, Option<CreateRollback>)> {
+) -> Result<(Schema, Arc<dyn Storage>, Option<IndexDirClaim>)> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
@@ -773,10 +781,9 @@ fn resolve_storage_and_schema(
             Ok((schema, storage, None))
         }
         Some(p) => {
-            let rollback = CreateRollback::snapshot(Path::new(p));
-            let (schema, storage) =
+            let (schema, storage, claim) =
                 laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err)?;
-            Ok((schema, storage, Some(rollback)))
+            Ok((schema, storage, Some(claim)))
         }
     }
 }

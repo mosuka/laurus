@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust** 1.85 or later (edition 2024)
+- **Rust** 1.89 or later (edition 2024)
 - **Cargo** (included with Rust)
 - **protobuf compiler** (`protoc`) -- required for building `laurus-server`
 - **[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)** --

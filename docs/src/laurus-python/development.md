@@ -5,7 +5,7 @@ This page covers how to set up a local development environment for the
 
 ## Prerequisites
 
-- **Rust** 1.85 or later with Cargo
+- **Rust** 1.89 or later with Cargo
 - **Python** 3.8 or later
 - Repository cloned locally
 

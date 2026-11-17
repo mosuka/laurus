@@ -2,7 +2,7 @@
 
 ## 前提条件
 
-- **Rust** 1.85 以降（edition 2024）
+- **Rust** 1.89 以降（edition 2024）
 - **Cargo**（Rust に付属）
 - **protobuf コンパイラ**（`protoc`）-- `laurus-server` のビルドに必要
 - **[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)** --

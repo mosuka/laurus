@@ -194,11 +194,15 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// its child's. Nothing is synced when `dir` already exists. A directory
 /// that another process creates meanwhile is left to that process.
 ///
+/// Returns whether this call created `dir` itself, which tells an index
+/// directory's claim whether its rollback may remove the directory (Issue
+/// #1665).
+///
 /// # Errors
 ///
 /// Returns the error from inspecting, creating or syncing a directory,
 /// including when a path component exists but is not a directory.
-pub(crate) fn create_dir_all(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_dir_all(dir: &Path) -> io::Result<bool> {
     // The missing directories, deepest first. The empty path that ends a
     // relative path's ancestors is the current directory, which exists.
     let mut missing = Vec::new();
@@ -213,14 +217,18 @@ pub(crate) fn create_dir_all(dir: &Path) -> io::Result<()> {
         }
     }
 
+    let mut created_dir = false;
     for created in missing.into_iter().rev() {
         match std::fs::create_dir(created) {
-            Ok(()) => sync_dir(parent_dir(created))?,
+            Ok(()) => {
+                sync_dir(parent_dir(created))?;
+                created_dir = created == dir;
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists && created.is_dir() => {}
             Err(err) => return Err(err),
         }
     }
-    Ok(())
+    Ok(created_dir)
 }
 
 /// Replace the file at `path` with `contents` atomically and durably, by
@@ -285,6 +293,25 @@ pub(crate) fn remove_dir_all(dir: &Path) -> io::Result<()> {
     sync_dir(parent_dir(dir))
 }
 
+/// Remove the directory `dir` if it is empty, and make the removal durable
+/// by syncing the directory that held it.
+///
+/// An index directory's claim removes the directory it made this way, so
+/// that it never removes what another call put in it meanwhile (Issue
+/// #1665).
+///
+/// # Errors
+///
+/// Returns the error from removing the directory, which includes one that
+/// is not empty, [`io::ErrorKind::NotFound`] when there is none (in both
+/// cases nothing is synced), or the error from syncing the directory that
+/// held it, after which `dir` is already removed.
+pub(crate) fn remove_dir(dir: &Path) -> io::Result<()> {
+    record(SyncEvent::Remove(dir.to_path_buf()));
+    std::fs::remove_dir(dir)?;
+    sync_dir(parent_dir(dir))
+}
+
 /// Write `contents` to `tmp` with `path`'s permissions and sync it.
 fn write_synced(path: &Path, tmp: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
@@ -313,8 +340,9 @@ mod tests {
         let dir = root.path().join("a").join("b");
 
         let trace = SyncTrace::start();
-        create_dir_all(&dir).unwrap();
+        let created = create_dir_all(&dir).unwrap();
 
+        assert!(created, "the call made the directory it was asked for");
         assert!(dir.is_dir());
         assert_eq!(
             trace.events(),
@@ -330,9 +358,22 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
 
         let trace = SyncTrace::start();
-        create_dir_all(root.path()).unwrap();
+        let created = create_dir_all(root.path()).unwrap();
 
+        assert!(!created, "the directory existed");
         assert_eq!(trace.events(), Vec::new());
+    }
+
+    /// Issue #1665: a call that only made a missing parent did not make the
+    /// directory itself.
+    #[test]
+    fn create_dir_all_reports_only_the_directory_itself() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+
+        assert!(!create_dir_all(&dir).unwrap());
+        assert!(create_dir_all(&dir.join("b")).unwrap());
     }
 
     #[test]
@@ -397,6 +438,34 @@ mod tests {
             vec![
                 SyncEvent::Remove(dir),
                 SyncEvent::Dir(root.path().to_path_buf()),
+            ]
+        );
+    }
+
+    /// Issue #1665: an empty directory is removed durably, and one with
+    /// anything in it is kept, with nothing synced.
+    #[test]
+    fn remove_dir_removes_only_an_empty_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let empty = root.path().join("empty");
+        let full = root.path().join("full");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("file"), b"").unwrap();
+
+        let trace = SyncTrace::start();
+        remove_dir(&empty).unwrap();
+        let err = remove_dir(&full).unwrap_err();
+
+        assert!(!empty.exists());
+        assert!(full.join("file").is_file(), "got: {err}");
+        assert_eq!(err.kind(), io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(empty),
+                SyncEvent::Dir(root.path().to_path_buf()),
+                SyncEvent::Remove(full),
             ]
         );
     }

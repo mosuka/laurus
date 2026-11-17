@@ -35,7 +35,7 @@ rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
 
 ### `CreateIndex`
 
-Create a new index with the given schema. Fails with `ALREADY_EXISTS` if an index is already open, and with `FAILED_PRECONDITION` if the data directory has a `store/` but no `schema.toml` (Issue #1560): the `store/` may hold the documents of an earlier index, so nothing is written or removed. Restore `schema.toml` and restart the server to open that index, or remove `store/` to create a new one. A server older than this check opened such a `store/` as the new index's storage and served its documents.
+Create a new index with the given schema. Fails with `ALREADY_EXISTS` if an index is already open, if the data directory already holds an index (one another process created, for example), or if another process is creating or opening an index there at the same moment (Issue #1665), and with `FAILED_PRECONDITION` if the data directory has a `store/` but no `schema.toml` (Issue #1560): the `store/` may hold the documents of an earlier index, so nothing is written or removed. Restore `schema.toml` and restart the server to open that index, or remove `store/` to create a new one. A server older than this check opened such a `store/` as the new index's storage and served its documents.
 
 ```protobuf
 rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
@@ -840,6 +840,6 @@ gRPC errors are returned as standard `Status` codes:
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
 | Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed at or after its write-ahead-log append; restart the server to replay the log, which applies that write whole if its record reached the log in full, and otherwise not at all (see [Failed Writes](../laurus/persistence.md#failed-writes)). A write whose call is cancelled, whose deadline expires or whose client disconnects does not stop writes: each of its documents is either applied in full or not written at all |
 | Leftover store | `FAILED_PRECONDITION` | `CreateIndex` over a data directory that has a `store/` but no `schema.toml` |
-| Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice |
+| Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice, over an index another process created, or while another process creates or opens an index in the data directory |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |
 | Internal errors | `INTERNAL` | I/O, storage, or unexpected errors |

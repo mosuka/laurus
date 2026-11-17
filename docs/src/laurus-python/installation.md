@@ -8,7 +8,7 @@ pip install laurus
 
 ## From source
 
-Building from source requires a Rust toolchain (1.85 or later, matching `workspace.package.rust-version` in the root `Cargo.toml`) and [Maturin](https://github.com/PyO3/maturin).
+Building from source requires a Rust toolchain (1.89 or later, matching `workspace.package.rust-version` in the root `Cargo.toml`) and [Maturin](https://github.com/PyO3/maturin).
 
 ```bash
 # Install Maturin

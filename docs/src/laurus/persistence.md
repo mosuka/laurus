@@ -428,7 +428,10 @@ concept of `schema.toml` or where its storage root sits within a larger
 directory. `laurus-cli`, `laurus-server`, and the language bindings
 (Python, Node.js, Ruby, PHP) all place `<storage root>` at
 `<index_dir>/store/`, alongside a `<index_dir>/schema.toml` holding the
-schema — a convention owned by those entry points, not the engine. This
+schema and an empty `<index_dir>/index.lock`, whose lock a create or an open
+holds while it works (see
+[Concurrent creates and opens](#concurrent-creates-and-opens)) — a
+convention owned by those entry points, not the engine. This
 means an index directory created by one of them can be opened by any of
 the others without restructuring anything on disk; see each binding's
 `Index`/`create index` documentation for the exact create-vs-reopen
@@ -453,7 +456,9 @@ the layout in a fixed order and makes each step durable before the next
 ([#1587](https://github.com/mosuka/laurus/issues/1587)):
 
 1. The index directory and any missing parent are created, and each
-   directory created is synced into the directory that holds it.
+   directory created is synced into the directory that holds it. The create
+   then takes the directory's lock (see
+   [Concurrent creates and opens](#concurrent-creates-and-opens)).
 2. The schema is written to `schema.toml.tmp`, which is synced and renamed
    over `schema.toml`, and the index directory is synced.
 3. `store/` is created, and the index directory is synced again.
@@ -468,12 +473,15 @@ point, which creates the missing `store/`. A crash never leaves a `store/`
 without `schema.toml`, which a create refuses, or a partial `schema.toml`.
 
 A create that fails removes what it wrote in the reverse order: `store/`,
-then `schema.toml`, then the index directory if the create made it
+then `schema.toml`, then `index.lock` and the index directory if the create
+made the directory
 ([#1666](https://github.com/mosuka/laurus/issues/1666)). The directory that
 held each is synced before the next removal, so what the create removed
 stays removed after a crash, and a crash during the removal does not leave a
-`store/` without `schema.toml` either. Missing parent directories that the
-create made are kept, empty.
+`store/` without `schema.toml` either. The index directory is removed only
+if it is empty, so nothing another process put in it meanwhile is removed
+([#1665](https://github.com/mosuka/laurus/issues/1665)). Missing parent
+directories that the create made are kept, empty.
 
 `laurus-cli` and `laurus-server` persist every schema change (`add_field`,
 `delete_field`, `update_field`, and
@@ -493,6 +501,42 @@ a rename:
 On Windows, `std` cannot open a directory to sync it, so only the file
 contents and the atomicity of the rename hold there, as for the storage's
 own directory syncs.
+
+### Concurrent creates and opens
+
+Every create and every open of an index directory, through `laurus-cli`,
+`laurus-server` or a binding, holds an OS lock on `<index_dir>/index.lock`
+(`flock` on Unix, `LockFileEx` on Windows) from before it looks at the
+directory until its engine holds the engine lock, or until a failed create
+has removed what it wrote
+([#1665](https://github.com/mosuka/laurus/issues/1665)). Only the holder
+changes the directory, and a failed create removes only what it created
+after it took the lock, so it never removes an index that another process
+created or opened meanwhile.
+
+A call that finds the lock held fails at once instead of waiting:
+
+- A create fails with "an index already exists at …, or another call (in
+  this process or another) is creating or opening one there". The server's
+  `CreateIndex` returns it as `ALREADY_EXISTS`.
+- An open fails with "the index at … is being created or opened by another
+  call (in this process or another); try again once it has finished".
+
+The lock is held only while an index is being created or opened. Once an
+engine runs, its own `store/engine.lock` keeps a second engine out. The
+operating system releases the lock when the process exits, crash or not,
+so `index.lock` is never stale and must not be removed by hand. It is kept
+once an index exists. Since every create in progress holds the lock, a
+`schema.toml` without `store/` is recovered only when a crash left it, never
+taken over from a create that is still running.
+
+Not covered:
+
+- A process running a laurus older than this lock does not take it.
+- On a network file system, whether `flock` keeps out processes on other
+  machines depends on the file system.
+- Removing `index.lock` by hand while a call holds its lock lets another
+  call take a lock on a new file of the same name.
 
 ## Next Steps
 

@@ -4,7 +4,7 @@
 
 ## From source
 
-Building from source requires a Rust toolchain (1.85 or later) and PHP 8.1 or later with development headers.
+Building from source requires a Rust toolchain (1.89 or later) and PHP 8.1 or later with development headers.
 
 ```bash
 # Clone the repository
@@ -45,5 +45,5 @@ echo $index;  // Index()
 ## Requirements
 
 - PHP 8.1 or later with development headers (`php-dev` / `php-devel`)
-- Rust toolchain 1.85 or later with Cargo
+- Rust toolchain 1.89 or later with Cargo
 - No runtime dependencies beyond the compiled native extension

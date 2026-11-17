@@ -20,7 +20,7 @@ bundle install
 
 ## From source
 
-Building from source requires a Rust toolchain (1.85 or later) and [rb_sys](https://github.com/oxidize-rb/rb-sys).
+Building from source requires a Rust toolchain (1.89 or later) and [rb_sys](https://github.com/oxidize-rb/rb-sys).
 
 ```bash
 # Clone the repository

@@ -6,7 +6,7 @@ suite.
 
 ## Prerequisites
 
-- **Rust** 1.85 or later with Cargo
+- **Rust** 1.89 or later with Cargo
 - **PHP** 8.1 or later with development headers (`php-dev` / `php-devel`)
 - **Composer** for dependency management
 - Repository cloned locally

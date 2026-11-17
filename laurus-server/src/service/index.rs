@@ -62,10 +62,12 @@ impl IndexServiceTrait for IndexService {
         laurus::index_dir::check_no_leftover_store(&self.data_dir)
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
 
+        // An index another process created or is creating (Issue #1665) is
+        // ALREADY_EXISTS, as one this server loaded is above.
         let engine =
             context::create_index(&self.data_dir, &schema, self.wal_policy, self.commit_policy)
                 .await
-                .map_err(error::anyhow_to_status)?;
+                .map_err(error::create_index_to_status)?;
         *guard = Some(engine);
 
         tracing::info!("Index created at {}", self.data_dir.display());
@@ -260,6 +262,62 @@ mod tests {
             .await
             .unwrap();
         (dir, service)
+    }
+
+    /// An `IndexService` with no index loaded, over `data_dir`.
+    fn service_without_index(data_dir: &std::path::Path) -> IndexService {
+        IndexService {
+            engine: Arc::new(RwLock::new(None)),
+            data_dir: data_dir.to_path_buf(),
+            wal_policy: WalSyncPolicy::PerRecord,
+            commit_policy: CommitPolicy::Manual,
+        }
+    }
+
+    fn create_request() -> Request<CreateIndexRequest> {
+        Request::new(CreateIndexRequest {
+            schema: Some(schema_convert::to_proto(&Schema::new())),
+        })
+    }
+
+    /// Issue #1665: a `CreateIndex` while another process holds the data
+    /// directory (here, a claim taken in this process, which the lock
+    /// excludes the same way) is `ALREADY_EXISTS` and writes nothing.
+    #[tokio::test]
+    async fn create_index_while_another_process_creates_it_is_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = service_without_index(&data_dir);
+        let other = laurus::index_dir::IndexDirClaim::acquire_for_create(&data_dir).unwrap();
+
+        let status = service.create_index(create_request()).await.unwrap_err();
+
+        assert!(!data_dir.join("schema.toml").exists());
+        assert!(service.engine.read().await.is_none());
+        drop(other);
+        assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    }
+
+    /// Issue #1665: a `CreateIndex` over an index another process created is
+    /// `ALREADY_EXISTS`, as over one this server loaded, not `INTERNAL`.
+    #[tokio::test]
+    async fn create_index_over_an_index_created_elsewhere_is_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let engine = context::create_index(
+            &data_dir,
+            &Schema::new(),
+            WalSyncPolicy::PerRecord,
+            CommitPolicy::Manual,
+        )
+        .await
+        .unwrap();
+        drop(engine);
+        let service = service_without_index(&data_dir);
+
+        let status = service.create_index(create_request()).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
     }
 
     /// The schema `GetSchema` returns, which is read back from disk.

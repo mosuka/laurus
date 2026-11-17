@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use laurus::index_dir::CreateRollback;
+use laurus::index_dir::{IndexDirClaim, IndexDirError};
 use laurus::storage::file::FileStorageConfig;
 use laurus::{CommitPolicy, Engine, LaurusError, Schema, StorageConfig, StorageFactory};
 
@@ -50,6 +50,8 @@ fn schema_persist_hook(index_dir: &Path) -> laurus::SchemaPersistHook {
 /// Returns an error if:
 /// - A complete index already exists in `index_dir` (both `schema.toml` and
 ///   `store/` are present).
+/// - Another create or open of `index_dir`, in this process or another, holds
+///   the directory (Issue #1665).
 /// - `index_dir` has a `store/` but no `schema.toml` (Issue #1560).
 /// - The schema file cannot be read or parsed.
 /// - The index directory cannot be created.
@@ -83,6 +85,8 @@ pub async fn create_index(index_dir: &Path, schema_path: &Path) -> Result<()> {
 /// Returns an error if:
 /// - A complete index already exists in `index_dir` (both `schema.toml` and
 ///   `store/` are present).
+/// - Another create or open of `index_dir`, in this process or another, holds
+///   the directory (Issue #1665).
 /// - `index_dir` has a `store/` but no `schema.toml` (Issue #1560).
 /// - The index directory cannot be created.
 /// - The engine or storage initialisation fails.
@@ -111,9 +115,19 @@ pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Resul
 /// ignores the `schema` argument and reads the existing file instead so that
 /// a plain `create index` (without `--schema`) recovers correctly.
 ///
+/// The whole call holds the directory's
+/// [`IndexDirClaim`](laurus::index_dir::IndexDirClaim), from the checks
+/// above until the engine is built or what the call wrote is rolled back
+/// (Issue #1665). Another create or open of the same directory, in this
+/// process or another, cannot change it meanwhile: a create that finds the
+/// claim held fails with "an index already exists ...", and the call itself
+/// fails that way if another call holds it. Since every create in progress
+/// holds the claim, the recovery row above only ever applies to a
+/// `schema.toml` that a crash left behind, never to another create's.
+///
 /// A new index's `schema.toml` and `store/` are written by
-/// [`laurus::index_dir::create_schema_and_store`]: the directories it
-/// creates, then `schema.toml`, then `store/`, each synced before the next,
+/// [`IndexDirClaim::create_schema_and_store`]: the directories the claim
+/// created, then `schema.toml`, then `store/`, each synced before the next,
 /// so once this returns they survive a crash, and a crash before that leaves
 /// at most `schema.toml`, never `store/` alone (Issue #1587).
 ///
@@ -132,56 +146,62 @@ pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Resul
 ///
 /// # Errors
 ///
-/// Returns an error if the index already fully exists, the directory,
-/// `schema.toml` or `store/` cannot be created or synced, or engine/storage
-/// initialisation fails. Any of these failures leaves `index_dir` in the
-/// state it was in before this call -- nothing is left behind to block a
-/// retry (Issue #1308, #1587).
+/// Returns an error if the index already fully exists, another create or
+/// open holds the directory, the directory, `schema.toml` or `store/` cannot
+/// be created or synced, or engine/storage initialisation fails. Any of
+/// these failures leaves `index_dir` in the state it was in before this
+/// call -- nothing is left behind to block a retry (Issue #1308, #1587).
 async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
     let schema_path = index_dir.join(SCHEMA_FILE);
     let store_path = index_dir.join(STORE_DIR);
     let schema_exists = schema_path.exists();
-    let store_exists = store_path.exists();
 
-    if schema_exists && store_exists {
-        bail!(
-            "Index already exists at {}. Delete the directory first to recreate.",
-            index_dir.display()
-        );
+    // Checked before the claim is taken, so that a refused create writes
+    // nothing, and again once it is held.
+    if schema_exists && store_path.exists() {
+        bail!(already_exists_message(index_dir));
     }
     laurus::index_dir::check_no_leftover_store(index_dir)?;
-
-    let rollback = CreateRollback::snapshot(index_dir);
-
-    // If schema.toml exists but store/ is missing, recover using the existing
-    // schema rather than the one passed in (which may come from the wizard).
-    let (schema, created_storage) = if schema_exists && !store_exists {
-        let content =
-            std::fs::read_to_string(&schema_path).context("Failed to read existing schema file")?;
-        let schema = Schema::from_toml(&content).context("Failed to parse existing schema TOML")?;
-        (schema, None)
-    } else {
+    if !schema_exists {
         // Before anything is written, so a rejected schema leaves no
         // schema.toml behind to block the retry.
         schema.validate_for_create()?;
-        // Create the index directory, schema.toml and store/, durably and in
-        // that order (Issue #1587). A failure there is rolled back by the
-        // call itself.
-        let storage = laurus::index_dir::create_schema_and_store(index_dir, &schema)
-            .context("Failed to create index directory")?;
-        (schema, Some(storage))
-    };
+    }
 
-    // Create the storage (on recovery) and engine to initialize the index
-    // structure. A failure here must not leave schema.toml/store/ behind to
-    // block a retry (Issue #1308), so undo exactly what this call added
-    // above.
-    let storage_config = StorageConfig::File(FileStorageConfig::new(&store_path));
-    let build_result: Result<()> = async {
-        let storage = match created_storage {
-            Some(storage) => storage,
-            None => StorageFactory::create(storage_config)?,
+    let claim = IndexDirClaim::acquire_for_create(index_dir)?;
+
+    // A failure from here on must not leave schema.toml/store/ behind to
+    // block a retry (Issue #1308), so undo exactly what this call added.
+    let result: Result<()> = async {
+        if claim.schema_existed() && claim.store_existed() {
+            bail!(already_exists_message(index_dir));
+        }
+        laurus::index_dir::check_no_leftover_store(index_dir)?;
+
+        let (schema, storage) = if claim.schema_existed() {
+            // A crash left schema.toml without store/, since a create in
+            // progress would hold the claim. Recover using the existing
+            // schema rather than the one passed in (which may come from the
+            // wizard).
+            let content = std::fs::read_to_string(&schema_path)
+                .context("Failed to read existing schema file")?;
+            let schema =
+                Schema::from_toml(&content).context("Failed to parse existing schema TOML")?;
+            let config = StorageConfig::File(FileStorageConfig::new(&store_path));
+            (schema, StorageFactory::create(config)?)
+        } else {
+            if schema_exists {
+                // schema.toml was there before the claim and is gone now.
+                schema.validate_for_create()?;
+            }
+            // schema.toml, then store/, durably and in that order (Issue
+            // #1587).
+            let storage = claim
+                .create_schema_and_store(&schema)
+                .context("Failed to create index directory")?;
+            (schema, storage)
         };
+
         Engine::builder(storage, schema)
             .persist_schema_with(schema_persist_hook(index_dir))
             .build()
@@ -190,12 +210,19 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
     }
     .await;
 
-    if let Err(err) = build_result {
-        rollback.rollback();
+    if let Err(err) = result {
+        claim.rollback();
         return Err(err);
     }
-
     Ok(())
+}
+
+/// The error message for a create over a complete index.
+fn already_exists_message(index_dir: &Path) -> String {
+    format!(
+        "Index already exists at {}. Delete the directory first to recreate.",
+        index_dir.display()
+    )
 }
 
 /// Open an existing index from the given index directory.
@@ -218,6 +245,8 @@ async fn init_index(index_dir: &Path, schema: Schema) -> Result<()> {
 ///
 /// Returns an error if:
 /// - No `schema.toml` file is found in `index_dir`.
+/// - Another create or open of `index_dir`, in this process or another, holds
+///   the directory (Issue #1665).
 /// - The schema file cannot be read or parsed.
 /// - The storage backend cannot be opened (or created) or the engine cannot
 ///   be initialised.
@@ -247,13 +276,24 @@ pub async fn open_index_with_commit_policy(
     index_dir: &Path,
     commit_policy: CommitPolicy,
 ) -> Result<Engine> {
-    let schema_path = index_dir.join(SCHEMA_FILE);
-    if !schema_path.exists() {
-        bail!(
+    let no_index = || {
+        anyhow::anyhow!(
             "No index found at {}. Run 'create index' first.",
             index_dir.display()
-        );
+        )
+    };
+    let schema_path = index_dir.join(SCHEMA_FILE);
+    if !schema_path.exists() {
+        return Err(no_index());
     }
+
+    // Held until the engine is built, so that no create can change or roll
+    // back the directory meanwhile (Issue #1665).
+    let claim = match IndexDirClaim::acquire_for_open(index_dir) {
+        Ok(claim) => claim,
+        Err(IndexDirError::NotAnIndexDirectory { .. }) => return Err(no_index()),
+        Err(err) => return Err(err.into()),
+    };
 
     // Read the schema.
     let schema_toml =
@@ -263,7 +303,7 @@ pub async fn open_index_with_commit_policy(
     // Open or create storage depending on whether the store directory exists.
     let store_path = index_dir.join(STORE_DIR);
     let storage_config = StorageConfig::File(FileStorageConfig::new(&store_path));
-    let storage = if store_path.exists() {
+    let storage = if claim.store_existed() {
         StorageFactory::open(storage_config)?
     } else {
         StorageFactory::create(storage_config)?
@@ -274,6 +314,7 @@ pub async fn open_index_with_commit_policy(
         .build()
         .await?;
 
+    drop(claim);
     Ok(engine)
 }
 
@@ -878,6 +919,130 @@ mod tests {
                 .unwrap()
                 .fields
                 .contains_key("title")
+        );
+    }
+
+    // --- Concurrent creates and opens (Issue #1665) ---
+    //
+    // Another process is stood in for by a claim taken here through
+    // `laurus::index_dir`: the lock belongs to the file handle, so it
+    // excludes this process's own calls as it would another process's.
+
+    fn titled(field: &str) -> Schema {
+        Schema::builder()
+            .add_field(
+                field,
+                laurus::FieldOption::Text(laurus::TextOption::default()),
+            )
+            .build()
+    }
+
+    /// Put and commit a document through `engine`, close it, and check
+    /// through the CLI's own open that the index at `index_dir` still has
+    /// `field` and the document.
+    async fn assert_index_survives(index_dir: &Path, engine: Engine, field: &str) {
+        let document = laurus::Document::builder().add_text(field, "hello").build();
+        engine.put_document("doc", document).await.unwrap();
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let engine = open_index(index_dir).await.unwrap();
+        assert!(
+            engine.schema().fields.contains_key(field),
+            "schema.toml must still be the surviving index's"
+        );
+        assert_eq!(engine.get_documents("doc").await.unwrap().len(), 1);
+    }
+
+    /// Finish the create that holds `claim`: write the index with `schema`
+    /// and build its engine.
+    async fn finish_create(claim: IndexDirClaim, schema: Schema) -> Engine {
+        let storage = claim.create_schema_and_store(&schema).unwrap();
+        let engine = Engine::builder(storage, schema).build().await.unwrap();
+        drop(claim);
+        engine
+    }
+
+    /// A `create index` while another create holds the directory fails and
+    /// writes nothing.
+    #[tokio::test]
+    async fn create_index_during_another_create_fails_and_writes_nothing() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+        let other = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+
+        let result = create_index_from_schema(&index_dir, titled("b_field")).await;
+        assert!(
+            !index_dir.join(SCHEMA_FILE).exists(),
+            "the CLI must not write while another create holds the directory"
+        );
+        let engine = finish_create(other, titled("a_field")).await;
+
+        assert_index_survives(&index_dir, engine, "a_field").await;
+        let err = result.expect_err("the CLI's create must fail");
+        assert!(err.to_string().contains("already exists"), "got: {err:#}");
+    }
+
+    /// The recovery path applies only to a `schema.toml` that a crash left:
+    /// a `create index` that finds another create's `schema.toml` without
+    /// `store/` fails instead of building that index with the other
+    /// create's schema and ignoring its own.
+    #[tokio::test]
+    async fn create_index_never_takes_over_another_creates_schema() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+        let other = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        laurus::index_dir::write_schema(&index_dir, &titled("a_field")).unwrap();
+
+        let result = create_index_from_schema(&index_dir, titled("b_field")).await;
+        assert!(
+            !index_dir.join(STORE_DIR).exists(),
+            "the CLI must not create store/ under another create's schema.toml"
+        );
+        let engine = finish_create(other, titled("a_field")).await;
+
+        assert_index_survives(&index_dir, engine, "a_field").await;
+        let err = result.expect_err("the CLI's create must fail");
+        assert!(err.to_string().contains("already exists"), "got: {err:#}");
+    }
+
+    /// A CLI open while a create holds the directory fails, so it cannot
+    /// build first and have the create's rollback remove the index under
+    /// it.
+    #[tokio::test]
+    async fn open_index_during_a_create_fails_and_the_create_keeps_its_index() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+        let schema = titled("a_field");
+        let create = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        let storage = create.create_schema_and_store(&schema).unwrap();
+
+        let opened = open_index(&index_dir).await;
+        let created = match Engine::builder(storage, schema).build().await {
+            Ok(engine) => {
+                drop(create);
+                Ok(engine)
+            }
+            Err(err) => {
+                create.rollback();
+                Err(err)
+            }
+        };
+
+        let (survivor, open_err) = match (created, opened) {
+            (Ok(engine), Err(err)) => (engine, Some(err)),
+            (Err(_), Ok(engine)) => (engine, None),
+            (created, opened) => panic!(
+                "exactly one engine must be built, got create: {:?}, open: {:?}",
+                created.err(),
+                opened.err()
+            ),
+        };
+        assert_index_survives(&index_dir, survivor, "a_field").await;
+        let err = open_err.expect("the CLI's open must fail and the create keep its engine");
+        assert!(
+            err.to_string().contains("being created or opened"),
+            "got: {err:#}"
         );
     }
 }

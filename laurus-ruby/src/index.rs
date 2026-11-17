@@ -13,7 +13,7 @@ use crate::search::{
     to_rb_search_result,
 };
 use crate::wal::RbWalSyncPolicy;
-use laurus::index_dir::CreateRollback;
+use laurus::index_dir::IndexDirClaim;
 use laurus::{Engine, EngineStats, Schema, Storage, StorageConfig, StorageFactory};
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -141,7 +141,9 @@ impl RbIndex {
         let schema = schema_ref.map(|s| s.inner.borrow().clone());
         // Returns `magnus::Error` (holds a `Value`, so it's `!Send`); must
         // run with the GVL held, before entering `without_gvl` below.
-        let (schema, storage, rollback) = resolve_storage_and_schema(path.as_deref(), schema)?;
+        // A file-backed index's claim is held until the engine is built
+        // (Issue #1665); it is `Send`, so it moves into `without_gvl`.
+        let (schema, storage, claim) = resolve_storage_and_schema(path.as_deref(), schema)?;
         let wal_sync_policy = wal_sync_policy.map(|p| p.inner);
         let commit_policy = commit_policy.map(|p| p.inner);
 
@@ -158,10 +160,13 @@ impl RbIndex {
             // block a retry (Issue #1308), so undo exactly what
             // `resolve_storage_and_schema` added above.
             match rt_for_build.block_on(builder.build()) {
-                Ok(engine) => Ok(engine),
+                Ok(engine) => {
+                    drop(claim);
+                    Ok(engine)
+                }
                 Err(err) => {
-                    if let Some(rollback) = rollback {
-                        rollback.rollback();
+                    if let Some(claim) = claim {
+                        claim.rollback();
                     }
                     Err(err)
                 }
@@ -642,18 +647,18 @@ fn pairs_to_documents(ruby: &Ruby, docs: RArray) -> Result<Vec<(String, laurus::
 /// `Result<T, magnus::Error>` spelling (unlike `PyResult`/`napi::Result`,
 /// `magnus` has no single-generic result alias) doesn't trip clippy's
 /// `type_complexity` lint, which this crate denies via `#![deny(clippy::all)]`.
-type ResolvedIndex = (Schema, Arc<dyn Storage>, Option<CreateRollback>);
+type ResolvedIndex = (Schema, Arc<dyn Storage>, Option<IndexDirClaim>);
 
 /// Resolve the `(Schema, Storage)` pair for [`RbIndex::new`], plus the
-/// [`CreateRollback`] snapshot a build failure must undo (Issue #1308).
+/// directory's [`IndexDirClaim`], which the caller holds until the engine
+/// is built and uses to undo a failed build (Issue #1308, #1665).
 ///
 /// `path: nil` keeps the pre-existing in-memory behavior (schema defaults
 /// to empty, no persistence, no conflict checking) -- nothing is ever
-/// written to disk there, so the rollback is always `None`. `path: Some(p)`
+/// written to disk there, so the claim is always `None`. `path: Some(p)`
 /// defers to `laurus::index_dir::open_or_create`, which applies the
-/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli`; the
-/// snapshot is taken immediately before that call, since it's the point
-/// `schema.toml`/`store/` may first be written.
+/// `<p>/schema.toml` + `<p>/store/` convention shared with `laurus-cli` and
+/// returns the claim.
 ///
 /// # Arguments
 ///
@@ -665,8 +670,8 @@ type ResolvedIndex = (Schema, Arc<dyn Storage>, Option<CreateRollback>);
 /// # Returns
 ///
 /// The resolved `Schema`, an `Arc<dyn Storage>` for the engine, and the
-/// rollback snapshot to call `rollback()` on if building the engine fails
-/// (`None` for an in-memory index).
+/// claim to hold until the engine is built and to call `rollback()` on if
+/// the build fails (`None` for an in-memory index).
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<Schema>,
@@ -680,11 +685,9 @@ fn resolve_storage_and_schema(
             Ok((schema, storage, None))
         }
         Some(p) => {
-            let index_dir = Path::new(p);
-            let rollback = CreateRollback::snapshot(index_dir);
-            let (schema, storage) =
-                laurus::index_dir::open_or_create(index_dir, schema).map_err(index_dir_err)?;
-            Ok((schema, storage, Some(rollback)))
+            let (schema, storage, claim) =
+                laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err)?;
+            Ok((schema, storage, Some(claim)))
         }
     }
 }
