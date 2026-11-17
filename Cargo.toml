@@ -15,7 +15,7 @@ resolver = "2"
 [workspace.package]
 version = "0.13.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Unified search library for lexical, vector, and semantic retrieval"
 documentation = "https://docs.rs/laurus"
 homepage = "https://github.com/mosuka/laurus"

@@ -113,7 +113,10 @@ pub fn with_context(err: PhpException, context: &str) -> PhpException {
 /// `Exception`, same as `LaurusError::Io` in [`laurus_err`]; there is no
 /// PHP-specific path-preserving I/O exception in this crate, so
 /// `err.to_string()` (which already formats as `"{path}: {source}"`) carries
-/// the path in the message instead. `Core` delegates to [`laurus_err`].
+/// the path in the message instead. `AlreadyExists`/`InUse` (another call
+/// holds the directory, Issue #1665) map to `Exception`, like the engine's
+/// own "already locked" error, since a retry can succeed. `Core` delegates
+/// to [`laurus_err`].
 pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PhpException {
     use laurus::index_dir::IndexDirError;
     match err {
@@ -123,7 +126,9 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PhpException {
         | IndexDirError::NotAnIndexDirectory { .. } => {
             PhpException::new(err.to_string(), 0, ce::value_error())
         }
-        IndexDirError::Io { .. } => PhpException::new(err.to_string(), 0, ce::exception()),
+        IndexDirError::AlreadyExists { .. }
+        | IndexDirError::InUse { .. }
+        | IndexDirError::Io { .. } => PhpException::new(err.to_string(), 0, ce::exception()),
         IndexDirError::Core(e) => laurus_err(e),
     }
 }

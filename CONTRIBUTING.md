@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Laurus! This document provides gu
 
 ### Prerequisites
 
-- **Rust** stable toolchain (1.85+, edition 2024)
+- **Rust** stable toolchain (1.89+, edition 2024)
 - **Cargo** (comes with Rust)
 - **Git**
 

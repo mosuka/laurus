@@ -5,7 +5,7 @@
 
 ## 前提条件
 
-- **Rust** 1.85 以降（Cargo 含む）
+- **Rust** 1.89 以降（Cargo 含む）
 - **Node.js** 24.15 以降（npm 含む。`package.json` の `engines.node` と一致）
 - リポジトリがローカルにクローン済み
 

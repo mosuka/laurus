@@ -56,6 +56,20 @@ fn code_for(err: &LaurusError) -> tonic::Code {
     }
 }
 
+/// Convert the error of [`crate::context::create_index`] into a tonic
+/// Status: an index that already exists, or that another call is creating
+/// or opening, is `ALREADY_EXISTS`, and a `store/` left without
+/// `schema.toml` is `FAILED_PRECONDITION` (Issue #1560, #1665). Any other
+/// error converts as in [`anyhow_to_status`].
+pub fn create_index_to_status(err: anyhow::Error) -> Status {
+    use laurus::index_dir::IndexDirError;
+    match err.downcast_ref::<IndexDirError>() {
+        Some(IndexDirError::AlreadyExists { .. }) => Status::already_exists(err.to_string()),
+        Some(IndexDirError::LeftoverStore { .. }) => Status::failed_precondition(err.to_string()),
+        _ => anyhow_to_status(err),
+    }
+}
+
 /// Convert an anyhow::Error into a tonic Status.
 pub fn anyhow_to_status(err: anyhow::Error) -> Status {
     Status::internal(err.to_string())

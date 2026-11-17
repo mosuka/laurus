@@ -100,7 +100,9 @@ pub fn io_err_with_path(path: &Path, e: io::Error) -> PyErr {
 /// [`laurus_err`] treats `LaurusError::Schema`/`InvalidArgument`). `Io` goes through [`io_err_with_path`] rather
 /// than `laurus_err` for the same reason `laurus_err` isn't used for plain
 /// I/O elsewhere in this crate: it preserves `FileNotFoundError` etc.
-/// instead of flattening to a generic `OSError`.
+/// instead of flattening to a generic `OSError`. `AlreadyExists`/`InUse`
+/// (another call holds the directory, Issue #1665) become `RuntimeError`,
+/// like the engine's own "already locked" error, since a retry can succeed.
 pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PyErr {
     use laurus::index_dir::IndexDirError;
     match err {
@@ -108,6 +110,9 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PyErr {
         | IndexDirError::LegacyFlatLayout { .. }
         | IndexDirError::LeftoverStore { .. }
         | IndexDirError::NotAnIndexDirectory { .. } => PyValueError::new_err(err.to_string()),
+        IndexDirError::AlreadyExists { .. } | IndexDirError::InUse { .. } => {
+            PyRuntimeError::new_err(err.to_string())
+        }
         IndexDirError::Io { path, source } => io_err_with_path(&path, source),
         IndexDirError::Core(e) => laurus_err(e),
     }

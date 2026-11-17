@@ -8,7 +8,7 @@ npm install laurus-nodejs
 
 ## From source
 
-Building from source requires a Rust toolchain (1.85 or later)
+Building from source requires a Rust toolchain (1.89 or later)
 and Node.js 24.15 or later.
 
 ```bash

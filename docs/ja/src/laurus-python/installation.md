@@ -8,7 +8,7 @@ pip install laurus
 
 ## ソースからビルド
 
-ソースからビルドするには Rust ツールチェーン（1.85 以降。ルート `Cargo.toml` の `workspace.package.rust-version` と一致）と [Maturin](https://github.com/PyO3/maturin) が必要です。
+ソースからビルドするには Rust ツールチェーン（1.89 以降。ルート `Cargo.toml` の `workspace.package.rust-version` と一致）と [Maturin](https://github.com/PyO3/maturin) が必要です。
 
 ```bash
 # Maturin をインストール

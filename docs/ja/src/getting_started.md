@@ -13,7 +13,7 @@ Laurus へようこそ! このセクションでは、ライブラリのイン�
 
 ## 前提条件
 
-- **Rust** 1.85 以降（edition 2024）
+- **Rust** 1.89 以降（edition 2024）
 - **Cargo**（Rust に同梱）
 - **Tokio** ランタイム（Laurus は非同期 API を使用します）
 

@@ -64,7 +64,9 @@ fn message(err: &LaurusError) -> String {
 /// are caller-fixable misuse, so they map to `InvalidArg` (matching how
 /// [`laurus_err`] treats `LaurusError::Schema`/`Query`/`Field`/`InvalidArgument`). `Io` matches
 /// the `LaurusError::Io` treatment above (`GenericFailure`, `"IO error: "`
-/// prefix) for consistency.
+/// prefix) for consistency. `AlreadyExists`/`InUse` (another call holds the
+/// directory, Issue #1665) map to `GenericFailure`, like the engine's own
+/// "already locked" error, since a retry can succeed.
 pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> napi::Error {
     use laurus::index_dir::IndexDirError;
     match err {
@@ -73,6 +75,9 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> napi::Error {
         | IndexDirError::LeftoverStore { .. }
         | IndexDirError::NotAnIndexDirectory { .. } => {
             napi::Error::new(Status::InvalidArg, err.to_string())
+        }
+        IndexDirError::AlreadyExists { .. } | IndexDirError::InUse { .. } => {
+            napi::Error::new(Status::GenericFailure, err.to_string())
         }
         IndexDirError::Io { .. } => {
             napi::Error::new(Status::GenericFailure, format!("IO error: {err}"))

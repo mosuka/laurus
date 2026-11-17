@@ -22,23 +22,38 @@
 //!   index's storage, which would serve its documents (Issue #1560).
 //!   Otherwise, the given schema (or [`Schema::default`] when omitted) is
 //!   checked with [`Schema::validate_for_create`], and
-//!   [`create_schema_and_store`] writes it to `schema.toml` and creates a
-//!   new `store/` directory, durably and in that order (Issue #1587).
+//!   [`IndexDirClaim::create_schema_and_store`] writes it to `schema.toml`
+//!   and creates a new `store/` directory, durably and in that order (Issue
+//!   #1587).
 //!
 //! [`open_or_create`] itself is not used by `laurus-cli`/`laurus-server`
 //! (see Issue #1061) — it exists solely for the four bindings, which had no
-//! shared convention before Issue #1059. [`check_no_leftover_store`],
-//! [`create_schema_and_store`] and [`CreateRollback`], however, are shared
-//! by all three entry points, since the write-then-build-engine shape (and
-//! the checks, ordering and cleanup it needs) is the same everywhere, and
-//! `laurus-cli` and `laurus-server` persist every schema change with
-//! [`write_schema`].
+//! shared convention before Issue #1059. [`check_no_leftover_store`] and
+//! [`IndexDirClaim`], however, are shared by all three entry points, since
+//! the write-then-build-engine shape (and the checks, ordering, locking and
+//! cleanup it needs) is the same everywhere, and `laurus-cli` and
+//! `laurus-server` persist every schema change with [`write_schema`].
+//!
+//! # Concurrent creates and opens (Issue #1665)
+//!
+//! Every create and every open of an index directory holds an
+//! [`IndexDirClaim`], an OS lock on `<index_dir>/index.lock`
+//! ([`LOCK_FILE`]), from before it checks the directory until its engine
+//! holds the engine lock, or until its rollback has finished. Only the
+//! holder changes the layout, and its rollback removes only what it created
+//! after taking the lock, so a create that fails never removes an index
+//! that another call created or opened. A call that cannot take the lock
+//! fails at once: a create with [`IndexDirError::AlreadyExists`], an open
+//! with [`IndexDirError::InUse`].
 
+use std::fs::{File, TryLockError};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::storage::durable;
 use crate::storage::file::FileStorageConfig;
+use crate::storage::platform;
 use crate::storage::{Storage, StorageConfig, StorageFactory};
 use crate::{LaurusError, Schema};
 
@@ -52,6 +67,18 @@ pub const SCHEMA_TMP_FILE: &str = "schema.toml.tmp";
 
 /// Name of the storage subdirectory within an index directory.
 pub const STORE_DIR: &str = "store";
+
+/// Name of the lock file within an index directory, whose OS lock an
+/// [`IndexDirClaim`] holds (Issue #1665).
+///
+/// The file is empty and kept once an index exists. The OS releases its
+/// lock when the holding process exits, crash or not, so unlike
+/// `store/engine.lock` it is never stale and must not be removed by hand.
+pub const LOCK_FILE: &str = "index.lock";
+
+/// How many times a claim opens the lock file again after finding that the
+/// file it locked no longer has the name (see [`IndexDirClaim`]).
+const CLAIM_ATTEMPTS: usize = 3;
 
 /// A file that only ever exists directly under an index directory created
 /// by this project's pre-Issue-1059 flat layout (segments were written
@@ -107,6 +134,30 @@ pub enum IndexDirError {
         path: PathBuf,
     },
 
+    /// A create could not take `path`'s lock because another call, in this
+    /// process or another, holds it while creating or opening an index there
+    /// (Issue #1665). An index exists there, or is being written.
+    #[error(
+        "an index already exists at {path}, or another call (in this process or another) is \
+         creating or opening one there"
+    )]
+    AlreadyExists {
+        /// The index directory.
+        path: PathBuf,
+    },
+
+    /// An open could not take `path`'s lock because another call, in this
+    /// process or another, holds it while creating or opening the index
+    /// (Issue #1665).
+    #[error(
+        "the index at {path} is being created or opened by another call (in this process or \
+         another); try again once it has finished"
+    )]
+    InUse {
+        /// The index directory.
+        path: PathBuf,
+    },
+
     /// A filesystem operation on `path` failed.
     #[error("{path}: {source}")]
     Io {
@@ -134,93 +185,330 @@ pub enum IndexDirError {
     Core(#[from] LaurusError),
 }
 
-/// Snapshot of an index directory's on-disk state, taken before a create
-/// attempt writes `schema.toml`/`store/` and builds an [`crate::Engine`],
-/// used to undo exactly what that attempt added if the build fails
-/// afterwards (Issue #1308).
+/// Exclusive hold on an index directory while a create or an open checks
+/// it, writes `schema.toml`/`store/` and builds its [`crate::Engine`]
+/// (Issue #1665).
 ///
-/// Every entry point that writes the `schema.toml` + `store/` layout before
-/// building an engine (`laurus-cli`, `laurus-server`, and each binding's
-/// `Index` constructor, all built on this module's convention) takes a
-/// snapshot right after checking that a complete index doesn't already
-/// exist and that no `store/` is left without `schema.toml`
-/// ([`check_no_leftover_store`]), and calls [`Self::rollback`] if the
-/// build fails -- otherwise a retry is blocked by state the failed attempt
-/// left behind. [`create_schema_and_store`] takes its own snapshot too, and
-/// rolls back when writing the layout itself fails (Issue #1587).
-#[must_use = "take the snapshot before the create attempt and call rollback() if it fails"]
-pub struct CreateRollback {
+/// A claim holds an OS lock ([`File::try_lock`]: `flock` on Unix,
+/// `LockFileEx` on Windows) on `<index_dir>/index.lock` ([`LOCK_FILE`]).
+/// Every entry point (`laurus-cli`, `laurus-server`, and the bindings
+/// through [`open_or_create`]) takes one before it checks the directory,
+/// and keeps it until its engine holds the engine lock -- then it drops the
+/// claim -- or until [`Self::rollback`] has undone a failed attempt. So:
+///
+/// - Only the holder changes the layout, and it records which of
+///   `schema.toml` and `store/` existed only once it holds the lock. A
+///   rollback therefore removes only what this call created, never an index
+///   that another call created or opened meanwhile.
+/// - A holder that finds `schema.toml` without `store/` knows that a crash
+///   left it there, since a create in progress would hold the lock, and can
+///   recover it.
+///
+/// The lock is not waited for: a call that cannot take it fails at once,
+/// with [`IndexDirError::AlreadyExists`] for a create and
+/// [`IndexDirError::InUse`] for an open. The lock belongs to the file
+/// handle, so two claims in one process exclude each other as two
+/// processes do, and the OS releases it when the process exits.
+///
+/// Not covered: a process running a laurus that predates the claim, a
+/// network file system whose `flock` does not lock across clients, and an
+/// `index.lock` removed by hand while a claim holds it.
+#[must_use = "hold the claim until the engine is built, and call rollback() if the attempt fails"]
+#[derive(Debug)]
+pub struct IndexDirClaim {
     index_dir: PathBuf,
-    dir_existed: bool,
+    /// The locked file. `None` once the rollback has taken it.
+    lock: Option<File>,
+    created_dir: bool,
+    created_lock_file: bool,
     schema_existed: bool,
     store_existed: bool,
 }
 
-impl CreateRollback {
-    /// Record `index_dir`'s state. Call this before writing `schema.toml`
-    /// or creating `store/`.
-    pub fn snapshot(index_dir: &Path) -> Self {
-        Self {
-            index_dir: index_dir.to_path_buf(),
-            dir_existed: index_dir.exists(),
-            schema_existed: index_dir.join(SCHEMA_FILE).exists(),
-            store_existed: index_dir.join(STORE_DIR).exists(),
+/// Which kind of call takes an [`IndexDirClaim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimPurpose {
+    Create,
+    Open,
+}
+
+impl ClaimPurpose {
+    /// The error for a call that found the lock held.
+    fn contended(self, index_dir: &Path) -> IndexDirError {
+        let path = index_dir.to_path_buf();
+        match self {
+            Self::Create => IndexDirError::AlreadyExists { path },
+            Self::Open => IndexDirError::InUse { path },
         }
     }
+}
 
-    /// Undo whatever the create attempt added, and never remove anything
-    /// that predates the snapshot. The removals run in the reverse order of
-    /// the create:
+impl IndexDirClaim {
+    /// Claim `index_dir` to create an index there: create the directory
+    /// and any missing parent durably if needed, take the lock, and then
+    /// record whether `schema.toml` and `store/` exist.
+    ///
+    /// The caller decides from [`Self::schema_existed`] and
+    /// [`Self::store_existed`] whether an index is already there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexDirError::AlreadyExists`] if another call holds the
+    /// lock, and [`IndexDirError::Io`] if the directory or the lock file
+    /// cannot be created or locked.
+    pub fn acquire_for_create(index_dir: &Path) -> Result<Self, IndexDirError> {
+        Self::acquire(index_dir, ClaimPurpose::Create)
+    }
+
+    /// Claim the index at `index_dir` to open it. Creates neither the
+    /// directory nor `schema.toml`; it only creates the lock file, if the
+    /// index has none yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexDirError::NotAnIndexDirectory`] if `index_dir` has no
+    /// `schema.toml`, before or after the lock is taken (a failed create
+    /// may have removed it meanwhile), [`IndexDirError::InUse`] if another
+    /// call holds the lock, and [`IndexDirError::Io`] if the lock file
+    /// cannot be created or locked.
+    pub fn acquire_for_open(index_dir: &Path) -> Result<Self, IndexDirError> {
+        Self::acquire(index_dir, ClaimPurpose::Open)
+    }
+
+    fn acquire(index_dir: &Path, purpose: ClaimPurpose) -> Result<Self, IndexDirError> {
+        let lock_path = index_dir.join(LOCK_FILE);
+        let lock_err = |source| IndexDirError::Io {
+            path: lock_path.clone(),
+            source,
+        };
+        for _ in 0..CLAIM_ATTEMPTS {
+            let created_dir = match purpose {
+                ClaimPurpose::Create => {
+                    durable::create_dir_all(index_dir).map_err(|source| IndexDirError::Io {
+                        path: index_dir.to_path_buf(),
+                        source,
+                    })?
+                }
+                ClaimPurpose::Open => {
+                    if !index_dir.join(SCHEMA_FILE).exists() {
+                        return Err(not_an_index_directory(index_dir));
+                    }
+                    false
+                }
+            };
+            let (lock, created_lock_file) = match platform::open_lock_file(&lock_path) {
+                Ok(opened) => opened,
+                // A failed create's rollback removed the directory meanwhile.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(lock_err(err)),
+            };
+            #[cfg(test)]
+            test_hooks::run_before_lock();
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => return Err(purpose.contended(index_dir)),
+                Err(TryLockError::Error(err)) => return Err(lock_err(err)),
+            }
+            // The file was unlinked between the open and the lock, so another
+            // claim may hold a new file under the name (Unix only; see
+            // `platform::is_lock_file_current`). Dropping `lock` releases it.
+            if !platform::is_lock_file_current(&lock, &lock_path).map_err(lock_err)? {
+                continue;
+            }
+
+            let claim = Self {
+                index_dir: index_dir.to_path_buf(),
+                lock: Some(lock),
+                created_dir,
+                created_lock_file,
+                schema_existed: index_dir.join(SCHEMA_FILE).exists(),
+                store_existed: index_dir.join(STORE_DIR).exists(),
+            };
+            if purpose == ClaimPurpose::Open && !claim.schema_existed {
+                // A failed create's rollback removed schema.toml meanwhile.
+                claim.rollback();
+                return Err(not_an_index_directory(index_dir));
+            }
+            return Ok(claim);
+        }
+        Err(purpose.contended(index_dir))
+    }
+
+    /// The claimed index directory.
+    pub fn index_dir(&self) -> &Path {
+        &self.index_dir
+    }
+
+    /// Whether `schema.toml` existed when the lock was taken.
+    pub fn schema_existed(&self) -> bool {
+        self.schema_existed
+    }
+
+    /// Whether `store/` existed when the lock was taken.
+    pub fn store_existed(&self) -> bool {
+        self.store_existed
+    }
+
+    /// Create a new index's `schema.toml` and `store/` in the claimed
+    /// directory, and return the storage over `store/` (Issue #1587).
+    ///
+    /// The directory and any missing parent were created, durably, when
+    /// the claim was taken. Then, each made durable before the next:
+    ///
+    /// 1. `schema.toml` is written with [`write_schema`].
+    /// 2. `store/` is created, and the directory synced, by
+    ///    [`FileStorage::new`](crate::storage::file::FileStorage::new).
+    ///
+    /// Once this returns, `schema.toml` and `store/` survive a crash. A
+    /// crash before that leaves nothing, empty directories,
+    /// [`SCHEMA_TMP_FILE`] or `schema.toml` alone, and every entry point
+    /// recovers from each of them; it never leaves a `store/` without
+    /// `schema.toml` ([`IndexDirError::LeftoverStore`]) or a partial
+    /// `schema.toml`.
+    ///
+    /// The caller checks first that neither `schema.toml` nor `store/`
+    /// exists ([`Self::schema_existed`], [`check_no_leftover_store`]) and
+    /// validates the schema ([`Schema::validate_for_create`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexDirError::Io`] if `schema.toml` cannot be written or a
+    /// directory cannot be synced, and [`IndexDirError::Core`] if the schema
+    /// cannot be serialized or the storage cannot be created. The caller
+    /// then calls [`Self::rollback`], which removes what this wrote.
+    pub fn create_schema_and_store(
+        &self,
+        schema: &Schema,
+    ) -> Result<Arc<dyn Storage>, IndexDirError> {
+        write_schema(&self.index_dir, schema)?;
+        let config = StorageConfig::File(FileStorageConfig::new(self.index_dir.join(STORE_DIR)));
+        Ok(StorageFactory::create(config)?)
+    }
+
+    /// Undo whatever this call added after it took the lock, and release
+    /// the lock. Nothing that existed then is removed. The removals run in
+    /// the reverse order of the create:
     ///
     /// 1. `store/`, if it didn't exist.
     /// 2. `schema.toml`, if it didn't exist.
-    /// 3. `index_dir` itself, with anything else in it, if it didn't exist.
+    /// 3. `index.lock` and then the directory itself, if this call created
+    ///    them and found neither `schema.toml` nor `store/`. The directory is
+    ///    removed only if it is empty, so nothing another call put in it
+    ///    meanwhile is removed (Issue #1665).
     ///
     /// A reopen (`schema.toml` and `store/` both existed) touches nothing,
-    /// and the CLI's recovery path (only `schema.toml` existed) keeps
-    /// `schema.toml`.
+    /// and the recovery of a crashed create (only `schema.toml` existed)
+    /// keeps `schema.toml`.
     ///
     /// Each removal is made durable, by syncing the directory that held the
-    /// removed entry, before the next one runs (Issue #1666). What the
-    /// rollback removed therefore stays removed after a crash, and since
-    /// `store/` is gone for good before `schema.toml` is removed, a crash
-    /// during the rollback never leaves a `store/` without `schema.toml`,
-    /// which a create refuses ([`IndexDirError::LeftoverStore`]). Missing
-    /// parents that the create made above `index_dir` are kept, empty.
-    ///
-    /// A `store/` that predates the snapshot without `schema.toml` is
-    /// refused before any snapshot is taken ([`check_no_leftover_store`]),
-    /// so keeping it only matters for a caller that skips that check: the
-    /// store may hold the documents of an earlier index (Issue #1560).
+    /// removed entry, before the next one runs (Issue #1666), except for
+    /// `index.lock`, which only lets the next claim reuse it if a crash
+    /// brings it back. What the rollback removed therefore stays removed
+    /// after a crash, and since `store/` is gone for good before
+    /// `schema.toml` is removed, a crash during the rollback never leaves a
+    /// `store/` without `schema.toml`, which a create refuses
+    /// ([`IndexDirError::LeftoverStore`]). Missing parents that the create
+    /// made above the index directory are kept, empty.
     ///
     /// Best-effort: a failed removal or sync is logged through the `log`
     /// crate and the rollback goes on, since the caller is already on its
-    /// way to returning the original build error.
-    pub fn rollback(self) {
+    /// way to returning the original error.
+    pub fn rollback(mut self) {
         if !self.store_existed {
-            Self::remove_best_effort(&self.index_dir.join(STORE_DIR), true);
+            remove_best_effort(&self.index_dir.join(STORE_DIR), true);
         }
         if !self.schema_existed {
-            Self::remove_best_effort(&self.index_dir.join(SCHEMA_FILE), false);
+            remove_best_effort(&self.index_dir.join(SCHEMA_FILE), false);
         }
-        if !self.dir_existed {
-            Self::remove_best_effort(&self.index_dir, true);
+        let lock = self.lock.take();
+        if self.created_lock_file
+            && !self.schema_existed
+            && !self.store_existed
+            && let Some(lock) = lock
+        {
+            let lock_path = self.index_dir.join(LOCK_FILE);
+            // On Windows, the file stays if another call opened it after this
+            // call released the lock; that call then goes on with the directory.
+            if let Err(err) = platform::remove_lock_file(lock, &lock_path) {
+                log::warn!("kept {} after a failed create: {err}", lock_path.display());
+            } else if self.created_dir {
+                match durable::remove_dir(&self.index_dir) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                        log::debug!(
+                            "kept {} after a failed create: another call wrote into it",
+                            self.index_dir.display()
+                        );
+                    }
+                    Err(err) => log::warn!(
+                        "failed to remove {} durably after a failed create: {err}",
+                        self.index_dir.display()
+                    ),
+                }
+            }
         }
     }
+}
 
-    fn remove_best_effort(path: &Path, is_dir: bool) {
-        let result = if is_dir {
-            durable::remove_dir_all(path)
-        } else {
-            durable::remove_file(path)
-        };
-        if let Err(err) = result
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            log::warn!(
-                "failed to remove {} durably after a failed create: {err}",
-                path.display()
-            );
+impl Drop for IndexDirClaim {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            // Explicitly, before the file is closed: Windows may release the
+            // lock of a closed handle only some time later.
+            let _ = lock.unlock();
+        }
+    }
+}
+
+/// Remove `path` durably on behalf of a rollback, logging a failure other
+/// than its absence.
+fn remove_best_effort(path: &Path, is_dir: bool) {
+    let result = if is_dir {
+        durable::remove_dir_all(path)
+    } else {
+        durable::remove_file(path)
+    };
+    if let Err(err) = result
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "failed to remove {} durably after a failed create: {err}",
+            path.display()
+        );
+    }
+}
+
+fn not_an_index_directory(index_dir: &Path) -> IndexDirError {
+    IndexDirError::NotAnIndexDirectory {
+        path: index_dir.to_path_buf(),
+    }
+}
+
+/// A hook a test can run in the middle of [`IndexDirClaim::acquire`], after
+/// the lock file is opened and before it is locked, to run another call
+/// there in a fixed order (Issue #1665).
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BEFORE_LOCK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once, in the next claim on this thread, after it opens the
+    /// lock file and before it locks it.
+    pub(super) fn set_before_lock(hook: impl FnOnce() + 'static) {
+        BEFORE_LOCK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_before_lock() {
+        // Taken out before it runs, so a claim inside the hook runs none.
+        let hook = BEFORE_LOCK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }
@@ -232,8 +520,8 @@ impl CreateRollback {
 /// there would serve the leftover store's documents as the new index's.
 /// Every entry point that creates the `schema.toml` + `store/` layout
 /// (`laurus-cli`, `laurus-server`, and [`open_or_create`] for the bindings)
-/// calls this before it writes anything or takes a [`CreateRollback`]
-/// snapshot.
+/// calls this before it writes anything or takes an [`IndexDirClaim`], and
+/// checks the state again once it holds the claim.
 ///
 /// # Errors
 ///
@@ -259,8 +547,11 @@ pub fn check_no_leftover_store(index_dir: &Path) -> Result<(), IndexDirError> {
 /// exist.
 ///
 /// Every create path writes the first `schema.toml` with this (through
-/// [`create_schema_and_store`]), and `laurus-cli` and `laurus-server`
-/// persist each schema change with it.
+/// [`IndexDirClaim::create_schema_and_store`]), and `laurus-cli` and
+/// `laurus-server` persist each schema change with it. Two calls must not
+/// write the same directory's `schema.toml` at once, since they share
+/// [`SCHEMA_TMP_FILE`]: a create holds the directory's [`IndexDirClaim`],
+/// and a schema change holds the engine lock (Issue #1665).
 ///
 /// # Errors
 ///
@@ -282,100 +573,103 @@ pub fn write_schema(index_dir: &Path, schema: &Schema) -> Result<(), IndexDirErr
     })
 }
 
-/// Create a new index's `schema.toml` and `store/` in `index_dir`, and
-/// return the storage over `store/` (Issue #1587).
+/// Resolve `index_dir` into a `(Schema, Storage)` pair, creating a new
+/// index or opening an existing one as appropriate, and return it with the
+/// directory's [`IndexDirClaim`]. See the module docs for the exact rules.
 ///
-/// The steps run in this order, each made durable before the next:
-///
-/// 1. `index_dir` and any missing parent are created, each synced into the
-///    directory that holds it.
-/// 2. `schema.toml` is written with [`write_schema`].
-/// 3. `store/` is created, and `index_dir` synced, by
-///    [`FileStorage::new`](crate::storage::file::FileStorage::new).
-///
-/// Once this returns, `schema.toml` and `store/` survive a crash. A crash
-/// before that leaves nothing, empty directories, [`SCHEMA_TMP_FILE`] or
-/// `schema.toml` alone, and every entry point recovers from each of them;
-/// it never leaves a `store/` without `schema.toml`
-/// ([`IndexDirError::LeftoverStore`]) or a partial `schema.toml`.
-///
-/// The caller checks first that neither `schema.toml` nor `store/` exists
-/// (see [`check_no_leftover_store`]) and validates the schema
-/// ([`Schema::validate_for_create`]). Every entry point that creates an
-/// index (`laurus-cli`, `laurus-server`, and [`open_or_create`] for the
-/// bindings) calls this.
+/// The caller holds the claim while it builds the engine over the storage,
+/// calls [`IndexDirClaim::rollback`] if the build fails, and drops the
+/// claim once the engine holds the engine lock (Issue #1665). Every error
+/// this returns has already undone what the call wrote.
 ///
 /// # Errors
 ///
-/// Returns [`IndexDirError::Io`] if a directory cannot be created or
-/// synced, or `schema.toml` cannot be written, and [`IndexDirError::Core`]
-/// if the schema cannot be serialized or the storage cannot be created. On
-/// an error, what this call created is removed again, as by
-/// [`CreateRollback::rollback`], so it does not block a retry.
-pub fn create_schema_and_store(
-    index_dir: &Path,
-    schema: &Schema,
-) -> Result<Arc<dyn Storage>, IndexDirError> {
-    let rollback = CreateRollback::snapshot(index_dir);
-    let created = (|| {
-        durable::create_dir_all(index_dir).map_err(|source| IndexDirError::Io {
-            path: index_dir.to_path_buf(),
-            source,
-        })?;
-        write_schema(index_dir, schema)?;
-        let config = StorageConfig::File(FileStorageConfig::new(index_dir.join(STORE_DIR)));
-        Ok(StorageFactory::create(config)?)
-    })();
-    if created.is_err() {
-        rollback.rollback();
-    }
-    created
-}
-
-/// Resolve `index_dir` into a `(Schema, Storage)` pair, creating a new
-/// index or opening an existing one as appropriate. See the module docs
-/// for the exact rules.
+/// Besides the errors the module docs describe, returns
+/// [`IndexDirError::AlreadyExists`] when a create, or
+/// [`IndexDirError::InUse`] when an open, finds another call holding the
+/// claim.
 pub fn open_or_create(
     index_dir: &Path,
     schema: Option<Schema>,
-) -> Result<(Schema, Arc<dyn Storage>), IndexDirError> {
-    let schema_path = index_dir.join(SCHEMA_FILE);
-    let store_path = index_dir.join(STORE_DIR);
-
-    if !schema_path.exists() {
-        if index_dir.join(LEGACY_LAYOUT_MARKER).exists() {
-            return Err(IndexDirError::LegacyFlatLayout {
-                path: index_dir.to_path_buf(),
-            });
+) -> Result<(Schema, Arc<dyn Storage>, IndexDirClaim), IndexDirError> {
+    if index_dir.join(SCHEMA_FILE).exists() {
+        match IndexDirClaim::acquire_for_open(index_dir) {
+            Ok(claim) => return open_claimed(claim, schema),
+            // A failed create's rollback removed it meanwhile: create one.
+            Err(IndexDirError::NotAnIndexDirectory { .. }) => {}
+            Err(err) => return Err(err),
         }
-        check_no_leftover_store(index_dir)?;
-        let schema = schema.unwrap_or_default();
-        // Before anything is written, so a rejected schema leaves no
-        // schema.toml behind to block the retry.
-        schema.validate_for_create()?;
-        let storage = create_schema_and_store(index_dir, &schema)?;
-        return Ok((schema, storage));
     }
 
+    // Before anything is written or locked, so a refused create leaves
+    // nothing behind to block the retry.
+    check_create_preconditions(index_dir)?;
+    let new_schema = schema.clone().unwrap_or_default();
+    new_schema.validate_for_create()?;
+
+    let claim = IndexDirClaim::acquire_for_create(index_dir)?;
+    if claim.schema_existed() {
+        // Another create finished between the check and the lock.
+        return open_claimed(claim, schema);
+    }
+    match check_create_preconditions(index_dir)
+        .and_then(|()| claim.create_schema_and_store(&new_schema))
+    {
+        Ok(storage) => Ok((new_schema, storage, claim)),
+        Err(err) => {
+            claim.rollback();
+            Err(err)
+        }
+    }
+}
+
+/// Refuse a create over the pre-Issue-1059 flat layout or a `store/` left
+/// without `schema.toml`.
+fn check_create_preconditions(index_dir: &Path) -> Result<(), IndexDirError> {
+    if index_dir.join(LEGACY_LAYOUT_MARKER).exists() {
+        return Err(IndexDirError::LegacyFlatLayout {
+            path: index_dir.to_path_buf(),
+        });
+    }
+    check_no_leftover_store(index_dir)
+}
+
+/// The open branch of [`open_or_create`], for a claim that found
+/// `schema.toml`.
+fn open_claimed(
+    claim: IndexDirClaim,
+    schema: Option<Schema>,
+) -> Result<(Schema, Arc<dyn Storage>, IndexDirClaim), IndexDirError> {
+    let schema_path = claim.index_dir().join(SCHEMA_FILE);
     if schema.is_some() {
         return Err(IndexDirError::SchemaConflict { path: schema_path });
     }
-    let content = std::fs::read_to_string(&schema_path).map_err(|e| IndexDirError::Io {
-        path: schema_path.clone(),
-        source: e,
-    })?;
-    let resolved_schema = Schema::from_toml(&content)?;
+    let opened = (|| {
+        let content = std::fs::read_to_string(&schema_path).map_err(|e| IndexDirError::Io {
+            path: schema_path.clone(),
+            source: e,
+        })?;
+        let resolved_schema = Schema::from_toml(&content)?;
 
-    // A `store/` missing beside `schema.toml` (a create interrupted between
-    // the two) is created here, durably, by `FileStorage::new`.
-    let config = StorageConfig::File(FileStorageConfig::new(&store_path));
-    let storage = if store_path.exists() {
-        StorageFactory::open(config)
-    } else {
-        StorageFactory::create(config)
-    }?;
-
-    Ok((resolved_schema, storage))
+        // A `store/` missing beside `schema.toml` is what a crash during a
+        // create leaves, since a create in progress would hold the claim. It
+        // is created here, durably, by `FileStorage::new`.
+        let store_path = claim.index_dir().join(STORE_DIR);
+        let config = StorageConfig::File(FileStorageConfig::new(&store_path));
+        let storage = if claim.store_existed() {
+            StorageFactory::open(config)
+        } else {
+            StorageFactory::create(config)
+        }?;
+        Ok((resolved_schema, storage))
+    })();
+    match opened {
+        Ok((resolved_schema, storage)) => Ok((resolved_schema, storage, claim)),
+        Err(err) => {
+            claim.rollback();
+            Err(err)
+        }
+    }
 }
 
 /// Read the persisted commit generation (Issue #1088) for `index_dir`
@@ -435,7 +729,7 @@ mod tests {
         let mut schema = Schema::new();
         schema.default_fields = vec!["title".to_string()];
 
-        let (resolved, _storage) = open_or_create(dir.path(), Some(schema)).unwrap();
+        let (resolved, _storage, _claim) = open_or_create(dir.path(), Some(schema)).unwrap();
         assert_eq!(resolved.default_fields, vec!["title".to_string()]);
         assert!(dir.path().join(SCHEMA_FILE).is_file());
         assert!(dir.path().join(STORE_DIR).is_dir());
@@ -444,7 +738,7 @@ mod tests {
     #[test]
     fn test_create_with_no_schema_uses_default() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (resolved, _storage) = open_or_create(dir.path(), None).unwrap();
+        let (resolved, _storage, _claim) = open_or_create(dir.path(), None).unwrap();
         assert!(resolved.fields.is_empty());
         assert!(dir.path().join(SCHEMA_FILE).is_file());
     }
@@ -454,16 +748,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut schema = Schema::new();
         schema.default_fields = vec!["title".to_string()];
-        open_or_create(dir.path(), Some(schema)).unwrap();
+        let _ = open_or_create(dir.path(), Some(schema)).unwrap();
 
-        let (reopened, _storage) = open_or_create(dir.path(), None).unwrap();
+        let (reopened, _storage, _claim) = open_or_create(dir.path(), None).unwrap();
         assert_eq!(reopened.default_fields, vec!["title".to_string()]);
     }
 
     #[test]
     fn test_reopen_with_schema_is_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        let _ = open_or_create(dir.path(), Some(Schema::new())).unwrap();
 
         let err = open_or_create(dir.path(), Some(Schema::new())).unwrap_err();
         assert!(matches!(err, IndexDirError::SchemaConflict { .. }));
@@ -497,7 +791,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_ANALYZER_SCHEMA_TOML).unwrap();
 
-        let (reopened, _storage) = open_or_create(dir.path(), None).unwrap();
+        let (reopened, _storage, _claim) = open_or_create(dir.path(), None).unwrap();
         assert!(reopened.analyzers.contains_key("standard"));
     }
 
@@ -524,11 +818,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(SCHEMA_FILE), RESERVED_FIELD_SCHEMA_TOML).unwrap();
 
-        let (reopened, _storage) = open_or_create(dir.path(), None).unwrap();
+        let (reopened, _storage, _claim) = open_or_create(dir.path(), None).unwrap();
         assert!(reopened.fields.contains_key("_secret"));
     }
 
-    // --- CreateRollback (Issue #1308) ---
+    // --- IndexDirClaim::rollback (Issue #1308, #1665) ---
     //
     // Each test also checks, through `SyncTrace`, that the rollback removes
     // `store/`, then `schema.toml`, then the directory, and syncs the
@@ -539,13 +833,14 @@ mod tests {
         let parent = tempfile::TempDir::new().unwrap();
         let index_dir = parent.path().join("idx");
 
-        let rollback = CreateRollback::snapshot(&index_dir);
-        open_or_create(&index_dir, Some(Schema::new())).unwrap();
+        let (_, storage, claim) = open_or_create(&index_dir, Some(Schema::new())).unwrap();
+        drop(storage);
         assert!(index_dir.join(SCHEMA_FILE).is_file());
         assert!(index_dir.join(STORE_DIR).is_dir());
+        assert!(index_dir.join(LOCK_FILE).is_file());
 
         let trace = SyncTrace::start();
-        rollback.rollback();
+        claim.rollback();
         assert!(!index_dir.exists());
         assert_eq!(
             trace.events(),
@@ -566,11 +861,11 @@ mod tests {
         // An unrelated file already in the directory before the attempt.
         std::fs::write(dir.path().join("README.txt"), b"keep me").unwrap();
 
-        let rollback = CreateRollback::snapshot(dir.path());
-        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        let (_, storage, claim) = open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        drop(storage);
 
         let trace = SyncTrace::start();
-        rollback.rollback();
+        claim.rollback();
         assert_eq!(
             trace.events(),
             vec![
@@ -590,19 +885,23 @@ mod tests {
         );
         assert!(!dir.path().join(SCHEMA_FILE).exists());
         assert!(!dir.path().join(STORE_DIR).exists());
+        assert!(
+            !dir.path().join(LOCK_FILE).exists(),
+            "the lock file the create added must be removed"
+        );
     }
 
     #[test]
     fn create_rollback_never_removes_a_store_that_predates_it() {
         let dir = tempfile::TempDir::new().unwrap();
         // A store/ left without schema.toml. Every entry point refuses to
-        // create over it before taking a snapshot (Issue #1560), but a
-        // caller that skips that check must still not lose it to a
-        // rollback: it may hold the documents of an earlier index.
+        // create over it (Issue #1560), but a caller that skips that check
+        // must still not lose it to a rollback: it may hold the documents of
+        // an earlier index.
         let stale = dir.path().join(STORE_DIR).join("stale");
         std::fs::create_dir_all(&stale).unwrap();
 
-        let rollback = CreateRollback::snapshot(dir.path());
+        let claim = IndexDirClaim::acquire_for_create(dir.path()).unwrap();
         // What such a caller's create attempt would write first.
         std::fs::write(
             dir.path().join(SCHEMA_FILE),
@@ -611,7 +910,7 @@ mod tests {
         .unwrap();
 
         let trace = SyncTrace::start();
-        rollback.rollback();
+        claim.rollback();
         assert_eq!(
             trace.events(),
             vec![
@@ -638,12 +937,12 @@ mod tests {
         )
         .unwrap();
 
-        let rollback = CreateRollback::snapshot(dir.path());
-        open_or_create(dir.path(), None).unwrap();
+        let (_, storage, claim) = open_or_create(dir.path(), None).unwrap();
+        drop(storage);
         assert!(dir.path().join(STORE_DIR).is_dir());
 
         let trace = SyncTrace::start();
-        rollback.rollback();
+        claim.rollback();
         assert_eq!(
             trace.events(),
             vec![
@@ -664,13 +963,13 @@ mod tests {
     #[test]
     fn create_rollback_on_reopen_never_removes_a_pre_existing_store() {
         let dir = tempfile::TempDir::new().unwrap();
-        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        let _ = open_or_create(dir.path(), Some(Schema::new())).unwrap();
 
         // Simulate a later call that only reopens (schema.toml and store/
         // both already exist): a build failure here must not touch either.
-        let rollback = CreateRollback::snapshot(dir.path());
+        let claim = IndexDirClaim::acquire_for_open(dir.path()).unwrap();
         let trace = SyncTrace::start();
-        rollback.rollback();
+        claim.rollback();
 
         assert_eq!(trace.events(), Vec::new());
         assert!(dir.path().join(SCHEMA_FILE).is_file());
@@ -714,7 +1013,7 @@ mod tests {
     /// leaves. Returns the removed `schema.toml`.
     async fn leave_a_store_without_schema(dir: &Path, schema: Schema) -> String {
         let has_vector = schema.fields.contains_key("vec");
-        let (schema, storage) = open_or_create(dir, Some(schema)).unwrap();
+        let (schema, storage, _claim) = open_or_create(dir, Some(schema)).unwrap();
         let engine = crate::Engine::builder(storage, schema)
             .build()
             .await
@@ -763,7 +1062,7 @@ mod tests {
         );
 
         std::fs::write(dir.path().join(SCHEMA_FILE), schema_toml).unwrap();
-        let (schema, storage) = open_or_create(dir.path(), None).unwrap();
+        let (schema, storage, _claim) = open_or_create(dir.path(), None).unwrap();
         let engine = crate::Engine::builder(storage, schema)
             .build()
             .await
@@ -830,7 +1129,7 @@ mod tests {
     #[test]
     fn peek_commit_generation_is_zero_before_any_commit() {
         let dir = tempfile::TempDir::new().unwrap();
-        open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        let _ = open_or_create(dir.path(), Some(Schema::new())).unwrap();
 
         // `store/` now exists (created by `open_or_create`), but no Engine
         // has ever committed, so `commit_generation.json` doesn't exist yet.
@@ -840,7 +1139,7 @@ mod tests {
     #[tokio::test]
     async fn peek_commit_generation_matches_a_real_engine_after_a_commit() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (schema, storage) = open_or_create(dir.path(), Some(Schema::new())).unwrap();
+        let (schema, storage, _claim) = open_or_create(dir.path(), Some(Schema::new())).unwrap();
         let engine = crate::Engine::builder(storage, schema)
             .build()
             .await
@@ -972,7 +1271,7 @@ mod tests {
         let tmp_path = index_dir.join(SCHEMA_TMP_FILE);
 
         let trace = SyncTrace::start();
-        open_or_create(&index_dir, Some(titled_schema())).unwrap();
+        let _ = open_or_create(&index_dir, Some(titled_schema())).unwrap();
 
         assert_eq!(
             trace.events(),
@@ -1007,7 +1306,283 @@ mod tests {
         assert!(matches!(err, IndexDirError::Io { .. }), "got: {err}");
         assert!(!index_dir.exists(), "the failed create must be rolled back");
 
-        open_or_create(&index_dir, Some(titled_schema())).unwrap();
+        let _ = open_or_create(&index_dir, Some(titled_schema())).unwrap();
         assert!(index_dir.join(SCHEMA_FILE).is_file());
+    }
+
+    // --- Concurrent creates and opens (Issue #1665) ---
+    //
+    // Each test runs two callers in a fixed order on one thread. The lock
+    // belongs to the file handle, so two claims in one process exclude each
+    // other as two processes do. The surviving index is checked first, so
+    // that a regression fails on the lost data itself; the loser's error is
+    // checked after that.
+
+    fn schema_with(field: &str) -> Schema {
+        Schema::builder()
+            .add_text_field(field, crate::TextOption::default())
+            .build()
+    }
+
+    /// What a binding does with `open_or_create`'s result: build the
+    /// engine, then drop the claim, or roll back if the build fails.
+    async fn build_like_a_binding(
+        resolved: Result<(Schema, Arc<dyn Storage>, IndexDirClaim), IndexDirError>,
+    ) -> Result<crate::Engine, String> {
+        let (schema, storage, claim) = resolved.map_err(|err| err.to_string())?;
+        match crate::Engine::builder(storage, schema).build().await {
+            Ok(engine) => {
+                drop(claim);
+                Ok(engine)
+            }
+            Err(err) => {
+                claim.rollback();
+                Err(err.to_string())
+            }
+        }
+    }
+
+    /// Put and commit the document `id` through `engine`.
+    async fn commit_document(engine: &crate::Engine, id: &str, field: &str) {
+        let document = crate::Document::builder().add_text(field, "hello").build();
+        engine.put_document(id, document).await.unwrap();
+        engine.commit().await.unwrap();
+    }
+
+    /// Put and commit the document `doc` through `engine`, close it, reopen
+    /// the index at `index_dir`, and check that its `schema.toml` still has
+    /// `field` and that `doc` and the documents `earlier` (committed before
+    /// the other call ran) are there.
+    async fn assert_index_survives(
+        index_dir: &Path,
+        engine: crate::Engine,
+        field: &str,
+        earlier: &[&str],
+    ) {
+        commit_document(&engine, "doc", field).await;
+        drop(engine);
+
+        let (schema, storage, _claim) = open_or_create(index_dir, None).unwrap();
+        assert!(
+            schema.fields.contains_key(field),
+            "schema.toml must still be the surviving index's, got fields {:?}",
+            schema.fields.keys().collect::<Vec<_>>()
+        );
+        let engine = crate::Engine::builder(storage, schema)
+            .build()
+            .await
+            .unwrap();
+        for id in earlier.iter().copied().chain(["doc"]) {
+            assert_eq!(
+                engine.get_documents(id).await.unwrap().len(),
+                1,
+                "the surviving index must keep its committed document {id:?}"
+            );
+        }
+    }
+
+    /// R1: a create that runs while another create holds the claim fails
+    /// and removes nothing; before Issue #1665, its rollback removed the
+    /// first index after its build failed on the engine lock.
+    #[tokio::test]
+    async fn a_create_during_another_create_fails_and_removes_nothing() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+
+        // A has checked the directory and holds the claim.
+        let a = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        // B, a binding's create, runs now and builds after A.
+        let b = open_or_create(&index_dir, Some(schema_with("b_field")));
+        let storage = a.create_schema_and_store(&schema_with("a_field")).unwrap();
+        let engine = crate::Engine::builder(storage, schema_with("a_field"))
+            .build()
+            .await
+            .unwrap();
+        drop(a);
+        commit_document(&engine, "before", "a_field").await;
+        let b = build_like_a_binding(b).await;
+
+        assert_index_survives(&index_dir, engine, "a_field", &["before"]).await;
+        let err = b.err().expect("the second create must fail");
+        assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    /// R2: an open that runs between a create's `schema.toml` and `store/`
+    /// fails and removes nothing; before Issue #1665, it created `store/`,
+    /// lost the engine lock, and its rollback removed the `store/` the
+    /// create's engine was using.
+    #[tokio::test]
+    async fn an_open_between_a_creates_schema_and_store_fails_and_removes_nothing() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+        let schema = schema_with("a_field");
+
+        let a = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        write_schema(&index_dir, &schema).unwrap();
+        // B, a binding's open, runs now and builds after A.
+        let b = open_or_create(&index_dir, None);
+        let storage = StorageFactory::create(StorageConfig::File(FileStorageConfig::new(
+            index_dir.join(STORE_DIR),
+        )))
+        .unwrap();
+        let engine = crate::Engine::builder(storage, schema)
+            .build()
+            .await
+            .unwrap();
+        drop(a);
+        commit_document(&engine, "before", "a_field").await;
+        let b = build_like_a_binding(b).await;
+
+        assert_index_survives(&index_dir, engine, "a_field", &["before"]).await;
+        let err = b.err().expect("the open must fail");
+        assert!(err.contains("being created or opened"), "got: {err}");
+    }
+
+    /// R3: an open that runs after a create wrote the index but before it
+    /// built its engine fails; before Issue #1665, it built first, and the
+    /// create's rollback removed everything under the open engine.
+    #[tokio::test]
+    async fn an_open_before_a_creates_build_fails_and_the_create_keeps_its_index() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+        let schema = schema_with("a_field");
+
+        let a = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        let storage = a.create_schema_and_store(&schema).unwrap();
+        // B, a binding's open, runs and builds now, before A builds.
+        let b = build_like_a_binding(open_or_create(&index_dir, None)).await;
+        let a = match crate::Engine::builder(storage, schema).build().await {
+            Ok(engine) => {
+                drop(a);
+                Ok(engine)
+            }
+            Err(err) => {
+                a.rollback();
+                Err(err)
+            }
+        };
+
+        let (survivor, b_err) = match (a, b) {
+            (Ok(engine), Err(b_err)) => (engine, Some(b_err)),
+            (Err(_), Ok(engine)) => (engine, None),
+            (a, b) => panic!(
+                "exactly one engine must be built, got create: {:?}, open: {:?}",
+                a.err(),
+                b.err()
+            ),
+        };
+        assert_index_survives(&index_dir, survivor, "a_field", &[]).await;
+        let err = b_err.expect("the open must fail and the create must keep its engine");
+        assert!(err.contains("being created or opened"), "got: {err}");
+    }
+
+    /// A claim records which of `schema.toml` and `store/` exist only once
+    /// it holds the lock: B opened the lock file, then another create ran to
+    /// the end, and B must find its index rather than create over it.
+    #[test]
+    fn a_claim_looks_at_the_directory_only_once_it_holds_the_lock() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+        let runtime = std::rc::Rc::new(tokio::runtime::Runtime::new().unwrap());
+        let a_engine = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        let (dir, rt, slot) = (index_dir.clone(), runtime.clone(), a_engine.clone());
+        test_hooks::set_before_lock(move || {
+            let resolved = open_or_create(&dir, Some(schema_with("a_field")));
+            let engine = rt.block_on(build_like_a_binding(resolved)).unwrap();
+            *slot.borrow_mut() = Some(engine);
+        });
+        let b = runtime.block_on(build_like_a_binding(open_or_create(&index_dir, None)));
+
+        let engine = a_engine.borrow_mut().take().expect("A's create ran");
+        runtime.block_on(assert_index_survives(&index_dir, engine, "a_field", &[]));
+        let err = b.err().expect("B must not build over A's engine");
+        assert!(err.contains("already locked"), "got: {err}");
+    }
+
+    /// A claim that locks a lock file whose name was removed meanwhile, and
+    /// now names another claim's file, must not count as holding the
+    /// directory (Unix), and on Windows the file cannot be removed while
+    /// the claim has it open; either way it ends as `AlreadyExists`.
+    #[test]
+    fn a_claim_on_a_lock_file_removed_meanwhile_does_not_hold_the_directory() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+
+        // Y made the directory and rolls back while X is between opening and
+        // locking the lock file; then Z claims the directory again.
+        let y = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        let z = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (dir, z_slot) = (index_dir.clone(), z.clone());
+        test_hooks::set_before_lock(move || {
+            y.rollback();
+            *z_slot.borrow_mut() = Some(IndexDirClaim::acquire_for_create(&dir).unwrap());
+        });
+        let x = IndexDirClaim::acquire_for_create(&index_dir);
+
+        assert!(z.borrow().is_some());
+        assert!(
+            matches!(x, Err(IndexDirError::AlreadyExists { .. })),
+            "X must not hold the directory while Z does, got: {x:?}"
+        );
+    }
+
+    /// A rollback removes the directory it made only if it is empty, so it
+    /// never removes what another call put in it meanwhile.
+    #[test]
+    fn a_rollback_keeps_what_another_call_put_in_the_directory_it_made() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let index_dir = parent.path().join("idx");
+
+        let claim = IndexDirClaim::acquire_for_create(&index_dir).unwrap();
+        std::fs::write(index_dir.join("other.txt"), b"not the create's").unwrap();
+        let storage = claim.create_schema_and_store(&titled_schema()).unwrap();
+        drop(storage);
+        claim.rollback();
+
+        assert!(index_dir.join("other.txt").is_file());
+        assert!(!index_dir.join(SCHEMA_FILE).exists());
+        assert!(!index_dir.join(STORE_DIR).exists());
+    }
+
+    /// An open of a directory without `schema.toml` creates nothing there.
+    #[test]
+    fn a_claim_to_open_a_non_index_directory_creates_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let err = IndexDirClaim::acquire_for_open(dir.path()).unwrap_err();
+
+        assert!(
+            matches!(err, IndexDirError::NotAnIndexDirectory { .. }),
+            "got: {err}"
+        );
+        assert!(!dir.path().join(LOCK_FILE).exists());
+    }
+
+    /// A claim held by one call makes a create fail with `AlreadyExists`
+    /// and an open with `InUse`, and dropping it lets both through.
+    #[test]
+    fn a_held_claim_turns_away_creates_and_opens_until_it_is_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, storage, _) = open_or_create(dir.path(), Some(titled_schema())).unwrap();
+        drop(storage);
+        let empty = tempfile::TempDir::new().unwrap();
+
+        let held = IndexDirClaim::acquire_for_open(dir.path()).unwrap();
+        let held_empty = IndexDirClaim::acquire_for_create(empty.path()).unwrap();
+        let open = open_or_create(dir.path(), None).map(|_| ());
+        let create = open_or_create(empty.path(), None).map(|_| ());
+        assert!(
+            matches!(open, Err(IndexDirError::InUse { .. })),
+            "got: {open:?}"
+        );
+        assert!(
+            matches!(create, Err(IndexDirError::AlreadyExists { .. })),
+            "got: {create:?}"
+        );
+
+        drop((held, held_empty));
+        let _ = open_or_create(dir.path(), None).unwrap();
+        let _ = open_or_create(empty.path(), None).unwrap();
     }
 }

@@ -107,6 +107,8 @@ pub fn io_err_with_path(path: &str, e: std::io::Error) -> Error {
 /// | `LegacyFlatLayout`       | `ArgumentError` |
 /// | `LeftoverStore`          | `ArgumentError` |
 /// | `NotAnIndexDirectory`    | `ArgumentError` |
+/// | `AlreadyExists`          | `RuntimeError`  |
+/// | `InUse`                  | `RuntimeError`  |
 /// | `Io`                     | `IOError`       |
 /// | `Core`                   | see [`laurus_err`] |
 ///
@@ -117,7 +119,9 @@ pub fn io_err_with_path(path: &str, e: std::io::Error) -> Error {
 /// `LaurusError::Io` above; unlike the Python binding, there is no
 /// path-preserving exception hierarchy to lose here, and
 /// `IndexDirError::Io`'s `Display` already includes the offending path, so
-/// `err.to_string()` carries it through.
+/// `err.to_string()` carries it through. `AlreadyExists`/`InUse` (another
+/// call holds the directory, Issue #1665) map to `RuntimeError`, like the
+/// engine's own "already locked" error, since a retry can succeed.
 pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> Error {
     use laurus::index_dir::IndexDirError;
     let ruby = Ruby::get().expect("called from Ruby thread");
@@ -127,6 +131,9 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> Error {
         | IndexDirError::LeftoverStore { .. }
         | IndexDirError::NotAnIndexDirectory { .. } => {
             Error::new(ruby.exception_arg_error(), err.to_string())
+        }
+        IndexDirError::AlreadyExists { .. } | IndexDirError::InUse { .. } => {
+            Error::new(ruby.exception_runtime_error(), err.to_string())
         }
         IndexDirError::Io { .. } => Error::new(ruby.exception_io_error(), err.to_string()),
         IndexDirError::Core(e) => laurus_err(e),

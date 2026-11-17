@@ -13,7 +13,7 @@ By the end of this guide, you will have a working search engine that can:
 
 ## Prerequisites
 
-- **Rust** 1.85 or later (edition 2024)
+- **Rust** 1.89 or later (edition 2024)
 - **Cargo** (included with Rust)
 - **Tokio** runtime (Laurus uses async APIs)
 

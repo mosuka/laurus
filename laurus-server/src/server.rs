@@ -304,6 +304,30 @@ mod tests {
         assert!(engine.is_some());
     }
 
+    /// Issue #1665: a start while another process is creating the index
+    /// (here, a claim taken in this process, which the lock excludes the
+    /// same way) fails instead of opening the index under that create, whose
+    /// rollback could then remove it.
+    #[tokio::test]
+    async fn open_index_at_startup_fails_while_another_process_creates_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("idx");
+        let other = laurus::index_dir::IndexDirClaim::acquire_for_create(&data_dir).unwrap();
+        drop(other.create_schema_and_store(&Schema::new()).unwrap());
+
+        let result =
+            open_index_at_startup(&data_dir, WalSyncPolicy::default(), CommitPolicy::Manual).await;
+        drop(other);
+
+        let Err(err) = result else {
+            panic!("the start must not open an index another create holds");
+        };
+        assert!(
+            format!("{err:#}").contains("being created or opened"),
+            "got: {err:#}"
+        );
+    }
+
     /// Issue #1480: `schema.toml` existing but the engine failing to open
     /// (here, a stale `engine.lock` left by a crash) must surface as an
     /// `Err` naming both the real cause and the data directory, not the

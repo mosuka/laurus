@@ -76,6 +76,8 @@ laurus --index-dir ./my_index create index --schema schema.toml \
 ```
 
 > **注意:** `schema.toml` と `store/` の両方が存在する場合はエラーが返されます。再作成するにはインデックスディレクトリを削除してください。`schema.toml` のみ存在する場合（作成が中断された場合など）は、`--schema` なしで `create index` を実行すると既存スキーマからストレージが復旧されます。`create index` は `store/` を作成する前に `schema.toml` を永続化するので、作成が中断されても残るのは多くて `schema.toml` だけで、`store/` だけが残ることはありません（[インデックスディレクトリの耐久性](../laurus/persistence.md#インデックスディレクトリの耐久性)を参照）。`store/` のみ存在する場合（`schema.toml` を手で削除した場合など）は、`store/` に以前のインデックスのドキュメントが残っている可能性があるため、エラーが返され、何も書き込まず何も削除しません。そのインデックスを開くには `schema.toml` を戻し、新しいインデックスを作るには `store/` を削除してください（Issue #1560）。このチェックより前の `create index` は、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。
+>
+> 同じ時に、ほかのプロセス（ほかの `create index`、サーバー、バインディング）が同じディレクトリでインデックスを作成または open している場合、`create index` は何も書かずにすぐ「an index already exists at ..., or another call ... is creating or opening one there」で失敗し、ほかのコマンドは「the index at ... is being created or opened by another call」で失敗します。そのため、まだ動いている作成が書いた `schema.toml` を、中断された作成の残りとみなすことはありません（[同時の作成と open](../laurus/persistence.md#同時の作成と-open) を参照、Issue #1665）。
 
 ### `create schema`
 

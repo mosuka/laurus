@@ -436,7 +436,9 @@ commit は文書化された契約（`flush_wal()` や `commit()` でまだ dura
 配置されるかを一切関知しません。`laurus-cli`・`laurus-server`・各言語
 バインディング（Python・Node.js・Ruby・PHP）はいずれも `<storage root>` を
 `<index_dir>/store/` に配置し、スキーマを保持する `<index_dir>/schema.toml`
-と対にして扱います。これはエンジンではなく、これらのエントリポイントが
+と、作成や open の間そのロックを持つ空の `<index_dir>/index.lock`
+（[同時の作成と open](#同時の作成と-open) を参照）と対にして扱います。
+これはエンジンではなく、これらのエントリポイントが
 独自に採用している規約です。この規約のおかげで、いずれか1つで作成した
 インデックスディレクトリを、ディスク上の構造を変更することなく他のもので
 そのまま開けます。作成・再オープン時の正確な挙動は各バインディングの
@@ -462,7 +464,9 @@ manifest を書くときに記録が足されます。記録を知らない古�
 （[#1587](https://github.com/mosuka/laurus/issues/1587)）。
 
 1. インデックスディレクトリと、存在しない親ディレクトリを作成し、作成した
-   各ディレクトリを、それを含むディレクトリに sync します。
+   各ディレクトリを、それを含むディレクトリに sync します。続けて、作成は
+   ディレクトリのロックを取ります（[同時の作成と open](#同時の作成と-open)
+   を参照）。
 2. スキーマを `schema.toml.tmp` に書き、sync してから `schema.toml` に
    rename し、インデックスディレクトリを sync します。
 3. `store/` を作成し、インデックスディレクトリをもう一度 sync します。
@@ -478,11 +482,15 @@ manifest を書くときに記録が足されます。記録を知らない古�
 `schema.toml` が残ることはありません。
 
 失敗した作成は、書いたものを逆の順に削除します。`store/`、`schema.toml`、
-作成で作った場合はインデックスディレクトリの順です
+インデックスディレクトリを作成で作った場合は `index.lock` とインデックス
+ディレクトリの順です
 （[#1666](https://github.com/mosuka/laurus/issues/1666)）。削除したものを
 含んでいたディレクトリを、次の削除の前に sync するため、削除したものは
 クラッシュ後も戻らず、削除の途中でクラッシュしても `schema.toml` のない
-`store/` は残りません。作成で作った親ディレクトリは、空のまま残ります。
+`store/` は残りません。インデックスディレクトリは空のときだけ削除するので、
+その間にほかのプロセスが置いたものは削除しません
+（[#1665](https://github.com/mosuka/laurus/issues/1665)）。作成で作った
+親ディレクトリは、空のまま残ります。
 
 `laurus-cli` と `laurus-server` は、すべてのスキーマ変更（`add_field`・
 `delete_field`・`update_field`・
@@ -502,6 +510,42 @@ sync した `schema.toml.tmp` を `schema.toml` に rename し、インデック
 Windows では `std` でディレクトリを開いて sync できないため、ストレージ自身の
 ディレクトリの sync と同じく、ファイルの中身と rename の原子性だけが保証
 されます。
+
+### 同時の作成と open
+
+`laurus-cli`・`laurus-server`・各バインディングによるインデックス
+ディレクトリの作成と open は、どれも、ディレクトリを調べる前から、エンジンが
+エンジンのロックを持つまで（失敗した作成なら、書いたものを削除し終えるまで）、
+`<index_dir>/index.lock` の OS のロック（Unix では `flock`、Windows では
+`LockFileEx`）を持ちます
+（[#1665](https://github.com/mosuka/laurus/issues/1665)）。ディレクトリを
+変えるのはロックを持つ側だけで、失敗した作成が削除するのは、ロックを取った
+後に自分で作ったものだけです。そのため、その間にほかのプロセスが作成した
+インデックスや開いたインデックスを削除することはありません。
+
+ロックがほかで持たれているときは、待たずにすぐ失敗します。
+
+- 作成は「an index already exists at …, or another call (in this process or
+  another) is creating or opening one there」で失敗します。サーバーの
+  `CreateIndex` は、これを `ALREADY_EXISTS` で返します。
+- open は「the index at … is being created or opened by another call (in
+  this process or another); try again once it has finished」で失敗します。
+
+ロックを持つのは、インデックスを作成している間と open している間だけです。
+エンジンが動き出した後は、エンジン自身の `store/engine.lock` が 2 つ目の
+エンジンを防ぎます。プロセスが終わると、クラッシュでも OS がロックを外すので、
+`index.lock` が古いまま残ることはなく、手で削除してはいけません。
+インデックスができた後も、ファイルは残ります。作成中はどれもロックを持つので、
+`store/` のない `schema.toml` を復旧するのはクラッシュが残した場合だけで、
+まだ動いている作成のものを引き継ぐことはありません。
+
+次の場合は守られません。
+
+- このロックより古い laurus を動かすプロセスは、ロックを取りません。
+- ネットワークファイルシステムでは、ほかのマシンのプロセスを `flock` で
+  防げるかは、ファイルシステムによります。
+- ロックを持たれている間に `index.lock` を手で削除すると、ほかの呼び出しが
+  同じ名前の新しいファイルのロックを取れてしまいます。
 
 ## 次のステップ
 

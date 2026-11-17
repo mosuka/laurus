@@ -14,7 +14,7 @@ use ext_php_rs::convert::FromZval;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
 use ext_php_rs::zend::ce;
-use laurus::index_dir::CreateRollback;
+use laurus::index_dir::IndexDirClaim;
 use laurus::{
     CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, Engine, EngineStats, Storage,
     StorageConfig, StorageFactory, WalSyncPolicy,
@@ -361,8 +361,9 @@ impl PhpIndex {
             .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()))?;
 
         let schema_val = schema.map(|php_schema| php_schema.inner.borrow().clone());
-        let (schema_val, storage, rollback) =
-            resolve_storage_and_schema(path.as_deref(), schema_val)?;
+        // A file-backed index's claim is held until the engine is built
+        // (Issue #1665).
+        let (schema_val, storage, claim) = resolve_storage_and_schema(path.as_deref(), schema_val)?;
 
         let mut builder = Engine::builder(storage, schema_val);
         if let Some(policy) = wal_sync_policy {
@@ -373,13 +374,16 @@ impl PhpIndex {
         }
 
         match rt.block_on(builder.build()) {
-            Ok(engine) => Ok(Self {
-                engine: RefCell::new(Some(Arc::new(engine))),
-                rt: Arc::new(rt),
-            }),
+            Ok(engine) => {
+                drop(claim);
+                Ok(Self {
+                    engine: RefCell::new(Some(Arc::new(engine))),
+                    rt: Arc::new(rt),
+                })
+            }
             Err(err) => {
-                if let Some(rollback) = rollback {
-                    rollback.rollback();
+                if let Some(claim) = claim {
+                    claim.rollback();
                 }
                 Err(laurus_err(err))
             }
@@ -890,14 +894,15 @@ pub fn peek_commit_generation_function_entry() -> ext_php_rs::builders::Function
 ///
 /// # Returns
 ///
-/// The resolved `(Schema, Storage)` pair for the engine builder, plus a
-/// [`CreateRollback`] snapshot to undo whatever `open_or_create` wrote if
-/// the engine subsequently fails to build (Issue #1308). `None` for the
-/// in-memory path, since nothing is ever written to disk there.
+/// The resolved `(Schema, Storage)` pair for the engine builder, plus the
+/// directory's [`IndexDirClaim`], which the caller holds until the engine
+/// is built and uses to undo whatever `open_or_create` wrote if the build
+/// fails (Issue #1308, #1665). `None` for the in-memory path, since nothing
+/// is ever written to disk there.
 fn resolve_storage_and_schema(
     path: Option<&str>,
     schema: Option<laurus::Schema>,
-) -> PhpResult<(laurus::Schema, Arc<dyn Storage>, Option<CreateRollback>)> {
+) -> PhpResult<(laurus::Schema, Arc<dyn Storage>, Option<IndexDirClaim>)> {
     match path {
         None => {
             let schema = schema.unwrap_or_default();
@@ -907,11 +912,9 @@ fn resolve_storage_and_schema(
             Ok((schema, storage, None))
         }
         Some(p) => {
-            let index_dir = Path::new(p);
-            let rollback = CreateRollback::snapshot(index_dir);
-            let (schema, storage) =
-                laurus::index_dir::open_or_create(index_dir, schema).map_err(index_dir_err)?;
-            Ok((schema, storage, Some(rollback)))
+            let (schema, storage, claim) =
+                laurus::index_dir::open_or_create(Path::new(p), schema).map_err(index_dir_err)?;
+            Ok((schema, storage, Some(claim)))
         }
     }
 }

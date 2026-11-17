@@ -6,7 +6,7 @@ suite.
 
 ## Prerequisites
 
-- **Rust** 1.85 or later with Cargo
+- **Rust** 1.89 or later with Cargo
 - **Ruby** 3.1 or later with Bundler
 - Repository cloned locally
 

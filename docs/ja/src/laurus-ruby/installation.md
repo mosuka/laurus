@@ -20,7 +20,7 @@ bundle install
 
 ## ソースからビルド
 
-ソースからビルドするには Rust ツールチェーン（1.85 以降）と [rb_sys](https://github.com/oxidize-rb/rb-sys) が必要です。
+ソースからビルドするには Rust ツールチェーン（1.89 以降）と [rb_sys](https://github.com/oxidize-rb/rb-sys) が必要です。
 
 ```bash
 # リポジトリをクローン

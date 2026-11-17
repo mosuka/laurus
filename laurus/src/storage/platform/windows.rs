@@ -17,10 +17,18 @@
 //!
 //! Directories cannot be opened as files through `std`, so
 //! [`sync_dir`] is a no-op here.
+//!
+//! An index directory's lock file (Issue #1665) is opened without
+//! `FILE_SHARE_DELETE`, so it cannot be removed or renamed while any call
+//! has it open, and the name a claim locked always names the locked file.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
+
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE`, without `FILE_SHARE_DELETE`.
+const LOCK_FILE_SHARE_MODE: u32 = 0x1 | 0x2;
 
 /// Returns the platform default for [`crate::storage::file::FileStorageConfig::use_mmap`].
 ///
@@ -61,4 +69,56 @@ pub fn sync_dir(_dir: &Path) -> io::Result<()> {
 /// Never returns an error.
 pub fn copy_permissions(_from: &Path, _to: &File) -> io::Result<()> {
     Ok(())
+}
+
+/// Open an index directory's lock file at `path` for reading and writing,
+/// creating it if it is missing, without `FILE_SHARE_DELETE` (Issue #1665).
+///
+/// Returns the file and whether this call created it. The file stays empty;
+/// only its lock matters.
+///
+/// # Errors
+///
+/// Returns the error from opening or creating the file, including
+/// [`io::ErrorKind::NotFound`] when the directory that should hold it is
+/// gone.
+pub fn open_lock_file(path: &Path) -> io::Result<(File, bool)> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .share_mode(LOCK_FILE_SHARE_MODE);
+    match options.clone().create_new(true).open(path) {
+        Ok(file) => Ok((file, true)),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok((options.open(path)?, false)),
+        Err(err) => Err(err),
+    }
+}
+
+/// Always `true`: a lock file opened by [`open_lock_file`] cannot be
+/// removed or renamed while it is open, so its name still names it (Issue
+/// #1665).
+///
+/// # Errors
+///
+/// Never returns an error.
+pub fn is_lock_file_current(_file: &File, _path: &Path) -> io::Result<bool> {
+    Ok(true)
+}
+
+/// Release the lock `file` holds on the lock file at `path`, close it, and
+/// then remove the file (Issue #1665).
+///
+/// The file cannot be removed while it is open, so it is closed first. If
+/// another call opened it in between, the removal fails and the file stays,
+/// which only lets that call go on.
+///
+/// # Errors
+///
+/// Returns the error from removing the file. The lock is released either
+/// way.
+pub fn remove_lock_file(file: File, path: &Path) -> io::Result<()> {
+    let _ = file.unlock();
+    drop(file);
+    std::fs::remove_file(path)
 }

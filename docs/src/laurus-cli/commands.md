@@ -76,6 +76,8 @@ laurus --index-dir ./my_index create index --schema schema.toml \
 ```
 
 > **Note:** If both `schema.toml` and `store/` already exist, an error is returned. Delete the index directory to recreate. If only `schema.toml` exists (e.g. after an interrupted creation), running `create index` without `--schema` recovers the index by creating the missing storage from the existing schema. Since `create index` makes `schema.toml` durable before it creates `store/`, an interrupted creation leaves at most `schema.toml`, never `store/` alone (see [Durability of the index directory](../laurus/persistence.md#durability-of-the-index-directory)). If only `store/` exists (e.g. `schema.toml` was removed by hand), an error is returned and nothing is written or removed, since `store/` may hold the documents of an earlier index: restore `schema.toml` to open that index, or remove `store/` to create a new one (Issue #1560). Before this check, `create index` opened such a `store/` as the new index's storage and served its documents.
+>
+> If another process (another `create index`, a server, or a binding) is creating or opening an index in the same directory at the same moment, `create index` fails at once with "an index already exists at ..., or another call ... is creating or opening one there", without writing anything, and every other command fails with "the index at ... is being created or opened by another call". A `schema.toml` that a create still in progress has written is therefore never taken for an interrupted creation (see [Concurrent creates and opens](../laurus/persistence.md#concurrent-creates-and-opens), Issue #1665).
 
 ### `create schema`
 

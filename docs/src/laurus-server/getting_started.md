@@ -41,6 +41,7 @@ On startup, the server attempts to open an existing index at the configured data
 - No index at that directory (no `schema.toml`) -- the server starts without one; you can create an index later via the `CreateIndex` RPC.
 - An index exists and opens successfully -- the server serves it immediately.
 - An index exists but fails to open (a stale lock left by an unclean shutdown, a corrupt `schema.toml`, a failed WAL replay, ...) -- the server logs the cause at error level and exits with a non-zero status instead of starting as if the directory were empty. See [Recovering from an Unclean Shutdown](#recovering-from-an-unclean-shutdown).
+- Another process is creating or opening the index at that moment (for example, a `laurus create index` or a binding's `Index` on the same directory) -- the server exits the same way, with an error saying that the index is being created or opened by another call (Issue #1665). Start it again once that call has finished.
 
 ## Configuration
 
@@ -91,6 +92,11 @@ with an error naming the lock file. To recover:
 
 Removing the lock does not touch the index data itself; it only stops the
 engine from refusing to reopen a directory it believes is already in use.
+
+Do not delete `<data-dir>/index.lock`. It is not a stale lock: the operating
+system releases its lock when the process that holds it exits, and it only
+keeps creates and opens of the index from running at the same moment (see
+[Concurrent creates and opens](../laurus/persistence.md#concurrent-creates-and-opens)).
 
 ## Connecting via gRPC
 
