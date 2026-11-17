@@ -465,8 +465,15 @@ directories, `schema.toml.tmp`, or `schema.toml` alone. The create can then
 be retried, and it reuses a leftover `schema.toml.tmp`. An index with
 `schema.toml` alone is recovered by `create index` and opened by every entry
 point, which creates the missing `store/`. A crash never leaves a `store/`
-without `schema.toml`, which a create refuses, or a partial `schema.toml`. A
-create that fails removes what it wrote.
+without `schema.toml`, which a create refuses, or a partial `schema.toml`.
+
+A create that fails removes what it wrote in the reverse order: `store/`,
+then `schema.toml`, then the index directory if the create made it
+([#1666](https://github.com/mosuka/laurus/issues/1666)). The directory that
+held each is synced before the next removal, so what the create removed
+stays removed after a crash, and a crash during the removal does not leave a
+`store/` without `schema.toml` either. Missing parent directories that the
+create made are kept, empty.
 
 `laurus-cli` and `laurus-server` persist every schema change (`add_field`,
 `delete_field`, `update_field`, and

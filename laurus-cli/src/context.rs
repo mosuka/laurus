@@ -806,6 +806,41 @@ mod tests {
         );
     }
 
+    /// Issue #1666: when the engine build fails in a directory the create
+    /// made, the rollback removes `store/`, then `schema.toml`, then the
+    /// directory, and syncs the directory that held each before the next
+    /// removal, so what it removed stays removed after a crash.
+    #[tokio::test]
+    async fn create_index_build_failure_removes_what_it_wrote_durably() {
+        let root = tempfile::tempdir().unwrap();
+        let index_dir = root.path().join("idx");
+        let schema = Schema::from_toml(MALFORMED_REGEX_SCHEMA_TOML).unwrap();
+
+        let trace = SyncTrace::start();
+        let err = create_index_from_schema(&index_dir, schema)
+            .await
+            .unwrap_err();
+
+        assert_build_failure(&err);
+        assert!(!index_dir.exists());
+        let rollback_events: Vec<SyncEvent> = trace
+            .events()
+            .into_iter()
+            .skip_while(|event| !matches!(event, SyncEvent::Remove(_)))
+            .collect();
+        assert_eq!(
+            rollback_events,
+            vec![
+                SyncEvent::Remove(index_dir.join(STORE_DIR)),
+                SyncEvent::Dir(index_dir.clone()),
+                SyncEvent::Remove(index_dir.join(SCHEMA_FILE)),
+                SyncEvent::Dir(index_dir.clone()),
+                SyncEvent::Remove(index_dir.clone()),
+                SyncEvent::Dir(root.path().to_path_buf()),
+            ]
+        );
+    }
+
     /// Issue #1587: a schema change replaces `schema.toml` through a synced
     /// temporary file and syncs the index directory, instead of rewriting
     /// the file in place.

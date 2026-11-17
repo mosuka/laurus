@@ -169,47 +169,56 @@ impl CreateRollback {
     }
 
     /// Undo whatever the create attempt added, and never remove anything
-    /// that predates the snapshot:
+    /// that predates the snapshot. The removals run in the reverse order of
+    /// the create:
     ///
-    /// - `index_dir` itself didn't exist: remove the whole directory.
-    /// - Otherwise, remove `store/` only if it didn't exist, and
-    ///   `schema.toml` only if it didn't exist. A reopen (both existed)
-    ///   touches nothing, and the CLI's recovery path (only `schema.toml`
-    ///   existed) keeps `schema.toml`.
+    /// 1. `store/`, if it didn't exist.
+    /// 2. `schema.toml`, if it didn't exist.
+    /// 3. `index_dir` itself, with anything else in it, if it didn't exist.
+    ///
+    /// A reopen (`schema.toml` and `store/` both existed) touches nothing,
+    /// and the CLI's recovery path (only `schema.toml` existed) keeps
+    /// `schema.toml`.
+    ///
+    /// Each removal is made durable, by syncing the directory that held the
+    /// removed entry, before the next one runs (Issue #1666). What the
+    /// rollback removed therefore stays removed after a crash, and since
+    /// `store/` is gone for good before `schema.toml` is removed, a crash
+    /// during the rollback never leaves a `store/` without `schema.toml`,
+    /// which a create refuses ([`IndexDirError::LeftoverStore`]). Missing
+    /// parents that the create made above `index_dir` are kept, empty.
     ///
     /// A `store/` that predates the snapshot without `schema.toml` is
     /// refused before any snapshot is taken ([`check_no_leftover_store`]),
     /// so keeping it only matters for a caller that skips that check: the
     /// store may hold the documents of an earlier index (Issue #1560).
     ///
-    /// Best-effort: a removal failure is logged through the `log` crate and
-    /// otherwise ignored, since the caller is already on its way to
-    /// returning the original build error.
+    /// Best-effort: a failed removal or sync is logged through the `log`
+    /// crate and the rollback goes on, since the caller is already on its
+    /// way to returning the original build error.
     pub fn rollback(self) {
-        if !self.dir_existed {
-            Self::remove_best_effort(&self.index_dir, true);
-            return;
-        }
-
         if !self.store_existed {
             Self::remove_best_effort(&self.index_dir.join(STORE_DIR), true);
         }
         if !self.schema_existed {
             Self::remove_best_effort(&self.index_dir.join(SCHEMA_FILE), false);
         }
+        if !self.dir_existed {
+            Self::remove_best_effort(&self.index_dir, true);
+        }
     }
 
     fn remove_best_effort(path: &Path, is_dir: bool) {
         let result = if is_dir {
-            std::fs::remove_dir_all(path)
+            durable::remove_dir_all(path)
         } else {
-            std::fs::remove_file(path)
+            durable::remove_file(path)
         };
         if let Err(err) = result
             && err.kind() != std::io::ErrorKind::NotFound
         {
             log::warn!(
-                "failed to remove {} after a failed create: {err}",
+                "failed to remove {} durably after a failed create: {err}",
                 path.display()
             );
         }
@@ -520,6 +529,10 @@ mod tests {
     }
 
     // --- CreateRollback (Issue #1308) ---
+    //
+    // Each test also checks, through `SyncTrace`, that the rollback removes
+    // `store/`, then `schema.toml`, then the directory, and syncs the
+    // directory that held each before the next removal (Issue #1666).
 
     #[test]
     fn create_rollback_removes_the_whole_directory_when_it_did_not_exist_before() {
@@ -531,8 +544,20 @@ mod tests {
         assert!(index_dir.join(SCHEMA_FILE).is_file());
         assert!(index_dir.join(STORE_DIR).is_dir());
 
+        let trace = SyncTrace::start();
         rollback.rollback();
         assert!(!index_dir.exists());
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(index_dir.join(STORE_DIR)),
+                SyncEvent::Dir(index_dir.clone()),
+                SyncEvent::Remove(index_dir.join(SCHEMA_FILE)),
+                SyncEvent::Dir(index_dir.clone()),
+                SyncEvent::Remove(index_dir.clone()),
+                SyncEvent::Dir(parent.path().to_path_buf()),
+            ]
+        );
     }
 
     #[test]
@@ -544,7 +569,17 @@ mod tests {
         let rollback = CreateRollback::snapshot(dir.path());
         open_or_create(dir.path(), Some(Schema::new())).unwrap();
 
+        let trace = SyncTrace::start();
         rollback.rollback();
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(dir.path().join(STORE_DIR)),
+                SyncEvent::Dir(dir.path().to_path_buf()),
+                SyncEvent::Remove(dir.path().join(SCHEMA_FILE)),
+                SyncEvent::Dir(dir.path().to_path_buf()),
+            ]
+        );
         assert!(
             dir.path().is_dir(),
             "the pre-existing directory must survive"
@@ -575,7 +610,15 @@ mod tests {
         )
         .unwrap();
 
+        let trace = SyncTrace::start();
         rollback.rollback();
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(dir.path().join(SCHEMA_FILE)),
+                SyncEvent::Dir(dir.path().to_path_buf()),
+            ]
+        );
         assert!(
             stale.is_dir(),
             "a store/ that predates the snapshot must survive the rollback"
@@ -599,7 +642,15 @@ mod tests {
         open_or_create(dir.path(), None).unwrap();
         assert!(dir.path().join(STORE_DIR).is_dir());
 
+        let trace = SyncTrace::start();
         rollback.rollback();
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(dir.path().join(STORE_DIR)),
+                SyncEvent::Dir(dir.path().to_path_buf()),
+            ]
+        );
         assert!(
             dir.path().join(SCHEMA_FILE).is_file(),
             "a schema.toml that predates the attempt must never be removed"
@@ -618,8 +669,10 @@ mod tests {
         // Simulate a later call that only reopens (schema.toml and store/
         // both already exist): a build failure here must not touch either.
         let rollback = CreateRollback::snapshot(dir.path());
+        let trace = SyncTrace::start();
         rollback.rollback();
 
+        assert_eq!(trace.events(), Vec::new());
         assert!(dir.path().join(SCHEMA_FILE).is_file());
         assert!(dir.path().join(STORE_DIR).is_dir());
     }

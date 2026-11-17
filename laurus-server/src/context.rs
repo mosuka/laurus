@@ -392,6 +392,50 @@ mod tests {
         );
     }
 
+    /// Issue #1666: when the engine build fails in a directory `CreateIndex`
+    /// made, the rollback removes `store/`, then `schema.toml`, then the
+    /// directory, and syncs the directory that held each before the next
+    /// removal, so what it removed stays removed after a crash.
+    #[tokio::test]
+    async fn create_index_build_failure_removes_what_it_wrote_durably() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("idx");
+        let bad_schema = Schema::from_toml(MALFORMED_REGEX_SCHEMA_TOML).unwrap();
+
+        let trace = SyncTrace::start();
+        let err = create_index(
+            &data_dir,
+            &bad_schema,
+            WalSyncPolicy::default(),
+            CommitPolicy::default(),
+        )
+        .await
+        .map(|_engine| ())
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Failed to resolve analyzer for field 'body'"),
+            "got: {err:#}"
+        );
+        assert!(!data_dir.exists());
+        let rollback_events: Vec<SyncEvent> = trace
+            .events()
+            .into_iter()
+            .skip_while(|event| !matches!(event, SyncEvent::Remove(_)))
+            .collect();
+        assert_eq!(
+            rollback_events,
+            vec![
+                SyncEvent::Remove(data_dir.join(STORE_DIR)),
+                SyncEvent::Dir(data_dir.clone()),
+                SyncEvent::Remove(data_dir.join(SCHEMA_FILE)),
+                SyncEvent::Dir(data_dir.clone()),
+                SyncEvent::Remove(data_dir.clone()),
+                SyncEvent::Dir(root.path().to_path_buf()),
+            ]
+        );
+    }
+
     /// Issue #1587: a schema change replaces `schema.toml` through a synced
     /// temporary file and syncs the data directory, instead of rewriting the
     /// file in place.

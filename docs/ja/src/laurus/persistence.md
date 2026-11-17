@@ -475,7 +475,14 @@ manifest を書くときに記録が足されます。記録を知らない古�
 `schema.toml` だけのインデックスは、`create index` で復旧でき、どの
 エントリポイントでも開けます（開くときに、欠けている `store/` を作成します）。
 `schema.toml` のない `store/`（作成が拒否する状態）や、途中までの
-`schema.toml` が残ることはありません。失敗した作成は、書いたものを削除します。
+`schema.toml` が残ることはありません。
+
+失敗した作成は、書いたものを逆の順に削除します。`store/`、`schema.toml`、
+作成で作った場合はインデックスディレクトリの順です
+（[#1666](https://github.com/mosuka/laurus/issues/1666)）。削除したものを
+含んでいたディレクトリを、次の削除の前に sync するため、削除したものは
+クラッシュ後も戻らず、削除の途中でクラッシュしても `schema.toml` のない
+`store/` は残りません。作成で作った親ディレクトリは、空のまま残ります。
 
 `laurus-cli` と `laurus-server` は、すべてのスキーマ変更（`add_field`・
 `delete_field`・`update_field`・
