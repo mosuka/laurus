@@ -340,7 +340,7 @@ Error: Invalid argument: vector field 'embedding': its files were written with k
 
 To open the index, set the field back to the values the message names. Then change them on the open index: [`laurus update field`](commands.md#update-field) with `--reindex` changes the kind, `dimension` or `distance` and discards the field's vectors (a change of kind since Issue #1536). The field is left empty, so its documents need to be put again.
 
-Every other option of a vector field may still change in `schema.toml` while the index is closed: `quantizer`, `m`, `ef_construction`, `n_clusters`, `n_probe`, `rerank_storage`, `pq_codebook_path`, `base_weight` and `embedder`, and a `MultiVector` field's `storage` and `pool_factor`. Segments already written keep what they were written with until a reindex or a merge rewrites them.
+Every other option of a vector field may still change in `schema.toml` while the index is closed: `quantizer`, `m`, `ef_construction`, `n_clusters`, `n_probe`, `rerank_storage`, `pq_codebook_path`, `base_weight` and `embedder`, and a `MultiVector` field's `storage` and `pool_factor`. Segments already written keep what they were written with until a reindex or a merge rewrites them. When the index is next opened, laurus syncs the edited `schema.toml` and the index directory before it writes anything under the new schema, so the edit survives a crash even if the editor did not sync it (Issue #1668; see [Durability of the index directory](../laurus/persistence.md#durability-of-the-index-directory) for Windows).
 
 Exceptions:
 
@@ -655,7 +655,7 @@ A vector field's `embedder` must name an `[embedders.*]` entry. An undeclared na
 Error: Invalid argument: Unknown embedder 'missing' for field 'vec': not defined in schema.embedders
 ```
 
-To open such an index, edit its `schema.toml`. Declaring the name with `type = "precomputed"` keeps the field working as it did, with documents supplying its vectors. Deleting the field's `embedder` line does the same.
+To open such an index, edit its `schema.toml`. Declaring the name with `type = "precomputed"` keeps the field working as it did, with documents supplying its vectors. Deleting the field's `embedder` line does the same. The open that follows syncs the edited file before it writes to the index (Issue #1668).
 
 ### Example: one embedder shared by two fields
 

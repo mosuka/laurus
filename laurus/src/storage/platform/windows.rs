@@ -71,6 +71,18 @@ pub fn copy_permissions(_from: &Path, _to: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Open the existing file at `path` to read it and then sync it, for
+/// reading and writing without truncating it (Issue #1668):
+/// `FlushFileBuffers`, which `File::sync_all` calls, needs write access.
+///
+/// # Errors
+///
+/// Returns the error from opening the file, including the one for a file
+/// that cannot be opened for writing (a read-only file, for example).
+pub fn open_for_sync(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
 /// Open an index directory's lock file at `path` for reading and writing,
 /// creating it if it is missing, without `FILE_SHARE_DELETE` (Issue #1665).
 ///

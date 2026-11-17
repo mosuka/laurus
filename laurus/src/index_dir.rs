@@ -12,7 +12,9 @@
 //!
 //! - `schema.toml` exists: this is an **open**. The caller must not also
 //!   pass a schema ([`IndexDirError::SchemaConflict`] if they do); the
-//!   persisted schema is loaded and the `store/` directory is opened.
+//!   persisted schema is loaded, after it is made durable since it may have
+//!   been edited by hand ([`IndexDirClaim::read_schema`], Issue #1668), and
+//!   the `store/` directory is opened.
 //! - `schema.toml` is absent: this is a **create**. If old segment files
 //!   are found directly under `index_dir` (this project's pre-Issue-1059
 //!   flat layout), that's refused as [`IndexDirError::LegacyFlatLayout`]
@@ -349,6 +351,39 @@ impl IndexDirClaim {
         self.store_existed
     }
 
+    /// Read the claimed directory's `schema.toml`, after making it durable
+    /// (Issue #1668).
+    ///
+    /// The file is synced through the handle it is read from, and then the
+    /// index directory is synced, so that a `schema.toml` edited by hand while
+    /// the index was closed -- also one an editor saved by renaming a new
+    /// file over it -- survives a crash once the engine has written to
+    /// `store/` under it. Every entry point that opens an index reads its
+    /// schema with this before it builds the engine.
+    ///
+    /// On Windows, a sync needs write access to the file; one that cannot be
+    /// opened for writing (a read-only file, for example) is read without
+    /// the sync, and a warning is logged. The directory sync does nothing on
+    /// Windows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexDirError::Io`] if `schema.toml` cannot be read or
+    /// synced, or the directory cannot be synced, and
+    /// [`IndexDirError::Core`] if the file is not a valid schema.
+    pub fn read_schema(&self) -> Result<Schema, IndexDirError> {
+        let schema_path = self.index_dir.join(SCHEMA_FILE);
+        let content = durable::read_synced(&schema_path).map_err(|source| IndexDirError::Io {
+            path: schema_path,
+            source,
+        })?;
+        durable::sync_dir(&self.index_dir).map_err(|source| IndexDirError::Io {
+            path: self.index_dir.clone(),
+            source,
+        })?;
+        Ok(Schema::from_toml(&content)?)
+    }
+
     /// Create a new index's `schema.toml` and `store/` in the claimed
     /// directory, and return the storage over `store/` (Issue #1587).
     ///
@@ -645,11 +680,9 @@ fn open_claimed(
         return Err(IndexDirError::SchemaConflict { path: schema_path });
     }
     let opened = (|| {
-        let content = std::fs::read_to_string(&schema_path).map_err(|e| IndexDirError::Io {
-            path: schema_path.clone(),
-            source: e,
-        })?;
-        let resolved_schema = Schema::from_toml(&content)?;
+        // Made durable first, since the engine writes to store/ under it
+        // (Issue #1668).
+        let resolved_schema = claim.read_schema()?;
 
         // A `store/` missing beside `schema.toml` is what a crash during a
         // create leaves, since a create in progress would hold the claim. It
@@ -1288,6 +1321,27 @@ mod tests {
             ]
         );
         assert!(index_dir.join(STORE_DIR).is_dir());
+    }
+
+    /// Issue #1668: opening an existing index (the bindings' path) makes its
+    /// `schema.toml`, which may have been edited by hand, durable, and then
+    /// the directory that holds it, before the engine is built over it.
+    #[test]
+    fn open_or_create_syncs_schema_toml_then_the_directory_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = open_or_create(dir.path(), Some(titled_schema())).unwrap();
+
+        let trace = SyncTrace::start();
+        let (schema, _storage, _claim) = open_or_create(dir.path(), None).unwrap();
+
+        assert_eq!(schema.default_fields, titled_schema().default_fields);
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::File(dir.path().join(SCHEMA_FILE)),
+                SyncEvent::Dir(dir.path().to_path_buf()),
+            ]
+        );
     }
 
     /// Issue #1587: a create whose sync of the index directory fails (after

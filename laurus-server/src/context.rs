@@ -175,9 +175,9 @@ pub async fn open_index(
         Err(err) => return Err(err.into()),
     };
 
-    let schema_toml =
-        std::fs::read_to_string(&schema_path).context("Failed to read schema file")?;
-    let schema: Schema = toml::from_str(&schema_toml).context("Failed to parse schema TOML")?;
+    // Made durable before the engine writes under it, since it may have been
+    // edited by hand while the server was down (Issue #1668).
+    let schema = claim.read_schema().context("Failed to read schema file")?;
 
     let store_path = data_dir.join(STORE_DIR);
     let storage_config = StorageConfig::File(FileStorageConfig::new(&store_path));
@@ -379,6 +379,38 @@ mod tests {
             .into_iter()
             .filter(|event| !event.path().starts_with(&store))
             .collect()
+    }
+
+    /// Issue #1668: opening an index at start-up makes its `schema.toml`,
+    /// which may have been edited by hand while the server was down, durable,
+    /// and then the data directory, before the engine is built over it.
+    #[tokio::test]
+    async fn open_index_syncs_schema_toml_then_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("idx");
+        let engine = create_index(
+            &data_dir,
+            &Schema::new(),
+            WalSyncPolicy::default(),
+            CommitPolicy::default(),
+        )
+        .await
+        .unwrap();
+        drop(engine);
+
+        let trace = SyncTrace::start();
+        let engine = open_index(&data_dir, WalSyncPolicy::default(), CommitPolicy::default())
+            .await
+            .unwrap();
+        drop(engine);
+
+        assert_eq!(
+            outside_store(trace.events(), &data_dir),
+            vec![
+                SyncEvent::File(data_dir.join(SCHEMA_FILE)),
+                SyncEvent::Dir(data_dir.clone()),
+            ]
+        );
     }
 
     /// Issue #1587: `CreateIndex` syncs each directory it creates into its

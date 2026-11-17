@@ -498,6 +498,17 @@ a rename:
 - If the sync of the index directory after the rename fails, the schema
   change returns an error, but the new `schema.toml` is already in place.
 
+Every entry point that opens an index (`laurus-cli`, `laurus-server` and the
+bindings, including `create index` recovering a `schema.toml` without
+`store/`) syncs `schema.toml` through the handle it reads it from, and then
+the index directory, before it builds the engine
+([#1668](https://github.com/mosuka/laurus/issues/1668)). A `schema.toml`
+edited by hand while the index was closed, also one an editor saved by
+renaming a new file over it, therefore survives a crash once anything has
+been written under it. On Windows, a sync needs write access to the file, so
+a `schema.toml` that cannot be opened for writing (a read-only file, for
+example) is read without the sync, and a warning is logged.
+
 On Windows, `std` cannot open a directory to sync it, so only the file
 contents and the atomicity of the rename hold there, as for the storage's
 own directory syncs.

@@ -61,6 +61,17 @@ pub fn copy_permissions(from: &Path, to: &File) -> io::Result<()> {
     }
 }
 
+/// Open the existing file at `path` to read it and then sync it (Issue
+/// #1668). Read-only is enough: `fsync(2)` takes a descriptor opened for
+/// reading.
+///
+/// # Errors
+///
+/// Returns the error from opening the file.
+pub fn open_for_sync(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 /// Open an index directory's lock file at `path` for reading and writing,
 /// creating it if it is missing (Issue #1665).
 ///
