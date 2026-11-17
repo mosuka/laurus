@@ -16,6 +16,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
+use laurus::index_dir::{SCHEMA_FILE, STORE_DIR};
 
 use crate::context;
 
@@ -61,7 +62,7 @@ pub async fn run_index(
     // Determine the schema that will actually be persisted, replicating
     // init_index's recovery rule: an existing schema.toml without store/
     // wins over the argument/wizard schema.
-    let schema = if index_dir.join("schema.toml").exists() && !index_dir.join("store").exists() {
+    let schema = if index_dir.join(SCHEMA_FILE).exists() && !index_dir.join(STORE_DIR).exists() {
         context::read_schema(index_dir)?
     } else {
         match schema_path {
@@ -966,8 +967,8 @@ distance = "DotProduct"
     }
 
     /// Stage 2 (Issue #481): the schema TOML accepts `rerank_storage =
-    /// "F32"` on an HNSW field and the field round-trips through the
-    /// same toml::from_str path the cli uses to load schema.toml.
+    /// "F32"` on an HNSW field and the field round-trips through
+    /// `Schema::from_toml`, the parse the cli uses to load schema.toml.
     /// Omitting the key keeps the Stage 1 default (None).
     #[test]
     fn schema_toml_round_trips_rerank_storage_on_hnsw_field() {
@@ -979,8 +980,8 @@ m = 4
 ef_construction = 16
 rerank_storage = "F32"
 "#;
-        let schema: Schema =
-            toml::from_str(toml_with).expect("schema TOML with rerank_storage must parse");
+        let schema =
+            Schema::from_toml(toml_with).expect("schema TOML with rerank_storage must parse");
         let opt = schema
             .fields
             .get("embedding")
@@ -999,7 +1000,7 @@ distance = "Cosine"
 m = 4
 ef_construction = 16
 "#;
-        let schema: Schema = toml::from_str(toml_without)
+        let schema = Schema::from_toml(toml_without)
             .expect("schema TOML without rerank_storage must still parse");
         let opt = schema.fields.get("embedding").unwrap();
         match opt {
