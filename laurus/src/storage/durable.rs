@@ -3,19 +3,20 @@
 //! A [`Storage`](crate::storage::Storage) makes the files inside its root
 //! durable with [`Storage::sync`](crate::storage::Storage::sync). This
 //! module covers what lies outside a root: creating the root directory
-//! itself (and any missing parent), and replacing a file such as an index
-//! directory's `schema.toml` atomically.
+//! itself (and any missing parent), replacing a file such as an index
+//! directory's `schema.toml` atomically, and removing what a failed create
+//! of an index directory wrote (Issue #1666).
 //!
 //! A name created, renamed or removed in a directory is durable only once
 //! that directory is synced, so every operation here syncs the directory
-//! that holds what it created. On Windows, directories cannot be synced
-//! through `std` (see [`super::platform`]), and only the file contents and
-//! the atomicity of a rename hold.
+//! that holds what it created, or held what it removed. On Windows,
+//! directories cannot be synced through `std` (see [`super::platform`]), and
+//! only the file contents and the atomicity of a rename hold.
 //!
 //! # Test hooks
 //!
-//! [`SyncTrace`] records the syncs and renames that the functions here
-//! request on the current thread, so tests (including those of
+//! [`SyncTrace`] records the syncs, renames and removals that the functions
+//! here request on the current thread, so tests (including those of
 //! `laurus-cli` and `laurus-server`) can check what was made durable and in
 //! which order, since a crash cannot be simulated in a test. Those items are
 //! `#[doc(hidden)]` and not part of the supported API.
@@ -28,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use super::platform;
 
-/// A sync or rename requested through this module, as recorded by
+/// A sync, rename or removal requested through this module, as recorded by
 /// [`SyncTrace`].
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,14 +45,16 @@ pub enum SyncEvent {
         /// The new name.
         to: PathBuf,
     },
+    /// A file, or a directory with everything in it, was removed.
+    Remove(PathBuf),
 }
 
 impl SyncEvent {
-    /// The path the event is about: the synced file or directory, or a
-    /// rename's new name.
+    /// The path the event is about: the synced file or directory, a
+    /// rename's new name, or the removed path.
     pub fn path(&self) -> &Path {
         match self {
-            SyncEvent::File(path) | SyncEvent::Dir(path) => path,
+            SyncEvent::File(path) | SyncEvent::Dir(path) | SyncEvent::Remove(path) => path,
             SyncEvent::Rename { to, .. } => to,
         }
     }
@@ -67,8 +70,8 @@ thread_local! {
     static TRACE: RefCell<Option<TraceState>> = const { RefCell::new(None) };
 }
 
-/// Records the syncs and renames this module requests on the current
-/// thread while it is alive, for tests.
+/// Records the syncs, renames and removals this module requests on the
+/// current thread while it is alive, for tests.
 ///
 /// Only operations on the thread that started the trace are recorded, so a
 /// test sees its own operations and none of the tests running beside it.
@@ -250,6 +253,38 @@ pub(crate) fn replace_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Resu
     sync_dir(parent_dir(path))
 }
 
+/// Remove the file `path` and make the removal durable by syncing the
+/// directory that held it (Issue #1666).
+///
+/// # Errors
+///
+/// Returns the error from removing the file, [`io::ErrorKind::NotFound`]
+/// when there is none (then nothing is synced), or the error from syncing
+/// the directory, after which the file is already removed.
+pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
+    record(SyncEvent::Remove(path.to_path_buf()));
+    std::fs::remove_file(path)?;
+    sync_dir(parent_dir(path))
+}
+
+/// Remove the directory `dir` and everything in it, and make the removal
+/// durable by syncing the directory that held it (Issue #1666).
+///
+/// Only the directory that held `dir` is synced: once `dir`'s own entry is
+/// gone, nothing that was inside it can be reached.
+///
+/// # Errors
+///
+/// Returns the error from removing the directory or anything in it,
+/// [`io::ErrorKind::NotFound`] when there is none (then nothing is synced),
+/// or the error from syncing the directory that held it, after which `dir`
+/// is already removed.
+pub(crate) fn remove_dir_all(dir: &Path) -> io::Result<()> {
+    record(SyncEvent::Remove(dir.to_path_buf()));
+    std::fs::remove_dir_all(dir)?;
+    sync_dir(parent_dir(dir))
+}
+
 /// Write `contents` to `tmp` with `path`'s permissions and sync it.
 fn write_synced(path: &Path, tmp: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
@@ -321,6 +356,70 @@ mod tests {
         assert_eq!(
             trace.events(),
             vec![SyncEvent::Dir(root.path().to_path_buf())]
+        );
+    }
+
+    /// Issue #1666: a removed file stays removed after a crash.
+    #[test]
+    fn remove_file_syncs_the_directory_that_held_it() {
+        let root = tempfile::TempDir::new().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+
+        let trace = SyncTrace::start();
+        remove_file(&file).unwrap();
+
+        assert!(!file.exists());
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(file),
+                SyncEvent::Dir(root.path().to_path_buf()),
+            ]
+        );
+    }
+
+    /// Issue #1666: a removed directory stays removed after a crash, and
+    /// only the directory that held it needs a sync.
+    #[test]
+    fn remove_dir_all_syncs_the_directory_that_held_it() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("b").join("file"), b"").unwrap();
+
+        let trace = SyncTrace::start();
+        remove_dir_all(&dir).unwrap();
+
+        assert!(!dir.exists());
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(dir),
+                SyncEvent::Dir(root.path().to_path_buf()),
+            ]
+        );
+    }
+
+    /// Issue #1666: removing a path that does not exist reports NotFound
+    /// and syncs nothing, since no directory changed.
+    #[test]
+    fn removing_a_missing_path_syncs_nothing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let missing = root.path().join("missing");
+
+        let trace = SyncTrace::start();
+        let file_err = remove_file(&missing).unwrap_err();
+        let dir_err = remove_dir_all(&missing).unwrap_err();
+
+        assert_eq!(file_err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(dir_err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            trace.events(),
+            vec![
+                SyncEvent::Remove(missing.clone()),
+                SyncEvent::Remove(missing)
+            ]
         );
     }
 
