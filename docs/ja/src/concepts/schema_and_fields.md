@@ -684,6 +684,8 @@ let outcome = engine.update_field(
 
 `Reindex` は、作り直したセグメントを公開した時点で成功します。その後に再構築の手順が失敗しても、フィールド名付きの警告をログに出すだけで、フィールドは作り直したセグメントを使います（[#1436](https://github.com/mosuka/laurus/issues/1436)、[#1538](https://github.com/mosuka/laurus/issues/1538)）。公開した manifest を永続化するストレージの sync も、その手順に含まれます。sync が失敗したときは、crash で前の manifest が戻る場合に備えて、置き換えられたセグメントのファイルを次にインデックスを開くまで残します（[#1542](https://github.com/mosuka/laurus/issues/1542)）。
 
+ベクトルフィールドを作り直している間も、検索は動きます。作り直したセグメントがフィールドのセグメントと入れ替わるまで、検索は `Reindex` の前のフィールドを読みます。置き換えられたセグメントのファイルを消すことと、作り直しで落としたドキュメントの削除の印を外すことは、入れ替わった後に行います（[#1543](https://github.com/mosuka/laurus/issues/1543)）。
+
 `Destructive` な変更を適用すると、対象フィールド名がスキーマの `pending_reindex` に記録されます。これは Solr のように「スキーマとインデックスが静かに食い違う」状態を避けるための可視化機構で、`GetSchema` / `laurus get schema` から確認できます。既存データを失ったフィールドが分かるので、必要に応じてドキュメントの再投入で解消してください。
 
 ベクトルフィールドに登録される embedder は、新しい `embedder` の指定に従います（Issue #1354）。名前を指定すればその embedder が登録され、名前を外せば以前の embedder の登録が解除されて、フィールドは既定の embedder にフォールバックします（既定が `PrecomputedEmbedder` なら、そのフィールドに送ったテキストは拒否されます）。変更の前後どちらでも名前を指定していないフィールドでは、`EngineBuilder::embedder` で直接登録した embedder はそのまま残ります。

@@ -655,13 +655,12 @@ impl SegmentManager {
 
     /// Apply a merge result by replacing source segments with the merged segment.
     ///
-    /// The manifest that lists the merged segment instead of the sources is
-    /// published first, and the in-memory list takes it only once it is.
-    /// The sources' files are deleted only once that manifest is also
-    /// synced: when the sync fails, a crash may bring back the previous
-    /// manifest, which lists the sources, so their files stay for the next
-    /// open's orphan sweep, which removes whichever segments the manifest it
-    /// reads does not list (Issue #1542).
+    /// [`Self::publish_merge`] publishes the manifest that lists the merged
+    /// segment instead of the sources. The sources' files are deleted only
+    /// once that manifest is also synced: when the sync fails, a crash may
+    /// bring back the previous manifest, which lists the sources, so their
+    /// files stay for the next open's orphan sweep, which removes whichever
+    /// segments the manifest it reads does not list (Issue #1542).
     ///
     /// # Returns
     ///
@@ -675,6 +674,47 @@ impl SegmentManager {
     /// list and the manifest then still list the sources, and the merged
     /// segment's files are left for the next open's orphan sweep.
     pub fn apply_merge(
+        &self,
+        candidate: MergeCandidate,
+        merged_segment: ManagedSegmentInfo,
+    ) -> Result<Option<LaurusError>> {
+        let source_ids: Vec<String> = candidate
+            .segments
+            .iter()
+            .map(|s| s.segment_id.clone())
+            .collect();
+        if let Some(sync_error) = self.publish_merge(candidate, merged_segment)? {
+            return Ok(Some(sync_error));
+        }
+        for segment_id in &source_ids {
+            self.delete_segment_files(segment_id)?;
+        }
+        Ok(None)
+    }
+
+    /// Publish a merge result: the manifest that lists the merged segment
+    /// instead of the sources is saved, and the in-memory list takes it only
+    /// once it is.
+    ///
+    /// Unlike [`Self::apply_merge`], the sources' files stay on storage
+    /// (Issue #1543): another manager opened over the same storage before
+    /// the merge still lists them, and a reader built through it loads them.
+    /// The caller deletes them with [`Self::delete_segment_files`] once
+    /// nothing can read them through such a manager, and only when this
+    /// returned no sync error.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the merge is published and synced, or the error of the
+    /// sync that failed after it was published. The merged segment replaces
+    /// the sources in memory either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest was not published. The in-memory
+    /// list and the manifest then still list the sources, and the merged
+    /// segment's files are left for the next open's orphan sweep.
+    pub fn publish_merge(
         &self,
         candidate: MergeCandidate,
         mut merged_segment: ManagedSegmentInfo,
@@ -695,17 +735,7 @@ impl SegmentManager {
         // 2. Publish it (lock held — see `save_state_locked`).
         let sync_error = self.save_state_until_published(&merged_list)?;
         *segments_lock = merged_list;
-        drop(segments_lock);
-        if sync_error.is_some() {
-            return Ok(sync_error);
-        }
-
-        // 3. Cleanup physical files of source segments
-        for segment in candidate.segments {
-            self.delete_segment_files(&segment.segment_id)?;
-        }
-
-        Ok(None)
+        Ok(sync_error)
     }
     pub fn total_vectors(&self) -> u64 {
         self.segments.read().iter().map(|s| s.vector_count).sum()

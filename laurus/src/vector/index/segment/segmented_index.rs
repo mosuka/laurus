@@ -31,8 +31,8 @@ use crate::vector::index::segment::manager::{
 };
 use crate::vector::index::segment::merge_policy::TieredMergePolicy;
 use crate::vector::index::segment::reader_cache::SegmentedReaderCache;
-use crate::vector::index::segment::segmented_core::SegmentedCore;
-use crate::vector::index::{VectorIndex, VectorIndexStats};
+use crate::vector::index::segment::segmented_core::{SegmentedCore, SourceFiles};
+use crate::vector::index::{MergeCleanup, VectorIndex, VectorIndexStats};
 use crate::vector::reader::VectorIndexReader;
 use crate::vector::search::searcher::VectorIndexSearcher;
 use crate::vector::store::embedding_writer::EmbeddingVectorIndexWriter;
@@ -200,13 +200,14 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
 
     /// Merge `segments` into one new segment, dropping the documents
     /// `deletions` (a [`SegmentedCore::deletion_snapshot`]) marks, and drop
-    /// their cached readers.
+    /// their cached readers. The sources' files are deleted or kept as
+    /// `source_files` says.
     ///
     /// # Returns
     ///
-    /// The error of the manifest sync that failed after the merge was
-    /// published, if it failed (Issue #1542). The readers are dropped
-    /// either way.
+    /// The ids of the replaced segments, and the error of the manifest sync
+    /// that failed after the merge was published, if it failed (Issue
+    /// #1542). The readers are dropped either way.
     ///
     /// # Errors
     ///
@@ -216,10 +217,12 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
         config: &B::Config,
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<Arc<DeletionBitmap>>,
-    ) -> Result<Option<LaurusError>> {
+        source_files: SourceFiles,
+    ) -> Result<(Vec<String>, Option<LaurusError>)> {
         let (source_ids, sync_error) = self.core.merge_segments(
             segments,
             deletions,
+            source_files,
             |deletions, segments, new_segment_id| {
                 B::merge_segments(
                     config,
@@ -233,7 +236,7 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
         for id in &source_ids {
             self.reader_cache.invalidate(id);
         }
-        Ok(sync_error)
+        Ok((source_ids, sync_error))
     }
 }
 
@@ -385,10 +388,13 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
             return Ok(false);
         };
         let deletions = self.shared.core.deletion_snapshot()?;
-        if let Some(e) = self
-            .shared
-            .merge(&self.config(), candidate.segments, deletions)?
-        {
+        let (_, sync_error) = self.shared.merge(
+            &self.config(),
+            candidate.segments,
+            deletions,
+            SourceFiles::Delete,
+        )?;
+        if let Some(e) = sync_error {
             return Err(e);
         }
         Ok(true)
@@ -477,32 +483,49 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
     }
 
     fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
+        self.publish_full_merge().map(MergeCleanup::run)
+    }
+
+    fn publish_full_merge(&self) -> Result<MergeCleanup> {
         self.check_closed()?;
 
         let segments = self.shared.core.manager().list_segments();
         if segments.is_empty() {
-            return Ok(None);
+            return Ok(MergeCleanup::done(None));
         }
         // Force-merge everything into one segment, filtering with a frozen
         // copy of the deletions: a soft delete takes no writer lock and can
         // land while the merge runs (Issue #1518).
         let deletions = self.shared.core.deletion_snapshot()?;
-        if let Some(e) = self
-            .shared
-            .merge(&self.config(), segments, deletions.clone())?
-        {
+        let (source_ids, sync_error) = self.shared.merge(
+            &self.config(),
+            segments,
+            deletions.clone(),
+            SourceFiles::Keep,
+        )?;
+        if let Some(e) = sync_error {
             // Published, but a crash may bring back the manifest that lists
-            // the sources, so their deleted documents stay marked (Issue
-            // #1542).
-            return Ok(Some(e));
+            // the sources, so their files stay and their deleted documents
+            // stay marked (Issue #1542).
+            return Ok(MergeCleanup::done(Some(e)));
         }
 
-        // Every document the copy marks was physically dropped by the merge;
-        // a delete marked since stays marked. The merge has published, so a
-        // failure here is reported apart (Issue #1538): the bitmap then keeps
-        // the copy's marks, which name only documents the merge dropped.
-        let forgotten = self.shared.core.forget_deletions(deletions.as_deref());
-        Ok(forgotten.err())
+        let shared = Arc::clone(&self.shared);
+        Ok(MergeCleanup::new(move || {
+            let manager = shared.core.manager();
+            if let Some(e) = source_ids
+                .iter()
+                .find_map(|id| manager.delete_segment_files(id).err())
+            {
+                return Some(e);
+            }
+            // Every document the copy marks was physically dropped by the
+            // merge; a delete marked since stays marked. The merge has
+            // published, so a failure here is reported apart (Issue #1538):
+            // the bitmap then keeps the copy's marks, which name only
+            // documents the merge dropped.
+            shared.core.forget_deletions(deletions.as_deref()).err()
+        }))
     }
 
     // `refresh` keeps its trait default (no-op), like the monolithic index:

@@ -591,18 +591,29 @@ impl VectorIndex for MultiFieldVectorIndex {
         // data. Once the merge has published, the manifest lists only the
         // merged segment and only the new index can read the field, so it
         // replaces the old one whatever a later step returns (Issue #1538).
-        // A later step either syncs the published manifest, which keeps the
-        // source segments' files and the deletion marks when it fails, in
-        // case a crash brings back the previous manifest (Issue #1542), or
-        // forgets the deletion marks of the documents the merge dropped.
-        // Marks left behind hide nothing more until the next full merge
-        // forgets them.
-        let cleanup_error = index.optimize_until_published()?;
+        //
+        // The merge stops once it has published (Issue #1543). Until the
+        // swap below, the old index is the field's: a search builds readers
+        // over the source segments it lists, and loads the deletion marks
+        // from storage if it has not yet. The steps that change those files,
+        // deleting the sources' files and forgetting the marks of the
+        // documents the merge dropped, are the cleanup, run once the field
+        // uses the new index. The swap takes the `fields` write lock, so it
+        // waits for every read of the old index made under the read lock,
+        // and none starts after it. The cleanup does neither step when the
+        // sync of the published manifest failed, keeping the files and the
+        // marks in case a crash brings back the previous manifest (Issue
+        // #1542). Marks left behind hide nothing more until the next full
+        // merge forgets them.
+        let cleanup = index.publish_full_merge()?;
+
+        #[cfg(test)]
+        test_hooks::run_before_swap();
 
         self.fields
             .write()
             .insert(name.to_string(), FieldEntry::new(index, &new_config));
-        if let Some(e) = cleanup_error {
+        if let Some(e) = cleanup.run() {
             log::warn!(
                 "vector field '{name}' was rebuilt and uses the rebuilt segments, but a step \
                  after its merge published failed: {e}"
@@ -639,16 +650,21 @@ impl VectorIndex for MultiFieldVectorIndex {
             .collect()
     }
 
+    /// The field's snapshot, built while the `fields` read lock is held, as
+    /// [`Self::searcher`] builds its searchers. A rebuild swaps the field
+    /// under the write lock and deletes the replaced segments' files after
+    /// it (Issue #1543), so a snapshot of the old index is done loading them
+    /// by then.
     fn multi_vector_snapshot(&self, field: &str) -> Result<Option<MultiVectorSnapshot>> {
-        let index = match self.fields.read().get(field) {
-            Some(entry) => entry.index.clone(),
-            None => {
-                return Err(LaurusError::invalid_argument(format!(
-                    "unknown vector field '{field}': no index configured for it"
-                )));
-            }
+        let fields = self.fields.read();
+        let Some(entry) = fields.get(field) else {
+            return Err(LaurusError::invalid_argument(format!(
+                "unknown vector field '{field}': no index configured for it"
+            )));
         };
-        index.multi_vector_snapshot(field)
+        #[cfg(test)]
+        test_hooks::run_in_snapshot();
+        entry.index.multi_vector_snapshot(field)
     }
 
     fn late_interaction_fields(&self) -> BTreeSet<String> {
@@ -661,7 +677,8 @@ impl VectorIndex for MultiFieldVectorIndex {
     }
 
     /// The field's own pooling. The `fields` lock is released before
-    /// asking, as in [`Self::multi_vector_snapshot`].
+    /// asking: the pooling comes from the index's config, and no segment is
+    /// read, unlike in [`Self::multi_vector_snapshot`].
     fn token_pooling(&self, field: &str) -> Option<TokenPooling> {
         let index = self.fields.read().get(field)?.index.clone();
         index.token_pooling(field)
@@ -1329,6 +1346,49 @@ impl VectorIndexReader for MultiFieldReaderFacade {
     }
 }
 
+/// Hooks a test can run in the middle of
+/// [`MultiFieldVectorIndex::rebuild_field`] and
+/// [`MultiFieldVectorIndex::multi_vector_snapshot`], on the thread that set
+/// them, to read the field at a fixed point (Issue #1543).
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BEFORE_SWAP: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static IN_SNAPSHOT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once, in the next rebuild on this thread, after its merge
+    /// has published and before it swaps the field to the rebuilt index.
+    pub(crate) fn set_before_swap(hook: impl FnOnce() + 'static) {
+        BEFORE_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_before_swap() {
+        // Taken out before it runs, so a rebuild inside the hook runs none.
+        let hook = BEFORE_SWAP.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `hook` once, in the next `multi_vector_snapshot` on this thread,
+    /// just before the field's index builds the snapshot.
+    pub(crate) fn set_in_snapshot(hook: impl FnOnce() + 'static) {
+        IN_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_in_snapshot() {
+        let hook = IN_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1981,6 +2041,220 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The ids of the segments that have files in field `name`'s directory.
+    fn segment_ids(storage: &Arc<dyn Storage>, name: &str) -> BTreeSet<String> {
+        PrefixedStorage::new(name.to_string(), storage.clone())
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.starts_with("segment_"))
+            .map(|file| file.split('.').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Issue #1543: a read of a field while it is rebuilt, after the
+    /// rebuild's merge has published and before the field uses the rebuilt
+    /// index, sees the field as it was. The old index lists the source
+    /// segments, and an index reopened over the field has loaded neither
+    /// their readers nor the deletion marks, so the read loads both from
+    /// storage: the sources' files must still be there, and the marks must
+    /// still name the documents the merge dropped. Once the rebuild returns,
+    /// the sources' files are gone.
+    #[test]
+    fn a_read_before_a_rebuild_swaps_the_field_sees_the_field_as_it_was() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::{
+            FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, MultiVectorIndexConfig,
+        };
+
+        let cases = [
+            (
+                "flat",
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hnsw",
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ivf",
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension: 2,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "tokens",
+                VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let embedder = MultiVectorIndexConfig::default().embedder;
+        let failures = Rc::new(RefCell::new(Vec::new()));
+        for (name, config) in cases {
+            let storage: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let configs = BTreeMap::from([(name.to_string(), config.clone())]);
+            {
+                let index = MultiFieldVectorIndex::open_or_create(
+                    storage.clone(),
+                    &configs,
+                    embedder.clone(),
+                )
+                .unwrap();
+                let mut writer = index.writer().unwrap();
+                for doc_id in 1..=3u64 {
+                    let x = doc_id as f32;
+                    let vectors = if name == "tokens" {
+                        vec![v(x), Vector::new(vec![0.0, x])]
+                    } else {
+                        vec![Vector::new(vec![x, 1.0])]
+                    };
+                    writer
+                        .add_document_vectors(doc_id, vec![(name.to_string(), vectors)])
+                        .unwrap();
+                }
+                writer.commit().unwrap();
+                drop(writer);
+                index.soft_delete_document(2).unwrap();
+                index.persist_deletions().unwrap();
+            }
+            let sources = segment_ids(&storage, name);
+            if sources.is_empty() {
+                failures
+                    .borrow_mut()
+                    .push(format!("{name}: no segment before the rebuild"));
+                continue;
+            }
+
+            let index = Arc::new(
+                MultiFieldVectorIndex::open_or_create(storage.clone(), &configs, embedder.clone())
+                    .unwrap(),
+            );
+            let ran = Rc::new(Cell::new(false));
+            {
+                let index = Arc::clone(&index);
+                let failures = Rc::clone(&failures);
+                let ran = Rc::clone(&ran);
+                test_hooks::set_before_swap(move || {
+                    ran.set(true);
+                    let mut failures = failures.borrow_mut();
+                    check_rebuilt_documents(&index, name, "before the swap", &mut failures);
+                    if name == "tokens" {
+                        return;
+                    }
+                    let query = VectorIndexQuery::new(Vector::new(vec![1.0, 1.0]))
+                        .field_name(name.to_string())
+                        .top_k(10);
+                    match index
+                        .searcher()
+                        .and_then(|searcher| searcher.search(&query))
+                    {
+                        Ok(results) => {
+                            let ids: Vec<u64> = results.results.iter().map(|r| r.doc_id).collect();
+                            if ids.is_empty() || ids.iter().any(|id| *id != 1 && *id != 3) {
+                                failures.push(format!(
+                                    "{name} before the swap: the search returned {ids:?}, \
+                                     expected docs among 1 and 3"
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            failures.push(format!("{name} before the swap: the search failed: {e}"))
+                        }
+                    }
+                });
+            }
+            if let Err(e) = index.rebuild_field(name, config.clone()) {
+                failures
+                    .borrow_mut()
+                    .push(format!("{name}: the rebuild failed: {e}"));
+            }
+            if !ran.get() {
+                failures
+                    .borrow_mut()
+                    .push(format!("{name}: the hook before the swap did not run"));
+            }
+            let rebuilt = segment_ids(&storage, name);
+            if rebuilt.len() != 1 || !rebuilt.is_disjoint(&sources) {
+                failures.borrow_mut().push(format!(
+                    "{name}: segments {sources:?} before the rebuild and {rebuilt:?} after it, \
+                     expected one new segment only"
+                ));
+            }
+            check_rebuilt_documents(
+                &index,
+                name,
+                "after the rebuild",
+                &mut failures.borrow_mut(),
+            );
+        }
+        let failures = failures.borrow();
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Issue #1543: `multi_vector_snapshot` builds the snapshot while it
+    /// holds the `fields` read lock, so a rebuild cannot swap the field, and
+    /// then delete the replaced segments' files, while the snapshot loads
+    /// them.
+    #[test]
+    fn multi_vector_snapshot_reads_under_the_fields_lock() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::vector::index::config::MultiVectorIndexConfig;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = MultiVectorIndexConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let embedder = config.embedder.clone();
+        let configs = BTreeMap::from([(
+            "tokens".to_string(),
+            VectorIndexTypeConfig::MultiVector(config),
+        )]);
+        let index =
+            Arc::new(MultiFieldVectorIndex::open_or_create(storage, &configs, embedder).unwrap());
+        let mut writer = index.writer().unwrap();
+        writer
+            .add_document_vectors(1, vec![("tokens".to_string(), vec![v(1.0)])])
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let swap_blocked = Rc::new(Cell::new(None));
+        {
+            let index = Arc::clone(&index);
+            let swap_blocked = Rc::clone(&swap_blocked);
+            test_hooks::set_in_snapshot(move || {
+                swap_blocked.set(Some(index.fields.try_write().is_none()));
+            });
+        }
+        let snapshot = index.multi_vector_snapshot("tokens").unwrap().unwrap();
+        assert!(snapshot.vectors(1).unwrap().is_some());
+        assert_eq!(
+            swap_blocked.get(),
+            Some(true),
+            "a swap could take the fields lock while the snapshot was built"
+        );
     }
 
     /// A searcher that answers every query with no hits.

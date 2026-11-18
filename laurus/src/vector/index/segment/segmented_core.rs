@@ -372,8 +372,9 @@ impl SegmentedCore {
     /// `merge` receives `deletions` (the [`Self::deletion_snapshot`] the
     /// merge filters with), the source segments and a freshly allocated
     /// segment id, writes the merged segment, and returns its info. The
-    /// source segments are then replaced by it (see
-    /// [`SegmentManager::apply_merge`]).
+    /// source segments are then replaced by it, and their files deleted or
+    /// kept as `source_files` says (see [`SegmentManager::apply_merge`] and
+    /// [`SegmentManager::publish_merge`]).
     ///
     /// # Returns
     ///
@@ -388,6 +389,7 @@ impl SegmentedCore {
         &self,
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<Arc<DeletionBitmap>>,
+        source_files: SourceFiles,
         merge: impl FnOnce(
             Option<Arc<DeletionBitmap>>,
             Vec<ManagedSegmentInfo>,
@@ -403,9 +405,24 @@ impl SegmentedCore {
             total_size: segments.iter().map(|s| s.size_bytes).sum(),
             segments,
         };
-        let sync_error = self.manager.apply_merge(candidate, merged)?;
+        let sync_error = match source_files {
+            SourceFiles::Delete => self.manager.apply_merge(candidate, merged)?,
+            SourceFiles::Keep => self.manager.publish_merge(candidate, merged)?,
+        };
         Ok((source_ids, sync_error))
     }
+}
+
+/// What a merge does with the files of the segments it replaced (Issue
+/// #1543).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceFiles {
+    /// Delete them once the merge is published and its manifest synced
+    /// ([`SegmentManager::apply_merge`]).
+    Delete,
+    /// Keep them, for the caller to delete once nothing that listed them
+    /// can still load them ([`SegmentManager::publish_merge`]).
+    Keep,
 }
 
 #[cfg(test)]
@@ -690,6 +707,7 @@ mod tests {
             .merge_segments(
                 vec![first.clone(), second.clone()],
                 core.deletion_snapshot().unwrap(),
+                SourceFiles::Delete,
                 |bitmap, segments, id| {
                     storage
                         .create_output(&format!("{id}.test"))
@@ -718,9 +736,10 @@ mod tests {
         let core = open(&storage);
         let first = add_segment(&core, 3);
 
-        let result = core.merge_segments(vec![first.clone()], None, |_, _, _| {
-            Err(LaurusError::internal("merge failed"))
-        });
+        let result =
+            core.merge_segments(vec![first.clone()], None, SourceFiles::Delete, |_, _, _| {
+                Err(LaurusError::internal("merge failed"))
+            });
         assert!(result.is_err());
         let segments = core.manager().list_segments();
         assert_eq!(segments.len(), 1);
