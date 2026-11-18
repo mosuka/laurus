@@ -3576,28 +3576,34 @@ impl Engine {
     }
 
     /// Borrowed `(field_name, value)` pairs of `doc`'s fields for the
-    /// lexical store, without its multi-vector fields (Issues #1177,
-    /// #1492). The counterpart of [`Self::vector_field_refs`], as an
+    /// lexical store: `_id` and the schema's lexical fields (Issues #1177,
+    /// #1492, #1634). The counterpart of [`Self::vector_field_refs`], as an
     /// iterator so that a put allocates nothing for it.
     ///
-    /// The lexical store ignores fields it does not know, except when its
-    /// field list is empty: it then stores every field, which would copy
-    /// each document's token vectors into its stored fields.
+    /// The lexical store skips a field it does not declare, except when it
+    /// declares none: it then indexes and stores every field it gets. So
+    /// with no lexical field in the schema, a vector field's value passed
+    /// here would be copied into the lexical segments' stored fields, where
+    /// nothing reads it (Issue #1634), and token vectors likewise (Issue
+    /// #1177).
     fn lexical_fields<'a>(
         schema: &'a Schema,
         doc: &'a Document,
     ) -> impl Iterator<Item = (&'a str, &'a DataValue)> + 'a {
         doc.fields
             .iter()
-            .filter(|(name, _)| !Self::is_multi_vector_field(schema, name))
+            .filter(|(name, _)| Self::is_lexical_store_field(schema, name))
             .map(|(name, val)| (name.as_str(), val))
     }
 
-    fn is_multi_vector_field(schema: &Schema, name: &str) -> bool {
-        schema
-            .fields
-            .get(name)
-            .is_some_and(|option| option.is_multi_vector())
+    /// Whether the lexical store gets `name`'s value: `_id`, or a lexical
+    /// field of `schema`.
+    fn is_lexical_store_field(schema: &Schema, name: &str) -> bool {
+        name == schema::RESERVED_ID_FIELD
+            || schema
+                .fields
+                .get(name)
+                .is_some_and(|option| option.is_lexical())
     }
 
     /// Borrowed `(field_name, value)` pairs of `doc`'s vector fields, for
@@ -9115,6 +9121,117 @@ mod tests {
             .limit(1)
             .build();
         hit_ids(engine, request).await
+    }
+
+    /// A schema with one 3-dimensional `Flat` vector field, `vec`, and no
+    /// lexical field.
+    fn vector_only_schema() -> Schema {
+        use crate::engine::schema::FieldOption;
+        use crate::vector::core::field::FlatOption;
+        Schema::builder()
+            .add_field("vec", FieldOption::Flat(FlatOption::default().dimension(3)))
+            .build()
+    }
+
+    /// The names of the fields the lexical store keeps for `id`'s document,
+    /// sorted, read back from its stored fields (Issue #1634).
+    fn lexical_stored_field_names(engine: &Engine, id: &str) -> Vec<String> {
+        use crate::lexical::query::term::TermQuery;
+        use crate::lexical::search::searcher::LexicalSearchRequest;
+        let hits = engine
+            .lexical
+            .search(
+                LexicalSearchRequest::new(Box::new(TermQuery::new("_id", id))).load_documents(true),
+            )
+            .unwrap()
+            .hits;
+        assert_eq!(hits.len(), 1, "the lexical store has one document for {id}");
+        let document = hits[0]
+            .document
+            .as_ref()
+            .expect("the lexical store returns the stored document");
+        let mut names: Vec<String> = document.fields.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Issue #1634: with no lexical field in the schema, the lexical store
+    /// keeps a document's `_id` only. Its field table is empty, and it then
+    /// stores every field it gets, so it used to keep a copy of the vector.
+    #[tokio::test]
+    async fn a_vector_only_schema_keeps_vectors_out_of_the_lexical_store() {
+        let engine = Engine::new(unlocked_memory_storage(), vector_only_schema())
+            .await
+            .unwrap();
+        engine
+            .put_document(
+                "a",
+                Document::builder()
+                    .add_vector("vec", vec![1.0, 0.0, 0.0])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        assert_eq!(nearest_id(&engine, [1.0, 0.0, 0.0]).await, vec!["a"]);
+        assert_eq!(lexical_stored_field_names(&engine, "a"), vec!["_id"]);
+    }
+
+    /// Issue #1634: once `delete_field` removed the schema's last lexical
+    /// field, the lexical store keeps a later put's `_id` only, as for a
+    /// schema that never had a lexical field.
+    #[tokio::test]
+    async fn deleting_the_last_lexical_field_keeps_vectors_out_of_the_lexical_store() {
+        let engine = Engine::new(unlocked_memory_storage(), title_schema(&["vec"]))
+            .await
+            .unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine.delete_field("title").await.unwrap();
+        engine
+            .put_document(
+                "b",
+                Document::builder()
+                    .add_vector("vec", vec![0.0, 1.0, 0.0])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        assert_eq!(nearest_id(&engine, [0.0, 1.0, 0.0]).await, vec!["b"]);
+        assert_eq!(lexical_stored_field_names(&engine, "b"), vec!["_id"]);
+        assert_eq!(lexical_stored_field_names(&engine, "a"), vec!["_id"]);
+    }
+
+    /// Issue #1634: a put the WAL replays on open goes to the lexical store
+    /// like a live one, `_id` only for a schema with no lexical field.
+    #[tokio::test]
+    async fn a_replayed_put_keeps_vectors_out_of_the_lexical_store() {
+        let storage = unlocked_memory_storage();
+        let engine = Engine::new(storage.clone(), vector_only_schema())
+            .await
+            .unwrap();
+        engine
+            .put_document(
+                "a",
+                Document::builder()
+                    .add_vector("vec", vec![1.0, 0.0, 0.0])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // Crash: no drop-time writer close and no commit, so "a" is in the
+        // WAL only.
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage, vector_only_schema()).await.unwrap();
+        assert_eq!(nearest_id(&reopened, [1.0, 0.0, 0.0]).await, vec!["a"]);
+        assert_eq!(lexical_stored_field_names(&reopened, "a"), vec!["_id"]);
     }
 
     /// Issue #1502: a put made after a commit and a clean reopen must survive
