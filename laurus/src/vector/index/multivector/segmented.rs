@@ -54,8 +54,8 @@ use crate::vector::index::segment::manager::{
 };
 use crate::vector::index::segment::merge_policy::TieredMergePolicy;
 use crate::vector::index::segment::reader_cache::SegmentedReaderCache;
-use crate::vector::index::segment::segmented_core::SegmentedCore;
-use crate::vector::index::{VectorIndex, VectorIndexStats};
+use crate::vector::index::segment::segmented_core::{SegmentedCore, SourceFiles};
+use crate::vector::index::{MergeCleanup, VectorIndex, VectorIndexStats};
 use crate::vector::reader::VectorIndexReader;
 use crate::vector::search::searcher::VectorIndexSearcher;
 use crate::vector::writer::{FieldVectors, VectorIndexWriter};
@@ -224,13 +224,14 @@ impl Shared {
     /// dropping the documents `deletions` (a
     /// [`SegmentedCore::deletion_snapshot`]) marks and stale copies. Pass 2
     /// copies each surviving document's payload, so memory stays
-    /// proportional to the document count.
+    /// proportional to the document count. The sources' files are deleted
+    /// or kept as `source_files` says.
     ///
     /// # Returns
     ///
-    /// The error of the manifest sync that failed after the merge was
-    /// published, if it failed (Issue #1542). The merged segment replaces
-    /// the sources either way.
+    /// The ids of the replaced segments, and the error of the manifest sync
+    /// that failed after the merge was published, if it failed (Issue
+    /// #1542). The merged segment replaces the sources either way.
     ///
     /// # Errors
     ///
@@ -239,8 +240,9 @@ impl Shared {
         &self,
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<&DeletionBitmap>,
-    ) -> Result<Option<LaurusError>> {
-        self.merge_within(segments, deletions, POOLING_BUDGET_BYTES)
+        source_files: SourceFiles,
+    ) -> Result<(Vec<String>, Option<LaurusError>)> {
+        self.merge_within(segments, deletions, POOLING_BUDGET_BYTES, source_files)
     }
 
     /// [`Self::merge`], pooling the documents it pools in windows of at most
@@ -253,7 +255,8 @@ impl Shared {
         segments: Vec<ManagedSegmentInfo>,
         deletions: Option<&DeletionBitmap>,
         pooling_budget: usize,
-    ) -> Result<Option<LaurusError>> {
+        source_files: SourceFiles,
+    ) -> Result<(Vec<String>, Option<LaurusError>)> {
         let mut binary = self.binary.lock();
         let mut sources = segments.clone();
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
@@ -383,12 +386,16 @@ impl Shared {
             .iter()
             .map(|s| s.segment_id.clone())
             .collect();
-        let sync_error = self.core.manager().apply_merge(candidate, merged)?;
+        let manager = self.core.manager();
+        let sync_error = match source_files {
+            SourceFiles::Delete => manager.apply_merge(candidate, merged)?,
+            SourceFiles::Keep => manager.publish_merge(candidate, merged)?,
+        };
         Self::publish(&mut binary, &target, trained);
         for id in &source_ids {
             self.readers.invalidate(id);
         }
-        Ok(sync_error)
+        Ok((source_ids, sync_error))
     }
 
     /// Pool the stored rows of the survivors at `window` (indices into
@@ -575,10 +582,12 @@ impl MultiVectorIndex {
             return Ok(false);
         };
         let deletions = self.shared.core.deletion_snapshot()?;
-        if let Some(e) = self
-            .shared
-            .merge(candidate.segments, deletions.as_deref())?
-        {
+        let (_, sync_error) = self.shared.merge(
+            candidate.segments,
+            deletions.as_deref(),
+            SourceFiles::Delete,
+        )?;
+        if let Some(e) = sync_error {
             return Err(e);
         }
         Ok(true)
@@ -634,26 +643,44 @@ impl VectorIndex for MultiVectorIndex {
     }
 
     fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
+        self.publish_full_merge().map(MergeCleanup::run)
+    }
+
+    fn publish_full_merge(&self) -> Result<MergeCleanup> {
         self.check_closed()?;
         let segments = self.shared.core.manager().list_segments();
         if segments.is_empty() {
-            return Ok(None);
+            return Ok(MergeCleanup::done(None));
         }
         // Filter with a frozen copy of the deletions: a soft delete takes no
         // writer lock and can land while the merge runs (Issue #1518).
         let deletions = self.shared.core.deletion_snapshot()?;
-        if let Some(e) = self.shared.merge(segments, deletions.as_deref())? {
+        let (source_ids, sync_error) =
+            self.shared
+                .merge(segments, deletions.as_deref(), SourceFiles::Keep)?;
+        if let Some(e) = sync_error {
             // Published, but a crash may bring back the manifest that lists
-            // the sources, so their deleted documents stay marked (Issue
-            // #1542).
-            return Ok(Some(e));
+            // the sources, so their files stay and their deleted documents
+            // stay marked (Issue #1542).
+            return Ok(MergeCleanup::done(Some(e)));
         }
-        // Every document the copy marks was dropped by the merge; a delete
-        // marked since stays marked. The merge has published, so a failure
-        // here is reported apart (Issue #1538): the bitmap then keeps the
-        // copy's marks, which name only documents the merge dropped.
-        let forgotten = self.shared.core.forget_deletions(deletions.as_deref());
-        Ok(forgotten.err())
+
+        let shared = Arc::clone(&self.shared);
+        Ok(MergeCleanup::new(move || {
+            let manager = shared.core.manager();
+            if let Some(e) = source_ids
+                .iter()
+                .find_map(|id| manager.delete_segment_files(id).err())
+            {
+                return Some(e);
+            }
+            // Every document the copy marks was dropped by the merge; a
+            // delete marked since stays marked. The merge has published, so
+            // a failure here is reported apart (Issue #1538): the bitmap then
+            // keeps the copy's marks, which name only documents the merge
+            // dropped.
+            shared.core.forget_deletions(deletions.as_deref()).err()
+        }))
     }
 
     fn searcher(&self) -> Result<Box<dyn VectorIndexSearcher>> {
@@ -2427,9 +2454,12 @@ mod tests {
                 .build()
                 .unwrap()
                 .install(|| {
-                    index
-                        .shared
-                        .merge_within(segments, deletions.as_deref(), budget)
+                    index.shared.merge_within(
+                        segments,
+                        deletions.as_deref(),
+                        budget,
+                        SourceFiles::Delete,
+                    )
                 })
                 .unwrap();
             let merged = index.shared.core.manager().list_segments();

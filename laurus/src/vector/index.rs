@@ -107,9 +107,10 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// [`Self::optimize`], telling a failure before its merge published
     /// apart from one after it (Issue #1538).
     ///
-    /// [`Self::rebuild_field`] optimizes a new index opened over a field's
-    /// files. Once the merge has published, only that index can read the
-    /// field, so the caller must keep it even if a later step fails.
+    /// [`Self::rebuild_field`] merges a new index opened over a field's
+    /// files, through [`Self::publish_full_merge`]. Once the merge has
+    /// published, only that index can read the field, so the caller must
+    /// keep it even if a later step fails.
     ///
     /// The default reports every [`Self::optimize`] error as one before the
     /// publish. The segmented indexes and the MultiVector index override
@@ -130,6 +131,30 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// anything.
     fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
         self.optimize().map(|()| None)
+    }
+
+    /// Merge every segment into one and publish it, as
+    /// [`Self::optimize_until_published`] does, but leave what follows the
+    /// publish to the returned [`MergeCleanup`] (Issue #1543).
+    ///
+    /// [`Self::rebuild_field`] merges a second index opened over a field's
+    /// files and then swaps it in. Until the swap, the field's current
+    /// index still lists the replaced segments and reads the field's
+    /// deletion marks from storage, so the rebuild runs the cleanup only
+    /// once the field uses the new index.
+    ///
+    /// The default runs [`Self::optimize_until_published`] and leaves
+    /// nothing to clean up. The segmented indexes and the MultiVector index
+    /// override it: their cleanup deletes the replaced segments' files and
+    /// then forgets the deletion marks of the documents the merge dropped.
+    /// When the published manifest failed to sync, it does neither and
+    /// returns that error (Issue #1542).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge failed before it published anything.
+    fn publish_full_merge(&self) -> Result<MergeCleanup> {
+        self.optimize_until_published().map(MergeCleanup::done)
     }
 
     /// Refresh the index metadata from storage.
@@ -348,6 +373,11 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// `Engine::update_field` updates the schema only on `Ok` (Issue
     /// #1538).
     ///
+    /// A search may run while the rebuild does. Until the field uses the
+    /// rewritten segments, the rebuild leaves every file the field's current
+    /// index reads as it was, so a search in the meantime reads the field as
+    /// it was before the rebuild (Issue #1543).
+    ///
     /// The documents deleted since the last [`Self::persist_deletions`] stay
     /// deleted (Issue #1527): the rebuild drops them, as it drops the ones
     /// deleted before. The caller must not soft delete a document while the
@@ -477,6 +507,49 @@ pub struct VectorIndexStats {
 
     /// Last modified time (seconds since epoch).
     pub last_modified: u64,
+}
+
+/// The rest of a full merge that [`VectorIndex::publish_full_merge`]
+/// stopped once it had published (Issue #1543): deleting the files of the
+/// segments it replaced and forgetting the deletion marks of the documents
+/// it dropped.
+///
+/// Until [`Self::run`] is called, the merge has changed no file that a
+/// reader of the index's previous segments reads. Dropping it without
+/// running it leaves the replaced segments' files for the next open's
+/// orphan sweep, and the marks until the next full merge forgets them; they
+/// hide nothing more meanwhile.
+pub struct MergeCleanup(Box<dyn FnOnce() -> Option<LaurusError>>);
+
+impl MergeCleanup {
+    /// A cleanup with nothing left to do, which returns `error`: the error
+    /// of a step after the merge published, if one failed.
+    pub fn done(error: Option<LaurusError>) -> Self {
+        Self(Box::new(move || error))
+    }
+
+    /// A cleanup that runs `cleanup`.
+    pub(crate) fn new(cleanup: impl FnOnce() -> Option<LaurusError> + 'static) -> Self {
+        Self(Box::new(cleanup))
+    }
+
+    /// Delete the replaced segments' files and forget the dropped
+    /// documents' deletion marks.
+    ///
+    /// # Returns
+    ///
+    /// `None` when every step after the publish succeeded, or the error of
+    /// the one that failed, as [`VectorIndex::optimize_until_published`]
+    /// returns it. The index uses the merged segment either way.
+    pub fn run(self) -> Option<LaurusError> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for MergeCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeCleanup").finish_non_exhaustive()
+    }
 }
 
 // Add imports for readers

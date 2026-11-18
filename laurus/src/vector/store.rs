@@ -3271,6 +3271,56 @@ mod tests {
         assert_eq!(search_ids(&store, "a").unwrap(), all);
     }
 
+    /// Issue #1543: a search while a field is rebuilt, after the rebuild's
+    /// merge has published and before the field uses the rebuilt index,
+    /// returns the field as it was instead of failing on a replaced
+    /// segment's file. The commit drops the cached searcher, so that search
+    /// builds one over the field's old index, whose readers no search has
+    /// loaded yet.
+    #[tokio::test]
+    async fn a_search_during_a_rebuild_reads_the_field_as_it_was() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = Arc::new(VectorStore::new(storage, config).unwrap());
+        for doc_id in 1..=10 {
+            put_doc(&store, doc_id).await;
+        }
+        store.commit().await.unwrap();
+        store.delete_document_by_internal_id(1).await.unwrap();
+        store.commit().await.unwrap();
+
+        let during = Rc::new(RefCell::new(None));
+        {
+            let store = Arc::clone(&store);
+            let during = Rc::clone(&during);
+            crate::vector::index::multi_field::test_hooks::set_before_swap(move || {
+                *during.borrow_mut() = Some(search_ids(&store, "a"));
+            });
+        }
+        store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, false)
+            .await
+            .unwrap();
+
+        let live: Vec<u64> = (2..=10).collect();
+        match during.take() {
+            Some(Ok(ids)) => assert_eq!(ids, live, "the search during the rebuild"),
+            Some(Err(e)) => panic!("the search during the rebuild failed: {e}"),
+            None => panic!("the hook before the swap did not run"),
+        }
+        assert_eq!(search_ids(&store, "a").unwrap(), live);
+    }
+
     /// Issue #1457 — a purge to a Flat or IVF option with a product
     /// quantizer is rejected before the field's data is discarded.
     #[tokio::test]

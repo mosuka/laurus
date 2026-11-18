@@ -827,6 +827,12 @@ replaced segments' files are kept until the index is next opened, in case
 a crash brings back the previous manifest
 ([#1542](https://github.com/mosuka/laurus/issues/1542)).
 
+Searches keep running while a vector field is rebuilt. Until the rebuilt
+segments replace the field's segments, a search reads the field as it was
+before the `Reindex`: the replaced segments' files are deleted, and the
+deletion marks of the documents the rebuild dropped are forgotten, only
+after that ([#1543](https://github.com/mosuka/laurus/issues/1543)).
+
 Applying a `Destructive` change records the field's name in the schema's
 `pending_reindex` set. This is a visibility mechanism against the known
 Solr failure mode where the schema and the index silently drift apart —
