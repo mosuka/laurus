@@ -123,6 +123,8 @@ graph LR
 
 The reserved `_id` field is always added to the lexical config with `KeywordAnalyzer` for exact match lookups.
 
+A put passes the `LexicalStore` a document's lexical fields and `_id` only, also when the schema has no lexical field, and the `VectorStore` its vector fields (Issue #1634). The `LexicalStore` indexes and stores every field it gets while it declares none, so before this, with no lexical field in the schema (a vector-only schema, or one whose last lexical field `delete_field` removed), it kept a copy of each single-vector value among its stored field values. An index written then keeps those copies. Nothing reads them, since search results take their documents from the document log, and a copy goes away once its document is replaced or deleted and the segment that holds the copy is merged.
+
 ## Per-Field Dispatch
 
 ### PerFieldAnalyzer
