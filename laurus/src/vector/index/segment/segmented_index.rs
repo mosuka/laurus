@@ -159,6 +159,10 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
     }
 }
 
+/// Sealed segment readers, and the deletion bitmap they were loaded with
+/// (see [`SegmentedReaderCache::sealed_readers_newest_first`]).
+type DynReadersWithBitmap = (Vec<Arc<dyn VectorIndexReader>>, Option<Arc<DeletionBitmap>>);
+
 /// State shared between the index handle, its writers, and its searchers.
 struct SegmentedShared<B: SegmentedBackend> {
     /// Segment manifest, index-level deletion bitmap (`{name}.delmap`) and
@@ -182,20 +186,19 @@ impl<B: SegmentedBackend> fmt::Debug for SegmentedShared<B> {
 
 impl<B: SegmentedBackend> SegmentedShared<B> {
     /// Sealed segment readers, newest generation first, with the deletion
-    /// bitmap attached.
-    fn sealed_readers_newest_first(
-        &self,
-        config: &B::Config,
-    ) -> Result<Vec<Arc<dyn VectorIndexReader>>> {
-        let readers =
+    /// bitmap attached, and that bitmap, which the caller pairs them with
+    /// (see [`SegmentedReaderCache::sealed_readers_newest_first`]).
+    fn sealed_readers_newest_first(&self, config: &B::Config) -> Result<DynReadersWithBitmap> {
+        let (readers, bitmap) =
             self.reader_cache
                 .sealed_readers_newest_first(&self.core, |segment_id, bitmap| {
                     B::load_segment_reader(config, self.core.storage(), segment_id, bitmap)
                 })?;
-        Ok(readers
+        let readers = readers
             .into_iter()
             .map(|r| r as Arc<dyn VectorIndexReader>)
-            .collect())
+            .collect();
+        Ok((readers, bitmap))
     }
 
     /// Merge `segments` into one new segment, dropping the documents
@@ -405,8 +408,9 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
     fn reader(&self) -> Result<Arc<dyn VectorIndexReader>> {
         self.check_closed()?;
         let config = self.config();
-        let readers = self.shared.sealed_readers_newest_first(&config)?;
-        let bitmap = self.shared.core.bitmap()?;
+        let (readers, bitmap) = self.shared.sealed_readers_newest_first(&config)?;
+        #[cfg(test)]
+        crate::vector::index::segment::manager::test_hooks::run_after_build();
         Ok(Arc::new(SegmentedReaderFacade::new(
             readers,
             bitmap,
@@ -519,6 +523,13 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
             {
                 return Some(e);
             }
+            // The merge dropped their readers when it published, but a
+            // build that listed the sources before could load one after
+            // that. The deletion has waited for every such build (Issue
+            // #1678), so none is cached again after this.
+            for id in &source_ids {
+                shared.reader_cache.invalidate(id);
+            }
             // Every document the copy marks was physically dropped by the
             // merge; a delete marked since stays marked. The merge has
             // published, so a failure here is reported apart (Issue #1538):
@@ -537,8 +548,9 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
 
     fn searcher(&self) -> Result<Box<dyn VectorIndexSearcher>> {
         self.check_closed()?;
-        let readers = self.shared.sealed_readers_newest_first(&self.config())?;
-        let bitmap = self.shared.core.bitmap()?;
+        let (readers, bitmap) = self.shared.sealed_readers_newest_first(&self.config())?;
+        #[cfg(test)]
+        crate::vector::index::segment::manager::test_hooks::run_after_build();
         // `SegmentFanoutSearcher::new`'s per-segment builder must be `'static`,
         // so the config is cloned into it rather than borrowed; its heavy
         // fields (embedder, PQ codebook) are `Arc`s, so this is cheap.
@@ -921,5 +933,346 @@ mod tests {
         .collect();
         assert!(accepted.is_empty(), "not refused: {accepted:?}");
         assert_eq!(index.config().default_ef_search, Some(300));
+    }
+
+    /// What a merging thread reports to the build that waits for it.
+    #[derive(Debug)]
+    enum MergeEvent {
+        /// The merge's deletion of the replaced files waits for builds.
+        Waiting,
+        /// The merge returned.
+        Finished(std::result::Result<(), String>),
+    }
+
+    /// The merge a test runs while a build is in progress.
+    #[derive(Debug, Clone, Copy)]
+    enum Merge {
+        /// `optimize`: a full merge, whose cleanup deletes the sources'
+        /// files and then forgets the marks of the documents it dropped.
+        Full,
+        /// `maybe_auto_compact` over ten segments: a tiered merge, which
+        /// deletes the sources' files in `apply_merge`.
+        Tiered,
+    }
+
+    fn kinds() -> Vec<(&'static str, VectorIndexTypeConfig)> {
+        use crate::vector::index::config::IvfIndexConfig;
+
+        vec![
+            (
+                "flat",
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension: 2,
+                    ..Default::default()
+                }),
+            ),
+            ("hnsw", VectorIndexTypeConfig::HNSW(hnsw(2, None))),
+            (
+                "ivf",
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension: 2,
+                    n_clusters: 1,
+                    n_probe: 1,
+                    ..Default::default()
+                }),
+            ),
+        ]
+    }
+
+    /// Run `check` on a new index of the kind `config` is for, over memory
+    /// storage.
+    fn with_index(
+        config: VectorIndexTypeConfig,
+        check: impl FnOnce(Arc<dyn Storage>, &dyn IndexUnderTest),
+    ) {
+        use crate::vector::index::flat::segmented::SegmentedFlatIndex;
+        use crate::vector::index::ivf::segmented::SegmentedIvfIndex;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        match config {
+            VectorIndexTypeConfig::Flat(config) => check(
+                storage.clone(),
+                &Arc::new(SegmentedFlatIndex::open_or_create(storage, "vec", config).unwrap()),
+            ),
+            VectorIndexTypeConfig::HNSW(config) => check(
+                storage.clone(),
+                &Arc::new(SegmentedHnswIndex::open_or_create(storage, "vec", config).unwrap()),
+            ),
+            VectorIndexTypeConfig::IVF(config) => check(
+                storage.clone(),
+                &Arc::new(SegmentedIvfIndex::open_or_create(storage, "vec", config).unwrap()),
+            ),
+            other => panic!("not a segmented kind: {other:?}"),
+        }
+    }
+
+    /// The index a test drives, whatever its backend.
+    trait IndexUnderTest {
+        fn index(&self) -> Arc<dyn VectorIndex>;
+        fn segment_ids(&self) -> Vec<String>;
+        fn caches_reader(&self, segment_id: &str) -> bool;
+        fn deleted_count(&self) -> u64;
+    }
+
+    impl<B: SegmentedBackend> IndexUnderTest for Arc<SegmentedIndex<B>> {
+        fn index(&self) -> Arc<dyn VectorIndex> {
+            Arc::clone(self) as Arc<dyn VectorIndex>
+        }
+
+        fn segment_ids(&self) -> Vec<String> {
+            self.shared
+                .core
+                .manager()
+                .list_segments()
+                .into_iter()
+                .map(|s| s.segment_id)
+                .collect()
+        }
+
+        fn caches_reader(&self, segment_id: &str) -> bool {
+            self.shared.reader_cache.contains(segment_id)
+        }
+
+        fn deleted_count(&self) -> u64 {
+            self.shared.core.deleted_count().unwrap()
+        }
+    }
+
+    /// Commit documents `ids`, each in a segment of its own, with vector
+    /// `[id, 1]` in field `vec`.
+    fn commit_one_per_segment(index: &dyn VectorIndex, ids: impl IntoIterator<Item = u64>) {
+        use crate::vector::core::vector::Vector;
+
+        for id in ids {
+            let mut writer = index.writer().unwrap();
+            writer
+                .add_vectors(vec![(
+                    id,
+                    "vec".to_string(),
+                    Vector::new(vec![id as f32, 1.0]),
+                )])
+                .unwrap();
+            writer.commit().unwrap();
+        }
+    }
+
+    /// The ids of the segments that have files on `storage`.
+    fn segment_files(storage: &Arc<dyn Storage>) -> std::collections::BTreeSet<String> {
+        storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.starts_with("segment_"))
+            .map(|file| file.split('.').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn query() -> crate::vector::search::searcher::VectorIndexQuery {
+        use crate::vector::core::vector::Vector;
+
+        crate::vector::search::searcher::VectorIndexQuery::new(Vector::new(vec![1.0, 1.0]))
+            .field_name("vec".to_string())
+            .top_k(20)
+    }
+
+    /// Issue #1678: a searcher build that listed the segments a merge
+    /// replaces loads their readers while the merge waits to delete their
+    /// files, and its search succeeds.
+    ///
+    /// Right after the build lists the segments, a hook runs the merge on
+    /// another thread and waits for its first event. The merge publishes,
+    /// then its deletion finds the build holding the gate, reports
+    /// `Waiting` and waits; the build then loads every listed segment.
+    /// Without the gate the merge would finish, deleting the files, before
+    /// the build loads them. Afterwards only the merged segment's files are
+    /// left, and no replaced segment's reader stays cached.
+    #[test]
+    fn a_build_that_listed_the_segments_a_merge_replaces_loads_them() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::vector::index::segment::manager::test_hooks;
+
+        let mut failures = Vec::new();
+        let cases = kinds()
+            .into_iter()
+            .map(|(kind, config)| (kind, config, Merge::Full))
+            .chain(
+                kinds()
+                    .into_iter()
+                    .take(1)
+                    .map(|(kind, config)| (kind, config, Merge::Tiered)),
+            );
+        for (kind, config, merge) in cases {
+            let case = format!("{kind}, {merge:?} merge");
+            with_index(config, |storage, under_test| {
+                let index = under_test.index();
+                let count = match merge {
+                    Merge::Full => 3,
+                    Merge::Tiered => 10,
+                };
+                commit_one_per_segment(index.as_ref(), 1..=count);
+                index.soft_delete_document(2).unwrap();
+                let sources = under_test.segment_ids();
+
+                let first = Rc::new(RefCell::new(None));
+                let merger = Rc::new(RefCell::new(None));
+                {
+                    let index = Arc::clone(&index);
+                    let first = Rc::clone(&first);
+                    let merger = Rc::clone(&merger);
+                    test_hooks::set_after_listing(move || {
+                        let (events, received) = mpsc::channel();
+                        let handle = std::thread::spawn(move || {
+                            let waiting = events.clone();
+                            test_hooks::set_when_deletion_waits(move || {
+                                let _ = waiting.send(MergeEvent::Waiting);
+                            });
+                            let result = match merge {
+                                Merge::Full => index.optimize(),
+                                Merge::Tiered => index.maybe_auto_compact().and_then(|merged| {
+                                    if merged {
+                                        Ok(())
+                                    } else {
+                                        Err(LaurusError::internal("no tiered merge ran"))
+                                    }
+                                }),
+                            };
+                            let _ = events
+                                .send(MergeEvent::Finished(result.map_err(|e| e.to_string())));
+                        });
+                        *first.borrow_mut() = received.recv_timeout(Duration::from_secs(60)).ok();
+                        *merger.borrow_mut() = Some((handle, received));
+                    });
+                }
+
+                match index
+                    .searcher()
+                    .and_then(|searcher| searcher.search(&query()))
+                {
+                    Ok(results) => {
+                        let ids: Vec<u64> = results.results.iter().map(|r| r.doc_id).collect();
+                        if ids.is_empty() || ids.iter().any(|id| *id == 2 || *id > count) {
+                            failures.push(format!(
+                                "{case}: the search returned {ids:?}, expected live documents \
+                                 among 1 to {count} but 2"
+                            ));
+                        }
+                    }
+                    Err(e) => failures.push(format!("{case}: the search failed: {e}")),
+                }
+
+                let Some((handle, received)) = merger.borrow_mut().take() else {
+                    failures.push(format!("{case}: the hook after the listing did not run"));
+                    return;
+                };
+                handle.join().unwrap();
+                let events: Vec<MergeEvent> = first
+                    .borrow_mut()
+                    .take()
+                    .into_iter()
+                    .chain(received.try_iter())
+                    .collect();
+                if !matches!(
+                    events.as_slice(),
+                    [MergeEvent::Waiting, MergeEvent::Finished(Ok(()))]
+                ) {
+                    failures.push(format!(
+                        "{case}: the merge reported {events:?}, expected it to wait for the \
+                         build and then succeed"
+                    ));
+                }
+                let left = segment_files(&storage);
+                if left.len() != 1 || sources.iter().any(|id| left.contains(id)) {
+                    failures.push(format!(
+                        "{case}: segment files {left:?} are left, expected only the merged \
+                         one, none of {sources:?}"
+                    ));
+                }
+                let cached: Vec<&String> = sources
+                    .iter()
+                    .filter(|id| under_test.caches_reader(id))
+                    .collect();
+                if !cached.is_empty() {
+                    failures.push(format!(
+                        "{case}: the readers of replaced segments {cached:?} stay cached"
+                    ));
+                }
+            });
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Issue #1678: a build pairs its readers with the deletion bitmap they
+    /// were loaded with. A full merge that ends between the build's loads
+    /// and its use of the bitmap forgets the marks of the documents it
+    /// dropped, which the readers of the replaced segments still hold; the
+    /// reader and the searcher built must still leave those documents out.
+    #[test]
+    fn a_build_pairs_its_readers_with_the_marks_they_were_loaded_with() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::vector::index::segment::manager::test_hooks;
+
+        let failures = Rc::new(RefCell::new(Vec::new()));
+        for (kind, config) in kinds() {
+            for build in ["reader", "searcher"] {
+                let case = format!("{kind}, {build}");
+                with_index(config.clone(), |_, under_test| {
+                    let index = under_test.index();
+                    commit_one_per_segment(index.as_ref(), 1..=3);
+                    index.soft_delete_document(2).unwrap();
+                    {
+                        let index = Arc::clone(&index);
+                        let failures = Rc::clone(&failures);
+                        let case = case.clone();
+                        test_hooks::set_after_build(move || {
+                            if let Err(e) = index.optimize() {
+                                failures
+                                    .borrow_mut()
+                                    .push(format!("{case}: the merge failed: {e}"));
+                            }
+                        });
+                    }
+                    let live = match build {
+                        "reader" => index.reader().and_then(|reader| {
+                            Ok(reader.vector_ids()?.into_iter().map(|(id, _)| id).collect())
+                        }),
+                        _ => index.searcher().and_then(|searcher| {
+                            let count = searcher.count(query())?;
+                            Ok(vec![count])
+                        }),
+                    };
+                    let mut failures = failures.borrow_mut();
+                    if under_test.deleted_count() != 0 {
+                        failures.push(format!("{case}: the merge kept the marks"));
+                    }
+                    match (build, live) {
+                        ("reader", Ok(mut ids)) => {
+                            ids.sort_unstable();
+                            if ids != [1, 3] {
+                                failures.push(format!(
+                                    "{case}: the reader lists {ids:?}, expected [1, 3]"
+                                ));
+                            }
+                        }
+                        (_, Ok(count)) => {
+                            if count != [2] {
+                                failures.push(format!(
+                                    "{case}: the searcher counts {count:?}, expected 2"
+                                ));
+                            }
+                        }
+                        (_, Err(e)) => failures.push(format!("{case}: the build failed: {e}")),
+                    }
+                });
+            }
+        }
+        let failures = failures.borrow();
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

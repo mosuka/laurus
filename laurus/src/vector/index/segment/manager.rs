@@ -232,6 +232,41 @@ pub struct SegmentManager {
     /// What the segments were written with (see
     /// [`SegmentManifest::field`]). Persisted by the next save.
     field_record: RwLock<Option<FieldRecord>>,
+    /// Orders reader builds before the deletion of the segment files they
+    /// listed (Issue #1678): a build holds it for reading from listing the
+    /// segments until it has loaded their readers (see
+    /// [`Self::pinned_segments`]), and [`Self::delete_segment_files`] holds
+    /// it for writing.
+    build_gate: RwLock<()>,
+}
+
+/// The segments a reader build reads, listed by
+/// [`SegmentManager::pinned_segments`], with their files kept on storage
+/// while it lives (Issue #1678).
+///
+/// A merge can publish the segment that replaces some of them meanwhile,
+/// but [`SegmentManager::delete_segment_files`] waits until every
+/// `PinnedSegments` taken before has been dropped. A build holds it until
+/// it has loaded the readers of the listed segments.
+pub(crate) struct PinnedSegments<'a> {
+    segments: Vec<ManagedSegmentInfo>,
+    _gate: parking_lot::RwLockReadGuard<'a, ()>,
+}
+
+impl std::ops::Deref for PinnedSegments<'_> {
+    type Target = [ManagedSegmentInfo];
+
+    fn deref(&self) -> &[ManagedSegmentInfo] {
+        &self.segments
+    }
+}
+
+/// Lets a build order the listed segments in place (newest generation
+/// first, say) instead of copying them.
+impl std::ops::DerefMut for PinnedSegments<'_> {
+    fn deref_mut(&mut self) -> &mut [ManagedSegmentInfo] {
+        &mut self.segments
+    }
 }
 
 impl SegmentManager {
@@ -261,6 +296,7 @@ impl SegmentManager {
             next_segment_id: Arc::new(RwLock::new(0)),
             last_wal_seq: AtomicU64::new(0),
             field_record: RwLock::new(None),
+            build_gate: RwLock::new(()),
         };
 
         manager.load_state()?;
@@ -583,7 +619,20 @@ impl SegmentManager {
     /// legacy-migrated segment's id EQUALS the index name, so deleting the
     /// segment's "delmap" here would destroy live deletion state when a
     /// merge consumes that segment.
+    ///
+    /// Waits until every reader build of the index that listed the segments
+    /// before this call has loaded its readers (Issue #1678). A build that
+    /// lists them afterwards finds the manifest the caller published,
+    /// without the segment.
     pub fn delete_segment_files(&self, segment_id: &str) -> Result<()> {
+        let _gate = match self.build_gate.try_write() {
+            Some(gate) => gate,
+            None => {
+                #[cfg(test)]
+                test_hooks::run_when_deletion_waits();
+                self.build_gate.write()
+            }
+        };
         // Best effort deletion - ignore if a file doesn't exist
         for suffix in
             std::iter::once(self.layout.primary).chain(self.layout.sidecars.iter().copied())
@@ -627,6 +676,28 @@ impl SegmentManager {
         segments.clone()
     }
 
+    /// List all segments for a reader build, keeping their files on storage
+    /// until the result is dropped (Issue #1678).
+    ///
+    /// A build that may run while a merge replaces segments lists them
+    /// here and holds the result until it has loaded their readers:
+    /// [`Self::delete_segment_files`] waits for it, so every listed
+    /// segment's files are there to load. A merge's reads of its own
+    /// sources need not, since only merges delete segment files.
+    ///
+    /// Take it only where the segments are listed, never again on the same
+    /// thread while holding one: the lock is fair, so a second read waits
+    /// behind a waiting deletion, which waits for the first.
+    pub(crate) fn pinned_segments(&self) -> PinnedSegments<'_> {
+        // The gate before the list: a merge that publishes after this
+        // listing deletes the replaced files only after the build.
+        let gate = self.build_gate.read();
+        PinnedSegments {
+            segments: self.list_segments(),
+            _gate: gate,
+        }
+    }
+
     /// Check if any segments need merging.
     pub fn check_merge(&self, policy: &dyn MergePolicy) -> Option<MergeCandidate> {
         let segments_lock = self.segments.read();
@@ -660,7 +731,9 @@ impl SegmentManager {
     /// once that manifest is also synced: when the sync fails, a crash may
     /// bring back the previous manifest, which lists the sources, so their
     /// files stay for the next open's orphan sweep, which removes whichever
-    /// segments the manifest it reads does not list (Issue #1542).
+    /// segments the manifest it reads does not list (Issue #1542). The
+    /// deletion waits for the reader builds that listed the sources before
+    /// the publish (Issue #1678, see [`Self::delete_segment_files`]).
     ///
     /// # Returns
     ///
@@ -773,6 +846,61 @@ impl SegmentManager {
             total_size,
             avg_vectors_per_segment,
         }
+    }
+}
+
+/// Points where a test can act in the middle of a reader build or a merge
+/// on the same thread (Issue #1678). Each hook runs once, in the next build
+/// or deletion that reaches its point.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_LISTING: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static WHEN_DELETION_WAITS: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static AFTER_BUILD: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    fn run(slot: &'static std::thread::LocalKey<RefCell<Option<Hook>>>) {
+        // Taken out before it runs, so a build inside the hook runs none.
+        let hook = slot.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `hook` in the next reader build on this thread, right after it
+    /// has listed the segments and before it loads their readers.
+    pub(crate) fn set_after_listing(hook: impl FnOnce() + 'static) {
+        AFTER_LISTING.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_after_listing() {
+        run(&AFTER_LISTING);
+    }
+
+    /// Run `hook` when a deletion of segment files on this thread has to
+    /// wait for reader builds, before it waits.
+    pub(crate) fn set_when_deletion_waits(hook: impl FnOnce() + 'static) {
+        WHEN_DELETION_WAITS.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_when_deletion_waits() {
+        run(&WHEN_DELETION_WAITS);
+    }
+
+    /// Run `hook` in the next reader build on this thread, once it has
+    /// loaded the readers and released the listed segments, before it
+    /// pairs them with a deletion bitmap.
+    pub(crate) fn set_after_build(hook: impl FnOnce() + 'static) {
+        AFTER_BUILD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_after_build() {
+        run(&AFTER_BUILD);
     }
 }
 

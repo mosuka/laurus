@@ -1046,6 +1046,10 @@ segments:
   inside `commit()` after the commit's segment and deletions are durable,
   so a merge that fails does not fail the commit (Issue #1500): it is
   logged as a warning that names the field, and the next commit retries it.
+  Searches keep running during a merge and read either the segments it
+  replaces or the merged one: the merge deletes the replaced segments'
+  files only once every search that listed them has loaded them, so it
+  may wait briefly for such searches (Issue #1678).
 - **Per-segment training**: HNSW's graphs and IVF's centroids are both
   built independently per segment — IVF adapts its cluster count to each
   segment's own size (capped by the schema's `n_clusters`) rather than

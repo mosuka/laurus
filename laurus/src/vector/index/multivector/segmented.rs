@@ -53,7 +53,7 @@ use crate::vector::index::segment::manager::{
     ManagedSegmentInfo, MergeCandidate, SegmentManager, SegmentManagerConfig,
 };
 use crate::vector::index::segment::merge_policy::TieredMergePolicy;
-use crate::vector::index::segment::reader_cache::SegmentedReaderCache;
+use crate::vector::index::segment::reader_cache::{ReadersWithBitmap, SegmentedReaderCache};
 use crate::vector::index::segment::segmented_core::{SegmentedCore, SourceFiles};
 use crate::vector::index::{MergeCleanup, VectorIndex, VectorIndexStats};
 use crate::vector::reader::VectorIndexReader;
@@ -96,11 +96,21 @@ impl Shared {
         format!("{segment_id}{}", LAYOUT.primary)
     }
 
-    /// Sealed segment readers, newest generation first.
-    fn readers_newest_first(&self) -> Result<Vec<Arc<SegmentReader>>> {
-        let mut segments = self.core.manager().list_segments();
+    /// Sealed segment readers, newest generation first, and the deletion
+    /// bitmap to read them with.
+    ///
+    /// The segments are listed with
+    /// [`SegmentManager::pinned_segments`](crate::vector::index::segment::manager::SegmentManager::pinned_segments)
+    /// and held until the readers are loaded and the bitmap is read (Issue
+    /// #1678): a merge that replaces a listed segment meanwhile deletes its
+    /// files, and then forgets the marks of the documents it dropped, only
+    /// after that.
+    fn readers_newest_first(&self) -> Result<ReadersWithBitmap<SegmentReader>> {
+        let mut segments = self.core.manager().pinned_segments();
+        #[cfg(test)]
+        crate::vector::index::segment::manager::test_hooks::run_after_listing();
         segments.sort_by_key(|s| std::cmp::Reverse(s.generation));
-        self.load_readers(&segments)
+        Ok((self.load_readers(&segments)?, self.core.bitmap()?))
     }
 
     fn load_readers(&self, segments: &[ManagedSegmentInfo]) -> Result<Vec<Arc<SegmentReader>>> {
@@ -210,11 +220,14 @@ impl Shared {
     }
 
     fn snapshot(&self) -> Result<MultiVectorSnapshot> {
+        let (readers, bitmap) = self.readers_newest_first()?;
+        #[cfg(test)]
+        crate::vector::index::segment::manager::test_hooks::run_after_build();
         Ok(MultiVectorSnapshot::new(
             self.config.dimension,
             self.config.distance_metric,
-            self.readers_newest_first()?,
-            self.core.bitmap()?,
+            readers,
+            bitmap,
         ))
     }
 
@@ -673,6 +686,13 @@ impl VectorIndex for MultiVectorIndex {
                 .find_map(|id| manager.delete_segment_files(id).err())
             {
                 return Some(e);
+            }
+            // The merge dropped their readers when it published, but a
+            // snapshot that listed the sources before could load one after
+            // that. The deletion has waited for every such snapshot (Issue
+            // #1678), so none is cached again after this.
+            for id in &source_ids {
+                shared.readers.invalidate(id);
             }
             // Every document the copy marks was dropped by the merge; a
             // delete marked since stays marked. The merge has published, so
@@ -1362,7 +1382,7 @@ mod tests {
 
     /// `(doc_id, vector_count)` of every document in the newest segment.
     fn newest_segment_entries(index: &MultiVectorIndex) -> Vec<(u64, u32)> {
-        index.shared.readers_newest_first().unwrap()[0]
+        index.shared.readers_newest_first().unwrap().0[0]
             .entries()
             .map(|entry| (entry.doc_id, entry.vector_count))
             .collect()
@@ -1772,6 +1792,7 @@ mod tests {
                 .shared
                 .readers_newest_first()
                 .unwrap()
+                .0
                 .iter()
                 .map(|reader| {
                     let kind = reader
@@ -2219,6 +2240,7 @@ mod tests {
                 .shared
                 .readers_newest_first()
                 .unwrap()
+                .0
                 .iter()
                 .flat_map(|reader| reader.entries().collect::<Vec<_>>())
                 .collect()
@@ -2271,6 +2293,7 @@ mod tests {
                 .shared
                 .readers_newest_first()
                 .unwrap()
+                .0
                 .iter()
                 .find_map(|reader| reader.binary_params().map(|p| (**p).clone()))
         }
@@ -2693,5 +2716,156 @@ mod tests {
         })
         .collect();
         assert!(accepted.is_empty(), "not refused: {accepted:?}");
+    }
+
+    /// The ids of the segments that have files on `storage`.
+    fn segment_files(storage: &Arc<dyn Storage>) -> std::collections::BTreeSet<String> {
+        storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.starts_with("segment_"))
+            .map(|file| file.split('.').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Three documents, one segment each, with document 2 deleted.
+    fn three_segments_with_a_delete(storage: &Arc<dyn Storage>) -> MultiVectorIndex {
+        let index = open(storage);
+        for doc_id in 1..=3u64 {
+            let x = doc_id as f32;
+            commit(&index, &[(doc_id, &[[x, 1.0], [1.0, x]])]);
+        }
+        index.soft_delete_document(2).unwrap();
+        index
+    }
+
+    /// Issue #1678: a snapshot that listed the segments a merge replaces
+    /// loads their readers while the merge waits to delete their files.
+    ///
+    /// Right after the snapshot lists the segments, a hook runs `optimize`
+    /// on another thread and waits for its first event: the merge publishes,
+    /// then its deletion finds the snapshot holding the gate, reports
+    /// `Waiting` and waits. Without the gate the merge would finish,
+    /// deleting the files, before the snapshot loads them. Afterwards only
+    /// the merged segment's files are left, and no replaced segment's
+    /// reader stays cached.
+    #[test]
+    fn a_snapshot_that_listed_the_segments_a_merge_replaces_loads_them() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::vector::index::segment::manager::test_hooks;
+
+        let storage = storage();
+        let index = Arc::new(three_segments_with_a_delete(&storage));
+        let sources: Vec<String> = index
+            .shared
+            .core
+            .manager()
+            .list_segments()
+            .into_iter()
+            .map(|s| s.segment_id)
+            .collect();
+
+        let first = Rc::new(RefCell::new(None));
+        let merger = Rc::new(RefCell::new(None));
+        {
+            let index = Arc::clone(&index);
+            let first = Rc::clone(&first);
+            let merger = Rc::clone(&merger);
+            test_hooks::set_after_listing(move || {
+                let (events, received) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let waiting = events.clone();
+                    test_hooks::set_when_deletion_waits(move || {
+                        let _ = waiting.send("waiting".to_string());
+                    });
+                    let result = match index.optimize() {
+                        Ok(()) => "finished".to_string(),
+                        Err(e) => format!("failed: {e}"),
+                    };
+                    let _ = events.send(result);
+                });
+                *first.borrow_mut() = received.recv_timeout(Duration::from_secs(60)).ok();
+                *merger.borrow_mut() = Some((handle, received));
+            });
+        }
+
+        let mut failures = Vec::new();
+        match index.snapshot() {
+            Ok(snapshot) => {
+                let live: Vec<u64> = (1..=3)
+                    .filter(|doc_id| snapshot.vectors(*doc_id).unwrap().is_some())
+                    .collect();
+                if live != [1, 3] {
+                    failures.push(format!("the snapshot holds {live:?}, expected [1, 3]"));
+                }
+            }
+            Err(e) => failures.push(format!("the snapshot failed: {e}")),
+        }
+        let (handle, received) = merger
+            .borrow_mut()
+            .take()
+            .expect("the hook after the listing runs");
+        handle.join().unwrap();
+        let events: Vec<String> = first
+            .borrow_mut()
+            .take()
+            .into_iter()
+            .chain(received.try_iter())
+            .collect();
+        if events != ["waiting", "finished"] {
+            failures.push(format!(
+                "the merge reported {events:?}, expected it to wait for the snapshot and then \
+                 succeed"
+            ));
+        }
+        let left = segment_files(&storage);
+        if left.len() != 1 || sources.iter().any(|id| left.contains(id)) {
+            failures.push(format!(
+                "segment files {left:?} are left, expected only the merged one, none of \
+                 {sources:?}"
+            ));
+        }
+        let cached: Vec<&String> = sources
+            .iter()
+            .filter(|id| index.shared.readers.contains(id))
+            .collect();
+        if !cached.is_empty() {
+            failures.push(format!(
+                "the readers of replaced segments {cached:?} stay cached"
+            ));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Issue #1678: a snapshot pairs its readers with the deletion bitmap it
+    /// read while it held the segments. A full merge that ends after the
+    /// loads forgets the marks of the documents it dropped, which the
+    /// readers of the replaced segments still hold; the snapshot must still
+    /// leave those documents out.
+    #[test]
+    fn a_snapshot_pairs_its_readers_with_the_marks_they_were_read_with() {
+        use crate::vector::index::segment::manager::test_hooks;
+
+        let storage = storage();
+        let index = Arc::new(three_segments_with_a_delete(&storage));
+        {
+            let index = Arc::clone(&index);
+            test_hooks::set_after_build(move || index.optimize().unwrap());
+        }
+        let snapshot = index.snapshot().unwrap();
+        assert_eq!(
+            index.shared.core.deleted_count().unwrap(),
+            0,
+            "the merge in the hook forgets the marks it reclaimed"
+        );
+        let live: Vec<u64> = (1..=3)
+            .filter(|doc_id| snapshot.vectors(*doc_id).unwrap().is_some())
+            .collect();
+        assert_eq!(live, [1, 3], "a reclaimed document is back in the snapshot");
     }
 }
