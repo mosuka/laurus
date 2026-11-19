@@ -55,6 +55,7 @@ pub mod writer;
 use self::reader::{InvertedIndexReader, InvertedIndexReaderConfig};
 use self::searcher::InvertedIndexSearcher;
 use self::segment::{Membership, SegmentInfo};
+use self::segment_reader_cache::delete_segment_files;
 use self::writer::{InvertedIndexWriter, InvertedIndexWriterConfig};
 
 /// Metadata about an inverted index.
@@ -577,13 +578,14 @@ impl InvertedIndex {
                     }
                 },
             )?;
-            self.release_replaced_segment_readers();
 
             if let Some(e) = sync_error {
                 // A crash may bring back the previous manifest, which lists
-                // the replaced segments, so their files stay. The next
-                // open's orphan sweep removes whichever segments the
+                // the replaced segments, so their files stay, even once no
+                // reader can read them: only their cached readers go. The
+                // next open's orphan sweep removes whichever segments the
                 // manifest it reads does not list.
+                self.release_replaced_segment_readers();
                 log::warn!(
                     "the rewrite of field {field} has taken effect: {e}. The files of the \
                      segments it replaced are left for the next open's orphan sweep"
@@ -595,13 +597,15 @@ impl InvertedIndex {
                 // sweep reclaims. Returning its error would skip the
                 // caller's change to the field and report a rewrite that
                 // took effect as a failed one, so a rebuild would keep the
-                // old analyzer (Issue #1436).
-                for info in &segments {
-                    if let Err(e) = self.delete_segment_files(&info.segment_id) {
+                // old analyzer (Issue #1436). A segment some reader can
+                // still read keeps its files until that reader is dropped
+                // (Issue #1680).
+                for segment_id in self.retire_replaced_segments(&source_ids) {
+                    if let Err(e) = delete_segment_files(self.storage.as_ref(), &segment_id) {
                         log::warn!(
-                            "cannot delete the files of segment {} replaced by rewriting field \
-                             {field}: {e}; they are left for the next open's orphan sweep",
-                            info.segment_id
+                            "cannot delete the files of segment {segment_id} replaced by \
+                             rewriting field {field}: {e}; they are left for the next open's \
+                             orphan sweep"
                         );
                     }
                 }
@@ -975,15 +979,18 @@ impl InvertedIndex {
                 segment_manifest::upsert_entry(list, info);
             }
         })?;
-        self.release_replaced_segment_readers();
 
         // Physical cleanup only (#1024): the manifest write above already
         // removed the sources from discovery atomically, so file deletion
         // order no longer matters — anything a crash leaves behind is an
-        // unreferenced orphan the next open's sweep reclaims.
-        for info in sources {
-            self.delete_segment_files(&info.segment_id)?;
+        // unreferenced orphan the next open's sweep reclaims. A source some
+        // reader can still read keeps its files until that reader is
+        // dropped (Issue #1680).
+        for segment_id in self.retire_replaced_segments(&source_ids) {
+            delete_segment_files(self.storage.as_ref(), &segment_id)?;
         }
+        #[cfg(test)]
+        segment_reader_cache::test_hooks::run_after_merge();
 
         Ok(())
     }
@@ -995,6 +1002,23 @@ impl InvertedIndex {
     fn release_replaced_segment_readers(&self) {
         let segments = self.segment_manifest.read().segments.clone();
         self.segment_readers.retain(&segments);
+    }
+
+    /// Release the cached readers of the segments `replaced`, as
+    /// [`Self::release_replaced_segment_readers`] does, right after a merge
+    /// or a field rebuild published the manifest without them, and leave
+    /// the files of each one a reader can still read until the last such
+    /// reader is dropped (Issue #1680): a segment reader opens its parts on
+    /// first use, so a searcher built before the publish may read them
+    /// later.
+    ///
+    /// # Returns
+    ///
+    /// The ids of the replaced segments no reader can read, whose files the
+    /// caller deletes.
+    fn retire_replaced_segments(&self, replaced: &[String]) -> Vec<String> {
+        let segments = self.segment_manifest.read().segments.clone();
+        self.segment_readers.retire(&segments, replaced)
     }
 
     /// Sum the on-disk size of every file belonging to `segment_id`.
@@ -1035,16 +1059,6 @@ impl InvertedIndex {
                     .sum()
             })
             .collect())
-    }
-
-    /// Delete every file belonging to `segment_id`.
-    fn delete_segment_files(&self, segment_id: &str) -> Result<()> {
-        let prefix = format!("{segment_id}.");
-        let files = self.storage.list_files()?;
-        for file in files.iter().filter(|f| f.starts_with(&prefix)) {
-            self.storage.delete_file(file)?;
-        }
-        Ok(())
     }
 
     /// Check if an index exists in the given directory.
@@ -2717,6 +2731,217 @@ mod tests {
 
         index.close().unwrap();
         assert!(held.iter().all(|segment| segment.upgrade().is_none()));
+    }
+
+    // ---- A searcher built before a merge, Issue #1680 ------------------
+
+    /// A case of [`storages_and_layouts`]: its name, the storage, whether
+    /// segments are compound, and the temporary directory under a
+    /// `FileStorage`, which must outlive the storage.
+    type StorageCase = (String, Arc<dyn Storage>, bool, Option<tempfile::TempDir>);
+
+    /// The storages and layouts a reader must keep reading over: loose
+    /// segments, whose parts are files of their own, and compound segments
+    /// on `FileStorage`, which re-opens the container for every part read.
+    fn storages_and_layouts() -> Vec<StorageCase> {
+        use crate::storage::file::{FileStorage, FileStorageConfig};
+
+        let mut cases: Vec<StorageCase> = vec![(
+            "loose, memory".to_string(),
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default())),
+            false,
+            None,
+        )];
+        for use_mmap in [true, false] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = FileStorageConfig {
+                use_mmap,
+                ..FileStorageConfig::new(dir.path())
+            };
+            cases.push((
+                format!("compound, file, mmap {use_mmap}"),
+                Arc::new(FileStorage::new(dir.path(), config).unwrap()),
+                true,
+                Some(dir),
+            ));
+        }
+        cases
+    }
+
+    /// An index over `storage` holding one segment per body in `bodies`.
+    fn index_over(storage: Arc<dyn Storage>, use_compound: bool, bodies: &[&str]) -> InvertedIndex {
+        let index = InvertedIndex::create(
+            storage,
+            InvertedIndexConfig {
+                use_compound,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut writer = index.writer().unwrap();
+        for body in bodies {
+            writer.add_document(doc_with_body(body)).unwrap();
+            writer.commit().unwrap();
+        }
+        index
+    }
+
+    /// The ids of the segments that have files on `storage`.
+    fn segment_files(storage: &dyn Storage) -> std::collections::BTreeSet<String> {
+        storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.starts_with("segment_") || file.starts_with("merged_"))
+            .map(|file| file.split('.').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The documents `searcher` finds for `body:term`.
+    fn body_hits(searcher: &dyn LexicalSearcher, term: &str) -> Result<Vec<u64>> {
+        use crate::lexical::search::searcher::LexicalSearchRequest;
+
+        let query = Box::new(crate::lexical::query::term::TermQuery::new("body", term));
+        let results = searcher.search(LexicalSearchRequest::new(query).limit(100))?;
+        let mut ids: Vec<u64> = results.hits.iter().map(|hit| hit.doc_id).collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Issue #1680: a searcher and a reader built before a merge still read
+    /// the segments they were built over once the merge has published, and
+    /// the replaced segments' files are deleted when the last of them is
+    /// dropped.
+    ///
+    /// A segment reader opens its parts on first use, so without the leases
+    /// the merge deleted the files under them: a reader that had loaded
+    /// nothing found no term dictionary and no hits, and one that had
+    /// loaded its dictionaries failed to open the postings of a compound
+    /// segment on `FileStorage`.
+    #[test]
+    fn a_searcher_built_before_a_merge_reads_the_segments_it_was_built_over() {
+        let mut failures = Vec::new();
+        for warmed in [false, true] {
+            for (layout, storage, use_compound, _dir) in storages_and_layouts() {
+                let case = format!("{layout}, warmed {warmed}");
+                let index = index_over(storage.clone(), use_compound, &["alpha", "beta", "gamma"]);
+                let sources = segment_files(storage.as_ref());
+                let searcher = index.searcher().unwrap();
+                let reader = index.reader().unwrap();
+                if warmed {
+                    // Loads every segment's term dictionary.
+                    assert_eq!(body_hits(searcher.as_ref(), "alpha").unwrap(), vec![0]);
+                }
+
+                index.optimize().unwrap();
+                let merged = segment_files(storage.as_ref());
+                if !sources.is_subset(&merged) || merged.len() != sources.len() + 1 {
+                    failures.push(format!(
+                        "{case}: segments {sources:?} before the merge and {merged:?} while \
+                         the old readers live, expected the sources and the merged one"
+                    ));
+                }
+                for (term, expected) in [("alpha", vec![0]), ("beta", vec![1]), ("gamma", vec![2])]
+                {
+                    match body_hits(searcher.as_ref(), term) {
+                        Ok(ids) if ids == expected => {}
+                        other => failures.push(format!(
+                            "{case}: body:{term} found {other:?}, expected {expected:?}"
+                        )),
+                    }
+                }
+                match reader.document(1) {
+                    Ok(Some(_)) => {}
+                    other => failures.push(format!(
+                        "{case}: the reader fetched document 1 as {other:?}"
+                    )),
+                }
+
+                drop(searcher);
+                drop(reader);
+                let left = segment_files(storage.as_ref());
+                if left.len() != 1 || !left.is_disjoint(&sources) {
+                    failures.push(format!(
+                        "{case}: segments {left:?} are left once the old readers are dropped, \
+                         expected only the merged one"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Issue #1680: when no reader can read the segments a merge replaced
+    /// (the only one built has been dropped), the merge deletes their files
+    /// before it returns.
+    #[test]
+    fn a_merge_no_reader_can_see_deletes_the_replaced_files_at_once() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let index = index_over(storage.clone(), false, &["alpha", "beta"]);
+        let sources = segment_files(storage.as_ref());
+        drop(index.reader().unwrap());
+
+        index.optimize().unwrap();
+        let left = segment_files(storage.as_ref());
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            left.is_disjoint(&sources),
+            "{left:?} still holds a source of {sources:?}"
+        );
+    }
+
+    /// Issue #1680: a field rebuild leaves the files of the segments it
+    /// rewrote to a searcher built before it, as a merge does, and they go
+    /// once the searcher is dropped. When the manifest's sync failed after
+    /// the publish, the files stay even then: a crash may bring back the
+    /// manifest that lists them (Issue #1542).
+    #[test]
+    fn a_field_rebuild_leaves_the_rewritten_segments_to_a_searcher_built_before() {
+        use crate::lexical::core::field::TextOption;
+        use crate::storage::manifest::test_support::FailSyncAfterRename;
+        use std::sync::atomic::Ordering;
+
+        let mut failures = Vec::new();
+        for sync_fails in [false, true] {
+            let case = format!("sync fails {sync_fails}");
+            let inner: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let failing = Arc::new(FailSyncAfterRename::new(inner.clone(), "segments.json"));
+            let index = index_over(failing.clone(), false, &["alpha", "beta"]);
+            let sources = segment_files(inner.as_ref());
+            let searcher = index.searcher().unwrap();
+
+            failing.armed.store(sync_fails, Ordering::SeqCst);
+            index
+                .rebuild_field("body", FieldOption::Text(TextOption::default()), None)
+                .unwrap();
+            failing.armed.store(false, Ordering::SeqCst);
+            if failing.failures.load(Ordering::SeqCst) != usize::from(sync_fails) {
+                failures.push(format!(
+                    "{case}: the sync failure was not injected as expected"
+                ));
+            }
+
+            for (term, expected) in [("alpha", vec![0]), ("beta", vec![1])] {
+                match body_hits(searcher.as_ref(), term) {
+                    Ok(ids) if ids == expected => {}
+                    other => failures.push(format!(
+                        "{case}: body:{term} found {other:?}, expected {expected:?}"
+                    )),
+                }
+            }
+            drop(searcher);
+            let left = segment_files(inner.as_ref());
+            let sources_left = !left.is_disjoint(&sources);
+            if sources_left != sync_fails {
+                failures.push(format!(
+                    "{case}: segments {left:?} are left once the searcher is dropped, sources \
+                     {sources:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Issue #1494: `update_field_option` replaces a base-config field's
