@@ -759,6 +759,8 @@ impl LexicalStore {
         {
             let guard = self.searcher_cache.read();
             if let Some(ref searcher) = *guard {
+                #[cfg(test)]
+                test_hooks::run_in_search();
                 return f(searcher.as_ref());
             }
         }
@@ -772,6 +774,8 @@ impl LexicalStore {
             *guard = Some(self.index.searcher()?);
         }
         let guard = parking_lot::RwLockWriteGuard::downgrade(guard);
+        #[cfg(test)]
+        test_hooks::run_in_search();
         f(guard.as_ref().unwrap().as_ref())
     }
 
@@ -1209,6 +1213,32 @@ impl LexicalStore {
         *self.searcher_cache.write() = None;
         drop(writer_guard);
         deleted
+    }
+}
+
+/// A point where a test can act in the middle of a search on the same
+/// thread (Issue #1680).
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static IN_SEARCH: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` in the next search on this thread, once it holds the
+    /// cached searcher and before it searches.
+    pub(crate) fn set_in_search(hook: impl FnOnce() + 'static) {
+        IN_SEARCH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_in_search() {
+        let hook = IN_SEARCH.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -1736,6 +1766,135 @@ mod tests {
             let query = if crash { "title:rust" } else { "title:Rust" };
             assert_eq!(hits(&reopened, query), vec![1], "crash: {crash}");
         }
+    }
+
+    /// Issue #1680: a search that runs while `optimize` merges the segments
+    /// of the searcher it uses finds every document, instead of nothing or
+    /// an error from the replaced segments' deleted files, and those files
+    /// are gone once the optimize has dropped the searcher.
+    ///
+    /// The commits leave no cached searcher, so the search builds one,
+    /// loading nothing yet. A hook, once the search holds it, runs the
+    /// optimize on another thread and waits until the merge has published
+    /// and retired the replaced segments; the optimize then waits for the
+    /// search to drop the searcher cache.
+    #[test]
+    fn a_search_during_an_optimize_reads_the_segments_its_searcher_was_built_over() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::lexical::index::config::InvertedIndexConfig;
+        use crate::lexical::index::inverted::segment_reader_cache::test_hooks as cache_hooks;
+
+        let segment_ids = |storage: &dyn Storage| -> std::collections::BTreeSet<String> {
+            storage
+                .list_files()
+                .unwrap()
+                .into_iter()
+                .filter(|file| file.starts_with("segment_") || file.starts_with("merged_"))
+                .map(|file| file.split('.').next().unwrap_or_default().to_string())
+                .collect()
+        };
+        let dir = TempDir::new().unwrap();
+        let cases: [(&str, Arc<dyn Storage>, bool); 2] = [
+            (
+                "compound, file",
+                Arc::new(FileStorage::new(dir.path(), FileStorageConfig::new(dir.path())).unwrap()),
+                true,
+            ),
+            (
+                "loose, memory",
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default())),
+                false,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, storage, use_compound) in cases {
+            let config = LexicalIndexConfig::Inverted(InvertedIndexConfig {
+                use_compound,
+                ..Default::default()
+            });
+            let store = Arc::new(LexicalStore::new(storage.clone(), config).unwrap());
+            for (id, word) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
+                store
+                    .upsert_document(id, create_test_document("t", &format!("{word} shared")))
+                    .unwrap();
+                store.commit().unwrap();
+            }
+            let sources = segment_ids(storage.as_ref());
+
+            let first = Rc::new(RefCell::new(None));
+            let merger = Rc::new(RefCell::new(None));
+            {
+                let store = Arc::clone(&store);
+                let first = Rc::clone(&first);
+                let merger = Rc::clone(&merger);
+                test_hooks::set_in_search(move || {
+                    let (events, received) = mpsc::channel();
+                    let handle = std::thread::spawn(move || {
+                        let merged = events.clone();
+                        cache_hooks::set_after_merge(move || {
+                            let _ = merged.send("merged".to_string());
+                        });
+                        let _ = events.send(match store.optimize() {
+                            Ok(()) => "finished".to_string(),
+                            Err(e) => format!("failed: {e}"),
+                        });
+                    });
+                    *first.borrow_mut() = received.recv_timeout(Duration::from_secs(60)).ok();
+                    *merger.borrow_mut() = Some((handle, received));
+                });
+            }
+
+            let query = || Box::new(TermQuery::new("body", "shared")) as Box<dyn Query>;
+            let during = store.search(LexicalSearchRequest::new(query()).limit(10));
+            let Some((handle, received)) = merger.borrow_mut().take() else {
+                failures.push(format!("{case}: the hook in the search did not run"));
+                continue;
+            };
+            handle.join().unwrap();
+            let events: Vec<String> = first
+                .borrow_mut()
+                .take()
+                .into_iter()
+                .chain(received.try_iter())
+                .collect();
+
+            let ids = |results: Result<LexicalSearchResults>| {
+                results.map(|results| {
+                    let mut ids: Vec<u64> = results.hits.iter().map(|hit| hit.doc_id).collect();
+                    ids.sort_unstable();
+                    ids
+                })
+            };
+            match ids(during) {
+                Ok(found) if found == [1, 2, 3] => {}
+                other => failures.push(format!(
+                    "{case}: the search during the optimize found {other:?}, expected [1, 2, 3]"
+                )),
+            }
+            if events != ["merged", "finished"] {
+                failures.push(format!(
+                    "{case}: the optimize reported {events:?}, expected it to merge and then \
+                     finish"
+                ));
+            }
+            let left = segment_ids(storage.as_ref());
+            if left.len() != 1 || !left.is_disjoint(&sources) {
+                failures.push(format!(
+                    "{case}: segments {left:?} are left after the optimize, sources {sources:?}"
+                ));
+            }
+            match ids(store.search(LexicalSearchRequest::new(query()).limit(10))) {
+                Ok(found) if found == [1, 2, 3] => {}
+                other => failures.push(format!(
+                    "{case}: a search after the optimize found {other:?}, expected [1, 2, 3]"
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// #1016 — a document written before the writer's automatic

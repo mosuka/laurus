@@ -27,7 +27,7 @@ use crate::lexical::index::inverted::id_filter::{CommittedIdFilter, ID_FIELD, Id
 use crate::lexical::index::inverted::posting_cache::PostingCache;
 use crate::lexical::index::inverted::query_cache::QueryFilterCache;
 use crate::lexical::index::inverted::segment::{Membership, SegmentInfo, SegmentKey};
-use crate::lexical::index::inverted::segment_reader_cache::SegmentReaderCache;
+use crate::lexical::index::inverted::segment_reader_cache::{SegmentLease, SegmentReaderCache};
 use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree};
 use crate::lexical::index::structures::dictionary::BLOCK_SIZE;
 use crate::lexical::index::structures::dictionary::BlockTermDictionary;
@@ -481,6 +481,13 @@ pub(crate) struct SegmentCore {
     /// [`Self::membership`]. It depends only on the segment's files, so the
     /// answer cannot go stale.
     membership: OnceLock<Membership>,
+
+    /// The segment's lease when the index's reader cache opened this core
+    /// (Issue #1680): a merge that replaces the segment leaves its files
+    /// until every core holding the lease is dropped, since the parts above
+    /// are read from them on first use. `None` for a core opened outside the
+    /// cache (a merge's own reads, a writer's unpublished segments).
+    _lease: Option<Arc<SegmentLease>>,
 }
 
 /// Reader for a single segment (schema-less mode).
@@ -529,9 +536,14 @@ pub struct SegmentReader {
 }
 
 impl SegmentCore {
-    /// Open the core of the segment `info` describes. Reads nothing but the
-    /// compound container's part table; every part loads on first use.
-    fn open(info: &SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
+    /// Open the core of the segment `info` describes, holding `lease` (see
+    /// [`Self::_lease`]). Reads nothing but the compound container's part
+    /// table; every part loads on first use.
+    fn open(
+        info: &SegmentInfo,
+        storage: Arc<dyn Storage>,
+        lease: Option<Arc<SegmentLease>>,
+    ) -> Result<Self> {
         // Layout detection (#554): a `{segment_id}.cfs` container routes
         // every part read through a windowed facade; its absence means a
         // loose (pre-#554) segment and the storage is used as-is. Loose
@@ -555,6 +567,7 @@ impl SegmentCore {
             bkd_trees: RwLock::new(AHashMap::new()),
             loaded: AtomicBool::new(false),
             membership: OnceLock::new(),
+            _lease: lease,
         })
     }
 
@@ -872,7 +885,17 @@ impl SegmentReader {
     /// scan fallback analyzes stored values like the writer did (Issue
     /// #1196); without it the fallback uses `StandardAnalyzer`.
     pub fn open(info: SegmentInfo, storage: Arc<dyn Storage>) -> Result<Self> {
-        let core = Arc::new(SegmentCore::open(&info, storage)?);
+        Self::open_with_lease(info, storage, None)
+    }
+
+    /// [`Self::open`], with the core holding the segment's `lease` (Issue
+    /// #1680), for the index's reader cache.
+    fn open_with_lease(
+        info: SegmentInfo,
+        storage: Arc<dyn Storage>,
+        lease: Option<Arc<SegmentLease>>,
+    ) -> Result<Self> {
+        let core = Arc::new(SegmentCore::open(&info, storage, lease)?);
         // Unlike the other parts, `.delmap` is read here rather than on first
         // use (Issue #1265). The deletion checks behind `doc_count` and
         // `has_effective_deletions` cannot return an error, so a lazy load
@@ -2259,7 +2282,9 @@ impl InvertedIndexReader {
     /// deletions changed gets a new reader over the same
     /// [`SegmentCore`], so it reads only its `.delmap`. Any other segment is
     /// opened. A reader built earlier keeps its own segment readers, so it
-    /// still sees exactly its snapshot.
+    /// still sees exactly its snapshot, and every core opened here holds the
+    /// segment's lease, so a merge that replaces the segment leaves its files
+    /// until the last such reader is dropped (Issue #1680).
     ///
     /// The cached readers were configured by an earlier call, so every call
     /// with one `cache` must pass the same `config`, as the index's
@@ -2282,16 +2307,21 @@ impl InvertedIndexReader {
         cache: &SegmentReaderCache,
         snapshot: impl FnOnce() -> Result<Vec<SegmentInfo>>,
     ) -> Result<Self> {
-        let (segments, segment_readers) = cache.build(snapshot, |info, cached| {
-            let reader = match cached {
-                Some(cached) => match cached.read().unwrap().reopen(info)? {
-                    None => return Ok(Arc::clone(cached)),
-                    Some(reader) => reader,
-                },
-                None => SegmentReader::open(info.clone(), storage.clone())?,
-            };
-            Self::configured(reader, &config)
-        })?;
+        let (segments, segment_readers) =
+            cache.build(&storage, snapshot, |info, cached, lease| {
+                let reader = match cached {
+                    Some(cached) => match cached.read().unwrap().reopen(info)? {
+                        None => return Ok(Arc::clone(cached)),
+                        Some(reader) => reader,
+                    },
+                    None => SegmentReader::open_with_lease(
+                        info.clone(),
+                        storage.clone(),
+                        Some(lease()),
+                    )?,
+                };
+                Self::configured(reader, &config)
+            })?;
         Ok(Self::from_segment_readers(
             segments,
             segment_readers,
@@ -4060,7 +4090,8 @@ mod tests {
         let (a_storage, a) = docs_only_segment("cache_a", &[(0, vec![("body", text("x"))])], false);
         let (b_storage, b) = docs_only_segment("cache_b", &[(1, vec![("body", text("y"))])], false);
         let open = |info: &SegmentInfo,
-                    cached: Option<&Arc<RwLock<SegmentReader>>>|
+                    cached: Option<&Arc<RwLock<SegmentReader>>>,
+                    _lease: &mut dyn FnMut() -> Arc<SegmentLease>|
          -> Result<Arc<RwLock<SegmentReader>>> {
             if let Some(cached) = cached {
                 return Ok(Arc::clone(cached));
@@ -4078,21 +4109,147 @@ mod tests {
         let cache = SegmentReaderCache::default();
 
         let (_, first) = cache
-            .build(|| Ok(vec![a.clone(), b.clone()]), open)
+            .build(&a_storage, || Ok(vec![a.clone(), b.clone()]), open)
             .unwrap();
         let a_reader = Arc::downgrade(&first[0]);
         let b_reader = Arc::clone(&first[1]);
         drop(first);
 
-        let failed = cache.build(|| Err(LaurusError::index("no snapshot")), open);
+        let failed = cache.build(&a_storage, || Err(LaurusError::index("no snapshot")), open);
         assert!(failed.is_err());
         assert_eq!(cache.len(), 2);
         assert!(a_reader.upgrade().is_some());
 
-        let (_, second) = cache.build(|| Ok(vec![b.clone()]), open).unwrap();
+        let (_, second) = cache
+            .build(&a_storage, || Ok(vec![b.clone()]), open)
+            .unwrap();
         assert_eq!(cache.len(), 1);
         assert!(a_reader.upgrade().is_none());
         assert!(Arc::ptr_eq(&second[0], &b_reader));
+    }
+
+    // ---- Leases on the files of replaced segments, Issue #1680 ---------
+
+    /// Whether any file of `segment_id` is on `storage`.
+    fn has_segment_files(storage: &Arc<dyn crate::storage::Storage>, segment_id: &str) -> bool {
+        let prefix = format!("{segment_id}.");
+        storage
+            .list_files()
+            .unwrap()
+            .iter()
+            .any(|file| file.starts_with(&prefix))
+    }
+
+    /// A reader of `info` built through `cache`, as `InvertedIndex::reader`
+    /// builds them.
+    fn cached_reader(
+        storage: &Arc<dyn crate::storage::Storage>,
+        cache: &SegmentReaderCache,
+        info: &SegmentInfo,
+    ) -> InvertedIndexReader {
+        InvertedIndexReader::with_segment_cache(
+            storage.clone(),
+            InvertedIndexReaderConfig::default(),
+            cache,
+            || Ok(vec![info.clone()]),
+        )
+        .unwrap()
+    }
+
+    /// A retire takes the lock a build holds while it lists and opens the
+    /// segments, so a build that listed a segment before a merge retired it
+    /// has opened the segment's lease by the time the retire looks: the
+    /// files stay for the reader it built, and go when it is dropped.
+    ///
+    /// Right after the build lists the segment, a hook runs the retire on
+    /// another thread and waits for its first event: the retire finds the
+    /// cache locked, reports `waiting` and waits.
+    #[test]
+    fn a_retire_waits_for_a_build_that_listed_the_segment() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::lexical::index::inverted::segment_reader_cache::test_hooks;
+        use crate::lexical::reader::LexicalIndexReader as _;
+
+        let (storage, info) =
+            docs_only_segment("retire_wait", &[(0, vec![("body", text("x"))])], false);
+        let cache = Arc::new(SegmentReaderCache::default());
+        let retirer = Rc::new(RefCell::new(None));
+        {
+            let cache = Arc::clone(&cache);
+            let segment_id = info.segment_id.clone();
+            let retirer = Rc::clone(&retirer);
+            test_hooks::set_after_snapshot(move || {
+                let (events, received) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let waiting = events.clone();
+                    test_hooks::set_when_retire_waits(move || {
+                        let _ = waiting.send("waiting");
+                    });
+                    let unread = cache.retire(&[], &[segment_id]);
+                    let _ = events.send("retired");
+                    unread
+                });
+                let first = received.recv_timeout(Duration::from_secs(60)).ok();
+                *retirer.borrow_mut() = Some((handle, received, first));
+            });
+        }
+
+        let reader = cached_reader(&storage, &cache, &info);
+        let (handle, received, first) = retirer
+            .borrow_mut()
+            .take()
+            .expect("the hook after the snapshot runs");
+        let unread = handle.join().unwrap();
+        let events: Vec<&str> = first.into_iter().chain(received.try_iter()).collect();
+        assert_eq!(
+            events,
+            ["waiting", "retired"],
+            "the retire waits for the build"
+        );
+        assert!(
+            unread.is_empty(),
+            "the build's reader holds the lease: {unread:?}"
+        );
+        assert!(has_segment_files(&storage, &info.segment_id));
+        assert!(reader.document(0).unwrap().is_some());
+
+        drop(reader);
+        assert!(!has_segment_files(&storage, &info.segment_id));
+    }
+
+    /// Every core of a segment holds one lease, kept by the cache even
+    /// across `clear()`: once the segment is retired, its files stay until
+    /// the last core is dropped, whichever core goes first.
+    #[test]
+    fn a_retired_segment_keeps_its_files_until_its_last_core_is_dropped() {
+        use crate::lexical::reader::LexicalIndexReader as _;
+
+        let (storage, info) =
+            docs_only_segment("two_cores", &[(0, vec![("body", text("x"))])], false);
+        let cache = SegmentReaderCache::default();
+        let first = cached_reader(&storage, &cache, &info);
+        cache.clear();
+        let second = cached_reader(&storage, &cache, &info);
+        assert!(!Arc::ptr_eq(
+            first.segment_readers()[0].read().unwrap().core(),
+            second.segment_readers()[0].read().unwrap().core()
+        ));
+
+        let unread = cache.retire(&[], std::slice::from_ref(&info.segment_id));
+        assert!(unread.is_empty(), "the readers hold the lease: {unread:?}");
+        drop(second);
+        assert!(
+            has_segment_files(&storage, &info.segment_id),
+            "the files go with the newer core while the older one reads them"
+        );
+        assert!(first.document(0).unwrap().is_some());
+
+        drop(first);
+        assert!(!has_segment_files(&storage, &info.segment_id));
     }
 
     /// `InvertedIndexReader::new` opens every segment anew, so the readers it
