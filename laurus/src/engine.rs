@@ -784,8 +784,12 @@ pub struct Engine {
     /// Ingestion (`index_internal`, `delete_documents`) takes a read lock —
     /// any number of writers can ingest concurrently — while the schema
     /// changes take a write lock, so a schema change never races a document
-    /// that assumes the old fields. `add_field` is also called from
-    /// ingestion (`apply_dynamic_schema`), before the read lock is taken.
+    /// that assumes the old fields. A put checks its document against the
+    /// schema's `DynamicFieldPolicy` and coerces its values under the read
+    /// lock, so it is coerced to the options it is indexed under (Issue
+    /// #1498). Under `DynamicFieldPolicy::Dynamic` it first adds its
+    /// undeclared fields with `add_field`, holding no lock, and adds a field
+    /// again if a `delete_field` removed it before the put took the lock.
     ///
     /// A `tokio::sync::RwLock` because the guard must be held across
     /// `await` points (a `parking_lot::RwLock` guard is not `Send` across
@@ -1649,24 +1653,56 @@ impl Engine {
         doc.fields
             .insert("_id".to_string(), DataValue::Text(id.to_string()));
 
-        // 1b. Validate reserved field-name namespace, then apply the schema's
-        // DynamicFieldPolicy to add / coerce / drop user fields.
-        self.apply_dynamic_schema(&mut doc).await?;
+        // 1b. Reject a field name in the reserved namespace before waiting
+        // for anything. `_id` was just injected by the engine.
+        for name in doc.fields.keys() {
+            if name != schema::RESERVED_ID_FIELD {
+                schema::validate_field_name(name)?;
+            }
+        }
+        let dynamic =
+            self.schema.read().dynamic_field_policy == schema::DynamicFieldPolicy::Dynamic;
 
-        // Serialize everything that follows against other mutations of this
-        // same id (#1049). The delete and the add below take the store locks
-        // separately, so without this guard two concurrent upserts of one id
-        // both delete-then-add and leave two live versions. Held across the
-        // whole sequence, including the WAL append, so the log's record order
-        // for an id matches the order the stores applied them in.
-        let _id_guard = self.id_lock(id).lock().await;
-        // Block a concurrent `update_field` from swapping the field option
-        // this document was just coerced against (Issue #1079). Taken after
-        // `_id_guard` (the outermost lock) and held for the rest of this
-        // mutation, including the internal delete below.
-        let _schema_guard = self.schema_change_lock.read().await;
-        // Refuse before any work once writes stopped (Issue #1492).
-        self.write_stop.check()?;
+        let (_id_guard, _schema_guard) = loop {
+            // 1c. Under `DynamicFieldPolicy::Dynamic`, add the document's
+            // undeclared fields to the schema. `add_field` takes
+            // `schema_change_lock` for writing, so this runs before the put
+            // takes it below (Issue #1498).
+            if dynamic {
+                self.add_undeclared_fields(&doc).await?;
+            }
+            // Serialize everything that follows against other mutations of
+            // this same id (#1049). The delete and the add below take the
+            // store locks separately, so without this guard two concurrent
+            // upserts of one id both delete-then-add and leave two live
+            // versions. Held across the whole sequence, including the WAL
+            // append, so the log's record order for an id matches the order
+            // the stores applied them in.
+            let id_guard = self.id_lock(id).lock().await;
+            // Keep `update_field`, `add_field` and `delete_field` from
+            // changing the fields from here to the end of this mutation,
+            // including the internal delete below (Issues #1079, #1492):
+            // the document is checked against the schema, coerced to its
+            // fields' options, embedded, analyzed and written under the same
+            // fields (Issue #1498). Taken after `id_guard`, the outermost
+            // lock.
+            let schema_guard = self.schema_change_lock.read().await;
+            // Refuse before any work once writes stopped (Issue #1492).
+            self.write_stop.check()?;
+            // 1d. Apply the schema's `DynamicFieldPolicy` and coerce the
+            // values, under the lock.
+            let fits = {
+                let schema = self.schema.read();
+                Self::apply_dynamic_schema(&schema, &mut doc)?
+            };
+            if fits {
+                break (id_guard, schema_guard);
+            }
+            // A `delete_field` removed a field of this document after 1c
+            // added it, or after the put found it declared. The guards drop
+            // here, and the put adds the field again, as a put that came
+            // after the delete does.
+        };
 
         // 2. Prepare the vector document (extract vector fields only) and embed
         // it BEFORE anything durable or destructive happens (Issue #1326): a
@@ -1873,167 +1909,194 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply the schema's [`DynamicFieldPolicy`](schema::DynamicFieldPolicy)
-    /// to an incoming document's fields.
+    /// Whether [`DynamicFieldPolicy::Dynamic`](schema::DynamicFieldPolicy::Dynamic)
+    /// adds the field `name`, holding `value`, to `current` before a put of
+    /// it: a field other than `_id`, with a value other than null, that
+    /// `current` does not declare.
     ///
-    /// For each user-supplied field:
-    ///
-    /// - **Reserved names**: any field name starting with `_` other than
-    ///   `_id` is rejected regardless of policy.
-    /// - **Declared fields**: the value is coerced to the declared type (see
-    ///   [`type_coercion::coerce_value`]).
-    /// - **Undeclared fields**: handled according to the policy:
-    ///   - `Strict`: ingest fails with an error.
-    ///   - `Dynamic`: the field type is inferred (see
-    ///     [`type_inference::infer_option_from_data_value`]) and the field
-    ///     is added to the schema.
-    ///   - `Ignore`: the field is silently dropped.
+    /// [`Self::add_undeclared_fields`] adds these fields, and
+    /// [`Self::apply_dynamic_schema`] checks under the lock that none is
+    /// left, both through this one predicate (Issue #1498): a field that one
+    /// of them left out and the other still required would be added over
+    /// and over.
     ///
     /// # Arguments
     ///
+    /// * `current` - The schema as it stands.
+    /// * `name` - The field's name.
+    /// * `value` - The document's value for the field.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the field must be added before the put.
+    fn needs_field(current: &Schema, name: &str, value: &crate::data::DataValue) -> bool {
+        name != schema::RESERVED_ID_FIELD
+            && !matches!(value, crate::data::DataValue::Null)
+            && !current.fields.contains_key(name)
+    }
+
+    /// Add to the schema every field of `doc` that
+    /// [`DynamicFieldPolicy::Dynamic`](schema::DynamicFieldPolicy::Dynamic)
+    /// adds (see [`Self::needs_field`]), with the type inferred from its
+    /// value (see [`type_inference::infer_option_from_data_value`]).
+    ///
+    /// [`Self::index_internal`] calls this before it takes its locks, since
+    /// [`Self::add_field`] takes [`Engine`]'s `schema_change_lock` for
+    /// writing (Issue #1498). The values are left as they are:
+    /// [`Self::apply_dynamic_schema`] coerces them under the lock, to the
+    /// option each field has then. That is the inferred one unless another
+    /// call changed it in between, or added the field first with another
+    /// type.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc` - The document whose undeclared fields to add.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an undeclared field's value holds a `NaN` or
+    /// infinite number, or has a type that cannot be inferred (raw vectors
+    /// or bytes), or when [`Self::add_field`] fails and the schema still
+    /// lacks the field. A field another call added first is not an error.
+    async fn add_undeclared_fields(&self, doc: &Document) -> Result<()> {
+        for (name, value) in &doc.fields {
+            let needed = Self::needs_field(&self.schema.read(), name, value);
+            if !needed {
+                continue;
+            }
+            // An undeclared value is checked here, before its field is
+            // added to the schema, for a `NaN` or infinite number, as a
+            // declared field's value is when it is coerced (Issue #1604).
+            type_coercion::check_finite(name, value)?;
+            let Some(option) = type_inference::infer_option_from_data_value(value)? else {
+                continue;
+            };
+            if let Err(e) = self.add_field(name, option).await {
+                // Another put, or an `add_field` call, may have added the
+                // field since the check above: then the field is there, as
+                // this put needs. Any other failure is returned, also the
+                // lexical index's "already exists" when the field is in the
+                // index but not in the schema, which the put would otherwise
+                // retry forever (Issue #1498).
+                let added_by_another = self.schema.read().fields.contains_key(name);
+                if !added_by_another {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the schema's [`DynamicFieldPolicy`](schema::DynamicFieldPolicy)
+    /// to a document's fields and coerce their values, in place.
+    ///
+    /// [`Self::index_internal`] calls this holding its id lock and
+    /// [`Engine`]'s `schema_change_lock` for reading, so the fields cannot
+    /// change until the document is written: it is coerced to the options
+    /// it is indexed under (Issue #1498). Reserved names were rejected
+    /// before.
+    ///
+    /// - **Declared fields**, including one this put added: the value is
+    ///   coerced to the field's option (see [`type_coercion::coerce_value`]).
+    ///   A value that cannot be is dropped under `Ignore` and an error
+    ///   otherwise.
+    /// - **Undeclared fields**: handled according to the policy:
+    ///   - `Strict`: the put fails with an error.
+    ///   - `Dynamic`: [`Self::add_undeclared_fields`] added each before the
+    ///     lock was taken. When one is missing, a `delete_field` removed it
+    ///     in between, and this returns `false` without changing the
+    ///     document, for the put to add it again. A null value is dropped.
+    ///   - `Ignore`: the field is dropped.
+    /// - `_id` is kept as it is.
+    ///
+    /// # Arguments
+    ///
+    /// * `current` - The schema, read under the lock.
     /// * `doc` - The document to normalise in place.
+    ///
+    /// # Returns
+    ///
+    /// `true` once the document fits `current`, or `false` when, under
+    /// `Dynamic`, a field must be added first.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::LaurusError::invalid_argument`] when:
     ///
-    /// - A field name collides with the reserved namespace.
-    /// - Strict policy is set and an undeclared field is encountered.
-    /// - A declared field's value cannot be coerced to its type.
-    /// - Dynamic policy is set and an undeclared field has a value whose
-    ///   type cannot be inferred (e.g. raw vectors or bytes).
-    async fn apply_dynamic_schema(&self, doc: &mut Document) -> Result<()> {
-        // 1. Validate reserved field-name namespace for user-supplied keys.
-        //    `_id` was just injected by the engine and is always allowed.
-        for name in doc.fields.keys() {
-            if name == schema::RESERVED_ID_FIELD {
-                continue;
-            }
-            schema::validate_field_name(name)?;
-        }
-
-        // 2. Snapshot the current policy and declared-field set.
-        let (policy, declared): (
-            schema::DynamicFieldPolicy,
-            std::collections::HashSet<String>,
-        ) = {
-            let s = self.schema.read();
-            (s.dynamic_field_policy, s.fields.keys().cloned().collect())
-        };
-
-        // 3. Partition fields into declared vs undeclared.
-        let mut undeclared: Vec<(String, crate::data::DataValue)> = Vec::new();
-        let mut declared_updates: Vec<(String, crate::data::DataValue)> = Vec::new();
-        for (name, value) in doc.fields.drain() {
-            if name == schema::RESERVED_ID_FIELD || declared.contains(&name) {
-                declared_updates.push((name, value));
-            } else {
-                undeclared.push((name, value));
-            }
-        }
-
-        // 4. Handle undeclared fields per policy.
+    /// - Strict policy is set and the document has an undeclared field.
+    /// - A declared field's value cannot be coerced to its type, under
+    ///   Strict or Dynamic.
+    fn apply_dynamic_schema(current: &Schema, doc: &mut Document) -> Result<bool> {
+        let policy = current.dynamic_field_policy;
         match policy {
+            schema::DynamicFieldPolicy::Dynamic => {
+                if doc
+                    .fields
+                    .iter()
+                    .any(|(name, value)| Self::needs_field(current, name, value))
+                {
+                    return Ok(false);
+                }
+            }
             schema::DynamicFieldPolicy::Strict => {
-                if !undeclared.is_empty() {
-                    let names: Vec<&str> = undeclared.iter().map(|(n, _)| n.as_str()).collect();
+                let names: Vec<&str> = doc
+                    .fields
+                    .keys()
+                    .filter(|name| {
+                        *name != schema::RESERVED_ID_FIELD && !current.fields.contains_key(*name)
+                    })
+                    .map(String::as_str)
+                    .collect();
+                if !names.is_empty() {
                     return Err(crate::error::LaurusError::invalid_argument(format!(
                         "undeclared fields {names:?} are not permitted \
                          (DynamicFieldPolicy::Strict)"
                     )));
                 }
             }
-            schema::DynamicFieldPolicy::Ignore => {
-                // Silently drop undeclared fields.
-                for (name, _) in &undeclared {
+            schema::DynamicFieldPolicy::Ignore => {}
+        }
+
+        let mut error = None;
+        doc.fields.retain(|name, value| {
+            if error.is_some() || name == schema::RESERVED_ID_FIELD {
+                return true;
+            }
+            let Some(option) = current.fields.get(name) else {
+                // A null under Dynamic, any undeclared field under Ignore.
+                if policy == schema::DynamicFieldPolicy::Ignore {
                     log::debug!(
                         target: "laurus::engine::dynamic_schema",
                         "dropping undeclared field '{name}' \
                          (DynamicFieldPolicy::Ignore)",
                     );
                 }
-                undeclared.clear();
-            }
-            schema::DynamicFieldPolicy::Dynamic => {
-                // Infer a FieldOption for each undeclared field and add it to
-                // the schema. Keep the original values on the document so they
-                // are indexed under the newly-added fields.
-                let mut kept: Vec<(String, crate::data::DataValue)> = Vec::new();
-                for (name, value) in undeclared.drain(..) {
-                    // An undeclared value is kept as is rather than coerced,
-                    // so it gets the declared fields' check of a `NaN` or
-                    // infinite number here (Issue #1604), before the field
-                    // is added to the schema.
-                    type_coercion::check_finite(&name, &value)?;
-                    match type_inference::infer_option_from_data_value(&value)? {
-                        Some(option) => {
-                            match self.add_field(&name, option).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    // Another concurrent ingest may have added
-                                    // this field in the meantime. Accept it
-                                    // silently; any other failure propagates.
-                                    let msg = e.to_string();
-                                    if !msg.contains("already exists") {
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                            kept.push((name, value));
-                        }
-                        None => {
-                            // Null value — skip this field entirely.
-                        }
-                    }
+                return false;
+            };
+            let raw = std::mem::replace(value, crate::data::DataValue::Null);
+            match type_coercion::coerce_value(name, option, raw) {
+                Ok(coerced) => {
+                    *value = coerced;
+                    true
                 }
-                undeclared = kept;
-            }
-        }
-
-        // 5. Coerce declared-field values to their declared types.
-        let coerced_declared: Vec<(String, crate::data::DataValue)> = {
-            let s = self.schema.read();
-            let mut out = Vec::with_capacity(declared_updates.len());
-            for (name, value) in declared_updates {
-                if name == schema::RESERVED_ID_FIELD {
-                    out.push((name, value));
-                    continue;
+                Err(e) if policy == schema::DynamicFieldPolicy::Ignore => {
+                    log::debug!(
+                        target: "laurus::engine::dynamic_schema",
+                        "dropping declared field '{name}' due to coercion \
+                         failure ({e}) (DynamicFieldPolicy::Ignore)",
+                    );
+                    false
                 }
-                // The field is declared (we partitioned above) so this lookup
-                // is infallible in practice, but guard just in case.
-                match s.fields.get(&name) {
-                    Some(option) => {
-                        let coerced = match type_coercion::coerce_value(&name, option, value) {
-                            Ok(v) => v,
-                            Err(e) => match policy {
-                                schema::DynamicFieldPolicy::Ignore => {
-                                    log::debug!(
-                                        target: "laurus::engine::dynamic_schema",
-                                        "dropping declared field '{name}' due to coercion \
-                                         failure ({e}) (DynamicFieldPolicy::Ignore)",
-                                    );
-                                    continue;
-                                }
-                                _ => return Err(e),
-                            },
-                        };
-                        out.push((name, coerced));
-                    }
-                    None => out.push((name, value)),
+                Err(e) => {
+                    error = Some(e);
+                    true
                 }
             }
-            out
-        };
-
-        // 6. Re-populate the document with processed fields.
-        for (name, value) in coerced_declared {
-            doc.fields.insert(name, value);
+        });
+        match error {
+            Some(e) => Err(e),
+            None => Ok(true),
         }
-        for (name, value) in undeclared {
-            doc.fields.insert(name, value);
-        }
-
-        Ok(())
     }
 
     /// Delete all documents (including chunks) by external ID.
@@ -2494,7 +2557,13 @@ impl Engine {
     /// Like [`Self::update_field`], this waits for in-flight ingestion and
     /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
     /// `schema_change_lock`), so a document is never written against fields
-    /// that changed after it was embedded and analyzed.
+    /// that changed after it was embedded and analyzed. A
+    /// [`DynamicFieldPolicy::Dynamic`](schema::DynamicFieldPolicy::Dynamic)
+    /// put calls this for its undeclared fields before it takes that lock,
+    /// and coerces their values once it holds the lock, to the options the
+    /// fields have then (Issue #1498): when another call added a field
+    /// first with another type, the value is coerced to that type, or the
+    /// put fails.
     ///
     /// Everything this waits for, the commit before a vector field is added
     /// and the vector writer among them, comes before either store changes,
@@ -2653,7 +2722,13 @@ impl Engine {
     /// Like [`Self::update_field`], this waits for in-flight ingestion and
     /// blocks new ingestion until it returns (Issue #1492; see [`Engine`]'s
     /// `schema_change_lock`). A put between its embedding and its vector
-    /// write used to find the field gone and fail after its WAL append.
+    /// write used to find the field gone and fail after its WAL append. A
+    /// put that waits for this call and has a value for the field handles
+    /// it as its schema's
+    /// [`DynamicFieldPolicy`](schema::DynamicFieldPolicy) says for an
+    /// undeclared field, as a put after the call would (Issue #1498):
+    /// `Strict` fails, `Dynamic` adds the field again, and `Ignore` drops
+    /// the value.
     ///
     /// Everything this waits for, the vector writer among them, comes before
     /// either store changes, so a call whose future is dropped, as when a
@@ -2784,7 +2859,12 @@ impl Engine {
     ///
     /// Blocks concurrently with ingestion via an internal write lock (see
     /// [`Engine`]'s `schema_change_lock`), so a document is never coerced
-    /// against a field option that is being replaced mid-write.
+    /// against a field option that is being replaced mid-write: a put that
+    /// holds the lock first finishes under the old option, and a put that
+    /// waits for this call is coerced to the new one (Issue #1498). A value
+    /// that cannot be is handled as any coercion error under the schema's
+    /// [`DynamicFieldPolicy`](schema::DynamicFieldPolicy): `Ignore` drops
+    /// it, and the other policies fail the put.
     ///
     /// # Arguments
     ///
@@ -11559,5 +11639,377 @@ mod tests {
                 .build();
             assert_eq!(engine.search(request).await.unwrap().len(), 3);
         }
+    }
+
+    /// A schema with a `title` text field and, when `n` is given, a field
+    /// `n` of that option, under `policy` (Issue #1498).
+    fn coercion_schema(
+        n: Option<schema::FieldOption>,
+        policy: schema::DynamicFieldPolicy,
+    ) -> Schema {
+        let mut builder = Schema::builder()
+            .add_field("title", text_option())
+            .dynamic_field_policy(policy);
+        if let Some(option) = n {
+            builder = builder.add_field("n", option);
+        }
+        builder.build()
+    }
+
+    fn text_option() -> schema::FieldOption {
+        schema::FieldOption::Text(crate::lexical::core::field::TextOption::default())
+    }
+
+    fn integer_option() -> schema::FieldOption {
+        schema::FieldOption::Integer(crate::lexical::core::field::IntegerOption::default())
+    }
+
+    fn rebuild() -> UpdateFieldOptions {
+        UpdateFieldOptions {
+            reindex: true,
+            ..Default::default()
+        }
+    }
+
+    const POLICIES: [schema::DynamicFieldPolicy; 3] = [
+        schema::DynamicFieldPolicy::Strict,
+        schema::DynamicFieldPolicy::Dynamic,
+        schema::DynamicFieldPolicy::Ignore,
+    ];
+
+    /// The value of `field` in the one stored document of `id`.
+    async fn stored_value(
+        engine: &Engine,
+        id: &str,
+        field: &str,
+    ) -> Option<crate::data::DataValue> {
+        let docs = engine.get_documents(id).await.unwrap();
+        assert_eq!(docs.len(), 1, "one stored document of {id}");
+        docs[0].fields.get(field).cloned()
+    }
+
+    /// The document of the last WAL upsert of `id`.
+    fn logged_document(engine: &Engine, id: &str) -> Option<Document> {
+        use crate::store::log::LogEntry;
+        engine
+            .log
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.entry {
+                LogEntry::Upsert {
+                    external_id,
+                    document,
+                    ..
+                } if external_id == id => Some(document),
+                _ => None,
+            })
+    }
+
+    /// Await `future`, failing the test if it has not finished in 30
+    /// seconds. Only stops a put that retries forever (Issue #1498).
+    async fn within_a_while<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(30), future)
+            .await
+            .expect("the call did not finish")
+    }
+
+    /// Issue #1498: a put that waits for an `update_field` changing its
+    /// field's type is coerced to the new type. The test holds
+    /// `schema_change_lock` for reading, so the change queues for the write
+    /// lock and the put queues behind it. The put used to coerce its
+    /// document before it took the lock, and the value it coerced to
+    /// `Integer` went into the field, now `Text`, as an integer.
+    #[tokio::test]
+    async fn a_put_waiting_for_update_field_is_coerced_to_the_new_option() {
+        let mut wrong = Vec::new();
+        for policy in POLICIES {
+            let schema = coercion_schema(Some(integer_option()), policy);
+            let engine = Engine::new(unlocked_memory_storage(), schema)
+                .await
+                .unwrap();
+            let held = engine.schema_change_lock.read().await;
+            let mut change = Box::pin(engine.update_field("n", text_option(), rebuild()));
+            assert!(futures::poll!(change.as_mut()).is_pending());
+            let mut put =
+                Box::pin(engine.put_document("a", Document::builder().add_text("n", "42").build()));
+            assert!(futures::poll!(put.as_mut()).is_pending());
+            drop(held);
+            change.await.unwrap();
+            if let Err(e) = put.await {
+                wrong.push(format!("{policy:?}: the put failed: {e}"));
+                continue;
+            }
+            let stored = stored_value(&engine, "a", "n").await;
+            if stored != Some(crate::data::DataValue::Text("42".to_string())) {
+                wrong.push(format!("{policy:?}: stored {stored:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1498: a value that the new type of its field rejects is a
+    /// coercion error for a put that waits for the change: Strict and
+    /// Dynamic fail the put before its WAL append, and Ignore drops the
+    /// value. It used to go in as text, into a field now `Integer`.
+    #[tokio::test]
+    async fn a_put_waiting_for_update_field_with_a_value_the_new_option_rejects() {
+        let mut wrong = Vec::new();
+        for policy in POLICIES {
+            let schema = coercion_schema(Some(text_option()), policy);
+            let engine = Engine::new(unlocked_memory_storage(), schema)
+                .await
+                .unwrap();
+            let seq_before = engine.log.last_seq();
+            let held = engine.schema_change_lock.read().await;
+            let mut change = Box::pin(engine.update_field("n", integer_option(), rebuild()));
+            assert!(futures::poll!(change.as_mut()).is_pending());
+            let doc = Document::builder()
+                .add_text("title", "t")
+                .add_text("n", "abc")
+                .build();
+            let mut put = Box::pin(engine.put_document("a", doc));
+            assert!(futures::poll!(put.as_mut()).is_pending());
+            drop(held);
+            change.await.unwrap();
+            let result = put.await;
+            if policy == schema::DynamicFieldPolicy::Ignore {
+                if let Err(e) = result {
+                    wrong.push(format!("{policy:?}: the put failed: {e}"));
+                    continue;
+                }
+                let stored = stored_value(&engine, "a", "n").await;
+                if stored.is_some() {
+                    wrong.push(format!("{policy:?}: stored {stored:?}"));
+                }
+            } else {
+                let docs = engine.get_documents("a").await.unwrap();
+                if result.is_ok() || engine.log.last_seq() != seq_before || !docs.is_empty() {
+                    wrong.push(format!(
+                        "{policy:?}: {result:?}, {} records appended, stored {docs:?}",
+                        engine.log.last_seq() - seq_before
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1498: a Dynamic put coerces the value of a field it added to
+    /// the option the field has once the put holds the lock. Here `x` is
+    /// added as `Text` from `"42"`, and an `update_field` queued behind that
+    /// `add_field` changes it to `Integer` before the put takes the lock.
+    /// The put used to keep the value of a field it added as it was.
+    #[tokio::test]
+    async fn a_dynamic_put_coerces_a_field_it_added_to_its_option_under_the_lock() {
+        let schema = coercion_schema(None, schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        let held = engine.schema_change_lock.read().await;
+        let mut put =
+            Box::pin(engine.put_document("a", Document::builder().add_text("x", "42").build()));
+        assert!(futures::poll!(put.as_mut()).is_pending(), "waits to add x");
+        let mut change = Box::pin(engine.update_field("x", integer_option(), rebuild()));
+        assert!(futures::poll!(change.as_mut()).is_pending());
+        drop(held);
+        assert!(
+            futures::poll!(put.as_mut()).is_pending(),
+            "added x, waits for the change"
+        );
+        assert!(matches!(
+            engine.schema().fields.get("x"),
+            Some(schema::FieldOption::Text(_))
+        ));
+        change.await.unwrap();
+        put.await.unwrap();
+        assert_eq!(
+            stored_value(&engine, "a", "x").await,
+            Some(crate::data::DataValue::Int64(42))
+        );
+    }
+
+    /// Issue #1498: two Dynamic puts that add the same field with values
+    /// of different types both succeed, and the second's value is coerced
+    /// to the type the first added. Both wait for `add_field` holding no
+    /// lock of the engine: their id locks are free meanwhile. The second
+    /// put used to keep its text, in an `Integer` field.
+    #[tokio::test]
+    async fn dynamic_puts_adding_one_field_both_get_the_type_it_was_added_with() {
+        let schema = coercion_schema(None, schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        let held = engine.schema_change_lock.read().await;
+        let mut first =
+            Box::pin(engine.put_document("a", Document::builder().add_integer("x", 7).build()));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let mut second =
+            Box::pin(engine.put_document("b", Document::builder().add_text("x", "7").build()));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(
+            engine.id_lock("a").try_lock().is_ok() && engine.id_lock("b").try_lock().is_ok(),
+            "a put waiting to add a field holds no id lock"
+        );
+        drop(held);
+        let (first, second) = futures::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        assert!(matches!(
+            engine.schema().fields.get("x"),
+            Some(schema::FieldOption::Integer(_))
+        ));
+        for id in ["a", "b"] {
+            assert_eq!(
+                stored_value(&engine, id, "x").await,
+                Some(crate::data::DataValue::Int64(7)),
+                "{id}"
+            );
+        }
+    }
+
+    /// Issue #1498: a Dynamic put adds again a field that a `delete_field`
+    /// removed after the put added it and before the put took the lock, as
+    /// a put after the delete would. The put used to drop the field's value
+    /// and leave the field out of the schema.
+    #[tokio::test]
+    async fn a_dynamic_put_adds_again_a_field_deleted_before_it_took_the_lock() {
+        let schema = coercion_schema(None, schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        let held = engine.schema_change_lock.read().await;
+        let doc = Document::builder()
+            .add_text("title", "t")
+            .add_integer("x", 1)
+            .build();
+        let mut put = Box::pin(engine.put_document("a", doc));
+        assert!(futures::poll!(put.as_mut()).is_pending(), "waits to add x");
+        let mut delete = Box::pin(engine.delete_field("x"));
+        assert!(futures::poll!(delete.as_mut()).is_pending());
+        drop(held);
+        assert!(
+            futures::poll!(put.as_mut()).is_pending(),
+            "added x, waits for the delete"
+        );
+        assert!(engine.schema().fields.contains_key("x"));
+        delete.await.unwrap();
+        assert!(!engine.schema().fields.contains_key("x"));
+        within_a_while(put).await.unwrap();
+        assert!(matches!(
+            engine.schema().fields.get("x"),
+            Some(schema::FieldOption::Integer(_))
+        ));
+        assert_eq!(
+            stored_value(&engine, "a", "x").await,
+            Some(crate::data::DataValue::Int64(1))
+        );
+        let logged = logged_document(&engine, "a").expect("the put's WAL record");
+        assert_eq!(
+            logged.fields.get("x"),
+            Some(&crate::data::DataValue::Int64(1))
+        );
+    }
+
+    /// Issue #1498: a Strict put rejects a field that a `delete_field`
+    /// removed while the put waited for it, as a put after the delete
+    /// would, and writes nothing. It used to drop the value and succeed.
+    #[tokio::test]
+    async fn a_strict_put_rejects_a_field_deleted_while_it_waited() {
+        let schema = coercion_schema(Some(integer_option()), schema::DynamicFieldPolicy::Strict);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        let seq_before = engine.log.last_seq();
+        let held = engine.schema_change_lock.read().await;
+        let mut delete = Box::pin(engine.delete_field("n"));
+        assert!(futures::poll!(delete.as_mut()).is_pending());
+        let doc = Document::builder()
+            .add_text("title", "t")
+            .add_integer("n", 1)
+            .build();
+        let mut put = Box::pin(engine.put_document("a", doc));
+        assert!(futures::poll!(put.as_mut()).is_pending());
+        drop(held);
+        delete.await.unwrap();
+        let error = put.await.expect_err("n is undeclared now");
+        assert!(error.to_string().contains("\"n\""), "{error}");
+        assert_eq!(engine.log.last_seq(), seq_before);
+        assert!(engine.get_documents("a").await.unwrap().is_empty());
+    }
+
+    /// Issue #1498: an Ignore put drops the value of a field that a
+    /// `delete_field` removed while the put waited, before its WAL append.
+    /// It used to log the value, which the stores then dropped.
+    #[tokio::test]
+    async fn an_ignore_put_drops_a_field_deleted_while_it_waited() {
+        let schema = coercion_schema(Some(integer_option()), schema::DynamicFieldPolicy::Ignore);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        let held = engine.schema_change_lock.read().await;
+        let mut delete = Box::pin(engine.delete_field("n"));
+        assert!(futures::poll!(delete.as_mut()).is_pending());
+        let doc = Document::builder()
+            .add_text("title", "t")
+            .add_integer("n", 1)
+            .build();
+        let mut put = Box::pin(engine.put_document("a", doc));
+        assert!(futures::poll!(put.as_mut()).is_pending());
+        drop(held);
+        delete.await.unwrap();
+        put.await.unwrap();
+        let logged = logged_document(&engine, "a").expect("the put's WAL record");
+        assert!(!logged.fields.contains_key("n"), "{logged:?}");
+        assert!(logged.fields.contains_key("title"));
+        assert_eq!(stored_value(&engine, "a", "n").await, None);
+    }
+
+    /// Issue #1498: a Dynamic put of a null value for an undeclared field
+    /// adds no field and drops the value. The check before the lock and the
+    /// check under it share one predicate; were a null a field to add for
+    /// one and not the other, the put would retry forever.
+    #[tokio::test]
+    async fn a_dynamic_put_of_a_null_value_adds_no_field() {
+        let schema = coercion_schema(None, schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        let doc = Document::builder()
+            .add_text("title", "t")
+            .add_field("x", crate::data::DataValue::Null)
+            .build();
+        within_a_while(engine.put_document("a", doc)).await.unwrap();
+        assert!(!engine.schema().fields.contains_key("x"));
+        assert_eq!(stored_value(&engine, "a", "x").await, None);
+    }
+
+    /// Issue #1498: when the lexical index has a field that the schema
+    /// lacks, as a lexical `add_field` whose commit failed leaves it, a
+    /// Dynamic put of that field fails with the lexical index's error. A
+    /// put accepted any "already exists" error, and with the retry it would
+    /// add the field forever; before the retry it dropped the value.
+    #[tokio::test]
+    async fn a_dynamic_put_fails_for_a_field_only_the_lexical_index_has() {
+        let schema = coercion_schema(None, schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        engine
+            .lexical
+            .add_field("x", integer_option().to_lexical().unwrap(), None)
+            .unwrap();
+        let put = engine.put_document("a", Document::builder().add_integer("x", 1).build());
+        let error = within_a_while(put)
+            .await
+            .expect_err("x is in the lexical index");
+        assert!(
+            error
+                .to_string()
+                .contains("already exists in the lexical index"),
+            "{error}"
+        );
+        assert!(!engine.schema().fields.contains_key("x"));
     }
 }

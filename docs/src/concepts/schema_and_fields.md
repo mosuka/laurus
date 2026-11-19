@@ -396,6 +396,20 @@ let schema = Schema::builder()
     .build();
 ```
 
+The policy and the coercion described below apply to the schema as it stands
+when the document is indexed. A put waits for an `add_field`, `delete_field`
+or `update_field` call in progress, and checks and coerces the document
+against the fields that call leaves
+([#1498](https://github.com/mosuka/laurus/issues/1498)):
+
+- Under `Dynamic`, a put first adds its undeclared fields, then coerces their
+  values as it does a declared field's. When another put or an `add_field`
+  call adds the same field first with another type, the value is coerced to
+  that type, and the put fails if it cannot be.
+- When a `delete_field` call removes one of the document's fields while the
+  put waits, the put handles the field as undeclared: `Strict` rejects the
+  document, `Dynamic` adds the field again, and `Ignore` drops the value.
+
 ### Type inference rules (Dynamic policy)
 
 | Incoming value | Inferred field type |
@@ -598,7 +612,9 @@ layout the scalar `Bytes` value uses (an empty MIME string means `None`).
 ### Type conflicts
 
 When a value arrives for a field that is **already declared**, Laurus attempts
-to coerce the value to the declared type. The coercion rules are:
+to coerce the value to the declared type. A field the `Dynamic` policy adds
+for the document is coerced the same way, to the type it has when the
+document is indexed. The coercion rules are:
 
 | Declared type | Incoming value | Result |
 | :--- | :--- | :--- |
@@ -759,6 +775,10 @@ When a field is deleted:
   `schema.toml`, so they show the name until then.
 - Any per-field analyzer or embedder registered for the field is
   unregistered.
+- A put that waits for the call and has a value for the field handles it as
+  undeclared, as a put after the call would: `Strict` rejects the document,
+  `Dynamic` adds the field again, and `Ignore` drops the value
+  ([#1498](https://github.com/mosuka/laurus/issues/1498)).
 
 Adding a field with the same name later does not bring its data back, and
 the field starts empty. A lexical field's data was discarded when it was
@@ -803,6 +823,12 @@ The requested change is classified into one of three kinds, reported as
 `Reindex` and `Destructive` changes are rejected unless you explicitly
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against
 accidentally triggering an expensive rebuild or a data-losing change.
+
+`update_field` waits for the puts already being written, which finish under
+the field's old option. A put that waits for `update_field` is coerced to the
+new option, and a value that cannot be is handled as
+[Type conflicts](#type-conflicts) describes
+([#1498](https://github.com/mosuka/laurus/issues/1498)).
 
 A `MetadataOnly` change takes effect in the open index at once, without
 reopening it or restarting `laurus serve`
