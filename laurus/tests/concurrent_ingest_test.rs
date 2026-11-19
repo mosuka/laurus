@@ -17,7 +17,7 @@ use std::sync::Arc;
 use laurus::lexical::TextOption;
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
-use laurus::{DataValue, Document, Engine, FieldOption, Schema};
+use laurus::{DataValue, Document, Engine, FieldOption, Schema, SearchRequestBuilder};
 
 /// Threads used by the concurrent tests. Fixed rather than derived from
 /// the host's core count so a CI runner and a workstation exercise the
@@ -302,4 +302,104 @@ fn concurrent_deletes_remove_exactly_their_targets() {
         stats.document_count, survivors,
         "the count must match the documents that actually survived"
     );
+}
+
+/// Dynamic puts from several threads that add the same new fields all
+/// succeed, and leave each field in the schema once, with the type of its
+/// values (Issue #1498).
+///
+/// Every document has a field all threads add, one only its own thread
+/// adds and one that two threads add, so puts that need a field race each
+/// other's `add_field`, and each put then coerces its values under the
+/// schema lock to the type the field was added with.
+#[test]
+fn concurrent_dynamic_puts_add_each_new_field_once() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let setup = tokio::runtime::Runtime::new().unwrap();
+    // `schema()` keeps the default policy, `DynamicFieldPolicy::Dynamic`.
+    let engine = Arc::new(setup.block_on(Engine::new(storage, schema())).unwrap());
+    let doc = |t: usize, i: usize| {
+        Document::builder()
+            .add_field("title", DataValue::Text(format!("title {t} {i}")))
+            .add_field("shared", DataValue::Int64(i as i64))
+            .add_field(format!("own_{t}"), DataValue::Text(format!("word{i}")))
+            .add_field(
+                format!("pair_{}", t / 2),
+                DataValue::Bool(i.is_multiple_of(2)),
+            )
+            .build()
+    };
+
+    {
+        let engine = Arc::clone(&engine);
+        in_parallel(move |t| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for i in 0..PER_THREAD {
+                    engine
+                        .put_document(&format!("t{t}-d{i}"), doc(t, i))
+                        .await
+                        .unwrap();
+                }
+            });
+        });
+    }
+
+    setup.block_on(engine.commit()).unwrap();
+
+    let schema = engine.schema();
+    let mut wrong = Vec::new();
+    if !matches!(schema.fields.get("shared"), Some(FieldOption::Integer(_))) {
+        wrong.push(format!("shared: {:?}", schema.fields.get("shared")));
+    }
+    for t in 0..THREADS {
+        let own = format!("own_{t}");
+        if !matches!(schema.fields.get(&own), Some(FieldOption::Text(_))) {
+            wrong.push(format!("{own}: {:?}", schema.fields.get(&own)));
+        }
+        let pair = format!("pair_{}", t / 2);
+        if !matches!(schema.fields.get(&pair), Some(FieldOption::Boolean(_))) {
+            wrong.push(format!("{pair}: {:?}", schema.fields.get(&pair)));
+        }
+    }
+    // title and owner from `schema()`, shared, one own_ per thread and one
+    // pair_ per two threads.
+    let expected_fields = 3 + THREADS + THREADS / 2;
+    if schema.fields.len() != expected_fields {
+        wrong.push(format!(
+            "{} fields, not {expected_fields}: {:?}",
+            schema.fields.len(),
+            schema.fields.keys().collect::<Vec<_>>()
+        ));
+    }
+
+    setup.block_on(async {
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let id = format!("t{t}-d{i}");
+                let docs = engine.get_documents(&id).await.unwrap();
+                let want = doc(t, i);
+                let fits = docs.len() == 1
+                    && want
+                        .fields
+                        .iter()
+                        .all(|(name, value)| docs[0].fields.get(name) == Some(value));
+                if !fits {
+                    wrong.push(format!("{id}: {docs:?}"));
+                }
+            }
+        }
+        let request = SearchRequestBuilder::new()
+            .query_dsl(format!("shared:[0 TO {}]", PER_THREAD - 1))
+            .limit(THREADS * PER_THREAD + 1)
+            .build();
+        let hits = engine.search(request).await.unwrap().len();
+        if hits != THREADS * PER_THREAD {
+            wrong.push(format!("shared:[..] finds {hits} documents"));
+        }
+    });
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

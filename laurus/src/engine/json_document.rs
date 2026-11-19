@@ -51,7 +51,7 @@ use super::type_inference::{InferredValue, infer_from_json};
 /// The per-field [`FieldOption`](super::schema::FieldOption) that
 /// `infer_from_json` also produces is discarded here: schema registration
 /// for undeclared fields is the engine's responsibility
-/// (`Engine::apply_dynamic_schema`, via
+/// (`Engine::add_undeclared_fields`, via
 /// [`infer_option_from_data_value`](super::type_inference::infer_option_from_data_value)),
 /// not the transport layer's.
 ///
