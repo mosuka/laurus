@@ -493,8 +493,16 @@ impl SegmentedVectorField {
 
     /// Load the readers of every sealed segment, newest generation first
     /// (Issue #660 cache; entries invalidated on merge).
+    ///
+    /// The segments are listed with
+    /// [`SegmentManager::pinned_segments`](crate::vector::index::segment::manager::SegmentManager::pinned_segments)
+    /// and held until the readers are loaded (Issue #1678): a merge that
+    /// replaces a listed segment meanwhile deletes its files only after
+    /// that.
     fn sealed_readers_newest_first(&self) -> Result<Vec<Arc<HnswIndexReader>>> {
-        let mut segments = self.segment_manager.list_segments();
+        let mut segments = self.segment_manager.pinned_segments();
+        #[cfg(test)]
+        crate::vector::index::segment::manager::test_hooks::run_after_listing();
         // Newest generation first: earlier entries are authoritative for
         // newest-source-wins masking.
         segments.sort_by_key(|s| std::cmp::Reverse(s.generation));
@@ -506,13 +514,13 @@ impl SegmentedVectorField {
         };
 
         segments
-            .into_iter()
+            .iter()
             .map(|info| {
                 let storage = self.storage.clone();
                 let deletion_bitmap = self.deletion_bitmap.clone();
-                let segment_id = info.segment_id;
-                self.reader_cache.get_or_load(&segment_id, || {
-                    let mut r = HnswIndexReader::load(storage, &segment_id, distance_metric)?;
+                let segment_id = &info.segment_id;
+                self.reader_cache.get_or_load(segment_id, || {
+                    let mut r = HnswIndexReader::load(storage, segment_id, distance_metric)?;
                     if let Some(bitmap) = deletion_bitmap {
                         r.set_deletion_bitmap(bitmap);
                     }
@@ -949,5 +957,115 @@ mod tests {
                 SegmentManager::new(SegmentManagerConfig::default(), inner, layout).unwrap();
             assert_eq!(reopened.list_segments().len(), 1, "{case}");
         }
+    }
+
+    /// Issue #1678: a search that listed the segments a merge replaces
+    /// loads their readers while the merge waits to delete their files.
+    ///
+    /// Right after the search lists the segments, a hook runs a force merge
+    /// on another thread and waits for its first event: the merge publishes,
+    /// then its deletion finds the search holding the gate, reports
+    /// `waiting` and waits. Without the gate the merge would finish,
+    /// deleting the files, before the search loads them.
+    #[tokio::test]
+    async fn a_search_that_listed_the_segments_a_merge_replaces_loads_them() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::vector::index::segment::manager::test_hooks;
+        use crate::vector::index::segment::merge_policy::ForceMergePolicy;
+
+        let (field, _bitmap, manager) = field_with_bitmap();
+        for (doc_id, vector) in [
+            (1, [1.0, 0.0, 0.0, 0.0]),
+            (2, [0.0, 1.0, 0.0, 0.0]),
+            (3, [0.0, 0.0, 1.0, 0.0]),
+        ] {
+            field
+                .add_stored_vector(doc_id, &StoredVector::new(vector.to_vec()), 0)
+                .await
+                .unwrap();
+            field.flush().await.unwrap();
+        }
+        field.delete_document(2, 0).await.unwrap();
+        let sources: Vec<String> = manager
+            .list_segments()
+            .into_iter()
+            .map(|s| s.segment_id)
+            .collect();
+        assert_eq!(sources.len(), 3);
+
+        let field = Arc::new(field);
+        let first = Rc::new(RefCell::new(None));
+        let merger = Rc::new(RefCell::new(None));
+        {
+            let field = Arc::clone(&field);
+            let first = Rc::clone(&first);
+            let merger = Rc::clone(&merger);
+            test_hooks::set_after_listing(move || {
+                let (events, received) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let waiting = events.clone();
+                    test_hooks::set_when_deletion_waits(move || {
+                        let _ = waiting.send("waiting".to_string());
+                    });
+                    let result = match field.perform_merge_with_policy(&ForceMergePolicy::new()) {
+                        Ok(()) => "finished".to_string(),
+                        Err(e) => format!("failed: {e}"),
+                    };
+                    let _ = events.send(result);
+                });
+                *first.borrow_mut() = received.recv_timeout(Duration::from_secs(60)).ok();
+                *merger.borrow_mut() = Some((handle, received));
+            });
+        }
+
+        let mut failures = Vec::new();
+        match field.search(query(vec![1.0, 1.0, 1.0, 0.0], 3)) {
+            Ok(results) => {
+                let mut ids: Vec<u64> = results.hits.iter().map(|h| h.doc_id).collect();
+                ids.sort_unstable();
+                if ids.is_empty() || ids.iter().any(|id| *id != 1 && *id != 3) {
+                    failures.push(format!(
+                        "the search returned {ids:?}, expected documents among 1 and 3"
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("the search failed: {e}")),
+        }
+        let (handle, received) = merger
+            .borrow_mut()
+            .take()
+            .expect("the hook after the listing runs");
+        handle.join().unwrap();
+        let events: Vec<String> = first
+            .borrow_mut()
+            .take()
+            .into_iter()
+            .chain(received.try_iter())
+            .collect();
+        if events != ["waiting", "finished"] {
+            failures.push(format!(
+                "the merge reported {events:?}, expected it to wait for the search and then \
+                 succeed"
+            ));
+        }
+        let left: std::collections::BTreeSet<String> = field
+            .storage
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.starts_with("segment_"))
+            .map(|file| file.split('.').next().unwrap_or_default().to_string())
+            .collect();
+        if left.len() != 1 || sources.iter().any(|id| left.contains(id)) {
+            failures.push(format!(
+                "segment files {left:?} are left, expected only the merged one, none of \
+                 {sources:?}"
+            ));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

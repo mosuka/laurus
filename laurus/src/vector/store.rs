@@ -3321,6 +3321,93 @@ mod tests {
         assert_eq!(search_ids(&store, "a").unwrap(), live);
     }
 
+    /// Issue #1678: a search that builds its searcher while
+    /// `VectorStore::optimize` merges the field returns the live documents
+    /// instead of failing on a replaced segment's file. The commit drops the
+    /// cached searcher, so the search lists the field's segments; a hook
+    /// right after the listing starts the optimize on another thread and
+    /// waits until the merge has published and waits to delete the files.
+    #[tokio::test]
+    async fn a_search_during_an_optimize_reads_the_segments_it_listed() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::vector::index::segment::manager::test_hooks;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = Arc::new(VectorStore::new(storage, config).unwrap());
+        for docs in [1..=5, 6..=10] {
+            for doc_id in docs {
+                put_doc(&store, doc_id).await;
+            }
+            store.commit().await.unwrap();
+        }
+        store.delete_document_by_internal_id(1).await.unwrap();
+        store.commit().await.unwrap();
+
+        let first = Rc::new(RefCell::new(None));
+        let merger = Rc::new(RefCell::new(None));
+        {
+            let store = Arc::clone(&store);
+            let first = Rc::clone(&first);
+            let merger = Rc::clone(&merger);
+            test_hooks::set_after_listing(move || {
+                let (events, received) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let waiting = events.clone();
+                    test_hooks::set_when_deletion_waits(move || {
+                        let _ = waiting.send("waiting".to_string());
+                    });
+                    let optimized = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap()
+                        .block_on(store.optimize());
+                    let _ = events.send(match optimized {
+                        Ok(()) => "finished".to_string(),
+                        Err(e) => format!("failed: {e}"),
+                    });
+                });
+                *first.borrow_mut() = received.recv_timeout(Duration::from_secs(60)).ok();
+                *merger.borrow_mut() = Some((handle, received));
+            });
+        }
+
+        let during = search_ids(&store, "a");
+        let (handle, received) = merger
+            .borrow_mut()
+            .take()
+            .expect("the hook after the listing runs");
+        handle.join().unwrap();
+        let events: Vec<String> = first
+            .borrow_mut()
+            .take()
+            .into_iter()
+            .chain(received.try_iter())
+            .collect();
+
+        let live: Vec<u64> = (2..=10).collect();
+        match during {
+            Ok(ids) => assert_eq!(ids, live, "the search during the optimize"),
+            Err(e) => panic!("the search during the optimize failed: {e}"),
+        }
+        assert_eq!(
+            events,
+            ["waiting", "finished"],
+            "the optimize waits for the search's build, then succeeds"
+        );
+        assert_eq!(search_ids(&store, "a").unwrap(), live);
+    }
+
     /// Issue #1457 — a purge to a Flat or IVF option with a product
     /// quantizer is rejected before the field's data is discarded.
     #[tokio::test]

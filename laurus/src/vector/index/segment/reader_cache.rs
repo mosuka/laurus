@@ -33,6 +33,10 @@ use crate::error::Result;
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::vector::index::segment::segmented_core::SegmentedCore;
 
+/// Sealed segment readers, and the deletion bitmap they were loaded with
+/// (see [`SegmentedReaderCache::sealed_readers_newest_first`]).
+pub(crate) type ReadersWithBitmap<R> = (Vec<Arc<R>>, Option<Arc<DeletionBitmap>>);
+
 /// Caches `Arc<R>` per `segment_id`.
 ///
 /// The cache is intentionally minimal: it stores every requested reader for
@@ -118,7 +122,7 @@ impl<R> SegmentedReaderCache<R> {
     }
 
     /// Readers of `core`'s sealed segments, newest generation first, each
-    /// loaded with the current deletion bitmap attached.
+    /// loaded with the current deletion bitmap attached, and that bitmap.
     ///
     /// `load` builds the reader of one segment and attaches the bitmap when
     /// it is `Some`. Segment readers filter deletions through the bitmap
@@ -127,6 +131,15 @@ impl<R> SegmentedReaderCache<R> {
     /// [`SegmentedCore::bitmap_epoch`] are therefore dropped before the
     /// build, and the build is redone if a bitmap is created while it runs.
     ///
+    /// The segments are listed with
+    /// [`SegmentManager::pinned_segments`](crate::vector::index::segment::manager::SegmentManager::pinned_segments)
+    /// and held until the readers are loaded (Issue #1678): a merge that
+    /// replaces a listed segment meanwhile deletes its files only after
+    /// this build, so a redone build loads the same list again. The caller
+    /// pairs the readers with the returned bitmap, not one read later: a
+    /// full merge that ends after the build forgets the marks of documents
+    /// that the sources returned here still hold.
+    ///
     /// # Errors
     ///
     /// Returns the first error from reading the bitmap or from `load`.
@@ -134,8 +147,10 @@ impl<R> SegmentedReaderCache<R> {
         &self,
         core: &SegmentedCore,
         load: impl Fn(&str, Option<Arc<DeletionBitmap>>) -> Result<R>,
-    ) -> Result<Vec<Arc<R>>> {
-        let mut segments = core.manager().list_segments();
+    ) -> Result<ReadersWithBitmap<R>> {
+        let mut segments = core.manager().pinned_segments();
+        #[cfg(test)]
+        crate::vector::index::segment::manager::test_hooks::run_after_listing();
         segments.sort_by_key(|s| std::cmp::Reverse(s.generation));
 
         loop {
@@ -162,7 +177,7 @@ impl<R> SegmentedReaderCache<R> {
             // drop them and rebuild. That happens only on the first delete
             // and at the end of a full merge, so the loop rarely repeats.
             if core.bitmap_epoch() == epoch {
-                return Ok(readers);
+                return Ok((readers, bitmap));
             }
             self.clear();
         }
@@ -330,6 +345,7 @@ mod tests {
                     Ok(bitmap.is_some())
                 })
                 .unwrap()
+                .0
                 .iter()
                 .map(|reader| **reader)
                 .collect()
@@ -339,7 +355,7 @@ mod tests {
         fn readers_come_newest_generation_first() {
             let (core, ids) = core_with_segments(3);
             let cache: SegmentedReaderCache<String> = SegmentedReaderCache::new();
-            let readers = cache
+            let (readers, _) = cache
                 .sealed_readers_newest_first(&core, |id, _| Ok(id.to_string()))
                 .unwrap();
             let order: Vec<String> = readers.iter().map(|r| r.to_string()).collect();
@@ -376,7 +392,7 @@ mod tests {
             let cache: SegmentedReaderCache<Option<Arc<DeletionBitmap>>> =
                 SegmentedReaderCache::new();
             let attached = || {
-                let readers = cache
+                let (readers, _) = cache
                     .sealed_readers_newest_first(&core, |_, bitmap| Ok(bitmap))
                     .unwrap();
                 readers[0].as_ref().clone().unwrap()
@@ -404,7 +420,7 @@ mod tests {
 
             // The first load races a first delete: it was handed the `None`
             // snapshot, but the bitmap exists once it returns.
-            let readers = cache
+            let (readers, _) = cache
                 .sealed_readers_newest_first(&core, |_, bitmap| {
                     if !created.swap(true, Ordering::SeqCst) {
                         core.mark_deleted(1).unwrap();
