@@ -263,21 +263,20 @@ impl FileStorage {
         }
     }
 
-    /// Recursively fsync a directory and its subdirectories.
+    /// Recursively sync a directory and its subdirectories.
     ///
-    /// On Unix, opening a directory and calling `sync_all()` ensures that
-    /// directory entries (file creation, rename, delete) are flushed to disk.
-    ///
-    /// On Windows, directories cannot be opened as regular files, so directory
-    /// fsync is not applicable. Instead, the file-level `sync_all()` in
-    /// `FileOutput::close()` ensures data durability, and the explicit handle
-    /// release ensures file visibility for subsequent reads.
+    /// Syncing a directory flushes its entries (file creation, rename,
+    /// delete) to disk: on Unix by opening it and calling `sync_all()`, and on
+    /// Windows by opening it with `FILE_FLAG_BACKUP_SEMANTICS` and flushing it,
+    /// which Windows documents to persist the entries on NTFS (Issue #1667).
+    /// The file contents are made durable by the `sync_all()` in
+    /// `FileOutput::close()`.
     fn sync_directory_recursive(dir: &Path) -> Result<()> {
         if !dir.exists() {
             return Ok(());
         }
 
-        // Fsync subdirectories first (depth-first).
+        // Sync subdirectories first (depth-first).
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
@@ -286,8 +285,7 @@ impl FileStorage {
             }
         }
 
-        // Fsync the directory itself (a no-op on Windows, which does not
-        // support opening directories as files for fsync).
+        // Sync the directory itself.
         durable::sync_dir(dir).map_err(|e| {
             LaurusError::storage(format!("Failed to sync directory {:?}: {}", dir, e))
         })?;
@@ -704,9 +702,8 @@ impl Storage for FileStorage {
     fn sync(&self) -> Result<()> {
         self.check_closed()?;
 
-        // Recursively fsync directories to ensure that all file metadata
-        // (creation, rename, size changes) is visible to subsequent readers.
-        // This is essential on Windows where directory listings may be cached.
+        // Recursively sync the directories, so the names of the files created,
+        // renamed or removed under the root are durable.
         Self::sync_directory_recursive(&self.directory)?;
 
         Ok(())

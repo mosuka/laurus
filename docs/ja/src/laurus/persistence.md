@@ -520,9 +520,15 @@ sync した `schema.toml.tmp` を `schema.toml` に rename し、インデック
 要るので、書き込みで開けない `schema.toml`（読み取り専用のファイルなど）は
 sync せずに読み、警告をログに出します。
 
-Windows では `std` でディレクトリを開いて sync できないため、ストレージ自身の
-ディレクトリの sync と同じく、ファイルの中身と rename の原子性だけが保証
-されます。
+Windows では、これらのディレクトリの sync は、コミットの後のストレージ自身の
+sync と同じく、ディレクトリを `FILE_FLAG_BACKUP_SEMANTICS` で開いて flush
+します（[#1667](https://github.com/mosuka/laurus/issues/1667)）。flush には、
+そのディレクトリにファイルかサブディレクトリを追加する権限が要ります。
+Windows の文書が、flush でディレクトリのエントリを永続化すると定めているのは
+NTFS だけで、ReFS や FAT などほかのファイルシステムは、永続化せずに flush を
+完了します。SMB の共有のように、ディレクトリを flush できないファイル
+システムでは flush が失敗し、sync は何もしません。NTFS 以外のファイル
+システムで保証されるのは、ファイルの中身と rename の原子性だけです。
 
 ### 同時の作成と open
 

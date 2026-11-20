@@ -363,8 +363,8 @@ impl IndexDirClaim {
     ///
     /// On Windows, a sync needs write access to the file; one that cannot be
     /// opened for writing (a read-only file, for example) is read without
-    /// the sync, and a warning is logged. The directory sync does nothing on
-    /// Windows.
+    /// the sync, and a warning is logged. The directory sync persists the
+    /// directory's entries on NTFS (Issue #1667).
     ///
     /// # Errors
     ///
