@@ -12361,4 +12361,99 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
+
+    /// `update_field(name, new, ..)` as a dry run and then for real, with
+    /// `reindex: true`, returning both classifications (Issue #1685).
+    async fn classify_and_apply(
+        engine: &Engine,
+        name: &str,
+        new: schema::FieldOption,
+    ) -> (schema::FieldChangeKind, schema::FieldChangeKind) {
+        let dry = engine
+            .update_field(
+                name,
+                new.clone(),
+                UpdateFieldOptions {
+                    reindex: true,
+                    dry_run: true,
+                },
+            )
+            .await
+            .unwrap()
+            .classification;
+        let applied = engine
+            .update_field(name, new, rebuild())
+            .await
+            .unwrap()
+            .classification;
+        (dry, applied)
+    }
+
+    /// Issue #1685: a type change of a `stored: false` lexical field is
+    /// `Destructive`, as a dry run and for real, and the schema records the
+    /// field in `pending_reindex`: the rebuild has no stored value to
+    /// convert, so the field's data is discarded. It used to be a
+    /// `Reindex`, recorded nowhere.
+    #[tokio::test]
+    async fn a_type_change_of_an_unstored_field_is_destructive() {
+        use crate::data::DataValue;
+        use crate::lexical::core::field::{IntegerOption, TextOption};
+
+        let unstored_text = schema::FieldOption::Text(TextOption::default().stored(false));
+        let schema = coercion_schema(Some(unstored_text), schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        engine
+            .put_document("a", item_doc("n", DataValue::Text("42".into())))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        let unstored_integer = schema::FieldOption::Integer(IntegerOption::default().stored(false));
+        let (dry, applied) = classify_and_apply(&engine, "n", unstored_integer).await;
+        assert_eq!(dry, schema::FieldChangeKind::Destructive, "dry run");
+        assert_eq!(applied, schema::FieldChangeKind::Destructive);
+        assert!(
+            engine.schema().pending_reindex.contains("n"),
+            "{:?}",
+            engine.schema().pending_reindex
+        );
+    }
+
+    /// Issue #1685: turning `multi_valued` off on a `stored: false`
+    /// BKD-backed field (here `Integer`) is `Destructive` and recorded in
+    /// `pending_reindex`: a field rebuild does not read the field's points
+    /// back from its BKD tree. It used to be a `Reindex` that left the
+    /// field without points.
+    #[tokio::test]
+    async fn turning_multi_valued_off_on_an_unstored_numeric_field_is_destructive() {
+        use crate::data::DataValue;
+        use crate::lexical::core::field::IntegerOption;
+
+        let multi = schema::FieldOption::Integer(IntegerOption {
+            multi_valued: true,
+            stored: false,
+            ..Default::default()
+        });
+        let schema = coercion_schema(Some(multi), schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        engine
+            .put_document("a", item_doc("n", DataValue::Int64Array(vec![7])))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+
+        let single = schema::FieldOption::Integer(IntegerOption::default().stored(false));
+        let (dry, applied) = classify_and_apply(&engine, "n", single).await;
+        assert_eq!(dry, schema::FieldChangeKind::Destructive, "dry run");
+        assert_eq!(applied, schema::FieldChangeKind::Destructive);
+        assert!(
+            engine.schema().pending_reindex.contains("n"),
+            "{:?}",
+            engine.schema().pending_reindex
+        );
+    }
 }

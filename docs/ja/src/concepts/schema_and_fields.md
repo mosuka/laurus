@@ -458,7 +458,7 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 ではなく多値 `Text` と推論されます（Issue #1175）—— ブールとして推論させたい配列には JSON のブール値を使ってください。
 既存の `Boolean` フィールドで `multi_valued` を有効にする変更は metadata-only です。無効にする変更は、
 フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら **`Destructive`**
-になります —— BKD ベースの型と異なり、再構築の元になるポイントツリーがなく、保存された値しかないためです。
+になります —— どの型の lexical フィールドも、再構築は保存された値だけから作り直すためです（[#1685](https://github.com/mosuka/laurus/issues/1685)）。
 
 `Text` フィールドも同様に `multi_valued = true` を指定できます（Issue #1175）。あわせて
 `position_increment_gap` オプション（デフォルト `100`。Lucene / Elasticsearch と同じ値）が追加されています。
@@ -479,7 +479,7 @@ BKD tree（`Geo` は 2 次元、`Geo3d` は 3 次元）に登録されます。�
 そうでなければ多値 `Text` と推論されます（例: `["rust", "search"]`）。*単一*の文字列は従来どおり `Text` と推論され、
 日時と判定されることはありません。既存の `Text` フィールドで `multi_valued` を有効にする変更は metadata-only です。
 無効にする変更は、フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら
-**`Destructive`** になります —— `Boolean` と同じく、再構築の元になる BKD tree がないためです。
+**`Destructive`** になります —— どの型の lexical フィールドとも同じく、再構築の元になるのは保存された値だけだからです。
 `position_increment_gap` の変更は、フィールドが位置を保存している（`term_vectors: true`）場合に再インデックスが
 必要です（`stored` なら `Reindex`、そうでなければ `Destructive`）。既存の posting は古い gap で付番されているためです。
 `term_vectors` が `false` なら gap は観測できないため、変更は metadata-only です。
@@ -499,8 +499,8 @@ base64 の `Text` 文字列は要素 1 個の配列に自動ラップされ（`T
 base64 デコードされます）、空の数値配列（`[]`）は空のバイト値リストとして受理されます。
 既存の `Bytes` フィールドで `multi_valued` を有効にする変更は metadata-only です。無効にする
 変更は、フィールドが `stored` なら再インデックス（`Reindex`）が必要で、`stored: false` なら
-**`Destructive`** になります —— `Boolean` や `Text` と同じく、再構築の元になるポイントツリーも
-posting もなく、保存された値しかないためです。
+**`Destructive`** になります —— どの型の lexical フィールドとも同じく、再構築の元になるのは
+保存された値だけだからです。
 
 ファセット集計はすべての多値型を要素ごとに展開します（Issue #1187）: 整数・浮動小数点・ブール・
 日時・テキストの各要素がそれぞれ独立したファセット値になり（`/` を含むテキスト要素は階層パスになります）、
@@ -681,7 +681,7 @@ let outcome = engine.update_field(
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
 - **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、保存するフィールドの型の変更（`Text` から `Integer` など）、HNSW の `m`/`ef_construction` 変更）。
-- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` やインデックスの種類の変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` / `Bytes` フィールドの `multi_valued` を無効にする変更）。
+- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` やインデックスの種類の変更、`stored: false` フィールドの型変更、`stored: false` なフィールドの `multi_valued` を無効にする変更（lexical のどの型でも））。lexical フィールドは保存された値だけから作り直すので、`stored: false` の lexical フィールドの作り直しが要る変更は、すべて `Destructive` です（[#1685](https://github.com/mosuka/laurus/issues/1685)）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 

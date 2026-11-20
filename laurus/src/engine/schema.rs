@@ -470,9 +470,13 @@ pub enum FieldChangeKind {
 /// # Cross-type changes
 ///
 /// Changing between two lexical variants (e.g. `Text` -> `Integer`) is a
-/// [`FieldChangeKind::Reindex`] — the rebuild converts each stored value to
-/// the new variant, as a put to the field would (Issue #1683), and analyzes
-/// it again; a value the new variant cannot take fails the change. Changing
+/// [`FieldChangeKind::Reindex`] when the old option is `stored` — the
+/// rebuild converts each stored value to the new variant, as a put to the
+/// field would (Issue #1683), and analyzes it again; a value the new
+/// variant cannot take fails the change. When the old option is not
+/// stored, it is [`FieldChangeKind::Destructive`]: a lexical rebuild
+/// re-derives the field from its stored values only, so nothing of the
+/// field is left (Issue #1685). Changing
 /// between two vector variants (e.g. `Hnsw` ->
 /// `Flat`) is always [`FieldChangeKind::Destructive`]: each index kind reads
 /// only its own segment files, so applying the change discards the field's
@@ -568,7 +572,17 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         // vector share no on-disk layout either.
         (o, n) if o.is_vector() && n.is_vector() => FieldChangeKind::Destructive,
 
-        (o, n) if o.is_lexical() && n.is_lexical() => FieldChangeKind::Reindex,
+        // A lexical rebuild re-derives the field from its stored values
+        // only, so without them the change discards the field's data
+        // (Issue #1685), as the helpers above say for a change within one
+        // variant.
+        (o, n) if o.is_lexical() && n.is_lexical() => {
+            if o.to_lexical().is_some_and(|option| option.stored()) {
+                FieldChangeKind::Reindex
+            } else {
+                FieldChangeKind::Destructive
+            }
+        }
         _ => FieldChangeKind::Destructive,
     }
 }
@@ -701,12 +715,12 @@ fn classify_text(old: &TextOption, new: &TextOption) -> FieldChangeKind {
 /// true` is metadata-only (existing single values are still valid
 /// single-element matches under "any match" semantics); the reverse could
 /// leave stale multi-value postings misread as single-valued, so it
-/// conservatively requires a reindex — always `Reindex`, never
-/// `Destructive`, regardless of `stored`: numeric and geo points are read
-/// back from the segment's BKD tree (the authoritative source, Issue #758),
-/// not from stored fields, so a field that was already `indexed: true`
-/// always has a rebuild source. Boolean, which indexes terms only, uses
-/// [`classify_term_lexical`] instead.
+/// requires a rebuild: `Reindex` when `old_stored`, and `Destructive`
+/// otherwise (Issue #1685). A field rebuild re-derives the field's terms
+/// and points from its stored values only; it does not read them back from
+/// the segment's BKD tree, as an ordinary merge does (Issue #758). The
+/// rule is the one [`classify_term_lexical`] applies to Boolean, which
+/// indexes terms only.
 fn classify_bkd_lexical(
     old_indexed: bool,
     new_indexed: bool,
@@ -716,7 +730,11 @@ fn classify_bkd_lexical(
 ) -> FieldChangeKind {
     let mut kind = classify_indexed_only(old_indexed, new_indexed, old_stored);
     if old_multi_valued && !new_multi_valued {
-        kind = kind.max(FieldChangeKind::Reindex);
+        kind = kind.max(if old_stored {
+            FieldChangeKind::Reindex
+        } else {
+            FieldChangeKind::Destructive
+        });
     }
     kind
 }
@@ -726,10 +744,10 @@ fn classify_bkd_lexical(
 /// follows the same shape as [`classify_bkd_lexical`] — `false -> true` is
 /// metadata-only (an existing single value is a valid one-element match),
 /// `true -> false` needs a rebuild so stale multi-value postings are not
-/// misread as single-valued. Unlike the BKD-backed options there is no
-/// point tree to rebuild from: a Boolean field's on-disk data is one
+/// misread as single-valued. A Boolean field's on-disk data is one
 /// `"true"` / `"false"` posting per element, and the rebuild path
-/// re-derives a field from its stored value. So the rebuild is `Reindex`
+/// re-derives a field from its stored value, as it does for every lexical
+/// option (Issue #1685). So the rebuild is `Reindex`
 /// only when `old_stored`, and `Destructive` otherwise (the field's
 /// existing data is discarded) — the same `stored`-dependence
 /// [`classify_indexed_only`] applies to turning `indexed` on.
@@ -1511,14 +1529,14 @@ mod tests {
                 Destructive,
             ),
             (
-                "integer: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                "integer: multi_valued true->false on a stored:false field is destructive (a rebuild has no stored values to rebuild from, Issue #1685)",
                 integer(|mut o| {
                     o.stored = false;
                     o.multi_valued = true;
                     o
                 }),
                 integer(|o| o.stored(false)),
-                Reindex,
+                Destructive,
             ),
             (
                 "integer: doc_values false->true requires reindex",
@@ -1547,6 +1565,16 @@ mod tests {
                 }),
                 float(|o| o),
                 Reindex,
+            ),
+            (
+                "float: multi_valued true->false on a stored:false field is destructive (a rebuild has no stored values to rebuild from, Issue #1685)",
+                float(|mut o| {
+                    o.stored = false;
+                    o.multi_valued = true;
+                    o
+                }),
+                float(|o| o.stored(false)),
+                Destructive,
             ),
             // ---- Boolean ----
             (
@@ -1627,14 +1655,14 @@ mod tests {
                 Reindex,
             ),
             (
-                "datetime: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                "datetime: multi_valued true->false on a stored:false field is destructive (a rebuild has no stored values to rebuild from, Issue #1685)",
                 datetime(|mut o| {
                     o.stored = false;
                     o.multi_valued = true;
                     o
                 }),
                 datetime(|o| o.stored(false)),
-                Reindex,
+                Destructive,
             ),
             // ---- Geo ----
             (
@@ -1668,14 +1696,14 @@ mod tests {
                 Reindex,
             ),
             (
-                "geo: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                "geo: multi_valued true->false on a stored:false field is destructive (a rebuild has no stored values to rebuild from, Issue #1685)",
                 geo(|mut o| {
                     o.stored = false;
                     o.multi_valued = true;
                     o
                 }),
                 geo(|o| o.stored(false)),
-                Reindex,
+                Destructive,
             ),
             // ---- Geo3d ----
             (
@@ -1709,14 +1737,14 @@ mod tests {
                 Reindex,
             ),
             (
-                "geo3d: multi_valued true->false on a stored:false field stays a reindex (BKD is the source, not stored fields)",
+                "geo3d: multi_valued true->false on a stored:false field is destructive (a rebuild has no stored values to rebuild from, Issue #1685)",
                 geo3d(|mut o| {
                     o.stored = false;
                     o.multi_valued = true;
                     o
                 }),
                 geo3d(|o| o.stored(false)),
-                Reindex,
+                Destructive,
             ),
             // ---- Bytes (no `indexed`; only `stored` and `multi_valued`) ----
             (
@@ -1940,6 +1968,18 @@ mod tests {
                 text(|o| o),
                 Reindex,
             ),
+            (
+                "text -> integer on a stored:false field is destructive (no stored values to convert, Issue #1685)",
+                text(|o| o.stored(false)),
+                integer(|o| o.stored(false)),
+                Destructive,
+            ),
+            (
+                "integer -> text on a stored:false field is destructive, also when the new field is stored",
+                integer(|o| o.stored(false)),
+                text(|o| o),
+                Destructive,
+            ),
             // ---- Cross-variant: vector <-> vector ----
             // Each kind reads only its own segment files (Issue #1536).
             (
@@ -2135,6 +2175,103 @@ mod tests {
             failures.is_empty(),
             "cases failed:\n{}",
             failures.join("\n")
+        );
+    }
+
+    /// Issue #1685: a lexical rebuild re-derives a field from its stored
+    /// values only, so no change from a `stored: false` lexical option can
+    /// be a [`FieldChangeKind::Reindex`]: it would discard the field's data
+    /// without the schema's `pending_reindex` recording it. Every pair of a
+    /// `stored: false` old option and a new option is checked, across the
+    /// eight lexical variants and their `indexed`, `multi_valued`,
+    /// `doc_values` and, for text, `term_vectors`, `position_increment_gap`
+    /// and `analyzer`. A change between two variants and turning
+    /// `multi_valued` off on a BKD-backed variant used to be `Reindex`.
+    #[test]
+    fn no_change_from_an_unstored_lexical_option_is_a_reindex() {
+        let flags = [false, true];
+        let options = |stored: bool| -> Vec<FieldOption> {
+            let mut out = Vec::new();
+            for indexed in flags {
+                for multi_valued in flags {
+                    for doc_values in flags {
+                        for term_vectors in flags {
+                            for gap in [50, 100] {
+                                for analyzer in [None, Some("english")] {
+                                    out.push(FieldOption::Text(TextOption {
+                                        indexed,
+                                        stored,
+                                        multi_valued,
+                                        doc_values,
+                                        term_vectors,
+                                        position_increment_gap: gap,
+                                        analyzer: analyzer.map(Into::into),
+                                    }));
+                                }
+                            }
+                        }
+                        out.push(FieldOption::Integer(IntegerOption {
+                            indexed,
+                            stored,
+                            multi_valued,
+                            doc_values,
+                        }));
+                        out.push(FieldOption::Float(FloatOption {
+                            indexed,
+                            stored,
+                            multi_valued,
+                            doc_values,
+                        }));
+                        out.push(FieldOption::Boolean(BooleanOption {
+                            indexed,
+                            stored,
+                            multi_valued,
+                            doc_values,
+                        }));
+                        out.push(FieldOption::DateTime(DateTimeOption {
+                            indexed,
+                            stored,
+                            multi_valued,
+                            doc_values,
+                        }));
+                        out.push(FieldOption::Geo(GeoOption {
+                            indexed,
+                            stored,
+                            multi_valued,
+                            doc_values,
+                        }));
+                        out.push(FieldOption::Geo3d(Geo3dOption {
+                            indexed,
+                            stored,
+                            multi_valued,
+                            doc_values,
+                        }));
+                    }
+                }
+                // Bytes has no `indexed`: this loop's flag varies its
+                // `multi_valued` instead.
+                out.push(FieldOption::Bytes(BytesOption {
+                    stored,
+                    multi_valued: indexed,
+                }));
+            }
+            out
+        };
+        let new_options: Vec<FieldOption> =
+            options(false).into_iter().chain(options(true)).collect();
+        let mut reindexed = Vec::new();
+        for old in options(false) {
+            for new in &new_options {
+                if classify_change(&old, new) == FieldChangeKind::Reindex {
+                    reindexed.push(format!("{old:?} -> {new:?}"));
+                }
+            }
+        }
+        assert!(
+            reindexed.is_empty(),
+            "{} changes from a stored:false option are Reindex, e.g. {:#?}",
+            reindexed.len(),
+            &reindexed[..reindexed.len().min(5)]
         );
     }
 

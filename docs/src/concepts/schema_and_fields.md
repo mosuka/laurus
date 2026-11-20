@@ -503,9 +503,9 @@ however, that array infers a multi-valued `Text` (Issue #1175), not a
 `Boolean` — use JSON booleans for arrays you want inferred as booleans.
 Turning `multi_valued` on for an existing Boolean field is a
 metadata-only change; turning it off requires a reindex when the field is
-`stored`, and is **Destructive** when the field is `stored: false` —
-unlike the BKD-backed types there is no point tree to rebuild from, only
-the stored value.
+`stored`, and is **Destructive** when the field is `stored: false` — a
+rebuild re-derives a lexical field of any type from its stored values
+only ([#1685](https://github.com/mosuka/laurus/issues/1685)).
 
 Text fields accept `multi_valued = true` as well (Issue #1175), together
 with a second option, `position_increment_gap` (default `100`, matching
@@ -549,8 +549,8 @@ multi-valued `Text` otherwise (e.g. `["rust", "search"]`); a *single*
 string still infers `Text`, never a datetime. Turning `multi_valued` on
 for an existing Text field is a metadata-only change; turning it off
 requires a reindex when the field is `stored` and is **Destructive** when
-it is `stored: false` — like Boolean, there is no BKD tree to rebuild
-from. Changing `position_increment_gap` requires a reindex when the field
+it is `stored: false` — like every lexical type, a rebuild has only the
+stored values to rebuild from. Changing `position_increment_gap` requires a reindex when the field
 stores positions (`term_vectors: true`) — `Reindex` when `stored`,
 `Destructive` otherwise — because the existing postings were numbered
 under the old gap; when `term_vectors` is `false` the gap is unobservable
@@ -575,8 +575,8 @@ rule the scalar field uses), and an empty numeric array (`[]`) is accepted
 as an empty byte-value list. Turning `multi_valued` on for an existing
 Bytes field is a metadata-only change; turning it off requires a reindex
 when the field is `stored`, and is **Destructive** when the field is
-`stored: false` — like Boolean and Text, there is no point tree or
-postings to rebuild from, only the stored value.
+`stored: false` — like every lexical type, a rebuild has only the stored
+values to rebuild from.
 
 Faceting expands every multi-valued type element by element (Issue #1187):
 each integer, float, boolean, datetime or text element becomes its own facet
@@ -817,8 +817,10 @@ The requested change is classified into one of three kinds, reported as
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
   `distance` or its index kind, a type change on a `stored: false` field,
-  or turning `multi_valued` off on a `stored: false` Boolean, Text or Bytes
-  field).
+  or turning `multi_valued` off on a `stored: false` field of any lexical
+  type). A lexical field is rebuilt from its stored values only, so every
+  change that needs a rebuild of a `stored: false` lexical field is
+  `Destructive` ([#1685](https://github.com/mosuka/laurus/issues/1685)).
 
 `Reindex` and `Destructive` changes are rejected unless you explicitly
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against

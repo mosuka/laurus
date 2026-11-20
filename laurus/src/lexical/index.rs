@@ -197,12 +197,13 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// segments before atomically publishing them, mirroring how a normal
     /// segment merge already works).
     ///
-    /// Only valid for a change that does not need original values the
-    /// index cannot supply — a field whose value was never stored on disk
-    /// has no original text/points to rebuild from, so callers gate this
-    /// via `laurus::engine::schema::classify_change` (which classifies
-    /// such a change `Destructive` instead, handled by the caller as
-    /// remove-then-add).
+    /// The field is re-derived from each document's stored value only: a
+    /// field whose value was never stored on disk has no original
+    /// text/points to rebuild from, and is left empty. Callers gate this
+    /// via `laurus::engine::schema::classify_change`, which classifies
+    /// such a change `Destructive` instead (Issue #1685); the engine still
+    /// calls this for it, which discards the field's data, and records the
+    /// field in the schema's `pending_reindex`.
     ///
     /// Each document's stored value of the field is converted to `option`
     /// before the field is rebuilt from it (Issue #1683), as a put to a
@@ -225,10 +226,11 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// The default implementation always errors, the same as
     /// [`Self::add_field`]/[`Self::delete_field`] (mirrors
     /// [`crate::vector::index::VectorIndex::rebuild_field`]'s contract on
-    /// the vector side). Implementations also error if no field named
-    /// `name` is registered, or if the rebuild itself fails, among others
-    /// when a live document's stored value cannot be converted to
-    /// `option`.
+    /// the vector side). Implementations also error if the rebuild itself
+    /// fails, among others when a live document's stored value cannot be
+    /// converted to `option`. The inverted index does not check that a
+    /// field named `name` is registered; `Engine::update_field` checks its
+    /// schema first.
     ///
     /// An error must mean that nothing changed. Once the rebuilt data is
     /// published, implementations return `Ok` even if cleaning up the data
