@@ -873,6 +873,29 @@ class LaurusTest extends TestCase
         $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)));
     }
 
+    /**
+     * A bound left out is open, as `null` is: the API reference writes both
+     * bounds `= null`, and they used to be required (Issue #1613).
+     */
+    public function testDateTimeRangeQueryBoundsCanBeLeftOut(): void
+    {
+        $idx = $this->indexWithDateField();
+        $search = fn (Laurus\DateTimeRangeQuery $q) => $this->idsOf($idx->search($q));
+        $this->assertSame(
+            $search(new Laurus\DateTimeRangeQuery("created_at", null, null)),
+            $search(new Laurus\DateTimeRangeQuery("created_at"))
+        );
+        $this->assertSame(["d1", "d2", "d3"], $search(new Laurus\DateTimeRangeQuery("created_at")));
+        $this->assertSame(
+            ["d2", "d3"],
+            $search(new Laurus\DateTimeRangeQuery("created_at", "2024-06-15T12:00:00Z"))
+        );
+        $this->assertSame(
+            ["d1", "d2"],
+            $search(new Laurus\DateTimeRangeQuery("created_at", max: "2024-06-15T12:00:00Z"))
+        );
+    }
+
     public function testDateTimeRangeQueryDslFormReachesTheIndex(): void
     {
         $idx = $this->indexWithDateField();
@@ -1238,6 +1261,38 @@ class LaurusTest extends TestCase
         );
         $results = $idx->search($req);
         $this->assertSame("doc1", $results[0]->getId());
+    }
+
+    /**
+     * A request names only the arguments it sets: the first five default to
+     * `null`, as the API reference writes them, and a request built so
+     * searches like the same one with all five given (Issue #1613). They
+     * used to be required.
+     */
+    public function testSearchRequestArgumentsCanBeLeftOut(): void
+    {
+        $idx = $this->createVectorIndex();
+        $ids = fn (Laurus\SearchRequest $req) => $this->idsOf($idx->search($req));
+        $term = new Laurus\TermQuery("title", "rust");
+        $vector = new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]);
+
+        $this->assertSame(
+            $ids(new Laurus\SearchRequest("title:rust", null, null, null, null)),
+            $ids(new Laurus\SearchRequest(query: "title:rust"))
+        );
+        $this->assertSame(["doc1"], $ids(new Laurus\SearchRequest(query: "title:rust")));
+        $this->assertSame(
+            $ids(new Laurus\SearchRequest(null, $term, null, null, null)),
+            $ids(new Laurus\SearchRequest(lexicalQuery: $term))
+        );
+        $this->assertSame(
+            $ids(new Laurus\SearchRequest(null, $term, $vector, null, new Laurus\RRF(60.0))),
+            $ids(new Laurus\SearchRequest(
+                lexicalQuery: $term,
+                vectorQuery: $vector,
+                fusion: new Laurus\RRF(60.0),
+            ))
+        );
     }
 
     /**
@@ -3210,5 +3265,279 @@ class LaurusTest extends TestCase
                 $this->assertStringContainsString("group_by", $e->getMessage());
             }
         }
+    }
+
+    // ── API reference (Issue #1613) ──────────────────────────────────────
+
+    /**
+     * The English API reference names every parameter and default as PHP
+     * takes them, so a named argument written from it works (Issue #1613).
+     */
+    public function testEnglishApiReferenceMatchesReflection(): void
+    {
+        $this->assertApiReferenceMatchesReflection(
+            "en",
+            __DIR__ . "/../../docs/src/laurus-php/api_reference.md"
+        );
+    }
+
+    /**
+     * The Japanese API reference does too (Issue #1613).
+     */
+    public function testJapaneseApiReferenceMatchesReflection(): void
+    {
+        $this->assertApiReferenceMatchesReflection(
+            "ja",
+            __DIR__ . "/../../docs/ja/src/laurus-php/api_reference.md"
+        );
+    }
+
+    /**
+     * Check every signature the API reference at `$path` writes against
+     * PHP reflection: the parameters' names and order, and, where the
+     * reference gives them, which are optional and their defaults.
+     *
+     * @param string $label Names the reference in the failure messages.
+     * @param string $path  The reference's Markdown file.
+     */
+    private function assertApiReferenceMatchesReflection(string $label, string $path): void
+    {
+        $signatures = self::referenceSignatures($path);
+        $this->assertNotEmpty($signatures, "no signature found in $path");
+        $wrong = [];
+        foreach ($signatures as [$class, $method, $params, $line, $withDefaults]) {
+            $where = "$label line $line: $class::$method";
+            $fqcn = "Laurus\\$class";
+            if (!method_exists($fqcn, $method)) {
+                $wrong[] = "$where: no such method";
+                continue;
+            }
+            $actual = (new \ReflectionMethod($fqcn, $method))->getParameters();
+            $names = array_map(fn ($p) => '$' . $p['name'], $params);
+            $actualNames = array_map(fn ($p) => '$' . $p->getName(), $actual);
+            if ($names !== $actualNames) {
+                $wrong[] = "$where: (" . implode(", ", $names) . "), but PHP takes ("
+                    . implode(", ", $actualNames) . ")";
+                continue;
+            }
+            if (!$withDefaults) {
+                continue;
+            }
+            foreach ($params as $i => $param) {
+                $p = $actual[$i];
+                if ($param['default'] === null) {
+                    if ($p->isOptional()) {
+                        $wrong[] = "$where: \$" . $param['name'] . " has a default in PHP";
+                    }
+                    continue;
+                }
+                if (!$p->isOptional() || !$p->isDefaultValueAvailable()) {
+                    $wrong[] = "$where: \$" . $param['name'] . " has no default in PHP";
+                    continue;
+                }
+                [$parsed, $value] = self::parseLiteral($param['default']);
+                if (!$parsed || $value !== $p->getDefaultValue()) {
+                    $wrong[] = "$where: \$" . $param['name'] . " = " . $param['default']
+                        . ", but PHP's default is " . var_export($p->getDefaultValue(), true);
+                }
+            }
+        }
+        $this->assertSame([], $wrong, implode("\n", $wrong));
+    }
+
+    /**
+     * Every signature the API reference at `$path` writes, as
+     * `[class, method, params, line, withDefaults]`, `params` being a list of
+     * `["name" => ..., "default" => literal or null when required]`.
+     *
+     * A heading (levels 2 to 4) that names a class starts that class's
+     * section, which a heading of the same or a higher level ends. In it,
+     * a signature is the first cell of a table row (`name(...)` or
+     * `Class::name(...)`), a `new \Laurus\Class(...)` or
+     * `\Laurus\Class::name(...)` line in a code block, or a "Parameter"
+     * table, which lists the constructor's parameters. Code whose
+     * arguments are not all parameters (`string $field = "x"` but not
+     * `"body"`) is an example, not a signature, and is skipped.
+     *
+     * @return list<array{string, string, list<array{name: string, default: ?string}>, int, bool}>
+     */
+    private static function referenceSignatures(string $path): array
+    {
+        $lines = file($path, FILE_IGNORE_NEW_LINES);
+        $classAt = [];
+        $inFence = false;
+        $table = null;
+        $signatures = [];
+        $flushTable = function () use (&$table, &$signatures, &$classAt) {
+            if ($table !== null && $table['params'] !== [] && self::currentClass($classAt) !== null) {
+                $signatures[] = [
+                    self::currentClass($classAt), "__construct", $table['params'],
+                    $table['line'], $table['withDefaults'],
+                ];
+            }
+            $table = null;
+        };
+        // A signature in a code block may run over several lines, as in
+        // `\Laurus\GeoDistanceQuery::withinRadius(` ... `): GeoDistanceQuery`.
+        $pending = null;
+        foreach ($lines as $i => $line) {
+            $number = $i + 1;
+            if (str_starts_with($line, "```")) {
+                $flushTable();
+                $inFence = !$inFence;
+                $pending = null;
+                continue;
+            }
+            if ($inFence) {
+                $code = trim($line);
+                if ($pending !== null) {
+                    $pending['code'] .= " " . $code;
+                    if (!str_contains($code, ")")) {
+                        continue;
+                    }
+                    [$code, $number] = [$pending['code'], $pending['line']];
+                    $pending = null;
+                } elseif (preg_match('/^(?:new )?\\\\Laurus\\\\[\w:]+\([^)]*$/', $code)) {
+                    $pending = ["code" => $code, "line" => $number];
+                    continue;
+                }
+                $code = preg_replace('/\(\s+/', '(', $code);
+                if (preg_match('/^new \\\\Laurus\\\\(\w+)\((.*)\);?$/', $code, $m)) {
+                    $params = self::parseParams($m[2]);
+                    if ($params !== null) {
+                        $signatures[] = [$m[1], "__construct", $params, $number, true];
+                    }
+                } elseif (preg_match('/^\\\\Laurus\\\\(\w+)::(\w+)\((.*)\)(?::\s*\S.*)?;?$/', $code, $m)) {
+                    $params = self::parseParams($m[3]);
+                    if ($params !== null) {
+                        $signatures[] = [$m[1], $m[2], $params, $number, true];
+                    }
+                }
+                continue;
+            }
+            if (preg_match('/^(#{2,4}) (.+)$/', $line, $m)) {
+                $flushTable();
+                $level = strlen($m[1]);
+                foreach (array_keys($classAt) as $l) {
+                    if ($l >= $level) {
+                        unset($classAt[$l]);
+                    }
+                }
+                $name = trim($m[2], " `");
+                $classAt[$level] = class_exists("Laurus\\$name") ? $name : null;
+                continue;
+            }
+            if (!str_starts_with($line, "|")) {
+                $flushTable();
+                continue;
+            }
+            $cells = array_map('trim', explode(" | ", trim($line, "| ")));
+            if (preg_match('/^:?-+/', $cells[0])) {
+                continue;
+            }
+            if ($cells[0] === "Parameter" || $cells[0] === "パラメータ" || $cells[0] === "引数") {
+                $flushTable();
+                $default = array_search("Default", $cells, true);
+                if ($default === false) {
+                    $default = array_search("デフォルト", $cells, true);
+                }
+                $table = [
+                    "params" => [], "line" => $number,
+                    "withDefaults" => $default !== false, "defaultColumn" => $default,
+                ];
+                continue;
+            }
+            if ($table !== null) {
+                if (preg_match('/^`\$(\w+)`$/', $cells[0], $m)) {
+                    $default = null;
+                    // `--` marks a required parameter; a default is the
+                    // cell's first code span, as in `null` (100), where the
+                    // parenthesis gives the value `null` stands for.
+                    if ($table['withDefaults']
+                        && preg_match('/^`([^`]+)`/', $cells[$table['defaultColumn']] ?? "", $d)) {
+                        $default = $d[1];
+                    }
+                    $table['params'][] = ["name" => $m[1], "default" => $default];
+                }
+                continue;
+            }
+            if (preg_match('/^`(?:static\s+)?(?:(\w+)::)?(\w+)\((.*)\)(?::\s*[^`]+)?`$/', $cells[0], $m)) {
+                $class = $m[1] !== "" ? $m[1] : self::currentClass($classAt);
+                $params = self::parseParams($m[3]);
+                if ($class !== null && $params !== null) {
+                    $signatures[] = [$class, $m[2], $params, $number, true];
+                }
+            }
+        }
+        $flushTable();
+        return $signatures;
+    }
+
+    /**
+     * The class of the innermost heading that names one, if any.
+     *
+     * @param array<int, ?string> $classAt
+     */
+    private static function currentClass(array $classAt): ?string
+    {
+        krsort($classAt);
+        foreach ($classAt as $class) {
+            if ($class !== null) {
+                return $class;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Split a written parameter list, such as `string $name, ?int $m = 16`,
+     * into names and defaults; `null` when an argument is not a parameter
+     * (an example's `"body"`), so the code is not a signature.
+     *
+     * @return ?list<array{name: string, default: ?string}>
+     */
+    private static function parseParams(string $list): ?array
+    {
+        $list = trim($list);
+        if ($list === "") {
+            return [];
+        }
+        $params = [];
+        // A multi-line signature may end its list with a comma.
+        $list = rtrim($list, ", ");
+        foreach (preg_split('/,(?=(?:[^"\']*["\'][^"\']*["\'])*[^"\']*$)/', $list) as $part) {
+            if (!preg_match('/^(?:[?\\\\\w|]+\s+)?\$(\w+)(?:\s*=\s*(.+))?$/', trim($part), $m)) {
+                return null;
+            }
+            $params[] = ["name" => $m[1], "default" => isset($m[2]) ? trim($m[2]) : null];
+        }
+        return $params;
+    }
+
+    /**
+     * Read a default written in the reference: `null`, `true`, `false`, an
+     * integer, a float or a quoted string.
+     *
+     * @return array{bool, mixed} whether it parsed, and its value
+     */
+    private static function parseLiteral(string $text): array
+    {
+        $lower = strtolower($text);
+        if ($lower === "null") {
+            return [true, null];
+        }
+        if ($lower === "true" || $lower === "false") {
+            return [true, $lower === "true"];
+        }
+        if (preg_match('/^-?\d+$/', $text)) {
+            return [true, (int) $text];
+        }
+        if (preg_match('/^-?\d+\.\d+$/', $text)) {
+            return [true, (float) $text];
+        }
+        if (preg_match('/^"(.*)"$|^\'(.*)\'$/', $text, $m)) {
+            return [true, $m[1] !== "" ? $m[1] : ($m[2] ?? "")];
+        }
+        return [false, null];
     }
 }
