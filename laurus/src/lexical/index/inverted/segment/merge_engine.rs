@@ -12,6 +12,7 @@ use roaring::RoaringTreemap;
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::analyzed::{AnalyzedDocument, AnalyzedTerm, field_length_from_terms};
+use crate::lexical::core::field::FieldOption;
 use crate::lexical::index::inverted::reader::SegmentReader;
 use crate::lexical::index::inverted::segment::SegmentInfo;
 use crate::lexical::index::inverted::segment::{ManagedSegmentInfo, MergeCandidate, MergeStrategy};
@@ -158,6 +159,85 @@ pub struct MergeResult {
 
     /// File paths of the new segment.
     pub file_paths: Vec<String>,
+}
+
+/// What a field rewrite does with the rewritten field's stored value (see
+/// `MergeEngine::reconstruct_segment_with_field_override`).
+#[derive(Debug, Clone, Copy)]
+enum TargetValue<'a> {
+    /// Convert it to this option, the field's new one: a rebuild for
+    /// `Engine::update_field` (Issue #1683).
+    CoerceTo(&'a crate::engine::schema::FieldOption),
+    /// Drop it: `delete_field` discards the field (Issue #1546).
+    Discard,
+}
+
+/// The longest `{:?}` of a value an error quotes, in characters.
+const QUOTED_VALUE_CHARS: usize = 200;
+
+/// Convert `document`'s stored value of `field`, if it has one, to `option`
+/// in place, as a rebuild does before it writes the value back and analyzes
+/// it (Issue #1683). A value that becomes no value (an empty array, for a
+/// single-valued `option`) is removed.
+///
+/// # Arguments
+///
+/// * `document` - A live document read back from the segment.
+/// * `field` - The field being rebuilt.
+/// * `option` - The field's new option.
+/// * `doc_id` - The document's internal id, named in the error when the
+///   document has no `_id`.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] when `option` cannot take the
+/// value, naming the field, the document's `_id` and the value, and saying
+/// why.
+fn coerce_target_value(
+    document: &mut crate::lexical::core::document::Document,
+    field: &str,
+    option: &crate::engine::schema::FieldOption,
+    doc_id: u64,
+) -> Result<()> {
+    let Some(slot) = document.fields.get_mut(field) else {
+        return Ok(());
+    };
+    let value = std::mem::replace(slot, crate::data::DataValue::Null);
+    // Kept for the error only: the coercion consumes the value, and its
+    // message does not always quote it.
+    let original = value.clone();
+    match crate::engine::type_coercion::coerce_stored_value(field, option, value) {
+        Ok(Some(coerced)) => {
+            *slot = coerced;
+            Ok(())
+        }
+        Ok(None) => {
+            document.fields.remove(field);
+            Ok(())
+        }
+        Err(e) => {
+            let document_name = match document
+                .fields
+                .get(crate::engine::schema::RESERVED_ID_FIELD)
+            {
+                Some(crate::data::DataValue::Text(id)) => format!("document '{id}'"),
+                _ => format!("the document with internal id {doc_id}"),
+            };
+            let mut quoted = format!("{original:?}");
+            if let Some((end, _)) = quoted.char_indices().nth(QUOTED_VALUE_CHARS) {
+                quoted.truncate(end);
+                quoted.push('…');
+            }
+            let reason = match e {
+                LaurusError::InvalidArgument(message) => message,
+                other => other.to_string(),
+            };
+            Err(LaurusError::invalid_argument(format!(
+                "the stored value {quoted} of field '{field}' in {document_name} cannot be \
+                 converted to the field's new option: {reason}"
+            )))
+        }
+    }
 }
 
 /// Core merge engine for segment operations (schema-less mode).
@@ -572,13 +652,26 @@ impl MergeEngine {
     /// [`MergeConfig::field_doc_values`] first, detection second, exactly
     /// as [`Self::perform_merge`] does.
     ///
+    /// `target_option` is `target_field`'s new option. Each document's
+    /// stored value of `target_field` is converted to it, with the put
+    /// path's coercion, before it is written back and analyzed (Issue
+    /// #1683), so a change of the field's type or `multi_valued` rebuilds
+    /// the documents written before it as a document written after it is
+    /// written: a `Text("42")` becomes an `Int64(42)` with a point, for a
+    /// field changed to `Integer`. For a single-valued option, a
+    /// one-element array is unwrapped first and an empty array leaves no
+    /// value.
+    ///
     /// # Errors
     ///
     /// Returns the first error encountered and aborts the writer that hit
     /// it (no partial segment is left committed). The caller is expected
     /// to treat any error here as "nothing published yet" and leave the
     /// existing segments completely untouched — this function never
-    /// touches a manifest itself.
+    /// touches a manifest itself. A live document's stored value that
+    /// `target_option` cannot take is such an error, an
+    /// [`LaurusError::InvalidArgument`] naming the field, the document's
+    /// `_id` and the value.
     ///
     /// # Panics
     ///
@@ -588,12 +681,14 @@ impl MergeEngine {
         &self,
         segments: &[ManagedSegmentInfo],
         target_field: &str,
+        target_option: &FieldOption,
         analyzer: Option<&Arc<dyn Analyzer>>,
         target_term_vectors: bool,
         target_doc_values: bool,
         target_position_increment_gap: u32,
         new_segment_ids: &[String],
     ) -> Result<Vec<MergeResult>> {
+        let option = crate::engine::schema::FieldOption::from_lexical(target_option.clone());
         self.rewrite_field_across_segments(
             segments,
             target_field,
@@ -601,7 +696,7 @@ impl MergeEngine {
             target_term_vectors,
             target_doc_values,
             target_position_increment_gap,
-            true,
+            TargetValue::CoerceTo(&option),
             new_segment_ids,
         )
     }
@@ -638,14 +733,14 @@ impl MergeEngine {
             false,
             false,
             0,
-            false,
+            TargetValue::Discard,
             new_segment_ids,
         )
     }
 
     /// The body of [`Self::rebuild_field_across_segments`] and
-    /// [`Self::discard_field_across_segments`]. `keep_target_stored` is
-    /// `false` to drop `target_field`'s stored value too (see
+    /// [`Self::discard_field_across_segments`]. `target_value` says what
+    /// becomes of `target_field`'s stored value (see
     /// [`Self::reconstruct_segment_with_field_override`]).
     #[allow(clippy::too_many_arguments)]
     fn rewrite_field_across_segments(
@@ -656,7 +751,7 @@ impl MergeEngine {
         target_term_vectors: bool,
         target_doc_values: bool,
         target_position_increment_gap: u32,
-        keep_target_stored: bool,
+        target_value: TargetValue<'_>,
         new_segment_ids: &[String],
     ) -> Result<Vec<MergeResult>> {
         assert_eq!(
@@ -692,7 +787,7 @@ impl MergeEngine {
                 target_field,
                 analyzer,
                 target_position_increment_gap,
-                keep_target_stored,
+                target_value,
             )?;
 
             let doc_count = reconstructed.len() as u64;
@@ -1105,10 +1200,24 @@ impl MergeEngine {
     /// `Engine::update_field`'s `classify_change` call) are responsible
     /// for that.
     ///
-    /// `keep_target_stored` is `false` when the field is discarded (Issue
-    /// #1546, with `analyzer` `None`): `target_field`'s stored value is
-    /// dropped too, and with it the doc values a flush builds from it, so
-    /// nothing of the field is left in the segment.
+    /// `target_value` says what becomes of `target_field`'s stored value
+    /// before anything reads it:
+    ///
+    /// - [`TargetValue::CoerceTo`] (a rebuild): it is converted to the
+    ///   field's new option (Issue #1683), so the value written back, the
+    ///   doc values a flush builds from it and the terms and points
+    ///   analyzed from it are those of a document written under the new
+    ///   option. This runs also when `analyzer` is `None`, since the
+    ///   stored value and its doc values remain.
+    /// - [`TargetValue::Discard`] (Issue #1546, with `analyzer` `None`):
+    ///   it is dropped, and with it the doc values a flush builds from it,
+    ///   so nothing of the field is left in the segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the segment fails, if analysis fails,
+    /// or, for [`TargetValue::CoerceTo`], if a live document's value cannot
+    /// be converted (see [`coerce_target_value`]).
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_segment_with_field_override(
         &self,
@@ -1119,7 +1228,7 @@ impl MergeEngine {
         target_field: &str,
         analyzer: Option<&Arc<dyn Analyzer>>,
         target_position_increment_gap: u32,
-        keep_target_stored: bool,
+        target_value: TargetValue<'_>,
     ) -> Result<Vec<(u64, AnalyzedDocument)>> {
         // Pass 1: bucket postings into per-doc analyzed terms, EXCEPT
         // `target_field` — its old postings were built under the previous
@@ -1209,18 +1318,23 @@ impl MergeEngine {
             if deleted.contains(doc_id) {
                 continue;
             }
-            let Some(stored) = reader.document(doc_id)? else {
+            let Some(mut stored) = reader.document(doc_id)? else {
                 continue;
             };
+            match target_value {
+                TargetValue::CoerceTo(option) => {
+                    coerce_target_value(&mut stored, target_field, option, doc_id)?;
+                }
+                TargetValue::Discard => {
+                    stored.fields.remove(target_field);
+                }
+            }
 
             let mut analyzed = AnalyzedDocument::new();
             analyzed.field_terms = field_terms.remove(&doc_id).unwrap_or_default();
             analyzed.point_values = points.remove(&doc_id).unwrap_or_default();
 
             for (field_name, value) in &stored.fields {
-                if !keep_target_stored && field_name == target_field {
-                    continue;
-                }
                 if InvertedIndexWriter::is_doc_values_candidate(value) {
                     // `target_field` is pre-seeded by
                     // `rebuild_field_across_segments` with the field's NEW
@@ -1243,12 +1357,10 @@ impl MergeEngine {
             // into `field_terms` when re-analysis actually produced terms.
             let target_field_present_for_doc = stored.fields.contains_key(target_field);
 
-            if let (Some(analyzer), Some(target_value)) =
-                (analyzer, stored.fields.get(target_field))
-            {
+            if let (Some(analyzer), Some(converted)) = (analyzer, stored.fields.get(target_field)) {
                 let (terms, pts) = analyze_field_value(
                     target_field,
-                    target_value,
+                    converted,
                     analyzer,
                     target_position_increment_gap,
                 )?;
@@ -2433,6 +2545,7 @@ mod tests {
             .rebuild_field_across_segments(
                 &[ManagedSegmentInfo::new(si0)],
                 "body",
+                &FieldOption::Text(crate::lexical::core::field::TextOption::default()),
                 Some(&rebuild_analyzer),
                 false,
                 false,
@@ -2880,7 +2993,7 @@ mod tests {
                     "num",
                     None,
                     0,
-                    true,
+                    TargetValue::Discard,
                 )
                 .map(|_| ()),
         );

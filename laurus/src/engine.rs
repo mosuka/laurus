@@ -2829,12 +2829,22 @@ impl Engine {
     ///   **vector** field (e.g. HNSW `m`/`ef_construction`, any index
     ///   kind's `quantizer`/`rerank_storage`, IVF `n_clusters`) this reads
     ///   only the field's own segments, no document-store read. For a
-    ///   **lexical** field (e.g. a text field's `analyzer`, or
-    ///   `indexed: false -> true`) every segment is rebuilt, re-deriving
-    ///   this field from its stored value while every other field is
-    ///   carried over unchanged — see
+    ///   **lexical** field (e.g. a text field's `analyzer`,
+    ///   `indexed: false -> true`, a change between two lexical types, or
+    ///   `multi_valued: true -> false`) every segment is rebuilt,
+    ///   re-deriving this field from its stored value while every other
+    ///   field is carried over unchanged — see
     ///   [`crate::lexical::index::inverted::InvertedIndex::rebuild_field`].
-    ///   Requires `opts.reindex == true`.
+    ///   Each stored value is first converted to the new option, as a put
+    ///   to the field converts its value (Issue #1683), so a document
+    ///   written before a change of type is indexed as one written after
+    ///   it; for a single-valued option a one-element array is unwrapped
+    ///   and an empty array leaves no value. A value the new option cannot
+    ///   take fails the call under every
+    ///   [`DynamicFieldPolicy`](schema::DynamicFieldPolicy), and nothing
+    ///   changes; a dry run does not check the values. The document store
+    ///   keeps the values documents were put with, which
+    ///   [`Self::get_documents`] returns. Requires `opts.reindex == true`.
     /// - [`FieldChangeKind::Destructive`](schema::FieldChangeKind::Destructive):
     ///   the field's existing data is discarded rather than rebuilt (data
     ///   loss — "warn and proceed", see #1077's investigation). For a
@@ -2893,6 +2903,9 @@ impl Engine {
     ///   field, the commit before it.
     /// - The underlying vector or lexical rebuild/recreate fails, or a store
     ///   refuses a `MetadataOnly` change (the schema then stays as it was).
+    ///   A lexical rebuild fails with [`LaurusError::InvalidArgument`] on
+    ///   a document whose stored value the new option cannot take, naming
+    ///   the document and the value (Issue #1683).
     /// - A configured schema-persist hook fails (the in-memory schema has
     ///   already been updated at that point; this is not rolled back).
     /// - Writes stopped ([`LaurusError::WritesStopped`], Issue #1492).
@@ -3056,7 +3069,8 @@ impl Engine {
                     // above. Note there is no `purge`-driven branch here,
                     // unlike the vector side: `LexicalStore::rebuild_field`
                     // re-derives `name`'s terms/points from its stored
-                    // value when one exists, and simply leaves them empty
+                    // value, converted to `lexical_opt` (Issue #1683),
+                    // when one exists, and simply leaves them empty
                     // when it doesn't (a `stored: false` field never has
                     // one — this is exactly what makes a `Destructive`
                     // lexical change "discard existing data" without a
@@ -12011,5 +12025,340 @@ mod tests {
             "{error}"
         );
         assert!(!engine.schema().fields.contains_key("x"));
+    }
+
+    /// The value of `field` in the lexical store's stored document of `id`
+    /// (Issue #1683): what a rebuild writes back, which the doc values, the
+    /// range queries' stored-document scan and later rebuilds read.
+    fn lexical_stored_value(
+        engine: &Engine,
+        id: &str,
+        field: &str,
+    ) -> Option<crate::data::DataValue> {
+        use crate::lexical::query::term::TermQuery;
+        use crate::lexical::search::searcher::LexicalSearchRequest;
+        let hits = engine
+            .lexical
+            .search(
+                LexicalSearchRequest::new(Box::new(TermQuery::new("_id", id))).load_documents(true),
+            )
+            .unwrap()
+            .hits;
+        assert_eq!(hits.len(), 1, "the lexical store has one document for {id}");
+        hits[0]
+            .document
+            .as_ref()
+            .expect("the lexical store returns the stored document")
+            .fields
+            .get(field)
+            .cloned()
+    }
+
+    /// The external ids a lexical query finds, sorted.
+    async fn query_hits(engine: &Engine, query: &str) -> Vec<String> {
+        use crate::lexical::search::searcher::LexicalSearchQuery;
+        let request = search::SearchRequestBuilder::new()
+            .lexical_query(LexicalSearchQuery::from(query))
+            .limit(20)
+            .build();
+        let mut ids = hit_ids(engine, request).await;
+        ids.sort();
+        ids
+    }
+
+    /// The external ids of the documents with `title: item`, sorted by
+    /// `field` in ascending order.
+    async fn item_ids_sorted_by(engine: &Engine, field: &str) -> Vec<String> {
+        use crate::lexical::search::searcher::{LexicalSearchQuery, SortField, SortOrder};
+        let request = search::SearchRequestBuilder::new()
+            .lexical_query(LexicalSearchQuery::from("title:item"))
+            .sort_by(SortField::Field {
+                name: field.into(),
+                order: SortOrder::Asc,
+            })
+            .limit(20)
+            .build();
+        hit_ids(engine, request).await
+    }
+
+    /// A document with `title: item` and `field` set to `value`.
+    fn item_doc(field: &str, value: crate::data::DataValue) -> Document {
+        Document::builder()
+            .add_text("title", "item")
+            .add_field(field, value)
+            .build()
+    }
+
+    /// The bytes of the lexical store's segment manifest.
+    fn lexical_manifest(engine: &Engine) -> Vec<u8> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        engine
+            .lexical
+            .storage()
+            .open_input(crate::lexical::index::inverted::segment_manifest::MANIFEST_FILE)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// Issue #1683: a change of a lexical field's type converts the stored
+    /// values of the documents put before it, so they are indexed as the
+    /// documents put after it. The stored value, the doc value built from
+    /// it, the sort order and, once a merge has given the segment a BKD tree,
+    /// the range query used to see the old `Text("50")`. The document store
+    /// keeps what was put.
+    #[tokio::test]
+    async fn a_type_change_converts_the_stored_values_of_documents_put_before_it() {
+        use crate::data::DataValue;
+        use crate::lexical::search::searcher::DocValueLookup;
+
+        let schema = coercion_schema(Some(text_option()), schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        engine
+            .put_document("a", item_doc("n", DataValue::Text("50".into())))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        let outcome = engine
+            .update_field("n", integer_option(), rebuild())
+            .await
+            .unwrap();
+        assert_eq!(outcome.classification, schema::FieldChangeKind::Reindex);
+        for (id, n) in [("b", "43"), ("c", "60")] {
+            engine
+                .put_document(id, item_doc("n", DataValue::Text(n.into())))
+                .await
+                .unwrap();
+        }
+        engine.commit().await.unwrap();
+
+        let mut wrong = Vec::new();
+        let stored = lexical_stored_value(&engine, "a", "n");
+        if stored != Some(DataValue::Int64(50)) {
+            wrong.push(format!("lexical stored value {stored:?}"));
+        }
+        let doc_values = engine
+            .lexical
+            .doc_values_batch("n", &[internal_id(&engine, "a")])
+            .unwrap();
+        if !matches!(
+            doc_values.as_slice(),
+            [DocValueLookup::Value(DataValue::Int64(50))]
+        ) {
+            wrong.push(format!("doc value {doc_values:?}"));
+        }
+        let sorted = item_ids_sorted_by(&engine, "n").await;
+        if sorted != ["b", "a", "c"] {
+            wrong.push(format!("sorted by n: {sorted:?}"));
+        }
+        engine.lexical.optimize().unwrap();
+        for (query, want) in [
+            ("n:[45 TO 55]", vec!["a"]),
+            ("n:[40 TO 70]", vec!["a", "b", "c"]),
+        ] {
+            let got = query_hits(&engine, query).await;
+            if got != want {
+                wrong.push(format!("{query} after the merge: {got:?}"));
+            }
+        }
+        let put_value = stored_value(&engine, "a", "n").await;
+        if put_value != Some(DataValue::Text("50".into())) {
+            wrong.push(format!("document store {put_value:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1683: a stored value the field's new type cannot take fails
+    /// `update_field` with an error naming the document and the value, and
+    /// nothing changes: the schema, the manifest, the other documents'
+    /// stored values, the search, and no rebuilt segment is left on disk. A
+    /// deleted document's value is not converted. The change used to
+    /// succeed and keep `Text("abc")` in a field now `Integer`.
+    #[tokio::test]
+    async fn a_type_change_over_a_value_the_new_option_rejects_changes_nothing() {
+        use crate::data::DataValue;
+
+        let schema = coercion_schema(Some(text_option()), schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        // One segment per commit; `doc-7` is in the last one, so a segment
+        // is rebuilt before the rebuild fails.
+        engine
+            .put_document("b", item_doc("n", DataValue::Text("42".into())))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine
+            .put_document("gone", item_doc("n", DataValue::Text("xyz".into())))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine.delete_documents("gone").await.unwrap();
+        engine.commit().await.unwrap();
+        engine
+            .put_document("doc-7", item_doc("n", DataValue::Text("abc".into())))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        let manifest = lexical_manifest(&engine);
+        let files_before = engine.lexical.storage().list_files().unwrap();
+
+        let error = engine
+            .update_field("n", integer_option(), rebuild())
+            .await
+            .expect_err("Integer cannot take \"abc\"");
+
+        let mut wrong = Vec::new();
+        let message = error.to_string();
+        if !matches!(error, LaurusError::InvalidArgument(_))
+            || !message.contains("'doc-7'")
+            || !message.contains("abc")
+            || message.contains("gone")
+            || message.contains("xyz")
+        {
+            wrong.push(format!("error {error:?}"));
+        }
+        let schema = engine.schema();
+        if !matches!(schema.fields.get("n"), Some(schema::FieldOption::Text(_)))
+            || !schema.pending_reindex.is_empty()
+        {
+            wrong.push(format!(
+                "schema {:?}, pending_reindex {:?}",
+                schema.fields.get("n"),
+                schema.pending_reindex
+            ));
+        }
+        if lexical_manifest(&engine) != manifest {
+            wrong.push("the manifest changed".to_string());
+        }
+        let left: Vec<String> = engine
+            .lexical
+            .storage()
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| !files_before.contains(file))
+            .collect();
+        if !left.is_empty() {
+            wrong.push(format!("files left by the failed rebuild: {left:?}"));
+        }
+        let stored = lexical_stored_value(&engine, "b", "n");
+        if stored != Some(DataValue::Text("42".into())) {
+            wrong.push(format!("b's lexical stored value {stored:?}"));
+        }
+        let found = query_hits(&engine, "n:abc").await;
+        if found != ["doc-7"] {
+            wrong.push(format!("n:abc finds {found:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1683: a change from `Integer` to `Geo` over an integer fails
+    /// naming the value, which the coercion's own message does not quote,
+    /// and leaves the field an `Integer`. It used to succeed, keep the
+    /// integer's one-dimensional point, and fail every later merge of the
+    /// field with two-dimensional points.
+    #[tokio::test]
+    async fn a_type_change_to_geo_over_an_integer_fails_naming_the_value() {
+        use crate::data::DataValue;
+
+        let schema = coercion_schema(Some(integer_option()), schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        engine
+            .put_document("doc-7", item_doc("n", DataValue::Int64(7341)))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        let geo = schema::FieldOption::Geo(crate::lexical::core::field::GeoOption::default());
+
+        let error = engine
+            .update_field("n", geo, rebuild())
+            .await
+            .expect_err("Geo cannot take an integer");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("'doc-7'") && message.contains("7341"),
+            "{message}"
+        );
+        assert!(matches!(
+            engine.schema().fields.get("n"),
+            Some(schema::FieldOption::Integer(_))
+        ));
+        engine
+            .put_document("b", item_doc("n", DataValue::Int64(2)))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine.lexical.optimize().unwrap();
+        assert_eq!(query_hits(&engine, "n:[0 TO 10000]").await, ["b", "doc-7"]);
+    }
+
+    /// Issue #1683: turning `multi_valued` off unwraps the one-element
+    /// array a `multi_valued` field stores even one value as, and leaves no
+    /// value for an empty array; an array of two values fails the change
+    /// and changes nothing. The change used to succeed and keep every array.
+    #[tokio::test]
+    async fn turning_multi_valued_off_unwraps_one_value_and_fails_on_two() {
+        use crate::data::DataValue;
+
+        let multi = schema::FieldOption::Integer(crate::lexical::core::field::IntegerOption {
+            multi_valued: true,
+            ..Default::default()
+        });
+        let schema = coercion_schema(Some(multi), schema::DynamicFieldPolicy::Dynamic);
+        let engine = Engine::new(unlocked_memory_storage(), schema)
+            .await
+            .unwrap();
+        for (id, values) in [("a", vec![1]), ("b", Vec::new()), ("c", vec![1, 2])] {
+            engine
+                .put_document(id, item_doc("n", DataValue::Int64Array(values)))
+                .await
+                .unwrap();
+        }
+        engine.commit().await.unwrap();
+
+        let error = engine
+            .update_field("n", integer_option(), rebuild())
+            .await
+            .expect_err("c has two values");
+        assert!(error.to_string().contains("'c'"), "{error}");
+        assert!(matches!(
+            engine.schema().fields.get("n"),
+            Some(schema::FieldOption::Integer(option)) if option.multi_valued
+        ));
+        assert_eq!(
+            lexical_stored_value(&engine, "a", "n"),
+            Some(DataValue::Int64Array(vec![1]))
+        );
+
+        engine.delete_documents("c").await.unwrap();
+        engine.commit().await.unwrap();
+        engine
+            .update_field("n", integer_option(), rebuild())
+            .await
+            .unwrap();
+
+        let mut wrong = Vec::new();
+        let a = lexical_stored_value(&engine, "a", "n");
+        if a != Some(DataValue::Int64(1)) {
+            wrong.push(format!("a: {a:?}"));
+        }
+        let b = lexical_stored_value(&engine, "b", "n");
+        if b.is_some() {
+            wrong.push(format!("b: {b:?}"));
+        }
+        let found = query_hits(&engine, "n:[1 TO 1]").await;
+        if found != ["a"] {
+            wrong.push(format!("n:[1 TO 1] finds {found:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

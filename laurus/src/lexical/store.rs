@@ -1026,6 +1026,17 @@ impl LexicalStore {
     /// classification for lexical fields — e.g. a text field's
     /// `analyzer`, or `indexed: false -> true`).
     ///
+    /// Each document's stored value of the field is converted to `option`
+    /// before it is written back and analyzed again (Issue #1683), with the
+    /// rules a put follows (see `laurus::engine::type_coercion`), so a
+    /// change of the field's type or `multi_valued` rebuilds the documents
+    /// written before it as documents written after it: a `Text("42")`
+    /// becomes an `Int64(42)` with a point for a field changed to
+    /// `Integer`. When `option` is single-valued, a one-element array is
+    /// unwrapped to its element and an empty array leaves no value. A value
+    /// `option` cannot take fails the rebuild, whatever the schema's
+    /// dynamic field policy.
+    ///
     /// # Arguments
     ///
     /// * `name` - The field name. Must already exist.
@@ -1050,7 +1061,10 @@ impl LexicalStore {
     /// # Errors
     ///
     /// Returns an error if flushing a cached writer's pending changes
-    /// fails, or if the underlying rebuild fails. A failed flush rebuilds
+    /// fails, or if the underlying rebuild fails, among others with
+    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// naming a live document whose stored value `option` cannot take, and
+    /// the value (Issue #1683). A failed flush rebuilds
     /// nothing and keeps the writer cached with its buffered state, as
     /// [`Self::commit`] does. Once the flush succeeds, the writer and the
     /// cached searcher are dropped whether the rebuild succeeds or not, so
@@ -2743,6 +2757,47 @@ mod tests {
             kept.push("the stored value".to_string());
         }
         assert!(kept.is_empty(), "left after delete_field: {kept:#?}");
+    }
+
+    /// Issue #1683 — `delete_field` discards a field's values without
+    /// converting them: a rebuild converts each stored value to the field's
+    /// new option and fails on one it cannot take, but a discard has no new
+    /// option. Here the store holds an array in a single-valued text field
+    /// (a store does not coerce what it is given), which a conversion to the
+    /// field's option would reject.
+    #[test]
+    fn delete_field_discards_values_the_field_option_would_not_take() {
+        use crate::lexical::core::field::{FieldOption, TextOption};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = LexicalIndexConfig::builder()
+            .add_field("title", title_option())
+            .add_field("n", FieldOption::Text(TextOption::default()))
+            .build();
+        let store = LexicalStore::new(storage, config).unwrap();
+        let document = Document::builder()
+            .add_text("_id", "ida")
+            .add_text("title", "rust programming")
+            .add_field("n", DataValue::TextArray(vec!["x".into(), "y".into()]))
+            .build();
+        store.upsert_document(1, document).unwrap();
+        store.commit().unwrap();
+
+        store.delete_field("n").unwrap();
+
+        let request =
+            LexicalSearchRequest::new(Box::new(TermQuery::new("title", "rust")) as Box<dyn Query>)
+                .load_documents(true);
+        let hits = store.search(request).unwrap().hits;
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0]
+                .document
+                .as_ref()
+                .is_some_and(|doc| !doc.has_field("n")),
+            "{:?}",
+            hits[0].document
+        );
     }
 
     /// Issue #1546 — a `delete_field` whose segment rewrite fails publishes

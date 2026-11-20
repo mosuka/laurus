@@ -812,8 +812,8 @@ The requested change is classified into one of three kinds, reported as
   an HNSW field's `default_ef_search`).
 - **`Reindex`** — can be rebuilt from the field's already-stored values
   (e.g. a text field's `analyzer` or — while `term_vectors` is on — its
-  `position_increment_gap`, `indexed: false → true`, or an HNSW field's
-  `m`/`ef_construction`).
+  `position_increment_gap`, `indexed: false → true`, a stored field's type,
+  such as `Text` to `Integer`, or an HNSW field's `m`/`ef_construction`).
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
   `distance` or its index kind, a type change on a `stored: false` field,
@@ -829,6 +829,27 @@ the field's old option. A put that waits for `update_field` is coerced to the
 new option, and a value that cannot be is handled as
 [Type conflicts](#type-conflicts) describes
 ([#1498](https://github.com/mosuka/laurus/issues/1498)).
+
+A lexical `Reindex` converts each document's stored value of the field to
+the new option, with the rules a put follows (see
+[Type conflicts](#type-conflicts)), and indexes the converted value
+([#1683](https://github.com/mosuka/laurus/issues/1683)). A document put
+before a change of the field's type is then found, sorted and faceted as
+one put after it: after `Text` to `Integer`, a stored `"42"` becomes the
+integer `42`, which a range query finds. When the field becomes
+single-valued (`multi_valued` turned off), a one-element array, which is
+how a `multi_valued` field stores even one value, becomes its element, and
+an empty array becomes no value.
+
+A stored value the new option cannot take, such as `"abc"` for `Integer`,
+an integer for `Geo`, or an array of two or more values for a field that
+becomes single-valued, makes `update_field` fail with `InvalidArgument`
+under every `DynamicFieldPolicy`. The error names the document's `_id` and
+the value, and nothing changes: the schema and the index stay as they
+were. Fix or delete those documents and call `update_field` again. A dry
+run does not check the values. The document store keeps the values
+documents were put with, so `get_documents` and the documents a search
+returns show them unconverted.
 
 A `MetadataOnly` change takes effect in the open index at once, without
 reopening it or restarting `laurus serve`

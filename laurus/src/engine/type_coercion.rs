@@ -30,6 +30,12 @@
 //!   rule is already embedded in this module; truly incompatible values are
 //!   reported back.
 //! - `Ignore` → drops the field and continues.
+//!
+//! A lexical rebuild for `Engine::update_field` (a change classified
+//! `Reindex`) converts each document's stored value of the changed field
+//! with the same rules, through [`coerce_stored_value`] (Issue #1683). It
+//! does not follow the policy: a value that cannot be coerced fails the
+//! rebuild, and nothing changes.
 
 use base64::Engine as _;
 
@@ -72,6 +78,112 @@ pub fn coerce_value(field_name: &str, option: &FieldOption, value: DataValue) ->
     // which `parse::<f64>()` reads as a non-finite float, is caught too.
     check_finite(field_name, &coerced)?;
     Ok(coerced)
+}
+
+/// Coerce a document's stored value of `field_name`, written under another
+/// option of the field, to `option`, as a lexical rebuild does when
+/// `Engine::update_field` changes the field's type or `multi_valued`
+/// (Issue #1683).
+///
+/// The same as [`coerce_value`], except for a single-valued `option`: a
+/// one-element array is first unwrapped to its element, and an empty array
+/// becomes no value. A put to a `multi_valued` field stores even one value
+/// as an array, so without this, turning `multi_valued` off would fail for
+/// every document of the field. An array of two or more values is still
+/// rejected. A put keeps rejecting every array for a single-valued field.
+///
+/// # Arguments
+///
+/// * `field_name` - The name of the field, used for error messages.
+/// * `option` - The field's new option.
+/// * `value` - The document's stored value.
+///
+/// # Returns
+///
+/// The coerced value, or `None` when the value becomes no value.
+///
+/// # Errors
+///
+/// Returns what [`coerce_value`] returns for a value that cannot be
+/// coerced.
+pub(crate) fn coerce_stored_value(
+    field_name: &str,
+    option: &FieldOption,
+    value: DataValue,
+) -> Result<Option<DataValue>> {
+    let value = if is_multi_valued(option) {
+        value
+    } else {
+        match unwrap_single_element(value) {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+    coerce_value(field_name, option, value).map(Some)
+}
+
+/// Whether a lexical `option` accepts an array of values per document. A
+/// vector option counts as multi-valued, so nothing is unwrapped for it.
+fn is_multi_valued(option: &FieldOption) -> bool {
+    match option {
+        FieldOption::Text(opt) => opt.multi_valued,
+        FieldOption::Integer(opt) => opt.multi_valued,
+        FieldOption::Float(opt) => opt.multi_valued,
+        FieldOption::Boolean(opt) => opt.multi_valued,
+        FieldOption::DateTime(opt) => opt.multi_valued,
+        FieldOption::Geo(opt) => opt.multi_valued,
+        FieldOption::Geo3d(opt) => opt.multi_valued,
+        FieldOption::Bytes(opt) => opt.multi_valued,
+        FieldOption::Hnsw(_)
+        | FieldOption::Flat(_)
+        | FieldOption::Ivf(_)
+        | FieldOption::MultiVector(_) => true,
+    }
+}
+
+/// `value` with a one-element array unwrapped to its element, for a field
+/// becoming single-valued (see [`coerce_stored_value`]).
+///
+/// # Returns
+///
+/// `None` for an empty array, the element for a one-element array, and
+/// `value` itself otherwise (a scalar, or an array of two or more values,
+/// which the coercion then rejects).
+fn unwrap_single_element(value: DataValue) -> Option<DataValue> {
+    /// The element of a one-element `items`, `None` for no element, and
+    /// the array again for more.
+    fn single<T>(
+        mut items: Vec<T>,
+        scalar: impl FnOnce(T) -> DataValue,
+        array: impl FnOnce(Vec<T>) -> DataValue,
+    ) -> Option<DataValue> {
+        match items.len() {
+            0 => None,
+            1 => items.pop().map(scalar),
+            _ => Some(array(items)),
+        }
+    }
+    match value {
+        DataValue::Int64Array(items) => single(items, DataValue::Int64, DataValue::Int64Array),
+        DataValue::Float64Array(items) => {
+            single(items, DataValue::Float64, DataValue::Float64Array)
+        }
+        DataValue::BoolArray(items) => single(items, DataValue::Bool, DataValue::BoolArray),
+        DataValue::TextArray(items) => single(items, DataValue::Text, DataValue::TextArray),
+        DataValue::DateTimeArray(items) => {
+            single(items, DataValue::DateTime, DataValue::DateTimeArray)
+        }
+        DataValue::GeoArray(items) => single(items, DataValue::Geo, DataValue::GeoArray),
+        DataValue::GeoEcefArray(items) => {
+            single(items, DataValue::GeoEcef, DataValue::GeoEcefArray)
+        }
+        DataValue::BytesArray(items) => single(
+            items,
+            |(bytes, mime)| DataValue::Bytes(bytes, mime),
+            DataValue::BytesArray,
+        ),
+        other => Some(other),
+    }
 }
 
 /// Reject a value holding a `NaN` or infinite number (Issue #1604): a
@@ -1633,5 +1745,110 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1683: for a single-valued option, `coerce_stored_value`
+    /// unwraps a one-element array of every kind to its element and leaves
+    /// no value for an empty one, while two values still fail; a
+    /// multi-valued option keeps the array.
+    #[test]
+    fn coerce_stored_value_unwraps_one_element_for_a_single_valued_option() {
+        use crate::data::{GeoEcefPoint, GeoPoint};
+        use chrono::TimeZone;
+
+        let instant = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let point = GeoPoint::new(35.1, 139.0);
+        let ecef = GeoEcefPoint::new(1_234_567.0, 2_345_678.0, 3_456_789.0);
+        let bytes_option = bytes();
+        let cases: Vec<(&str, FieldOption, DataValue, DataValue, DataValue)> = vec![
+            (
+                "integer",
+                integer(),
+                DataValue::Int64Array(vec![7]),
+                DataValue::Int64(7),
+                DataValue::Int64Array(vec![7, 8]),
+            ),
+            (
+                "float",
+                float(),
+                DataValue::Float64Array(vec![1.5]),
+                DataValue::Float64(1.5),
+                DataValue::Float64Array(vec![1.5, 2.5]),
+            ),
+            (
+                "boolean",
+                boolean(),
+                DataValue::BoolArray(vec![true]),
+                DataValue::Bool(true),
+                DataValue::BoolArray(vec![true, false]),
+            ),
+            (
+                "text",
+                text(),
+                DataValue::TextArray(vec!["a".into()]),
+                DataValue::Text("a".into()),
+                DataValue::TextArray(vec!["a".into(), "b".into()]),
+            ),
+            (
+                "datetime",
+                dt_single(),
+                DataValue::DateTimeArray(vec![instant]),
+                DataValue::DateTime(instant),
+                DataValue::DateTimeArray(vec![instant, instant]),
+            ),
+            (
+                "geo",
+                geo(),
+                DataValue::GeoArray(vec![point]),
+                DataValue::Geo(point),
+                DataValue::GeoArray(vec![point, point]),
+            ),
+            (
+                "geo3d",
+                geo3d(),
+                DataValue::GeoEcefArray(vec![ecef]),
+                DataValue::GeoEcef(ecef),
+                DataValue::GeoEcefArray(vec![ecef, ecef]),
+            ),
+            (
+                "bytes",
+                bytes_option,
+                DataValue::BytesArray(vec![(b"hi".to_vec(), None)]),
+                DataValue::Bytes(b"hi".to_vec(), None),
+                DataValue::BytesArray(vec![(b"hi".to_vec(), None), (b"ho".to_vec(), None)]),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (kind, option, one, unwrapped, two) in cases {
+            match coerce_stored_value("f", &option, one) {
+                Ok(Some(value)) if value == unwrapped => {}
+                other => wrong.push(format!("{kind}, one element: {other:?}")),
+            }
+            let empty = match two.clone() {
+                DataValue::Int64Array(_) => DataValue::Int64Array(Vec::new()),
+                DataValue::Float64Array(_) => DataValue::Float64Array(Vec::new()),
+                DataValue::BoolArray(_) => DataValue::BoolArray(Vec::new()),
+                DataValue::TextArray(_) => DataValue::TextArray(Vec::new()),
+                DataValue::DateTimeArray(_) => DataValue::DateTimeArray(Vec::new()),
+                DataValue::GeoArray(_) => DataValue::GeoArray(Vec::new()),
+                DataValue::GeoEcefArray(_) => DataValue::GeoEcefArray(Vec::new()),
+                DataValue::BytesArray(_) => DataValue::BytesArray(Vec::new()),
+                other => panic!("not an array: {other:?}"),
+            };
+            match coerce_stored_value("f", &option, empty) {
+                Ok(None) => {}
+                other => wrong.push(format!("{kind}, empty: {other:?}")),
+            }
+            if let Ok(value) = coerce_stored_value("f", &option, two) {
+                wrong.push(format!("{kind}, two elements: Ok({value:?})"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+
+        // A multi-valued option keeps a one-element array.
+        assert_eq!(
+            coerce_stored_value("f", &multi_integer(), DataValue::Int64Array(vec![7])).unwrap(),
+            Some(DataValue::Int64Array(vec![7]))
+        );
     }
 }

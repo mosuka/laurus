@@ -405,6 +405,34 @@ impl FieldOption {
             _ => None,
         }
     }
+
+    /// The engine's `FieldOption` for a lexical-subsystem `FieldOption`,
+    /// the reverse of [`Self::to_lexical`]: a lexical rebuild converts the
+    /// stored values to the option it is given with the put path's
+    /// coercion, which takes this type (Issue #1683).
+    ///
+    /// Crate-private rather than a `From` impl, which would add public API.
+    ///
+    /// # Arguments
+    ///
+    /// * `option` - The lexical field option.
+    ///
+    /// # Returns
+    ///
+    /// The same option, as the engine's `FieldOption`.
+    pub(crate) fn from_lexical(option: crate::lexical::core::field::FieldOption) -> Self {
+        use crate::lexical::core::field::FieldOption as Lexical;
+        match option {
+            Lexical::Text(o) => Self::Text(o),
+            Lexical::Integer(o) => Self::Integer(o),
+            Lexical::Float(o) => Self::Float(o),
+            Lexical::Boolean(o) => Self::Boolean(o),
+            Lexical::DateTime(o) => Self::DateTime(o),
+            Lexical::Geo(o) => Self::Geo(o),
+            Lexical::Geo3d(o) => Self::Geo3d(o),
+            Lexical::Bytes(o) => Self::Bytes(o),
+        }
+    }
 }
 
 /// The impact of changing a field's [`FieldOption`] via
@@ -442,8 +470,10 @@ pub enum FieldChangeKind {
 /// # Cross-type changes
 ///
 /// Changing between two lexical variants (e.g. `Text` -> `Integer`) is a
-/// [`FieldChangeKind::Reindex`] — analysis just needs to run again over the
-/// stored values. Changing between two vector variants (e.g. `Hnsw` ->
+/// [`FieldChangeKind::Reindex`] — the rebuild converts each stored value to
+/// the new variant, as a put to the field would (Issue #1683), and analyzes
+/// it again; a value the new variant cannot take fails the change. Changing
+/// between two vector variants (e.g. `Hnsw` ->
 /// `Flat`) is always [`FieldChangeKind::Destructive`]: each index kind reads
 /// only its own segment files, so applying the change discards the field's
 /// vectors and recreates it empty under the new kind (Issue #1536).

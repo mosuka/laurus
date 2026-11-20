@@ -680,12 +680,16 @@ let outcome = engine.update_field(
 変更内容は次の3種類に分類され、`outcome.classification` で確認できます。
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
-- **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、HNSW の `m`/`ef_construction` 変更）。
+- **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、保存するフィールドの型の変更（`Text` から `Integer` など）、HNSW の `m`/`ef_construction` 変更）。
 - **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` やインデックスの種類の変更、`stored: false` フィールドの型変更、`stored: false` な `Boolean` / `Text` / `Bytes` フィールドの `multi_valued` を無効にする変更）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 
 `update_field` は、書き込み中の put を待ちます。その put は、フィールドの古いオプションのまま終わります。`update_field` を待っている put は、新しいオプションへ変換されます。変換できない値は、[型衝突](#型衝突)で説明する扱いになります（[#1498](https://github.com/mosuka/laurus/issues/1498)）。
+
+lexical の `Reindex` は、各ドキュメントのそのフィールドの保存値を、put と同じ規則（[型衝突](#型衝突)を参照）で新しいオプションへ変換し、変換した値でインデックスを作り直します（[#1683](https://github.com/mosuka/laurus/issues/1683)）。そのため、型を変える前に put したドキュメントも、変えた後に put したドキュメントと同じように、検索・並べ替え・ファセットに使われます。たとえば `Text` から `Integer` に変えると、保存値の `"42"` は整数の `42` になり、範囲検索で見つかります。フィールドを単一値にする（`multi_valued` を無効にする）ときは、1 要素の配列をその値に、空の配列を「値なし」にします。`multi_valued` のフィールドは、値が 1 つでも 1 要素の配列で保存するためです。
+
+新しいオプションが受け付けない保存値があると、`DynamicFieldPolicy` にかかわらず、`update_field` は `InvalidArgument` で失敗します。たとえば、`Integer` にするときの `"abc"`、`Geo` にするときの整数、単一値にするときの 2 つ以上の値を持つ配列です。エラーはそのドキュメントの `_id` と値を示し、スキーマもインデックスも変わりません。そのドキュメントを直すか削除してから、`update_field` を呼び直してください。dry run は値を確かめません。ドキュメントストアは put したときの値を保つので、`get_documents` と検索が返すドキュメントは、変換していない値を示します。
 
 `MetadataOnly` の変更は、インデックスを開き直したり `laurus serve` を再起動したりしなくても、開いているインデックスにすぐ効きます（[#1494](https://github.com/mosuka/laurus/issues/1494)）。ベクトルフィールドの新しい `default_ef_search`・`n_probe`・`base_weight` は、次の検索から使われます。lexical フィールドの新しいオプション（例: `stored`、無効にした `indexed`・`doc_values`）は、変更の後に書いたドキュメントに効きます。変更の前に書いたドキュメントは、書いたときのオプションのままです。
 
