@@ -204,6 +204,14 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// such a change `Destructive` instead, handled by the caller as
     /// remove-then-add).
     ///
+    /// Each document's stored value of the field is converted to `option`
+    /// before the field is rebuilt from it (Issue #1683), as a put to a
+    /// field with `option` converts its value, except that a one-element
+    /// array is unwrapped for a single-valued `option` and an empty array
+    /// leaves no value: the documents written before a change of the
+    /// field's type or `multi_valued` are rebuilt as documents written
+    /// after it.
+    ///
     /// # Arguments
     ///
     /// * `name` - The field name. Must already be configured.
@@ -218,7 +226,9 @@ pub trait LexicalIndex: Send + Sync + std::fmt::Debug {
     /// [`Self::add_field`]/[`Self::delete_field`] (mirrors
     /// [`crate::vector::index::VectorIndex::rebuild_field`]'s contract on
     /// the vector side). Implementations also error if no field named
-    /// `name` is registered, or if the rebuild itself fails.
+    /// `name` is registered, or if the rebuild itself fails, among others
+    /// when a live document's stored value cannot be converted to
+    /// `option`.
     ///
     /// An error must mean that nothing changed. Once the rebuilt data is
     /// published, implementations return `Ok` even if cleaning up the data

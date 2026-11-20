@@ -491,7 +491,10 @@ impl InvertedIndex {
     /// # Errors
     ///
     /// An error means nothing was published: the manifest lists the same
-    /// segments as before. Deleting the replaced segments' files after the
+    /// segments as before, and the segments `rewrite` wrote before it
+    /// failed are deleted (Issue #1683; a failure to delete them is logged
+    /// at `warn`, and the orphan sweep reclaims them at the next open).
+    /// Deleting the replaced segments' files after the
     /// manifest write is cleanup only: a failure there is logged at `warn`
     /// and not returned (Issue #1436), and the files left behind are
     /// reclaimed by the orphan sweep when the index is next opened. A
@@ -545,11 +548,31 @@ impl InvertedIndex {
             );
             // Nothing is published yet: a failure here leaves every source
             // segment and the manifest completely untouched (Issue #1081's
-            // acceptance criterion). Only a partially-written new segment
-            // file might exist on disk, which is not referenced by any
-            // manifest and is swept up as an orphan on next open, the same
-            // as an aborted `perform_merge`.
-            let results = rewrite(&engine, &managed, &new_segment_ids)?;
+            // acceptance criterion). The segments rewritten before the
+            // failure are on disk, though, referenced by no manifest; they
+            // are deleted here, since a rebuild now fails on a stored value
+            // the field's new option cannot take (Issue #1683), and a
+            // caller fixing such values one by one would otherwise leave a
+            // copy of most of the index per attempt until the next open's
+            // orphan sweep. A failure to delete them is logged only: the
+            // sweep still reclaims them.
+            let results = match rewrite(&engine, &managed, &new_segment_ids) {
+                Ok(results) => results,
+                Err(e) => {
+                    for segment_id in &new_segment_ids {
+                        if let Err(cleanup) =
+                            delete_segment_files(self.storage.as_ref(), segment_id)
+                        {
+                            log::warn!(
+                                "cannot delete the files of segment {segment_id}, written by \
+                                 a rewrite of field '{field}' that failed: {cleanup}; they \
+                                 are left for the next open's orphan sweep"
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
 
             // Publish the whole batch as ONE manifest write (mirrors
             // `merge_segment_set`): drop every source and insert every
@@ -1426,10 +1449,14 @@ impl LexicalIndex for InvertedIndex {
         // back to the index-wide default in exactly that one case.
         let target_doc_values = option.doc_values().unwrap_or(self.config.store_doc_values);
 
+        // #1683: the stored values are converted to `option` as well, so a
+        // change of the field's type rebuilds the documents written before
+        // it as documents written after it.
         self.rewrite_segments(name, |engine, segments, new_segment_ids| {
             engine.rebuild_field_across_segments(
                 segments,
                 name,
+                &option,
                 analyzer.as_ref(),
                 target_term_vectors,
                 target_doc_values,
