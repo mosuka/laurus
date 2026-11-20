@@ -8,6 +8,11 @@
 //! either before the merge reads any segment, or after the merged segment
 //! holds every surviving document, just before the merge is published and
 //! `optimize` forgets the deletions it reclaimed.
+//!
+//! The same holds for the monolithic HNSW layout, whose `optimize` rebuilds
+//! its one graph without the deleted documents (Issue #1526): the tests
+//! pause before the rebuild reads the graph, or before it renames the
+//! rebuilt graph into place.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -20,6 +25,7 @@ use laurus::vector::index::config::{
     FlatIndexConfig, HnswIndexConfig, IvfIndexConfig, MultiVectorIndexConfig,
 };
 use laurus::vector::index::flat::segmented::SegmentedFlatIndex;
+use laurus::vector::index::hnsw::HnswIndex;
 use laurus::vector::index::hnsw::segmented::SegmentedHnswIndex;
 use laurus::vector::index::ivf::segmented::SegmentedIvfIndex;
 use laurus::vector::index::multivector::segmented::MultiVectorIndex;
@@ -34,14 +40,18 @@ const WAIT: Duration = Duration::from_secs(30);
 /// The segment manifest every segmented vector index publishes merges to.
 const MANIFEST: &str = "segments.json";
 
+/// The graph file of a monolithic HNSW index named `vector_index`, which its
+/// `optimize` reads and then replaces (Issue #1526).
+const MONOLITHIC_GRAPH: &str = "vector_index.hnsw";
+
 /// Where [`PausingStorage`] pauses a merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pause {
     /// Before the merge reads anything: the first `open_input` of a segment
-    /// file.
+    /// file, or of the monolithic graph.
     BeforeRead,
     /// After the merged segment holds every surviving document: the rename
-    /// onto [`MANIFEST`] that publishes it.
+    /// onto [`MANIFEST`] that publishes it, or onto the monolithic graph.
     AfterCopy,
 }
 
@@ -106,7 +116,7 @@ impl PausingStorage {
 
 impl Storage for PausingStorage {
     fn open_input(&self, name: &str) -> laurus::Result<Box<dyn StorageInput>> {
-        if name.starts_with("segment_") {
+        if name.starts_with("segment_") || name == MONOLITHIC_GRAPH {
             self.pause_at(Pause::BeforeRead);
         }
         self.inner.open_input(name)
@@ -130,7 +140,7 @@ impl Storage for PausingStorage {
         self.inner.file_size(name)
     }
     fn rename_file(&self, from: &str, to: &str) -> laurus::Result<()> {
-        if to == MANIFEST {
+        if to == MANIFEST || to == MONOLITHIC_GRAPH {
             self.pause_at(Pause::AfterCopy);
         }
         self.inner.rename_file(from, to)
@@ -325,6 +335,95 @@ fn ivf_delete_before_the_merge_reads_survives() {
 #[test]
 fn ivf_delete_after_the_merge_copies_survives() {
     assert_delete_during_optimize_survives(open_ivf, Pause::AfterCopy);
+}
+
+/// The configuration of the monolithic HNSW index (Issue #1526).
+fn monolithic_hnsw_config() -> HnswIndexConfig {
+    HnswIndexConfig {
+        dimension: DIMENSION,
+        m: 16,
+        ef_construction: 100,
+        normalize_vectors: false,
+        distance_metric: DistanceMetric::Cosine,
+        ..Default::default()
+    }
+}
+
+/// A monolithic HNSW index of twenty documents; doc 3 is deleted before the
+/// rebuild (and so reclaimed by it), doc 14 while it runs (Issue #1526).
+/// The monolithic reader's `contains_vector` does not look at the deletion
+/// bitmap and its `stats` reports no deletions, so the deletes are checked
+/// through search, and through a reopen once they are persisted.
+fn assert_monolithic_hnsw_delete_during_optimize_survives(pause: Pause) {
+    let storage = PausingStorage::new();
+    let index =
+        HnswIndex::create(storage.clone(), "vector_index", monolithic_hnsw_config()).unwrap();
+    commit_batch(&index, 0..20);
+    index.soft_delete_document(3).unwrap();
+    index.persist_deletions().unwrap();
+
+    optimize_deleting_during_merge(&index, &storage, pause, 14);
+
+    let reader = index.reader().unwrap();
+    assert!(
+        !reader.contains_vector(3, FIELD),
+        "the rebuild reclaims doc 3"
+    );
+    assert!(
+        reader.contains_vector(14, FIELD),
+        "precondition: the rebuild keeps doc 14, deleted after it started"
+    );
+    let ids = searched_ids(index.searcher().unwrap().as_ref(), 14, 20);
+    assert!(!ids.contains(&14), "search returned doc 14: {ids:?}");
+    assert!(ids.contains(&15), "search lost doc 15: {ids:?}");
+
+    // The next commit persists the deletions; a reopen still hides doc 14.
+    index.persist_deletions().unwrap();
+    let reopened =
+        HnswIndex::open(storage.clone(), "vector_index", monolithic_hnsw_config()).unwrap();
+    let ids = searched_ids(reopened.searcher().unwrap().as_ref(), 14, 20);
+    assert!(
+        !ids.contains(&14),
+        "search after a reopen returned doc 14: {ids:?}"
+    );
+    assert!(
+        ids.contains(&15),
+        "search after a reopen lost doc 15: {ids:?}"
+    );
+}
+
+#[test]
+fn monolithic_hnsw_delete_before_the_rebuild_reads_survives() {
+    assert_monolithic_hnsw_delete_during_optimize_survives(Pause::BeforeRead);
+}
+
+#[test]
+fn monolithic_hnsw_delete_before_the_rebuild_is_published_survives() {
+    assert_monolithic_hnsw_delete_during_optimize_survives(Pause::AfterCopy);
+}
+
+/// With no delete during the rebuild, a monolithic `optimize` forgets every
+/// mark and removes `vector_index.delmap` (Issue #1526), so a reopen loads
+/// no reclaimed mark.
+#[test]
+fn monolithic_hnsw_optimize_removes_the_delmap_when_it_reclaims_every_mark() {
+    let storage = PausingStorage::new();
+    let index =
+        HnswIndex::create(storage.clone(), "vector_index", monolithic_hnsw_config()).unwrap();
+    commit_batch(&index, 0..20);
+    index.soft_delete_document(3).unwrap();
+    index.persist_deletions().unwrap();
+    assert!(
+        storage.file_exists("vector_index.delmap"),
+        "precondition: the delete is persisted"
+    );
+
+    index.optimize().unwrap();
+
+    assert!(
+        !storage.file_exists("vector_index.delmap"),
+        "the rebuild reclaimed doc 3, so no mark is left on storage"
+    );
 }
 
 /// A searcher built before `optimize` keeps hiding the documents the merge
