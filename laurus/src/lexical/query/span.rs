@@ -716,30 +716,46 @@ pub struct SpanScorer {
     // This implies `SpanScorer` must ALSO pre-calculate scores or have access to pre-calculated data?
     // PhraseScorer calculates `phrase_doc_freq` map upfront!
     // So `SpanScorer` must behave similarly: Pre-calculate everything in `new`.
-    scores: HashMap<u64, f32>,
+    /// The number of spans of each matching document, counted in `new`.
+    span_counts: HashMap<u64, usize>,
+    /// The largest of `span_counts`, `0` when nothing matches.
+    max_span_count: usize,
     boost: f32,
 }
 
 impl SpanScorer {
+    /// Count the spans of every document that matches `span_query`.
+    ///
+    /// A document scores its number of spans times the scorer's current
+    /// boost, so [`Scorer::max_score`], the largest number times the same
+    /// boost, is an exact bound whatever boost the scorer gets later
+    /// (Issue #1691). It used to be `boost * 100`, below the score of a
+    /// document with more than 100 spans, and the search loop stopped on it
+    /// before reaching such a document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the candidates or their spans fails.
     pub fn new(
         span_query: Box<dyn SpanQuery>,
         reader: &dyn LexicalIndexReader,
         boost: f32,
     ) -> Result<Self> {
-        // Enumerate actual doc_ids from posting lists and pre-compute scores.
+        // Enumerate actual doc_ids from posting lists and count their spans.
         let candidates = span_query.candidate_doc_ids(reader)?;
-        let mut scores = HashMap::new();
+        let mut span_counts = HashMap::new();
         for doc_id in candidates {
             let spans = span_query.get_spans(doc_id, reader)?;
             if !spans.is_empty() {
-                let score = (spans.len() as f32) * boost;
-                scores.insert(doc_id, score);
+                span_counts.insert(doc_id, spans.len());
             }
         }
+        let max_span_count = span_counts.values().copied().max().unwrap_or(0);
 
         Ok(SpanScorer {
             span_query,
-            scores,
+            span_counts,
+            max_span_count,
             boost,
         })
     }
@@ -747,7 +763,9 @@ impl SpanScorer {
 
 impl Scorer for SpanScorer {
     fn score(&self, doc_id: u64, _term_freq: f32, _field_length: Option<f32>) -> f32 {
-        *self.scores.get(&doc_id).unwrap_or(&0.0)
+        self.span_counts
+            .get(&doc_id)
+            .map_or(0.0, |&count| count as f32 * self.boost)
     }
 
     fn boost(&self) -> f32 {
@@ -758,9 +776,11 @@ impl Scorer for SpanScorer {
         self.boost = boost;
     }
 
+    /// The largest number of spans of a matching document times the
+    /// boost: no document scores more (Issue #1691). The block bounds
+    /// default to it.
     fn max_score(&self) -> f32 {
-        // Approximate
-        self.boost * 100.0
+        self.max_span_count as f32 * self.boost
     }
 
     fn name(&self) -> &'static str {
@@ -1088,5 +1108,47 @@ mod tests {
             Span::new(1, u32::MAX, "world".to_string()),
         ];
         assert!(query.spans_satisfy_proximity(&spans));
+    }
+
+    /// A span scorer's bound is the largest number of spans of a matching
+    /// document times its boost, so no score exceeds it, even past 100
+    /// spans, and it follows a later boost as the scores do (Issue #1691).
+    #[test]
+    fn span_scorer_max_score_bounds_every_score() {
+        use std::sync::Arc;
+
+        use crate::analysis::analyzer::standard::StandardAnalyzer;
+        use crate::data::Document;
+        use crate::lexical::InvertedIndexConfig;
+        use crate::lexical::index::LexicalIndex;
+        use crate::lexical::index::inverted::InvertedIndex;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = InvertedIndexConfig {
+            analyzer: Arc::new(StandardAnalyzer::new().unwrap()),
+            ..Default::default()
+        };
+        let index = InvertedIndex::create(storage, config).unwrap();
+        let mut writer = index.writer().unwrap();
+        // Doc 0 holds "world" 150 times, doc 1 200 times.
+        for times in [150, 200] {
+            let text = vec!["world"; times].join(" ");
+            writer
+                .add_document(Document::builder().add_text("content", text).build())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+
+        let span_query = Box::new(SpanTermQuery::new("content", "world"));
+        let mut scorer = SpanScorer::new(span_query, reader.as_ref(), 2.0).unwrap();
+        let scores = |scorer: &SpanScorer| (scorer.score(0, 1.0, None), scorer.score(1, 1.0, None));
+        assert_eq!(scores(&scorer), (300.0, 400.0));
+        assert_eq!(scorer.max_score(), 400.0);
+
+        scorer.set_boost(3.0);
+        assert_eq!(scores(&scorer), (450.0, 600.0));
+        assert_eq!(scorer.max_score(), 600.0);
     }
 }
