@@ -267,27 +267,73 @@ impl HnswIndex {
         }
 
         let mut guard = self.deletion.write();
-        // Re-check under the write lock in case another thread populated it.
-        if let Some(bitmap) = guard.as_ref() {
-            return Ok(Some(bitmap.clone()));
-        }
+        self.load_into(&mut guard, create_if_missing)?;
+        Ok(guard.clone())
+    }
 
+    /// Fill an empty `slot`, held under the `deletion` write lock, from
+    /// `<name>.delmap` when the file exists, or with a new empty bitmap when
+    /// `create_if_missing` is set. A `slot` another thread has filled is
+    /// left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading an existing `.delmap` file fails.
+    fn load_into(
+        &self,
+        slot: &mut Option<Arc<DeletionBitmap>>,
+        create_if_missing: bool,
+    ) -> Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
         let file = self.delmap_file_name();
         if self.storage.file_exists(&file) {
             let input = self.storage.open_input(&file)?;
             let mut reader = StructReader::new(input)?;
-            let bitmap = Arc::new(DeletionBitmap::read_from_storage(&mut reader)?);
-            *guard = Some(bitmap.clone());
-            return Ok(Some(bitmap));
+            *slot = Some(Arc::new(DeletionBitmap::read_from_storage(&mut reader)?));
+        } else if create_if_missing {
+            *slot = Some(Arc::new(DeletionBitmap::new(
+                self.name.clone(),
+                0,
+                u64::MAX - 1,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply `change` to the deletion bitmap while holding the `deletion`
+    /// lock, loading the bitmap first, or creating it when
+    /// `create_if_missing` is set (Issue #1526, as Issue #1518 does for the
+    /// segmented indexes).
+    ///
+    /// [`Self::forget_deletions`] replaces the bitmap under the write lock.
+    /// A change made through a clone of the old `Arc` after the lock was
+    /// released would land on the replaced bitmap and be lost.
+    ///
+    /// # Returns
+    ///
+    /// `None`, without calling `change`, when there is no bitmap and
+    /// `create_if_missing` is not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading the bitmap or `change` fails.
+    fn change_bitmap<T>(
+        &self,
+        create_if_missing: bool,
+        change: impl FnOnce(&DeletionBitmap) -> Result<T>,
+    ) -> Result<Option<T>> {
+        {
+            let guard = self.deletion.read();
+            if let Some(bitmap) = guard.as_ref() {
+                return change(bitmap).map(Some);
+            }
         }
 
-        if create_if_missing {
-            let bitmap = Arc::new(DeletionBitmap::new(self.name.clone(), 0, u64::MAX - 1));
-            *guard = Some(bitmap.clone());
-            return Ok(Some(bitmap));
-        }
-
-        Ok(None)
+        let mut guard = self.deletion.write();
+        self.load_into(&mut guard, create_if_missing)?;
+        guard.as_deref().map(change).transpose()
     }
 
     /// Number of vectors in the committed graph, including logically deleted
@@ -316,18 +362,53 @@ impl HnswIndex {
         Ok(u64::from_le_bytes(buf))
     }
 
-    /// Drop all logical deletions and remove the `.delmap` file (Issue #624).
+    /// Forget the deletions an `optimize` rebuild physically removed (Issue
+    /// #1526, as Issue #1518 does for the segmented indexes).
     ///
-    /// Called after [`Self::optimize`] has physically rebuilt the graph
-    /// without the deleted documents.
+    /// `reclaimed` is the copy of the bitmap whose documents the rebuild
+    /// dropped. Under the `deletion` write lock, the bitmap is replaced by
+    /// one with only the marks made since, or by `None` when there are none,
+    /// and `<name>.delmap` is rewritten or removed to match before the lock
+    /// is released, so neither a reopen nor a lazy load brings the reclaimed
+    /// marks back. A document deleted while the rebuild ran is still in the
+    /// new graph, and stays marked.
+    ///
+    /// The bitmap is replaced rather than edited: a reader built before the
+    /// rebuild holds it together with the old graph, which still holds the
+    /// reclaimed documents.
     ///
     /// # Errors
     ///
-    /// Returns an error if deleting the `.delmap` file fails.
-    fn clear_deletions(&self) -> Result<()> {
-        *self.deletion.write() = None;
+    /// Returns an error if writing or removing `<name>.delmap` fails; the
+    /// bitmap is then left as it was.
+    fn forget_deletions(&self, reclaimed: &DeletionBitmap) -> Result<()> {
+        let mut guard = self.deletion.write();
+        let remaining = match guard.as_ref() {
+            Some(bitmap) => bitmap.difference(reclaimed),
+            None => return Ok(()),
+        };
+        self.write_delmap(&remaining)?;
+        *guard = (remaining.deleted_count.load(Ordering::Relaxed) > 0).then(|| Arc::new(remaining));
+        Ok(())
+    }
+
+    /// Write `bitmap` to `<name>.delmap`, or remove the file when `bitmap`
+    /// marks nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing, renaming or removing the file fails.
+    fn write_delmap(&self, bitmap: &DeletionBitmap) -> Result<()> {
         let file = self.delmap_file_name();
-        if self.storage.file_exists(&file) {
+        if bitmap.deleted_count.load(Ordering::Relaxed) > 0 {
+            // Temp-then-rename for crash safety (Issue #784).
+            let tmp = format!("{file}.tmp");
+            let output = self.storage.create_output(&tmp)?;
+            let mut writer = StructWriter::new(output);
+            bitmap.write_to_storage(&mut writer)?;
+            writer.close()?;
+            self.storage.rename_file(&tmp, &file)?;
+        } else if self.storage.file_exists(&file) {
             self.storage.delete_file(&file)?;
         }
         Ok(())
@@ -421,10 +502,14 @@ impl VectorIndex for HnswIndex {
         // invalidates the graph), then commit to rebuild a clean graph without
         // them. The expensive rebuild happens here (intentional compaction),
         // not on every delete.
-        let deleted: Vec<u64> = match self.load_or_get_bitmap(false)? {
-            Some(bitmap) if bitmap.deleted_count.load(Ordering::Relaxed) > 0 => {
-                bitmap.get_deleted_docs()
-            }
+        //
+        // A soft delete takes no writer lock, so it can mark a document while
+        // the rebuild runs (Issue #1526). The rebuild drops the documents of
+        // a frozen copy of the bitmap, and only the copy's marks are
+        // forgotten afterwards: a document deleted meanwhile stays in the
+        // new graph, and stays marked.
+        let reclaimed = match self.load_or_get_bitmap(false)? {
+            Some(bitmap) if bitmap.deleted_count.load(Ordering::Relaxed) > 0 => bitmap.snapshot(),
             _ => {
                 self.update_metadata()?;
                 return Ok(());
@@ -437,12 +522,12 @@ impl VectorIndex for HnswIndex {
             self.name.clone(),
             self.storage.clone(),
         )?;
-        for doc_id in &deleted {
-            writer.delete_document(*doc_id)?;
+        for doc_id in reclaimed.get_deleted_docs() {
+            writer.delete_document(doc_id)?;
         }
         writer.commit()?;
 
-        self.clear_deletions()?;
+        self.forget_deletions(&reclaimed)?;
         self.update_metadata()?;
         Ok(())
     }
@@ -468,12 +553,13 @@ impl VectorIndex for HnswIndex {
         true
     }
 
+    /// Mark `doc_id` deleted, holding the `deletion` lock across the mark so
+    /// that an `optimize` replacing the bitmap meanwhile cannot drop it
+    /// (Issue #1526).
     fn soft_delete_document(&self, doc_id: u64) -> Result<()> {
         self.check_closed()?;
-        let bitmap = self
-            .load_or_get_bitmap(true)?
+        self.change_bitmap(true, |bitmap| bitmap.delete_document(doc_id))?
             .ok_or_else(|| LaurusError::internal("deletion bitmap unexpectedly missing"))?;
-        bitmap.delete_document(doc_id)?;
         Ok(())
     }
 

@@ -84,7 +84,7 @@ graph LR
 2. Rebuilds the inverted index and/or vector index without deleted entries
 3. Writes new, clean segment files
 4. Removes the old segment files
-5. Clears the deletion marks of the documents it removed. A document deleted while compaction runs stays deleted: its mark is kept
+5. Clears the deletion marks of the documents it removed. A document deleted while compaction runs stays deleted: its mark is kept. This holds for the monolithic (`segmented: false`) HNSW layout too, whose compaction used to drop such a mark ([#1526](https://github.com/mosuka/laurus/issues/1526))
 
 ### Cost and Frequency
 
