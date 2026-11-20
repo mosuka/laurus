@@ -297,10 +297,10 @@ from segments that lack one — there is no stored-document fallback for
 Matches terms based on their proximity within a document. Use `SpanTermQuery` and `SpanNearQuery` to build proximity queries:
 
 ```rust
-use laurus::lexical::query::span::{SpanQuery, SpanTermQuery, SpanNearQuery};
+use laurus::lexical::query::span::{SpanQuery, SpanQueryWrapper, SpanTermQuery, SpanNearQuery};
 
 // Find documents where "quick" appears near "fox" (within 3 positions)
-let query = SpanNearQuery::new(
+let near = SpanNearQuery::new(
     "body",
     vec![
         Box::new(SpanTermQuery::new("body", "quick")) as Box<dyn SpanQuery>,
@@ -309,7 +309,12 @@ let query = SpanNearQuery::new(
     3,    // slop (max distance between terms)
     true, // in_order (terms must appear in order)
 );
+
+// The query to search: a SpanQueryWrapper, which carries the boost
+let query = SpanQueryWrapper::new(Box::new(near)).boost(2.0);
 ```
+
+A span query is searched through a `SpanQueryWrapper`, and its boost goes there: it multiplies the score. The span queries inside (`SpanTermQuery`, `SpanNearQuery`, `SpanContainingQuery`, `SpanWithinQuery`) have no boost of their own, as in Lucene, since they only supply positions. They had a `boost` setter that changed nothing until Issue #1569 removed it.
 
 ## Scoring
 
