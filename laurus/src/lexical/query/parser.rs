@@ -17,7 +17,8 @@
 //! - Range queries: `[100 TO 500]`, `{A TO Z}`, and datetime ranges such as
 //!   `[2024-01-01 TO 2024-12-31]` or `[2024-01-01T00:00:00Z TO *]` (#1179)
 //! - Wildcards: `te?t`, `test*`
-//! - Boosting: `jakarta^4`
+//! - Boosting: `jakarta^4`; a group's boost multiplies the boosts inside
+//!   it, so `(jakarta^2 apache)^3` boosts `jakarta` by 6 (#1568)
 //! - Grouping: `(title:hello OR body:world)`
 
 use std::collections::BTreeMap;
@@ -336,6 +337,25 @@ impl LexicalQueryParser {
         Err(LaurusError::parse("Invalid sub-clause".to_string()))
     }
 
+    /// Parse a parenthesized group, `( ... )` with an optional `^boost`.
+    ///
+    /// The group's boost multiplies the boost of the query it holds,
+    /// whatever the number of clauses or the nesting (Issue #1568), as
+    /// Lucene's `BoostQuery` does: `(title:hello^2)^3` and
+    /// `(title:hello^2 title:world)^3` both boost `hello` by 6, and
+    /// `((title:hello^2)^3)^4` by 24. [`Self::parse_boolean_query`] returns
+    /// a group of one clause unwrapped, so setting the group's boost would
+    /// replace the clause's own. Multiplying gives the same score as a
+    /// `BooleanQuery` around the clause would, since every query's score
+    /// and bounds are proportional to its boost: the searcher runs a
+    /// one-clause `BooleanQuery` by multiplying its boost into the clause
+    /// the same way (Issue #1290). A boost of 1 changes nothing, so it
+    /// needs no special case. A product too large for an `f32` is
+    /// infinite, which [`Query::validate_boosts`] rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the group's contents do not parse.
     fn parse_grouped_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<Box<dyn Query>> {
         let mut boost = 1.0;
         let mut query: Option<Box<dyn Query>> = None;
@@ -353,9 +373,7 @@ impl LexicalQueryParser {
         }
 
         if let Some(mut q) = query {
-            if boost != 1.0 {
-                q.set_boost(boost);
-            }
+            q.set_boost(q.boost() * boost);
             Ok(q)
         } else {
             Err(LaurusError::parse("Invalid grouped query".to_string()))
@@ -1337,6 +1355,43 @@ mod tests {
     fn create_test_parser() -> LexicalQueryParser {
         let analyzer = Arc::new(StandardAnalyzer::new().unwrap());
         LexicalQueryParser::new(analyzer)
+    }
+
+    // ---- Group boosts (#1568) ----
+
+    /// A group's boost multiplies the boost of the query it holds, whatever
+    /// the number of clauses or the nesting, instead of replacing the boost
+    /// of a group of one clause (#1568).
+    #[test]
+    fn a_group_s_boost_multiplies_the_boosts_inside_it() {
+        let parser = create_test_parser();
+        let mut wrong = Vec::new();
+        for (dsl, kind, boost) in [
+            ("(title:hello^2)^3", "term", 6.0),
+            ("(title:hello)^3", "term", 3.0),
+            ("(title:hello^2)^1", "term", 2.0),
+            ("((title:hello^2)^3)^4", "term", 24.0),
+            ("((title:apple title:banana)^2)^3", "boolean", 6.0),
+            ("(+title:hello^2)^3", "term", 6.0),
+            // One prohibited clause stays in a `BooleanQuery` (#997).
+            ("(-title:hello)^3", "boolean", 3.0),
+        ] {
+            let query = parser.parse(dsl).unwrap();
+            let got = if query.as_any().is::<TermQuery>() {
+                "term"
+            } else if query.as_any().is::<BooleanQuery>() {
+                "boolean"
+            } else {
+                "other"
+            };
+            if got != kind || query.boost() != boost {
+                wrong.push(format!(
+                    "{dsl}: {got} with boost {}, expected {kind} with boost {boost}",
+                    query.boost()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     // ---- Range queries (#1179: datetime bounds) ----

@@ -255,7 +255,7 @@ rust~1^2
 
 A term, a phrase, a fuzzy or wildcard term and a group take a boost; a range or geo clause does not. The boost multiplies the clause's score, and is written as digits with an optional fraction, so it is never negative. `0` keeps the matches with a score of `0`. A number too large for a 32-bit float, such as forty `1`s, is rejected with `InvalidArgument` (HTTP 400) instead of giving `null` scores (Issue #1550). A query built through the Rust API follows the same rule: a boost must be finite and at least `0` (`-0.0` is rejected). A fuzzy or wildcard term used to drop its boost. A very large finite boost can still overflow a score to infinity, which also shows as `null`; there is no upper bound.
 
-A group of one clause gives that clause the group's boost, replacing the one it had: `(title:hello^2)^3` boosts by 3, while `(title:hello^2)^1` keeps 2. A group of several clauses multiplies: in `(title:hello^2 title:world)^3`, `hello` is boosted by 6.
+A group's boost multiplies the boosts inside it, whatever the number of clauses or the nesting, as in Lucene: `(title:hello^2)^3` and `(title:hello^2 title:world)^3` both boost `hello` by 6, `((title:hello^2)^3)^4` boosts it by 24, and `(title:hello^2)^1` keeps 2. Two boosts whose product is too large for a 32-bit float are rejected with `InvalidArgument`, as one boost that large is. Before Issue #1568, a group of one clause, and a group around another group, replaced the boost it held, so `(title:hello^2)^3` boosted by 3 and `((title:hello^2)^3)^4` by 4.
 
 ### Grouping
 
