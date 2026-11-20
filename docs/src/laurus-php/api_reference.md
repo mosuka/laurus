@@ -89,7 +89,7 @@ flushed. Pass it to the `Index` constructor's `$wal_sync_policy` argument.
 | Constructor | Description |
 | :--- | :--- |
 | `WalSyncPolicy::perRecord()` | Default. Every record is `fsync`ed before the write returns — fully durable per write. |
-| `WalSyncPolicy::group($max_records, $max_bytes, $max_interval_ms)` | Batch `fsync`s. With all arguments `null` uses the defaults (`max_records = 1024`, `max_bytes = 1 MiB`, no timer). The WAL is flushed when **either** `$max_records` **or** `$max_bytes` accumulate, and on every `commit()`. Pass `$max_interval_ms` to also flush on a periodic timer; `0` runs no timer but syncs every append. A negative argument throws `\ValueError` (Issue #1609). |
+| `WalSyncPolicy::group($max_records = null, $max_bytes = null, $max_interval_ms = null)` | Batch `fsync`s. With all arguments `null` uses the defaults (`max_records = 1024`, `max_bytes = 1 MiB`, no timer). The WAL is flushed when **either** `$max_records` **or** `$max_bytes` accumulate, and on every `commit()`. Pass `$max_interval_ms` to also flush on a periodic timer; `0` runs no timer but syncs every append. A negative argument throws `\ValueError` (Issue #1609). |
 
 Group commit is analogous to SQLite's `synchronous = NORMAL`: a crash can lose
 at most the last unsynced batch of records, but the index never corrupts.
@@ -177,24 +177,24 @@ new \Laurus\Schema()
 
 | Method | Description |
 | :--- | :--- |
-| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | Full-text field (inverted index, BM25). `$docValues` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `$stored` is also `true`. Pass `$multiValued = true` to accept a sequential array of strings (Issue #1175): a term query matches if any element contains the term, a phrase query never spans two elements unless its slop reaches `$positionIncrementGap` (default 100; `0` numbers the elements as if concatenated), and values are read back as an array of strings. `$analyzer` accepts a parameter-less built-in name (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or any custom name registered via `addAnalyzer` (e.g. a Japanese/Lindera analyzer). |
-| `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64-bit integer field. Pass `$multiValued = true` to accept arrays of integers (range queries match if any value satisfies the predicate). See `$docValues` above. |
-| `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64-bit float field. Pass `$multiValued = true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `$docValues` above. |
-| `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | Boolean field. Pass `$multiValued = true` to accept a sequential array of `bool` (a term query such as `flags:true` matches if any element equals the value; values are read back as an array of `bool`). See `$docValues` above. |
-| `addBytesField(string $name, bool $stored = true, bool $multiValued = false): void` | Raw bytes field. No `$docValues` option: a `Bytes` value is never written to DocValues regardless. Pass `$multiValued = true` to accept a sequential array of base64 strings (Issue #1176), decoded element-wise the same way a single base64 string is; `Bytes` is never indexed, so unlike every other `$multiValued` option this has no query-matching semantics — it only governs the stored shape and ingestion arity. Values are read back as an array of binary strings, mirroring the scalar field. |
-| `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | Geographic coordinate field (lat/lon). Pass `$multiValued = true` to accept an array of `["lat" => .., "lon" => ..]` arrays (distance / bounding-box queries match if any point satisfies the predicate). See `$docValues` above. |
-| `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `$multiValued = true` to accept an array of `["x" => .., "y" => .., "z" => ..]` arrays (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `$docValues` above. |
-| `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | UTC datetime field. Pass `$multiValued = true` to accept a sequential array of RFC 3339 strings (range queries match if any instant satisfies the predicate; values are read back as an array of RFC 3339 strings normalized to UTC). See `$docValues` above. |
-| `addHnswField(string $name, int $dimension, ?string $distance = "cosine", int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW approximate nearest-neighbor vector field. `$baseWeight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). A negative integer argument throws `\ValueError` (Issue #1493). |
-| `addFlatField(string $name, int $dimension, ?string $distance = "cosine", ?string $embedder = null, float $baseWeight = 1.0, ?string $quantizer = null): void` | Flat (brute-force) vector field. A negative `$dimension` throws `\ValueError` (Issue #1493). |
-| `addIvfField(string $name, int $dimension, ?string $distance = "cosine", int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0, ?string $quantizer = null): void` | IVF approximate nearest-neighbor vector field. A negative integer argument throws `\ValueError` (Issue #1493). |
-| `addMultiVectorField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, ?string $storage = null, ?int $poolFactor = null): void` | Multi-vector field holding a variable number of token vectors per document, read by the [late-interaction rescore](#lateinteractionrescore) (Issue #1351); see [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields). `$dimension` is each token vector's length and must be positive; `$distance` is `"cosine"` (default) or `"dot_product"`. Both are checked when the field is added (`\ValueError`). `$storage` sets the on-disk element kind of the token vectors (Issue #1346): `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"` (~4x smaller), or `"binary"` (32x smaller, 1 bit per element; requires `"cosine"`); also checked when the field is added (`\ValueError`). `$poolFactor` keeps about `1 / $poolFactor` of each document's token vectors by averaging similar ones at index time (default `1`, all; a value below 1 throws `\ValueError`); see [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling). `$embedder` names a token-level embedder (a `"candle_colbert"` one) that embeds the field's text values and the rescore's query text. The field is not a vector-search target, and its token vectors are not stored: `getDocuments` and search results omit it. |
+| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $term_vectors = true, bool $doc_values = true, ?string $analyzer = null, bool $multi_valued = false, int $position_increment_gap = 100): void` | Full-text field (inverted index, BM25). `$doc_values` controls whether the value is also copied into DocValues, the column-oriented store sort/facet/aggregation read from (Issue #1047); takes effect only when `$stored` is also `true`. Pass `$multi_valued = true` to accept a sequential array of strings (Issue #1175): a term query matches if any element contains the term, a phrase query never spans two elements unless its slop reaches `$position_increment_gap` (default 100; `0` numbers the elements as if concatenated), and values are read back as an array of strings. `$analyzer` accepts a parameter-less built-in name (`"standard"`, `"english"`, `"keyword"`, `"simple"`, `"noop"`) or any custom name registered via `addAnalyzer` (e.g. a Japanese/Lindera analyzer). |
+| `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 64-bit integer field. Pass `$multi_valued = true` to accept arrays of integers (range queries match if any value satisfies the predicate). See `$doc_values` above. |
+| `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 64-bit float field. Pass `$multi_valued = true` to accept arrays of floats (range queries match if any value satisfies the predicate). See `$doc_values` above. |
+| `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | Boolean field. Pass `$multi_valued = true` to accept a sequential array of `bool` (a term query such as `flags:true` matches if any element equals the value; values are read back as an array of `bool`). See `$doc_values` above. |
+| `addBytesField(string $name, bool $stored = true, bool $multi_valued = false): void` | Raw bytes field. No `$doc_values` option: a `Bytes` value is never written to DocValues regardless. Pass `$multi_valued = true` to accept a sequential array of base64 strings (Issue #1176), decoded element-wise the same way a single base64 string is; `Bytes` is never indexed, so unlike every other `$multi_valued` option this has no query-matching semantics — it only governs the stored shape and ingestion arity. Values are read back as an array of binary strings, mirroring the scalar field. |
+| `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | Geographic coordinate field (lat/lon). Pass `$multi_valued = true` to accept an array of `["lat" => .., "lon" => ..]` arrays (distance / bounding-box queries match if any point satisfies the predicate). See `$doc_values` above. |
+| `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 3D ECEF Cartesian point field (x, y, z in metres). Pass `$multi_valued = true` to accept an array of `["x" => .., "y" => .., "z" => ..]` arrays (distance / bounding-box / nearest queries match if any point satisfies the predicate). See [Geo3d concepts](../concepts/geo3d.md) and `$doc_values` above. |
+| `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | UTC datetime field. Pass `$multi_valued = true` to accept a sequential array of RFC 3339 strings (range queries match if any instant satisfies the predicate; values are read back as an array of RFC 3339 strings normalized to UTC). See `$doc_values` above. |
+| `addHnswField(string $name, int $dimension, ?string $distance = null, int $m = 16, int $ef_construction = 200, ?int $default_ef_search = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvector_count = null, ?string $rerank_storage = null, ?string $pq_codebook_path = null, float $base_weight = 1.0): void` | HNSW approximate nearest-neighbor vector field. `$base_weight` sets this field's relative scoring priority when searched alongside other vector fields (Issue #1084); see [Vector Search → Weights](../concepts/search/vector_search.md#weights). A negative integer argument throws `\ValueError` (Issue #1493). |
+| `addFlatField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, float $base_weight = 1.0, ?string $quantizer = null): void` | Flat (brute-force) vector field. A negative `$dimension` throws `\ValueError` (Issue #1493). |
+| `addIvfField(string $name, int $dimension, ?string $distance = null, int $n_clusters = 100, int $n_probe = 1, ?string $embedder = null, float $base_weight = 1.0, ?string $quantizer = null): void` | IVF approximate nearest-neighbor vector field. A negative integer argument throws `\ValueError` (Issue #1493). |
+| `addMultiVectorField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, ?string $storage = null, ?int $pool_factor = null): void` | Multi-vector field holding a variable number of token vectors per document, read by the [late-interaction rescore](#lateinteractionrescore) (Issue #1351); see [Multi-Vector Fields](../concepts/schema_and_fields.md#multi-vector-fields). `$dimension` is each token vector's length and must be positive; `$distance` is `"cosine"` (default) or `"dot_product"`. Both are checked when the field is added (`\ValueError`). `$storage` sets the on-disk element kind of the token vectors (Issue #1346): `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"` (~4x smaller), or `"binary"` (32x smaller, 1 bit per element; requires `"cosine"`); also checked when the field is added (`\ValueError`). `$pool_factor` keeps about `1 / $pool_factor` of each document's token vectors by averaging similar ones at index time (default `1`, all; a value below 1 throws `\ValueError`); see [Token pooling](../concepts/indexing/vector_indexing.md#token-pooling). `$embedder` names a token-level embedder (a `"candle_colbert"` one) that embeds the field's text values and the rescore's query text. The field is not a vector-search target, and its token vectors are not stored: `getDocuments` and search results omit it. |
 
 **Vector quantization & rerank storage** (HNSW fields; `quantizer` also on Flat and IVF fields):
 
-- `quantizer` — `"scalar_8bit"` (default, 4× compression), `"float16"` (IEEE 754 half precision, 2× compression, nothing to train; Issue #623) or `"product_quantization"` for higher compression. Product quantization requires `subvectorCount` (must divide `dimension`). `addFlatField` and `addIvfField` take `$quantizer` as their last argument and accept `"scalar_8bit"` and `"float16"`; `"product_quantization"` is HNSW-only and throws `\Exception` there.
-- `rerankStorage` — set to `"f32"` to write a full-precision `*.hnsw.f32` sidecar enabling exact Stage-2 rerank; omit to keep the int8-only segment.
-- `pqCodebookPath` — storage-relative file name of a shared PQ codebook (Issue #631), trained once via the `laurus train pq-codebook` CLI command. Only meaningful with `$quantizer = "product_quantization"`; commits then encode against the pre-trained codebook instead of re-training k-means per segment. Omit to keep per-segment training.
+- `quantizer` — `"scalar_8bit"` (default, 4× compression), `"float16"` (IEEE 754 half precision, 2× compression, nothing to train; Issue #623) or `"product_quantization"` for higher compression. Product quantization requires `subvector_count` (must divide `dimension`). `addFlatField` and `addIvfField` take `$quantizer` as their last argument and accept `"scalar_8bit"` and `"float16"`; `"product_quantization"` is HNSW-only and throws `\Exception` there.
+- `rerank_storage` — set to `"f32"` to write a full-precision `*.hnsw.f32` sidecar enabling exact Stage-2 rerank; omit to keep the int8-only segment.
+- `pq_codebook_path` — storage-relative file name of a shared PQ codebook (Issue #631), trained once via the `laurus train pq-codebook` CLI command. Only meaningful with `$quantizer = "product_quantization"`; commits then encode against the pre-trained codebook instead of re-training k-means per segment. Omit to keep per-segment training.
 
 Every `add*Field` method above throws `\ValueError` when `name` starts with `_` (other than `_id`), and adds nothing. A schema loaded with `fromToml` / `fromTomlFile` keeps accepting such a field, so a persisted schema still loads; creating a new `Index` from it throws `\ValueError`. See [Field Naming](../laurus-cli/schema_format.md#field-naming).
 
@@ -203,9 +203,9 @@ Every `add*Field` method above throws `\ValueError` when `name` starts with `_` 
 | Method | Description |
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | Register a named embedder definition. `$config` is an associative array with a `"type"` key (see below), decoded with the same rules as the schema TOML format. A missing or unknown type, or a missing required key, throws `\Exception` (`invalid embedder config: ...`). |
-| `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | Register a custom analyzer definition. `$tokenizer` is required; `$charFilters`/`$tokenFilters` are optional arrays of associative arrays. Each uses the same `{"type": "...", ...}` shape as the schema TOML/JSON format (see below). A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) throws `\ValueError`, and so does creating a new `Index` from a schema that defines one (e.g. loaded with `fromToml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
+| `addAnalyzer(string $name, array $tokenizer, ?array $char_filters = null, ?array $token_filters = null): void` | Register a custom analyzer definition. `$tokenizer` is required; `$char_filters`/`$token_filters` are optional arrays of associative arrays. Each uses the same `{"type": "...", ...}` shape as the schema TOML/JSON format (see below). A name reserved for a built-in analyzer (`standard`, `keyword`, `english`, `simple`, `noop`) throws `\ValueError`, and so does creating a new `Index` from a schema that defines one (e.g. loaded with `fromToml`). Semantic validity (e.g. a malformed regex) is checked when the schema is used to build an `Index`, not here. |
 | `analyzerNames(): array` | Return the names of custom analyzers registered via `addAnalyzer` or loaded from TOML. |
-| `Schema::fromToml(string $tomlStr): Schema` | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. Throws `ValueError` if the TOML is not a valid schema. |
+| `Schema::fromToml(string $toml_str): Schema` | Parse a schema from a TOML string, in the same format `laurus-cli create index --schema` accepts. Throws `ValueError` if the TOML is not a valid schema. |
 | `Schema::fromTomlFile(string $path): Schema` | Load a schema from a TOML file. Throws `Exception` (message prefixed with the path) if the file cannot be read, or `ValueError` if its content is not a valid schema. |
 | `toToml(): string` | Serialize this schema to a TOML string in the same format `laurus-cli` accepts. Tables come out in sorted key order, so compare round-tripped schemas by content, not raw text. |
 | `toTomlFile(string $path): void` | Write this schema to a TOML file, overwriting any existing file. Throws `Exception` (message prefixed with the path) if the file cannot be written. |
@@ -250,9 +250,9 @@ $schema->addMultiVectorField("body_colbert", 128, null, "colbert");
 
 ### Analyzer components
 
-Used by `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null)`
+Used by `addAnalyzer(string $name, array $tokenizer, ?array $char_filters = null, ?array $token_filters = null)`
 and by the `[analyzers.<name>]` TOML section. `$tokenizer` is a single
-associative array; `$charFilters`/`$tokenFilters` are arrays of associative
+associative array; `$char_filters`/`$token_filters` are arrays of associative
 arrays, applied in array order.
 
 See [Schema Format Reference → Analyzers](../laurus-cli/schema_format.md#analyzers) for the canonical description of each component.
@@ -268,7 +268,7 @@ See [Schema Format Reference → Analyzers](../laurus-cli/schema_format.md#analy
 | `"lindera"` | `"mode"`, `"dict"` | `"user_dict"` |
 | `"whole"` | -- | -- |
 
-**Char filters** (`$charFilters`, applied to raw text before tokenization):
+**Char filters** (`$char_filters`, applied to raw text before tokenization):
 
 | `"type"` | Required keys | Optional keys |
 | :--- | :--- | :--- |
@@ -277,7 +277,7 @@ See [Schema Format Reference → Analyzers](../laurus-cli/schema_format.md#analy
 | `"mapping"` | `"mapping"` (associative array of string replacements) | -- |
 | `"japanese_iteration_mark"` | -- | `"kanji"` (default `true`), `"kana"` (default `true`) |
 
-**Token filters** (`$tokenFilters`, applied to the token stream after tokenization):
+**Token filters** (`$token_filters`, applied to the token stream after tokenization):
 
 | `"type"` | Required keys | Optional keys |
 | :--- | :--- | :--- |
@@ -314,7 +314,7 @@ $schema->addTextField("title", analyzer: "ja_ipadic");
 | `"manhattan"` | Manhattan distance |
 | `"angular"` | Angular distance |
 
-`addMultiVectorField` accepts only `"cosine"` and `"dot_product"`.
+The vector field methods take `$distance = null`, which is `"cosine"`. `addMultiVectorField` accepts only `"cosine"` and `"dot_product"`.
 
 ---
 
@@ -355,10 +355,10 @@ Pattern match. `*` matches any sequence of characters, `?` matches any single ch
 ### NumericRangeQuery
 
 ```php
-new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $numericType = "integer")
+new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $numeric_type = null)
 ```
 
-Matches numeric values in the range `[$min, $max]`. Pass `null` for an open bound. Set `$numericType` to `"integer"` or `"float"`. Either type takes an `int` or a `float` as a bound, and an integer range truncates a `float`. A bound compares as a number, so `INF` as `$max` finds what `null` finds; a `NAN` bound would match nothing, so the search throws `ValueError`. A bound of any other type, such as a string, an array or a `bool`, throws `TypeError` when the query is constructed.
+Matches numeric values in the range `[$min, $max]`. Pass `null` for an open bound. Set `$numeric_type` to `"integer"` or `"float"`; `null`, the default, is `"integer"`. Either type takes an `int` or a `float` as a bound, and an integer range truncates a `float`. A bound compares as a number, so `INF` as `$max` finds what `null` finds; a `NAN` bound would match nothing, so the search throws `ValueError`. A bound of any other type, such as a string, an array or a `bool`, throws `TypeError` when the query is constructed.
 
 ### DateTimeRangeQuery
 
@@ -366,31 +366,31 @@ Matches numeric values in the range `[$min, $max]`. Pass `null` for an open boun
 new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max = null)
 ```
 
-Matches `DateTime` values in the range `[$min, $max]` (both bounds inclusive). Pass `null` for an open bound. Bounds are string literals in any form the query DSL accepts: RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC); pass `$dt->format(DATE_RFC3339)` for a `DateTimeInterface`. Because ext-php-rs constructors cannot fail, a malformed bound is reported as a `\Throwable` when the query is used (`Index::search`, `BooleanQuery`, `SearchRequest`).
+Matches `DateTime` values in the range `[$min, $max]` (both bounds inclusive). Pass `null`, or leave the bound out, for an open bound; both bounds had to be given before Issue #1613. Bounds are string literals in any form the query DSL accepts: RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC); pass `$dt->format(DATE_RFC3339)` for a `DateTimeInterface`. Because ext-php-rs constructors cannot fail, a malformed bound is reported as a `\Throwable` when the query is used (`Index::search`, `BooleanQuery`, `SearchRequest`).
 
 ### GeoDistanceQuery
 
 ```php
 \Laurus\GeoDistanceQuery::withinRadius(
-    string $field, float $lat, float $lon, float $distanceM,
+    string $field, float $lat, float $lon, float $distance_m,
 ): GeoDistanceQuery
 ```
 
 Geo-distance (radius) search. Returns documents whose `(lat, lon)` coordinate
-is within `$distanceM` metres of the given point.
+is within `$distance_m` metres of the given point.
 
 ### GeoBoundingBoxQuery
 
 ```php
 \Laurus\GeoBoundingBoxQuery::withinBoundingBox(
     string $field,
-    float $minLat, float $minLon,
-    float $maxLat, float $maxLon,
+    float $min_lat, float $min_lon,
+    float $max_lat, float $max_lon,
 ): GeoBoundingBoxQuery
 ```
 
 Geo bounding-box search. Returns documents whose `(lat, lon)` coordinate lies
-inside the axis-aligned `[$minLat, $maxLat] × [$minLon, $maxLon]` rectangle.
+inside the axis-aligned `[$min_lat, $max_lat] × [$min_lon, $max_lon]` rectangle.
 
 ### Geo3dDistanceQuery
 
@@ -398,12 +398,12 @@ inside the axis-aligned `[$minLat, $maxLat] × [$minLon, $maxLon]` rectangle.
 \Laurus\Geo3dDistanceQuery::withinSphere(
     string $field,
     float $x, float $y, float $z,
-    float $distanceM,
+    float $distance_m,
 ): Geo3dDistanceQuery
 ```
 
 Sphere search over a 3D ECEF point field. Returns documents whose `(x, y, z)`
-coordinate is within `$distanceM` metres of the centre. See
+coordinate is within `$distance_m` metres of the centre. See
 [Geo3d concepts](../concepts/geo3d.md) for ECEF theory.
 
 ### Geo3dBoundingBoxQuery
@@ -411,8 +411,8 @@ coordinate is within `$distanceM` metres of the centre. See
 ```php
 \Laurus\Geo3dBoundingBoxQuery::withinBox(
     string $field,
-    float $minX, float $minY, float $minZ,
-    float $maxX, float $maxY, float $maxZ,
+    float $min_x, float $min_y, float $min_z,
+    float $max_x, float $max_y, float $max_z,
 ): Geo3dBoundingBoxQuery
 ```
 
@@ -425,13 +425,13 @@ Axis-aligned 3D bounding-box search.
     string $field,
     float $x, float $y, float $z,
     int $k,
-    ?float $initialRadiusM = null,
-    ?float $maxRadiusM = null,
+    ?float $initial_radius_m = null,
+    ?float $max_radius_m = null,
 ): Geo3dNearestQuery
 ```
 
 k-nearest-neighbour search over a 3D ECEF point field. The optional
-`$initialRadiusM` and `$maxRadiusM` parameters tune the iterative-expansion
+`$initial_radius_m` and `$max_radius_m` parameters tune the iterative-expansion
 search cone. `$k` must be between 0 and 4294967295; `kNearest` throws
 `\ValueError` otherwise (Issue #1590).
 
@@ -491,7 +491,7 @@ Converts `$text` to an embedding at query time and runs vector search. Requires 
 
 ## SearchRequest
 
-Full-featured search request for advanced control.
+Full-featured search request for advanced control. Every argument is optional, so a request names only the ones it sets (`new \Laurus\SearchRequest(query: "title:rust", limit: 5)`). Before Issue #1613, the first five had to be given, if only as `null`.
 
 ```php
 new \Laurus\SearchRequest(
@@ -592,7 +592,7 @@ new \Laurus\GroupBy(string $field, ?int $groupSize = null)
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `$field` | `string` | -- | `_id` (chunks added with `addDocument` share their document's `_id`), or a single-valued, stored text, integer, float, boolean or datetime field with `docValues` enabled (the defaults). |
+| `$field` | `string` | -- | `_id` (chunks added with `addDocument` share their document's `_id`), or a single-valued, stored text, integer, float, boolean or datetime field with `doc_values` enabled (the defaults). |
 | `$groupSize` | `int\|null` | `null` (1) | How many hits each group keeps, the returned result included, `1..=100`. |
 
 ### Methods
@@ -608,7 +608,7 @@ new \Laurus\GroupBy(string $field, ?int $groupSize = null)
 Each returned `SearchResult` is then the best hit of a group: its `getGroupKey()` is the value the group shares and its `getInnerHits()` hold up to `$groupSize - 1` further hits of the group, in ranking order. `$limit` and `$offset` count groups. Grouping runs on the final ranking, after fusion and rescore, for lexical, vector and hybrid searches alike. See [Result Grouping](../concepts/search/result_grouping.md) for the ordering, the candidate pool and why a group can hold fewer than `$groupSize` hits.
 
 - `Index->search()`, `Index->searchBatch()` and `SearchRequest` throw `\TypeError` (`groupBy must be a Laurus\GroupBy`) for any other `$groupBy` value.
-- Everything else is checked by the engine when searching, before any search runs, and throws `\ValueError` with a message containing `group_by: ...`: the field is unknown, of another type, multi-valued, not stored or without `docValues`, `$groupSize` is outside `1..=100` (a negative size is reported as 0), or `$offset + $limit` exceeds 10,000.
+- Everything else is checked by the engine when searching, before any search runs, and throws `\ValueError` with a message containing `group_by: ...`: the field is unknown, of another type, multi-valued, not stored or without `doc_values`, `$groupSize` is outside `1..=100` (a negative size is reported as 0), or `$offset + $limit` exceeds 10,000.
 
 ### Example
 
@@ -747,10 +747,10 @@ PHP values are automatically converted to Laurus `DataValue` types:
 | `array` of numerics (sequential) | `Float64Array` | Multi-valued float field (integers widened); vector fields cast the array to `f32` |
 | `array` with `"lat"`, `"lon"` | `Geo` | Two `float` values |
 | `array` with `"x"`, `"y"`, `"z"` | `GeoEcef` | Three `float` values, meters (3D ECEF Cartesian) |
-| `array` of `["lat" => .., "lon" => ..]` arrays | `GeoArray` | Sequential array; requires `$multiValued = true` on the field |
-| `array` of `["x" => .., "y" => .., "z" => ..]` arrays | `GeoEcefArray` | Sequential array; requires `$multiValued = true` on the field |
+| `array` of `["lat" => .., "lon" => ..]` arrays | `GeoArray` | Sequential array; requires `$multi_valued = true` on the field |
+| `array` of `["x" => .., "y" => .., "z" => ..]` arrays | `GeoEcefArray` | Sequential array; requires `$multi_valued = true` on the field |
 | `array` of numeric lists (sequential, e.g. `[[0.1, 0.2], [0.3, 0.4]]`) | `VectorArray` | Token vectors of a multi-vector field (Issue #1351). The inner arrays are lists, not keyed geo points, so the two never collide. Integers are widened; a `bool` or `string` element throws `\TypeError` ("token vector N must hold only numbers"). The vector count and dimension are checked against the field (`\ValueError`). Not stored: `getDocuments` and search results omit the field |
 | `string` (ISO 8601) | `DateTime` | Parsed from ISO 8601 format |
-| `array` of ISO 8601 strings (sequential) | `DateTimeArray` | Chosen only when every element parses as ISO 8601. Requires `$multiValued = true` on the field |
-| `array` of `string` (sequential, not all ISO 8601) | `TextArray` | Multi-valued text field (Issue #1175); read back as an array of strings. Requires `$multiValued = true` on the field. On a declared multi-valued `Bytes` field, the same array of base64 strings is instead decoded element-wise (Issue #1176) |
-| `array` of `bool` (sequential) | `BoolArray` | All elements must be `bool`; a mixed array such as `[true, 1]` is an error ("numeric array elements must be numeric"). Requires `$multiValued = true` on the field |
+| `array` of ISO 8601 strings (sequential) | `DateTimeArray` | Chosen only when every element parses as ISO 8601. Requires `$multi_valued = true` on the field |
+| `array` of `string` (sequential, not all ISO 8601) | `TextArray` | Multi-valued text field (Issue #1175); read back as an array of strings. Requires `$multi_valued = true` on the field. On a declared multi-valued `Bytes` field, the same array of base64 strings is instead decoded element-wise (Issue #1176) |
+| `array` of `bool` (sequential) | `BoolArray` | All elements must be `bool`; a mixed array such as `[true, 1]` is an error ("numeric array elements must be numeric"). Requires `$multi_valued = true` on the field |

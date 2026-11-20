@@ -554,15 +554,15 @@ impl PhpDateTimeRangeQuery {
     /// # Arguments
     ///
     /// * `field` - Field name.
-    /// * `min` - Lower bound literal (optional, pass null for unbounded).
-    /// * `max` - Upper bound literal (optional, pass null for unbounded).
-    pub fn __construct(field: String, min: &Zval, max: &Zval) -> Self {
-        let literal = |zv: &Zval| {
-            if zv.is_null() {
-                None
-            } else {
-                String::from_zval(zv)
-            }
+    /// * `min` - Lower bound literal (default: `null`, unbounded).
+    /// * `max` - Upper bound literal (default: `null`, unbounded).
+    ///
+    /// Both bounds can be left out, as `null` (Issue #1613); they used to
+    /// be required.
+    pub fn __construct(field: String, min: Option<&Zval>, max: Option<&Zval>) -> Self {
+        let literal = |zv: Option<&Zval>| match zv {
+            Some(zv) if !zv.is_null() => String::from_zval(zv),
+            _ => None,
         };
         Self {
             field,

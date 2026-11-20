@@ -590,18 +590,22 @@ pub struct PhpSearchRequest {
 impl PhpSearchRequest {
     /// Create a new search request.
     ///
-    /// All arguments are optional:
+    /// All arguments are optional, so a request can name only the ones it
+    /// sets (`new SearchRequest(query: "title:rust")`). The first five used
+    /// to be required, although `null` was accepted for each (Issue #1613).
     ///
     /// # Arguments
     ///
-    /// * `query` - DSL string or query object. A DSL string may be combined
-    ///   with `vectorQuery`, which is added to the DSL's vector part; any
-    ///   other combination with `lexicalQuery` / `vectorQuery` throws
-    ///   `ValueError` when the request is built (Issue #1372).
-    /// * `lexicalQuery` - Lexical query for hybrid search.
-    /// * `vectorQuery` - Vector query for hybrid search.
-    /// * `filterQuery` - Post-scoring filter query.
-    /// * `fusion` - `RRF` or `WeightedSum` fusion algorithm.
+    /// * `query` - DSL string or query object (default: `null`). A DSL
+    ///   string may be combined with `vectorQuery`, which is added to the
+    ///   DSL's vector part; any other combination with `lexicalQuery` /
+    ///   `vectorQuery` throws `ValueError` when the request is built (Issue
+    ///   #1372).
+    /// * `lexicalQuery` - Lexical query for hybrid search (default: `null`).
+    /// * `vectorQuery` - Vector query for hybrid search (default: `null`).
+    /// * `filterQuery` - Post-scoring filter query (default: `null`).
+    /// * `fusion` - `RRF` or `WeightedSum` fusion algorithm (default:
+    ///   `null`).
     /// * `limit` - Maximum results (default: 10).
     /// * `offset` - Pagination offset (default: 0).
     /// * `highlight` - Field list or config array for search-result
@@ -619,43 +623,48 @@ impl PhpSearchRequest {
     #[php(defaults(limit = 10, offset = 0))]
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
-        query: &Zval,
-        lexicalQuery: &Zval,
-        vectorQuery: &Zval,
-        filterQuery: &Zval,
-        fusion: &Zval,
+        query: Option<&Zval>,
+        lexicalQuery: Option<&Zval>,
+        vectorQuery: Option<&Zval>,
+        filterQuery: Option<&Zval>,
+        fusion: Option<&Zval>,
         limit: i64,
         offset: i64,
         highlight: Option<&ZendHashTable>,
         rescore: Option<&Zval>,
         groupBy: Option<&Zval>,
     ) -> PhpResult<Self> {
+        // A query or fusion left out is the same as `null` (Issue #1613).
+        fn present(zv: Option<&Zval>) -> Option<&Zval> {
+            zv.filter(|zv| !zv.is_null())
+        }
+
         // Convert fusion
-        let fusion_alg = parse_fusion_option(fusion)?;
+        let fusion_alg = match present(fusion) {
+            Some(fusion) => parse_fusion_option(fusion)?,
+            None => None,
+        };
 
         // Convert filter query
-        let filter = if !filterQuery.is_null() {
-            Some(extract_lexical_query(filterQuery)?)
-        } else {
-            None
+        let filter = match present(filterQuery) {
+            Some(filterQuery) => Some(extract_lexical_query(filterQuery)?),
+            None => None,
         };
 
         // Convert lexical query
-        let lex_q = if !lexicalQuery.is_null() {
-            Some(zval_to_lexical_search_query(lexicalQuery)?)
-        } else {
-            None
+        let lex_q = match present(lexicalQuery) {
+            Some(lexicalQuery) => Some(zval_to_lexical_search_query(lexicalQuery)?),
+            None => None,
         };
 
         // Convert vector query
-        let vec_q = if !vectorQuery.is_null() {
-            Some(zval_to_vector_search_query(vectorQuery)?)
-        } else {
-            None
+        let vec_q = match present(vectorQuery) {
+            Some(vectorQuery) => Some(zval_to_vector_search_query(vectorQuery)?),
+            None => None,
         };
 
         // Convert single query
-        let q = if !query.is_null() {
+        let q = if let Some(query) = present(query) {
             if let Some(s) = String::from_zval(query) {
                 Some(QueryRepr::Dsl(s))
             } else if is_vector_query(query) {
