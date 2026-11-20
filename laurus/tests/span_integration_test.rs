@@ -105,6 +105,25 @@ fn test_span_query_wrapper_integration() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// The boost of a span query is the `SpanQueryWrapper`'s, and it multiplies
+/// the score; the span queries it holds have none (Issue #1569).
+#[test]
+fn test_span_query_wrapper_boost_multiplies_the_score() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, reader) = create_test_index()?;
+    let score = |boost: f32| -> Result<f32, Box<dyn std::error::Error>> {
+        let wrapper =
+            SpanQueryWrapper::new(Box::new(SpanTermQuery::new("content", "world"))).boost(boost);
+        // Doc 0 ("hello world") holds one span of "world".
+        Ok(wrapper.scorer(reader.as_ref())?.score(0, 1.0, None))
+    };
+
+    let unboosted = score(1.0)?;
+    assert!(unboosted > 0.0, "precondition: doc 0 scores");
+    assert_eq!(score(2.0)?, 2.0 * unboosted);
+
+    Ok(())
+}
+
 #[test]
 fn test_span_near_query_integration() -> Result<(), Box<dyn std::error::Error>> {
     let (_, reader) = create_test_index()?;

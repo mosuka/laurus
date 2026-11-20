@@ -295,10 +295,10 @@ BKD tree を持たないセグメントからはヒットを返しません — 
 ドキュメント内のタームの近接度に基づいてマッチングします。`SpanTermQuery` と `SpanNearQuery` を使用して近接クエリを構築します。
 
 ```rust
-use laurus::lexical::query::span::{SpanQuery, SpanTermQuery, SpanNearQuery};
+use laurus::lexical::query::span::{SpanQuery, SpanQueryWrapper, SpanTermQuery, SpanNearQuery};
 
 // Find documents where "quick" appears near "fox" (within 3 positions)
-let query = SpanNearQuery::new(
+let near = SpanNearQuery::new(
     "body",
     vec![
         Box::new(SpanTermQuery::new("body", "quick")) as Box<dyn SpanQuery>,
@@ -307,7 +307,12 @@ let query = SpanNearQuery::new(
     3,    // slop (max distance between terms)
     true, // in_order (terms must appear in order)
 );
+
+// The query to search: a SpanQueryWrapper, which carries the boost
+let query = SpanQueryWrapper::new(Box::new(near)).boost(2.0);
 ```
+
+span クエリは `SpanQueryWrapper` で包んで検索し、ブーストもそこに付けます。このブーストはスコアに掛かります。中の span クエリ（`SpanTermQuery`、`SpanNearQuery`、`SpanContainingQuery`、`SpanWithinQuery`）は、位置を出すだけなので、Lucene と同じく自分のブーストを持ちません。これらには何も変えない `boost` の setter がありましたが、Issue #1569 で削除しました。
 
 ## スコアリング
 

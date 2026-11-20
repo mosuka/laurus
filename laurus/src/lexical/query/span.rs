@@ -94,14 +94,23 @@ pub trait SpanQuery: Send + Sync + std::fmt::Debug {
 }
 
 /// A span query that matches a single term.
+///
+/// A span query has no boost of its own: the search scores the
+/// [`SpanQueryWrapper`] around it, so the boost goes on the wrapper, with
+/// [`SpanQueryWrapper::boost`]. As in Lucene, a span query inside another
+/// only supplies positions (Issue #1569). So this does not compile:
+///
+/// ```compile_fail,E0599
+/// use laurus::lexical::query::span::SpanTermQuery;
+///
+/// let _ = SpanTermQuery::new("body", "quick").boost(2.0);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpanTermQuery {
     /// Field to search in
     field: String,
     /// Term to search for
     term: String,
-    /// Boost factor
-    boost: f32,
 }
 
 impl SpanTermQuery {
@@ -110,14 +119,7 @@ impl SpanTermQuery {
         SpanTermQuery {
             field: field.into(),
             term: term.into(),
-            boost: 1.0,
         }
-    }
-
-    /// Set the boost factor.
-    pub fn boost(mut self, boost: f32) -> Self {
-        self.boost = boost;
-        self
     }
 
     /// Get the term.
@@ -176,6 +178,16 @@ impl SpanQuery for SpanTermQuery {
 }
 
 /// A span query that matches terms near each other.
+///
+/// Like every span query, it has no boost of its own (Issue #1569; see
+/// [`SpanTermQuery`]): set it on the [`SpanQueryWrapper`]. So this does not
+/// compile:
+///
+/// ```compile_fail,E0599
+/// use laurus::lexical::query::span::SpanNearQuery;
+///
+/// let _ = SpanNearQuery::new("body", Vec::new(), 0, true).boost(2.0);
+/// ```
 #[derive(Debug)]
 pub struct SpanNearQuery {
     /// Field to search in
@@ -186,8 +198,6 @@ pub struct SpanNearQuery {
     slop: u32,
     /// Whether terms must appear in order
     in_order: bool,
-    /// Boost factor
-    boost: f32,
 }
 
 impl SpanNearQuery {
@@ -203,14 +213,7 @@ impl SpanNearQuery {
             clauses,
             slop,
             in_order,
-            boost: 1.0,
         }
-    }
-
-    /// Set the boost factor.
-    pub fn boost(mut self, boost: f32) -> Self {
-        self.boost = boost;
-        self
     }
 
     /// Get the slop (maximum distance).
@@ -294,7 +297,6 @@ impl SpanQuery for SpanNearQuery {
             clauses: cloned_clauses,
             slop: self.slop,
             in_order: self.in_order,
-            boost: self.boost,
         })
     }
 }
@@ -380,6 +382,18 @@ impl SpanNearQuery {
 }
 
 /// A span query that matches the first span that contains the second.
+///
+/// Like every span query, it has no boost of its own (Issue #1569; see
+/// [`SpanTermQuery`]): set it on the [`SpanQueryWrapper`]. So this does not
+/// compile:
+///
+/// ```compile_fail,E0599
+/// use laurus::lexical::query::span::{SpanContainingQuery, SpanTermQuery};
+///
+/// let big = Box::new(SpanTermQuery::new("body", "quick"));
+/// let little = Box::new(SpanTermQuery::new("body", "fox"));
+/// let _ = SpanContainingQuery::new("body", big, little).boost(2.0);
+/// ```
 #[derive(Debug)]
 pub struct SpanContainingQuery {
     /// Field to search in
@@ -388,8 +402,6 @@ pub struct SpanContainingQuery {
     big: Box<dyn SpanQuery>,
     /// The contained span query
     little: Box<dyn SpanQuery>,
-    /// Boost factor
-    boost: f32,
 }
 
 impl SpanContainingQuery {
@@ -403,14 +415,7 @@ impl SpanContainingQuery {
             field: field.into(),
             big,
             little,
-            boost: 1.0,
         }
-    }
-
-    /// Set the boost factor.
-    pub fn boost(mut self, boost: f32) -> Self {
-        self.boost = boost;
-        self
     }
 }
 
@@ -465,12 +470,23 @@ impl SpanQuery for SpanContainingQuery {
             field: self.field.clone(),
             big: self.big.clone_box(),
             little: self.little.clone_box(),
-            boost: self.boost,
         })
     }
 }
 
 /// A span query that matches spans within a certain distance of another span.
+///
+/// Like every span query, it has no boost of its own (Issue #1569; see
+/// [`SpanTermQuery`]): set it on the [`SpanQueryWrapper`]. So this does not
+/// compile:
+///
+/// ```compile_fail,E0599
+/// use laurus::lexical::query::span::{SpanTermQuery, SpanWithinQuery};
+///
+/// let include = Box::new(SpanTermQuery::new("body", "quick"));
+/// let exclude = Box::new(SpanTermQuery::new("body", "fox"));
+/// let _ = SpanWithinQuery::new("body", include, exclude, 3).boost(2.0);
+/// ```
 #[derive(Debug)]
 pub struct SpanWithinQuery {
     /// Field to search in
@@ -481,8 +497,6 @@ pub struct SpanWithinQuery {
     exclude: Box<dyn SpanQuery>,
     /// Maximum distance from exclude spans
     distance: u32,
-    /// Boost factor
-    boost: f32,
 }
 
 impl SpanWithinQuery {
@@ -498,14 +512,7 @@ impl SpanWithinQuery {
             include,
             exclude,
             distance,
-            boost: 1.0,
         }
-    }
-
-    /// Set the boost factor.
-    pub fn boost(mut self, boost: f32) -> Self {
-        self.boost = boost;
-        self
     }
 }
 
@@ -571,7 +578,6 @@ impl SpanQuery for SpanWithinQuery {
             include: self.include.clone_box(),
             exclude: self.exclude.clone_box(),
             distance: self.distance,
-            boost: self.boost,
         })
     }
 }
@@ -594,7 +600,19 @@ impl SpanQueryWrapper {
         }
     }
 
-    /// Set the boost factor.
+    /// Set the boost of the span query: it multiplies the score.
+    ///
+    /// This is the only boost of a span query. The span queries the wrapper
+    /// holds have none of their own, since they only supply positions, as in
+    /// Lucene (Issue #1569).
+    ///
+    /// ```
+    /// use laurus::lexical::Query;
+    /// use laurus::lexical::query::span::{SpanQueryWrapper, SpanTermQuery};
+    ///
+    /// let query = SpanQueryWrapper::new(Box::new(SpanTermQuery::new("body", "quick"))).boost(2.0);
+    /// assert_eq!(Query::boost(&query), 2.0);
+    /// ```
     pub fn boost(mut self, boost: f32) -> Self {
         self.boost = boost;
         self
@@ -915,11 +933,10 @@ mod tests {
 
     #[test]
     fn test_span_term_query() {
-        let query = SpanTermQuery::new("content", "hello").boost(2.0);
+        let query = SpanTermQuery::new("content", "hello");
 
         assert_eq!(query.field_name(), "content");
         assert_eq!(query.term(), "hello");
-        assert_eq!(query.boost, 2.0);
     }
 
     #[test]
