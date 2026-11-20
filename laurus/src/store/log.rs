@@ -422,6 +422,22 @@ impl WalWriterState {
     }
 }
 
+/// Whether `name` is a temporary file of a replacement of the WAL at
+/// `wal_path` (Issue #1588): `<wal_path>_<n>.tmp`, with `n` one or more
+/// ASCII digits, the name `FileStorage` and `MemoryStorage` give to
+/// `create_temp_output(wal_path)`.
+///
+/// # Arguments
+///
+/// * `wal_path` - The WAL's path, relative to the storage root.
+/// * `name` - A file name, relative to the same root.
+fn is_wal_temp_file(wal_path: &str, name: &str) -> bool {
+    name.strip_prefix(wal_path)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Unified document log providing WAL, doc_id generation, and document storage.
 ///
 /// This component replaces the separate `WalManager` and `UnifiedDocumentStore`,
@@ -1101,6 +1117,15 @@ impl DocumentLog {
     /// them. Reading it fails, and the file is left as it is, so the index
     /// does not open until the newer build opens it (Issue #1507).
     ///
+    /// Before reading, it deletes the temporary files that an earlier
+    /// replacement of the WAL (the cut, or a commit's rewrite) left, as a
+    /// crash before its rename leaves one: files named `<wal_path>_<n>.tmp`
+    /// with `n` a number (Issue #1588). This is best-effort: a failure to
+    /// list or delete them is logged as a warning and does not fail the
+    /// read. Another log writing to the same WAL meanwhile would lose its
+    /// temporary file, so only one log may use a WAL at a time, as the
+    /// engine's storage lock ensures.
+    ///
     /// # Errors
     ///
     /// Returns an error if the WAL has a version this build does not know,
@@ -1108,9 +1133,20 @@ impl DocumentLog {
     /// failure is the storage sync after its rename leaves the cut file in
     /// place (see [`Self::cut_wal`]).
     pub fn read_all(&self) -> Result<Vec<LogRecord>> {
-        // Held across the read and the cut, so that no append opens the
-        // file in between.
+        // Held across the sweep, the read and the cut, so that no append
+        // opens the file, and no replacement writes a temporary file, in
+        // between.
         let writer_guard = self.wal_writer.lock();
+        // Best-effort, like the sweep of vector segment files (Issue
+        // #1532): a leftover costs only disk space, so it does not keep the
+        // index from opening.
+        if let Err(error) = self.sweep_temp_files() {
+            ::log::warn!(
+                "WAL '{}': could not delete every temporary file an earlier replacement \
+                 left: {error}",
+                self.wal_path
+            );
+        }
         let (records, cut_at) = self.read_wal()?;
         if let Some(valid_len) = cut_at
             && writer_guard.is_none()
@@ -1281,40 +1317,34 @@ impl DocumentLog {
     /// complete record (Issue #1503).
     ///
     /// Copies those bytes unchanged into a temporary file, so the file
-    /// keeps its framing, and renames it over the WAL, as
-    /// [`Self::truncate_retaining_after`] does: a crash leaves either the
-    /// whole old file or the cut one. Only [`Self::read_all`] calls this,
-    /// holding the writer lock with no append handle open, so the file
-    /// cannot change during the copy.
+    /// keeps its framing, and renames it over the WAL with
+    /// [`Self::replace_wal`], as [`Self::truncate_retaining_after`] does: a
+    /// crash leaves either the whole old file or the cut one. Only
+    /// [`Self::read_all`] calls this, holding the writer lock with no append
+    /// handle open, so the file cannot change during the copy.
     ///
-    /// The storage is synced after the rename, as in [`Self::rewrite_wal`],
-    /// which also says what a failure of only that sync leaves: here too,
-    /// the file a crash could bring back holds every record the cut one
-    /// does.
+    /// The storage is synced after the rename, which makes it durable before
+    /// an append lands on the cut file. [`Self::rewrite_wal`] says what a
+    /// failure of only that sync leaves: here too, the file a crash could
+    /// bring back holds every record the cut one does.
     ///
     /// # Errors
     ///
     /// Returns an error if reading the WAL, writing the temporary file,
-    /// renaming it, or syncing the storage fails.
+    /// renaming it, or syncing the storage fails. A failure before the
+    /// rename leaves the WAL as it was and deletes the temporary file.
     fn cut_wal(&self, valid_len: u64) -> Result<()> {
-        let (tmp_name, mut tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
-        {
-            // Dropped before the rename: on Windows, a mapping of the file
-            // that is still open (an mmap `FileStorage` input) fails it.
-            let mut input = self.wal_storage.open_input(&self.wal_path)?;
-            std::io::copy(&mut (&mut input).take(valid_len), &mut tmp_out)?;
-        }
-        tmp_out.flush_and_sync()?;
-        tmp_out.close()?;
-
-        // A crash can undo the rename until a storage sync succeeds (Issue
-        // #1566).
-        self.wal_name_synced.store(false, Ordering::Release);
-        self.wal_storage.rename_file(&tmp_name, &self.wal_path)?;
-        // Make the rename durable before an append lands on the cut file.
-        self.sync_wal_storage()?;
-
-        Ok(())
+        self.replace_wal(|mut tmp_out| {
+            {
+                // Dropped before the rename: on Windows, a mapping of the
+                // file that is still open (an mmap `FileStorage` input)
+                // fails it.
+                let mut input = self.wal_storage.open_input(&self.wal_path)?;
+                std::io::copy(&mut (&mut input).take(valid_len), &mut tmp_out)?;
+            }
+            tmp_out.flush_and_sync()?;
+            tmp_out.close()
+        })
     }
 
     /// Truncate (clear) the WAL.
@@ -1431,36 +1461,131 @@ impl DocumentLog {
     ///
     /// Returns an error if writing the temporary file, renaming it or
     /// syncing the storage fails. A failure before the rename leaves the
-    /// live WAL untouched.
+    /// live WAL untouched and deletes the temporary file (see
+    /// [`Self::replace_wal`]).
     fn rewrite_wal(&self, records: &[LogRecord]) -> Result<()> {
-        let (tmp_name, mut tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
-        tmp_out.write_all(WAL_MAGIC)?;
-        tmp_out.write_all(&[WAL_VERSION])?;
-        let mut tmp_state = Some(WalWriterState::new(tmp_out));
-        // Defer the per-record fsync `write_record` would otherwise do under
-        // `WalSyncPolicy::PerRecord` (one syscall per record) and sync once
-        // after the whole file is written instead.
+        self.replace_wal(|mut tmp_out| {
+            tmp_out.write_all(WAL_MAGIC)?;
+            tmp_out.write_all(&[WAL_VERSION])?;
+            let mut tmp_state = Some(WalWriterState::new(tmp_out));
+            // Defer the per-record fsync `write_record` would otherwise do
+            // under `WalSyncPolicy::PerRecord` (one syscall per record) and
+            // sync once after the whole file is written instead.
+            {
+                let _deferral = self.defer_sync();
+                // No `torn` flag: a failure here leaves the live WAL
+                // untouched.
+                for record in records {
+                    self.write_record(&mut tmp_state, record, None)?;
+                }
+            }
+            if let Some(state) = tmp_state.as_mut() {
+                state.out.flush_and_sync()?;
+                state.out.close()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Replace the WAL with a new file, atomically: create a temporary file
+    /// next to it, let `write` fill it, and rename it over the WAL.
+    ///
+    /// `write` gets the temporary file's output, writes the new file into
+    /// it, and flushes, syncs and closes it; the output is dropped by the
+    /// time `write` returns. The storage is synced after the rename, so that
+    /// the rename survives a crash: on Unix, `FileStorage::sync` fsyncs the
+    /// directories, which is where a rename is recorded. Until that sync
+    /// succeeds, [`Self::wal_name_synced`] stays unset (Issue #1566).
+    ///
+    /// When `write` or the rename fails, the temporary file is deleted
+    /// before the error is returned (Issue #1588): nothing else would, and
+    /// each failure would leave one more, since the storage names each new
+    /// temporary file after the first free number. The output is dropped
+    /// first, as a `MemoryOutput` dropped after the deletion would publish
+    /// the file again. A temporary file a crash leaves, or one whose
+    /// deletion fails, is deleted the next time the log opens (see
+    /// [`Self::sweep_temp_files`]).
+    ///
+    /// The caller holds the writer lock with no append handle open: a handle
+    /// open on the replaced file would go on writing to it.
+    ///
+    /// # Arguments
+    ///
+    /// * `write` - Writes the new file into the given output, and flushes,
+    ///   syncs and closes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the temporary file, `write`, the rename
+    /// or the storage sync fails. A failure before the rename leaves the
+    /// live WAL untouched.
+    fn replace_wal(
+        &self,
+        write: impl FnOnce(Box<dyn crate::storage::StorageOutput>) -> Result<()>,
+    ) -> Result<()> {
+        let (tmp_name, tmp_out) = self.wal_storage.create_temp_output(&self.wal_path)?;
+        let renamed = write(tmp_out).and_then(|()| {
+            // A crash can undo the rename until a storage sync succeeds
+            // (Issue #1566).
+            self.wal_name_synced.store(false, Ordering::Release);
+            self.wal_storage.rename_file(&tmp_name, &self.wal_path)
+        });
+        if let Err(error) = renamed {
+            self.delete_temp_file(&tmp_name);
+            return Err(error);
+        }
+        self.sync_wal_storage()
+    }
+
+    /// Delete the temporary file `name` of a replacement of the WAL that
+    /// failed (Issue #1588), logging a warning if that fails: the file
+    /// costs only disk space, and the next open sweeps it (see
+    /// [`Self::sweep_temp_files`]).
+    fn delete_temp_file(&self, name: &str) {
+        if !self.wal_storage.file_exists(name) {
+            return;
+        }
+        if let Err(error) = self.wal_storage.delete_file(name) {
+            ::log::warn!(
+                "WAL '{}': could not delete the temporary file '{name}' of a failed \
+                 replacement: {error}",
+                self.wal_path
+            );
+        }
+    }
+
+    /// Delete every temporary file that an earlier replacement of the WAL
+    /// left (Issue #1588): a crash before its rename leaves one, and so does
+    /// a failure whose deletion failed too (see [`Self::replace_wal`]).
+    ///
+    /// Only names of the form `<wal_path>_<n>.tmp` are deleted (see
+    /// [`is_wal_temp_file`]), the name `FileStorage` and `MemoryStorage`
+    /// give a temporary file of the WAL, so files of other names are never
+    /// affected. A file that cannot be deleted does not stop the deletion of
+    /// the others.
+    ///
+    /// The caller holds the writer lock. Every temporary file of this log is
+    /// created, and renamed or deleted, under that lock, so none of them is
+    /// being written. The engine also holds its storage lock, so that no
+    /// other engine writes to the same WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing the files fails, or the first error of a
+    /// deletion that failed.
+    fn sweep_temp_files(&self) -> Result<()> {
+        let mut first_error = None;
+        for name in self
+            .wal_storage
+            .list_files()?
+            .iter()
+            .filter(|name| is_wal_temp_file(&self.wal_path, name))
         {
-            let _deferral = self.defer_sync();
-            // No `torn` flag: a failure here leaves the live WAL untouched.
-            for record in records {
-                self.write_record(&mut tmp_state, record, None)?;
+            if let Err(error) = self.wal_storage.delete_file(name) {
+                first_error.get_or_insert(error);
             }
         }
-        if let Some(state) = tmp_state.as_mut() {
-            state.out.flush_and_sync()?;
-            state.out.close()?;
-        }
-
-        // A crash can undo the rename until a storage sync succeeds (Issue
-        // #1566).
-        self.wal_name_synced.store(false, Ordering::Release);
-        self.wal_storage.rename_file(&tmp_name, &self.wal_path)?;
-        // Make the rename durable: on Unix, `FileStorage::sync` fsyncs the
-        // directories, which is where a rename is recorded.
-        self.sync_wal_storage()?;
-
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Sync the WAL's storage, which makes the WAL file's name durable, and
