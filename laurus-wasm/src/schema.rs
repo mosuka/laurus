@@ -156,6 +156,77 @@ fn embed_function(config: &JsValue, signature: &str) -> Result<js_sys::Function,
         })
 }
 
+/// Fail if an `addEmbedder` config has a key its type does not take
+/// (Issue #1700), as the other bindings' embedder definitions do.
+///
+/// The config holds a JS function, which serde cannot read, so its own
+/// enumerable keys are checked instead.
+///
+/// # Arguments
+///
+/// * `config` - The `addEmbedder` config object.
+/// * `embedder_type` - Its `type`, for the error message.
+/// * `keys` - The keys that type takes, `type` included.
+fn check_embedder_keys(
+    config: &JsValue,
+    embedder_type: &str,
+    keys: &[&str],
+) -> Result<(), JsValue> {
+    let Some(object) = config.dyn_ref::<js_sys::Object>() else {
+        return Err(JsValue::from_str("Embedder config must be an object"));
+    };
+    let unknown: Vec<String> = js_sys::Object::keys(object)
+        .iter()
+        .filter_map(|key| key.as_string())
+        .filter(|key| !keys.contains(&key.as_str()))
+        .map(|key| format!("`{key}`"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let expected: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
+    Err(JsValue::from_str(&format!(
+        "unknown key {} in a '{embedder_type}' embedder config, expected {}",
+        unknown.join(", "),
+        expected.join(", ")
+    )))
+}
+
+/// The shape `addAnalyzerDefinition` takes, so that a key it does not
+/// declare is an error (Issue #1700).
+///
+/// It is read from a [`serde_json::Value`] of the whole JS object, not
+/// straight from the `JsValue`: serde-wasm-bindgen reads a struct by asking
+/// for its declared keys only, so `deny_unknown_fields` would never see an
+/// unknown one. A property set to `undefined` arrives as `null`. The
+/// components stay `serde_json::Value`s here and are read into the core
+/// types afterwards, each with its own error prefix.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AnalyzerDefinitionInput {
+    #[serde(default)]
+    tokenizer: Option<serde_json::Value>,
+    #[serde(default)]
+    char_filters: Option<serde_json::Value>,
+    #[serde(default)]
+    token_filters: Option<serde_json::Value>,
+}
+
+impl AnalyzerDefinitionInput {
+    /// Read `definition`, failing on a key the shape does not declare.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JS error if `definition` is not an object, or has a key
+    /// other than `tokenizer`, `charFilters` and `tokenFilters`.
+    fn from_js(definition: JsValue) -> Result<Self, JsValue> {
+        let value: serde_json::Value = serde_wasm_bindgen::from_value(definition)
+            .map_err(|e| JsValue::from_str(&format!("invalid analyzer definition: {e}")))?;
+        serde_json::from_value(value)
+            .map_err(|e| JsValue::from_str(&format!("invalid analyzer definition: {e}")))
+    }
+}
+
 /// Schema builder for defining index fields and embedders.
 ///
 /// ```javascript
@@ -711,6 +782,9 @@ impl WasmSchema {
     /// A `"token_callback"` function receives `role` as `"query"` or
     /// `"document"`, and returns one `dimension`-long vector per token.
     ///
+    /// A key the type does not take is an error (Issue #1700), as in the
+    /// other bindings' embedder definitions.
+    ///
     /// ## Example — callback embedder with Transformers.js
     ///
     /// ```javascript
@@ -734,16 +808,19 @@ impl WasmSchema {
 
         let embedder: Arc<dyn Embedder> = match embedder_type.as_str() {
             "precomputed" => {
+                check_embedder_keys(&config, "precomputed", &["type"])?;
                 self.inner
                     .embedders
                     .insert(name, EmbedderDefinition::Precomputed);
                 return Ok(());
             }
             "callback" => {
+                check_embedder_keys(&config, "callback", &["type", "embed"])?;
                 let func = embed_function(&config, "(text: string) => Promise<number[]>")?;
                 Arc::new(JsCallbackEmbedder::new(name.clone(), func))
             }
             "token_callback" => {
+                check_embedder_keys(&config, "token_callback", &["type", "embed", "dimension"])?;
                 let func = embed_function(
                     &config,
                     "(text: string, role: \"query\" | \"document\") => number[][] | Promise<number[][]>",
@@ -840,9 +917,11 @@ impl WasmSchema {
     /// # Errors
     ///
     /// Returns a JS error if `name` is reserved for a built-in analyzer
-    /// (`standard`, `keyword`, `english`, `simple`, `noop`), if `tokenizer`
+    /// (`standard`, `keyword`, `english`, `simple`, `noop`), if `definition`
+    /// has a key other than the three above (Issue #1700), if `tokenizer`
     /// is missing, or if `tokenizer`/`charFilters`/`tokenFilters` do not
-    /// match a known component shape.
+    /// match a known component shape, including a component with a key it
+    /// does not take.
     #[wasm_bindgen(js_name = "addAnalyzerDefinition")]
     pub fn add_analyzer_definition(
         &mut self,
@@ -850,36 +929,29 @@ impl WasmSchema {
         definition: js_sys::Object,
     ) -> Result<(), JsValue> {
         laurus::analysis::analyzer::registry::validate_analyzer_name(&name).map_err(laurus_err)?;
-        let tokenizer_val = js_sys::Reflect::get(&definition, &JsValue::from_str("tokenizer"))
-            .unwrap_or(JsValue::UNDEFINED);
-        if tokenizer_val.is_undefined() {
-            return Err(JsValue::from_str(
-                "analyzer definition must have a 'tokenizer' key",
-            ));
-        }
-        let tokenizer: TokenizerConfig = serde_wasm_bindgen::from_value(tokenizer_val)
-            .map_err(|e| JsValue::from_str(&format!("invalid tokenizer: {e}")))?;
+        let definition = AnalyzerDefinitionInput::from_js(definition.into())?;
 
-        let char_filters_val = js_sys::Reflect::get(&definition, &JsValue::from_str("charFilters"))
-            .unwrap_or(JsValue::UNDEFINED);
-        let char_filters: Vec<CharFilterConfig> =
-            if char_filters_val.is_undefined() || char_filters_val.is_null() {
-                Vec::new()
-            } else {
-                serde_wasm_bindgen::from_value(char_filters_val)
-                    .map_err(|e| JsValue::from_str(&format!("invalid charFilters: {e}")))?
-            };
+        let tokenizer: TokenizerConfig = match definition.tokenizer {
+            Some(value) if !value.is_null() => serde_json::from_value(value)
+                .map_err(|e| JsValue::from_str(&format!("invalid tokenizer: {e}")))?,
+            _ => {
+                return Err(JsValue::from_str(
+                    "analyzer definition must have a 'tokenizer' key",
+                ));
+            }
+        };
 
-        let token_filters_val =
-            js_sys::Reflect::get(&definition, &JsValue::from_str("tokenFilters"))
-                .unwrap_or(JsValue::UNDEFINED);
-        let token_filters: Vec<TokenFilterConfig> =
-            if token_filters_val.is_undefined() || token_filters_val.is_null() {
-                Vec::new()
-            } else {
-                serde_wasm_bindgen::from_value(token_filters_val)
-                    .map_err(|e| JsValue::from_str(&format!("invalid tokenFilters: {e}")))?
-            };
+        let char_filters: Vec<CharFilterConfig> = match definition.char_filters {
+            Some(value) if !value.is_null() => serde_json::from_value(value)
+                .map_err(|e| JsValue::from_str(&format!("invalid charFilters: {e}")))?,
+            _ => Vec::new(),
+        };
+
+        let token_filters: Vec<TokenFilterConfig> = match definition.token_filters {
+            Some(value) if !value.is_null() => serde_json::from_value(value)
+                .map_err(|e| JsValue::from_str(&format!("invalid tokenFilters: {e}")))?,
+            _ => Vec::new(),
+        };
 
         self.inner.analyzers.insert(
             name,
@@ -989,5 +1061,127 @@ impl WasmSchema {
         laurus::validate_field_name(&name).map_err(laurus_err)?;
         self.inner.fields.insert(name, option);
         Ok(())
+    }
+}
+
+// This crate's tests run on `wasm32` only (see the note on `wal.rs`'s
+// tests).
+#[cfg(test)]
+#[cfg(target_arch = "wasm32")]
+mod tests {
+    use wasm_bindgen::{JsCast, JsValue};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::WasmSchema;
+
+    fn object(json: &str) -> js_sys::Object {
+        js_sys::JSON::parse(json).unwrap().dyn_into().unwrap()
+    }
+
+    /// The error message of `result`, or `None` if it succeeded.
+    fn error_message<T>(result: Result<T, JsValue>) -> Option<String> {
+        result.err().map(|e| e.as_string().unwrap_or_default())
+    }
+
+    /// Issue #1700: a key the definition or a component does not take
+    /// (also on a component that takes no parameters) is an error naming
+    /// it, not a setting that silently keeps its default. A property set to
+    /// `undefined` is the same as leaving it out.
+    #[wasm_bindgen_test]
+    fn add_analyzer_definition_rejects_an_unknown_key() {
+        let cases = [
+            (
+                r#"{"tokenizer": {"type": "whitespace"}, "tokenFilter": [{"type": "lowercase"}]}"#,
+                "invalid analyzer definition: unknown field `tokenFilter`",
+            ),
+            (
+                r#"{"tokenizer": {"type": "regex", "gap": true}}"#,
+                "invalid tokenizer: unknown field `gap`",
+            ),
+            (
+                r#"{"tokenizer": {"type": "whitespace"}, "tokenFilters": [{"type": "lowercase", "words": ["the"]}]}"#,
+                "invalid tokenFilters: unknown field `words`",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (definition, expected) in cases {
+            let result = WasmSchema::new().add_analyzer_definition("a".into(), object(definition));
+            match error_message(result) {
+                Some(message) if message.starts_with(expected) => {}
+                other => wrong.push(format!("{definition}: {other:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+
+        let definition = object(r#"{"tokenizer": {"type": "whitespace"}}"#);
+        js_sys::Reflect::set(&definition, &"tokenFilters".into(), &JsValue::UNDEFINED).unwrap();
+        let mut schema = WasmSchema::new();
+        schema
+            .add_analyzer_definition("a".into(), definition)
+            .unwrap();
+        assert_eq!(schema.analyzer_names(), vec!["a".to_string()]);
+    }
+
+    /// Issue #1700: an `addEmbedder` config with a key its type does not
+    /// take is an error naming it; each type still accepts its own keys.
+    #[wasm_bindgen_test]
+    fn add_embedder_rejects_a_key_its_type_does_not_take() {
+        let embed = js_sys::Function::new_no_args("return [];");
+        let config = |json: &str| -> JsValue {
+            let config = object(json);
+            if js_sys::Reflect::get(&config, &"type".into()).unwrap() != "precomputed" {
+                js_sys::Reflect::set(&config, &"embed".into(), &embed).unwrap();
+            }
+            config.into()
+        };
+
+        let rejected = [
+            (
+                r#"{"type": "precomputed", "model": "x"}"#,
+                "unknown key `model` in a 'precomputed' embedder config, expected `type`",
+            ),
+            (
+                r#"{"type": "callback", "dimension": 4}"#,
+                "unknown key `dimension` in a 'callback' embedder config, expected `type`, `embed`",
+            ),
+            (
+                r#"{"type": "token_callback", "dimension": 4, "dimesion": 4}"#,
+                "unknown key `dimesion` in a 'token_callback' embedder config, expected `type`, \
+                 `embed`, `dimension`",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (json, expected) in rejected {
+            let result = WasmSchema::new().add_embedder("e".into(), config(json));
+            if error_message(result).as_deref() != Some(expected) {
+                wrong.push(json.to_string());
+            }
+        }
+        for json in [
+            r#"{"type": "precomputed"}"#,
+            r#"{"type": "callback"}"#,
+            r#"{"type": "token_callback", "dimension": 4}"#,
+        ] {
+            if let Some(message) =
+                error_message(WasmSchema::new().add_embedder("e".into(), config(json)))
+            {
+                wrong.push(format!("{json}: {message}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1700: `fromToml` rejects a key the schema does not declare.
+    #[wasm_bindgen_test]
+    fn from_toml_rejects_an_unknown_key() {
+        let message = error_message(WasmSchema::from_toml(
+            "[fields.body.Text]\nindexd = false\n".into(),
+        ));
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("unknown field `indexd`")),
+            "{message:?}"
+        );
     }
 }

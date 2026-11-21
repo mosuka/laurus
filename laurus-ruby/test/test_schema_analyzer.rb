@@ -355,4 +355,67 @@ class TestSchemaAnalyzer < Minitest::Test
       assert_equal schema.analyzer_names, restored.analyzer_names
     end
   end
+
+  # ---------------------------------------------------------------------
+  # Unknown keys (Issue #1700): an error naming the key, not a setting that
+  # silently keeps its default
+  # ---------------------------------------------------------------------
+
+  def test_add_analyzer_rejects_an_unknown_key
+    cases = [
+      [{ type: "regex", gap: true }, {}, /invalid tokenizer: unknown field `gap`/],
+      [{ type: "whitespace", pattern: "x" }, {}, /invalid tokenizer: unknown field `pattern`/],
+      [
+        { type: "whitespace" },
+        { char_filters: [{ type: "unicode_normalization", form: "nfkc", from: "x" }] },
+        /invalid char_filters\[0\]: unknown field `from`/
+      ],
+      [
+        { type: "whitespace" },
+        { token_filters: [{ type: "lowercase", words: ["the"] }] },
+        /invalid token_filters\[0\]: unknown field `words`/
+      ]
+    ]
+    cases.each do |tokenizer, filters, message|
+      err = assert_raises(ArgumentError, tokenizer.inspect) do
+        Laurus::Schema.new.add_analyzer("a", tokenizer, **filters)
+      end
+      assert_match(message, err.message)
+    end
+  end
+
+  def test_add_embedder_rejects_an_unknown_key
+    [
+      [{ type: "precomputed", model: "x" }, /unknown field `model`/],
+      [{ type: "candle_bert", model: "m", modle: "x" }, /unknown field `modle`/]
+    ].each do |config, message|
+      err = assert_raises(ArgumentError, config.inspect) do
+        Laurus::Schema.new.add_embedder("e", config)
+      end
+      assert_match(message, err.message)
+    end
+  end
+
+  def test_from_toml_rejects_an_unknown_key
+    err = assert_raises(ArgumentError) do
+      Laurus::Schema.from_toml("[fields.body.Text]\nindexd = false\n")
+    end
+    assert_match(/unknown field `indexd`/, err.message)
+  end
+
+  # `add_hnsw_field` collects the keywords it does not name in a splat (for
+  # `base_weight:`), so it rejects any other one itself, as Ruby does for
+  # the other builders, whose rejection this also pins.
+  def test_field_builders_reject_an_unknown_keyword
+    schema = Laurus::Schema.new
+    err = assert_raises(ArgumentError) { schema.add_hnsw_field("v", 4, dimesion: 8) }
+    assert_equal "unknown keyword: :dimesion", err.message
+    err = assert_raises(ArgumentError) do
+      schema.add_hnsw_field("v", 4, base_weight: 2.0, mm: 1, ef: 2)
+    end
+    assert_equal "unknown keywords: :mm, :ef", err.message
+    err = assert_raises(ArgumentError) { schema.add_text_field("body", stord: true) }
+    assert_match(/unknown keyword: :stord/, err.message)
+    assert_empty schema.field_names
+  end
 end

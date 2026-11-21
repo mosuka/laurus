@@ -370,18 +370,20 @@ impl IndexDirClaim {
     ///
     /// Returns [`IndexDirError::Io`] if `schema.toml` cannot be read or
     /// synced, or the directory cannot be synced, and
-    /// [`IndexDirError::Core`] if the file is not a valid schema.
+    /// [`IndexDirError::Core`] with a [`LaurusError::Schema`] naming the
+    /// file if it is not a valid schema, such as one with a key the schema
+    /// does not declare (Issue #1700).
     pub fn read_schema(&self) -> Result<Schema, IndexDirError> {
         let schema_path = self.index_dir.join(SCHEMA_FILE);
         let content = durable::read_synced(&schema_path).map_err(|source| IndexDirError::Io {
-            path: schema_path,
+            path: schema_path.clone(),
             source,
         })?;
         durable::sync_dir(&self.index_dir).map_err(|source| IndexDirError::Io {
             path: self.index_dir.clone(),
             source,
         })?;
-        Ok(Schema::from_toml(&content)?)
+        parse_schema_file(&schema_path, &content)
     }
 
     /// Create a new index's `schema.toml` and `store/` in the claimed
@@ -605,6 +607,41 @@ pub fn write_schema(index_dir: &Path, schema: &Schema) -> Result<(), IndexDirErr
     .map_err(|source| IndexDirError::Io {
         path: schema_path,
         source,
+    })
+}
+
+/// Read the `schema.toml` of the index at `index_dir`, to show or change
+/// the schema without opening the index.
+///
+/// Unlike [`IndexDirClaim::read_schema`], which every open path uses, this
+/// takes no claim and does not sync the file. Both parse it the same way: a
+/// file that is not a valid schema, such as one with a key the schema does
+/// not declare (Issue #1700), fails with an error that names the file.
+///
+/// # Errors
+///
+/// Returns [`IndexDirError::Io`] if `schema.toml` cannot be read, and
+/// [`IndexDirError::Core`] with a [`LaurusError::Schema`] naming the file
+/// if it is not a valid schema.
+pub fn read_schema(index_dir: &Path) -> Result<Schema, IndexDirError> {
+    let schema_path = index_dir.join(SCHEMA_FILE);
+    let content = std::fs::read_to_string(&schema_path).map_err(|source| IndexDirError::Io {
+        path: schema_path.clone(),
+        source,
+    })?;
+    parse_schema_file(&schema_path, &content)
+}
+
+/// Parse `content`, read from the `schema.toml` at `schema_path`, adding the
+/// path to a [`LaurusError::Schema`] so that the error says which file is
+/// not a valid schema.
+fn parse_schema_file(schema_path: &Path, content: &str) -> Result<Schema, IndexDirError> {
+    Schema::from_toml(content).map_err(|err| match err {
+        LaurusError::Schema(message) => IndexDirError::Core(LaurusError::Schema(format!(
+            "{}: {message}",
+            schema_path.display()
+        ))),
+        other => IndexDirError::Core(other),
     })
 }
 
@@ -853,6 +890,36 @@ mod tests {
 
         let (reopened, _storage, _claim) = open_or_create(dir.path(), None).unwrap();
         assert!(reopened.fields.contains_key("_secret"));
+    }
+
+    /// Issue #1700: a persisted `schema.toml` with a key the schema does
+    /// not declare (a hand edit, or a newer laurus) is not opened, unlike a
+    /// reserved name above, since opening it would run without what the key
+    /// was meant to set. Opening and the display read both fail with a
+    /// schema error that names the file and the key.
+    #[test]
+    fn reopen_with_an_unknown_key_in_schema_toml_fails_naming_the_file_and_the_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema_path = dir.path().join(SCHEMA_FILE);
+        std::fs::write(&schema_path, "[fields.body.Text]\nindexd = false\n").unwrap();
+        let prefix = format!("{}: invalid schema TOML:", schema_path.display());
+
+        let mut failures = Vec::new();
+        let open = open_or_create(dir.path(), None).map(|(schema, _, _)| schema);
+        for (label, result) in [("open", open), ("display read", read_schema(dir.path()))] {
+            match result {
+                Err(IndexDirError::Core(LaurusError::Schema(message)))
+                    if message.starts_with(&prefix)
+                        && message.contains("unknown field `indexd`") => {}
+                Err(other) => failures.push(format!("{label}: {other}")),
+                Ok(_) => failures.push(format!("{label}: opened")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "each must fail naming {} and `indexd`: {failures:?}",
+            schema_path.display()
+        );
     }
 
     // --- IndexDirClaim::rollback (Issue #1308, #1665) ---

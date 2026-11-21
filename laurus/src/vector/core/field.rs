@@ -186,7 +186,10 @@ fn reject_field(field_name: &str, reason: Option<String>) -> Result<()> {
 }
 
 /// Options for Flat vector index.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlatOption {
     /// Number of dimensions for each vector. Defaults to `128`.
     #[serde(default = "default_dimension")]
@@ -246,7 +249,10 @@ impl Default for FlatOption {
 }
 
 /// Options for HNSW vector index.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HnswOption {
     /// Number of dimensions for each vector. Defaults to `128`.
     #[serde(default = "default_dimension")]
@@ -359,7 +365,10 @@ impl Default for HnswOption {
 }
 
 /// Options for IVF vector index.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IvfOption {
     /// Number of dimensions for each vector.
     pub dimension: usize,
@@ -434,7 +443,10 @@ impl Default for IvfOption {
 /// vector-search target; it is read by late-interaction rescoring, which
 /// scores a document as `Σ_i max_j sim(q_i, d_j)` over the query's and the
 /// document's token vectors.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultiVectorOption {
     /// Number of dimensions of every token vector. Defaults to `128`.
     #[serde(default = "default_dimension")]

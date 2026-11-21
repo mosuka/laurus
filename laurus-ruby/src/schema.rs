@@ -66,10 +66,36 @@ fn parse_multi_vector_storage(s: &str) -> Result<MultiVectorStorage, Error> {
 /// `ScanArgsOpt` is only implemented for tuples up to 9 elements
 /// (Issue #1084) and the HNSW field builder's existing option list
 /// already uses all 9.
+///
+/// # Errors
+///
+/// Raises `ArgumentError` for any other keyword in `splat`, worded as Ruby
+/// words it for a method that declares its keywords (`unknown keyword:
+/// :dimesion`), since the splat would otherwise drop it (Issue #1700). Raises
+/// `TypeError` if `base_weight:` is not a number.
 fn base_weight_from_splat(splat: RHash) -> Result<f32, Error> {
     let ruby = Ruby::get().expect("called from Ruby thread");
+    let base_weight_key = ruby.to_symbol("base_weight");
+    let mut unknown = Vec::new();
+    splat.foreach(|key: Value, _value: Value| {
+        if !key.eql(base_weight_key)? {
+            unknown.push(key.inspect());
+        }
+        Ok(ForEach::Continue)
+    })?;
+    if !unknown.is_empty() {
+        let noun = if unknown.len() == 1 {
+            "keyword"
+        } else {
+            "keywords"
+        };
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            format!("unknown {noun}: {}", unknown.join(", ")),
+        ));
+    }
     let value: Option<f64> = splat
-        .get(ruby.to_symbol("base_weight"))
+        .get(base_weight_key)
         .map(TryConvert::try_convert)
         .transpose()?;
     Ok(value.unwrap_or(1.0) as f32)
@@ -739,9 +765,10 @@ impl RbSchema {
     ///
     /// Raises `ArgumentError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields, if `distance:`, `quantizer:` or
-    /// `rerank_storage:` is not a known value, or if `subvector_count:` is
+    /// `rerank_storage:` is not a known value, if `subvector_count:` is
     /// missing for `quantizer:` "product_quantization" or given with any
-    /// other quantizer.
+    /// other quantizer, or for a keyword it does not take (Issue #1700), as
+    /// the other field builders do.
     fn add_hnsw_field(&self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String, usize), (), (), (), RHash, ()>(args)?;
         let (name, dimension) = args.required;

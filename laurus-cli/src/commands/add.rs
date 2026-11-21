@@ -73,3 +73,37 @@ pub async fn run_doc(id: &str, data_json: &str, index_dir: &Path) -> Result<()> 
     println!("Document '{id}' added. Run 'commit' to persist changes.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laurus::Schema;
+
+    /// Issue #1700: an unknown key in `--field-option` is an error naming
+    /// it, instead of a field whose `indexed` silently keeps its default,
+    /// and no field is added.
+    #[tokio::test]
+    async fn run_field_rejects_an_unknown_key_in_the_field_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Schema::from_toml("[fields.body.Text]\n").unwrap();
+        context::create_index_from_schema(dir.path(), schema)
+            .await
+            .unwrap();
+
+        let error = run_field("title", r#"{"Text": {"indexd": false}}"#, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("unknown field `indexd`"),
+            "{error:#}"
+        );
+        assert!(
+            !context::read_schema(dir.path())
+                .unwrap()
+                .fields
+                .contains_key("title"),
+            "no field may be added"
+        );
+    }
+}

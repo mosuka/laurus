@@ -32,6 +32,44 @@ default_fields = ["title", "body"]
 - **`embedders`** — 名前と埋め込みモデルのマップです。ベクトルフィールドは `embedder` オプションに名前を書いて使います。省略可能です。[エンベダー](#エンベダー) を参照してください。
 - **`fields`** — フィールド名とその型付き設定のマップです。各フィールドにはフィールド型を1つだけ指定する必要があります。
 
+### 知らないキー
+
+どのテーブルも、このページがそのテーブルに挙げるキーだけを取ります（一番上の階層、フィールドのオプション、アナライザの定義とその各コンポーネント、組み込みアナライザのテーブル、エンベダー、量子化）。挙げていないキー、たとえば書き間違えた `indexd` や、引数を取らない `lowercase` フィルターの `words` は、黙ってデフォルト値のままにされるのではなく、キーを名指しするエラーになります（Issue #1700）。このとき `create index` は何も作りません。
+
+```toml
+# schema.toml
+[fields.title.Text]
+indexd = false
+```
+
+```text
+$ laurus --index-dir index create index --schema schema.toml
+Error: Failed to parse schema TOML
+
+Caused by:
+    Schema error: invalid schema TOML: TOML parse error at line 2, column 1
+      |
+    2 | indexd = false
+      | ^^^^^^
+    unknown field `indexd`, expected one of `indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`
+```
+
+既存のインデックスの `schema.toml` にも同じ規則が当たります。laurus はそこに自分の知っているキーしか書かないので、知らないキーがあるなら、手で書き足したか、新しい版の laurus が書いたものです。そのようなインデックスは開けず、エラーはファイルとキーを名指しします。次の例は、`index/schema.toml` に同じ `indexd` を書き足したものです。
+
+```text
+$ laurus --index-dir index get stats
+Error: Failed to read schema file
+
+Caused by:
+    Schema error: index/schema.toml: invalid schema TOML: TOML parse error at line 2, column 1
+      |
+    2 | indexd = false
+      | ^^^^^^
+    unknown field `indexd`, expected one of `indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`
+```
+
+キーを消すか、そのインデックスを書いた版の laurus で開いてください。新しく足す省略可能なキーは、デフォルト値以外を設定したときだけ `schema.toml` に書かれるので、古い版で開けなくなるのは、新しい設定を使ったインデックスだけです。
+
 ## フィールド命名規則
 
 - フィールド名は任意の文字列です（例: `title`、`body_vec`、`created_at`）。
@@ -560,7 +598,7 @@ analyzer = "english_stemmed"
 
 エラーは次の 3 つの時点で起きます:
 
-- 未知の `type` や必須キーの欠落は、スキーマの解析時にエラーになります。このとき `create index` は何も作りません。
+- 未知の `type`、必須キーの欠落、コンポーネントが取らないキー（[知らないキー](#知らないキー) を参照）は、スキーマの解析時にエラーになります。このとき `create index` は何も作りません。
 - 組み込みと同じ名前のエントリは、インデックスの作成時に `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name` というエラーになります。このとき `create index` は何も作りません。各バインディングの `addAnalyzer` / `add_analyzer`（WASM では `addAnalyzerDefinition`）も同じエラーを返します。この検査より前に作ったインデックスは、これまでどおり開けます。エントリは使われないままで、開くときに `log` クレートで警告を出します（`laurus-server` はこれをログに表示します）。`boost` が有限でないか負の `boost` トークンフィルターも、同じく `Analyzer 'a': token_filters[0]: boost must be finite and at least 0, got NaN` というエラーになります（Issue #1701）。バインディングの `addAnalyzer` はこれを検査せず、インデックスの作成が検査します。この検査より前に作ったインデックスは、そのフィルターを外して警告を出したうえで開くので、それまでの検索結果のままです。Issue #1701 より前は、このフィルターはどのスコアも変えていませんでした。
 - 不正な値（誤った正規表現、未知の `form` や `stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。このとき `create index` は何も作りません — `schema.toml` と `store/` は、呼び出し前の状態（何もなければ「何もない」状態）まで巻き戻されます。
 

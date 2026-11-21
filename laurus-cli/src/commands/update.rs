@@ -103,4 +103,37 @@ mod tests {
              existing data (classified as Reindex); enable `reindex` to proceed"
         );
     }
+
+    /// Issue #1700: an unknown key in `--field-option` is an error naming
+    /// it, instead of a change that silently keeps the key's default, and
+    /// the field is left as it was.
+    #[tokio::test]
+    async fn run_field_rejects_an_unknown_key_in_the_field_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Schema::from_toml("[fields.body.Text]\nstored = false\n").unwrap();
+        context::create_index_from_schema(dir.path(), schema)
+            .await
+            .unwrap();
+
+        let error = run_field(
+            "body",
+            r#"{"Text": {"stord": true}}"#,
+            false,
+            false,
+            dir.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("unknown field `stord`"),
+            "{error:#}"
+        );
+        let schema = context::read_schema(dir.path()).unwrap();
+        assert!(
+            matches!(&schema.fields["body"], laurus::FieldOption::Text(option) if !option.stored),
+            "the field must be left as it was: {:?}",
+            schema.fields["body"]
+        );
+    }
 }

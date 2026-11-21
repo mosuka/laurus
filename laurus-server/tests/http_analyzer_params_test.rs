@@ -258,3 +258,68 @@ async fn a_component_of_the_wrong_shape_is_a_400_and_creates_nothing() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Issue #1700: a component with a key it does not take, also one that
+/// takes no parameters, is a 400 that names the key, and creates nothing,
+/// instead of a component that silently keeps the key's default. A key set
+/// to `null` is the same as omitting it, so an unknown one set to `null` is
+/// dropped without an error: it carries no value to lose.
+#[tokio::test]
+async fn a_component_with_an_unknown_key_is_a_400_and_creates_nothing() {
+    let whitespace = json!({"type": "whitespace"});
+    let analyzer = |char_filters: Value, tokenizer: Value, token_filters: Value| json!({"a": {"char_filters": char_filters, "tokenizer": tokenizer, "token_filters": token_filters}});
+    let cases = [
+        (
+            analyzer(json!([]), json!({"type": "regex", "gap": true}), json!([])),
+            "Analyzer 'a': tokenizer: unknown field `gap`, expected `pattern` or `gaps`",
+        ),
+        (
+            analyzer(
+                json!([]),
+                json!({"type": "whitespace", "pattern": "x"}),
+                json!([]),
+            ),
+            "Analyzer 'a': tokenizer: unknown field `pattern`, there are no fields",
+        ),
+        (
+            analyzer(
+                json!([]),
+                whitespace.clone(),
+                json!([{"type": "lowercase", "words": ["the"]}]),
+            ),
+            "Analyzer 'a': token_filters[0]: unknown field `words`, there are no fields",
+        ),
+        (
+            analyzer(
+                json!([{"type": "japanese_iteration_mark", "kanjj": false}]),
+                whitespace.clone(),
+                json!([]),
+            ),
+            "Analyzer 'a': char_filters[0]: unknown field `kanjj`, expected `kanji` or `kana`",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (analyzers, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let router = gateway(data_dir.clone()).await;
+        let (status, body) = send(&router, "POST", "/v1/index", schema(analyzers.clone())).await;
+        if status != StatusCode::BAD_REQUEST || body["error"]["message"] != json!(expected) {
+            wrong.push(format!("{analyzers}: {status} {body}"));
+        }
+        if data_dir.exists() {
+            wrong.push(format!("{analyzers}: an index was created"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let router = gateway(dir.path().join("data")).await;
+    let analyzers = analyzer(
+        json!([]),
+        json!({"type": "whitespace", "gapz": null}),
+        json!([]),
+    );
+    let (status, body) = send(&router, "POST", "/v1/index", schema(analyzers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

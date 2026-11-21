@@ -3127,6 +3127,44 @@ class LaurusTest extends TestCase
         }
     }
 
+    /**
+     * Issue #1700: an unknown key in an analyzer component (also one that
+     * takes no parameters), an embedder config or a TOML schema is an error
+     * naming the key, not a setting that silently keeps its default.
+     */
+    public function testUnknownKeysAreRejected(): void
+    {
+        $whitespace = ["type" => "whitespace"];
+        $cases = [
+            "invalid tokenizer: unknown field `gap`" => fn () => (new Laurus\Schema())
+                ->addAnalyzer("a", ["type" => "regex", "gap" => true]),
+            "invalid tokenizer: unknown field `pattern`" => fn () => (new Laurus\Schema())
+                ->addAnalyzer("a", ["type" => "whitespace", "pattern" => "x"]),
+            "invalid charFilters[0]: unknown field `from`" => fn () => (new Laurus\Schema())
+                ->addAnalyzer("a", $whitespace, [["type" => "unicode_normalization", "form" => "nfkc", "from" => "x"]]),
+            "invalid tokenFilters[0]: unknown field `words`" => fn () => (new Laurus\Schema())
+                ->addAnalyzer("a", $whitespace, null, [["type" => "lowercase", "words" => ["the"]]]),
+            "unknown field `model`" => fn () => (new Laurus\Schema())
+                ->addEmbedder("e", ["type" => "precomputed", "model" => "x"]),
+            "unknown field `modle`" => fn () => (new Laurus\Schema())
+                ->addEmbedder("e", ["type" => "candle_bert", "model" => "m", "modle" => "x"]),
+            "unknown field `indexd`" => fn () => Laurus\Schema::fromToml("[fields.body.Text]\nindexd = false\n"),
+        ];
+        foreach ($cases as $message => $call) {
+            // Checked outside the `try`, since `fail()` throws an exception
+            // whose message would contain `$message`; `fromToml` throws a
+            // `ValueError`, which is not an `\Exception`.
+            $error = null;
+            try {
+                $call();
+            } catch (\Throwable $e) {
+                $error = $e->getMessage();
+            }
+            $this->assertNotNull($error, "accepted an unknown key: $message");
+            $this->assertStringContainsString($message, $error);
+        }
+    }
+
     // ── Result grouping (Issue #1297) ─────────────────────────────────────
     //
     // Uses the corpus of `laurus-server/tests/grpc_group_by_test.rs`: three

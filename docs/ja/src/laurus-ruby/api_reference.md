@@ -196,6 +196,8 @@ Laurus::Schema.new
 
 上記のどの `add_*_field` メソッドも、`name` が `_`（`_id` を除く）で始まる場合は `ArgumentError` を発生させ、何も追加しない。`from_toml` / `from_toml_file` で読み込むスキーマはそのようなフィールドを引き続き受け付けるため、永続化済みのスキーマはそのまま読み込める。ただし、そのスキーマから新しい `Index` を作成すると `ArgumentError` になる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
 
+スキーマのフォーマットが宣言していないキーは、黙ってデフォルト値のままにされるのではなく、キーを名指しする `ArgumentError` になる（Issue #1700）。`add_analyzer` のコンポーネント（`{ type: "lowercase", words: ["the"] }` のように、引数を取らないコンポーネントも同じ）、`add_embedder` の `config`、`from_toml` / `from_toml_file` の TOML が対象で、エラーは ``invalid tokenizer: unknown field `gap` ...`` のようになる。どの `add_*_field` メソッドも、取らないキーワード（`add_hnsw_field("v", 4, dimesion: 8)` など）には `ArgumentError`（`unknown keyword: :dimesion`）を発生させる。
+
 ### その他のメソッド
 
 | メソッド | 説明 |

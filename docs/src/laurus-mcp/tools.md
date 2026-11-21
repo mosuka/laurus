@@ -62,6 +62,12 @@ values: `"Strict"`, `"Dynamic"` (default), `"Ignore"`. **Warning**: under
 [Schema & Fields](../concepts/schema_and_fields.md#dynamic-schema) for the
 full behaviour matrix.
 
+The JSON is read by the types `schema.toml` is read by, so a key that a
+table does not declare, such as a misspelled `"indexd"`, is an error that
+names the key, as in ``Failed to parse schema JSON: unknown field `indexd` ...``,
+and no index is created (Issue #1700). The same holds for the
+`field_option_json` of `add_field` and `update_field`.
+
 ### Example
 
 ```text

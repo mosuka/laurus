@@ -360,6 +360,41 @@ mod tests {
         );
     }
 
+    /// Issue #1700: a start against an index whose `schema.toml` was edited
+    /// to hold a key the schema does not declare fails, naming the file
+    /// itself (not only the data directory, which the startup error names
+    /// anyway) and the key, instead of serving the index without what the
+    /// key was meant to set.
+    #[tokio::test]
+    async fn open_index_at_startup_fails_on_an_unknown_key_in_schema_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("idx");
+        let engine = context::create_index(
+            &data_dir,
+            &Schema::new(),
+            WalSyncPolicy::default(),
+            CommitPolicy::Manual,
+        )
+        .await
+        .unwrap();
+        drop(engine);
+        let schema_path = data_dir.join(laurus::index_dir::SCHEMA_FILE);
+        std::fs::write(&schema_path, "[fields.body.Text]\nindexd = false\n").unwrap();
+
+        let Err(err) =
+            open_index_at_startup(&data_dir, WalSyncPolicy::default(), CommitPolicy::Manual).await
+        else {
+            panic!("the start must not open an index whose schema.toml has an unknown key");
+        };
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("{}: invalid schema TOML:", schema_path.display()))
+                && message.contains("unknown field `indexd`"),
+            "got: {message}"
+        );
+    }
+
     /// Issue #1480: SIGTERM must resolve `shutdown_signal` the same way
     /// Ctrl+C does, reaching the commit and (once the last `Engine` handle
     /// is dropped, as happens when `run()` returns) the lock release --

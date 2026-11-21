@@ -368,3 +368,69 @@ def test_to_toml_file_then_from_toml_file_round_trip(tmp_path):
 
     assert restored.field_names() == schema.field_names()
     assert restored.analyzer_names() == schema.analyzer_names()
+
+
+# ---------------------------------------------------------------------------
+# Unknown keys (Issue #1700): an error naming the key, not a setting that
+# silently keeps its default
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tokenizer", "filters", "message"),
+    [
+        ({"type": "regex", "gap": True}, {}, r"invalid tokenizer: unknown field `gap`"),
+        (
+            {"type": "whitespace", "pattern": "x"},
+            {},
+            r"invalid tokenizer: unknown field `pattern`",
+        ),
+        (
+            {"type": "whitespace"},
+            {"char_filters": [{"type": "unicode_normalization", "form": "nfkc", "from": "x"}]},
+            r"invalid char_filters\[0\]: unknown field `from`",
+        ),
+        (
+            {"type": "whitespace"},
+            {"token_filters": [{"type": "lowercase", "words": ["the"]}]},
+            r"invalid token_filters\[0\]: unknown field `words`",
+        ),
+    ],
+    ids=["regex-gap", "whitespace-pattern", "char-filter", "parameterless-filter"],
+)
+def test_add_analyzer_rejects_an_unknown_key(tokenizer, filters, message):
+    schema = laurus.Schema()
+    with pytest.raises(ValueError, match=message):
+        schema.add_analyzer("a", tokenizer, **filters)
+
+
+@pytest.mark.parametrize(
+    ("config", "key"),
+    [
+        ({"type": "precomputed", "model": "x"}, "model"),
+        ({"type": "candle_bert", "model": "m", "modle": "x"}, "modle"),
+    ],
+    ids=["precomputed", "candle_bert"],
+)
+def test_add_embedder_rejects_an_unknown_key(config, key):
+    schema = laurus.Schema()
+    with pytest.raises(ValueError, match=f"unknown field `{key}`"):
+        schema.add_embedder("e", config)
+
+
+def test_analyzer_dict_is_read_as_the_core_builtin_analyzer():
+    # The dict is read as `schema.toml` reads it, so an unknown key and a
+    # value of the wrong type are both a `ValueError`.
+    schema = laurus.Schema()
+    with pytest.raises(ValueError, match="invalid analyzer: unknown field `mod`"):
+        schema.add_text_field(
+            "body", analyzer={"language": "japanese", "dict": "/d", "mod": "normal"}
+        )
+    with pytest.raises(ValueError, match="invalid analyzer: invalid type"):
+        schema.add_text_field("body", analyzer={"language": "japanese", "dict": "/d", "mode": 1})
+    assert schema.field_names() == []
+
+
+def test_from_toml_rejects_an_unknown_key():
+    with pytest.raises(ValueError, match="unknown field `indexd`"):
+        laurus.Schema.from_toml("[fields.body.Text]\nindexd = false\n")

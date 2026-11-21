@@ -194,6 +194,8 @@ Laurus::Schema.new
 
 Every `add_*_field` method above raises `ArgumentError` when `name` starts with `_` (other than `_id`), and adds nothing. A schema loaded with `from_toml` / `from_toml_file` keeps accepting such a field, so a persisted schema still loads; creating a new `Index` from it raises `ArgumentError`. See [Field Naming](../laurus-cli/schema_format.md#field-naming).
 
+A key the schema format does not declare raises `ArgumentError` naming the key, instead of a setting that silently keeps its default (Issue #1700): in an `add_analyzer` component (also one that takes no parameters, such as `{ type: "lowercase", words: ["the"] }`), in an `add_embedder` `config`, and in the TOML of `from_toml` / `from_toml_file`, as in ``invalid tokenizer: unknown field `gap` ...``. Every `add_*_field` method also raises `ArgumentError` for a keyword it does not take, such as `add_hnsw_field("v", 4, dimesion: 8)` (`unknown keyword: :dimesion`).
+
 ### Other methods
 
 | Method | Description |

@@ -188,9 +188,12 @@ fn default_position_increment_gap() -> u32 {
 /// Options for Text fields (used by Lexical indexing).
 ///
 /// Controls how text fields are analyzed, indexed, and stored.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct TextOption {
     /// Whether to index this field for search.
     #[serde(default = "default_true")]
@@ -417,10 +420,12 @@ impl Default for TextOption {
 /// of any flag (`is_doc_values_candidate` excludes both types
 /// unconditionally, Issue #1052/#1053), so a `doc_values` field here
 /// would always be a dead setting.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
-
+#[serde(deny_unknown_fields)]
 pub struct BytesOption {
     /// If true, the value is stored.
     #[serde(default = "default_true")]
@@ -473,9 +478,12 @@ impl BytesOption {
 }
 
 /// Options for Integer fields.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct IntegerOption {
     /// Whether to index this field for range queries.
     #[serde(default = "default_true")]
@@ -539,9 +547,12 @@ impl Default for IntegerOption {
 }
 
 /// Options for Float fields.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct FloatOption {
     /// Whether to index this field for range queries.
     #[serde(default = "default_true")]
@@ -605,9 +616,12 @@ impl Default for FloatOption {
 }
 
 /// Options for Boolean fields.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct BooleanOption {
     /// Whether to index this field.
     #[serde(default = "default_true")]
@@ -678,9 +692,12 @@ impl Default for BooleanOption {
 }
 
 /// Options for DateTime fields.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct DateTimeOption {
     /// Whether to index this field for range queries.
     #[serde(default = "default_true")]
@@ -744,9 +761,12 @@ impl Default for DateTimeOption {
 }
 
 /// Options for Geo (geographic point) fields.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct GeoOption {
     /// Whether to index this field for geo queries.
     #[serde(default = "default_true")]
@@ -805,9 +825,12 @@ impl GeoOption {
 /// 3D bounding boxes — that 2D `GeoOption` cannot express. Schema fields
 /// declared with `Geo3dOption` accept `DataValue::GeoEcef` values and are
 /// indexed in a 3D BKD tree.
+///
+/// An unknown key is an error (Issue #1700).
 #[derive(
     Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct Geo3dOption {
     /// Whether to index this field for 3D geo queries.
     #[serde(default = "default_true")]

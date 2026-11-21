@@ -1097,6 +1097,31 @@ ef_construction = 16
             .expect("first commit must encode against the create-time codebook");
     }
 
+    /// Issue #1700: `create index --schema` rejects a schema with a key it
+    /// does not declare, naming the key, instead of creating an index whose
+    /// regex tokenizer silently keeps `gaps = false`, and creates nothing.
+    #[tokio::test]
+    async fn create_rejects_a_schema_with_an_unknown_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("schema.toml");
+        std::fs::write(
+            &schema_path,
+            "[fields.body.Text]\nanalyzer = \"a\"\n\n[analyzers.a.tokenizer]\ntype = \"regex\"\ngap = true\n",
+        )
+        .unwrap();
+        let index_dir = dir.path().join("index");
+
+        let error = run_index(Some(&schema_path), None, &index_dir)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("unknown field `gap`"),
+            "{error:#}"
+        );
+        assert!(!index_dir.exists(), "a rejected create must write nothing");
+    }
+
     /// Control pinning the hazard itself: without the flag, the same
     /// schema's first commit hard-errors per the #918 failure policy.
     #[tokio::test]

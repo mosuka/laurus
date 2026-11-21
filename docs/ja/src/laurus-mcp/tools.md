@@ -54,6 +54,8 @@ FieldOption は serde の externally-tagged 表現を使用します（バリア
 
 オプションの `dynamic_field_policy` キーは、スキーマに宣言されていないフィールドが投入ドキュメントに含まれる場合の挙動を制御します。指定可能な値は `"Strict"` / `"Dynamic"`（デフォルト）/ `"Ignore"`。**警告**: `"Dynamic"` では integer フィールドに入ってきた float 値が静かに切り捨てられます（`3.14` → `3`）。厳密さが必要なら `"Strict"` を使用してください。詳細な挙動マトリクスは [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
 
+この JSON は `schema.toml` と同じ型で読まれます。そのため、書き間違えた `"indexd"` のように、テーブルが宣言していないキーはキーを名指しするエラーになり（例: ``Failed to parse schema JSON: unknown field `indexd` ...``）、インデックスは作られません（Issue #1700）。`add_field` と `update_field` の `field_option_json` も同じです。
+
 ### 例
 
 ```text

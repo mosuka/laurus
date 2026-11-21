@@ -261,3 +261,92 @@ async fn get_schema_leaves_out_unset_parameters_and_keeps_empty_tables() {
         );
     }
 }
+
+/// Issue #1700: a component with a key it does not take, also one that
+/// takes no parameters, is `INVALID_ARGUMENT` naming the key, and no index
+/// is created, instead of a component that silently keeps the key's
+/// default.
+#[tokio::test]
+async fn a_component_with_an_unknown_key_is_rejected() {
+    let whitespace = || component(json!({"type": "whitespace"}));
+    let cases = [
+        (
+            v1::AnalyzerDefinition {
+                tokenizer: Some(component(json!({"type": "regex", "gap": true}))),
+                ..Default::default()
+            },
+            "Analyzer 'a': tokenizer: unknown field `gap`, expected `pattern` or `gaps`",
+        ),
+        (
+            v1::AnalyzerDefinition {
+                tokenizer: Some(whitespace()),
+                token_filters: vec![component(json!({"type": "lowercase", "words": ["the"]}))],
+                ..Default::default()
+            },
+            "Analyzer 'a': token_filters[0]: unknown field `words`, there are no fields",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (definition, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let result = index_service(&data_dir)
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema(HashMap::from([(
+                    "a".to_string(),
+                    definition.clone(),
+                )]))),
+            }))
+            .await;
+        match result {
+            Ok(_) => wrong.push(format!("{definition:?}: created")),
+            Err(status)
+                if status.code() != Code::InvalidArgument || status.message() != expected =>
+            {
+                wrong.push(format!(
+                    "{definition:?}: {:?} {}",
+                    status.code(),
+                    status.message()
+                ));
+            }
+            Err(_) => {}
+        }
+        if data_dir.exists() {
+            wrong.push(format!("{definition:?}: an index was created"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Issue #1700: GetSchema reads `schema.toml`, and one edited to hold a key
+/// the schema does not declare is `INTERNAL` with the whole cause, naming
+/// the file and the key, rather than only that the file could not be read.
+#[tokio::test]
+async fn get_schema_of_an_edited_schema_toml_names_the_file_and_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let service = index_service(&data_dir);
+    service
+        .create_index(Request::new(CreateIndexRequest {
+            schema: Some(schema(HashMap::new())),
+        }))
+        .await
+        .unwrap();
+    let schema_path = data_dir.join("schema.toml");
+    std::fs::write(&schema_path, "[fields.body.Text]\nindexd = false\n").unwrap();
+
+    let status = service
+        .get_schema(Request::new(GetSchemaRequest {}))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::Internal, "{}", status.message());
+    assert!(
+        status
+            .message()
+            .contains(&format!("{}: invalid schema TOML:", schema_path.display()))
+            && status.message().contains("unknown field `indexd`"),
+        "{}",
+        status.message()
+    );
+}

@@ -210,9 +210,10 @@ pub fn save_schema(data_dir: &Path, schema: &Schema) -> anyhow::Result<()> {
 /// Read the schema from the data directory without opening the full engine.
 ///
 /// This is a lightweight operation for display (`GetSchema`): it only
-/// parses `schema.toml`, with [`Schema::from_toml`] as `laurus::index_dir`
-/// and the CLI do (Issue #1669), and does not touch the storage layer. It
-/// neither takes the index directory's lock nor syncs the file; a path
+/// reads `schema.toml`, with [`laurus::index_dir::read_schema`] as the CLI
+/// does, so that every reader parses it the same way and names the file in
+/// its errors (Issue #1669, #1700), and does not touch the storage layer.
+/// It neither takes the index directory's lock nor syncs the file; a path
 /// that builds an engine reads the schema with
 /// [`IndexDirClaim::read_schema`] instead.
 ///
@@ -227,14 +228,11 @@ pub fn save_schema(data_dir: &Path, schema: &Schema) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the schema file cannot be read or parsed. A file that
-/// is not a valid schema TOML fails with a [`LaurusError::Schema`] as the
-/// error's source.
+/// is not a valid schema TOML, such as one with a key the schema does not
+/// declare, fails with an [`IndexDirError::Core`] holding a
+/// [`LaurusError::Schema`] that names the file as the error's source.
 pub fn read_schema(data_dir: &Path) -> anyhow::Result<Schema> {
-    let schema_path = data_dir.join(SCHEMA_FILE);
-    let schema_toml =
-        std::fs::read_to_string(&schema_path).context("Failed to read schema file")?;
-    let schema = Schema::from_toml(&schema_toml).context("Failed to parse schema TOML")?;
-    Ok(schema)
+    laurus::index_dir::read_schema(data_dir).context("Failed to read schema file")
 }
 
 #[cfg(test)]
@@ -533,25 +531,48 @@ mod tests {
         assert!(read_schema(&data_dir).unwrap().fields.contains_key("title"));
     }
 
-    /// Issue #1669: the display read (`GetSchema`) parses `schema.toml` with
-    /// `Schema::from_toml`, as `laurus::index_dir` and the CLI do, so a file
-    /// that is not a valid schema TOML fails with a `LaurusError::Schema` as
-    /// its source. The outermost message, the only part `GetSchema`'s status
-    /// carries, stays the same.
+    /// Issue #1669, #1700: the display read (`GetSchema`) reads
+    /// `schema.toml` with `laurus::index_dir::read_schema`, as the CLI does,
+    /// so a file that is not a valid schema TOML, including one with a key
+    /// the schema does not declare, fails with a `LaurusError::Schema` that
+    /// names the file.
     #[test]
-    fn read_schema_fails_on_an_invalid_schema_toml_with_a_schema_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(SCHEMA_FILE), "[fields.body.Text\n").unwrap();
+    fn read_schema_fails_on_an_invalid_schema_toml_naming_the_file() {
+        let mut failures = Vec::new();
+        for (content, expected) in [
+            ("[fields.body.Text\n", "invalid schema TOML:"),
+            (
+                "[fields.body.Text]\nindexd = false\n",
+                "unknown field `indexd`",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let schema_path = dir.path().join(SCHEMA_FILE);
+            std::fs::write(&schema_path, content).unwrap();
 
-        let err = read_schema(dir.path()).unwrap_err();
+            let err = match read_schema(dir.path()) {
+                Ok(_) => {
+                    failures.push(format!("{content:?}: read"));
+                    continue;
+                }
+                Err(err) => err,
+            };
 
+            let prefix = format!("{}: invalid schema TOML:", schema_path.display());
+            let names_the_file = err.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<IndexDirError>(),
+                    Some(IndexDirError::Core(LaurusError::Schema(message)))
+                        if message.starts_with(&prefix) && message.contains(expected)
+                )
+            });
+            if !names_the_file || err.to_string() != "Failed to read schema file" {
+                failures.push(format!("{content:?}: {err:#}"));
+            }
+        }
         assert!(
-            err.chain().any(|cause| matches!(
-                cause.downcast_ref::<LaurusError>(),
-                Some(LaurusError::Schema(message)) if message.starts_with("invalid schema TOML:")
-            )),
-            "the parse error must come from Schema::from_toml: {err:#}"
+            failures.is_empty(),
+            "each error must name the file and say why: {failures:#?}"
         );
-        assert_eq!(err.to_string(), "Failed to parse schema TOML");
     }
 }

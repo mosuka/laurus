@@ -7,11 +7,11 @@ use laurus::vector::core::field::{
     DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_M, DEFAULT_IVF_N_CLUSTERS, DEFAULT_IVF_N_PROBE,
 };
 use laurus::{
-    AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
-    CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
-    FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption, IntegerOption,
-    IvfOption, MultiVectorOption, MultiVectorStorage, QuantizationMethod, RerankStorageKind,
-    Schema, TextOption, TokenFilterConfig, TokenizerConfig,
+    AnalyzerDefinition, AnalyzerSpec, BooleanOption, BytesOption, CharFilterConfig, DateTimeOption,
+    DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldOption, FlatOption, FloatOption,
+    Geo3dOption, GeoOption, HnswOption, IntegerOption, IvfOption, MultiVectorOption,
+    MultiVectorStorage, QuantizationMethod, RerankStorageKind, Schema, TextOption,
+    TokenFilterConfig, TokenizerConfig,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -23,49 +23,21 @@ use crate::errors::io_err_with_path;
 /// Convert a Python analyzer reference into an [`AnalyzerSpec`].
 ///
 /// Accepts either a `str` (resolved as [`AnalyzerSpec::Named`]) or a
-/// `dict` describing a parameterized built-in preset. The dict must
-/// include a `"language"` key naming the preset (currently only
-/// `"japanese"`) plus its required parameters (`"dict"` for Japanese,
-/// optionally `"mode"` and `"user_dict"`).
+/// `dict` describing a parameterized built-in preset. The dict is read as
+/// the core [`AnalyzerSpec`], in the shape `schema.toml` uses, as analyzer
+/// components are: a `"language"` key naming the preset (currently only
+/// `"japanese"`) plus its parameters (`"dict"` for Japanese, optionally
+/// `"mode"` and `"user_dict"`). A key the preset does not take raises
+/// `ValueError` (Issue #1700), as does a missing or mistyped parameter.
 fn analyzer_spec_from_py(py: Python<'_>, obj: Py<PyAny>) -> PyResult<AnalyzerSpec> {
     if let Ok(name) = obj.extract::<String>(py) {
         return Ok(AnalyzerSpec::Named(name));
     }
     let bound = obj.bind(py);
-    if let Ok(dict) = bound.cast::<PyDict>() {
-        let language = dict
-            .get_item("language")?
-            .ok_or_else(|| PyValueError::new_err("analyzer dict requires a 'language' key"))?
-            .extract::<String>()?;
-        match language.as_str() {
-            "japanese" => {
-                let dict_path = dict
-                    .get_item("dict")?
-                    .ok_or_else(|| {
-                        PyValueError::new_err("japanese analyzer requires a 'dict' path")
-                    })?
-                    .extract::<String>()?;
-                let mode = dict
-                    .get_item("mode")?
-                    .map(|v| v.extract::<String>())
-                    .transpose()?
-                    .unwrap_or_else(|| "normal".to_string());
-                let user_dict = dict
-                    .get_item("user_dict")?
-                    .map(|v| v.extract::<String>())
-                    .transpose()?;
-                return Ok(AnalyzerSpec::Builtin(BuiltinAnalyzerSpec::Japanese {
-                    mode,
-                    dict: dict_path,
-                    user_dict,
-                }));
-            }
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unsupported analyzer language: {other}"
-                )));
-            }
-        }
+    if bound.cast::<PyDict>().is_ok() {
+        let value = py_to_json_value(bound)?;
+        return serde_json::from_value(value)
+            .map_err(|e| PyValueError::new_err(format!("invalid analyzer: {e}")));
     }
     Err(PyValueError::new_err(
         "analyzer must be a str or a dict (e.g. {'language': 'japanese', 'dict': '/path'})",

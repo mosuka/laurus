@@ -92,12 +92,15 @@ An analyzer's char filters, tokenizer and token filters take the shapes of
 as `{"type": "stop", "words": ["new,york", "the"]}`, and the server reads
 them by the rules `schema.toml` is read by (Issue #1478). Each must be an
 object nested at most 8 levels deep. A missing required key, an unknown
-`type` or a value of the wrong type, such as `"min_gram": "2"` or
-`"words": "a,b"`, is rejected with 400 and no index is created; the message
-names the analyzer and the component, as in
+`type`, a key the component does not take (also on one that takes no
+parameters, such as `"words"` on a `lowercase` filter; Issue #1700) or a
+value of the wrong type, such as `"min_gram": "2"` or `"words": "a,b"`, is
+rejected with 400 and no index is created; the message names the analyzer
+and the component, as in
 `Analyzer 'a': token_filters[0]: invalid type: string "a,b", expected a sequence`.
 A whole number such as `2.0` also fills an integer parameter, and `null` is
-the same as omitting a key. `GET /v1/schema` returns each component in the
+the same as omitting a key, so a key the component does not take is not
+reported when its value is `null`. `GET /v1/schema` returns each component in the
 same shape, with the defaults filled in, so the response can be posted
 back. A server older than this fix joined a list into one comma-separated
 string and split it again, so a stop word with a comma became two words
@@ -106,6 +109,13 @@ mapping value that was not a string, took `"2"` for a number, read a
 misspelled boolean such as `"False"` as its default, and returned every
 parameter as a string, with a mapping's entries at the top level of the
 component.
+
+The rest of a schema in the body (an analyzer's `char_filters`, `tokenizer`
+and `token_filters` keys, the field options, the embedders and the schema's
+top level) is read by the gateway itself, which still drops a key it does
+not know, such as `"indexd"` in a `text` field option, without an error
+(Issue #1706). `schema.toml`, the CLI, MCP and the language
+bindings reject such a key.
 
 If the data directory has a `store/` but no `schema.toml`, the request is
 rejected with 412 and nothing is written or removed, since the `store/` may

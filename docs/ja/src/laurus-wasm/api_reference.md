@@ -711,6 +711,10 @@ schema.addTextField("body", undefined, undefined, undefined, undefined, "ja-ipad
 `"token_callback"` は、WASM にはないネイティブの `candle_colbert` Embedder の
 代わりになります（[Embedding 戦略](../laurus-wasm.md#embedding-戦略)を参照）。
 
+`"precomputed"` の `model` や `"callback"` の `dimension` のように、その `type` が
+取らないキーは、キーを名指しする例外になります（Issue #1700）。他のバインディングの
+エンベダーの定義と同じです。
+
 ```javascript
 // Precomputed embedder
 schema.addEmbedder("precomputed-embedder", { type: "precomputed" });
@@ -748,6 +752,11 @@ schema.addMultiVectorField("body_colbert", 128, "cosine", "colbert");
 キーはこのワイヤ形式に合わせて snake_case のままです。外側のラッパーキー
 （`charFilters`/`tokenFilters`）のみ、このバインディング独自の camelCase 規約に従います。
 
+`definition` のこの 3 つ以外のキーと、コンポーネントが取らないキー（引数を取らない
+コンポーネントも同じで、`{ type: "lowercase" }` の `words` などが当たります）は、
+キーを名指しする例外になります（Issue #1700）。値が `undefined` のプロパティは、
+書かないのと同じです。
+
 組み込みアナライザ用に予約された名前（`standard`、`keyword`、`english`、`simple`、
 `noop`）は例外になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）で
 `Index.create` や初回の `Index.open` をする場合も同じです。`addAnalyzer` は対象外です。
@@ -770,6 +779,7 @@ schema.addTextField("title", undefined, undefined, undefined, undefined, "ngram3
 
 `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。
 ファイルパス版は提供しません（ブラウザ WASM ターゲットにはファイルシステムがないため）。
+フォーマットが宣言していないキーは、キーを名指しする例外になります（Issue #1700）。
 
 #### `toToml()`
 

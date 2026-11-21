@@ -71,8 +71,12 @@ pub fn create_index_to_status(err: anyhow::Error) -> Status {
 }
 
 /// Convert an anyhow::Error into a tonic Status.
+///
+/// The message is the whole chain of causes (`{err:#}`), not only the
+/// outermost context, so that a client sees why, e.g. which key of which
+/// `schema.toml` could not be read (Issue #1700).
 pub fn anyhow_to_status(err: anyhow::Error) -> Status {
-    Status::internal(err.to_string())
+    Status::internal(format!("{err:#}"))
 }
 
 #[cfg(test)]
